@@ -471,9 +471,8 @@ while True:
             )
             console.print(buy_panel)
 
-            # Straddle entry: combined cost under $1.0 (guaranteed edge at resolution)
-            # AND not too directional so the sell-down logic still works
-            if combined <= 0.98 and max_side <= 0.60:
+            # Straddle entry: both sides individually cheap enough (<= 0.52)
+            if yes_ask <= 0.52 and no_ask <= 0.52:
                 min_size = market.get("orderMinSize", 1)
                 max_fillable = min(yes_depth, no_depth)
 
