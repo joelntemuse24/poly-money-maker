@@ -452,7 +452,7 @@ while True:
             end_ts = datetime.fromisoformat(end_date.replace("Z", "+00:00")).timestamp() * 1000
             minutes_ahead = (end_ts - now_ms) / 60000
 
-            if not (minutes_ahead > 60):
+            if not (60 < minutes_ahead < 300):
                 continue
 
             yes_token, no_token = get_yes_no_tokens(market)
