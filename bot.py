@@ -164,6 +164,19 @@ def safe_get_price(token_id, side):
         console.print(f"  [dim red]Price fetch failed ({side}): {e}[/]")
         return None
 
+def get_book_depth(token_id):
+    """Return (best_ask_price, best_ask_size) from the order book."""
+    try:
+        book = client.get_order_book(token_id)
+        asks = book.get("asks", [])
+        if not asks:
+            return None, 0.0
+        best = min(asks, key=lambda x: float(x.get("price", 999)))
+        return float(best.get("price", 0)), float(best.get("size", 0))
+    except Exception as e:
+        console.print(f"  [dim red]Book fetch failed: {e}[/]")
+        return None, 0.0
+
 def place_order(token_id, price, size, side, order_type, tick_size="0.01"):
     try:
         neg_risk = client.get_neg_risk(token_id)
@@ -438,8 +451,8 @@ while True:
                 continue
 
             yes_token, no_token = get_yes_no_tokens(market)
-            yes_ask = safe_get_price(yes_token, BUY)
-            no_ask = safe_get_price(no_token, BUY)
+            yes_ask, yes_depth = get_book_depth(yes_token)
+            no_ask, no_depth = get_book_depth(no_token)
             if yes_ask is None or no_ask is None:
                 continue
 
@@ -448,8 +461,8 @@ while True:
 
             buy_panel = Panel(
                 f"  [white]{market['question']}[/]\n"
-                f"  UP=[{'bold green' if yes_ask > 0.5 else 'bold red'}]{yes_ask:.3f}[/]  "
-                f"DOWN=[{'bold green' if no_ask > 0.5 else 'bold red'}]{no_ask:.3f}[/]  "
+                f"  UP=[{'bold green' if yes_ask > 0.5 else 'bold red'}]{yes_ask:.3f}[/] ({yes_depth:.1f} avail)  "
+                f"DOWN=[{'bold green' if no_ask > 0.5 else 'bold red'}]{no_ask:.3f}[/] ({no_depth:.1f} avail)  "
                 f"SUM=[bold yellow]{combined:.3f}[/]  "
                 f"[cyan]? {minutes_ahead:.1f}m ahead[/]",
                 title="[bold green]? BUY CHECK[/]",
@@ -461,7 +474,14 @@ while True:
             # Straddle entry: combined cost under $1.0 (guaranteed edge at resolution)
             # AND not too directional so the sell-down logic still works
             if combined <= 0.98 and max_side <= 0.60:
-                size = market.get("orderMinSize", 1)
+                min_size = market.get("orderMinSize", 1)
+                max_fillable = min(yes_depth, no_depth)
+
+                if max_fillable < min_size:
+                    console.print(f"  [dim]Insufficient depth: YES={yes_depth:.1f} NO={no_depth:.1f} (min={min_size})[/]")
+                    continue
+
+                size = round(max_fillable, 2)
                 tick_size = str(market.get("orderPriceMinTickSize", "0.01"))
                 console.print(Panel(
                     f"  [bold white]{market['question']}[/]\n"
