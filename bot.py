@@ -401,7 +401,7 @@ while True:
             end_ts = datetime.fromisoformat(end_date.replace("Z", "+00:00")).timestamp() * 1000
             minutes_left = (end_ts - now_ms) / 60000
 
-            if not (0 < minutes_left <= 20):
+            if minutes_left <= 0:
                 continue
 
             yes_token, no_token = get_yes_no_tokens(market)
@@ -410,25 +410,30 @@ while True:
             if yes_ask is None or no_ask is None:
                 continue
 
-            sell_panel = Panel(
-                f"  [white]{market['question']}[/]\n"
-                f"  UP=[{'bold green' if yes_ask > 0.5 else 'bold red'}]{yes_ask:.3f}[/]  "
-                f"DOWN=[{'bold green' if no_ask > 0.5 else 'bold red'}]{no_ask:.3f}[/]  "
-                f"[yellow]? {minutes_left:.1f}m left[/]",
-                title="[bold yellow]? SELL CHECK[/]",
-                border_style="yellow",
-                box=box.ROUNDED,
-            )
-            console.print(sell_panel)
+            # Sell loser if <= 2% at any time, or < 3% in last 20 minutes
+            sell_yes = not pos["yes_sold"] and (yes_ask <= 0.02 or (minutes_left <= 20 and yes_ask < 0.03))
+            sell_no = not pos["no_sold"] and (no_ask <= 0.02 or (minutes_left <= 20 and no_ask < 0.03))
 
-            if not pos["yes_sold"] and (yes_ask <= 0.02 or (minutes_left <= 15 and yes_ask < 0.03)):
+            if sell_yes or sell_no:
+                sell_panel = Panel(
+                    f"  [white]{market['question']}[/]\n"
+                    f"  UP=[{'bold green' if yes_ask > 0.5 else 'bold red'}]{yes_ask:.3f}[/]  "
+                    f"DOWN=[{'bold green' if no_ask > 0.5 else 'bold red'}]{no_ask:.3f}[/]  "
+                    f"[yellow]? {minutes_left:.1f}m left[/]",
+                    title="[bold yellow]? SELL CHECK[/]",
+                    border_style="yellow",
+                    box=box.ROUNDED,
+                )
+                console.print(sell_panel)
+
+            if sell_yes:
                 best_bid = safe_get_price(yes_token, SELL)
                 if best_bid is not None:
                     result = place_order(yes_token, best_bid, pos["yes_size"], SELL, OrderType.FOK)
                     if result:
                         pos["yes_sold"] = True
 
-            if not pos["no_sold"] and (no_ask <= 0.02 or (minutes_left <= 15 and no_ask < 0.03)):
+            if sell_no:
                 best_bid = safe_get_price(no_token, SELL)
                 if best_bid is not None:
                     result = place_order(no_token, best_bid, pos["no_size"], SELL, OrderType.FOK)
@@ -447,7 +452,7 @@ while True:
             end_ts = datetime.fromisoformat(end_date.replace("Z", "+00:00")).timestamp() * 1000
             minutes_ahead = (end_ts - now_ms) / 60000
 
-            if not (120 < minutes_ahead < 180):
+            if not (minutes_ahead > 60):
                 continue
 
             yes_token, no_token = get_yes_no_tokens(market)
@@ -456,14 +461,10 @@ while True:
             if yes_ask is None or no_ask is None:
                 continue
 
-            combined = round(yes_ask + no_ask, 3)
-            max_side = round(max(yes_ask, no_ask), 3)
-
             buy_panel = Panel(
                 f"  [white]{market['question']}[/]\n"
                 f"  UP=[{'bold green' if yes_ask > 0.5 else 'bold red'}]{yes_ask:.3f}[/] ({yes_depth:.1f} avail)  "
                 f"DOWN=[{'bold green' if no_ask > 0.5 else 'bold red'}]{no_ask:.3f}[/] ({no_depth:.1f} avail)  "
-                f"SUM=[bold yellow]{combined:.3f}[/]  "
                 f"[cyan]? {minutes_ahead:.1f}m ahead[/]",
                 title="[bold green]? BUY CHECK[/]",
                 border_style="green",
@@ -471,8 +472,8 @@ while True:
             )
             console.print(buy_panel)
 
-            # Straddle entry: both sides individually cheap enough (<= 0.52)
-            if yes_ask <= 0.52 and no_ask <= 0.52:
+            # Straddle entry: both sides at exactly the same price, and price <= 0.52
+            if round(yes_ask, 3) == round(no_ask, 3) and yes_ask <= 0.52:
                 min_size = market.get("orderMinSize", 1)
                 max_fillable = min(yes_depth, no_depth)
 
