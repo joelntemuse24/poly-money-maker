@@ -443,10 +443,14 @@ while True:
             if yes_ask is None or no_ask is None:
                 continue
 
+            combined = round(yes_ask + no_ask, 3)
+            max_side = round(max(yes_ask, no_ask), 3)
+
             buy_panel = Panel(
                 f"  [white]{market['question']}[/]\n"
                 f"  UP=[{'bold green' if yes_ask > 0.5 else 'bold red'}]{yes_ask:.3f}[/]  "
                 f"DOWN=[{'bold green' if no_ask > 0.5 else 'bold red'}]{no_ask:.3f}[/]  "
+                f"SUM=[bold yellow]{combined:.3f}[/]  "
                 f"[cyan]? {minutes_ahead:.1f}m ahead[/]",
                 title="[bold green]? BUY CHECK[/]",
                 border_style="green",
@@ -454,7 +458,9 @@ while True:
             )
             console.print(buy_panel)
 
-            if abs(yes_ask - 0.5) <= 0.02 and abs(no_ask - 0.5) <= 0.02:
+            # Straddle entry: combined cost under $1.0 (guaranteed edge at resolution)
+            # AND not too directional so the sell-down logic still works
+            if combined <= 0.98 and max_side <= 0.60:
                 size = market.get("orderMinSize", 1)
                 tick_size = str(market.get("orderPriceMinTickSize", "0.01"))
                 console.print(Panel(
