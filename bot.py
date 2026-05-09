@@ -481,9 +481,9 @@ while True:
                     console.print(f"  [dim]Insufficient depth: YES={yes_depth:.1f} NO={no_depth:.1f} (min={min_size})[/]")
                     continue
 
-                # API requires maker amount (size * price) to have max 2 decimal accuracy.
-                # Integer sizes guarantee this for any price with 2 decimal places.
-                size = int(max_fillable)
+                # Target $1.00 worth of each side (integer shares)
+                target_dollars = 1.0
+                size = max(1, round(target_dollars / yes_ask))
 
                 # Cap by available balance (need enough for BOTH sides)
                 total_cost = size * (yes_ask + no_ask)
