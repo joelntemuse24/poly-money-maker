@@ -481,7 +481,12 @@ while True:
                     console.print(f"  [dim]Insufficient depth: YES={yes_depth:.1f} NO={no_depth:.1f} (min={min_size})[/]")
                     continue
 
-                size = round(max_fillable, 2)
+                # API requires maker amount (size * price) to have max 2 decimal accuracy.
+                # Integer sizes guarantee this for any price with 2 decimal places.
+                size = int(max_fillable)
+                if size < min_size:
+                    console.print(f"  [dim]Integer size too small after rounding: {size} < {min_size}[/]")
+                    continue
                 tick_size = str(market.get("orderPriceMinTickSize", "0.01"))
                 console.print(Panel(
                     f"  [bold white]{market['question']}[/]\n"
