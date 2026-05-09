@@ -91,7 +91,7 @@ pusd_bal = 0.0
 try:
     from py_clob_client_v2.client import BalanceAllowanceParams
     bal_info = client.get_balance_allowance(BalanceAllowanceParams(asset_type="COLLATERAL"))
-    pusd_bal = float(bal_info.get("balance", 0))
+    pusd_bal = float(bal_info.get("balance", 0)) / 1_000_000
 except Exception:
     pass
 
@@ -484,8 +484,15 @@ while True:
                 # API requires maker amount (size * price) to have max 2 decimal accuracy.
                 # Integer sizes guarantee this for any price with 2 decimal places.
                 size = int(max_fillable)
+
+                # Cap by available balance (need enough for BOTH sides)
+                total_cost = size * (yes_ask + no_ask)
+                if total_cost > pusd_bal:
+                    size = int(pusd_bal / (yes_ask + no_ask))
+                    console.print(f"  [dim]Balance cap: reduced size to {size} (balance={pusd_bal:.2f} pUSD, need={total_cost:.2f})[/]")
+
                 if size < min_size:
-                    console.print(f"  [dim]Integer size too small after rounding: {size} < {min_size}[/]")
+                    console.print(f"  [dim]Size too small: {size} < min_size={min_size} (balance={pusd_bal:.2f} pUSD)[/]")
                     continue
                 tick_size = str(market.get("orderPriceMinTickSize", "0.01"))
                 console.print(Panel(
