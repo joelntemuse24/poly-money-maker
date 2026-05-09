@@ -1,0 +1,24 @@
+# Environment / secrets
+.env
+.env.*
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+
+# Virtualenv
+.venv/
+venv/
+env/
+
+# Bot state
+positions.json
+*.log
+
+# IDE
+.vscode/
+.idea/
+*.swp

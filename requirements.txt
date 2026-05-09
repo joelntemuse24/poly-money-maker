@@ -1,0 +1,6 @@
+py_clob_client_v2
+requests
+python-dotenv
+rich
+web3
+eth-account
