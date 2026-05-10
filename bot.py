@@ -245,7 +245,11 @@ def get_order_details(order_id):
             "size_matched": float(getattr(result, "size_matched", 0) or 0),
             "size": float(getattr(result, "size", 1)),
         }
-    except Exception:
+    except Exception as e:
+        err = str(e).lower()
+        if "not found" in err or "404" in err:
+            # Order likely fully filled and removed from active API
+            return {"status": "NOT_FOUND", "size_matched": None, "size": None}
         return None
 
 
@@ -519,7 +523,7 @@ while True:
 
             console.print(f"  [dim]Pending {mid[:20]}... YES={yes_status} matched={yes_matched}  NO={no_status} matched={no_matched}[/]")
 
-            both_filled = is_filled(yes_status) and is_filled(no_status)
+            both_filled = (yes_matched >= p["yes_size"]) and (no_matched >= p["no_size"])
             yes_has_fill = yes_matched > 0
             no_has_fill = no_matched > 0
             timed_out = now_ms > p.get("placed_at", 0) + PENDING_TIMEOUT_MS
@@ -611,6 +615,25 @@ while True:
                 del pending[mid]
                 save_json(PENDING_FILE, pending)
                 console.print("  [yellow]Partial - flattened NO[/]")
+
+            elif yes_has_fill and no_has_fill:
+                # Both sides partially filled — enter whatever we have
+                cancel_order_safe(p["yes_order_id"])
+                cancel_order_safe(p["no_order_id"])
+                positions[mid] = {
+                    "yes_size": yes_matched,
+                    "no_size": no_matched,
+                    "yes_remaining": yes_matched,
+                    "no_remaining": no_matched,
+                    "yes_token": p["yes_token"],
+                    "no_token": p["no_token"],
+                    "end_ts": p["end_ts"],
+                    "question": p.get("question", ""),
+                }
+                save_json(STATE_FILE, positions)
+                del pending[mid]
+                save_json(PENDING_FILE, pending)
+                console.print("  [bold green]Both partial — entered with matched sizes[/]")
 
             elif timed_out:
                 console.print(f"  [dim]Pending timeout - cancelling[/]")
