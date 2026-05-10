@@ -617,10 +617,26 @@ while True:
                 cancel_order_safe(p["yes_order_id"])
                 cancel_order_safe(p["no_order_id"])
                 # If anything filled during the timeout window, flatten it
+                rem_yes = 0
+                rem_no = 0
                 if yes_matched > 0:
-                    sell_with_retry(p["yes_token"], yes_matched)
+                    sold_y, _ = sell_with_retry(p["yes_token"], yes_matched)
+                    rem_yes = yes_matched - sold_y
                 if no_matched > 0:
-                    sell_with_retry(p["no_token"], no_matched)
+                    sold_n, _ = sell_with_retry(p["no_token"], no_matched)
+                    rem_no = no_matched - sold_n
+                if rem_yes > 0 or rem_no > 0:
+                    positions[mid] = {
+                        "yes_size": yes_matched,
+                        "no_size": no_matched,
+                        "yes_remaining": rem_yes,
+                        "no_remaining": rem_no,
+                        "yes_token": p["yes_token"],
+                        "no_token": p["no_token"],
+                        "end_ts": p["end_ts"],
+                        "question": p.get("question", ""),
+                    }
+                    save_json(STATE_FILE, positions)
                 del pending[mid]
                 save_json(PENDING_FILE, pending)
 
@@ -738,8 +754,20 @@ while True:
                         if yes_matched >= size:
                             # YES fully filled before NO placed — flatten immediately
                             console.print("  [yellow]YES filled before NO placed — flattening[/]")
-                            sell_with_retry(yes_token, yes_matched)
+                            sold, _ = sell_with_retry(yes_token, yes_matched)
                             cancel_order_safe(yes_oid)
+                            if sold < yes_matched:
+                                positions[mid] = {
+                                    "yes_size": yes_matched,
+                                    "no_size": 0,
+                                    "yes_remaining": yes_matched - sold,
+                                    "no_remaining": 0,
+                                    "yes_token": yes_token,
+                                    "no_token": no_token,
+                                    "end_ts": end_ts,
+                                    "question": market.get("question", ""),
+                                }
+                                save_json(STATE_FILE, positions)
                             continue
 
                         no_order = place_order(no_token, no_ask, size, BUY, OrderType.GTC, tick_size)
@@ -761,7 +789,19 @@ while True:
                             yes_det2 = get_order_details(yes_oid)
                             yes_m2 = int(yes_det2.get("size_matched", 0)) if yes_det2 else 0
                             if yes_m2 > 0:
-                                sell_with_retry(yes_token, yes_m2)
+                                sold, _ = sell_with_retry(yes_token, yes_m2)
+                                if sold < yes_m2:
+                                    positions[mid] = {
+                                        "yes_size": yes_m2,
+                                        "no_size": 0,
+                                        "yes_remaining": yes_m2 - sold,
+                                        "no_remaining": 0,
+                                        "yes_token": yes_token,
+                                        "no_token": no_token,
+                                        "end_ts": end_ts,
+                                        "question": market.get("question", ""),
+                                    }
+                                    save_json(STATE_FILE, positions)
                             cancel_order_safe(yes_oid)
                     else:
                         console.print("  [dim]YES placement failed, skipping[/]")
