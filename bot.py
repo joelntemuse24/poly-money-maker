@@ -489,6 +489,11 @@ while True:
         # ================= PROCESS PENDING GTC ORDERS =================
         for mid in list(pending.keys()):
             p = pending[mid]
+            age = now_ms - p.get("placed_at", 0)
+            if age < 120_000:  # Let GTC orders sit for 2 minutes before acting
+                console.print(f"  [dim]Pending {mid[:20]}... age={age//1000}s, letting sit[/]")
+                continue
+
             yes_status = get_order_status(p["yes_order_id"])
             no_status = get_order_status(p["no_order_id"])
 
