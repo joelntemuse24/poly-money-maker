@@ -110,7 +110,7 @@ def safe_api_call(func, *args, **kwargs):
         return func(*args, **kwargs)
     except Exception as e:
         err_str = str(e)
-        if "order couldn't be fully filled" not in err_str and "not enough balance" not in err_str:
+        if not any(s in err_str for s in ("order couldn't be fully filled", "not enough balance", "not found", "404")):
             console.print(f"  [dim red]API error: {err_str[:120]}[/]")
         raise
 
@@ -227,11 +227,13 @@ def get_book_bid(token_id):
 def extract_order_id(order_obj):
     if isinstance(order_obj, dict):
         return order_obj.get("orderID") or order_obj.get("id")
-    return getattr(order_obj, "orderID", None) or getattr(order_obj, "id", None) or str(order_obj)
+    return getattr(order_obj, "orderID", None) or getattr(order_obj, "id", None) or (str(order_obj) if order_obj is not None else None)
 
 
 def get_order_details(order_id):
     """Return dict with size_matched and status, or None."""
+    if not order_id:
+        return None
     try:
         result = safe_api_call(client.get_order, order_id)
         if isinstance(result, dict):
@@ -249,20 +251,45 @@ def get_order_details(order_id):
         err = str(e).lower()
         if "not found" in err or "404" in err:
             # Order likely fully filled and removed from active API
-            return {"status": "NOT_FOUND", "size_matched": None, "size": None}
+            return {"status": "NOT_FOUND"}
         return None
 
 
-def is_filled(status):
-    return status in ("FILLED", "MATCHED", "DONE", "FULLY_FILLED")
-
-
 def cancel_order_safe(order_id):
+    if not order_id:
+        return True
     try:
         safe_api_call(client.cancel_order, OrderPayload(orderID=order_id))
         return True
     except Exception:
         return False
+
+
+def matched_from_det(det, fallback_size):
+    """Convert a get_order_details() return into an int matched size.
+    NOT_FOUND is treated as fully filled at fallback_size (caller knows the cap)."""
+    if not det:
+        return 0
+    if det.get("status") == "NOT_FOUND":
+        return int(fallback_size)
+    sm = det.get("size_matched", 0)
+    return int(sm) if sm is not None else 0
+
+
+def refetch_matched_after_cancel(order_id, prev_matched):
+    """Re-read matched count after a cancel succeeded. Fills are frozen post-cancel.
+    Returns int, or None on transient API error (caller should defer).
+    NOT_FOUND post-cancel = archived ⇒ trust prev_matched (cancel killed the unfilled portion)."""
+    if not order_id:
+        return prev_matched
+    det = get_order_details(order_id)
+    if det is None:
+        return None
+    if det.get("status") == "NOT_FOUND":
+        return prev_matched
+    sm = det.get("size_matched", 0)
+    new = int(sm) if sm is not None else 0
+    return max(prev_matched, new)
 
 
 def place_order(token_id, price, size, side, order_type, tick_size="0.01"):
@@ -299,6 +326,8 @@ def sell_with_retry(token_id, size, tick_size="0.01", max_retries=3):
         sell_size = remaining
         if bid_depth < remaining:
             sell_size = int(bid_depth)
+            if sell_size < 1 and bid_depth > 0:
+                sell_size = min(remaining, 1)
             console.print(f"  [dim]Bid depth {bid_depth:.1f} < {remaining}, selling {sell_size}[/]")
 
         if sell_size < 1:
@@ -313,12 +342,25 @@ def sell_with_retry(token_id, size, tick_size="0.01", max_retries=3):
                 order_type=OrderType.FAK,
             )
             if result:
-                # Verify actual matched amount
-                oid = extract_order_id(result)
-                details = get_order_details(oid) if oid else None
+                # Try to get matched amount directly from result first
                 matched = 0
-                if details:
-                    matched = int(details.get("size_matched", 0))
+                if isinstance(result, dict):
+                    matched = int(float(result.get("size_matched", 0) or result.get("makingAmount", 0) or result.get("takerAmount", 0) or 0))
+                else:
+                    matched = int(getattr(result, "size_matched", 0) or 0)
+
+                # If result shows 0, verify via get_order_details (order may have been archived)
+                if matched <= 0:
+                    oid = extract_order_id(result)
+                    details = get_order_details(oid) if oid else None
+                    if details:
+                        if details.get("status") == "NOT_FOUND":
+                            # FAK was archived after fill — assume full fill for this chunk
+                            matched = sell_size
+                        else:
+                            sm = details.get("size_matched", 0)
+                            matched = int(sm) if sm is not None else 0
+
                 if matched <= 0:
                     # API returned order obj but nothing filled — retry
                     console.print(f"  [dim]FAK returned but 0 matched, retrying[/]")
@@ -351,6 +393,8 @@ def redeem_positions(positions):
         pos = positions[mid]
         if pos.get("redeemed"):
             continue
+        if pos.get("redeem_submitted_at") and (time.time() * 1000 - pos["redeem_submitted_at"]) < 300_000:
+            continue  # recently submitted, wait 5 min before retry
         try:
             m_res = requests.get(f"{GAMMA_API}/markets/{mid}", timeout=10)
             if m_res.status_code != 200:
@@ -420,7 +464,7 @@ def redeem_positions(positions):
             if submit_r.status_code == 200:
                 tx_id = submit_r.json().get("transactionID") or "?"
                 console.print(f"  [dim green]Redeem submitted for {mid[:20]}... tx={str(tx_id)[:20]}[/]")
-                pos["redeemed"] = True
+                pos["redeem_submitted_at"] = time.time() * 1000
                 save_json(STATE_FILE, positions)
             else:
                 console.print(f"  [dim red]Redeem failed for {mid}: {submit_r.status_code} {submit_r.text[:100]}[/]")
@@ -442,7 +486,6 @@ while True:
         pusd_bal = get_balance()
 
         markets = get_active_btc_hourly_markets()
-        market_by_id = {m["id"]: m for m in markets}
 
         console.rule(
             f"[bold blue]CYCLE #{CYCLE}[/]  [dim]{now_str}[/]  "
@@ -496,11 +539,28 @@ while True:
         # ================= REDEEM BEFORE CLEANUP =================
         redeem_positions(positions)
 
-        # ================= CLEANUP: only delete redeemed positions =================
+        # ================= CLEANUP: delete sold-out or redeemed+expired positions =================
         for mid in list(positions.keys()):
             pos = positions.get(mid)
-            if pos and pos.get("redeemed") and pos.get("end_ts") and now_ms > pos["end_ts"] + 300000:
+            if not pos:
+                continue
+            # Remove fully liquidated positions
+            yes_rem = pos.get("yes_remaining", 0)
+            no_rem = pos.get("no_remaining", 0)
+            if yes_rem == 0 and no_rem == 0 and not pos.get("redeemed") and not pos.get("redeem_submitted_at"):
+                console.print(f"  [dim]Sold-out position {mid[:20]}... removed[/]")
+                del positions[mid]
+                save_json(STATE_FILE, positions)
+                continue
+            # Remove redeemed+expired positions (with grace period for on-chain settlement)
+            if pos.get("redeemed") and pos.get("end_ts") and now_ms > pos["end_ts"] + 300000:
                 console.print(f"  [dim]Redeemed+expired market {mid[:20]}... removed[/]")
+                del positions[mid]
+                save_json(STATE_FILE, positions)
+                continue
+            # Remove positions where redemption was submitted long ago
+            if pos.get("redeem_submitted_at") and pos.get("end_ts") and now_ms > pos["end_ts"] + 3600_000:
+                console.print(f"  [dim]Redemption settled market {mid[:20]}... removed[/]")
                 del positions[mid]
                 save_json(STATE_FILE, positions)
 
@@ -512,24 +572,38 @@ while True:
                 console.print(f"  [dim]Pending {mid[:20]}... age={age//1000}s, letting sit[/]")
                 continue
 
-            # Use get_order_details for actual size_matched, not just status
-            yes_det = get_order_details(p["yes_order_id"])
-            no_det = get_order_details(p["no_order_id"])
+            # Crash recovery: if already in positions, just drop stale pending
+            if mid in positions:
+                del pending[mid]
+                save_json(PENDING_FILE, pending)
+                continue
 
-            yes_matched = int(yes_det.get("size_matched", 0)) if yes_det else 0
-            no_matched = int(no_det.get("size_matched", 0)) if no_det else 0
+            # Use get_order_details for actual size_matched, not just status
+            yes_oid = p.get("yes_order_id")
+            no_oid = p.get("no_order_id")
+            yes_det = get_order_details(yes_oid) if yes_oid else None
+            no_det = get_order_details(no_oid) if no_oid else None
+
+            # If either real order ID failed transiently, defer to next cycle
+            yes_err = yes_oid and yes_det is None
+            no_err = no_oid and no_det is None
+            if yes_err or no_err:
+                console.print(f"  [dim]Pending {mid[:20]}... order details unavailable, retry next cycle[/]")
+                continue
+
+            yes_matched = matched_from_det(yes_det, p["yes_size"])
+            no_matched = matched_from_det(no_det, p["no_size"])
+
             yes_status = yes_det.get("status", "UNKNOWN") if yes_det else "UNKNOWN"
             no_status = no_det.get("status", "UNKNOWN") if no_det else "UNKNOWN"
 
             console.print(f"  [dim]Pending {mid[:20]}... YES={yes_status} matched={yes_matched}  NO={no_status} matched={no_matched}[/]")
 
             both_filled = (yes_matched >= p["yes_size"]) and (no_matched >= p["no_size"])
-            yes_has_fill = yes_matched > 0
-            no_has_fill = no_matched > 0
             timed_out = now_ms > p.get("placed_at", 0) + PENDING_TIMEOUT_MS
 
+            # Promote without cancellation if both already at full size
             if both_filled:
-                # Full straddle
                 positions[mid] = {
                     "yes_size": yes_matched,
                     "no_size": no_matched,
@@ -539,87 +613,41 @@ while True:
                     "no_token": p["no_token"],
                     "end_ts": p["end_ts"],
                     "question": p.get("question", ""),
+                    "entered_at": now_ms,
                 }
                 save_json(STATE_FILE, positions)
                 del pending[mid]
                 save_json(PENDING_FILE, pending)
                 console.print("  [bold green]FULL STRADDLE ENTERED[/]")
+                continue
 
-            elif yes_has_fill and not no_has_fill:
-                cancel_order_safe(p["no_order_id"])
-                if yes_matched >= p["yes_size"]:
-                    # Fully filled on YES, flatten all
-                    sold, _ = sell_with_retry(p["yes_token"], yes_matched)
-                    if sold < yes_matched:
-                        # Some unsold — track remainder
-                        positions[mid] = {
-                            "yes_size": yes_matched,
-                            "no_size": 0,
-                            "yes_remaining": yes_matched - sold,
-                            "no_remaining": 0,
-                            "yes_token": p["yes_token"],
-                            "no_token": p["no_token"],
-                            "end_ts": p["end_ts"],
-                            "question": p.get("question", ""),
-                        }
-                        save_json(STATE_FILE, positions)
-                else:
-                    # Partial fill on YES
-                    sold, _ = sell_with_retry(p["yes_token"], yes_matched)
-                    if sold < yes_matched:
-                        positions[mid] = {
-                            "yes_size": yes_matched,
-                            "no_size": 0,
-                            "yes_remaining": yes_matched - sold,
-                            "no_remaining": 0,
-                            "yes_token": p["yes_token"],
-                            "no_token": p["no_token"],
-                            "end_ts": p["end_ts"],
-                            "question": p.get("question", ""),
-                        }
-                        save_json(STATE_FILE, positions)
-                del pending[mid]
-                save_json(PENDING_FILE, pending)
-                console.print("  [yellow]Partial - flattened YES[/]")
+            # Nothing filled and not yet timed out — keep waiting
+            if yes_matched == 0 and no_matched == 0 and not timed_out:
+                continue
 
-            elif no_has_fill and not yes_has_fill:
-                cancel_order_safe(p["yes_order_id"])
-                if no_matched >= p["no_size"]:
-                    sold, _ = sell_with_retry(p["no_token"], no_matched)
-                    if sold < no_matched:
-                        positions[mid] = {
-                            "yes_size": 0,
-                            "no_size": no_matched,
-                            "yes_remaining": 0,
-                            "no_remaining": no_matched - sold,
-                            "yes_token": p["yes_token"],
-                            "no_token": p["no_token"],
-                            "end_ts": p["end_ts"],
-                            "question": p.get("question", ""),
-                        }
-                        save_json(STATE_FILE, positions)
-                else:
-                    sold, _ = sell_with_retry(p["no_token"], no_matched)
-                    if sold < no_matched:
-                        positions[mid] = {
-                            "yes_size": 0,
-                            "no_size": no_matched,
-                            "yes_remaining": 0,
-                            "no_remaining": no_matched - sold,
-                            "yes_token": p["yes_token"],
-                            "no_token": p["no_token"],
-                            "end_ts": p["end_ts"],
-                            "question": p.get("question", ""),
-                        }
-                        save_json(STATE_FILE, positions)
-                del pending[mid]
-                save_json(PENDING_FILE, pending)
-                console.print("  [yellow]Partial - flattened NO[/]")
+            # Partial fill (one or both sides) OR timeout: cancel BOTH first to freeze fills,
+            # then re-read matched amounts so the flatten/promote uses the true final values.
+            if not cancel_order_safe(p["yes_order_id"]):
+                console.print("  [dim red]Cancel YES failed, retry next cycle[/]")
+                continue
+            if not cancel_order_safe(p["no_order_id"]):
+                console.print("  [dim red]Cancel NO failed, retry next cycle[/]")
+                continue
 
-            elif yes_has_fill and no_has_fill:
-                # Both sides partially filled — enter whatever we have
-                cancel_order_safe(p["yes_order_id"])
-                cancel_order_safe(p["no_order_id"])
+            yes_matched_post = refetch_matched_after_cancel(p["yes_order_id"], yes_matched)
+            no_matched_post = refetch_matched_after_cancel(p["no_order_id"], no_matched)
+            if yes_matched_post is None or no_matched_post is None:
+                console.print(f"  [dim]Pending {mid[:20]}... post-cancel re-read failed, retry next cycle[/]")
+                continue
+            yes_matched = yes_matched_post
+            no_matched = no_matched_post
+
+            # Re-classify based on post-cancel (final) matched counts
+            both_full_post = yes_matched >= p["yes_size"] and no_matched >= p["no_size"]
+            yes_has = yes_matched > 0
+            no_has = no_matched > 0
+
+            if both_full_post:
                 positions[mid] = {
                     "yes_size": yes_matched,
                     "no_size": no_matched,
@@ -629,39 +657,77 @@ while True:
                     "no_token": p["no_token"],
                     "end_ts": p["end_ts"],
                     "question": p.get("question", ""),
+                    "entered_at": now_ms,
+                }
+                save_json(STATE_FILE, positions)
+                del pending[mid]
+                save_json(PENDING_FILE, pending)
+                console.print("  [bold green]Both filled post-cancel — straddle entered[/]")
+                continue
+
+            if yes_has and no_has:
+                # Both partial — promote with matched sizes; no flattening
+                positions[mid] = {
+                    "yes_size": yes_matched,
+                    "no_size": no_matched,
+                    "yes_remaining": yes_matched,
+                    "no_remaining": no_matched,
+                    "yes_token": p["yes_token"],
+                    "no_token": p["no_token"],
+                    "end_ts": p["end_ts"],
+                    "question": p.get("question", ""),
+                    "entered_at": now_ms,
                 }
                 save_json(STATE_FILE, positions)
                 del pending[mid]
                 save_json(PENDING_FILE, pending)
                 console.print("  [bold green]Both partial — entered with matched sizes[/]")
+                continue
 
-            elif timed_out:
-                console.print(f"  [dim]Pending timeout - cancelling[/]")
-                cancel_order_safe(p["yes_order_id"])
-                cancel_order_safe(p["no_order_id"])
-                # If anything filled during the timeout window, flatten it
-                rem_yes = 0
-                rem_no = 0
-                if yes_matched > 0:
-                    sold_y, _ = sell_with_retry(p["yes_token"], yes_matched)
-                    rem_yes = yes_matched - sold_y
-                if no_matched > 0:
-                    sold_n, _ = sell_with_retry(p["no_token"], no_matched)
-                    rem_no = no_matched - sold_n
-                if rem_yes > 0 or rem_no > 0:
+            if yes_has:
+                sold, _ = sell_with_retry(p["yes_token"], yes_matched)
+                if sold < yes_matched:
                     positions[mid] = {
                         "yes_size": yes_matched,
-                        "no_size": no_matched,
-                        "yes_remaining": rem_yes,
-                        "no_remaining": rem_no,
+                        "no_size": 0,
+                        "yes_remaining": yes_matched - sold,
+                        "no_remaining": 0,
                         "yes_token": p["yes_token"],
                         "no_token": p["no_token"],
                         "end_ts": p["end_ts"],
                         "question": p.get("question", ""),
+                        "entered_at": now_ms,
                     }
                     save_json(STATE_FILE, positions)
                 del pending[mid]
                 save_json(PENDING_FILE, pending)
+                console.print("  [yellow]Partial - flattened YES[/]")
+                continue
+
+            if no_has:
+                sold, _ = sell_with_retry(p["no_token"], no_matched)
+                if sold < no_matched:
+                    positions[mid] = {
+                        "yes_size": 0,
+                        "no_size": no_matched,
+                        "yes_remaining": 0,
+                        "no_remaining": no_matched - sold,
+                        "yes_token": p["yes_token"],
+                        "no_token": p["no_token"],
+                        "end_ts": p["end_ts"],
+                        "question": p.get("question", ""),
+                        "entered_at": now_ms,
+                    }
+                    save_json(STATE_FILE, positions)
+                del pending[mid]
+                save_json(PENDING_FILE, pending)
+                console.print("  [yellow]Partial - flattened NO[/]")
+                continue
+
+            # Timeout with zero fills on both sides — just clean up
+            console.print(f"  [dim]Pending timeout, no fills — cleaned up[/]")
+            del pending[mid]
+            save_json(PENDING_FILE, pending)
 
         # ================= SELL PHASE (iterates positions directly) =================
         for mid in list(positions.keys()):
@@ -670,6 +736,11 @@ while True:
             minutes_left = (end_ts - now_ms) / 60000
 
             if minutes_left <= 0:
+                continue
+
+            # Grace: don't sell positions just inserted in this cycle (give book a moment)
+            entered_at = pos.get("entered_at", 0)
+            if entered_at and now_ms - entered_at < 30_000:
                 continue
 
             yes_token = pos["yes_token"]
@@ -715,6 +786,7 @@ while True:
         if active_count >= MAX_POSITIONS:
             console.print(f"  [dim]Max positions reached ({active_count}/{MAX_POSITIONS})[/]")
         else:
+            available_bal = pusd_bal
             for market in markets:
                 mid = market["id"]
                 if mid in positions or mid in pending:
@@ -744,14 +816,14 @@ while True:
                 )
                 console.print(buy_panel)
 
-                if round(yes_ask, 3) == round(no_ask, 3) and yes_ask <= 0.52:
+                if round(yes_ask, 3) == round(no_ask, 3) and yes_ask <= 0.51:
                     min_size = int(market.get("orderMinSize", 1))
                     target_dollars = 1.0
                     size = max(1, round(target_dollars / yes_ask))
                     total_cost = size * (yes_ask + no_ask)
-                    if total_cost > pusd_bal:
-                        size = int(pusd_bal / (yes_ask + no_ask))
-                        console.print(f"  [dim]Balance cap: size={size} (bal={pusd_bal:.2f}, need={total_cost:.2f})[/]")
+                    if total_cost > available_bal:
+                        size = int(available_bal / (yes_ask + no_ask))
+                        console.print(f"  [dim]Balance cap: size={size} (bal={available_bal:.2f}, need={total_cost:.2f})[/]")
 
                     if size < min_size:
                         console.print(f"  [dim]Size too small: {size} < {min_size}[/]")
@@ -768,66 +840,92 @@ while True:
 
                     # Place YES first, then check if it filled before placing NO
                     yes_order = place_order(yes_token, yes_ask, size, BUY, OrderType.GTC, tick_size)
-                    if yes_order:
-                        time.sleep(0.5)
-                        yes_oid = extract_order_id(yes_order)
-                        yes_det = get_order_details(yes_oid)
-                        yes_matched = int(yes_det.get("size_matched", 0)) if yes_det else 0
+                    if not yes_order:
+                        console.print("  [dim]YES placement failed, skipping[/]")
+                        continue
 
-                        if yes_matched >= size:
-                            # YES fully filled before NO placed — flatten immediately
-                            console.print("  [yellow]YES filled before NO placed — flattening[/]")
-                            sold, _ = sell_with_retry(yes_token, yes_matched)
-                            cancel_order_safe(yes_oid)
-                            if sold < yes_matched:
+                    yes_oid = extract_order_id(yes_order)
+                    # Write preliminary pending immediately to prevent YES orphan on crash
+                    pending[mid] = {
+                        "yes_order_id": yes_oid,
+                        "no_order_id": None,
+                        "yes_token": yes_token,
+                        "no_token": no_token,
+                        "yes_size": size,
+                        "no_size": size,
+                        "placed_at": now_ms,
+                        "end_ts": end_ts,
+                        "question": market.get("question", ""),
+                    }
+                    save_json(PENDING_FILE, pending)
+
+                    time.sleep(0.5)
+                    yes_det = get_order_details(yes_oid)
+                    yes_matched = 0
+                    if yes_det:
+                        if yes_det.get("status") == "NOT_FOUND":
+                            yes_matched = size
+                        else:
+                            sm = yes_det.get("size_matched", 0)
+                            yes_matched = int(sm) if sm is not None else 0
+
+                    if yes_matched >= size:
+                        # YES fully filled before NO placed — flatten immediately
+                        # No cancel needed: yes_matched >= size means the GTC is exhausted/archived
+                        console.print("  [yellow]YES filled before NO placed — flattening[/]")
+                        sold, _ = sell_with_retry(yes_token, yes_matched)
+                        if sold < yes_matched:
+                            positions[mid] = {
+                                "yes_size": yes_matched,
+                                "no_size": 0,
+                                "yes_remaining": yes_matched - sold,
+                                "no_remaining": 0,
+                                "yes_token": yes_token,
+                                "no_token": no_token,
+                                "end_ts": end_ts,
+                                "question": market.get("question", ""),
+                                "entered_at": now_ms,
+                            }
+                            save_json(STATE_FILE, positions)
+                        del pending[mid]
+                        save_json(PENDING_FILE, pending)
+                        continue
+
+                    no_order = place_order(no_token, no_ask, size, BUY, OrderType.GTC, tick_size)
+                    if no_order:
+                        pending[mid]["no_order_id"] = extract_order_id(no_order)
+                        save_json(PENDING_FILE, pending)
+                        available_bal -= size * (yes_ask + no_ask)
+                    else:
+                        # NO placement failed — check YES status, flatten if needed
+                        yes_det2 = get_order_details(yes_oid)
+                        yes_m2 = 0
+                        if yes_det2:
+                            if yes_det2.get("status") == "NOT_FOUND":
+                                yes_m2 = size
+                            else:
+                                sm = yes_det2.get("size_matched", 0)
+                                yes_m2 = int(sm) if sm is not None else 0
+                        if yes_m2 > 0:
+                            sold, _ = sell_with_retry(yes_token, yes_m2)
+                            if sold < yes_m2:
                                 positions[mid] = {
-                                    "yes_size": yes_matched,
+                                    "yes_size": yes_m2,
                                     "no_size": 0,
-                                    "yes_remaining": yes_matched - sold,
+                                    "yes_remaining": yes_m2 - sold,
                                     "no_remaining": 0,
                                     "yes_token": yes_token,
                                     "no_token": no_token,
                                     "end_ts": end_ts,
                                     "question": market.get("question", ""),
+                                    "entered_at": now_ms,
                                 }
                                 save_json(STATE_FILE, positions)
-                            continue
-
-                        no_order = place_order(no_token, no_ask, size, BUY, OrderType.GTC, tick_size)
-                        if no_order:
-                            pending[mid] = {
-                                "yes_order_id": yes_oid,
-                                "no_order_id": extract_order_id(no_order),
-                                "yes_token": yes_token,
-                                "no_token": no_token,
-                                "yes_size": size,
-                                "no_size": size,
-                                "placed_at": now_ms,
-                                "end_ts": end_ts,
-                                "question": market.get("question", ""),
-                            }
+                        if cancel_order_safe(yes_oid):
+                            del pending[mid]
                             save_json(PENDING_FILE, pending)
                         else:
-                            # NO placement failed — check YES status, flatten if needed
-                            yes_det2 = get_order_details(yes_oid)
-                            yes_m2 = int(yes_det2.get("size_matched", 0)) if yes_det2 else 0
-                            if yes_m2 > 0:
-                                sold, _ = sell_with_retry(yes_token, yes_m2)
-                                if sold < yes_m2:
-                                    positions[mid] = {
-                                        "yes_size": yes_m2,
-                                        "no_size": 0,
-                                        "yes_remaining": yes_m2 - sold,
-                                        "no_remaining": 0,
-                                        "yes_token": yes_token,
-                                        "no_token": no_token,
-                                        "end_ts": end_ts,
-                                        "question": market.get("question", ""),
-                                    }
-                                    save_json(STATE_FILE, positions)
-                            cancel_order_safe(yes_oid)
-                    else:
-                        console.print("  [dim]YES placement failed, skipping[/]")
+                            console.print("  [dim red]Cancel YES failed, keeping in pending[/]")
 
                     time.sleep(2)
 

@@ -16,6 +16,7 @@ env/
 
 # Bot state
 positions.json
+pending.json
 *.log
 
 # IDE
