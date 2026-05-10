@@ -2,7 +2,6 @@ import os
 import time
 import json
 import traceback
-import tempfile
 from datetime import datetime
 import requests
 from dotenv import load_dotenv
@@ -71,11 +70,11 @@ except Exception as e:
 
 banner = Panel(
     Align.center(
-        "[bold white]Polymarket BTC Straddle Bot v6[/]\n"
-        "[dim]GTC Entry + FAK Exit + Order Tracking[/]",
+        "[bold white]Polymarket BTC Straddle Bot v7[/]\n"
+        "[dim]Bug-fixed: GTC+FAK with partial-fill tracking[/]",
         vertical="middle",
     ),
-    title="[bold yellow]v6[/]",
+    title="[bold yellow]v7[/]",
     border_style="bright_yellow",
     box=box.HEAVY_EDGE,
     padding=(1, 4),
@@ -104,13 +103,12 @@ except Exception:
 
 # ------------------------- HELPERS -------------------------
 
+
 def safe_api_call(func, *args, **kwargs):
-    """Rate-limited API wrapper."""
     time.sleep(0.3)
     try:
         return func(*args, **kwargs)
     except Exception as e:
-        # Only print if it's not a common expected error
         err_str = str(e)
         if "order couldn't be fully filled" not in err_str and "not enough balance" not in err_str:
             console.print(f"  [dim red]API error: {err_str[:120]}[/]")
@@ -146,25 +144,6 @@ def save_json(path, data):
     atomic_save(path, data)
 
 
-def show_wallet(pusd_bal):
-    wallet_lines = f"  [bold]Proxy Wallet:[/] [cyan]{FUNDER_ADDRESS}[/]\n"
-    wallet_lines += f"  [bold]pUSD Balance:[/] [{'bold green' if pusd_bal >= 2 else 'bold red'}]{pusd_bal:.2f} pUSD[/]\n"
-    if eoa_address:
-        wallet_lines += f"  [dim]EOA: {eoa_address}[/]\n"
-    if deposit_addr != "unknown":
-        wallet_lines += f"  [bold]Deposit:[/] [cyan]{deposit_addr}[/]\n"
-    wallet_lines += "  [dim]Send USDC (Polygon) to deposit address above[/]"
-    wallet_panel = Panel(
-        wallet_lines,
-        title="[bold yellow]Wallet Info[/]",
-        border_style="yellow",
-        box=box.ROUNDED,
-    )
-    console.print(wallet_panel)
-
-
-# ------------------------- TOKEN & MARKET -------------------------
-
 def get_yes_no_tokens(market):
     clob = market.get("clobTokenIds")
     if isinstance(clob, str):
@@ -179,11 +158,12 @@ def get_yes_no_tokens(market):
     raise Exception(f"Could not map YES/NO tokens for market {market['id']}")
 
 
+# ------------------------- MARKET FETCH -------------------------
+
 def get_active_btc_hourly_markets():
     now = time.time() * 1000
     try:
-        res = safe_api_call(
-            requests.get,
+        res = requests.get(
             f"{GAMMA_API}/events",
             params={"series_slug": "btc-up-or-down-hourly", "active": "true", "closed": "false", "limit": 20},
             timeout=10,
@@ -219,7 +199,6 @@ def get_active_btc_hourly_markets():
 # ------------------------- PRICING & DEPTH -------------------------
 
 def get_book_ask(token_id):
-    """Return (best_ask_price, best_ask_size)."""
     try:
         book = safe_api_call(client.get_order_book, token_id)
         asks = book.get("asks", [])
@@ -227,13 +206,11 @@ def get_book_ask(token_id):
             return None, 0.0
         best = min(asks, key=lambda x: float(x.get("price", 999)))
         return float(best.get("price", 0)), float(best.get("size", 0))
-    except Exception as e:
-        console.print(f"  [dim red]Book ask failed: {e}[/]")
+    except Exception:
         return None, 0.0
 
 
 def get_book_bid(token_id):
-    """Return (best_bid_price, best_bid_size)."""
     try:
         book = safe_api_call(client.get_order_book, token_id)
         bids = book.get("bids", [])
@@ -241,17 +218,47 @@ def get_book_bid(token_id):
             return None, 0.0
         best = max(bids, key=lambda x: float(x.get("price", 0)))
         return float(best.get("price", 0)), float(best.get("size", 0))
-    except Exception as e:
-        console.print(f"  [dim red]Book bid failed: {e}[/]")
+    except Exception:
         return None, 0.0
 
 
-# ------------------------- ORDER PLACEMENT -------------------------
+# ------------------------- ORDER HELPERS -------------------------
 
 def extract_order_id(order_obj):
     if isinstance(order_obj, dict):
         return order_obj.get("orderID") or order_obj.get("id")
     return getattr(order_obj, "orderID", None) or getattr(order_obj, "id", None) or str(order_obj)
+
+
+def get_order_details(order_id):
+    """Return dict with size_matched and status, or None."""
+    try:
+        result = safe_api_call(client.get_order, order_id)
+        if isinstance(result, dict):
+            return {
+                "status": result.get("status", "UNKNOWN"),
+                "size_matched": float(result.get("size_matched", 0) or result.get("takerAmount", 0) or 0),
+                "size": float(result.get("size", 0) or result.get("originalSize", 0) or result.get("makerAmount", 0) or 1),
+            }
+        return {
+            "status": getattr(result, "status", "UNKNOWN"),
+            "size_matched": float(getattr(result, "size_matched", 0) or 0),
+            "size": float(getattr(result, "size", 1)),
+        }
+    except Exception:
+        return None
+
+
+def is_filled(status):
+    return status in ("FILLED", "MATCHED", "DONE", "FULLY_FILLED")
+
+
+def cancel_order_safe(order_id):
+    try:
+        safe_api_call(client.cancel_order, OrderPayload(orderID=order_id))
+        return True
+    except Exception:
+        return False
 
 
 def place_order(token_id, price, size, side, order_type, tick_size="0.01"):
@@ -264,50 +271,34 @@ def place_order(token_id, price, size, side, order_type, tick_size="0.01"):
             order_type=order_type,
         )
         oid = extract_order_id(order)
-        console.print(f"  [bold green]PLACED[/] {side.upper()} {size} @ {price:.3f}  id={oid[:16]}...")
+        log_id = (oid[:16] + "...") if oid and len(str(oid)) > 16 else str(oid)
+        console.print(f"  [bold green]PLACED[/] {side.upper()} {size} @ {price:.3f}  id={log_id}")
         return order
     except Exception as e:
         console.print(f"  [bold red]PLACE FAILED[/] {side.upper()} {size} @ {price:.3f}: {e}")
         return None
 
 
-def get_order_status(order_id):
-    """Return status string or 'UNKNOWN'."""
-    try:
-        result = safe_api_call(client.get_order, order_id)
-        if result is None:
-            return "UNKNOWN"
-        if isinstance(result, dict):
-            return result.get("status", "UNKNOWN")
-        return getattr(result, "status", "UNKNOWN")
-    except Exception as e:
-        if "not found" in str(e).lower() or "404" in str(e):
-            return "NOT_FOUND"
-        return "UNKNOWN"
-
-
-def cancel_order_safe(order_id):
-    try:
-        safe_api_call(client.cancel_order, OrderPayload(orderID=order_id))
-        return True
-    except Exception:
-        return False
-
-
 def sell_with_retry(token_id, size, tick_size="0.01", max_retries=3):
-    """FAK sell at best bid. Adjusts size to bid depth. Retries."""
+    """FAK sell at best bid. Returns (sold_size, result) or (0, None)."""
+    total_sold = 0
     for attempt in range(max_retries):
+        remaining = size - total_sold
+        if remaining < 1:
+            break
+
         bid_price, bid_depth = get_book_bid(token_id)
         if bid_price is None:
             console.print(f"  [dim]No bids available[/]")
-            return None
+            break
 
-        sell_size = size
-        if bid_depth < size:
+        sell_size = remaining
+        if bid_depth < remaining:
             sell_size = int(bid_depth)
-            console.print(f"  [dim]Bid depth {bid_depth:.1f} < {size}, selling {sell_size}[/]")
-            if sell_size < 1:
-                return None
+            console.print(f"  [dim]Bid depth {bid_depth:.1f} < {remaining}, selling {sell_size}[/]")
+
+        if sell_size < 1:
+            break
 
         try:
             neg_risk = safe_api_call(client.get_neg_risk, token_id)
@@ -318,16 +309,119 @@ def sell_with_retry(token_id, size, tick_size="0.01", max_retries=3):
                 order_type=OrderType.FAK,
             )
             if result:
+                # Verify actual matched amount
                 oid = extract_order_id(result)
-                console.print(f"  [bold green]SOLD[/] {sell_size} @ {bid_price:.3f}  id={oid[:16]}...")
-                return result
+                details = get_order_details(oid) if oid else None
+                matched = 0
+                if details:
+                    matched = int(details.get("size_matched", 0))
+                if matched <= 0:
+                    # API returned order obj but nothing filled — retry
+                    console.print(f"  [dim]FAK returned but 0 matched, retrying[/]")
+                    time.sleep(1)
+                    continue
+
+                total_sold += matched
+                log_id = (oid[:16] + "...") if oid and len(str(oid)) > 16 else str(oid)
+                console.print(f"  [bold green]SOLD[/] {matched} @ {bid_price:.3f}  id={log_id}")
+
+                if total_sold >= size:
+                    return total_sold, result
         except Exception as e:
             console.print(f"  [dim red]Sell attempt {attempt+1}/{max_retries} failed: {e}[/]")
 
         time.sleep(1)
 
-    console.print(f"  [bold red]SELL FAILED after {max_retries} retries[/]")
-    return None
+    if total_sold > 0:
+        return total_sold, {"partial": True, "sold": total_sold}
+    console.print(f"  [bold red]SELL FAILED[/] 0/{size} sold")
+    return 0, None
+
+
+# ------------------------- REDEEM -------------------------
+
+def redeem_positions(positions):
+    if not positions:
+        return
+    for mid in list(positions.keys()):
+        pos = positions[mid]
+        if pos.get("redeemed"):
+            continue
+        try:
+            m_res = requests.get(f"{GAMMA_API}/markets/{mid}", timeout=10)
+            if m_res.status_code != 200:
+                continue
+            m_data = m_res.json()
+            if not m_data.get("closed"):
+                continue
+            condition_id = m_data.get("conditionId")
+            if not condition_id:
+                continue
+
+            from eth_abi import encode
+            from eth_utils import keccak, to_checksum_address
+            from eth_account import Account
+
+            pUSD = to_checksum_address("0xC011a7E12a19f7B1f670d46F03B03f3342E82DFB")
+            CTF = to_checksum_address("0x4D97DCd97eC945f40cF65F87097ACe5EA0476045")
+            proxy = to_checksum_address(FUNDER_ADDRESS)
+            eoa = Account.from_key(PRIVATE_KEY).address
+
+            redeem_sel = keccak(b"redeemPositions(address,bytes32,bytes32,uint256[])")[:4]
+            redeem_data = redeem_sel + encode(
+                ["address", "bytes32", "bytes32", "uint256[]"],
+                [pUSD, bytes(32), bytes.fromhex(condition_id.replace("0x", "")), [1, 2]],
+            )
+
+            execute_sel = keccak(b"execute(address,uint256,bytes)")[:4]
+            proxy_data = execute_sel + encode(
+                ["address", "uint256", "bytes"],
+                [CTF, 0, redeem_data],
+            )
+
+            relayer_url = "https://relayer-v2.polymarket.com"
+            relayer_headers = {
+                "Content-Type": "application/json",
+                "RELAYER_API_KEY": "019df62f-45bc-796e-975c-3f434472b163",
+                "RELAYER_API_KEY_ADDRESS": "0x42aec4505559c0613f7ce2541d9d29741bc5e195",
+            }
+
+            nonce_r = requests.get(
+                f"{relayer_url}/nonce",
+                params={"address": eoa, "type": "PROXY"},
+                headers=relayer_headers,
+                timeout=10,
+            )
+            if nonce_r.status_code != 200:
+                console.print(f"  [dim red]Redeem nonce fetch failed: {nonce_r.status_code}[/]")
+                continue
+            nonce = nonce_r.json().get("nonce", "0")
+
+            body = {
+                "type": "PROXY",
+                "from": eoa,
+                "to": proxy,
+                "nonce": nonce,
+                "data": "0x" + proxy_data.hex(),
+                "value": "0",
+            }
+
+            submit_r = requests.post(
+                f"{relayer_url}/submit",
+                json=body,
+                headers=relayer_headers,
+                timeout=10,
+            )
+
+            if submit_r.status_code == 200:
+                tx_id = submit_r.json().get("transactionID") or "?"
+                console.print(f"  [dim green]Redeem submitted for {mid[:20]}... tx={str(tx_id)[:20]}[/]")
+                pos["redeemed"] = True
+                save_json(STATE_FILE, positions)
+            else:
+                console.print(f"  [dim red]Redeem failed for {mid}: {submit_r.status_code} {submit_r.text[:100]}[/]")
+        except Exception as e:
+            console.print(f"  [dim red]Redeem error for {mid}: {e}[/]")
 
 
 # ------------------------- MAIN LOOP -------------------------
@@ -341,10 +435,10 @@ while True:
         now_ms = time.time() * 1000
         now_str = datetime.now().strftime("%H:%M:%S")
 
-        # Re-read balance every cycle
         pusd_bal = get_balance()
 
         markets = get_active_btc_hourly_markets()
+        market_by_id = {m["id"]: m for m in markets}
 
         console.rule(
             f"[bold blue]CYCLE #{CYCLE}[/]  [dim]{now_str}[/]  "
@@ -395,176 +489,169 @@ while True:
                     continue
             console.print(table)
 
-        # ================= CLEANUP EXPIRED POSITIONS =================
+        # ================= REDEEM BEFORE CLEANUP =================
+        redeem_positions(positions)
+
+        # ================= CLEANUP: only delete redeemed positions =================
         for mid in list(positions.keys()):
             pos = positions.get(mid)
-            if pos and pos.get("end_ts") and now_ms > pos["end_ts"] + 300000:
-                console.print(f"  [dim]Expired market {mid[:20]}... removed[/]")
+            if pos and pos.get("redeemed") and pos.get("end_ts") and now_ms > pos["end_ts"] + 300000:
+                console.print(f"  [dim]Redeemed+expired market {mid[:20]}... removed[/]")
                 del positions[mid]
                 save_json(STATE_FILE, positions)
-
-        # ================= REDEEM SETTLED POSITIONS =================
-        def redeem_positions():
-            if not positions:
-                return
-            for mid in list(positions.keys()):
-                pos = positions[mid]
-                if pos.get("redeemed"):
-                    continue
-                try:
-                    m_res = requests.get(f"{GAMMA_API}/markets/{mid}", timeout=10)
-                    if m_res.status_code != 200:
-                        continue
-                    m_data = m_res.json()
-                    if not m_data.get("closed"):
-                        continue
-                    condition_id = m_data.get("conditionId")
-                    if not condition_id:
-                        continue
-
-                    from eth_abi import encode
-                    from eth_utils import keccak, to_checksum_address
-                    from eth_account import Account
-
-                    pUSD = to_checksum_address("0xC011a7E12a19f7B1f670d46F03B03f3342E82DFB")
-                    CTF = to_checksum_address("0x4D97DCd97eC945f40cF65F87097ACe5EA0476045")
-                    proxy = to_checksum_address(FUNDER_ADDRESS)
-                    eoa = Account.from_key(PRIVATE_KEY).address
-
-                    redeem_sel = keccak(b"redeemPositions(address,bytes32,bytes32,uint256[])")[:4]
-                    redeem_data = redeem_sel + encode(
-                        ["address", "bytes32", "bytes32", "uint256[]"],
-                        [pUSD, bytes(32), bytes.fromhex(condition_id.replace("0x", "")), [1, 2]],
-                    )
-
-                    execute_sel = keccak(b"execute(address,uint256,bytes)")[:4]
-                    proxy_data = execute_sel + encode(
-                        ["address", "uint256", "bytes"],
-                        [CTF, 0, redeem_data],
-                    )
-
-                    relayer_url = "https://relayer-v2.polymarket.com"
-                    relayer_headers = {
-                        "Content-Type": "application/json",
-                        "RELAYER_API_KEY": "019df62f-45bc-796e-975c-3f434472b163",
-                        "RELAYER_API_KEY_ADDRESS": "0x42aec4505559c0613f7ce2541d9d29741bc5e195",
-                    }
-
-                    nonce_r = requests.get(
-                        f"{relayer_url}/nonce",
-                        params={"address": eoa, "type": "PROXY"},
-                        headers=relayer_headers,
-                        timeout=10,
-                    )
-                    nonce = nonce_r.json().get("nonce", "0")
-
-                    body = {
-                        "type": "PROXY",
-                        "from": eoa,
-                        "to": proxy,
-                        "nonce": nonce,
-                        "data": "0x" + proxy_data.hex(),
-                        "value": "0",
-                    }
-
-                    submit_r = requests.post(
-                        f"{relayer_url}/submit",
-                        json=body,
-                        headers=relayer_headers,
-                        timeout=10,
-                    )
-
-                    if submit_r.status_code == 200:
-                        tx_id = submit_r.json().get("transactionID")
-                        console.print(f"  [dim green]Redeem submitted for {mid[:20]}... tx={tx_id[:20]}[/]")
-                        pos["redeemed"] = True
-                        save_json(STATE_FILE, positions)
-                    else:
-                        console.print(f"  [dim red]Redeem failed for {mid}: {submit_r.status_code} {submit_r.text[:100]}[/]")
-                except Exception as e:
-                    console.print(f"  [dim red]Redeem error for {mid}: {e}[/]")
-
-        redeem_positions()
 
         # ================= PROCESS PENDING GTC ORDERS =================
         for mid in list(pending.keys()):
             p = pending[mid]
             age = now_ms - p.get("placed_at", 0)
-            if age < 120_000:  # Let GTC orders sit for 2 minutes before acting
+            if age < 120_000:
                 console.print(f"  [dim]Pending {mid[:20]}... age={age//1000}s, letting sit[/]")
                 continue
 
-            yes_status = get_order_status(p["yes_order_id"])
-            no_status = get_order_status(p["no_order_id"])
+            # Use get_order_details for actual size_matched, not just status
+            yes_det = get_order_details(p["yes_order_id"])
+            no_det = get_order_details(p["no_order_id"])
 
-            yes_filled = yes_status in ("FILLED", "MATCHED", "DONE", "FULLY_FILLED")
-            no_filled = no_status in ("FILLED", "MATCHED", "DONE", "FULLY_FILLED")
+            yes_matched = int(yes_det.get("size_matched", 0)) if yes_det else 0
+            no_matched = int(no_det.get("size_matched", 0)) if no_det else 0
+            yes_status = yes_det.get("status", "UNKNOWN") if yes_det else "UNKNOWN"
+            no_status = no_det.get("status", "UNKNOWN") if no_det else "UNKNOWN"
 
-            console.print(f"  [dim]Pending {mid[:20]}... YES={yes_status} NO={no_status}[/]")
+            console.print(f"  [dim]Pending {mid[:20]}... YES={yes_status} matched={yes_matched}  NO={no_status} matched={no_matched}[/]")
 
-            if yes_filled and no_filled:
-                # Full straddle achieved
+            both_filled = is_filled(yes_status) and is_filled(no_status)
+            yes_has_fill = yes_matched > 0
+            no_has_fill = no_matched > 0
+            timed_out = now_ms > p.get("placed_at", 0) + PENDING_TIMEOUT_MS
+
+            if both_filled:
+                # Full straddle
                 positions[mid] = {
-                    "yes_size": p["yes_size"],
-                    "no_size": p["no_size"],
-                    "yes_sold": False,
-                    "no_sold": False,
+                    "yes_size": yes_matched,
+                    "no_size": no_matched,
+                    "yes_remaining": yes_matched,
+                    "no_remaining": no_matched,
+                    "yes_token": p["yes_token"],
+                    "no_token": p["no_token"],
                     "end_ts": p["end_ts"],
+                    "question": p.get("question", ""),
                 }
                 save_json(STATE_FILE, positions)
                 del pending[mid]
                 save_json(PENDING_FILE, pending)
                 console.print("  [bold green]FULL STRADDLE ENTERED[/]")
 
-            elif yes_filled and not no_filled:
+            elif yes_has_fill and not no_has_fill:
                 cancel_order_safe(p["no_order_id"])
-                sell_with_retry(p["yes_token"], p["yes_size"])
+                if yes_matched >= p["yes_size"]:
+                    # Fully filled on YES, flatten all
+                    sold, _ = sell_with_retry(p["yes_token"], yes_matched)
+                    if sold < yes_matched:
+                        # Some unsold — track remainder
+                        positions[mid] = {
+                            "yes_size": yes_matched,
+                            "no_size": 0,
+                            "yes_remaining": yes_matched - sold,
+                            "no_remaining": 0,
+                            "yes_token": p["yes_token"],
+                            "no_token": p["no_token"],
+                            "end_ts": p["end_ts"],
+                            "question": p.get("question", ""),
+                        }
+                        save_json(STATE_FILE, positions)
+                else:
+                    # Partial fill on YES
+                    sold, _ = sell_with_retry(p["yes_token"], yes_matched)
+                    if sold < yes_matched:
+                        positions[mid] = {
+                            "yes_size": yes_matched,
+                            "no_size": 0,
+                            "yes_remaining": yes_matched - sold,
+                            "no_remaining": 0,
+                            "yes_token": p["yes_token"],
+                            "no_token": p["no_token"],
+                            "end_ts": p["end_ts"],
+                            "question": p.get("question", ""),
+                        }
+                        save_json(STATE_FILE, positions)
                 del pending[mid]
                 save_json(PENDING_FILE, pending)
                 console.print("  [yellow]Partial - flattened YES[/]")
 
-            elif no_filled and not yes_filled:
+            elif no_has_fill and not yes_has_fill:
                 cancel_order_safe(p["yes_order_id"])
-                sell_with_retry(p["no_token"], p["no_size"])
+                if no_matched >= p["no_size"]:
+                    sold, _ = sell_with_retry(p["no_token"], no_matched)
+                    if sold < no_matched:
+                        positions[mid] = {
+                            "yes_size": 0,
+                            "no_size": no_matched,
+                            "yes_remaining": 0,
+                            "no_remaining": no_matched - sold,
+                            "yes_token": p["yes_token"],
+                            "no_token": p["no_token"],
+                            "end_ts": p["end_ts"],
+                            "question": p.get("question", ""),
+                        }
+                        save_json(STATE_FILE, positions)
+                else:
+                    sold, _ = sell_with_retry(p["no_token"], no_matched)
+                    if sold < no_matched:
+                        positions[mid] = {
+                            "yes_size": 0,
+                            "no_size": no_matched,
+                            "yes_remaining": 0,
+                            "no_remaining": no_matched - sold,
+                            "yes_token": p["yes_token"],
+                            "no_token": p["no_token"],
+                            "end_ts": p["end_ts"],
+                            "question": p.get("question", ""),
+                        }
+                        save_json(STATE_FILE, positions)
                 del pending[mid]
                 save_json(PENDING_FILE, pending)
                 console.print("  [yellow]Partial - flattened NO[/]")
 
-            elif now_ms > p.get("placed_at", 0) + PENDING_TIMEOUT_MS:
-                console.print(f"  [dim]Pending timeout ({PENDING_TIMEOUT_MS//60000}min) - cancelling[/]")
+            elif timed_out:
+                console.print(f"  [dim]Pending timeout - cancelling[/]")
                 cancel_order_safe(p["yes_order_id"])
                 cancel_order_safe(p["no_order_id"])
+                # If anything filled during the timeout window, flatten it
+                if yes_matched > 0:
+                    sell_with_retry(p["yes_token"], yes_matched)
+                if no_matched > 0:
+                    sell_with_retry(p["no_token"], no_matched)
                 del pending[mid]
                 save_json(PENDING_FILE, pending)
 
-        # ================= SELL PHASE =================
-        for market in markets:
-            mid = market["id"]
-            if mid not in positions:
-                continue
+        # ================= SELL PHASE (iterates positions directly) =================
+        for mid in list(positions.keys()):
             pos = positions[mid]
-
-            end_date = market.get("endDate") or market.get("end_date")
-            end_ts = datetime.fromisoformat(end_date.replace("Z", "+00:00")).timestamp() * 1000
+            end_ts = pos.get("end_ts", 0)
             minutes_left = (end_ts - now_ms) / 60000
 
             if minutes_left <= 0:
                 continue
 
-            yes_token, no_token = get_yes_no_tokens(market)
-            yes_ask, _ = get_book_ask(yes_token)
-            no_ask, _ = get_book_ask(no_token)
-            if yes_ask is None or no_ask is None:
+            yes_token = pos["yes_token"]
+            no_token = pos["no_token"]
+            yes_bid, _ = get_book_bid(yes_token)
+            no_bid, _ = get_book_bid(no_token)
+            if yes_bid is None or no_bid is None:
                 continue
 
-            sell_yes = not pos["yes_sold"] and (yes_ask <= 0.02 or (minutes_left <= 20 and yes_ask < 0.03))
-            sell_no = not pos["no_sold"] and (no_ask <= 0.02 or (minutes_left <= 20 and no_ask < 0.03))
+            yes_rem = pos.get("yes_remaining", 0)
+            no_rem = pos.get("no_remaining", 0)
+
+            sell_yes = yes_rem > 0 and (yes_bid <= 0.02 or (minutes_left <= 20 and yes_bid < 0.03))
+            sell_no = no_rem > 0 and (no_bid <= 0.02 or (minutes_left <= 20 and no_bid < 0.03))
 
             if sell_yes or sell_no:
+                q = pos.get("question", "Unknown")
                 sell_panel = Panel(
-                    f"  [white]{market['question']}[/]\n"
-                    f"  UP=[{'bold green' if yes_ask > 0.5 else 'bold red'}]{yes_ask:.3f}[/]  "
-                    f"DOWN=[{'bold green' if no_ask > 0.5 else 'bold red'}]{no_ask:.3f}[/]  "
+                    f"  [white]{q}[/]\n"
+                    f"  UP bid={yes_bid:.3f} (rem={yes_rem})  "
+                    f"DOWN bid={no_bid:.3f} (rem={no_rem})  "
                     f"[yellow]{minutes_left:.1f}m left[/]",
                     title="[bold yellow]SELL CHECK[/]",
                     border_style="yellow",
@@ -573,16 +660,16 @@ while True:
                 console.print(sell_panel)
 
             if sell_yes:
-                result = sell_with_retry(yes_token, pos["yes_size"])
-                if result:
-                    pos["yes_sold"] = True
+                sold, _ = sell_with_retry(yes_token, yes_rem)
+                if sold > 0:
+                    pos["yes_remaining"] = max(0, yes_rem - sold)
+                    save_json(STATE_FILE, positions)
 
             if sell_no:
-                result = sell_with_retry(no_token, pos["no_size"])
-                if result:
-                    pos["no_sold"] = True
-
-            save_json(STATE_FILE, positions)
+                sold, _ = sell_with_retry(no_token, no_rem)
+                if sold > 0:
+                    pos["no_remaining"] = max(0, no_rem - sold)
+                    save_json(STATE_FILE, positions)
 
         # ================= BUY PHASE =================
         active_count = len(positions) + len(pending)
@@ -618,15 +705,10 @@ while True:
                 )
                 console.print(buy_panel)
 
-                # Entry: equal prices, both <= 0.52
                 if round(yes_ask, 3) == round(no_ask, 3) and yes_ask <= 0.52:
-                    min_size = market.get("orderMinSize", 1)
-
-                    # Target $1.00 per side
+                    min_size = int(market.get("orderMinSize", 1))
                     target_dollars = 1.0
                     size = max(1, round(target_dollars / yes_ask))
-
-                    # Cap by balance
                     total_cost = size * (yes_ask + no_ask)
                     if total_cost > pusd_bal:
                         size = int(pusd_bal / (yes_ask + no_ask))
@@ -645,27 +727,44 @@ while True:
                         box=box.HEAVY_EDGE,
                     ))
 
+                    # Place YES first, then check if it filled before placing NO
                     yes_order = place_order(yes_token, yes_ask, size, BUY, OrderType.GTC, tick_size)
-                    no_order = place_order(no_token, no_ask, size, BUY, OrderType.GTC, tick_size)
+                    if yes_order:
+                        time.sleep(0.5)
+                        yes_oid = extract_order_id(yes_order)
+                        yes_det = get_order_details(yes_oid)
+                        yes_matched = int(yes_det.get("size_matched", 0)) if yes_det else 0
 
-                    if yes_order and no_order:
-                        pending[mid] = {
-                            "yes_order_id": extract_order_id(yes_order),
-                            "no_order_id": extract_order_id(no_order),
-                            "yes_token": yes_token,
-                            "no_token": no_token,
-                            "yes_size": size,
-                            "no_size": size,
-                            "placed_at": now_ms,
-                            "end_ts": end_ts,
-                        }
-                        save_json(PENDING_FILE, pending)
-                    else:
-                        # Clean up any placed order
-                        if yes_order:
-                            cancel_order_safe(extract_order_id(yes_order))
+                        if yes_matched >= size:
+                            # YES fully filled before NO placed — flatten immediately
+                            console.print("  [yellow]YES filled before NO placed — flattening[/]")
+                            sell_with_retry(yes_token, yes_matched)
+                            cancel_order_safe(yes_oid)
+                            continue
+
+                        no_order = place_order(no_token, no_ask, size, BUY, OrderType.GTC, tick_size)
                         if no_order:
-                            cancel_order_safe(extract_order_id(no_order))
+                            pending[mid] = {
+                                "yes_order_id": yes_oid,
+                                "no_order_id": extract_order_id(no_order),
+                                "yes_token": yes_token,
+                                "no_token": no_token,
+                                "yes_size": size,
+                                "no_size": size,
+                                "placed_at": now_ms,
+                                "end_ts": end_ts,
+                                "question": market.get("question", ""),
+                            }
+                            save_json(PENDING_FILE, pending)
+                        else:
+                            # NO placement failed — check YES status, flatten if needed
+                            yes_det2 = get_order_details(yes_oid)
+                            yes_m2 = int(yes_det2.get("size_matched", 0)) if yes_det2 else 0
+                            if yes_m2 > 0:
+                                sell_with_retry(yes_token, yes_m2)
+                            cancel_order_safe(yes_oid)
+                    else:
+                        console.print("  [dim]YES placement failed, skipping[/]")
 
                     time.sleep(2)
 
