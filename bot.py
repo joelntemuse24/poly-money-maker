@@ -46,11 +46,11 @@ if API_KEY and API_SECRET and API_PASSPHRASE:
         api_secret=API_SECRET,
         api_passphrase=API_PASSPHRASE,
     )
-    console.print("[bold cyan]Using pre-generated API credentials[/]")
+    console.print("[bold bright_cyan]▶ AUTH[/] [dim]pre-generated API credentials loaded[/]")
 else:
     temp_client = ClobClient(host=HOST, key=PRIVATE_KEY, chain_id=CHAIN_ID)
     api_creds = temp_client.create_or_derive_api_key()
-    console.print("[bold cyan]Auto-derived API credentials[/]")
+    console.print("[bold bright_cyan]▶ AUTH[/] [dim]API credentials derived from private key[/]")
 
 client = ClobClient(
     host=HOST,
@@ -64,18 +64,23 @@ client = ClobClient(
 try:
     from py_clob_client_v2.client import BalanceAllowanceParams
     client.update_balance_allowance(BalanceAllowanceParams(asset_type="COLLATERAL"))
-    console.print("[dim green]Balance allowance synced[/]")
+    console.print("[bold bright_green]▶ COLLATERAL[/] [dim]allowance synced · USDC.e armed[/]")
 except Exception as e:
-    console.print(f"[dim red]Balance sync warning: {e}[/]")
+    console.print(f"[bold red]▶ COLLATERAL [WARN][/] [dim]{e}[/]")
 
 banner = Panel(
     Align.center(
-        "[bold white]Polymarket BTC Straddle Bot v7[/]\n"
-        "[dim]Bug-fixed: GTC+FAK with partial-fill tracking[/]",
+        "[bold bright_green]██████╗ ████████╗ ██████╗[/]   [bright_yellow]//[/]  [bold white]STRADDLE DESK[/]\n"
+        "[bold bright_green]██╔══██╗╚══██╔══╝██╔════╝[/]   [bright_yellow]//[/]  [dim]POLYMARKET CLOB · MATIC[/]\n"
+        "[bold bright_green]██████╔╝   ██║   ██║     [/]   [bright_yellow]//[/]  [dim]GTC ENTRY · FAK FLATTEN[/]\n"
+        "[bold bright_green]██╔══██╗   ██║   ██║     [/]   [bright_yellow]//[/]  [dim]Δ-NEUTRAL · HOURLY EXPIRY[/]\n"
+        "[bold bright_green]██████╔╝   ██║   ╚██████╗[/]   [bright_yellow]//[/]  STATUS: [bold bright_green]● ARMED[/]\n"
+        "[bold bright_green]╚═════╝    ╚═╝    ╚═════╝[/]   [bright_yellow]//[/]  [dim]v7.3 · partial-fill safe[/]",
         vertical="middle",
     ),
-    title="[bold yellow]v7[/]",
-    border_style="bright_yellow",
+    title="[bold bright_yellow]▰▱▰▱  TRADING SYSTEM ONLINE  ▱▰▱▰[/]",
+    subtitle="[dim]press Ctrl-C to disarm[/]",
+    border_style="bright_green",
     box=box.HEAVY_EDGE,
     padding=(1, 4),
 )
@@ -111,7 +116,7 @@ def safe_api_call(func, *args, **kwargs):
     except Exception as e:
         err_str = str(e)
         if not any(s in err_str for s in ("order couldn't be fully filled", "not enough balance", "not found", "404")):
-            console.print(f"  [dim red]API error: {err_str[:120]}[/]")
+            console.print(f"  [bold red][API ERR][/] [dim]{err_str[:120]}[/]")
         raise
 
 
@@ -170,9 +175,9 @@ def get_active_btc_hourly_markets():
         )
         res.raise_for_status()
         events = res.json()
-        console.print(f"  [dim]API returned {len(events)} events[/]")
+        console.print(f"  [dim cyan][SCAN][/] [dim]gamma returned {len(events)} events[/]")
     except Exception as e:
-        console.print(f"  [bold red]API fetch failed: {e}[/]")
+        console.print(f"  [bold red][SCAN FAIL][/] [dim]{e}[/]")
         return []
 
     candidates = []
@@ -192,7 +197,7 @@ def get_active_btc_hourly_markets():
             continue
 
     candidates.sort(key=lambda x: x[0])
-    console.print(f"  [dim]{len(candidates)} future markets found[/]")
+    console.print(f"  [dim cyan][SCAN][/] [dim]{len(candidates)} forward contracts in window[/]")
     return [m for _, m in candidates]
 
 
@@ -303,10 +308,11 @@ def place_order(token_id, price, size, side, order_type, tick_size="0.01"):
         )
         oid = extract_order_id(order)
         log_id = (oid[:16] + "...") if oid and len(str(oid)) > 16 else str(oid)
-        console.print(f"  [bold green]PLACED[/] {side.upper()} {size} @ {price:.3f}  id={log_id}")
+        arrow = "▲" if side.upper() == "BUY" else "▼"
+        console.print(f"  [bold bright_green][ORDER {arrow}][/] {side.upper():<4} {size:>3} @ {price:.3f}  [dim]id={log_id}[/]")
         return order
     except Exception as e:
-        console.print(f"  [bold red]PLACE FAILED[/] {side.upper()} {size} @ {price:.3f}: {e}")
+        console.print(f"  [bold red][ORDER REJECT][/] {side.upper():<4} {size:>3} @ {price:.3f}  [dim]{e}[/]")
         return None
 
 
@@ -320,7 +326,7 @@ def sell_with_retry(token_id, size, tick_size="0.01", max_retries=3):
 
         bid_price, bid_depth = get_book_bid(token_id)
         if bid_price is None:
-            console.print(f"  [dim]No bids available[/]")
+            console.print(f"  [dim yellow][BOOK][/] [dim]bid side empty[/]")
             break
 
         sell_size = remaining
@@ -328,7 +334,7 @@ def sell_with_retry(token_id, size, tick_size="0.01", max_retries=3):
             sell_size = int(bid_depth)
             if sell_size < 1 and bid_depth > 0:
                 sell_size = min(remaining, 1)
-            console.print(f"  [dim]Bid depth {bid_depth:.1f} < {remaining}, selling {sell_size}[/]")
+            console.print(f"  [dim yellow][DEPTH][/] [dim]bid={bid_depth:.1f} < req={remaining} · sizing to {sell_size}[/]")
 
         if sell_size < 1:
             break
@@ -363,24 +369,24 @@ def sell_with_retry(token_id, size, tick_size="0.01", max_retries=3):
 
                 if matched <= 0:
                     # API returned order obj but nothing filled — retry
-                    console.print(f"  [dim]FAK returned but 0 matched, retrying[/]")
+                    console.print(f"  [dim yellow][FAK NULL][/] [dim]0 matched · retrying[/]")
                     time.sleep(1)
                     continue
 
                 total_sold += matched
                 log_id = (oid[:16] + "...") if oid and len(str(oid)) > 16 else str(oid)
-                console.print(f"  [bold green]SOLD[/] {matched} @ {bid_price:.3f}  id={log_id}")
+                console.print(f"  [bold bright_green][FILL ▼][/] SELL {matched:>3} @ {bid_price:.3f}  [dim]id={log_id}[/]")
 
                 if total_sold >= size:
                     return total_sold, result
         except Exception as e:
-            console.print(f"  [dim red]Sell attempt {attempt+1}/{max_retries} failed: {e}[/]")
+            console.print(f"  [dim red][FAK FAIL {attempt+1}/{max_retries}][/] [dim]{e}[/]")
 
         time.sleep(1)
 
     if total_sold > 0:
         return total_sold, {"partial": True, "sold": total_sold}
-    console.print(f"  [bold red]SELL FAILED[/] 0/{size} sold")
+    console.print(f"  [bold red][EXIT FAIL][/] 0/{size} cleared")
     return 0, None
 
 
@@ -441,7 +447,7 @@ def redeem_positions(positions):
                 timeout=10,
             )
             if nonce_r.status_code != 200:
-                console.print(f"  [dim red]Redeem nonce fetch failed: {nonce_r.status_code}[/]")
+                console.print(f"  [dim red][REDEEM][/] [dim]nonce fetch fail HTTP {nonce_r.status_code}[/]")
                 continue
             nonce = nonce_r.json().get("nonce", "0")
 
@@ -463,13 +469,13 @@ def redeem_positions(positions):
 
             if submit_r.status_code == 200:
                 tx_id = submit_r.json().get("transactionID") or "?"
-                console.print(f"  [dim green]Redeem submitted for {mid[:20]}... tx={str(tx_id)[:20]}[/]")
+                console.print(f"  [bold bright_green][SETTLE ▶][/] {mid[:18]}…  [dim]tx={str(tx_id)[:18]}…[/]")
                 pos["redeem_submitted_at"] = time.time() * 1000
                 save_json(STATE_FILE, positions)
             else:
-                console.print(f"  [dim red]Redeem failed for {mid}: {submit_r.status_code} {submit_r.text[:100]}[/]")
+                console.print(f"  [dim red][SETTLE FAIL][/] {mid[:18]}…  [dim]HTTP {submit_r.status_code} · {submit_r.text[:80]}[/]")
         except Exception as e:
-            console.print(f"  [dim red]Redeem error for {mid}: {e}[/]")
+            console.print(f"  [dim red][SETTLE ERR][/] {mid[:18]}…  [dim]{e}[/]")
 
 
 # ------------------------- MAIN LOOP -------------------------
@@ -488,27 +494,27 @@ while True:
         markets = get_active_btc_hourly_markets()
 
         console.rule(
-            f"[bold blue]CYCLE #{CYCLE}[/]  [dim]{now_str}[/]  "
-            f"[green]{len(markets)} markets[/]  "
-            f"[yellow]{len(positions)} pos[/]  "
-            f"[cyan]{len(pending)} pending[/]  "
-            f"[bold]{'${:.2f}'.format(pusd_bal)}[/]",
-            style="blue",
+            f"[bold bright_yellow]▰ TICK #{CYCLE:04d}[/] [dim]·[/] [bright_white]{now_str}[/] [dim]·[/] "
+            f"[bright_cyan]MKT[/] [bold]{len(markets):>2}[/] [dim]·[/] "
+            f"[bright_green]POS[/] [bold]{len(positions):>2}[/] [dim]·[/] "
+            f"[bright_magenta]PEND[/] [bold]{len(pending):>2}[/] [dim]·[/] "
+            f"[bright_yellow]NAV[/] [bold]${pusd_bal:>7.2f}[/] [dim]▰[/]",
+            style="bright_yellow",
         )
 
         # ================= MARKET TABLE =================
         if markets:
             table = Table(
-                title="Active BTC Hourly Markets",
-                box=box.ROUNDED,
-                border_style="dim blue",
-                title_style="bold cyan",
+                title="[bold bright_cyan]≡ ORDER BOOK SCANNER ≡[/]  [dim]BTC HOURLY · GAMMA FEED[/]",
+                box=box.HEAVY_HEAD,
+                border_style="bright_blue",
+                title_style="bold bright_cyan",
                 show_lines=True,
             )
-            table.add_column("Market", style="white", max_width=40)
-            table.add_column("Ends", style="dim cyan")
-            table.add_column("Min Left", justify="right")
-            table.add_column("In Pos?", justify="center")
+            table.add_column("INSTRUMENT", style="white", max_width=40)
+            table.add_column("EXPIRY", style="dim cyan", justify="center")
+            table.add_column("TTM", justify="right")
+            table.add_column("STATE", justify="center")
 
             for m in markets:
                 try:
@@ -518,9 +524,9 @@ while True:
                     ends_str = datetime.fromisoformat(end_date.replace("Z", "+00:00")).strftime("%H:%M")
                     status = "[dim]-[/]"
                     if m["id"] in positions:
-                        status = "[green]POS[/]"
+                        status = "[bold bright_green]● LONG[/]"
                     elif m["id"] in pending:
-                        status = "[yellow]PEND[/]"
+                        status = "[bold bright_yellow]◌ WORK[/]"
 
                     if mins < 20:
                         mins_style = "bold red"
@@ -548,19 +554,19 @@ while True:
             yes_rem = pos.get("yes_remaining", 0)
             no_rem = pos.get("no_remaining", 0)
             if yes_rem == 0 and no_rem == 0 and not pos.get("redeemed") and not pos.get("redeem_submitted_at"):
-                console.print(f"  [dim]Sold-out position {mid[:20]}... removed[/]")
+                console.print(f"  [dim cyan][BOOK CLOSE][/] {mid[:18]}…  [dim]inventory cleared[/]")
                 del positions[mid]
                 save_json(STATE_FILE, positions)
                 continue
             # Remove redeemed+expired positions (with grace period for on-chain settlement)
             if pos.get("redeemed") and pos.get("end_ts") and now_ms > pos["end_ts"] + 300000:
-                console.print(f"  [dim]Redeemed+expired market {mid[:20]}... removed[/]")
+                console.print(f"  [dim cyan][BOOK CLOSE][/] {mid[:18]}…  [dim]settled · expired[/]")
                 del positions[mid]
                 save_json(STATE_FILE, positions)
                 continue
             # Remove positions where redemption was submitted long ago
             if pos.get("redeem_submitted_at") and pos.get("end_ts") and now_ms > pos["end_ts"] + 3600_000:
-                console.print(f"  [dim]Redemption settled market {mid[:20]}... removed[/]")
+                console.print(f"  [dim cyan][BOOK CLOSE][/] {mid[:18]}…  [dim]settle window elapsed[/]")
                 del positions[mid]
                 save_json(STATE_FILE, positions)
 
@@ -569,7 +575,7 @@ while True:
             p = pending[mid]
             age = now_ms - p.get("placed_at", 0)
             if age < 120_000:
-                console.print(f"  [dim]Pending {mid[:20]}... age={age//1000}s, letting sit[/]")
+                console.print(f"  [dim magenta][WORKING][/] {mid[:18]}…  [dim]age {age//1000}s · resting[/]")
                 continue
 
             # Crash recovery: if already in positions, just drop stale pending
@@ -588,7 +594,7 @@ while True:
             yes_err = yes_oid and yes_det is None
             no_err = no_oid and no_det is None
             if yes_err or no_err:
-                console.print(f"  [dim]Pending {mid[:20]}... order details unavailable, retry next cycle[/]")
+                console.print(f"  [dim yellow][API DEFER][/] {mid[:18]}…  [dim]order detail unavail · retry[/]")
                 continue
 
             yes_matched = matched_from_det(yes_det, p["yes_size"])
@@ -597,7 +603,7 @@ while True:
             yes_status = yes_det.get("status", "UNKNOWN") if yes_det else "UNKNOWN"
             no_status = no_det.get("status", "UNKNOWN") if no_det else "UNKNOWN"
 
-            console.print(f"  [dim]Pending {mid[:20]}... YES={yes_status} matched={yes_matched}  NO={no_status} matched={no_matched}[/]")
+            console.print(f"  [dim magenta][WORKING][/] {mid[:18]}…  [bright_green]UP[/]:{yes_status}/{yes_matched}  [bright_red]DN[/]:{no_status}/{no_matched}")
 
             both_filled = (yes_matched >= p["yes_size"]) and (no_matched >= p["no_size"])
             timed_out = now_ms > p.get("placed_at", 0) + PENDING_TIMEOUT_MS
@@ -618,7 +624,7 @@ while True:
                 save_json(STATE_FILE, positions)
                 del pending[mid]
                 save_json(PENDING_FILE, pending)
-                console.print("  [bold green]FULL STRADDLE ENTERED[/]")
+                console.print("  [bold bright_green]■ STRADDLE LIVE ■[/] [dim]both legs filled[/]")
                 continue
 
             # Nothing filled and not yet timed out — keep waiting
@@ -628,16 +634,16 @@ while True:
             # Partial fill (one or both sides) OR timeout: cancel BOTH first to freeze fills,
             # then re-read matched amounts so the flatten/promote uses the true final values.
             if not cancel_order_safe(p["yes_order_id"]):
-                console.print("  [dim red]Cancel YES failed, retry next cycle[/]")
+                console.print("  [bold red][KILL FAIL][/] UP leg · retry next tick")
                 continue
             if not cancel_order_safe(p["no_order_id"]):
-                console.print("  [dim red]Cancel NO failed, retry next cycle[/]")
+                console.print("  [bold red][KILL FAIL][/] DN leg · retry next tick")
                 continue
 
             yes_matched_post = refetch_matched_after_cancel(p["yes_order_id"], yes_matched)
             no_matched_post = refetch_matched_after_cancel(p["no_order_id"], no_matched)
             if yes_matched_post is None or no_matched_post is None:
-                console.print(f"  [dim]Pending {mid[:20]}... post-cancel re-read failed, retry next cycle[/]")
+                console.print(f"  [dim yellow][API DEFER][/] {mid[:18]}…  [dim]post-kill refetch failed · retry[/]")
                 continue
             yes_matched = yes_matched_post
             no_matched = no_matched_post
@@ -662,7 +668,7 @@ while True:
                 save_json(STATE_FILE, positions)
                 del pending[mid]
                 save_json(PENDING_FILE, pending)
-                console.print("  [bold green]Both filled post-cancel — straddle entered[/]")
+                console.print("  [bold bright_green]■ STRADDLE LIVE ■[/] [dim]both legs filled post-kill[/]")
                 continue
 
             if yes_has and no_has:
@@ -681,7 +687,7 @@ while True:
                 save_json(STATE_FILE, positions)
                 del pending[mid]
                 save_json(PENDING_FILE, pending)
-                console.print("  [bold green]Both partial — entered with matched sizes[/]")
+                console.print("  [bold bright_green]◐ STRADDLE LIVE ◐[/] [dim]both legs partial · sized to fills[/]")
                 continue
 
             if yes_has:
@@ -701,7 +707,7 @@ while True:
                     save_json(STATE_FILE, positions)
                 del pending[mid]
                 save_json(PENDING_FILE, pending)
-                console.print("  [yellow]Partial - flattened YES[/]")
+                console.print("  [bold bright_yellow]▲ ASYMMETRIC FILL[/] [dim]UP filled · flattened to flat[/]")
                 continue
 
             if no_has:
@@ -721,11 +727,11 @@ while True:
                     save_json(STATE_FILE, positions)
                 del pending[mid]
                 save_json(PENDING_FILE, pending)
-                console.print("  [yellow]Partial - flattened NO[/]")
+                console.print("  [bold bright_yellow]▼ ASYMMETRIC FILL[/] [dim]DN filled · flattened to flat[/]")
                 continue
 
             # Timeout with zero fills on both sides — just clean up
-            console.print(f"  [dim]Pending timeout, no fills — cleaned up[/]")
+            console.print(f"  [dim magenta][WORK EXPIRE][/] [dim]no fills · cleaned[/]")
             del pending[mid]
             save_json(PENDING_FILE, pending)
 
@@ -758,14 +764,15 @@ while True:
 
             if sell_yes or sell_no:
                 q = pos.get("question", "Unknown")
+                ttm_color = "bold red" if minutes_left <= 20 else "bright_yellow"
                 sell_panel = Panel(
-                    f"  [white]{q}[/]\n"
-                    f"  UP bid={yes_bid:.3f} (rem={yes_rem})  "
-                    f"DOWN bid={no_bid:.3f} (rem={no_rem})  "
-                    f"[yellow]{minutes_left:.1f}m left[/]",
-                    title="[bold yellow]SELL CHECK[/]",
-                    border_style="yellow",
-                    box=box.ROUNDED,
+                    f"  [bright_white]{q}[/]\n"
+                    f"  [bright_green]UP[/]   bid [bold]{yes_bid:.3f}[/]  inv [bold]{yes_rem:>3}[/]   \u2502   "
+                    f"[bright_red]DN[/]  bid [bold]{no_bid:.3f}[/]  inv [bold]{no_rem:>3}[/]   \u2502   "
+                    f"[{ttm_color}]TTM {minutes_left:>4.1f}m[/]",
+                    title="[bold bright_yellow]\u25bc EXIT TRIGGER \u2014 RISK-OFF[/]",
+                    border_style="bright_yellow",
+                    box=box.HEAVY,
                 )
                 console.print(sell_panel)
 
@@ -784,7 +791,7 @@ while True:
         # ================= BUY PHASE =================
         active_count = len(positions) + len(pending)
         if active_count >= MAX_POSITIONS:
-            console.print(f"  [dim]Max positions reached ({active_count}/{MAX_POSITIONS})[/]")
+            console.print(f"  [dim yellow][BOOK FULL][/] [dim]exposure {active_count}/{MAX_POSITIONS} \u00b7 no new entries[/]")
         else:
             available_bal = pusd_bal
             for market in markets:
@@ -805,14 +812,17 @@ while True:
                 if yes_ask is None or no_ask is None:
                     continue
 
+                joint = yes_ask + no_ask
+                edge_bps = int((1.0 - joint) * 10000) if joint > 0 else 0
+                edge_color = "bright_green" if edge_bps > 0 else "bright_red"
                 buy_panel = Panel(
-                    f"  [white]{market['question']}[/]\n"
-                    f"  UP={yes_ask:.3f} ({yes_depth:.1f} avail)  "
-                    f"DOWN={no_ask:.3f} ({no_depth:.1f} avail)  "
-                    f"[cyan]{minutes_ahead:.1f}m ahead[/]",
-                    title="[bold green]BUY CHECK[/]",
-                    border_style="green",
-                    box=box.ROUNDED,
+                    f"  [bright_white]{market['question']}[/]\n"
+                    f"  [bright_green]UP[/]   ask [bold]{yes_ask:.3f}[/]  depth [bold]{yes_depth:>5.1f}[/]   \u2502   "
+                    f"[bright_red]DN[/]  ask [bold]{no_ask:.3f}[/]  depth [bold]{no_depth:>5.1f}[/]\n"
+                    f"  [dim]joint[/] [bold]{joint:.3f}[/]   [dim]edge[/] [{edge_color}]{edge_bps:+d} bps[/]   [dim]horizon[/] [bright_cyan]{minutes_ahead:>5.1f}m[/]",
+                    title="[bold bright_green]\u25b2 ENTRY SCAN \u2014 STRADDLE QUOTE[/]",
+                    border_style="bright_green",
+                    box=box.HEAVY,
                 )
                 console.print(buy_panel)
 
@@ -823,17 +833,21 @@ while True:
                     total_cost = size * (yes_ask + no_ask)
                     if total_cost > available_bal:
                         size = int(available_bal / (yes_ask + no_ask))
-                        console.print(f"  [dim]Balance cap: size={size} (bal={available_bal:.2f}, need={total_cost:.2f})[/]")
+                        console.print(f"  [dim yellow][MARGIN CAP][/] [dim]size={size} \u00b7 NAV={available_bal:.2f} \u00b7 req={total_cost:.2f}[/]")
 
                     if size < min_size:
-                        console.print(f"  [dim]Size too small: {size} < {min_size}[/]")
+                        console.print(f"  [dim yellow][SIZE FLOOR][/] [dim]{size} < min {min_size} \u00b7 skip[/]")
                         continue
 
                     tick_size = str(market.get("orderPriceMinTickSize", "0.01"))
+                    notional = size * (yes_ask + no_ask)
                     console.print(Panel(
-                        f"  [bold white]{market['question']}[/]\n"
-                        f"  Size: [bold yellow]{size}[/]  YES @ {yes_ask:.3f} + NO @ {no_ask:.3f}",
-                        title="[bold bright_yellow]STRADDLE ENTRY[/]",
+                        f"  [bold bright_white]{market['question']}[/]\n"
+                        f"  [bright_yellow]\u25cf SIZE[/] [bold]{size}[/]  \u2502  "
+                        f"[bright_green]UP[/] @ [bold]{yes_ask:.3f}[/]  +  [bright_red]DN[/] @ [bold]{no_ask:.3f}[/]  \u2502  "
+                        f"[dim]notional[/] [bold]${notional:.2f}[/]",
+                        title="[bold bright_yellow]\u2261\u2261  POSITION OPEN  \u2261\u2261[/]",
+                        subtitle="[dim]GTC \u00b7 both legs \u00b7 delta-neutral[/]",
                         border_style="bright_yellow",
                         box=box.HEAVY_EDGE,
                     ))
@@ -841,7 +855,7 @@ while True:
                     # Place YES first, then check if it filled before placing NO
                     yes_order = place_order(yes_token, yes_ask, size, BUY, OrderType.GTC, tick_size)
                     if not yes_order:
-                        console.print("  [dim]YES placement failed, skipping[/]")
+                        console.print("  [dim red][LEG FAIL][/] [dim]UP rejected \u00b7 abort entry[/]")
                         continue
 
                     yes_oid = extract_order_id(yes_order)
@@ -872,7 +886,7 @@ while True:
                     if yes_matched >= size:
                         # YES fully filled before NO placed — flatten immediately
                         # No cancel needed: yes_matched >= size means the GTC is exhausted/archived
-                        console.print("  [yellow]YES filled before NO placed — flattening[/]")
+                        console.print("  [bold bright_yellow][RACE FILL][/] [dim]UP filled pre-DN \u00b7 emergency flatten[/]")
                         sold, _ = sell_with_retry(yes_token, yes_matched)
                         if sold < yes_matched:
                             positions[mid] = {
@@ -925,17 +939,18 @@ while True:
                             del pending[mid]
                             save_json(PENDING_FILE, pending)
                         else:
-                            console.print("  [dim red]Cancel YES failed, keeping in pending[/]")
+                            console.print("  [bold red][KILL FAIL][/] [dim]UP leg \u00b7 holding in pending[/]")
 
                     time.sleep(2)
 
     except Exception:
         console.print(Panel(
             traceback.format_exc(),
-            title="[bold red]CRITICAL ERROR[/]",
-            border_style="red",
+            title="[bold bright_red]\u25a0\u25a0  SYSTEM FAULT  \u25a0\u25a0[/]",
+            subtitle="[dim]auto-restart in 30s \u00b7 cycle aborted[/]",
+            border_style="bright_red",
             box=box.HEAVY_EDGE,
         ))
 
-    console.print("[dim]Waiting 30s...[/]")
+    console.print("[dim bright_black]\u00b7 \u00b7 \u00b7  sleeping 30s  \u00b7 \u00b7 \u00b7[/]")
     time.sleep(30)
