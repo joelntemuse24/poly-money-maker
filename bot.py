@@ -759,8 +759,8 @@ while True:
             yes_rem = pos.get("yes_remaining", 0)
             no_rem = pos.get("no_remaining", 0)
 
-            sell_yes = yes_rem > 0 and (yes_bid <= 0.02 or (minutes_left <= 20 and yes_bid < 0.03))
-            sell_no = no_rem > 0 and (no_bid <= 0.02 or (minutes_left <= 20 and no_bid < 0.03))
+            sell_yes = yes_rem > 0 and (yes_bid <= 0.04 or (minutes_left <= 20 and yes_bid < 0.05))
+            sell_no = no_rem > 0 and (no_bid <= 0.04 or (minutes_left <= 20 and no_bid < 0.05))
 
             if sell_yes or sell_no:
                 q = pos.get("question", "Unknown")
