@@ -348,6 +348,7 @@ def sell_with_retry(token_id, size, tick_size="0.01", max_retries=3):
                 order_type=OrderType.FAK,
             )
             if result:
+                oid = extract_order_id(result)
                 # Try to get matched amount directly from result first
                 matched = 0
                 if isinstance(result, dict):
@@ -357,7 +358,6 @@ def sell_with_retry(token_id, size, tick_size="0.01", max_retries=3):
 
                 # If result shows 0, verify via get_order_details (order may have been archived)
                 if matched <= 0:
-                    oid = extract_order_id(result)
                     details = get_order_details(oid) if oid else None
                     if details:
                         if details.get("status") == "NOT_FOUND":
