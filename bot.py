@@ -826,10 +826,15 @@ while True:
                 )
                 console.print(buy_panel)
 
-                if round(yes_ask, 3) == round(no_ask, 3) and yes_ask <= 0.51:
-                    # Always trade the exchange minimum during testing — smallest legal straddle
+                # Enter if sides are within 1c of each other AND joint <= 1.02
+                # (4c loser-scrape covers up to 2c of joint slippage)
+                if abs(yes_ask - no_ask) <= 0.01 and (yes_ask + no_ask) <= 1.02:
                     size = int(market.get("orderMinSize", 5))
                     total_cost = size * (yes_ask + no_ask)
+                    MAX_STRADDLE_COST = 5.50
+                    if total_cost > MAX_STRADDLE_COST:
+                        console.print(f"  [dim yellow][COST CAP][/] [dim]${total_cost:.2f} > ${MAX_STRADDLE_COST:.2f} ceiling · skip[/]")
+                        continue
                     if total_cost > available_bal:
                         console.print(f"  [dim yellow][MARGIN CAP][/] [dim]need ${total_cost:.2f} · NAV ${available_bal:.2f} · skip[/]")
                         continue
