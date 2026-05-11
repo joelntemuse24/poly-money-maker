@@ -29,7 +29,7 @@ GAMMA_API = "https://gamma-api.polymarket.com"
 CHAIN_ID = 137
 STATE_FILE = "positions.json"
 PENDING_FILE = "pending.json"
-MAX_POSITIONS = 5
+MAX_POSITIONS = 2  # testing: $10 budget → 2 concurrent straddles at exchange-min size
 PENDING_TIMEOUT_MS = 5 * 60 * 1000  # 5 minutes
 
 PRIVATE_KEY = os.getenv("PRIVATE_KEY")
@@ -827,16 +827,11 @@ while True:
                 console.print(buy_panel)
 
                 if round(yes_ask, 3) == round(no_ask, 3) and yes_ask <= 0.51:
-                    min_size = int(market.get("orderMinSize", 1))
-                    target_dollars = 1.0
-                    size = max(1, round(target_dollars / yes_ask))
+                    # Always trade the exchange minimum during testing — smallest legal straddle
+                    size = int(market.get("orderMinSize", 5))
                     total_cost = size * (yes_ask + no_ask)
                     if total_cost > available_bal:
-                        size = int(available_bal / (yes_ask + no_ask))
-                        console.print(f"  [dim yellow][MARGIN CAP][/] [dim]size={size} \u00b7 NAV={available_bal:.2f} \u00b7 req={total_cost:.2f}[/]")
-
-                    if size < min_size:
-                        console.print(f"  [dim yellow][SIZE FLOOR][/] [dim]{size} < min {min_size} \u00b7 skip[/]")
+                        console.print(f"  [dim yellow][MARGIN CAP][/] [dim]need ${total_cost:.2f} · NAV ${available_bal:.2f} · skip[/]")
                         continue
 
                     tick_size = str(market.get("orderPriceMinTickSize", "0.01"))
