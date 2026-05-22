@@ -28,6 +28,7 @@ DATA_API = "https://data-api.polymarket.com"
 CHAIN_ID = 137
 STATE_FILE = "positions.json"  # metadata cache only: redeem_submitted_at, entered_at
 BTC_SLUG_PREFIX = "bitcoin-up-or-down"  # event/market slug filter for managed markets
+BTC_SLUG_ALIASES = ("bitcoin-up-or-down", "btc-updown")
 
 PRIVATE_KEY = os.getenv("PRIVATE_KEY")
 FUNDER_ADDRESS = os.getenv("FUNDER_ADDRESS")
@@ -175,8 +176,8 @@ def group_btc_complete_sets(positions, positions_meta=None):
         event_slug = (p.get("eventSlug") or "").lower()
         title = (p.get("title") or "").lower()
         if not (
-            slug.startswith(BTC_SLUG_PREFIX)
-            or event_slug.startswith(BTC_SLUG_PREFIX)
+            slug.startswith(BTC_SLUG_ALIASES)
+            or event_slug.startswith(BTC_SLUG_ALIASES)
             or "bitcoin up or down" in title
         ):
             continue
@@ -262,6 +263,16 @@ def get_book_bid(token_id):
             return None, 0.0
         best = max(bids, key=lambda x: float(x.get("price", 0)))
         return float(best.get("price", 0)), float(best.get("size", 0))
+    except Exception:
+        return None, 0.0
+
+
+def get_midpoint(token_id):
+    try:
+        price = safe_api_call(client.get_midpoint, token_id)
+        if isinstance(price, dict):
+            price = price.get("mid")
+        return float(price), 0.0
     except Exception:
         return None, 0.0
 
@@ -587,20 +598,24 @@ while True:
 
             up_bid, _ = get_book_bid(up_token) if up_size > 0 else (None, 0.0)
             dn_bid, _ = get_book_bid(dn_token) if dn_size > 0 else (None, 0.0)
+            up_mid, _ = get_midpoint(up_token) if up_size > 0 else (None, 0.0)
+            dn_mid, _ = get_midpoint(dn_token) if dn_size > 0 else (None, 0.0)
 
             # Strategy: in the last 20 minutes, sell whichever side has dropped to 4c
             # (the loser leg). Hold the other side to expiry for the $1 payout.
-            up_trigger = up_size > 0 and minutes_left <= EXIT_WINDOW_MIN and up_bid is not None and up_bid <= SELL_THRESHOLD
-            dn_trigger = dn_size > 0 and minutes_left <= EXIT_WINDOW_MIN and dn_bid is not None and dn_bid <= SELL_THRESHOLD
+            up_price = up_bid if up_bid is not None else up_mid
+            dn_price = dn_bid if dn_bid is not None else dn_mid
+            up_trigger = up_size > 0 and minutes_left <= EXIT_WINDOW_MIN and up_price is not None and up_price <= SELL_THRESHOLD
+            dn_trigger = dn_size > 0 and minutes_left <= EXIT_WINDOW_MIN and dn_price is not None and dn_price <= SELL_THRESHOLD
 
             if minutes_left <= FALLBACK_WINDOW_MIN:
-                up_trigger = up_trigger or (up_size > 0 and up_bid is not None and up_bid <= FALLBACK_THRESHOLD)
-                dn_trigger = dn_trigger or (dn_size > 0 and dn_bid is not None and dn_bid <= FALLBACK_THRESHOLD)
+                up_trigger = up_trigger or (up_size > 0 and up_price is not None and up_price <= FALLBACK_THRESHOLD)
+                dn_trigger = dn_trigger or (dn_size > 0 and dn_price is not None and dn_price <= FALLBACK_THRESHOLD)
 
             # Guard: if both legs trigger, only sell the lower-priced one to ensure
             # we still hold a winner for the $1 payout at resolution.
             if up_trigger and dn_trigger:
-                if up_bid <= dn_bid:
+                if up_price <= dn_price:
                     dn_trigger = False
                 else:
                     up_trigger = False
@@ -612,12 +627,12 @@ while True:
             will_sell_dn = sell_dn and (now_ms - (meta.get("last_sell_dn_at") or 0) >= SELL_COOLDOWN_S * 1000)
 
             if will_sell_up or will_sell_dn:
-                up_bid_str = f"{up_bid:.3f}" if up_bid is not None else "  -  "
-                dn_bid_str = f"{dn_bid:.3f}" if dn_bid is not None else "  -  "
+                up_bid_str = f"{up_price:.3f}" if up_price is not None else "  -  "
+                dn_bid_str = f"{dn_price:.3f}" if dn_price is not None else "  -  "
                 console.print(Panel(
                     f"  [bright_white]{s['question']}[/]\n"
-                    f"  [bright_green]UP[/]   bid [bold]{up_bid_str}[/]  inv [bold]{up_size:>3}[/]   \u2502   "
-                    f"[bright_red]DN[/]  bid [bold]{dn_bid_str}[/]  inv [bold]{dn_size:>3}[/]   \u2502   "
+                    f"  [bright_green]UP[/]   px [bold]{up_bid_str}[/]  inv [bold]{up_size:>3}[/]   \u2502   "
+                    f"[bright_red]DN[/]  px [bold]{dn_bid_str}[/]  inv [bold]{dn_size:>3}[/]   \u2502   "
                     f"[bold red]TTM {minutes_left:>4.1f}m[/]",
                     title="[bold bright_yellow]\u25bc EXIT TRIGGER \u2014 LOSER LEG[/]",
                     border_style="bright_yellow",
@@ -627,6 +642,9 @@ while True:
             if sell_up:
                 if not will_sell_up:
                     console.print(f"  [dim][SKIP][/] [dim]UP sell suppressed · sold <{SELL_COOLDOWN_S:.0f}s ago[/]")
+                elif up_bid is None:
+                    log_event("sell_skip_no_bid", condition_id=cond, leg="up", price=up_price, size=up_size)
+                    console.print("  [dim yellow][BOOK][/] [dim]UP bid side empty · cannot FAK sell[/]")
                 else:
                     log_event("sell_attempt", condition_id=cond, leg="up", size=up_size, bid=up_bid)
                     sold, _ = sell_with_retry(up_token, up_size)
@@ -640,6 +658,9 @@ while True:
             if sell_dn:
                 if not will_sell_dn:
                     console.print(f"  [dim][SKIP][/] [dim]DN sell suppressed · sold <{SELL_COOLDOWN_S:.0f}s ago[/]")
+                elif dn_bid is None:
+                    log_event("sell_skip_no_bid", condition_id=cond, leg="down", price=dn_price, size=dn_size)
+                    console.print("  [dim yellow][BOOK][/] [dim]DN bid side empty · cannot FAK sell[/]")
                 else:
                     log_event("sell_attempt", condition_id=cond, leg="down", size=dn_size, bid=dn_bid)
                     sold, _ = sell_with_retry(dn_token, dn_size)
