@@ -13,6 +13,7 @@ from rich import box
 
 from py_clob_client_v2 import (
     ClobClient,
+    MarketOrderArgs,
     OrderArgs,
     OrderType,
     PartialCreateOrderOptions,
@@ -28,6 +29,10 @@ DATA_API = "https://data-api.polymarket.com"
 CHAIN_ID = 137
 STATE_FILE = "positions.json"  # metadata cache only: redeem_submitted_at, entered_at
 BTC_SLUG_PREFIX = "bitcoin-up-or-down"  # event/market slug filter for managed markets
+BTC_SLUG_ALIASES = ("bitcoin-up-or-down", "btc-updown")
+PUSD = "0xC011a7E12a19f7B1f670d46F03B03f3342E82DFB"
+CTF = "0x4D97DCd97eC945f40cF65F87097ACe5EA0476045"
+CTF_COLLATERAL_ADAPTER = "0xAdA100Db00Ca00073811820692005400218FcE1f"
 
 PRIVATE_KEY = os.getenv("PRIVATE_KEY")
 FUNDER_ADDRESS = os.getenv("FUNDER_ADDRESS")
@@ -175,8 +180,8 @@ def group_btc_complete_sets(positions, positions_meta=None):
         event_slug = (p.get("eventSlug") or "").lower()
         title = (p.get("title") or "").lower()
         if not (
-            slug.startswith(BTC_SLUG_PREFIX)
-            or event_slug.startswith(BTC_SLUG_PREFIX)
+            slug.startswith(BTC_SLUG_ALIASES)
+            or event_slug.startswith(BTC_SLUG_ALIASES)
             or "bitcoin up or down" in title
         ):
             continue
@@ -262,6 +267,16 @@ def get_book_bid(token_id):
             return None, 0.0
         best = max(bids, key=lambda x: float(x.get("price", 0)))
         return float(best.get("price", 0)), float(best.get("size", 0))
+    except Exception:
+        return None, 0.0
+
+
+def get_midpoint(token_id):
+    try:
+        price = safe_api_call(client.get_midpoint, token_id)
+        if isinstance(price, dict):
+            price = price.get("mid")
+        return float(price), 0.0
     except Exception:
         return None, 0.0
 
@@ -374,8 +389,124 @@ def sell_with_retry(token_id, size, tick_size="0.01", max_retries=3):
 
     if total_sold > 0:
         return total_sold, {"partial": True, "sold": total_sold}
-    console.print(f"  [bold red][EXIT FAIL][/] 0/{size} cleared")
+    console.print(f"  [bold red][EXIT FAIL][/] limit sell 0/{size} cleared")
     return 0, None
+
+
+def sell_market_with_retry(token_id, size, price_limit, tick_size="0.01", max_retries=3):
+    total_sold = 0
+    remaining = int(size)
+    price = max(float(price_limit or tick_size), float(tick_size))
+    for attempt in range(max_retries):
+        if remaining < 1:
+            break
+        try:
+            neg_risk = safe_api_call(client.get_neg_risk, token_id)
+            result = safe_api_call(
+                client.create_and_post_market_order,
+                MarketOrderArgs(token_id=token_id, amount=remaining, side=SELL, price=price),
+                options=PartialCreateOrderOptions(tick_size=tick_size, neg_risk=neg_risk),
+                order_type=OrderType.FAK,
+            )
+            if result:
+                oid = extract_order_id(result)
+                filled = remaining
+                if isinstance(result, dict):
+                    filled = int(float(result.get("size_matched") or result.get("makingAmount") or remaining))
+                total_sold += filled
+                remaining -= filled
+                console.print(f"  [bold green][EXIT FAK][/]{filled} @ ≥{price:.3f}  [dim]id={str(oid)[:16]}...[/]")
+                if remaining < 1:
+                    return total_sold, result
+        except Exception as e:
+            console.print(f"  [dim red]Market sell {attempt+1}/{max_retries} failed: {e}[/]")
+        time.sleep(1)
+
+    if total_sold > 0:
+        return total_sold, {"partial": True, "sold": total_sold}
+    console.print(f"  [bold red][EXIT FAIL][/] market sell 0/{size} cleared")
+    return 0, None
+
+
+def get_relayer_headers():
+    relayer_url = "https://relayer-v2.polymarket.com"
+    relayer_headers = {
+        "Content-Type": "application/json",
+        "RELAYER_API_KEY": "019df62f-45bc-796e-975c-3f434472b163",
+        "RELAYER_API_KEY_ADDRESS": "0x42aec4505559c0613f7ce2541d9d29741bc5e195",
+    }
+    return relayer_url, relayer_headers
+
+
+def submit_proxy_tx(target, data, tx_type="PROXY"):
+    from eth_account import Account
+
+    relayer_url, relayer_headers = get_relayer_headers()
+    eoa = Account.from_key(PRIVATE_KEY).address
+    nonce_r = requests.get(
+        f"{relayer_url}/nonce",
+        params={"address": eoa, "type": tx_type},
+        headers=relayer_headers,
+        timeout=10,
+    )
+    if nonce_r.status_code != 200:
+        return None, f"nonce fetch fail HTTP {nonce_r.status_code}"
+    body = {
+        "type": tx_type,
+        "from": eoa,
+        "to": target,
+        "nonce": nonce_r.json().get("nonce", "0"),
+        "data": "0x" + data.hex(),
+        "value": "0",
+    }
+    submit_r = requests.post(
+        f"{relayer_url}/submit",
+        json=body,
+        headers=relayer_headers,
+        timeout=10,
+    )
+    if submit_r.status_code == 200:
+        return submit_r.json().get("transactionID") or "?", None
+    return None, f"HTTP {submit_r.status_code} · {submit_r.text[:80]}"
+
+
+def merge_complete_set(condition_id, amount, label=""):
+    try:
+        from eth_abi import encode
+        from eth_utils import keccak, to_checksum_address
+
+        merge_size = int(amount)
+        if merge_size < 1:
+            return None
+        pUSD = to_checksum_address(PUSD)
+        adapter = to_checksum_address(CTF_COLLATERAL_ADAPTER)
+        merge_sel = keccak(b"mergePositions(address,bytes32,bytes32,uint256[],uint256)")[:4]
+        merge_data = merge_sel + encode(
+            ["address", "bytes32", "bytes32", "uint256[]", "uint256"],
+            [pUSD, bytes(32), bytes.fromhex(condition_id.lower().removeprefix("0x")), [1, 2], merge_size * 1_000_000],
+        )
+        execute_sel = keccak(b"execute(address,uint256,bytes)")[:4]
+        proxy_data = execute_sel + encode(
+            ["address", "uint256", "bytes"],
+            [adapter, 0, merge_data],
+        )
+        tx_id, err = submit_proxy_tx(to_checksum_address(FUNDER_ADDRESS), proxy_data)
+        if tx_id:
+            console.print(f"  [bold bright_green][MERGE ▶][/] {label}  [dim]tx={str(tx_id)[:18]}…[/]")
+            return tx_id
+        console.print(f"  [dim red][MERGE FAIL][/] {label}  [dim]{err}[/]")
+        return None
+    except Exception as e:
+        console.print(f"  [dim red][MERGE ERR][/] {label}  [dim]{e}[/]")
+        return None
+
+
+def quote_complete_set_exit(trigger_bid, other_bid, trigger_mid, other_mid):
+    matched = None if trigger_bid is None else float(trigger_bid)
+    other = other_bid if other_bid is not None else other_mid
+    other = 0.0 if other is None else float(other)
+    merged = max(0.0, 1.0 - other)
+    return max(matched or 0.0, merged), matched, merged
 
 
 # ------------------------- REDEEM -------------------------
@@ -386,12 +517,10 @@ def redeem_condition(condition_id, label=""):
     try:
         from eth_abi import encode
         from eth_utils import keccak, to_checksum_address
-        from eth_account import Account
 
-        pUSD = to_checksum_address("0xC011a7E12a19f7B1f670d46F03B03f3342E82DFB")
-        CTF = to_checksum_address("0x4D97DCd97eC945f40cF65F87097ACe5EA0476045")
+        pUSD = to_checksum_address(PUSD)
+        CTF_CONTRACT = to_checksum_address(CTF)
         proxy = to_checksum_address(FUNDER_ADDRESS)
-        eoa = Account.from_key(PRIVATE_KEY).address
 
         redeem_sel = keccak(b"redeemPositions(address,bytes32,bytes32,uint256[])")[:4]
         redeem_data = redeem_sel + encode(
@@ -402,48 +531,14 @@ def redeem_condition(condition_id, label=""):
         execute_sel = keccak(b"execute(address,uint256,bytes)")[:4]
         proxy_data = execute_sel + encode(
             ["address", "uint256", "bytes"],
-            [CTF, 0, redeem_data],
+            [CTF_CONTRACT, 0, redeem_data],
         )
 
-        relayer_url = "https://relayer-v2.polymarket.com"
-        relayer_headers = {
-            "Content-Type": "application/json",
-            "RELAYER_API_KEY": "019df62f-45bc-796e-975c-3f434472b163",
-            "RELAYER_API_KEY_ADDRESS": "0x42aec4505559c0613f7ce2541d9d29741bc5e195",
-        }
-
-        nonce_r = requests.get(
-            f"{relayer_url}/nonce",
-            params={"address": eoa, "type": "PROXY"},
-            headers=relayer_headers,
-            timeout=10,
-        )
-        if nonce_r.status_code != 200:
-            console.print(f"  [dim red][REDEEM][/] [dim]{label} \u00b7 nonce fetch fail HTTP {nonce_r.status_code}[/]")
-            return None
-        nonce = nonce_r.json().get("nonce", "0")
-
-        body = {
-            "type": "PROXY",
-            "from": eoa,
-            "to": proxy,
-            "nonce": nonce,
-            "data": "0x" + proxy_data.hex(),
-            "value": "0",
-        }
-
-        submit_r = requests.post(
-            f"{relayer_url}/submit",
-            json=body,
-            headers=relayer_headers,
-            timeout=10,
-        )
-
-        if submit_r.status_code == 200:
-            tx_id = submit_r.json().get("transactionID") or "?"
+        tx_id, err = submit_proxy_tx(proxy, proxy_data)
+        if tx_id:
             console.print(f"  [bold bright_green][SETTLE \u25b6][/] {label}  [dim]tx={str(tx_id)[:18]}\u2026[/]")
             return tx_id
-        console.print(f"  [dim red][SETTLE FAIL][/] {label}  [dim]HTTP {submit_r.status_code} \u00b7 {submit_r.text[:80]}[/]")
+        console.print(f"  [dim red][SETTLE FAIL][/] {label}  [dim]{err}[/]")
         return None
     except Exception as e:
         console.print(f"  [dim red][SETTLE ERR][/] {label}  [dim]{e}[/]")
@@ -587,20 +682,24 @@ while True:
 
             up_bid, _ = get_book_bid(up_token) if up_size > 0 else (None, 0.0)
             dn_bid, _ = get_book_bid(dn_token) if dn_size > 0 else (None, 0.0)
+            up_mid, _ = get_midpoint(up_token) if up_size > 0 else (None, 0.0)
+            dn_mid, _ = get_midpoint(dn_token) if dn_size > 0 else (None, 0.0)
 
             # Strategy: in the last 20 minutes, sell whichever side has dropped to 4c
             # (the loser leg). Hold the other side to expiry for the $1 payout.
-            up_trigger = up_size > 0 and minutes_left <= EXIT_WINDOW_MIN and up_bid is not None and up_bid <= SELL_THRESHOLD
-            dn_trigger = dn_size > 0 and minutes_left <= EXIT_WINDOW_MIN and dn_bid is not None and dn_bid <= SELL_THRESHOLD
+            up_price, up_matched_price, up_merge_price = quote_complete_set_exit(up_bid, dn_bid, up_mid, dn_mid)
+            dn_price, dn_matched_price, dn_merge_price = quote_complete_set_exit(dn_bid, up_bid, dn_mid, up_mid)
+            up_trigger = up_size > 0 and minutes_left <= EXIT_WINDOW_MIN and up_price is not None and up_price <= SELL_THRESHOLD
+            dn_trigger = dn_size > 0 and minutes_left <= EXIT_WINDOW_MIN and dn_price is not None and dn_price <= SELL_THRESHOLD
 
             if minutes_left <= FALLBACK_WINDOW_MIN:
-                up_trigger = up_trigger or (up_size > 0 and up_bid is not None and up_bid <= FALLBACK_THRESHOLD)
-                dn_trigger = dn_trigger or (dn_size > 0 and dn_bid is not None and dn_bid <= FALLBACK_THRESHOLD)
+                up_trigger = up_trigger or (up_size > 0 and up_price is not None and up_price <= FALLBACK_THRESHOLD)
+                dn_trigger = dn_trigger or (dn_size > 0 and dn_price is not None and dn_price <= FALLBACK_THRESHOLD)
 
             # Guard: if both legs trigger, only sell the lower-priced one to ensure
             # we still hold a winner for the $1 payout at resolution.
             if up_trigger and dn_trigger:
-                if up_bid <= dn_bid:
+                if up_price <= dn_price:
                     dn_trigger = False
                 else:
                     up_trigger = False
@@ -610,46 +709,62 @@ while True:
 
             will_sell_up = sell_up and (now_ms - (meta.get("last_sell_up_at") or 0) >= SELL_COOLDOWN_S * 1000)
             will_sell_dn = sell_dn and (now_ms - (meta.get("last_sell_dn_at") or 0) >= SELL_COOLDOWN_S * 1000)
+            merge_amount = min(up_size, dn_size)
+            merge_trigger = (
+                will_sell_up and up_merge_price >= (up_matched_price or 0.0)
+            ) or (
+                will_sell_dn and dn_merge_price >= (dn_matched_price or 0.0)
+            )
 
             if will_sell_up or will_sell_dn:
-                up_bid_str = f"{up_bid:.3f}" if up_bid is not None else "  -  "
-                dn_bid_str = f"{dn_bid:.3f}" if dn_bid is not None else "  -  "
+                up_bid_str = f"{up_price:.3f}" if up_price is not None else "  -  "
+                dn_bid_str = f"{dn_price:.3f}" if dn_price is not None else "  -  "
                 console.print(Panel(
                     f"  [bright_white]{s['question']}[/]\n"
-                    f"  [bright_green]UP[/]   bid [bold]{up_bid_str}[/]  inv [bold]{up_size:>3}[/]   \u2502   "
-                    f"[bright_red]DN[/]  bid [bold]{dn_bid_str}[/]  inv [bold]{dn_size:>3}[/]   \u2502   "
+                    f"  [bright_green]UP[/]   px [bold]{up_bid_str}[/]  inv [bold]{up_size:>3}[/]   \u2502   "
+                    f"[bright_red]DN[/]  px [bold]{dn_bid_str}[/]  inv [bold]{dn_size:>3}[/]   \u2502   "
                     f"[bold red]TTM {minutes_left:>4.1f}m[/]",
                     title="[bold bright_yellow]\u25bc EXIT TRIGGER \u2014 LOSER LEG[/]",
                     border_style="bright_yellow",
                     box=box.HEAVY,
                 ))
 
+            if merge_trigger and merge_amount >= 1:
+                log_event("merge_attempt", condition_id=cond, size=merge_amount)
+                tx = merge_complete_set(cond, merge_amount, label=s["question"][:52])
+                if tx:
+                    meta["last_sell_up_at"] = now_ms
+                    meta["last_sell_dn_at"] = now_ms
+                    log_event("merge_submitted", condition_id=cond, size=merge_amount, tx=tx)
+                    save_json(STATE_FILE, positions_meta)
+                continue
+
             if sell_up:
                 if not will_sell_up:
                     console.print(f"  [dim][SKIP][/] [dim]UP sell suppressed · sold <{SELL_COOLDOWN_S:.0f}s ago[/]")
                 else:
-                    log_event("sell_attempt", condition_id=cond, leg="up", size=up_size, bid=up_bid)
-                    sold, _ = sell_with_retry(up_token, up_size)
+                    log_event("sell_attempt", condition_id=cond, leg="up", size=up_size, bid=up_bid, price_limit=up_price)
+                    sold, _ = sell_market_with_retry(up_token, up_size, up_price or SELL_THRESHOLD)
                     if sold > 0:
                         meta["last_sell_up_at"] = now_ms
                         meta["expected_up_size"] = up_size - sold
-                        log_event("sell_fill", condition_id=cond, leg="up", sold=sold, remaining=up_size - sold, price=up_bid)
+                        log_event("sell_fill", condition_id=cond, leg="up", sold=sold, remaining=up_size - sold, price=up_price)
                         save_json(STATE_FILE, positions_meta)
                     else:
-                        log_event("sell_fail", condition_id=cond, leg="up", size=up_size, bid=up_bid)
+                        log_event("sell_fail", condition_id=cond, leg="up", size=up_size, bid=up_bid, price_limit=up_price)
             if sell_dn:
                 if not will_sell_dn:
                     console.print(f"  [dim][SKIP][/] [dim]DN sell suppressed · sold <{SELL_COOLDOWN_S:.0f}s ago[/]")
                 else:
-                    log_event("sell_attempt", condition_id=cond, leg="down", size=dn_size, bid=dn_bid)
-                    sold, _ = sell_with_retry(dn_token, dn_size)
+                    log_event("sell_attempt", condition_id=cond, leg="down", size=dn_size, bid=dn_bid, price_limit=dn_price)
+                    sold, _ = sell_market_with_retry(dn_token, dn_size, dn_price or SELL_THRESHOLD)
                     if sold > 0:
                         meta["last_sell_dn_at"] = now_ms
                         meta["expected_dn_size"] = dn_size - sold
-                        log_event("sell_fill", condition_id=cond, leg="down", sold=sold, remaining=dn_size - sold, price=dn_bid)
+                        log_event("sell_fill", condition_id=cond, leg="down", sold=sold, remaining=dn_size - sold, price=dn_price)
                         save_json(STATE_FILE, positions_meta)
                     else:
-                        log_event("sell_fail", condition_id=cond, leg="down", size=dn_size, bid=dn_bid)
+                        log_event("sell_fail", condition_id=cond, leg="down", size=dn_size, bid=dn_bid, price_limit=dn_price)
 
     except Exception:
         log_event("cycle_error", traceback=traceback.format_exc())
