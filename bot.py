@@ -247,6 +247,10 @@ def group_btc_complete_sets(positions, positions_meta=None):
             end_ts = end_dt.timestamp() * 1000
         except Exception:
             continue
+        age_ms = time.time() * 1000 - end_ts
+        redeemable = bool(up.get("redeemable")) or bool(dn.get("redeemable"))
+        if age_ms > MAX_REDEEM_AGE_DAYS * 86400 * 1000 and redeemable:
+            continue
         sets.append({
             "conditionId": cond,
             "up": up,
