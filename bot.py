@@ -49,6 +49,7 @@ SELL_GRACE_S = float(os.getenv("SELL_GRACE_S", "30"))
 SELL_COOLDOWN_S = float(os.getenv("SELL_COOLDOWN_S", "30"))
 REDEEM_THROTTLE_S = float(os.getenv("REDEEM_THROTTLE_S", "300"))
 COMPLEMENT_MAX_ASK = float(os.getenv("COMPLEMENT_MAX_ASK", "0.99"))
+MAX_REDEEM_AGE_DAYS = float(os.getenv("MAX_REDEEM_AGE_DAYS", "7"))
 
 # ------------------------- CLIENT SETUP -------------------------
 if API_KEY and API_SECRET and API_PASSPHRASE:
@@ -730,6 +731,8 @@ while True:
             cond = s["conditionId"]
             redeemable = bool(s["up"].get("redeemable")) or bool(s["dn"].get("redeemable"))
             if not redeemable:
+                continue
+            if now_ms - s["end_ts"] > MAX_REDEEM_AGE_DAYS * 86400 * 1000:
                 continue
             meta = positions_meta.setdefault(cond, {})
             last = meta.get("redeem_submitted_at") or 0
