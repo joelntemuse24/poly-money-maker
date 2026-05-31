@@ -53,6 +53,9 @@ SELL_COOLDOWN_S = float(os.getenv("SELL_COOLDOWN_S", "30"))
 REDEEM_THROTTLE_S = float(os.getenv("REDEEM_THROTTLE_S", "300"))
 COMPLEMENT_MAX_ASK = float(os.getenv("COMPLEMENT_MAX_ASK", "0.99"))
 MAX_REDEEM_AGE_DAYS = float(os.getenv("MAX_REDEEM_AGE_DAYS", "7"))
+# Dry-run: log every sell/buy/merge/redeem the bot *would* place, but never send an
+# order or on-chain tx. Lets you watch the new exit logic against live books safely.
+DRY_RUN = os.getenv("DRY_RUN", "0").strip().lower() in ("1", "true", "yes", "on")
 
 # ------------------------- CLIENT SETUP -------------------------
 if API_KEY and API_SECRET and API_PASSPHRASE:
@@ -101,6 +104,8 @@ banner = Panel(
     padding=(1, 4),
 )
 console.print(banner)
+if DRY_RUN:
+    console.print("[bold black on yellow] DRY-RUN [/] [yellow]no orders or on-chain txs will be sent · decisions are logged only[/]")
 
 # ------------------------- HELPERS -------------------------
 
@@ -478,6 +483,10 @@ def sell_market_with_retry(token_id, size, price_limit, tick_size="0.01", max_re
     total_sold = 0
     remaining = int(size)
     price = max(float(price_limit or tick_size), float(tick_size))
+    if DRY_RUN:
+        console.print(f"  [bold black on yellow][DRY SELL][/] would SELL {remaining} {str(token_id)[:12]}… @ ≥{price:.3f}")
+        log_event("dry_sell", token_id=token_id, size=remaining, price_limit=price)
+        return 0, None
     for attempt in range(max_retries):
         if remaining < 1:
             break
@@ -514,6 +523,10 @@ def buy_market_with_retry(token_id, size, price_limit, tick_size="0.01", max_ret
     total_bought = 0
     remaining = int(size)
     price = min(max(float(price_limit or 1.0), float(tick_size)), 1.0)
+    if DRY_RUN:
+        console.print(f"  [bold black on yellow][DRY BUY][/] would BUY complement {remaining} {str(token_id)[:12]}… @ ≤{price:.3f}")
+        log_event("dry_buy", token_id=token_id, size=remaining, price_limit=price)
+        return 0, None
     for attempt in range(max_retries):
         if remaining < 1:
             break
@@ -591,6 +604,10 @@ def submit_proxy_tx(target, data, tx_type="PROXY"):
 
 
 def merge_complete_set(condition_id, amount, label=""):
+    if DRY_RUN:
+        console.print(f"  [bold black on yellow][DRY MERGE][/] would merge {int(amount)} sets · {label}")
+        log_event("dry_merge", condition_id=condition_id, size=int(amount), label=label)
+        return None
     try:
         from eth_abi import encode
         from eth_utils import keccak, to_checksum_address
@@ -647,6 +664,10 @@ def quote_complete_set_exit(trigger_bid, complement_ask, trigger_mid, complement
 def redeem_condition(condition_id, label=""):
     """Submit a redemption tx for a resolved Polymarket conditionId via the Polygon relayer.
     Returns the transactionID string on success, or None on failure."""
+    if DRY_RUN:
+        console.print(f"  [bold black on yellow][DRY SETTLE][/] would redeem · {label}")
+        log_event("dry_redeem", condition_id=condition_id, label=label)
+        return None
     try:
         from eth_abi import encode
         from eth_utils import keccak, to_checksum_address
