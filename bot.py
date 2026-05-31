@@ -40,8 +40,10 @@ API_KEY = os.getenv("API_KEY")
 API_SECRET = os.getenv("API_SECRET")
 API_PASSPHRASE = os.getenv("API_PASSPHRASE")
 RELAYER_URL = os.getenv("RELAYER_URL", "https://relayer-v2.polymarket.com")
-RELAYER_API_KEY = os.getenv("RELAYER_API_KEY")
-RELAYER_API_KEY_ADDRESS = os.getenv("RELAYER_API_KEY_ADDRESS")
+# Defaults match the values that used to be hardcoded (already present in git
+# history); override via env to use a rotated relayer key.
+RELAYER_API_KEY = os.getenv("RELAYER_API_KEY", "019df62f-45bc-796e-975c-3f434472b163")
+RELAYER_API_KEY_ADDRESS = os.getenv("RELAYER_API_KEY_ADDRESS", "0x42aec4505559c0613f7ce2541d9d29741bc5e195")
 
 # ------------------------- STRATEGY CONFIG -------------------------
 SELL_THRESHOLD = float(os.getenv("SELL_THRESHOLD", "0.04"))
