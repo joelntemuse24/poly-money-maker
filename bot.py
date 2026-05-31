@@ -39,6 +39,9 @@ FUNDER_ADDRESS = os.getenv("FUNDER_ADDRESS")
 API_KEY = os.getenv("API_KEY")
 API_SECRET = os.getenv("API_SECRET")
 API_PASSPHRASE = os.getenv("API_PASSPHRASE")
+RELAYER_URL = os.getenv("RELAYER_URL", "https://relayer-v2.polymarket.com")
+RELAYER_API_KEY = os.getenv("RELAYER_API_KEY")
+RELAYER_API_KEY_ADDRESS = os.getenv("RELAYER_API_KEY_ADDRESS")
 
 # ------------------------- STRATEGY CONFIG -------------------------
 SELL_THRESHOLD = float(os.getenv("SELL_THRESHOLD", "0.04"))
@@ -365,6 +368,33 @@ def get_order_details(order_id):
         return None
 
 
+def confirm_fill_size(result, oid, requested):
+    """Best-effort number of shares an order actually filled.
+
+    Prefers an explicit size_matched on the response, otherwise verifies via the
+    order endpoint (a 404/NOT_FOUND means the FAK was archived after filling, so the
+    requested chunk filled). Returns 0 when the fill cannot be confirmed, so callers
+    never assume a full fill on an ambiguous response -- assuming a full fill would
+    over-report sells and silently skip real exits.
+    """
+    matched = 0.0
+    if isinstance(result, dict):
+        sm = result.get("size_matched")
+        if sm:
+            matched = float(sm)
+    else:
+        matched = float(getattr(result, "size_matched", 0) or 0)
+    if matched <= 0 and oid:
+        details = get_order_details(oid)
+        if details:
+            if details.get("status") == "NOT_FOUND":
+                matched = float(requested)
+            else:
+                sm = details.get("size_matched", 0)
+                matched = float(sm) if sm else 0.0
+    return matched
+
+
 _neg_risk_cache = {}
 
 
@@ -461,9 +491,10 @@ def sell_market_with_retry(token_id, size, price_limit, tick_size="0.01", max_re
             )
             if result:
                 oid = extract_order_id(result)
-                filled = remaining
-                if isinstance(result, dict):
-                    filled = int(float(result.get("size_matched") or result.get("makingAmount") or remaining))
+                filled = int(round(confirm_fill_size(result, oid, remaining)))
+                if filled <= 0:
+                    console.print("  [dim yellow][FAK NULL][/] [dim]0 confirmed fill · stopping to avoid double-sell[/]")
+                    break
                 total_sold += filled
                 remaining -= filled
                 console.print(f"  [bold green][EXIT FAK][/]{filled} @ ≥{price:.3f}  [dim]id={str(oid)[:16]}...[/]")
@@ -497,9 +528,10 @@ def buy_market_with_retry(token_id, size, price_limit, tick_size="0.01", max_ret
             )
             if result:
                 oid = extract_order_id(result)
-                filled = remaining
-                if isinstance(result, dict):
-                    filled = int(float(result.get("size_matched") or result.get("makingAmount") or remaining))
+                filled = int(round(confirm_fill_size(result, oid, remaining)))
+                if filled <= 0:
+                    console.print("  [dim yellow][COMP NULL][/] [dim]0 confirmed fill · stopping[/]")
+                    break
                 total_bought += filled
                 remaining -= filled
                 console.print(f"  [bold green][COMP BUY][/]{filled} @ ≤{price:.3f}  [dim]id={str(oid)[:16]}...[/]")
@@ -516,13 +548,14 @@ def buy_market_with_retry(token_id, size, price_limit, tick_size="0.01", max_ret
 
 
 def get_relayer_headers():
-    relayer_url = "https://relayer-v2.polymarket.com"
+    if not RELAYER_API_KEY or not RELAYER_API_KEY_ADDRESS:
+        console.print("[bold red]▶ RELAYER [WARN][/] [dim]RELAYER_API_KEY / RELAYER_API_KEY_ADDRESS not set · redeem & merge will fail[/]")
     relayer_headers = {
         "Content-Type": "application/json",
-        "RELAYER_API_KEY": "019df62f-45bc-796e-975c-3f434472b163",
-        "RELAYER_API_KEY_ADDRESS": "0x42aec4505559c0613f7ce2541d9d29741bc5e195",
+        "RELAYER_API_KEY": RELAYER_API_KEY or "",
+        "RELAYER_API_KEY_ADDRESS": RELAYER_API_KEY_ADDRESS or "",
     }
-    return relayer_url, relayer_headers
+    return RELAYER_URL, relayer_headers
 
 
 def submit_proxy_tx(target, data, tx_type="PROXY"):
@@ -588,12 +621,25 @@ def merge_complete_set(condition_id, amount, label=""):
         return None
 
 
-def quote_complete_set_exit(trigger_bid, other_bid, trigger_mid, other_mid):
+def quote_complete_set_exit(trigger_bid, complement_ask, trigger_mid, complement_mid):
+    """Value a single leg for exit decisions.
+
+    Returns (self_price, matched_price, merge_price):
+      - self_price:    this leg's own value (own bid, falling back to own mid). Used to
+                       decide whether the leg is the worthless "loser" worth dumping.
+      - matched_price: realizable price for a *direct* sell (own bid).
+      - merge_price:   value from completing+merging the set, i.e. 1 - complement_ask.
+                       Merging requires BUYING the complement, so it executes at the
+                       complement's ask, not its bid.
+    """
     matched = None if trigger_bid is None else float(trigger_bid)
-    other = other_bid if other_bid is not None else other_mid
-    other = 0.0 if other is None else float(other)
-    merged = max(0.0, 1.0 - other)
-    return max(matched or 0.0, merged), matched, merged
+    self_price = matched if matched is not None else (
+        None if trigger_mid is None else float(trigger_mid)
+    )
+    comp = complement_ask if complement_ask is not None else complement_mid
+    comp = None if comp is None else float(comp)
+    merge_price = None if comp is None else max(0.0, 1.0 - comp)
+    return self_price, matched, merge_price
 
 
 # ------------------------- REDEEM -------------------------
@@ -778,8 +824,8 @@ while True:
 
             # Strategy: in the last 20 minutes, sell whichever side has dropped to 4c
             # (the loser leg). Hold the other side to expiry for the $1 payout.
-            up_price, up_matched_price, up_merge_price = quote_complete_set_exit(up_bid, dn_bid, up_mid, dn_mid)
-            dn_price, dn_matched_price, dn_merge_price = quote_complete_set_exit(dn_bid, up_bid, dn_mid, up_mid)
+            up_price, up_matched_price, up_merge_price = quote_complete_set_exit(up_bid, dn_ask, up_mid, dn_mid)
+            dn_price, dn_matched_price, dn_merge_price = quote_complete_set_exit(dn_bid, up_ask, dn_mid, up_mid)
             up_trigger = up_size > 0 and minutes_left <= EXIT_WINDOW_MIN and up_price is not None and up_price <= SELL_THRESHOLD
             dn_trigger = dn_size > 0 and minutes_left <= EXIT_WINDOW_MIN and dn_price is not None and dn_price <= SELL_THRESHOLD
 
@@ -820,9 +866,11 @@ while True:
                 and dn_complement_exit >= (dn_matched_price or 0.0)
             )
             merge_trigger = (
-                merge_amount >= 1 and will_sell_up and up_merge_price >= (up_matched_price or 0.0)
+                merge_amount >= 1 and will_sell_up
+                and up_merge_price is not None and up_merge_price >= (up_matched_price or 0.0)
             ) or (
-                merge_amount >= 1 and will_sell_dn and dn_merge_price >= (dn_matched_price or 0.0)
+                merge_amount >= 1 and will_sell_dn
+                and dn_merge_price is not None and dn_merge_price >= (dn_matched_price or 0.0)
             )
 
             if will_sell_up or will_sell_dn:
@@ -885,7 +933,7 @@ while True:
                     console.print(f"  [dim][SKIP][/] [dim]UP sell suppressed · sold <{SELL_COOLDOWN_S:.0f}s ago[/]")
                 else:
                     log_event("sell_attempt", condition_id=cond, leg="up", size=up_size, bid=up_bid, price_limit=up_price)
-                    sold, _ = sell_market_with_retry(up_token, up_size, up_price or SELL_THRESHOLD)
+                    sold, _ = sell_market_with_retry(up_token, up_size, up_matched_price or SELL_THRESHOLD)
                     if sold > 0:
                         meta["last_sell_up_at"] = now_ms
                         meta["expected_up_size"] = up_size - sold
@@ -898,7 +946,7 @@ while True:
                     console.print(f"  [dim][SKIP][/] [dim]DN sell suppressed · sold <{SELL_COOLDOWN_S:.0f}s ago[/]")
                 else:
                     log_event("sell_attempt", condition_id=cond, leg="down", size=dn_size, bid=dn_bid, price_limit=dn_price)
-                    sold, _ = sell_market_with_retry(dn_token, dn_size, dn_price or SELL_THRESHOLD)
+                    sold, _ = sell_market_with_retry(dn_token, dn_size, dn_matched_price or SELL_THRESHOLD)
                     if sold > 0:
                         meta["last_sell_dn_at"] = now_ms
                         meta["expected_dn_size"] = dn_size - sold
