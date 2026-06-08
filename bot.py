@@ -18,7 +18,7 @@ from py_clob_client_v2 import (
     OrderType,
     PartialCreateOrderOptions,
 )
-from py_clob_client_v2.order_builder.constants import BUY, SELL
+from py_clob_client_v2.order_builder.constants import SELL
 
 console = Console()
 
@@ -32,7 +32,6 @@ BTC_SLUG_PREFIX = "bitcoin-up-or-down"  # event/market slug filter for managed m
 BTC_SLUG_ALIASES = ("bitcoin-up-or-down", "btc-updown")
 PUSD = "0xC011a7E12a19f7B1f670d46F03B03f3342E82DFB"
 CTF = "0x4D97DCd97eC945f40cF65F87097ACe5EA0476045"
-CTF_COLLATERAL_ADAPTER = "0xAdA100Db00Ca00073811820692005400218FcE1f"
 
 PRIVATE_KEY = os.getenv("PRIVATE_KEY")
 FUNDER_ADDRESS = os.getenv("FUNDER_ADDRESS")
@@ -53,10 +52,9 @@ FALLBACK_WINDOW_MIN = float(os.getenv("FALLBACK_WINDOW_MIN", "1.5"))
 SELL_GRACE_S = float(os.getenv("SELL_GRACE_S", "30"))
 SELL_COOLDOWN_S = float(os.getenv("SELL_COOLDOWN_S", "30"))
 REDEEM_THROTTLE_S = float(os.getenv("REDEEM_THROTTLE_S", "300"))
-COMPLEMENT_MAX_ASK = float(os.getenv("COMPLEMENT_MAX_ASK", "0.99"))
 MAX_REDEEM_AGE_DAYS = float(os.getenv("MAX_REDEEM_AGE_DAYS", "7"))
-# Dry-run: log every sell/buy/merge/redeem the bot *would* place, but never send an
-# order or on-chain tx. Lets you watch the new exit logic against live books safely.
+# Dry-run: log every sell/redeem the bot *would* place, but never send an
+# order or on-chain tx. Lets you watch the exit logic against live books safely.
 DRY_RUN = os.getenv("DRY_RUN", "0").strip().lower() in ("1", "true", "yes", "on")
 
 # ------------------------- CLIENT SETUP -------------------------
@@ -320,17 +318,6 @@ def get_book_bid(token_id):
         return None, 0.0
 
 
-def get_book_ask(token_id):
-    try:
-        book = safe_api_call(client.get_order_book, token_id)
-        asks = book.get("asks", [])
-        if not asks:
-            return None, 0.0
-        best = min(asks, key=lambda x: float(x.get("price", 1)))
-        return float(best.get("price", 0)), float(best.get("size", 0))
-    except Exception:
-        return None, 0.0
-
 
 def get_midpoint(token_id):
     try:
@@ -521,50 +508,10 @@ def sell_market_with_retry(token_id, size, price_limit, tick_size="0.01", max_re
     return 0, None
 
 
-def buy_market_with_retry(token_id, size, price_limit, tick_size="0.01", max_retries=3):
-    total_bought = 0
-    remaining = int(size)
-    price = min(max(float(price_limit or 1.0), float(tick_size)), 1.0)
-    if DRY_RUN:
-        console.print(f"  [bold black on yellow][DRY BUY][/] would BUY complement {remaining} {str(token_id)[:12]}… @ ≤{price:.3f}")
-        log_event("dry_buy", token_id=token_id, size=remaining, price_limit=price)
-        return 0, None
-    for attempt in range(max_retries):
-        if remaining < 1:
-            break
-        try:
-            neg_risk = safe_api_call(client.get_neg_risk, token_id)
-            usdc_amount = remaining * price
-            result = safe_api_call(
-                client.create_and_post_market_order,
-                MarketOrderArgs(token_id=token_id, amount=usdc_amount, side=BUY, price=price),
-                options=PartialCreateOrderOptions(tick_size=tick_size, neg_risk=neg_risk),
-                order_type=OrderType.FAK,
-            )
-            if result:
-                oid = extract_order_id(result)
-                filled = int(round(confirm_fill_size(result, oid, remaining)))
-                if filled <= 0:
-                    console.print("  [dim yellow][COMP NULL][/] [dim]0 confirmed fill · stopping[/]")
-                    break
-                total_bought += filled
-                remaining -= filled
-                console.print(f"  [bold green][COMP BUY][/]{filled} @ ≤{price:.3f}  [dim]id={str(oid)[:16]}...[/]")
-                if remaining < 1:
-                    return total_bought, result
-        except Exception as e:
-            console.print(f"  [dim red]Complement buy {attempt+1}/{max_retries} failed: {e}[/]")
-        time.sleep(1)
-
-    if total_bought > 0:
-        return total_bought, {"partial": True, "bought": total_bought}
-    console.print(f"  [bold red][COMP BUY FAIL][/] market buy 0/{size} cleared")
-    return 0, None
-
 
 def get_relayer_headers():
     if not RELAYER_API_KEY or not RELAYER_API_KEY_ADDRESS:
-        console.print("[bold red]▶ RELAYER [WARN][/] [dim]RELAYER_API_KEY / RELAYER_API_KEY_ADDRESS not set · redeem & merge will fail[/]")
+        console.print("[bold red]▶ RELAYER [WARN][/] [dim]RELAYER_API_KEY / RELAYER_API_KEY_ADDRESS not set · redeem will fail[/]")
     relayer_headers = {
         "Content-Type": "application/json",
         "RELAYER_API_KEY": RELAYER_API_KEY or "",
@@ -605,60 +552,19 @@ def submit_proxy_tx(target, data, tx_type="PROXY"):
     return None, f"HTTP {submit_r.status_code} · {submit_r.text[:80]}"
 
 
-def merge_complete_set(condition_id, amount, label=""):
-    if DRY_RUN:
-        console.print(f"  [bold black on yellow][DRY MERGE][/] would merge {int(amount)} sets · {label}")
-        log_event("dry_merge", condition_id=condition_id, size=int(amount), label=label)
-        return None
-    try:
-        from eth_abi import encode
-        from eth_utils import keccak, to_checksum_address
 
-        merge_size = int(amount)
-        if merge_size < 1:
-            return None
-        pUSD = to_checksum_address(PUSD)
-        adapter = to_checksum_address(CTF_COLLATERAL_ADAPTER)
-        merge_sel = keccak(b"mergePositions(address,bytes32,bytes32,uint256[],uint256)")[:4]
-        merge_data = merge_sel + encode(
-            ["address", "bytes32", "bytes32", "uint256[]", "uint256"],
-            [pUSD, bytes(32), bytes.fromhex(condition_id.lower().removeprefix("0x")), [1, 2], merge_size * 1_000_000],
-        )
-        execute_sel = keccak(b"execute(address,uint256,bytes)")[:4]
-        proxy_data = execute_sel + encode(
-            ["address", "uint256", "bytes"],
-            [adapter, 0, merge_data],
-        )
-        tx_id, err = submit_proxy_tx(to_checksum_address(FUNDER_ADDRESS), proxy_data)
-        if tx_id:
-            console.print(f"  [bold bright_green][MERGE ▶][/] {label}  [dim]tx={str(tx_id)[:18]}…[/]")
-            return tx_id
-        console.print(f"  [dim red][MERGE FAIL][/] {label}  [dim]{err}[/]")
-        return None
-    except Exception as e:
-        console.print(f"  [dim red][MERGE ERR][/] {label}  [dim]{e}[/]")
-        return None
+def quote_leg(bid, mid):
+    """Return (self_price, matched_price) for a single leg.
 
-
-def quote_complete_set_exit(trigger_bid, complement_ask, trigger_mid, complement_mid):
-    """Value a single leg for exit decisions.
-
-    Returns (self_price, matched_price, merge_price):
-      - self_price:    this leg's own value (own bid, falling back to own mid). Used to
-                       decide whether the leg is the worthless "loser" worth dumping.
-      - matched_price: realizable price for a *direct* sell (own bid).
-      - merge_price:   value from completing+merging the set, i.e. 1 - complement_ask.
-                       Merging requires BUYING the complement, so it executes at the
-                       complement's ask, not its bid.
+      - self_price:    leg's value (bid, falling back to mid). Used to decide
+                       whether the leg is the worthless "loser" worth dumping.
+      - matched_price: realizable price for a direct sell (bid).
     """
-    matched = None if trigger_bid is None else float(trigger_bid)
+    matched = None if bid is None else float(bid)
     self_price = matched if matched is not None else (
-        None if trigger_mid is None else float(trigger_mid)
+        None if mid is None else float(mid)
     )
-    comp = complement_ask if complement_ask is not None else complement_mid
-    comp = None if comp is None else float(comp)
-    merge_price = None if comp is None else max(0.0, 1.0 - comp)
-    return self_price, matched, merge_price
+    return self_price, matched
 
 
 # ------------------------- REDEEM -------------------------
@@ -840,15 +746,13 @@ while True:
 
             up_bid, _ = get_book_bid(up_token) if up_token else (None, 0.0)
             dn_bid, _ = get_book_bid(dn_token) if dn_token else (None, 0.0)
-            up_ask, _ = get_book_ask(up_token) if up_token else (None, 0.0)
-            dn_ask, _ = get_book_ask(dn_token) if dn_token else (None, 0.0)
             up_mid, _ = get_midpoint(up_token) if up_token else (None, 0.0)
             dn_mid, _ = get_midpoint(dn_token) if dn_token else (None, 0.0)
 
             # Strategy: in the last 20 minutes, sell whichever side has dropped to 4c
             # (the loser leg). Hold the other side to expiry for the $1 payout.
-            up_price, up_matched_price, up_merge_price = quote_complete_set_exit(up_bid, dn_ask, up_mid, dn_mid)
-            dn_price, dn_matched_price, dn_merge_price = quote_complete_set_exit(dn_bid, up_ask, dn_mid, up_mid)
+            up_price, up_matched_price = quote_leg(up_bid, up_mid)
+            dn_price, dn_matched_price = quote_leg(dn_bid, dn_mid)
             up_trigger = up_size > 0 and minutes_left <= EXIT_WINDOW_MIN and up_price is not None and up_price <= SELL_THRESHOLD
             dn_trigger = dn_size > 0 and minutes_left <= EXIT_WINDOW_MIN and dn_price is not None and dn_price <= SELL_THRESHOLD
 
@@ -869,32 +773,6 @@ while True:
 
             will_sell_up = sell_up and (now_ms - (meta.get("last_sell_up_at") or 0) >= SELL_COOLDOWN_S * 1000)
             will_sell_dn = sell_dn and (now_ms - (meta.get("last_sell_dn_at") or 0) >= SELL_COOLDOWN_S * 1000)
-            merge_amount = min(up_size, dn_size)
-            up_complement_exit = None if dn_ask is None else max(0.0, 1.0 - dn_ask)
-            dn_complement_exit = None if up_ask is None else max(0.0, 1.0 - up_ask)
-            up_single_leg_merge = (
-                will_sell_up
-                and merge_amount < 1
-                and dn_token
-                and dn_ask is not None
-                and dn_ask <= COMPLEMENT_MAX_ASK
-                and up_complement_exit >= (up_matched_price or 0.0)
-            )
-            dn_single_leg_merge = (
-                will_sell_dn
-                and merge_amount < 1
-                and up_token
-                and up_ask is not None
-                and up_ask <= COMPLEMENT_MAX_ASK
-                and dn_complement_exit >= (dn_matched_price or 0.0)
-            )
-            merge_trigger = (
-                merge_amount >= 1 and will_sell_up
-                and up_merge_price is not None and up_merge_price >= (up_matched_price or 0.0)
-            ) or (
-                merge_amount >= 1 and will_sell_dn
-                and dn_merge_price is not None and dn_merge_price >= (dn_matched_price or 0.0)
-            )
 
             if will_sell_up or will_sell_dn:
                 up_bid_str = f"{up_price:.3f}" if up_price is not None else "  -  "
@@ -908,48 +786,6 @@ while True:
                     border_style="bright_yellow",
                     box=box.HEAVY,
                 ))
-
-            if merge_trigger and merge_amount >= 1:
-                log_event("merge_attempt", condition_id=cond, size=merge_amount)
-                tx = merge_complete_set(cond, merge_amount, label=s["question"][:52])
-                if tx:
-                    meta["last_sell_up_at"] = now_ms
-                    meta["last_sell_dn_at"] = now_ms
-                    log_event("merge_submitted", condition_id=cond, size=merge_amount, tx=tx)
-                    save_json(STATE_FILE, positions_meta)
-                continue
-
-            if up_single_leg_merge:
-                log_event("complement_merge_attempt", condition_id=cond, leg="up", size=up_size, complement="down", ask=dn_ask, effective_exit=up_complement_exit)
-                bought, _ = buy_market_with_retry(dn_token, up_size, dn_ask)
-                if bought > 0:
-                    tx = merge_complete_set(cond, min(up_size, bought), label=s["question"][:52])
-                    if tx:
-                        meta["last_sell_up_at"] = now_ms
-                        meta["last_sell_dn_at"] = now_ms
-                        meta["expected_up_size"] = max(0, up_size - bought)
-                        log_event("complement_merge_submitted", condition_id=cond, leg="up", complement_bought=bought, tx=tx)
-                        save_json(STATE_FILE, positions_meta)
-                        continue
-                    log_event("complement_merge_fail", condition_id=cond, leg="up", complement_bought=bought)
-                else:
-                    log_event("complement_buy_fail", condition_id=cond, leg="up", size=up_size, complement="down", ask=dn_ask, effective_exit=up_complement_exit)
-
-            if dn_single_leg_merge:
-                log_event("complement_merge_attempt", condition_id=cond, leg="down", size=dn_size, complement="up", ask=up_ask, effective_exit=dn_complement_exit)
-                bought, _ = buy_market_with_retry(up_token, dn_size, up_ask)
-                if bought > 0:
-                    tx = merge_complete_set(cond, min(dn_size, bought), label=s["question"][:52])
-                    if tx:
-                        meta["last_sell_up_at"] = now_ms
-                        meta["last_sell_dn_at"] = now_ms
-                        meta["expected_dn_size"] = max(0, dn_size - bought)
-                        log_event("complement_merge_submitted", condition_id=cond, leg="down", complement_bought=bought, tx=tx)
-                        save_json(STATE_FILE, positions_meta)
-                        continue
-                    log_event("complement_merge_fail", condition_id=cond, leg="down", complement_bought=bought)
-                else:
-                    log_event("complement_buy_fail", condition_id=cond, leg="down", size=dn_size, complement="up", ask=up_ask, effective_exit=dn_complement_exit)
 
             if sell_up:
                 if not will_sell_up:
