@@ -219,8 +219,8 @@ def parse_position_end_dt(legs):
         try:
             base = datetime.fromisoformat(end_date.replace("Z", "+00:00"))
             if slug_hour is not None:
-                # Combine date with the parsed ET hour
-                et_dt = base.replace(hour=slug_hour, tzinfo=_ET)
+                # Slug hour is the start of the window; market closes 1h later
+                et_dt = base.replace(hour=slug_hour, tzinfo=_ET) + timedelta(hours=1)
                 return et_dt.astimezone(tz=None).replace(tzinfo=None)
             return base
         except Exception:
