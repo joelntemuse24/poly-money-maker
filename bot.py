@@ -1,8 +1,10 @@
 import os
+import re
 import time
 import json
 import traceback
-from datetime import datetime
+from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
 import requests
 from dotenv import load_dotenv
 from rich.console import Console
@@ -179,6 +181,10 @@ def get_user_positions():
         return None
 
 
+_ET = ZoneInfo("America/New_York")
+_SLUG_TIME_RE = re.compile(r"(\d{1,2})(am|pm)-et$")
+
+
 def parse_position_end_dt(legs):
     for p in legs:
         for key in ("slug", "eventSlug"):
@@ -189,12 +195,34 @@ def parse_position_end_dt(legs):
                 if ts > 1_700_000_000:
                     return datetime.fromtimestamp(ts)
 
+    # Extract hour+am/pm from slug (e.g. "…-12pm-et" → 12PM ET)
+    slug_hour = None
+    for p in legs:
+        for key in ("slug", "eventSlug"):
+            m = _SLUG_TIME_RE.search((p.get(key) or "").lower())
+            if m:
+                h = int(m.group(1))
+                ampm = m.group(2)
+                if ampm == "pm" and h != 12:
+                    h += 12
+                elif ampm == "am" and h == 12:
+                    h = 0
+                slug_hour = h
+                break
+        if slug_hour is not None:
+            break
+
     for p in legs:
         end_date = p.get("endDate")
         if not end_date:
             continue
         try:
-            return datetime.fromisoformat(end_date.replace("Z", "+00:00"))
+            base = datetime.fromisoformat(end_date.replace("Z", "+00:00"))
+            if slug_hour is not None:
+                # Combine date with the parsed ET hour
+                et_dt = base.replace(hour=slug_hour, tzinfo=_ET)
+                return et_dt.astimezone(tz=None).replace(tzinfo=None)
+            return base
         except Exception:
             continue
     return None
