@@ -47,7 +47,7 @@ RELAYER_API_KEY = os.getenv("RELAYER_API_KEY", "019df62f-45bc-796e-975c-3f434472
 RELAYER_API_KEY_ADDRESS = os.getenv("RELAYER_API_KEY_ADDRESS", "0x42aec4505559c0613f7ce2541d9d29741bc5e195")
 
 # ------------------------- STRATEGY CONFIG -------------------------
-SELL_THRESHOLD = float(os.getenv("SELL_THRESHOLD", "0.06"))
+SELL_THRESHOLD = float(os.getenv("SELL_THRESHOLD", "0.05"))
 EXIT_WINDOW_MIN = float(os.getenv("EXIT_WINDOW_MIN", "20"))
 FALLBACK_THRESHOLD = float(os.getenv("FALLBACK_THRESHOLD", "0.10"))
 FALLBACK_WINDOW_MIN = float(os.getenv("FALLBACK_WINDOW_MIN", "1.5"))
@@ -777,16 +777,12 @@ while True:
             up_mid, _ = get_midpoint(up_token) if up_token else (None, 0.0)
             dn_mid, _ = get_midpoint(dn_token) if dn_token else (None, 0.0)
 
-            # Strategy: in the last 20 minutes, sell whichever side has dropped to 4c
-            # (the loser leg). Hold the other side to expiry for the $1 payout.
+            # Strategy: sell whichever side drops to 5c at any time.
+            # Hold the other side to expiry for the $1 payout.
             up_price, up_matched_price = quote_leg(up_bid, up_mid)
             dn_price, dn_matched_price = quote_leg(dn_bid, dn_mid)
-            up_trigger = up_size > 0 and minutes_left <= EXIT_WINDOW_MIN and up_price is not None and up_price <= SELL_THRESHOLD
-            dn_trigger = dn_size > 0 and minutes_left <= EXIT_WINDOW_MIN and dn_price is not None and dn_price <= SELL_THRESHOLD
-
-            if minutes_left <= FALLBACK_WINDOW_MIN:
-                up_trigger = up_trigger or (up_size > 0 and up_price is not None and up_price <= FALLBACK_THRESHOLD)
-                dn_trigger = dn_trigger or (dn_size > 0 and dn_price is not None and dn_price <= FALLBACK_THRESHOLD)
+            up_trigger = up_size > 0 and up_price is not None and up_price <= SELL_THRESHOLD
+            dn_trigger = dn_size > 0 and dn_price is not None and dn_price <= SELL_THRESHOLD
 
             # Guard: if both legs trigger, only sell the lower-priced one to ensure
             # we still hold a winner for the $1 payout at resolution.
