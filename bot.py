@@ -848,5 +848,5 @@ while True:
             box=box.HEAVY_EDGE,
         ))
 
-    console.print("[dim bright_black]\u00b7 \u00b7 \u00b7  sleeping 30s  \u00b7 \u00b7 \u00b7[/]")
-    time.sleep(30)
+    console.print("[dim bright_black]\u00b7 \u00b7 \u00b7  sleeping 5s  \u00b7 \u00b7 \u00b7[/]")
+    time.sleep(5)
