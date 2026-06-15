@@ -47,7 +47,7 @@ RELAYER_API_KEY = os.getenv("RELAYER_API_KEY", "019df62f-45bc-796e-975c-3f434472
 RELAYER_API_KEY_ADDRESS = os.getenv("RELAYER_API_KEY_ADDRESS", "0x42aec4505559c0613f7ce2541d9d29741bc5e195")
 
 # ------------------------- STRATEGY CONFIG -------------------------
-SELL_THRESHOLD = float(os.getenv("SELL_THRESHOLD", "0.05"))
+SELL_THRESHOLD = float(os.getenv("SELL_THRESHOLD", "0.08"))
 EXIT_WINDOW_MIN = float(os.getenv("EXIT_WINDOW_MIN", "20"))
 FALLBACK_THRESHOLD = float(os.getenv("FALLBACK_THRESHOLD", "0.10"))
 FALLBACK_WINDOW_MIN = float(os.getenv("FALLBACK_WINDOW_MIN", "1.5"))
