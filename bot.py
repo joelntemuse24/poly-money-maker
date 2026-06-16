@@ -1,3 +1,4 @@
+import math
 import os
 import re
 import time
@@ -696,8 +697,8 @@ while True:
                     end_dt = s["end_dt"]
                     mins = (s["end_ts"] - now_ms) / 60000
                     ends_str = end_dt.strftime("%H:%M")
-                    up_sz = round(float(s["up"].get("size", 0)))
-                    dn_sz = round(float(s["dn"].get("size", 0)))
+                    up_sz = math.floor(float(s["up"].get("size", 0)))
+                    dn_sz = math.floor(float(s["dn"].get("size", 0)))
 
                     if s["up"].get("redeemable") or s["dn"].get("redeemable"):
                         state = "[bold bright_magenta]\u2713 REDEEM[/]"
@@ -767,8 +768,8 @@ while True:
                 save_json(STATE_FILE, positions_meta)
             if now_ms - meta["entered_at"] < SELL_GRACE_S * 1000:
                 continue
-            up_size = round(float(s["up"].get("size", 0)))
-            dn_size = round(float(s["dn"].get("size", 0)))
+            up_size = math.floor(float(s["up"].get("size", 0)))
+            dn_size = math.floor(float(s["dn"].get("size", 0)))
             if up_size < 1 and dn_size < 1:
                 continue
 
