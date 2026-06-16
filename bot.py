@@ -113,7 +113,6 @@ if DRY_RUN:
 
 
 def safe_api_call(func, *args, **kwargs):
-    time.sleep(0.3)
     try:
         return func(*args, **kwargs)
     except Exception as e:
