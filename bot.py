@@ -1,4 +1,3 @@
-import math
 import os
 import re
 import time
@@ -423,10 +422,10 @@ _neg_risk_cache = {}
 
 def sell_with_retry(token_id, size, tick_size="0.01", max_retries=3):
     """FAK sell at best bid. Returns (sold_size, result) or (0, None)."""
-    total_sold = 0
+    total_sold = 0.0
     for attempt in range(max_retries):
         remaining = size - total_sold
-        if remaining < 1:
+        if remaining < 0.01:
             break
 
         bid_price, bid_depth = get_book_bid(token_id)
@@ -436,12 +435,12 @@ def sell_with_retry(token_id, size, tick_size="0.01", max_retries=3):
 
         sell_size = remaining
         if bid_depth < remaining:
-            sell_size = round(bid_depth)
-            if sell_size < 1 and bid_depth > 0:
-                sell_size = min(remaining, 1)
-            console.print(f"  [dim yellow][DEPTH][/] [dim]bid={bid_depth:.1f} < req={remaining} · sizing to {sell_size}[/]")
+            sell_size = bid_depth
+            if sell_size < 0.01:
+                sell_size = min(remaining, 0.01)
+            console.print(f"  [dim yellow][DEPTH][/] [dim]bid={bid_depth:.4f} < req={remaining:.4f} · sizing to {sell_size:.4f}[/]")
 
-        if sell_size < 1:
+        if sell_size < 0.01:
             break
 
         try:
@@ -498,15 +497,15 @@ def sell_with_retry(token_id, size, tick_size="0.01", max_retries=3):
 
 
 def sell_market_with_retry(token_id, size, price_limit, tick_size="0.01", max_retries=3):
-    total_sold = 0
-    remaining = int(size)
+    total_sold = 0.0
+    remaining = float(size)
     price = max(float(price_limit or tick_size), float(tick_size))
     if DRY_RUN:
-        console.print(f"  [bold black on yellow][DRY SELL][/] would SELL {remaining} {str(token_id)[:12]}… @ ≥{price:.3f}")
+        console.print(f"  [bold black on yellow][DRY SELL][/] would SELL {remaining:.4f} {str(token_id)[:12]}… @ ≥{price:.3f}")
         log_event("dry_sell", token_id=token_id, size=remaining, price_limit=price)
         return 0, None
     for attempt in range(max_retries):
-        if remaining < 1:
+        if remaining < 0.01:
             break
         try:
             neg_risk = safe_api_call(client.get_neg_risk, token_id)
@@ -518,14 +517,14 @@ def sell_market_with_retry(token_id, size, price_limit, tick_size="0.01", max_re
             )
             if result:
                 oid = extract_order_id(result)
-                filled = int(round(confirm_fill_size(result, oid, remaining)))
+                filled = float(confirm_fill_size(result, oid, remaining))
                 if filled <= 0:
                     console.print("  [dim yellow][FAK NULL][/] [dim]0 confirmed fill · stopping to avoid double-sell[/]")
                     break
                 total_sold += filled
                 remaining -= filled
                 console.print(f"  [bold green][EXIT FAK][/]{filled} @ ≥{price:.3f}  [dim]id={str(oid)[:16]}...[/]")
-                if remaining < 1:
+                if remaining < 0.01:
                     return total_sold, result
         except Exception as e:
             console.print(f"  [dim red]Market sell {attempt+1}/{max_retries} failed: {e}[/]")
@@ -533,7 +532,7 @@ def sell_market_with_retry(token_id, size, price_limit, tick_size="0.01", max_re
 
     if total_sold > 0:
         return total_sold, {"partial": True, "sold": total_sold}
-    console.print(f"  [bold red][EXIT FAIL][/] market sell 0/{size} cleared")
+    console.print(f"  [bold red][EXIT FAIL][/] market sell 0/{size:.4f} cleared")
     return 0, None
 
 
@@ -697,8 +696,8 @@ while True:
                     end_dt = s["end_dt"]
                     mins = (s["end_ts"] - now_ms) / 60000
                     ends_str = end_dt.strftime("%H:%M")
-                    up_sz = math.floor(float(s["up"].get("size", 0)))
-                    dn_sz = math.floor(float(s["dn"].get("size", 0)))
+                    up_sz = float(s["up"].get("size", 0))
+                    dn_sz = float(s["dn"].get("size", 0))
 
                     if s["up"].get("redeemable") or s["dn"].get("redeemable"):
                         state = "[bold bright_magenta]\u2713 REDEEM[/]"
@@ -720,8 +719,8 @@ while True:
                         (s["question"] or "?")[:40],
                         ends_str,
                         f"[{mins_style}]{mins:.0f}m[/]",
-                        f"{up_sz}",
-                        f"{dn_sz}",
+                        f"{up_sz:.2f}",
+                        f"{dn_sz:.2f}",
                         state,
                     )
                 except Exception:
@@ -768,9 +767,9 @@ while True:
                 save_json(STATE_FILE, positions_meta)
             if now_ms - meta["entered_at"] < SELL_GRACE_S * 1000:
                 continue
-            up_size = math.floor(float(s["up"].get("size", 0)))
-            dn_size = math.floor(float(s["dn"].get("size", 0)))
-            if up_size < 1 and dn_size < 1:
+            up_size = float(s["up"].get("size", 0))
+            dn_size = float(s["dn"].get("size", 0))
+            if up_size < 0.01 and dn_size < 0.01:
                 continue
 
             up_bid, _ = get_book_bid(up_token) if up_token else (None, 0.0)
@@ -804,8 +803,8 @@ while True:
                 dn_bid_str = f"{dn_price:.3f}" if dn_price is not None else "  -  "
                 console.print(Panel(
                     f"  [bright_white]{s['question']}[/]\n"
-                    f"  [bright_green]UP[/]   px [bold]{up_bid_str}[/]  inv [bold]{up_size:>3}[/]   \u2502   "
-                    f"[bright_red]DN[/]  px [bold]{dn_bid_str}[/]  inv [bold]{dn_size:>3}[/]   \u2502   "
+                    f"  [bright_green]UP[/]   px [bold]{up_bid_str}[/]  inv [bold]{up_size:>6.2f}[/]   \u2502   "
+                    f"[bright_red]DN[/]  px [bold]{dn_bid_str}[/]  inv [bold]{dn_size:>6.2f}[/]   \u2502   "
                     f"[bold red]TTM {minutes_left:>4.1f}m[/]",
                     title="[bold bright_yellow]\u25bc EXIT TRIGGER \u2014 LOSER LEG[/]",
                     border_style="bright_yellow",
