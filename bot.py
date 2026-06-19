@@ -52,33 +52,6 @@ EXIT_WINDOW_MIN = float(os.getenv("EXIT_WINDOW_MIN", "20"))
 FALLBACK_THRESHOLD = float(os.getenv("FALLBACK_THRESHOLD", "0.10"))
 FALLBACK_WINDOW_MIN = float(os.getenv("FALLBACK_WINDOW_MIN", "1.5"))
 
-# Time-scaled sell thresholds: tighter early, looser near expiry.
-# Override via env: SELL_TIERS="10:0.08,30:0.05,9999:0.03"
-# Tiers sorted ascending by cutoff: (max_minutes_left, threshold).
-# Walk from smallest cutoff up; the first tier where TTM <= cutoff wins.
-# TTM=5 → <=10 → 0.08;  TTM=15 → <=30 → 0.05;  TTM=45 → beyond all → 0.03
-_default_tiers = [(10, SELL_THRESHOLD), (30, 0.05), (9999, 0.03)]
-def _parse_tiers(env_val):
-    tiers = []
-    for part in env_val.split(","):
-        mins_str, thresh_str = part.strip().split(":")
-        tiers.append((float(mins_str), float(thresh_str)))
-    tiers.sort(key=lambda t: t[0])
-    return tiers
-SELL_TIERS = _parse_tiers(os.getenv("SELL_TIERS", "")) if os.getenv("SELL_TIERS") else _default_tiers
-
-def get_sell_threshold(minutes_left):
-    """Return the active sell threshold based on time to expiry.
-
-    Tiers are checked smallest-cutoff first:
-      TTM ≤ 10m → 0.08  (near expiry, confident → loose threshold)
-      TTM ≤ 30m → 0.05  (moderate confidence)
-      TTM > 30m → 0.03  (far from expiry → tight threshold)
-    """
-    for max_min, thresh in SELL_TIERS:
-        if minutes_left <= max_min:
-            return thresh
-    return SELL_TIERS[-1][1]
 SELL_GRACE_S = float(os.getenv("SELL_GRACE_S", "30"))
 SELL_COOLDOWN_S = float(os.getenv("SELL_COOLDOWN_S", "30"))
 REDEEM_THROTTLE_S = float(os.getenv("REDEEM_THROTTLE_S", "300"))
@@ -809,9 +782,8 @@ while True:
             # Hold the other side to expiry for the $1 payout.
             up_price, up_matched_price = quote_leg(up_bid, up_mid)
             dn_price, dn_matched_price = quote_leg(dn_bid, dn_mid)
-            active_threshold = get_sell_threshold(minutes_left)
-            up_trigger = up_size > 0 and up_price is not None and up_price <= active_threshold
-            dn_trigger = dn_size > 0 and dn_price is not None and dn_price <= active_threshold
+            up_trigger = up_size > 0 and up_price is not None and up_price <= SELL_THRESHOLD
+            dn_trigger = dn_size > 0 and dn_price is not None and dn_price <= SELL_THRESHOLD
 
             # Guard: if both legs trigger, only sell the lower-priced one to ensure
             # we still hold a winner for the $1 payout at resolution.
@@ -834,7 +806,7 @@ while True:
                     f"  [bright_white]{s['question']}[/]\n"
                     f"  [bright_green]UP[/]   px [bold]{up_bid_str}[/]  inv [bold]{up_size:>6.2f}[/]   \u2502   "
                     f"[bright_red]DN[/]  px [bold]{dn_bid_str}[/]  inv [bold]{dn_size:>6.2f}[/]   \u2502   "
-                    f"[bold red]TTM {minutes_left:>4.1f}m[/]  [dim]thresh={active_threshold:.2f}[/]",
+                    f"[bold red]TTM {minutes_left:>4.1f}m[/]",
                     title="[bold bright_yellow]\u25bc EXIT TRIGGER \u2014 LOSER LEG[/]",
                     border_style="bright_yellow",
                     box=box.HEAVY,
@@ -844,8 +816,8 @@ while True:
                 if not will_sell_up:
                     console.print(f"  [dim][SKIP][/] [dim]UP sell suppressed · sold <{SELL_COOLDOWN_S:.0f}s ago[/]")
                 else:
-                    log_event("sell_attempt", condition_id=cond, leg="up", size=up_size, bid=up_bid, price_limit=up_price, threshold=active_threshold, ttm=minutes_left)
-                    sold, _ = sell_market_with_retry(up_token, up_size, up_matched_price or active_threshold)
+                    log_event("sell_attempt", condition_id=cond, leg="up", size=up_size, bid=up_bid, price_limit=up_price)
+                    sold, _ = sell_market_with_retry(up_token, up_size, up_matched_price or SELL_THRESHOLD)
                     if sold > 0:
                         meta["last_sell_up_at"] = now_ms
                         meta["expected_up_size"] = up_size - sold
@@ -857,8 +829,8 @@ while True:
                 if not will_sell_dn:
                     console.print(f"  [dim][SKIP][/] [dim]DN sell suppressed · sold <{SELL_COOLDOWN_S:.0f}s ago[/]")
                 else:
-                    log_event("sell_attempt", condition_id=cond, leg="down", size=dn_size, bid=dn_bid, price_limit=dn_price, threshold=active_threshold, ttm=minutes_left)
-                    sold, _ = sell_market_with_retry(dn_token, dn_size, dn_matched_price or active_threshold)
+                    log_event("sell_attempt", condition_id=cond, leg="down", size=dn_size, bid=dn_bid, price_limit=dn_price)
+                    sold, _ = sell_market_with_retry(dn_token, dn_size, dn_matched_price or SELL_THRESHOLD)
                     if sold > 0:
                         meta["last_sell_dn_at"] = now_ms
                         meta["expected_dn_size"] = dn_size - sold
