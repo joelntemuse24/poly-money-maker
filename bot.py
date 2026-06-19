@@ -181,6 +181,21 @@ def get_user_positions():
         return None
 
 
+def check_token_balance(token_id):
+    """Re-fetch positions and return the current size for a specific token.
+    Returns the float balance, or None if lookup fails."""
+    try:
+        positions = get_user_positions()
+        if positions is None:
+            return None
+        for p in positions:
+            if p.get("asset") == token_id:
+                return float(p.get("size", 0))
+        return 0.0
+    except Exception:
+        return None
+
+
 _ET = ZoneInfo("America/New_York")
 _SLUG_TIME_RE = re.compile(r"(\d{1,2})(am|pm)-et$")
 
@@ -824,7 +839,17 @@ while True:
                         log_event("sell_fill", condition_id=cond, leg="up", sold=sold, remaining=up_size - sold, price=up_price)
                         save_json(STATE_FILE, positions_meta)
                     else:
-                        log_event("sell_fail", condition_id=cond, leg="up", size=up_size, bid=up_bid, price_limit=up_price)
+                        time.sleep(2)
+                        actual_bal = check_token_balance(up_token)
+                        if actual_bal is not None and actual_bal < up_size - 0.01:
+                            ghost_sold = up_size - actual_bal
+                            meta["last_sell_up_at"] = now_ms
+                            meta["expected_up_size"] = actual_bal
+                            log_event("sell_ghost_fill", condition_id=cond, leg="up", sold=ghost_sold, remaining=actual_bal, price=up_price)
+                            console.print(f"  [bold yellow][GHOST FILL][/] UP sell confirmed via balance check: {ghost_sold:.4f} sold")
+                            save_json(STATE_FILE, positions_meta)
+                        else:
+                            log_event("sell_fail", condition_id=cond, leg="up", size=up_size, bid=up_bid, price_limit=up_price)
             if sell_dn:
                 if not will_sell_dn:
                     console.print(f"  [dim][SKIP][/] [dim]DN sell suppressed · sold <{SELL_COOLDOWN_S:.0f}s ago[/]")
@@ -837,7 +862,17 @@ while True:
                         log_event("sell_fill", condition_id=cond, leg="down", sold=sold, remaining=dn_size - sold, price=dn_price)
                         save_json(STATE_FILE, positions_meta)
                     else:
-                        log_event("sell_fail", condition_id=cond, leg="down", size=dn_size, bid=dn_bid, price_limit=dn_price)
+                        time.sleep(2)
+                        actual_bal = check_token_balance(dn_token)
+                        if actual_bal is not None and actual_bal < dn_size - 0.01:
+                            ghost_sold = dn_size - actual_bal
+                            meta["last_sell_dn_at"] = now_ms
+                            meta["expected_dn_size"] = actual_bal
+                            log_event("sell_ghost_fill", condition_id=cond, leg="down", sold=ghost_sold, remaining=actual_bal, price=dn_price)
+                            console.print(f"  [bold yellow][GHOST FILL][/] DN sell confirmed via balance check: {ghost_sold:.4f} sold")
+                            save_json(STATE_FILE, positions_meta)
+                        else:
+                            log_event("sell_fail", condition_id=cond, leg="down", size=dn_size, bid=dn_bid, price_limit=dn_price)
 
     except Exception:
         log_event("cycle_error", traceback=traceback.format_exc())
