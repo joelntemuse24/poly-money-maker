@@ -11,6 +11,7 @@ for price data, and discovers new markets via gamma-api event IDs.
 
 import json
 import os
+import re
 import time
 from datetime import datetime
 from zoneinfo import ZoneInfo
@@ -143,8 +144,12 @@ def _discover_markets(state):
                 continue
 
             title = data.get("title", "")
-            # Only track BTC hourly markets (not 5-min, not other coins)
+            # Only track BTC hourly markets (not 5-min, not other coins, not daily)
             if "bitcoin up or down" not in title.lower():
+                continue
+            # Must be hourly format: "Bitcoin Up or Down - June 20, 8AM ET"
+            # Skip daily markets like "Bitcoin Up or Down on June 20?"
+            if not re.search(r"\d{1,2}(AM|PM)\s+ET", title, re.IGNORECASE):
                 continue
             # Skip sub-hourly markets (5min intervals like "8:20PM-8:25PM")
             if "-" in title.split(",")[-1].strip().split(" ")[0] and ":" in title:
@@ -246,21 +251,6 @@ def _discover_markets(state):
         _save_state(state)
 
 
-def _get_market_volume(event_id):
-    """Fetch total volume for a market from gamma-api."""
-    if not event_id:
-        return None
-    try:
-        res = requests.get(
-            f"{GAMMA_API}/events/{event_id}",
-            timeout=3,
-        )
-        if res.status_code != 200:
-            return None
-        data = res.json()
-        return data.get("volume") or data.get("volumeNum")
-    except Exception:
-        return None
 
 
 def _check_market_resolution(condition_id, entry, state):
@@ -386,13 +376,11 @@ def _resolve_completed(state):
             # Market ended without any leg hitting threshold — no trade
             # Only log if we were actively monitoring (not pre-closed discoveries)
             if entry.get("status") == "monitoring":
-                volume = _get_market_volume(entry.get("event_id"))
                 _log_paper(
                     "paper_no_trade",
                     condition_id=cond_id,
                     question=entry.get("question"),
                     reason="no_leg_hit_threshold",
-                    volume=volume,
                 )
             entry["status"] = "resolved"
             entry["pnl"] = 0.0
@@ -453,7 +441,6 @@ def _resolve_completed(state):
         else:
             state["stats"]["losses"] = state["stats"].get("losses", 0) + 1
 
-        volume = _get_market_volume(entry.get("event_id"))
         _log_paper(
             "paper_resolved",
             condition_id=cond_id,
@@ -465,7 +452,6 @@ def _resolve_completed(state):
             pnl=round(pnl, 4),
             cumulative_pnl=round(state["stats"]["total_pnl"], 4),
             record=f"{state['stats']['wins']}W-{state['stats']['losses']}L",
-            volume=volume,
         )
 
     # Clean up old resolved entries
