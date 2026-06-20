@@ -246,6 +246,23 @@ def _discover_markets(state):
         _save_state(state)
 
 
+def _get_market_volume(event_id):
+    """Fetch total volume for a market from gamma-api."""
+    if not event_id:
+        return None
+    try:
+        res = requests.get(
+            f"{GAMMA_API}/events/{event_id}",
+            timeout=3,
+        )
+        if res.status_code != 200:
+            return None
+        data = res.json()
+        return data.get("volume") or data.get("volumeNum")
+    except Exception:
+        return None
+
+
 def _check_market_resolution(condition_id, entry, state):
     """Use the CLOB market endpoint to determine winner after close."""
     try:
@@ -369,11 +386,13 @@ def _resolve_completed(state):
             # Market ended without any leg hitting threshold — no trade
             # Only log if we were actively monitoring (not pre-closed discoveries)
             if entry.get("status") == "monitoring":
+                volume = _get_market_volume(entry.get("event_id"))
                 _log_paper(
                     "paper_no_trade",
                     condition_id=cond_id,
                     question=entry.get("question"),
                     reason="no_leg_hit_threshold",
+                    volume=volume,
                 )
             entry["status"] = "resolved"
             entry["pnl"] = 0.0
@@ -434,6 +453,7 @@ def _resolve_completed(state):
         else:
             state["stats"]["losses"] = state["stats"].get("losses", 0) + 1
 
+        volume = _get_market_volume(entry.get("event_id"))
         _log_paper(
             "paper_resolved",
             condition_id=cond_id,
@@ -445,6 +465,7 @@ def _resolve_completed(state):
             pnl=round(pnl, 4),
             cumulative_pnl=round(state["stats"]["total_pnl"], 4),
             record=f"{state['stats']['wins']}W-{state['stats']['losses']}L",
+            volume=volume,
         )
 
     # Clean up old resolved entries
