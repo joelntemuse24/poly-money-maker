@@ -4,12 +4,15 @@ Paper-trade monitor for BTC hourly markets.
 Runs alongside the main bot, tracking what the strategy *would* do on
 every hourly market — whether or not we actually hold a position. Logs
 hypothetical P&L to paper_trades.log for backtesting analysis.
+
+Market discovery: uses the same CLOB book/midpoint endpoints as the bot
+for price data, and discovers new markets via gamma-api event IDs.
 """
 
 import json
 import os
 import time
-from datetime import datetime, timedelta
+from datetime import datetime
 from zoneinfo import ZoneInfo
 
 import requests
@@ -26,12 +29,23 @@ PAPER_THRESHOLD = float(os.getenv("SELL_THRESHOLD", "0.08"))
 # Assumed cost per side when entering a position (both sides cost ~$1 total)
 ENTRY_COST = 1.00
 
+# How many event IDs to scan ahead when searching for new markets
+_SCAN_BATCH = 30
+# How often to scan for new markets (seconds)
+_DISCOVERY_INTERVAL = 300  # 5 minutes
+
+_last_discovery_time = 0
+
 
 def _load_state():
     if os.path.exists(PAPER_STATE_FILE):
         with open(PAPER_STATE_FILE, "r") as f:
             return json.load(f)
-    return {"markets": {}, "stats": {"wins": 0, "losses": 0, "total_pnl": 0.0}}
+    return {
+        "markets": {},
+        "stats": {"wins": 0, "losses": 0, "total_pnl": 0.0},
+        "last_event_id": 608200,  # Known baseline near June 20, 2026
+    }
 
 
 def _save_state(state):
@@ -48,37 +62,8 @@ def _log_paper(event, **kwargs):
         f.write(json.dumps(entry) + "\n")
 
 
-def fetch_active_btc_hourly_markets():
-    """Fetch active BTC hourly markets from Polymarket gamma-api."""
-    try:
-        res = requests.get(
-            f"{GAMMA_API}/markets",
-            params={
-                "closed": "false",
-                "limit": 50,
-            },
-            timeout=10,
-        )
-        res.raise_for_status()
-        markets = res.json() or []
-        # Filter to BTC hourly markets
-        btc_markets = []
-        for m in markets:
-            question = (m.get("question") or "").lower()
-            slug = (m.get("slug") or "").lower()
-            group_slug = (m.get("groupItemTitle") or m.get("eventSlug") or "").lower()
-            if any(
-                kw in question or kw in slug or kw in group_slug
-                for kw in ("bitcoin up or down", "btc up or down", "bitcoin-up-or-down", "btc-updown")
-            ):
-                btc_markets.append(m)
-        return btc_markets
-    except Exception:
-        return []
-
-
 def _get_book_bid(token_id):
-    """Get best bid for a token from CLOB."""
+    """Get best bid for a token from CLOB order book (same as bot)."""
     try:
         res = requests.get(
             f"{CLOB_API}/book",
@@ -98,7 +83,7 @@ def _get_book_bid(token_id):
 
 
 def _get_midpoint(token_id):
-    """Get midpoint price for a token."""
+    """Get midpoint price for a token (same as bot)."""
     try:
         res = requests.get(
             f"{CLOB_API}/midpoint",
@@ -124,93 +109,190 @@ def _get_price(token_id):
     return _get_midpoint(token_id)
 
 
-def run_paper_cycle(console=None):
-    """Run one paper-monitoring cycle. Called from the main bot loop.
-    
-    Returns a brief status string for display, or None if nothing notable.
+def _discover_markets(state):
+    """Scan gamma-api event IDs to find new BTC hourly markets.
+
+    Only runs every _DISCOVERY_INTERVAL seconds to stay lightweight.
+    Scans forward from the last known event ID.
     """
-    state = _load_state()
-    markets = fetch_active_btc_hourly_markets()
-    now = datetime.now()
-    now_ts = time.time()
-    notable = []
+    global _last_discovery_time
+    now = time.time()
+    if now - _last_discovery_time < _DISCOVERY_INTERVAL:
+        return
+    _last_discovery_time = now
 
-    for m in markets:
-        condition_id = m.get("conditionId") or m.get("condition_id")
-        if not condition_id:
-            continue
+    start_id = state.get("last_event_id", 608200)
+    found_any = False
 
-        # Get token IDs for both outcomes
-        tokens = m.get("tokens") or []
-        if not tokens or len(tokens) < 2:
-            # Try to get from clobTokenIds
-            clob_ids = m.get("clobTokenIds")
-            if clob_ids and len(clob_ids) >= 2:
-                tokens = [
-                    {"token_id": clob_ids[0], "outcome": "Yes"},
-                    {"token_id": clob_ids[1], "outcome": "No"},
-                ]
-            else:
+    for event_id in range(start_id, start_id + _SCAN_BATCH):
+        try:
+            res = requests.get(
+                f"{GAMMA_API}/events/{event_id}",
+                timeout=5,
+            )
+            if res.status_code != 200:
+                continue
+            data = res.json()
+            if not isinstance(data, dict) or not data.get("title"):
                 continue
 
-        up_token = None
-        dn_token = None
-        for t in tokens:
-            outcome = (t.get("outcome") or "").lower()
-            token_id = t.get("token_id") or t.get("tokenId")
-            if outcome in ("yes", "up"):
-                up_token = token_id
-            elif outcome in ("no", "down"):
-                dn_token = token_id
+            title = data.get("title", "")
+            # Only track BTC hourly markets (not 5-min, not other coins)
+            if "bitcoin up or down" not in title.lower():
+                continue
+            # Skip sub-hourly markets (5min intervals like "8:20PM-8:25PM")
+            if "-" in title.split(",")[-1].strip().split(" ")[0] and ":" in title:
+                # Check if it's a range like "8:20PM-8:25PM" vs "8PM ET"
+                time_part = title.split(",")[-1].strip()
+                if "-" in time_part and ":" in time_part.split("-")[0]:
+                    continue
 
-        if not up_token or not dn_token:
-            continue
+            markets = data.get("markets", [])
+            if not markets:
+                continue
 
-        # Parse end time
-        end_date_str = m.get("endDate") or m.get("end_date_iso")
-        if not end_date_str:
-            continue
-        try:
-            end_dt = datetime.fromisoformat(end_date_str.replace("Z", "+00:00"))
-            end_ts = end_dt.timestamp()
-        except Exception:
-            continue
+            m = markets[0]
+            condition_id = m.get("conditionId")
+            if not condition_id:
+                continue
 
-        # Skip markets that already ended
-        if end_ts < now_ts:
-            # Check if we have a pending paper trade to resolve
+            # Already tracking this market
             if condition_id in state["markets"]:
-                entry = state["markets"][condition_id]
-                if entry.get("status") == "pending_sell":
-                    # Market ended — we had a trigger but couldn't verify outcome yet
-                    # Mark as needing resolution
-                    entry["status"] = "awaiting_resolution"
-                    _save_state(state)
-            continue
+                state["last_event_id"] = max(state.get("last_event_id", 0), event_id + 1)
+                continue
 
-        # Initialize tracking for new markets
-        if condition_id not in state["markets"]:
+            # Get token IDs (clobTokenIds/outcomes may be JSON strings)
+            clob_ids = m.get("clobTokenIds")
+            outcomes = m.get("outcomes", [])
+            if isinstance(clob_ids, str):
+                try:
+                    clob_ids = json.loads(clob_ids)
+                except (json.JSONDecodeError, TypeError):
+                    continue
+            if isinstance(outcomes, str):
+                try:
+                    outcomes = json.loads(outcomes)
+                except (json.JSONDecodeError, TypeError):
+                    outcomes = []
+            if not clob_ids or len(clob_ids) < 2:
+                continue
+
+            # Map outcomes to up/down tokens
+            up_token = None
+            dn_token = None
+            for i, outcome in enumerate(outcomes):
+                if outcome.lower() in ("up", "yes"):
+                    up_token = clob_ids[i]
+                elif outcome.lower() in ("down", "no"):
+                    dn_token = clob_ids[i]
+
+            if not up_token or not dn_token:
+                continue
+
+            # Parse end time
+            end_date_str = data.get("endDate") or m.get("endDate")
+            if not end_date_str:
+                continue
+            try:
+                end_dt = datetime.fromisoformat(end_date_str.replace("Z", "+00:00"))
+                end_ts = end_dt.timestamp()
+            except Exception:
+                continue
+
+            closed = data.get("closed", False) or m.get("closed", False)
+
+            # Register market
             state["markets"][condition_id] = {
-                "question": m.get("question") or "BTC Hourly",
+                "event_id": event_id,
+                "question": title,
                 "condition_id": condition_id,
                 "up_token": up_token,
                 "dn_token": dn_token,
                 "end_ts": end_ts,
-                "first_seen": now.isoformat(),
-                "status": "monitoring",  # monitoring → triggered → resolved
+                "first_seen": datetime.now().isoformat(),
+                "status": "resolved" if closed else "monitoring",
                 "sell_triggered": False,
                 "sell_leg": None,
                 "sell_price": None,
                 "sell_time": None,
             }
+            state["last_event_id"] = max(state.get("last_event_id", 0), event_id + 1)
+            found_any = True
 
-        entry = state["markets"][condition_id]
+            if not closed:
+                _log_paper(
+                    "paper_market_discovered",
+                    condition_id=condition_id,
+                    question=title,
+                    end_ts=end_ts,
+                    event_id=event_id,
+                )
 
-        # Skip if already triggered or resolved
+        except Exception:
+            continue
+
+    if found_any:
+        _save_state(state)
+
+
+def _check_market_resolution(condition_id, entry, state):
+    """Use the CLOB market endpoint to determine winner after close."""
+    try:
+        res = requests.get(
+            f"{CLOB_API}/markets/{condition_id}",
+            timeout=5,
+        )
+        if res.status_code != 200:
+            return None
+        data = res.json()
+        if not data.get("closed"):
+            return None
+        tokens = data.get("tokens", [])
+        for t in tokens:
+            if t.get("winner"):
+                outcome = (t.get("outcome") or "").lower()
+                if outcome in ("up", "yes"):
+                    return "up"
+                elif outcome in ("down", "no"):
+                    return "down"
+        return None
+    except Exception:
+        return None
+
+
+def run_paper_cycle(console=None):
+    """Run one paper-monitoring cycle. Called from the main bot loop.
+
+    Returns a brief status string for display, or None if nothing notable.
+    """
+    state = _load_state()
+    now = datetime.now()
+    now_ts = time.time()
+    notable = []
+
+    # Discover new markets (rate-limited internally)
+    _discover_markets(state)
+
+    # Check prices on active markets
+    for cond_id, entry in list(state["markets"].items()):
+        if entry.get("status") != "monitoring":
+            continue
+
+        end_ts = entry.get("end_ts", 0)
+        if end_ts <= now_ts:
+            # Market ended while we were monitoring — skip to resolution
+            continue
+
+        # Already triggered
         if entry.get("sell_triggered"):
             continue
 
-        # Check prices
+        up_token = entry.get("up_token")
+        dn_token = entry.get("dn_token")
+        if not up_token or not dn_token:
+            continue
+
+        # Check prices using CLOB (same method as bot)
         up_price = _get_price(up_token)
         dn_price = _get_price(dn_token)
 
@@ -231,16 +313,18 @@ def run_paper_cycle(console=None):
             entry["sell_leg"] = sell_leg
             entry["sell_price"] = sell_price
             entry["sell_time"] = now.isoformat()
-            entry["status"] = "pending_sell"
+            entry["status"] = "pending_resolution"
             _log_paper(
                 "paper_sell",
-                condition_id=condition_id,
+                condition_id=cond_id,
                 question=entry["question"],
                 leg=sell_leg,
                 price=sell_price,
                 ttm_min=round((end_ts - now_ts) / 60, 1),
             )
-            notable.append(f"PAPER SELL {sell_leg.upper()} @ {sell_price:.2f}¢ on {entry['question']}")
+            notable.append(
+                f"PAPER SELL {sell_leg.upper()} @ ${sell_price:.2f} on {entry['question']}"
+            )
 
     # Resolve completed markets
     _resolve_completed(state)
@@ -259,87 +343,68 @@ def _resolve_completed(state):
     now_ts = time.time()
     to_remove = []
 
-    for cond_id, entry in state["markets"].items():
+    for cond_id, entry in list(state["markets"].items()):
         end_ts = entry.get("end_ts", 0)
         if end_ts > now_ts:
             continue  # Still active
 
         if entry.get("status") == "resolved":
-            # Already resolved, mark for cleanup if old (>1h)
-            if now_ts - end_ts > 3600:
+            # Already resolved, mark for cleanup if old (>2h)
+            if now_ts - end_ts > 7200:
                 to_remove.append(cond_id)
             continue
 
         if not entry.get("sell_triggered"):
             # Market ended without any leg hitting threshold — no trade
-            _log_paper(
-                "paper_no_trade",
-                condition_id=cond_id,
-                question=entry.get("question"),
-                reason="no_leg_hit_threshold",
-            )
+            # Only log if we were actively monitoring (not pre-closed discoveries)
+            if entry.get("status") == "monitoring":
+                _log_paper(
+                    "paper_no_trade",
+                    condition_id=cond_id,
+                    question=entry.get("question"),
+                    reason="no_leg_hit_threshold",
+                )
             entry["status"] = "resolved"
             entry["pnl"] = 0.0
-            if now_ts - end_ts > 3600:
-                to_remove.append(cond_id)
             continue
 
-        # We have a triggered sell — determine outcome
-        # The sell leg is what we sold (assumed loser). The other leg is held to maturity.
-        # If our sell was correct (we sold the actual loser):
-        #   P&L = $1.00 (winner payout) + sell_price (loser sale) - $1.00 (entry cost)
-        #       = sell_price (net profit per $1 invested)
-        # If our sell was WRONG (we sold the actual winner):
-        #   P&L = sell_price (from selling winner) + $0 (loser held) - $1.00 (entry cost)
-        #       = sell_price - $1.00 (net loss)
+        # Determine winner via CLOB market endpoint
+        winner = _check_market_resolution(cond_id, entry, state)
 
-        # To determine which side won, check the final prices.
-        # After resolution, the winning side should be at $1 and loser at $0.
-        # We can check via the order book or just use the resolution data.
-        up_token = entry.get("up_token")
-        dn_token = entry.get("dn_token")
-        sell_leg = entry.get("sell_leg")
-        sell_price = entry.get("sell_price", 0)
+        if winner is None:
+            # Try midpoint fallback (winner should be ~$1, loser ~$0)
+            up_token = entry.get("up_token")
+            dn_token = entry.get("dn_token")
+            up_final = _get_midpoint(up_token) if up_token else None
+            dn_final = _get_midpoint(dn_token) if dn_token else None
 
-        # Try to get final prices (winner should be ~$1, loser ~$0)
-        up_final = _get_midpoint(up_token)
-        dn_final = _get_midpoint(dn_token)
+            if up_final is not None and dn_final is not None:
+                winner = "up" if up_final > dn_final else "down"
+            elif up_final is not None:
+                winner = "up" if up_final > 0.5 else "down"
+            elif dn_final is not None:
+                winner = "down" if dn_final > 0.5 else "up"
 
-        # If we can't determine the outcome yet (API might lag), skip
-        if up_final is None and dn_final is None:
-            # Give it some time after end — if >10 min past end, assume we can't resolve
-            if now_ts - end_ts < 600:
+        if winner is None:
+            # Give it time — if >15 min past end, log as unresolved
+            if now_ts - end_ts < 900:
                 continue
-            # Can't determine — log as unresolved
             _log_paper(
                 "paper_unresolved",
                 condition_id=cond_id,
                 question=entry.get("question"),
-                sell_leg=sell_leg,
-                sell_price=sell_price,
+                sell_leg=entry.get("sell_leg"),
+                sell_price=entry.get("sell_price"),
             )
             entry["status"] = "resolved"
             entry["pnl"] = None
-            to_remove.append(cond_id)
-            continue
-
-        # Determine winner: the side with higher final price won
-        winner = None
-        if up_final is not None and dn_final is not None:
-            winner = "up" if up_final > dn_final else "down"
-        elif up_final is not None:
-            winner = "up" if up_final > 0.5 else "down"
-        elif dn_final is not None:
-            winner = "down" if dn_final > 0.5 else "up"
-
-        if winner is None:
-            entry["status"] = "resolved"
-            entry["pnl"] = None
-            to_remove.append(cond_id)
             continue
 
         # Calculate P&L
+        sell_leg = entry.get("sell_leg")
+        sell_price = entry.get("sell_price", 0)
         correct_sell = (sell_leg != winner)  # We sold the loser = correct
+
         if correct_sell:
             # Sold loser at sell_price, held winner to $1
             pnl = sell_price + 1.00 - ENTRY_COST  # e.g. 0.08 + 1.00 - 1.00 = +0.08
@@ -371,9 +436,6 @@ def _resolve_completed(state):
             record=f"{state['stats']['wins']}W-{state['stats']['losses']}L",
         )
 
-        if now_ts - end_ts > 3600:
-            to_remove.append(cond_id)
-
     # Clean up old resolved entries
     for cond_id in to_remove:
         del state["markets"][cond_id]
@@ -387,7 +449,14 @@ def get_paper_summary():
     losses = stats.get("losses", 0)
     total = wins + losses
     pnl = stats.get("total_pnl", 0)
-    if total == 0:
+    active = sum(1 for m in state.get("markets", {}).values() if m.get("status") == "monitoring")
+    if total == 0 and active == 0:
         return None
-    win_rate = (wins / total) * 100
-    return f"{wins}W-{losses}L ({win_rate:.0f}%) · PnL: ${pnl:+.2f}"
+    parts = []
+    if total > 0:
+        win_rate = (wins / total) * 100
+        parts.append(f"{wins}W-{losses}L ({win_rate:.0f}%)")
+        parts.append(f"PnL: ${pnl:+.2f}")
+    if active > 0:
+        parts.append(f"Tracking: {active}")
+    return " · ".join(parts)
