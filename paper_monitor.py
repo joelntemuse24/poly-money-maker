@@ -68,7 +68,7 @@ def _get_book_bid(token_id):
         res = requests.get(
             f"{CLOB_API}/book",
             params={"token_id": token_id},
-            timeout=5,
+            timeout=2,
         )
         if res.status_code != 200:
             return None
@@ -88,7 +88,7 @@ def _get_midpoint(token_id):
         res = requests.get(
             f"{CLOB_API}/midpoint",
             params={"token_id": token_id},
-            timeout=5,
+            timeout=2,
         )
         if res.status_code != 200:
             return None
@@ -124,14 +124,20 @@ def _discover_markets(state):
     start_id = state.get("last_event_id", 608200)
     found_any = False
 
+    highest_valid_id = start_id
+
     for event_id in range(start_id, start_id + _SCAN_BATCH):
         try:
             res = requests.get(
                 f"{GAMMA_API}/events/{event_id}",
-                timeout=5,
+                timeout=3,
             )
+            if res.status_code == 404:
+                # Event doesn't exist yet — stop scanning forward
+                break
             if res.status_code != 200:
                 continue
+            highest_valid_id = event_id + 1
             data = res.json()
             if not isinstance(data, dict) or not data.get("title"):
                 continue
@@ -230,6 +236,11 @@ def _discover_markets(state):
 
         except Exception:
             continue
+
+    # Always advance the cursor so we don't re-scan the same IDs
+    if highest_valid_id > state.get("last_event_id", 0):
+        state["last_event_id"] = highest_valid_id
+        found_any = True
 
     if found_any:
         _save_state(state)
