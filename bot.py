@@ -13,6 +13,8 @@ from rich.panel import Panel
 from rich.align import Align
 from rich import box
 
+from paper_monitor import run_paper_cycle, get_paper_summary
+
 from py_clob_client_v2 import (
     ClobClient,
     MarketOrderArgs,
@@ -883,6 +885,15 @@ while True:
             border_style="bright_red",
             box=box.HEAVY_EDGE,
         ))
+
+    # ---------- PAPER MONITOR ----------
+    try:
+        run_paper_cycle(console=console)
+        paper_summary = get_paper_summary()
+        if paper_summary and CYCLE % 60 == 0:  # Show summary every ~5 min
+            console.print(f"  [dim cyan][PAPER STATS] {paper_summary}[/]")
+    except Exception:
+        pass  # Paper monitor failures should never crash the main bot
 
     console.print("[dim bright_black]\u00b7 \u00b7 \u00b7  sleeping 5s  \u00b7 \u00b7 \u00b7[/]")
     time.sleep(5)
