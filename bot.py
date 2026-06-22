@@ -1,5 +1,7 @@
 import os
 import re
+import signal
+import sys
 import time
 import json
 import traceback
@@ -111,6 +113,24 @@ banner = Panel(
 console.print(banner)
 if DRY_RUN:
     console.print("[bold black on yellow] DRY-RUN [/] [yellow]no orders or on-chain txs will be sent · decisions are logged only[/]")
+
+# ------------------------- GRACEFUL SHUTDOWN -------------------------
+
+_shutdown_requested = False
+
+
+def _handle_shutdown(signum, frame):
+    global _shutdown_requested
+    sig_name = signal.Signals(signum).name
+    console.print(f"\n[bold yellow]▶ {sig_name} received — finishing current cycle then exiting[/]")
+    _shutdown_requested = True
+
+
+signal.signal(signal.SIGTERM, _handle_shutdown)
+signal.signal(signal.SIGINT, _handle_shutdown)
+
+# Track positions with permanent redeem failures to avoid retry spam
+_redeem_permanent_failures = set()
 
 # ------------------------- HELPERS -------------------------
 
@@ -646,6 +666,9 @@ def redeem_condition(condition_id, label=""):
             console.print(f"  [bold bright_green][SETTLE \u25b6][/] {label}  [dim]tx={str(tx_id)[:18]}\u2026[/]")
             return tx_id
         console.print(f"  [dim red][SETTLE FAIL][/] {label}  [dim]{err}[/]")
+        if err and ("proxyWallet" in err or "invalid" in err.lower()):
+            _redeem_permanent_failures.add(condition_id)
+            console.print(f"  [dim red][SETTLE SKIP][/] {label}  [dim]permanent failure — will not retry[/]")
         return None
     except Exception as e:
         console.print(f"  [dim red][SETTLE ERR][/] {label}  [dim]{e}[/]")
@@ -662,7 +685,7 @@ def redeem_condition(condition_id, label=""):
 positions_meta = load_json(STATE_FILE)
 CYCLE = 0
 
-while True:
+while not _shutdown_requested:
     try:
         CYCLE += 1
         now_ms = time.time() * 1000
@@ -753,6 +776,8 @@ while True:
             if not redeemable:
                 continue
             if now_ms - s["end_ts"] > MAX_REDEEM_AGE_DAYS * 86400 * 1000:
+                continue
+            if cond in _redeem_permanent_failures:
                 continue
             meta = positions_meta.setdefault(cond, {})
             last = meta.get("redeem_submitted_at") or 0
@@ -897,3 +922,8 @@ while True:
 
     console.print("[dim bright_black]\u00b7 \u00b7 \u00b7  sleeping 5s  \u00b7 \u00b7 \u00b7[/]")
     time.sleep(5)
+
+# Graceful shutdown complete
+console.print("[bold bright_green]▶ SHUTDOWN COMPLETE[/] [dim]state saved · exiting cleanly[/]")
+log_event("shutdown", reason="signal")
+sys.exit(0)
