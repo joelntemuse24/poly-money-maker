@@ -31,9 +31,11 @@ PAPER_THRESHOLD = float(os.getenv("SELL_THRESHOLD", "0.08"))
 ENTRY_COST = 1.00
 
 # How many event IDs to scan ahead when searching for new markets
-_SCAN_BATCH = 30
+_SCAN_BATCH = 500
 # How often to scan for new markets (seconds)
 _DISCOVERY_INTERVAL = 300  # 5 minutes
+# If cursor is this far behind the frontier, jump ahead
+_MAX_LAG = 1000
 
 _last_discovery_time = 0
 
@@ -131,7 +133,9 @@ def _discover_markets(state):
     """Scan gamma-api event IDs to find new BTC hourly markets.
 
     Only runs every _DISCOVERY_INTERVAL seconds to stay lightweight.
-    Scans forward from the last known event ID.
+    Scans forward from the last known event ID.  When the cursor is far
+    behind the frontier (e.g. after downtime), jumps ahead to avoid
+    scanning thousands of irrelevant events one batch at a time.
     """
     global _last_discovery_time
     now = time.time()
@@ -140,6 +144,19 @@ def _discover_markets(state):
     _last_discovery_time = now
 
     start_id = state.get("last_event_id", 610000)
+
+    # If no active markets are being tracked, check whether the cursor
+    # is far behind the frontier and jump ahead if so.
+    active_count = sum(
+        1 for m in state.get("markets", {}).values()
+        if m.get("status") == "monitoring"
+    )
+    if active_count == 0:
+        frontier = _fetch_current_event_id() + _SCAN_BATCH
+        if frontier - start_id > _MAX_LAG:
+            start_id = max(frontier - _SCAN_BATCH, start_id)
+            state["last_event_id"] = start_id
+
     found_any = False
 
     highest_valid_id = start_id
