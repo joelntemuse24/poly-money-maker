@@ -38,6 +38,23 @@ _DISCOVERY_INTERVAL = 300  # 5 minutes
 _last_discovery_time = 0
 
 
+def _fetch_current_event_id():
+    """Probe gamma-api to find a recent event ID for bootstrapping."""
+    try:
+        # Start high and binary-search down to find the current frontier
+        lo, hi = 600000, 700000
+        while lo < hi:
+            mid = (lo + hi) // 2
+            r = requests.get(f"{GAMMA_API}/events/{mid}", timeout=3)
+            if r.status_code == 404:
+                hi = mid
+            else:
+                lo = mid + 1
+        return max(lo - _SCAN_BATCH, 600000)
+    except Exception:
+        return 610000
+
+
 def _load_state():
     if os.path.exists(PAPER_STATE_FILE):
         with open(PAPER_STATE_FILE, "r") as f:
@@ -45,7 +62,7 @@ def _load_state():
     return {
         "markets": {},
         "stats": {"wins": 0, "losses": 0, "total_pnl": 0.0},
-        "last_event_id": 608200,  # Known baseline near June 20, 2026
+        "last_event_id": _fetch_current_event_id(),
     }
 
 
@@ -122,7 +139,7 @@ def _discover_markets(state):
         return
     _last_discovery_time = now
 
-    start_id = state.get("last_event_id", 608200)
+    start_id = state.get("last_event_id", 610000)
     found_any = False
 
     highest_valid_id = start_id
