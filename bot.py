@@ -52,7 +52,7 @@ RELAYER_API_KEY_ADDRESS = os.getenv("RELAYER_API_KEY_ADDRESS", "0x42aec4505559c0
 # ------------------------- STRATEGY CONFIG -------------------------
 SELL_THRESHOLD = 0.08        # Sell the "loser" leg when per-share bid <= this
 HEDGE_THRESHOLD = 0.50       # After selling loser, sell the held leg if it drops below this
-SELL_GRACE_S = 30            # Wait N seconds after first seeing a position before selling
+SELL_GRACE_S = 10            # Wait N seconds after first seeing a position before selling
 SELL_COOLDOWN_S = 30         # Min seconds between sell attempts on the same leg
 REDEEM_THROTTLE_S = 300      # Min seconds between redemption retries
 MAX_REDEEM_AGE_DAYS = 7      # Stop trying to redeem after N days
@@ -712,8 +712,10 @@ while not _shutdown_requested:
             minutes_left = (end_ts - now_ms) / 60000
             if minutes_left <= 0:
                 continue
-
             cond = s["conditionId"]
+            if cond in _redeem_permanent_failures:
+                continue
+
             up_token = s["up"].get("asset")
             dn_token = s["dn"].get("asset")
             meta = positions_meta.setdefault(cond, {})
@@ -835,7 +837,16 @@ while not _shutdown_requested:
                     log_event("hedge_fill", condition_id=cond, leg="down", sold=sold, remaining=dn_size - sold, price=dn_price)
                     save_json(STATE_FILE, positions_meta)
                 else:
-                    log_event("hedge_fail", condition_id=cond, leg="down", size=dn_size, bid=dn_bid)
+                    time.sleep(2)
+                    actual_bal = check_token_balance(dn_token)
+                    if actual_bal is not None and actual_bal < dn_size - 0.01:
+                        ghost_sold = dn_size - actual_bal
+                        meta["expected_dn_size"] = actual_bal
+                        log_event("hedge_ghost_fill", condition_id=cond, leg="down", sold=ghost_sold, remaining=actual_bal, price=dn_price)
+                        console.print(f"  [bold yellow][GHOST FILL][/] DN hedge confirmed via balance check: {ghost_sold:.4f} sold")
+                        save_json(STATE_FILE, positions_meta)
+                    else:
+                        log_event("hedge_fail", condition_id=cond, leg="down", size=dn_size, bid=dn_bid)
 
             elif loser_was_dn and up_price is not None and up_price <= HEDGE_THRESHOLD:
                 console.print(Panel(
@@ -853,7 +864,16 @@ while not _shutdown_requested:
                     log_event("hedge_fill", condition_id=cond, leg="up", sold=sold, remaining=up_size - sold, price=up_price)
                     save_json(STATE_FILE, positions_meta)
                 else:
-                    log_event("hedge_fail", condition_id=cond, leg="up", size=up_size, bid=up_bid)
+                    time.sleep(2)
+                    actual_bal = check_token_balance(up_token)
+                    if actual_bal is not None and actual_bal < up_size - 0.01:
+                        ghost_sold = up_size - actual_bal
+                        meta["expected_up_size"] = actual_bal
+                        log_event("hedge_ghost_fill", condition_id=cond, leg="up", sold=ghost_sold, remaining=actual_bal, price=up_price)
+                        console.print(f"  [bold yellow][GHOST FILL][/] UP hedge confirmed via balance check: {ghost_sold:.4f} sold")
+                        save_json(STATE_FILE, positions_meta)
+                    else:
+                        log_event("hedge_fail", condition_id=cond, leg="up", size=up_size, bid=up_bid)
 
     except Exception:
         log_event("cycle_error", traceback=traceback.format_exc())
