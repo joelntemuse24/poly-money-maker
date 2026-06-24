@@ -18,6 +18,7 @@ env/
 positions.json
 bot.log
 *.log
+.dashboard_status.json
 
 # IDE
 .vscode/
