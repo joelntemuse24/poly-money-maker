@@ -898,6 +898,26 @@ while not _shutdown_requested:
         ))
 
 
+    # Write dashboard status for live viewer
+    try:
+        _dash_positions = []
+        for s in managed_sets:
+            mins = (s["end_ts"] - now_ms) / 60000
+            _dash_positions.append({
+                "question": (s["question"] or "?")[:40],
+                "ttm_min": round(mins, 1),
+                "up_size": float(s["up"].get("size", 0)),
+                "dn_size": float(s["dn"].get("size", 0)),
+                "up_token": s["up"].get("asset"),
+                "dn_token": s["dn"].get("asset"),
+                "redeemable": bool(s["up"].get("redeemable") or s["dn"].get("redeemable")),
+            })
+        with open(".dashboard_status.json", "w") as _df:
+            json.dump({"cycle": CYCLE, "nav": pusd_bal, "ts": time.time(),
+                       "positions": _dash_positions}, _df)
+    except Exception:
+        pass
+
     console.print("[dim bright_black]\u00b7 \u00b7 \u00b7  sleeping 5s  \u00b7 \u00b7 \u00b7[/]")
     time.sleep(5)
 
