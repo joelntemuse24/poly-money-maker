@@ -50,18 +50,13 @@ RELAYER_API_KEY = os.getenv("RELAYER_API_KEY", "019df62f-45bc-796e-975c-3f434472
 RELAYER_API_KEY_ADDRESS = os.getenv("RELAYER_API_KEY_ADDRESS", "0x42aec4505559c0613f7ce2541d9d29741bc5e195")
 
 # ------------------------- STRATEGY CONFIG -------------------------
-SELL_THRESHOLD = float(os.getenv("SELL_THRESHOLD", "0.08"))
-EXIT_WINDOW_MIN = float(os.getenv("EXIT_WINDOW_MIN", "20"))
-FALLBACK_THRESHOLD = float(os.getenv("FALLBACK_THRESHOLD", "0.10"))
-FALLBACK_WINDOW_MIN = float(os.getenv("FALLBACK_WINDOW_MIN", "1.5"))
-
-SELL_GRACE_S = float(os.getenv("SELL_GRACE_S", "30"))
-SELL_COOLDOWN_S = float(os.getenv("SELL_COOLDOWN_S", "30"))
-REDEEM_THROTTLE_S = float(os.getenv("REDEEM_THROTTLE_S", "300"))
-MAX_REDEEM_AGE_DAYS = float(os.getenv("MAX_REDEEM_AGE_DAYS", "7"))
-# Dry-run: log every sell/redeem the bot *would* place, but never send an
-# order or on-chain tx. Lets you watch the exit logic against live books safely.
-DRY_RUN = os.getenv("DRY_RUN", "0").strip().lower() in ("1", "true", "yes", "on")
+SELL_THRESHOLD = 0.08        # Sell the "loser" leg when per-share bid <= this
+HEDGE_THRESHOLD = 0.50       # After selling loser, sell the held leg if it drops below this
+SELL_GRACE_S = 30            # Wait N seconds after first seeing a position before selling
+SELL_COOLDOWN_S = 30         # Min seconds between sell attempts on the same leg
+REDEEM_THROTTLE_S = 300      # Min seconds between redemption retries
+MAX_REDEEM_AGE_DAYS = 7      # Stop trying to redeem after N days
+DRY_RUN = False
 
 # ------------------------- CLIENT SETUP -------------------------
 if API_KEY and API_SECRET and API_PASSPHRASE:
@@ -742,7 +737,7 @@ while not _shutdown_requested:
                         state = "[bold bright_magenta]\u2713 REDEEM[/]"
                     elif mins <= 0:
                         state = "[dim]\u00b7 closed[/]"
-                    elif mins <= EXIT_WINDOW_MIN:
+                    elif mins <= 20:
                         state = "[bold red]\u25cc EXIT WINDOW[/]"
                     else:
                         state = "[bold bright_green]\u25cf HOLD[/]"
@@ -899,6 +894,48 @@ while not _shutdown_requested:
                             save_json(STATE_FILE, positions_meta)
                         else:
                             log_event("sell_fail", condition_id=cond, leg="down", size=dn_size, bid=dn_bid, price_limit=dn_price)
+
+            # ================= HEDGE PHASE =================
+            # If we already sold one leg (the "loser") and the held leg drops
+            # below HEDGE_THRESHOLD, sell it too to limit reversal losses.
+            loser_was_up = meta.get("last_sell_up_at") and up_size < 0.01 and dn_size >= 0.01
+            loser_was_dn = meta.get("last_sell_dn_at") and dn_size < 0.01 and up_size >= 0.01
+
+            if loser_was_up and dn_price is not None and dn_price <= HEDGE_THRESHOLD:
+                console.print(Panel(
+                    f"  [bright_white]{s['question']}[/]\n"
+                    f"  [bright_red]REVERSAL DETECTED[/] — DN (held leg) dropped to [bold]{dn_price:.3f}[/]  ·  "
+                    f"[bold red]TTM {minutes_left:>4.1f}m[/]",
+                    title="[bold bright_red]▼ HEDGE SELL — CUTTING LOSSES[/]",
+                    border_style="bright_red",
+                    box=box.HEAVY,
+                ))
+                log_event("hedge_attempt", condition_id=cond, leg="down", size=dn_size, bid=dn_bid, price_limit=dn_price)
+                sold, _ = sell_market_with_retry(dn_token, dn_size, dn_matched_price or HEDGE_THRESHOLD)
+                if sold > 0:
+                    meta["expected_dn_size"] = dn_size - sold
+                    log_event("hedge_fill", condition_id=cond, leg="down", sold=sold, remaining=dn_size - sold, price=dn_price)
+                    save_json(STATE_FILE, positions_meta)
+                else:
+                    log_event("hedge_fail", condition_id=cond, leg="down", size=dn_size, bid=dn_bid)
+
+            elif loser_was_dn and up_price is not None and up_price <= HEDGE_THRESHOLD:
+                console.print(Panel(
+                    f"  [bright_white]{s['question']}[/]\n"
+                    f"  [bright_red]REVERSAL DETECTED[/] — UP (held leg) dropped to [bold]{up_price:.3f}[/]  ·  "
+                    f"[bold red]TTM {minutes_left:>4.1f}m[/]",
+                    title="[bold bright_red]▼ HEDGE SELL — CUTTING LOSSES[/]",
+                    border_style="bright_red",
+                    box=box.HEAVY,
+                ))
+                log_event("hedge_attempt", condition_id=cond, leg="up", size=up_size, bid=up_bid, price_limit=up_price)
+                sold, _ = sell_market_with_retry(up_token, up_size, up_matched_price or HEDGE_THRESHOLD)
+                if sold > 0:
+                    meta["expected_up_size"] = up_size - sold
+                    log_event("hedge_fill", condition_id=cond, leg="up", sold=sold, remaining=up_size - sold, price=up_price)
+                    save_json(STATE_FILE, positions_meta)
+                else:
+                    log_event("hedge_fail", condition_id=cond, leg="up", size=up_size, bid=up_bid)
 
     except Exception:
         log_event("cycle_error", traceback=traceback.format_exc())
