@@ -19,7 +19,6 @@ from rich import box
 from py_clob_client_v2 import (
     ClobClient,
     MarketOrderArgs,
-    OrderArgs,
     OrderType,
     PartialCreateOrderOptions,
 )
@@ -396,17 +395,6 @@ def get_book_bid(token_id):
         return None, 0.0
 
 
-
-def get_midpoint(token_id):
-    try:
-        price = safe_api_call(client.get_midpoint, token_id)
-        if isinstance(price, dict):
-            price = price.get("mid")
-        return float(price), 0.0
-    except Exception:
-        return None, 0.0
-
-
 # ------------------------- ORDER HELPERS -------------------------
 
 def extract_order_id(order_obj):
@@ -465,9 +453,6 @@ def confirm_fill_size(result, oid, requested):
                 sm = details.get("size_matched", 0)
                 matched = float(sm) if sm else 0.0
     return matched
-
-
-_neg_risk_cache = {}
 
 
 def sell_market_with_retry(token_id, size, price_limit, tick_size="0.01", max_retries=3):
@@ -555,7 +540,7 @@ def submit_proxy_tx(target, data, tx_type="PROXY"):
 
 
 
-def quote_leg(bid, mid):
+def quote_leg(bid):
     """Return (self_price, matched_price) for a single leg.
 
       - self_price:    leg's value used for sell/hedge decisions. Only uses bid
@@ -615,7 +600,7 @@ def redeem_condition(condition_id, label=""):
 # positions_meta is a metadata cache keyed by conditionId. The on-chain holdings
 # (size, redeemable flag, etc.) come fresh from data-api each cycle. We only
 # persist:
-#   - entered_at: when we first saw this set (used for 30s sell grace)
+#   - entered_at: when we first saw this set (used for sell grace period)
 #   - redeem_submitted_at: throttle redemption resubmissions
 #   - last_sell_up_at / last_sell_dn_at: 30s post-sell cooldown per leg
 positions_meta = load_json(STATE_FILE)
@@ -755,8 +740,8 @@ while not _shutdown_requested:
             up_bid, _ = get_book_bid(up_token) if up_token else (None, 0.0)
             dn_bid, _ = get_book_bid(dn_token) if dn_token else (None, 0.0)
 
-            up_price, up_matched_price = quote_leg(up_bid, None)
-            dn_price, dn_matched_price = quote_leg(dn_bid, None)
+            up_price, up_matched_price = quote_leg(up_bid)
+            dn_price, dn_matched_price = quote_leg(dn_bid)
             up_trigger = up_size > 0 and up_price is not None and up_price <= SELL_THRESHOLD
             dn_trigger = dn_size > 0 and dn_price is not None and dn_price <= SELL_THRESHOLD
 
@@ -795,8 +780,9 @@ while not _shutdown_requested:
                     sold, _ = sell_market_with_retry(up_token, up_size, up_matched_price or SELL_THRESHOLD)
                     if sold > 0:
                         meta["last_sell_up_at"] = now_ms
-                        meta["expected_up_size"] = up_size - sold
-                        log_event("sell_fill", condition_id=cond, leg="up", sold=sold, remaining=up_size - sold, price=up_price)
+                        up_size -= sold
+                        meta["expected_up_size"] = up_size
+                        log_event("sell_fill", condition_id=cond, leg="up", sold=sold, remaining=up_size, price=up_price)
                         save_json(STATE_FILE, positions_meta)
                     else:
                         time.sleep(2)
@@ -804,6 +790,7 @@ while not _shutdown_requested:
                         if actual_bal is not None and actual_bal < up_size - 0.01:
                             ghost_sold = up_size - actual_bal
                             meta["last_sell_up_at"] = now_ms
+                            up_size = actual_bal
                             meta["expected_up_size"] = actual_bal
                             log_event("sell_ghost_fill", condition_id=cond, leg="up", sold=ghost_sold, remaining=actual_bal, price=up_price)
                             console.print(f"  [bold yellow][GHOST FILL][/] UP sell confirmed via balance check: {ghost_sold:.4f} sold")
@@ -818,8 +805,9 @@ while not _shutdown_requested:
                     sold, _ = sell_market_with_retry(dn_token, dn_size, dn_matched_price or SELL_THRESHOLD)
                     if sold > 0:
                         meta["last_sell_dn_at"] = now_ms
-                        meta["expected_dn_size"] = dn_size - sold
-                        log_event("sell_fill", condition_id=cond, leg="down", sold=sold, remaining=dn_size - sold, price=dn_price)
+                        dn_size -= sold
+                        meta["expected_dn_size"] = dn_size
+                        log_event("sell_fill", condition_id=cond, leg="down", sold=sold, remaining=dn_size, price=dn_price)
                         save_json(STATE_FILE, positions_meta)
                     else:
                         time.sleep(2)
@@ -827,6 +815,7 @@ while not _shutdown_requested:
                         if actual_bal is not None and actual_bal < dn_size - 0.01:
                             ghost_sold = dn_size - actual_bal
                             meta["last_sell_dn_at"] = now_ms
+                            dn_size = actual_bal
                             meta["expected_dn_size"] = actual_bal
                             log_event("sell_ghost_fill", condition_id=cond, leg="down", sold=ghost_sold, remaining=actual_bal, price=dn_price)
                             console.print(f"  [bold yellow][GHOST FILL][/] DN sell confirmed via balance check: {ghost_sold:.4f} sold")
