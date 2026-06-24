@@ -5,8 +5,9 @@ Runs alongside the main bot, tracking what the strategy *would* do on
 every hourly market — whether or not we actually hold a position. Logs
 hypothetical P&L to paper_trades.log for backtesting analysis.
 
-Market discovery: uses the same CLOB book/midpoint endpoints as the bot
-for price data, and discovers new markets via gamma-api event IDs.
+Market discovery: queries gamma-api /events list for recent BTC hourly
+markets.  Price data comes from the same CLOB book/midpoint endpoints
+as the real bot.
 """
 
 import json
@@ -30,29 +31,15 @@ PAPER_THRESHOLD = float(os.getenv("SELL_THRESHOLD", "0.08"))
 # Assumed cost per side when entering a position (both sides cost ~$1 total)
 ENTRY_COST = 1.00
 
-# How many event IDs to scan ahead when searching for new markets
-_SCAN_BATCH = 30
 # How often to scan for new markets (seconds)
 _DISCOVERY_INTERVAL = 300  # 5 minutes
+# How many pages to fetch from the events list per discovery cycle
+_DISCOVERY_PAGES = 5
 
 _last_discovery_time = 0
 
-
-def _fetch_current_event_id():
-    """Probe gamma-api to find a recent event ID for bootstrapping."""
-    try:
-        # Start high and binary-search down to find the current frontier
-        lo, hi = 600000, 700000
-        while lo < hi:
-            mid = (lo + hi) // 2
-            r = requests.get(f"{GAMMA_API}/events/{mid}", timeout=3)
-            if r.status_code == 404:
-                hi = mid
-            else:
-                lo = mid + 1
-        return max(lo - _SCAN_BATCH, 600000)
-    except Exception:
-        return 610000
+# Regex: true hourly format ends with bare "8AM ET" or "11PM ET" (no colon)
+_HOURLY_RE = re.compile(r",\s*\d{1,2}(AM|PM)\s+ET\s*$", re.IGNORECASE)
 
 
 def _load_state():
@@ -62,7 +49,6 @@ def _load_state():
     return {
         "markets": {},
         "stats": {"wins": 0, "losses": 0, "total_pnl": 0.0},
-        "last_event_id": _fetch_current_event_id(),
     }
 
 
@@ -127,11 +113,23 @@ def _get_price(token_id):
     return _get_midpoint(token_id)
 
 
-def _discover_markets(state):
-    """Scan gamma-api event IDs to find new BTC hourly markets.
+def _is_btc_hourly(title):
+    """Return True only for true 1-hour BTC markets like '… June 23, 4PM ET'.
 
-    Only runs every _DISCOVERY_INTERVAL seconds to stay lightweight.
-    Scans forward from the last known event ID.
+    Rejects sub-hourly ranges ('3:40PM-3:45PM ET'), daily markets
+    ('Bitcoin Up or Down on June 20?'), and non-BTC coins.
+    """
+    if "bitcoin up or down" not in title.lower():
+        return False
+    return bool(_HOURLY_RE.search(title))
+
+
+def _discover_markets(state):
+    """Query gamma-api /events list for recent BTC hourly markets.
+
+    Fetches the most recent events (newest first) and registers any
+    BTC hourly markets we haven't seen yet.  Only runs every
+    _DISCOVERY_INTERVAL seconds.
     """
     global _last_discovery_time
     now = time.time()
@@ -139,41 +137,42 @@ def _discover_markets(state):
         return
     _last_discovery_time = now
 
-    start_id = state.get("last_event_id", 610000)
     found_any = False
+    seen_ids = set()
+    next_cursor = None
 
-    highest_valid_id = start_id
-
-    for event_id in range(start_id, start_id + _SCAN_BATCH):
+    for _ in range(_DISCOVERY_PAGES):
         try:
+            params = {
+                "limit": "100",
+                "order": "id",
+                "ascending": "false",
+                "closed": "false",
+            }
+            if next_cursor is not None:
+                params["id_lt"] = str(next_cursor)
             res = requests.get(
-                f"{GAMMA_API}/events/{event_id}",
-                timeout=3,
+                f"{GAMMA_API}/events",
+                params=params,
+                timeout=5,
             )
-            if res.status_code == 404:
-                # Event doesn't exist yet — stop scanning forward
-                break
             if res.status_code != 200:
-                continue
-            highest_valid_id = event_id + 1
-            data = res.json()
-            if not isinstance(data, dict) or not data.get("title"):
-                continue
+                break
+            events = res.json()
+            if not isinstance(events, list) or not events:
+                break
+        except Exception:
+            break
 
-            title = data.get("title", "")
-            # Only track BTC hourly markets (not 5-min, not other coins, not daily)
-            if "bitcoin up or down" not in title.lower():
+        for data in events:
+            eid = data.get("id")
+            if eid in seen_ids:
                 continue
-            # Must be hourly format: "Bitcoin Up or Down - June 20, 8AM ET"
-            # Skip daily markets like "Bitcoin Up or Down on June 20?"
-            if not re.search(r"\d{1,2}(AM|PM)\s+ET", title, re.IGNORECASE):
+            seen_ids.add(eid)
+
+            title = data.get("title") or ""
+            if not _is_btc_hourly(title):
                 continue
-            # Skip sub-hourly markets (5min intervals like "8:20PM-8:25PM")
-            if "-" in title.split(",")[-1].strip().split(" ")[0] and ":" in title:
-                # Check if it's a range like "8:20PM-8:25PM" vs "8PM ET"
-                time_part = title.split(",")[-1].strip()
-                if "-" in time_part and ":" in time_part.split("-")[0]:
-                    continue
 
             markets = data.get("markets", [])
             if not markets:
@@ -181,15 +180,9 @@ def _discover_markets(state):
 
             m = markets[0]
             condition_id = m.get("conditionId")
-            if not condition_id:
+            if not condition_id or condition_id in state["markets"]:
                 continue
 
-            # Already tracking this market
-            if condition_id in state["markets"]:
-                state["last_event_id"] = max(state.get("last_event_id", 0), event_id + 1)
-                continue
-
-            # Get token IDs (clobTokenIds/outcomes may be JSON strings)
             clob_ids = m.get("clobTokenIds")
             outcomes = m.get("outcomes", [])
             if isinstance(clob_ids, str):
@@ -205,7 +198,6 @@ def _discover_markets(state):
             if not clob_ids or len(clob_ids) < 2:
                 continue
 
-            # Map outcomes to up/down tokens
             up_token = None
             dn_token = None
             for i, outcome in enumerate(outcomes):
@@ -217,7 +209,6 @@ def _discover_markets(state):
             if not up_token or not dn_token:
                 continue
 
-            # Parse end time
             end_date_str = data.get("endDate") or m.get("endDate")
             if not end_date_str:
                 continue
@@ -229,9 +220,8 @@ def _discover_markets(state):
 
             closed = data.get("closed", False) or m.get("closed", False)
 
-            # Register market
             state["markets"][condition_id] = {
-                "event_id": event_id,
+                "event_id": eid,
                 "question": title,
                 "condition_id": condition_id,
                 "up_token": up_token,
@@ -244,7 +234,6 @@ def _discover_markets(state):
                 "sell_price": None,
                 "sell_time": None,
             }
-            state["last_event_id"] = max(state.get("last_event_id", 0), event_id + 1)
             found_any = True
 
             if not closed:
@@ -253,16 +242,14 @@ def _discover_markets(state):
                     condition_id=condition_id,
                     question=title,
                     end_ts=end_ts,
-                    event_id=event_id,
+                    event_id=eid,
                 )
 
-        except Exception:
-            continue
-
-    # Always advance the cursor so we don't re-scan the same IDs
-    if highest_valid_id > state.get("last_event_id", 0):
-        state["last_event_id"] = highest_valid_id
-        found_any = True
+        # Advance pagination cursor
+        min_id = min(e.get("id", 999999) for e in events)
+        if next_cursor is not None and min_id >= next_cursor:
+            break
+        next_cursor = min_id
 
     if found_any:
         _save_state(state)
