@@ -126,6 +126,25 @@ signal.signal(signal.SIGINT, _handle_shutdown)
 # Track positions with permanent redeem failures to avoid retry spam
 _redeem_permanent_failures = set()
 
+# ------------------------- NOTIFICATIONS -------------------------
+
+NTFY_TOPIC = os.getenv("NTFY_TOPIC", "polybot-joel-btc")
+
+def notify(title, message, priority="default"):
+    """Send a push notification via ntfy.sh. Fire-and-forget."""
+    try:
+        requests.post(
+            f"https://ntfy.sh/{NTFY_TOPIC}",
+            data=message.encode("utf-8"),
+            headers={"Title": title, "Priority": priority},
+            timeout=5,
+        )
+    except Exception:
+        pass  # notifications are best-effort, never crash the bot
+
+notify("Polybot Started", f"Bot started at {datetime.now().strftime('%Y-%m-%d %H:%M:%S UTC')}", priority="high")
+console.print(f"[bold bright_cyan]▶ NOTIFY[/] [dim]ntfy.sh topic: {NTFY_TOPIC}[/]")
+
 # ------------------------- HELPERS -------------------------
 
 
@@ -835,6 +854,7 @@ while not _shutdown_requested:
                 if sold > 0:
                     meta["expected_dn_size"] = dn_size - sold
                     log_event("hedge_fill", condition_id=cond, leg="down", sold=sold, remaining=dn_size - sold, price=dn_price)
+                    notify("HEDGE FIRED", f"Reversal on {s['question']}\nSold DN at ~{dn_price:.3f} ({sold:.2f} shares)", priority="urgent")
                     save_json(STATE_FILE, positions_meta)
                 else:
                     time.sleep(2)
@@ -843,6 +863,7 @@ while not _shutdown_requested:
                         ghost_sold = dn_size - actual_bal
                         meta["expected_dn_size"] = actual_bal
                         log_event("hedge_ghost_fill", condition_id=cond, leg="down", sold=ghost_sold, remaining=actual_bal, price=dn_price)
+                        notify("HEDGE FIRED (ghost)", f"Reversal on {s['question']}\nDN hedge ghost fill: {ghost_sold:.2f} shares", priority="urgent")
                         console.print(f"  [bold yellow][GHOST FILL][/] DN hedge confirmed via balance check: {ghost_sold:.4f} sold")
                         save_json(STATE_FILE, positions_meta)
                     else:
@@ -862,6 +883,7 @@ while not _shutdown_requested:
                 if sold > 0:
                     meta["expected_up_size"] = up_size - sold
                     log_event("hedge_fill", condition_id=cond, leg="up", sold=sold, remaining=up_size - sold, price=up_price)
+                    notify("HEDGE FIRED", f"Reversal on {s['question']}\nSold UP at ~{up_price:.3f} ({sold:.2f} shares)", priority="urgent")
                     save_json(STATE_FILE, positions_meta)
                 else:
                     time.sleep(2)
@@ -870,6 +892,7 @@ while not _shutdown_requested:
                         ghost_sold = up_size - actual_bal
                         meta["expected_up_size"] = actual_bal
                         log_event("hedge_ghost_fill", condition_id=cond, leg="up", sold=ghost_sold, remaining=actual_bal, price=up_price)
+                        notify("HEDGE FIRED (ghost)", f"Reversal on {s['question']}\nUP hedge ghost fill: {ghost_sold:.2f} shares", priority="urgent")
                         console.print(f"  [bold yellow][GHOST FILL][/] UP hedge confirmed via balance check: {ghost_sold:.4f} sold")
                         save_json(STATE_FILE, positions_meta)
                     else:
