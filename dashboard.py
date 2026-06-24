@@ -157,7 +157,7 @@ def build_dashboard(status, events):
     table.add_column("DN qty", justify="right", width=8)
     table.add_column("STATE", justify="center", width=10)
 
-    display_sets = active + redeemable[:2]
+    display_sets = active + redeemable
 
     if not display_sets:
         table.add_row("[dim]no positions[/]", "", "", "", "[dim]IDLE[/]")
