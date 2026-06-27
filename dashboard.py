@@ -24,6 +24,7 @@ from rich.text import Text
 
 SELL_THRESHOLD = 0.08
 HEDGE_THRESHOLD = 0.50
+SELL_WINDOW_MIN = 15
 STATUS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".dashboard_status.json")
 LOG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "bot.log")
 
@@ -170,14 +171,11 @@ def build_dashboard(status, events):
         if p["redeemable"]:
             state = "[bright_magenta]REDEEM[/]"
             ttm_str = "[dim]done[/]"
-        elif mins <= 10:
-            state = "[bold red]EXIT[/]"
+        elif mins <= SELL_WINDOW_MIN:
+            state = "[bold red]EXIT WINDOW[/]"
             ttm_str = f"[bold red]{mins:.0f}m[/]"
-        elif mins <= 30:
-            state = "[bold yellow]WATCH[/]"
-            ttm_str = f"[yellow]{mins:.0f}m[/]"
         else:
-            state = "[bright_green]HOLD[/]"
+            state = "[bright_green]WATCHING[/]"
             ttm_str = f"[green]{mins:.0f}m[/]"
 
         table.add_row(

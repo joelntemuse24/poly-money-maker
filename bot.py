@@ -51,6 +51,7 @@ RELAYER_API_KEY_ADDRESS = os.getenv("RELAYER_API_KEY_ADDRESS", "0x42aec4505559c0
 # ------------------------- STRATEGY CONFIG -------------------------
 SELL_THRESHOLD = 0.08        # Sell the "loser" leg when per-share bid <= this
 HEDGE_THRESHOLD = 0.50       # After selling loser, sell the held leg if it drops below this
+SELL_WINDOW_MIN = 15         # Only sell in the last N minutes of the hour (reduces reversal risk)
 SELL_GRACE_S = 10            # Wait N seconds after first seeing a position before selling
 SELL_COOLDOWN_S = 30         # Min seconds between sell attempts on the same leg
 REDEEM_THROTTLE_S = 300      # Min seconds between redemption retries
@@ -664,12 +665,12 @@ while not _shutdown_requested:
                         state = "[bold bright_magenta]\u2713 REDEEM[/]"
                     elif mins <= 0:
                         state = "[dim]\u00b7 closed[/]"
-                    elif mins <= 20:
+                    elif mins <= SELL_WINDOW_MIN:
                         state = "[bold red]\u25cc EXIT WINDOW[/]"
                     else:
-                        state = "[bold bright_green]\u25cf HOLD[/]"
+                        state = "[bold bright_green]\u25cf WATCHING[/]"
 
-                    if mins < 20:
+                    if mins < SELL_WINDOW_MIN:
                         mins_style = "bold red"
                     elif mins < 60:
                         mins_style = "yellow"
@@ -731,6 +732,9 @@ while not _shutdown_requested:
                 meta["end_date"] = s["up"].get("endDate") or s["dn"].get("endDate")
                 save_json(STATE_FILE, positions_meta)
             if now_ms - meta["entered_at"] < SELL_GRACE_S * 1000:
+                continue
+            # Only sell in the last SELL_WINDOW_MIN minutes to reduce reversal risk
+            if minutes_left > SELL_WINDOW_MIN:
                 continue
             up_size = float(s["up"].get("size", 0))
             dn_size = float(s["dn"].get("size", 0))
