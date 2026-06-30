@@ -73,7 +73,11 @@ def load_strategy():
                 overrides = json.load(f)
             for k, v in overrides.items():
                 if k in cfg:
-                    cfg[k] = type(cfg[k])(v)
+                    expected = type(cfg[k])
+                    if expected is bool:
+                        cfg[k] = v if isinstance(v, bool) else str(v).lower() in ("1", "true", "yes")
+                    else:
+                        cfg[k] = expected(v)
     except Exception as e:
         console.print(f"[bold red]▶ STRATEGY [WARN][/] [dim]failed to load {STRATEGY_FILE}: {e}[/]")
     return cfg
@@ -827,10 +831,12 @@ while not _shutdown_requested:
             tx = redeem_condition(cond, label=(s["question"] or "?")[:32])
             if tx:
                 meta["redeem_submitted_at"] = now_ms
-                # P&L: winner resolves at $1/share — record value of remaining holdings
+                # P&L: only the winning side resolves at $1/share; the loser
+                # resolves at $0.  min(up, dn) complete sets pay $1 each, and
+                # the excess shares on one side also pay $1 (they are the winner).
                 remaining_up = float(s["up"].get("size", 0))
                 remaining_dn = float(s["dn"].get("size", 0))
-                meta["pnl_redeem_value"] = round(remaining_up + remaining_dn, 4)
+                meta["pnl_redeem_value"] = round(max(remaining_up, remaining_dn), 4)
                 log_event("redeem_submit", condition_id=cond, tx_id=str(tx))
                 save_json(STATE_FILE, positions_meta)
 
