@@ -1,0 +1,27 @@
+name: Deploy to GCP
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'bot.py'
+      - 'dashboard.py'
+      - 'requirements.txt'
+      - 'strategy.json'
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Deploy via SSH
+        uses: appleboy/ssh-action@v1
+        with:
+          host: ${{ secrets.GCP_HOST }}
+          username: ${{ secrets.GCP_USER }}
+          key: ${{ secrets.GCP_SSH_KEY }}
+          script: |
+            cd ~/poly-money-maker
+            git pull origin main
+            pip install -r requirements.txt --quiet
+            sudo systemctl restart polybot
+            echo "Deployed $(git rev-parse --short HEAD) at $(date)"

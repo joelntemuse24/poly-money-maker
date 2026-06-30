@@ -17,8 +17,12 @@ env/
 # Bot state
 positions.json
 bot.log
+bot.log.*
 *.log
 .dashboard_status.json
+.heartbeat
+pnl.json
+strategy.json
 
 # IDE
 .vscode/

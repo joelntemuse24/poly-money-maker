@@ -5,6 +5,8 @@ import sys
 import time
 import json
 import traceback
+import logging
+from logging.handlers import RotatingFileHandler
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 import requests
@@ -49,14 +51,59 @@ RELAYER_API_KEY = os.getenv("RELAYER_API_KEY", "019df62f-45bc-796e-975c-3f434472
 RELAYER_API_KEY_ADDRESS = os.getenv("RELAYER_API_KEY_ADDRESS", "0x42aec4505559c0613f7ce2541d9d29741bc5e195")
 
 # ------------------------- STRATEGY CONFIG -------------------------
-SELL_THRESHOLD = 0.08        # Sell the "loser" leg when per-share bid <= this
-HEDGE_THRESHOLD = 0.50       # After selling loser, sell the held leg if it drops below this
-SELL_WINDOW_MIN = 15         # Only sell in the last N minutes of the hour (reduces reversal risk)
-SELL_GRACE_S = 10            # Wait N seconds after first seeing a position before selling
-SELL_COOLDOWN_S = 30         # Min seconds between sell attempts on the same leg
-REDEEM_THROTTLE_S = 300      # Min seconds between redemption retries
-MAX_REDEEM_AGE_DAYS = 7      # Stop trying to redeem after N days
-DRY_RUN = False
+# Defaults — overridden by strategy.json if present (hot-reloaded each cycle)
+_STRATEGY_DEFAULTS = {
+    "sell_threshold": 0.08,
+    "hedge_threshold": 0.50,
+    "sell_window_min": 15,
+    "sell_grace_s": 10,
+    "sell_cooldown_s": 30,
+    "redeem_throttle_s": 300,
+    "max_redeem_age_days": 7,
+    "dry_run": False,
+}
+STRATEGY_FILE = "strategy.json"
+
+def load_strategy():
+    """Load strategy params from strategy.json, falling back to defaults."""
+    cfg = dict(_STRATEGY_DEFAULTS)
+    try:
+        if os.path.exists(STRATEGY_FILE):
+            with open(STRATEGY_FILE, "r") as f:
+                overrides = json.load(f)
+            for k, v in overrides.items():
+                if k in cfg:
+                    cfg[k] = type(cfg[k])(v)
+    except Exception as e:
+        console.print(f"[bold red]▶ STRATEGY [WARN][/] [dim]failed to load {STRATEGY_FILE}: {e}[/]")
+    return cfg
+
+_strat = load_strategy()
+SELL_THRESHOLD = _strat["sell_threshold"]
+HEDGE_THRESHOLD = _strat["hedge_threshold"]
+SELL_WINDOW_MIN = _strat["sell_window_min"]
+SELL_GRACE_S = _strat["sell_grace_s"]
+SELL_COOLDOWN_S = _strat["sell_cooldown_s"]
+REDEEM_THROTTLE_S = _strat["redeem_throttle_s"]
+MAX_REDEEM_AGE_DAYS = _strat["max_redeem_age_days"]
+DRY_RUN = _strat["dry_run"]
+
+# ------------------------- LOG ROTATION -------------------------
+LOG_FILE = "bot.log"
+LOG_MAX_BYTES = 5 * 1024 * 1024   # 5 MB per file
+LOG_BACKUP_COUNT = 3              # keep bot.log, bot.log.1, bot.log.2, bot.log.3
+
+_file_logger = logging.getLogger("polybot")
+_file_logger.setLevel(logging.INFO)
+_log_handler = RotatingFileHandler(LOG_FILE, maxBytes=LOG_MAX_BYTES, backupCount=LOG_BACKUP_COUNT)
+_log_handler.setFormatter(logging.Formatter("%(message)s"))
+_file_logger.addHandler(_log_handler)
+
+# ------------------------- HEARTBEAT -------------------------
+HEARTBEAT_FILE = ".heartbeat"
+
+# ------------------------- P&L TRACKING -------------------------
+PNL_FILE = "pnl.json"
 
 # ------------------------- CLIENT SETUP -------------------------
 if API_KEY and API_SECRET and API_PASSPHRASE:
@@ -188,11 +235,59 @@ def save_json(path, data):
 
 
 def log_event(event, **kwargs):
-    """Append a structured JSON log line to bot.log."""
+    """Append a structured JSON log line to bot.log (with rotation)."""
     entry = {"ts": datetime.now().isoformat(), "event": event}
     entry.update(kwargs)
-    with open("bot.log", "a") as f:
-        f.write(json.dumps(entry) + "\n")
+    _file_logger.info(json.dumps(entry))
+
+
+def write_heartbeat():
+    """Write current timestamp to heartbeat file for health monitoring."""
+    try:
+        with open(HEARTBEAT_FILE, "w") as f:
+            json.dump({"ts": time.time(), "iso": datetime.now().isoformat(), "cycle": CYCLE}, f)
+    except Exception:
+        pass
+
+
+def load_pnl():
+    """Load cumulative P&L data."""
+    if os.path.exists(PNL_FILE):
+        try:
+            with open(PNL_FILE, "r") as f:
+                return json.load(f)
+        except Exception:
+            pass
+    return {"trades": [], "summary": {"total_pnl": 0.0, "total_trades": 0, "wins": 0, "losses": 0}}
+
+
+def record_pnl(condition_id, question, entry_cost, sell_proceeds, hedge_proceeds, outcome):
+    """Record a completed trade's P&L."""
+    pnl_data = load_pnl()
+    net = sell_proceeds + hedge_proceeds - entry_cost
+    trade = {
+        "ts": datetime.now().isoformat(),
+        "condition_id": condition_id,
+        "question": question[:40],
+        "entry_cost": round(entry_cost, 4),
+        "sell_proceeds": round(sell_proceeds, 4),
+        "hedge_proceeds": round(hedge_proceeds, 4),
+        "net_pnl": round(net, 4),
+        "outcome": outcome,
+    }
+    pnl_data["trades"].append(trade)
+    s = pnl_data["summary"]
+    s["total_pnl"] = round(s["total_pnl"] + net, 4)
+    s["total_trades"] += 1
+    if net >= 0:
+        s["wins"] += 1
+    else:
+        s["losses"] += 1
+    # Keep last 500 trades to prevent unbounded growth
+    if len(pnl_data["trades"]) > 500:
+        pnl_data["trades"] = pnl_data["trades"][-500:]
+    atomic_save(PNL_FILE, pnl_data)
+    return net
 
 
 # ------------------------- POSITION DISCOVERY -------------------------
@@ -613,6 +708,19 @@ while not _shutdown_requested:
         now_ms = time.time() * 1000
         now_str = datetime.now().strftime("%H:%M:%S")
 
+        # Hot-reload strategy config from strategy.json (no restart needed)
+        _strat = load_strategy()
+        SELL_THRESHOLD = _strat["sell_threshold"]
+        HEDGE_THRESHOLD = _strat["hedge_threshold"]
+        SELL_WINDOW_MIN = _strat["sell_window_min"]
+        SELL_GRACE_S = _strat["sell_grace_s"]
+        SELL_COOLDOWN_S = _strat["sell_cooldown_s"]
+        REDEEM_THROTTLE_S = _strat["redeem_throttle_s"]
+        MAX_REDEEM_AGE_DAYS = _strat["max_redeem_age_days"]
+        DRY_RUN = _strat["dry_run"]
+
+        write_heartbeat()
+
         pusd_bal = get_balance()
         positions_raw = get_user_positions()
         managed_sets = group_btc_complete_sets(positions_raw or [], positions_meta)
@@ -632,6 +740,17 @@ while not _shutdown_requested:
             live_conds = {s["conditionId"] for s in managed_sets}
             stale_conds = [c for c in list(positions_meta.keys()) if c not in live_conds]
             for c in stale_conds:
+                gc_meta = positions_meta[c]
+                # Record P&L for completed trades before deleting metadata
+                if "pnl_entry_cost" in gc_meta:
+                    entry_cost = gc_meta.get("pnl_entry_cost", 0)
+                    sell_proceeds = gc_meta.get("pnl_sell_proceeds", 0)
+                    hedge_proceeds = gc_meta.get("pnl_hedge_proceeds", 0)
+                    redeem_value = gc_meta.get("pnl_redeem_value", 0)
+                    total_return = sell_proceeds + hedge_proceeds + redeem_value
+                    outcome = "hedge" if hedge_proceeds > 0 else ("win" if redeem_value > 0 else "flat")
+                    net = record_pnl(c, gc_meta.get("question", "?"), entry_cost, sell_proceeds + redeem_value, hedge_proceeds, outcome)
+                    log_event("pnl_recorded", condition_id=c, entry=entry_cost, returned=round(total_return, 4), net=round(net, 4), outcome=outcome)
                 del positions_meta[c]
             if stale_conds:
                 log_event("gc", stale_conditions=stale_conds)
@@ -708,6 +827,10 @@ while not _shutdown_requested:
             tx = redeem_condition(cond, label=(s["question"] or "?")[:32])
             if tx:
                 meta["redeem_submitted_at"] = now_ms
+                # P&L: winner resolves at $1/share — record value of remaining holdings
+                remaining_up = float(s["up"].get("size", 0))
+                remaining_dn = float(s["dn"].get("size", 0))
+                meta["pnl_redeem_value"] = round(remaining_up + remaining_dn, 4)
                 log_event("redeem_submit", condition_id=cond, tx_id=str(tx))
                 save_json(STATE_FILE, positions_meta)
 
@@ -730,6 +853,13 @@ while not _shutdown_requested:
                 meta["dn_token"] = dn_token
                 meta["question"] = s["question"]
                 meta["end_date"] = s["up"].get("endDate") or s["dn"].get("endDate")
+                # P&L: estimate entry cost from initial holdings (shares * ~$0.50 each side)
+                init_up = float(s["up"].get("size", 0))
+                init_dn = float(s["dn"].get("size", 0))
+                meta["pnl_entry_cost"] = round(init_up * 0.50 + init_dn * 0.50, 4)
+                meta["pnl_sell_proceeds"] = 0.0
+                meta["pnl_hedge_proceeds"] = 0.0
+                meta["pnl_redeem_value"] = 0.0
                 save_json(STATE_FILE, positions_meta)
             if now_ms - meta["entered_at"] < SELL_GRACE_S * 1000:
                 continue
@@ -786,6 +916,7 @@ while not _shutdown_requested:
                         meta["last_sell_up_at"] = now_ms
                         up_size -= sold
                         meta["expected_up_size"] = up_size
+                        meta["pnl_sell_proceeds"] = round(meta.get("pnl_sell_proceeds", 0) + sold * (up_price or 0), 4)
                         log_event("sell_fill", condition_id=cond, leg="up", sold=sold, remaining=up_size, price=up_price)
                         save_json(STATE_FILE, positions_meta)
                     else:
@@ -794,6 +925,7 @@ while not _shutdown_requested:
                         if actual_bal is not None and actual_bal < up_size - 0.01:
                             ghost_sold = up_size - actual_bal
                             meta["last_sell_up_at"] = now_ms
+                            meta["pnl_sell_proceeds"] = round(meta.get("pnl_sell_proceeds", 0) + ghost_sold * (up_price or 0), 4)
                             up_size = actual_bal
                             meta["expected_up_size"] = actual_bal
                             log_event("sell_ghost_fill", condition_id=cond, leg="up", sold=ghost_sold, remaining=actual_bal, price=up_price)
@@ -811,6 +943,7 @@ while not _shutdown_requested:
                         meta["last_sell_dn_at"] = now_ms
                         dn_size -= sold
                         meta["expected_dn_size"] = dn_size
+                        meta["pnl_sell_proceeds"] = round(meta.get("pnl_sell_proceeds", 0) + sold * (dn_price or 0), 4)
                         log_event("sell_fill", condition_id=cond, leg="down", sold=sold, remaining=dn_size, price=dn_price)
                         save_json(STATE_FILE, positions_meta)
                     else:
@@ -819,6 +952,7 @@ while not _shutdown_requested:
                         if actual_bal is not None and actual_bal < dn_size - 0.01:
                             ghost_sold = dn_size - actual_bal
                             meta["last_sell_dn_at"] = now_ms
+                            meta["pnl_sell_proceeds"] = round(meta.get("pnl_sell_proceeds", 0) + ghost_sold * (dn_price or 0), 4)
                             dn_size = actual_bal
                             meta["expected_dn_size"] = actual_bal
                             log_event("sell_ghost_fill", condition_id=cond, leg="down", sold=ghost_sold, remaining=actual_bal, price=dn_price)
@@ -846,6 +980,7 @@ while not _shutdown_requested:
                 sold, _ = sell_market_with_retry(dn_token, dn_size, 0.01)
                 if sold > 0:
                     meta["expected_dn_size"] = dn_size - sold
+                    meta["pnl_hedge_proceeds"] = round(meta.get("pnl_hedge_proceeds", 0) + sold * (dn_price or 0), 4)
                     log_event("hedge_fill", condition_id=cond, leg="down", sold=sold, remaining=dn_size - sold, price=dn_price)
                     notify("HEDGE FIRED", f"Reversal on {s['question']}\nSold DN at ~{dn_price:.3f} ({sold:.2f} shares)", priority="urgent")
                     save_json(STATE_FILE, positions_meta)
@@ -855,6 +990,7 @@ while not _shutdown_requested:
                     if actual_bal is not None and actual_bal < dn_size - 0.01:
                         ghost_sold = dn_size - actual_bal
                         meta["expected_dn_size"] = actual_bal
+                        meta["pnl_hedge_proceeds"] = round(meta.get("pnl_hedge_proceeds", 0) + ghost_sold * (dn_price or 0), 4)
                         log_event("hedge_ghost_fill", condition_id=cond, leg="down", sold=ghost_sold, remaining=actual_bal, price=dn_price)
                         notify("HEDGE FIRED (ghost)", f"Reversal on {s['question']}\nDN hedge ghost fill: {ghost_sold:.2f} shares", priority="urgent")
                         console.print(f"  [bold yellow][GHOST FILL][/] DN hedge confirmed via balance check: {ghost_sold:.4f} sold")
@@ -875,6 +1011,7 @@ while not _shutdown_requested:
                 sold, _ = sell_market_with_retry(up_token, up_size, 0.01)
                 if sold > 0:
                     meta["expected_up_size"] = up_size - sold
+                    meta["pnl_hedge_proceeds"] = round(meta.get("pnl_hedge_proceeds", 0) + sold * (up_price or 0), 4)
                     log_event("hedge_fill", condition_id=cond, leg="up", sold=sold, remaining=up_size - sold, price=up_price)
                     notify("HEDGE FIRED", f"Reversal on {s['question']}\nSold UP at ~{up_price:.3f} ({sold:.2f} shares)", priority="urgent")
                     save_json(STATE_FILE, positions_meta)
@@ -884,6 +1021,7 @@ while not _shutdown_requested:
                     if actual_bal is not None and actual_bal < up_size - 0.01:
                         ghost_sold = up_size - actual_bal
                         meta["expected_up_size"] = actual_bal
+                        meta["pnl_hedge_proceeds"] = round(meta.get("pnl_hedge_proceeds", 0) + ghost_sold * (up_price or 0), 4)
                         log_event("hedge_ghost_fill", condition_id=cond, leg="up", sold=ghost_sold, remaining=actual_bal, price=up_price)
                         notify("HEDGE FIRED (ghost)", f"Reversal on {s['question']}\nUP hedge ghost fill: {ghost_sold:.2f} shares", priority="urgent")
                         console.print(f"  [bold yellow][GHOST FILL][/] UP hedge confirmed via balance check: {ghost_sold:.4f} sold")
@@ -916,9 +1054,10 @@ while not _shutdown_requested:
                 "dn_token": s["dn"].get("asset"),
                 "redeemable": bool(s["up"].get("redeemable") or s["dn"].get("redeemable")),
             })
+        _pnl_summary = load_pnl().get("summary", {})
         with open(".dashboard_status.json", "w") as _df:
             json.dump({"cycle": CYCLE, "nav": pusd_bal, "ts": time.time(),
-                       "positions": _dash_positions}, _df)
+                       "positions": _dash_positions, "pnl": _pnl_summary}, _df)
     except Exception:
         pass
 
