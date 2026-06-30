@@ -54,6 +54,8 @@ RELAYER_API_KEY_ADDRESS = os.getenv("RELAYER_API_KEY_ADDRESS", "0x42aec4505559c0
 # Defaults — overridden by strategy.json if present (hot-reloaded each cycle)
 _STRATEGY_DEFAULTS = {
     "sell_threshold": 0.08,
+    "sell_threshold_early": 0.04,
+    "sell_aggressive_min": 9,
     "hedge_threshold": 0.50,
     "sell_window_min": 15,
     "sell_grace_s": 10,
@@ -84,6 +86,8 @@ def load_strategy():
 
 _strat = load_strategy()
 SELL_THRESHOLD = _strat["sell_threshold"]
+SELL_THRESHOLD_EARLY = _strat["sell_threshold_early"]
+SELL_AGGRESSIVE_MIN = _strat["sell_aggressive_min"]
 HEDGE_THRESHOLD = _strat["hedge_threshold"]
 SELL_WINDOW_MIN = _strat["sell_window_min"]
 SELL_GRACE_S = _strat["sell_grace_s"]
@@ -727,6 +731,8 @@ while not _shutdown_requested:
         # Hot-reload strategy config from strategy.json (no restart needed)
         _strat = load_strategy()
         SELL_THRESHOLD = _strat["sell_threshold"]
+        SELL_THRESHOLD_EARLY = _strat["sell_threshold_early"]
+        SELL_AGGRESSIVE_MIN = _strat["sell_aggressive_min"]
         HEDGE_THRESHOLD = _strat["hedge_threshold"]
         SELL_WINDOW_MIN = _strat["sell_window_min"]
         SELL_GRACE_S = _strat["sell_grace_s"]
@@ -800,8 +806,10 @@ while not _shutdown_requested:
                         state = "[bold bright_magenta]\u2713 REDEEM[/]"
                     elif mins <= 0:
                         state = "[dim]\u00b7 closed[/]"
+                    elif mins <= SELL_AGGRESSIVE_MIN:
+                        state = "[bold red]\u25cc EXIT \u22648\u00a2[/]"
                     elif mins <= SELL_WINDOW_MIN:
-                        state = "[bold red]\u25cc EXIT WINDOW[/]"
+                        state = "[bold yellow]\u25cc EXIT 4-8\u00a2[/]"
                     else:
                         state = "[bold bright_green]\u25cf WATCHING[/]"
 
@@ -894,8 +902,18 @@ while not _shutdown_requested:
 
             up_price, up_matched_price = quote_leg(up_bid)
             dn_price, dn_matched_price = quote_leg(dn_bid)
-            up_trigger = up_size > 0 and up_price is not None and up_price <= SELL_THRESHOLD
-            dn_trigger = dn_size > 0 and dn_price is not None and dn_price <= SELL_THRESHOLD
+
+            # Tiered sell thresholds within the exit window:
+            #   Minutes 15–9 (early): only sell between SELL_THRESHOLD_EARLY and SELL_THRESHOLD
+            #   Minutes  9–0 (aggressive): sell at any price <= SELL_THRESHOLD
+            if minutes_left > SELL_AGGRESSIVE_MIN:
+                up_trigger = (up_size > 0 and up_price is not None
+                              and SELL_THRESHOLD_EARLY <= up_price <= SELL_THRESHOLD)
+                dn_trigger = (dn_size > 0 and dn_price is not None
+                              and SELL_THRESHOLD_EARLY <= dn_price <= SELL_THRESHOLD)
+            else:
+                up_trigger = up_size > 0 and up_price is not None and up_price <= SELL_THRESHOLD
+                dn_trigger = dn_size > 0 and dn_price is not None and dn_price <= SELL_THRESHOLD
 
             # Guard: if both legs trigger, only sell the lower-priced one to ensure
             # we still hold a winner for the $1 payout at resolution.
