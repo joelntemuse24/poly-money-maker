@@ -1,5 +1,7 @@
 {
     "sell_threshold": 0.08,
+    "sell_threshold_early": 0.04,
+    "sell_aggressive_min": 9,
     "hedge_threshold": 0.50,
     "sell_window_min": 15,
     "sell_grace_s": 10,
