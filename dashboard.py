@@ -10,7 +10,6 @@ Press Ctrl+C to exit (does NOT affect the running bot).
 import json
 import os
 import time
-from collections import deque
 from datetime import datetime
 
 from rich import box

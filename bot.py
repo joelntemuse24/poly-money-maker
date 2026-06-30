@@ -93,7 +93,7 @@ banner = Panel(
         "[bold bright_green]██████╗ ████████╗ ██████╗[/]   [bright_yellow]//[/]  [bold white]EXIT DESK[/]\n"
         "[bold bright_green]██╔══██╗╚══██╔══╝██╔════╝[/]   [bright_yellow]//[/]  [dim]POLYMARKET CLOB · MATIC[/]\n"
         "[bold bright_green]██████╔╝   ██║   ██║     [/]   [bright_yellow]//[/]  [dim]SELL-SIDE EXECUTION ONLY[/]\n"
-        "[bold bright_green]██╔══██╗   ██║   ██║     [/]   [bright_yellow]//[/]  [dim]BTC HOURLY · 4\u00a2 LOSER TRIG[/]\n"
+        "[bold bright_green]██╔══██╗   ██║   ██║     [/]   [bright_yellow]//[/]  [dim]BTC HOURLY · 8\u00a2 LOSER TRIG[/]\n"
         "[bold bright_green]██████╔╝   ██║   ╚██████╗[/]   [bright_yellow]//[/]  STATUS: [bold bright_green]\u25cf ARMED[/]\n"
         "[bold bright_green]╚═════╝    ╚═╝    ╚═════╝[/]   [bright_yellow]//[/]  [dim]v8.0 \u00b7 sell-only \u00b7 data-api[/]",
         vertical="middle",
@@ -896,7 +896,7 @@ while not _shutdown_requested:
         console.print(Panel(
             traceback.format_exc(),
             title="[bold bright_red]\u25a0\u25a0  SYSTEM FAULT  \u25a0\u25a0[/]",
-            subtitle="[dim]auto-restart in 30s \u00b7 cycle aborted[/]",
+            subtitle="[dim]auto-restart in 5s \u00b7 cycle aborted[/]",
             border_style="bright_red",
             box=box.HEAVY_EDGE,
         ))
