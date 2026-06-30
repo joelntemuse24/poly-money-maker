@@ -372,20 +372,23 @@ def parse_position_end_dt(legs):
         try:
             base = datetime.fromisoformat(end_date.replace("Z", "+00:00"))
             if slug_hour is not None:
-                # Convert endDate to ET so we use the correct calendar date.
-                # Evening ET markets (e.g. 10PM ET) have a UTC endDate one day
-                # ahead; naively setting the hour on the UTC date overshoots by
-                # 24 h and the sell window never opens.
+                # The endDate is the UTC calendar date on which the market
+                # expires.  We know the ET hour from the slug.  Find the ET
+                # date such that (slug_hour + 1h) in ET falls on the
+                # endDate in UTC.  Try the endDate itself, then ±1 day.
                 if base.tzinfo is None:
                     base = base.replace(tzinfo=ZoneInfo("UTC"))
+                end_utc_date = base.astimezone(ZoneInfo("UTC")).date()
+                for day_offset in (0, -1, 1):
+                    candidate = datetime(
+                        end_utc_date.year, end_utc_date.month, end_utc_date.day,
+                        slug_hour, 0, 0, tzinfo=_ET,
+                    ) + timedelta(days=day_offset, hours=1)
+                    if candidate.astimezone(ZoneInfo("UTC")).date() == end_utc_date:
+                        return candidate.astimezone(tz=None).replace(tzinfo=None)
+                # Fallback: use endDate + slug offset without date matching
                 base_et = base.astimezone(_ET)
                 et_dt = base_et.replace(hour=slug_hour, minute=0, second=0, microsecond=0) + timedelta(hours=1)
-                # Guard: pick the candidate day closest to the endDate
-                diff_s = (et_dt - base_et).total_seconds()
-                if diff_s > 12 * 3600:
-                    et_dt -= timedelta(days=1)
-                elif diff_s < -12 * 3600:
-                    et_dt += timedelta(days=1)
                 return et_dt.astimezone(tz=None).replace(tzinfo=None)
             return base
         except Exception:
