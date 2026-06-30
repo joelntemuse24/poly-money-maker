@@ -137,6 +137,14 @@ def build_dashboard(status, events):
     active = [p for p in positions if p["ttm_min"] > 0 and not p["redeemable"]]
     redeemable = [p for p in positions if p["redeemable"]]
 
+    # P&L summary
+    pnl = status.get("pnl", {})
+    total_pnl = pnl.get("total_pnl", 0.0)
+    total_trades = pnl.get("total_trades", 0)
+    wins = pnl.get("wins", 0)
+    losses = pnl.get("losses", 0)
+    pnl_color = "bright_green" if total_pnl >= 0 else "bright_red"
+
     # Header
     header_text = (
         f"  {status_icon}  [dim]|[/]  "
@@ -145,7 +153,9 @@ def build_dashboard(status, events):
         f"[bright_yellow]NAV[/] [bold]${nav:>7.2f}[/]  [dim]|[/]  "
         f"[bright_cyan]TICK[/] #{cycle:04d}  [dim]|[/]  "
         f"[bright_green]{len(active)} active[/]  "
-        f"[bright_magenta]{len(redeemable)} redeem[/]  "
+        f"[bright_magenta]{len(redeemable)} redeem[/]  [dim]|[/]  "
+        f"[{pnl_color}]P&L[/] [bold {pnl_color}]${total_pnl:>+.2f}[/]  "
+        f"[dim]({wins}W/{losses}L)[/]"
     )
     header = Panel(header_text, border_style="bright_green", box=box.HEAVY, padding=(0, 0))
 

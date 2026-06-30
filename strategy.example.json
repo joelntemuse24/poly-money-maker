@@ -1,0 +1,10 @@
+{
+    "sell_threshold": 0.08,
+    "hedge_threshold": 0.50,
+    "sell_window_min": 15,
+    "sell_grace_s": 10,
+    "sell_cooldown_s": 30,
+    "redeem_throttle_s": 300,
+    "max_redeem_age_days": 7,
+    "dry_run": false
+}
