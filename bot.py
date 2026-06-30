@@ -364,8 +364,20 @@ def parse_position_end_dt(legs):
         try:
             base = datetime.fromisoformat(end_date.replace("Z", "+00:00"))
             if slug_hour is not None:
-                # Slug hour is the start of the window; market closes 1h later
-                et_dt = base.replace(hour=slug_hour, tzinfo=_ET) + timedelta(hours=1)
+                # Convert endDate to ET so we use the correct calendar date.
+                # Evening ET markets (e.g. 10PM ET) have a UTC endDate one day
+                # ahead; naively setting the hour on the UTC date overshoots by
+                # 24 h and the sell window never opens.
+                if base.tzinfo is None:
+                    base = base.replace(tzinfo=ZoneInfo("UTC"))
+                base_et = base.astimezone(_ET)
+                et_dt = base_et.replace(hour=slug_hour, minute=0, second=0, microsecond=0) + timedelta(hours=1)
+                # Guard: pick the candidate day closest to the endDate
+                diff_s = (et_dt - base_et).total_seconds()
+                if diff_s > 12 * 3600:
+                    et_dt -= timedelta(days=1)
+                elif diff_s < -12 * 3600:
+                    et_dt += timedelta(days=1)
                 return et_dt.astimezone(tz=None).replace(tzinfo=None)
             return base
         except Exception:
