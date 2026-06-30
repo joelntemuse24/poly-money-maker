@@ -216,11 +216,12 @@ async, no message queues, no databases.
 
 | File | Purpose | Size |
 |---|---|---|
-| `bot.py` | The main bot — all trading logic lives here | ~928 lines |
-| `dashboard.py` | Live terminal dashboard viewer (reads bot output) | ~244 lines |
+| `bot.py` | The main bot — all trading logic lives here | ~931 lines |
+| `dashboard.py` | Live terminal dashboard viewer (reads bot output) | ~241 lines |
 | `check_book.py` | Diagnostic script for inspecting live order books | ~32 lines |
-| `requirements.txt` | Python dependencies | 9 lines |
+| `requirements.txt` | Python dependencies | 8 lines |
 | `.env` | Environment variables (secrets — gitignored) | — |
+| `TECHNICAL_DESIGN.md` | This document — architecture & code walkthrough | ~2012 lines |
 | `.gitignore` | Excludes secrets, state files, and Python artifacts | — |
 | `positions.json` | Runtime state cache (gitignored, auto-generated) | — |
 | `bot.log` | Structured JSON-line log (gitignored, auto-generated) | — |
@@ -1573,11 +1574,9 @@ the data API reflects actual on-chain holdings.
 The bot sleeps **5 seconds** between cycles (down from 30 seconds in the previous
 version). This tighter loop is possible because:
 
-- The sell trigger is purely price-based (no time window), so faster polling
-  means we catch price drops sooner.
 - `safe_api_call` no longer has a built-in delay, so API calls are faster.
-- 5 seconds is fast enough to react to rapid price movements in the last minutes
-  of a market, while still being reasonable for the API.
+- 5 seconds is fast enough to react to rapid price movements in the final
+  sell window (last 15 minutes), while still being reasonable for the API.
 
 ### 14.7 Dashboard Status Writing
 
@@ -1689,6 +1688,22 @@ bid on the book. The priority is exit, not price.
 was sold and DOWN is collapsing, we hedge DOWN. We don't also check UP (which has
 size ~0 anyway). The `elif` makes this mutual exclusion explicit.
 
+### 15.3 The Hedge Is Implicitly Time-Gated
+
+The hedge phase runs inside the same `for s in managed_sets` loop iteration as
+the sell phase. Because the sell phase starts with:
+
+```python
+if minutes_left > SELL_WINDOW_MIN:
+    continue
+```
+
+…the hedge code is only reachable during the last 15 minutes. This is correct
+behaviour: you can't hedge before you've sold the loser, and you can only sell
+the loser in the last 15 minutes. Once you sell (say at 14 minutes left), all
+subsequent ticks are still within the window, so the hedge check runs every
+cycle until the market expires.
+
 ---
 
 ## 16. State Management & Persistence
@@ -1751,7 +1766,7 @@ The bot's error handling follows a **defensive, fail-safe** philosophy.
         console.print(Panel(
             traceback.format_exc(),
             title="[bold bright_red]■■  SYSTEM FAULT  ■■[/]",
-            subtitle="[dim]auto-restart in 5s · cycle aborted[/]",
+            subtitle="[dim]auto-restart in 5s \u00b7 cycle aborted[/]",
             border_style="bright_red",
             box=box.HEAVY_EDGE,
         ))
@@ -1854,9 +1869,12 @@ string. Different event types get different colours and labels:
 |---|---|
 | `sell_fill` | `[bold bright_yellow]SELL[/] UP 50.00 @ 0.080` |
 | `hedge_fill` | `[bold bright_red]HEDGE[/] DN 100.00 @ 0.450` |
-| `sell_ghost_fill` | `[bold yellow]GHOST[/] UP 50.00 confirmed` |
+| `sell_ghost_fill` / `hedge_ghost_fill` | `[bold yellow]GHOST[/] UP 50.00 confirmed` |
+| `sell_attempt` | `[dim]ATTEMPT[/] UP sell` |
+| `hedge_attempt` | `[dim yellow]HEDGE ATTEMPT[/] DN` |
 | `redeem_submit` | `[bright_magenta]REDEEM[/] submitted` |
 | `cycle_error` | `[bold red]ERROR[/] <last traceback line>` |
+| `gc` | `[dim]GC[/] cleaned stale positions` |
 | `shutdown` | `[bright_green]SHUTDOWN[/] clean exit` |
 
 **`build_dashboard(status, events)`** — Composes the full dashboard layout using
