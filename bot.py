@@ -772,6 +772,13 @@ while not _shutdown_requested:
                     sell_proceeds = gc_meta.get("pnl_sell_proceeds", 0)
                     hedge_proceeds = gc_meta.get("pnl_hedge_proceeds", 0)
                     redeem_value = gc_meta.get("pnl_redeem_value", 0)
+                    # If no explicit redeem was recorded, estimate from remaining holdings.
+                    # Winner resolves at $1/share; use tracked sizes (post-sell) or initial sizes.
+                    if redeem_value == 0:
+                        rem_up = gc_meta.get("expected_up_size", gc_meta.get("pnl_init_up_size", 0))
+                        rem_dn = gc_meta.get("expected_dn_size", gc_meta.get("pnl_init_dn_size", 0))
+                        if rem_up > 0 or rem_dn > 0:
+                            redeem_value = round(max(rem_up, rem_dn), 4)
                     total_return = sell_proceeds + hedge_proceeds + redeem_value
                     outcome = "hedge" if hedge_proceeds > 0 else ("win" if redeem_value > 0 else "flat")
                     net = record_pnl(c, gc_meta.get("question", "?"), entry_cost, sell_proceeds + redeem_value, hedge_proceeds, outcome)
@@ -882,10 +889,14 @@ while not _shutdown_requested:
                 meta["dn_token"] = dn_token
                 meta["question"] = s["question"]
                 meta["end_date"] = s["up"].get("endDate") or s["dn"].get("endDate")
-                # P&L: estimate entry cost from initial holdings (shares * ~$0.50 each side)
+                # P&L: entry cost from actual avgPrice (data-api), fallback $0.50
                 init_up = float(s["up"].get("size", 0))
                 init_dn = float(s["dn"].get("size", 0))
-                meta["pnl_entry_cost"] = round(init_up * 0.50 + init_dn * 0.50, 4)
+                up_avg = float(s["up"].get("avgPrice", 0) or 0) or 0.50
+                dn_avg = float(s["dn"].get("avgPrice", 0) or 0) or 0.50
+                meta["pnl_entry_cost"] = round(init_up * up_avg + init_dn * dn_avg, 4)
+                meta["pnl_init_up_size"] = init_up
+                meta["pnl_init_dn_size"] = init_dn
                 meta["pnl_sell_proceeds"] = 0.0
                 meta["pnl_hedge_proceeds"] = 0.0
                 meta["pnl_redeem_value"] = 0.0
