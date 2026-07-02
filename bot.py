@@ -510,7 +510,8 @@ def get_book_bid(token_id):
             return None, 0.0
         best = max(bids, key=lambda x: float(x.get("price", 0)))
         return float(best.get("price", 0)), float(best.get("size", 0))
-    except Exception:
+    except Exception as e:
+        log_event("book_fetch_fail", token_id=token_id, error=str(e))
         return None, 0.0
 
 
@@ -775,8 +776,10 @@ while not _shutdown_requested:
                     # If no explicit redeem was recorded, estimate from remaining holdings.
                     # Winner resolves at $1/share; use tracked sizes (post-sell) or initial sizes.
                     if redeem_value == 0:
-                        rem_up = gc_meta.get("expected_up_size", gc_meta.get("pnl_init_up_size", 0))
-                        rem_dn = gc_meta.get("expected_dn_size", gc_meta.get("pnl_init_dn_size", 0))
+                        # Use expected sizes if non-zero, else fall back to init sizes
+                        # (orphan expiry path may have zeroed expected_*_size)
+                        rem_up = gc_meta.get("expected_up_size", 0) or gc_meta.get("pnl_init_up_size", 0)
+                        rem_dn = gc_meta.get("expected_dn_size", 0) or gc_meta.get("pnl_init_dn_size", 0)
                         if rem_up > 0 or rem_dn > 0:
                             redeem_value = round(max(rem_up, rem_dn), 4)
                     total_return = sell_proceeds + hedge_proceeds + redeem_value
@@ -877,8 +880,8 @@ while not _shutdown_requested:
             if minutes_left <= 0:
                 continue
             cond = s["conditionId"]
-            if cond in _redeem_permanent_failures:
-                continue
+            # Note: do NOT skip sell phase for _redeem_permanent_failures —
+            # a bad redeem response should never prevent selling the loser.
 
             up_token = s["up"].get("asset")
             dn_token = s["dn"].get("asset")
@@ -913,6 +916,19 @@ while not _shutdown_requested:
 
             up_bid, _ = get_book_bid(up_token) if up_token else (None, 0.0)
             dn_bid, _ = get_book_bid(dn_token) if dn_token else (None, 0.0)
+
+            # Alert if book fetch failed for either leg during the sell window
+            if up_bid is None and up_size > 0:
+                log_event("sell_skip_no_book", condition_id=cond, leg="up", minutes_left=round(minutes_left, 1))
+            if dn_bid is None and dn_size > 0:
+                log_event("sell_skip_no_book", condition_id=cond, leg="dn", minutes_left=round(minutes_left, 1))
+            if up_bid is None and dn_bid is None and (up_size > 0 or dn_size > 0):
+                _book_fail_count = meta.get("_book_fail_count", 0) + 1
+                meta["_book_fail_count"] = _book_fail_count
+                if _book_fail_count == 6:  # ~30s of failures at 5s tick
+                    notify("\u26a0 Book Unavailable", f"{s['question']} \u2014 order book unreachable with {round(minutes_left)}m left", priority="high")
+            else:
+                meta["_book_fail_count"] = 0
 
             up_price, up_matched_price = quote_leg(up_bid)
             dn_price, dn_matched_price = quote_leg(dn_bid)
