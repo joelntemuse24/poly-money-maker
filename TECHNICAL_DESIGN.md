@@ -216,20 +216,25 @@ async, no message queues, no databases.
 
 | File | Purpose | Size |
 |---|---|---|
-| `bot.py` | The main bot — all trading logic lives here | ~931 lines |
-| `dashboard.py` | Live terminal dashboard viewer (reads bot output) | ~241 lines |
-| `check_book.py` | Diagnostic script for inspecting live order books | ~32 lines |
+| `bot.py` | The main bot — all trading logic lives here | ~1120 lines |
+| `dashboard.py` | Live terminal dashboard viewer (reads bot output) | ~250 lines |
+| `check_book.py` | Diagnostic script for inspecting live order books | ~31 lines |
 | `requirements.txt` | Python dependencies | 8 lines |
+| `strategy.example.json` | Example strategy config with all tunable parameters | — |
+| `.github/workflows/deploy.yml` | CI/CD pipeline — auto-deploy on push to main | — |
 | `.env` | Environment variables (secrets — gitignored) | — |
-| `TECHNICAL_DESIGN.md` | This document — architecture & code walkthrough | ~2012 lines |
+| `strategy.json` | Live strategy config (hot-reloaded each cycle, gitignored) | — |
+| `TECHNICAL_DESIGN.md` | This document — architecture & code walkthrough | — |
 | `.gitignore` | Excludes secrets, state files, and Python artifacts | — |
 | `positions.json` | Runtime state cache (gitignored, auto-generated) | — |
-| `bot.log` | Structured JSON-line log (gitignored, auto-generated) | — |
+| `pnl.json` | P&L history — one entry per completed trade (gitignored) | — |
+| `bot.log` | Structured JSON-line log with rotation (gitignored, auto-generated) | — |
 | `.dashboard_status.json` | Per-cycle status snapshot for dashboard (gitignored) | — |
+| `.heartbeat` | Tick counter updated every cycle for uptime monitoring (gitignored) | — |
 
 ### Why a Single-File Bot?
 
-For a bot of this size (~930 lines), splitting into modules would add import
+For a bot of this size (~1120 lines), splitting into modules would add import
 overhead and cognitive load without meaningful benefit. The code is organised
 internally with **section comment banners** (e.g., `# --- HELPER FUNCTIONS ---`)
 that act as visual module boundaries. The dashboard is separate because it's a
@@ -289,41 +294,78 @@ The bot reads credentials and relayer configuration from environment variables:
 | `RELAYER_API_KEY_ADDRESS` | Relayer key address (has a hardcoded default). |
 | `NTFY_TOPIC` | ntfy.sh push notification topic (defaults to `polybot-joel-btc`). |
 
-### 6.2 Strategy Constants
+### 6.2 Strategy Constants (Hot-Reloaded from `strategy.json`)
 
-Unlike the earlier version of this bot which used `os.getenv` for strategy
-parameters, the current version uses **hardcoded constants**:
+Strategy parameters are loaded from `strategy.json` at the start of **every
+cycle** (every 5 seconds). This allows you to change thresholds without
+restarting the bot — just edit the file and the next tick picks up the new values.
 
-```@/c:/Users/ntemu/Downloads/poly money maker/bot.py:51-59
-# ------------------------- STRATEGY CONFIG -------------------------
-SELL_THRESHOLD = 0.08        # Sell the "loser" leg when per-share bid <= this
-HEDGE_THRESHOLD = 0.50       # After selling loser, sell the held leg if it drops below this
-SELL_WINDOW_MIN = 15         # Only sell in the last N minutes of the hour (reduces reversal risk)
-SELL_GRACE_S = 10            # Wait N seconds after first seeing a position before selling
-SELL_COOLDOWN_S = 30         # Min seconds between sell attempts on the same leg
-REDEEM_THROTTLE_S = 300      # Min seconds between redemption retries
-MAX_REDEEM_AGE_DAYS = 7      # Stop trying to redeem after N days
-DRY_RUN = False
+Defaults are defined in `_STRATEGY_DEFAULTS` and used if the file is missing or
+malformed:
+
+```python
+_STRATEGY_DEFAULTS = {
+    "sell_threshold": 0.08,
+    "sell_threshold_early": 0.04,
+    "sell_aggressive_min": 9,
+    "hedge_threshold": 0.50,
+    "sell_window_min": 15,
+    "sell_grace_s": 10,
+    "sell_cooldown_s": 30,
+    "redeem_throttle_s": 300,
+    "max_redeem_age_days": 7,
+    "dry_run": False,
+}
 ```
 
-**Why hardcoded constants instead of env-based?** The strategy parameters are
-tightly coupled to the bot's risk model. Changing them without understanding the
-full flow could lead to unexpected losses. By hardcoding, we make it explicit
-that these are the *design parameters* — not runtime-tunable knobs. If you want
-to experiment, you edit the code (and hopefully read the comments first).
+**Why hot-reload instead of hardcoded?** During live trading, you sometimes need
+to adjust thresholds without downtime — e.g., tightening `sell_threshold` from
+8¢ to 6¢ during volatile conditions, or enabling `dry_run` to debug without
+restarting. The `load_strategy()` function reads the file each cycle, coerces
+types safely (booleans use `str(v).lower() in ("1", "true", "yes")`), and falls
+back to defaults on any parse error.
 
-| Constant | Value | Meaning |
+An example file is committed as `strategy.example.json` for reference.
+
+| Constant | Default | Meaning |
 |---|---|---|
-| `SELL_THRESHOLD` | `0.08` (8 cents) | If the loser leg's best bid drops to or below this price, sell it. Below 8 cents, the remaining value isn't worth the risk of holding. |
-| `HEDGE_THRESHOLD` | `0.50` (50 cents) | After selling the loser, if the held (winner) leg drops below 50 cents, sell it too. This is the reversal protection — if the market flips, we cut losses at 50 cents rather than riding to $0. |
-| `SELL_WINDOW_MIN` | `15` minutes | Only sell within the last 15 minutes before market expiry. This **time-gates** the sell trigger — even if the loser leg hits 8 cents with 2 hours left, the bot waits until the final 15 minutes. This reduces reversal risk: selling early locks in a few cents but exposes you to the market flipping; selling late means the outcome is nearly certain. |
-| `SELL_GRACE_S` | `10` seconds | When we first discover a new position, wait 10 seconds before selling. This prevents selling on the very first tick where data might be stale or incomplete. |
-| `SELL_COOLDOWN_S` | `30` seconds | After selling a leg, wait 30 seconds before attempting another sell on the same leg. Prevents hammering the API with rapid-fire orders. |
-| `REDEEM_THROTTLE_S` | `300` seconds (5 min) | After submitting a redemption, wait 5 minutes before retrying. Redemptions are on-chain transactions that take time to confirm. |
-| `MAX_REDEEM_AGE_DAYS` | `7` days | Stop trying to redeem after 7 days past expiry. Old conditions may have been cleaned up on-chain and retries are pointless. |
-| `DRY_RUN` | `False` | When `True`, the bot logs decisions but doesn't send orders or transactions. Used for testing. |
+| `sell_threshold` | `0.08` (8 cents) | If the loser leg's best bid drops to or below this price, sell it (used in aggressive tier, minutes 9→0). |
+| `sell_threshold_early` | `0.04` (4 cents) | Minimum bid to sell during the early tier (minutes 15→9). Prevents selling dust positions for negligible value. |
+| `sell_aggressive_min` | `9` minutes | The boundary between early and aggressive tiers within the sell window. |
+| `hedge_threshold` | `0.50` (50 cents) | After selling the loser, if the held (winner) leg drops below 50 cents, sell it too. This is the reversal protection — if the market flips, we cut losses at 50 cents rather than riding to $0. |
+| `sell_window_min` | `15` minutes | Only sell within the last 15 minutes before market expiry. This **time-gates** the sell trigger — even if the loser leg hits 8 cents with 2 hours left, the bot waits until the final 15 minutes. This reduces reversal risk: selling early locks in a few cents but exposes you to the market flipping; selling late means the outcome is nearly certain. |
+| `sell_grace_s` | `10` seconds | When we first discover a new position, wait 10 seconds before selling. This prevents selling on the very first tick where data might be stale or incomplete. |
+| `sell_cooldown_s` | `30` seconds | After selling a leg, wait 30 seconds before attempting another sell on the same leg. Prevents hammering the API with rapid-fire orders. |
+| `redeem_throttle_s` | `300` seconds (5 min) | After submitting a redemption, wait 5 minutes before retrying. Redemptions are on-chain transactions that take time to confirm. |
+| `max_redeem_age_days` | `7` days | Stop trying to redeem after 7 days past expiry. Old conditions may have been cleaned up on-chain and retries are pointless. |
+| `dry_run` | `false` | When `true`, the bot logs decisions but doesn't send orders or transactions. Used for testing. |
 
-### 6.3 Other Constants
+### 6.3 Tiered Sell Thresholds
+
+The sell window (last 15 minutes) is split into two tiers to balance value
+capture against reversal risk:
+
+```
+     15m ──────────── 9m ──────────── 0m (expiry)
+     │   EARLY TIER   │  AGGRESSIVE  │
+     │  4¢ ≤ bid ≤ 8¢ │  bid ≤ 8¢    │
+     └────────────────┴──────────────┘
+```
+
+- **Early tier (minutes 15→9):** Only sell if the bid is between
+  `sell_threshold_early` (4¢) and `sell_threshold` (8¢). A bid below 4¢ is not
+  worth the execution risk — just let it expire. A bid above 8¢ suggests the
+  market hasn't fully decided yet.
+
+- **Aggressive tier (minutes 9→0):** Sell at any bid ≤ `sell_threshold` (8¢).
+  With under 9 minutes left, the outcome is nearly certain, so even a 2¢ bid is
+  worth capturing vs. letting it expire at $0.
+
+This tiered approach was informed by real trading history: sells at 1-2¢ with 15
+minutes left produced negligible value ($0.04 on 2 shares, $0.25 on 20 shares)
+while still carrying reversal risk.
+
+### 6.4 Other Constants
 
 ```@/c:/Users/ntemu/Downloads/poly money maker/bot.py:31-38
 HOST = "https://clob.polymarket.com"
@@ -531,9 +573,124 @@ for 30 seconds waiting. 5 seconds is generous for a push notification.
 - **Bot started** — confirmation that the bot is running (priority: high)
 - **Hedge fired** — reversal detected, cutting losses (priority: urgent)
 - **Hedge ghost fill** — hedge confirmed via balance check (priority: urgent)
+- **Book unavailable** — order book API unreachable for ~30s during sell window (priority: high)
 
 The bot doesn't notify on normal sells — those are expected and frequent. Only
 exceptional events warrant a push.
+
+### 8.4 CI/CD Auto-Deploy Pipeline
+
+The bot uses **GitHub Actions** for continuous deployment. When code is pushed to
+`main` (specifically changes to `bot.py`, `dashboard.py`, `requirements.txt`, or
+`strategy.json`), the pipeline SSHs into the GCP instance and deploys:
+
+```yaml
+# .github/workflows/deploy.yml
+name: Deploy to GCP
+on:
+  push:
+    branches: [main]
+    paths: ['bot.py', 'dashboard.py', 'requirements.txt', 'strategy.json']
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Deploy via SSH
+        uses: appleboy/ssh-action@v1
+        with:
+          host: ${{ secrets.GCP_HOST }}
+          username: ${{ secrets.GCP_USER }}
+          key: ${{ secrets.GCP_SSH_KEY }}
+          script: |
+            cd ~/poly-money-maker
+            git pull origin main
+            pip install -r requirements.txt --quiet
+            sudo systemctl restart polybot
+```
+
+**Why SSH-based deployment?** For a single-instance bot, this is the simplest
+approach: no container registry, no orchestrator, no rolling deploy needed.
+The bot is a single process managed by systemd — restarting it takes < 2 seconds
+and the state file (`positions.json`) survives restarts.
+
+**Required GitHub secrets:** `GCP_HOST` (instance IP), `GCP_USER` (SSH
+username), `GCP_SSH_KEY` (ED25519 private key for SSH auth).
+
+### 8.5 Log Rotation
+
+```python
+LOG_FILE = "bot.log"
+LOG_MAX_BYTES = 5 * 1024 * 1024   # 5 MB per file
+LOG_BACKUP_COUNT = 3              # keep bot.log, bot.log.1, bot.log.2, bot.log.3
+
+_file_logger = logging.getLogger("polybot")
+_file_logger.setLevel(logging.INFO)
+_log_handler = RotatingFileHandler(LOG_FILE, maxBytes=LOG_MAX_BYTES, backupCount=LOG_BACKUP_COUNT)
+_log_handler.setFormatter(logging.Formatter("%(message)s"))
+_file_logger.addHandler(_log_handler)
+```
+
+**Why log rotation?** Without it, `bot.log` grows indefinitely — at 5s ticks
+with sells happening hourly, the log can reach 100+ MB within weeks. The
+`RotatingFileHandler` from Python's `logging` module automatically rolls over
+to `bot.log.1`, `.2`, `.3` when the file hits 5 MB, keeping total disk usage
+under 20 MB.
+
+### 8.6 Heartbeat File
+
+Each cycle, the bot writes the current tick count to `.heartbeat`:
+
+```python
+with open(HEARTBEAT_FILE, "w") as hf:
+    hf.write(str(CYCLE))
+```
+
+**Why a heartbeat file?** External monitoring (e.g., a cron job or systemd
+watchdog) can check the file's modification time. If `.heartbeat` hasn't been
+updated in > 30 seconds, the bot is frozen. This is simpler and more reliable
+than parsing logs or checking process status — a hung Python process might still
+show as "running" in `ps` but not actually be doing work.
+
+### 8.7 P&L Tracking
+
+The bot records a P&L entry for each completed trade when a position is
+garbage-collected (GC'd — meaning it no longer appears in the data-api response):
+
+```python
+def record_pnl(cond, meta, outcome):
+    """Append a P&L record to pnl.json for a completed trade."""
+    pnl_data = load_json(PNL_FILE)
+    pnl_data[cond] = {
+        "question": meta.get("question", "?"),
+        "entry_cost": meta.get("pnl_entry_cost", 0),
+        "sell_proceeds": meta.get("pnl_sell_proceeds", 0),
+        "hedge_proceeds": meta.get("pnl_hedge_proceeds", 0),
+        "redeem_value": meta.get("pnl_redeem_value", 0),
+        "outcome": outcome,
+        "closed_at": datetime.now().isoformat(),
+    }
+    save_json(PNL_FILE, pnl_data)
+```
+
+**P&L fields tracked in `positions_meta`:**
+
+| Field | Source | When Set |
+|---|---|---|
+| `pnl_entry_cost` | `size × avgPrice` from data-api | First sighting of position |
+| `pnl_init_up_size` / `pnl_init_dn_size` | Initial share counts from data-api | First sighting |
+| `pnl_sell_proceeds` | `sold × observed_bid` | After each sell fill |
+| `pnl_hedge_proceeds` | `sold × observed_bid` | After each hedge fill |
+| `pnl_redeem_value` | `shares × $1.00` (estimated from remaining holdings) | On GC or explicit redeem |
+
+**Entry cost accuracy:** Uses the actual `avgPrice` field returned by the
+data-api (typically ~$0.51-0.53 per share), not a $0.50 guess. Total entry cost
+is `up_size × up_avgPrice + dn_size × dn_avgPrice`.
+
+**Redemption estimation:** When a position disappears from the data-api
+(resolved and auto-redeemed by Polymarket), the bot estimates winner payout
+from remaining holdings: `max(remaining_up, remaining_dn) × $1.00`. This
+handles the common case where positions are redeemed by the protocol before
+the bot's explicit `redeem_condition` call.
 
 ---
 
@@ -743,11 +900,12 @@ This is the **ghost fill detection** pattern, which we'll see in the sell phase.
 
 ### 10.3 `parse_position_end_dt` — Parsing Market Expiry from Slugs
 
-```@/c:/Users/ntemu/Downloads/poly money maker/bot.py:233-277
+```python
 _ET = ZoneInfo("America/New_York")
 _SLUG_TIME_RE = re.compile(r"(\d{1,2})(am|pm)-et$")
 
 def parse_position_end_dt(legs):
+    # Strategy 1: Unix timestamp in slug
     for p in legs:
         for key in ("slug", "eventSlug"):
             slug = p.get(key) or ""
@@ -756,38 +914,80 @@ def parse_position_end_dt(legs):
                 ts = int(tail)
                 if ts > 1_700_000_000:
                     return datetime.fromtimestamp(ts)
-    ...
+
+    # Strategy 2: Hour+AM/PM from slug + UTC date matching
+    for p in legs:
+        for key in ("slug", "eventSlug"):
+            slug = p.get(key) or ""
+            m = _SLUG_TIME_RE.search(slug)
+            if not m:
+                continue
+            hour_12 = int(m.group(1))
+            ampm = m.group(2)
+            # Convert to 24h; slug hour is window START, expiry = +1h
+            hour_24 = (hour_12 % 12) + (12 if ampm == "pm" else 0)
+            expiry_hour = (hour_24 + 1) % 24
+
+            end_date_str = p.get("endDate") or ""
+            end_date_utc = ...  # parse to UTC date
+
+            # Try day_offset in (0, -1, 1) to find which date's
+            # expiry falls on end_date's UTC calendar date
+            for day_offset in (0, -1, 1):
+                candidate = datetime(year, month, day + day_offset,
+                                     expiry_hour, 0, tzinfo=_ET)
+                if candidate.astimezone(UTC).date() == end_date_utc:
+                    return candidate.astimezone(tz=None).replace(tzinfo=None)
 ```
 
-**What it does:** Determines when a market expires by parsing the slug. This is
-necessary because the `endDate` field from the API isn't always reliable —
-sometimes it's missing, sometimes it's in the wrong timezone.
+**What it does:** Determines when a market expires by parsing the slug and
+matching it against the `endDate` from the API. This is the most critical
+calculation in the bot — getting it wrong means the sell window opens at the
+wrong time (or never).
 
 **The two parsing strategies:**
 
 1. **Unix timestamp in slug** — Some slugs end with a Unix timestamp (e.g.,
    `bitcoin-up-or-down-1719259200`). We extract the last segment after `-`,
    check if it's a large number (> 1.7 billion = year 2024), and convert it
-   directly.
+   directly. Simple and unambiguous.
 
-2. **Hour + AM/PM from slug** — Other slugs end with a time like `12pm-et`
-   (e.g., `bitcoin-up-or-down-2024-06-24-12pm-et`). We use a **regex**
-   (`_SLUG_TIME_RE`) to extract the hour and AM/PM, convert to 24-hour format,
-   then combine with the `endDate` to compute the actual expiry. The slug hour
-   is the *start* of the hourly window; the market closes 1 hour later.
+2. **Hour + AM/PM from slug with UTC date matching** — Most BTC hourly slugs
+   end with a time like `5pm-et` (e.g., `bitcoin-up-or-down-2024-06-24-5pm-et`).
+   We use a regex to extract the hour and AM/PM, convert to 24-hour format, then
+   add 1 hour (slug is the window *start*; market *closes* 1 hour later).
+
+   The critical challenge is determining the correct **calendar date** for the
+   expiry. The API provides an `endDate` field in UTC (e.g., `2026-07-04`), but
+   because ET is UTC-4 (EDT), evening markets cross midnight UTC. For example:
+   - A "9PM ET" market expires at 10PM ET = 02:00 UTC **the next day**
+   - A "5PM ET" market expires at 6PM ET = 22:00 UTC **the same day**
+
+   The old approach (PRs #31) used a ±12h heuristic that only worked for
+   late-night/early-morning hours. The current approach (PR #35) is correct by
+   construction: it tries `day_offset` values of 0, -1, and +1, computing the
+   candidate expiry in ET, converting to UTC, and checking if the UTC calendar
+   date matches `endDate`. Exactly one offset will match for any hour, both
+   during EDT and EST.
 
 **Why `ZoneInfo("America/New_York")`?** BTC hourly markets on Polymarket use
 Eastern Time (ET) for their slug times. We need to interpret "12pm ET" correctly
 regardless of what timezone the server runs in. `ZoneInfo` provides proper
-timezone-aware datetime handling.
+timezone-aware datetime handling, including automatic EDT/EST transitions.
 
 **Why `_ET` and `_SLUG_TIME_RE` at module level?** These are **compiled once**
 at import time and reused across all calls. Compiling a regex on every function
 call would be wasteful. The leading underscore marks them as internal.
 
-**Why `rsplit("-", 1)[-1]`?** `rsplit` splits from the right. `rsplit("-", 1)`
-splits into at most 2 parts, taking only the last `-` separator. `[-1]` gets the
-last segment. For `bitcoin-up-or-down-1719259200`, this returns `1719259200`.
+**Why the day_offset loop instead of naive date arithmetic?** Naive approaches
+(like "just use the endDate as the ET date") fail for evening markets that cross
+the UTC midnight boundary. The loop is a brute-force but provably correct
+solution: since the expiry can only be on the endDate's UTC calendar date, and
+the ET→UTC offset is at most ±1 day, trying 3 offsets guarantees finding it.
+
+**Verified for all 24 hours:** This approach has been tested against every
+hourly slot (12AM through 11PM ET) in both EDT and EST, confirming correct
+results for all cases.
 
 ### 10.4 `empty_opposite_leg` — Constructing Missing Legs
 
@@ -1474,40 +1674,49 @@ outcome is nearly settled and reversal is unlikely.
 We only fetch the order book for legs we actually hold. `quote_leg` converts the
 raw bid into the pricing tuple used for decisions.
 
-**Step 4: Trigger evaluation**
+**Step 4: Tiered trigger evaluation**
 
-```@/c:/Users/ntemu/Downloads/poly money maker/bot.py:745-754
-            up_trigger = up_size > 0 and up_price is not None and up_price <= SELL_THRESHOLD
-            dn_trigger = dn_size > 0 and dn_price is not None and dn_price <= SELL_THRESHOLD
-
-            # Guard: if both legs trigger, only sell the lower-priced one to ensure
-            # we still hold a winner for the $1 payout at resolution.
-            if up_trigger and dn_trigger:
-                if up_price <= dn_price:
-                    dn_trigger = False
-                else:
-                    up_trigger = False
-```
-
-**The trigger has two conditions:** Sell a leg if (1) we hold shares, there's a
-bid, and the bid is at or below 8 cents, **and** (2) the market is in its final
-15 minutes (`minutes_left <= SELL_WINDOW_MIN`). The time gate is enforced by
-the check at the top of the sell phase:
+The trigger logic applies different thresholds depending on how far into the
+sell window we are (see §6.3 for the tier diagram):
 
 ```python
-# Only sell in the last SELL_WINDOW_MIN minutes to reduce reversal risk
-if minutes_left > SELL_WINDOW_MIN:
-    continue
+# Determine which threshold applies based on time remaining
+if minutes_left > SELL_AGGRESSIVE_MIN:
+    # Early tier (15→9 min): only sell between 4¢ and 8¢
+    up_trigger = (up_size > 0 and up_price is not None
+                  and SELL_THRESHOLD_EARLY <= up_price <= SELL_THRESHOLD)
+    dn_trigger = (dn_size > 0 and dn_price is not None
+                  and SELL_THRESHOLD_EARLY <= dn_price <= SELL_THRESHOLD)
+else:
+    # Aggressive tier (9→0 min): sell at any price ≤ 8¢
+    up_trigger = up_size > 0 and up_price is not None and up_price <= SELL_THRESHOLD
+    dn_trigger = dn_size > 0 and dn_price is not None and dn_price <= SELL_THRESHOLD
+
+# Guard: if both legs trigger, only sell the lower-priced one to ensure
+# we still hold a winner for the $1 payout at resolution.
+if up_trigger and dn_trigger:
+    if up_price <= dn_price:
+        dn_trigger = False
+    else:
+        up_trigger = False
 ```
 
-This means even if the loser leg hits 8 cents with 2 hours left, the bot waits.
-Selling early locks in a few cents but exposes you to the market reversing —
-the held "winner" could flip and go to $0. By waiting until the final 15
-minutes, the outcome is nearly certain and reversal risk is minimal.
+**The trigger logic:**
+
+- **Early tier (minutes 15→9):** `SELL_THRESHOLD_EARLY <= price <= SELL_THRESHOLD`
+  (4¢-8¢). A bid below 4¢ is not worth selling — the execution risk outweighs
+  the $0.04/share recovery. A bid above 8¢ means the market hasn't decided yet.
+
+- **Aggressive tier (minutes 9→0):** `price <= SELL_THRESHOLD` (any bid ≤ 8¢).
+  With under 9 minutes left, the outcome is nearly certain. Even a 2¢ bid is
+  worth capturing vs. letting it expire worthless.
+
+- **Both tiers are gated by the sell window** — nothing happens until
+  `minutes_left <= SELL_WINDOW_MIN` (15 min).
 
 **Mutual exclusion:** If both legs trigger (both at ≤ 8 cents), only sell the one
 with the lower bid (the bigger loser). We always keep the winning leg to redeem
-$1.00 at resolution.
+$1.00 at resolution. Tie breaks sell UP.
 
 **Step 5: Cooldown check**
 
@@ -1723,6 +1932,11 @@ the data API every cycle. We only persist things that the API *can't* tell us:
 | `expected_up_size` / `expected_dn_size` | Our estimate of remaining shares after a partial or ghost sell. |
 | `last_sell_up_at` / `last_sell_dn_at` | Timestamps for the 30-second sell cooldown. |
 | `redeem_submitted_at` | Timestamp for the 5-minute redeem throttle. |
+| `pnl_entry_cost` | Total entry cost (`size × avgPrice` per leg). |
+| `pnl_init_up_size` / `pnl_init_dn_size` | Initial share counts at first sighting. |
+| `pnl_sell_proceeds` | Accumulated sell revenue (loser leg). |
+| `pnl_hedge_proceeds` | Accumulated hedge revenue (if reversal occurred). |
+| `pnl_redeem_value` | Estimated/actual redemption value for winner leg. |
 
 **Why not persist sizes?** Because the API is the source of truth for sizes. If
 we cached sizes and the cache got out of sync (e.g., we sold shares but the
@@ -1805,7 +2019,8 @@ is allowed to crash the bot — at worst, a cycle is skipped.
 
 ### 17.3 The Complete Audit Log
 
-Every significant action is logged to `bot.log`:
+Every significant action is logged to `bot.log` (with log rotation via
+`RotatingFileHandler` — see §8.5):
 
 | Event | When | Key Fields |
 |---|---|---|
@@ -1813,11 +2028,14 @@ Every significant action is logged to `bot.log`:
 | `sell_fill` | After a successful sell | `condition_id`, `leg`, `sold`, `remaining`, `price` |
 | `sell_ghost_fill` | Sell confirmed via balance check | `condition_id`, `leg`, `sold`, `remaining`, `price` |
 | `sell_fail` | After a failed sell (0 filled, no ghost) | `condition_id`, `leg`, `size`, `bid`, `price_limit` |
+| `sell_skip_no_book` | Order book unavailable during sell window | `condition_id`, `leg`, `minutes_left` |
 | `hedge_attempt` | Before submitting a hedge sell | `condition_id`, `leg`, `size`, `bid`, `price_limit` |
 | `hedge_fill` | After a successful hedge sell | `condition_id`, `leg`, `sold`, `remaining`, `price` |
 | `hedge_ghost_fill` | Hedge confirmed via balance check | `condition_id`, `leg`, `sold`, `remaining`, `price` |
 | `hedge_fail` | After a failed hedge sell | `condition_id`, `leg`, `size`, `bid` |
+| `book_fetch_fail` | Order book API threw an exception | `token_id`, `error` |
 | `redeem_submit` | After submitting a redemption | `condition_id`, `tx_id` |
+| `pnl_record` | P&L entry written for a completed trade | `condition_id`, `outcome`, `entry_cost`, `proceeds` |
 | `dry_sell` | DRY_RUN sell simulation | `token_id`, `size`, `price_limit` |
 | `dry_redeem` | DRY_RUN redeem simulation | `condition_id`, `label` |
 | `gc` | After garbage-collecting stale metadata | `stale_conditions` |
@@ -2025,6 +2243,9 @@ asymmetry is fundamental to how order books work.
 
 ---
 
-*This document was generated as a technical design reference for the Poly Money
-Maker trading bot. It reflects the current state of the codebase on the `main`
-branch (commit `3e6d415` — "Restrict sells to last 15 minutes of the hour").*
+*This document was last updated to reflect the codebase on the `main` branch
+(commit `283db15`). Key changes since the original version: hot-reload strategy
+config (PR #30), CI/CD auto-deploy (PR #30), P&L tracking with actual entry
+costs (PR #34), tiered sell thresholds (PR #33), comprehensive TTM fix for all
+24 hourly slots using UTC date matching (PR #35), log rotation, and heartbeat
+monitoring.*
