@@ -367,7 +367,7 @@ while still carrying reversal risk.
 
 ### 6.4 Other Constants
 
-```@/c:/Users/ntemu/Downloads/poly money maker/bot.py:31-38
+```@/c:/Users/ntemu/Downloads/poly money maker/bot.py:33-42
 HOST = "https://clob.polymarket.com"
 DATA_API = "https://data-api.polymarket.com"
 CHAIN_ID = 137
@@ -395,7 +395,7 @@ CTF = "0x4D97DCd97eC945f40cF65F87097ACe5EA0476045"
 
 ## 7. Client Setup & Authentication
 
-```@/c:/Users/ntemu/Downloads/poly money maker/bot.py:60-81
+```@/c:/Users/ntemu/Downloads/poly money maker/bot.py:117-137
 if API_KEY and API_SECRET and API_PASSPHRASE:
     from py_clob_client_v2 import ApiCreds
     api_creds = ApiCreds(
@@ -447,7 +447,7 @@ auth issues.
 
 ### 7.3 Collateral Synchronisation
 
-```@/c:/Users/ntemu/Downloads/poly money maker/bot.py:83-88
+```@/c:/Users/ntemu/Downloads/poly money maker/bot.py:139-144
 try:
     from py_clob_client_v2.client import BalanceAllowanceParams
     client.update_balance_allowance(BalanceAllowanceParams(asset_type="COLLATERAL"))
@@ -463,7 +463,7 @@ crash — the bot might still function for sell-only operations.
 
 ### 7.4 The Banner and DRY_RUN Flag
 
-```@/c:/Users/ntemu/Downloads/poly money maker/bot.py:90-108
+```@/c:/Users/ntemu/Downloads/poly money maker/bot.py:146-164
 ```
 
 The ASCII art banner provides immediate visual confirmation that the bot started
@@ -478,7 +478,7 @@ strategy changes without risking funds.
 
 ### 8.1 Signal Handling
 
-```@/c:/Users/ntemu/Downloads/poly money maker/bot.py:110-123
+```@/c:/Users/ntemu/Downloads/poly money maker/bot.py:168-179
 _shutdown_requested = False
 
 
@@ -518,7 +518,7 @@ from outside." These exist solely to support the shutdown mechanism.
 
 ### 8.2 Permanent Redeem Failures
 
-```@/c:/Users/ntemu/Downloads/poly money maker/bot.py:125-126
+```@/c:/Users/ntemu/Downloads/poly money maker/bot.py:182
 _redeem_permanent_failures = set()
 ```
 
@@ -534,7 +534,7 @@ the right data structure is good practice.
 
 ### 8.3 Push Notifications via ntfy.sh
 
-```@/c:/Users/ntemu/Downloads/poly money maker/bot.py:130-145
+```@/c:/Users/ntemu/Downloads/poly money maker/bot.py:186-201
 NTFY_TOPIC = os.getenv("NTFY_TOPIC", "polybot-joel-btc")
 
 def notify(title, message, priority="default"):
@@ -638,11 +638,17 @@ under 20 MB.
 
 ### 8.6 Heartbeat File
 
-Each cycle, the bot writes the current tick count to `.heartbeat`:
+Each cycle, the bot writes a JSON object with timestamp and tick count to
+`.heartbeat`:
 
-```python
-with open(HEARTBEAT_FILE, "w") as hf:
-    hf.write(str(CYCLE))
+```@/c:/Users/ntemu/Downloads/poly money maker/bot.py:252-258
+def write_heartbeat():
+    """Write current timestamp to heartbeat file for health monitoring."""
+    try:
+        with open(HEARTBEAT_FILE, "w") as f:
+            json.dump({"ts": time.time(), "iso": datetime.now().isoformat(), "cycle": CYCLE}, f)
+    except Exception:
+        pass
 ```
 
 **Why a heartbeat file?** External monitoring (e.g., a cron job or systemd
@@ -654,22 +660,38 @@ show as "running" in `ps` but not actually be doing work.
 ### 8.7 P&L Tracking
 
 The bot records a P&L entry for each completed trade when a position is
-garbage-collected (GC'd — meaning it no longer appears in the data-api response):
+garbage-collected (GC'd — meaning it no longer appears in the data-api response).
+The P&L system maintains a cumulative summary (total P&L, wins, losses) and a
+list of individual trade records, capped at 500 to prevent unbounded growth:
 
-```python
-def record_pnl(cond, meta, outcome):
-    """Append a P&L record to pnl.json for a completed trade."""
-    pnl_data = load_json(PNL_FILE)
-    pnl_data[cond] = {
-        "question": meta.get("question", "?"),
-        "entry_cost": meta.get("pnl_entry_cost", 0),
-        "sell_proceeds": meta.get("pnl_sell_proceeds", 0),
-        "hedge_proceeds": meta.get("pnl_hedge_proceeds", 0),
-        "redeem_value": meta.get("pnl_redeem_value", 0),
+```@/c:/Users/ntemu/Downloads/poly money maker/bot.py:272-298
+def record_pnl(condition_id, question, entry_cost, sell_proceeds, hedge_proceeds, outcome):
+    """Record a completed trade's P&L."""
+    pnl_data = load_pnl()
+    net = sell_proceeds + hedge_proceeds - entry_cost
+    trade = {
+        "ts": datetime.now().isoformat(),
+        "condition_id": condition_id,
+        "question": question[:40],
+        "entry_cost": round(entry_cost, 4),
+        "sell_proceeds": round(sell_proceeds, 4),
+        "hedge_proceeds": round(hedge_proceeds, 4),
+        "net_pnl": round(net, 4),
         "outcome": outcome,
-        "closed_at": datetime.now().isoformat(),
     }
-    save_json(PNL_FILE, pnl_data)
+    pnl_data["trades"].append(trade)
+    s = pnl_data["summary"]
+    s["total_pnl"] = round(s["total_pnl"] + net, 4)
+    s["total_trades"] += 1
+    if net >= 0:
+        s["wins"] += 1
+    else:
+        s["losses"] += 1
+    # Keep last 500 trades to prevent unbounded growth
+    if len(pnl_data["trades"]) > 500:
+        pnl_data["trades"] = pnl_data["trades"][-500:]
+    atomic_save(PNL_FILE, pnl_data)
+    return net
 ```
 
 **P&L fields tracked in `positions_meta`:**
@@ -701,7 +723,7 @@ cross-cutting concerns: API safety, file I/O, logging, and balance queries.
 
 ### 9.1 `safe_api_call` — The Error Filter
 
-```@/c:/Users/ntemu/Downloads/poly money maker/bot.py:150-157
+```@/c:/Users/ntemu/Downloads/poly money maker/bot.py:206-213
 def safe_api_call(func, *args, **kwargs):
     try:
         return func(*args, **kwargs)
@@ -731,7 +753,7 @@ of concerns.
 
 ### 9.2 `get_balance` — Reading USDC Balance
 
-```@/c:/Users/ntemu/Downloads/poly money maker/bot.py:160-168
+```@/c:/Users/ntemu/Downloads/poly money maker/bot.py:216-224
 def get_balance():
     try:
         from py_clob_client_v2.client import BalanceAllowanceParams
@@ -758,7 +780,7 @@ actually called, keeping the top-level imports clean.
 
 ### 9.3 `atomic_save` — Crash-Safe File Writes
 
-```@/c:/Users/ntemu/Downloads/poly money maker/bot.py:171-175
+```@/c:/Users/ntemu/Downloads/poly money maker/bot.py:227-231
 def atomic_save(path, data):
     tmp = path + ".tmp"
     with open(tmp, "w") as f:
@@ -779,7 +801,7 @@ the next startup, `json.load()` would throw and the bot would lose all its state
 
 ### 9.4 `load_json` and `save_json` — Thin Wrappers
 
-```@/c:/Users/ntemu/Downloads/poly money maker/bot.py:178-186
+```@/c:/Users/ntemu/Downloads/poly money maker/bot.py:234-242
 def load_json(path):
     if os.path.exists(path):
         with open(path, "r") as f:
@@ -797,13 +819,12 @@ is a one-line wrapper around `atomic_save` for API symmetry.
 
 ### 9.5 `log_event` — Structured Logging
 
-```@/c:/Users/ntemu/Downloads/poly money maker/bot.py:189-194
+```@/c:/Users/ntemu/Downloads/poly money maker/bot.py:245-249
 def log_event(event, **kwargs):
-    """Append a structured JSON log line to bot.log."""
+    """Append a structured JSON log line to bot.log (with rotation)."""
     entry = {"ts": datetime.now().isoformat(), "event": event}
     entry.update(kwargs)
-    with open("bot.log", "a") as f:
-        f.write(json.dumps(entry) + "\n")
+    _file_logger.info(json.dumps(entry))
 ```
 
 **Why JSON-lines instead of plain text?** Each line is a self-contained JSON
@@ -829,7 +850,7 @@ logic.
 
 ### 10.1 `get_user_positions` — Fetching from the Data API
 
-```@/c:/Users/ntemu/Downloads/poly money maker/bot.py:199-215
+```@/c:/Users/ntemu/Downloads/poly money maker/bot.py:303-319
 def get_user_positions():
     """Fetch user's current open positions from Polymarket data-api.
     Returns a list of position dicts on success, or None on failure."""
@@ -874,7 +895,7 @@ letting downstream code crash when it tries to iterate.
 
 ### 10.2 `check_token_balance` — Verifying Actual Holdings
 
-```@/c:/Users/ntemu/Downloads/poly money maker/bot.py:218-230
+```@/c:/Users/ntemu/Downloads/poly money maker/bot.py:322-335
 def check_token_balance(token_id):
     """Re-fetch positions and return the current size for a specific token.
     Returns the float balance, or None if lookup fails."""
@@ -991,7 +1012,7 @@ results for all cases.
 
 ### 10.4 `empty_opposite_leg` — Constructing Missing Legs
 
-```@/c:/Users/ntemu/Downloads/poly money maker/bot.py:280-290
+```@/c:/Users/ntemu/Downloads/poly money maker/bot.py:399-409
 def empty_opposite_leg(source, outcome):
     return {
         "asset": source.get("oppositeAsset"),
@@ -1014,7 +1035,7 @@ of the other side).
 
 ### 10.5 `group_btc_complete_sets` — The Core Grouping Function
 
-```@/c:/Users/ntemu/Downloads/poly money maker/bot.py:293-381
+```@/c:/Users/ntemu/Downloads/poly money maker/bot.py:412-500
 def group_btc_complete_sets(positions, positions_meta=None):
     """Filter to BTC markets, grouped by conditionId with UP/DOWN leg metadata.
     Includes single-leg positions so direct sells can still be managed."""
@@ -1121,7 +1142,7 @@ sizes and skip — no point managing an expired market.
 
 ### 11.1 `get_book_bid` — Finding the Best Buyer
 
-```@/c:/Users/ntemu/Downloads/poly money maker/bot.py:386-395
+```@/c:/Users/ntemu/Downloads/poly money maker/bot.py:505-515
 def get_book_bid(token_id):
     try:
         book = safe_api_call(client.get_order_book, token_id)
@@ -1158,7 +1179,7 @@ pattern**: `None` is a signal value that means "data unavailable," distinct from
 
 ### 11.2 `quote_leg` — Pricing a Single Leg
 
-```@/c:/Users/ntemu/Downloads/poly money maker/bot.py:543-553
+```@/c:/Users/ntemu/Downloads/poly money maker/bot.py:663-674
 def quote_leg(bid):
     """Return (self_price, matched_price) for a single leg.
 
@@ -1194,7 +1215,7 @@ impossible to accidentally ignore, because the caller must explicitly check for
 
 ### 12.1 `extract_order_id` — Handling Polymorphic Responses
 
-```@/c:/Users/ntemu/Downloads/poly money maker/bot.py:400-403
+```@/c:/Users/ntemu/Downloads/poly money maker/bot.py:520-523
 def extract_order_id(order_obj):
     if isinstance(order_obj, dict):
         return order_obj.get("orderID") or order_obj.get("id")
@@ -1213,7 +1234,7 @@ way to handle multiple possible field names without nested `if/else`.
 
 ### 12.2 `get_order_details` — Querying Order Status
 
-```@/c:/Users/ntemu/Downloads/poly money maker/bot.py:406-428
+```@/c:/Users/ntemu/Downloads/poly money maker/bot.py:526-548
 def get_order_details(order_id):
     """Return dict with size_matched and status, or None."""
     if not order_id:
@@ -1251,7 +1272,7 @@ caller (`confirm_fill_size`) uses this to infer a full fill.
 
 ### 12.3 `confirm_fill_size` — Multi-Step Fill Verification
 
-```@/c:/Users/ntemu/Downloads/poly money maker/bot.py:431-455
+```@/c:/Users/ntemu/Downloads/poly money maker/bot.py:551-575
 def confirm_fill_size(result, oid, requested):
     """Best-effort number of shares an order actually filled.
 
@@ -1280,7 +1301,7 @@ The function follows a **verification cascade**:
 
 ### 12.4 `sell_market_with_retry` — The Execution Engine
 
-```@/c:/Users/ntemu/Downloads/poly money maker/bot.py:458-495
+```@/c:/Users/ntemu/Downloads/poly money maker/bot.py:578-615
 def sell_market_with_retry(token_id, size, price_limit, tick_size="0.01", max_retries=3):
     total_sold = 0.0
     remaining = float(size)
@@ -1375,7 +1396,7 @@ operation on Polygon.
 The current codebase has refactored the relayer submission into two reusable
 functions:
 
-```@/c:/Users/ntemu/Downloads/poly money maker/bot.py:499-539
+```@/c:/Users/ntemu/Downloads/poly money maker/bot.py:619-660
 def get_relayer_headers():
     if not RELAYER_API_KEY or not RELAYER_API_KEY_ADDRESS:
         console.print("[bold red]▶ RELAYER [WARN][/] [dim]RELAYER_API_KEY / RELAYER_API_KEY_ADDRESS not set · redeem will fail[/]")
@@ -1437,7 +1458,7 @@ context without try/except boilerplate.
 
 ### 13.2 `redeem_condition` — Building the Redemption Calldata
 
-```@/c:/Users/ntemu/Downloads/poly money maker/bot.py:558-596
+```@/c:/Users/ntemu/Downloads/poly money maker/bot.py:678-716
 def redeem_condition(condition_id, label=""):
     """Submit a redemption tx for a resolved Polymarket conditionId via the Polygon relayer.
     Returns the transactionID string on success, or None on failure."""
@@ -1523,7 +1544,7 @@ dashboard status → sleep.
 
 ### 14.1 Loop Structure
 
-```@/c:/Users/ntemu/Downloads/poly money maker/bot.py:606-617
+```@/c:/Users/ntemu/Downloads/poly money maker/bot.py:726-741
 positions_meta = load_json(STATE_FILE)
 CYCLE = 0
 
@@ -1552,11 +1573,27 @@ metadata cache for this cycle.
 
 ### 14.2 Garbage Collection
 
-```@/c:/Users/ntemu/Downloads/poly money maker/bot.py:630-637
+```@/c:/Users/ntemu/Downloads/poly money maker/bot.py:765-792
         if positions_raw is not None:
             live_conds = {s["conditionId"] for s in managed_sets}
             stale_conds = [c for c in list(positions_meta.keys()) if c not in live_conds]
             for c in stale_conds:
+                gc_meta = positions_meta[c]
+                # Record P&L for completed trades before deleting metadata
+                if "pnl_entry_cost" in gc_meta:
+                    entry_cost = gc_meta.get("pnl_entry_cost", 0)
+                    sell_proceeds = gc_meta.get("pnl_sell_proceeds", 0)
+                    hedge_proceeds = gc_meta.get("pnl_hedge_proceeds", 0)
+                    redeem_value = gc_meta.get("pnl_redeem_value", 0)
+                    if redeem_value == 0:
+                        rem_up = gc_meta.get("expected_up_size", 0) or gc_meta.get("pnl_init_up_size", 0)
+                        rem_dn = gc_meta.get("expected_dn_size", 0) or gc_meta.get("pnl_init_dn_size", 0)
+                        if rem_up > 0 or rem_dn > 0:
+                            redeem_value = round(max(rem_up, rem_dn), 4)
+                    total_return = sell_proceeds + hedge_proceeds + redeem_value
+                    outcome = "hedge" if hedge_proceeds > 0 else ("win" if redeem_value > 0 else "flat")
+                    net = record_pnl(c, gc_meta.get("question", "?"), entry_cost, sell_proceeds + redeem_value, hedge_proceeds, outcome)
+                    log_event("pnl_recorded", condition_id=c, entry=entry_cost, returned=round(total_return, 4), net=round(net, 4), outcome=outcome)
                 del positions_meta[c]
             if stale_conds:
                 log_event("gc", stale_conditions=stale_conds)
@@ -1564,9 +1601,16 @@ metadata cache for this cycle.
 ```
 
 Removes metadata for conditions we no longer hold. Only runs when the data API
-query succeeded (`positions_raw is not None`). **Why `list(positions_meta.keys())`?**
-We're deleting from the dict while iterating — converting to a list first avoids
-`RuntimeError: dictionary changed size during iteration`.
+query succeeded (`positions_raw is not None`). Before deleting, it records a
+P&L entry — if the position had tracked entry costs, the bot calculates the
+final return (sell proceeds + hedge proceeds + redeem value) and calls
+`record_pnl()` to append to `pnl.json`. If no explicit redeem value was recorded
+(e.g., the protocol auto-redeemed), it estimates from remaining holdings using
+`max(remaining_up, remaining_dn)`.
+
+**Why `list(positions_meta.keys())`?** We're deleting from the dict while
+iterating — converting to a list first avoids `RuntimeError: dictionary changed
+size during iteration`.
 
 ### 14.3 The Positions Table
 
@@ -1582,12 +1626,13 @@ The bot uses `rich.Table` to render a colour-coded dashboard. Each row shows:
 - **STATE** — one of:
   - `✓ REDEEM` (magenta) — market resolved, ready for redemption.
   - `· closed` (dim) — market expired but not yet redeemable.
-  - `○ EXIT WINDOW` (red) — in the final 15-minute sell window.
+  - `○ EXIT ≤8¢` (red) — in the aggressive tier (minutes 9→0), sell at any bid ≤ 8¢.
+  - `○ EXIT 4-8¢` (yellow) — in the early tier (minutes 15→9), sell only between 4¢ and 8¢.
   - `● WATCHING` (green) — holding, outside the sell window.
 
 ### 14.4 The Redeem Phase
 
-```@/c:/Users/ntemu/Downloads/poly money maker/bot.py:694-711
+```@/c:/Users/ntemu/Downloads/poly money maker/bot.py:850-874
         for s in managed_sets:
             cond = s["conditionId"]
             redeemable = bool(s["up"].get("redeemable")) or bool(s["dn"].get("redeemable"))
@@ -1600,10 +1645,16 @@ The bot uses `rich.Table` to render a colour-coded dashboard. Each row shows:
             meta = positions_meta.setdefault(cond, {})
             last = meta.get("redeem_submitted_at") or 0
             if now_ms - last < REDEEM_THROTTLE_S * 1000:
-                continue
+                continue  # already submitted, wait 5 min before retry
             tx = redeem_condition(cond, label=(s["question"] or "?")[:32])
             if tx:
                 meta["redeem_submitted_at"] = now_ms
+                # P&L: only the winning side resolves at $1/share; the loser
+                # resolves at $0.  min(up, dn) complete sets pay $1 each, and
+                # the excess shares on one side also pay $1 (they are the winner).
+                remaining_up = float(s["up"].get("size", 0))
+                remaining_dn = float(s["dn"].get("size", 0))
+                meta["pnl_redeem_value"] = round(max(remaining_up, remaining_dn), 4)
                 log_event("redeem_submit", condition_id=cond, tx_id=str(tx))
                 save_json(STATE_FILE, positions_meta)
 ```
@@ -1616,6 +1667,11 @@ Three guard conditions before attempting redemption:
    permanent error.
 3. **`REDEEM_THROTTLE_S`** — Don't retry within 5 minutes of the last submission.
 
+After a successful redeem submission, the bot records `pnl_redeem_value` in the
+metadata cache using `max(remaining_up, remaining_dn)` — the winning side's
+share count, which resolves at $1.00 per share. This value is later used by the
+GC phase to compute the final P&L for the trade.
+
 ### 14.5 The Sell Phase — Trigger Evaluation
 
 For each managed set, the bot determines whether to sell the UP leg, the DOWN
@@ -1623,19 +1679,34 @@ leg, or neither.
 
 **Step 1: Record entry time**
 
-```python
-if "entered_at" not in meta:
-    meta["entered_at"] = now_ms
-    meta["up_token"] = up_token
-    meta["dn_token"] = dn_token
-    meta["question"] = s["question"]
-    meta["end_date"] = s["up"].get("endDate") or s["dn"].get("endDate")
-    save_json(STATE_FILE, positions_meta)
+```@/c:/Users/ntemu/Downloads/poly money maker/bot.py:889-906
+            if "entered_at" not in meta:
+                meta["entered_at"] = now_ms
+                meta["up_token"] = up_token
+                meta["dn_token"] = dn_token
+                meta["question"] = s["question"]
+                meta["end_date"] = s["up"].get("endDate") or s["dn"].get("endDate")
+                # P&L: entry cost from actual avgPrice (data-api), fallback $0.50
+                init_up = float(s["up"].get("size", 0))
+                init_dn = float(s["dn"].get("size", 0))
+                up_avg = float(s["up"].get("avgPrice", 0) or 0) or 0.50
+                dn_avg = float(s["dn"].get("avgPrice", 0) or 0) or 0.50
+                meta["pnl_entry_cost"] = round(init_up * up_avg + init_dn * dn_avg, 4)
+                meta["pnl_init_up_size"] = init_up
+                meta["pnl_init_dn_size"] = init_dn
+                meta["pnl_sell_proceeds"] = 0.0
+                meta["pnl_hedge_proceeds"] = 0.0
+                meta["pnl_redeem_value"] = 0.0
+                save_json(STATE_FILE, positions_meta)
 ```
 
-The first time we see a position, we record when we entered and cache the token
-IDs and market metadata. This is the backfill data that `group_btc_complete_sets`
-uses if the API later loses track of the position.
+The first time we see a position, we record when we entered, cache the token
+IDs and market metadata (for backfill), and initialise all P&L tracking fields.
+Entry cost is calculated from the actual `avgPrice` field returned by the
+data-api (typically ~$0.51-0.53 per share), with a $0.50 fallback if `avgPrice`
+is missing. Total entry cost is `up_size × up_avgPrice + dn_size × dn_avgPrice`.
+This is the backfill data that `group_btc_complete_sets` uses if the API later
+loses track of the position.
 
 **Step 2: Grace period**
 
@@ -1663,9 +1734,22 @@ outcome is nearly settled and reversal is unlikely.
 
 **Step 3: Fetch best bids and price both legs**
 
-```@/c:/Users/ntemu/Downloads/poly money maker/bot.py:740-744
+```@/c:/Users/ntemu/Downloads/poly money maker/bot.py:917-934
             up_bid, _ = get_book_bid(up_token) if up_token else (None, 0.0)
             dn_bid, _ = get_book_bid(dn_token) if dn_token else (None, 0.0)
+
+            # Alert if book fetch failed for either leg during the sell window
+            if up_bid is None and up_size > 0:
+                log_event("sell_skip_no_book", condition_id=cond, leg="up", minutes_left=round(minutes_left, 1))
+            if dn_bid is None and dn_size > 0:
+                log_event("sell_skip_no_book", condition_id=cond, leg="dn", minutes_left=round(minutes_left, 1))
+            if up_bid is None and dn_bid is None and (up_size > 0 or dn_size > 0):
+                _book_fail_count = meta.get("_book_fail_count", 0) + 1
+                meta["_book_fail_count"] = _book_fail_count
+                if _book_fail_count == 6:  # ~30s of failures at 5s tick
+                    notify("\u26a0 Book Unavailable", f"{s['question']} \u2014 order book unreachable with {round(minutes_left)}m left", priority="high")
+            else:
+                meta["_book_fail_count"] = 0
 
             up_price, up_matched_price = quote_leg(up_bid)
             dn_price, dn_matched_price = quote_leg(dn_bid)
@@ -1720,7 +1804,7 @@ $1.00 at resolution. Tie breaks sell UP.
 
 **Step 5: Cooldown check**
 
-```@/c:/Users/ntemu/Downloads/poly money maker/bot.py:759-760
+```@/c:/Users/ntemu/Downloads/poly money maker/bot.py:959-960
             will_sell_up = sell_up and (now_ms - (meta.get("last_sell_up_at") or 0) >= SELL_COOLDOWN_S * 1000)
             will_sell_dn = sell_dn and (now_ms - (meta.get("last_sell_dn_at") or 0) >= SELL_COOLDOWN_S * 1000)
 ```
@@ -1729,7 +1813,7 @@ Even if the trigger fires, we check a per-leg 30-second cooldown.
 
 **Step 6: Execute the sell with ghost fill detection**
 
-```@/c:/Users/ntemu/Downloads/poly money maker/bot.py:778-799
+```@/c:/Users/ntemu/Downloads/poly money maker/bot.py:978-1001
                 else:
                     log_event("sell_attempt", condition_id=cond, leg="up", size=up_size, bid=up_bid, price_limit=up_price)
                     sold, _ = sell_market_with_retry(up_token, up_size, up_matched_price or SELL_THRESHOLD)
@@ -1737,6 +1821,7 @@ Even if the trigger fires, we check a per-leg 30-second cooldown.
                         meta["last_sell_up_at"] = now_ms
                         up_size -= sold
                         meta["expected_up_size"] = up_size
+                        meta["pnl_sell_proceeds"] = round(meta.get("pnl_sell_proceeds", 0) + sold * (up_price or 0), 4)
                         log_event("sell_fill", condition_id=cond, leg="up", sold=sold, remaining=up_size, price=up_price)
                         save_json(STATE_FILE, positions_meta)
                     else:
@@ -1745,6 +1830,7 @@ Even if the trigger fires, we check a per-leg 30-second cooldown.
                         if actual_bal is not None and actual_bal < up_size - 0.01:
                             ghost_sold = up_size - actual_bal
                             meta["last_sell_up_at"] = now_ms
+                            meta["pnl_sell_proceeds"] = round(meta.get("pnl_sell_proceeds", 0) + ghost_sold * (up_price or 0), 4)
                             up_size = actual_bal
                             meta["expected_up_size"] = actual_bal
                             log_event("sell_ghost_fill", condition_id=cond, leg="up", sold=ghost_sold, remaining=actual_bal, price=up_price)
@@ -1775,7 +1861,7 @@ the data API reflects actual on-chain holdings.
 
 ### 14.6 The Sleep
 
-```@/c:/Users/ntemu/Downloads/poly money maker/bot.py:921-922
+```@/c:/Users/ntemu/Downloads/poly money maker/bot.py:1130-1131
     console.print("[dim bright_black]· · ·  sleeping 5s  · · ·[/]")
     time.sleep(5)
 ```
@@ -1789,7 +1875,7 @@ version). This tighter loop is possible because:
 
 ### 14.7 Dashboard Status Writing
 
-```@/c:/Users/ntemu/Downloads/poly money maker/bot.py:901-919
+```@/c:/Users/ntemu/Downloads/poly money maker/bot.py:1109-1128
     try:
         _dash_positions = []
         for s in managed_sets:
@@ -1803,9 +1889,10 @@ version). This tighter loop is possible because:
                 "dn_token": s["dn"].get("asset"),
                 "redeemable": bool(s["up"].get("redeemable") or s["dn"].get("redeemable")),
             })
+        _pnl_summary = load_pnl().get("summary", {})
         with open(".dashboard_status.json", "w") as _df:
             json.dump({"cycle": CYCLE, "nav": pusd_bal, "ts": time.time(),
-                       "positions": _dash_positions}, _df)
+                       "positions": _dash_positions, "pnl": _pnl_summary}, _df)
     except Exception:
         pass
 ```
@@ -1818,7 +1905,7 @@ shouldn't care.
 
 ### 14.8 Graceful Shutdown Exit
 
-```@/c:/Users/ntemu/Downloads/poly money maker/bot.py:924-927
+```@/c:/Users/ntemu/Downloads/poly money maker/bot.py:1134-1136
 console.print("[bold bright_green]▶ SHUTDOWN COMPLETE[/] [dim]state saved · exiting cleanly[/]")
 log_event("shutdown", reason="signal")
 sys.exit(0)
@@ -1849,7 +1936,7 @@ $1.00 = $1.08) into a loss (sold DOWN for 8 cents + UP goes to $0 = $0.08).
 
 ### 15.2 The Hedge Logic
 
-```@/c:/Users/ntemu/Downloads/poly money maker/bot.py:826-888
+```@/c:/Users/ntemu/Downloads/poly money maker/bot.py:1030-1096
             # ================= HEDGE PHASE =================
             # If we already sold one leg (the "loser") and the held leg drops
             # below HEDGE_THRESHOLD, sell it too to limit reversal losses.
@@ -1974,7 +2061,7 @@ The bot's error handling follows a **defensive, fail-safe** philosophy.
 
 ### 17.1 Never Crash the Loop
 
-```@/c:/Users/ntemu/Downloads/poly money maker/bot.py:890-898
+```@/c:/Users/ntemu/Downloads/poly money maker/bot.py:1098-1106
     except Exception:
         log_event("cycle_error", traceback=traceback.format_exc())
         console.print(Panel(
@@ -2035,7 +2122,7 @@ Every significant action is logged to `bot.log` (with log rotation via
 | `hedge_fail` | After a failed hedge sell | `condition_id`, `leg`, `size`, `bid` |
 | `book_fetch_fail` | Order book API threw an exception | `token_id`, `error` |
 | `redeem_submit` | After submitting a redemption | `condition_id`, `tx_id` |
-| `pnl_record` | P&L entry written for a completed trade | `condition_id`, `outcome`, `entry_cost`, `proceeds` |
+| `pnl_recorded` | P&L entry written for a completed trade | `condition_id`, `entry`, `returned`, `net`, `outcome` |
 | `dry_sell` | DRY_RUN sell simulation | `token_id`, `size`, `price_limit` |
 | `dry_redeem` | DRY_RUN redeem simulation | `condition_id`, `label` |
 | `gc` | After garbage-collecting stale metadata | `stale_conditions` |
@@ -2244,7 +2331,7 @@ asymmetry is fundamental to how order books work.
 ---
 
 *This document was last updated to reflect the codebase on the `main` branch
-(commit `283db15`). Key changes since the original version: hot-reload strategy
+(commit `8d541fe`). Key changes since the original version: hot-reload strategy
 config (PR #30), CI/CD auto-deploy (PR #30), P&L tracking with actual entry
 costs (PR #34), tiered sell thresholds (PR #33), comprehensive TTM fix for all
 24 hourly slots using UTC date matching (PR #35), log rotation, and heartbeat
