@@ -35,18 +35,19 @@
 ## 1. Project Overview
 
 **Poly Money Maker** is an automated **sell-side execution bot** for Polymarket's
-Bitcoin hourly prediction markets. It does not buy positions — the operator enters
-positions manually through Polymarket's web UI. The bot's job is to **monitor those
-positions and automatically sell the "loser leg"** before the market expires, then
-**redeem** any resolved positions back into USDC. It also includes a **hedge
-mechanism** that cuts losses if the held leg reverses after the loser has been sold.
+Bitcoin 5-minute (and hourly) prediction markets. It does not buy positions — the
+operator enters positions manually through Polymarket's web UI. The bot's job is to
+**monitor those positions and automatically sell the "loser leg"** before the market
+expires, then **redeem** any resolved positions back into USDC. It also includes a
+**hedge mechanism** that cuts losses if the held leg reverses after the loser has
+been sold.
 
 ### The Core Thesis
 
-In a binary prediction market ("Will Bitcoin go up or down this hour?"), you buy
-**both** sides (UP and DOWN) as a pair — a "complete set." One side will be worth
-$1.00 at resolution and the other $0.00. If you hold both, you're guaranteed to
-redeem $1.00 per pair.
+In a binary prediction market ("Will Bitcoin go up or down this 5-minute
+window?"), you buy **both** sides (UP and DOWN) as a pair — a "complete set."
+One side will be worth $1.00 at resolution and the other $0.00. If you hold both,
+you're guaranteed to redeem $1.00 per pair.
 
 The profit comes from selling the **loser leg** — the side that's heading to $0.
 If you can sell that loser leg for even 8 cents before the market resolves,
@@ -59,7 +60,7 @@ and when the losing side's best bid drops to 8 cents, it fires a sell order.
 After selling the loser leg, you're left holding only the winner. Normally this is
 fine — the winner goes to $1.00. But if the market **reverses** (the side you
 thought was winning starts losing), your remaining shares can go to $0. The hedge
-phase watches for this: if the held leg's bid drops below 50 cents after the loser
+phase watches for this: if the held leg's bid drops below 60 cents after the loser
 was sold, the bot sells the held leg too, cutting losses before they compound.
 
 ### What the Bot Does NOT Do
@@ -67,7 +68,8 @@ was sold, the bot sells the held leg too, cutting losses before they compound.
 - **No buying.** The bot is sell-only. Entry is manual.
 - **No market making.** It doesn't post resting orders or provide liquidity.
 - **No price prediction.** It doesn't try to forecast BTC direction.
-- **No portfolio rebalancing.** It manages one specific market type (BTC hourly).
+- **No portfolio rebalancing.** It manages one specific market type (BTC 5-minute
+  and hourly).
 
 This narrow scope is intentional — it keeps the codebase small, the failure
 modes predictable, and the risk surface minimal.
@@ -203,9 +205,10 @@ async, no message queues, no databases.
   top-to-bottom and understand the full flow without jumping between modules.
 - **Single process** means no concurrency bugs, no race conditions on state, no
   inter-process communication overhead.
-- **Polling loop** (5-second sleep between cycles) is simple and robust. The BTC
-  hourly markets move fast enough to warrant a tight loop, and polling is far
-  easier to reason about than event-driven code.
+- **Polling loop** with variable sleep (5s / 2s / 1s depending on time to expiry)
+  is simple and robust. The BTC 5-minute markets move extremely fast, especially
+  in the final minute, so the bot polls every 1 second during the sell window.
+  Polling is far easier to reason about than event-driven code.
 - **Separate dashboard (`dashboard.py`)** reads a status JSON file and log file
   that the bot writes each cycle. It's a read-only viewer — it doesn't affect the
   bot's operation and can be started/stopped independently.
@@ -216,7 +219,7 @@ async, no message queues, no databases.
 
 | File | Purpose | Size |
 |---|---|---|
-| `bot.py` | The main bot — all trading logic lives here | ~1120 lines |
+| `bot.py` | The main bot — all trading logic lives here | ~1150 lines |
 | `dashboard.py` | Live terminal dashboard viewer (reads bot output) | ~250 lines |
 | `check_book.py` | Diagnostic script for inspecting live order books | ~31 lines |
 | `requirements.txt` | Python dependencies | 8 lines |
@@ -234,7 +237,7 @@ async, no message queues, no databases.
 
 ### Why a Single-File Bot?
 
-For a bot of this size (~1120 lines), splitting into modules would add import
+For a bot of this size (~1150 lines), splitting into modules would add import
 overhead and cognitive load without meaningful benefit. The code is organised
 internally with **section comment banners** (e.g., `# --- HELPER FUNCTIONS ---`)
 that act as visual module boundaries. The dashboard is separate because it's a
@@ -297,8 +300,8 @@ The bot reads credentials and relayer configuration from environment variables:
 ### 6.2 Strategy Constants (Hot-Reloaded from `strategy.json`)
 
 Strategy parameters are loaded from `strategy.json` at the start of **every
-cycle** (every 5 seconds). This allows you to change thresholds without
-restarting the bot — just edit the file and the next tick picks up the new values.
+cycle**. This allows you to change thresholds without restarting the bot — just
+edit the file and the next tick picks up the new values.
 
 Defaults are defined in `_STRATEGY_DEFAULTS` and used if the file is missing or
 malformed:
@@ -307,12 +310,12 @@ malformed:
 _STRATEGY_DEFAULTS = {
     "sell_threshold": 0.08,
     "sell_threshold_early": 0.04,
-    "sell_aggressive_min": 9,
-    "hedge_threshold": 0.50,
-    "sell_window_min": 15,
-    "sell_grace_s": 10,
-    "sell_cooldown_s": 30,
-    "redeem_throttle_s": 300,
+    "sell_aggressive_min": 0.17,       # ~10 seconds — aggressive tier
+    "hedge_threshold": 0.60,
+    "sell_window_min": 0.5,            # last 30 seconds — sell window
+    "sell_grace_s": 2,                # don't sell within 2s of first seeing a position
+    "sell_cooldown_s": 5,             # 5s between sell attempts per leg
+    "redeem_throttle_s": 30,          # 30s between redeem attempts
     "max_redeem_age_days": 7,
     "dry_run": False,
 }
@@ -329,51 +332,52 @@ An example file is committed as `strategy.example.json` for reference.
 
 | Constant | Default | Meaning |
 |---|---|---|
-| `sell_threshold` | `0.08` (8 cents) | If the loser leg's best bid drops to or below this price, sell it (used in aggressive tier, minutes 9→0). |
-| `sell_threshold_early` | `0.04` (4 cents) | Minimum bid to sell during the early tier (minutes 15→9). Prevents selling dust positions for negligible value. |
-| `sell_aggressive_min` | `9` minutes | The boundary between early and aggressive tiers within the sell window. |
-| `hedge_threshold` | `0.50` (50 cents) | After selling the loser, if the held (winner) leg drops below 50 cents, sell it too. This is the reversal protection — if the market flips, we cut losses at 50 cents rather than riding to $0. |
-| `sell_window_min` | `15` minutes | Only sell within the last 15 minutes before market expiry. This **time-gates** the sell trigger — even if the loser leg hits 8 cents with 2 hours left, the bot waits until the final 15 minutes. This reduces reversal risk: selling early locks in a few cents but exposes you to the market flipping; selling late means the outcome is nearly certain. |
-| `sell_grace_s` | `10` seconds | When we first discover a new position, wait 10 seconds before selling. This prevents selling on the very first tick where data might be stale or incomplete. |
-| `sell_cooldown_s` | `30` seconds | After selling a leg, wait 30 seconds before attempting another sell on the same leg. Prevents hammering the API with rapid-fire orders. |
-| `redeem_throttle_s` | `300` seconds (5 min) | After submitting a redemption, wait 5 minutes before retrying. Redemptions are on-chain transactions that take time to confirm. |
+| `sell_threshold` | `0.08` (8 cents) | If the loser leg's best bid drops to or below this price, sell it (used in aggressive tier, last 10→0 seconds). |
+| `sell_threshold_early` | `0.04` (4 cents) | Minimum bid to sell during the early tier (30→10 seconds before expiry). Prevents selling dust positions for negligible value. |
+| `sell_aggressive_min` | `0.17` minutes (~10 seconds) | The boundary between early and aggressive tiers within the sell window. |
+| `hedge_threshold` | `0.60` (60 cents) | After selling the loser, if the held (winner) leg drops below 60 cents, sell it too. This is the reversal protection — if the market flips, we cut losses at 60 cents rather than riding to $0. |
+| `sell_window_min` | `0.5` minutes (30 seconds) | Only sell within the last 30 seconds before market expiry. This **time-gates** the sell trigger — even if the loser leg hits 8 cents with 2 minutes left, the bot waits until the final 30 seconds. This reduces reversal risk: selling early locks in a few cents but exposes you to the market flipping; selling late means the outcome is nearly certain. |
+| `sell_grace_s` | `2` seconds | When we first discover a new position, wait 2 seconds before selling. This prevents selling on the very first tick where data might be stale or incomplete. |
+| `sell_cooldown_s` | `5` seconds | After selling a leg, wait 5 seconds before attempting another sell on the same leg. Prevents hammering the API with rapid-fire orders. |
+| `redeem_throttle_s` | `30` seconds | After submitting a redemption, wait 30 seconds before retrying. Redemptions are on-chain transactions that take time to confirm. |
 | `max_redeem_age_days` | `7` days | Stop trying to redeem after 7 days past expiry. Old conditions may have been cleaned up on-chain and retries are pointless. |
 | `dry_run` | `false` | When `true`, the bot logs decisions but doesn't send orders or transactions. Used for testing. |
 
 ### 6.3 Tiered Sell Thresholds
 
-The sell window (last 15 minutes) is split into two tiers to balance value
+The sell window (last 30 seconds) is split into two tiers to balance value
 capture against reversal risk:
 
 ```
-     15m ──────────── 9m ──────────── 0m (expiry)
+     30s ─────────── 10s ─────────── 0s (expiry)
      │   EARLY TIER   │  AGGRESSIVE  │
      │  4¢ ≤ bid ≤ 8¢ │  bid ≤ 8¢    │
      └────────────────┴──────────────┘
 ```
 
-- **Early tier (minutes 15→9):** Only sell if the bid is between
+- **Early tier (30→10 seconds):** Only sell if the bid is between
   `sell_threshold_early` (4¢) and `sell_threshold` (8¢). A bid below 4¢ is not
   worth the execution risk — just let it expire. A bid above 8¢ suggests the
   market hasn't fully decided yet.
 
-- **Aggressive tier (minutes 9→0):** Sell at any bid ≤ `sell_threshold` (8¢).
-  With under 9 minutes left, the outcome is nearly certain, so even a 2¢ bid is
+- **Aggressive tier (10→0 seconds):** Sell at any bid ≤ `sell_threshold` (8¢).
+  With under 10 seconds left, the outcome is nearly certain, so even a 2¢ bid is
   worth capturing vs. letting it expire at $0.
 
-This tiered approach was informed by real trading history: sells at 1-2¢ with 15
-minutes left produced negligible value ($0.04 on 2 shares, $0.25 on 20 shares)
-while still carrying reversal risk.
+This tiered approach was informed by real trading history: sells at 1-2¢ with
+significant time left produced negligible value while still carrying reversal
+risk. The 5-minute market adaptation compresses the same logic into seconds
+rather than minutes.
 
 ### 6.4 Other Constants
 
-```@/c:/Users/ntemu/Downloads/poly money maker/bot.py:33-42
+```@/c:/Users/ntemu/Downloads/poly money maker/bot.py:33-40
 HOST = "https://clob.polymarket.com"
 DATA_API = "https://data-api.polymarket.com"
 CHAIN_ID = 137
 STATE_FILE = "positions.json"
 BTC_SLUG_PREFIX = "bitcoin-up-or-down"
-BTC_SLUG_ALIASES = ("bitcoin-up-or-down", "btc-updown")
+BTC_SLUG_ALIASES = ("bitcoin-up-or-down", "btc-updown", "btc-updown-5m")
 PUSD = "0xC011a7E12a19f7B1f670d46F03B03f3342E82DFB"
 CTF = "0x4D97DCd97eC945f40cF65F87097ACe5EA0476045"
 ```
@@ -383,9 +387,10 @@ CTF = "0x4D97DCd97eC945f40cF65F87097ACe5EA0476045"
 - **`CHAIN_ID = 137`** — Polygon's chain ID.
 - **`STATE_FILE`** — The JSON file where we persist metadata between cycles.
 - **`BTC_SLUG_PREFIX`** / **`BTC_SLUG_ALIASES`** — Slug prefixes that identify BTC
-  hourly markets. `BTC_SLUG_ALIASES` is a **tuple** of accepted prefixes, because
-  Polymarket has used different slug formats over time (`bitcoin-up-or-down` and
-  `btc-updown`). The tuple lets us match either one.
+  markets. `BTC_SLUG_ALIASES` is a **tuple** of accepted prefixes, because
+  Polymarket has used different slug formats over time (`bitcoin-up-or-down`,
+  `btc-updown` for hourly markets, and `btc-updown-5m` for 5-minute markets).
+  The tuple lets us match any of them.
 - **`PUSD`** — The Polymarket USDC (pUSD) contract address on Polygon. Used in
   redemption calldata.
 - **`CTF`** — The **Conditional Token Framework** contract address. This is
@@ -573,7 +578,8 @@ for 30 seconds waiting. 5 seconds is generous for a push notification.
 - **Bot started** — confirmation that the bot is running (priority: high)
 - **Hedge fired** — reversal detected, cutting losses (priority: urgent)
 - **Hedge ghost fill** — hedge confirmed via balance check (priority: urgent)
-- **Book unavailable** — order book API unreachable for ~30s during sell window (priority: high)
+- **Book unavailable** — order book API unreachable for ~6 consecutive cycles
+  during sell window (priority: high)
 
 The bot doesn't notify on normal sells — those are expected and frequent. Only
 exceptional events warrant a push.
@@ -1538,9 +1544,9 @@ the gas. This is subsidised by Polymarket to encourage market resolution.
 ## 14. The Main Loop — Putting It All Together
 
 The main loop is the heart of the bot. It's a `while not _shutdown_requested`
-loop that runs every 5 seconds, executing a complete cycle of: discover
-positions → display status → redeem resolved → sell losers → hedge → write
-dashboard status → sleep.
+loop with variable sleep (5s / 2s / 1s depending on time to expiry), executing a
+complete cycle of: discover positions → display status → redeem resolved → sell
+losers → hedge → write dashboard status → sleep.
 
 ### 14.1 Loop Structure
 
@@ -1618,16 +1624,17 @@ The bot uses `rich.Table` to render a colour-coded dashboard. Each row shows:
 
 - **INSTRUMENT** — the market question (truncated to 40 chars).
 - **EXPIRY** — the market end time (HH:MM format).
-- **TTM** — Time To Maturity in minutes, colour-coded:
-  - Red if < `SELL_WINDOW_MIN` (15 minutes, in the exit window).
+- **TTM** — Time To Maturity, displayed in seconds when < 1 minute, otherwise in
+  minutes. Colour-coded:
+  - Red if < `SELL_WINDOW_MIN` (30 seconds, in the exit window).
   - Yellow if < 60 minutes (approaching the window).
   - Green if > 60 minutes (safe).
 - **UP / DN** — share counts for each leg.
 - **STATE** — one of:
   - `✓ REDEEM` (magenta) — market resolved, ready for redemption.
   - `· closed` (dim) — market expired but not yet redeemable.
-  - `○ EXIT ≤8¢` (red) — in the aggressive tier (minutes 9→0), sell at any bid ≤ 8¢.
-  - `○ EXIT 4-8¢` (yellow) — in the early tier (minutes 15→9), sell only between 4¢ and 8¢.
+  - `○ EXIT ≤8¢` (red) — in the aggressive tier (last 10→0 seconds), sell at any bid ≤ 8¢.
+  - `○ EXIT 4-8¢` (yellow) — in the early tier (30→10 seconds), sell only between 4¢ and 8¢.
   - `● WATCHING` (green) — holding, outside the sell window.
 
 ### 14.4 The Redeem Phase
@@ -1715,7 +1722,7 @@ if now_ms - meta["entered_at"] < SELL_GRACE_S * 1000:
     continue
 ```
 
-Wait 10 seconds after first discovery before selling. Prevents acting on
+Wait 2 seconds after first discovery before selling. Prevents acting on
 potentially stale data from the very first tick.
 
 **Step 2b: Sell window check**
@@ -1726,10 +1733,10 @@ if minutes_left > SELL_WINDOW_MIN:
     continue
 ```
 
-If the market has more than 15 minutes left until expiry, skip the sell phase
+If the market has more than 30 seconds left until expiry, skip the sell phase
 entirely for this set. This is the **reversal risk mitigation** — selling the
-loser leg early (e.g., with 2 hours left) locks in 8 cents but leaves you
-exposed to the market flipping. By waiting until the final 15 minutes, the
+loser leg early (e.g., with 2 minutes left) locks in 8 cents but leaves you
+exposed to the market flipping. By waiting until the final 30 seconds, the
 outcome is nearly settled and reversal is unlikely.
 
 **Step 3: Fetch best bids and price both legs**
@@ -1746,8 +1753,9 @@ outcome is nearly settled and reversal is unlikely.
             if up_bid is None and dn_bid is None and (up_size > 0 or dn_size > 0):
                 _book_fail_count = meta.get("_book_fail_count", 0) + 1
                 meta["_book_fail_count"] = _book_fail_count
-                if _book_fail_count == 6:  # ~30s of failures at 5s tick
-                    notify("\u26a0 Book Unavailable", f"{s['question']} \u2014 order book unreachable with {round(minutes_left)}m left", priority="high")
+                if _book_fail_count == 6:  # ~6s of failures at 1s tick in sell window
+                    _ttm_str = f"{max(minutes_left*60, 0):.0f}s" if minutes_left < 1 else f"{round(minutes_left)}m"
+                    notify("\u26a0 Book Unavailable", f"{s['question']} \u2014 order book unreachable with {_ttm_str} left", priority="high")
             else:
                 meta["_book_fail_count"] = 0
 
@@ -1766,13 +1774,13 @@ sell window we are (see §6.3 for the tier diagram):
 ```python
 # Determine which threshold applies based on time remaining
 if minutes_left > SELL_AGGRESSIVE_MIN:
-    # Early tier (15→9 min): only sell between 4¢ and 8¢
+    # Early tier (30→10s): only sell between 4¢ and 8¢
     up_trigger = (up_size > 0 and up_price is not None
                   and SELL_THRESHOLD_EARLY <= up_price <= SELL_THRESHOLD)
     dn_trigger = (dn_size > 0 and dn_price is not None
                   and SELL_THRESHOLD_EARLY <= dn_price <= SELL_THRESHOLD)
 else:
-    # Aggressive tier (9→0 min): sell at any price ≤ 8¢
+    # Aggressive tier (10→0s): sell at any price ≤ 8¢
     up_trigger = up_size > 0 and up_price is not None and up_price <= SELL_THRESHOLD
     dn_trigger = dn_size > 0 and dn_price is not None and dn_price <= SELL_THRESHOLD
 
@@ -1787,16 +1795,16 @@ if up_trigger and dn_trigger:
 
 **The trigger logic:**
 
-- **Early tier (minutes 15→9):** `SELL_THRESHOLD_EARLY <= price <= SELL_THRESHOLD`
+- **Early tier (30→10 seconds):** `SELL_THRESHOLD_EARLY <= price <= SELL_THRESHOLD`
   (4¢-8¢). A bid below 4¢ is not worth selling — the execution risk outweighs
   the $0.04/share recovery. A bid above 8¢ means the market hasn't decided yet.
 
-- **Aggressive tier (minutes 9→0):** `price <= SELL_THRESHOLD` (any bid ≤ 8¢).
-  With under 9 minutes left, the outcome is nearly certain. Even a 2¢ bid is
+- **Aggressive tier (10→0 seconds):** `price <= SELL_THRESHOLD` (any bid ≤ 8¢).
+  With under 10 seconds left, the outcome is nearly certain. Even a 2¢ bid is
   worth capturing vs. letting it expire worthless.
 
 - **Both tiers are gated by the sell window** — nothing happens until
-  `minutes_left <= SELL_WINDOW_MIN` (15 min).
+  `minutes_left <= SELL_WINDOW_MIN` (0.5 min = 30 seconds).
 
 **Mutual exclusion:** If both legs trigger (both at ≤ 8 cents), only sell the one
 with the lower bid (the bigger loser). We always keep the winning leg to redeem
@@ -1809,7 +1817,7 @@ $1.00 at resolution. Tie breaks sell UP.
             will_sell_dn = sell_dn and (now_ms - (meta.get("last_sell_dn_at") or 0) >= SELL_COOLDOWN_S * 1000)
 ```
 
-Even if the trigger fires, we check a per-leg 30-second cooldown.
+Even if the trigger fires, we check a per-leg 5-second cooldown.
 
 **Step 6: Execute the sell with ghost fill detection**
 
@@ -1859,30 +1867,46 @@ would think the sell failed and retry — potentially selling shares it no longe
 has, or at minimum wasting cycles. The balance check is the **ground truth** —
 the data API reflects actual on-chain holdings.
 
-### 14.6 The Sleep
+### 14.6 The Sleep — Variable Polling
 
-```@/c:/Users/ntemu/Downloads/poly money maker/bot.py:1130-1131
-    console.print("[dim bright_black]· · ·  sleeping 5s  · · ·[/]")
-    time.sleep(5)
+```@/c:/Users/ntemu/Downloads/poly money maker/bot.py:1137-1147
+    # Variable polling: 5s >2min, 2s in 2-1min, 1s in last minute (sell window)
+    _now = time.time() * 1000
+    _min_ttm = min((s["end_ts"] - _now) / 60000 for s in managed_sets) if managed_sets else 999
+    if _min_ttm <= 1:           # ≤60s — poll every 1s (covers sell window)
+        _sleep_s = 1
+    elif _min_ttm <= 2:         # ≤2min — poll every 2s
+        _sleep_s = 2
+    else:                       # >2min — poll every 5s
+        _sleep_s = 5
+    console.print(f"[dim bright_black]· · ·  sleeping {_sleep_s}s  · · ·[/]")
+    time.sleep(_sleep_s)
 ```
 
-The bot sleeps **5 seconds** between cycles (down from 30 seconds in the previous
-version). This tighter loop is possible because:
+The bot uses **variable polling** that adapts to time-to-expiry:
 
-- `safe_api_call` no longer has a built-in delay, so API calls are faster.
-- 5 seconds is fast enough to react to rapid price movements in the final
-  sell window (last 15 minutes), while still being reasonable for the API.
+| Time remaining | Sleep | Rationale |
+|---|---|---|
+| > 2 min | 5s | Market outcome still uncertain; no need for tight polling |
+| 2 min → 1 min | 2s | Approaching sell window; tighten polling |
+| ≤ 1 min | 1s | Inside sell window; maximum reaction speed needed |
+
+This gives ~30 cycles at 1s during the 30-second sell window, ensuring the bot
+can react to rapid price movements in 5-minute markets. The sleep duration is
+computed using a fresh `time.time()` call (not the cycle-start `now_ms`, which
+is several seconds old by this point).
 
 ### 14.7 Dashboard Status Writing
 
-```@/c:/Users/ntemu/Downloads/poly money maker/bot.py:1109-1128
+```@/c:/Users/ntemu/Downloads/poly money maker/bot.py:1115-1135
     try:
         _dash_positions = []
         for s in managed_sets:
             mins = (s["end_ts"] - now_ms) / 60000
             _dash_positions.append({
                 "question": (s["question"] or "?")[:40],
-                "ttm_min": round(mins, 1),
+                "ttm_min": round(mins, 2),
+                "ttm_sec": round(max(mins, 0) * 60, 0) if mins < 1 else None,
                 "up_size": float(s["up"].get("size", 0)),
                 "dn_size": float(s["dn"].get("size", 0)),
                 "up_token": s["up"].get("asset"),
@@ -1956,7 +1980,7 @@ $1.00 = $1.08) into a loss (sold DOWN for 8 cents + UP goes to $0 = $0.08).
    DOWN shares. `loser_was_dn` is the mirror.
 
 2. **Check if the held leg is collapsing** — if the held leg's bid drops to or
-   below `HEDGE_THRESHOLD` (50 cents), the market has reversed. The winner is
+   below `HEDGE_THRESHOLD` (60 cents), the market has reversed. The winner is
    becoming the loser.
 
 3. **Sell the held leg** — using `sell_market_with_retry` with a price limit of
@@ -1971,10 +1995,12 @@ $1.00 = $1.08) into a loss (sold DOWN for 8 cents + UP goes to $0 = $0.08).
 5. **Ghost fill detection** — same pattern as the sell phase. If the hedge sell
    returns 0 confirmed fills, check the actual balance to detect ghost fills.
 
-**Why `HEDGE_THRESHOLD = 0.50`?** At 50 cents, the market is saying there's a
-50/50 chance of either outcome. If we're holding the side that was previously
-winning but is now at 50 cents, the reversal is real. Selling at 50 cents
-recovers half the $1.00 redemption value — much better than riding it to $0.
+**Why `HEDGE_THRESHOLD = 0.60`?** At 60 cents, the market is saying the held
+leg's outcome is less likely than before. For 5-minute markets, which are more
+volatile than hourly ones, a 60-cent threshold provides earlier reversal
+detection while still recovering more than half the $1.00 redemption value.
+Selling at 60 cents recovers 60 cents per share — much better than riding it
+to $0.
 
 **Why sell at `$0.01` price limit?** The hedge is an emergency. We don't want to
 miss a fill because we set the price limit too high. At 1 cent, we'll match any
@@ -1994,9 +2020,9 @@ if minutes_left > SELL_WINDOW_MIN:
     continue
 ```
 
-…the hedge code is only reachable during the last 15 minutes. This is correct
+…the hedge code is only reachable during the last 30 seconds. This is correct
 behaviour: you can't hedge before you've sold the loser, and you can only sell
-the loser in the last 15 minutes. Once you sell (say at 14 minutes left), all
+the loser in the last 30 seconds. Once you sell (say at 25 seconds left), all
 subsequent ticks are still within the window, so the hedge check runs every
 cycle until the market expires.
 
@@ -2012,13 +2038,13 @@ the data API every cycle. We only persist things that the API *can't* tell us:
 
 | Field | Purpose |
 |---|---|
-| `entered_at` | When we first saw this set. Used for the 10-second grace period. |
+| `entered_at` | When we first saw this set. Used for the 2-second grace period. |
 | `up_token` / `dn_token` | Token IDs for backfill when the API loses track. |
 | `question` | Market name for display when backfilling. |
 | `end_date` | Market expiry for backfill. |
 | `expected_up_size` / `expected_dn_size` | Our estimate of remaining shares after a partial or ghost sell. |
-| `last_sell_up_at` / `last_sell_dn_at` | Timestamps for the 30-second sell cooldown. |
-| `redeem_submitted_at` | Timestamp for the 5-minute redeem throttle. |
+| `last_sell_up_at` / `last_sell_dn_at` | Timestamps for the 5-second sell cooldown. |
+| `redeem_submitted_at` | Timestamp for the 30-second redeem throttle. |
 | `pnl_entry_cost` | Total entry cost (`size × avgPrice` per leg). |
 | `pnl_init_up_size` / `pnl_init_dn_size` | Initial share counts at first sighting. |
 | `pnl_sell_proceeds` | Accumulated sell revenue (loser leg). |
@@ -2212,9 +2238,9 @@ with Live(console=console, refresh_per_second=2, screen=True) as live_display:
 updates in place (like `htop` or `top`). The dashboard refreshes twice per
 second (every 0.5s sleep), reading fresh data from the files each time.
 
-**Why `refresh_per_second=2`?** The bot writes status every 5 seconds, so
-refreshing faster than 2Hz would show the same data multiple times. 2Hz is
-smooth enough for human perception without wasting CPU.
+**Why `refresh_per_second=2`?** The bot writes status every 1–5 seconds
+depending on time to expiry, so refreshing at 2Hz is smooth enough for human
+perception without wasting CPU.
 
 **Why `except KeyboardInterrupt: break`?** Ctrl-C exits the dashboard but
 doesn't affect the bot. The `with` block ensures the terminal is restored to
@@ -2322,17 +2348,19 @@ asymmetry is fundamental to how order books work.
 | **Redemption** | The process of returning a complete set (UP + DOWN tokens) to the smart contract to receive $1.00 USDC after market resolution. |
 | **Relayer** | A Polymarket-operated service that submits on-chain transactions on behalf of users, paying the gas fees. |
 | **Reversal** | When the market flips direction — the side that was winning starts losing. Triggers the hedge phase. |
-| **Sell window** | The final N minutes before market expiry during which the bot is allowed to sell. Currently 15 minutes (`SELL_WINDOW_MIN`). |
-| **Slug** | A human-readable URL fragment identifying a market (e.g., `bitcoin-up-or-down-2024-06-24-5pm`). |
+| **Sell window** | The final N seconds before market expiry during which the bot is allowed to sell. Currently 30 seconds (`SELL_WINDOW_MIN` = 0.5 min). |
+| **Slug** | A human-readable URL fragment identifying a market (e.g., `btc-updown-5m-1783218000`). |
 | **Tick size** | The minimum price increment for a market. On Polymarket, typically $0.01. |
 | **Token ID** | The ERC-1155 token identifier for a specific outcome in a market. Each binary market has two (UP and DOWN). |
-| **TTM** | Time To Maturity — how many minutes remain until the market expires. |
+| **TTM** | Time To Maturity — how much time remains until the market expires. Displayed in seconds when under 1 minute, otherwise in minutes. |
 
 ---
 
 *This document was last updated to reflect the codebase on the `main` branch
-(commit `8d541fe`). Key changes since the original version: hot-reload strategy
-config (PR #30), CI/CD auto-deploy (PR #30), P&L tracking with actual entry
-costs (PR #34), tiered sell thresholds (PR #33), comprehensive TTM fix for all
-24 hourly slots using UTC date matching (PR #35), log rotation, and heartbeat
+(commit `fe24630`). Key changes: 5-minute market adaptation with 30-second sell
+window, variable polling (5s/2s/1s), hedge threshold raised to 60¢, `btc-updown-5m`
+slug alias added, TTM display in seconds for sub-minute values, 2s grace period,
+5s sell cooldown, 30s redeem throttle, hot-reload strategy config, CI/CD auto-deploy,
+P&L tracking with actual entry costs, tiered sell thresholds, comprehensive TTM
+fix for all 24 hourly slots using UTC date matching, log rotation, and heartbeat
 monitoring.*
