@@ -6,6 +6,8 @@
     "sell_window_min": 0.5,
     "sell_grace_s": 2,
     "sell_cooldown_s": 3,
+    "sell_lastchance_threshold": 0.35,
+    "sell_lastchance_s": 5,
     "redeem_throttle_s": 30,
     "max_redeem_age_days": 7,
     "dry_run": false

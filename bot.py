@@ -60,6 +60,8 @@ _STRATEGY_DEFAULTS = {
     "sell_window_min": 0.5,            # last 30 seconds — sell window
     "sell_grace_s": 2,                # don't sell within 2s of first seeing a position
     "sell_cooldown_s": 3,             # 3s between sell attempts per leg
+    "sell_lastchance_threshold": 0.35, # last-chance sell: any side < 35¢ in final seconds
+    "sell_lastchance_s": 5,            # last-chance window: final 5 seconds
     "redeem_throttle_s": 30,          # 30s between redeem attempts
     "max_redeem_age_days": 7,
     "dry_run": False,
@@ -92,6 +94,8 @@ HEDGE_THRESHOLD = _strat["hedge_threshold"]
 SELL_WINDOW_MIN = _strat["sell_window_min"]
 SELL_GRACE_S = _strat["sell_grace_s"]
 SELL_COOLDOWN_S = _strat["sell_cooldown_s"]
+SELL_LASTCHANCE_THRESHOLD = _strat["sell_lastchance_threshold"]
+SELL_LASTCHANCE_S = _strat["sell_lastchance_s"]
 REDEEM_THROTTLE_S = _strat["redeem_throttle_s"]
 MAX_REDEEM_AGE_DAYS = _strat["max_redeem_age_days"]
 DRY_RUN = _strat["dry_run"]
@@ -750,6 +754,8 @@ while not _shutdown_requested:
         SELL_WINDOW_MIN = _strat["sell_window_min"]
         SELL_GRACE_S = _strat["sell_grace_s"]
         SELL_COOLDOWN_S = _strat["sell_cooldown_s"]
+        SELL_LASTCHANCE_THRESHOLD = _strat["sell_lastchance_threshold"]
+        SELL_LASTCHANCE_S = _strat["sell_lastchance_s"]
         REDEEM_THROTTLE_S = _strat["redeem_throttle_s"]
         MAX_REDEEM_AGE_DAYS = _strat["max_redeem_age_days"]
         DRY_RUN = _strat["dry_run"]
@@ -828,6 +834,8 @@ while not _shutdown_requested:
                         state = "[bold bright_magenta]\u2713 REDEEM[/]"
                     elif mins <= 0:
                         state = "[dim]\u00b7 closed[/]"
+                    elif mins <= SELL_LASTCHANCE_S / 60:
+                        state = f"[bold red]\u25cc LAST \u2264{int(SELL_LASTCHANCE_THRESHOLD*100)}\u00a2[/]"
                     elif mins <= SELL_AGGRESSIVE_MIN:
                         state = f"[bold red]\u25cc EXIT \u2264{int(SELL_THRESHOLD*100)}\u00a2[/]"
                     elif mins <= SELL_WINDOW_MIN:
@@ -959,6 +967,15 @@ while not _shutdown_requested:
             else:
                 up_trigger = up_size > 0 and up_price is not None and up_price <= SELL_THRESHOLD
                 dn_trigger = dn_size > 0 and dn_price is not None and dn_price <= SELL_THRESHOLD
+
+            # Last-chance sell: in the final seconds, if normal thresholds didn't
+            # fire, sell any side priced below the last-chance threshold.
+            seconds_left = minutes_left * 60
+            if seconds_left <= SELL_LASTCHANCE_S and not up_trigger and not dn_trigger:
+                if up_size > 0 and up_price is not None and up_price < SELL_LASTCHANCE_THRESHOLD:
+                    up_trigger = True
+                if dn_size > 0 and dn_price is not None and dn_price < SELL_LASTCHANCE_THRESHOLD:
+                    dn_trigger = True
 
             # Guard: if both legs trigger, only sell the lower-priced one to ensure
             # we still hold a winner for the $1 payout at resolution.
