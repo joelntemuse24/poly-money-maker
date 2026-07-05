@@ -338,6 +338,10 @@ _ET = ZoneInfo("America/New_York")
 _SLUG_TIME_RE = re.compile(r"(\d{1,2})(am|pm)-et$")
 
 
+# Regex to detect duration marker in slugs like "btc-updown-5m-{ts}"
+_SLUG_DURATION_RE = re.compile(r"-(\d+)m-")
+
+
 def parse_position_end_dt(legs):
     for p in legs:
         for key in ("slug", "eventSlug"):
@@ -346,7 +350,12 @@ def parse_position_end_dt(legs):
             if tail.isdigit():
                 ts = int(tail)
                 if ts > 1_700_000_000:
-                    return datetime.fromtimestamp(ts)
+                    # Slug timestamp is the market START time.
+                    # Detect duration from slug (e.g. "5m" → 5 minutes)
+                    # and add it to get the actual end/expiry time.
+                    dur_match = _SLUG_DURATION_RE.search(slug)
+                    dur_min = int(dur_match.group(1)) if dur_match else 60
+                    return datetime.fromtimestamp(ts) + timedelta(minutes=dur_min)
 
     # Extract hour+am/pm from slug (e.g. "…-12pm-et" → 12PM ET)
     slug_hour = None
@@ -968,11 +977,12 @@ while not _shutdown_requested:
             if will_sell_up or will_sell_dn:
                 up_bid_str = f"{up_price:.3f}" if up_price is not None else "  -  "
                 dn_bid_str = f"{dn_price:.3f}" if dn_price is not None else "  -  "
+                _ttm_disp = f"{minutes_left*60:>3.0f}s" if minutes_left < 1 else f"{minutes_left:>4.1f}m"
                 console.print(Panel(
                     f"  [bright_white]{s['question']}[/]\n"
                     f"  [bright_green]UP[/]   px [bold]{up_bid_str}[/]  inv [bold]{up_size:>6.2f}[/]   \u2502   "
                     f"[bright_red]DN[/]  px [bold]{dn_bid_str}[/]  inv [bold]{dn_size:>6.2f}[/]   \u2502   "
-                    f"[bold red]TTM {minutes_left:>4.1f}m[/]",
+                    f"[bold red]TTM {_ttm_disp}[/]",
                     title="[bold bright_yellow]\u25bc EXIT TRIGGER \u2014 LOSER LEG[/]",
                     border_style="bright_yellow",
                     box=box.HEAVY,
@@ -992,7 +1002,7 @@ while not _shutdown_requested:
                         log_event("sell_fill", condition_id=cond, leg="up", sold=sold, remaining=up_size, price=up_price)
                         save_json(STATE_FILE, positions_meta)
                     else:
-                        time.sleep(2)
+                        time.sleep(1)
                         actual_bal = check_token_balance(up_token)
                         if actual_bal is not None and actual_bal < up_size - 0.01:
                             ghost_sold = up_size - actual_bal
@@ -1019,7 +1029,7 @@ while not _shutdown_requested:
                         log_event("sell_fill", condition_id=cond, leg="down", sold=sold, remaining=dn_size, price=dn_price)
                         save_json(STATE_FILE, positions_meta)
                     else:
-                        time.sleep(2)
+                        time.sleep(1)
                         actual_bal = check_token_balance(dn_token)
                         if actual_bal is not None and actual_bal < dn_size - 0.01:
                             ghost_sold = dn_size - actual_bal
@@ -1057,7 +1067,7 @@ while not _shutdown_requested:
                     notify("HEDGE FIRED", f"Reversal on {s['question']}\nSold DN at ~{dn_price:.3f} ({sold:.2f} shares)", priority="urgent")
                     save_json(STATE_FILE, positions_meta)
                 else:
-                    time.sleep(2)
+                    time.sleep(1)
                     actual_bal = check_token_balance(dn_token)
                     if actual_bal is not None and actual_bal < dn_size - 0.01:
                         ghost_sold = dn_size - actual_bal
@@ -1088,7 +1098,7 @@ while not _shutdown_requested:
                     notify("HEDGE FIRED", f"Reversal on {s['question']}\nSold UP at ~{up_price:.3f} ({sold:.2f} shares)", priority="urgent")
                     save_json(STATE_FILE, positions_meta)
                 else:
-                    time.sleep(2)
+                    time.sleep(1)
                     actual_bal = check_token_balance(up_token)
                     if actual_bal is not None and actual_bal < up_size - 0.01:
                         ghost_sold = up_size - actual_bal
