@@ -1134,14 +1134,14 @@ while not _shutdown_requested:
     except Exception:
         pass
 
-    # Variable polling: 5s >1min, 2s in last minute, 1s in last 35s
+    # Variable polling: 5s >2min, 2s in 2-1min, 1s in last minute (sell window)
     _now = time.time() * 1000
     _min_ttm = min((s["end_ts"] - _now) / 60000 for s in managed_sets) if managed_sets else 999
-    if _min_ttm <= 0.583:       # ≤35s — poll every 1s
+    if _min_ttm <= 1:           # ≤60s — poll every 1s (covers sell window)
         _sleep_s = 1
-    elif _min_ttm <= 1:         # ≤60s — poll every 2s
+    elif _min_ttm <= 2:         # ≤2min — poll every 2s
         _sleep_s = 2
-    else:                       # >1min — poll every 5s
+    else:                       # >2min — poll every 5s
         _sleep_s = 5
     console.print(f"[dim bright_black]\u00b7 \u00b7 \u00b7  sleeping {_sleep_s}s  \u00b7 \u00b7 \u00b7[/]")
     time.sleep(_sleep_s)
