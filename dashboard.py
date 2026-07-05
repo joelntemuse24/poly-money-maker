@@ -22,7 +22,7 @@ from rich.table import Table
 from rich.text import Text
 
 SELL_THRESHOLD = 0.08
-HEDGE_THRESHOLD = 0.50
+HEDGE_THRESHOLD = 0.60
 SELL_WINDOW_MIN = 0.5  # 30 seconds
 STATUS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".dashboard_status.json")
 LOG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "bot.log")
