@@ -339,6 +339,8 @@ An example file is committed as `strategy.example.json` for reference.
 | `sell_window_min` | `0.5` minutes (30 seconds) | Only sell within the last 30 seconds before market expiry. This **time-gates** the sell trigger — even if the loser leg hits 8 cents with 2 minutes left, the bot waits until the final 30 seconds. This reduces reversal risk: selling early locks in a few cents but exposes you to the market flipping; selling late means the outcome is nearly certain. |
 | `sell_grace_s` | `2` seconds | When we first discover a new position, wait 2 seconds before selling. This prevents selling on the very first tick where data might be stale or incomplete. |
 | `sell_cooldown_s` | `3` seconds | After selling a leg, wait 3 seconds before attempting another sell on the same leg. Reduced from 5s to allow more retry attempts within the 30-second sell window. |
+| `sell_lastchance_threshold` | `0.35` (35 cents) | In the final `sell_lastchance_s` seconds, if normal thresholds didn't fire, sell any side priced below this. Catches losing sides that haven't dropped below 8¢ yet. |
+| `sell_lastchance_s` | `5` seconds | How many seconds before expiry the last-chance tier activates. |
 | `redeem_throttle_s` | `30` seconds | After submitting a redemption, wait 30 seconds before retrying. Redemptions are on-chain transactions that take time to confirm. |
 | `max_redeem_age_days` | `7` days | Stop trying to redeem after 7 days past expiry. Old conditions may have been cleaned up on-chain and retries are pointless. |
 | `dry_run` | `false` | When `true`, the bot logs decisions but doesn't send orders or transactions. Used for testing. |
@@ -349,10 +351,10 @@ The sell window (last 30 seconds) is split into two tiers to balance value
 capture against reversal risk:
 
 ```
-     30s ─────────── 10s ─────────── 0s (expiry)
-     │   EARLY TIER   │  AGGRESSIVE  │
-     │  4¢ ≤ bid ≤ 8¢ │  bid ≤ 8¢    │
-     └────────────────┴──────────────┘
+     30s ─────────── 10s ─────── 5s ──── 0s (expiry)
+     │   EARLY TIER   │ AGGRESSIVE│ LAST │
+     │  4¢ ≤ bid ≤ 8¢ │ bid ≤ 8¢  │ <35¢ │
+     └────────────────┴───────────┴──────┘
 ```
 
 - **Early tier (30→10 seconds):** Only sell if the bid is between
@@ -360,9 +362,18 @@ capture against reversal risk:
   worth the execution risk — just let it expire. A bid above 8¢ suggests the
   market hasn't fully decided yet.
 
-- **Aggressive tier (10→0 seconds):** Sell at any bid ≤ `sell_threshold` (8¢).
+- **Aggressive tier (10→5 seconds):** Sell at any bid ≤ `sell_threshold` (8¢).
   With under 10 seconds left, the outcome is nearly certain, so even a 2¢ bid is
   worth capturing vs. letting it expire at $0.
+
+- **Last-chance tier (5→0 seconds):** If the normal thresholds didn't fire (both
+  sides are above 8¢), sell any side priced below `sell_lastchance_threshold`
+  (35¢). This captures value from a side that's clearly losing but hasn't dropped
+  below 8¢ yet — with only 5 seconds left, a side at 20-34¢ is almost certainly
+  going to $0, and selling at even 20¢ is far better than letting it expire
+  worthless. The last-chance tier only activates when neither side already
+  triggered via the normal thresholds, so it won't interfere with existing sell
+  logic.
 
 This tiered approach was informed by real trading history: sells at 1-2¢ with
 significant time left produced negligible value while still carrying reversal
