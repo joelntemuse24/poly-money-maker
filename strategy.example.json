@@ -5,7 +5,7 @@
     "hedge_threshold": 0.60,
     "sell_window_min": 0.5,
     "sell_grace_s": 2,
-    "sell_cooldown_s": 5,
+    "sell_cooldown_s": 3,
     "redeem_throttle_s": 30,
     "max_redeem_age_days": 7,
     "dry_run": false

@@ -21,11 +21,32 @@ from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
 
-SELL_THRESHOLD = 0.08
-HEDGE_THRESHOLD = 0.60
-SELL_WINDOW_MIN = 0.5  # 30 seconds
-STATUS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".dashboard_status.json")
-LOG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "bot.log")
+_BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+STATUS_FILE = os.path.join(_BASE_DIR, ".dashboard_status.json")
+LOG_FILE = os.path.join(_BASE_DIR, "bot.log")
+STRATEGY_FILE = os.path.join(_BASE_DIR, "strategy.json")
+
+# Defaults — kept in sync with bot.py _STRATEGY_DEFAULTS
+_DEFAULTS = {"sell_threshold": 0.08, "hedge_threshold": 0.60, "sell_window_min": 0.5}
+
+def _load_thresholds():
+    """Read thresholds from strategy.json, falling back to defaults."""
+    cfg = dict(_DEFAULTS)
+    try:
+        if os.path.exists(STRATEGY_FILE):
+            with open(STRATEGY_FILE, "r") as f:
+                overrides = json.load(f)
+            for k in cfg:
+                if k in overrides:
+                    cfg[k] = float(overrides[k])
+    except Exception:
+        pass
+    return cfg
+
+_strat = _load_thresholds()
+SELL_THRESHOLD = _strat["sell_threshold"]
+HEDGE_THRESHOLD = _strat["hedge_threshold"]
+SELL_WINDOW_MIN = _strat["sell_window_min"]
 
 console = Console()
 

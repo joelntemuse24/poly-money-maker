@@ -59,7 +59,7 @@ _STRATEGY_DEFAULTS = {
     "hedge_threshold": 0.60,
     "sell_window_min": 0.5,            # last 30 seconds — sell window
     "sell_grace_s": 2,                # don't sell within 2s of first seeing a position
-    "sell_cooldown_s": 5,             # 5s between sell attempts per leg
+    "sell_cooldown_s": 3,             # 3s between sell attempts per leg
     "redeem_throttle_s": 30,          # 30s between redeem attempts
     "max_redeem_age_days": 7,
     "dry_run": False,
@@ -466,7 +466,7 @@ def group_btc_complete_sets(positions, positions_meta=None):
             "dn": dn,
             "end_ts": end_ts,
             "end_dt": end_dt,
-            "question": up.get("title") or dn.get("title") or "BTC Hourly",
+            "question": up.get("title") or dn.get("title") or "BTC Market",
         })
     sets.sort(key=lambda s: s["end_ts"])
 
@@ -502,7 +502,7 @@ def group_btc_complete_sets(positions, positions_meta=None):
                 "dn": {"asset": dn_token, "size": exp_dn, "outcome": "down", "redeemable": False},
                 "end_ts": end_ts,
                 "end_dt": end_dt,
-                "question": meta.get("question", "BTC Hourly"),
+                "question": meta.get("question", "BTC Market"),
             })
         sets.sort(key=lambda s: s["end_ts"])
 
@@ -939,7 +939,7 @@ while not _shutdown_requested:
             if up_bid is None and dn_bid is None and (up_size > 0 or dn_size > 0):
                 _book_fail_count = meta.get("_book_fail_count", 0) + 1
                 meta["_book_fail_count"] = _book_fail_count
-                if _book_fail_count == 6:  # ~12s of failures at 2s tick (or ~30s at 5s)
+                if _book_fail_count == 15:  # ~15s at 1s polling in sell window
                     _ttm_str = f"{round(minutes_left*60)}s" if minutes_left < 1 else f"{round(minutes_left)}m"
                     notify("\u26a0 Book Unavailable", f"{s['question']} \u2014 order book unreachable with {_ttm_str} left", priority="high")
             else:
