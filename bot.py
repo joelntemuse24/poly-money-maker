@@ -35,7 +35,7 @@ DATA_API = "https://data-api.polymarket.com"
 CHAIN_ID = 137
 STATE_FILE = "positions.json"  # metadata cache only: redeem_submitted_at, entered_at
 BTC_SLUG_PREFIX = "bitcoin-up-or-down"  # event/market slug filter for managed markets
-BTC_SLUG_ALIASES = ("bitcoin-up-or-down", "btc-updown")
+BTC_SLUG_ALIASES = ("bitcoin-up-or-down", "btc-updown", "btc-updown-5m")
 PUSD = "0xC011a7E12a19f7B1f670d46F03B03f3342E82DFB"
 CTF = "0x4D97DCd97eC945f40cF65F87097ACe5EA0476045"
 
@@ -55,12 +55,12 @@ RELAYER_API_KEY_ADDRESS = os.getenv("RELAYER_API_KEY_ADDRESS", "0x42aec4505559c0
 _STRATEGY_DEFAULTS = {
     "sell_threshold": 0.08,
     "sell_threshold_early": 0.04,
-    "sell_aggressive_min": 9,
+    "sell_aggressive_min": 0.17,       # ~10 seconds — aggressive tier
     "hedge_threshold": 0.50,
-    "sell_window_min": 15,
-    "sell_grace_s": 10,
-    "sell_cooldown_s": 30,
-    "redeem_throttle_s": 300,
+    "sell_window_min": 0.5,            # last 30 seconds — sell window
+    "sell_grace_s": 2,                # don't sell within 2s of first seeing a position
+    "sell_cooldown_s": 5,             # 5s between sell attempts per leg
+    "redeem_throttle_s": 30,          # 30s between redeem attempts
     "max_redeem_age_days": 7,
     "dry_run": False,
 }
@@ -148,9 +148,9 @@ banner = Panel(
         "[bold bright_green]██████╗ ████████╗ ██████╗[/]   [bright_yellow]//[/]  [bold white]EXIT DESK[/]\n"
         "[bold bright_green]██╔══██╗╚══██╔══╝██╔════╝[/]   [bright_yellow]//[/]  [dim]POLYMARKET CLOB · MATIC[/]\n"
         "[bold bright_green]██████╔╝   ██║   ██║     [/]   [bright_yellow]//[/]  [dim]SELL-SIDE EXECUTION ONLY[/]\n"
-        "[bold bright_green]██╔══██╗   ██║   ██║     [/]   [bright_yellow]//[/]  [dim]BTC HOURLY · 8\u00a2 LOSER TRIG[/]\n"
+        "[bold bright_green]██╔══██╗   ██║   ██║     [/]   [bright_yellow]//[/]  [dim]BTC 5-MIN · 8\u00a2 LOSER TRIG[/]\n"
         "[bold bright_green]██████╔╝   ██║   ╚██████╗[/]   [bright_yellow]//[/]  STATUS: [bold bright_green]\u25cf ARMED[/]\n"
-        "[bold bright_green]╚═════╝    ╚═╝    ╚═════╝[/]   [bright_yellow]//[/]  [dim]v8.0 \u00b7 sell-only \u00b7 data-api[/]",
+        "[bold bright_green]╚═════╝    ╚═╝    ╚═════╝[/]   [bright_yellow]//[/]  [dim]v9.0 \u00b7 5m \u00b7 sell-only \u00b7 data-api[/]",
         vertical="middle",
     ),
     title="[bold bright_yellow]▰▱▰▱  TRADING SYSTEM ONLINE  ▱▰▱▰[/]",
@@ -820,23 +820,28 @@ while not _shutdown_requested:
                     elif mins <= 0:
                         state = "[dim]\u00b7 closed[/]"
                     elif mins <= SELL_AGGRESSIVE_MIN:
-                        state = "[bold red]\u25cc EXIT \u22648\u00a2[/]"
+                        state = f"[bold red]\u25cc EXIT \u2264{int(SELL_THRESHOLD*100)}\u00a2[/]"
                     elif mins <= SELL_WINDOW_MIN:
-                        state = "[bold yellow]\u25cc EXIT 4-8\u00a2[/]"
+                        state = f"[bold yellow]\u25cc EXIT {int(SELL_THRESHOLD_EARLY*100)}-{int(SELL_THRESHOLD*100)}\u00a2[/]"
                     else:
                         state = "[bold bright_green]\u25cf WATCHING[/]"
 
-                    if mins < SELL_WINDOW_MIN:
+                    if mins < 1:
                         mins_style = "bold red"
                     elif mins < 60:
                         mins_style = "yellow"
                     else:
                         mins_style = "green"
 
+                    if mins < 1:
+                        ttm_str = f"{max(mins*60, 0):.0f}s"
+                    else:
+                        ttm_str = f"{mins:.0f}m"
+
                     table.add_row(
                         (s["question"] or "?")[:40],
                         ends_str,
-                        f"[{mins_style}]{mins:.0f}m[/]",
+                        f"[{mins_style}]{ttm_str}[/]",
                         f"{up_sz:.2f}",
                         f"{dn_sz:.2f}",
                         state,
@@ -925,8 +930,9 @@ while not _shutdown_requested:
             if up_bid is None and dn_bid is None and (up_size > 0 or dn_size > 0):
                 _book_fail_count = meta.get("_book_fail_count", 0) + 1
                 meta["_book_fail_count"] = _book_fail_count
-                if _book_fail_count == 6:  # ~30s of failures at 5s tick
-                    notify("\u26a0 Book Unavailable", f"{s['question']} \u2014 order book unreachable with {round(minutes_left)}m left", priority="high")
+                if _book_fail_count == 6:  # ~12s of failures at 2s tick (or ~30s at 5s)
+                    _ttm_str = f"{round(minutes_left*60)}s" if minutes_left < 1 else f"{round(minutes_left)}m"
+                    notify("\u26a0 Book Unavailable", f"{s['question']} \u2014 order book unreachable with {_ttm_str} left", priority="high")
             else:
                 meta["_book_fail_count"] = 0
 
@@ -934,8 +940,8 @@ while not _shutdown_requested:
             dn_price, dn_matched_price = quote_leg(dn_bid)
 
             # Tiered sell thresholds within the exit window:
-            #   Minutes 15–9 (early): only sell between SELL_THRESHOLD_EARLY and SELL_THRESHOLD
-            #   Minutes  9–0 (aggressive): sell at any price <= SELL_THRESHOLD
+            #   30s–10s (early): only sell between SELL_THRESHOLD_EARLY and SELL_THRESHOLD
+            #   10s–0s  (aggressive): sell at any price <= SELL_THRESHOLD
             if minutes_left > SELL_AGGRESSIVE_MIN:
                 up_trigger = (up_size > 0 and up_price is not None
                               and SELL_THRESHOLD_EARLY <= up_price <= SELL_THRESHOLD)
@@ -1113,7 +1119,8 @@ while not _shutdown_requested:
             mins = (s["end_ts"] - now_ms) / 60000
             _dash_positions.append({
                 "question": (s["question"] or "?")[:40],
-                "ttm_min": round(mins, 1),
+                "ttm_min": round(mins, 2),
+                "ttm_sec": round(max(mins, 0) * 60, 0) if mins < 1 else None,
                 "up_size": float(s["up"].get("size", 0)),
                 "dn_size": float(s["dn"].get("size", 0)),
                 "up_token": s["up"].get("asset"),
@@ -1127,8 +1134,12 @@ while not _shutdown_requested:
     except Exception:
         pass
 
-    console.print("[dim bright_black]\u00b7 \u00b7 \u00b7  sleeping 5s  \u00b7 \u00b7 \u00b7[/]")
-    time.sleep(5)
+    # Variable polling: 5s when all positions are >1min from expiry, 2s in the last minute
+    _now = time.time() * 1000
+    _min_ttm = min((s["end_ts"] - _now) / 60000 for s in managed_sets) if managed_sets else 999
+    _sleep_s = 2 if _min_ttm <= 1 else 5
+    console.print(f"[dim bright_black]\u00b7 \u00b7 \u00b7  sleeping {_sleep_s}s  \u00b7 \u00b7 \u00b7[/]")
+    time.sleep(_sleep_s)
 
 # Graceful shutdown complete
 console.print("[bold bright_green]▶ SHUTDOWN COMPLETE[/] [dim]state saved · exiting cleanly[/]")

@@ -23,7 +23,7 @@ from rich.text import Text
 
 SELL_THRESHOLD = 0.08
 HEDGE_THRESHOLD = 0.50
-SELL_WINDOW_MIN = 15
+SELL_WINDOW_MIN = 0.5  # 30 seconds
 STATUS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".dashboard_status.json")
 LOG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "bot.log")
 
@@ -182,10 +182,17 @@ def build_dashboard(status, events):
             ttm_str = "[dim]done[/]"
         elif mins <= SELL_WINDOW_MIN:
             state = "[bold red]EXIT WINDOW[/]"
-            ttm_str = f"[bold red]{mins:.0f}m[/]"
+            ttm_sec = p.get("ttm_sec")
+            if ttm_sec is not None:
+                ttm_str = f"[bold red]{ttm_sec:.0f}s[/]"
+            else:
+                ttm_str = f"[bold red]{mins:.0f}m[/]"
         else:
             state = "[bright_green]WATCHING[/]"
-            ttm_str = f"[green]{mins:.0f}m[/]"
+            if mins < 1:
+                ttm_str = f"[green]{mins*60:.0f}s[/]"
+            else:
+                ttm_str = f"[green]{mins:.0f}m[/]"
 
         table.add_row(
             p["question"][:38],
