@@ -314,7 +314,7 @@ _STRATEGY_DEFAULTS = {
     "hedge_threshold": 0.60,
     "sell_window_min": 0.5,            # last 30 seconds — sell window
     "sell_grace_s": 2,                # don't sell within 2s of first seeing a position
-    "sell_cooldown_s": 5,             # 5s between sell attempts per leg
+    "sell_cooldown_s": 3,             # 3s between sell attempts per leg
     "redeem_throttle_s": 30,          # 30s between redeem attempts
     "max_redeem_age_days": 7,
     "dry_run": False,
@@ -338,7 +338,7 @@ An example file is committed as `strategy.example.json` for reference.
 | `hedge_threshold` | `0.60` (60 cents) | After selling the loser, if the held (winner) leg drops below 60 cents, sell it too. This is the reversal protection — if the market flips, we cut losses at 60 cents rather than riding to $0. |
 | `sell_window_min` | `0.5` minutes (30 seconds) | Only sell within the last 30 seconds before market expiry. This **time-gates** the sell trigger — even if the loser leg hits 8 cents with 2 minutes left, the bot waits until the final 30 seconds. This reduces reversal risk: selling early locks in a few cents but exposes you to the market flipping; selling late means the outcome is nearly certain. |
 | `sell_grace_s` | `2` seconds | When we first discover a new position, wait 2 seconds before selling. This prevents selling on the very first tick where data might be stale or incomplete. |
-| `sell_cooldown_s` | `5` seconds | After selling a leg, wait 5 seconds before attempting another sell on the same leg. Prevents hammering the API with rapid-fire orders. |
+| `sell_cooldown_s` | `3` seconds | After selling a leg, wait 3 seconds before attempting another sell on the same leg. Reduced from 5s to allow more retry attempts within the 30-second sell window. |
 | `redeem_throttle_s` | `30` seconds | After submitting a redemption, wait 30 seconds before retrying. Redemptions are on-chain transactions that take time to confirm. |
 | `max_redeem_age_days` | `7` days | Stop trying to redeem after 7 days past expiry. Old conditions may have been cleaned up on-chain and retries are pointless. |
 | `dry_run` | `false` | When `true`, the bot logs decisions but doesn't send orders or transactions. Used for testing. |
@@ -578,7 +578,7 @@ for 30 seconds waiting. 5 seconds is generous for a push notification.
 - **Bot started** — confirmation that the bot is running (priority: high)
 - **Hedge fired** — reversal detected, cutting losses (priority: urgent)
 - **Hedge ghost fill** — hedge confirmed via balance check (priority: urgent)
-- **Book unavailable** — order book API unreachable for ~6 consecutive cycles
+- **Book unavailable** — order book API unreachable for ~15 consecutive cycles (~15s at 1s polling)
   during sell window (priority: high)
 
 The bot doesn't notify on normal sells — those are expected and frequent. Only
@@ -930,9 +930,10 @@ This is the **ghost fill detection** pattern, which we'll see in the sell phase.
 ```python
 _ET = ZoneInfo("America/New_York")
 _SLUG_TIME_RE = re.compile(r"(\d{1,2})(am|pm)-et$")
+_SLUG_DURATION_RE = re.compile(r"-(\d+)m-")
 
 def parse_position_end_dt(legs):
-    # Strategy 1: Unix timestamp in slug
+    # Strategy 1: Unix timestamp in slug (5-minute markets)
     for p in legs:
         for key in ("slug", "eventSlug"):
             slug = p.get(key) or ""
@@ -940,9 +941,14 @@ def parse_position_end_dt(legs):
             if tail.isdigit():
                 ts = int(tail)
                 if ts > 1_700_000_000:
-                    return datetime.fromtimestamp(ts)
+                    # Slug timestamp is the market START time.
+                    # Detect duration from slug (e.g. "-5m-" → 5 minutes)
+                    # and add it to get the actual end/expiry time.
+                    dur_match = _SLUG_DURATION_RE.search(slug)
+                    dur_min = int(dur_match.group(1)) if dur_match else 60
+                    return datetime.fromtimestamp(ts) + timedelta(minutes=dur_min)
 
-    # Strategy 2: Hour+AM/PM from slug + UTC date matching
+    # Strategy 2: Hour+AM/PM from slug + UTC date matching (hourly markets)
     for p in legs:
         for key in ("slug", "eventSlug"):
             slug = p.get(key) or ""
@@ -953,7 +959,6 @@ def parse_position_end_dt(legs):
             ampm = m.group(2)
             # Convert to 24h; slug hour is window START, expiry = +1h
             hour_24 = (hour_12 % 12) + (12 if ampm == "pm" else 0)
-            expiry_hour = (hour_24 + 1) % 24
 
             end_date_str = p.get("endDate") or ""
             end_date_utc = ...  # parse to UTC date
@@ -962,7 +967,7 @@ def parse_position_end_dt(legs):
             # expiry falls on end_date's UTC calendar date
             for day_offset in (0, -1, 1):
                 candidate = datetime(year, month, day + day_offset,
-                                     expiry_hour, 0, tzinfo=_ET)
+                                     hour_24, 0, tzinfo=_ET) + timedelta(hours=1)
                 if candidate.astimezone(UTC).date() == end_date_utc:
                     return candidate.astimezone(tz=None).replace(tzinfo=None)
 ```
@@ -974,12 +979,20 @@ wrong time (or never).
 
 **The two parsing strategies:**
 
-1. **Unix timestamp in slug** — Some slugs end with a Unix timestamp (e.g.,
-   `bitcoin-up-or-down-1719259200`). We extract the last segment after `-`,
-   check if it's a large number (> 1.7 billion = year 2024), and convert it
-   directly. Simple and unambiguous.
+1. **Unix timestamp in slug** — 5-minute market slugs (e.g.,
+   `btc-updown-5m-1783261800`) end with a Unix timestamp representing the market
+   **start** time (not end). The function detects the duration marker in the slug
+   (`-5m-`) via `_SLUG_DURATION_RE` and adds it to the timestamp to compute the
+   actual expiry. If no duration marker is found (e.g., an hourly market with a
+   timestamp slug), it defaults to 60 minutes.
 
-2. **Hour + AM/PM from slug with UTC date matching** — Most BTC hourly slugs
+   **Critical detail:** The timestamp is the *start* time. A slug like
+   `btc-updown-5m-1783261800` where `1783261800` = July 5, 10:30 AM ET means the
+   market runs 10:30–10:35 AM. The function returns 10:35 AM (start + 5 min), not
+   10:30 AM. Getting this wrong would make the sell window open 5 minutes early
+   (PR #38 fixed this bug).
+
+2. **Hour + AM/PM from slug with UTC date matching** — Hourly BTC market slugs
    end with a time like `5pm-et` (e.g., `bitcoin-up-or-down-2024-06-24-5pm-et`).
    We use a regex to extract the hour and AM/PM, convert to 24-hour format, then
    add 1 hour (slug is the window *start*; market *closes* 1 hour later).
@@ -990,21 +1003,17 @@ wrong time (or never).
    - A "9PM ET" market expires at 10PM ET = 02:00 UTC **the next day**
    - A "5PM ET" market expires at 6PM ET = 22:00 UTC **the same day**
 
-   The old approach (PRs #31) used a ±12h heuristic that only worked for
-   late-night/early-morning hours. The current approach (PR #35) is correct by
-   construction: it tries `day_offset` values of 0, -1, and +1, computing the
-   candidate expiry in ET, converting to UTC, and checking if the UTC calendar
-   date matches `endDate`. Exactly one offset will match for any hour, both
-   during EDT and EST.
+   The current approach (PR #35) is correct by construction: it tries
+   `day_offset` values of 0, -1, and +1, computing the candidate expiry in ET,
+   converting to UTC, and checking if the UTC calendar date matches `endDate`.
+   Exactly one offset will match for any hour, both during EDT and EST.
 
-**Why `ZoneInfo("America/New_York")`?** BTC hourly markets on Polymarket use
-Eastern Time (ET) for their slug times. We need to interpret "12pm ET" correctly
-regardless of what timezone the server runs in. `ZoneInfo` provides proper
-timezone-aware datetime handling, including automatic EDT/EST transitions.
+**Why three regexes at module level?**
+- `_SLUG_TIME_RE` — matches hourly slug tails like `5pm-et`
+- `_SLUG_DURATION_RE` — matches duration markers like `-5m-` in 5-minute slugs
 
-**Why `_ET` and `_SLUG_TIME_RE` at module level?** These are **compiled once**
-at import time and reused across all calls. Compiling a regex on every function
-call would be wasteful. The leading underscore marks them as internal.
+These are **compiled once** at import time and reused across all calls. The
+leading underscore marks them as internal.
 
 **Why the day_offset loop instead of naive date arithmetic?** Naive approaches
 (like "just use the endDate as the ET date") fail for evening markets that cross
@@ -1012,9 +1021,9 @@ the UTC midnight boundary. The loop is a brute-force but provably correct
 solution: since the expiry can only be on the endDate's UTC calendar date, and
 the ET→UTC offset is at most ±1 day, trying 3 offsets guarantees finding it.
 
-**Verified for all 24 hours:** This approach has been tested against every
-hourly slot (12AM through 11PM ET) in both EDT and EST, confirming correct
-results for all cases.
+**Verified for all 24 hours:** The hourly approach has been tested against every
+hourly slot (12AM through 11PM ET) in both EDT and EST. The 5-minute approach
+has been verified against live slug data from the data-api.
 
 ### 10.4 `empty_opposite_leg` — Constructing Missing Legs
 
@@ -1753,7 +1762,7 @@ outcome is nearly settled and reversal is unlikely.
             if up_bid is None and dn_bid is None and (up_size > 0 or dn_size > 0):
                 _book_fail_count = meta.get("_book_fail_count", 0) + 1
                 meta["_book_fail_count"] = _book_fail_count
-                if _book_fail_count == 6:  # ~6s of failures at 1s tick in sell window
+                if _book_fail_count == 15:  # ~15s at 1s polling in sell window
                     _ttm_str = f"{max(minutes_left*60, 0):.0f}s" if minutes_left < 1 else f"{round(minutes_left)}m"
                     notify("\u26a0 Book Unavailable", f"{s['question']} \u2014 order book unreachable with {_ttm_str} left", priority="high")
             else:
@@ -1833,7 +1842,7 @@ Even if the trigger fires, we check a per-leg 5-second cooldown.
                         log_event("sell_fill", condition_id=cond, leg="up", sold=sold, remaining=up_size, price=up_price)
                         save_json(STATE_FILE, positions_meta)
                     else:
-                        time.sleep(2)
+                        time.sleep(1)
                         actual_bal = check_token_balance(up_token)
                         if actual_bal is not None and actual_bal < up_size - 0.01:
                             ghost_sold = up_size - actual_bal
@@ -2168,11 +2177,17 @@ reconstruct exactly what happened by parsing `bot.log`.
 ### 18.1 Purpose
 
 The dashboard is a **separate, read-only process** that provides a live
-terminal-based view of the bot's operation. It reads two files the bot writes
-each cycle:
+terminal-based view of the bot's operation. It reads three files:
 
-- `.dashboard_status.json` — current positions, NAV, cycle count
+- `.dashboard_status.json` — current positions, NAV, cycle count (written by bot each cycle)
 - `bot.log` — recent events (tail)
+- `strategy.json` — threshold values for state display (read once at startup)
+
+The dashboard reads `strategy.json` at launch to pick up the current
+`sell_threshold`, `hedge_threshold`, and `sell_window_min` values. This ensures
+state labels (WATCHING, EXIT WINDOW) and price colouring match whatever
+thresholds the bot is actually using. If `strategy.json` is missing, it falls
+back to the same defaults as the bot.
 
 It does **not** communicate with the bot directly. There's no socket, no pipe,
 no shared memory. The bot writes files; the dashboard reads them. This
