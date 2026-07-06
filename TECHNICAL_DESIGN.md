@@ -60,7 +60,7 @@ and when the losing side's best bid drops to 8 cents, it fires a sell order.
 After selling the loser leg, you're left holding only the winner. Normally this is
 fine — the winner goes to $1.00. But if the market **reverses** (the side you
 thought was winning starts losing), your remaining shares can go to $0. The hedge
-phase watches for this: if the held leg's bid drops below 60 cents after the loser
+phase watches for this: if the held leg's bid drops below 50 cents after the loser
 was sold, the bot sells the held leg too, cutting losses before they compound.
 
 ### What the Bot Does NOT Do
@@ -311,7 +311,7 @@ _STRATEGY_DEFAULTS = {
     "sell_threshold": 0.08,
     "sell_threshold_early": 0.04,
     "sell_aggressive_min": 0.17,       # ~10 seconds — aggressive tier
-    "hedge_threshold": 0.60,
+    "hedge_threshold": 0.50,
     "sell_window_min": 0.5,            # last 30 seconds — sell window
     "sell_grace_s": 2,                # don't sell within 2s of first seeing a position
     "sell_cooldown_s": 3,             # 3s between sell attempts per leg
@@ -335,7 +335,7 @@ An example file is committed as `strategy.example.json` for reference.
 | `sell_threshold` | `0.08` (8 cents) | If the loser leg's best bid drops to or below this price, sell it (used in aggressive tier, last 10→0 seconds). |
 | `sell_threshold_early` | `0.04` (4 cents) | Minimum bid to sell during the early tier (30→10 seconds before expiry). Prevents selling dust positions for negligible value. |
 | `sell_aggressive_min` | `0.17` minutes (~10 seconds) | The boundary between early and aggressive tiers within the sell window. |
-| `hedge_threshold` | `0.60` (60 cents) | After selling the loser, if the held (winner) leg drops below 60 cents, sell it too. This is the reversal protection — if the market flips, we cut losses at 60 cents rather than riding to $0. |
+| `hedge_threshold` | `0.50` (50 cents) | After selling the loser, if the held (winner) leg drops below 50 cents, sell it too. This is the reversal protection — if the market flips, we cut losses at 50 cents rather than riding to $0. |
 | `sell_window_min` | `0.5` minutes (30 seconds) | Only sell within the last 30 seconds before market expiry. This **time-gates** the sell trigger — even if the loser leg hits 8 cents with 2 minutes left, the bot waits until the final 30 seconds. This reduces reversal risk: selling early locks in a few cents but exposes you to the market flipping; selling late means the outcome is nearly certain. |
 | `sell_grace_s` | `2` seconds | When we first discover a new position, wait 2 seconds before selling. This prevents selling on the very first tick where data might be stale or incomplete. |
 | `sell_cooldown_s` | `3` seconds | After selling a leg, wait 3 seconds before attempting another sell on the same leg. Reduced from 5s to allow more retry attempts within the 30-second sell window. |
@@ -2000,7 +2000,7 @@ $1.00 = $1.08) into a loss (sold DOWN for 8 cents + UP goes to $0 = $0.08).
    DOWN shares. `loser_was_dn` is the mirror.
 
 2. **Check if the held leg is collapsing** — if the held leg's bid drops to or
-   below `HEDGE_THRESHOLD` (60 cents), the market has reversed. The winner is
+   below `HEDGE_THRESHOLD` (50 cents), the market has reversed. The winner is
    becoming the loser.
 
 3. **Sell the held leg** — using `sell_market_with_retry` with a price limit of
@@ -2015,11 +2015,11 @@ $1.00 = $1.08) into a loss (sold DOWN for 8 cents + UP goes to $0 = $0.08).
 5. **Ghost fill detection** — same pattern as the sell phase. If the hedge sell
    returns 0 confirmed fills, check the actual balance to detect ghost fills.
 
-**Why `HEDGE_THRESHOLD = 0.60`?** At 60 cents, the market is saying the held
+**Why `HEDGE_THRESHOLD = 0.50`?** At 50 cents, the market is saying the held
 leg's outcome is less likely than before. For 5-minute markets, which are more
 volatile than hourly ones, a 60-cent threshold provides earlier reversal
 detection while still recovering more than half the $1.00 redemption value.
-Selling at 60 cents recovers 60 cents per share — much better than riding it
+Selling at 50 cents recovers 50 cents per share — much better than riding it
 to $0.
 
 **Why sell at `$0.01` price limit?** The hedge is an emergency. We don't want to
