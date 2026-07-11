@@ -55,13 +55,13 @@ instead of letting it expire worthless, you lock in extra profit on top of the
 $1.00 redemption. That's exactly what this bot does: it watches the order book,
 and when the losing side's best bid drops to 8 cents, it fires a sell order.
 
-### The Hedge Safety Net
+### Optional Hedge (Disabled by Default)
 
-After selling the loser leg, you're left holding only the winner. Normally this is
-fine — the winner goes to $1.00. But if the market **reverses** (the side you
-thought was winning starts losing), your remaining shares can go to $0. The hedge
-phase watches for this: if the held leg's bid drops below 50 cents after the loser
-was sold, the bot sells the held leg too, cutting losses before they compound.
+After selling the loser leg, the bot normally retains the other leg for its $1.00
+redemption. An optional hedge can sell that held leg if its bid falls below a
+configured threshold, but it is disabled by default. Near expiry, best bids can be
+far below fair value on both outcomes, so a low held-leg bid alone is not reliable
+evidence of a reversal.
 
 ### What the Bot Does NOT Do
 
@@ -311,6 +311,7 @@ _STRATEGY_DEFAULTS = {
     "sell_threshold": 0.08,
     "sell_threshold_early": 0.04,
     "sell_aggressive_min": 0.17,       # ~10 seconds — aggressive tier
+    "hedge_enabled": False,
     "hedge_threshold": 0.50,
     "sell_window_min": 0.5,            # last 30 seconds — sell window
     "sell_grace_s": 2,                # don't sell within 2s of first seeing a position
@@ -335,11 +336,12 @@ An example file is committed as `strategy.example.json` for reference.
 | `sell_threshold` | `0.08` (8 cents) | If the loser leg's best bid drops to or below this price, sell it (used in aggressive tier, last 10→0 seconds). |
 | `sell_threshold_early` | `0.04` (4 cents) | Minimum bid to sell during the early tier (30→10 seconds before expiry). Prevents selling dust positions for negligible value. |
 | `sell_aggressive_min` | `0.17` minutes (~10 seconds) | The boundary between early and aggressive tiers within the sell window. |
-| `hedge_threshold` | `0.50` (50 cents) | After selling the loser, if the held (winner) leg drops below 50 cents, sell it too. This is the reversal protection — if the market flips, we cut losses at 50 cents rather than riding to $0. |
+| `hedge_enabled` | `false` | Enables the experimental reversal hedge. Disabled by default because a low best bid near expiry can reflect spread or illiquidity rather than a true reversal. |
+| `hedge_threshold` | `0.50` (50 cents) | Held-leg bid threshold used only when `hedge_enabled` is true. |
 | `sell_window_min` | `0.5` minutes (30 seconds) | Only sell within the last 30 seconds before market expiry. This **time-gates** the sell trigger — even if the loser leg hits 8 cents with 2 minutes left, the bot waits until the final 30 seconds. This reduces reversal risk: selling early locks in a few cents but exposes you to the market flipping; selling late means the outcome is nearly certain. |
 | `sell_grace_s` | `2` seconds | When we first discover a new position, wait 2 seconds before selling. This prevents selling on the very first tick where data might be stale or incomplete. |
 | `sell_cooldown_s` | `3` seconds | After selling a leg, wait 3 seconds before attempting another sell on the same leg. Reduced from 5s to allow more retry attempts within the 30-second sell window. |
-| `sell_lastchance_threshold` | `0.35` (35 cents) | In the final `sell_lastchance_s` seconds, if normal thresholds didn't fire, sell any side priced below this. Catches losing sides that haven't dropped below 8¢ yet. |
+| `sell_lastchance_threshold` | `0.35` (35 cents) | In the final `sell_lastchance_s` seconds, consider a side below this only when the opposite bid confirms at or above `1 - sell_lastchance_threshold` (65¢ by default). |
 | `sell_lastchance_s` | `5` seconds | How many seconds before expiry the last-chance tier activates. |
 | `redeem_throttle_s` | `30` seconds | After submitting a redemption, wait 30 seconds before retrying. Redemptions are on-chain transactions that take time to confirm. |
 | `max_redeem_age_days` | `7` days | Stop trying to redeem after 7 days past expiry. Old conditions may have been cleaned up on-chain and retries are pointless. |
@@ -352,8 +354,8 @@ capture against reversal risk:
 
 ```
      30s ─────────── 10s ─────── 5s ──── 0s (expiry)
-     │   EARLY TIER   │ AGGRESSIVE│ LAST │
-     │  4¢ ≤ bid ≤ 8¢ │ bid ≤ 8¢  │ <35¢ │
+     │   EARLY TIER   │ AGGRESSIVE│ LAST-CHANCE │
+     │  4¢ ≤ bid ≤ 8¢ │ bid ≤ 8¢  │ <35¢ + opposite ≥65¢ │
      └────────────────┴───────────┴──────┘
 ```
 
@@ -366,14 +368,15 @@ capture against reversal risk:
   With under 10 seconds left, the outcome is nearly certain, so even a 2¢ bid is
   worth capturing vs. letting it expire at $0.
 
-- **Last-chance tier (5→0 seconds):** If the normal thresholds didn't fire (both
-  sides are above 8¢), sell any side priced below `sell_lastchance_threshold`
-  (35¢). This captures value from a side that's clearly losing but hasn't dropped
-  below 8¢ yet — with only 5 seconds left, a side at 20-34¢ is almost certainly
-  going to $0, and selling at even 20¢ is far better than letting it expire
-  worthless. The last-chance tier only activates when neither side already
-  triggered via the normal thresholds, so it won't interfere with existing sell
-  logic.
+- **Last-chance tier (5→0 seconds):** If the normal thresholds did not fire, a
+  side below `sell_lastchance_threshold` (35¢) is sold only when the opposite
+  side's bid is at least 65¢. If both bids are low, or the opposite bid does not
+  confirm, the bot skips the sale and records `sell_skip_ambiguous`. This avoids
+  treating a wide or illiquid book as proof of which outcome is losing.
+
+Across cycles, once one leg is fully sold, the normal tiers preserve the remaining
+leg for redemption. Only the explicitly enabled experimental hedge can override
+this invariant.
 
 This tiered approach was informed by real trading history: sells at 1-2¢ with
 significant time left produced negligible value while still carrying reversal
@@ -1962,89 +1965,38 @@ exit codes to determine restart behaviour.
 
 ---
 
-## 15. The Hedge Phase — Cutting Losses on Reversals
+## 15. Optional Experimental Hedge
 
-The hedge phase is the most significant new feature in the current codebase. It
-runs *after* the sell phase, for each managed set.
+The hedge code runs after the sell phase for each managed set, but it is disabled
+by default because a single low best bid is not sufficient reversal evidence.
 
-### 15.1 The Problem It Solves
+### 15.1 Purpose and Risk
 
-After selling the loser leg, you hold only the "winner." For example, if BTC was
-going up and you sold the DOWN leg at 8 cents, you now hold only UP shares.
-Normally, UP goes to $1.00 at resolution and you redeem.
+The optional hedge attempts to protect against a genuine reversal after one leg
+has already been sold. It checks whether the remaining leg's bid is at or below
+`HEDGE_THRESHOLD`, then sells that leg as an emergency exit.
 
-But what if the market **reverses**? BTC starts going down. The UP shares you're
-holding start losing value — from 92 cents to 50 cents to 10 cents to $0. Without
-a hedge, you've turned a profitable trade (sold DOWN for 8 cents + redeem UP for
-$1.00 = $1.08) into a loss (sold DOWN for 8 cents + UP goes to $0 = $0.08).
+A best bid near expiry is not a reliable probability estimate. Wide spreads and
+thin books can put both best bids below 50¢ even though one outcome will shortly
+redeem for $1.00. Automatically selling the held leg in that state can liquidate
+the eventual winner at a large discount.
 
-### 15.2 The Hedge Logic
-
-```@/c:/Users/ntemu/Downloads/poly money maker/bot.py:1030-1096
-            # ================= HEDGE PHASE =================
-            # If we already sold one leg (the "loser") and the held leg drops
-            # below HEDGE_THRESHOLD, sell it too to limit reversal losses.
-            loser_was_up = meta.get("last_sell_up_at") and up_size < 0.01 and dn_size >= 0.01
-            loser_was_dn = meta.get("last_sell_dn_at") and dn_size < 0.01 and up_size >= 0.01
-
-            if loser_was_up and dn_price is not None and dn_price <= HEDGE_THRESHOLD:
-                # ... sell the DOWN (held) leg
-            elif loser_was_dn and up_price is not None and up_price <= HEDGE_THRESHOLD:
-                # ... sell the UP (held) leg
-```
-
-**How it works:**
-
-1. **Detect that we sold a loser** — `loser_was_up` is True if we previously sold
-   the UP leg (`last_sell_up_at` exists), UP size is now ~0, and we still hold
-   DOWN shares. `loser_was_dn` is the mirror.
-
-2. **Check if the held leg is collapsing** — if the held leg's bid drops to or
-   below `HEDGE_THRESHOLD` (50 cents), the market has reversed. The winner is
-   becoming the loser.
-
-3. **Sell the held leg** — using `sell_market_with_retry` with a price limit of
-   `$0.01` (sell at any price above 1 cent). This is a **panic exit** — we're not
-   trying to get a good price, we're trying to get *something* before it goes to
-   $0.
-
-4. **Notify the operator** — `notify("HEDGE FIRED", ...)` sends an urgent push
-   notification. A hedge firing is an exceptional event that warrants immediate
-   attention.
-
-5. **Ghost fill detection** — same pattern as the sell phase. If the hedge sell
-   returns 0 confirmed fills, check the actual balance to detect ghost fills.
-
-**Why `HEDGE_THRESHOLD = 0.50`?** At 50 cents, the market is saying the held
-leg's outcome is less likely than before. For 5-minute markets, which are more
-volatile than hourly ones, a 60-cent threshold provides earlier reversal
-detection while still recovering more than half the $1.00 redemption value.
-Selling at 50 cents recovers 50 cents per share — much better than riding it
-to $0.
-
-**Why sell at `$0.01` price limit?** The hedge is an emergency. We don't want to
-miss a fill because we set the price limit too high. At 1 cent, we'll match any
-bid on the book. The priority is exit, not price.
-
-**Why the `elif`?** Only one hedge can fire per set per cycle — if the UP loser
-was sold and DOWN is collapsing, we hedge DOWN. We don't also check UP (which has
-size ~0 anyway). The `elif` makes this mutual exclusion explicit.
-
-### 15.3 The Hedge Is Implicitly Time-Gated
-
-The hedge phase runs inside the same `for s in managed_sets` loop iteration as
-the sell phase. Because the sell phase starts with:
+### 15.2 Hedge Configuration
 
 ```python
-if minutes_left > SELL_WINDOW_MIN:
-    continue
+"hedge_enabled": False,
+"hedge_threshold": 0.50,
 ```
 
-…the hedge code is only reachable during the last 30 seconds. This is correct
-behaviour: you can't hedge before you've sold the loser, and you can only sell
-the loser in the last 30 seconds. Once you sell (say at 25 seconds left), all
-subsequent ticks are still within the window, so the hedge check runs every
-cycle until the market expires.
+The hedge is therefore **disabled by default**. When disabled, the normal sell
+logic preserves the remaining leg for resolution and redemption after the other
+leg has been fully sold. The existing hedge implementation remains available only
+as an explicit experimental override through `strategy.json`.
+
+If it is enabled, the hedge still runs only inside the final sell window, sends an
+urgent notification, and uses balance reconciliation for ambiguous responses.
+It should not be enabled without stronger reversal confirmation and replay data
+showing that it adds value after spread and execution costs.
 
 ---
 
