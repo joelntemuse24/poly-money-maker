@@ -54,15 +54,13 @@ RELAYER_API_KEY_ADDRESS = os.getenv("RELAYER_API_KEY_ADDRESS", "0x42aec4505559c0
 # Defaults — overridden by strategy.json if present (hot-reloaded each cycle)
 _STRATEGY_DEFAULTS = {
     "sell_threshold": 0.10,
-    "sell_threshold_early": 0.04,
-    "sell_aggressive_min": 0.17,       # ~10 seconds — aggressive tier
     "hedge_enabled": False,
     "hedge_threshold": 0.50,
     "sell_window_min": 0.75,           # last 45 seconds — sell window
     "sell_grace_s": 2,                # don't sell within 2s of first seeing a position
     "sell_cooldown_s": 3,             # 3s between sell attempts per leg
     "sell_lastchance_threshold": 0.35, # confirmed loser below 35¢ in final seconds
-    "sell_lastchance_s": 5,            # last-chance window: final 5 seconds
+    "sell_lastchance_s": 10,           # last-chance window: final 10 seconds
     "redeem_throttle_s": 30,          # 30s between redeem attempts
     "max_redeem_age_days": 7,
     "dry_run": False,
@@ -89,8 +87,6 @@ def load_strategy():
 
 _strat = load_strategy()
 SELL_THRESHOLD = _strat["sell_threshold"]
-SELL_THRESHOLD_EARLY = _strat["sell_threshold_early"]
-SELL_AGGRESSIVE_MIN = _strat["sell_aggressive_min"]
 HEDGE_ENABLED = _strat["hedge_enabled"]
 HEDGE_THRESHOLD = _strat["hedge_threshold"]
 SELL_WINDOW_MIN = _strat["sell_window_min"]
@@ -750,8 +746,6 @@ while not _shutdown_requested:
         # Hot-reload strategy config from strategy.json (no restart needed)
         _strat = load_strategy()
         SELL_THRESHOLD = _strat["sell_threshold"]
-        SELL_THRESHOLD_EARLY = _strat["sell_threshold_early"]
-        SELL_AGGRESSIVE_MIN = _strat["sell_aggressive_min"]
         HEDGE_ENABLED = _strat["hedge_enabled"]
         HEDGE_THRESHOLD = _strat["hedge_threshold"]
         SELL_WINDOW_MIN = _strat["sell_window_min"]
@@ -838,11 +832,9 @@ while not _shutdown_requested:
                     elif mins <= 0:
                         state = "[dim]\u00b7 closed[/]"
                     elif mins <= SELL_LASTCHANCE_S / 60:
-                        state = f"[bold red]\u25cc LAST \u2264{int(SELL_LASTCHANCE_THRESHOLD*100)}\u00a2[/]"
-                    elif mins <= SELL_AGGRESSIVE_MIN:
-                        state = f"[bold red]\u25cc EXIT \u2264{int(SELL_THRESHOLD*100)}\u00a2[/]"
+                        state = f"[bold red]\u25cc EXIT \u2264{int(SELL_THRESHOLD*100)}\u00a2 \u00b7 LAST <{int(SELL_LASTCHANCE_THRESHOLD*100)}\u00a2[/]"
                     elif mins <= SELL_WINDOW_MIN:
-                        state = f"[bold yellow]\u25cc EXIT {int(SELL_THRESHOLD_EARLY*100)}-{int(SELL_THRESHOLD*100)}\u00a2[/]"
+                        state = f"[bold yellow]\u25cc EXIT \u2264{int(SELL_THRESHOLD*100)}\u00a2[/]"
                     else:
                         state = "[bold bright_green]\u25cf WATCHING[/]"
 
@@ -959,32 +951,19 @@ while not _shutdown_requested:
             up_price, up_matched_price = quote_leg(up_bid)
             dn_price, dn_matched_price = quote_leg(dn_bid)
 
-            # Tiered sell thresholds within the exit window:
-            #   45s–10s (early): only sell between SELL_THRESHOLD_EARLY and SELL_THRESHOLD
-            #   10s–0s  (aggressive): sell at any price <= SELL_THRESHOLD
-            up_trigger = False
-            dn_trigger = False
-            up_trigger_reason = None
-            dn_trigger_reason = None
+            # Sell at or below the configured threshold throughout the exit window.
+            up_trigger = bool(
+                up_size > 0 and up_price is not None and up_price <= SELL_THRESHOLD
+            )
+            dn_trigger = bool(
+                dn_size > 0 and dn_price is not None and dn_price <= SELL_THRESHOLD
+            )
+            up_trigger_reason = "threshold" if up_trigger else None
+            dn_trigger_reason = "threshold" if dn_trigger else None
             seconds_left = minutes_left * 60
-            if minutes_left > SELL_AGGRESSIVE_MIN:
-                if (up_size > 0 and up_price is not None
-                        and SELL_THRESHOLD_EARLY <= up_price <= SELL_THRESHOLD):
-                    up_trigger = True
-                    up_trigger_reason = "early"
-                if (dn_size > 0 and dn_price is not None
-                        and SELL_THRESHOLD_EARLY <= dn_price <= SELL_THRESHOLD):
-                    dn_trigger = True
-                    dn_trigger_reason = "early"
-            else:
-                if up_size > 0 and up_price is not None and up_price <= SELL_THRESHOLD:
-                    up_trigger = True
-                    up_trigger_reason = "aggressive"
-                if dn_size > 0 and dn_price is not None and dn_price <= SELL_THRESHOLD:
-                    dn_trigger = True
-                    dn_trigger_reason = "aggressive"
 
-            # A last-chance loser needs confirmation from a strong opposite bid.
+            # In the final seconds, a higher-priced loser needs confirmation from
+            # a strong opposite bid when neither side met the normal threshold.
             if seconds_left <= SELL_LASTCHANCE_S and not up_trigger and not dn_trigger:
                 confirmation_price = 1.0 - SELL_LASTCHANCE_THRESHOLD
                 up_candidate = (up_size > 0 and up_price is not None
