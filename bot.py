@@ -53,12 +53,12 @@ RELAYER_API_KEY_ADDRESS = os.getenv("RELAYER_API_KEY_ADDRESS", "0x42aec4505559c0
 # ------------------------- STRATEGY CONFIG -------------------------
 # Defaults — overridden by strategy.json if present (hot-reloaded each cycle)
 _STRATEGY_DEFAULTS = {
-    "sell_threshold": 0.08,
+    "sell_threshold": 0.10,
     "sell_threshold_early": 0.04,
     "sell_aggressive_min": 0.17,       # ~10 seconds — aggressive tier
     "hedge_enabled": False,
     "hedge_threshold": 0.50,
-    "sell_window_min": 0.5,            # last 30 seconds — sell window
+    "sell_window_min": 0.75,           # last 45 seconds — sell window
     "sell_grace_s": 2,                # don't sell within 2s of first seeing a position
     "sell_cooldown_s": 3,             # 3s between sell attempts per leg
     "sell_lastchance_threshold": 0.35, # confirmed loser below 35¢ in final seconds
@@ -960,7 +960,7 @@ while not _shutdown_requested:
             dn_price, dn_matched_price = quote_leg(dn_bid)
 
             # Tiered sell thresholds within the exit window:
-            #   30s–10s (early): only sell between SELL_THRESHOLD_EARLY and SELL_THRESHOLD
+            #   45s–10s (early): only sell between SELL_THRESHOLD_EARLY and SELL_THRESHOLD
             #   10s–0s  (aggressive): sell at any price <= SELL_THRESHOLD
             up_trigger = False
             dn_trigger = False

@@ -28,10 +28,10 @@ STRATEGY_FILE = os.path.join(_BASE_DIR, "strategy.json")
 
 # Defaults — kept in sync with bot.py _STRATEGY_DEFAULTS
 _DEFAULTS = {
-    "sell_threshold": 0.08,
+    "sell_threshold": 0.10,
     "hedge_enabled": False,
     "hedge_threshold": 0.50,
-    "sell_window_min": 0.5,
+    "sell_window_min": 0.75,
 }
 
 def _load_thresholds():

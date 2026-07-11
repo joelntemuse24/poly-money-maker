@@ -50,10 +50,10 @@ One side will be worth $1.00 at resolution and the other $0.00. If you hold both
 you're guaranteed to redeem $1.00 per pair.
 
 The profit comes from selling the **loser leg** — the side that's heading to $0.
-If you can sell that loser leg for even 8 cents before the market resolves,
+If you can sell that loser leg for even 10 cents before the market resolves,
 instead of letting it expire worthless, you lock in extra profit on top of the
 $1.00 redemption. That's exactly what this bot does: it watches the order book,
-and when the losing side's best bid drops to 8 cents, it fires a sell order.
+and when the losing side's best bid drops to 10 cents, it fires a sell order.
 
 ### Optional Hedge (Disabled by Default)
 
@@ -308,12 +308,12 @@ malformed:
 
 ```python
 _STRATEGY_DEFAULTS = {
-    "sell_threshold": 0.08,
+    "sell_threshold": 0.10,
     "sell_threshold_early": 0.04,
     "sell_aggressive_min": 0.17,       # ~10 seconds — aggressive tier
     "hedge_enabled": False,
     "hedge_threshold": 0.50,
-    "sell_window_min": 0.5,            # last 30 seconds — sell window
+    "sell_window_min": 0.75,           # last 45 seconds — sell window
     "sell_grace_s": 2,                # don't sell within 2s of first seeing a position
     "sell_cooldown_s": 3,             # 3s between sell attempts per leg
     "redeem_throttle_s": 30,          # 30s between redeem attempts
@@ -324,7 +324,7 @@ _STRATEGY_DEFAULTS = {
 
 **Why hot-reload instead of hardcoded?** During live trading, you sometimes need
 to adjust thresholds without downtime — e.g., tightening `sell_threshold` from
-8¢ to 6¢ during volatile conditions, or enabling `dry_run` to debug without
+10¢ to 8¢ during volatile conditions, or enabling `dry_run` to debug without
 restarting. The `load_strategy()` function reads the file each cycle, coerces
 types safely (booleans use `str(v).lower() in ("1", "true", "yes")`), and falls
 back to defaults on any parse error.
@@ -333,14 +333,14 @@ An example file is committed as `strategy.example.json` for reference.
 
 | Constant | Default | Meaning |
 |---|---|---|
-| `sell_threshold` | `0.08` (8 cents) | If the loser leg's best bid drops to or below this price, sell it (used in aggressive tier, last 10→0 seconds). |
-| `sell_threshold_early` | `0.04` (4 cents) | Minimum bid to sell during the early tier (30→10 seconds before expiry). Prevents selling dust positions for negligible value. |
+| `sell_threshold` | `0.10` (10 cents) | If the loser leg's best bid drops to or below this price, sell it (used in aggressive tier, last 10→0 seconds). |
+| `sell_threshold_early` | `0.04` (4 cents) | Minimum bid to sell during the early tier (45→10 seconds before expiry). Prevents selling dust positions for negligible value. |
 | `sell_aggressive_min` | `0.17` minutes (~10 seconds) | The boundary between early and aggressive tiers within the sell window. |
 | `hedge_enabled` | `false` | Enables the experimental reversal hedge. Disabled by default because a low best bid near expiry can reflect spread or illiquidity rather than a true reversal. |
 | `hedge_threshold` | `0.50` (50 cents) | Held-leg bid threshold used only when `hedge_enabled` is true. |
-| `sell_window_min` | `0.5` minutes (30 seconds) | Only sell within the last 30 seconds before market expiry. This **time-gates** the sell trigger — even if the loser leg hits 8 cents with 2 minutes left, the bot waits until the final 30 seconds. This reduces reversal risk: selling early locks in a few cents but exposes you to the market flipping; selling late means the outcome is nearly certain. |
+| `sell_window_min` | `0.75` minutes (45 seconds) | Only sell within the last 45 seconds before market expiry. This **time-gates** the sell trigger — even if the loser leg hits 10 cents with 2 minutes left, the bot waits until the final 45 seconds. The wider live-test window seeks more exit opportunities while retaining the ambiguity and remaining-leg safeguards. |
 | `sell_grace_s` | `2` seconds | When we first discover a new position, wait 2 seconds before selling. This prevents selling on the very first tick where data might be stale or incomplete. |
-| `sell_cooldown_s` | `3` seconds | After selling a leg, wait 3 seconds before attempting another sell on the same leg. Reduced from 5s to allow more retry attempts within the 30-second sell window. |
+| `sell_cooldown_s` | `3` seconds | After selling a leg, wait 3 seconds before attempting another sell on the same leg. Reduced from 5s to allow more retry attempts within the sell window. |
 | `sell_lastchance_threshold` | `0.35` (35 cents) | In the final `sell_lastchance_s` seconds, consider a side below this only when the opposite bid confirms at or above `1 - sell_lastchance_threshold` (65¢ by default). |
 | `sell_lastchance_s` | `5` seconds | How many seconds before expiry the last-chance tier activates. |
 | `redeem_throttle_s` | `30` seconds | After submitting a redemption, wait 30 seconds before retrying. Redemptions are on-chain transactions that take time to confirm. |
@@ -349,22 +349,22 @@ An example file is committed as `strategy.example.json` for reference.
 
 ### 6.3 Tiered Sell Thresholds
 
-The sell window (last 30 seconds) is split into two tiers to balance value
+The sell window (last 45 seconds) is split into two tiers to balance value
 capture against reversal risk:
 
 ```
-     30s ─────────── 10s ─────── 5s ──── 0s (expiry)
+     45s ─────────── 10s ─────── 5s ──── 0s (expiry)
      │   EARLY TIER   │ AGGRESSIVE│ LAST-CHANCE │
-     │  4¢ ≤ bid ≤ 8¢ │ bid ≤ 8¢  │ <35¢ + opposite ≥65¢ │
+     │ 4¢ ≤ bid ≤ 10¢ │ bid ≤ 10¢ │ <35¢ + opposite ≥65¢ │
      └────────────────┴───────────┴──────┘
 ```
 
-- **Early tier (30→10 seconds):** Only sell if the bid is between
-  `sell_threshold_early` (4¢) and `sell_threshold` (8¢). A bid below 4¢ is not
-  worth the execution risk — just let it expire. A bid above 8¢ suggests the
+- **Early tier (45→10 seconds):** Only sell if the bid is between
+  `sell_threshold_early` (4¢) and `sell_threshold` (10¢). A bid below 4¢ is not
+  worth the execution risk — just let it expire. A bid above 10¢ suggests the
   market hasn't fully decided yet.
 
-- **Aggressive tier (10→5 seconds):** Sell at any bid ≤ `sell_threshold` (8¢).
+- **Aggressive tier (10→5 seconds):** Sell at any bid ≤ `sell_threshold` (10¢).
   With under 10 seconds left, the outcome is nearly certain, so even a 2¢ bid is
   worth capturing vs. letting it expire at $0.
 
@@ -1649,15 +1649,15 @@ The bot uses `rich.Table` to render a colour-coded dashboard. Each row shows:
 - **EXPIRY** — the market end time (HH:MM format).
 - **TTM** — Time To Maturity, displayed in seconds when < 1 minute, otherwise in
   minutes. Colour-coded:
-  - Red if < `SELL_WINDOW_MIN` (30 seconds, in the exit window).
+  - Red if < `SELL_WINDOW_MIN` (45 seconds, in the exit window).
   - Yellow if < 60 minutes (approaching the window).
   - Green if > 60 minutes (safe).
 - **UP / DN** — share counts for each leg.
 - **STATE** — one of:
   - `✓ REDEEM` (magenta) — market resolved, ready for redemption.
   - `· closed` (dim) — market expired but not yet redeemable.
-  - `○ EXIT ≤8¢` (red) — in the aggressive tier (last 10→0 seconds), sell at any bid ≤ 8¢.
-  - `○ EXIT 4-8¢` (yellow) — in the early tier (30→10 seconds), sell only between 4¢ and 8¢.
+  - `○ EXIT ≤10¢` (red) — in the aggressive tier (last 10→0 seconds), sell at any bid ≤ 10¢.
+  - `○ EXIT 4-10¢` (yellow) — in the early tier (45→10 seconds), sell only between 4¢ and 10¢.
   - `● WATCHING` (green) — holding, outside the sell window.
 
 ### 14.4 The Redeem Phase
@@ -1797,41 +1797,39 @@ sell window we are (see §6.3 for the tier diagram):
 ```python
 # Determine which threshold applies based on time remaining
 if minutes_left > SELL_AGGRESSIVE_MIN:
-    # Early tier (30→10s): only sell between 4¢ and 8¢
+    # Early tier (45→10s): only sell between 4¢ and 10¢
     up_trigger = (up_size > 0 and up_price is not None
                   and SELL_THRESHOLD_EARLY <= up_price <= SELL_THRESHOLD)
     dn_trigger = (dn_size > 0 and dn_price is not None
                   and SELL_THRESHOLD_EARLY <= dn_price <= SELL_THRESHOLD)
 else:
-    # Aggressive tier (10→0s): sell at any price ≤ 8¢
+    # Aggressive tier (10→0s): sell at any price ≤ 10¢
     up_trigger = up_size > 0 and up_price is not None and up_price <= SELL_THRESHOLD
     dn_trigger = dn_size > 0 and dn_price is not None and dn_price <= SELL_THRESHOLD
 
-# Guard: if both legs trigger, only sell the lower-priced one to ensure
-# we still hold a winner for the $1 payout at resolution.
+# Ambiguous books do not identify a loser reliably.
 if up_trigger and dn_trigger:
-    if up_price <= dn_price:
-        dn_trigger = False
-    else:
-        up_trigger = False
+    log_event("sell_skip_ambiguous", reason="both_legs_triggered")
+    up_trigger = False
+    dn_trigger = False
 ```
 
 **The trigger logic:**
 
-- **Early tier (30→10 seconds):** `SELL_THRESHOLD_EARLY <= price <= SELL_THRESHOLD`
-  (4¢-8¢). A bid below 4¢ is not worth selling — the execution risk outweighs
-  the $0.04/share recovery. A bid above 8¢ means the market hasn't decided yet.
+- **Early tier (45→10 seconds):** `SELL_THRESHOLD_EARLY <= price <= SELL_THRESHOLD`
+  (4¢-10¢). A bid below 4¢ is not worth selling in this tier, while a bid above
+  10¢ means the market has not met the configured live-test threshold.
 
-- **Aggressive tier (10→0 seconds):** `price <= SELL_THRESHOLD` (any bid ≤ 8¢).
-  With under 10 seconds left, the outcome is nearly certain. Even a 2¢ bid is
-  worth capturing vs. letting it expire worthless.
+- **Aggressive tier (10→0 seconds):** `price <= SELL_THRESHOLD` (any bid ≤ 10¢).
+  With under 10 seconds left, even a small bid can be worth capturing instead of
+  letting the leg expire worthless.
 
 - **Both tiers are gated by the sell window** — nothing happens until
-  `minutes_left <= SELL_WINDOW_MIN` (0.5 min = 30 seconds).
+  `minutes_left <= SELL_WINDOW_MIN` (0.75 min = 45 seconds).
 
-**Mutual exclusion:** If both legs trigger (both at ≤ 8 cents), only sell the one
-with the lower bid (the bigger loser). We always keep the winning leg to redeem
-$1.00 at resolution. Tie breaks sell UP.
+**Mutual exclusion:** If both legs satisfy a normal trigger, the book is treated
+as ambiguous and neither leg is sold. The bot records `sell_skip_ambiguous`
+instead of guessing the loser from the lower bid.
 
 **Step 5: Cooldown check**
 
@@ -1840,7 +1838,7 @@ $1.00 at resolution. Tie breaks sell UP.
             will_sell_dn = sell_dn and (now_ms - (meta.get("last_sell_dn_at") or 0) >= SELL_COOLDOWN_S * 1000)
 ```
 
-Even if the trigger fires, we check a per-leg 5-second cooldown.
+Even if the trigger fires, we check a per-leg 3-second cooldown.
 
 **Step 6: Execute the sell with ghost fill detection**
 
@@ -2176,7 +2174,7 @@ string. Different event types get different colours and labels:
 
 | Event | Display |
 |---|---|
-| `sell_fill` | `[bold bright_yellow]SELL[/] UP 50.00 @ 0.080` |
+| `sell_fill` | `[bold bright_yellow]SELL[/] UP 50.00 @ 0.100` |
 | `hedge_fill` | `[bold bright_red]HEDGE[/] DN 100.00 @ 0.450` |
 | `sell_ghost_fill` / `hedge_ghost_fill` | `[bold yellow]GHOST[/] UP 50.00 confirmed` |
 | `sell_attempt` | `[dim]ATTEMPT[/] UP sell` |
@@ -2326,7 +2324,7 @@ asymmetry is fundamental to how order books work.
 | **Redemption** | The process of returning a complete set (UP + DOWN tokens) to the smart contract to receive $1.00 USDC after market resolution. |
 | **Relayer** | A Polymarket-operated service that submits on-chain transactions on behalf of users, paying the gas fees. |
 | **Reversal** | When the market flips direction — the side that was winning starts losing. Triggers the hedge phase. |
-| **Sell window** | The final N seconds before market expiry during which the bot is allowed to sell. Currently 30 seconds (`SELL_WINDOW_MIN` = 0.5 min). |
+| **Sell window** | The final N seconds before market expiry during which the bot is allowed to sell. Currently 45 seconds (`SELL_WINDOW_MIN` = 0.75 min). |
 | **Slug** | A human-readable URL fragment identifying a market (e.g., `btc-updown-5m-1783218000`). |
 | **Tick size** | The minimum price increment for a market. On Polymarket, typically $0.01. |
 | **Token ID** | The ERC-1155 token identifier for a specific outcome in a market. Each binary market has two (UP and DOWN). |
