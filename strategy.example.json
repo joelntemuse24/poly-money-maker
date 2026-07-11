@@ -1,10 +1,10 @@
 {
-    "sell_threshold": 0.08,
+    "sell_threshold": 0.10,
     "sell_threshold_early": 0.04,
     "sell_aggressive_min": 0.17,
     "hedge_enabled": false,
     "hedge_threshold": 0.50,
-    "sell_window_min": 0.5,
+    "sell_window_min": 0.75,
     "sell_grace_s": 2,
     "sell_cooldown_s": 3,
     "sell_lastchance_threshold": 0.35,
