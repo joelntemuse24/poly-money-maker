@@ -309,13 +309,13 @@ malformed:
 ```python
 _STRATEGY_DEFAULTS = {
     "sell_threshold": 0.10,
-    "sell_threshold_early": 0.04,
-    "sell_aggressive_min": 0.17,       # ~10 seconds — aggressive tier
     "hedge_enabled": False,
     "hedge_threshold": 0.50,
     "sell_window_min": 0.75,           # last 45 seconds — sell window
     "sell_grace_s": 2,                # don't sell within 2s of first seeing a position
     "sell_cooldown_s": 3,             # 3s between sell attempts per leg
+    "sell_lastchance_threshold": 0.35, # confirmed loser below 35¢
+    "sell_lastchance_s": 10,           # final 10-second fallback
     "redeem_throttle_s": 30,          # 30s between redeem attempts
     "max_redeem_age_days": 7,
     "dry_run": False,
@@ -333,55 +333,45 @@ An example file is committed as `strategy.example.json` for reference.
 
 | Constant | Default | Meaning |
 |---|---|---|
-| `sell_threshold` | `0.10` (10 cents) | If the loser leg's best bid drops to or below this price, sell it (used in aggressive tier, last 10→0 seconds). |
-| `sell_threshold_early` | `0.04` (4 cents) | Minimum bid to sell during the early tier (45→10 seconds before expiry). Prevents selling dust positions for negligible value. |
-| `sell_aggressive_min` | `0.17` minutes (~10 seconds) | The boundary between early and aggressive tiers within the sell window. |
+| `sell_threshold` | `0.10` (10 cents) | Sell a leg when its best bid is at or below this price anywhere in the final 45-second sell window. |
 | `hedge_enabled` | `false` | Enables the experimental reversal hedge. Disabled by default because a low best bid near expiry can reflect spread or illiquidity rather than a true reversal. |
 | `hedge_threshold` | `0.50` (50 cents) | Held-leg bid threshold used only when `hedge_enabled` is true. |
 | `sell_window_min` | `0.75` minutes (45 seconds) | Only sell within the last 45 seconds before market expiry. This **time-gates** the sell trigger — even if the loser leg hits 10 cents with 2 minutes left, the bot waits until the final 45 seconds. The wider live-test window seeks more exit opportunities while retaining the ambiguity and remaining-leg safeguards. |
 | `sell_grace_s` | `2` seconds | When we first discover a new position, wait 2 seconds before selling. This prevents selling on the very first tick where data might be stale or incomplete. |
 | `sell_cooldown_s` | `3` seconds | After selling a leg, wait 3 seconds before attempting another sell on the same leg. Reduced from 5s to allow more retry attempts within the sell window. |
 | `sell_lastchance_threshold` | `0.35` (35 cents) | In the final `sell_lastchance_s` seconds, consider a side below this only when the opposite bid confirms at or above `1 - sell_lastchance_threshold` (65¢ by default). |
-| `sell_lastchance_s` | `5` seconds | How many seconds before expiry the last-chance tier activates. |
+| `sell_lastchance_s` | `10` seconds | How many seconds before expiry the confirmed last-chance fallback activates. |
 | `redeem_throttle_s` | `30` seconds | After submitting a redemption, wait 30 seconds before retrying. Redemptions are on-chain transactions that take time to confirm. |
 | `max_redeem_age_days` | `7` days | Stop trying to redeem after 7 days past expiry. Old conditions may have been cleaned up on-chain and retries are pointless. |
 | `dry_run` | `false` | When `true`, the bot logs decisions but doesn't send orders or transactions. Used for testing. |
 
-### 6.3 Tiered Sell Thresholds
+### 6.3 Sell Thresholds
 
-The sell window (last 45 seconds) is split into two tiers to balance value
-capture against reversal risk:
+The normal threshold applies throughout the final 45-second sell window. The
+last 10 seconds add a confirmed fallback for a losing side that remains above
+the normal threshold:
 
 ```
-     45s ─────────── 10s ─────── 5s ──── 0s (expiry)
-     │   EARLY TIER   │ AGGRESSIVE│ LAST-CHANCE │
-     │ 4¢ ≤ bid ≤ 10¢ │ bid ≤ 10¢ │ <35¢ + opposite ≥65¢ │
-     └────────────────┴───────────┴──────┘
+     45s ─────────────────────────────── 0s (expiry)
+     │          NORMAL: bid ≤ 10¢          │
+                         10s ──────────── 0s
+                         │ FALLBACK: bid <35¢
+                         │ + opposite bid ≥65¢
 ```
 
-- **Early tier (45→10 seconds):** Only sell if the bid is between
-  `sell_threshold_early` (4¢) and `sell_threshold` (10¢). A bid below 4¢ is not
-  worth the execution risk — just let it expire. A bid above 10¢ suggests the
-  market hasn't fully decided yet.
+- **Normal threshold (45→0 seconds):** Sell a held leg whenever its bid is at or
+  below `sell_threshold` (10¢). There is no minimum-price floor, so available
+  bids below 4¢ are eligible throughout the window.
 
-- **Aggressive tier (10→5 seconds):** Sell at any bid ≤ `sell_threshold` (10¢).
-  With under 10 seconds left, the outcome is nearly certain, so even a 2¢ bid is
-  worth capturing vs. letting it expire at $0.
+- **Confirmed fallback (10→0 seconds):** If neither side met the normal 10¢
+  threshold, sell a side below `sell_lastchance_threshold` (35¢) only when the
+  opposite side's bid is at least 65¢. Thus 19¢/81¢ sells the 19¢ side, while
+  37¢/63¢ does nothing. If both bids are low, or the opposite bid does not
+  confirm, the bot skips the sale and records `sell_skip_ambiguous`.
 
-- **Last-chance tier (5→0 seconds):** If the normal thresholds did not fire, a
-  side below `sell_lastchance_threshold` (35¢) is sold only when the opposite
-  side's bid is at least 65¢. If both bids are low, or the opposite bid does not
-  confirm, the bot skips the sale and records `sell_skip_ambiguous`. This avoids
-  treating a wide or illiquid book as proof of which outcome is losing.
-
-Across cycles, once one leg is fully sold, the normal tiers preserve the remaining
-leg for redemption. Only the explicitly enabled experimental hedge can override
-this invariant.
-
-This tiered approach was informed by real trading history: sells at 1-2¢ with
-significant time left produced negligible value while still carrying reversal
-risk. The 5-minute market adaptation compresses the same logic into seconds
-rather than minutes.
+Across cycles, once one leg is fully sold, the normal threshold preserves the
+remaining leg for redemption. Only the explicitly enabled experimental hedge
+can override this invariant.
 
 ### 6.4 Other Constants
 
@@ -1656,8 +1646,8 @@ The bot uses `rich.Table` to render a colour-coded dashboard. Each row shows:
 - **STATE** — one of:
   - `✓ REDEEM` (magenta) — market resolved, ready for redemption.
   - `· closed` (dim) — market expired but not yet redeemable.
-  - `○ EXIT ≤10¢` (red) — in the aggressive tier (last 10→0 seconds), sell at any bid ≤ 10¢.
-  - `○ EXIT 4-10¢` (yellow) — in the early tier (45→10 seconds), sell only between 4¢ and 10¢.
+  - `○ EXIT ≤10¢ · LAST <35¢` (red) — in the final 10 seconds, the normal threshold remains active and the confirmed fallback is available.
+  - `○ EXIT ≤10¢` (yellow) — in the final 45-second window, sell at any bid ≤ 10¢.
   - `● WATCHING` (green) — holding, outside the sell window.
 
 ### 14.4 The Redeem Phase
@@ -1789,23 +1779,23 @@ outcome is nearly settled and reversal is unlikely.
 We only fetch the order book for legs we actually hold. `quote_leg` converts the
 raw bid into the pricing tuple used for decisions.
 
-**Step 4: Tiered trigger evaluation**
+**Step 4: Trigger evaluation**
 
-The trigger logic applies different thresholds depending on how far into the
-sell window we are (see §6.3 for the tier diagram):
+The normal threshold applies throughout the sell window, with a confirmed
+fallback in the final 10 seconds (see §6.3):
 
 ```python
-# Determine which threshold applies based on time remaining
-if minutes_left > SELL_AGGRESSIVE_MIN:
-    # Early tier (45→10s): only sell between 4¢ and 10¢
-    up_trigger = (up_size > 0 and up_price is not None
-                  and SELL_THRESHOLD_EARLY <= up_price <= SELL_THRESHOLD)
-    dn_trigger = (dn_size > 0 and dn_price is not None
-                  and SELL_THRESHOLD_EARLY <= dn_price <= SELL_THRESHOLD)
-else:
-    # Aggressive tier (10→0s): sell at any price ≤ 10¢
-    up_trigger = up_size > 0 and up_price is not None and up_price <= SELL_THRESHOLD
-    dn_trigger = dn_size > 0 and dn_price is not None and dn_price <= SELL_THRESHOLD
+up_trigger = up_size > 0 and up_price is not None and up_price <= SELL_THRESHOLD
+dn_trigger = dn_size > 0 and dn_price is not None and dn_price <= SELL_THRESHOLD
+
+if seconds_left <= SELL_LASTCHANCE_S and not up_trigger and not dn_trigger:
+    confirmation_price = 1.0 - SELL_LASTCHANCE_THRESHOLD
+    up_candidate = up_price is not None and up_price < SELL_LASTCHANCE_THRESHOLD
+    dn_candidate = dn_price is not None and dn_price < SELL_LASTCHANCE_THRESHOLD
+    if up_candidate and not dn_candidate and dn_price is not None and dn_price >= confirmation_price:
+        up_trigger = True
+    elif dn_candidate and not up_candidate and up_price is not None and up_price >= confirmation_price:
+        dn_trigger = True
 
 # Ambiguous books do not identify a loser reliably.
 if up_trigger and dn_trigger:
@@ -1816,15 +1806,13 @@ if up_trigger and dn_trigger:
 
 **The trigger logic:**
 
-- **Early tier (45→10 seconds):** `SELL_THRESHOLD_EARLY <= price <= SELL_THRESHOLD`
-  (4¢-10¢). A bid below 4¢ is not worth selling in this tier, while a bid above
-  10¢ means the market has not met the configured live-test threshold.
+- **Normal threshold (45→0 seconds):** `price <= SELL_THRESHOLD` (any bid ≤10¢).
+  There is no lower price floor.
 
-- **Aggressive tier (10→0 seconds):** `price <= SELL_THRESHOLD` (any bid ≤ 10¢).
-  With under 10 seconds left, even a small bid can be worth capturing instead of
-  letting the leg expire worthless.
+- **Confirmed fallback (10→0 seconds):** When neither normal trigger fired, a
+  side below 35¢ is eligible only if the opposite bid is at least 65¢.
 
-- **Both tiers are gated by the sell window** — nothing happens until
+- **All triggers are gated by the sell window** — nothing happens until
   `minutes_left <= SELL_WINDOW_MIN` (0.75 min = 45 seconds).
 
 **Mutual exclusion:** If both legs satisfy a normal trigger, the book is treated
