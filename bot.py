@@ -56,11 +56,12 @@ _STRATEGY_DEFAULTS = {
     "sell_threshold": 0.08,
     "sell_threshold_early": 0.04,
     "sell_aggressive_min": 0.17,       # ~10 seconds — aggressive tier
+    "hedge_enabled": False,
     "hedge_threshold": 0.50,
     "sell_window_min": 0.5,            # last 30 seconds — sell window
     "sell_grace_s": 2,                # don't sell within 2s of first seeing a position
     "sell_cooldown_s": 3,             # 3s between sell attempts per leg
-    "sell_lastchance_threshold": 0.35, # last-chance sell: any side < 35¢ in final seconds
+    "sell_lastchance_threshold": 0.35, # confirmed loser below 35¢ in final seconds
     "sell_lastchance_s": 5,            # last-chance window: final 5 seconds
     "redeem_throttle_s": 30,          # 30s between redeem attempts
     "max_redeem_age_days": 7,
@@ -90,6 +91,7 @@ _strat = load_strategy()
 SELL_THRESHOLD = _strat["sell_threshold"]
 SELL_THRESHOLD_EARLY = _strat["sell_threshold_early"]
 SELL_AGGRESSIVE_MIN = _strat["sell_aggressive_min"]
+HEDGE_ENABLED = _strat["hedge_enabled"]
 HEDGE_THRESHOLD = _strat["hedge_threshold"]
 SELL_WINDOW_MIN = _strat["sell_window_min"]
 SELL_GRACE_S = _strat["sell_grace_s"]
@@ -750,6 +752,7 @@ while not _shutdown_requested:
         SELL_THRESHOLD = _strat["sell_threshold"]
         SELL_THRESHOLD_EARLY = _strat["sell_threshold_early"]
         SELL_AGGRESSIVE_MIN = _strat["sell_aggressive_min"]
+        HEDGE_ENABLED = _strat["hedge_enabled"]
         HEDGE_THRESHOLD = _strat["hedge_threshold"]
         SELL_WINDOW_MIN = _strat["sell_window_min"]
         SELL_GRACE_S = _strat["sell_grace_s"]
@@ -959,31 +962,99 @@ while not _shutdown_requested:
             # Tiered sell thresholds within the exit window:
             #   30s–10s (early): only sell between SELL_THRESHOLD_EARLY and SELL_THRESHOLD
             #   10s–0s  (aggressive): sell at any price <= SELL_THRESHOLD
-            if minutes_left > SELL_AGGRESSIVE_MIN:
-                up_trigger = (up_size > 0 and up_price is not None
-                              and SELL_THRESHOLD_EARLY <= up_price <= SELL_THRESHOLD)
-                dn_trigger = (dn_size > 0 and dn_price is not None
-                              and SELL_THRESHOLD_EARLY <= dn_price <= SELL_THRESHOLD)
-            else:
-                up_trigger = up_size > 0 and up_price is not None and up_price <= SELL_THRESHOLD
-                dn_trigger = dn_size > 0 and dn_price is not None and dn_price <= SELL_THRESHOLD
-
-            # Last-chance sell: in the final seconds, if normal thresholds didn't
-            # fire, sell any side priced below the last-chance threshold.
+            up_trigger = False
+            dn_trigger = False
+            up_trigger_reason = None
+            dn_trigger_reason = None
             seconds_left = minutes_left * 60
-            if seconds_left <= SELL_LASTCHANCE_S and not up_trigger and not dn_trigger:
-                if up_size > 0 and up_price is not None and up_price < SELL_LASTCHANCE_THRESHOLD:
+            if minutes_left > SELL_AGGRESSIVE_MIN:
+                if (up_size > 0 and up_price is not None
+                        and SELL_THRESHOLD_EARLY <= up_price <= SELL_THRESHOLD):
                     up_trigger = True
-                if dn_size > 0 and dn_price is not None and dn_price < SELL_LASTCHANCE_THRESHOLD:
+                    up_trigger_reason = "early"
+                if (dn_size > 0 and dn_price is not None
+                        and SELL_THRESHOLD_EARLY <= dn_price <= SELL_THRESHOLD):
                     dn_trigger = True
+                    dn_trigger_reason = "early"
+            else:
+                if up_size > 0 and up_price is not None and up_price <= SELL_THRESHOLD:
+                    up_trigger = True
+                    up_trigger_reason = "aggressive"
+                if dn_size > 0 and dn_price is not None and dn_price <= SELL_THRESHOLD:
+                    dn_trigger = True
+                    dn_trigger_reason = "aggressive"
 
-            # Guard: if both legs trigger, only sell the lower-priced one to ensure
-            # we still hold a winner for the $1 payout at resolution.
+            # A last-chance loser needs confirmation from a strong opposite bid.
+            if seconds_left <= SELL_LASTCHANCE_S and not up_trigger and not dn_trigger:
+                confirmation_price = 1.0 - SELL_LASTCHANCE_THRESHOLD
+                up_candidate = (up_size > 0 and up_price is not None
+                                and up_price < SELL_LASTCHANCE_THRESHOLD)
+                dn_candidate = (dn_size > 0 and dn_price is not None
+                                and dn_price < SELL_LASTCHANCE_THRESHOLD)
+                if (up_candidate and not dn_candidate and dn_price is not None
+                        and dn_price >= confirmation_price):
+                    up_trigger = True
+                    up_trigger_reason = "last_chance"
+                elif (dn_candidate and not up_candidate and up_price is not None
+                        and up_price >= confirmation_price):
+                    dn_trigger = True
+                    dn_trigger_reason = "last_chance"
+                elif up_candidate or dn_candidate:
+                    log_event(
+                        "sell_skip_ambiguous",
+                        condition_id=cond,
+                        reason="last_chance_unconfirmed",
+                        seconds_left=round(seconds_left, 3),
+                        up_bid=up_bid,
+                        dn_bid=dn_bid,
+                    )
+
+            # Two low bids indicate an ambiguous or illiquid book, not two losers.
             if up_trigger and dn_trigger:
-                if up_price <= dn_price:
-                    dn_trigger = False
-                else:
-                    up_trigger = False
+                log_event(
+                    "sell_skip_ambiguous",
+                    condition_id=cond,
+                    reason="both_legs_triggered",
+                    seconds_left=round(seconds_left, 3),
+                    up_bid=up_bid,
+                    dn_bid=dn_bid,
+                )
+                up_trigger = False
+                dn_trigger = False
+                up_trigger_reason = None
+                dn_trigger_reason = None
+
+            # Once one leg is fully sold, preserve the other for redemption.
+            preserve_up = bool(
+                meta.get("last_sell_dn_at") and dn_size < 0.01 and up_size >= 0.01
+            )
+            preserve_dn = bool(
+                meta.get("last_sell_up_at") and up_size < 0.01 and dn_size >= 0.01
+            )
+            if up_trigger and preserve_up:
+                log_event(
+                    "sell_skip_preserve_leg",
+                    condition_id=cond,
+                    leg="up",
+                    trigger_reason=up_trigger_reason,
+                    seconds_left=round(seconds_left, 3),
+                    up_bid=up_bid,
+                    dn_bid=dn_bid,
+                )
+                up_trigger = False
+                up_trigger_reason = None
+            if dn_trigger and preserve_dn:
+                log_event(
+                    "sell_skip_preserve_leg",
+                    condition_id=cond,
+                    leg="down",
+                    trigger_reason=dn_trigger_reason,
+                    seconds_left=round(seconds_left, 3),
+                    up_bid=up_bid,
+                    dn_bid=dn_bid,
+                )
+                dn_trigger = False
+                dn_trigger_reason = None
 
             sell_up = up_trigger
             sell_dn = dn_trigger
@@ -1009,14 +1080,26 @@ while not _shutdown_requested:
                 if not will_sell_up:
                     console.print(f"  [dim][SKIP][/] [dim]UP sell suppressed · sold <{SELL_COOLDOWN_S:.0f}s ago[/]")
                 else:
-                    log_event("sell_attempt", condition_id=cond, leg="up", size=up_size, bid=up_bid, price_limit=up_price)
+                    log_event(
+                        "sell_attempt", condition_id=cond, leg="up", size=up_size,
+                        bid=up_bid, price_limit=up_price,
+                        trigger_reason=up_trigger_reason,
+                        seconds_left=round(seconds_left, 3),
+                        up_bid=up_bid, dn_bid=dn_bid,
+                    )
                     sold, _ = sell_market_with_retry(up_token, up_size, up_matched_price or SELL_THRESHOLD)
                     if sold > 0:
                         meta["last_sell_up_at"] = now_ms
                         up_size -= sold
                         meta["expected_up_size"] = up_size
                         meta["pnl_sell_proceeds"] = round(meta.get("pnl_sell_proceeds", 0) + sold * (up_price or 0), 4)
-                        log_event("sell_fill", condition_id=cond, leg="up", sold=sold, remaining=up_size, price=up_price)
+                        log_event(
+                            "sell_fill", condition_id=cond, leg="up", sold=sold,
+                            remaining=up_size, price=up_price,
+                            trigger_reason=up_trigger_reason,
+                            seconds_left=round(seconds_left, 3),
+                            up_bid=up_bid, dn_bid=dn_bid,
+                        )
                         save_json(STATE_FILE, positions_meta)
                     else:
                         time.sleep(1)
@@ -1027,23 +1110,47 @@ while not _shutdown_requested:
                             meta["pnl_sell_proceeds"] = round(meta.get("pnl_sell_proceeds", 0) + ghost_sold * (up_price or 0), 4)
                             up_size = actual_bal
                             meta["expected_up_size"] = actual_bal
-                            log_event("sell_ghost_fill", condition_id=cond, leg="up", sold=ghost_sold, remaining=actual_bal, price=up_price)
+                            log_event(
+                                "sell_ghost_fill", condition_id=cond, leg="up",
+                                sold=ghost_sold, remaining=actual_bal, price=up_price,
+                                trigger_reason=up_trigger_reason,
+                                seconds_left=round(seconds_left, 3),
+                                up_bid=up_bid, dn_bid=dn_bid,
+                            )
                             console.print(f"  [bold yellow][GHOST FILL][/] UP sell confirmed via balance check: {ghost_sold:.4f} sold")
                             save_json(STATE_FILE, positions_meta)
                         else:
-                            log_event("sell_fail", condition_id=cond, leg="up", size=up_size, bid=up_bid, price_limit=up_price)
+                            log_event(
+                                "sell_fail", condition_id=cond, leg="up", size=up_size,
+                                bid=up_bid, price_limit=up_price,
+                                trigger_reason=up_trigger_reason,
+                                seconds_left=round(seconds_left, 3),
+                                up_bid=up_bid, dn_bid=dn_bid,
+                            )
             if sell_dn:
                 if not will_sell_dn:
                     console.print(f"  [dim][SKIP][/] [dim]DN sell suppressed · sold <{SELL_COOLDOWN_S:.0f}s ago[/]")
                 else:
-                    log_event("sell_attempt", condition_id=cond, leg="down", size=dn_size, bid=dn_bid, price_limit=dn_price)
+                    log_event(
+                        "sell_attempt", condition_id=cond, leg="down", size=dn_size,
+                        bid=dn_bid, price_limit=dn_price,
+                        trigger_reason=dn_trigger_reason,
+                        seconds_left=round(seconds_left, 3),
+                        up_bid=up_bid, dn_bid=dn_bid,
+                    )
                     sold, _ = sell_market_with_retry(dn_token, dn_size, dn_matched_price or SELL_THRESHOLD)
                     if sold > 0:
                         meta["last_sell_dn_at"] = now_ms
                         dn_size -= sold
                         meta["expected_dn_size"] = dn_size
                         meta["pnl_sell_proceeds"] = round(meta.get("pnl_sell_proceeds", 0) + sold * (dn_price or 0), 4)
-                        log_event("sell_fill", condition_id=cond, leg="down", sold=sold, remaining=dn_size, price=dn_price)
+                        log_event(
+                            "sell_fill", condition_id=cond, leg="down", sold=sold,
+                            remaining=dn_size, price=dn_price,
+                            trigger_reason=dn_trigger_reason,
+                            seconds_left=round(seconds_left, 3),
+                            up_bid=up_bid, dn_bid=dn_bid,
+                        )
                         save_json(STATE_FILE, positions_meta)
                     else:
                         time.sleep(1)
@@ -1054,19 +1161,32 @@ while not _shutdown_requested:
                             meta["pnl_sell_proceeds"] = round(meta.get("pnl_sell_proceeds", 0) + ghost_sold * (dn_price or 0), 4)
                             dn_size = actual_bal
                             meta["expected_dn_size"] = actual_bal
-                            log_event("sell_ghost_fill", condition_id=cond, leg="down", sold=ghost_sold, remaining=actual_bal, price=dn_price)
+                            log_event(
+                                "sell_ghost_fill", condition_id=cond, leg="down",
+                                sold=ghost_sold, remaining=actual_bal, price=dn_price,
+                                trigger_reason=dn_trigger_reason,
+                                seconds_left=round(seconds_left, 3),
+                                up_bid=up_bid, dn_bid=dn_bid,
+                            )
                             console.print(f"  [bold yellow][GHOST FILL][/] DN sell confirmed via balance check: {ghost_sold:.4f} sold")
                             save_json(STATE_FILE, positions_meta)
                         else:
-                            log_event("sell_fail", condition_id=cond, leg="down", size=dn_size, bid=dn_bid, price_limit=dn_price)
+                            log_event(
+                                "sell_fail", condition_id=cond, leg="down", size=dn_size,
+                                bid=dn_bid, price_limit=dn_price,
+                                trigger_reason=dn_trigger_reason,
+                                seconds_left=round(seconds_left, 3),
+                                up_bid=up_bid, dn_bid=dn_bid,
+                            )
 
             # ================= HEDGE PHASE =================
-            # If we already sold one leg (the "loser") and the held leg drops
-            # below HEDGE_THRESHOLD, sell it too to limit reversal losses.
-            loser_was_up = meta.get("last_sell_up_at") and up_size < 0.01 and dn_size >= 0.01
-            loser_was_dn = meta.get("last_sell_dn_at") and dn_size < 0.01 and up_size >= 0.01
+            # Disabled by default; strategy.json must explicitly enable it.
+            # If one leg was sold and the held leg drops below HEDGE_THRESHOLD,
+            # sell the held leg too to limit reversal losses.
+            loser_was_up = preserve_dn
+            loser_was_dn = preserve_up
 
-            if loser_was_up and dn_price is not None and dn_price <= HEDGE_THRESHOLD:
+            if HEDGE_ENABLED and loser_was_up and dn_price is not None and dn_price <= HEDGE_THRESHOLD:
                 console.print(Panel(
                     f"  [bright_white]{s['question']}[/]\n"
                     f"  [bright_red]REVERSAL DETECTED[/] — DN (held leg) dropped to [bold]{dn_price:.3f}[/]  ·  "
@@ -1097,7 +1217,7 @@ while not _shutdown_requested:
                     else:
                         log_event("hedge_fail", condition_id=cond, leg="down", size=dn_size, bid=dn_bid)
 
-            elif loser_was_dn and up_price is not None and up_price <= HEDGE_THRESHOLD:
+            elif HEDGE_ENABLED and loser_was_dn and up_price is not None and up_price <= HEDGE_THRESHOLD:
                 console.print(Panel(
                     f"  [bright_white]{s['question']}[/]\n"
                     f"  [bright_red]REVERSAL DETECTED[/] — UP (held leg) dropped to [bold]{up_price:.3f}[/]  ·  "

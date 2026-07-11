@@ -27,7 +27,12 @@ LOG_FILE = os.path.join(_BASE_DIR, "bot.log")
 STRATEGY_FILE = os.path.join(_BASE_DIR, "strategy.json")
 
 # Defaults — kept in sync with bot.py _STRATEGY_DEFAULTS
-_DEFAULTS = {"sell_threshold": 0.08, "hedge_threshold": 0.60, "sell_window_min": 0.5}
+_DEFAULTS = {
+    "sell_threshold": 0.08,
+    "hedge_enabled": False,
+    "hedge_threshold": 0.50,
+    "sell_window_min": 0.5,
+}
 
 def _load_thresholds():
     """Read thresholds from strategy.json, falling back to defaults."""
@@ -38,13 +43,21 @@ def _load_thresholds():
                 overrides = json.load(f)
             for k in cfg:
                 if k in overrides:
-                    cfg[k] = float(overrides[k])
+                    if isinstance(cfg[k], bool):
+                        value = overrides[k]
+                        cfg[k] = (
+                            value if isinstance(value, bool)
+                            else str(value).lower() in ("1", "true", "yes")
+                        )
+                    else:
+                        cfg[k] = float(overrides[k])
     except Exception:
         pass
     return cfg
 
 _strat = _load_thresholds()
 SELL_THRESHOLD = _strat["sell_threshold"]
+HEDGE_ENABLED = _strat["hedge_enabled"]
 HEDGE_THRESHOLD = _strat["hedge_threshold"]
 SELL_WINDOW_MIN = _strat["sell_window_min"]
 
@@ -87,7 +100,13 @@ def format_event(line):
         leg = e.get("leg", "?").upper()
         sold = e.get("sold", 0)
         px = e.get("price", 0)
-        return f"[dim]{ts}[/]  [bold bright_yellow]SELL[/] {leg} [bold]{sold:.2f}[/] @ {px:.3f}"
+        reason = e.get("trigger_reason", "unknown")
+        seconds_left = e.get("seconds_left")
+        ttm = f" · {seconds_left:.1f}s left" if isinstance(seconds_left, (int, float)) else ""
+        return (
+            f"[dim]{ts}[/]  [bold bright_yellow]SELL[/] {leg} "
+            f"[bold]{sold:.2f}[/] @ {px:.3f} [dim]({reason}{ttm})[/]"
+        )
     elif event == "hedge_fill":
         leg = e.get("leg", "?").upper()
         sold = e.get("sold", 0)
@@ -99,7 +118,8 @@ def format_event(line):
         return f"[dim]{ts}[/]  [bold yellow]GHOST[/] {leg} [bold]{sold:.2f}[/] confirmed"
     elif event == "sell_attempt":
         leg = e.get("leg", "?").upper()
-        return f"[dim]{ts}[/]  [dim]ATTEMPT[/] {leg} sell"
+        reason = e.get("trigger_reason", "unknown")
+        return f"[dim]{ts}[/]  [dim]ATTEMPT[/] {leg} sell [dim]({reason})[/]"
     elif event == "hedge_attempt":
         leg = e.get("leg", "?").upper()
         return f"[dim]{ts}[/]  [dim yellow]HEDGE ATTEMPT[/] {leg}"
@@ -125,7 +145,7 @@ def px_style(px, sz):
         return "[dim]?[/]"
     if px <= SELL_THRESHOLD:
         return f"[bold red]{px:.2f}[/]"
-    elif px <= HEDGE_THRESHOLD:
+    elif HEDGE_ENABLED and px <= HEDGE_THRESHOLD:
         return f"[yellow]{px:.2f}[/]"
     else:
         return f"[bright_green]{px:.2f}[/]"
