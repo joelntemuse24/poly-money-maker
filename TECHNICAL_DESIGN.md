@@ -1790,10 +1790,10 @@ if minutes_left > SELL_WINDOW_MIN:
     continue
 ```
 
-If the market has more than 30 seconds left until expiry, skip the sell phase
+If the market has more than 45 seconds left until expiry, skip the sell phase
 entirely for this set. This is the **reversal risk mitigation** — selling the
 loser leg early (e.g., with 2 minutes left) locks in 8 cents but leaves you
-exposed to the market flipping. By waiting until the final 30 seconds, the
+exposed to the market flipping. By waiting until the final 45 seconds, the
 outcome is nearly settled and reversal is unlikely.
 
 **Step 3: Read pre-fetched best bids and price both legs**
