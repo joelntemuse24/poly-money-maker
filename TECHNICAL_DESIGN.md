@@ -198,17 +198,27 @@ External Services:
 ```
 
 The architecture is a **single-file, single-process, polling loop** with a
-**separate dashboard viewer** that runs independently. There are no threads, no
-async, no message queues, no databases.
+**separate dashboard viewer** that runs independently. The main trading logic
+is single-threaded for simplicity, but order book fetches use a background
+thread pool for parallel I/O. There are no async frameworks, no message
+queues, no databases.
 
 - **Single file (`bot.py`)** keeps everything visible. You can read the entire bot
   top-to-bottom and understand the full flow without jumping between modules.
-- **Single process** means no concurrency bugs, no race conditions on state, no
-  inter-process communication overhead.
-- **Polling loop** with variable sleep (5s / 2s / 1s depending on time to expiry)
-  is simple and robust. The BTC 5-minute markets move extremely fast, especially
-  in the final minute, so the bot polls every 1 second during the sell window.
-  Polling is far easier to reason about than event-driven code.
+- **Single process** means no concurrency bugs on state, no race conditions on
+  trading logic, no inter-process communication overhead. The only threads are
+  read-only HTTP fetches for order books — they never mutate trading state.
+- **Polling loop** with variable sleep (5s / 1s / 0.25s depending on time to
+  expiry) is simple and robust. The BTC 5-minute markets move extremely fast,
+  especially in the final minute, so the bot polls every 250ms during the sell
+  window. Order book fetches are overlapped with sleep via a background thread
+  pool, so the effective cycle time is `max(sleep, fetch_time)` instead of
+  `sleep + fetch_time`. Polling is far easier to reason about than event-driven
+  code.
+- **Throttled data fetches** — balance and position queries are cached and only
+  refreshed every 2s (positions) and 15s (balance), not every sub-second cycle.
+  This reduces API calls from ~240/min to ~30/min (positions) and ~4/min
+  (balance) during the sell window.
 - **Separate dashboard (`dashboard.py`)** reads a status JSON file and log file
   that the bot writes each cycle. It's a read-only viewer — it doesn't affect the
   bot's operation and can be started/stopped independently.
@@ -219,7 +229,7 @@ async, no message queues, no databases.
 
 | File | Purpose | Size |
 |---|---|---|
-| `bot.py` | The main bot — all trading logic lives here | ~1150 lines |
+| `bot.py` | The main bot — all trading logic lives here | ~1340 lines |
 | `dashboard.py` | Live terminal dashboard viewer (reads bot output) | ~250 lines |
 | `check_book.py` | Diagnostic script for inspecting live order books | ~31 lines |
 | `requirements.txt` | Python dependencies | 8 lines |
@@ -237,7 +247,7 @@ async, no message queues, no databases.
 
 ### Why a Single-File Bot?
 
-For a bot of this size (~1150 lines), splitting into modules would add import
+For a bot of this size (~1340 lines), splitting into modules would add import
 overhead and cognitive load without meaningful benefit. The code is organised
 internally with **section comment banners** (e.g., `# --- HELPER FUNCTIONS ---`)
 that act as visual module boundaries. The dashboard is separate because it's a
@@ -319,6 +329,9 @@ _STRATEGY_DEFAULTS = {
     "redeem_throttle_s": 30,          # 30s between redeem attempts
     "max_redeem_age_days": 7,
     "dry_run": False,
+    "poll_sell_window_s": 0.25,      # sub-second polling in sell window
+    "positions_refresh_s": 2,        # refresh positions every N seconds
+    "balance_refresh_s": 15,         # refresh balance every N seconds
 }
 ```
 
@@ -344,6 +357,9 @@ An example file is committed as `strategy.example.json` for reference.
 | `redeem_throttle_s` | `30` seconds | After submitting a redemption, wait 30 seconds before retrying. Redemptions are on-chain transactions that take time to confirm. |
 | `max_redeem_age_days` | `7` days | Stop trying to redeem after 7 days past expiry. Old conditions may have been cleaned up on-chain and retries are pointless. |
 | `dry_run` | `false` | When `true`, the bot logs decisions but doesn't send orders or transactions. Used for testing. |
+| `poll_sell_window_s` | `0.25` seconds | Polling interval during the sell window (last 45s). Sub-second polling ensures the bot catches rapid price movements. Order book fetches are overlapped with sleep via a background thread pool. |
+| `positions_refresh_s` | `2` seconds | How often to refresh positions from the data-api. Between refreshes, cached data is used. Prevents excessive API calls during sub-second polling. |
+| `balance_refresh_s` | `15` seconds | How often to refresh the USDC balance. Between refreshes, the last known value is displayed. |
 
 ### 6.3 Sell Thresholds
 
@@ -1557,15 +1573,21 @@ the gas. This is subsidised by Polymarket to encourage market resolution.
 ## 14. The Main Loop — Putting It All Together
 
 The main loop is the heart of the bot. It's a `while not _shutdown_requested`
-loop with variable sleep (5s / 2s / 1s depending on time to expiry), executing a
-complete cycle of: discover positions → display status → redeem resolved → sell
-losers → hedge → write dashboard status → sleep.
+loop with variable sleep (5s / 1s / 0.25s depending on time to expiry), executing a
+complete cycle of: collect pre-fetched order books → discover positions (throttled)
+→ display status → redeem resolved → sell losers → hedge → write dashboard status
+→ kick off next cycle's book fetch in background → sleep.
 
 ### 14.1 Loop Structure
 
-```@/c:/Users/ntemu/Downloads/poly money maker/bot.py:726-741
+```python
 positions_meta = load_json(STATE_FILE)
 CYCLE = 0
+_last_positions_refresh = 0.0
+_last_balance_refresh = 0.0
+_cached_managed_sets = []
+_book_executor = ThreadPoolExecutor(max_workers=16)
+_pending_book_futs = {}  # {future: token_id} — books fetched during previous sleep
 
 while not _shutdown_requested:
     try:
@@ -1573,9 +1595,19 @@ while not _shutdown_requested:
         now_ms = time.time() * 1000
         now_str = datetime.now().strftime("%H:%M:%S")
 
-        pusd_bal = get_balance()
-        positions_raw = get_user_positions()
-        managed_sets = group_btc_complete_sets(positions_raw or [], positions_meta)
+        # Throttled balance and position refreshes — not every sub-second cycle
+        _now_f = time.time()
+        if _now_f - _last_balance_refresh >= BALANCE_REFRESH_S:
+            pusd_bal = get_balance()
+            _last_balance_refresh = _now_f
+
+        if _now_f - _last_positions_refresh >= POSITIONS_REFRESH_S:
+            positions_raw = get_user_positions()
+            _cached_managed_sets = group_btc_complete_sets(positions_raw or [], positions_meta)
+            _last_positions_refresh = _now_f
+        else:
+            positions_raw = None  # skip GC when not refreshing positions
+        managed_sets = _cached_managed_sets
 ```
 
 **`positions_meta = load_json(STATE_FILE)`** — Load the persisted metadata cache
@@ -1583,12 +1615,24 @@ before entering the loop. This survives restarts.
 
 **`CYCLE = 0`** — A counter for visual tracking (`TICK #0001`, `TICK #0002`, ...).
 
-**`now_ms = time.time() * 1000`** — Current time in milliseconds (the API uses
-millisecond timestamps).
+**`_book_executor`** — A persistent `ThreadPoolExecutor` (16 workers) used to
+fetch order books in parallel during sleep. It lives outside the loop so threads
+aren't created/destroyed each cycle.
 
-**`positions_raw or []`** — If `get_user_positions()` returns `None` (API
-failure), we pass an empty list. The grouping function will rely entirely on the
-metadata cache for this cycle.
+**`_pending_book_futs`** — A dict of `{future: token_id}` for book fetches
+submitted at the end of the previous cycle. By the time the next cycle starts,
+these futures are already complete — collecting their results is instant.
+
+**Throttled refreshes** — Balance and positions are not fetched every cycle.
+At 0.25s polling, fetching positions every cycle would mean 240 API calls/min.
+Instead, positions refresh every 2s (30 calls/min) and balance every 15s
+(4 calls/min). Between refreshes, cached data is used. When a sell fills, the
+cached set's `size` field is updated immediately so the next sub-second cycle
+sees the correct remaining size without needing a position refresh.
+
+**`positions_raw = None`** between refreshes — The GC phase checks
+`positions_raw is not None` before cleaning up stale metadata, so GC only runs
+when we have fresh data.
 
 ### 14.2 Garbage Collection
 
@@ -1752,11 +1796,16 @@ loser leg early (e.g., with 2 minutes left) locks in 8 cents but leaves you
 exposed to the market flipping. By waiting until the final 30 seconds, the
 outcome is nearly settled and reversal is unlikely.
 
-**Step 3: Fetch best bids and price both legs**
+**Step 3: Read pre-fetched best bids and price both legs**
 
-```@/c:/Users/ntemu/Downloads/poly money maker/bot.py:917-934
-            up_bid, _ = get_book_bid(up_token) if up_token else (None, 0.0)
-            dn_bid, _ = get_book_bid(dn_token) if dn_token else (None, 0.0)
+Order books are fetched in parallel *before* the sell loop starts, using a
+background thread pool that runs during the previous cycle's sleep. The results
+are collected into `_book_cache` at the top of the cycle (see §14.1). The sell
+loop reads from this cache — no HTTP calls happen during sell evaluation.
+
+```python
+            up_bid, _ = _book_cache.get(up_token, (None, 0.0)) if up_token else (None, 0.0)
+            dn_bid, _ = _book_cache.get(dn_token, (None, 0.0)) if dn_token else (None, 0.0)
 
             # Alert if book fetch failed for either leg during the sell window
             if up_bid is None and up_size > 0:
@@ -1766,7 +1815,7 @@ outcome is nearly settled and reversal is unlikely.
             if up_bid is None and dn_bid is None and (up_size > 0 or dn_size > 0):
                 _book_fail_count = meta.get("_book_fail_count", 0) + 1
                 meta["_book_fail_count"] = _book_fail_count
-                if _book_fail_count == 15:  # ~15s at 1s polling in sell window
+                if _book_fail_count == 15:  # ~3.75s at 0.25s polling in sell window
                     _ttm_str = f"{max(minutes_left*60, 0):.0f}s" if minutes_left < 1 else f"{round(minutes_left)}m"
                     notify("\u26a0 Book Unavailable", f"{s['question']} \u2014 order book unreachable with {_ttm_str} left", priority="high")
             else:
@@ -1776,7 +1825,10 @@ outcome is nearly settled and reversal is unlikely.
             dn_price, dn_matched_price = quote_leg(dn_bid)
 ```
 
-We only fetch the order book for legs we actually hold. `quote_leg` converts the
+Only markets in the sell window (≤ `SELL_WINDOW_MIN`) have their books fetched.
+Markets outside the window are skipped entirely — no wasted API calls. Books
+for all in-window markets are fetched simultaneously via `ThreadPoolExecutor`,
+taking ~150ms total instead of ~150ms × N sequentially. `quote_leg` converts the
 raw bid into the pricing tuple used for decisions.
 
 **Step 4: Trigger evaluation**
@@ -1876,18 +1928,29 @@ would think the sell failed and retry — potentially selling shares it no longe
 has, or at minimum wasting cycles. The balance check is the **ground truth** —
 the data API reflects actual on-chain holdings.
 
-### 14.6 The Sleep — Variable Polling
+### 14.6 The Sleep — Variable Polling with Overlapped Book Fetch
 
-```@/c:/Users/ntemu/Downloads/poly money maker/bot.py:1137-1147
-    # Variable polling: 5s >2min, 2s in 2-1min, 1s in last minute (sell window)
+```python
+    # Variable polling: 5s >2min, 1s ≤2min, sub-second in sell window (≤45s)
     _now = time.time() * 1000
     _min_ttm = min((s["end_ts"] - _now) / 60000 for s in managed_sets) if managed_sets else 999
-    if _min_ttm <= 1:           # ≤60s — poll every 1s (covers sell window)
+    if _min_ttm <= SELL_WINDOW_MIN:  # ≤45s — sub-second polling in sell window
+        _sleep_s = POLL_SELL_WINDOW_S
+    elif _min_ttm <= 2:              # ≤2min — poll every 1s
         _sleep_s = 1
-    elif _min_ttm <= 2:         # ≤2min — poll every 2s
-        _sleep_s = 2
-    else:                       # >2min — poll every 5s
+    else:                            # >2min — poll every 5s
         _sleep_s = 5
+
+    # Kick off next cycle's book fetch in the background BEFORE sleeping.
+    # The HTTP requests run concurrently with sleep, so by the time the next
+    # cycle starts, the books are already fetched and waiting.
+    _next_now = time.time() * 1000 + _sleep_s * 1000
+    for s in managed_sets:
+        _ml = (s["end_ts"] - _next_now) / 60000
+        if _ml <= 0 or _ml > SELL_WINDOW_MIN:
+            continue
+        # ... submit get_book_bid for each held leg to _book_executor ...
+
     console.print(f"[dim bright_black]· · ·  sleeping {_sleep_s}s  · · ·[/]")
     time.sleep(_sleep_s)
 ```
@@ -1897,13 +1960,20 @@ The bot uses **variable polling** that adapts to time-to-expiry:
 | Time remaining | Sleep | Rationale |
 |---|---|---|
 | > 2 min | 5s | Market outcome still uncertain; no need for tight polling |
-| 2 min → 1 min | 2s | Approaching sell window; tighten polling |
-| ≤ 1 min | 1s | Inside sell window; maximum reaction speed needed |
+| 2 min → 45s | 1s | Approaching sell window; tighten polling |
+| ≤ 45s (sell window) | 0.25s | Inside sell window; maximum reaction speed needed |
 
-This gives ~30 cycles at 1s during the 30-second sell window, ensuring the bot
-can react to rapid price movements in 5-minute markets. The sleep duration is
-computed using a fresh `time.time()` call (not the cycle-start `now_ms`, which
-is several seconds old by this point).
+This gives ~180 cycles at 0.25s during the 45-second sell window, ensuring the
+bot can react to rapid price movements in 5-minute markets.
+
+**Overlapped fetching** — The key innovation is that order book fetches for the
+*next* cycle are submitted to the background thread pool *before* sleeping. The
+HTTP requests run concurrently with the sleep, so the effective cycle time is
+`max(sleep_s, fetch_time)` instead of `sleep_s + fetch_time`. With 12 concurrent
+markets (24 book fetches), this reduces cycle time from ~400ms (250ms sleep +
+150ms fetch) to ~250ms — a 38% improvement. The sleep duration is computed
+using a fresh `time.time()` call (not the cycle-start `now_ms`, which is
+several seconds old by this point).
 
 ### 14.7 Dashboard Status Writing
 
@@ -2320,11 +2390,10 @@ asymmetry is fundamental to how order books work.
 
 ---
 
-*This document was last updated to reflect the codebase on the `main` branch
-(commit `fe24630`). Key changes: 5-minute market adaptation with 30-second sell
-window, variable polling (5s/2s/1s), hedge threshold raised to 60¢, `btc-updown-5m`
-slug alias added, TTM display in seconds for sub-minute values, 2s grace period,
-5s sell cooldown, 30s redeem throttle, hot-reload strategy config, CI/CD auto-deploy,
-P&L tracking with actual entry costs, tiered sell thresholds, comprehensive TTM
-fix for all 24 hourly slots using UTC date matching, log rotation, and heartbeat
-monitoring.*
+*This document was last updated to reflect the codebase on the `main` branch.
+Key changes: sub-second polling (0.25s) in the sell window, parallel order book
+fetches via `ThreadPoolExecutor` overlapped with sleep, throttled balance/position
+refreshes (2s/15s) with caching between sub-second cycles, cached set size updates
+after sells for consistency, 45-second sell window, tiered sell thresholds (10¢
+normal / 35¢ last-chance), hot-reload strategy config, CI/CD auto-deploy, P&L
+tracking with actual entry costs, log rotation, and heartbeat monitoring.*

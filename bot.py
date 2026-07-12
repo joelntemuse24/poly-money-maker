@@ -10,6 +10,7 @@ from logging.handlers import RotatingFileHandler
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 import requests
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dotenv import load_dotenv
 from rich.console import Console
 from rich.table import Table
@@ -64,6 +65,9 @@ _STRATEGY_DEFAULTS = {
     "redeem_throttle_s": 30,          # 30s between redeem attempts
     "max_redeem_age_days": 7,
     "dry_run": False,
+    "poll_sell_window_s": 0.25,      # sub-second polling in sell window
+    "positions_refresh_s": 2,        # refresh positions every N seconds (not every sub-second cycle)
+    "balance_refresh_s": 15,         # refresh balance every N seconds
 }
 STRATEGY_FILE = "strategy.json"
 
@@ -97,6 +101,9 @@ SELL_LASTCHANCE_S = _strat["sell_lastchance_s"]
 REDEEM_THROTTLE_S = _strat["redeem_throttle_s"]
 MAX_REDEEM_AGE_DAYS = _strat["max_redeem_age_days"]
 DRY_RUN = _strat["dry_run"]
+POLL_SELL_WINDOW_S = _strat["poll_sell_window_s"]
+POSITIONS_REFRESH_S = _strat["positions_refresh_s"]
+BALANCE_REFRESH_S = _strat["balance_refresh_s"]
 
 # ------------------------- LOG ROTATION -------------------------
 LOG_FILE = "bot.log"
@@ -736,6 +743,11 @@ def redeem_condition(condition_id, label=""):
 #   - last_sell_up_at / last_sell_dn_at: 30s post-sell cooldown per leg
 positions_meta = load_json(STATE_FILE)
 CYCLE = 0
+_last_positions_refresh = 0.0
+_last_balance_refresh = 0.0
+_cached_managed_sets = []
+_book_executor = ThreadPoolExecutor(max_workers=16)
+_pending_book_futs = {}  # {future: token_id} — books fetched during previous sleep
 
 while not _shutdown_requested:
     try:
@@ -756,12 +768,24 @@ while not _shutdown_requested:
         REDEEM_THROTTLE_S = _strat["redeem_throttle_s"]
         MAX_REDEEM_AGE_DAYS = _strat["max_redeem_age_days"]
         DRY_RUN = _strat["dry_run"]
+        POLL_SELL_WINDOW_S = _strat["poll_sell_window_s"]
+        POSITIONS_REFRESH_S = _strat["positions_refresh_s"]
+        BALANCE_REFRESH_S = _strat["balance_refresh_s"]
 
         write_heartbeat()
 
-        pusd_bal = get_balance()
-        positions_raw = get_user_positions()
-        managed_sets = group_btc_complete_sets(positions_raw or [], positions_meta)
+        _now_f = time.time()
+        if _now_f - _last_balance_refresh >= BALANCE_REFRESH_S:
+            pusd_bal = get_balance()
+            _last_balance_refresh = _now_f
+
+        if _now_f - _last_positions_refresh >= POSITIONS_REFRESH_S:
+            positions_raw = get_user_positions()
+            _cached_managed_sets = group_btc_complete_sets(positions_raw or [], positions_meta)
+            _last_positions_refresh = _now_f
+        else:
+            positions_raw = None  # skip GC when not refreshing positions
+        managed_sets = _cached_managed_sets
 
         console.rule(
             f"[bold bright_yellow]\u25b0 TICK #{CYCLE:04d}[/] [dim]\u00b7[/] [bright_white]{now_str}[/] [dim]\u00b7[/] "
@@ -890,6 +914,17 @@ while not _shutdown_requested:
                 log_event("redeem_submit", condition_id=cond, tx_id=str(tx))
                 save_json(STATE_FILE, positions_meta)
 
+        # ================= COLLECT PRE-FETCHED BOOKS =================
+        # Books were fetched in the background during the previous cycle's sleep.
+        # They should already be complete — just collect the results (instant).
+        _book_cache = {}
+        for _f, _t in list(_pending_book_futs.items()):
+            try:
+                _book_cache[_t] = _f.result(timeout=1)
+            except Exception:
+                _book_cache[_t] = (None, 0.0)
+        _pending_book_futs = {}
+
         # ================= SELL PHASE =================
         for s in managed_sets:
             end_ts = s["end_ts"]
@@ -931,8 +966,8 @@ while not _shutdown_requested:
             if up_size < 0.01 and dn_size < 0.01:
                 continue
 
-            up_bid, _ = get_book_bid(up_token) if up_token else (None, 0.0)
-            dn_bid, _ = get_book_bid(dn_token) if dn_token else (None, 0.0)
+            up_bid, _ = _book_cache.get(up_token, (None, 0.0)) if up_token else (None, 0.0)
+            dn_bid, _ = _book_cache.get(dn_token, (None, 0.0)) if dn_token else (None, 0.0)
 
             # Alert if book fetch failed for either leg during the sell window
             if up_bid is None and up_size > 0:
@@ -1071,6 +1106,7 @@ while not _shutdown_requested:
                         meta["last_sell_up_at"] = now_ms
                         up_size -= sold
                         meta["expected_up_size"] = up_size
+                        s["up"]["size"] = up_size
                         meta["pnl_sell_proceeds"] = round(meta.get("pnl_sell_proceeds", 0) + sold * (up_price or 0), 4)
                         log_event(
                             "sell_fill", condition_id=cond, leg="up", sold=sold,
@@ -1089,6 +1125,7 @@ while not _shutdown_requested:
                             meta["pnl_sell_proceeds"] = round(meta.get("pnl_sell_proceeds", 0) + ghost_sold * (up_price or 0), 4)
                             up_size = actual_bal
                             meta["expected_up_size"] = actual_bal
+                            s["up"]["size"] = actual_bal
                             log_event(
                                 "sell_ghost_fill", condition_id=cond, leg="up",
                                 sold=ghost_sold, remaining=actual_bal, price=up_price,
@@ -1122,6 +1159,7 @@ while not _shutdown_requested:
                         meta["last_sell_dn_at"] = now_ms
                         dn_size -= sold
                         meta["expected_dn_size"] = dn_size
+                        s["dn"]["size"] = dn_size
                         meta["pnl_sell_proceeds"] = round(meta.get("pnl_sell_proceeds", 0) + sold * (dn_price or 0), 4)
                         log_event(
                             "sell_fill", condition_id=cond, leg="down", sold=sold,
@@ -1140,6 +1178,7 @@ while not _shutdown_requested:
                             meta["pnl_sell_proceeds"] = round(meta.get("pnl_sell_proceeds", 0) + ghost_sold * (dn_price or 0), 4)
                             dn_size = actual_bal
                             meta["expected_dn_size"] = actual_bal
+                            s["dn"]["size"] = actual_bal
                             log_event(
                                 "sell_ghost_fill", condition_id=cond, leg="down",
                                 sold=ghost_sold, remaining=actual_bal, price=dn_price,
@@ -1178,6 +1217,7 @@ while not _shutdown_requested:
                 sold, _ = sell_market_with_retry(dn_token, dn_size, 0.01)
                 if sold > 0:
                     meta["expected_dn_size"] = dn_size - sold
+                    s["dn"]["size"] = dn_size - sold
                     meta["pnl_hedge_proceeds"] = round(meta.get("pnl_hedge_proceeds", 0) + sold * (dn_price or 0), 4)
                     log_event("hedge_fill", condition_id=cond, leg="down", sold=sold, remaining=dn_size - sold, price=dn_price)
                     notify("HEDGE FIRED", f"Reversal on {s['question']}\nSold DN at ~{dn_price:.3f} ({sold:.2f} shares)", priority="urgent")
@@ -1188,6 +1228,7 @@ while not _shutdown_requested:
                     if actual_bal is not None and actual_bal < dn_size - 0.01:
                         ghost_sold = dn_size - actual_bal
                         meta["expected_dn_size"] = actual_bal
+                        s["dn"]["size"] = actual_bal
                         meta["pnl_hedge_proceeds"] = round(meta.get("pnl_hedge_proceeds", 0) + ghost_sold * (dn_price or 0), 4)
                         log_event("hedge_ghost_fill", condition_id=cond, leg="down", sold=ghost_sold, remaining=actual_bal, price=dn_price)
                         notify("HEDGE FIRED (ghost)", f"Reversal on {s['question']}\nDN hedge ghost fill: {ghost_sold:.2f} shares", priority="urgent")
@@ -1209,6 +1250,7 @@ while not _shutdown_requested:
                 sold, _ = sell_market_with_retry(up_token, up_size, 0.01)
                 if sold > 0:
                     meta["expected_up_size"] = up_size - sold
+                    s["up"]["size"] = up_size - sold
                     meta["pnl_hedge_proceeds"] = round(meta.get("pnl_hedge_proceeds", 0) + sold * (up_price or 0), 4)
                     log_event("hedge_fill", condition_id=cond, leg="up", sold=sold, remaining=up_size - sold, price=up_price)
                     notify("HEDGE FIRED", f"Reversal on {s['question']}\nSold UP at ~{up_price:.3f} ({sold:.2f} shares)", priority="urgent")
@@ -1219,6 +1261,7 @@ while not _shutdown_requested:
                     if actual_bal is not None and actual_bal < up_size - 0.01:
                         ghost_sold = up_size - actual_bal
                         meta["expected_up_size"] = actual_bal
+                        s["up"]["size"] = actual_bal
                         meta["pnl_hedge_proceeds"] = round(meta.get("pnl_hedge_proceeds", 0) + ghost_sold * (up_price or 0), 4)
                         log_event("hedge_ghost_fill", condition_id=cond, leg="up", sold=ghost_sold, remaining=actual_bal, price=up_price)
                         notify("HEDGE FIRED (ghost)", f"Reversal on {s['question']}\nUP hedge ghost fill: {ghost_sold:.2f} shares", priority="urgent")
@@ -1260,15 +1303,36 @@ while not _shutdown_requested:
     except Exception:
         pass
 
-    # Variable polling: 5s >2min, 2s in 2-1min, 1s in last minute (sell window)
+    # Variable polling: 5s >2min, 1s ≤2min, sub-second in sell window (≤45s)
     _now = time.time() * 1000
     _min_ttm = min((s["end_ts"] - _now) / 60000 for s in managed_sets) if managed_sets else 999
-    if _min_ttm <= 1:           # ≤60s — poll every 1s (covers sell window)
+    if _min_ttm <= SELL_WINDOW_MIN:  # ≤45s — sub-second polling in sell window
+        _sleep_s = POLL_SELL_WINDOW_S
+    elif _min_ttm <= 2:              # ≤2min — poll every 1s
         _sleep_s = 1
-    elif _min_ttm <= 2:         # ≤2min — poll every 2s
-        _sleep_s = 2
-    else:                       # >2min — poll every 5s
+    else:                            # >2min — poll every 5s
         _sleep_s = 5
+    # ================= KICK OFF NEXT CYCLE'S BOOK FETCH =================
+    # Start fetching books in the background NOW, so they're ready by the time
+    # the next cycle starts after sleep. This overlaps HTTP latency with sleep,
+    # making the effective cycle time = max(sleep_s, fetch_time) instead of
+    # sleep_s + fetch_time.
+    _next_now = time.time() * 1000 + _sleep_s * 1000  # predicted TTM at next cycle start
+    for s in managed_sets:
+        _ml = (s["end_ts"] - _next_now) / 60000
+        if _ml <= 0 or _ml > SELL_WINDOW_MIN:
+            continue
+        _us = float(s["up"].get("size", 0))
+        _ds = float(s["dn"].get("size", 0))
+        if _us < 0.01 and _ds < 0.01:
+            continue
+        _ut = s["up"].get("asset")
+        _dt = s["dn"].get("asset")
+        if _ut and _us >= 0.01:
+            _pending_book_futs[_book_executor.submit(get_book_bid, _ut)] = _ut
+        if _dt and _ds >= 0.01:
+            _pending_book_futs[_book_executor.submit(get_book_bid, _dt)] = _dt
+
     console.print(f"[dim bright_black]\u00b7 \u00b7 \u00b7  sleeping {_sleep_s}s  \u00b7 \u00b7 \u00b7[/]")
     time.sleep(_sleep_s)
 
