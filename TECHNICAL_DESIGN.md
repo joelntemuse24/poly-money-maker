@@ -65,14 +65,18 @@ evidence of a reversal.
 
 ### What the Bot Does NOT Do
 
-- **No buying.** The bot is sell-only. Entry is manual.
+- **No buying.** The bot is sell-only. Entry is manual (typically 50¢ limit orders
+  on both legs). Realized fill quality is an open operator issue — see §2.2.1.
 - **No market making.** It doesn't post resting orders or provide liquidity.
 - **No price prediction.** It doesn't try to forecast BTC direction.
 - **No portfolio rebalancing.** It manages one specific market type (BTC 5-minute
   and hourly).
+- **No set-cost gate.** It does not reject or alert on expensive complete-set
+  entries (e.g. combined avg price > $1.02).
 
 This narrow scope is intentional — it keeps the codebase small, the failure
-modes predictable, and the risk surface minimal.
+modes predictable, and the risk surface minimal. Entry economics are outside
+the bot; sell execution is inside.
 
 ---
 
@@ -99,6 +103,43 @@ A **complete set** is one UP token + one DOWN token for the same market. Togethe
 they're always worth exactly $1.00 at resolution (one wins, one loses). You can
 **mint** a complete set by depositing $1.00 of USDC, or **redeem** a complete set
 to get $1.00 back after the market resolves.
+
+### 2.2.1 Entry Fill Quality (Open Issue — Outside the Bot)
+
+The bot is **sell-only**. Entry (buying both legs) is done manually, typically with
+**limit orders nominally at ~50¢ per side** so a complete set costs ~$1.00.
+
+**The open issue is realized fill quality, not the sell strategy.**
+
+- **Nominal limit price ≠ average fill price.** A resting 50¢ bid can still fill
+  worse if the book walks, only one side fills at 50¢, or fees/slippage push the
+  effective cost up. Historical trade exports showed complete sets often costing
+  **~$1.045/share** (e.g. ~52.7¢ Up + ~51.8¢ Down), not $1.00.
+- **Unit economics depend on set cost.** After selling the loser at price `p` and
+  redeeming the winner at $1.00:
+
+  ```
+  PnL per share ≈ p + 1.00 − set_cost
+                = p − (set_cost − 1.00)
+  ```
+
+  | Realized set cost | Break-even loser sell | Miss sell (p = 0) |
+  |---|---|---|
+  | **$1.00** (true 50/50) | **$0.00** | ~$0 (only opportunity cost) |
+  | **$1.045** (historical) | **~$0.045** | **−4.5¢/share** locked in |
+
+- **Why this matters more than polling.** Sub-second polling, a 45s sell window,
+  and a 10¢ threshold only help *after* entry. If set cost is $1.045, many
+  "successful" sells at 1–4¢ still lose money, and every missed sell burns the
+  entry premium. If set cost is truly ~$1.00, those same outcomes are flat or
+  profitable.
+- **Operator checklist (manual entry):** After each market, verify
+  `avg_up + avg_dn` (or total USDC in / shares) is **≤ ~$1.01–1.02**. Treat
+  anything near $1.04+ as a failed entry fill, not a bot sell failure.
+- **Not yet automated.** The bot records `pnl_entry_cost` from data-api
+  `avgPrice` for P&L, but it does **not** reject positions, alert on expensive
+  sets, or place the entry orders itself. Closing this gap (alerts, max set-cost
+  gate, or automated 50¢ GTC entries with fill verification) is future work.
 
 ### 2.3 The CLOB (Central Limit Order Book)
 
@@ -731,14 +772,22 @@ def record_pnl(condition_id, question, entry_cost, sell_proceeds, hedge_proceeds
 | `pnl_redeem_value` | `shares × $1.00` (estimated from remaining holdings) | On GC or explicit redeem |
 
 **Entry cost accuracy:** Uses the actual `avgPrice` field returned by the
-data-api (typically ~$0.51-0.53 per share), not a $0.50 guess. Total entry cost
-is `up_size × up_avgPrice + dn_size × dn_avgPrice`.
+data-api (typically ~$0.51-0.53 per share historically), not a $0.50 guess.
+Total entry cost is `up_size × up_avgPrice + dn_size × dn_avgPrice`. The
+**combined set cost** (`avg_up + avg_dn`) drives unit economics: at ~$1.045 the
+strategy needs loser sells above ~4.5¢ to break even; at a true ~$1.00
+(50¢+50¢ limits fully filled) break-even is ~$0. See §2.2.1 — entry fill quality
+is the main open issue outside the sell bot.
 
 **Redemption estimation:** When a position disappears from the data-api
 (resolved and auto-redeemed by Polymarket), the bot estimates winner payout
 from remaining holdings: `max(remaining_up, remaining_dn) × $1.00`. This
 handles the common case where positions are redeemed by the protocol before
 the bot's explicit `redeem_condition` call.
+
+**Set-cost gate (not implemented):** The bot does not alert or skip when realized
+set cost exceeds a threshold (e.g. $1.02). That remains operator responsibility
+until automated. See §2.2.1.
 
 ---
 
@@ -2396,4 +2445,6 @@ fetches via `ThreadPoolExecutor` overlapped with sleep, throttled balance/positi
 refreshes (2s/15s) with caching between sub-second cycles, cached set size updates
 after sells for consistency, 45-second sell window, tiered sell thresholds (10¢
 normal / 35¢ last-chance), hot-reload strategy config, CI/CD auto-deploy, P&L
-tracking with actual entry costs, log rotation, and heartbeat monitoring.*
+tracking with actual entry costs, log rotation, heartbeat monitoring, and
+documentation of the open entry-fill / set-cost issue (§2.2.1) — nominal 50¢
+limits vs realized ~$1.045 historical set cost and break-even math.*
