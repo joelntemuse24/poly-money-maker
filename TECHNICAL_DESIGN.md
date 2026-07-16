@@ -28,7 +28,8 @@
 17. [Error Handling Philosophy](#17-error-handling-philosophy)
 18. [The Dashboard — `dashboard.py`](#18-the-dashboard--dashboardpy)
 19. [The Diagnostic Tool: `check_book.py`](#19-the-diagnostic-tool-check_bookpy)
-20. [Glossary](#20-glossary)
+20. [Live Shadow Simulator (`sim/`)](#20-live-shadow-simulator-sim)
+21. [Glossary](#21-glossary)
 
 ---
 
@@ -230,6 +231,12 @@ order-building logic differs.
          │ Live viewer  │
          └─────────────┘
 
+         ┌──────────────────────┐
+         │  sim/shadow.py       │  ← separate process (polyshadow)
+         │  Live shadow sim     │     public books only, paper trades
+         │  writes sim_data/    │     never imports bot.py / never orders
+         └──────────────────────┘
+
 External Services:
   • Polymarket CLOB API  (clob.polymarket.com)    — order book, order submission
   • Polymarket Data API  (data-api.polymarket.com) — position tracking
@@ -263,6 +270,10 @@ queues, no databases.
 - **Separate dashboard (`dashboard.py`)** reads a status JSON file and log file
   that the bot writes each cycle. It's a read-only viewer — it doesn't affect the
   bot's operation and can be started/stopped independently.
+- **Separate shadow simulator (`sim/`)** paper-trades every BTC 5m market using
+  the same public order books and sell policy as the live bot. It never places
+  orders, never imports `bot.py`, and writes only under `sim_data/`. It can run
+  permanently beside `polybot` as the `polyshadow` systemd service (see §20).
 
 ---
 
@@ -273,18 +284,30 @@ queues, no databases.
 | `bot.py` | The main bot — all trading logic lives here | ~1340 lines |
 | `dashboard.py` | Live terminal dashboard viewer (reads bot output) | ~250 lines |
 | `check_book.py` | Diagnostic script for inspecting live order books | ~31 lines |
+| `sim/` | Live shadow simulator package (paper trade all BTC 5m markets) | package |
+| `sim/shadow.py` | Shadow main loop — discover, paper enter, policy, FAK fills, settle | ~600 lines |
+| `sim/policy.py` | Pure sell / last-chance / hedge decision logic | ~80 lines |
+| `sim/fills.py` | FAK fill simulation against live bid depth | ~80 lines |
+| `sim/discovery.py` | Gamma market discovery + parallel public book fetch | ~230 lines |
+| `sim/store.py` | `sim_data/` persistence, prune, results summary | ~140 lines |
+| `sim/config.py` | Sim paths, strategy defaults, isolation guards | ~150 lines |
+| `sim/analyze_history.py` | Calibrate `set_cost` from Polymarket history CSV | — |
+| `sim/strategy.sim.json` | Shadow strategy + sim economics (not live `strategy.json`) | — |
+| `sim/README.md` | Operator guide for the shadow simulator | — |
+| `deploy/polyshadow.service` | systemd unit template for permanent shadow on GCP | — |
 | `requirements.txt` | Python dependencies | 8 lines |
 | `strategy.example.json` | Example strategy config with all tunable parameters | — |
 | `.github/workflows/deploy.yml` | CI/CD pipeline — auto-deploy on push to main | — |
 | `.env` | Environment variables (secrets — gitignored) | — |
 | `strategy.json` | Live strategy config (hot-reloaded each cycle, gitignored) | — |
 | `TECHNICAL_DESIGN.md` | This document — architecture & code walkthrough | — |
-| `.gitignore` | Excludes secrets, state files, and Python artifacts | — |
+| `.gitignore` | Excludes secrets, state files, sim runtime data, Python artifacts | — |
 | `positions.json` | Runtime state cache (gitignored, auto-generated) | — |
 | `pnl.json` | P&L history — one entry per completed trade (gitignored) | — |
 | `bot.log` | Structured JSON-line log with rotation (gitignored, auto-generated) | — |
 | `.dashboard_status.json` | Per-cycle status snapshot for dashboard (gitignored) | — |
 | `.heartbeat` | Tick counter updated every cycle for uptime monitoring (gitignored) | — |
+| `sim_data/` | Shadow runtime outputs only (gitignored) — never bot state | — |
 
 ### Why a Single-File Bot?
 
@@ -2401,7 +2424,121 @@ asymmetry is fundamental to how order books work.
 
 ---
 
-## 20. Glossary
+## 20. Live Shadow Simulator (`sim/`)
+
+The live bot only manages **positions you actually hold**. That yields few samples
+per day and is a poor way to gain statistical confidence in sell/fill behaviour.
+The **live shadow simulator** paper-trades **every** active BTC 5-minute market
+using **real public order books**, applying the same sell policy as the bot, and
+recording path + fill + PnL data under `sim_data/`.
+
+### 20.1 Goals
+
+- Paper-trade **all** BTC 5m markets (≈12/hour), not only live holdings.
+- Use **live** CLOB books (`GET /book`) — same public data the bot sees.
+- Apply the **same** sell / last-chance / hedge rules as `bot.py`.
+- Model **FAK fills** by walking real bid depth (not a free fill at best bid).
+- Run **permanently beside** `polybot` on GCP with **zero shared state**.
+- Never place real orders; never load `.env` or trading credentials.
+
+### 20.2 Isolation Guarantees
+
+| Shadow uses | Live bot uses (untouched) |
+|---|---|
+| `sim/strategy.sim.json` | `strategy.json` |
+| `sim_data/*` only | `positions.json`, `pnl.json`, `bot.log`, `.env` |
+| Public Gamma + CLOB HTTP | Same public APIs **plus** authenticated trading |
+
+Hard rules enforced in code:
+
+- **No `import bot`** — policy is reimplemented as pure functions in `sim/policy.py`.
+- **Path guard** (`assert_path_safe`) — refuses writes to bot filenames / outside `sim_data/` or `sim/`.
+- **Single-instance lock** — `sim_data/shadow.lock` (fcntl / msvcrt).
+- **No secrets** — no API keys, no order endpoints, no relayer.
+- **systemd caps** — `Nice=10`, `CPUQuota=40%`, `MemoryMax=400M` so live trading wins resources.
+
+### 20.3 Cycle Flow
+
+Each cycle of `python -m sim.shadow`:
+
+1. **Discover** active `btc-up-or-down-5m` markets via Gamma (cached ~25s).
+2. **Paper enter** markets with TTM in `[enter_min_ttm_min, enter_max_ttm_min]`
+   at calibrated complete-set cost (`sim.set_cost`, default **1.043** from history).
+3. **Fetch books** only for open paper positions with TTM ≤ `book_horizon_min`
+   (default 3 minutes) — reduces API contention with the live bot.
+4. **Evaluate policy** (`sim/policy.py`): sell window, 10¢ threshold, last-chance
+   35¢/65¢ in final 10s, optional hedge.
+5. **Simulate FAK** (`sim/fills.py`, model `depth`): walk bids at/above limit;
+   partial or zero fill → MISS (same failure class as thin books near expiry).
+6. **After expiry** resolve winner from bid dominance;
+   `PnL = sell_proceeds + hedge + redeem − entry_cost`.
+7. **Persist** ticks, trades, results; prune old files on a timer.
+
+Adaptive sleep: far markets ~5s, near ~1s, inside sell window ~0.35s
+(slightly slower than the bot's 0.25s to reduce shared-API pressure).
+
+### 20.4 Package Layout
+
+| Module | Role |
+|---|---|
+| `sim/shadow.py` | Main loop, lock, heartbeat, enter/close, status |
+| `sim/policy.py` | Pure decision function (sell / last-chance / hedge) |
+| `sim/fills.py` | FAK fill models against a book snapshot |
+| `sim/discovery.py` | Gamma discovery + parallel `/book` fetch + cache |
+| `sim/store.py` | State / ticks / trades / results + disk prune |
+| `sim/config.py` | Paths, defaults, `load_strategy` / `load_sim` |
+| `sim/analyze_history.py` | Calibrate `set_cost` from trade export CSV |
+| `sim/strategy.sim.json` | Tunables (strategy + sim economics) |
+
+### 20.5 Outputs (`sim_data/`, gitignored)
+
+| Path | Content |
+|---|---|
+| `shadow_state.json` | Open paper positions |
+| `results.jsonl` | One line per completed market (PnL, fills, misses) |
+| `ticks/<conditionId>.jsonl` | Sampled bid path |
+| `trades/<conditionId>.json` | Full trade record + events |
+| `shadow.log` | Rotating operator log |
+| `shadow.lock` | Single-instance lock |
+| `shadow.heartbeat` | Last successful cycle timestamp |
+
+### 20.6 Operations (GCP)
+
+```bash
+cd ~/poly-money-maker && git pull
+
+USER=$(whoami); DIR=$(pwd)
+sed -e "s|YOUR_USER|$USER|g" -e "s|/home/YOUR_USER/poly-money-maker|$DIR|g" \
+  deploy/polyshadow.service | sudo tee /etc/systemd/system/polyshadow.service
+
+sudo systemctl daemon-reload
+sudo systemctl enable --now polyshadow
+systemctl status polyshadow --no-pager
+journalctl -u polyshadow -n 50 --no-pager
+python -m sim.shadow --summary
+```
+
+Manual / local:
+
+```bash
+python -m sim.shadow          # continuous
+python -m sim.shadow --once   # smoke test
+python -m sim.shadow --summary
+```
+
+Do **not** run a second `bot.py`. Shadow is paper-only.
+
+### 20.7 What Shadow Does Not Prove
+
+- Entry fill quality (still open; see §2.2.1) — entry is a fixed calibrated cost.
+- Queue priority / adverse selection beyond the snapshot book.
+- Relayer / redemption latency (shadow assumes $1 redeem on the inferred winner).
+- Perfect isolation from rate limits if both processes hammer the public API
+  (mitigated by cache + book horizon + lower sell poll rate).
+
+---
+
+## 21. Glossary
 
 | Term | Definition |
 |---|---|
@@ -2432,6 +2569,9 @@ asymmetry is fundamental to how order books work.
 | **Relayer** | A Polymarket-operated service that submits on-chain transactions on behalf of users, paying the gas fees. |
 | **Reversal** | When the market flips direction — the side that was winning starts losing. Triggers the hedge phase. |
 | **Sell window** | The final N seconds before market expiry during which the bot is allowed to sell. Currently 45 seconds (`SELL_WINDOW_MIN` = 0.75 min). |
+| **Shadow simulator** | Paper-trading process (`sim/shadow.py`) that applies the live sell policy to every BTC 5m market using public books; never places real orders. |
+| **set_cost** | Complete-set entry cost per share used by the shadow sim (default ~1.043 from history). Live bot does not gate on this. |
+| **polyshadow** | systemd service name for the permanent shadow simulator on GCP. |
 | **Slug** | A human-readable URL fragment identifying a market (e.g., `btc-updown-5m-1783218000`). |
 | **Tick size** | The minimum price increment for a market. On Polymarket, typically $0.01. |
 | **Token ID** | The ERC-1155 token identifier for a specific outcome in a market. Each binary market has two (UP and DOWN). |
@@ -2439,12 +2579,12 @@ asymmetry is fundamental to how order books work.
 
 ---
 
-*This document was last updated to reflect the codebase on the `main` branch.
-Key changes: sub-second polling (0.25s) in the sell window, parallel order book
-fetches via `ThreadPoolExecutor` overlapped with sleep, throttled balance/position
-refreshes (2s/15s) with caching between sub-second cycles, cached set size updates
-after sells for consistency, 45-second sell window, tiered sell thresholds (10¢
-normal / 35¢ last-chance), hot-reload strategy config, CI/CD auto-deploy, P&L
-tracking with actual entry costs, log rotation, heartbeat monitoring, and
-documentation of the open entry-fill / set-cost issue (§2.2.1) — nominal 50¢
-limits vs realized ~$1.045 historical set cost and break-even math.*
+*This document was last updated to reflect the codebase on the `main` branch
+(commit `e4ba24a` and later). Key topics: live sell bot (`bot.py`) with sub-second
+polling (0.25s) in the sell window, parallel order-book fetches, throttled
+balance/position refreshes, 45-second sell window, 10¢ sell + 35¢ last-chance,
+optional hedge (off by default), hot-reload `strategy.json`, CI/CD auto-deploy,
+P&L tracking, open entry-fill / set-cost issue (§2.2.1), and the **live shadow
+simulator** (`sim/`, §20) — paper-trades every BTC 5m market on public books with
+FAK depth fills, isolated under `sim_data/`, deployable as `polyshadow` beside
+`polybot` without shared state or real orders.*
