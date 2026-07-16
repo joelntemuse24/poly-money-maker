@@ -24,6 +24,9 @@ bot.log.*
 pnl.json
 strategy.json
 
+# Shadow simulator runtime data
+sim_data/
+
 # IDE
 .vscode/
 .idea/

@@ -1,0 +1,533 @@
+#!/usr/bin/env python3
+"""Live shadow simulator — paper-trades EVERY BTC 5m market using real books.
+
+Does NOT send orders. Does NOT import bot.py.
+
+What it does each cycle:
+  1. Discover all active btc-updown-5m markets (Gamma)
+  2. Paper-enter complete sets at calibrated set_cost (default $1.045)
+  3. Poll live CLOB order books (same public /book endpoint as the bot)
+  4. Apply the same sell/last-chance/hedge policy as the live bot
+  5. Simulate FAK fills by walking real bid depth
+  6. After expiry, resolve winner from book dominance and record PnL
+
+Run:
+  python -m sim.shadow
+  python -m sim.shadow --once
+  python -m sim.shadow --summary
+"""
+
+from __future__ import annotations
+
+import argparse
+import logging
+import signal
+import sys
+import time
+from logging.handlers import RotatingFileHandler
+from typing import Any, Dict, List, Optional
+
+from .config import (
+    LOG_FILE,
+    ensure_dirs,
+    load_sim,
+    load_strategy,
+)
+from .discovery import Market, discover_btc_5m, fetch_books_parallel, pair_books
+from .fills import simulate_fak_sell
+from .policy import evaluate
+from .store import (
+    append_result,
+    append_tick,
+    load_state,
+    save_state,
+    save_trade,
+    summarize_results,
+)
+
+_shutdown = False
+
+
+def _setup_log() -> logging.Logger:
+    ensure_dirs()
+    log = logging.getLogger("shadow")
+    log.setLevel(logging.INFO)
+    log.handlers.clear()
+    fmt = logging.Formatter("%(asctime)s %(levelname)s %(message)s", "%H:%M:%S")
+    sh = logging.StreamHandler(sys.stdout)
+    sh.setFormatter(fmt)
+    log.addHandler(sh)
+    fh = RotatingFileHandler(LOG_FILE, maxBytes=5_000_000, backupCount=3)
+    fh.setFormatter(fmt)
+    log.addHandler(fh)
+    return log
+
+
+def _on_signal(signum, frame):
+    global _shutdown
+    _shutdown = True
+
+
+def new_position(market: Market, sim: dict, now: float) -> dict:
+    shares = float(sim["shares"])
+    set_cost = float(sim["set_cost"])
+    return {
+        "condition_id": market.condition_id,
+        "slug": market.slug,
+        "question": market.question,
+        "end_ts": market.end_ts,
+        "up_token": market.up_token,
+        "dn_token": market.dn_token,
+        "entered_at": now,
+        "set_cost": set_cost,
+        "shares": shares,
+        "entry_cost_total": set_cost * shares,
+        "up_size": shares,
+        "dn_size": shares,
+        "sold_up": False,
+        "sold_dn": False,
+        "sell_proceeds": 0.0,
+        "hedge_proceeds": 0.0,
+        "sell_filled": 0.0,
+        "sell_avg_px": 0.0,
+        "sell_leg": None,
+        "sell_reason": None,
+        "sell_seconds_left": None,
+        "triggered": False,
+        "trigger_attempts": 0,
+        "fill_fails": 0,
+        "last_sell_attempt_at": 0.0,
+        "events": [],
+        "status": "open",  # open | closed
+        "winner": None,
+        "redeem_value": 0.0,
+        "pnl": None,
+        "last_up_bid": None,
+        "last_dn_bid": None,
+    }
+
+
+def try_resolve(pos: dict, up_bid: Optional[float], dn_bid: Optional[float], sim: dict) -> bool:
+    """Infer winner after expiry from bid dominance. Returns True if resolved."""
+    edge = float(sim["resolve_bid_edge"])
+    if up_bid is not None and up_bid >= edge and (dn_bid is None or dn_bid <= 1.0 - edge + 0.05):
+        pos["winner"] = "up"
+        return True
+    if dn_bid is not None and dn_bid >= edge and (up_bid is None or up_bid <= 1.0 - edge + 0.05):
+        pos["winner"] = "dn"
+        return True
+    # Strong one-sided book after expiry
+    if up_bid is not None and dn_bid is not None:
+        if up_bid >= 0.90 and dn_bid <= 0.15:
+            pos["winner"] = "up"
+            return True
+        if dn_bid >= 0.90 and up_bid <= 0.15:
+            pos["winner"] = "dn"
+            return True
+    return False
+
+
+def finalize(pos: dict, log: logging.Logger) -> dict:
+    """Compute terminal PnL once winner known (or both legs flat)."""
+    up = float(pos["up_size"])
+    dn = float(pos["dn_size"])
+    winner = pos.get("winner")
+    redeem = 0.0
+    if winner == "up" and up > 0:
+        redeem = up * 1.0
+    elif winner == "dn" and dn > 0:
+        redeem = dn * 1.0
+    elif winner is None and up < 0.01 and dn < 0.01:
+        redeem = 0.0
+    else:
+        # unresolved — estimate redeem as max remaining (optimistic hold)
+        # only if we must close without winner; prefer waiting
+        pass
+
+    pos["redeem_value"] = redeem
+    pnl = (
+        float(pos["sell_proceeds"])
+        + float(pos["hedge_proceeds"])
+        + redeem
+        - float(pos["entry_cost_total"])
+    )
+    pos["pnl"] = round(pnl, 6)
+    pos["status"] = "closed"
+    pos["closed_at"] = time.time()
+
+    row = {
+        "ts": time.time(),
+        "condition_id": pos["condition_id"],
+        "slug": pos["slug"],
+        "question": pos["question"],
+        "set_cost": pos["set_cost"],
+        "shares": pos["shares"],
+        "entry_cost_total": pos["entry_cost_total"],
+        "sell_leg": pos.get("sell_leg"),
+        "sell_reason": pos.get("sell_reason"),
+        "sell_filled": pos.get("sell_filled"),
+        "sell_avg_px": pos.get("sell_avg_px"),
+        "sell_seconds_left": pos.get("sell_seconds_left"),
+        "sell_proceeds": pos.get("sell_proceeds"),
+        "hedge_proceeds": pos.get("hedge_proceeds"),
+        "triggered": pos.get("triggered"),
+        "trigger_attempts": pos.get("trigger_attempts"),
+        "fill_fails": pos.get("fill_fails"),
+        "winner": winner,
+        "redeem_value": redeem,
+        "pnl": pos["pnl"],
+        "final_up": up,
+        "final_dn": dn,
+    }
+    append_result(row)
+    save_trade(pos["condition_id"], pos)
+    log.info(
+        "CLOSED %s pnl=%.4f sell=%s@%.3f x%.2f redeem=%.2f winner=%s fails=%s",
+        pos["slug"],
+        pos["pnl"],
+        pos.get("sell_leg"),
+        float(pos.get("sell_avg_px") or 0),
+        float(pos.get("sell_filled") or 0),
+        redeem,
+        winner,
+        pos.get("fill_fails"),
+    )
+    return row
+
+
+def apply_decision(pos: dict, decision, up_book, dn_book, sim: dict, strategy: dict, now: float, seconds_left: float, log: logging.Logger):
+    if decision.action == "none":
+        return
+
+    cooldown = float(strategy["sell_cooldown_s"])
+    if now - float(pos.get("last_sell_attempt_at") or 0) < cooldown:
+        return
+
+    pos["triggered"] = True
+    pos["trigger_attempts"] = int(pos.get("trigger_attempts") or 0) + 1
+    pos["last_sell_attempt_at"] = now
+
+    if decision.action in ("sell_up", "hedge_up"):
+        leg, size, book = "up", float(pos["up_size"]), up_book
+    else:
+        leg, size, book = "dn", float(pos["dn_size"]), dn_book
+
+    if size < 0.01 or book is None:
+        return
+
+    # FAK limit: use observed bid (bot uses matched bid as limit)
+    limit = decision.limit_price
+    fill = simulate_fak_sell(
+        size=size,
+        bids=book.bids,
+        limit_price=limit,
+        model=sim["fill_model"],
+        slippage=float(sim["fill_slippage"]),
+        seconds_left=seconds_left,
+        no_fill_after_s=float(sim["no_fill_after_s"]),
+    )
+
+    evt = {
+        "ts": now,
+        "seconds_left": round(seconds_left, 3),
+        "action": decision.action,
+        "reason": decision.reason,
+        "limit": limit,
+        "best_bid": book.best_bid,
+        "best_bid_size": book.best_bid_size,
+        "filled": fill.filled,
+        "avg_price": fill.avg_price,
+        "fill_reason": fill.reason,
+        "levels_used": fill.levels_used,
+    }
+    pos["events"].append(evt)
+
+    if fill.filled <= 0:
+        pos["fill_fails"] = int(pos.get("fill_fails") or 0) + 1
+        log.info(
+            "MISS  %s %s reason=%s bid=%s ttm=%.1fs fail=%s",
+            pos["slug"],
+            decision.action,
+            decision.reason,
+            book.best_bid,
+            seconds_left,
+            fill.reason,
+        )
+        return
+
+    # Apply fill
+    if leg == "up":
+        pos["up_size"] = max(0.0, float(pos["up_size"]) - fill.filled)
+        if pos["up_size"] < 0.01:
+            pos["sold_up"] = True
+            pos["up_size"] = 0.0
+    else:
+        pos["dn_size"] = max(0.0, float(pos["dn_size"]) - fill.filled)
+        if pos["dn_size"] < 0.01:
+            pos["sold_dn"] = True
+            pos["dn_size"] = 0.0
+
+    if decision.action.startswith("hedge"):
+        pos["hedge_proceeds"] = float(pos["hedge_proceeds"]) + fill.notional
+    else:
+        prev_f = float(pos.get("sell_filled") or 0)
+        prev_n = float(pos.get("sell_proceeds") or 0)
+        new_f = prev_f + fill.filled
+        new_n = prev_n + fill.notional
+        pos["sell_filled"] = new_f
+        pos["sell_proceeds"] = new_n
+        pos["sell_avg_px"] = new_n / new_f if new_f else 0.0
+        pos["sell_leg"] = leg
+        pos["sell_reason"] = decision.reason
+        pos["sell_seconds_left"] = round(seconds_left, 3)
+
+    log.info(
+        "FILL  %s %s %.4f@%.4f (%s) ttm=%.1fs rem_up=%.2f rem_dn=%.2f",
+        pos["slug"],
+        decision.action,
+        fill.filled,
+        fill.avg_price,
+        decision.reason,
+        seconds_left,
+        pos["up_size"],
+        pos["dn_size"],
+    )
+
+
+def choose_sleep(positions: Dict[str, dict], markets: List[Market], sim: dict, strategy: dict) -> float:
+    now = time.time()
+    sell_w = float(strategy["sell_window_min"])
+    min_ttm = 999.0
+    for m in markets:
+        min_ttm = min(min_ttm, m.seconds_left(now) / 60.0)
+    for p in positions.values():
+        if p.get("status") != "open":
+            continue
+        min_ttm = min(min_ttm, (float(p["end_ts"]) - now) / 60.0)
+    if min_ttm <= sell_w:
+        return float(sim["poll_sell_s"])
+    if min_ttm <= 2.0:
+        return float(sim["poll_near_s"])
+    return float(sim["poll_far_s"])
+
+
+def run_cycle(state: dict, strategy: dict, sim: dict, log: logging.Logger) -> None:
+    now = time.time()
+    positions: Dict[str, dict] = state.setdefault("positions", {})
+
+    # Discover markets
+    try:
+        markets = discover_btc_5m(
+            horizon_min=float(sim["discover_horizon_min"]),
+            lookback_min=2.0,
+        )
+    except Exception as e:
+        log.error("discover failed: %s", e)
+        return
+
+    # Paper enter new markets
+    enter_max = float(sim["enter_max_ttm_min"])
+    enter_min = float(sim["enter_min_ttm_min"])
+    for m in markets:
+        ttm_min = m.seconds_left(now) / 60.0
+        if m.condition_id in positions:
+            continue
+        if enter_min <= ttm_min <= enter_max:
+            positions[m.condition_id] = new_position(m, sim, now)
+            log.info(
+                "ENTER %s ttm=%.1fm set_cost=%.3f shares=%.1f",
+                m.slug,
+                ttm_min,
+                sim["set_cost"],
+                sim["shares"],
+            )
+
+    # Tokens to fetch: all open positions + markets near window for pre-entry ticks
+    token_ids = set()
+    active_markets = {m.condition_id: m for m in markets}
+    for cid, pos in list(positions.items()):
+        if pos.get("status") != "open":
+            continue
+        token_ids.add(pos["up_token"])
+        token_ids.add(pos["dn_token"])
+        # refresh end_ts if market still listed
+        if cid in active_markets:
+            pos["end_ts"] = active_markets[cid].end_ts
+
+    books = fetch_books_parallel(list(token_ids))
+
+    closed_ids = []
+    for cid, pos in list(positions.items()):
+        if pos.get("status") != "open":
+            continue
+
+        up_book = books.get(pos["up_token"])
+        dn_book = books.get(pos["dn_token"])
+        up_bid = up_book.best_bid if up_book and up_book.ok else None
+        dn_bid = dn_book.best_bid if dn_book and dn_book.ok else None
+        pos["last_up_bid"] = up_bid
+        pos["last_dn_bid"] = dn_bid
+
+        seconds_left = float(pos["end_ts"]) - now
+        tick = {
+            "ts": now,
+            "seconds_left": round(seconds_left, 3),
+            "up_bid": up_bid,
+            "dn_bid": dn_bid,
+            "up_bid_sz": up_book.best_bid_size if up_book else None,
+            "dn_bid_sz": dn_book.best_bid_size if dn_book else None,
+            "up_size": pos["up_size"],
+            "dn_size": pos["dn_size"],
+        }
+        append_tick(cid, tick)
+
+        # Still live — evaluate policy
+        if seconds_left > 0:
+            # grace period after entry
+            if now - float(pos["entered_at"]) < float(strategy["sell_grace_s"]):
+                continue
+            decision = evaluate(
+                seconds_left=seconds_left,
+                up_bid=up_bid,
+                dn_bid=dn_bid,
+                up_size=float(pos["up_size"]),
+                dn_size=float(pos["dn_size"]),
+                sold_up=bool(pos["sold_up"]),
+                sold_dn=bool(pos["sold_dn"]),
+                strategy=strategy,
+            )
+            apply_decision(
+                pos, decision, up_book, dn_book, sim, strategy, now, seconds_left, log
+            )
+            continue
+
+        # Expired — try resolve and finalize
+        post = float(sim["post_expiry_record_s"])
+        if try_resolve(pos, up_bid, dn_bid, sim):
+            finalize(pos, log)
+            closed_ids.append(cid)
+        elif -seconds_left > post:
+            # timed out resolving — if one leg remains, assume it won if other sold
+            if pos["sold_up"] and not pos["sold_dn"] and float(pos["dn_size"]) >= 0.01:
+                pos["winner"] = "dn"
+            elif pos["sold_dn"] and not pos["sold_up"] and float(pos["up_size"]) >= 0.01:
+                pos["winner"] = "up"
+            elif float(pos["up_size"]) < 0.01 and float(pos["dn_size"]) < 0.01:
+                pos["winner"] = None
+            else:
+                # both still held — unknown; mark unresolved with 0 redeem (conservative)
+                pos["winner"] = None
+                log.warning("UNRESOLVED %s up_bid=%s dn_bid=%s", pos["slug"], up_bid, dn_bid)
+            finalize(pos, log)
+            closed_ids.append(cid)
+
+    for cid in closed_ids:
+        # keep completed summary ids, drop from active
+        state.setdefault("completed", []).append(cid)
+        positions.pop(cid, None)
+
+    state["last_cycle_at"] = now
+    state["n_open"] = sum(1 for p in positions.values() if p.get("status") == "open")
+    state["n_markets_seen"] = len(markets)
+    save_state(state)
+
+
+def print_status(state: dict, log: logging.Logger) -> None:
+    positions = state.get("positions") or {}
+    open_pos = [p for p in positions.values() if p.get("status") == "open"]
+    now = time.time()
+    log.info(
+        "STATUS open=%d completed=%d",
+        len(open_pos),
+        len(state.get("completed") or []),
+    )
+    for p in sorted(open_pos, key=lambda x: x["end_ts"])[:12]:
+        ttm = float(p["end_ts"]) - now
+        log.info(
+            "  %s ttm=%5.1fs up=%.2f dn=%.2f bidU=%s bidD=%s soldU=%s soldD=%s",
+            p["slug"],
+            ttm,
+            p["up_size"],
+            p["dn_size"],
+            p.get("last_up_bid"),
+            p.get("last_dn_bid"),
+            p.get("sold_up"),
+            p.get("sold_dn"),
+        )
+
+
+def main(argv: Optional[List[str]] = None) -> int:
+    parser = argparse.ArgumentParser(description="Live shadow simulator (no real orders)")
+    parser.add_argument("--once", action="store_true", help="Run a single cycle and exit")
+    parser.add_argument("--summary", action="store_true", help="Print results summary and exit")
+    parser.add_argument("--config", default=None, help="Path to strategy.sim.json")
+    args = parser.parse_args(argv)
+
+    log = _setup_log()
+    if args.summary:
+        s = summarize_results()
+        print(json_dumps(s))
+        return 0
+
+    strategy = load_strategy(args.config)
+    sim = load_sim(args.config)
+    ensure_dirs()
+
+    signal.signal(signal.SIGINT, _on_signal)
+    signal.signal(signal.SIGTERM, _on_signal)
+
+    log.info(
+        "SHADOW START strategy=%s sim_fill=%s set_cost=%.3f shares=%.1f window=%.0fs thr=%.2f",
+        {k: strategy[k] for k in ("sell_threshold", "sell_window_min", "hedge_enabled", "sell_lastchance_s")},
+        sim["fill_model"],
+        sim["set_cost"],
+        sim["shares"],
+        strategy["sell_window_min"] * 60,
+        strategy["sell_threshold"],
+    )
+    log.info("NO REAL ORDERS — public books only")
+
+    state = load_state()
+    cycles = 0
+    last_status = 0.0
+
+    while not _shutdown:
+        strategy = load_strategy(args.config)
+        sim = load_sim(args.config)
+        try:
+            run_cycle(state, strategy, sim, log)
+            cycles += 1
+            if time.time() - last_status >= 15:
+                print_status(state, log)
+                last_status = time.time()
+        except Exception:
+            log.exception("cycle error")
+
+        if args.once:
+            break
+
+        sleep_s = choose_sleep(state.get("positions") or {}, [], sim, strategy)
+        # recompute with markets if possible
+        try:
+            mkts = discover_btc_5m(horizon_min=float(sim["discover_horizon_min"]), lookback_min=1.0)
+            sleep_s = choose_sleep(state.get("positions") or {}, mkts, sim, strategy)
+        except Exception:
+            pass
+
+        end = time.time() + sleep_s
+        while time.time() < end and not _shutdown:
+            time.sleep(min(0.2, end - time.time()))
+
+    save_state(state)
+    log.info("SHADOW STOP cycles=%d summary=%s", cycles, summarize_results())
+    return 0
+
+
+def json_dumps(obj: Any) -> str:
+    import json
+
+    return json.dumps(obj, indent=2)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
