@@ -1,110 +1,78 @@
 # Live Shadow Simulator
 
 Paper-trades **every** BTC 5-minute market using **live Polymarket order books**.  
-**Never places real orders.** Does **not** import `bot.py`.
+**Never places real orders.** Does **not** import `bot.py`. Safe beside `polybot`.
 
-## What this is (plain English)
+## What this is
 
-1. **Entry (simulated, calibrated)**  
-   When a new 5m market appears with ~1–4.5 minutes left, we pretend we bought a complete set (UP+DOWN) at your historical cost, default **`$1.045` per share** (from your trade export: ~4.5¢ over $1).
+1. **Entry (simulated)** — complete set at calibrated `set_cost` (default **$1.043**/share)
+2. **Live books (real)** — public CLOB `/book` only, no API keys
+3. **Strategy** — same sell / last-chance / hedge rules as live bot
+4. **Fills** — walk real bid depth (FAK model)
+5. **Settlement** — winner from post-expiry book dominance → PnL
 
-2. **Live data (real)**  
-   For every open paper position we poll the public CLOB  
-   `https://clob.polymarket.com/book?token_id=...`  
-   — same books the real bot sees — for **both** legs, on **all** markets (not just ones you hold for real).
+## Isolation (won't touch the bot)
 
-3. **Strategy (same rules as live bot)**  
-   - Sell window: last **45s**  
-   - Sell if best bid ≤ **10¢**  
-   - Last **10s**: bid **&lt; 35¢** and opposite **≥ 65¢**  
-   - Hedge: off by default  
+| Shadow uses | Bot uses (untouched) |
+|-------------|----------------------|
+| `sim/strategy.sim.json` | `strategy.json` |
+| `sim_data/*` | `positions.json`, `pnl.json`, `bot.log`, `.env` |
+| public Gamma + CLOB | same public APIs + private trading |
 
-4. **Fills (simulated against real depth)**  
-   When the strategy would sell, we **walk the live bid book** like a FAK order:  
-   fill what size is actually resting at/above the limit price.  
-   If the book is empty or too thin → **MISS** (same class of failure you saw at expiry).
+Also: single-instance lock, Nice=10 + CPU/memory caps in systemd, discovery cache, book poll only when TTM ≤ 3 min.
 
-5. **Settlement**  
-   After expiry we infer the winner from book dominance (e.g. one side ≥ 90¢) and  
-   `PnL = sell_proceeds + hedge + redeem($1 on winner) − entry_cost`.
-
-That gives you **12 markets/hour** of realistic path+fill data while the real bot runs separately.
-
-## Run (local or GCP)
+## Run
 
 ```bash
-# from repo root, same venv is fine (only needs requests)
-pip install requests
-
-# optional: calibrate set_cost from your export
-python -m sim.analyze_history "Polymarket-History-2026-07-15.csv"
-
-# start live shadow (Ctrl-C to stop)
-python -m sim.shadow
-
-# one cycle smoke test
-python -m sim.shadow --once
-
-# results summary
+# repo root, same venv is fine
+python -m sim.shadow          # continuous
+python -m sim.shadow --once   # smoke test
 python -m sim.shadow --summary
 ```
 
-### GCP (alongside polybot, separate process)
+## GCP permanent install (alongside polybot)
 
 ```bash
-cd ~/poly-money-maker
-git pull   # after you push this
-# optional systemd unit later; for now:
-nohup .venv/bin/python -m sim.shadow >> sim_data/nohup.out 2>&1 &
+cd ~/poly-money-maker   # or your actual path
+git pull
+
+# edit user/path in the unit if needed
+USER=$(whoami)
+DIR=$(pwd)
+sed -e "s|YOUR_USER|$USER|g" -e "s|/home/YOUR_USER/poly-money-maker|$DIR|g" \
+  deploy/polyshadow.service | sudo tee /etc/systemd/system/polyshadow.service
+
+sudo systemctl daemon-reload
+sudo systemctl enable --now polyshadow
+
+# verify
+systemctl status polyshadow --no-pager
+journalctl -u polyshadow -n 50 --no-pager
+tail -f sim_data/shadow.log
+python -m sim.shadow --summary
 ```
 
-Do **not** run this as a second `bot.py`. This module never trades.
+polybot stays as-is. Do **not** run a second `bot.py`.
 
-## Config
-
-Edit `sim/strategy.sim.json`:
+## Config (`sim/strategy.sim.json`)
 
 | Key | Meaning |
 |-----|---------|
-| `strategy.*` | Same knobs as the live bot |
-| `sim.set_cost` | Complete-set entry cost per share (default 1.045) |
-| `sim.shares` | Paper size per leg (default 5) |
-| `sim.fill_model` | `depth` (realistic) / `best_bid` / `best_bid_partial` |
-| `sim.poll_sell_s` | 0.25s inside sell window |
+| `strategy.*` | Same knobs as live bot |
+| `sim.set_cost` | Entry cost per share |
+| `sim.shares` | Paper size per leg |
+| `sim.fill_model` | `depth` / `best_bid` / `best_bid_partial` |
+| `sim.poll_sell_s` | Poll inside sell window (default 0.35s) |
+| `sim.book_horizon_min` | Only fetch books when TTM ≤ this (default 3) |
 
 ## Outputs (`sim_data/`)
 
 | Path | Content |
 |------|---------|
 | `shadow_state.json` | Open paper positions |
-| `results.jsonl` | One line per completed market (PnL, fills, misses) |
-| `ticks/<conditionId>.jsonl` | Bid time series for research |
-| `trades/<conditionId>.json` | Full event log for one market |
-| `shadow.log` | Human-readable log |
-
-## How to read results
-
-```bash
-python -m sim.shadow --summary
-```
-
-- **mean_pnl > 0** at set_cost 1.045 under `fill_model=depth` → strategy looks viable  
-- **trigger_miss_rate** high → detection works but books won’t fill (your FAK problem)  
-- Compare `sell_avg_px` to your live loser sells (~7–8¢ historically)
-
-## Important limitations
-
-- Entry is **modeled** (fixed set_cost), not a live GTC fill path.  
-- Resolution is inferred from post-expiry books (usually clear; rare ties logged).  
-- Public REST books can lag a few hundred ms vs WebSocket — still far more realistic than mid-only history.  
-- This is a **shadow** of sell policy, not a full portfolio risk system.
-
-## Relation to the live bot
-
-| | Live `bot.py` | Shadow `sim.shadow` |
-|--|---------------|---------------------|
-| Orders | Real FAK sells | Simulated only |
-| Markets | Only ones you hold | **All** BTC 5m |
-| Entry | Manual UI | Assumed set_cost |
-| Books | CLOB SDK | Public `/book` REST |
-| Risk | Real money | Zero |
+| `results.jsonl` | One line per completed market |
+| `ticks/<id>.jsonl` | Bid path samples |
+| `trades/<id>.json` | Full trade record |
+| `shadow.log` | Rotating log |
+| `shadow.lock` | Single-instance lock |
+| `shadow.heartbeat` | Last cycle timestamp |

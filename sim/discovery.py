@@ -1,4 +1,7 @@
-"""Discover live BTC 5-minute markets and fetch public order books."""
+﻿"""Discover live BTC 5-minute markets and fetch public order books.
+
+Read-only public HTTP. No auth. No order placement.
+"""
 
 from __future__ import annotations
 
@@ -14,7 +17,10 @@ import requests
 from .config import CLOB_HOST, GAMMA_API, SERIES_SLUG
 
 SESSION = requests.Session()
-SESSION.headers.update({"User-Agent": "poly-money-maker-shadow-sim/1.0"})
+SESSION.headers.update({"User-Agent": "poly-money-maker-shadow-sim/1.1"})
+
+# Process-local discovery cache (reduces Gamma load when co-running with bot)
+_discover_cache: Dict[str, Any] = {"ts": 0.0, "markets": []}
 
 
 @dataclass
@@ -64,8 +70,22 @@ def discover_btc_5m(
     horizon_min: float = 35.0,
     lookback_min: float = 2.0,
     limit: int = 80,
+    cache_s: float = 0.0,
 ) -> List[Market]:
-    """Return active BTC 5m markets with end time in [-lookback, +horizon] minutes."""
+    """Return active BTC 5m markets with end time in [-lookback, +horizon] minutes.
+
+    If cache_s > 0, reuse last successful response for that many seconds.
+    """
+    now = time.time()
+    if cache_s > 0 and _discover_cache["markets"] and (now - float(_discover_cache["ts"])) < cache_s:
+        # re-filter by current time so expired markets drop out of the cached list
+        cached: List[Market] = _discover_cache["markets"]
+        return [
+            m
+            for m in cached
+            if -lookback_min <= m.seconds_left(now) / 60.0 <= horizon_min
+        ]
+
     url = f"{GAMMA_API}/events"
     params = {
         "series_slug": SERIES_SLUG,
@@ -76,7 +96,6 @@ def discover_btc_5m(
     r = SESSION.get(url, params=params, timeout=20)
     r.raise_for_status()
     events = r.json()
-    now = time.time()
     out: List[Market] = []
 
     for ev in events or []:
@@ -108,7 +127,6 @@ def discover_btc_5m(
                 elif o == "down":
                     dn_token = tokens[i]
         if not up_token or not dn_token:
-            # Polymarket usually lists Up then Down
             up_token, dn_token = tokens[0], tokens[1]
 
         cond = m.get("conditionId") or m.get("condition_id") or ev.get("conditionId") or ""
@@ -117,7 +135,7 @@ def discover_btc_5m(
 
         out.append(
             Market(
-                condition_id=cond,
+                condition_id=str(cond),
                 slug=ev.get("slug") or m.get("slug") or "",
                 question=m.get("question") or ev.get("title") or "",
                 end_ts=end_ts,
@@ -128,7 +146,6 @@ def discover_btc_5m(
         )
 
     out.sort(key=lambda x: x.end_ts)
-    # de-dupe by condition
     seen = set()
     uniq = []
     for mkt in out:
@@ -136,12 +153,19 @@ def discover_btc_5m(
             continue
         seen.add(mkt.condition_id)
         uniq.append(mkt)
+
+    _discover_cache["ts"] = now
+    _discover_cache["markets"] = uniq
     return uniq
 
 
 def fetch_book(token_id: str, timeout: float = 8.0) -> BookSnap:
     try:
-        r = SESSION.get(f"{CLOB_HOST}/book", params={"token_id": token_id}, timeout=timeout)
+        r = SESSION.get(
+            f"{CLOB_HOST}/book",
+            params={"token_id": token_id},
+            timeout=timeout,
+        )
         r.raise_for_status()
         book = r.json()
         bids = book.get("bids") or []
@@ -178,11 +202,15 @@ def fetch_book(token_id: str, timeout: float = 8.0) -> BookSnap:
         )
 
 
-def fetch_books_parallel(token_ids: List[str], max_workers: int = 12) -> Dict[str, BookSnap]:
+def fetch_books_parallel(
+    token_ids: List[str],
+    max_workers: int = 6,
+) -> Dict[str, BookSnap]:
     out: Dict[str, BookSnap] = {}
     if not token_ids:
         return out
-    with ThreadPoolExecutor(max_workers=max_workers) as ex:
+    workers = max(1, min(int(max_workers), len(token_ids), 8))
+    with ThreadPoolExecutor(max_workers=workers) as ex:
         futs = {ex.submit(fetch_book, t): t for t in token_ids}
         for fut in as_completed(futs):
             snap = fut.result()
@@ -191,6 +219,10 @@ def fetch_books_parallel(token_ids: List[str], max_workers: int = 12) -> Dict[st
 
 
 def pair_books(market: Market, books: Dict[str, BookSnap]) -> Tuple[BookSnap, BookSnap]:
-    up = books.get(market.up_token) or BookSnap(market.up_token, None, 0.0, None, 0.0, ok=False, error="missing")
-    dn = books.get(market.dn_token) or BookSnap(market.dn_token, None, 0.0, None, 0.0, ok=False, error="missing")
+    up = books.get(market.up_token) or BookSnap(
+        market.up_token, None, 0.0, None, 0.0, ok=False, error="missing"
+    )
+    dn = books.get(market.dn_token) or BookSnap(
+        market.dn_token, None, 0.0, None, 0.0, ok=False, error="missing"
+    )
     return up, dn
