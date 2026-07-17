@@ -5,19 +5,37 @@ Paper-trades BTC up/down markets using **live Polymarket order books**.
 
 ## Current experiment (15m)
 
-Default config (`sim/strategy.sim.json`):
-
 | Knob | Value |
 |------|-------|
 | Series | `btc-up-or-down-15m` |
 | Sell window | last **2 minutes** |
 | Sell threshold | **12¢** |
 | Last-chance | last **10s**, bid **&lt;35¢** + opposite **≥65¢** |
-| Data dir | `sim_data/15m/` (keeps old 5m results separate) |
+| Data dir | `sim_data/15m/` |
 
-## Why 15m
+## Disk safety
 
-The old complete-set thesis assumed ~$1.00 entry. Realized set cost is often ~$1.043, so break-even needs meaningful loser sells. 15m markets may have deeper books and a longer exit window to test before changing the live 5m bot.
+- `record_ticks: false` by default (results.jsonl only)
+- Prune ticks after **6h**, trades **7d**
+- Cap `sim_data/` ~**150MB**; want ~**200MB** free
+- On ENOSPC: stop ticks/trades, prune, no traceback spam
+- Unresolved markets do not count as full-entry strategy losses in summary
+
+### If the VM disk is full
+
+```bash
+sudo systemctl stop polyshadow
+df -h
+du -sh sim_data/* sim_data/15m/* 2>/dev/null | sort -h
+rm -rf sim_data/15m/ticks/* sim_data/*/ticks/* 2>/dev/null
+find sim_data -name '*.log*' -type f -delete
+sudo journalctl --vacuum-size=50M
+df -h .
+git pull
+sudo systemctl start polyshadow
+journalctl -u polyshadow -n 30 --no-pager
+# expect: DISK free=... record_ticks=False
+```
 
 ## Run
 
@@ -31,8 +49,6 @@ python -m sim.shadow --summary
 
 ```bash
 cd ~/poly-money-maker && git pull
-# archive old 5m root results if present (optional)
-# mv sim_data/results.jsonl sim_data/results_5m_archive.jsonl 2>/dev/null || true
 sudo systemctl restart polyshadow
 systemctl status polyshadow --no-pager
 journalctl -u polyshadow -n 40 --no-pager
@@ -46,14 +62,3 @@ journalctl -u polyshadow -n 40 --no-pager
 | `sim/strategy.sim.json` | `strategy.json` |
 | `sim_data/<tag>/` | `positions.json`, `.env`, `bot.log` |
 | public books only | real orders |
-
-## Switch series later
-
-Edit `sim/strategy.sim.json`:
-
-```json
-"series_slug": "btc-up-or-down-5m",
-"data_tag": "5m"
-```
-
-Then restart `polyshadow`.

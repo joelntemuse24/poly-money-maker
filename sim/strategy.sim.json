@@ -28,13 +28,16 @@
     "no_fill_after_s": 0.0,
     "post_expiry_record_s": 90.0,
     "resolve_bid_edge": 0.70,
-    "tick_sample_far_s": 5.0,
-    "tick_sample_near_s": 1.0,
-    "tick_sample_sell_s": 0.35,
-    "prune_ticks_after_hours": 48.0,
-    "prune_trades_after_days": 14.0,
+    "record_ticks": false,
+    "tick_sample_far_s": 30.0,
+    "tick_sample_near_s": 10.0,
+    "tick_sample_sell_s": 5.0,
+    "prune_ticks_after_hours": 6.0,
+    "prune_trades_after_days": 7.0,
     "max_completed_ids": 500,
-    "max_events_per_pos": 200,
-    "prune_every_s": 300.0
+    "max_events_per_pos": 50,
+    "prune_every_s": 120.0,
+    "max_sim_data_mb": 150.0,
+    "min_free_disk_mb": 200.0
   }
 }

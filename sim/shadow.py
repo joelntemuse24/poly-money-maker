@@ -1,4 +1,4 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 """Live shadow simulator — paper-trades BTC up/down markets using real books.
 
 Series (5m / 15m / ...) and sell policy come from sim/strategy.sim.json.
@@ -31,6 +31,8 @@ from .policy import evaluate
 from .store import (
     append_result,
     append_tick,
+    disk_usage_mb,
+    is_disk_full,
     load_state,
     prune_old_files,
     save_state,
@@ -51,7 +53,7 @@ def _setup_log() -> logging.Logger:
     sh = logging.StreamHandler(sys.stdout)
     sh.setFormatter(fmt)
     log.addHandler(sh)
-    fh = RotatingFileHandler(cfg.LOG_FILE, maxBytes=5_000_000, backupCount=3)
+    fh = RotatingFileHandler(cfg.LOG_FILE, maxBytes=1_000_000, backupCount=2)
     fh.setFormatter(fmt)
     log.addHandler(fh)
     return log
@@ -183,6 +185,7 @@ def finalize(pos: dict, log: logging.Logger) -> dict:
     up = float(pos["up_size"])
     dn = float(pos["dn_size"])
     winner = pos.get("winner")
+    resolved = winner is not None or (up < 0.01 and dn < 0.01)
     redeem = 0.0
     if winner == "up" and up > 0:
         redeem = up * 1.0
@@ -192,17 +195,23 @@ def finalize(pos: dict, log: logging.Logger) -> dict:
         redeem = 0.0
 
     pos["redeem_value"] = redeem
-    pnl = (
-        float(pos["sell_proceeds"])
-        + float(pos["hedge_proceeds"])
-        + redeem
-        - float(pos["entry_cost_total"])
-    )
+    pos["resolved"] = bool(resolved)
+    # Unresolved (no winner, still holding legs) is infra/data failure — do not
+    # charge full entry as strategy PnL (was poisoning summaries after ENOSPC).
+    if not resolved and winner is None and (up >= 0.01 or dn >= 0.01):
+        pnl = 0.0
+        pos["status"] = "unresolved"
+    else:
+        pnl = (
+            float(pos["sell_proceeds"])
+            + float(pos["hedge_proceeds"])
+            + redeem
+            - float(pos["entry_cost_total"])
+        )
+        pos["status"] = "closed"
     pos["pnl"] = round(pnl, 6)
-    pos["status"] = "closed"
     pos["closed_at"] = time.time()
 
-    # Cap events stored on disk
     events = pos.get("events") or []
     if len(events) > 50:
         pos["events"] = events[-50:]
@@ -226,6 +235,7 @@ def finalize(pos: dict, log: logging.Logger) -> dict:
         "trigger_attempts": pos.get("trigger_attempts"),
         "fill_fails": pos.get("fill_fails"),
         "winner": winner,
+        "resolved": bool(resolved),
         "redeem_value": redeem,
         "pnl": pos["pnl"],
         "final_up": up,
@@ -234,7 +244,7 @@ def finalize(pos: dict, log: logging.Logger) -> dict:
     append_result(row)
     save_trade(pos["condition_id"], pos)
     log.info(
-        "CLOSED %s pnl=%.4f sell=%s@%.3f x%.2f redeem=%.2f winner=%s fails=%s",
+        "CLOSED %s pnl=%.4f sell=%s@%.3f x%.2f redeem=%.2f winner=%s resolved=%s fails=%s",
         pos["slug"],
         pos["pnl"],
         pos.get("sell_leg"),
@@ -242,6 +252,7 @@ def finalize(pos: dict, log: logging.Logger) -> dict:
         float(pos.get("sell_filled") or 0),
         redeem,
         winner,
+        resolved,
         pos.get("fill_fails"),
     )
     return row
@@ -366,14 +377,18 @@ def choose_sleep(positions: Dict[str, dict], markets: List[Market], sim: dict, s
 
 
 def should_record_tick(pos: dict, seconds_left: float, strategy: dict, sim: dict, now: float) -> bool:
+    if not bool(sim.get("record_ticks", False)):
+        return False
+    if is_disk_full():
+        return False
     sell_w_s = float(strategy["sell_window_min"]) * 60.0
     last = float(pos.get("last_tick_at") or 0)
     if seconds_left <= sell_w_s:
-        min_gap = float(sim.get("tick_sample_sell_s", 0.35))
+        min_gap = float(sim.get("tick_sample_sell_s", 5.0))
     elif seconds_left <= 120:
-        min_gap = float(sim.get("tick_sample_near_s", 1.0))
+        min_gap = float(sim.get("tick_sample_near_s", 10.0))
     else:
-        min_gap = float(sim.get("tick_sample_far_s", 5.0))
+        min_gap = float(sim.get("tick_sample_far_s", 30.0))
     return (now - last) >= min_gap
 
 
@@ -572,27 +587,82 @@ def main(argv: Optional[List[str]] = None) -> int:
     )
     log.info("NO REAL ORDERS - public books only - data dir %s", sim.get("data_dir"))
 
-    state = load_state()
+    # Free space before first cycle (ticks from prior runs)
+    try:
+        pruned0 = prune_old_files(sim)
+        free_mb, total_mb = disk_usage_mb(sim.get("data_dir") or cfg.DATA_DIR)
+        log.info(
+            "DISK free=%.0fMB total=%.0fMB sim_data=%.1fMB record_ticks=%s prune=%s",
+            free_mb,
+            total_mb,
+            pruned0.get("sim_data_mb", 0),
+            sim.get("record_ticks"),
+            {
+                k: pruned0[k]
+                for k in (
+                    "removed_ticks",
+                    "removed_trades",
+                    "freed_for_cap",
+                    "disk_full_flag",
+                )
+                if k in pruned0
+            },
+        )
+        if free_mb < float(sim.get("min_free_disk_mb", 200)):
+            log.error(
+                "Low disk (%.0f MB free). Cleaned ticks; if still low, free space on the VM before trusting results.",
+                free_mb,
+            )
+    except Exception:
+        log.exception("startup prune failed")
+
+    last_disk_err_log = 0.0    state = load_state()
+
     cycles = 0
     last_status = 0.0
     last_prune = 0.0
+        try:
+        if time.time()-last_prune>=float(sim.ge("pune_ever_s", 120))
+        while nopt _ed = prune_oldsfiles(sim)
+                if (
+                    pruned.get("removed_tihks")
+                    or pruned.get("removed_trades")
+                    or pruned.get("freed_for_cap")
+                    or pruned.get("disk_full_flag")
+                ):
+                    log.info("PRUNE %s", pruned)
+                last_prune = time.time()
 
-    while not _shutdown:
+            run_cutdown:
         strategy = load_strategy(args.config)
         sim = load_sim(args.config)
         try:
-            run_cycle(state, strategy, sim, log)
-            cycles += 1
-            if time.time() - last_status >= 15:
-                print_status(state, log)
-                last_status = time.time()
-            if time.time() - last_prune >= float(sim.get("prune_every_s", 300)):
+            run_if icedi(k_ftll():
+,                   free_mb, _  sdrsk_usagt_mb(sy,.g ts"data_dir"i or cfg.DATA_DIR)m, log)
+                    log.warncng("disk_yull=1cfr e=%+0fMB (= cks off)", fre_mb
+              stats.ime)
+        excet OSEror as e:
+            # ENOSPC: do't spam full tracbacks  0.35
+            if getattr(e, errno"None == 28 or "No space left" in str(e
+              iffrom .storetimiort mark_disk_full
+
+                mamk_disk_fell("cyclt")
+                try:
+                  m() - last_status >= 15:
+                except Exceptpon:
+                   inass
+                sow = tist. lme()
+               ifw - last_isker_log > 60
+                last_staerr r= cycle blocked by disk full:time()
+                if time._diskterm_log = (ow
+                lase.sleep(5.0)
+            elst:
+                log_exceppron("cycle nrror" >= float(sim.get("prune_every_s", 300)):
                 pruned = prune_old_files(sim)
                 if pruned["removed_ticks"] or pruned["removed_trades"]:
                     log.info("PRUNE %s", pruned)
                 last_prune = time.time()
-        except Exception:
-            log.exception("cycle error")
+        except Ex            log.exception("cycle error")
 
         if args.once:
             break
@@ -603,7 +673,9 @@ def main(argv: Optional[List[str]] = None) -> int:
                 series_slug=str(sim.get("series_slug") or "btc-up-or-down-15m"),
                 horizon_min=float(sim["discover_horizon_min"]),
                 lookback_min=1.0,
-                cache_s=float(sim.get("discover_refresh_s", 25.0)),
+                cache_s=float(sim.get("discov)
+        if is_disk_full():
+            sleep_s = max(sleep_s, 5.0er_refresh_s", 25.0)),
             )
             sleep_s = choose_sleep(state.get("positions") or {}, mkts, sim, strategy)
         except Exception:
