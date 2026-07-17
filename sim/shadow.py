@@ -1,8 +1,9 @@
 ﻿#!/usr/bin/env python3
-"""Live shadow simulator — paper-trades EVERY BTC 5m market using real books.
+"""Live shadow simulator — paper-trades BTC up/down markets using real books.
 
+Series (5m / 15m / ...) and sell policy come from sim/strategy.sim.json.
 Does NOT send orders. Does NOT import bot.py.
-All state under sim_data/ only. Safe to run beside polybot.
+All state under sim_data/<data_tag>/ only. Safe to run beside polybot.
 """
 
 from __future__ import annotations
@@ -17,16 +18,14 @@ import time
 from logging.handlers import RotatingFileHandler
 from typing import Any, Dict, List, Optional
 
+from . import config as cfg
 from .config import (
-    HEARTBEAT_FILE,
-    LOCK_FILE,
-    LOG_FILE,
     assert_path_safe,
     ensure_dirs,
     load_sim,
     load_strategy,
 )
-from .discovery import Market, discover_btc_5m, fetch_books_parallel
+from .discovery import Market, discover_btc_markets, fetch_books_parallel
 from .fills import simulate_fak_sell
 from .policy import evaluate
 from .store import (
@@ -52,7 +51,7 @@ def _setup_log() -> logging.Logger:
     sh = logging.StreamHandler(sys.stdout)
     sh.setFormatter(fmt)
     log.addHandler(sh)
-    fh = RotatingFileHandler(LOG_FILE, maxBytes=5_000_000, backupCount=3)
+    fh = RotatingFileHandler(cfg.LOG_FILE, maxBytes=5_000_000, backupCount=3)
     fh.setFormatter(fmt)
     log.addHandler(fh)
     return log
@@ -67,8 +66,8 @@ def acquire_lock() -> None:
     """Single-instance lock under sim_data/. Prevents two shadow processes."""
     global _lock_fd
     ensure_dirs()
-    assert_path_safe(LOCK_FILE)
-    fd = open(LOCK_FILE, "a+")
+    assert_path_safe(cfg.LOCK_FILE)
+    fd = open(cfg.LOCK_FILE, "a+")
     try:
         if os.name == "nt":
             import msvcrt
@@ -81,7 +80,7 @@ def acquire_lock() -> None:
             fcntl.flock(fd.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
     except (OSError, BlockingIOError) as e:
         fd.close()
-        raise SystemExit(f"Another shadow instance is already running ({LOCK_FILE}): {e}")
+        raise SystemExit(f"Another shadow instance is already running ({cfg.LOCK_FILE}): {e}")
     fd.seek(0)
     fd.truncate()
     fd.write(str(os.getpid()))
@@ -115,8 +114,8 @@ def acquire_lock() -> None:
 
 def write_heartbeat() -> None:
     try:
-        assert_path_safe(HEARTBEAT_FILE)
-        with open(HEARTBEAT_FILE, "w", encoding="utf-8") as f:
+        assert_path_safe(cfg.HEARTBEAT_FILE)
+        with open(cfg.HEARTBEAT_FILE, "w", encoding="utf-8") as f:
             f.write(str(time.time()))
     except Exception:
         pass
@@ -383,7 +382,8 @@ def run_cycle(state: dict, strategy: dict, sim: dict, log: logging.Logger) -> No
     positions: Dict[str, dict] = state.setdefault("positions", {})
 
     try:
-        markets = discover_btc_5m(
+        markets = discover_btc_markets(
+            series_slug=str(sim.get("series_slug") or "btc-up-or-down-15m"),
             horizon_min=float(sim["discover_horizon_min"]),
             lookback_min=2.0,
             cache_s=float(sim.get("discover_refresh_s", 25.0)),
@@ -541,22 +541,25 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser.add_argument("--config", default=None, help="Path to strategy.sim.json")
     args = parser.parse_args(argv)
 
+    strategy = load_strategy(args.config)
+    sim = load_sim(args.config)
+    ensure_dirs()
+
     log = _setup_log()
     if args.summary:
         s = summarize_results()
         print(json_dumps(s))
         return 0
 
-    strategy = load_strategy(args.config)
-    sim = load_sim(args.config)
-    ensure_dirs()
     acquire_lock()
 
     signal.signal(signal.SIGINT, _on_signal)
     signal.signal(signal.SIGTERM, _on_signal)
 
     log.info(
-        "SHADOW START strategy=%s sim_fill=%s set_cost=%.3f shares=%.1f window=%.0fs thr=%.2f",
+        "SHADOW START series=%s tag=%s strategy=%s sim_fill=%s set_cost=%.3f shares=%.1f window=%.0fs thr=%.2f",
+        sim.get("series_slug"),
+        sim.get("data_tag"),
         {
             k: strategy[k]
             for k in ("sell_threshold", "sell_window_min", "hedge_enabled", "sell_lastchance_s")
@@ -567,7 +570,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         strategy["sell_window_min"] * 60,
         strategy["sell_threshold"],
     )
-    log.info("NO REAL ORDERS — public books only — data dir sim_data/")
+    log.info("NO REAL ORDERS - public books only - data dir %s", sim.get("data_dir"))
 
     state = load_state()
     cycles = 0
@@ -596,7 +599,8 @@ def main(argv: Optional[List[str]] = None) -> int:
 
         # Reuse discovery cache for sleep decision (no extra Gamma hit)
         try:
-            mkts = discover_btc_5m(
+            mkts = discover_btc_markets(
+                series_slug=str(sim.get("series_slug") or "btc-up-or-down-15m"),
                 horizon_min=float(sim["discover_horizon_min"]),
                 lookback_min=1.0,
                 cache_s=float(sim.get("discover_refresh_s", 25.0)),

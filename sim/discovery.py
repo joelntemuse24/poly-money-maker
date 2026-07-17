@@ -14,13 +14,13 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import requests
 
-from .config import CLOB_HOST, GAMMA_API, SERIES_SLUG
+from .config import CLOB_HOST, GAMMA_API, DEFAULT_SERIES_SLUG
 
 SESSION = requests.Session()
 SESSION.headers.update({"User-Agent": "poly-money-maker-shadow-sim/1.1"})
 
 # Process-local discovery cache (reduces Gamma load when co-running with bot)
-_discover_cache: Dict[str, Any] = {"ts": 0.0, "markets": []}
+_discover_cache: Dict[str, Any] = {"ts": 0.0, "markets": [], "series": ""}
 
 
 @dataclass
@@ -65,20 +65,28 @@ def _parse_json_list(val: Any) -> list:
     return []
 
 
-def discover_btc_5m(
+def discover_btc_markets(
     *,
+    series_slug: str = DEFAULT_SERIES_SLUG,
     horizon_min: float = 35.0,
     lookback_min: float = 2.0,
     limit: int = 80,
     cache_s: float = 0.0,
 ) -> List[Market]:
-    """Return active BTC 5m markets with end time in [-lookback, +horizon] minutes.
+    """Return active BTC up/down markets for a series in [-lookback, +horizon] minutes.
 
-    If cache_s > 0, reuse last successful response for that many seconds.
+    series_slug examples:
+      - btc-up-or-down-5m
+      - btc-up-or-down-15m
     """
     now = time.time()
-    if cache_s > 0 and _discover_cache["markets"] and (now - float(_discover_cache["ts"])) < cache_s:
-        # re-filter by current time so expired markets drop out of the cached list
+    series_slug = series_slug or DEFAULT_SERIES_SLUG
+    if (
+        cache_s > 0
+        and _discover_cache["markets"]
+        and _discover_cache.get("series") == series_slug
+        and (now - float(_discover_cache["ts"])) < cache_s
+    ):
         cached: List[Market] = _discover_cache["markets"]
         return [
             m
@@ -88,7 +96,7 @@ def discover_btc_5m(
 
     url = f"{GAMMA_API}/events"
     params = {
-        "series_slug": SERIES_SLUG,
+        "series_slug": series_slug,
         "active": "true",
         "closed": "false",
         "limit": str(limit),
@@ -155,6 +163,7 @@ def discover_btc_5m(
         uniq.append(mkt)
 
     _discover_cache["ts"] = now
+    _discover_cache["series"] = series_slug
     _discover_cache["markets"] = uniq
     return uniq
 
@@ -226,3 +235,9 @@ def pair_books(market: Market, books: Dict[str, BookSnap]) -> Tuple[BookSnap, Bo
         market.dn_token, None, 0.0, None, 0.0, ok=False, error="missing"
     )
     return up, dn
+
+
+def discover_btc_5m(**kwargs) -> List[Market]:
+    """Backward-compatible alias; prefer discover_btc_markets."""
+    kwargs.setdefault("series_slug", "btc-up-or-down-5m")
+    return discover_btc_markets(**kwargs)
