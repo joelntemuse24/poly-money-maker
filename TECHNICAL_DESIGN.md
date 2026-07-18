@@ -2434,12 +2434,14 @@ recording path + fill + PnL data under `sim_data/`.
 
 ### 20.1 Goals
 
-- Paper-trade **all** BTC 5m markets (≈12/hour), not only live holdings.
+- Paper-trade **all** markets in a chosen series (default experiment: **BTC 15m**,
+  ~4/hour; 5m still supported via `series_slug`).
 - Use **live** CLOB books (`GET /book`) — same public data the bot sees.
-- Apply the **same** sell / last-chance / hedge rules as `bot.py`.
+- Apply configurable sell / last-chance / hedge rules (mirror bot policy shape).
 - Model **FAK fills** by walking real bid depth (not a free fill at best bid).
 - Run **permanently beside** `polybot` on GCP with **zero shared state**.
 - Never place real orders; never load `.env` or trading credentials.
+- Stay **disk-light** on small VMs (ticks off by default; host journal capped).
 
 ### 20.2 Isolation Guarantees
 
@@ -2455,19 +2457,20 @@ Hard rules enforced in code:
 - **Path guard** (`assert_path_safe`) — refuses writes to bot filenames / outside `sim_data/` or `sim/`.
 - **Single-instance lock** — `sim_data/shadow.lock` (fcntl / msvcrt).
 - **No secrets** — no API keys, no order endpoints, no relayer.
-- **systemd caps** — `Nice=10`, `CPUQuota=40%`, `MemoryMax=400M` so live trading wins resources.
+- **systemd caps** — `Nice=10`, `CPUQuota=40%`, `MemoryMax=400M` so live trading wins CPU/RAM.
+  Disk is separate: journal caps + `sim` prune (see §20.8).
 
 ### 20.3 Cycle Flow
 
 Each cycle of `python -m sim.shadow`:
 
-1. **Discover** active `btc-up-or-down-5m` markets via Gamma (cached ~25s).
+1. **Discover** markets for `sim.series_slug` (e.g. `btc-up-or-down-15m`) via Gamma (cached ~25s).
 2. **Paper enter** markets with TTM in `[enter_min_ttm_min, enter_max_ttm_min]`
    at calibrated complete-set cost (`sim.set_cost`, default **1.043** from history).
 3. **Fetch books** only for open paper positions with TTM ≤ `book_horizon_min`
-   (default 3 minutes) — reduces API contention with the live bot.
-4. **Evaluate policy** (`sim/policy.py`): sell window, 10¢ threshold, last-chance
-   35¢/65¢ in final 10s, optional hedge.
+   — reduces API contention with the live bot.
+4. **Evaluate policy** (`sim/policy.py`): sell window + threshold from config
+   (15m experiment: **2 min / 12¢**), last-chance 35¢/65¢ in final 10s, optional hedge.
 5. **Simulate FAK** (`sim/fills.py`, model `depth`): walk bids at/above limit;
    partial or zero fill → MISS (same failure class as thin books near expiry).
 6. **After expiry** resolve winner from bid dominance;
@@ -2535,6 +2538,71 @@ Do **not** run a second `bot.py`. Shadow is paper-only.
 - Relayer / redemption latency (shadow assumes $1 redeem on the inferred winner).
 - Perfect isolation from rate limits if both processes hammer the public API
   (mitigated by cache + book horizon + lower sell poll rate).
+- Host disk capacity — the app cannot enlarge a 10GB GCP boot disk; operators must
+  cap `/var/log` and monitor free space (see §20.8).
+
+### 20.8 Disk capacity incident and prevention (2026-07)
+
+#### What happened
+
+On the GCP instance (~10GB root disk), the root filesystem hit **100% full**
+(`No space left on device` / ENOSPC). Symptoms:
+
+- `polyshadow` could not write state/ticks and error-looped.
+- `git pull` failed (`unable to create temporary file`).
+- Paper results for some 15m markets closed as `winner: null` with full-entry
+  losses until the disk was freed — those rows are **infra failures**, not
+  strategy edge.
+
+#### Root cause (measured)
+
+| Path | Approx size | Role |
+|---|---|---|
+| `/var/log` | **~5.0 GB** | **Primary consumer** (journal + system logs) |
+| `/usr` | ~2.4 GB | OS packages / google-cloud-sdk |
+| `/home/.../poly-money-maker` | ~0.25 GB | repo + venv |
+| `sim_data/` | **~5 MB** | shadow outputs — **not** the 5GB culprit |
+
+Earlier design work correctly capped **RAM** (`MemoryMax=400M`) and **CPU**
+(`Nice`, `CPUQuota`) for co-running with `polybot`. That does **not** limit
+**disk**. Tick logging could grow `sim_data` over time, but in this incident
+host logs dominated.
+
+#### App-side prevention (in repo)
+
+| Control | Where | Effect |
+|---|---|---|
+| `record_ticks: false` default | `sim/strategy.sim.json` | No dense bid-path files |
+| Prune ticks 6h / trades 7d | `sim/store.py` | Age-based cleanup |
+| `max_sim_data_mb` (~150) | config + prune | Hard size budget under `sim_data/` |
+| `min_free_disk_mb` (~200) | config + prune | Emergency tick wipe if free space low |
+| ENOSPC handling | `store.py` / `shadow.py` | Disable optional writes; no traceback spam |
+| Unresolved PnL = 0 in summary | `finalize` + `summarize_results` | Disk outages do not fake full-entry strategy losses |
+| Small rotating `shadow.log` | `shadow.py` | 1MB × 2 backups |
+
+#### Host-side prevention (required on GCP)
+
+| Control | Where | Effect |
+|---|---|---|
+| Journal size cap | `deploy/journald-size.conf` | Keep journal ≤ ~50MB |
+| Ops runbook | `deploy/DISK_OPS.md` | Find `/var/log`, vacuum, recover |
+| Prefer 20–30GB boot disk | GCP console | Headroom for OS + journal + bot |
+
+Install journal cap once:
+
+```bash
+sudo mkdir -p /etc/systemd/journald.conf.d
+sudo cp deploy/journald-size.conf /etc/systemd/journald.conf.d/size.conf
+sudo systemctl restart systemd-journald
+sudo journalctl --vacuum-size=50M
+```
+
+#### Operator check
+
+```bash
+df -h /
+# Avail should stay well above 1G on a 10G disk; alert if < 500M
+```
 
 ---
 
@@ -2569,9 +2637,10 @@ Do **not** run a second `bot.py`. Shadow is paper-only.
 | **Relayer** | A Polymarket-operated service that submits on-chain transactions on behalf of users, paying the gas fees. |
 | **Reversal** | When the market flips direction — the side that was winning starts losing. Triggers the hedge phase. |
 | **Sell window** | The final N seconds before market expiry during which the bot is allowed to sell. Currently 45 seconds (`SELL_WINDOW_MIN` = 0.75 min). |
-| **Shadow simulator** | Paper-trading process (`sim/shadow.py`) that applies the live sell policy to every BTC 5m market using public books; never places real orders. |
+| **Shadow simulator** | Paper-trading process (`sim/shadow.py`) that applies a configurable sell policy to every market in a series (5m/15m) using public books; never places real orders. |
 | **set_cost** | Complete-set entry cost per share used by the shadow sim (default ~1.043 from history). Live bot does not gate on this. |
 | **polyshadow** | systemd service name for the permanent shadow simulator on GCP. |
+| **ENOSPC** | OS errno 28 — no space left on device. On the bot VM (2026-07) this was caused mainly by `/var/log` growth, not by `sim_data`. |
 | **Slug** | A human-readable URL fragment identifying a market (e.g., `btc-updown-5m-1783218000`). |
 | **Tick size** | The minimum price increment for a market. On Polymarket, typically $0.01. |
 | **Token ID** | The ERC-1155 token identifier for a specific outcome in a market. Each binary market has two (UP and DOWN). |
@@ -2580,11 +2649,9 @@ Do **not** run a second `bot.py`. Shadow is paper-only.
 ---
 
 *This document was last updated to reflect the codebase on the `main` branch
-(commit `e4ba24a` and later). Key topics: live sell bot (`bot.py`) with sub-second
-polling (0.25s) in the sell window, parallel order-book fetches, throttled
-balance/position refreshes, 45-second sell window, 10¢ sell + 35¢ last-chance,
-optional hedge (off by default), hot-reload `strategy.json`, CI/CD auto-deploy,
-P&L tracking, open entry-fill / set-cost issue (§2.2.1), and the **live shadow
-simulator** (`sim/`, §20) — paper-trades every BTC 5m market on public books with
-FAK depth fills, isolated under `sim_data/`, deployable as `polyshadow` beside
-`polybot` without shared state or real orders.*
+(including disk-hardening and §20.8). Key topics: live sell bot (`bot.py`), open
+entry-fill / set-cost issue (§2.2.1), and the **live shadow simulator** (`sim/`,
+§20) — configurable series (default 15m experiment), FAK depth fills, isolation
+under `sim_data/<tag>/`, and **disk capacity** (§20.8): host `/var/log` was the
+2026-07 ENOSPC root cause on a 10GB VM; app tick caps + journal size limits
+prevent recurrence.*

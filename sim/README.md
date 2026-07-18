@@ -13,28 +13,32 @@ Paper-trades BTC up/down markets using **live Polymarket order books**.
 | Last-chance | last **10s**, bid **&lt;35¢** + opposite **≥65¢** |
 | Data dir | `sim_data/15m/` |
 
-## Disk safety
+## Disk safety (app + host)
 
+**App (`sim/`):**
 - `record_ticks: false` by default (results.jsonl only)
 - Prune ticks after **6h**, trades **7d**
 - Cap `sim_data/` ~**150MB**; want ~**200MB** free
 - On ENOSPC: stop ticks/trades, prune, no traceback spam
 - Unresolved markets do not count as full-entry strategy losses in summary
 
+**Host (GCP):** the July 2026 outage was **`/var/log` ≈ 5GB**, not `sim_data`.
+Install journal caps from `deploy/journald-size.conf` — see `deploy/DISK_OPS.md`.
+
 ### If the VM disk is full
 
 ```bash
 sudo systemctl stop polyshadow
 df -h
-du -sh sim_data/* sim_data/15m/* 2>/dev/null | sort -h
-rm -rf sim_data/15m/ticks/* sim_data/*/ticks/* 2>/dev/null
-find sim_data -name '*.log*' -type f -delete
-sudo journalctl --vacuum-size=50M
-df -h .
+sudo du -xh / --max-depth=1 2>/dev/null | sort -h
+sudo du -xh /var/log --max-depth=2 2>/dev/null | sort -h | tail -20
+sudo journalctl --vacuum-size=20M
+sudo find /var/log -type f -size +50M -exec truncate -s 0 {} \;
+sudo apt-get clean
+df -h /
 git pull
 sudo systemctl start polyshadow
 journalctl -u polyshadow -n 30 --no-pager
-# expect: DISK free=... record_ticks=False
 ```
 
 ## Run
@@ -49,6 +53,9 @@ python -m sim.shadow --summary
 
 ```bash
 cd ~/poly-money-maker && git pull
+sudo mkdir -p /etc/systemd/journald.conf.d
+sudo cp deploy/journald-size.conf /etc/systemd/journald.conf.d/size.conf
+sudo systemctl restart systemd-journald
 sudo systemctl restart polyshadow
 systemctl status polyshadow --no-pager
 journalctl -u polyshadow -n 40 --no-pager

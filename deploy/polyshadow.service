@@ -1,5 +1,5 @@
-﻿[Unit]
-Description=Polymarket BTC 5m shadow simulator (paper trade only)
+[Unit]
+Description=Polymarket BTC shadow simulator (paper trade only; series from sim/strategy.sim.json)
 After=network-online.target
 Wants=network-online.target
 
@@ -14,6 +14,8 @@ Restart=always
 RestartSec=5
 MemoryMax=400M
 CPUQuota=40%
+# Disk is NOT capped by MemoryMax — host /var/log and sim_data must be managed
+# separately (deploy/journald-size.conf, deploy/DISK_OPS.md).
 
 [Install]
 WantedBy=multi-user.target
