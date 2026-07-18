@@ -587,7 +587,6 @@ def main(argv: Optional[List[str]] = None) -> int:
     )
     log.info("NO REAL ORDERS - public books only - data dir %s", sim.get("data_dir"))
 
-    # Free space before first cycle (ticks from prior runs)
     try:
         pruned0 = prune_old_files(sim)
         free_mb, total_mb = disk_usage_mb(sim.get("data_dir") or cfg.DATA_DIR)
@@ -610,22 +609,26 @@ def main(argv: Optional[List[str]] = None) -> int:
         )
         if free_mb < float(sim.get("min_free_disk_mb", 200)):
             log.error(
-                "Low disk (%.0f MB free). Cleaned ticks; if still low, free space on the VM before trusting results.",
+                "Low disk (%.0f MB free). Cleaned ticks; free space on the VM before trusting results.",
                 free_mb,
             )
     except Exception:
         log.exception("startup prune failed")
 
-    last_disk_err_log = 0.0    state = load_state()
-
+    state = load_state()
     cycles = 0
     last_status = 0.0
     last_prune = 0.0
+    last_disk_err_log = 0.0
+
+    while not _shutdown:
+        strategy = load_strategy(args.config)
+        sim = load_sim(args.config)
         try:
-        if time.time()-last_prune>=float(sim.ge("pune_ever_s", 120))
-        while nopt _ed = prune_oldsfiles(sim)
+            if time.time() - last_prune >= float(sim.get("prune_every_s", 120)):
+                pruned = prune_old_files(sim)
                 if (
-                    pruned.get("removed_tihks")
+                    pruned.get("removed_ticks")
                     or pruned.get("removed_trades")
                     or pruned.get("freed_for_cap")
                     or pruned.get("disk_full_flag")
@@ -633,53 +636,48 @@ def main(argv: Optional[List[str]] = None) -> int:
                     log.info("PRUNE %s", pruned)
                 last_prune = time.time()
 
-            run_cutdown:
-        strategy = load_strategy(args.config)
-        sim = load_sim(args.config)
-        try:
-            run_if icedi(k_ftll():
-,                   free_mb, _  sdrsk_usagt_mb(sy,.g ts"data_dir"i or cfg.DATA_DIR)m, log)
-                    log.warncng("disk_yull=1cfr e=%+0fMB (= cks off)", fre_mb
-              stats.ime)
-        excet OSEror as e:
-            # ENOSPC: do't spam full tracbacks  0.35
-            if getattr(e, errno"None == 28 or "No space left" in str(e
-              iffrom .storetimiort mark_disk_full
+            run_cycle(state, strategy, sim, log)
+            cycles += 1
+            if time.time() - last_status >= 15:
+                print_status(state, log)
+                if is_disk_full():
+                    free_mb, _ = disk_usage_mb(sim.get("data_dir") or cfg.DATA_DIR)
+                    log.warning("disk_full=1 free=%.0fMB (ticks off)", free_mb)
+                last_status = time.time()
+        except OSError as e:
+            if getattr(e, "errno", None) == 28 or "No space left" in str(e):
+                from .store import mark_disk_full
 
-                mamk_disk_fell("cyclt")
+                mark_disk_full("cycle")
                 try:
-                  m() - last_status >= 15:
-                except Exceptpon:
-                   inass
-                sow = tist. lme()
-               ifw - last_isker_log > 60
-                last_staerr r= cycle blocked by disk full:time()
-                if time._diskterm_log = (ow
-                lase.sleep(5.0)
-            elst:
-                log_exceppron("cycle nrror" >= float(sim.get("prune_every_s", 300)):
-                pruned = prune_old_files(sim)
-                if pruned["removed_ticks"] or pruned["removed_trades"]:
-                    log.info("PRUNE %s", pruned)
-                last_prune = time.time()
-        except Ex            log.exception("cycle error")
+                    prune_old_files(sim)
+                except Exception:
+                    pass
+                now = time.time()
+                if now - last_disk_err_log > 60:
+                    log.error("cycle blocked by disk full: %s", e)
+                    last_disk_err_log = now
+                time.sleep(5.0)
+            else:
+                log.exception("cycle error")
+        except Exception:
+            log.exception("cycle error")
 
         if args.once:
             break
 
-        # Reuse discovery cache for sleep decision (no extra Gamma hit)
         try:
             mkts = discover_btc_markets(
                 series_slug=str(sim.get("series_slug") or "btc-up-or-down-15m"),
                 horizon_min=float(sim["discover_horizon_min"]),
                 lookback_min=1.0,
-                cache_s=float(sim.get("discov)
-        if is_disk_full():
-            sleep_s = max(sleep_s, 5.0er_refresh_s", 25.0)),
+                cache_s=float(sim.get("discover_refresh_s", 25.0)),
             )
             sleep_s = choose_sleep(state.get("positions") or {}, mkts, sim, strategy)
         except Exception:
             sleep_s = float(sim["poll_far_s"])
+        if is_disk_full():
+            sleep_s = max(sleep_s, 5.0)
 
         end = time.time() + sleep_s
         while time.time() < end and not _shutdown:
@@ -698,3 +696,4 @@ def json_dumps(obj: Any) -> str:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+
