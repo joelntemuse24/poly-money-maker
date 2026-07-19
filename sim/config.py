@@ -60,6 +60,8 @@ STRATEGY_DEFAULTS = {
     # Last-chance off for this experiment (threshold-only anytime)
     "sell_lastchance_threshold": 0.35,
     "sell_lastchance_s": 0,
+    # Require opposite bid >= this to fire threshold sell (0 = off)
+    "sell_confirm_opposite": 0.70,
 }
 
 SIM_DEFAULTS = {
@@ -67,9 +69,16 @@ SIM_DEFAULTS = {
     # Comma-separated multi-series (15m + hourly). Empty = use series_slug only.
     "series_slugs": "btc-up-or-down-15m,btc-up-or-down-hourly",
     # Fresh tag so anytime-8c results do not mix with prior 12c/2min run
-    "data_tag": "15m1h-8c-any",
+    "data_tag": "15m1h-8c-conf",
     "set_cost": 1.043,
     "shares": 5.0,
+    "use_live_entry_books": False,
+    "max_set_cost": 0.99,
+    "entry_limit_price": 0.99,
+    "entry_fill_model": "depth",
+    "entry_slippage": 0.0,
+    "entry_retry_s": 15.0,
+    "max_entry_attempts": 500,
     # Enter early enough that "anytime" has room (hourly up to ~55m left)
     "enter_max_ttm_min": 55.0,
     "enter_min_ttm_min": 2.5,

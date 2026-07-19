@@ -24,9 +24,10 @@ def evaluate(
     sold_dn: bool,
     strategy: dict,
 ) -> Decision:
-    """Return the action the live bot would take at this snapshot.
+    """Return the action the live bot / shadow would take at this snapshot.
 
-    Parameters match the live sell/hedge phase after books are known.
+    Threshold sells can require the opposite leg bid to be strong enough
+    (sell_confirm_opposite) so a lone soft bid is not treated as a sure loser.
     """
     sell_window_s = float(strategy["sell_window_min"]) * 60.0
     thr = float(strategy["sell_threshold"])
@@ -34,12 +35,12 @@ def evaluate(
     last_thr = float(strategy["sell_lastchance_threshold"])
     hedge_on = bool(strategy["hedge_enabled"])
     hedge_thr = float(strategy["hedge_threshold"])
+    # 0 = off (legacy). e.g. 0.70 means opposite best bid must be >= 70c.
+    confirm_opp = float(strategy.get("sell_confirm_opposite") or 0.0)
 
     if seconds_left <= 0:
         return Decision("none", "expired")
 
-    # Hedge: only after one leg fully sold, dual-condition if we ever enable it.
-    # Live bot at c8ea675: hedge if held leg bid <= hedge_threshold (when enabled).
     if hedge_on:
         if sold_up and not sold_dn and dn_size >= 0.01 and dn_bid is not None:
             if dn_bid <= hedge_thr:
@@ -51,9 +52,7 @@ def evaluate(
     if seconds_left > sell_window_s:
         return Decision("none", "outside_sell_window")
 
-    # Preserve remaining leg after a full sell of the other side
     if sold_dn and up_size >= 0.01 and dn_size < 0.01:
-        # only UP left — do not sell it under normal threshold
         preserve_up = True
     else:
         preserve_up = False
@@ -66,6 +65,21 @@ def evaluate(
     dn_trigger = bool(dn_size > 0 and dn_bid is not None and dn_bid <= thr and not preserve_dn)
     up_reason = "threshold" if up_trigger else None
     dn_reason = "threshold" if dn_trigger else None
+
+    # Opposite-leg confirmation for normal threshold sells (anytime or windowed).
+    if confirm_opp > 0:
+        if up_trigger:
+            if dn_bid is None or dn_bid < confirm_opp:
+                up_trigger = False
+                up_reason = None
+                if not dn_trigger:
+                    return Decision("none", "threshold_unconfirmed")
+        if dn_trigger:
+            if up_bid is None or up_bid < confirm_opp:
+                dn_trigger = False
+                dn_reason = None
+                if not up_trigger:
+                    return Decision("none", "threshold_unconfirmed")
 
     if seconds_left <= last_s and not up_trigger and not dn_trigger:
         confirm = 1.0 - last_thr

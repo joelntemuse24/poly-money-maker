@@ -27,6 +27,7 @@ from .config import (
     series_slug_list,
 )
 from .discovery import Market, discover_btc_markets, fetch_books_parallel
+from .entry import SetEntryEstimate, estimate_set_cost_from_books
 from .fills import simulate_fak_sell
 from .policy import evaluate
 from .store import (
@@ -124,10 +125,15 @@ def write_heartbeat() -> None:
         pass
 
 
-def new_position(market: Market, sim: dict, now: float) -> dict:
+def new_position(
+    market: Market,
+    sim: dict,
+    now: float,
+    entry: Optional[SetEntryEstimate] = None,
+) -> dict:
     shares = float(sim["shares"])
-    set_cost = float(sim["set_cost"])
-    return {
+    set_cost = float(entry.set_cost) if entry and entry.set_cost is not None else float(sim["set_cost"])
+    position = {
         "condition_id": market.condition_id,
         "slug": market.slug,
         "question": market.question,
@@ -150,6 +156,8 @@ def new_position(market: Market, sim: dict, now: float) -> dict:
         "sell_leg": None,
         "sell_reason": None,
         "sell_seconds_left": None,
+        "sell_up_bid": None,
+        "sell_dn_bid": None,
         "triggered": False,
         "trigger_attempts": 0,
         "fill_fails": 0,
@@ -163,6 +171,21 @@ def new_position(market: Market, sim: dict, now: float) -> dict:
         "last_up_bid": None,
         "last_dn_bid": None,
     }
+    if entry is not None:
+        position.update(
+            {
+                "entry_model": "live_books",
+                "entry_up_px": entry.up.avg_price,
+                "entry_dn_px": entry.dn.avg_price,
+                "entry_set_cost": entry.set_cost,
+                "entry_filled_up": entry.up.filled,
+                "entry_filled_dn": entry.dn.filled,
+                "entry_imbalance": entry.imbalance,
+                "entry_up_levels": entry.up.levels_used,
+                "entry_dn_levels": entry.dn.levels_used,
+            }
+        )
+    return position
 
 
 def try_resolve(pos: dict, up_bid: Optional[float], dn_bid: Optional[float], sim: dict) -> bool:
@@ -232,6 +255,8 @@ def finalize(pos: dict, log: logging.Logger) -> dict:
         "sell_filled": pos.get("sell_filled"),
         "sell_avg_px": pos.get("sell_avg_px"),
         "sell_seconds_left": pos.get("sell_seconds_left"),
+        "sell_up_bid": pos.get("sell_up_bid"),
+        "sell_dn_bid": pos.get("sell_dn_bid"),
         "sell_proceeds": pos.get("sell_proceeds"),
         "hedge_proceeds": pos.get("hedge_proceeds"),
         "triggered": pos.get("triggered"),
@@ -244,10 +269,23 @@ def finalize(pos: dict, log: logging.Logger) -> dict:
         "final_up": up,
         "final_dn": dn,
     }
+    if pos.get("entry_model"):
+        for key in (
+            "entry_model",
+            "entry_up_px",
+            "entry_dn_px",
+            "entry_set_cost",
+            "entry_filled_up",
+            "entry_filled_dn",
+            "entry_imbalance",
+            "entry_up_levels",
+            "entry_dn_levels",
+        ):
+            row[key] = pos.get(key)
     append_result(row)
     save_trade(pos["condition_id"], pos)
     log.info(
-        "CLOSED %s pnl=%.4f sell=%s@%.3f x%.2f redeem=%.2f winner=%s resolved=%s fails=%s",
+        "CLOSED %s pnl=%.4f sell=%s@%.3f x%.2f redeem=%.2f winner=%s resolved=%s fails=%s sell_bids=U%s/D%s",
         pos["slug"],
         pos["pnl"],
         pos.get("sell_leg"),
@@ -257,6 +295,8 @@ def finalize(pos: dict, log: logging.Logger) -> dict:
         winner,
         resolved,
         pos.get("fill_fails"),
+        pos.get("sell_up_bid"),
+        pos.get("sell_dn_bid"),
     )
     return row
 
@@ -348,15 +388,19 @@ def apply_decision(pos, decision, up_book, dn_book, sim, strategy, now, seconds_
         pos["sell_leg"] = leg
         pos["sell_reason"] = decision.reason
         pos["sell_seconds_left"] = round(seconds_left, 3)
+        pos["sell_up_bid"] = up_book.best_bid if up_book else None
+        pos["sell_dn_bid"] = dn_book.best_bid if dn_book else None
 
     log.info(
-        "FILL  %s %s %.4f@%.4f (%s) ttm=%.1fs rem_up=%.2f rem_dn=%.2f",
+        "FILL  %s %s %.4f@%.4f (%s) ttm=%.1fs bids=U%s/D%s rem_up=%.2f rem_dn=%.2f",
         pos["slug"],
         decision.action,
         fill.filled,
         fill.avg_price,
         decision.reason,
         seconds_left,
+        up_book.best_bid if up_book else None,
+        dn_book.best_bid if dn_book else None,
         pos["up_size"],
         pos["dn_size"],
     )
@@ -412,19 +456,86 @@ def run_cycle(state: dict, strategy: dict, sim: dict, log: logging.Logger) -> No
 
     enter_max = float(sim["enter_max_ttm_min"])
     enter_min = float(sim["enter_min_ttm_min"])
-    for m in markets:
-        ttm_min = m.seconds_left(now) / 60.0
-        if m.condition_id in positions:
-            continue
-        if enter_min <= ttm_min <= enter_max:
-            positions[m.condition_id] = new_position(m, sim, now)
+    entry_books = {}
+    if bool(sim.get("use_live_entry_books", False)):
+        attempts = state.setdefault("entry_attempts", {})
+        retry_s = float(sim.get("entry_retry_s", 15.0))
+        candidates = []
+        entry_token_ids = set()
+        for m in markets:
+            ttm_min = m.seconds_left(now) / 60.0
+            last_attempt = attempts.get(m.condition_id) or {}
+            if m.condition_id in positions or not (enter_min <= ttm_min <= enter_max):
+                continue
+            if now - float(last_attempt.get("ts") or 0) < retry_s:
+                continue
+            candidates.append(m)
+            entry_token_ids.add(m.up_token)
+            entry_token_ids.add(m.dn_token)
+        entry_books = fetch_books_parallel(
+            list(entry_token_ids),
+            max_workers=int(sim.get("book_workers", 6)),
+        )
+        for m in candidates:
+            up_book = entry_books.get(m.up_token)
+            dn_book = entry_books.get(m.dn_token)
+            estimate = estimate_set_cost_from_books(
+                shares=float(sim["shares"]),
+                up_asks=up_book.asks if up_book and up_book.ok else [],
+                dn_asks=dn_book.asks if dn_book and dn_book.ok else [],
+                max_set_cost=float(sim["max_set_cost"]),
+                limit_price=float(sim["entry_limit_price"]),
+                model=str(sim["entry_fill_model"]),
+                slippage=float(sim["entry_slippage"]),
+            )
+            attempts[m.condition_id] = {
+                "ts": now,
+                "slug": m.slug,
+                "reason": estimate.reason,
+                "entry_up_px": estimate.up.avg_price,
+                "entry_dn_px": estimate.dn.avg_price,
+                "entry_set_cost": estimate.set_cost,
+                "entry_filled_up": estimate.up.filled,
+                "entry_filled_dn": estimate.dn.filled,
+                "entry_imbalance": estimate.imbalance,
+            }
+            if not estimate.admissible:
+                log.info(
+                    "ENTRY SKIP %s reason=%s up=%.2f dn=%.2f set_cost=%s",
+                    m.slug,
+                    estimate.reason,
+                    estimate.up.filled,
+                    estimate.dn.filled,
+                    f"{estimate.set_cost:.3f}" if estimate.set_cost is not None else "-",
+                )
+                continue
+            positions[m.condition_id] = new_position(m, sim, now, estimate)
             log.info(
-                "ENTER %s ttm=%.1fm set_cost=%.3f shares=%.1f",
+                "ENTER %s ttm=%.1fm set_cost=%.3f shares=%.1f model=live_books",
                 m.slug,
-                ttm_min,
-                sim["set_cost"],
+                m.seconds_left(now) / 60.0,
+                estimate.set_cost,
                 sim["shares"],
             )
+        max_attempts = int(sim.get("max_entry_attempts", 500))
+        if len(attempts) > max_attempts:
+            oldest = sorted(attempts, key=lambda cid: float(attempts[cid].get("ts") or 0))
+            for condition_id in oldest[: len(attempts) - max_attempts]:
+                attempts.pop(condition_id, None)
+    else:
+        for m in markets:
+            ttm_min = m.seconds_left(now) / 60.0
+            if m.condition_id in positions:
+                continue
+            if enter_min <= ttm_min <= enter_max:
+                positions[m.condition_id] = new_position(m, sim, now)
+                log.info(
+                    "ENTER %s ttm=%.1fm set_cost=%.3f shares=%.1f",
+                    m.slug,
+                    ttm_min,
+                    sim["set_cost"],
+                    sim["shares"],
+                )
 
     # Only poll books for positions near decision horizon (or already expired)
     book_horizon_s = float(sim.get("book_horizon_min", 3.0)) * 60.0
@@ -440,9 +551,13 @@ def run_cycle(state: dict, strategy: dict, sim: dict, log: logging.Logger) -> No
             token_ids.add(pos["up_token"])
             token_ids.add(pos["dn_token"])
 
-    books = fetch_books_parallel(
-        list(token_ids),
-        max_workers=int(sim.get("book_workers", 6)),
+    books = dict(entry_books)
+    missing_token_ids = token_ids.difference(books)
+    books.update(
+        fetch_books_parallel(
+            list(missing_token_ids),
+            max_workers=int(sim.get("book_workers", 6)),
+        )
     )
 
     closed_ids = []
@@ -489,6 +604,19 @@ def run_cycle(state: dict, strategy: dict, sim: dict, log: logging.Logger) -> No
                 sold_dn=bool(pos["sold_dn"]),
                 strategy=strategy,
             )
+            if decision.reason == "threshold_unconfirmed":
+                # Low-noise: only when a leg is actually soft (already decided)
+                if int(pos.get("trigger_attempts") or 0) % 20 == 0:
+                    log.info(
+                        "WAIT  %s threshold_unconfirmed bids=U%s/D%s thr=%.2f conf=%.2f ttm=%.1fs",
+                        pos["slug"],
+                        up_bid,
+                        dn_bid,
+                        float(strategy["sell_threshold"]),
+                        float(strategy.get("sell_confirm_opposite") or 0),
+                        seconds_left,
+                    )
+                pos["trigger_attempts"] = int(pos.get("trigger_attempts") or 0) + 1
             apply_decision(
                 pos, decision, up_book, dn_book, sim, strategy, now, seconds_left, log
             )
