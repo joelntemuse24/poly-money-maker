@@ -196,6 +196,76 @@ def discover_btc_markets(
 
 
 
+
+def fetch_book(token_id: str, timeout: float = 8.0) -> BookSnap:
+    try:
+        r = SESSION.get(
+            f"{CLOB_HOST}/book",
+            params={"token_id": token_id},
+            timeout=timeout,
+        )
+        r.raise_for_status()
+        book = r.json()
+        bids = book.get("bids") or []
+        asks = book.get("asks") or []
+        best_bid = best_bid_sz = None
+        best_ask = best_ask_sz = None
+        if bids:
+            b = max(bids, key=lambda x: float(x.get("price", 0)))
+            best_bid = float(b.get("price", 0))
+            best_bid_sz = float(b.get("size", 0))
+        if asks:
+            a = min(asks, key=lambda x: float(x.get("price", 1e9)))
+            best_ask = float(a.get("price", 0))
+            best_ask_sz = float(a.get("size", 0))
+        return BookSnap(
+            token_id=token_id,
+            best_bid=best_bid,
+            best_bid_size=best_bid_sz or 0.0,
+            best_ask=best_ask,
+            best_ask_size=best_ask_sz or 0.0,
+            bids=bids,
+            asks=asks,
+            ok=True,
+        )
+    except Exception as e:
+        return BookSnap(
+            token_id=token_id,
+            best_bid=None,
+            best_bid_size=0.0,
+            best_ask=None,
+            best_ask_size=0.0,
+            ok=False,
+            error=str(e),
+        )
+
+
+def fetch_books_parallel(
+    token_ids: List[str],
+    max_workers: int = 6,
+) -> Dict[str, BookSnap]:
+    out: Dict[str, BookSnap] = {}
+    if not token_ids:
+        return out
+    workers = max(1, min(int(max_workers), len(token_ids), 8))
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        futs = {ex.submit(fetch_book, t): t for t in token_ids}
+        for fut in as_completed(futs):
+            snap = fut.result()
+            out[snap.token_id] = snap
+    return out
+
+
+def pair_books(market: Market, books: Dict[str, BookSnap]) -> Tuple[BookSnap, BookSnap]:
+    up = books.get(market.up_token) or BookSnap(
+        market.up_token, None, 0.0, None, 0.0, ok=False, error="missing"
+    )
+    dn = books.get(market.dn_token) or BookSnap(
+        market.dn_token, None, 0.0, None, 0.0, ok=False, error="missing"
+    )
+    return up, dn
+
+
 def discover_btc_5m(**kwargs) -> List[Market]:
     """Backward-compatible alias; prefer discover_btc_markets."""
     kwargs.setdefault("series_slug", "btc-up-or-down-5m")
