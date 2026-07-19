@@ -3,18 +3,33 @@
 Paper-trades BTC up/down markets using **live Polymarket order books**.
 **Never places real orders.** Does **not** import `bot.py`. Safe beside `polybot`.
 
-## Current experiment (anytime 8¢ — 15m + hourly)
+## Current experiment (8¢ anytime + opposite confirm)
 
 | Knob | Value |
 |------|-------|
 | Series | `btc-up-or-down-15m` **and** `btc-up-or-down-hourly` |
 | Sell threshold | **8¢** anytime a leg bids ≤ 8¢ |
-| Sell window | **120 min** (effectively full market; not last-N-only) |
+| Opposite confirm | opposite bid **≥ 70¢** (`sell_confirm_opposite`) |
+| Sell window | **120 min** (full market; not last-N-only) |
 | Last-chance | **off** (`sell_lastchance_s: 0`) |
 | Book horizon | **120 min** (poll books for open positions) |
-| Data dir | `sim_data/15m1h-8c-any/` (separate from prior 12¢/2min run) |
+| Data dir | `sim_data/15m1h-8c-conf/` |
 
-Prior 15m @ 12¢ / last-2min results remain in `sim_data/15m/`.
+### Why confirm
+
+Unconfirmed 8¢ anytime (`sim_data/15m1h-8c-any/`) had ~90% win rate but a few
+**sold-winner** wipeouts (~−$4.8) that dominated EV. Confirm requires the other
+leg to look like the favorite before selling. Each fill stores `sell_up_bid` /
+`sell_dn_bid` so wipeouts can be classified as **reversal** (opposite was high)
+vs **false signal** (opposite was soft — should be blocked now).
+
+### Prior result folders (do not mix)
+
+| Tag | Experiment |
+|-----|------------|
+| `sim_data/15m1h-8c-conf/` | 8¢ anytime + 70¢ opposite confirm (**current**) |
+| `sim_data/15m1h-8c-any/` | 8¢ anytime, no confirm |
+| `sim_data/15m/` | 15m only, 12¢ / last 2 min |
 
 ## Disk safety (app + host)
 
@@ -50,6 +65,7 @@ journalctl -u polyshadow -n 30 --no-pager
 python -m sim.shadow
 python -m sim.shadow --once
 python -m sim.shadow --summary
+python sim/test_policy.py
 ```
 
 ## GCP

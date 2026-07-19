@@ -2434,8 +2434,8 @@ recording path + fill + PnL data under `sim_data/`.
 
 ### 20.1 Goals
 
-- Paper-trade **all** markets in a chosen series (default experiment: **BTC 15m**,
-  ~4/hour; 5m still supported via `series_slug`).
+- Paper-trade **all** markets in one or more series (default experiment: **BTC 15m + hourly**;
+  5m still supported via `series_slug` / `series_slugs`).
 - Use **live** CLOB books (`GET /book`) — same public data the bot sees.
 - Apply configurable sell / last-chance / hedge rules (mirror bot policy shape).
 - Model **FAK fills** by walking real bid depth (not a free fill at best bid).
@@ -2464,28 +2464,30 @@ Hard rules enforced in code:
 
 Each cycle of `python -m sim.shadow`:
 
-1. **Discover** markets for `sim.series_slug` (e.g. `btc-up-or-down-15m`) via Gamma (cached ~25s).
+1. **Discover** markets for one or more series (`sim.series_slugs`, e.g.
+   `btc-up-or-down-15m` + `btc-up-or-down-hourly`) via Gamma (cached ~25s).
 2. **Paper enter** markets with TTM in `[enter_min_ttm_min, enter_max_ttm_min]`
    at calibrated complete-set cost (`sim.set_cost`, default **1.043** from history).
-3. **Fetch books** only for open paper positions with TTM ≤ `book_horizon_min`
-   — reduces API contention with the live bot.
-4. **Evaluate policy** (`sim/policy.py`): sell window + threshold from config
-   (15m experiment: **2 min / 12¢**), last-chance 35¢/65¢ in final 10s, optional hedge.
+   Optional live-book entry model exists behind `use_live_entry_books` (off by default).
+3. **Fetch books** for open paper positions with TTM ≤ `book_horizon_min`
+   (anytime experiments use a long horizon so books are polled early).
+4. **Evaluate policy** (`sim/policy.py`): threshold / window / optional last-chance /
+   optional hedge. Current experiment: **8¢ anytime** with **opposite-leg confirm**
+   (see §20.9).
 5. **Simulate FAK** (`sim/fills.py`, model `depth`): walk bids at/above limit;
    partial or zero fill → MISS (same failure class as thin books near expiry).
 6. **After expiry** resolve winner from bid dominance;
    `PnL = sell_proceeds + hedge + redeem − entry_cost`.
-7. **Persist** ticks, trades, results; prune old files on a timer.
+7. **Persist** results under `sim_data/<data_tag>/`; prune on a timer.
 
-Adaptive sleep: far markets ~5s, near ~1s, inside sell window ~0.35s
-(slightly slower than the bot's 0.25s to reduce shared-API pressure).
+Adaptive sleep: far markets ~5s, near ~1s, inside sell window ~0.5s.
 
 ### 20.4 Package Layout
 
 | Module | Role |
 |---|---|
 | `sim/shadow.py` | Main loop, lock, heartbeat, enter/close, status |
-| `sim/policy.py` | Pure decision function (sell / last-chance / hedge) |
+| `sim/policy.py` | Pure decision function (sell / confirm / last-chance / hedge) |
 | `sim/fills.py` | FAK fill models against a book snapshot |
 | `sim/discovery.py` | Gamma discovery + parallel `/book` fetch + cache |
 | `sim/store.py` | State / ticks / trades / results + disk prune |
@@ -2530,6 +2532,56 @@ python -m sim.shadow --summary
 ```
 
 Do **not** run a second `bot.py`. Shadow is paper-only.
+
+### 20.9 Current shadow experiment (8¢ anytime + opposite confirm)
+
+As of mid-2026 the permanent `polyshadow` run is **not** the original 5m / last-45s
+live-bot mirror. Tunables live only in `sim/strategy.sim.json` (live `strategy.json`
+is untouched).
+
+| Knob | Value | Notes |
+|---|---|---|
+| Series | `btc-up-or-down-15m`, `btc-up-or-down-hourly` | Multi-series via `series_slugs` |
+| Sell threshold | **8¢** | Anytime a single leg best bid ≤ 8¢ |
+| Sell window | **120 min** | Effectively full market duration |
+| Last-chance | **off** (`sell_lastchance_s: 0`) | Threshold path only |
+| Opposite confirm | **`sell_confirm_opposite: 0.70`** | Sell only if the *other* leg bid ≥ 70¢ |
+| Data tag | `sim_data/15m1h-8c-conf/` | Fresh folder per experiment |
+| Prior unconfirmed | `sim_data/15m1h-8c-any/` | 8¢ anytime **without** confirm (baseline) |
+| Prior 12¢/2min | `sim_data/15m/` | Earlier 15m-only windowed run |
+
+#### Why opposite-leg confirmation
+
+On the unconfirmed 8¢ anytime sample (~50 resolved markets):
+
+- **Win rate ~90%**, avg win ~**+$0.16** (sell ~7¢ + redeem $1 − set cost 1.043).
+- **~3 wipeouts** (~**−$4.8** each): sold leg == eventual winner, `redeem=0`.
+- Those few disasters dominated mean EV (~**−$0.15**/market).
+
+Two interpretations of a wipeout:
+
+1. **False loser signal** — one leg printed cheap while the book was still soft /
+   two-sided; selling was premature.
+2. **True reversal** — opposite was already strong (≥70¢) at sell time, then the
+   market flipped before expiry.
+
+`sell_confirm_opposite` addresses (1): threshold sells require the opposite best
+bid ≥ the confirm level (default **70¢**). Reason codes:
+
+- `threshold` — leg ≤ sell threshold **and** opposite ≥ confirm
+- `threshold_unconfirmed` — leg ≤ threshold but opposite missing/soft → **no sell**
+- `both_legs_triggered` — both legs soft → no sell (unchanged)
+
+Each fill/close records **`sell_up_bid` / `sell_dn_bid`** at decision time so later
+analysis can separate reversals (opposite was high) from false signals (opposite
+was low — should be rare under confirm).
+
+Set `sell_confirm_opposite: 0` to disable (legacy unconfirmed behaviour).
+
+#### Policy module
+
+`sim/policy.py` `evaluate()` is the single decision function. Unit tests:
+`sim/test_policy.py`.
 
 ### 20.7 What Shadow Does Not Prove
 
@@ -2654,4 +2706,5 @@ entry-fill / set-cost issue (§2.2.1), and the **live shadow simulator** (`sim/`
 §20) — configurable series (default 15m experiment), FAK depth fills, isolation
 under `sim_data/<tag>/`, and **disk capacity** (§20.8): host `/var/log` was the
 2026-07 ENOSPC root cause on a 10GB VM; app tick caps + journal size limits
-prevent recurrence.*
+prevent recurrence. Current shadow experiment (§20.9): **8¢ anytime** on 15m+
+hourly with **opposite-leg confirm ≥70¢** (`15m1h-8c-conf`).*
