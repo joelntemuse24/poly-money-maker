@@ -49,34 +49,38 @@ BOT_FORBIDDEN = frozenset(
 
 # Strategy defaults ? 15m experiment (not live bot)
 STRATEGY_DEFAULTS = {
-    "sell_threshold": 0.12,          # 12?
+    # Anytime 8c experiment: sell as soon as a leg bids <= 8c
+    "sell_threshold": 0.08,
     "hedge_enabled": False,
     "hedge_threshold": 0.50,
-    "sell_window_min": 2.0,          # last 2 minutes
-    "sell_grace_s": 2,
+    # Full market duration (covers hourly); sell not gated to last N minutes
+    "sell_window_min": 120.0,
+    "sell_grace_s": 5,
     "sell_cooldown_s": 3,
+    # Last-chance off for this experiment (threshold-only anytime)
     "sell_lastchance_threshold": 0.35,
-    "sell_lastchance_s": 10,
+    "sell_lastchance_s": 0,
 }
 
 SIM_DEFAULTS = {
     "series_slug": DEFAULT_SERIES_SLUG,
-    # Subfolder under sim_data/ so 5m history is not mixed with 15m
-    "data_tag": "15m",
-    # Entry: keep 5m-calibrated cost until we re-calibrate 15m fills
+    # Comma-separated multi-series (15m + hourly). Empty = use series_slug only.
+    "series_slugs": "btc-up-or-down-15m,btc-up-or-down-hourly",
+    # Fresh tag so anytime-8c results do not mix with prior 12c/2min run
+    "data_tag": "15m1h-8c-any",
     "set_cost": 1.043,
     "shares": 5.0,
-    # Enter paper position when TTM in this band (minutes)
-    "enter_max_ttm_min": 14.0,
+    # Enter early enough that "anytime" has room (hourly up to ~55m left)
+    "enter_max_ttm_min": 55.0,
     "enter_min_ttm_min": 2.5,
     "poll_far_s": 5.0,
     "poll_near_s": 1.0,
-    "poll_sell_s": 0.35,
-    "discover_horizon_min": 45.0,
+    "poll_sell_s": 0.5,
+    "discover_horizon_min": 90.0,
     "discover_refresh_s": 25.0,
     "book_workers": 6,
-    # Poll books once inside ~ sell window + buffer
-    "book_horizon_min": 4.0,
+    # Must cover full sell window — anytime means poll books for open positions
+    "book_horizon_min": 120.0,
     "fill_model": "depth",
     "fill_slippage": 0.0,
     "no_fill_after_s": 0.0,
@@ -161,7 +165,20 @@ def load_sim(path: str | None = None) -> dict:
     return apply_data_paths(cfg)
 
 
+def series_slug_list(sim: dict) -> list:
+    """Return list of Gamma series slugs from sim config."""
+    raw = sim.get("series_slugs")
+    if raw is None or raw == "" or raw == []:
+        return [str(sim.get("series_slug") or DEFAULT_SERIES_SLUG)]
+    if isinstance(raw, (list, tuple)):
+        out = [str(s).strip() for s in raw if str(s).strip()]
+        return out or [str(sim.get("series_slug") or DEFAULT_SERIES_SLUG)]
+    parts = [p.strip() for p in str(raw).split(",") if p.strip()]
+    return parts or [str(sim.get("series_slug") or DEFAULT_SERIES_SLUG)]
+
+
 def ensure_dirs() -> None:
+
     for d in (DATA_ROOT, DATA_DIR, TICKS_DIR, TRADES_DIR):
         os.makedirs(d, exist_ok=True)
 

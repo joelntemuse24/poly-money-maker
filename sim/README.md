@@ -3,15 +3,18 @@
 Paper-trades BTC up/down markets using **live Polymarket order books**.
 **Never places real orders.** Does **not** import `bot.py`. Safe beside `polybot`.
 
-## Current experiment (15m)
+## Current experiment (anytime 8¢ — 15m + hourly)
 
 | Knob | Value |
 |------|-------|
-| Series | `btc-up-or-down-15m` |
-| Sell window | last **2 minutes** |
-| Sell threshold | **12¢** |
-| Last-chance | last **10s**, bid **&lt;35¢** + opposite **≥65¢** |
-| Data dir | `sim_data/15m/` |
+| Series | `btc-up-or-down-15m` **and** `btc-up-or-down-hourly` |
+| Sell threshold | **8¢** anytime a leg bids ≤ 8¢ |
+| Sell window | **120 min** (effectively full market; not last-N-only) |
+| Last-chance | **off** (`sell_lastchance_s: 0`) |
+| Book horizon | **120 min** (poll books for open positions) |
+| Data dir | `sim_data/15m1h-8c-any/` (separate from prior 12¢/2min run) |
+
+Prior 15m @ 12¢ / last-2min results remain in `sim_data/15m/`.
 
 ## Disk safety (app + host)
 

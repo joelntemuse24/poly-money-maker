@@ -24,6 +24,7 @@ from .config import (
     ensure_dirs,
     load_sim,
     load_strategy,
+    series_slug_list,
 )
 from .discovery import Market, discover_btc_markets, fetch_books_parallel
 from .fills import simulate_fak_sell
@@ -131,6 +132,7 @@ def new_position(market: Market, sim: dict, now: float) -> dict:
         "slug": market.slug,
         "question": market.question,
         "end_ts": market.end_ts,
+        "series_slug": getattr(market, "series_slug", "") or "",
         "up_token": market.up_token,
         "dn_token": market.dn_token,
         "entered_at": now,
@@ -220,6 +222,7 @@ def finalize(pos: dict, log: logging.Logger) -> dict:
         "ts": time.time(),
         "condition_id": pos["condition_id"],
         "slug": pos["slug"],
+        "series_slug": pos.get("series_slug"),
         "question": pos["question"],
         "set_cost": pos["set_cost"],
         "shares": pos["shares"],
@@ -398,7 +401,7 @@ def run_cycle(state: dict, strategy: dict, sim: dict, log: logging.Logger) -> No
 
     try:
         markets = discover_btc_markets(
-            series_slug=str(sim.get("series_slug") or "btc-up-or-down-15m"),
+            series_slugs=series_slug_list(sim),
             horizon_min=float(sim["discover_horizon_min"]),
             lookback_min=2.0,
             cache_s=float(sim.get("discover_refresh_s", 25.0)),
@@ -573,7 +576,7 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     log.info(
         "SHADOW START series=%s tag=%s strategy=%s sim_fill=%s set_cost=%.3f shares=%.1f window=%.0fs thr=%.2f",
-        sim.get("series_slug"),
+        ",".join(series_slug_list(sim)),
         sim.get("data_tag"),
         {
             k: strategy[k]
@@ -668,7 +671,7 @@ def main(argv: Optional[List[str]] = None) -> int:
 
         try:
             mkts = discover_btc_markets(
-                series_slug=str(sim.get("series_slug") or "btc-up-or-down-15m"),
+                series_slugs=series_slug_list(sim),
                 horizon_min=float(sim["discover_horizon_min"]),
                 lookback_min=1.0,
                 cache_s=float(sim.get("discover_refresh_s", 25.0)),
