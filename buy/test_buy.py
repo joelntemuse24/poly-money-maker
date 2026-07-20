@@ -21,14 +21,10 @@ ADAPTER = "0xAdA100Db00Ca00073811820692005400218FcE1f"
 
 
 class FakeMarketGateway:
-    def __init__(self, market, positions=None, blocked=False):
+    def __init__(self, market, positions=None):
         self.market = market
         self.position_values = positions or {}
-        self.blocked = blocked
         self.position_calls = 0
-
-    def geoblock(self):
-        return {"blocked": self.blocked, "country": "IE", "region": "L"}
 
     def discover(self, series_slugs):
         return [self.market]
@@ -115,7 +111,6 @@ class MarketTests(unittest.TestCase):
         gateway = MarketGateway(
             gamma_url="https://example.test",
             data_api_url="https://example.test",
-            geoblock_url="https://example.test",
             session=FakeSession(payload),
         )
         markets = gateway.discover(["btc-up-or-down-15m"])
@@ -140,8 +135,6 @@ class ConfigTests(unittest.TestCase):
             validate_config(replace(BuyConfig(), max_set_cost=0.99))
 
     def test_live_safety_invariants_cannot_be_disabled(self):
-        with self.assertRaisesRegex(ValueError, "geoblock"):
-            validate_config(replace(BuyConfig(), require_geoblock_clear=False))
         with self.assertRaisesRegex(ValueError, "funder"):
             validate_config(replace(BuyConfig(), require_funder_match=False))
 
@@ -232,26 +225,6 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual(len(state["dry_plans"]), 1)
         self.assertEqual(state["intents"], {})
         save_state.assert_called_once()
-
-    @patch("buy.runner.consume_arm")
-    @patch("buy.runner.is_fresh_arm", return_value=True)
-    @patch("buy.runner.free_disk_mb", return_value=10_000)
-    def test_geoblock_stops_live_after_consuming_arm(
-        self, free_disk, fresh_arm, consume_arm
-    ):
-        result = run_once(
-            config=replace(self.config, dry_run=False),
-            state={"intents": {}, "dry_plans": []},
-            logger=self.logger,
-            now=self.now,
-            market_gateway=FakeMarketGateway(self.market, blocked=True),
-            chain=FakeChain(),
-            status_gateway=FakeStatusGateway(),
-            relayer_factory=lambda **kwargs: self.fail("relayer must not be constructed"),
-        )
-        self.assertEqual(result["status"], "blocked")
-        self.assertEqual(result["reason"], "geoblock")
-        consume_arm.assert_called_once()
 
     @patch("buy.runner.free_disk_mb", return_value=10_000)
     def test_ambiguous_intent_freezes_new_entry(self, free_disk):

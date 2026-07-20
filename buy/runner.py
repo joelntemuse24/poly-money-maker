@@ -229,7 +229,6 @@ def _record_dry_plan(
     market: MintMarket,
     config: BuyConfig,
     now: float,
-    geoblock: dict,
 ) -> None:
     state.setdefault("dry_plans", []).append(
         {
@@ -241,9 +240,6 @@ def _record_dry_plan(
             "set_cost": 1.0,
             "total_cost": config.shares,
             "ttm_min": market.ttm_minutes(now),
-            "geoblocked": bool(geoblock.get("blocked")),
-            "country": geoblock.get("country"),
-            "region": geoblock.get("region"),
         }
     )
 
@@ -277,7 +273,6 @@ def run_once(
     market_gateway = market_gateway or MarketGateway(
         gamma_url=config.gamma_url,
         data_api_url=config.data_api_url,
-        geoblock_url=config.geoblock_url,
     )
     chain = chain or ChainReader(config.rpc_url)
     status_gateway = status_gateway or RelayerStatusGateway(config.relayer_url)
@@ -298,17 +293,6 @@ def run_once(
         for intent in state.get("intents", {}).values()
     ):
         return {"status": "blocked", "reason": "ambiguous_intent"}
-
-    geo = {}
-    if config.require_geoblock_clear:
-        geo = market_gateway.geoblock()
-        if bool(geo.get("blocked")) and not dry_run:
-            return {
-                "status": "blocked",
-                "reason": "geoblock",
-                "country": geo.get("country"),
-                "region": geo.get("region"),
-            }
 
     markets = market_gateway.discover(config.series_slug_list())
     candidates = eligible_markets(markets, config, now)
@@ -349,7 +333,7 @@ def run_once(
         return {"status": "idle", "reason": "no_unowned_candidate"}
 
     if dry_run:
-        _record_dry_plan(state, candidate, config, now, geo)
+        _record_dry_plan(state, candidate, config, now)
         trim_state(state, config.max_state_intents, config.max_dry_plans)
         save_state(state)
         logger.info(
@@ -363,7 +347,6 @@ def run_once(
             "status": "planned",
             "condition_id": candidate.condition_id,
             "slug": candidate.slug,
-            "geoblocked": bool(geo.get("blocked")),
         }
 
     _require_live_credentials(credentials)

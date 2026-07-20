@@ -35,14 +35,12 @@ class BuyConfig:
     max_state_intents: int = 500
     max_dry_plans: int = 200
     min_free_disk_mb: float = 500.0
-    require_geoblock_clear: bool = True
     require_funder_match: bool = True
     arm_max_age_s: float = 900.0
     position_tolerance: float = 0.001
     rpc_url: str = "https://polygon.drpc.org"
     gamma_url: str = "https://gamma-api.polymarket.com"
     data_api_url: str = "https://data-api.polymarket.com"
-    geoblock_url: str = "https://polymarket.com/api/geoblock"
     relayer_url: str = "https://relayer-v2.polymarket.com"
     chain_id: int = 137
     pUSD_address: str = "0xC011a7E12a19f7B1f670d46F03B03f3342E82DFB"
@@ -77,8 +75,6 @@ def load_config(path: str | None = None) -> BuyConfig:
 def validate_config(config: BuyConfig) -> None:
     if config.entry_method != "mint":
         raise ValueError("entry_method must be mint")
-    if not config.require_geoblock_clear:
-        raise ValueError("require_geoblock_clear must remain true")
     if not config.require_funder_match:
         raise ValueError("require_funder_match must remain true")
     if not config.series_slug_list():

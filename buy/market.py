@@ -82,13 +82,11 @@ class MarketGateway:
         *,
         gamma_url: str,
         data_api_url: str,
-        geoblock_url: str,
         timeout: float = 15.0,
         session: requests.Session | None = None,
     ):
         self.gamma_url = gamma_url.rstrip("/")
         self.data_api_url = data_api_url.rstrip("/")
-        self.geoblock_url = geoblock_url
         self.timeout = timeout
         self.session = session or requests.Session()
         self.session.headers.update({"User-Agent": "poly-money-maker-mint-buyer/0.1"})
@@ -134,10 +132,3 @@ class MarketGateway:
             balances[str(token_id)] = float(position.get("size") or 0)
         return balances
 
-    def geoblock(self) -> dict:
-        response = self.session.get(self.geoblock_url, timeout=self.timeout)
-        response.raise_for_status()
-        payload = response.json()
-        if not isinstance(payload, dict) or "blocked" not in payload:
-            raise ValueError("invalid geoblock response")
-        return payload

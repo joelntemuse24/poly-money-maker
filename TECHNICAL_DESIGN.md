@@ -2730,7 +2730,7 @@ The buyer also has separate:
 | Module | Responsibility |
 |---|---|
 | `buy/config.py` | Fail-closed defaults, independent config parsing, paths, validation |
-| `buy/market.py` | Gamma discovery, exact UP/DOWN mapping, Data API balances, geoblock check |
+| `buy/market.py` | Gamma discovery, exact UP/DOWN mapping, Data API balances |
 | `buy/chain.py` | Read-only Polygon RPC checks for pUSD, outcome slots, contracts, and ERC-1155 balances |
 | `buy/contracts.py` | Pure ABI encoding for exact approval and standard-adapter `splitPosition` |
 | `buy/relayer.py` | Official Builder Relayer PROXY client and transaction-status lookup |
@@ -2750,24 +2750,22 @@ Each `polybuy` cycle performs these steps in order:
    An intent that was persisted as `submitting` but has no transaction ID is
    changed to `ambiguous`; all new entry freezes unless both on-chain balances
    conclusively prove that the requested mint occurred.
-4. Check Polymarket's geographic eligibility endpoint. A malformed response
-   fails closed. A blocked response is recorded in dry plans but blocks every live mint.
-5. Discover configured Gamma series and keep only active, open,
+4. Discover configured Gamma series and keep only active, open,
    `acceptingOrders=true`, non-neg-risk markets in the TTM entry window.
-6. Fetch current Data API holdings and apply one-entry, open-set, open-notional,
+5. Fetch current Data API holdings and apply one-entry, open-set, open-notional,
    daily-notional, and deterministic set-cost caps.
-7. In dry-run, persist a bounded plan record only. No private key, Builder key,
+6. In dry-run, persist a bounded plan record only. No private key, Builder key,
    relayer client, approval, or split call is used.
-8. In live mode, require and consume a fresh one-shot arm **before any network
+7. In live mode, require and consume a fresh one-shot arm **before any network
    or preflight work**, then require all credentials and verify: derived PROXY
    equals `FUNDER_ADDRESS`, pUSD and adapter contracts exist,
    `getOutcomeSlotCount(conditionId) == 2`, sufficient pUSD exists, and both
    on-chain token balances are still zero.
-9. Persist a `submitting` intent with pre-mint balances **before** calling the
+8. Persist a `submitting` intent with pre-mint balances **before** calling the
    relayer.
-10. Submit exact approval + split as one PROXY batch and persist the returned
-    transaction ID as `pending`. A failed preflight requires deliberate re-arming.
-11. Poll relayer state across later cycles. `STATE_CONFIRMED` still waits for
+9. Submit exact approval + split as one PROXY batch and persist the returned
+   transaction ID as `pending`. A failed preflight requires deliberate re-arming.
+10. Poll relayer state across later cycles. `STATE_CONFIRMED` still waits for
     both on-chain balances to increase by the requested share amount before the
     intent becomes `confirmed`.
 
@@ -2788,12 +2786,12 @@ Real mint submission requires all of the following simultaneously:
   `BUILDER_PASS_PHRASE` are present.
 - The official relayer client's derived PROXY exactly matches
   `FUNDER_ADDRESS`.
-- Geographic eligibility, disk, contract, condition, pUSD balance, position,
+- Disk, contract, condition, pUSD balance, position,
   one-entry, open-set, open-notional, and daily-notional checks all pass.
 
 The arm is one-shot: it is deleted at the start of an enabled live cycle, before
-geoblock, discovery, credential, wallet, RPC, or balance checks. A blocked or
-failed preflight therefore requires deliberate operator re-arming. A process
+discovery, credential, wallet, RPC, or balance checks. A failed preflight
+therefore requires deliberate operator re-arming. A process
 restart does not silently re-arm entry.
 
 Only standard binary CTF markets are supported. Any market with `negRisk=true`
@@ -2837,7 +2835,6 @@ defaults are deliberately conservative:
 | `poll_s` | `15` | Low API/CPU duty cycle beside `polybot` and `polyshadow` |
 | `min_free_disk_mb` | `500` | Entry fails closed before the historical ENOSPC range |
 | `arm_max_age_s` | `900` | One-shot arm validity |
-| `require_geoblock_clear` | `true` | Opening action requires eligibility; `false` is rejected as invalid config |
 | `require_funder_match` | `true` | Derived PROXY must equal configured funder; `false` is rejected as invalid config |
 
 Contract addresses are configurable for explicit upgrades, but defaults use the
@@ -2866,8 +2863,7 @@ Safe local/GCP checks:
 ```
 
 `--once` obeys the disabled config. `--plan` forces one public-data dry plan and
-cannot submit; it records geographic blocking but may continue reading public
-market/position data. Before considering live mode, run dry plans long enough to verify
+cannot submit. Before considering live mode, run dry plans long enough to verify
 series selection, TTM, duplicate suppression, caps, Data API holdings, RPC
 health, logs, heartbeat, disk use, and coexistence with both current services.
 
