@@ -29,19 +29,20 @@
 18. [The Dashboard — `dashboard.py`](#18-the-dashboard--dashboardpy)
 19. [The Diagnostic Tool: `check_book.py`](#19-the-diagnostic-tool-check_bookpy)
 20. [Live Shadow Simulator (`sim/`)](#20-live-shadow-simulator-sim)
-21. [Glossary](#21-glossary)
+21. [Atomic Mint Buyer (`buy/`)](#21-atomic-mint-buyer-buy)
+22. [Glossary](#22-glossary)
 
 ---
 
 ## 1. Project Overview
 
-**Poly Money Maker** is an automated **sell-side execution bot** for Polymarket's
-Bitcoin 5-minute (and hourly) prediction markets. It does not buy positions — the
-operator enters positions manually through Polymarket's web UI. The bot's job is to
-**monitor those positions and automatically sell the "loser leg"** before the market
-expires, then **redeem** any resolved positions back into USDC. It also includes a
-**hedge mechanism** that cuts losses if the held leg reverses after the loser has
-been sold.
+**Poly Money Maker** is centred on an automated **sell-side execution bot** for
+Polymarket's Bitcoin 5-minute, 15-minute, and hourly prediction markets. `bot.py`
+does not buy positions: it monitors holdings, sells the "loser leg," optionally
+hedges a reversal, and redeems resolved positions. Entry can remain manual, or an
+independent and disabled-by-default `buy/` process can atomically split pUSD into
+equal UP and DOWN tokens. The two live processes coordinate only through wallet
+holdings indexed by Polymarket's Data API; they do not share writable state.
 
 ### The Core Thesis
 
@@ -66,8 +67,9 @@ evidence of a reversal.
 
 ### What the Bot Does NOT Do
 
-- **No buying.** The bot is sell-only. Entry is manual (typically 50¢ limit orders
-  on both legs). Realized fill quality is an open operator issue — see §2.2.1.
+- **No buying inside `bot.py`.** The bot remains sell-only. Manual entry still works,
+  while the separate `buy/` package can create complete sets by atomic mint when
+  explicitly configured and one-shot armed — see §21.
 - **No market making.** It doesn't post resting orders or provide liquidity.
 - **No price prediction.** It doesn't try to forecast BTC direction.
 - **No portfolio rebalancing.** It manages one specific market type (BTC 5-minute
@@ -137,10 +139,11 @@ The bot is **sell-only**. Entry (buying both legs) is done manually, typically w
 - **Operator checklist (manual entry):** After each market, verify
   `avg_up + avg_dn` (or total USDC in / shares) is **≤ ~$1.01–1.02**. Treat
   anything near $1.04+ as a failed entry fill, not a bot sell failure.
-- **Not yet automated.** The bot records `pnl_entry_cost` from data-api
-  `avgPrice` for P&L, but it does **not** reject positions, alert on expensive
-  sets, or place the entry orders itself. Closing this gap (alerts, max set-cost
-  gate, or automated 50¢ GTC entries with fill verification) is future work.
+- **Automated mint is isolated from the bot.** `bot.py` still only records
+  `pnl_entry_cost` from Data API `avgPrice` and never places entry orders. The
+  optional `buy/` process closes the complete-set fill-quality gap by atomically
+  converting pUSD into equal UP/DOWN inventory at a deterministic $1.00 set cost.
+  It remains disabled and dry-run by default; see §21.
 
 ### 2.3 The CLOB (Central Limit Order Book)
 
@@ -237,6 +240,12 @@ order-building logic differs.
          │  writes sim_data/    │     never imports bot.py / never orders
          └──────────────────────┘
 
+         ┌──────────────────────┐
+         │  buy/runner.py       │  ← separate process (polybuy)
+         │  Atomic mint entry   │     disabled + dry-run by default
+         │  writes buy_data/    │     never imports or edits bot state
+         └──────────────────────┘
+
 External Services:
   • Polymarket CLOB API  (clob.polymarket.com)    — order book, order submission
   • Polymarket Data API  (data-api.polymarket.com) — position tracking
@@ -270,10 +279,13 @@ queues, no databases.
 - **Separate dashboard (`dashboard.py`)** reads a status JSON file and log file
   that the bot writes each cycle. It's a read-only viewer — it doesn't affect the
   bot's operation and can be started/stopped independently.
-- **Separate shadow simulator (`sim/`)** paper-trades every BTC 5m market using
-  the same public order books and sell policy as the live bot. It never places
-  orders, never imports `bot.py`, and writes only under `sim_data/`. It can run
-  permanently beside `polybot` as the `polyshadow` systemd service (see §20).
+- **Separate shadow simulator (`sim/`)** paper-trades every configured BTC series
+  using public order books and the sell policy. It never places orders, never
+  imports `bot.py`, and writes only under `sim_data/` (see §20).
+- **Separate atomic mint buyer (`buy/`)** discovers standard binary BTC markets and
+  can submit one atomic relayer batch containing exact pUSD approval plus CTF
+  `splitPosition`. It never imports `bot.py`, never sells or redeems, owns only
+  `buy_data/`, and is lower-priority than both existing services (see §21).
 
 ---
 
@@ -295,8 +307,13 @@ queues, no databases.
 | `sim/strategy.sim.json` | Shadow strategy + sim economics (not live `strategy.json`) | — |
 | `sim/README.md` | Operator guide for the shadow simulator | — |
 | `deploy/polyshadow.service` | systemd unit template for permanent shadow on GCP | — |
-| `requirements.txt` | Python dependencies | 8 lines |
-| `strategy.example.json` | Example strategy config with all tunable parameters | — |
+| `buy/` | Isolated complete-set mint package: config, discovery, calldata, chain checks, relayer, state, runner | package |
+| `buy/test_buy.py` | Atomic calldata and fail-closed buyer regression tests | — |
+| `strategy.buy.example.json` | Disabled/dry-run mint-buyer configuration template | — |
+| `requirements.buy.txt` | Optional official relayer-client dependencies; separate from bot deploy | — |
+| `deploy/polybuy.service` | Low-priority systemd template for the optional buyer | — |
+| `requirements.txt` | Existing live bot and simulator dependencies | 8 lines |
+| `strategy.example.json` | Example sell strategy config with all tunable parameters | — |
 | `.github/workflows/deploy.yml` | CI/CD pipeline — auto-deploy on push to main | — |
 | `.env` | Environment variables (secrets — gitignored) | — |
 | `strategy.json` | Live strategy config (hot-reloaded each cycle, gitignored) | — |
@@ -308,6 +325,8 @@ queues, no databases.
 | `.dashboard_status.json` | Per-cycle status snapshot for dashboard (gitignored) | — |
 | `.heartbeat` | Tick counter updated every cycle for uptime monitoring (gitignored) | — |
 | `sim_data/` | Shadow runtime outputs only (gitignored) — never bot state | — |
+| `buy_data/` | Buyer intents, dry plans, heartbeat, lock, arm/stop files, and rotating log (gitignored) | — |
+| `strategy.buy.json` | Buyer runtime config copied from the example; gitignored and independent of `strategy.json` | — |
 
 ### Why a Single-File Bot?
 
@@ -342,6 +361,8 @@ eth-utils
 | `eth-account` | Ethereum account management | Used to derive the EOA address from the private key for relayer submissions. |
 | `eth-abi` | Ethereum ABI encoding | Used to encode redemption calldata (the raw bytes that tell the smart contract what to do). |
 | `eth-utils` | Ethereum utility functions | Provides `keccak` (for function selectors) and `to_checksum_address` (Ethereum addresses must be in EIP-55 checksum format). |
+| `py-builder-relayer-client` | Official gasless transaction client, installed only through `requirements.buy.txt` | Builds and signs PROXY relayer batches without changing the existing bot dependency set. |
+| `py-builder-signing-sdk` | Builder API authentication for the relayer | Generates authenticated builder headers used only by live mint submission. |
 
 ### The `eth-*` Family
 
@@ -370,6 +391,9 @@ The bot reads credentials and relayer configuration from environment variables:
 | `RELAYER_API_KEY` | Relayer authentication key (has a hardcoded default from git history). |
 | `RELAYER_API_KEY_ADDRESS` | Relayer key address (has a hardcoded default). |
 | `NTFY_TOPIC` | ntfy.sh push notification topic (defaults to `polybot-joel-btc`). |
+| `BUILDER_API_KEY` | Builder key required only for a real `polybuy` relayer submission. |
+| `BUILDER_SECRET` | Builder signing secret required only for a real mint. |
+| `BUILDER_PASS_PHRASE` | Builder passphrase required only for a real mint. |
 
 ### 6.2 Strategy Constants (Hot-Reloaded from `strategy.json`)
 
@@ -2658,7 +2682,229 @@ df -h /
 
 ---
 
-## 21. Glossary
+## 21. Atomic Mint Buyer (`buy/`)
+
+The optional `polybuy` process replaces uncertain two-leg CLOB entry with one
+atomic Conditional Token Framework split. It deposits pUSD and receives equal UP
+and DOWN inventory for a standard binary BTC market:
+
+```text
+5.000000 pUSD
+      |
+      | approve adapter for exactly 5.000000 pUSD
+      | splitPosition(pUSD, zero parent, conditionId, [1, 2], 5_000_000)
+      v
+5.000000 UP + 5.000000 DOWN
+```
+
+The approval and split are submitted as one relayer batch. If either call
+reverts, the whole Polygon transaction reverts. This eliminates CLOB spread,
+BUY taker fees, unequal fills, and cross-leg race risk. The resulting complete
+set has deterministic collateral cost `$1.00 × shares`.
+
+### 21.1 Process ownership and isolation
+
+| Process | May do | Must never do | Writable state |
+|---|---|---|---|
+| `polybot` / `bot.py` | SELL, optional hedge, redeem | BUY or mint | existing bot files |
+| `polyshadow` / `sim/` | public-data paper simulation | load secrets or transact | `sim_data/` |
+| `polybuy` / `buy/` | atomic pUSD split only | SELL, hedge, redeem, edit bot/sim state | `buy_data/` |
+
+The buyer never imports `bot.py` or `sim/`. Polymarket wallet holdings are the
+only integration boundary: after a successful split, the Data API exposes the
+UP/DOWN positions and the unchanged sell bot discovers them on its normal
+refresh. There is no shared writable JSON protocol and no direct process call.
+
+The buyer also has separate:
+
+- Configuration: `strategy.buy.json` (gitignored).
+- State: `buy_data/state.json`.
+- Lock: `buy_data/polybuy.lock`.
+- Heartbeat: `buy_data/heartbeat.json`.
+- Rotating log: `buy_data/polybuy.log` (1 MB × three files).
+- Kill switch: `buy_data/STOP`.
+- One-shot live arm: `buy_data/ARM`.
+
+### 21.2 Package layout
+
+| Module | Responsibility |
+|---|---|
+| `buy/config.py` | Fail-closed defaults, independent config parsing, paths, validation |
+| `buy/market.py` | Gamma discovery, exact UP/DOWN mapping, Data API balances, geoblock check |
+| `buy/chain.py` | Read-only Polygon RPC checks for pUSD, outcome slots, contracts, and ERC-1155 balances |
+| `buy/contracts.py` | Pure ABI encoding for exact approval and standard-adapter `splitPosition` |
+| `buy/relayer.py` | Official Builder Relayer PROXY client and transaction-status lookup |
+| `buy/store.py` | Durable atomic state writes, free-disk check, heartbeat, bounded history, process lock |
+| `buy/runner.py` | Eligibility, caps, durable intent, submit/reconcile loop, CLI, notifications |
+| `buy/test_buy.py` | Synthetic calldata and fail-closed lifecycle tests |
+
+### 21.3 Cycle flow
+
+Each `polybuy` cycle performs these steps in order:
+
+1. Return immediately unless `buy.enabled` is true. `--plan` is the safe CLI
+   override: it forces dry-run for one cycle but cannot enable submission.
+2. Refuse entry if `buy_data/STOP` exists or free disk is below the configured
+   floor (500 MB by default).
+3. Reconcile existing relayer intents and on-chain inventory before discovery.
+   An intent that was persisted as `submitting` but has no transaction ID is
+   changed to `ambiguous`; all new entry freezes unless both on-chain balances
+   conclusively prove that the requested mint occurred.
+4. Check Polymarket's geographic eligibility endpoint. A malformed response
+   fails closed. A blocked response is recorded in dry plans but blocks every live mint.
+5. Discover configured Gamma series and keep only active, open,
+   `acceptingOrders=true`, non-neg-risk markets in the TTM entry window.
+6. Fetch current Data API holdings and apply one-entry, open-set, open-notional,
+   daily-notional, and deterministic set-cost caps.
+7. In dry-run, persist a bounded plan record only. No private key, Builder key,
+   relayer client, approval, or split call is used.
+8. In live mode, require and consume a fresh one-shot arm **before any network
+   or preflight work**, then require all credentials and verify: derived PROXY
+   equals `FUNDER_ADDRESS`, pUSD and adapter contracts exist,
+   `getOutcomeSlotCount(conditionId) == 2`, sufficient pUSD exists, and both
+   on-chain token balances are still zero.
+9. Persist a `submitting` intent with pre-mint balances **before** calling the
+   relayer.
+10. Submit exact approval + split as one PROXY batch and persist the returned
+    transaction ID as `pending`. A failed preflight requires deliberate re-arming.
+11. Poll relayer state across later cycles. `STATE_CONFIRMED` still waits for
+    both on-chain balances to increase by the requested share amount before the
+    intent becomes `confirmed`.
+
+No automatic retry occurs after an ambiguous submit, failed transaction, wrong
+wallet, RPC inconsistency, or inventory mismatch. This intentionally trades
+availability for duplicate-mint safety.
+
+### 21.4 Safety gates
+
+Real mint submission requires all of the following simultaneously:
+
+- Runtime config exists and sets `enabled: true`.
+- Runtime config sets `dry_run: false`.
+- `buy_data/STOP` does not exist.
+- `buy_data/ARM` contains exactly `MINT_REAL_PUSD` and is younger than
+  `arm_max_age_s` (15 minutes by default).
+- `PRIVATE_KEY`, `FUNDER_ADDRESS`, `BUILDER_API_KEY`, `BUILDER_SECRET`, and
+  `BUILDER_PASS_PHRASE` are present.
+- The official relayer client's derived PROXY exactly matches
+  `FUNDER_ADDRESS`.
+- Geographic eligibility, disk, contract, condition, pUSD balance, position,
+  one-entry, open-set, open-notional, and daily-notional checks all pass.
+
+The arm is one-shot: it is deleted at the start of an enabled live cycle, before
+geoblock, discovery, credential, wallet, RPC, or balance checks. A blocked or
+failed preflight therefore requires deliberate operator re-arming. A process
+restart does not silently re-arm entry.
+
+Only standard binary CTF markets are supported. Any market with `negRisk=true`
+is rejected rather than routed to a different adapter. CLOB BUY fallback is not
+implemented, so `polybuy` can never create one-leg inventory.
+
+### 21.5 Durable intent states
+
+| State | Meaning | New entry allowed? |
+|---|---|---|
+| `submitting` | Durable intent exists; submit call is in progress | No |
+| `ambiguous` | Process cannot prove whether submit occurred | No; only conclusive complete on-chain inventory self-recovers |
+| `pending` / `executed` / `mined` | Relayer transaction is progressing | No under default one-open-set cap |
+| `confirmed_waiting_inventory` | Relayer confirmed; balances not indexed/observed yet | No |
+| `confirmed` | Both on-chain outcome balances increased as expected | Subject to portfolio caps |
+| `failed` / `invalid` | Relayer reported terminal failure | Condition remains recorded; no blind retry |
+| `completed` | Market ended and observed inventory is gone | Yes, subject to other caps |
+
+`state.json` is written through a flushed temporary file followed by
+`os.replace`. A failed state write aborts before submission. State history is
+bounded, but active/ambiguous intents are never pruned merely to meet the cap.
+
+### 21.6 Configuration
+
+Copy `strategy.buy.example.json` to the gitignored `strategy.buy.json`. Important
+defaults are deliberately conservative:
+
+| Key | Default | Effect |
+|---|---:|---|
+| `enabled` | `false` | Entire buyer is inactive |
+| `dry_run` | `true` | Plan only; relayer code is unreachable |
+| `entry_method` | `mint` | CLOB BUY is unsupported |
+| `series_slugs` | `btc-up-or-down-15m` | Independent target-series allowlist |
+| `shares` | `5.0` | pUSD deposited and shares minted per market |
+| `enter_min_ttm_min` / `enter_max_ttm_min` | `3` / `12` | Entry timing window |
+| `max_set_cost` | `1.0` | Deterministic mint-cost gate; values below 1 are rejected as invalid config |
+| `max_open_sets` | `1` | Maximum active conditions |
+| `max_open_notional` | `5.0` | Maximum active pUSD-equivalent exposure |
+| `max_daily_notional` | `10.0` | UTC-day submitted mint cap |
+| `one_entry_per_market` | `true` | Any existing intent prevents another condition-level mint |
+| `poll_s` | `15` | Low API/CPU duty cycle beside `polybot` and `polyshadow` |
+| `min_free_disk_mb` | `500` | Entry fails closed before the historical ENOSPC range |
+| `arm_max_age_s` | `900` | One-shot arm validity |
+| `require_geoblock_clear` | `true` | Opening action requires eligibility; `false` is rejected as invalid config |
+| `require_funder_match` | `true` | Derived PROXY must equal configured funder; `false` is rejected as invalid config |
+
+Contract addresses are configurable for explicit upgrades, but defaults use the
+current Polygon pUSD, CTF, and standard pUSD collateral-adapter addresses. They
+must be rechecked against official Polymarket documentation before changing or
+enabling live mode.
+
+### 21.7 Commands and rollout
+
+Install buyer-only dependencies in an independent environment so the existing
+bot environment is not upgraded:
+
+```bash
+python3 -m venv .venv-buy
+.venv-buy/bin/pip install -r requirements.buy.txt
+cp strategy.buy.example.json strategy.buy.json
+```
+
+Safe local/GCP checks:
+
+```bash
+.venv-buy/bin/python -m buy --once
+.venv-buy/bin/python -m buy --plan
+.venv-buy/bin/python -m buy --status
+.venv-buy/bin/python -m unittest buy.test_buy -v
+```
+
+`--once` obeys the disabled config. `--plan` forces one public-data dry plan and
+cannot submit; it records geographic blocking but may continue reading public
+market/position data. Before considering live mode, run dry plans long enough to verify
+series selection, TTM, duplicate suppression, caps, Data API holdings, RPC
+health, logs, heartbeat, disk use, and coexistence with both current services.
+
+The optional `deploy/polybuy.service` template runs with `Nice=15`,
+`CPUQuota=20%`, and `MemoryMax=200M`, below `polyshadow`, which is already below
+`polybot`. It is intentionally excluded from the existing GitHub auto-deploy
+workflow, so adding or changing buyer code cannot restart or redeploy the sell
+bot. Install and enable this third service manually only after dry-run review.
+
+A live operator must set `enabled=true`, `dry_run=false`, install Builder
+credentials in the service environment, and create a fresh arm immediately
+before one intended mint:
+
+```bash
+printf 'MINT_REAL_PUSD\n' > buy_data/ARM
+```
+
+Creating the arm is the final capital authorization. Do not automate it in
+systemd, CI, cron, startup scripts, or configuration management. Creating
+`buy_data/STOP` disables entry even if every other live gate is satisfied.
+
+### 21.8 What did not change
+
+- No line in `bot.py`, `strategy.json`, sell execution, hedging, redemption,
+  position discovery, dashboard output, or bot state was changed for minting.
+- No line in `sim/` isolation, sell policy, disk pruning, `record_ticks`, or
+  `sim_data/` ownership was weakened.
+- `requirements.txt` and `.github/workflows/deploy.yml` remain unchanged;
+  buyer dependencies and service installation are separate and manual.
+- `polybuy` does not place CLOB orders, sell either leg, merge positions,
+  redeem, or alter the seller's cooldown/position metadata.
+- No runtime `strategy.buy.json`, arm file, Builder credentials, service enable,
+  or real relayer transaction is committed by this implementation.
+
+---
+
+## 22. Glossary
 
 | Term | Definition |
 |---|---|
@@ -2692,6 +2938,8 @@ df -h /
 | **Shadow simulator** | Paper-trading process (`sim/shadow.py`) that applies a configurable sell policy to every market in a series (5m/15m) using public books; never places real orders. |
 | **set_cost** | Complete-set entry cost per share used by the shadow sim (default ~1.043 from history). Live bot does not gate on this. |
 | **polyshadow** | systemd service name for the permanent shadow simulator on GCP. |
+| **polybuy** | Optional separate service that atomically splits pUSD into complete sets; disabled and dry-run by default. |
+| **Atomic mint** | One relayer batch that approves exact pUSD and calls standard-adapter `splitPosition`, producing equal UP and DOWN inventory or reverting entirely. |
 | **ENOSPC** | OS errno 28 — no space left on device. On the bot VM (2026-07) this was caused mainly by `/var/log` growth, not by `sim_data`. |
 | **Slug** | A human-readable URL fragment identifying a market (e.g., `btc-updown-5m-1783218000`). |
 | **Tick size** | The minimum price increment for a market. On Polymarket, typically $0.01. |
@@ -2700,11 +2948,11 @@ df -h /
 
 ---
 
-*This document was last updated to reflect the codebase on the `main` branch
-(including disk-hardening and §20.8). Key topics: live sell bot (`bot.py`), open
-entry-fill / set-cost issue (§2.2.1), and the **live shadow simulator** (`sim/`,
-§20) — configurable series (default 15m experiment), FAK depth fills, isolation
-under `sim_data/<tag>/`, and **disk capacity** (§20.8): host `/var/log` was the
-2026-07 ENOSPC root cause on a 10GB VM; app tick caps + journal size limits
-prevent recurrence. Current shadow experiment (§20.9): **8¢ anytime** on 15m+
-hourly with **opposite-leg confirm ≥70¢** (`15m1h-8c-conf`).*
+*This document was last updated for the isolated atomic mint buyer (§21), while
+preserving the live sell bot (`bot.py`) and shadow simulator (`sim/`). `polybuy`
+is a third, disabled/dry-run process with separate state, exact approval + split
+batching, proxy/funder verification, one-shot arming, durable intent recovery,
+portfolio/daily caps, and lower GCP resource priority. The current shadow
+experiment (§20.9) remains **8¢ anytime** on 15m+hourly with opposite-leg confirm
+≥70¢ (`15m1h-8c-conf`); the §20.8 host-journal and app disk protections remain
+unchanged.*
