@@ -26,11 +26,10 @@
 15. [The Hedge Phase — Cutting Losses on Reversals](#15-the-hedge-phase--cutting-losses-on-reversals)
 16. [State Management & Persistence](#16-state-management--persistence)
 17. [Error Handling Philosophy](#17-error-handling-philosophy)
-18. [The Dashboard — `dashboard.py`](#18-the-dashboard--dashboardpy)
-19. [The Diagnostic Tool: `check_book.py`](#19-the-diagnostic-tool-check_bookpy)
-20. [Live Shadow Simulator (`sim/`)](#20-live-shadow-simulator-sim)
-21. [Atomic Mint Buyer (`buy/`)](#21-atomic-mint-buyer-buy)
-22. [Glossary](#22-glossary)
+18. [The Diagnostic Tool: `check_book.py`](#18-the-diagnostic-tool-check_bookpy)
+19. [Live Shadow Simulator (`sim/`)](#19-live-shadow-simulator-sim)
+20. [Atomic Mint Buyer (`buy/`)](#20-atomic-mint-buyer-buy)
+21. [Glossary](#21-glossary)
 
 ---
 
@@ -69,7 +68,7 @@ evidence of a reversal.
 
 - **No buying inside `bot.py`.** The bot remains sell-only. Manual entry still works,
   while the separate `buy/` package can create complete sets by atomic mint when
-  explicitly configured and one-shot armed — see §21.
+  explicitly configured and one-shot armed — see §20.
 - **No market making.** It doesn't post resting orders or provide liquidity.
 - **No price prediction.** It doesn't try to forecast BTC direction.
 - **No portfolio rebalancing.** It manages one specific market type (BTC 5-minute
@@ -143,7 +142,7 @@ The bot is **sell-only**. Entry (buying both legs) is done manually, typically w
   `pnl_entry_cost` from Data API `avgPrice` and never places entry orders. The
   optional `buy/` process closes the complete-set fill-quality gap by atomically
   converting pUSD into equal UP/DOWN inventory at a deterministic $1.00 set cost.
-  It remains disabled and dry-run by default; see §21.
+  It remains disabled and dry-run by default; see §20.
 
 ### 2.3 The CLOB (Central Limit Order Book)
 
@@ -223,16 +222,11 @@ order-building logic differs.
 │                                  └───────────┘   │   │
 │                    ┌──────────────────────────────┘   │
 │                    ▼                                  │
-│              ┌──────────┐    ┌──────────────┐        │
-│              │  Logging │    │  Dashboard   │        │
-│              │ (bot.log)│    │  Status JSON │        │
-│              └──────────┘    └──────────────┘        │
+│              ┌──────────┐                             │
+│              │  Logging │                             │
+│              │ (bot.log)│                             │
+│              └──────────┘                             │
 └──────────────────────────────────────────────────────┘
-
-         ┌─────────────┐
-         │ dashboard.py │  ← separate process, reads status JSON + bot.log
-         │ Live viewer  │
-         └─────────────┘
 
          ┌──────────────────────┐
          │  sim/shadow.py       │  ← separate process (polyshadow)
@@ -254,8 +248,8 @@ External Services:
   • Polygon blockchain    (chain ID 137)            — settlement layer
 ```
 
-The architecture is a **single-file, single-process, polling loop** with a
-**separate dashboard viewer** that runs independently. The main trading logic
+The architecture is a **single-file, single-process, polling loop** with
+no separate dashboard. The main trading logic
 is single-threaded for simplicity, but order book fetches use a background
 thread pool for parallel I/O. There are no async frameworks, no message
 queues, no databases.
@@ -276,16 +270,13 @@ queues, no databases.
   refreshed every 2s (positions) and 15s (balance), not every sub-second cycle.
   This reduces API calls from ~240/min to ~30/min (positions) and ~4/min
   (balance) during the sell window.
-- **Separate dashboard (`dashboard.py`)** reads a status JSON file and log file
-  that the bot writes each cycle. It's a read-only viewer — it doesn't affect the
-  bot's operation and can be started/stopped independently.
 - **Separate shadow simulator (`sim/`)** paper-trades every configured BTC series
   using public order books and the sell policy. It never places orders, never
-  imports `bot.py`, and writes only under `sim_data/` (see §20).
+  imports `bot.py`, and writes only under `sim_data/` (see §19).
 - **Separate atomic mint buyer (`buy/`)** discovers standard binary BTC markets and
   can submit one atomic relayer batch containing exact pUSD approval plus CTF
   `splitPosition`. It never imports `bot.py`, never sells or redeems, owns only
-  `buy_data/`, and is lower-priority than both existing services (see §21).
+  `buy_data/`, and is lower-priority than both existing services (see §20).
 
 ---
 
@@ -294,7 +285,6 @@ queues, no databases.
 | File | Purpose | Size |
 |---|---|---|
 | `bot.py` | The main bot — all trading logic lives here | ~1340 lines |
-| `dashboard.py` | Live terminal dashboard viewer (reads bot output) | ~250 lines |
 | `check_book.py` | Diagnostic script for inspecting live order books | ~31 lines |
 | `sim/` | Live shadow simulator package (paper trade all BTC 5m markets) | package |
 | `sim/shadow.py` | Shadow main loop — discover, paper enter, policy, FAK fills, settle | ~600 lines |
@@ -322,7 +312,6 @@ queues, no databases.
 | `positions.json` | Runtime state cache (gitignored, auto-generated) | — |
 | `pnl.json` | P&L history — one entry per completed trade (gitignored) | — |
 | `bot.log` | Structured JSON-line log with rotation (gitignored, auto-generated) | — |
-| `.dashboard_status.json` | Per-cycle status snapshot for dashboard (gitignored) | — |
 | `.heartbeat` | Tick counter updated every cycle for uptime monitoring (gitignored) | — |
 | `sim_data/` | Shadow runtime outputs only (gitignored) — never bot state | — |
 | `buy_data/` | Buyer intents, dry plans, heartbeat, lock, arm/stop files, and rotating log (gitignored) | — |
@@ -333,8 +322,7 @@ queues, no databases.
 For a bot of this size (~1340 lines), splitting into modules would add import
 overhead and cognitive load without meaningful benefit. The code is organised
 internally with **section comment banners** (e.g., `# --- HELPER FUNCTIONS ---`)
-that act as visual module boundaries. The dashboard is separate because it's a
-different concern — it's a viewer, not part of the trading engine.
+that act as visual module boundaries.
 
 ---
 
@@ -356,7 +344,7 @@ eth-utils
 | `py_clob_client_v2` | Polymarket's official Python SDK for their CLOB | The only way to submit signed orders to Polymarket's order book. The `_v2` suffix indicates a fork or updated version of the upstream `py_clob_client`. |
 | `requests` | HTTP client library | Used for direct REST calls to Polymarket's data-api, the ntfy.sh notification service, and the relayer. The SDK doesn't cover all endpoints we need. |
 | `python-dotenv` | Loads `.env` files into `os.environ` | Keeps secrets out of the codebase. The bot reads API keys, private keys, and relayer config from environment variables. |
-| `rich` | Terminal formatting library (tables, panels, colours) | Trading bots produce a *lot* of console output. `rich` makes it readable — coloured tables, boxed panels, and formatted numbers. Both `bot.py` and `dashboard.py` use it. |
+| `rich` | Terminal formatting library (tables, panels, colours) | Trading bots produce a *lot* of console output. `rich` makes it readable — coloured tables, boxed panels, and formatted numbers. Used for readable console output. |
 | `web3` | Ethereum Python library | Used for blockchain interaction (though most on-chain work is done via the relayer). |
 | `eth-account` | Ethereum account management | Used to derive the EOA address from the private key for relayer submissions. |
 | `eth-abi` | Ethereum ABI encoding | Used to encode redemption calldata (the raw bytes that tell the smart contract what to do). |
@@ -695,7 +683,7 @@ exceptional events warrant a push.
 ### 8.4 CI/CD Auto-Deploy Pipeline
 
 The bot uses **GitHub Actions** for continuous deployment. When code is pushed to
-`main` (specifically changes to `bot.py`, `dashboard.py`, `requirements.txt`, or
+`main` (specifically changes to `bot.py`, `requirements.txt`, or
 `strategy.json`), the pipeline SSHs into the GCP instance and deploys:
 
 ```yaml
@@ -704,7 +692,7 @@ name: Deploy to GCP
 on:
   push:
     branches: [main]
-    paths: ['bot.py', 'dashboard.py', 'requirements.txt', 'strategy.json']
+    paths: ['bot.py', 'requirements.txt', 'strategy.json']
 jobs:
   deploy:
     runs-on: ubuntu-latest
@@ -1671,7 +1659,7 @@ the gas. This is subsidised by Polymarket to encourage market resolution.
 The main loop is the heart of the bot. It's a `while not _shutdown_requested`
 loop with variable sleep (5s / 1s / 0.25s depending on time to expiry), executing a
 complete cycle of: collect pre-fetched order books → discover positions (throttled)
-→ display status → redeem resolved → sell losers → hedge → write dashboard status
+→ display status → redeem resolved → sell losers → hedge
 → kick off next cycle's book fetch in background → sleep.
 
 ### 14.1 Loop Structure
@@ -1773,7 +1761,7 @@ size during iteration`.
 
 ### 14.3 The Positions Table
 
-The bot uses `rich.Table` to render a colour-coded dashboard. Each row shows:
+The bot uses `rich.Table` to render a colour-coded status table. Each row shows:
 
 - **INSTRUMENT** — the market question (truncated to 40 chars).
 - **EXPIRY** — the market end time (HH:MM format).
@@ -2071,38 +2059,7 @@ markets (24 book fetches), this reduces cycle time from ~400ms (250ms sleep +
 using a fresh `time.time()` call (not the cycle-start `now_ms`, which is
 several seconds old by this point).
 
-### 14.7 Dashboard Status Writing
-
-```@/c:/Users/ntemu/Downloads/poly money maker/bot.py:1115-1135
-    try:
-        _dash_positions = []
-        for s in managed_sets:
-            mins = (s["end_ts"] - now_ms) / 60000
-            _dash_positions.append({
-                "question": (s["question"] or "?")[:40],
-                "ttm_min": round(mins, 2),
-                "ttm_sec": round(max(mins, 0) * 60, 0) if mins < 1 else None,
-                "up_size": float(s["up"].get("size", 0)),
-                "dn_size": float(s["dn"].get("size", 0)),
-                "up_token": s["up"].get("asset"),
-                "dn_token": s["dn"].get("asset"),
-                "redeemable": bool(s["up"].get("redeemable") or s["dn"].get("redeemable")),
-            })
-        _pnl_summary = load_pnl().get("summary", {})
-        with open(".dashboard_status.json", "w") as _df:
-            json.dump({"cycle": CYCLE, "nav": pusd_bal, "ts": time.time(),
-                       "positions": _dash_positions, "pnl": _pnl_summary}, _df)
-    except Exception:
-        pass
-```
-
-Each cycle, the bot writes a JSON snapshot of its state to
-`.dashboard_status.json`. This file is read by `dashboard.py` (section 18) to
-render a live terminal dashboard. The write is wrapped in `try/except: pass`
-because the dashboard is a non-critical feature — if the write fails, the bot
-shouldn't care.
-
-### 14.8 Graceful Shutdown Exit
+### 14.7 Graceful Shutdown Exit
 
 ```@/c:/Users/ntemu/Downloads/poly money maker/bot.py:1134-1136
 console.print("[bold bright_green]▶ SHUTDOWN COMPLETE[/] [dim]state saved · exiting cleanly[/]")
@@ -2284,101 +2241,7 @@ reconstruct exactly what happened by parsing `bot.log`.
 
 ---
 
-## 18. The Dashboard — `dashboard.py`
-
-```@/c:/Users/ntemu/Downloads/poly money maker/dashboard.py:1-244
-```
-
-### 18.1 Purpose
-
-The dashboard is a **separate, read-only process** that provides a live
-terminal-based view of the bot's operation. It reads three files:
-
-- `.dashboard_status.json` — current positions, NAV, cycle count (written by bot each cycle)
-- `bot.log` — recent events (tail)
-- `strategy.json` — threshold values for state display (read once at startup)
-
-The dashboard reads `strategy.json` at launch to pick up the current
-`sell_threshold`, `hedge_threshold`, and `sell_window_min` values. This ensures
-state labels (WATCHING, EXIT WINDOW) and price colouring match whatever
-thresholds the bot is actually using. If `strategy.json` is missing, it falls
-back to the same defaults as the bot.
-
-It does **not** communicate with the bot directly. There's no socket, no pipe,
-no shared memory. The bot writes files; the dashboard reads them. This
-**decoupled architecture** means:
-
-- The dashboard can be started/stopped without affecting the bot.
-- The dashboard can't accidentally crash the bot.
-- The dashboard can run on a different machine (if the files are shared).
-
-### 18.2 Key Functions
-
-**`read_status()`** — Reads and parses `.dashboard_status.json`. Returns `None`
-if the file doesn't exist or is invalid JSON (e.g., the bot hasn't written it
-yet, or is mid-write).
-
-**`tail_log(n=10)`** — Reads the last `n` lines of `bot.log`. Uses a
-**seek-from-end** technique: seek to the end of the file, read the last 8KB,
-split into lines, return the last `n`. This is efficient — it doesn't read the
-entire log file, which could be megabytes.
-
-**`format_event(line)`** — Parses a JSON log line and returns a `rich`-formatted
-string. Different event types get different colours and labels:
-
-| Event | Display |
-|---|---|
-| `sell_fill` | `[bold bright_yellow]SELL[/] UP 50.00 @ 0.100` |
-| `hedge_fill` | `[bold bright_red]HEDGE[/] DN 100.00 @ 0.450` |
-| `sell_ghost_fill` / `hedge_ghost_fill` | `[bold yellow]GHOST[/] UP 50.00 confirmed` |
-| `sell_attempt` | `[dim]ATTEMPT[/] UP sell` |
-| `hedge_attempt` | `[dim yellow]HEDGE ATTEMPT[/] DN` |
-| `redeem_submit` | `[bright_magenta]REDEEM[/] submitted` |
-| `cycle_error` | `[bold red]ERROR[/] <last traceback line>` |
-| `gc` | `[dim]GC[/] cleaned stale positions` |
-| `shutdown` | `[bright_green]SHUTDOWN[/] clean exit` |
-
-**`build_dashboard(status, events)`** — Composes the full dashboard layout using
-`rich.Layout`:
-
-- **Header** — status icon (LIVE/STALE), NAV, cycle count, active/redeem counts.
-- **Positions table** — market name, TTM, UP/DN sizes, state (WATCHING/EXIT WINDOW/REDEEM).
-- **Events panel** — last 10 formatted log events.
-- **Footer** — data age and instructions.
-
-**Stale detection:** If the status file is older than 15 seconds, the header
-shows `STALE` in red instead of `LIVE` in green. This immediately alerts the
-operator that the bot may have stopped writing (crashed, hung, or lost API
-connectivity).
-
-### 18.3 The `Live` Display
-
-```python
-with Live(console=console, refresh_per_second=2, screen=True) as live_display:
-    while True:
-        status = read_status()
-        log_lines = tail_log(15)
-        events = [format_event(line) for line in log_lines if format_event(line)]
-        dashboard = build_dashboard(status, events)
-        live_display.update(dashboard)
-        time.sleep(0.5)
-```
-
-`rich.Live` with `screen=True` creates a **full-screen terminal display** that
-updates in place (like `htop` or `top`). The dashboard refreshes twice per
-second (every 0.5s sleep), reading fresh data from the files each time.
-
-**Why `refresh_per_second=2`?** The bot writes status every 1–5 seconds
-depending on time to expiry, so refreshing at 2Hz is smooth enough for human
-perception without wasting CPU.
-
-**Why `except KeyboardInterrupt: break`?** Ctrl-C exits the dashboard but
-doesn't affect the bot. The `with` block ensures the terminal is restored to
-normal mode on exit.
-
----
-
-## 19. The Diagnostic Tool: `check_book.py`
+## 18. The Diagnostic Tool: `check_book.py`
 
 ```@/c:/Users/ntemu/Downloads/poly money maker/check_book.py:1-32
 import requests, json, time
@@ -2448,7 +2311,7 @@ asymmetry is fundamental to how order books work.
 
 ---
 
-## 20. Live Shadow Simulator (`sim/`)
+## 19. Live Shadow Simulator (`sim/`)
 
 The live bot only manages **positions you actually hold**. That yields few samples
 per day and is a poor way to gain statistical confidence in sell/fill behaviour.
@@ -2482,7 +2345,7 @@ Hard rules enforced in code:
 - **Single-instance lock** — `sim_data/shadow.lock` (fcntl / msvcrt).
 - **No secrets** — no API keys, no order endpoints, no relayer.
 - **systemd caps** — `Nice=10`, `CPUQuota=40%`, `MemoryMax=400M` so live trading wins CPU/RAM.
-  Disk is separate: journal caps + `sim` prune (see §20.8).
+  Disk is separate: journal caps + `sim` prune (see §19.8).
 
 ### 20.3 Cycle Flow
 
@@ -2497,7 +2360,7 @@ Each cycle of `python -m sim.shadow`:
    (anytime experiments use a long horizon so books are polled early).
 4. **Evaluate policy** (`sim/policy.py`): threshold / window / optional last-chance /
    optional hedge. Current experiment: **8¢ anytime** with **opposite-leg confirm**
-   (see §20.9).
+   (see §19.9).
 5. **Simulate FAK** (`sim/fills.py`, model `depth`): walk bids at/above limit;
    partial or zero fill → MISS (same failure class as thin books near expiry).
 6. **After expiry** resolve winner from bid dominance;
@@ -2615,7 +2478,7 @@ Set `sell_confirm_opposite: 0` to disable (legacy unconfirmed behaviour).
 - Perfect isolation from rate limits if both processes hammer the public API
   (mitigated by cache + book horizon + lower sell poll rate).
 - Host disk capacity — the app cannot enlarge a 10GB GCP boot disk; operators must
-  cap `/var/log` and monitor free space (see §20.8).
+  cap `/var/log` and monitor free space (see §19.8).
 
 ### 20.8 Disk capacity incident and prevention (2026-07)
 
@@ -2682,7 +2545,7 @@ df -h /
 
 ---
 
-## 21. Atomic Mint Buyer (`buy/`)
+## 20. Atomic Mint Buyer (`buy/`)
 
 The optional `polybuy` process replaces uncertain two-leg CLOB entry with one
 atomic Conditional Token Framework split. It deposits pUSD and receives equal UP
@@ -2888,7 +2751,7 @@ systemd, CI, cron, startup scripts, or configuration management. Creating
 ### 21.8 What did not change
 
 - No line in `bot.py`, `strategy.json`, sell execution, hedging, redemption,
-  position discovery, dashboard output, or bot state was changed for minting.
+  position discovery, or bot state was changed for minting.
 - No line in `sim/` isolation, sell policy, disk pruning, `record_ticks`, or
   `sim_data/` ownership was weakened.
 - `requirements.txt` and `.github/workflows/deploy.yml` remain unchanged;
@@ -2900,7 +2763,7 @@ systemd, CI, cron, startup scripts, or configuration management. Creating
 
 ---
 
-## 22. Glossary
+## 21. Glossary
 
 | Term | Definition |
 |---|---|
@@ -2949,6 +2812,6 @@ preserving the live sell bot (`bot.py`) and shadow simulator (`sim/`). `polybuy`
 is a third, disabled/dry-run process with separate state, exact approval + split
 batching, proxy/funder verification, one-shot arming, durable intent recovery,
 portfolio/daily caps, and lower GCP resource priority. The current shadow
-experiment (§20.9) remains **8¢ anytime** on 15m+hourly with opposite-leg confirm
-≥70¢ (`15m1h-8c-conf`); the §20.8 host-journal and app disk protections remain
+experiment (§19.9) remains **8¢ anytime** on 15m+hourly with opposite-leg confirm
+≥70¢ (`15m1h-8c-conf`); the §19.8 host-journal and app disk protections remain
 unchanged.*

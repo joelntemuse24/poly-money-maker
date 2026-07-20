@@ -71,8 +71,19 @@ _STRATEGY_DEFAULTS = {
 }
 STRATEGY_FILE = "strategy.json"
 
+_strat_cache = None
+_strat_mtime = 0.0
+
 def load_strategy():
-    """Load strategy params from strategy.json, falling back to defaults."""
+    """Load strategy params from strategy.json, falling back to defaults.
+    Caches result and only re-reads when the file's mtime changes."""
+    global _strat_cache, _strat_mtime
+    try:
+        mtime = os.path.getmtime(STRATEGY_FILE) if os.path.exists(STRATEGY_FILE) else 0
+    except OSError:
+        mtime = 0
+    if _strat_cache is not None and mtime == _strat_mtime:
+        return _strat_cache
     cfg = dict(_STRATEGY_DEFAULTS)
     try:
         if os.path.exists(STRATEGY_FILE):
@@ -87,6 +98,8 @@ def load_strategy():
                         cfg[k] = expected(v)
     except Exception as e:
         console.print(f"[bold red]▶ STRATEGY [WARN][/] [dim]failed to load {STRATEGY_FILE}: {e}[/]")
+    _strat_cache = cfg
+    _strat_mtime = mtime
     return cfg
 
 _strat = load_strategy()
@@ -746,7 +759,7 @@ CYCLE = 0
 _last_positions_refresh = 0.0
 _last_balance_refresh = 0.0
 _cached_managed_sets = []
-_book_executor = ThreadPoolExecutor(max_workers=16)
+_book_executor = ThreadPoolExecutor(max_workers=4)
 _pending_book_futs = {}  # {future: token_id} — books fetched during previous sleep
 
 while not _shutdown_requested:
@@ -1280,28 +1293,6 @@ while not _shutdown_requested:
             box=box.HEAVY_EDGE,
         ))
 
-
-    # Write dashboard status for live viewer
-    try:
-        _dash_positions = []
-        for s in managed_sets:
-            mins = (s["end_ts"] - now_ms) / 60000
-            _dash_positions.append({
-                "question": (s["question"] or "?")[:40],
-                "ttm_min": round(mins, 2),
-                "ttm_sec": round(max(mins, 0) * 60, 0) if mins < 1 else None,
-                "up_size": float(s["up"].get("size", 0)),
-                "dn_size": float(s["dn"].get("size", 0)),
-                "up_token": s["up"].get("asset"),
-                "dn_token": s["dn"].get("asset"),
-                "redeemable": bool(s["up"].get("redeemable") or s["dn"].get("redeemable")),
-            })
-        _pnl_summary = load_pnl().get("summary", {})
-        with open(".dashboard_status.json", "w") as _df:
-            json.dump({"cycle": CYCLE, "nav": pusd_bal, "ts": time.time(),
-                       "positions": _dash_positions, "pnl": _pnl_summary}, _df)
-    except Exception:
-        pass
 
     # Variable polling: 5s >2min, 1s ≤2min, sub-second in sell window (≤45s)
     _now = time.time() * 1000

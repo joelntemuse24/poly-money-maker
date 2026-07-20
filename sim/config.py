@@ -42,7 +42,6 @@ BOT_FORBIDDEN = frozenset(
         "pnl.json",
         "bot.log",
         ".env",
-        ".dashboard_status.json",
         ".heartbeat",
     }
 )
