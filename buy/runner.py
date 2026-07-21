@@ -239,7 +239,7 @@ def _record_dry_plan(
             "shares": config.shares,
             "set_cost": 1.0,
             "total_cost": config.shares,
-            "ttm_min": market.ttm_minutes(now),
+            "mts_min": market.minutes_to_start(now),
         }
     )
 
@@ -337,11 +337,11 @@ def run_once(
         trim_state(state, config.max_state_intents, config.max_dry_plans)
         save_state(state)
         logger.info(
-            "DRY MINT %s shares=%.6f cost=%.6f ttm=%.2fm",
+            "DRY MINT %s shares=%.6f cost=%.6f mts=%.2fm",
             candidate.slug,
             config.shares,
             config.shares,
-            candidate.ttm_minutes(now),
+            candidate.minutes_to_start(now),
         )
         return {
             "status": "planned",
