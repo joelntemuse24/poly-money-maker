@@ -84,35 +84,56 @@ class MarketGateway:
         data_api_url: str,
         timeout: float = 15.0,
         session: requests.Session | None = None,
+        discover_cache_s: float = 25.0,
     ):
         self.gamma_url = gamma_url.rstrip("/")
         self.data_api_url = data_api_url.rstrip("/")
         self.timeout = timeout
         self.session = session or requests.Session()
         self.session.headers.update({"User-Agent": "poly-money-maker-mint-buyer/0.1"})
+        self._discover_cache: dict = {"ts": 0.0, "key": "", "markets": []}
+        self.discover_cache_s = discover_cache_s
 
     def discover(self, series_slugs: list[str]) -> list[MintMarket]:
+        cache_key = ",".join(series_slugs)
+        now = time.time()
+        if (
+            self._discover_cache["markets"]
+            and self._discover_cache["key"] == cache_key
+            and (now - self._discover_cache["ts"]) < self.discover_cache_s
+        ):
+            return list(self._discover_cache["markets"])
+
         markets: Dict[str, MintMarket] = {}
         for series_slug in series_slugs:
-            response = self.session.get(
-                f"{self.gamma_url}/events",
-                params={
-                    "series_slug": series_slug,
-                    "active": "true",
-                    "closed": "false",
-                    "limit": "80",
-                },
-                timeout=self.timeout,
-            )
-            response.raise_for_status()
-            payload = response.json()
-            events = payload if isinstance(payload, list) else [payload]
-            for event in events:
-                if not isinstance(event, dict):
-                    raise ValueError("Gamma events response contained a non-object event")
-                for market in _parse_event(event, series_slug):
-                    markets[market.condition_id] = market
-        return sorted(markets.values(), key=lambda market: market.end_ts)
+            try:
+                response = self.session.get(
+                    f"{self.gamma_url}/events",
+                    params={
+                        "series_slug": series_slug,
+                        "active": "true",
+                        "closed": "false",
+                        "limit": "80",
+                    },
+                    timeout=self.timeout,
+                )
+                response.raise_for_status()
+                payload = response.json()
+                events = payload if isinstance(payload, list) else [payload]
+                for event in events:
+                    if not isinstance(event, dict):
+                        continue
+                    for market in _parse_event(event, series_slug):
+                        markets[market.condition_id] = market
+            except Exception:
+                pass
+
+        if not markets and self._discover_cache["markets"]:
+            return list(self._discover_cache["markets"])
+
+        result = sorted(markets.values(), key=lambda market: market.end_ts)
+        self._discover_cache = {"ts": now, "key": cache_key, "markets": result}
+        return result
 
     def positions(self, funder_address: str) -> Dict[str, float]:
         response = self.session.get(
