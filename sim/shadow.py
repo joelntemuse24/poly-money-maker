@@ -116,6 +116,19 @@ def acquire_lock() -> None:
     atexit.register(_release)
 
 
+_prev_state_sig = None
+
+
+def _save_state_if_changed(state: dict) -> None:
+    global _prev_state_sig
+    sig = (len(state.get("positions") or {}), state.get("n_open"), state.get("n_markets_seen"),
+           len(state.get("completed") or []), state.get("last_cycle_at"))
+    if sig == _prev_state_sig:
+        return
+    _prev_state_sig = sig
+    save_state(state)
+
+
 def write_heartbeat() -> None:
     try:
         assert_path_safe(cfg.HEARTBEAT_FILE)
@@ -439,7 +452,8 @@ def should_record_tick(pos: dict, seconds_left: float, strategy: dict, sim: dict
     return (now - last) >= min_gap
 
 
-def run_cycle(state: dict, strategy: dict, sim: dict, log: logging.Logger) -> None:
+def run_cycle(state: dict, strategy: dict, sim: dict, log: logging.Logger) -> list:
+    """Run one cycle. Returns the markets list for reuse by sleep logic."""
     now = time.time()
     positions: Dict[str, dict] = state.setdefault("positions", {})
 
@@ -452,7 +466,7 @@ def run_cycle(state: dict, strategy: dict, sim: dict, log: logging.Logger) -> No
         )
     except Exception as e:
         log.error("discover failed: %s", e)
-        return
+        return []
 
     enter_max = float(sim["enter_max_ttm_min"])
     enter_min = float(sim["enter_min_ttm_min"])
@@ -652,8 +666,9 @@ def run_cycle(state: dict, strategy: dict, sim: dict, log: logging.Logger) -> No
     state["last_cycle_at"] = now
     state["n_open"] = sum(1 for p in positions.values() if p.get("status") == "open")
     state["n_markets_seen"] = len(markets)
-    save_state(state)
+    _save_state_if_changed(state)
     write_heartbeat()
+    return markets
 
 
 def print_status(state: dict, log: logging.Logger) -> None:
@@ -747,14 +762,27 @@ def main(argv: Optional[List[str]] = None) -> int:
         log.exception("startup prune failed")
 
     state = load_state()
+    _prev_state_sig = None
     cycles = 0
     last_status = 0.0
     last_prune = 0.0
     last_disk_err_log = 0.0
+    _cfg_mtime = 0.0
+    strategy = load_strategy(args.config)
+    sim = load_sim(args.config)
 
     while not _shutdown:
-        strategy = load_strategy(args.config)
-        sim = load_sim(args.config)
+        # Reload config only if file mtime changed (not every cycle)
+        try:
+            cfg_path = args.config or cfg.STRATEGY_FILE
+            mtime = os.path.getmtime(cfg_path)
+            if mtime != _cfg_mtime:
+                strategy = load_strategy(args.config)
+                sim = load_sim(args.config)
+                _cfg_mtime = mtime
+        except OSError:
+            pass
+
         try:
             if time.time() - last_prune >= float(sim.get("prune_every_s", 120)):
                 pruned = prune_old_files(sim)
@@ -767,7 +795,7 @@ def main(argv: Optional[List[str]] = None) -> int:
                     log.info("PRUNE %s", pruned)
                 last_prune = time.time()
 
-            run_cycle(state, strategy, sim, log)
+            cycle_markets = run_cycle(state, strategy, sim, log)
             cycles += 1
             if time.time() - last_status >= 15:
                 print_status(state, log)
@@ -798,13 +826,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             break
 
         try:
-            mkts = discover_btc_markets(
-                series_slugs=series_slug_list(sim),
-                horizon_min=float(sim["discover_horizon_min"]),
-                lookback_min=1.0,
-                cache_s=float(sim.get("discover_refresh_s", 25.0)),
-            )
-            sleep_s = choose_sleep(state.get("positions") or {}, mkts, sim, strategy)
+            sleep_s = choose_sleep(state.get("positions") or {}, cycle_markets, sim, strategy)
         except Exception:
             sleep_s = float(sim["poll_far_s"])
         if is_disk_full():
