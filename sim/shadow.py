@@ -121,8 +121,8 @@ _prev_state_sig = None
 
 def _save_state_if_changed(state: dict) -> None:
     global _prev_state_sig
-    sig = (len(state.get("positions") or {}), state.get("n_open"), state.get("n_markets_seen"),
-           len(state.get("completed") or []), state.get("last_cycle_at"))
+    sig = (len(state.get("positions") or {}), state.get("n_open"),
+           len(state.get("completed") or []))
     if sig == _prev_state_sig:
         return
     _prev_state_sig = sig
