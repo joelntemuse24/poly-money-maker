@@ -2321,8 +2321,8 @@ recording path + fill + PnL data under `sim_data/`.
 
 ### 20.1 Goals
 
-- Paper-trade **all** markets in one or more series (default experiment: **BTC 15m + hourly**;
-  5m still supported via `series_slug` / `series_slugs`).
+- Paper-trade **all** markets in one or more series (default: **BTC 15m**;
+  multi-series supported via `series_slugs`).
 - Use **live** CLOB books (`GET /book`) — same public data the bot sees.
 - Apply configurable sell / last-chance / hedge rules (mirror bot policy shape).
 - Model **FAK fills** by walking real bid depth (not a free fill at best bid).
@@ -2353,14 +2353,17 @@ Each cycle of `python -m sim.shadow`:
 
 1. **Discover** markets for one or more series (`sim.series_slugs`, e.g.
    `btc-up-or-down-15m` + `btc-up-or-down-hourly`) via Gamma (cached ~25s).
-2. **Paper enter** markets with TTM in `[enter_min_ttm_min, enter_max_ttm_min]`
-   at calibrated complete-set cost (`sim.set_cost`, default **1.043** from history).
+2. **Paper enter** markets with minutes-to-start in `[enter_min_ttm_min, enter_max_ttm_min]`
+   (default **0–60 min before market start**) at deterministic mint cost
+   (`sim.set_cost`, default **1.0** for atomic pUSD split).
+   Start time is parsed from the slug timestamp (e.g. `btc-updown-15m-1784638800`),
+   not Gamma's `startDate` field (which reflects listing time, not window start).
    Optional live-book entry model exists behind `use_live_entry_books` (off by default).
 3. **Fetch books** for open paper positions with TTM ≤ `book_horizon_min`
-   (anytime experiments use a long horizon so books are polled early).
-4. **Evaluate policy** (`sim/policy.py`): threshold / window / optional last-chance /
-   optional hedge. Current experiment: **8¢ anytime** with **opposite-leg confirm**
-   (see §19.9).
+   (default **3 min** — only poll books near expiry, matching live bot behaviour).
+4. **Evaluate policy** (`sim/policy.py`): threshold / window / last-chance / hedge.
+   Current config mirrors the live bot: **10¢ threshold**, **45-second sell window**,
+   **10-second last-chance** at 35¢ (see §20.9).
 5. **Simulate FAK** (`sim/fills.py`, model `depth`): walk bids at/above limit;
    partial or zero fill → MISS (same failure class as thin books near expiry).
 6. **After expiry** resolve winner from bid dominance;
@@ -2420,50 +2423,37 @@ python -m sim.shadow --summary
 
 Do **not** run a second `bot.py`. Shadow is paper-only.
 
-### 20.9 Current shadow experiment (8¢ anytime + opposite confirm)
+### 20.9 Current shadow experiment (live-bot mirror, mint entry)
 
-As of mid-2026 the permanent `polyshadow` run is **not** the original 5m / last-45s
-live-bot mirror. Tunables live only in `sim/strategy.sim.json` (live `strategy.json`
-is untouched).
+As of July 2026 the permanent `polyshadow` run mirrors the live `polybot` sell
+strategy and the `polybuy` mint entry timing. Tunables live only in
+`sim/strategy.sim.json` (live `strategy.json` is untouched).
 
 | Knob | Value | Notes |
 |---|---|---|
-| Series | `btc-up-or-down-15m`, `btc-up-or-down-hourly` | Multi-series via `series_slugs` |
-| Sell threshold | **8¢** | Anytime a single leg best bid ≤ 8¢ |
-| Sell window | **120 min** | Effectively full market duration |
-| Last-chance | **off** (`sell_lastchance_s: 0`) | Threshold path only |
-| Opposite confirm | **`sell_confirm_opposite: 0.70`** | Sell only if the *other* leg bid ≥ 70¢ |
-| Data tag | `sim_data/15m1h-8c-conf/` | Fresh folder per experiment |
-| Prior unconfirmed | `sim_data/15m1h-8c-any/` | 8¢ anytime **without** confirm (baseline) |
-| Prior 12¢/2min | `sim_data/15m/` | Earlier 15m-only windowed run |
+| Series | `btc-up-or-down-15m` | 15-minute BTC up/down only |
+| Entry timing | **0–60 min before start** | Parsed from slug timestamp, not Gamma `startDate` |
+| Set cost | **1.0** | Atomic pUSD mint (not CLOB buy) |
+| Sell threshold | **10¢** | Sell losing leg when best bid ≤ 10¢ |
+| Sell window | **45 seconds** | Last 45s before expiry (`sell_window_min: 0.75`) |
+| Last-chance | **10s @ 35¢** | Final 10s, confirmed loser below 35¢ |
+| Opposite confirm | **off** (`sell_confirm_opposite: 0.0`) | No opposite-leg confirmation gate |
+| Book horizon | **3 min** | Only poll books for positions near expiry |
+| Data tag | `sim_data/15m-mint-live-strategy/` | Fresh folder for this experiment |
 
-#### Why opposite-leg confirmation
+#### Prior experiments (archived data)
 
-On the unconfirmed 8¢ anytime sample (~50 resolved markets):
+| Tag | Description |
+|---|---|
+| `sim_data/15m1h-8c-conf/` | 8¢ anytime + 70¢ opposite confirm (15m + hourly) |
+| `sim_data/15m1h-8c-any/` | 8¢ anytime without confirm (baseline) |
+| `sim_data/15m/` | Earlier 12¢ / 2min windowed run |
 
-- **Win rate ~90%**, avg win ~**+$0.16** (sell ~7¢ + redeem $1 − set cost 1.043).
-- **~3 wipeouts** (~**−$4.8** each): sold leg == eventual winner, `redeem=0`.
-- Those few disasters dominated mean EV (~**−$0.15**/market).
-
-Two interpretations of a wipeout:
-
-1. **False loser signal** — one leg printed cheap while the book was still soft /
-   two-sided; selling was premature.
-2. **True reversal** — opposite was already strong (≥70¢) at sell time, then the
-   market flipped before expiry.
-
-`sell_confirm_opposite` addresses (1): threshold sells require the opposite best
-bid ≥ the confirm level (default **70¢**). Reason codes:
-
-- `threshold` — leg ≤ sell threshold **and** opposite ≥ confirm
-- `threshold_unconfirmed` — leg ≤ threshold but opposite missing/soft → **no sell**
-- `both_legs_triggered` — both legs soft → no sell (unchanged)
-
-Each fill/close records **`sell_up_bid` / `sell_dn_bid`** at decision time so later
-analysis can separate reversals (opposite was high) from false signals (opposite
-was low — should be rare under confirm).
-
-Set `sell_confirm_opposite: 0` to disable (legacy unconfirmed behaviour).
+The 8¢ anytime experiment (~50 resolved markets) showed ~90% win rate but
+~3 wipeouts at −$4.8 each dominated mean EV (~−$0.15/market). The current
+experiment tests whether the live bot's tighter 45-second window with 10¢
+threshold and last-chance logic avoids those wipeouts while maintaining
+the win rate, using deterministic $1.00 mint entry instead of $1.043 CLOB.
 
 #### Policy module
 
@@ -2613,8 +2603,12 @@ Each `polybuy` cycle performs these steps in order:
    An intent that was persisted as `submitting` but has no transaction ID is
    changed to `ambiguous`; all new entry freezes unless both on-chain balances
    conclusively prove that the requested mint occurred.
-4. Discover configured Gamma series and keep only active, open,
-   `acceptingOrders=true`, non-neg-risk markets in the TTM entry window.
+4. Discover configured Gamma series and keep only active, open, non-neg-risk
+   markets whose **minutes to start** falls within `[enter_min_ttm_min,
+   enter_max_ttm_min]` (default **0–60 min before market start**). Start time is
+   parsed from the slug timestamp (e.g. `btc-updown-15m-1784638800`), not Gamma's
+   `startDate` field. The `acceptingOrders` check is dropped because minting is
+   on-chain and pre-start markets are not yet accepting CLOB orders.
 5. Fetch current Data API holdings and apply one-entry, open-set, open-notional,
    daily-notional, and deterministic set-cost caps.
 6. In dry-run, persist a bounded plan record only. No private key, Builder key,
@@ -2689,7 +2683,7 @@ defaults are deliberately conservative:
 | `entry_method` | `mint` | CLOB BUY is unsupported |
 | `series_slugs` | `btc-up-or-down-15m` | Independent target-series allowlist |
 | `shares` | `5.0` | pUSD deposited and shares minted per market |
-| `enter_min_ttm_min` / `enter_max_ttm_min` | `3` / `12` | Entry timing window |
+| `enter_min_ttm_min` / `enter_max_ttm_min` | `0` / `60` | Minutes before market start |
 | `max_set_cost` | `1.0` | Deterministic mint-cost gate; values below 1 are rejected as invalid config |
 | `max_open_sets` | `1` | Maximum active conditions |
 | `max_open_notional` | `5.0` | Maximum active pUSD-equivalent exposure |
@@ -2727,8 +2721,9 @@ Safe local/GCP checks:
 
 `--once` obeys the disabled config. `--plan` forces one public-data dry plan and
 cannot submit. Before considering live mode, run dry plans long enough to verify
-series selection, TTM, duplicate suppression, caps, Data API holdings, RPC
-health, logs, heartbeat, disk use, and coexistence with both current services.
+series selection, start-time filtering, duplicate suppression, caps, Data API
+holdings, RPC health, logs, heartbeat, disk use, and coexistence with both
+current services.
 
 The optional `deploy/polybuy.service` template runs with `Nice=15`,
 `CPUQuota=20%`, and `MemoryMax=200M`, below `polyshadow`, which is already below
