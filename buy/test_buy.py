@@ -97,7 +97,7 @@ class MarketTests(unittest.TestCase):
             "closed": False,
             "markets": [{
                 "conditionId": CONDITION,
-                "slug": "btc-updown-15m-test",
+                "slug": "btc-updown-15m-1800000000",
                 "question": "Bitcoin Up or Down",
                 "endDate": "2030-01-01T00:15:00Z",
                 "startDate": "2030-01-01T00:00:00Z",
@@ -177,7 +177,7 @@ class RunnerTests(unittest.TestCase):
         self.now = 1_800_000_000.0
         self.market = MintMarket(
             condition_id=CONDITION,
-            slug="btc-updown-15m-test",
+            slug="btc-updown-15m-1800000300",
             question="Bitcoin Up or Down",
             end_ts=self.now + 900,
             series_slug="btc-up-or-down-15m",

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 import time
 from dataclasses import dataclass
 from datetime import datetime
@@ -50,6 +51,20 @@ def _bool(value: Any) -> bool:
     return str(value).lower() in ("1", "true", "yes")
 
 
+_SLUG_TS_RE = re.compile(r"-(\d{10,})$")
+
+
+def _slug_start_ts(slug: str) -> Optional[float]:
+    """Extract the real market start timestamp from a slug like
+    'btc-updown-15m-1784638800'. Returns None if no timestamp found."""
+    m = _SLUG_TS_RE.search(slug or "")
+    if m:
+        ts = int(m.group(1))
+        if ts > 1_700_000_000:
+            return float(ts)
+    return None
+
+
 def _parse_event(event: dict, series_slug: str) -> Iterable[MintMarket]:
     for market in event.get("markets") or []:
         end = market.get("endDate") or event.get("endDate")
@@ -66,13 +81,18 @@ def _parse_event(event: dict, series_slug: str) -> Iterable[MintMarket]:
             end_ts = _end_timestamp(str(end))
         except (TypeError, ValueError):
             continue
-        try:
-            start_ts = _end_timestamp(str(start))
-        except (TypeError, ValueError):
-            start_ts = end_ts
+        slug = str(market.get("slug") or event.get("slug") or condition_id)
+        slug_start = _slug_start_ts(slug)
+        if slug_start is not None:
+            start_ts = slug_start
+        else:
+            try:
+                start_ts = _end_timestamp(str(start))
+            except (TypeError, ValueError):
+                start_ts = end_ts
         yield MintMarket(
             condition_id=str(condition_id),
-            slug=str(market.get("slug") or event.get("slug") or condition_id),
+            slug=slug,
             question=str(market.get("question") or event.get("title") or ""),
             end_ts=end_ts,
             series_slug=series_slug,
