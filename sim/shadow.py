@@ -463,9 +463,9 @@ def run_cycle(state: dict, strategy: dict, sim: dict, log: logging.Logger) -> No
         candidates = []
         entry_token_ids = set()
         for m in markets:
-            ttm_min = m.seconds_left(now) / 60.0
+            mts = m.minutes_to_start(now)
             last_attempt = attempts.get(m.condition_id) or {}
-            if m.condition_id in positions or not (enter_min <= ttm_min <= enter_max):
+            if m.condition_id in positions or not (enter_min <= mts <= enter_max):
                 continue
             if now - float(last_attempt.get("ts") or 0) < retry_s:
                 continue
@@ -511,9 +511,9 @@ def run_cycle(state: dict, strategy: dict, sim: dict, log: logging.Logger) -> No
                 continue
             positions[m.condition_id] = new_position(m, sim, now, estimate)
             log.info(
-                "ENTER %s ttm=%.1fm set_cost=%.3f shares=%.1f model=live_books",
+                "ENTER %s mts=%.1fm set_cost=%.3f shares=%.1f model=live_books",
                 m.slug,
-                m.seconds_left(now) / 60.0,
+                m.minutes_to_start(now),
                 estimate.set_cost,
                 sim["shares"],
             )
@@ -524,15 +524,15 @@ def run_cycle(state: dict, strategy: dict, sim: dict, log: logging.Logger) -> No
                 attempts.pop(condition_id, None)
     else:
         for m in markets:
-            ttm_min = m.seconds_left(now) / 60.0
+            mts = m.minutes_to_start(now)
             if m.condition_id in positions:
                 continue
-            if enter_min <= ttm_min <= enter_max:
+            if enter_min <= mts <= enter_max:
                 positions[m.condition_id] = new_position(m, sim, now)
                 log.info(
-                    "ENTER %s ttm=%.1fm set_cost=%.3f shares=%.1f",
+                    "ENTER %s mts=%.1fm set_cost=%.3f shares=%.1f",
                     m.slug,
-                    ttm_min,
+                    mts,
                     sim["set_cost"],
                     sim["shares"],
                 )

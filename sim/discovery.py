@@ -6,6 +6,7 @@ Read-only public HTTP. No auth. No order placement.
 from __future__ import annotations
 
 import json
+import re
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
@@ -23,6 +24,18 @@ SESSION.headers.update({"User-Agent": "poly-money-maker-shadow-sim/1.1"})
 _discover_cache: Dict[str, Any] = {"ts": 0.0, "markets": [], "series": ""}
 
 
+_SLUG_TS_RE = re.compile(r"-(\d{10,})$")
+
+
+def _slug_start_ts(slug: str) -> Optional[float]:
+    m = _SLUG_TS_RE.search(slug or "")
+    if m:
+        ts = int(m.group(1))
+        if ts > 1_700_000_000:
+            return float(ts)
+    return None
+
+
 @dataclass
 class Market:
     condition_id: str
@@ -33,10 +46,15 @@ class Market:
     dn_token: str
     closed: bool = False
     series_slug: str = ""
+    start_ts: float = 0.0
 
     def seconds_left(self, now: Optional[float] = None) -> float:
         now = time.time() if now is None else now
         return self.end_ts - now
+
+    def minutes_to_start(self, now: Optional[float] = None) -> float:
+        now = time.time() if now is None else now
+        return (self.start_ts - now) / 60.0
 
 
 @dataclass
@@ -109,16 +127,20 @@ def _events_to_markets(
         cond = m.get("conditionId") or m.get("condition_id") or ""
         if not cond:
             continue
+        slug = str(ev.get("slug") or m.get("slug") or cond[:12])
+        slug_start = _slug_start_ts(slug)
+        start_ts = slug_start if slug_start is not None else float(end_ts)
         out.append(
             Market(
                 condition_id=str(cond),
-                slug=str(ev.get("slug") or m.get("slug") or cond[:12]),
+                slug=slug,
                 question=str(ev.get("title") or m.get("question") or ""),
                 end_ts=float(end_ts),
                 up_token=str(up_token),
                 dn_token=str(dn_token),
                 closed=bool(m.get("closed") or ev.get("closed")),
                 series_slug=series_slug,
+                start_ts=start_ts,
             )
         )
     return out

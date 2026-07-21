@@ -48,39 +48,35 @@ BOT_FORBIDDEN = frozenset(
 
 # Strategy defaults ? 15m experiment (not live bot)
 STRATEGY_DEFAULTS = {
-    # Anytime 8c experiment: sell as soon as a leg bids <= 8c
-    "sell_threshold": 0.08,
+    "sell_threshold": 0.10,
     "hedge_enabled": False,
     "hedge_threshold": 0.50,
-    # Full market duration (covers hourly); sell not gated to last N minutes
-    "sell_window_min": 120.0,
-    "sell_grace_s": 5,
+    "sell_window_min": 0.75,
+    "sell_grace_s": 2,
     "sell_cooldown_s": 3,
-    # Last-chance off for this experiment (threshold-only anytime)
     "sell_lastchance_threshold": 0.35,
-    "sell_lastchance_s": 0,
-    # Require opposite bid >= this to fire threshold sell (0 = off)
-    "sell_confirm_opposite": 0.70,
+    "sell_lastchance_s": 10,
+    "sell_confirm_opposite": 0.0,
 }
 
 SIM_DEFAULTS = {
     "series_slug": DEFAULT_SERIES_SLUG,
     # Comma-separated multi-series (15m + hourly). Empty = use series_slug only.
-    "series_slugs": "btc-up-or-down-15m,btc-up-or-down-hourly",
+    "series_slugs": "btc-up-or-down-15m",
     # Fresh tag so anytime-8c results do not mix with prior 12c/2min run
-    "data_tag": "15m1h-8c-conf",
-    "set_cost": 1.043,
+    "data_tag": "15m-mint-live-strategy",
+    "set_cost": 1.0,
     "shares": 5.0,
     "use_live_entry_books": False,
-    "max_set_cost": 0.99,
-    "entry_limit_price": 0.99,
+    "max_set_cost": 1.0,
+    "entry_limit_price": 1.0,
     "entry_fill_model": "depth",
     "entry_slippage": 0.0,
     "entry_retry_s": 15.0,
     "max_entry_attempts": 500,
     # Enter early enough that "anytime" has room (hourly up to ~55m left)
-    "enter_max_ttm_min": 55.0,
-    "enter_min_ttm_min": 2.5,
+    "enter_max_ttm_min": 60.0,
+    "enter_min_ttm_min": 0.0,
     "poll_far_s": 5.0,
     "poll_near_s": 1.0,
     "poll_sell_s": 0.5,
@@ -88,7 +84,7 @@ SIM_DEFAULTS = {
     "discover_refresh_s": 25.0,
     "book_workers": 6,
     # Must cover full sell window — anytime means poll books for open positions
-    "book_horizon_min": 120.0,
+    "book_horizon_min": 3.0,
     "fill_model": "depth",
     "fill_slippage": 0.0,
     "no_fill_after_s": 0.0,
