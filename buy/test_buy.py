@@ -99,7 +99,8 @@ class MarketTests(unittest.TestCase):
                 "conditionId": CONDITION,
                 "slug": "btc-updown-15m-test",
                 "question": "Bitcoin Up or Down",
-                "endDate": "2030-01-01T00:10:00Z",
+                "endDate": "2030-01-01T00:15:00Z",
+                "startDate": "2030-01-01T00:00:00Z",
                 "clobTokenIds": '["101", "202"]',
                 "outcomes": '["Up", "Down"]',
                 "active": "true",
@@ -178,7 +179,7 @@ class RunnerTests(unittest.TestCase):
             condition_id=CONDITION,
             slug="btc-updown-15m-test",
             question="Bitcoin Up or Down",
-            end_ts=self.now + 600,
+            end_ts=self.now + 900,
             series_slug="btc-up-or-down-15m",
             up_token="101",
             dn_token="202",
@@ -186,6 +187,7 @@ class RunnerTests(unittest.TestCase):
             closed=False,
             accepting_orders=True,
             neg_risk=False,
+            start_ts=self.now + 300,
         )
         self.config = replace(
             BuyConfig(),

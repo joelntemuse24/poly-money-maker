@@ -106,13 +106,13 @@ def consume_arm() -> None:
 def eligible_markets(markets: list[MintMarket], config: BuyConfig, now: float) -> list[MintMarket]:
     eligible = []
     for market in markets:
-        ttm = market.ttm_minutes(now)
-        if not config.enter_min_ttm_min <= ttm <= config.enter_max_ttm_min:
+        mts = market.minutes_to_start(now)
+        if not config.enter_min_ttm_min <= mts <= config.enter_max_ttm_min:
             continue
-        if not market.active or market.closed or not market.accepting_orders or market.neg_risk:
+        if not market.active or market.closed or market.neg_risk:
             continue
         eligible.append(market)
-    return sorted(eligible, key=lambda market: market.end_ts)
+    return sorted(eligible, key=lambda market: market.start_ts)
 
 
 def _today_start(now: float) -> float:

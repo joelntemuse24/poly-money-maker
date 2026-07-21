@@ -24,8 +24,8 @@ class BuyConfig:
     entry_method: str = "mint"
     series_slugs: str = "btc-up-or-down-15m"
     shares: float = 5.0
-    enter_min_ttm_min: float = 3.0
-    enter_max_ttm_min: float = 12.0
+    enter_min_ttm_min: float = 0.0
+    enter_max_ttm_min: float = 60.0
     max_set_cost: float = 1.0
     max_open_sets: int = 1
     max_open_notional: float = 5.0

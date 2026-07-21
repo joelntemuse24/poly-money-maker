@@ -22,9 +22,13 @@ class MintMarket:
     closed: bool
     accepting_orders: bool
     neg_risk: bool
+    start_ts: float = 0.0
 
     def ttm_minutes(self, now: Optional[float] = None) -> float:
         return (self.end_ts - (time.time() if now is None else now)) / 60.0
+
+    def minutes_to_start(self, now: Optional[float] = None) -> float:
+        return (self.start_ts - (time.time() if now is None else now)) / 60.0
 
 
 def _list(value: Any) -> list:
@@ -49,6 +53,7 @@ def _bool(value: Any) -> bool:
 def _parse_event(event: dict, series_slug: str) -> Iterable[MintMarket]:
     for market in event.get("markets") or []:
         end = market.get("endDate") or event.get("endDate")
+        start = market.get("startDate") or event.get("startDate") or end
         condition_id = market.get("conditionId") or market.get("condition_id")
         tokens = _list(market.get("clobTokenIds"))
         outcomes = [str(value).lower() for value in _list(market.get("outcomes"))]
@@ -61,6 +66,10 @@ def _parse_event(event: dict, series_slug: str) -> Iterable[MintMarket]:
             end_ts = _end_timestamp(str(end))
         except (TypeError, ValueError):
             continue
+        try:
+            start_ts = _end_timestamp(str(start))
+        except (TypeError, ValueError):
+            start_ts = end_ts
         yield MintMarket(
             condition_id=str(condition_id),
             slug=str(market.get("slug") or event.get("slug") or condition_id),
@@ -73,6 +82,7 @@ def _parse_event(event: dict, series_slug: str) -> Iterable[MintMarket]:
             closed=_bool(market.get("closed", event.get("closed", False))),
             accepting_orders=_bool(market.get("acceptingOrders", False)),
             neg_risk=_bool(market.get("negRisk", event.get("negRisk", False))),
+            start_ts=start_ts,
         )
 
 
