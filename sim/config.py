@@ -48,10 +48,10 @@ BOT_FORBIDDEN = frozenset(
 
 # Strategy defaults ? 15m experiment (not live bot)
 STRATEGY_DEFAULTS = {
-    "sell_threshold": 0.10,
+    "sell_threshold": 0.05,
     "hedge_enabled": False,
     "hedge_threshold": 0.50,
-    "sell_window_min": 0.75,
+    "sell_window_min": 1.5,
     "sell_grace_s": 2,
     "sell_cooldown_s": 3,
     "sell_lastchance_threshold": 0.35,
@@ -84,7 +84,7 @@ SIM_DEFAULTS = {
     "discover_refresh_s": 25.0,
     "book_workers": 6,
     # Must cover full sell window — anytime means poll books for open positions
-    "book_horizon_min": 3.0,
+    "book_horizon_min": 2.5,
     "fill_model": "depth",
     "fill_slippage": 0.0,
     "no_fill_after_s": 0.0,

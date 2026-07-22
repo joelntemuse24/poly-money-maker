@@ -270,6 +270,10 @@ def finalize(pos: dict, log: logging.Logger) -> dict:
         "sell_seconds_left": pos.get("sell_seconds_left"),
         "sell_up_bid": pos.get("sell_up_bid"),
         "sell_dn_bid": pos.get("sell_dn_bid"),
+        "sell_best_bid_size": pos.get("sell_best_bid_size"),
+        "sell_total_bid_depth": pos.get("sell_total_bid_depth"),
+        "sell_bid_levels": pos.get("sell_bid_levels"),
+        "sell_avg_px_if_full_depth": pos.get("sell_avg_px_if_full_depth"),
         "sell_proceeds": pos.get("sell_proceeds"),
         "hedge_proceeds": pos.get("hedge_proceeds"),
         "triggered": pos.get("triggered"),
@@ -345,6 +349,24 @@ def apply_decision(pos, decision, up_book, dn_book, sim, strategy, now, seconds_
         no_fill_after_s=float(sim["no_fill_after_s"]),
     )
 
+    # Capture full bid depth at sell time for fill-quality analysis
+    bid_depth = []
+    for b in (book.bids or [])[:10]:
+        try:
+            bid_depth.append({"px": float(b.get("price", 0)), "sz": float(b.get("size", 0))})
+        except (TypeError, ValueError):
+            pass
+    total_bid_depth = sum(b["sz"] for b in bid_depth)
+    depth_at_size = 0.0
+    acc = 0.0
+    for b in bid_depth:
+        if acc >= size:
+            break
+        take = min(size - acc, b["sz"])
+        depth_at_size += take * b["px"]
+        acc += take
+    avg_px_if_full_depth = depth_at_size / size if size > 0 else 0.0
+
     max_ev = int(sim.get("max_events_per_pos", 200))
     evt = {
         "ts": now,
@@ -354,6 +376,9 @@ def apply_decision(pos, decision, up_book, dn_book, sim, strategy, now, seconds_
         "limit": limit,
         "best_bid": book.best_bid,
         "best_bid_size": book.best_bid_size,
+        "total_bid_depth": round(total_bid_depth, 2),
+        "bid_levels": len(bid_depth),
+        "avg_px_if_full_depth": round(avg_px_if_full_depth, 4),
         "filled": fill.filled,
         "avg_price": fill.avg_price,
         "fill_reason": fill.reason,
@@ -403,6 +428,10 @@ def apply_decision(pos, decision, up_book, dn_book, sim, strategy, now, seconds_
         pos["sell_seconds_left"] = round(seconds_left, 3)
         pos["sell_up_bid"] = up_book.best_bid if up_book else None
         pos["sell_dn_bid"] = dn_book.best_bid if dn_book else None
+        pos["sell_best_bid_size"] = book.best_bid_size
+        pos["sell_total_bid_depth"] = round(total_bid_depth, 2)
+        pos["sell_bid_levels"] = len(bid_depth)
+        pos["sell_avg_px_if_full_depth"] = round(avg_px_if_full_depth, 4)
 
     log.info(
         "FILL  %s %s %.4f@%.4f (%s) ttm=%.1fs bids=U%s/D%s rem_up=%.2f rem_dn=%.2f",
