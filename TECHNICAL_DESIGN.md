@@ -2360,17 +2360,27 @@ Each cycle of `python -m sim.shadow`:
    not Gamma's `startDate` field (which reflects listing time, not window start).
    Optional live-book entry model exists behind `use_live_entry_books` (off by default).
 3. **Fetch books** for open paper positions with TTM ≤ `book_horizon_min`
-   (default **3 min** — only poll books near expiry, matching live bot behaviour).
+   (default **2.5 min** — only poll books near expiry, matching the wider sell window).
 4. **Evaluate policy** (`sim/policy.py`): threshold / window / last-chance / hedge.
-   Current config mirrors the live bot: **10¢ threshold**, **45-second sell window**,
+   Current config: **5¢ threshold**, **90-second sell window**,
    **10-second last-chance** at 35¢ (see §20.9).
-5. **Simulate FAK** (`sim/fills.py`, model `depth`): walk bids at/above limit;
-   partial or zero fill → MISS (same failure class as thin books near expiry).
-6. **After expiry** resolve winner from bid dominance;
+5. **Latency friction** (`exec_latency_s`, default 2s): after a sell decision,
+   sleep 2 seconds then **re-fetch the book** before simulating the fill.
+   This models the CLOB order-submission round-trip — the bid may have moved.
+6. **Simulate FAK** (`sim/fills.py`, model `depth`): walk bids at/above limit.
+   **Queue priority friction** (`exec_queue_fraction`, default 0.7) reduces
+   available bid sizes by 30% before the walk — we sit behind resting orders.
+   Partial or zero fill → MISS (same failure class as thin books near expiry).
+7. **Mint timing friction** (`exec_mint_delay_s`, default 4s): entry is delayed
+   by 4 seconds to model the on-chain approve+split transaction. If the market
+   starts during the delay (mts < 0), the entry is skipped with a `MINT MISS` log.
+8. **After expiry** resolve winner from bid dominance;
    `PnL = sell_proceeds + hedge + redeem − entry_cost`.
-7. **Persist** results under `sim_data/<data_tag>/`; prune on a timer.
+9. **Persist** results under `sim_data/<data_tag>/`; prune on a timer.
+   State is only written when the position set changes (dedup via signature).
 
 Adaptive sleep: far markets ~5s, near ~1s, inside sell window ~0.5s.
+Config is cached and only reloaded when `strategy.sim.json` mtime changes.
 
 ### 20.4 Package Layout
 
@@ -2390,7 +2400,7 @@ Adaptive sleep: far markets ~5s, near ~1s, inside sell window ~0.5s.
 | Path | Content |
 |---|---|
 | `shadow_state.json` | Open paper positions |
-| `results.jsonl` | One line per completed market (PnL, fills, misses) |
+| `results.jsonl` | One line per completed market (PnL, fills, misses, bid depth) |
 | `ticks/<conditionId>.jsonl` | Sampled bid path |
 | `trades/<conditionId>.json` | Full trade record + events |
 | `shadow.log` | Rotating operator log |
@@ -2434,11 +2444,14 @@ strategy and the `polybuy` mint entry timing. Tunables live only in
 | Series | `btc-up-or-down-15m` | 15-minute BTC up/down only |
 | Entry timing | **0–60 min before start** | Parsed from slug timestamp, not Gamma `startDate` |
 | Set cost | **1.0** | Atomic pUSD mint (not CLOB buy) |
-| Sell threshold | **10¢** | Sell losing leg when best bid ≤ 10¢ |
-| Sell window | **45 seconds** | Last 45s before expiry (`sell_window_min: 0.75`) |
+| Sell threshold | **5¢** | Sell losing leg when best bid ≤ 5¢ (avoids reversal zone) |
+| Sell window | **90 seconds** | Last 90s before expiry (`sell_window_min: 1.5`) |
 | Last-chance | **10s @ 35¢** | Final 10s, confirmed loser below 35¢ |
 | Opposite confirm | **off** (`sell_confirm_opposite: 0.0`) | No opposite-leg confirmation gate |
-| Book horizon | **3 min** | Only poll books for positions near expiry |
+| Book horizon | **2.5 min** | Only poll books for positions near expiry |
+| Latency friction | **2s** (`exec_latency_s`) | Re-fetch book after sell decision to model CLOB round-trip |
+| Queue priority | **70%** (`exec_queue_fraction`) | Reduce available bid sizes — behind resting orders |
+| Mint delay | **4s** (`exec_mint_delay_s`) | On-chain approve+split delay; skip if market starts during mint |
 | Data tag | `sim_data/15m-mint-live-strategy/` | Fresh folder for this experiment |
 
 #### Prior experiments (archived data)
@@ -2450,10 +2463,14 @@ strategy and the `polybuy` mint entry timing. Tunables live only in
 | `sim_data/15m/` | Earlier 12¢ / 2min windowed run |
 
 The 8¢ anytime experiment (~50 resolved markets) showed ~90% win rate but
-~3 wipeouts at −$4.8 each dominated mean EV (~−$0.15/market). The current
-experiment tests whether the live bot's tighter 45-second window with 10¢
-threshold and last-chance logic avoids those wipeouts while maintaining
-the win rate, using deterministic $1.00 mint entry instead of $1.043 CLOB.
+~3 wipeouts at −$4.8 each dominated mean EV (~−$0.15/market). A subsequent
+10¢/45s experiment (81 markets) showed **+$0.086/market** with only 1 wipeout
+(1.2% vs 6% prior), 70% win rate, median sell at 2¢. The single wipeout sold
+at 8¢ — still in the reversal zone — prompting the current 5¢/90s experiment
+which lowers the threshold to avoid selling while the outcome is still
+uncertain. Three execution frictions (latency, queue priority, mint delay)
+are now simulated to provide a pessimistic estimate of live performance.
+If the edge survives friction, the real live gap is small.
 
 #### Policy module
 
@@ -2462,9 +2479,11 @@ the win rate, using deterministic $1.00 mint entry instead of $1.043 CLOB.
 
 ### 20.7 What Shadow Does Not Prove
 
-- Entry fill quality (still open; see §2.2.1) — entry is a fixed calibrated cost.
-- Queue priority / adverse selection beyond the snapshot book.
-- Relayer / redemption latency (shadow assumes $1 redeem on the inferred winner).
+- Relayer / redemption latency beyond the simulated mint delay — the 4s
+  `exec_mint_delay_s` models the approve+split round-trip but not rare
+  congestion or nonce-stall scenarios.
+- Adverse selection beyond the queue-priority model — real CLOB orders may
+  face additional slippage from market makers pulling bids.
 - Perfect isolation from rate limits if both processes hammer the public API
   (mitigated by cache + book horizon + lower sell poll rate).
 - Host disk capacity — the app cannot enlarge a 10GB GCP boot disk; operators must
