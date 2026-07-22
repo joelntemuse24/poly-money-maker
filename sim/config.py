@@ -54,7 +54,7 @@ STRATEGY_DEFAULTS = {
     "sell_window_min": 1.5,
     "sell_grace_s": 2,
     "sell_cooldown_s": 3,
-    "sell_lastchance_threshold": 0.35,
+    "sell_lastchance_threshold": 0.25,
     "sell_lastchance_s": 10,
     "sell_confirm_opposite": 0.0,
 }
