@@ -2394,6 +2394,7 @@ Config is cached and only reloaded when `strategy.sim.json` mtime changes.
 | `sim/config.py` | Paths, defaults, `load_strategy` / `load_sim` |
 | `sim/analyze_history.py` | Calibrate `set_cost` from trade export CSV |
 | `sim/strategy.sim.json` | Tunables (strategy + sim economics) |
+| `sim/strategy.sim.50.json` | 50-share scaling test config (parallel instance) |
 
 ### 20.5 Outputs (`sim_data/`, gitignored)
 
@@ -2446,7 +2447,7 @@ strategy and the `polybuy` mint entry timing. Tunables live only in
 | Set cost | **1.0** | Atomic pUSD mint (not CLOB buy) |
 | Sell threshold | **5¢** | Sell losing leg when best bid ≤ 5¢ (avoids reversal zone) |
 | Sell window | **90 seconds** | Last 90s before expiry (`sell_window_min: 1.5`) |
-| Last-chance | **10s @ 35¢** | Final 10s, confirmed loser below 35¢ |
+| Last-chance | **10s @ 25¢** | Final 10s, sell if leg < 25¢ AND opposite ≥ 75¢ |
 | Opposite confirm | **off** (`sell_confirm_opposite: 0.0`) | No opposite-leg confirmation gate |
 | Book horizon | **2.5 min** | Only poll books for positions near expiry |
 | Latency friction | **2s** (`exec_latency_s`) | Re-fetch book after sell decision to model CLOB round-trip |
@@ -2471,6 +2472,25 @@ which lowers the threshold to avoid selling while the outcome is still
 uncertain. Three execution frictions (latency, queue priority, mint delay)
 are now simulated to provide a pessimistic estimate of live performance.
 If the edge survives friction, the real live gap is small.
+
+#### Scaling test (50 shares)
+
+A **parallel sim instance** (`polyshadow50.service`) runs at **50 shares/side**
+against the same live books to measure fill quality at scale. Config lives in
+`sim/strategy.sim.50.json` with `data_tag=15m-mint-live-strategy-50sh` to keep
+results isolated. The FAK fill model walks real bid depth, so at 50 shares it
+hits deeper levels and reveals real slippage during the sell window.
+
+Compare 5-share vs 50-share results:
+
+```bash
+echo "=== 5 shares ===" && .venv/bin/python -m sim.shadow --summary
+echo "=== 50 shares ===" && .venv/bin/python -m sim.shadow --config sim/strategy.sim.50.json --summary
+```
+
+If PnL scales linearly (50-share PnL ≈ 10× 5-share PnL), the order book has
+ample depth and the strategy is scalable. If 50-share fill prices degrade
+significantly, depth is a binding constraint.
 
 #### Policy module
 
