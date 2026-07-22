@@ -338,10 +338,35 @@ def apply_decision(pos, decision, up_book, dn_book, sim, strategy, now, seconds_
     if size < 0.01 or book is None:
         return
 
+    # --- Latency friction: sleep, then re-fetch the book ---
+    latency_s = float(sim.get("exec_latency_s", 0.0))
+    if latency_s > 0:
+        time.sleep(latency_s)
+        now += latency_s
+        seconds_left -= latency_s
+        from .discovery import fetch_book
+        fresh = fetch_book(book.token_id)
+        if fresh and fresh.ok:
+            book = fresh
+            if leg == "up":
+                up_book = fresh
+            else:
+                dn_book = fresh
+
     limit = decision.limit_price
+
+    # --- Queue priority friction: reduce available bid sizes ---
+    queue_frac = float(sim.get("exec_queue_fraction", 1.0))
+    adjusted_bids = book.bids
+    if queue_frac < 1.0 and book.bids:
+        adjusted_bids = [
+            {**b, "size": float(b.get("size", 0)) * queue_frac}
+            for b in book.bids
+        ]
+
     fill = simulate_fak_sell(
         size=size,
-        bids=book.bids,
+        bids=adjusted_bids,
         limit_price=limit,
         model=sim["fill_model"],
         slippage=float(sim["fill_slippage"]),
@@ -566,16 +591,31 @@ def run_cycle(state: dict, strategy: dict, sim: dict, log: logging.Logger) -> li
             for condition_id in oldest[: len(attempts) - max_attempts]:
                 attempts.pop(condition_id, None)
     else:
+        mint_delay = float(sim.get("exec_mint_delay_s", 0.0))
         for m in markets:
             mts = m.minutes_to_start(now)
             if m.condition_id in positions:
                 continue
             if enter_min <= mts <= enter_max:
-                positions[m.condition_id] = new_position(m, sim, now)
+                if mint_delay > 0:
+                    mts_after_delay = m.minutes_to_start(now + mint_delay)
+                    if mts_after_delay < enter_min:
+                        log.info(
+                            "MINT MISS %s mts=%.1fm -> %.1fm after %.1fs delay",
+                            m.slug, mts, mts_after_delay, mint_delay,
+                        )
+                        continue
+                    log.info(
+                        "MINT WAIT %s mts=%.1fm delay=%.1fs",
+                        m.slug, mts, mint_delay,
+                    )
+                    time.sleep(mint_delay)
+                entry_ts = time.time()
+                positions[m.condition_id] = new_position(m, sim, entry_ts)
                 log.info(
                     "ENTER %s mts=%.1fm set_cost=%.3f shares=%.1f",
                     m.slug,
-                    mts,
+                    m.minutes_to_start(entry_ts),
                     sim["set_cost"],
                     sim["shares"],
                 )

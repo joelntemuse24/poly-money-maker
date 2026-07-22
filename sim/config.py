@@ -88,6 +88,16 @@ SIM_DEFAULTS = {
     "fill_model": "depth",
     "fill_slippage": 0.0,
     "no_fill_after_s": 0.0,
+    # --- Execution friction simulation ---
+    # Latency: seconds between sell decision and fill evaluation.
+    # Sim sleeps this long, then re-fetches the book to see if it moved.
+    "exec_latency_s": 2.0,
+    # Queue priority: fraction of top-of-book size available to us (0-1).
+    # We're behind resting orders, so we get less than full displayed size.
+    "exec_queue_fraction": 0.7,
+    # Mint timing: seconds for on-chain approve+split transaction.
+    # Entry is delayed by this amount; if market starts during mint, we miss it.
+    "exec_mint_delay_s": 4.0,
     "post_expiry_record_s": 90.0,
     "resolve_bid_edge": 0.70,
     # Ticks off by default — results.jsonl is enough for strategy stats
