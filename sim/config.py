@@ -88,6 +88,7 @@ SIM_DEFAULTS = {
     "fill_model": "depth",
     "fill_slippage": 0.0,
     "no_fill_after_s": 0.0,
+    "sell_limit_price": 0.0,
     # --- Execution friction simulation ---
     # Latency: seconds between sell decision and fill evaluation.
     # Sim sleeps this long, then re-fetches the book to see if it moved.

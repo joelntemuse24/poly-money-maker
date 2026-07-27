@@ -353,7 +353,8 @@ def apply_decision(pos, decision, up_book, dn_book, sim, strategy, now, seconds_
             else:
                 dn_book = fresh
 
-    limit = decision.limit_price
+    sell_limit = float(sim.get("sell_limit_price", 0.0))
+    limit = sell_limit if sell_limit > 0 else decision.limit_price
 
     # --- Queue priority friction: reduce available bid sizes ---
     queue_frac = float(sim.get("exec_queue_fraction", 1.0))

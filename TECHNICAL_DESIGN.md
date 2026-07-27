@@ -2395,6 +2395,9 @@ Config is cached and only reloaded when `strategy.sim.json` mtime changes.
 | `sim/analyze_history.py` | Calibrate `set_cost` from trade export CSV |
 | `sim/strategy.sim.json` | Tunables (strategy + sim economics) |
 | `sim/strategy.sim.50.json` | 50-share scaling test config (parallel instance) |
+| `sim/strategy.sim.limit5c.json` | 5¢ limit sell + hourly markets experiment config |
+| `deploy/polyshadow50.service` | systemd unit for 50-share sim |
+| `deploy/polyshadow-limit5c.service` | systemd unit for 5¢ limit + hourly sim |
 
 ### 20.5 Outputs (`sim_data/`, gitignored)
 
@@ -2481,6 +2484,10 @@ against the same live books to measure fill quality at scale. Config lives in
 results isolated. The FAK fill model walks real bid depth, so at 50 shares it
 hits deeper levels and reveals real slippage during the sell window.
 
+Early results (34 resolved markets): **$0.778/market** mean PnL, 68% win rate,
+2.5¢ avg sell price, 14.7% trigger miss rate. Compared to 5-share ($0.082/market),
+scaling is **~95% linear** — only 5% slippage from queue priority at 10× size.
+
 Compare 5-share vs 50-share results:
 
 ```bash
@@ -2491,6 +2498,29 @@ echo "=== 50 shares ===" && .venv/bin/python -m sim.shadow --config sim/strategy
 If PnL scales linearly (50-share PnL ≈ 10× 5-share PnL), the order book has
 ample depth and the strategy is scalable. If 50-share fill prices degrade
 significantly, depth is a binding constraint.
+
+#### 5¢ limit sell + hourly markets experiment
+
+A **third parallel sim** (`polyshadow-limit5c.service`) tests two revenue levers:
+
+1. **5¢ limit sell** (`sell_limit_price: 0.05`) — FAK fill only from bids at or
+   above 5¢. Instead of selling at whatever the bid is (avg 2.5¢), we hold for 5¢.
+   If the bid drops below 5¢, no fill — keep polling. Last-chance logic still
+   catches truly dead legs in the final 10s.
+2. **Hourly markets** (`series_slugs: btc-up-or-down-15m,btc-up-or-down-hourly`) —
+   adds ~24 markets/day on top of 15m's ~96, increasing throughput by 25%.
+3. **0.1s sell-window polling** (`poll_sell_s: 0.1`) — faster polling to catch
+   the 5¢ bid before it drops. Tests whether rate limits allow this in production.
+
+Config: `sim/strategy.sim.limit5c.json`, data tag `15m-hourly-limit5c`.
+
+```bash
+echo "=== limit5c ===" && .venv/bin/python -m sim.shadow --config sim/strategy.sim.limit5c.json --summary
+```
+
+If mean PnL increases from $0.08 to ~$0.15+ per market, the 5¢ limit captures
+revenue we were leaving on the table. Combined with hourly markets, this could
+push hourly earnings from ~$3/hr to ~$7-8/hr at 50 shares.
 
 #### Policy module
 
@@ -2526,15 +2556,36 @@ On the GCP instance (~10GB root disk), the root filesystem hit **100% full**
 
 | Path | Approx size | Role |
 |---|---|---|
-| `/var/log` | **~5.0 GB** | **Primary consumer** (journal + system logs) |
-| `/usr` | ~2.4 GB | OS packages / google-cloud-sdk |
-| `/home/.../poly-money-maker` | ~0.25 GB | repo + venv |
-| `sim_data/` | **~5 MB** | shadow outputs — **not** the 5GB culprit |
+| `/var/log/syslog` | **4.0 GB** | **Primary consumer** — sim stdout via systemd → syslog |
+| `/var/log/syslog.1` | **948 MB** | Rotated previous syslog |
+| `/var/log/btmp` | 12 MB | Failed SSH attempts |
+| `/var/log/journal/` | 21 MB | journald (already capped) |
+| `sim_data/` | **~11 MB** | shadow outputs — **not** the culprit |
 
-Earlier design work correctly capped **RAM** (`MemoryMax=400M`) and **CPU**
-(`Nice`, `CPUQuota`) for co-running with `polybot`. That does **not** limit
-**disk**. Tick logging could grow `sim_data` over time, but in this incident
-host logs dominated.
+The journald cap (`deploy/journald-size.conf`) was correctly applied, but
+**rsyslog** had no size limit. Systemd routes sim stdout/stderr to both journald
+and syslog, so the same log lines were written twice — journald stayed small
+but syslog grew unbounded to ~5 GB over the weekend.
+
+#### Fix applied (2026-07-27)
+
+1. **Disk resized** from 10 GB → 20 GB via GCP console (stop/start, auto-expands).
+2. **Truncated** `/var/log/syslog`, `syslog.1`, `btmp` to reclaim 5 GB.
+3. **rsyslog size cap** — `/etc/rsyslog.d/99-size-limit.conf`:
+   ```text
+   $MaxFileSize 50M
+   $MaxFiles 2
+   ```
+   Caps syslog at 100 MB total (2 × 50 MB rotated files).
+4. **journald cap confirmed** — `/etc/systemd/journald.conf.d/99-size.conf`:
+   ```ini
+   [Journal]
+   SystemMaxUse=100M
+   MaxFileSec=3day
+   ```
+
+Combined log ceiling: ~200 MB (100 MB syslog + 100 MB journal). Cannot fill a
+20 GB disk.
 
 #### App-side prevention (in repo)
 
