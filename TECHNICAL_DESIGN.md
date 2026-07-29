@@ -2484,9 +2484,11 @@ against the same live books to measure fill quality at scale. Config lives in
 results isolated. The FAK fill model walks real bid depth, so at 50 shares it
 hits deeper levels and reveals real slippage during the sell window.
 
-Early results (34 resolved markets): **$0.778/market** mean PnL, 68% win rate,
-2.5¢ avg sell price, 14.7% trigger miss rate. Compared to 5-share ($0.082/market),
-scaling is **~95% linear** — only 5% slippage from queue priority at 10× size.
+Early results (179 resolved markets): **$0.124/market** mean PnL, 71% win rate,
+2.7¢ avg sell price, 7.8% trigger miss rate. Compared to 5-share ($0.020/market
+over 206 markets), scaling is **~62% linear** — reversals at 50 shares cost 10×
+more, dragging the ratio below the first batch's 95%. Win rate is stable (70-71%)
+across both sizes. Reversal rate is ~1.5-1.7%, the primary EV drag.
 
 Compare 5-share vs 50-share results:
 
@@ -2499,28 +2501,31 @@ If PnL scales linearly (50-share PnL ≈ 10× 5-share PnL), the order book has
 ample depth and the strategy is scalable. If 50-share fill prices degrade
 significantly, depth is a binding constraint.
 
-#### 5¢ limit sell + hourly markets experiment
+#### 5¢ limit sell experiment (failed — killed 2026-07-29)
 
-A **third parallel sim** (`polyshadow-limit5c.service`) tests two revenue levers:
+A **third sim** (`polyshadow-limit5c.service`) tested a 5¢ FAK limit sell
+(`sell_limit_price: 0.05`) with 0.1s polling and 15m+hourly markets.
 
-1. **5¢ limit sell** (`sell_limit_price: 0.05`) — FAK fill only from bids at or
-   above 5¢. Instead of selling at whatever the bid is (avg 2.5¢), we hold for 5¢.
-   If the bid drops below 5¢, no fill — keep polling. Last-chance logic still
-   catches truly dead legs in the final 10s.
-2. **Hourly markets** (`series_slugs: btc-up-or-down-15m,btc-up-or-down-hourly`) —
-   adds ~24 markets/day on top of 15m's ~96, increasing throughput by 25%.
-3. **0.1s sell-window polling** (`poll_sell_s: 0.1`) — faster polling to catch
-   the 5¢ bid before it drops. Tests whether rate limits allow this in production.
+**Result (176 resolved markets): negative EV.**
 
-Config: `sim/strategy.sim.limit5c.json`, data tag `15m-hourly-limit5c`.
+| Metric | Market sell (5sh) | 5¢ limit |
+|---|---|---|
+| Win rate | 70% | **24%** |
+| Trigger miss | 8% | **46%** |
+| Avg sell price | 2.6¢ | 6.6¢ |
+| Mean PnL | +$0.020 | **-$0.026** |
 
-```bash
-echo "=== limit5c ===" && .venv/bin/python -m sim.shadow --config sim/strategy.sim.limit5c.json --summary
-```
+**Why it failed:** At 5¢ the outcome is still uncertain — the bid bounces back
+~46% of the time (trigger miss), and when it does fill, the leg reverses often
+enough that win rate collapses to 24%. The higher sell price (6.6¢ vs 2.6¢)
+does not compensate for the reversals and missed sells.
 
-If mean PnL increases from $0.08 to ~$0.15+ per market, the 5¢ limit captures
-revenue we were leaving on the table. Combined with hourly markets, this could
-push hourly earnings from ~$3/hr to ~$7-8/hr at 50 shares.
+**Conclusion:** Selling at the current market bid (avg 2.6¢) is better than
+holding for 5¢. The low sell price is a feature, not a bug — it confirms the
+leg is truly dead. The `sell_limit_price` config option remains in the codebase
+for future experiments but is set to 0 (off) by default.
+
+Service stopped and disabled. Config archived as `sim/strategy.sim.limit5c.json`.
 
 #### Policy module
 
