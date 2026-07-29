@@ -2395,9 +2395,13 @@ Config is cached and only reloaded when `strategy.sim.json` mtime changes.
 | `sim/analyze_history.py` | Calibrate `set_cost` from trade export CSV |
 | `sim/strategy.sim.json` | Tunables (strategy + sim economics) |
 | `sim/strategy.sim.50.json` | 50-share scaling test config (parallel instance) |
-| `sim/strategy.sim.limit5c.json` | 5¢ limit sell + hourly markets experiment config |
+| `sim/strategy.sim.limit5c.json` | 5¢ limit sell experiment (failed, archived) |
+| `sim/strategy.sim.hedge40.json` | Hedge at 40c test config |
+| `sim/strategy.sim.hedge45.json` | Hedge at 45c test config |
 | `deploy/polyshadow50.service` | systemd unit for 50-share sim |
-| `deploy/polyshadow-limit5c.service` | systemd unit for 5¢ limit + hourly sim |
+| `deploy/polyshadow-limit5c.service` | systemd unit for 5¢ limit sim (stopped) |
+| `deploy/polyshadow-hedge40.service` | systemd unit for hedge-40c sim |
+| `deploy/polyshadow-hedge45.service` | systemd unit for hedge-45c sim |
 
 ### 20.5 Outputs (`sim_data/`, gitignored)
 
@@ -2526,6 +2530,39 @@ leg is truly dead. The `sell_limit_price` config option remains in the codebase
 for future experiments but is set to 0 (off) by default.
 
 Service stopped and disabled. Config archived as `sim/strategy.sim.limit5c.json`.
+
+#### Hedge experiment (40c / 45c — started 2026-07-29)
+
+The primary EV drag is **reversals** (~1.5% of markets): we sell the loser at
+~2.7¢, then the "winner" collapses and expires worthless — a ~$48.65 loss at
+50 shares that wipes out ~36 good markets.
+
+The hedge logic (`policy.py:44-50`) sells the remaining winner if its bid drops
+below `hedge_threshold` after the loser is already sold. This caps the reversal
+loss at ~(1 - threshold) × shares instead of the full entry cost.
+
+Two parallel sims test different thresholds:
+
+| Sim | Threshold | Reversal loss (50sh) | False hedge risk |
+|---|---|---|---|
+| `polyshadow-hedge40` | 40¢ | -$30 (sell winner at 40c) | Lower — winner must drop below 40c |
+| `polyshadow-hedge45` | 45¢ | -$27.50 (sell winner at 45c) | Slightly higher — catches more reversals but more false hedges |
+
+**False hedge risk:** If the winner temporarily dips below the threshold then
+recovers to $1, we sold it for $0.40-0.45 instead of redeeming for $1.00 —
+a $0.55-0.60 unnecessary loss. The 90-second sell window limits this exposure
+since markets resolve quickly.
+
+Configs: `sim/strategy.sim.hedge40.json`, `sim/strategy.sim.hedge45.json`.
+Data tags: `15m-hedge40`, `15m-hedge45`.
+
+```bash
+echo "=== hedge40 ===" && .venv/bin/python -m sim.shadow --config sim/strategy.sim.hedge40.json --summary
+echo "=== hedge45 ===" && .venv/bin/python -m sim.shadow --config sim/strategy.sim.hedge45.json --summary
+```
+
+Compare against the no-hedge baseline (`polyshadow`, 5 shares). If mean PnL
+increases from $0.020 to $0.05+ per market, the hedge is net positive.
 
 #### Policy module
 
