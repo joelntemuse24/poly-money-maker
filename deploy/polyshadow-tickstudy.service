@@ -1,0 +1,19 @@
+[Unit]
+Description=Polymarket BTC shadow simulator — tick study with bid path recording (paper trade only)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ntemusejoel
+WorkingDirectory=/home/ntemusejoel/poly-money-maker
+Environment=PYTHONUNBUFFERED=1
+Nice=12
+ExecStart=/home/ntemusejoel/poly-money-maker/.venv/bin/python -m sim.shadow --config sim/strategy.sim.tickstudy.json
+Restart=always
+RestartSec=5
+MemoryMax=400M
+CPUQuota=30%
+
+[Install]
+WantedBy=multi-user.target
