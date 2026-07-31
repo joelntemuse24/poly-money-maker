@@ -353,6 +353,40 @@ def apply_decision(pos, decision, up_book, dn_book, sim, strategy, now, seconds_
             else:
                 dn_book = fresh
 
+    # --- Post-latency validation: cancel sell if the leg bounced back ---
+    # The decision was made when the bid was <= threshold. After latency,
+    # the bid may have recovered. If it's now above the threshold, the leg
+    # is not dying — cancel the sell to avoid selling a recovering (or winning) leg.
+    thr = float(strategy["sell_threshold"])
+    last_thr = float(strategy["sell_lastchance_threshold"])
+    post_bid = book.best_bid if book and book.ok else None
+    if post_bid is not None and decision.reason in ("threshold", "last_chance"):
+        cancel_threshold = last_thr if decision.reason == "last_chance" else thr
+        if post_bid > cancel_threshold:
+            log.info(
+                "CANCEL %s %s bid bounced %.4f -> %.4f (> %.4f) during %.1fs latency, skipping",
+                pos["slug"],
+                decision.action,
+                decision.limit_price or 0,
+                post_bid,
+                cancel_threshold,
+                latency_s,
+            )
+            evt = {
+                "ts": now,
+                "seconds_left": round(seconds_left, 3),
+                "action": "cancel",
+                "reason": "bid_bounced_after_latency",
+                "trigger_bid": decision.limit_price,
+                "post_latency_bid": post_bid,
+                "threshold": cancel_threshold,
+            }
+            events = pos.setdefault("events", [])
+            events.append(evt)
+            if len(events) > int(sim.get("max_events_per_pos", 200)):
+                pos["events"] = events[-int(sim.get("max_events_per_pos", 200)):]
+            return
+
     sell_limit = float(sim.get("sell_limit_price", 0.0))
     limit = sell_limit if sell_limit > 0 else decision.limit_price
 
