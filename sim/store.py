@@ -305,43 +305,59 @@ def summarize_results(path: Optional[str] = None) -> dict:
     path = path or cfg.RESULTS_FILE
     if not os.path.exists(path):
         return {"n": 0, "path": path}
-    rows: List[dict] = []
+
+    n_total = 0
+    n_resolved = 0
+    n_unresolved = 0
+    sum_pnl = 0.0
+    n_win = 0
+    n_sell = 0
+    n_miss = 0
+    sum_sell_px = 0.0
+    sum_set_cost = 0.0
+
     with open(path, "r", encoding="utf-8") as f:
         for line in f:
             line = line.strip()
-            if line:
-                try:
-                    rows.append(json.loads(line))
-                except json.JSONDecodeError:
-                    continue
-    if not rows:
-        return {"n": 0, "path": path}
+            if not line:
+                continue
+            try:
+                r = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            n_total += 1
+            resolved = r.get("winner") is not None or r.get("resolved") is True
+            if resolved:
+                n_resolved += 1
+                pnl = float(r.get("pnl", 0) or 0)
+                sum_pnl += pnl
+                if pnl > 0:
+                    n_win += 1
+                sell_filled = float(r.get("sell_filled", 0) or 0)
+                if sell_filled > 0:
+                    n_sell += 1
+                    sum_sell_px += float(r.get("sell_avg_px", 0) or 0)
+                elif r.get("triggered"):
+                    n_miss += 1
+                sum_set_cost += float(r.get("set_cost", 0) or 0)
+            else:
+                n_unresolved += 1
 
-    resolved = [r for r in rows if r.get("winner") is not None or r.get("resolved") is True]
-    unresolved = [r for r in rows if r not in resolved]
-    use = resolved if resolved else rows
-    pnls = [float(r.get("pnl", 0)) for r in use]
-    sells = [r for r in use if float(r.get("sell_filled", 0) or 0) > 0]
-    misses = [
-        r for r in use
-        if r.get("triggered") and float(r.get("sell_filled", 0) or 0) <= 0
-    ]
+    n_use = n_resolved if n_resolved else n_total
+    if n_use == 0:
+        return {"n": n_total, "path": path}
+
     return {
-        "n": len(rows),
-        "n_resolved": len(resolved),
-        "n_unresolved": len(unresolved),
+        "n": n_total,
+        "n_resolved": n_resolved,
+        "n_unresolved": n_unresolved,
         "path": path,
-        "mean_pnl": sum(pnls) / len(pnls) if pnls else 0.0,
-        "total_pnl": sum(pnls),
-        "win_rate": (sum(1 for p in pnls if p > 0) / len(pnls)) if pnls else 0.0,
-        "sell_rate": (len(sells) / len(use)) if use else 0.0,
-        "trigger_miss_rate": (len(misses) / len(use)) if use else 0.0,
-        "avg_sell_px": (
-            sum(float(r.get("sell_avg_px", 0) or 0) for r in sells) / len(sells)
-            if sells else None
-        ),
-        "avg_set_cost": (
-            sum(float(r.get("set_cost", 0) or 0) for r in use) / len(use) if use else None
-        ),
-        "stats_on": "resolved" if resolved else "all",
+        "mean_pnl": sum_pnl / n_use,
+        "total_pnl": sum_pnl,
+        "win_rate": n_win / n_use,
+        "sell_rate": n_sell / n_use,
+        "trigger_miss_rate": n_miss / n_use,
+        "avg_sell_px": (sum_sell_px / n_sell) if n_sell else None,
+        "avg_set_cost": sum_set_cost / n_use,
+        "stats_on": "resolved" if n_resolved else "all",
     }

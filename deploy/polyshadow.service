@@ -12,8 +12,9 @@ Nice=10
 ExecStart=/home/ntemusejoel/poly-money-maker/.venv/bin/python -m sim.shadow
 Restart=always
 RestartSec=5
-MemoryMax=400M
-CPUQuota=40%
+Slice=polyshadow-slice.slice
+MemoryMax=200M
+CPUQuota=20%
 # Disk is NOT capped by MemoryMax — host /var/log and sim_data must be managed
 # separately (deploy/journald-size.conf, deploy/DISK_OPS.md).
 

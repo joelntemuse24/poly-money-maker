@@ -936,6 +936,7 @@ while not _shutdown_requested:
                 _book_cache[_t] = _f.result(timeout=1)
             except Exception:
                 _book_cache[_t] = (None, 0.0)
+                _f.cancel()
         _pending_book_futs = {}
 
         # ================= SELL PHASE =================
@@ -1309,6 +1310,8 @@ while not _shutdown_requested:
     # making the effective cycle time = max(sleep_s, fetch_time) instead of
     # sleep_s + fetch_time.
     _next_now = time.time() * 1000 + _sleep_s * 1000  # predicted TTM at next cycle start
+    _pending_tokens = set(_pending_book_futs.values())
+    _MAX_PENDING_BOOKS = 20
     for s in managed_sets:
         _ml = (s["end_ts"] - _next_now) / 60000
         if _ml <= 0 or _ml > SELL_WINDOW_MIN:
@@ -1319,9 +1322,9 @@ while not _shutdown_requested:
             continue
         _ut = s["up"].get("asset")
         _dt = s["dn"].get("asset")
-        if _ut and _us >= 0.01:
+        if _ut and _us >= 0.01 and _ut not in _pending_tokens and len(_pending_book_futs) < _MAX_PENDING_BOOKS:
             _pending_book_futs[_book_executor.submit(get_book_bid, _ut)] = _ut
-        if _dt and _ds >= 0.01:
+        if _dt and _ds >= 0.01 and _dt not in _pending_tokens and len(_pending_book_futs) < _MAX_PENDING_BOOKS:
             _pending_book_futs[_book_executor.submit(get_book_bid, _dt)] = _dt
 
     console.print(f"[dim bright_black]\u00b7 \u00b7 \u00b7  sleeping {_sleep_s}s  \u00b7 \u00b7 \u00b7[/]")

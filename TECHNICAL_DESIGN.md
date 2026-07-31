@@ -2665,6 +2665,76 @@ df -h /
 # Avail should stay well above 1G on a 10G disk; alert if < 500M
 ```
 
+### 20.9 Memory and resource management (2026-07-31)
+
+#### Problem
+
+Running 5+ shadow sim services each with `MemoryMax=400M` exceeded the small
+GCP VM's capacity. Combined footprint: 5 × 400M = 2.0 GB for sims alone, plus
+the main bot, `polybuy`, GCP Ops Agent, journald, and the OS. This caused
+VM-wide OOM kills.
+
+Two code-level issues compounded the problem:
+
+1. **Unbounded `ThreadPoolExecutor` queue in `bot.py`** — during the sell window,
+   the bot submits order-book fetches every 250ms. Slow or stalled Polymarket
+   responses caused queued work to accumulate without bound, growing memory.
+
+2. **`summarize_results()` loaded entire `results.jsonl` into memory** — every
+   sim called this during shutdown/restart, causing a memory spike under the
+   service limit.
+
+#### Fixes applied
+
+**Code fixes:**
+
+| Fix | File | Change |
+|---|---|---|
+| Bound book fetch queue | `bot.py` | `_MAX_PENDING_BOOKS=20`, skip duplicate tokens, cancel stale futures |
+| Stream summary | `sim/store.py` | `summarize_results()` now streams line-by-line instead of loading full list |
+
+**Systemd resource controls:**
+
+| Control | Where | Effect |
+|---|---|---|
+| Shared slice | `deploy/polyshadow-slice.service` | `MemoryMax=800M` total for ALL sims combined |
+| Per-service MemoryMax | all sim `.service` files | Reduced from 400M → 200M each |
+| Per-service CPUQuota | all sim `.service` files | Reduced from 30-40% → 20% each |
+| Restart rate limit | slice | `StartLimitBurst=10` per 300s — prevents crash loops |
+
+**Memory budget on 2GB VM:**
+
+| Component | Budget |
+|---|---|
+| OS + GCP agents | ~600M |
+| `polybot` | ~200M |
+| `polybuy` | ~200M |
+| All sims (shared slice) | 800M |
+| **Total** | **~1.8 GB** |
+
+Install the slice:
+
+```bash
+sudo cp deploy/polyshadow-slice.service /etc/systemd/system/
+sudo systemctl daemon-reload
+# Restart all sim services to pick up slice + new MemoryMax
+sudo systemctl restart polyshadow polyshadow50 polyshadow-hedge40 polyshadow-hedge45 polyshadow-tickstudy
+```
+
+#### Operator check
+
+```bash
+# VM-wide memory
+free -h
+
+# Per-service memory usage
+systemd-cgtop --order=memory
+
+# Check for OOM kills
+sudo journalctl -k --since "24 hours ago" | grep -Ei 'oom|killed process'
+sudo journalctl --since "24 hours ago" | grep -Ei 'memorymax|memory cgroup'
+```
+
 ---
 
 ## 20. Atomic Mint Buyer (`buy/`)

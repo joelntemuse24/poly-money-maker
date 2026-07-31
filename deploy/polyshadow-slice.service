@@ -1,0 +1,11 @@
+[Unit]
+Description=Shared resource slice for all polyshadow sim services
+Before=multi-user.target
+
+[Slice]
+# Total memory budget for ALL sim services combined
+MemoryMax=800M
+MemoryHigh=600M
+# Limit restart rate to prevent crash loops
+StartLimitIntervalSec=300
+StartLimitBurst=10
