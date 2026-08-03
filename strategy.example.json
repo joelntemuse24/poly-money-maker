@@ -1,16 +1,16 @@
 {
-    "sell_threshold": 0.10,
-    "hedge_enabled": false,
-    "hedge_threshold": 0.50,
-    "sell_window_min": 0.75,
+    "sell_threshold": 0.05,
+    "hedge_enabled": true,
+    "hedge_threshold": 0.40,
+    "sell_window_min": 1.5,
     "sell_grace_s": 2,
     "sell_cooldown_s": 3,
-    "sell_lastchance_threshold": 0.35,
+    "sell_lastchance_threshold": 0.10,
     "sell_lastchance_s": 10,
     "redeem_throttle_s": 30,
     "max_redeem_age_days": 7,
     "dry_run": false,
-    "poll_sell_window_s": 0.25,
+    "poll_sell_window_s": 0.1,
     "positions_refresh_s": 2,
     "balance_refresh_s": 15
 }

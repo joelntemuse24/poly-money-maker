@@ -54,18 +54,18 @@ RELAYER_API_KEY_ADDRESS = os.getenv("RELAYER_API_KEY_ADDRESS", "0x42aec4505559c0
 # ------------------------- STRATEGY CONFIG -------------------------
 # Defaults — overridden by strategy.json if present (hot-reloaded each cycle)
 _STRATEGY_DEFAULTS = {
-    "sell_threshold": 0.10,
-    "hedge_enabled": False,
-    "hedge_threshold": 0.50,
-    "sell_window_min": 0.75,           # last 45 seconds — sell window
+    "sell_threshold": 0.05,
+    "hedge_enabled": True,
+    "hedge_threshold": 0.40,
+    "sell_window_min": 1.5,            # last 90 seconds — sell window
     "sell_grace_s": 2,                # don't sell within 2s of first seeing a position
     "sell_cooldown_s": 3,             # 3s between sell attempts per leg
-    "sell_lastchance_threshold": 0.35, # confirmed loser below 35¢ in final seconds
+    "sell_lastchance_threshold": 0.10, # only sell in final seconds if truly dead
     "sell_lastchance_s": 10,           # last-chance window: final 10 seconds
     "redeem_throttle_s": 30,          # 30s between redeem attempts
     "max_redeem_age_days": 7,
     "dry_run": False,
-    "poll_sell_window_s": 0.25,      # sub-second polling in sell window
+    "poll_sell_window_s": 0.1,       # 0.1s polling in sell window
     "positions_refresh_s": 2,        # refresh positions every N seconds (not every sub-second cycle)
     "balance_refresh_s": 15,         # refresh balance every N seconds
 }
@@ -1090,6 +1090,46 @@ while not _shutdown_requested:
             will_sell_up = sell_up and (now_ms - (meta.get("last_sell_up_at") or 0) >= SELL_COOLDOWN_S * 1000)
             will_sell_dn = sell_dn and (now_ms - (meta.get("last_sell_dn_at") or 0) >= SELL_COOLDOWN_S * 1000)
 
+            # Post-latency bounce check: re-fetch the bid right before selling.
+            # If the leg recovered above threshold during trigger→execution
+            # latency, cancel the sell — bouncing legs are the ones that reverse.
+            if will_sell_up:
+                fresh_up_bid, _ = get_book_bid(up_token)
+                up_cancel_threshold = SELL_THRESHOLD if up_trigger_reason == "threshold" else SELL_LASTCHANCE_THRESHOLD
+                if fresh_up_bid is not None and fresh_up_bid > up_cancel_threshold:
+                    log_event(
+                        "sell_cancel_bounce", condition_id=cond, leg="up",
+                        trigger_bid=up_price, current_bid=fresh_up_bid,
+                        threshold=up_cancel_threshold,
+                        trigger_reason=up_trigger_reason,
+                        seconds_left=round(seconds_left, 3),
+                    )
+                    console.print(f"  [dim][CANCEL][/] UP sell cancelled — bid bounced {up_price:.3f} → {fresh_up_bid:.3f}")
+                    up_trigger = False
+                    sell_up = False
+                    will_sell_up = False
+                elif fresh_up_bid is not None:
+                    up_bid = fresh_up_bid
+                    up_price, up_matched_price = quote_leg(fresh_up_bid)
+            if will_sell_dn:
+                fresh_dn_bid, _ = get_book_bid(dn_token)
+                dn_cancel_threshold = SELL_THRESHOLD if dn_trigger_reason == "threshold" else SELL_LASTCHANCE_THRESHOLD
+                if fresh_dn_bid is not None and fresh_dn_bid > dn_cancel_threshold:
+                    log_event(
+                        "sell_cancel_bounce", condition_id=cond, leg="down",
+                        trigger_bid=dn_price, current_bid=fresh_dn_bid,
+                        threshold=dn_cancel_threshold,
+                        trigger_reason=dn_trigger_reason,
+                        seconds_left=round(seconds_left, 3),
+                    )
+                    console.print(f"  [dim][CANCEL][/] DN sell cancelled — bid bounced {dn_price:.3f} → {fresh_dn_bid:.3f}")
+                    dn_trigger = False
+                    sell_dn = False
+                    will_sell_dn = False
+                elif fresh_dn_bid is not None:
+                    dn_bid = fresh_dn_bid
+                    dn_price, dn_matched_price = quote_leg(fresh_dn_bid)
+
             if will_sell_up or will_sell_dn:
                 up_bid_str = f"{up_price:.3f}" if up_price is not None else "  -  "
                 dn_bid_str = f"{dn_price:.3f}" if dn_price is not None else "  -  "
@@ -1228,7 +1268,7 @@ while not _shutdown_requested:
                     box=box.HEAVY,
                 ))
                 log_event("hedge_attempt", condition_id=cond, leg="down", size=dn_size, bid=dn_bid, price_limit=dn_price)
-                sold, _ = sell_market_with_retry(dn_token, dn_size, 0.01)
+                sold, _ = sell_market_with_retry(dn_token, dn_size, HEDGE_THRESHOLD * 0.5)
                 if sold > 0:
                     meta["expected_dn_size"] = dn_size - sold
                     s["dn"]["size"] = dn_size - sold
@@ -1261,7 +1301,7 @@ while not _shutdown_requested:
                     box=box.HEAVY,
                 ))
                 log_event("hedge_attempt", condition_id=cond, leg="up", size=up_size, bid=up_bid, price_limit=up_price)
-                sold, _ = sell_market_with_retry(up_token, up_size, 0.01)
+                sold, _ = sell_market_with_retry(up_token, up_size, HEDGE_THRESHOLD * 0.5)
                 if sold > 0:
                     meta["expected_up_size"] = up_size - sold
                     s["up"]["size"] = up_size - sold
@@ -1295,10 +1335,10 @@ while not _shutdown_requested:
         ))
 
 
-    # Variable polling: 5s >2min, 1s ≤2min, sub-second in sell window (≤45s)
+    # Variable polling: 5s >2min, 1s ≤2min, sub-second in sell window
     _now = time.time() * 1000
     _min_ttm = min((s["end_ts"] - _now) / 60000 for s in managed_sets) if managed_sets else 999
-    if _min_ttm <= SELL_WINDOW_MIN:  # ≤45s — sub-second polling in sell window
+    if _min_ttm <= SELL_WINDOW_MIN:  # sub-second polling in sell window
         _sleep_s = POLL_SELL_WINDOW_S
     elif _min_ttm <= 2:              # ≤2min — poll every 1s
         _sleep_s = 1
