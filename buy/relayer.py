@@ -5,6 +5,8 @@ from dataclasses import asdict
 from typing import Optional
 
 import requests
+from eth_abi import encode
+from eth_utils import keccak, to_checksum_address
 
 from .contracts import ContractCall
 
@@ -65,8 +67,21 @@ class MintRelayer:
 
     def submit(self, calls: list[ContractCall], metadata: str) -> str:
         # Submit each call as a separate proxy transaction, then return the last tx ID.
+        funder = self.expected_funder()
+        if not funder:
+            raise RuntimeError("FUNDER_ADDRESS env var is required for proxy submission")
+        proxy = to_checksum_address(funder)
+        execute_sel = keccak(b"execute(address,uint256,bytes)")[:4]
         tx_id = None
         for call in calls:
+            # Wrap the raw call in the proxy wallet's execute(address,uint256,bytes),
+            # matching bot.py's submit_proxy_tx pattern: the relayer submits to the
+            # proxy wallet, which executes the inner call on the target contract.
+            inner = bytes.fromhex(call.data.removeprefix("0x"))
+            proxy_data = execute_sel + encode(
+                ["address", "uint256", "bytes"],
+                [to_checksum_address(call.to), int(call.value), inner],
+            )
             nonce_r = requests.get(
                 f"{self.relayer_url}/nonce",
                 params={"address": self.eoa, "type": "PROXY"},
@@ -78,11 +93,10 @@ class MintRelayer:
             body = {
                 "type": "PROXY",
                 "from": self.eoa,
-                "to": call.to,
+                "to": proxy,
                 "nonce": nonce_r.json().get("nonce", "0"),
-                "data": call.data,
-                "value": call.value,
-                "proxyWallet": os.getenv("FUNDER_ADDRESS", ""),
+                "data": "0x" + proxy_data.hex(),
+                "value": "0",
             }
             submit_r = requests.post(
                 f"{self.relayer_url}/submit",
