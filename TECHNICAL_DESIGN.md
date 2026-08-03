@@ -37,11 +37,12 @@
 
 **Poly Money Maker** is centred on an automated **sell-side execution bot** for
 Polymarket's Bitcoin 5-minute, 15-minute, and hourly prediction markets. `bot.py`
-does not buy positions: it monitors holdings, sells the "loser leg," optionally
-hedges a reversal, and redeems resolved positions. Entry can remain manual, or an
-independent and disabled-by-default `buy/` process can atomically split pUSD into
-equal UP and DOWN tokens. The two live processes coordinate only through wallet
-holdings indexed by Polymarket's Data API; they do not share writable state.
+does not buy positions: it monitors holdings, sells the "loser leg," hedges a
+reversal, and redeems resolved positions. Entry is handled by the autonomous
+`buy/` process (`polybuy`), which atomically splits pUSD into equal UP and DOWN
+tokens via the Polymarket relayer, gated by a cron-driven arming mechanism. The
+two live processes coordinate only through wallet holdings indexed by
+Polymarket's Data API; they do not share writable state.
 
 ### The Core Thesis
 
@@ -56,19 +57,21 @@ instead of letting it expire worthless, you lock in extra profit on top of the
 $1.00 redemption. That's exactly what this bot does: it watches the order book,
 and when the losing side's best bid drops to 10 cents, it fires a sell order.
 
-### Optional Hedge (Disabled by Default)
+### Reversal Hedge (Enabled in Production)
 
 After selling the loser leg, the bot normally retains the other leg for its $1.00
-redemption. An optional hedge can sell that held leg if its bid falls below a
-configured threshold, but it is disabled by default. Near expiry, best bids can be
-far below fair value on both outcomes, so a low held-leg bid alone is not reliable
-evidence of a reversal.
+redemption. Production runs the hedge enabled at a 40¢ threshold: if the held
+leg's bid collapses below it (a genuine reversal), the bot sells that leg too
+capping the loss instead of riding it to $0. The hedge sell uses a price limit
+of half the threshold (20¢) to avoid dumping into a momentarily empty book. A
+low held-leg bid alone is not always reliable evidence of a reversal, so the
+threshold is deliberately deep below fair value.
 
 ### What the Bot Does NOT Do
 
-- **No buying inside `bot.py`.** The bot remains sell-only. Manual entry still works,
-  while the separate `buy/` package can create complete sets by atomic mint when
-  explicitly configured and one-shot armed — see §20.
+- **No buying inside `bot.py`.** The bot remains sell-only. The separate `buy/`
+  package creates complete sets by atomic mint, running autonomously under
+  cron-spaced arming — see §20.
 - **No market making.** It doesn't post resting orders or provide liquidity.
 - **No price prediction.** It doesn't try to forecast BTC direction.
 - **No portfolio rebalancing.** It manages one specific market type (BTC 5-minute
@@ -106,10 +109,13 @@ they're always worth exactly $1.00 at resolution (one wins, one loses). You can
 **mint** a complete set by depositing $1.00 of USDC, or **redeem** a complete set
 to get $1.00 back after the market resolves.
 
-### 2.2.1 Entry Fill Quality (Open Issue — Outside the Bot)
+### 2.2.1 Entry Fill Quality (Solved by Atomic Mint)
 
-The bot is **sell-only**. Entry (buying both legs) is done manually, typically with
+The bot is **sell-only**. Entry was originally manual, typically with
 **limit orders nominally at ~50¢ per side** so a complete set costs ~$1.00.
+Production entry is now the `buy/` atomic mint, which deposits exactly
+`$1.00 × shares` of pUSD on-chain and receives equal UP/DOWN inventory —
+deterministic $1.00 set cost by construction.
 
 **The open issue is realized fill quality, not the sell strategy.**
 
@@ -135,14 +141,15 @@ The bot is **sell-only**. Entry (buying both legs) is done manually, typically w
   "successful" sells at 1–4¢ still lose money, and every missed sell burns the
   entry premium. If set cost is truly ~$1.00, those same outcomes are flat or
   profitable.
-- **Operator checklist (manual entry):** After each market, verify
-  `avg_up + avg_dn` (or total USDC in / shares) is **≤ ~$1.01–1.02**. Treat
-  anything near $1.04+ as a failed entry fill, not a bot sell failure.
+- **Operator checklist (any manual entry):** If a position was entered manually,
+  verify `avg_up + avg_dn` (or total USDC in / shares) is **≤ ~$1.01–1.02**. Treat
+  anything near $1.04+ as a failed entry fill, not a bot sell failure. Minted
+  entries skip this concern entirely.
 - **Automated mint is isolated from the bot.** `bot.py` still only records
   `pnl_entry_cost` from Data API `avgPrice` and never places entry orders. The
-  optional `buy/` process closes the complete-set fill-quality gap by atomically
-  converting pUSD into equal UP/DOWN inventory at a deterministic $1.00 set cost.
-  It remains disabled and dry-run by default; see §20.
+  `buy/` process closes the complete-set fill-quality gap by atomically
+  converting pUSD into equal UP/DOWN inventory at a deterministic $1.00 set cost;
+  it runs live under autonomous arming — see §20.
 
 ### 2.3 The CLOB (Central Limit Order Book)
 
@@ -183,6 +190,38 @@ order-building logic differs.
 ---
 
 ## 3. Architecture at a Glance
+
+Production runs two live systemd services plus a cron timer on one GCP VM:
+
+```
+┌──────┐   every 55 min    ┌────────────────────┐
+│ cron │ ────────────────▶ │ buy_data/ARM file  │
+└──────┘  echo MINT_REAL_  └─────────┬──────────┘
+          PUSD > ARM                 │ consumed one-shot
+                                     ▼
+                        ┌─────────────────────────┐      PROXY batch
+                        │  polybuy (buy/runner.py)│ ─────────────────▶
+                        │  mints complete sets    │   relayer-v2
+                        │  polls every 15s        │   (EIP-191 signed)
+                        └─────────────────────────┘ ─────────────────▶
+                                                                   │
+                 ┌──────────────────────────────────┐              ▼
+                 │  Polygon (chain 137)             │   approve + splitPosition
+                 │  Proxy wallet holds pUSD + UP/DN │   (atomic, $1.00/set)
+                 └───────────────┬──────────────────┘
+                                 │ Data API indexes holdings
+                                 ▼
+┌────────────────────────────────────────────────────────────────┐
+│  polybot (bot.py)                                              │
+│  discovers set → sells loser leg (5¢, final 90s, 0.1s poll)    │
+│  → hedges reversal at 40¢ → redeems winner at $1.00 → pnl.json │
+└────────────────────────────────────────────────────────────────┘
+```
+
+The relayer PROXY flow is documented in §20.9; the sell/hedge/redeem phases in
+§12–§15.
+
+Internal structure of the sell bot:
 
 ```
 ┌──────────────────────────────────────────────────────┐
@@ -229,21 +268,22 @@ order-building logic differs.
 └──────────────────────────────────────────────────────┘
 
          ┌──────────────────────┐
-         │  sim/shadow.py       │  ← separate process (polyshadow)
-         │  Live shadow sim     │     public books only, paper trades
+         │  sim/shadow.py       │  ← shadow simulators are currently STOPPED
+         │  Live shadow sim     │     (disabled on GCP; see §19)
          │  writes sim_data/    │     never imports bot.py / never orders
          └──────────────────────┘
 
          ┌──────────────────────┐
-         │  buy/runner.py       │  ← separate process (polybuy)
-         │  Atomic mint entry   │     disabled + dry-run by default
+         │  buy/runner.py       │  ← separate process (polybuy), LIVE
+         │  Atomic mint entry   │     autonomous under cron-spaced arming
          │  writes buy_data/    │     never imports or edits bot state
          └──────────────────────┘
 
 External Services:
   • Polymarket CLOB API  (clob.polymarket.com)    — order book, order submission
   • Polymarket Data API  (data-api.polymarket.com) — position tracking
-  • Polymarket Relayer   (relayer-v2.polymarket.com) — on-chain redemption
+  • Polymarket Gamma API (gamma-api.polymarket.com) — market discovery (polybuy)
+  • Polymarket Relayer   (relayer-v2.polymarket.com) — on-chain mint + redemption
   • ntfy.sh              (ntfy.sh)                 — push notifications
   • Polygon blockchain    (chain ID 137)            — settlement layer
 ```
@@ -259,10 +299,10 @@ queues, no databases.
 - **Single process** means no concurrency bugs on state, no race conditions on
   trading logic, no inter-process communication overhead. The only threads are
   read-only HTTP fetches for order books — they never mutate trading state.
-- **Polling loop** with variable sleep (5s / 1s / 0.25s depending on time to
-  expiry) is simple and robust. The BTC 5-minute markets move extremely fast,
-  especially in the final minute, so the bot polls every 250ms during the sell
-  window. Order book fetches are overlapped with sleep via a background thread
+- **Polling loop** with variable sleep (5s / 1s / 0.1s depending on time to
+  expiry) is simple and robust. The BTC 15-minute markets move extremely fast
+  in the final 90-second sell window, so the bot polls every 100ms there.
+  Order book fetches are overlapped with sleep via a background thread
   pool, so the effective cycle time is `max(sleep, fetch_time)` instead of
   `sleep + fetch_time`. Polling is far easier to reason about than event-driven
   code.
@@ -270,13 +310,17 @@ queues, no databases.
   refreshed every 2s (positions) and 15s (balance), not every sub-second cycle.
   This reduces API calls from ~240/min to ~30/min (positions) and ~4/min
   (balance) during the sell window.
-- **Separate shadow simulator (`sim/`)** paper-trades every configured BTC series
+- **Shadow simulator (`sim/`)** paper-trades every configured BTC series
   using public order books and the sell policy. It never places orders, never
-  imports `bot.py`, and writes only under `sim_data/` (see §19).
-- **Separate atomic mint buyer (`buy/`)** discovers standard binary BTC markets and
-  can submit one atomic relayer batch containing exact pUSD approval plus CTF
+  imports `bot.py`, and writes only under `sim_data/` (see §19). The shadow
+  services are currently stopped on the VM to keep API quota and CPU for the
+  live services.
+- **Atomic mint buyer (`buy/`)** discovers standard binary BTC markets and
+  submits one atomic relayer batch containing exact pUSD approval plus CTF
   `splitPosition`. It never imports `bot.py`, never sells or redeems, owns only
-  `buy_data/`, and is lower-priority than both existing services (see §20).
+  `buy_data/`, and is lower-priority than the sell bot (see §20). It runs live
+  and autonomously: a cron job re-arms it every 55 minutes and each arm permits
+  exactly one mint.
 
 ---
 
@@ -299,8 +343,8 @@ queues, no databases.
 | `deploy/polyshadow.service` | systemd unit template for permanent shadow on GCP | — |
 | `buy/` | Isolated complete-set mint package: config, discovery, calldata, chain checks, relayer, state, runner | package |
 | `buy/test_buy.py` | Atomic calldata and fail-closed buyer regression tests | — |
-| `strategy.buy.example.json` | Disabled/dry-run mint-buyer configuration template | — |
-| `requirements.buy.txt` | Optional official relayer-client dependencies; separate from bot deploy | — |
+| `strategy.buy.example.json` | Live autonomous mint-buyer configuration template | — |
+| `requirements.buy.txt` | Mint-buyer dependencies (`requests`, `eth-*`, pinned relayer SDK packages); separate from bot deploy | — |
 | `deploy/polybuy.service` | Low-priority systemd template for the optional buyer | — |
 | `requirements.txt` | Existing live bot and simulator dependencies | 8 lines |
 | `strategy.example.json` | Example sell strategy config with all tunable parameters | — |
@@ -349,8 +393,8 @@ eth-utils
 | `eth-account` | Ethereum account management | Used to derive the EOA address from the private key for relayer submissions. |
 | `eth-abi` | Ethereum ABI encoding | Used to encode redemption calldata (the raw bytes that tell the smart contract what to do). |
 | `eth-utils` | Ethereum utility functions | Provides `keccak` (for function selectors) and `to_checksum_address` (Ethereum addresses must be in EIP-55 checksum format). |
-| `py-builder-relayer-client` | Official gasless transaction client, installed only through `requirements.buy.txt` | Builds and signs PROXY relayer batches without changing the existing bot dependency set. |
-| `py-builder-signing-sdk` | Builder API authentication for the relayer | Generates authenticated builder headers used only by live mint submission. |
+| `hexbytes` | Hex-string/bytes type used across the eth stack | `buy/relayer.py` imports `HexBytes` from here (older `eth_utils` versions don't re-export it). |
+| `py-builder-relayer-client` / `py-builder-signing-sdk` | Pinned in `requirements.buy.txt` for provenance, but **no longer imported** | The mint relayer now replicates the SDK's PROXY signing flow directly with `eth-abi`/`eth-utils`/`eth-account` + `requests` (§20.9), using `RELAYER_API_KEY`/`RELAYER_API_KEY_ADDRESS` headers instead of builder credentials. |
 
 ### The `eth-*` Family
 
@@ -379,9 +423,7 @@ The bot reads credentials and relayer configuration from environment variables:
 | `RELAYER_API_KEY` | Relayer authentication key (has a hardcoded default from git history). |
 | `RELAYER_API_KEY_ADDRESS` | Relayer key address (has a hardcoded default). |
 | `NTFY_TOPIC` | ntfy.sh push notification topic (defaults to `polybot-joel-btc`). |
-| `BUILDER_API_KEY` | Builder key required only for a real `polybuy` relayer submission. |
-| `BUILDER_SECRET` | Builder signing secret required only for a real mint. |
-| `BUILDER_PASS_PHRASE` | Builder passphrase required only for a real mint. |
+| ~~`BUILDER_API_KEY` / `BUILDER_SECRET` / `BUILDER_PASS_PHRASE`~~ | **No longer required.** The mint relayer uses the same `RELAYER_API_KEY` / `RELAYER_API_KEY_ADDRESS` headers as the sell bot. The `builder_*` kwargs on `MintRelayer.__init__` remain as no-ops for call-site compatibility. |
 
 ### 6.2 Strategy Constants (Hot-Reloaded from `strategy.json`)
 
@@ -394,18 +436,18 @@ malformed:
 
 ```python
 _STRATEGY_DEFAULTS = {
-    "sell_threshold": 0.10,
-    "hedge_enabled": False,
-    "hedge_threshold": 0.50,
-    "sell_window_min": 0.75,           # last 45 seconds — sell window
+    "sell_threshold": 0.05,
+    "hedge_enabled": True,
+    "hedge_threshold": 0.40,
+    "sell_window_min": 1.5,            # last 90 seconds — sell window
     "sell_grace_s": 2,                # don't sell within 2s of first seeing a position
     "sell_cooldown_s": 3,             # 3s between sell attempts per leg
-    "sell_lastchance_threshold": 0.35, # confirmed loser below 35¢
+    "sell_lastchance_threshold": 0.10, # only sell in final seconds if truly dead
     "sell_lastchance_s": 10,           # final 10-second fallback
     "redeem_throttle_s": 30,          # 30s between redeem attempts
     "max_redeem_age_days": 7,
     "dry_run": False,
-    "poll_sell_window_s": 0.25,      # sub-second polling in sell window
+    "poll_sell_window_s": 0.1,       # 100ms polling in sell window
     "positions_refresh_s": 2,        # refresh positions every N seconds
     "balance_refresh_s": 15,         # refresh balance every N seconds
 }
@@ -420,46 +462,52 @@ back to defaults on any parse error.
 
 An example file is committed as `strategy.example.json` for reference.
 
-| Constant | Default | Meaning |
+| Constant | Default (production) | Meaning |
 |---|---|---|
-| `sell_threshold` | `0.10` (10 cents) | Sell a leg when its best bid is at or below this price anywhere in the final 45-second sell window. |
-| `hedge_enabled` | `false` | Enables the experimental reversal hedge. Disabled by default because a low best bid near expiry can reflect spread or illiquidity rather than a true reversal. |
-| `hedge_threshold` | `0.50` (50 cents) | Held-leg bid threshold used only when `hedge_enabled` is true. |
-| `sell_window_min` | `0.75` minutes (45 seconds) | Only sell within the last 45 seconds before market expiry. This **time-gates** the sell trigger — even if the loser leg hits 10 cents with 2 minutes left, the bot waits until the final 45 seconds. The wider live-test window seeks more exit opportunities while retaining the ambiguity and remaining-leg safeguards. |
+| `sell_threshold` | `0.05` (5 cents) | Sell a leg when its best bid is at or below this price anywhere in the final 90-second sell window. |
+| `hedge_enabled` | `true` | Enables the reversal hedge (production). A low best bid near expiry can reflect spread or illiquidity rather than a true reversal, so the threshold is deep. |
+| `hedge_threshold` | `0.40` (40 cents) | Held-leg bid threshold used only when `hedge_enabled` is true. The hedge sell's price limit is half this value (20¢). |
+| `sell_window_min` | `1.5` minutes (90 seconds) | Only sell within the last 90 seconds before market expiry. This **time-gates** the sell trigger — even if the loser leg hits 5 cents with 3 minutes left, the bot waits until the final 90 seconds. |
 | `sell_grace_s` | `2` seconds | When we first discover a new position, wait 2 seconds before selling. This prevents selling on the very first tick where data might be stale or incomplete. |
-| `sell_cooldown_s` | `3` seconds | After selling a leg, wait 3 seconds before attempting another sell on the same leg. Reduced from 5s to allow more retry attempts within the sell window. |
-| `sell_lastchance_threshold` | `0.35` (35 cents) | In the final `sell_lastchance_s` seconds, consider a side below this only when the opposite bid confirms at or above `1 - sell_lastchance_threshold` (65¢ by default). |
+| `sell_cooldown_s` | `3` seconds | After selling a leg, wait 3 seconds before attempting another sell on the same leg. |
+| `sell_lastchance_threshold` | `0.10` (10 cents) | In the final `sell_lastchance_s` seconds, consider a side below this only when the opposite bid confirms at or above `1 - sell_lastchance_threshold` (90¢). |
 | `sell_lastchance_s` | `10` seconds | How many seconds before expiry the confirmed last-chance fallback activates. |
 | `redeem_throttle_s` | `30` seconds | After submitting a redemption, wait 30 seconds before retrying. Redemptions are on-chain transactions that take time to confirm. |
 | `max_redeem_age_days` | `7` days | Stop trying to redeem after 7 days past expiry. Old conditions may have been cleaned up on-chain and retries are pointless. |
 | `dry_run` | `false` | When `true`, the bot logs decisions but doesn't send orders or transactions. Used for testing. |
-| `poll_sell_window_s` | `0.25` seconds | Polling interval during the sell window (last 45s). Sub-second polling ensures the bot catches rapid price movements. Order book fetches are overlapped with sleep via a background thread pool. |
+| `poll_sell_window_s` | `0.1` seconds | Polling interval during the sell window (last 90s). 100ms polling catches rapid price movements; book fetches are overlapped with sleep so the effective cadence is `max(0.1s, fetch_time)`. |
 | `positions_refresh_s` | `2` seconds | How often to refresh positions from the data-api. Between refreshes, cached data is used. Prevents excessive API calls during sub-second polling. |
 | `balance_refresh_s` | `15` seconds | How often to refresh the USDC balance. Between refreshes, the last known value is displayed. |
 
 ### 6.3 Sell Thresholds
 
-The normal threshold applies throughout the final 45-second sell window. The
+The normal threshold applies throughout the final 90-second sell window. The
 last 10 seconds add a confirmed fallback for a losing side that remains above
 the normal threshold:
 
 ```
-     45s ─────────────────────────────── 0s (expiry)
-     │          NORMAL: bid ≤ 10¢          │
+     90s ─────────────────────────────── 0s (expiry)
+     │          NORMAL: bid ≤ 5¢           │
                          10s ──────────── 0s
-                         │ FALLBACK: bid <35¢
-                         │ + opposite bid ≥65¢
+                         │ FALLBACK: bid <10¢
+                         │ + opposite bid ≥90¢
 ```
 
-- **Normal threshold (45→0 seconds):** Sell a held leg whenever its bid is at or
-  below `sell_threshold` (10¢). There is no minimum-price floor, so available
+- **Normal threshold (90→0 seconds):** Sell a held leg whenever its bid is at or
+  below `sell_threshold` (5¢). There is no minimum-price floor, so available
   bids below 4¢ are eligible throughout the window.
 
-- **Confirmed fallback (10→0 seconds):** If neither side met the normal 10¢
-  threshold, sell a side below `sell_lastchance_threshold` (35¢) only when the
-  opposite side's bid is at least 65¢. Thus 19¢/81¢ sells the 19¢ side, while
-  37¢/63¢ does nothing. If both bids are low, or the opposite bid does not
+- **Confirmed fallback (10→0 seconds):** If neither side met the normal 5¢
+  threshold, sell a side below `sell_lastchance_threshold` (10¢) only when the
+  opposite side's bid is at least 90¢. Thus 9¢/91¢ sells the 9¢ side, while
+  12¢/88¢ does nothing. If both bids are low, or the opposite bid does not
   confirm, the bot skips the sale and records `sell_skip_ambiguous`.
+
+- **Post-latency bounce cancel:** Between trigger evaluation and execution the
+  bid is re-fetched. If the leg recovered above the applicable threshold (5¢ for
+  threshold sells, 10¢ for last-chance), the sell is cancelled
+  (`sell_cancel_bounce`) — bouncing legs are the ones that reverse. If it hasn't
+  bounced, the fresh quote replaces the stale one for the actual sell.
 
 Across cycles, once one leg is fully sold, the normal threshold preserves the
 remaining leg for redemption. Only the explicitly enabled experimental hedge
@@ -2074,38 +2122,41 @@ exit codes to determine restart behaviour.
 
 ---
 
-## 15. Optional Experimental Hedge
+## 15. The Hedge Phase — Cutting Losses on Reversals
 
-The hedge code runs after the sell phase for each managed set, but it is disabled
-by default because a single low best bid is not sufficient reversal evidence.
+The hedge code runs after the sell phase for each managed set. Production runs
+with the hedge **enabled** (`hedge_enabled: true`).
 
 ### 15.1 Purpose and Risk
 
-The optional hedge attempts to protect against a genuine reversal after one leg
-has already been sold. It checks whether the remaining leg's bid is at or below
-`HEDGE_THRESHOLD`, then sells that leg as an emergency exit.
+The hedge protects against a genuine reversal after one leg has already been
+sold. It checks whether the remaining leg's bid is at or below
+`HEDGE_THRESHOLD`, then sells that leg as an emergency exit — BTC can reverse
+in the final 90 seconds, and without the hedge the "winner" we kept can expire
+worthless.
 
 A best bid near expiry is not a reliable probability estimate. Wide spreads and
 thin books can put both best bids below 50¢ even though one outcome will shortly
 redeem for $1.00. Automatically selling the held leg in that state can liquidate
-the eventual winner at a large discount.
+the eventual winner at a large discount — which is why the production threshold
+is a deep 40¢ rather than anything near fair value.
 
 ### 15.2 Hedge Configuration
 
 ```python
-"hedge_enabled": False,
-"hedge_threshold": 0.50,
+"hedge_enabled": True,
+"hedge_threshold": 0.40,
 ```
 
-The hedge is therefore **disabled by default**. When disabled, the normal sell
-logic preserves the remaining leg for resolution and redemption after the other
-leg has been fully sold. The existing hedge implementation remains available only
-as an explicit experimental override through `strategy.json`.
+When disabled, the normal sell logic preserves the remaining leg for resolution
+and redemption after the other leg has been fully sold.
 
-If it is enabled, the hedge still runs only inside the final sell window, sends an
-urgent notification, and uses balance reconciliation for ambiguous responses.
-It should not be enabled without stronger reversal confirmation and replay data
-showing that it adds value after spread and execution costs.
+The hedge runs only inside the final sell window, sends an urgent notification,
+and uses balance reconciliation for ambiguous responses. The hedge sell's price
+limit is **half the threshold** (`HEDGE_THRESHOLD * 0.5` = 20¢) rather than the
+old fixed 1¢ floor — a 1¢ FAK would fill at any residual bid even in a
+momentarily empty book, while 20¢ still accepts every realistically available
+bid when the held leg is trading below 40¢.
 
 ---
 
@@ -2739,17 +2790,19 @@ sudo journalctl --since "24 hours ago" | grep -Ei 'memorymax|memory cgroup'
 
 ## 20. Atomic Mint Buyer (`buy/`)
 
-The optional `polybuy` process replaces uncertain two-leg CLOB entry with one
+The `polybuy` process replaces uncertain two-leg CLOB entry with one
 atomic Conditional Token Framework split. It deposits pUSD and receives equal UP
-and DOWN inventory for a standard binary BTC market:
+and DOWN inventory for a standard binary BTC market. It runs **live and
+autonomously** in production: a cron job re-arms it every 55 minutes and each
+arm permits exactly one mint attempt (§20.4).
 
 ```text
-5.000000 pUSD
+20.000000 pUSD
       |
-      | approve adapter for exactly 5.000000 pUSD
-      | splitPosition(pUSD, zero parent, conditionId, [1, 2], 5_000_000)
+      | approve adapter for exactly 20.000000 pUSD
+      | splitPosition(pUSD, zero parent, conditionId, [1, 2], 20_000_000)
       v
-5.000000 UP + 5.000000 DOWN
+20.000000 UP + 20.000000 DOWN
 ```
 
 The approval and split are submitted as one relayer batch. If either call
@@ -2757,7 +2810,7 @@ reverts, the whole Polygon transaction reverts. This eliminates CLOB spread,
 BUY taker fees, unequal fills, and cross-leg race risk. The resulting complete
 set has deterministic collateral cost `$1.00 × shares`.
 
-### 21.1 Process ownership and isolation
+### 20.1 Process ownership and isolation
 
 | Process | May do | Must never do | Writable state |
 |---|---|---|---|
@@ -2778,9 +2831,10 @@ The buyer also has separate:
 - Heartbeat: `buy_data/heartbeat.json`.
 - Rotating log: `buy_data/polybuy.log` (1 MB × three files).
 - Kill switch: `buy_data/STOP`.
-- One-shot live arm: `buy_data/ARM`.
+- Arm file: `buy_data/ARM`, refreshed by cron every 55 minutes; consumed
+  one-shot on the first live cycle that sees it.
 
-### 21.2 Package layout
+### 20.2 Package layout
 
 | Module | Responsibility |
 |---|---|
@@ -2788,12 +2842,12 @@ The buyer also has separate:
 | `buy/market.py` | Gamma discovery, exact UP/DOWN mapping, Data API balances |
 | `buy/chain.py` | Read-only Polygon RPC checks for pUSD, outcome slots, contracts, and ERC-1155 balances |
 | `buy/contracts.py` | Pure ABI encoding for exact approval and standard-adapter `splitPosition` |
-| `buy/relayer.py` | Official Builder Relayer PROXY client and transaction-status lookup |
+| `buy/relayer.py` | SDK-equivalent PROXY encoding, EIP-191 signing, and HTTP submission (§20.9); transaction-status lookup |
 | `buy/store.py` | Durable atomic state writes, free-disk check, heartbeat, bounded history, process lock |
 | `buy/runner.py` | Eligibility, caps, durable intent, submit/reconcile loop, CLI, notifications |
 | `buy/test_buy.py` | Synthetic calldata and fail-closed lifecycle tests |
 
-### 21.3 Cycle flow
+### 20.3 Cycle flow
 
 Each `polybuy` cycle performs these steps in order:
 
@@ -2813,13 +2867,15 @@ Each `polybuy` cycle performs these steps in order:
    on-chain and pre-start markets are not yet accepting CLOB orders.
 5. Fetch current Data API holdings and apply one-entry, open-set, open-notional,
    daily-notional, and deterministic set-cost caps.
-6. In dry-run, persist a bounded plan record only. No private key, Builder key,
-   relayer client, approval, or split call is used.
-7. In live mode, require and consume a fresh one-shot arm **before any network
-   or preflight work**, then require all credentials and verify: derived PROXY
-   equals `FUNDER_ADDRESS`, pUSD and adapter contracts exist,
-   `getOutcomeSlotCount(conditionId) == 2`, sufficient pUSD exists, and both
-   on-chain token balances are still zero.
+6. In dry-run, persist a bounded plan record only. No private key, relayer
+   client, approval, or split call is used.
+7. In live mode, require and consume a fresh arm **before any network or
+   preflight work**, then require `PRIVATE_KEY` and `FUNDER_ADDRESS` and verify:
+   the relayer's expected funder equals `FUNDER_ADDRESS`, pUSD and adapter
+   contracts exist on-chain, `getOutcomeSlotCount(conditionId) == 2`, sufficient
+   pUSD exists, and both on-chain token balances are still zero. An insufficient
+   balance returns a clean `blocked/insufficient_balance` status rather than
+   raising, so a temporary shortfall is a quiet skip, not a crash.
 8. Persist a `submitting` intent with pre-mint balances **before** calling the
    relayer.
 9. Submit exact approval + split as one PROXY batch and persist the returned
@@ -2832,7 +2888,7 @@ No automatic retry occurs after an ambiguous submit, failed transaction, wrong
 wallet, RPC inconsistency, or inventory mismatch. This intentionally trades
 availability for duplicate-mint safety.
 
-### 21.4 Safety gates
+### 20.4 Safety gates
 
 Real mint submission requires all of the following simultaneously:
 
@@ -2840,30 +2896,38 @@ Real mint submission requires all of the following simultaneously:
 - Runtime config sets `dry_run: false`.
 - `buy_data/STOP` does not exist.
 - `buy_data/ARM` contains exactly `MINT_REAL_PUSD` and is younger than
-  `arm_max_age_s` (15 minutes by default).
-- `PRIVATE_KEY`, `FUNDER_ADDRESS`, `BUILDER_API_KEY`, `BUILDER_SECRET`, and
-  `BUILDER_PASS_PHRASE` are present.
-- The official relayer client's derived PROXY exactly matches
-  `FUNDER_ADDRESS`.
+  `arm_max_age_s` (1 hour in production).
+- `PRIVATE_KEY` and `FUNDER_ADDRESS` are present. (Builder credentials are no
+  longer used; the relayer authenticates with `RELAYER_API_KEY` /
+  `RELAYER_API_KEY_ADDRESS` headers, §20.9.)
 - Disk, contract, condition, pUSD balance, position,
   one-entry, open-set, open-notional, and daily-notional checks all pass.
 
-The arm is one-shot: it is deleted at the start of an enabled live cycle, before
-discovery, credential, wallet, RPC, or balance checks. A failed preflight
-therefore requires deliberate operator re-arming. A process
-restart does not silently re-arm entry.
+**Autonomous arming.** Production replaces manual arming with a cron job:
+
+```cron
+*/55 * * * * echo "MINT_REAL_PUSD" > ~/poly-money-maker/buy_data/ARM
+```
+
+The arm is one-shot: it is deleted (`consume_arm`) at the start of the first
+live cycle that sees it, before discovery, credential, wallet, RPC, or balance
+checks — so one arm can never produce two mints, even across a process restart.
+A failed preflight, a capped portfolio, or a lack of candidates consumes the
+arm and waits for the next cron tick. This creates ~55-minute minimum spacing
+between mint attempts (~26 attempts/day max), which in turn bounds spend to
+~$520/day at 20 shares even though `max_daily_notional` is set high.
 
 Only standard binary CTF markets are supported. Any market with `negRisk=true`
 is rejected rather than routed to a different adapter. CLOB BUY fallback is not
 implemented, so `polybuy` can never create one-leg inventory.
 
-### 21.5 Durable intent states
+### 20.5 Durable intent states
 
 | State | Meaning | New entry allowed? |
 |---|---|---|
 | `submitting` | Durable intent exists; submit call is in progress | No |
 | `ambiguous` | Process cannot prove whether submit occurred | No; only conclusive complete on-chain inventory self-recovers |
-| `pending` / `executed` / `mined` | Relayer transaction is progressing | No under default one-open-set cap |
+| `pending` / `executed` / `mined` | Relayer transaction is progressing | No — counts toward the 3-open-set cap |
 | `confirmed_waiting_inventory` | Relayer confirmed; balances not indexed/observed yet | No |
 | `confirmed` | Both on-chain outcome balances increased as expected | Subject to portfolio caps |
 | `failed` / `invalid` | Relayer reported terminal failure | Condition remains recorded; no blind retry |
@@ -2873,35 +2937,35 @@ implemented, so `polybuy` can never create one-leg inventory.
 `os.replace`. A failed state write aborts before submission. State history is
 bounded, but active/ambiguous intents are never pruned merely to meet the cap.
 
-### 21.6 Configuration
+### 20.6 Configuration
 
-Copy `strategy.buy.example.json` to the gitignored `strategy.buy.json`. Important
-defaults are deliberately conservative:
+Copy `strategy.buy.example.json` to the gitignored `strategy.buy.json`. The
+production values:
 
-| Key | Default | Effect |
+| Key | Production | Effect |
 |---|---:|---|
-| `enabled` | `false` | Entire buyer is inactive |
-| `dry_run` | `true` | Plan only; relayer code is unreachable |
+| `enabled` | `true` | Buyer loop is active |
+| `dry_run` | `false` | Live minting; relayer submission reachable |
 | `entry_method` | `mint` | CLOB BUY is unsupported |
 | `series_slugs` | `btc-up-or-down-15m` | Independent target-series allowlist |
-| `shares` | `5.0` | pUSD deposited and shares minted per market |
-| `enter_min_ttm_min` / `enter_max_ttm_min` | `0` / `60` | Minutes before market start |
+| `shares` | `20.0` | pUSD deposited and shares minted per market ($20/set) |
+| `enter_min_ttm_min` / `enter_max_ttm_min` | `0` / `60` | Minutes before market start; negative values (already started) are excluded |
 | `max_set_cost` | `1.0` | Deterministic mint-cost gate; values below 1 are rejected as invalid config |
-| `max_open_sets` | `1` | Maximum active conditions |
-| `max_open_notional` | `5.0` | Maximum active pUSD-equivalent exposure |
-| `max_daily_notional` | `10.0` | UTC-day submitted mint cap |
-| `one_entry_per_market` | `true` | Any existing intent prevents another condition-level mint |
-| `poll_s` | `15` | Low API/CPU duty cycle beside `polybot` and `polyshadow` |
+| `max_open_sets` | `3` | Maximum concurrent active conditions (owned on-chain + active intents) |
+| `max_open_notional` | `60.0` | Maximum concurrent pUSD-equivalent exposure; AND-ed with `max_open_sets`, whichever binds first |
+| `max_daily_notional` | `999999.0` | UTC-day submitted mint cap — effectively disabled; real pacing comes from the ~55-min arm cadence |
+| `one_entry_per_market` | `true` | Any existing intent prevents another condition-level mint (condition_ids are unique per market instance, so old intents never block future markets) |
+| `poll_s` | `15` | Low API/CPU duty cycle beside `polybot` |
 | `min_free_disk_mb` | `500` | Entry fails closed before the historical ENOSPC range |
-| `arm_max_age_s` | `900` | One-shot arm validity |
-| `require_funder_match` | `true` | Derived PROXY must equal configured funder; `false` is rejected as invalid config |
+| `arm_max_age_s` | `3600` | One-shot arm validity; cron re-arms every 55 min so an arm never expires unused |
+| `require_funder_match` | `true` | Relayer's expected funder must equal configured funder; `false` is rejected as invalid config |
 
 Contract addresses are configurable for explicit upgrades, but defaults use the
 current Polygon pUSD, CTF, and standard pUSD collateral-adapter addresses. They
 must be rechecked against official Polymarket documentation before changing or
 enabling live mode.
 
-### 21.7 Commands and rollout
+### 20.7 Commands and rollout
 
 Install buyer-only dependencies in an independent environment so the existing
 bot environment is not upgraded:
@@ -2927,25 +2991,33 @@ series selection, start-time filtering, duplicate suppression, caps, Data API
 holdings, RPC health, logs, heartbeat, disk use, and coexistence with both
 current services.
 
-The optional `deploy/polybuy.service` template runs with `Nice=15`,
+The `deploy/polybuy.service` template runs with `Nice=15`,
 `CPUQuota=20%`, and `MemoryMax=200M`, below `polyshadow`, which is already below
 `polybot`. It is intentionally excluded from the existing GitHub auto-deploy
 workflow, so adding or changing buyer code cannot restart or redeploy the sell
-bot. Install and enable this third service manually only after dry-run review.
+bot.
 
-A live operator must set `enabled=true`, `dry_run=false`, install Builder
-credentials in the service environment, and create a fresh arm immediately
-before one intended mint:
+Production operation is autonomous: `strategy.buy.json` sets `enabled=true` and
+`dry_run=false`, and a user crontab re-arms every 55 minutes:
 
-```bash
-printf 'MINT_REAL_PUSD\n' > buy_data/ARM
+```cron
+*/55 * * * * echo "MINT_REAL_PUSD" > ~/poly-money-maker/buy_data/ARM
 ```
 
-Creating the arm is the final capital authorization. Do not automate it in
-systemd, CI, cron, startup scripts, or configuration management. Creating
-`buy_data/STOP` disables entry even if every other live gate is satisfied.
+The cadence itself is the capital control: at most one mint per arm, ~26 arms
+per day, ~$520/day maximum spend at `shares=20`. To pause minting, create
+`buy_data/STOP` (disables entry even if every other live gate is satisfied) or
+remove the cron entry. To tighten spend, lower `shares` or slow the cron.
 
-### 21.8 What did not change
+The guard logic was verified by audit (2026-08): `_portfolio_usage()` counts
+both on-chain positions and active intents (covers Data API indexing lag);
+the balance check reads the proxy wallet's pUSD via `balanceOf(funder)`, not
+the EOA; `max_open_sets` and `max_open_notional` are AND-ed; the arm is consumed
+atomically before any mint attempt; `eligible_markets()` excludes already-
+started markets; and `one_entry_per_market` keys on condition_id, which is
+unique per market instance.
+
+### 20.8 What did not change
 
 - No line in `bot.py`, `strategy.json`, sell execution, hedging, redemption,
   position discovery, or bot state was changed for minting.
@@ -2955,8 +3027,94 @@ systemd, CI, cron, startup scripts, or configuration management. Creating
   buyer dependencies and service installation are separate and manual.
 - `polybuy` does not place CLOB orders, sell either leg, merge positions,
   redeem, or alter the seller's cooldown/position metadata.
-- No runtime `strategy.buy.json`, arm file, Builder credentials, service enable,
-  or real relayer transaction is committed by this implementation.
+- No runtime `strategy.buy.json`, arm file, or private key is committed to the
+  repository.
+
+### 20.9 The relayer PROXY transaction flow
+
+`buy/relayer.py` was rewritten to bypass the `py_builder_relayer_client` SDK
+(which requires builder credentials we don't hold) and instead replicate its
+PROXY transaction flow directly over HTTP, using the same
+`RELAYER_API_KEY` / `RELAYER_API_KEY_ADDRESS` header authentication as the sell
+bot's redemption path. The implementation was audited line-by-line against the
+official SDK source (`Polymarket/py-builder-relayer-client`).
+
+**1. Batch encoding** — all calls for a mint (approve + splitPosition) are
+encoded into a single `proxy((uint8,address,uint256,bytes)[])` call:
+
+- Selector: `keccak(b"proxy((uint8,address,uint256,bytes)[])")[:4]`
+- Each inner call is a tuple `(type_code, to, value, data)` with
+  `type_code = 1` (`CallType.Call`; `0` is `Invalid`, `2` is `DelegateCall`)
+- ABI-encoded with `eth_abi.encode(["(uint8,address,uint256,bytes)[]"], [tuples])`
+
+**2. Relay payload** — `GET /relay-payload?address={eoa}&type=PROXY` returns the
+`nonce` and the `relay` address. (The `/nonce` endpoint is for SAFE transactions
+and does not return the relay address — using it was an early bug.)
+
+**3. Struct hash and signature** — the message is a raw byte concatenation,
+keccak-hashed, then EIP-191 signed (`encode_defunct` + `Account.sign_message`):
+
+```
+message = b"rlx:"
+        + from(20)          # EOA
+        + to(20)            # PROXY_FACTORY
+        + data(variable)    # the batch calldata above, raw bytes
+        + txFee(32)         # "0", big-endian
+        + gasPrice(32)      # "0"
+        + gasLimit(32)      # "500000" (DEFAULT_GAS_LIMIT; fits the hub's ~650k budget)
+        + nonce(32)         # from the relay payload
+        + relayHub(20)      # RELAY_HUB
+        + relay(20)         # from the relay payload
+struct_hash = keccak256(message)
+```
+
+**4. Submission** — `POST /submit` with exactly the SDK's `TransactionRequest`
+fields:
+
+```json
+{
+  "type": "PROXY",
+  "from": "<eoa>",
+  "to": "<PROXY_FACTORY>",
+  "proxyWallet": "<CREATE2-derived proxy>",
+  "data": "0x<batch calldata>",
+  "nonce": "<nonce>",
+  "signature": "0x<eip191 signature>",
+  "signatureParams": {
+    "gasPrice": "0", "gasLimit": "500000", "relayerFee": "0",
+    "relayHub": "<RELAY_HUB>", "relay": "<relay>"
+  },
+  "metadata": "polybuy:mint:<condition_id>:<ts>"
+}
+```
+
+**5. Proxy wallet derivation** — `proxyWallet` is the CREATE2 address the relayer
+re-derives independently; a mismatch is rejected:
+
+```
+salt         = keccak256(encode_packed(["address"], [eoa]))
+proxy_wallet = keccak256(0xff + PROXY_FACTORY + salt + PROXY_INIT_CODE_HASH)[-20:]
+```
+
+This must equal `FUNDER_ADDRESS` — the proxy wallet that actually holds the pUSD
+and receives the minted UP/DOWN tokens.
+
+**Contract constants (Polygon, chain 137):**
+
+| Constant | Value |
+|---|---|
+| `PROXY_FACTORY` | `0xaB45c5A4B0c941a2F231C04C3f49182e1A254052` |
+| `RELAY_HUB` | `0xD216153c06E857cD7f72665E0aF1d7D82172F494` |
+| `PROXY_INIT_CODE_HASH` | `0xd21df8dc65880a8606f09fe0ce3df9b8869287ab0b058be05aa9e8af6330a00b` |
+| `DEFAULT_GAS_LIMIT` | `500000` |
+
+Two implementation gotchas, both learned the hard way:
+
+- `HexBytes` must be imported from the **`hexbytes`** package, not `eth_utils`
+  (older `eth_utils` versions, like the one in `.venv-buy`, don't re-export it).
+- The first live mint confirmed end-to-end on 2026-08-03: relayer state
+  `STATE_CONFIRMED`, `derivedMetadata` showing `ERC20 Approve` + `CTF Split`,
+  20 sets for $20.00 pUSD.
 
 ---
 
@@ -2990,11 +3148,11 @@ systemd, CI, cron, startup scripts, or configuration management. Creating
 | **Redemption** | The process of returning a complete set (UP + DOWN tokens) to the smart contract to receive $1.00 USDC after market resolution. |
 | **Relayer** | A Polymarket-operated service that submits on-chain transactions on behalf of users, paying the gas fees. |
 | **Reversal** | When the market flips direction — the side that was winning starts losing. Triggers the hedge phase. |
-| **Sell window** | The final N seconds before market expiry during which the bot is allowed to sell. Currently 45 seconds (`SELL_WINDOW_MIN` = 0.75 min). |
+| **Sell window** | The final N seconds before market expiry during which the bot is allowed to sell. Currently 90 seconds (`SELL_WINDOW_MIN` = 1.5 min). |
 | **Shadow simulator** | Paper-trading process (`sim/shadow.py`) that applies a configurable sell policy to every market in a series (5m/15m) using public books; never places real orders. |
 | **set_cost** | Complete-set entry cost per share used by the shadow sim (default ~1.043 from history). Live bot does not gate on this. |
 | **polyshadow** | systemd service name for the permanent shadow simulator on GCP. |
-| **polybuy** | Optional separate service that atomically splits pUSD into complete sets; disabled and dry-run by default. |
+| **polybuy** | Live autonomous service that atomically splits pUSD into complete sets; re-armed by cron every 55 minutes, one mint per arm. |
 | **Atomic mint** | One relayer batch that approves exact pUSD and calls standard-adapter `splitPosition`, producing equal UP and DOWN inventory or reverting entirely. |
 | **ENOSPC** | OS errno 28 — no space left on device. On the bot VM (2026-07) this was caused mainly by `/var/log` growth, not by `sim_data`. |
 | **Slug** | A human-readable URL fragment identifying a market (e.g., `btc-updown-5m-1783218000`). |
@@ -3004,11 +3162,11 @@ systemd, CI, cron, startup scripts, or configuration management. Creating
 
 ---
 
-*This document was last updated for the isolated atomic mint buyer (§21), while
-preserving the live sell bot (`bot.py`) and shadow simulator (`sim/`). `polybuy`
-is a third, disabled/dry-run process with separate state, exact approval + split
-batching, proxy/funder verification, one-shot arming, durable intent recovery,
-portfolio/daily caps, and lower GCP resource priority. The current shadow
-experiment (§19.9) remains **8¢ anytime** on 15m+hourly with opposite-leg confirm
-≥70¢ (`15m1h-8c-conf`); the §19.8 host-journal and app disk protections remain
-unchanged.*
+*This document was last updated for the autonomous production architecture
+(2026-08): `polybuy` mints complete sets live via an SDK-equivalent relayer
+PROXY flow (§20.9), paced by cron-driven one-shot arming (§20.4); `polybot`
+sells the loser leg at 5¢ in the final 90 seconds with 100ms polling and
+post-latency bounce cancellation, hedges reversals at 40¢ (20¢ limit), and
+redeems winners at $1.00. The shadow simulators (`sim/`, §19) are currently
+stopped on the VM; their disk and memory protections remain documented for
+when they're re-enabled.*
