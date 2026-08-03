@@ -82,6 +82,7 @@ class MintRelayer:
                 "nonce": nonce_r.json().get("nonce", "0"),
                 "data": call.data,
                 "value": call.value,
+                "proxyWallet": os.getenv("FUNDER_ADDRESS", ""),
             }
             submit_r = requests.post(
                 f"{self.relayer_url}/submit",

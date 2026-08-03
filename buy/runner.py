@@ -219,7 +219,8 @@ def _credentials() -> dict:
 
 
 def _require_live_credentials(credentials: dict) -> None:
-    missing = [key for key, value in credentials.items() if not value]
+    required = ["private_key", "funder_address"]
+    missing = [key for key in required if not credentials.get(key)]
     if missing:
         raise RuntimeError("missing live credentials: " + ", ".join(missing))
 
