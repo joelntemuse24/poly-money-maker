@@ -5,10 +5,46 @@ from dataclasses import asdict
 from typing import Optional
 
 import requests
-from eth_abi import encode
-from eth_utils import keccak, to_checksum_address
+from eth_abi import encode as abi_encode
+from eth_abi.packed import encode_packed
+from eth_utils import HexBytes, keccak, to_bytes, to_checksum_address
+from eth_account import Account
+from eth_account.messages import encode_defunct
 
 from .contracts import ContractCall
+
+# Polygon mainnet contract config for PROXY transactions
+PROXY_FACTORY = to_checksum_address("0xaB45c5A4B0c941a2F231C04C3f49182e1A254052")
+RELAY_HUB = to_checksum_address("0xD216153c06E857cD7f72665E0aF1d7D82172F494")
+PROXY_INIT_CODE_HASH = "0xd21df8dc65880a8606f09fe0ce3df9b8869287ab0b058be05aa9e8af6330a00b"
+DEFAULT_GAS_LIMIT = "500000"
+ZERO_ADDRESS = "0x0000000000000000000000000000000000000000"
+
+
+def _get_create2_address(bytecode_hash: str, from_address: str, salt: bytes) -> str:
+    if bytecode_hash.startswith("0x"):
+        bytecode_hash = bytecode_hash[2:]
+    bytecode_hash_bytes = to_bytes(hexstr=bytecode_hash)
+    from_address_bytes = to_bytes(hexstr=from_address)
+    address_hash = keccak(b"\xff" + from_address_bytes + salt + bytecode_hash_bytes)
+    return to_checksum_address(address_hash[-20:].hex())
+
+
+def _derive_proxy_wallet(eoa: str) -> str:
+    salt = keccak(encode_packed(["address"], [to_checksum_address(eoa)]))
+    return _get_create2_address(PROXY_INIT_CODE_HASH, PROXY_FACTORY, salt)
+
+
+def _encode_proxy_data(calls: list[ContractCall]) -> str:
+    """Encode calls into proxy((uint8,address,uint256,bytes)[]) format."""
+    selector = keccak(b"proxy((uint8,address,uint256,bytes)[])")[:4]
+    tuples = []
+    for call in calls:
+        to_addr = to_checksum_address(call.to)
+        data_bytes = to_bytes(hexstr=call.data)
+        tuples.append((0, to_addr, int(call.value), data_bytes))
+    encoded = abi_encode(["(uint8,address,uint256,bytes)[]"], [tuples])
+    return "0x" + (selector + encoded).hex()
 
 
 class RelayerStatusGateway:
@@ -53,6 +89,7 @@ class MintRelayer:
 
         self.relayer_url = relayer_url.rstrip("/")
         self.chain_id = chain_id
+        self._private_key = private_key
         self.eoa = Account.from_key(private_key).address
         self.headers = {
             "Content-Type": "application/json",
@@ -66,47 +103,89 @@ class MintRelayer:
         return os.getenv("FUNDER_ADDRESS", "")
 
     def submit(self, calls: list[ContractCall], metadata: str) -> str:
-        # Submit each call as a separate proxy transaction, then return the last tx ID.
-        funder = self.expected_funder()
-        if not funder:
-            raise RuntimeError("FUNDER_ADDRESS env var is required for proxy submission")
-        proxy = to_checksum_address(funder)
-        execute_sel = keccak(b"execute(address,uint256,bytes)")[:4]
-        tx_id = None
-        for call in calls:
-            # Wrap the raw call in the proxy wallet's execute(address,uint256,bytes),
-            # matching bot.py's submit_proxy_tx pattern: the relayer submits to the
-            # proxy wallet, which executes the inner call on the target contract.
-            inner = bytes.fromhex(call.data.removeprefix("0x"))
-            proxy_data = execute_sel + encode(
-                ["address", "uint256", "bytes"],
-                [to_checksum_address(call.to), int(call.value), inner],
-            )
-            nonce_r = requests.get(
-                f"{self.relayer_url}/nonce",
-                params={"address": self.eoa, "type": "PROXY"},
-                headers=self.headers,
-                timeout=15,
-            )
-            if nonce_r.status_code != 200:
-                raise RuntimeError(f"nonce fetch failed: HTTP {nonce_r.status_code} {nonce_r.text[:100]}")
-            body = {
-                "type": "PROXY",
-                "from": self.eoa,
-                "to": proxy,
-                "nonce": nonce_r.json().get("nonce", "0"),
-                "data": "0x" + proxy_data.hex(),
-                "value": "0",
-            }
-            submit_r = requests.post(
-                f"{self.relayer_url}/submit",
-                json=body,
-                headers=self.headers,
-                timeout=15,
-            )
-            if submit_r.status_code != 200:
-                raise RuntimeError(f"relayer submit failed: HTTP {submit_r.status_code} {submit_r.text[:200]}")
-            tx_id = submit_r.json().get("transactionID")
+        # Encode all calls into a single proxy batch transaction.
+        encoded_data = _encode_proxy_data(calls)
+
+        nonce_r = requests.get(
+            f"{self.relayer_url}/nonce",
+            params={"address": self.eoa, "type": "PROXY"},
+            headers=self.headers,
+            timeout=15,
+        )
+        if nonce_r.status_code != 200:
+            raise RuntimeError(f"nonce fetch failed: HTTP {nonce_r.status_code} {nonce_r.text[:100]}")
+        nonce = nonce_r.json().get("nonce", "0")
+        relay_address = nonce_r.json().get("address", ZERO_ADDRESS)
+
+        # Build the proxy struct hash for signing
+        data_bytes = to_bytes(hexstr=encoded_data)
+        struct_hash = self._proxy_struct_hash(
+            from_address=self.eoa,
+            to=PROXY_FACTORY,
+            data=data_bytes,
+            nonce=nonce,
+            relay=relay_address,
+        )
+        signature = self._sign(struct_hash)
+
+        body = {
+            "type": "PROXY",
+            "from": self.eoa,
+            "to": PROXY_FACTORY,
+            "proxyWallet": _derive_proxy_wallet(self.eoa),
+            "data": encoded_data,
+            "nonce": nonce,
+            "signature": signature,
+            "signatureParams": {
+                "gasPrice": "0",
+                "gasLimit": DEFAULT_GAS_LIMIT,
+                "relayerFee": "0",
+                "relayHub": RELAY_HUB,
+                "relay": relay_address,
+            },
+        }
+        if metadata:
+            body["metadata"] = metadata
+
+        submit_r = requests.post(
+            f"{self.relayer_url}/submit",
+            json=body,
+            headers=self.headers,
+            timeout=15,
+        )
+        if submit_r.status_code != 200:
+            raise RuntimeError(f"relayer submit failed: HTTP {submit_r.status_code} {submit_r.text[:200]}")
+        tx_id = submit_r.json().get("transactionID")
         if not tx_id:
             raise RuntimeError("relayer returned no transaction ID")
         return str(tx_id)
+
+    @staticmethod
+    def _proxy_struct_hash(from_address: str, to: str, data: bytes, nonce: str, relay: str) -> str:
+        prefix = b"rlx:"
+        from_bytes = HexBytes(to_checksum_address(from_address))
+        to_bytes_ = HexBytes(to_checksum_address(to))
+        tx_fee_bytes = int("0").to_bytes(32, "big")
+        gas_price_bytes = int("0").to_bytes(32, "big")
+        gas_limit_bytes = int(DEFAULT_GAS_LIMIT).to_bytes(32, "big")
+        nonce_bytes = int(nonce).to_bytes(32, "big")
+        relay_hub_bytes = HexBytes(RELAY_HUB)
+        relay_bytes = HexBytes(to_checksum_address(relay))
+        message = (
+            prefix
+            + from_bytes
+            + to_bytes_
+            + data
+            + tx_fee_bytes
+            + gas_price_bytes
+            + gas_limit_bytes
+            + nonce_bytes
+            + relay_hub_bytes
+            + relay_bytes
+        )
+        return "0x" + keccak(message).hex()
+
+    def _sign(self, struct_hash: str) -> str:
+        msg = encode_defunct(HexBytes(struct_hash))
+        sig = Account.sign_message(msg, self._private_key).signature.hex()
+        return "0x" + sig
