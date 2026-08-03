@@ -536,13 +536,31 @@ def group_btc_complete_sets(positions, positions_meta=None):
 def get_book_bid(token_id):
     try:
         book = safe_api_call(client.get_order_book, token_id)
+        path = "sdk"
+    except Exception as sdk_err:
+        # SDK HTTP layer failure (status_code=None = connection-level). Fall back
+        # to the public /book endpoint with plain requests — no auth required.
+        try:
+            resp = requests.get(
+                f"{HOST}/book", params={"token_id": token_id}, timeout=5
+            )
+            resp.raise_for_status()
+            book = resp.json()
+            path = "http"
+            log_event("book_fetch_fallback_ok", token_id=token_id,
+                      sdk_error=str(sdk_err)[:200])
+        except Exception as http_err:
+            log_event("book_fetch_fail", token_id=token_id,
+                      sdk_error=str(sdk_err)[:200], http_error=str(http_err)[:200])
+            return None, 0.0
+    try:
         bids = book.get("bids", [])
         if not bids:
             return None, 0.0
         best = max(bids, key=lambda x: float(x.get("price", 0)))
         return float(best.get("price", 0)), float(best.get("size", 0))
     except Exception as e:
-        log_event("book_fetch_fail", token_id=token_id, error=str(e))
+        log_event("book_fetch_fail", token_id=token_id, error=str(e), path=path)
         return None, 0.0
 
 
