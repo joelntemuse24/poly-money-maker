@@ -371,7 +371,7 @@ def run_once(
         raise RuntimeError("condition is not prepared as binary")
     balance = chain.pUSD_balance(config.pUSD_address, funder_address)
     if balance + 1e-9 < config.shares:
-        raise RuntimeError(f"insufficient pUSD balance: {balance:.6f}")
+        return {"status": "blocked", "reason": "insufficient_balance", "balance": round(balance, 6)}
     before_up = chain.position_balance(config.ctf_address, funder_address, candidate.up_token)
     before_dn = chain.position_balance(config.ctf_address, funder_address, candidate.dn_token)
     if max(before_up, before_dn) > config.position_tolerance:
