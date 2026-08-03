@@ -42,7 +42,7 @@ def _encode_proxy_data(calls: list[ContractCall]) -> str:
     for call in calls:
         to_addr = to_checksum_address(call.to)
         data_bytes = to_bytes(hexstr=call.data)
-        tuples.append((0, to_addr, int(call.value), data_bytes))
+        tuples.append((1, to_addr, int(call.value), data_bytes))
     encoded = abi_encode(["(uint8,address,uint256,bytes)[]"], [tuples])
     return "0x" + (selector + encoded).hex()
 
@@ -106,16 +106,19 @@ class MintRelayer:
         # Encode all calls into a single proxy batch transaction.
         encoded_data = _encode_proxy_data(calls)
 
-        nonce_r = requests.get(
-            f"{self.relayer_url}/nonce",
+        relay_r = requests.get(
+            f"{self.relayer_url}/relay-payload",
             params={"address": self.eoa, "type": "PROXY"},
             headers=self.headers,
             timeout=15,
         )
-        if nonce_r.status_code != 200:
-            raise RuntimeError(f"nonce fetch failed: HTTP {nonce_r.status_code} {nonce_r.text[:100]}")
-        nonce = nonce_r.json().get("nonce", "0")
-        relay_address = nonce_r.json().get("address", ZERO_ADDRESS)
+        if relay_r.status_code != 200:
+            raise RuntimeError(f"relay-payload fetch failed: HTTP {relay_r.status_code} {relay_r.text[:100]}")
+        payload = relay_r.json()
+        nonce = payload.get("nonce")
+        relay_address = payload.get("address")
+        if nonce is None or relay_address is None:
+            raise RuntimeError("invalid relay payload received")
 
         # Build the proxy struct hash for signing
         data_bytes = to_bytes(hexstr=encoded_data)
@@ -144,8 +147,7 @@ class MintRelayer:
                 "relay": relay_address,
             },
         }
-        if metadata:
-            body["metadata"] = metadata
+        body["metadata"] = metadata or ""
 
         submit_r = requests.post(
             f"{self.relayer_url}/submit",
