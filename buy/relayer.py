@@ -7,7 +7,8 @@ from typing import Optional
 import requests
 from eth_abi import encode as abi_encode
 from eth_abi.packed import encode_packed
-from eth_utils import HexBytes, keccak, to_bytes, to_checksum_address
+from eth_utils import keccak, to_bytes, to_checksum_address
+from hexbytes import HexBytes
 from eth_account import Account
 from eth_account.messages import encode_defunct
 
