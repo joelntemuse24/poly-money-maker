@@ -2793,16 +2793,17 @@ sudo journalctl --since "24 hours ago" | grep -Ei 'memorymax|memory cgroup'
 The `polybuy` process replaces uncertain two-leg CLOB entry with one
 atomic Conditional Token Framework split. It deposits pUSD and receives equal UP
 and DOWN inventory for a standard binary BTC market. It runs **live and
-autonomously** in production: a cron job re-arms it every 55 minutes and each
-arm permits exactly one mint attempt (§20.4).
+autonomously** in production: a cron job re-arms it at minutes 56, 11, 26, and 41
+of each hour (4 min before each BTC 15-minute market start), yielding up to 4 mints
+per hour. Each arm permits exactly one mint attempt (§20.4).
 
 ```text
-20.000000 pUSD
+50.000000 pUSD
       |
-      | approve adapter for exactly 20.000000 pUSD
-      | splitPosition(pUSD, zero parent, conditionId, [1, 2], 20_000_000)
+      | approve adapter for exactly 50.000000 pUSD
+      | splitPosition(pUSD, zero parent, conditionId, [1, 2], 50_000_000)
       v
-20.000000 UP + 20.000000 DOWN
+50.000000 UP + 50.000000 DOWN
 ```
 
 The approval and split are submitted as one relayer batch. If either call
@@ -2831,8 +2832,9 @@ The buyer also has separate:
 - Heartbeat: `buy_data/heartbeat.json`.
 - Rotating log: `buy_data/polybuy.log` (1 MB × three files).
 - Kill switch: `buy_data/STOP`.
-- Arm file: `buy_data/ARM`, refreshed by cron every 55 minutes; consumed
-  one-shot on the first live cycle that sees it.
+- Arm file: `buy_data/ARM`, refreshed by cron at minutes 56/11/26/41 (4×/hour,
+  one per BTC 15-minute market); consumed one-shot on the first live cycle that
+  sees it.
 
 ### 20.2 Package layout
 
@@ -3152,7 +3154,7 @@ Two implementation gotchas, both learned the hard way:
 | **Shadow simulator** | Paper-trading process (`sim/shadow.py`) that applies a configurable sell policy to every market in a series (5m/15m) using public books; never places real orders. |
 | **set_cost** | Complete-set entry cost per share used by the shadow sim (default ~1.043 from history). Live bot does not gate on this. |
 | **polyshadow** | systemd service name for the permanent shadow simulator on GCP. |
-| **polybuy** | Live autonomous service that atomically splits pUSD into complete sets; re-armed by cron every 55 minutes, one mint per arm. |
+| **polybuy** | Live autonomous service that atomically splits pUSD into complete sets; re-armed by cron 4×/hour (min 56/11/26/41), one mint per arm. |
 | **Atomic mint** | One relayer batch that approves exact pUSD and calls standard-adapter `splitPosition`, producing equal UP and DOWN inventory or reverting entirely. |
 | **ENOSPC** | OS errno 28 — no space left on device. On the bot VM (2026-07) this was caused mainly by `/var/log` growth, not by `sim_data`. |
 | **Slug** | A human-readable URL fragment identifying a market (e.g., `btc-updown-5m-1783218000`). |
@@ -3162,11 +3164,13 @@ Two implementation gotchas, both learned the hard way:
 
 ---
 
-*This document was last updated for the autonomous production architecture
-(2026-08): `polybuy` mints complete sets live via an SDK-equivalent relayer
-PROXY flow (§20.9), paced by cron-driven one-shot arming (§20.4); `polybot`
-sells the loser leg at 5¢ in the final 90 seconds with 100ms polling and
-post-latency bounce cancellation, hedges reversals at 40¢ (20¢ limit), and
+*This document was last updated for the scaled production architecture
+(2026-08-04): `polybuy` mints 50-share complete sets live via an SDK-equivalent
+relayer PROXY flow (§20.9), paced by cron-driven one-shot arming 4×/hour (min
+56/11/26/41) to cover all four BTC 15-minute markets per hour (§20.4);
+`polybuy` allows up to 3 concurrent open sets with $150 max notional.
+`polybot` sells the loser leg at 5¢ in the final 90 seconds with 100ms polling
+and post-latency bounce cancellation, hedges reversals at 40¢ (20¢ limit), and
 redeems winners at $1.00. The shadow simulators (`sim/`, §19) are currently
 stopped on the VM; their disk and memory protections remain documented for
 when they're re-enabled.*
