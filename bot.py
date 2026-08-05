@@ -636,11 +636,10 @@ def sell_market_with_retry(token_id, size, price_limit, tick_size="0.01", max_re
         if remaining < 0.01:
             break
         try:
-            neg_risk = safe_api_call(client.get_neg_risk, token_id)
             result = safe_api_call(
                 client.create_and_post_market_order,
                 MarketOrderArgs(token_id=token_id, amount=remaining, side=SELL, price=price),
-                options=PartialCreateOrderOptions(tick_size=tick_size, neg_risk=neg_risk),
+                options=PartialCreateOrderOptions(tick_size=tick_size, neg_risk=False),
                 order_type=OrderType.FAK,
             )
             if result:
