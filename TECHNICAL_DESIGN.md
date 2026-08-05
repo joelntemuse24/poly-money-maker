@@ -3150,7 +3150,7 @@ Two implementation gotchas, both learned the hard way:
 | **Redemption** | The process of returning a complete set (UP + DOWN tokens) to the smart contract to receive $1.00 USDC after market resolution. |
 | **Relayer** | A Polymarket-operated service that submits on-chain transactions on behalf of users, paying the gas fees. |
 | **Reversal** | When the market flips direction — the side that was winning starts losing. Triggers the hedge phase. |
-| **Sell window** | The final N seconds before market expiry during which the bot is allowed to sell. Currently 90 seconds (`SELL_WINDOW_MIN` = 1.5 min). |
+| **Sell window** | The final N seconds before market expiry during which the bot is allowed to sell. Currently 180 seconds (`SELL_WINDOW_MIN` = 3.0 min). |
 | **Shadow simulator** | Paper-trading process (`sim/shadow.py`) that applies a configurable sell policy to every market in a series (5m/15m) using public books; never places real orders. |
 | **set_cost** | Complete-set entry cost per share used by the shadow sim (default ~1.043 from history). Live bot does not gate on this. |
 | **polyshadow** | systemd service name for the permanent shadow simulator on GCP. |
@@ -3169,8 +3169,14 @@ Two implementation gotchas, both learned the hard way:
 relayer PROXY flow (§20.9), paced by cron-driven one-shot arming 4×/hour (min
 56/11/26/41) to cover all four BTC 15-minute markets per hour (§20.4);
 `polybuy` allows up to 3 concurrent open sets with $150 max notional.
-`polybot` sells the loser leg at 5¢ in the final 90 seconds with 100ms polling
-and post-latency bounce cancellation, hedges reversals at 40¢ (20¢ limit), and
-redeems winners at $1.00. The shadow simulators (`sim/`, §19) are currently
-stopped on the VM; their disk and memory protections remain documented for
-when they're re-enabled.*
+`polybot` sells the loser leg at ≤3¢ in the final 180 seconds (3-minute sell
+window) with 100ms polling and post-latency bounce cancellation, hedges
+reversals at 40¢ (20¢ limit), and redeems winners at $1.00. The 3¢/3m config
+was selected via tick-level backtesting against 97 markets of shadow-simulator
+bid data: it achieves a 74% sell rate with 0 reversals (vs 78% sell rate / 3
+reversals at the previous 5¢/1.5m config), maximising volume to ensure that
+rare reversal losses are dwarfed by aggregate sell revenue. The last-chance
+threshold is also 3¢ (down from 10¢), so the final 10 seconds only sell truly
+dead legs. The shadow simulators (`sim/`, §19) are currently stopped on the
+VM; their disk and memory protections remain documented for when they're
+re-enabled.*
