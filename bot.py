@@ -564,6 +564,54 @@ def get_book_bid(token_id):
         return None, 0.0
 
 
+def get_book_quote(token_id):
+    """Return (bid_price, bid_size, ask_price, ask_size, mid_price).
+
+    Uses the same SDK-first + HTTP-fallback pattern as get_book_bid. If no bids
+    exist, returns (None, 0.0, None, 0.0, None). If no asks exist, mid_price
+    falls back to the best bid. Mid is used as a sanity check against thin bids
+    that don't reflect actual market sentiment.
+    """
+    try:
+        book = safe_api_call(client.get_order_book, token_id)
+        path = "sdk"
+    except Exception as sdk_err:
+        try:
+            resp = requests.get(
+                f"{HOST}/book", params={"token_id": token_id}, timeout=5
+            )
+            resp.raise_for_status()
+            book = resp.json()
+            path = "http"
+            log_event("book_quote_fallback_ok", token_id=token_id,
+                      sdk_error=str(sdk_err)[:200])
+        except Exception as http_err:
+            log_event("book_quote_fail", token_id=token_id,
+                      sdk_error=str(sdk_err)[:200], http_error=str(http_err)[:200])
+            return None, 0.0, None, 0.0, None
+    try:
+        bids = book.get("bids", [])
+        asks = book.get("asks", [])
+        if not bids:
+            return None, 0.0, None, 0.0, None
+        best_bid = max(bids, key=lambda x: float(x.get("price", 0)))
+        bid_price = float(best_bid.get("price", 0))
+        bid_size = float(best_bid.get("size", 0))
+        if asks:
+            best_ask = min(asks, key=lambda x: float(x.get("price", 0)))
+            ask_price = float(best_ask.get("price", 0))
+            ask_size = float(best_ask.get("size", 0))
+            mid_price = (bid_price + ask_price) / 2.0
+        else:
+            ask_price = None
+            ask_size = 0.0
+            mid_price = bid_price
+        return bid_price, bid_size, ask_price, ask_size, mid_price
+    except Exception as e:
+        log_event("book_quote_fail", token_id=token_id, error=str(e), path=path)
+        return None, 0.0, None, 0.0, None
+
+
 # ------------------------- ORDER HELPERS -------------------------
 
 def extract_order_id(order_obj):
@@ -1250,70 +1298,98 @@ while not _shutdown_requested:
             loser_was_dn = preserve_up
 
             if HEDGE_ENABLED and loser_was_up and dn_price is not None and dn_price <= HEDGE_THRESHOLD:
-                console.print(Panel(
-                    f"  [bright_white]{s['question']}[/]\n"
-                    f"  [bright_red]REVERSAL DETECTED[/] — DN (held leg) dropped to [bold]{dn_price:.3f}[/]  ·  "
-                    f"[bold red]TTM {minutes_left:>4.1f}m[/]",
-                    title="[bold bright_red]▼ HEDGE SELL — CUTTING LOSSES[/]",
-                    border_style="bright_red",
-                    box=box.HEAVY,
-                ))
-                log_event("hedge_attempt", condition_id=cond, leg="down", size=dn_size, bid=dn_bid, price_limit=dn_price)
-                sold, _ = sell_market_with_retry(dn_token, dn_size, HEDGE_THRESHOLD * 0.5)
-                if sold > 0:
-                    meta["expected_dn_size"] = dn_size - sold
-                    s["dn"]["size"] = dn_size - sold
-                    meta["pnl_hedge_proceeds"] = round(meta.get("pnl_hedge_proceeds", 0) + sold * (dn_price or 0), 4)
-                    log_event("hedge_fill", condition_id=cond, leg="down", sold=sold, remaining=dn_size - sold, price=dn_price)
-                    notify("HEDGE FIRED", f"Reversal on {s['question']}\nSold DN at ~{dn_price:.3f} ({sold:.2f} shares)", priority="urgent")
-                    save_json(STATE_FILE, positions_meta)
+                # Fresh fetch before acting; cached book may be 5-10s stale. A thin bid
+                # below threshold can vanish, so use mid price as market-sentiment guard.
+                fresh_dn_bid, _, fresh_dn_ask, _, fresh_dn_mid = get_book_quote(dn_token)
+                if fresh_dn_mid is not None and fresh_dn_mid > HEDGE_THRESHOLD:
+                    log_event(
+                        "hedge_cancel_bounce", condition_id=cond, leg="down",
+                        trigger_bid=dn_price, current_bid=fresh_dn_bid,
+                        current_ask=fresh_dn_ask, current_mid=fresh_dn_mid,
+                        threshold=HEDGE_THRESHOLD,
+                    )
+                    console.print(
+                        f"  [dim][CANCEL][/] DN hedge cancelled — mid bounced {dn_price:.3f} → {fresh_dn_mid:.3f}"
+                    )
                 else:
-                    time.sleep(1)
-                    actual_bal = check_token_balance(dn_token)
-                    if actual_bal is not None and actual_bal < dn_size - 0.01:
-                        ghost_sold = dn_size - actual_bal
-                        meta["expected_dn_size"] = actual_bal
-                        s["dn"]["size"] = actual_bal
-                        meta["pnl_hedge_proceeds"] = round(meta.get("pnl_hedge_proceeds", 0) + ghost_sold * (dn_price or 0), 4)
-                        log_event("hedge_ghost_fill", condition_id=cond, leg="down", sold=ghost_sold, remaining=actual_bal, price=dn_price)
-                        notify("HEDGE FIRED (ghost)", f"Reversal on {s['question']}\nDN hedge ghost fill: {ghost_sold:.2f} shares", priority="urgent")
-                        console.print(f"  [bold yellow][GHOST FILL][/] DN hedge confirmed via balance check: {ghost_sold:.4f} sold")
+                    hedge_bid = fresh_dn_bid if fresh_dn_bid is not None else dn_price
+                    console.print(Panel(
+                        f"  [bright_white]{s['question']}[/]\n"
+                        f"  [bright_red]REVERSAL DETECTED[/] — DN (held leg) dropped to [bold]{hedge_bid:.3f}[/]  ·  "
+                        f"[bold red]TTM {minutes_left:>4.1f}m[/]",
+                        title="[bold bright_red]▼ HEDGE SELL — CUTTING LOSSES[/]",
+                        border_style="bright_red",
+                        box=box.HEAVY,
+                    ))
+                    log_event("hedge_attempt", condition_id=cond, leg="down", size=dn_size, bid=hedge_bid, mid=fresh_dn_mid, price_limit=hedge_bid)
+                    sold, _ = sell_market_with_retry(dn_token, dn_size, hedge_bid)
+                    if sold > 0:
+                        meta["expected_dn_size"] = dn_size - sold
+                        s["dn"]["size"] = dn_size - sold
+                        meta["pnl_hedge_proceeds"] = round(meta.get("pnl_hedge_proceeds", 0) + sold * (hedge_bid or 0), 4)
+                        log_event("hedge_fill", condition_id=cond, leg="down", sold=sold, remaining=dn_size - sold, price=hedge_bid, mid=fresh_dn_mid)
+                        notify("HEDGE FIRED", f"Reversal on {s['question']}\nSold DN at ~{hedge_bid:.3f} ({sold:.2f} shares)", priority="urgent")
                         save_json(STATE_FILE, positions_meta)
                     else:
-                        log_event("hedge_fail", condition_id=cond, leg="down", size=dn_size, bid=dn_bid)
+                        time.sleep(1)
+                        actual_bal = check_token_balance(dn_token)
+                        if actual_bal is not None and actual_bal < dn_size - 0.01:
+                            ghost_sold = dn_size - actual_bal
+                            meta["expected_dn_size"] = actual_bal
+                            s["dn"]["size"] = actual_bal
+                            meta["pnl_hedge_proceeds"] = round(meta.get("pnl_hedge_proceeds", 0) + ghost_sold * (hedge_bid or 0), 4)
+                            log_event("hedge_ghost_fill", condition_id=cond, leg="down", sold=ghost_sold, remaining=actual_bal, price=hedge_bid, mid=fresh_dn_mid)
+                            notify("HEDGE FIRED (ghost)", f"Reversal on {s['question']}\nDN hedge ghost fill: {ghost_sold:.2f} shares", priority="urgent")
+                            console.print(f"  [bold yellow][GHOST FILL][/] DN hedge confirmed via balance check: {ghost_sold:.4f} sold")
+                            save_json(STATE_FILE, positions_meta)
+                        else:
+                            log_event("hedge_fail", condition_id=cond, leg="down", size=dn_size, bid=hedge_bid, mid=fresh_dn_mid)
 
             elif HEDGE_ENABLED and loser_was_dn and up_price is not None and up_price <= HEDGE_THRESHOLD:
-                console.print(Panel(
-                    f"  [bright_white]{s['question']}[/]\n"
-                    f"  [bright_red]REVERSAL DETECTED[/] — UP (held leg) dropped to [bold]{up_price:.3f}[/]  ·  "
-                    f"[bold red]TTM {minutes_left:>4.1f}m[/]",
-                    title="[bold bright_red]▼ HEDGE SELL — CUTTING LOSSES[/]",
-                    border_style="bright_red",
-                    box=box.HEAVY,
-                ))
-                log_event("hedge_attempt", condition_id=cond, leg="up", size=up_size, bid=up_bid, price_limit=up_price)
-                sold, _ = sell_market_with_retry(up_token, up_size, HEDGE_THRESHOLD * 0.5)
-                if sold > 0:
-                    meta["expected_up_size"] = up_size - sold
-                    s["up"]["size"] = up_size - sold
-                    meta["pnl_hedge_proceeds"] = round(meta.get("pnl_hedge_proceeds", 0) + sold * (up_price or 0), 4)
-                    log_event("hedge_fill", condition_id=cond, leg="up", sold=sold, remaining=up_size - sold, price=up_price)
-                    notify("HEDGE FIRED", f"Reversal on {s['question']}\nSold UP at ~{up_price:.3f} ({sold:.2f} shares)", priority="urgent")
-                    save_json(STATE_FILE, positions_meta)
+                fresh_up_bid, _, fresh_up_ask, _, fresh_up_mid = get_book_quote(up_token)
+                if fresh_up_mid is not None and fresh_up_mid > HEDGE_THRESHOLD:
+                    log_event(
+                        "hedge_cancel_bounce", condition_id=cond, leg="up",
+                        trigger_bid=up_price, current_bid=fresh_up_bid,
+                        current_ask=fresh_up_ask, current_mid=fresh_up_mid,
+                        threshold=HEDGE_THRESHOLD,
+                    )
+                    console.print(
+                        f"  [dim][CANCEL][/] UP hedge cancelled — mid bounced {up_price:.3f} → {fresh_up_mid:.3f}"
+                    )
                 else:
-                    time.sleep(1)
-                    actual_bal = check_token_balance(up_token)
-                    if actual_bal is not None and actual_bal < up_size - 0.01:
-                        ghost_sold = up_size - actual_bal
-                        meta["expected_up_size"] = actual_bal
-                        s["up"]["size"] = actual_bal
-                        meta["pnl_hedge_proceeds"] = round(meta.get("pnl_hedge_proceeds", 0) + ghost_sold * (up_price or 0), 4)
-                        log_event("hedge_ghost_fill", condition_id=cond, leg="up", sold=ghost_sold, remaining=actual_bal, price=up_price)
-                        notify("HEDGE FIRED (ghost)", f"Reversal on {s['question']}\nUP hedge ghost fill: {ghost_sold:.2f} shares", priority="urgent")
-                        console.print(f"  [bold yellow][GHOST FILL][/] UP hedge confirmed via balance check: {ghost_sold:.4f} sold")
+                    hedge_bid = fresh_up_bid if fresh_up_bid is not None else up_price
+                    console.print(Panel(
+                        f"  [bright_white]{s['question']}[/]\n"
+                        f"  [bright_red]REVERSAL DETECTED[/] — UP (held leg) dropped to [bold]{hedge_bid:.3f}[/]  ·  "
+                        f"[bold red]TTM {minutes_left:>4.1f}m[/]",
+                        title="[bold bright_red]▼ HEDGE SELL — CUTTING LOSSES[/]",
+                        border_style="bright_red",
+                        box=box.HEAVY,
+                    ))
+                    log_event("hedge_attempt", condition_id=cond, leg="up", size=up_size, bid=hedge_bid, mid=fresh_up_mid, price_limit=hedge_bid)
+                    sold, _ = sell_market_with_retry(up_token, up_size, hedge_bid)
+                    if sold > 0:
+                        meta["expected_up_size"] = up_size - sold
+                        s["up"]["size"] = up_size - sold
+                        meta["pnl_hedge_proceeds"] = round(meta.get("pnl_hedge_proceeds", 0) + sold * (hedge_bid or 0), 4)
+                        log_event("hedge_fill", condition_id=cond, leg="up", sold=sold, remaining=up_size - sold, price=hedge_bid, mid=fresh_up_mid)
+                        notify("HEDGE FIRED", f"Reversal on {s['question']}\nSold UP at ~{hedge_bid:.3f} ({sold:.2f} shares)", priority="urgent")
                         save_json(STATE_FILE, positions_meta)
                     else:
-                        log_event("hedge_fail", condition_id=cond, leg="up", size=up_size, bid=up_bid)
+                        time.sleep(1)
+                        actual_bal = check_token_balance(up_token)
+                        if actual_bal is not None and actual_bal < up_size - 0.01:
+                            ghost_sold = up_size - actual_bal
+                            meta["expected_up_size"] = actual_bal
+                            s["up"]["size"] = actual_bal
+                            meta["pnl_hedge_proceeds"] = round(meta.get("pnl_hedge_proceeds", 0) + ghost_sold * (hedge_bid or 0), 4)
+                            log_event("hedge_ghost_fill", condition_id=cond, leg="up", sold=ghost_sold, remaining=actual_bal, price=hedge_bid, mid=fresh_up_mid)
+                            notify("HEDGE FIRED (ghost)", f"Reversal on {s['question']}\nUP hedge ghost fill: {ghost_sold:.2f} shares", priority="urgent")
+                            console.print(f"  [bold yellow][GHOST FILL][/] UP hedge confirmed via balance check: {ghost_sold:.4f} sold")
+                            save_json(STATE_FILE, positions_meta)
+                        else:
+                            log_event("hedge_fail", condition_id=cond, leg="up", size=up_size, bid=hedge_bid, mid=fresh_up_mid)
 
     except Exception:
         log_event("cycle_error", traceback=traceback.format_exc())
