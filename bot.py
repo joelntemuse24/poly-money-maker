@@ -1029,32 +1029,6 @@ while not _shutdown_requested:
             dn_trigger_reason = "threshold" if dn_trigger else None
             seconds_left = minutes_left * 60
 
-            # In the final seconds, a higher-priced loser needs confirmation from
-            # a strong opposite bid when neither side met the normal threshold.
-            if seconds_left <= SELL_LASTCHANCE_S and not up_trigger and not dn_trigger:
-                confirmation_price = 1.0 - SELL_LASTCHANCE_THRESHOLD
-                up_candidate = (up_size > 0 and up_price is not None
-                                and up_price < SELL_LASTCHANCE_THRESHOLD)
-                dn_candidate = (dn_size > 0 and dn_price is not None
-                                and dn_price < SELL_LASTCHANCE_THRESHOLD)
-                if (up_candidate and not dn_candidate and dn_price is not None
-                        and dn_price >= confirmation_price):
-                    up_trigger = True
-                    up_trigger_reason = "last_chance"
-                elif (dn_candidate and not up_candidate and up_price is not None
-                        and up_price >= confirmation_price):
-                    dn_trigger = True
-                    dn_trigger_reason = "last_chance"
-                elif up_candidate or dn_candidate:
-                    log_event(
-                        "sell_skip_ambiguous",
-                        condition_id=cond,
-                        reason="last_chance_unconfirmed",
-                        seconds_left=round(seconds_left, 3),
-                        up_bid=up_bid,
-                        dn_bid=dn_bid,
-                    )
-
             # Two low bids indicate an ambiguous or illiquid book, not two losers.
             if up_trigger and dn_trigger:
                 log_event(
@@ -1113,7 +1087,7 @@ while not _shutdown_requested:
             # latency, cancel the sell — bouncing legs are the ones that reverse.
             if will_sell_up:
                 fresh_up_bid, _ = get_book_bid(up_token)
-                up_cancel_threshold = SELL_THRESHOLD if up_trigger_reason == "threshold" else SELL_LASTCHANCE_THRESHOLD
+                up_cancel_threshold = SELL_THRESHOLD
                 if fresh_up_bid is not None and fresh_up_bid > up_cancel_threshold:
                     log_event(
                         "sell_cancel_bounce", condition_id=cond, leg="up",
@@ -1131,7 +1105,7 @@ while not _shutdown_requested:
                     up_price, up_matched_price = quote_leg(fresh_up_bid)
             if will_sell_dn:
                 fresh_dn_bid, _ = get_book_bid(dn_token)
-                dn_cancel_threshold = SELL_THRESHOLD if dn_trigger_reason == "threshold" else SELL_LASTCHANCE_THRESHOLD
+                dn_cancel_threshold = SELL_THRESHOLD
                 if fresh_dn_bid is not None and fresh_dn_bid > dn_cancel_threshold:
                     log_event(
                         "sell_cancel_bounce", condition_id=cond, leg="down",
