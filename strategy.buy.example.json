@@ -9,7 +9,7 @@
     "enter_max_ttm_min": 60.0,
     "max_set_cost": 1.0,
     "max_open_sets": 3,
-    "max_open_notional": 999999.0,
+    "max_open_notional": 200.0,
     "max_daily_notional": 999999.0,
     "one_entry_per_market": true,
     "poll_s": 15.0,
