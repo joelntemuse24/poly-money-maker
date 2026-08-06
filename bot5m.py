@@ -53,10 +53,10 @@ RELAYER_API_KEY_ADDRESS = os.getenv("RELAYER_API_KEY_ADDRESS", "0x42aec4505559c0
 # ------------------------- STRATEGY CONFIG -------------------------
 # Defaults — overridden by strategy5m.json if present (hot-reloaded each cycle)
 _STRATEGY_DEFAULTS = {
-    "sell_threshold": 0.03,          # final window: sell loser leg if bid ≤ 3¢
-    "sell_window_s": 22,             # threshold window: final 22 seconds
-    "sell_start_s": 30,              # early window opens 30s before expiry
-    "sell_start_price": 0.001,       # early window: floor price (fills at best bid)
+    "sell_threshold": 0.03,          # max sell price: never sell above 3¢
+    "sell_window_s": 22,             # final intense window (sub-second polling)
+    "sell_start_s": 30,              # sell window opens 30s before expiry
+    "sell_start_price": 0.001,       # FAK order floor (min acceptable price, not a trigger)
     "sell_grace_s": 1,               # don't sell within 1s of first seeing a position
     "sell_cooldown_s": 1,            # 1s between sell attempts per leg
     "redeem_throttle_s": 30,         # 30s between redeem attempts
@@ -893,7 +893,7 @@ while not _shutdown_requested:
                     elif secs <= SELL_WINDOW_S:
                         state = f"[bold red]◌ EXIT ≤{int(SELL_THRESHOLD*100)}¢[/]"
                     elif secs <= SELL_START_S:
-                        state = f"[bold yellow]◌ START @ {SELL_START_PRICE*100:.1f}¢ FLR[/]"
+                        state = f"[bold yellow]◌ WATCH ≤{int(SELL_THRESHOLD*100)}¢[/]"
                     else:
                         state = "[bold bright_green]● WATCHING[/]"
 
@@ -1041,32 +1041,26 @@ while not _shutdown_requested:
             else:
                 sell_leg = "down"
 
-            in_final_window = seconds_left <= SELL_WINDOW_S
-
-            if in_final_window:
-                # Threshold trigger: only salvage a near-dead leg (≤ 3¢).
-                loser_bid = up_bid if sell_leg == "up" else dn_bid
-                if loser_bid > SELL_THRESHOLD:
-                    continue
-                # Two low bids indicate an ambiguous or illiquid book, not two losers.
-                other_bid = dn_bid if sell_leg == "up" else up_bid
-                other_size = dn_size if sell_leg == "up" else up_size
-                if other_size >= 0.01 and other_bid is not None and other_bid <= SELL_THRESHOLD:
-                    log_event(
-                        "sell_skip_ambiguous",
-                        condition_id=cond,
-                        reason="both_legs_below_threshold",
-                        seconds_left=round(seconds_left, 3),
-                        up_bid=up_bid,
-                        dn_bid=dn_bid,
-                    )
-                    continue
-                trigger_reason = "threshold"
-            else:
-                # Early window (sell_start_s → sell_window_s): dump the apparent
-                # loser at market with a giveaway floor (sell_start_price). The
-                # FAK fills at the best bid; the floor only rejects a dead book.
-                trigger_reason = "start_price"
+            # 3¢ is the max sell price throughout the entire window (30s → 0s).
+            # The 0.1¢ start_price is only the FAK order floor, not a separate
+            # trigger — we never sell above SELL_THRESHOLD.
+            loser_bid = up_bid if sell_leg == "up" else dn_bid
+            if loser_bid > SELL_THRESHOLD:
+                continue
+            # Two low bids indicate an ambiguous or illiquid book, not two losers.
+            other_bid = dn_bid if sell_leg == "up" else up_bid
+            other_size = dn_size if sell_leg == "up" else up_size
+            if other_size >= 0.01 and other_bid is not None and other_bid <= SELL_THRESHOLD:
+                log_event(
+                    "sell_skip_ambiguous",
+                    condition_id=cond,
+                    reason="both_legs_below_threshold",
+                    seconds_left=round(seconds_left, 3),
+                    up_bid=up_bid,
+                    dn_bid=dn_bid,
+                )
+                continue
+            trigger_reason = "threshold"
 
             if sell_leg == "up":
                 token, size, stale_price = up_token, up_size, up_price
@@ -1084,29 +1078,24 @@ while not _shutdown_requested:
 
             # Post-latency bounce check: re-fetch the bid right before selling.
             fresh_bid, _ = get_book_bid(token)
-            if in_final_window:
-                if fresh_bid is not None and fresh_bid > SELL_THRESHOLD:
-                    log_event(
-                        "sell_cancel_bounce", condition_id=cond, leg=sell_leg,
-                        trigger_bid=stale_price, current_bid=fresh_bid,
-                        threshold=SELL_THRESHOLD,
-                        trigger_reason=trigger_reason,
-                        seconds_left=round(seconds_left, 3),
-                    )
-                    console.print(f"  [dim][CANCEL][/] {sell_leg.upper()} sell cancelled — bid bounced {stale_price:.3f} → {fresh_bid:.3f}")
-                    continue
-                price_limit = fresh_bid if fresh_bid is not None else stale_price
-                if price_limit is None:
-                    continue
-            else:
-                if fresh_bid is None or fresh_bid <= 0:
-                    log_event(
-                        "sell_skip_no_book", condition_id=cond, leg=sell_leg,
-                        trigger_reason=trigger_reason,
-                        seconds_left=round(seconds_left, 3),
-                    )
-                    continue
-                price_limit = SELL_START_PRICE
+            if fresh_bid is not None and fresh_bid > SELL_THRESHOLD:
+                log_event(
+                    "sell_cancel_bounce", condition_id=cond, leg=sell_leg,
+                    trigger_bid=stale_price, current_bid=fresh_bid,
+                    threshold=SELL_THRESHOLD,
+                    trigger_reason=trigger_reason,
+                    seconds_left=round(seconds_left, 3),
+                )
+                console.print(f"  [dim][CANCEL][/] {sell_leg.upper()} sell cancelled — bid bounced {stale_price:.3f} → {fresh_bid:.3f}")
+                continue
+            if fresh_bid is None or fresh_bid <= 0:
+                log_event(
+                    "sell_skip_no_book", condition_id=cond, leg=sell_leg,
+                    trigger_reason=trigger_reason,
+                    seconds_left=round(seconds_left, 3),
+                )
+                continue
+            price_limit = fresh_bid
 
             exec_price = fresh_bid if fresh_bid is not None else stale_price
             _ttm_disp = f"{seconds_left:>3.0f}s"
