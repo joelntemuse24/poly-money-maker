@@ -1,7 +1,7 @@
 {
-    "sell_threshold": 0.03,
+    "sell_threshold": 0.05,
     "sell_window_s": 22,
-    "sell_start_s": 22,
+    "sell_start_s": 30,
     "sell_start_price": 0.001,
     "sell_grace_s": 1,
     "sell_cooldown_s": 1,
