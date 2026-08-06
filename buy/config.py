@@ -7,7 +7,7 @@ from typing import List
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 CONFIG_FILE = os.path.join(REPO_ROOT, "strategy.buy.json")
-DATA_DIR = os.path.join(REPO_ROOT, "buy_data")
+DATA_DIR = os.environ.get("BUY_DATA_DIR") or os.path.join(REPO_ROOT, "buy_data")
 STATE_FILE = os.path.join(DATA_DIR, "state.json")
 LOG_FILE = os.path.join(DATA_DIR, "polybuy.log")
 LOCK_FILE = os.path.join(DATA_DIR, "polybuy.lock")

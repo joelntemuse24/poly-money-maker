@@ -17,19 +17,25 @@ env/
 
 # Bot state
 positions.json
+positions5m.json
 bot.log
 bot.log.*
 *.log
 .heartbeat
+.heartbeat5m
 pnl.json
+pnl5m.json
 strategy.json
+strategy5m.json
 
 # Shadow simulator runtime data
 sim_data/
 
 # Atomic mint buyer runtime data and live config
 buy_data/
+buy_data_5m/
 strategy.buy.json
+strategy.buy.5m.json
 
 # IDE
 .vscode/
