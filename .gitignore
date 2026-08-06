@@ -18,15 +18,19 @@ env/
 # Bot state
 positions.json
 positions5m.json
+positions_hourly.json
 bot.log
 bot.log.*
 *.log
 .heartbeat
 .heartbeat5m
+.heartbeat_hourly
 pnl.json
 pnl5m.json
+pnl_hourly.json
 strategy.json
 strategy5m.json
+strategy_hourly.json
 
 # Shadow simulator runtime data
 sim_data/
@@ -34,8 +38,10 @@ sim_data/
 # Atomic mint buyer runtime data and live config
 buy_data/
 buy_data_5m/
+buy_data_hourly/
 strategy.buy.json
 strategy.buy.5m.json
+strategy.buy.hourly.json
 
 # IDE
 .vscode/

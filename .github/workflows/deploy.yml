@@ -5,6 +5,7 @@ on:
     branches: [main]
     paths:
       - 'bot.py'
+      - 'bothourly.py'
       - 'requirements.txt'
       - 'strategy.json'
 

@@ -34,11 +34,10 @@ load_dotenv()
 HOST = "https://clob.polymarket.com"
 DATA_API = "https://data-api.polymarket.com"
 CHAIN_ID = 137
-STATE_FILE = "positions.json"  # metadata cache only: redeem_submitted_at, entered_at
-BTC_SLUG_PREFIX = "btc-updown"  # event/market slug filter for managed markets (15m)
-BTC_SLUG_ALIASES = ("btc-updown",)
-# Managed by bot5m.py and bothourly.py — exclude here so bots never touch the same market.
-BTC_SLUG_EXCLUDES = ("btc-updown-5m", "bitcoin-up-or-down")
+STATE_FILE = "positions_hourly.json"
+BTC_SLUG_PREFIX = "bitcoin-up-or-down"
+BTC_SLUG_ALIASES = ("bitcoin-up-or-down",)
+BTC_SLUG_EXCLUDES = ("btc-updown-5m",)
 PUSD = "0xC011a7E12a19f7B1f670d46F03B03f3342E82DFB"
 CTF = "0x4D97DCd97eC945f40cF65F87097ACe5EA0476045"
 
@@ -48,37 +47,32 @@ API_KEY = os.getenv("API_KEY")
 API_SECRET = os.getenv("API_SECRET")
 API_PASSPHRASE = os.getenv("API_PASSPHRASE")
 RELAYER_URL = os.getenv("RELAYER_URL", "https://relayer-v2.polymarket.com")
-# Defaults match the values that used to be hardcoded (already present in git
-# history); override via env to use a rotated relayer key.
 RELAYER_API_KEY = os.getenv("RELAYER_API_KEY", "019df62f-45bc-796e-975c-3f434472b163")
 RELAYER_API_KEY_ADDRESS = os.getenv("RELAYER_API_KEY_ADDRESS", "0x42aec4505559c0613f7ce2541d9d29741bc5e195")
 
 # ------------------------- STRATEGY CONFIG -------------------------
-# Defaults — overridden by strategy.json if present (hot-reloaded each cycle)
 _STRATEGY_DEFAULTS = {
     "sell_threshold": 0.05,
     "hedge_enabled": True,
-    "hedge_threshold": 0.40,
-    "sell_window_min": 1.5,            # last 90 seconds — sell window
-    "sell_grace_s": 2,                # don't sell within 2s of first seeing a position
-    "sell_cooldown_s": 3,             # 3s between sell attempts per leg
-    "sell_lastchance_threshold": 0.10, # only sell in final seconds if truly dead
-    "sell_lastchance_s": 10,           # last-chance window: final 10 seconds
-    "redeem_throttle_s": 30,          # 30s between redeem attempts
+    "hedge_threshold": 0.65,
+    "sell_window_min": 1.5,
+    "sell_grace_s": 2,
+    "sell_cooldown_s": 3,
+    "sell_lastchance_threshold": 0.10,
+    "sell_lastchance_s": 10,
+    "redeem_throttle_s": 30,
     "max_redeem_age_days": 7,
     "dry_run": False,
-    "poll_sell_window_s": 0.1,       # 0.1s polling in sell window
-    "positions_refresh_s": 2,        # refresh positions every N seconds (not every sub-second cycle)
-    "balance_refresh_s": 15,         # refresh balance every N seconds
+    "poll_sell_window_s": 0.1,
+    "positions_refresh_s": 2,
+    "balance_refresh_s": 15,
 }
-STRATEGY_FILE = "strategy.json"
+STRATEGY_FILE = "strategy_hourly.json"
 
 _strat_cache = None
 _strat_mtime = 0.0
 
 def load_strategy():
-    """Load strategy params from strategy.json, falling back to defaults.
-    Caches result and only re-reads when the file's mtime changes."""
     global _strat_cache, _strat_mtime
     try:
         mtime = os.path.getmtime(STRATEGY_FILE) if os.path.exists(STRATEGY_FILE) else 0
@@ -99,7 +93,7 @@ def load_strategy():
                     else:
                         cfg[k] = expected(v)
     except Exception as e:
-        console.print(f"[bold red]▶ STRATEGY [WARN][/] [dim]failed to load {STRATEGY_FILE}: {e}[/]")
+        console.print(f"[bold red]\u25b6 STRATEGY [WARN][/] [dim]failed to load {STRATEGY_FILE}: {e}[/]")
     _strat_cache = cfg
     _strat_mtime = mtime
     return cfg
@@ -121,21 +115,21 @@ POSITIONS_REFRESH_S = _strat["positions_refresh_s"]
 BALANCE_REFRESH_S = _strat["balance_refresh_s"]
 
 # ------------------------- LOG ROTATION -------------------------
-LOG_FILE = "bot.log"
-LOG_MAX_BYTES = 5 * 1024 * 1024   # 5 MB per file
-LOG_BACKUP_COUNT = 3              # keep bot.log, bot.log.1, bot.log.2, bot.log.3
+LOG_FILE = "bot_hourly.log"
+LOG_MAX_BYTES = 5 * 1024 * 1024
+LOG_BACKUP_COUNT = 3
 
-_file_logger = logging.getLogger("polybot")
+_file_logger = logging.getLogger("polybot_hourly")
 _file_logger.setLevel(logging.INFO)
 _log_handler = RotatingFileHandler(LOG_FILE, maxBytes=LOG_MAX_BYTES, backupCount=LOG_BACKUP_COUNT)
 _log_handler.setFormatter(logging.Formatter("%(message)s"))
 _file_logger.addHandler(_log_handler)
 
 # ------------------------- HEARTBEAT -------------------------
-HEARTBEAT_FILE = ".heartbeat"
+HEARTBEAT_FILE = ".heartbeat_hourly"
 
 # ------------------------- P&L TRACKING -------------------------
-PNL_FILE = "pnl.json"
+PNL_FILE = "pnl_hourly.json"
 
 # ------------------------- CLIENT SETUP -------------------------
 if API_KEY and API_SECRET and API_PASSPHRASE:
@@ -145,11 +139,11 @@ if API_KEY and API_SECRET and API_PASSPHRASE:
         api_secret=API_SECRET,
         api_passphrase=API_PASSPHRASE,
     )
-    console.print("[bold bright_cyan]▶ AUTH[/] [dim]pre-generated API credentials loaded[/]")
+    console.print("[bold bright_cyan]\u25b6 AUTH[/] [dim]pre-generated API credentials loaded[/]")
 else:
     temp_client = ClobClient(host=HOST, key=PRIVATE_KEY, chain_id=CHAIN_ID)
     api_creds = temp_client.create_or_derive_api_key()
-    console.print("[bold bright_cyan]▶ AUTH[/] [dim]API credentials derived from private key[/]")
+    console.print("[bold bright_cyan]\u25b6 AUTH[/] [dim]API credentials derived from private key[/]")
 
 client = ClobClient(
     host=HOST,
@@ -163,21 +157,21 @@ client = ClobClient(
 try:
     from py_clob_client_v2.client import BalanceAllowanceParams
     client.update_balance_allowance(BalanceAllowanceParams(asset_type="COLLATERAL"))
-    console.print("[bold bright_green]▶ COLLATERAL[/] [dim]allowance synced · USDC.e armed[/]")
+    console.print("[bold bright_green]\u25b6 COLLATERAL[/] [dim]allowance synced \u00b7 USDC.e armed[/]")
 except Exception as e:
-    console.print(f"[bold red]▶ COLLATERAL [WARN][/] [dim]{e}[/]")
+    console.print(f"[bold red]\u25b6 COLLATERAL [WARN][/] [dim]{e}[/]")
 
 banner = Panel(
     Align.center(
-        "[bold bright_green]██████╗ ████████╗ ██████╗[/]   [bright_yellow]//[/]  [bold white]EXIT DESK[/]\n"
-        "[bold bright_green]██╔══██╗╚══██╔══╝██╔════╝[/]   [bright_yellow]//[/]  [dim]POLYMARKET CLOB · MATIC[/]\n"
-        "[bold bright_green]██████╔╝   ██║   ██║     [/]   [bright_yellow]//[/]  [dim]SELL-SIDE EXECUTION ONLY[/]\n"
-        "[bold bright_green]██╔══██╗   ██║   ██║     [/]   [bright_yellow]//[/]  [dim]BTC 5-MIN · 8\u00a2 LOSER TRIG[/]\n"
-        "[bold bright_green]██████╔╝   ██║   ╚██████╗[/]   [bright_yellow]//[/]  STATUS: [bold bright_green]\u25cf ARMED[/]\n"
-        "[bold bright_green]╚═════╝    ╚═╝    ╚═════╝[/]   [bright_yellow]//[/]  [dim]v9.0 \u00b7 5m \u00b7 sell-only \u00b7 data-api[/]",
+        "[bold bright_green]\u2588\u2588\u2588\u2588\u2588\u2588\u2557 \u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2557 \u2588\u2588\u2588\u2588\u2588\u2588\u2557[/]   [bright_yellow]//[/]  [bold white]EXIT DESK[/]\n"
+        "[bold bright_green]\u2588\u2588\u2554\u2588\u2588\u2557\u2588\u2588\u2551 \u255a\u2550\u2550\u2588\u2588\u2554\u2550\u2550\u255d\u2588\u2588\u2554\u2550\u2550\u2550\u2550\u255d[/]   [bright_yellow]//[/]  [dim]POLYMARKET CLOB \u00b7 MATIC[/]\n"
+        "[bold bright_green]\u2588\u2588\u2588\u2588\u2588\u2588\u2554\u255d   \u2588\u2588\u2551   \u2588\u2588\u2551     [/]   [bright_yellow]//[/]  [dim]SELL-SIDE EXECUTION ONLY[/]\n"
+        "[bold bright_green]\u2588\u2588\u2554\u2588\u2588\u2557\u2588\u2588\u2551   \u2588\u2588\u2551   \u2588\u2588\u2551     [/]   [bright_yellow]//[/]  [dim]BTC HOURLY \u00b7 65\u00a2 HEDGE TRIG[/]\n"
+        "[bold bright_green]\u2588\u2588\u2588\u2588\u2588\u2588\u2554\u255d   \u2588\u2588\u2551   \u255a\u2588\u2588\u2588\u2588\u2588\u2588\u2557[/]   [bright_yellow]//[/]  STATUS: [bold bright_green]\u25cf ARMED[/]\n"
+        "[bold bright_green]\u255a\u2550\u2550\u2550\u2550\u2550\u255d    \u255a\u2550\u255d    \u255a\u2550\u2550\u2550\u2550\u2550\u255d[/]   [bright_yellow]//[/]  [dim]v1.0 \u00b7 hourly \u00b7 sell-only \u00b7 data-api[/]",
         vertical="middle",
     ),
-    title="[bold bright_yellow]▰▱▰▱  TRADING SYSTEM ONLINE  ▱▰▱▰[/]",
+    title="[bold bright_yellow]\u25b0\u25b1\u25b0\u25b1\u25b0\u25b1  TRADING SYSTEM ONLINE  \u25b1\u25b0\u25b1\u25b0\u25b1\u25b0[/]",
     subtitle="[dim]press Ctrl-C to disarm[/]",
     border_style="bright_green",
     box=box.HEAVY_EDGE,
@@ -185,7 +179,7 @@ banner = Panel(
 )
 console.print(banner)
 if DRY_RUN:
-    console.print("[bold black on yellow] DRY-RUN [/] [yellow]no orders or on-chain txs will be sent · decisions are logged only[/]")
+    console.print("[bold black on yellow] DRY-RUN [/] [yellow]no orders or on-chain txs will be sent \u00b7 decisions are logged only[/]")
 
 # ------------------------- GRACEFUL SHUTDOWN -------------------------
 
@@ -195,22 +189,20 @@ _shutdown_requested = False
 def _handle_shutdown(signum, frame):
     global _shutdown_requested
     sig_name = signal.Signals(signum).name
-    console.print(f"\n[bold yellow]▶ {sig_name} received — finishing current cycle then exiting[/]")
+    console.print(f"\n[bold yellow]\u25b6 {sig_name} received \u2014 finishing current cycle then exiting[/]")
     _shutdown_requested = True
 
 
 signal.signal(signal.SIGTERM, _handle_shutdown)
 signal.signal(signal.SIGINT, _handle_shutdown)
 
-# Track positions with permanent redeem failures to avoid retry spam
 _redeem_permanent_failures = set()
 
 # ------------------------- NOTIFICATIONS -------------------------
 
-NTFY_TOPIC = os.getenv("NTFY_TOPIC", "polybot-joel-btc")
+NTFY_TOPIC = os.getenv("NTFY_TOPIC_HOURLY", "polybot-joel-btc-hourly")
 
 def notify(title, message, priority="default"):
-    """Send a push notification via ntfy.sh. Fire-and-forget."""
     try:
         requests.post(
             f"https://ntfy.sh/{NTFY_TOPIC}",
@@ -219,10 +211,10 @@ def notify(title, message, priority="default"):
             timeout=5,
         )
     except Exception:
-        pass  # notifications are best-effort, never crash the bot
+        pass
 
-notify("Polybot Started", f"Bot started at {datetime.now().strftime('%Y-%m-%d %H:%M:%S UTC')}", priority="high")
-console.print(f"[bold bright_cyan]▶ NOTIFY[/] [dim]ntfy.sh topic: {NTFY_TOPIC}[/]")
+notify("Polybot Hourly Started", f"Hourly bot started at {datetime.now().strftime('%Y-%m-%d %H:%M:%S UTC')}", priority="high")
+console.print(f"[bold bright_cyan]\u25b6 NOTIFY[/] [dim]ntfy.sh topic: {NTFY_TOPIC}[/]")
 
 # ------------------------- HELPERS -------------------------
 
@@ -267,14 +259,12 @@ def save_json(path, data):
 
 
 def log_event(event, **kwargs):
-    """Append a structured JSON log line to bot.log (with rotation)."""
     entry = {"ts": datetime.now().isoformat(), "event": event}
     entry.update(kwargs)
     _file_logger.info(json.dumps(entry))
 
 
 def write_heartbeat():
-    """Write current timestamp to heartbeat file for health monitoring."""
     try:
         with open(HEARTBEAT_FILE, "w") as f:
             json.dump({"ts": time.time(), "iso": datetime.now().isoformat(), "cycle": CYCLE}, f)
@@ -283,7 +273,6 @@ def write_heartbeat():
 
 
 def load_pnl():
-    """Load cumulative P&L data."""
     if os.path.exists(PNL_FILE):
         try:
             with open(PNL_FILE, "r") as f:
@@ -294,7 +283,6 @@ def load_pnl():
 
 
 def record_pnl(condition_id, question, entry_cost, sell_proceeds, hedge_proceeds, outcome):
-    """Record a completed trade's P&L."""
     pnl_data = load_pnl()
     net = sell_proceeds + hedge_proceeds - entry_cost
     trade = {
@@ -315,7 +303,6 @@ def record_pnl(condition_id, question, entry_cost, sell_proceeds, hedge_proceeds
         s["wins"] += 1
     else:
         s["losses"] += 1
-    # Keep last 500 trades to prevent unbounded growth
     if len(pnl_data["trades"]) > 500:
         pnl_data["trades"] = pnl_data["trades"][-500:]
     atomic_save(PNL_FILE, pnl_data)
@@ -325,8 +312,6 @@ def record_pnl(condition_id, question, entry_cost, sell_proceeds, hedge_proceeds
 # ------------------------- POSITION DISCOVERY -------------------------
 
 def get_user_positions():
-    """Fetch user's current open positions from Polymarket data-api.
-    Returns a list of position dicts on success, or None on failure."""
     try:
         res = requests.get(
             f"{DATA_API}/positions",
@@ -344,8 +329,6 @@ def get_user_positions():
 
 
 def check_token_balance(token_id):
-    """Re-fetch positions and return the current size for a specific token.
-    Returns the float balance, or None if lookup fails."""
     try:
         positions = get_user_positions()
         if positions is None:
@@ -362,7 +345,6 @@ _ET = ZoneInfo("America/New_York")
 _SLUG_TIME_RE = re.compile(r"(\d{1,2})(am|pm)-et$")
 
 
-# Regex to detect duration marker in slugs like "btc-updown-5m-{ts}"
 _SLUG_DURATION_RE = re.compile(r"-(\d+)m-")
 
 
@@ -374,14 +356,10 @@ def parse_position_end_dt(legs):
             if tail.isdigit():
                 ts = int(tail)
                 if ts > 1_700_000_000:
-                    # Slug timestamp is the market START time.
-                    # Detect duration from slug (e.g. "5m" → 5 minutes)
-                    # and add it to get the actual end/expiry time.
                     dur_match = _SLUG_DURATION_RE.search(slug)
                     dur_min = int(dur_match.group(1)) if dur_match else 60
                     return datetime.fromtimestamp(ts) + timedelta(minutes=dur_min)
 
-    # Extract hour+am/pm from slug (e.g. "…-12pm-et" → 12PM ET)
     slug_hour = None
     for p in legs:
         for key in ("slug", "eventSlug"):
@@ -405,10 +383,6 @@ def parse_position_end_dt(legs):
         try:
             base = datetime.fromisoformat(end_date.replace("Z", "+00:00"))
             if slug_hour is not None:
-                # The endDate is the UTC calendar date on which the market
-                # expires.  We know the ET hour from the slug.  Find the ET
-                # date such that (slug_hour + 1h) in ET falls on the
-                # endDate in UTC.  Try the endDate itself, then ±1 day.
                 if base.tzinfo is None:
                     base = base.replace(tzinfo=ZoneInfo("UTC"))
                 end_utc_date = base.astimezone(ZoneInfo("UTC")).date()
@@ -419,7 +393,6 @@ def parse_position_end_dt(legs):
                     ) + timedelta(days=day_offset, hours=1)
                     if candidate.astimezone(ZoneInfo("UTC")).date() == end_utc_date:
                         return candidate.astimezone(tz=None).replace(tzinfo=None)
-                # Fallback: use endDate + slug offset without date matching
                 base_et = base.astimezone(_ET)
                 et_dt = base_et.replace(hour=slug_hour, minute=0, second=0, microsecond=0) + timedelta(hours=1)
                 return et_dt.astimezone(tz=None).replace(tzinfo=None)
@@ -442,19 +415,17 @@ def empty_opposite_leg(source, outcome):
     }
 
 
-def group_btc_complete_sets(positions, positions_meta=None):
-    """Filter to BTC markets, grouped by conditionId with UP/DOWN leg metadata.
-    Includes single-leg positions so direct sells can still be managed."""
+def group_hourly_complete_sets(positions, positions_meta=None):
     by_cond = {}
     for p in positions:
         slug = (p.get("slug") or "").lower()
         event_slug = (p.get("eventSlug") or "").lower()
-        title = (p.get("title") or "").lower()
         if slug.startswith(BTC_SLUG_EXCLUDES) or event_slug.startswith(BTC_SLUG_EXCLUDES):
             continue
         if not (
             slug.startswith(BTC_SLUG_ALIASES)
             or event_slug.startswith(BTC_SLUG_ALIASES)
+            or "bitcoin up or down" in (p.get("title") or "").lower()
         ):
             continue
         cond = p.get("conditionId")
@@ -491,12 +462,10 @@ def group_btc_complete_sets(positions, positions_meta=None):
             "dn": dn,
             "end_ts": end_ts,
             "end_dt": end_dt,
-            "question": up.get("title") or dn.get("title") or "BTC Market",
+            "question": up.get("title") or dn.get("title") or "BTC Hourly Market",
         })
     sets.sort(key=lambda s: s["end_ts"])
 
-    # Inject orphan legs from metadata: if we sold partially last cycle and
-    # data-api hasn't caught up, keep the remaining size alive for this cycle.
     if positions_meta:
         existing_conds = {s["conditionId"] for s in sets}
         now_ms = time.time() * 1000
@@ -527,7 +496,7 @@ def group_btc_complete_sets(positions, positions_meta=None):
                 "dn": {"asset": dn_token, "size": exp_dn, "outcome": "down", "redeemable": False},
                 "end_ts": end_ts,
                 "end_dt": end_dt,
-                "question": meta.get("question", "BTC Market"),
+                "question": meta.get("question", "BTC Hourly Market"),
             })
         sets.sort(key=lambda s: s["end_ts"])
 
@@ -541,8 +510,6 @@ def get_book_bid(token_id):
         book = safe_api_call(client.get_order_book, token_id)
         path = "sdk"
     except Exception as sdk_err:
-        # SDK HTTP layer failure (status_code=None = connection-level). Fall back
-        # to the public /book endpoint with plain requests — no auth required.
         try:
             resp = requests.get(
                 f"{HOST}/book", params={"token_id": token_id}, timeout=5
@@ -568,13 +535,6 @@ def get_book_bid(token_id):
 
 
 def get_book_quote(token_id):
-    """Return (bid_price, bid_size, ask_price, ask_size, mid_price).
-
-    Uses the same SDK-first + HTTP-fallback pattern as get_book_bid. If no bids
-    exist, returns (None, 0.0, None, 0.0, None). If no asks exist, mid_price
-    falls back to the best bid. Mid is used as a sanity check against thin bids
-    that don't reflect actual market sentiment.
-    """
     try:
         book = safe_api_call(client.get_order_book, token_id)
         path = "sdk"
@@ -624,7 +584,6 @@ def extract_order_id(order_obj):
 
 
 def get_order_details(order_id):
-    """Return dict with size_matched and status, or None."""
     if not order_id:
         return None
     try:
@@ -643,20 +602,11 @@ def get_order_details(order_id):
     except Exception as e:
         err = str(e).lower()
         if "not found" in err or "404" in err:
-            # Order likely fully filled and removed from active API
             return {"status": "NOT_FOUND"}
         return None
 
 
 def confirm_fill_size(result, oid, requested):
-    """Best-effort number of shares an order actually filled.
-
-    Prefers an explicit size_matched on the response, otherwise verifies via the
-    order endpoint (a 404/NOT_FOUND means the FAK was archived after filling, so the
-    requested chunk filled). Returns 0 when the fill cannot be confirmed, so callers
-    never assume a full fill on an ambiguous response -- assuming a full fill would
-    over-report sells and silently skip real exits.
-    """
     matched = 0.0
     if isinstance(result, dict):
         sm = result.get("size_matched")
@@ -680,7 +630,7 @@ def sell_market_with_retry(token_id, size, price_limit, tick_size="0.01", max_re
     remaining = float(size)
     price = max(float(price_limit or tick_size), float(tick_size))
     if DRY_RUN:
-        console.print(f"  [bold black on yellow][DRY SELL][/] would SELL {remaining:.4f} {str(token_id)[:12]}… @ ≥{price:.3f}")
+        console.print(f"  [bold black on yellow][DRY SELL][/] would SELL {remaining:.4f} {str(token_id)[:12]}\u2026 @ \u2265{price:.3f}")
         log_event("dry_sell", token_id=token_id, size=remaining, price_limit=price)
         return 0, None
     for attempt in range(max_retries):
@@ -697,11 +647,11 @@ def sell_market_with_retry(token_id, size, price_limit, tick_size="0.01", max_re
                 oid = extract_order_id(result)
                 filled = float(confirm_fill_size(result, oid, remaining))
                 if filled <= 0:
-                    console.print("  [dim yellow][FAK NULL][/] [dim]0 confirmed fill · stopping to avoid double-sell[/]")
+                    console.print("  [dim yellow][FAK NULL][/] [dim]0 confirmed fill \u00b7 stopping to avoid double-sell[/]")
                     break
                 total_sold += filled
                 remaining -= filled
-                console.print(f"  [bold green][EXIT FAK][/]{filled} @ ≥{price:.3f}  [dim]id={str(oid)[:16]}...[/]")
+                console.print(f"  [bold green][EXIT FAK][/]{filled} @ \u2265{price:.3f}  [dim]id={str(oid)[:16]}...[/]")
                 if remaining < 0.01:
                     return total_sold, result
         except Exception as e:
@@ -717,7 +667,7 @@ def sell_market_with_retry(token_id, size, price_limit, tick_size="0.01", max_re
 
 def get_relayer_headers():
     if not RELAYER_API_KEY or not RELAYER_API_KEY_ADDRESS:
-        console.print("[bold red]▶ RELAYER [WARN][/] [dim]RELAYER_API_KEY / RELAYER_API_KEY_ADDRESS not set · redeem will fail[/]")
+        console.print("[bold red]\u25b6 RELAYER [WARN][/] [dim]RELAYER_API_KEY / RELAYER_API_KEY_ADDRESS not set \u00b7 redeem will fail[/]")
     relayer_headers = {
         "Content-Type": "application/json",
         "RELAYER_API_KEY": RELAYER_API_KEY or "",
@@ -755,18 +705,11 @@ def submit_proxy_tx(target, data, tx_type="PROXY"):
     )
     if submit_r.status_code == 200:
         return submit_r.json().get("transactionID") or "?", None
-    return None, f"HTTP {submit_r.status_code} · {submit_r.text[:80]}"
+    return None, f"HTTP {submit_r.status_code} \u00b7 {submit_r.text[:80]}"
 
 
 
 def quote_leg(bid):
-    """Return (self_price, matched_price) for a single leg.
-
-      - self_price:    leg's value used for sell/hedge decisions. Only uses bid
-                       (actual buyers on the book). Returns None if no bid exists
-                       — the bot will NOT attempt to sell into an empty book.
-      - matched_price: realizable price for a direct sell (bid).
-    """
     if bid is None:
         return None, None
     return float(bid), float(bid)
@@ -775,10 +718,8 @@ def quote_leg(bid):
 # ------------------------- REDEEM -------------------------
 
 def redeem_condition(condition_id, label=""):
-    """Submit a redemption tx for a resolved Polymarket conditionId via the Polygon relayer.
-    Returns the transactionID string on success, or None on failure."""
     if DRY_RUN:
-        console.print(f"  [bold black on yellow][DRY SETTLE][/] would redeem · {label}")
+        console.print(f"  [bold black on yellow][DRY SETTLE][/] would redeem \u00b7 {label}")
         log_event("dry_redeem", condition_id=condition_id, label=label)
         return None
     try:
@@ -808,7 +749,7 @@ def redeem_condition(condition_id, label=""):
         console.print(f"  [dim red][SETTLE FAIL][/] {label}  [dim]{err}[/]")
         if err and ("proxyWallet" in err or "invalid" in err.lower()):
             _redeem_permanent_failures.add(condition_id)
-            console.print(f"  [dim red][SETTLE SKIP][/] {label}  [dim]permanent failure — will not retry[/]")
+            console.print(f"  [dim red][SETTLE SKIP][/] {label}  [dim]permanent failure \u2014 will not retry[/]")
         return None
     except Exception as e:
         console.print(f"  [dim red][SETTLE ERR][/] {label}  [dim]{e}[/]")
@@ -816,19 +757,13 @@ def redeem_condition(condition_id, label=""):
 
 
 # ------------------------- MAIN LOOP -------------------------
-# positions_meta is a metadata cache keyed by conditionId. The on-chain holdings
-# (size, redeemable flag, etc.) come fresh from data-api each cycle. We only
-# persist:
-#   - entered_at: when we first saw this set (used for sell grace period)
-#   - redeem_submitted_at: throttle redemption resubmissions
-#   - last_sell_up_at / last_sell_dn_at: 30s post-sell cooldown per leg
 positions_meta = load_json(STATE_FILE)
 CYCLE = 0
 _last_positions_refresh = 0.0
 _last_balance_refresh = 0.0
 _cached_managed_sets = []
 _book_executor = ThreadPoolExecutor(max_workers=4)
-_pending_book_futs = {}  # {future: token_id} — books fetched during previous sleep
+_pending_book_futs = {}
 
 while not _shutdown_requested:
     try:
@@ -836,7 +771,6 @@ while not _shutdown_requested:
         now_ms = time.time() * 1000
         now_str = datetime.now().strftime("%H:%M:%S")
 
-        # Hot-reload strategy config from strategy.json (no restart needed)
         _strat = load_strategy()
         SELL_THRESHOLD = _strat["sell_threshold"]
         HEDGE_ENABLED = _strat["hedge_enabled"]
@@ -862,10 +796,10 @@ while not _shutdown_requested:
 
         if _now_f - _last_positions_refresh >= POSITIONS_REFRESH_S:
             positions_raw = get_user_positions()
-            _cached_managed_sets = group_btc_complete_sets(positions_raw or [], positions_meta)
+            _cached_managed_sets = group_hourly_complete_sets(positions_raw or [], positions_meta)
             _last_positions_refresh = _now_f
         else:
-            positions_raw = None  # skip GC when not refreshing positions
+            positions_raw = None
         managed_sets = _cached_managed_sets
 
         console.rule(
@@ -876,25 +810,17 @@ while not _shutdown_requested:
         )
 
         # ================= GC META CACHE =================
-        # Drop metadata entries for conditions we no longer hold (sold out, expired+redeemed).
-        # Only run GC when data-api fetch succeeded; skip on transient failures to avoid
-        # wiping state during outages.
         if positions_raw is not None:
             live_conds = {s["conditionId"] for s in managed_sets}
             stale_conds = [c for c in list(positions_meta.keys()) if c not in live_conds]
             for c in stale_conds:
                 gc_meta = positions_meta[c]
-                # Record P&L for completed trades before deleting metadata
                 if "pnl_entry_cost" in gc_meta:
                     entry_cost = gc_meta.get("pnl_entry_cost", 0)
                     sell_proceeds = gc_meta.get("pnl_sell_proceeds", 0)
                     hedge_proceeds = gc_meta.get("pnl_hedge_proceeds", 0)
                     redeem_value = gc_meta.get("pnl_redeem_value", 0)
-                    # If no explicit redeem was recorded, estimate from remaining holdings.
-                    # Winner resolves at $1/share; use tracked sizes (post-sell) or initial sizes.
                     if redeem_value == 0:
-                        # Use expected sizes if non-zero, else fall back to init sizes
-                        # (orphan expiry path may have zeroed expected_*_size)
                         rem_up = gc_meta.get("expected_up_size", 0) or gc_meta.get("pnl_init_up_size", 0)
                         rem_dn = gc_meta.get("expected_dn_size", 0) or gc_meta.get("pnl_init_dn_size", 0)
                         if rem_up > 0 or rem_dn > 0:
@@ -967,7 +893,7 @@ while not _shutdown_requested:
                     continue
             console.print(table)
         else:
-            console.print("  [dim]\u00b7 no managed positions \u00b7 awaiting your manual buys on the UI \u00b7[/]")
+            console.print("  [dim]\u00b7 no managed hourly positions \u00b7 awaiting your manual buys on the UI \u00b7[/]")
 
         # ================= REDEEM =================
         for s in managed_sets:
@@ -982,13 +908,10 @@ while not _shutdown_requested:
             meta = positions_meta.setdefault(cond, {})
             last = meta.get("redeem_submitted_at") or 0
             if now_ms - last < REDEEM_THROTTLE_S * 1000:
-                continue  # already submitted, wait 5 min before retry
+                continue
             tx = redeem_condition(cond, label=(s["question"] or "?")[:32])
             if tx:
                 meta["redeem_submitted_at"] = now_ms
-                # P&L: only the winning side resolves at $1/share; the loser
-                # resolves at $0.  min(up, dn) complete sets pay $1 each, and
-                # the excess shares on one side also pay $1 (they are the winner).
                 remaining_up = float(s["up"].get("size", 0))
                 remaining_dn = float(s["dn"].get("size", 0))
                 meta["pnl_redeem_value"] = round(max(remaining_up, remaining_dn), 4)
@@ -996,8 +919,6 @@ while not _shutdown_requested:
                 save_json(STATE_FILE, positions_meta)
 
         # ================= COLLECT PRE-FETCHED BOOKS =================
-        # Books were fetched in the background during the previous cycle's sleep.
-        # They should already be complete — just collect the results (instant).
         _book_cache = {}
         for _f, _t in list(_pending_book_futs.items()):
             try:
@@ -1014,8 +935,6 @@ while not _shutdown_requested:
             if minutes_left <= 0:
                 continue
             cond = s["conditionId"]
-            # Note: do NOT skip sell phase for _redeem_permanent_failures —
-            # a bad redeem response should never prevent selling the loser.
 
             up_token = s["up"].get("asset")
             dn_token = s["dn"].get("asset")
@@ -1026,7 +945,6 @@ while not _shutdown_requested:
                 meta["dn_token"] = dn_token
                 meta["question"] = s["question"]
                 meta["end_date"] = s["up"].get("endDate") or s["dn"].get("endDate")
-                # P&L: entry cost from actual avgPrice (data-api), fallback $0.50
                 init_up = float(s["up"].get("size", 0))
                 init_dn = float(s["dn"].get("size", 0))
                 up_avg = float(s["up"].get("avgPrice", 0) or 0) or 0.50
@@ -1040,7 +958,6 @@ while not _shutdown_requested:
                 save_json(STATE_FILE, positions_meta)
             if now_ms - meta["entered_at"] < SELL_GRACE_S * 1000:
                 continue
-            # Only sell in the last SELL_WINDOW_MIN minutes to reduce reversal risk
             if minutes_left > SELL_WINDOW_MIN:
                 continue
             up_size = float(s["up"].get("size", 0))
@@ -1051,7 +968,6 @@ while not _shutdown_requested:
             up_bid, _ = _book_cache.get(up_token, (None, 0.0)) if up_token else (None, 0.0)
             dn_bid, _ = _book_cache.get(dn_token, (None, 0.0)) if dn_token else (None, 0.0)
 
-            # Alert if book fetch failed for either leg during the sell window
             if up_bid is None and up_size > 0:
                 log_event("sell_skip_no_book", condition_id=cond, leg="up", minutes_left=round(minutes_left, 1))
             if dn_bid is None and dn_size > 0:
@@ -1059,7 +975,7 @@ while not _shutdown_requested:
             if up_bid is None and dn_bid is None and (up_size > 0 or dn_size > 0):
                 _book_fail_count = meta.get("_book_fail_count", 0) + 1
                 meta["_book_fail_count"] = _book_fail_count
-                if _book_fail_count == 15:  # ~15s at 1s polling in sell window
+                if _book_fail_count == 15:
                     _ttm_str = f"{round(minutes_left*60)}s" if minutes_left < 1 else f"{round(minutes_left)}m"
                     notify("\u26a0 Book Unavailable", f"{s['question']} \u2014 order book unreachable with {_ttm_str} left", priority="high")
             else:
@@ -1068,7 +984,6 @@ while not _shutdown_requested:
             up_price, up_matched_price = quote_leg(up_bid)
             dn_price, dn_matched_price = quote_leg(dn_bid)
 
-            # Sell at or below the configured threshold throughout the exit window.
             up_trigger = bool(
                 up_size > 0 and up_price is not None and up_price <= SELL_THRESHOLD
             )
@@ -1079,7 +994,6 @@ while not _shutdown_requested:
             dn_trigger_reason = "threshold" if dn_trigger else None
             seconds_left = minutes_left * 60
 
-            # Two low bids indicate an ambiguous or illiquid book, not two losers.
             if up_trigger and dn_trigger:
                 log_event(
                     "sell_skip_ambiguous",
@@ -1094,7 +1008,6 @@ while not _shutdown_requested:
                 up_trigger_reason = None
                 dn_trigger_reason = None
 
-            # Once one leg is fully sold, preserve the other for redemption.
             preserve_up = bool(
                 meta.get("last_sell_dn_at") and dn_size < 0.01 and up_size >= 0.01
             )
@@ -1132,9 +1045,6 @@ while not _shutdown_requested:
             will_sell_up = sell_up and (now_ms - (meta.get("last_sell_up_at") or 0) >= SELL_COOLDOWN_S * 1000)
             will_sell_dn = sell_dn and (now_ms - (meta.get("last_sell_dn_at") or 0) >= SELL_COOLDOWN_S * 1000)
 
-            # Post-latency bounce check: re-fetch the bid right before selling.
-            # If the leg recovered above threshold during trigger→execution
-            # latency, cancel the sell — bouncing legs are the ones that reverse.
             if will_sell_up:
                 fresh_up_bid, _ = get_book_bid(up_token)
                 up_cancel_threshold = SELL_THRESHOLD
@@ -1146,7 +1056,7 @@ while not _shutdown_requested:
                         trigger_reason=up_trigger_reason,
                         seconds_left=round(seconds_left, 3),
                     )
-                    console.print(f"  [dim][CANCEL][/] UP sell cancelled — bid bounced {up_price:.3f} → {fresh_up_bid:.3f}")
+                    console.print(f"  [dim][CANCEL][/] UP sell cancelled \u2014 bid bounced {up_price:.3f} \u2192 {fresh_up_bid:.3f}")
                     up_trigger = False
                     sell_up = False
                     will_sell_up = False
@@ -1164,7 +1074,7 @@ while not _shutdown_requested:
                         trigger_reason=dn_trigger_reason,
                         seconds_left=round(seconds_left, 3),
                     )
-                    console.print(f"  [dim][CANCEL][/] DN sell cancelled — bid bounced {dn_price:.3f} → {fresh_dn_bid:.3f}")
+                    console.print(f"  [dim][CANCEL][/] DN sell cancelled \u2014 bid bounced {dn_price:.3f} \u2192 {fresh_dn_bid:.3f}")
                     dn_trigger = False
                     sell_dn = False
                     will_sell_dn = False
@@ -1188,7 +1098,7 @@ while not _shutdown_requested:
 
             if sell_up:
                 if not will_sell_up:
-                    console.print(f"  [dim][SKIP][/] [dim]UP sell suppressed · sold <{SELL_COOLDOWN_S:.0f}s ago[/]")
+                    console.print(f"  [dim][SKIP][/] [dim]UP sell suppressed \u00b7 sold <{SELL_COOLDOWN_S:.0f}s ago[/]")
                 else:
                     log_event(
                         "sell_attempt", condition_id=cond, leg="up", size=up_size,
@@ -1241,7 +1151,7 @@ while not _shutdown_requested:
                             )
             if sell_dn:
                 if not will_sell_dn:
-                    console.print(f"  [dim][SKIP][/] [dim]DN sell suppressed · sold <{SELL_COOLDOWN_S:.0f}s ago[/]")
+                    console.print(f"  [dim][SKIP][/] [dim]DN sell suppressed \u00b7 sold <{SELL_COOLDOWN_S:.0f}s ago[/]")
                 else:
                     log_event(
                         "sell_attempt", condition_id=cond, leg="down", size=dn_size,
@@ -1294,15 +1204,10 @@ while not _shutdown_requested:
                             )
 
             # ================= HEDGE PHASE =================
-            # Disabled by default; strategy.json must explicitly enable it.
-            # If one leg was sold and the held leg drops below HEDGE_THRESHOLD,
-            # sell the held leg too to limit reversal losses.
             loser_was_up = preserve_dn
             loser_was_dn = preserve_up
 
             if HEDGE_ENABLED and loser_was_up and dn_price is not None and dn_price <= HEDGE_THRESHOLD:
-                # Fresh fetch before acting; cached book may be 5-10s stale. A thin bid
-                # below threshold can vanish, so use mid price as market-sentiment guard.
                 fresh_dn_bid, _, fresh_dn_ask, _, fresh_dn_mid = get_book_quote(dn_token)
                 if fresh_dn_mid is not None and fresh_dn_mid > HEDGE_THRESHOLD:
                     log_event(
@@ -1312,15 +1217,15 @@ while not _shutdown_requested:
                         threshold=HEDGE_THRESHOLD,
                     )
                     console.print(
-                        f"  [dim][CANCEL][/] DN hedge cancelled — mid bounced {dn_price:.3f} → {fresh_dn_mid:.3f}"
+                        f"  [dim][CANCEL][/] DN hedge cancelled \u2014 mid bounced {dn_price:.3f} \u2192 {fresh_dn_mid:.3f}"
                     )
                 else:
                     hedge_bid = fresh_dn_bid if fresh_dn_bid is not None else dn_price
                     console.print(Panel(
                         f"  [bright_white]{s['question']}[/]\n"
-                        f"  [bright_red]REVERSAL DETECTED[/] — DN (held leg) dropped to [bold]{hedge_bid:.3f}[/]  ·  "
+                        f"  [bright_red]REVERSAL DETECTED[/] \u2014 DN (held leg) dropped to [bold]{hedge_bid:.3f}[/]  \u00b7  "
                         f"[bold red]TTM {minutes_left:>4.1f}m[/]",
-                        title="[bold bright_red]▼ HEDGE SELL — CUTTING LOSSES[/]",
+                        title="[bold bright_red]\u25bc HEDGE SELL \u2014 CUTTING LOSSES[/]",
                         border_style="bright_red",
                         box=box.HEAVY,
                     ))
@@ -1358,15 +1263,15 @@ while not _shutdown_requested:
                         threshold=HEDGE_THRESHOLD,
                     )
                     console.print(
-                        f"  [dim][CANCEL][/] UP hedge cancelled — mid bounced {up_price:.3f} → {fresh_up_mid:.3f}"
+                        f"  [dim][CANCEL][/] UP hedge cancelled \u2014 mid bounced {up_price:.3f} \u2192 {fresh_up_mid:.3f}"
                     )
                 else:
                     hedge_bid = fresh_up_bid if fresh_up_bid is not None else up_price
                     console.print(Panel(
                         f"  [bright_white]{s['question']}[/]\n"
-                        f"  [bright_red]REVERSAL DETECTED[/] — UP (held leg) dropped to [bold]{hedge_bid:.3f}[/]  ·  "
+                        f"  [bright_red]REVERSAL DETECTED[/] \u2014 UP (held leg) dropped to [bold]{hedge_bid:.3f}[/]  \u00b7  "
                         f"[bold red]TTM {minutes_left:>4.1f}m[/]",
-                        title="[bold bright_red]▼ HEDGE SELL — CUTTING LOSSES[/]",
+                        title="[bold bright_red]\u25bc HEDGE SELL \u2014 CUTTING LOSSES[/]",
                         border_style="bright_red",
                         box=box.HEAVY,
                     ))
@@ -1408,18 +1313,14 @@ while not _shutdown_requested:
     # Variable polling: 5s >2min, 1s ≤2min, sub-second in sell window
     _now = time.time() * 1000
     _min_ttm = min((s["end_ts"] - _now) / 60000 for s in managed_sets) if managed_sets else 999
-    if _min_ttm <= SELL_WINDOW_MIN:  # sub-second polling in sell window
+    if _min_ttm <= SELL_WINDOW_MIN:
         _sleep_s = POLL_SELL_WINDOW_S
-    elif _min_ttm <= 2:              # ≤2min — poll every 1s
+    elif _min_ttm <= 2:
         _sleep_s = 1
-    else:                            # >2min — poll every 5s
+    else:
         _sleep_s = 5
     # ================= KICK OFF NEXT CYCLE'S BOOK FETCH =================
-    # Start fetching books in the background NOW, so they're ready by the time
-    # the next cycle starts after sleep. This overlaps HTTP latency with sleep,
-    # making the effective cycle time = max(sleep_s, fetch_time) instead of
-    # sleep_s + fetch_time.
-    _next_now = time.time() * 1000 + _sleep_s * 1000  # predicted TTM at next cycle start
+    _next_now = time.time() * 1000 + _sleep_s * 1000
     _pending_tokens = set(_pending_book_futs.values())
     _MAX_PENDING_BOOKS = 20
     for s in managed_sets:
@@ -1441,6 +1342,6 @@ while not _shutdown_requested:
     time.sleep(_sleep_s)
 
 # Graceful shutdown complete
-console.print("[bold bright_green]▶ SHUTDOWN COMPLETE[/] [dim]state saved · exiting cleanly[/]")
+console.print("[bold bright_green]\u25b6 SHUTDOWN COMPLETE[/] [dim]state saved \u00b7 exiting cleanly[/]")
 log_event("shutdown", reason="signal")
 sys.exit(0)

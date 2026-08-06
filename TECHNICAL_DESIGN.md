@@ -38,7 +38,7 @@
 **Poly Money Maker** is centred on automated **sell-side execution bots** for
 Polymarket's Bitcoin prediction markets. Two bot instances run in production:
 
-- **`bot.py`** (`polybot`) — manages **15-minute** and hourly BTC markets. Sells
+- **`bot.py`** (`polybot`) — manages **15-minute** BTC markets. Sells
   the loser leg at ≤5¢ in the final 90-second sell window, hedges reversals at
   40¢, and redeems winners at $1.00.
 - **`bot5m.py`** (`polybot5m`) — manages **5-minute** BTC markets. Sells the
@@ -50,13 +50,20 @@ Polymarket's Bitcoin prediction markets. Two bot instances run in production:
   the loser is typically already near zero. The hedge is restricted to the final
   25s (vs the full sell window in `bot.py`) because 5m markets reverse less in
   the final seconds — the tighter window avoids false hedges.
+- **`bothourly.py`** (`polybot_hourly`) — manages **hourly** BTC markets
+  (series slug `btc-up-or-down-hourly`, event slugs starting with
+  `bitcoin-up-or-down`). Sells the loser leg at ≤5¢ in the final 90-second sell
+  window, hedges reversals at **65¢**, and redeems winners at $1.00. Uses
+  separate state files (`positions_hourly.json`, `pnl_hourly.json`,
+  `bot_hourly.log`, `.heartbeat_hourly`) and a separate ntfy topic
+  (`NTFY_TOPIC_HOURLY`) to avoid interfering with the 15m and 5m bots.
 
 Neither bot buys positions. Entry is handled by the autonomous `buy/` process
 (`polybuy`), which atomically splits pUSD into equal UP and DOWN tokens via the
 Polymarket relayer, gated by a cron-driven arming mechanism. The live processes
 coordinate only through wallet holdings indexed by Polymarket's Data API; they do
-not share writable state. `bot.py` excludes 5m slugs (`btc-updown-5m`) so the two
-bots never touch the same market.
+not share writable state. `bot.py` excludes 5m slugs (`btc-updown-5m`) and hourly
+slugs (`bitcoin-up-or-down`) so the three bots never touch the same market.
 
 ### The Core Thesis
 
@@ -205,7 +212,7 @@ order-building logic differs.
 
 ## 3. Architecture at a Glance
 
-Production runs **three** live systemd services plus cron timers on one GCP VM:
+Production runs **four** live processes plus cron timers on one GCP VM:
 
 ```
 ┌──────┐   every 55 min    ┌────────────────────┐
@@ -226,7 +233,7 @@ Production runs **three** live systemd services plus cron timers on one GCP VM:
                                  │ Data API indexes holdings
                                  ▼
 ┌────────────────────────────────────────────────────────────────┐
-│  polybot (bot.py) — 15m + hourly markets                       │
+│  polybot (bot.py) — 15m markets only                            │
 │  discovers set → sells loser leg (5¢, final 90s, 0.1s poll)    │
 │  → hedges reversal at 40¢ → redeems winner at $1.00 → pnl.json │
 └────────────────────────────────────────────────────────────────┘
@@ -235,6 +242,13 @@ Production runs **three** live systemd services plus cron timers on one GCP VM:
 │  polybot5m (bot5m.py) — 5-minute markets                       │
 │  discovers set → sells loser leg (2¢, final 150s, 0.1s poll)   │
 │  → hedges reversal at 40¢ (last 25s only) → redeems → pnl.json │
+└────────────────────────────────────────────────────────────────┘
+
+┌────────────────────────────────────────────────────────────────┐
+│  polybot_hourly (bothourly.py) — hourly markets                 │
+│  discovers set → sells loser leg (5¢, final 90s, 0.1s poll)    │
+│  → hedges reversal at 65¢ → redeems winner at $1.00            │
+│  → pnl_hourly.json                                              │
 └────────────────────────────────────────────────────────────────┘
 ```
 
@@ -348,10 +362,13 @@ queues, no databases.
 
 | File | Purpose | Size |
 |---|---|---|
-| `bot.py` | The main 15m/hourly bot — all trading logic lives here | ~1340 lines |
+| `bot.py` | The main 15m bot — all trading logic lives here | ~1340 lines |
 | `bot5m.py` | The 5-minute market bot — sell/hedge/redeem for 5m BTC markets | ~1370 lines |
+| `bothourly.py` | The hourly market bot — sell/hedge/redeem for hourly BTC markets (65¢ hedge) | ~680 lines |
 | `strategy5m.example.json` | Example strategy config for `bot5m.py` (2¢ threshold, 150s sell window, 25s hedge) | — |
 | `strategy5m.json` | Live 5m strategy config (hot-reloaded, gitignored) | — |
+| `strategy_hourly.example.json` | Example strategy config for `bothourly.py` (5¢ threshold, 90s sell window, 65¢ hedge) | — |
+| `strategy_hourly.json` | Live hourly strategy config (hot-reloaded, gitignored) | — |
 | `check_book.py` | Diagnostic script for inspecting live order books | ~31 lines |
 | `sim/` | Live shadow simulator package (paper trade all BTC 5m markets) | package |
 | `sim/shadow.py` | Shadow main loop — discover, paper enter, policy, FAK fills, settle | ~600 lines |
@@ -590,13 +607,14 @@ can override this invariant.
 
 ### 6.4 Other Constants
 
-```@/c:/Users/ntemu/Downloads/poly money maker/bot.py:33-40
+```@/c:/Users/ntemu/Downloads/poly money maker/bot.py:33-42
 HOST = "https://clob.polymarket.com"
 DATA_API = "https://data-api.polymarket.com"
 CHAIN_ID = 137
 STATE_FILE = "positions.json"
-BTC_SLUG_PREFIX = "bitcoin-up-or-down"
-BTC_SLUG_ALIASES = ("bitcoin-up-or-down", "btc-updown", "btc-updown-5m")
+BTC_SLUG_PREFIX = "btc-updown"  # 15m markets only
+BTC_SLUG_ALIASES = ("btc-updown",)
+BTC_SLUG_EXCLUDES = ("btc-updown-5m", "bitcoin-up-or-down")
 PUSD = "0xC011a7E12a19f7B1f670d46F03B03f3342E82DFB"
 CTF = "0x4D97DCd97eC945f40cF65F87097ACe5EA0476045"
 ```
@@ -607,9 +625,9 @@ CTF = "0x4D97DCd97eC945f40cF65F87097ACe5EA0476045"
 - **`STATE_FILE`** — The JSON file where we persist metadata between cycles.
 - **`BTC_SLUG_PREFIX`** / **`BTC_SLUG_ALIASES`** — Slug prefixes that identify BTC
   markets. `BTC_SLUG_ALIASES` is a **tuple** of accepted prefixes, because
-  Polymarket has used different slug formats over time (`bitcoin-up-or-down`,
-  `btc-updown` for hourly markets, and `btc-updown-5m` for 5-minute markets).
-  The tuple lets us match any of them.
+  `btc-updown` is the slug prefix for 15-minute markets. `bitcoin-up-or-down`
+  (hourly) and `btc-updown-5m` (5-minute) are excluded — those are managed by
+  `bothourly.py` and `bot5m.py` respectively.
 - **`PUSD`** — The Polymarket USDC (pUSD) contract address on Polygon. Used in
   redemption calldata.
 - **`CTF`** — The **Conditional Token Framework** contract address. This is
@@ -1293,19 +1311,20 @@ a complete UP+DOWN pair for a BTC hourly market.
 for p in positions:
     slug = (p.get("slug") or "").lower()
     event_slug = (p.get("eventSlug") or "").lower()
-    title = (p.get("title") or "").lower()
+    if slug.startswith(BTC_SLUG_EXCLUDES) or event_slug.startswith(BTC_SLUG_EXCLUDES):
+        continue
     if not (
         slug.startswith(BTC_SLUG_ALIASES)
         or event_slug.startswith(BTC_SLUG_ALIASES)
-        or "bitcoin up or down" in title
     ):
         continue
 ```
 
-We check three fields (`slug`, `eventSlug`, `title`) against multiple patterns.
-The `startswith(BTC_SLUG_ALIASES)` call works because `str.startswith()` accepts
-a **tuple** of prefixes — it returns `True` if the string starts with *any* of
-them. This is a clean Python idiom for multi-prefix matching.
+We check `slug` and `eventSlug` against the alias prefixes, after first
+excluding slugs managed by other bots. The `startswith(BTC_SLUG_ALIASES)` call
+works because `str.startswith()` accepts a **tuple** of prefixes — it returns
+`True` if the string starts with *any* of them. This is a clean Python idiom
+for multi-prefix matching.
 
 **Step 2: Group by conditionId**
 
