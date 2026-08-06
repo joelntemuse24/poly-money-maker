@@ -1,0 +1,15 @@
+{
+    "sell_threshold": 0.03,
+    "sell_window_s": 22,
+    "sell_start_s": 30,
+    "sell_start_price": 0.001,
+    "sell_grace_s": 1,
+    "sell_cooldown_s": 1,
+    "redeem_throttle_s": 30,
+    "max_redeem_age_days": 7,
+    "dry_run": true,
+    "poll_sell_window_s": 0.1,
+    "positions_refresh_s": 1,
+    "balance_refresh_s": 15,
+    "tick_size": "0.001"
+}
