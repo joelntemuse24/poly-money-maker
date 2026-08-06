@@ -36,7 +36,7 @@
 ## 1. Project Overview
 
 **Poly Money Maker** is centred on automated **sell-side execution bots** for
-Polymarket's Bitcoin prediction markets. Two bot instances run in production:
+Polymarket's Bitcoin prediction markets. Three bot instances run in production:
 
 - **`bot.py`** (`polybot`) — manages **15-minute** BTC markets. Sells
   the loser leg at ≤5¢ in the final 90-second sell window, hedges reversals at
@@ -52,7 +52,7 @@ Polymarket's Bitcoin prediction markets. Two bot instances run in production:
   the final seconds — the tighter window avoids false hedges.
 - **`bothourly.py`** (`polybot_hourly`) — manages **hourly** BTC markets
   (series slug `btc-up-or-down-hourly`, event slugs starting with
-  `bitcoin-up-or-down`). Sells the loser leg at ≤5¢ in the final 90-second sell
+  `bitcoin-up-or-down`). Sells the loser leg at ≤5¢ in the final 5-minute sell
   window, hedges reversals at **65¢**, and redeems winners at $1.00. Uses
   separate state files (`positions_hourly.json`, `pnl_hourly.json`,
   `bot_hourly.log`, `.heartbeat_hourly`) and a separate ntfy topic
@@ -60,7 +60,8 @@ Polymarket's Bitcoin prediction markets. Two bot instances run in production:
 
 Neither bot buys positions. Entry is handled by the autonomous `buy/` process
 (`polybuy`), which atomically splits pUSD into equal UP and DOWN tokens via the
-Polymarket relayer, gated by a cron-driven arming mechanism. The live processes
+Polymarket relayer, gated by a cron-driven arming mechanism. Three separate buy
+processes run for the 5m, 15m, and hourly series. The live processes
 coordinate only through wallet holdings indexed by Polymarket's Data API; they do
 not share writable state. `bot.py` excludes 5m slugs (`btc-updown-5m`) and hourly
 slugs (`bitcoin-up-or-down`) so the three bots never touch the same market.
@@ -367,7 +368,7 @@ queues, no databases.
 | `bothourly.py` | The hourly market bot — sell/hedge/redeem for hourly BTC markets (65¢ hedge) | ~680 lines |
 | `strategy5m.example.json` | Example strategy config for `bot5m.py` (2¢ threshold, 150s sell window, 25s hedge) | — |
 | `strategy5m.json` | Live 5m strategy config (hot-reloaded, gitignored) | — |
-| `strategy_hourly.example.json` | Example strategy config for `bothourly.py` (5¢ threshold, 90s sell window, 65¢ hedge) | — |
+| `strategy_hourly.example.json` | Example strategy config for `bothourly.py` (5¢ threshold, 5min sell window, 65¢ hedge) | — |
 | `strategy_hourly.json` | Live hourly strategy config (hot-reloaded, gitignored) | — |
 | `check_book.py` | Diagnostic script for inspecting live order books | ~31 lines |
 | `sim/` | Live shadow simulator package (paper trade all BTC 5m markets) | package |
@@ -383,7 +384,9 @@ queues, no databases.
 | `deploy/polyshadow.service` | systemd unit template for permanent shadow on GCP | — |
 | `buy/` | Isolated complete-set mint package: config, discovery, calldata, chain checks, relayer, state, runner | package |
 | `buy/test_buy.py` | Atomic calldata and fail-closed buyer regression tests | — |
-| `strategy.buy.example.json` | Live autonomous mint-buyer configuration template | — |
+| `strategy.buy.example.json` | Live autonomous mint-buyer configuration template (15m series) | — |
+| `strategy.buy.5m.example.json` | Example buy config for 5m series | — |
+| `strategy.buy.hourly.example.json` | Example buy config for hourly series | — |
 | `requirements.buy.txt` | Mint-buyer dependencies (`requests`, `eth-*`, pinned relayer SDK packages); separate from bot deploy | — |
 | `deploy/polybuy.service` | Low-priority systemd template for the optional buyer | — |
 | `requirements.txt` | Existing live bot and simulator dependencies | 8 lines |
@@ -399,7 +402,15 @@ queues, no databases.
 | `.heartbeat` | Tick counter updated every cycle for uptime monitoring (gitignored) | — |
 | `sim_data/` | Shadow runtime outputs only (gitignored) — never bot state | — |
 | `buy_data/` | Buyer intents, dry plans, heartbeat, lock, arm/stop files, and rotating log (gitignored) | — |
-| `strategy.buy.json` | Buyer runtime config copied from the example; gitignored and independent of `strategy.json` | — |
+| `strategy.buy.json` | 15m buyer runtime config (gitignored, VM-only) | — |
+| `strategy.buy.5m.json` | 5m buyer runtime config (gitignored, VM-only) | — |
+| `strategy.buy.hourly.json` | Hourly buyer runtime config (gitignored, VM-only) | — |
+| `buy_data_5m/` | 5m buyer runtime data (gitignored, VM-only) | — |
+| `buy_data_hourly/` | Hourly buyer runtime data (gitignored, VM-only) | — |
+| `positions_hourly.json` | Hourly bot state cache (gitignored, VM-only) | — |
+| `pnl_hourly.json` | Hourly bot P&L history (gitignored, VM-only) | — |
+| `bot_hourly.log` | Hourly bot log (gitignored, VM-only) | — |
+| `.heartbeat_hourly` | Hourly bot heartbeat (gitignored, VM-only) | — |
 
 ### Why a Single-File Bot?
 
@@ -824,7 +835,7 @@ exceptional events warrant a push.
 ### 8.4 CI/CD Auto-Deploy Pipeline
 
 The bot uses **GitHub Actions** for continuous deployment. When code is pushed to
-`main` (specifically changes to `bot.py`, `requirements.txt`, or
+`main` (specifically changes to `bot.py`, `bothourly.py`, `requirements.txt`, or
 `strategy.json`), the pipeline SSHs into the GCP instance and deploys:
 
 ```yaml
@@ -833,7 +844,7 @@ name: Deploy to GCP
 on:
   push:
     branches: [main]
-    paths: ['bot.py', 'requirements.txt', 'strategy.json']
+    paths: ['bot.py', 'bothourly.py', 'requirements.txt', 'strategy.json']
 jobs:
   deploy:
     runs-on: ubuntu-latest
@@ -859,7 +870,157 @@ and the state file (`positions.json`) survives restarts.
 **Required GitHub secrets:** `GCP_HOST` (instance IP), `GCP_USER` (SSH
 username), `GCP_SSH_KEY` (ED25519 private key for SSH auth).
 
-### 8.5 Log Rotation
+**Important:** The CI/CD pipeline only restarts `polybot` (the 15m sell bot).
+The 5m sell bot (`polybot5m`), hourly sell bot (`bothourly.py`), and all three
+buy bots are **not** automatically restarted by CI/CD. After a deploy, you must
+manually restart them on the VM (see §8.8).
+
+### 8.5 VM Operations — What Runs Where and How to Manage It
+
+The production system runs on a single GCP VM (`instance-20260516-185922`).
+Understanding the split between **what's in the Git repository** (code + example
+configs) and **what only exists on the VM** (live configs, state, runtime data)
+is critical for operators and other agents working on this system.
+
+#### 8.5.1 What Lives in the Git Repository (`git pull` brings these)
+
+| File | Purpose |
+|---|---|
+| `bot.py` | 15m sell bot code |
+| `bot5m.py` | 5m sell bot code |
+| `bothourly.py` | Hourly sell bot code |
+| `buy/` package | Atomic mint buyer code (shared by all three buy bots) |
+| `sim/` package | Shadow simulator code |
+| `strategy.example.json` | Example 15m sell strategy (template) |
+| `strategy5m.example.json` | Example 5m sell strategy (template) |
+| `strategy_hourly.example.json` | Example hourly sell strategy (template) |
+| `strategy.buy.example.json` | Example 15m buy strategy (template) |
+| `strategy.buy.5m.example.json` | Example 5m buy strategy (template) |
+| `strategy.buy.hourly.example.json` | Example hourly buy strategy (template) |
+| `TECHNICAL_DESIGN.md` | This document |
+| `.github/workflows/deploy.yml` | CI/CD pipeline |
+| `requirements.txt` / `requirements.buy.txt` | Python dependencies |
+
+#### 8.5.2 What Only Exists on the VM (gitignored, never committed)
+
+| File | Purpose | How to Change |
+|---|---|---|
+| `.env` | Secrets (private key, funder address, API keys) | Edit directly on VM |
+| `strategy.json` | Live 15m sell strategy | Edit on VM; hot-reloaded each cycle |
+| `strategy5m.json` | Live 5m sell strategy | Edit on VM; hot-reloaded each cycle |
+| `strategy_hourly.json` | Live hourly sell strategy | Edit on VM; hot-reloaded each cycle |
+| `strategy.buy.json` | Live 15m buy config | Edit on VM; requires buy bot restart |
+| `strategy.buy.5m.json` | Live 5m buy config | Edit on VM; requires buy bot restart |
+| `strategy.buy.hourly.json` | Live hourly buy config | Edit on VM; requires buy bot restart |
+| `positions.json` / `positions5m.json` / `positions_hourly.json` | Bot state caches | Auto-generated, never edit |
+| `pnl.json` / `pnl5m.json` / `pnl_hourly.json` | P&L history | Auto-generated, never edit |
+| `buy_data/` | 15m buyer runtime (ARM file, lock, state, logs) | Auto-managed |
+| `buy_data_5m/` | 5m buyer runtime | Auto-managed |
+| `buy_data_hourly/` | Hourly buyer runtime | Auto-managed |
+| `bot.log` / `bot_hourly.log` | Sell bot logs | Auto-generated |
+| `.heartbeat` / `.heartbeat5m` / `.heartbeat_hourly` | Heartbeat files | Auto-generated |
+
+#### 8.5.3 Running Processes on the VM
+
+Seven Python processes run concurrently on the VM:
+
+| Process | Command | Market | Managed by |
+|---|---|---|---|
+| 15m sell | `.venv/bin/python bot.py` | `btc-updown` (15m) | systemd (`polybot`) |
+| 5m sell | `.venv/bin/python bot5m.py` | `btc-updown-5m` (5m) | systemd (`polybot5m`) |
+| Hourly sell | `.venv/bin/python bothourly.py` | `bitcoin-up-or-down` (hourly) | Manual (`&` background) |
+| 15m buy | `.venv-buy/bin/python -m buy` | `btc-up-or-down-15m` | Manual (`&` background) |
+| 5m buy | `.venv-buy/bin/python -m buy --config strategy.buy.5m.json` | `btc-up-or-down-5m` | Manual (`&` background) |
+| Hourly buy | `BUY_DATA_DIR=buy_data_hourly .venv-buy/bin/python -m buy --config strategy.buy.hourly.json` | `btc-up-or-down-hourly` | Manual (`&` background) |
+| Shadow sim | `.venv/bin/python -m sim.shadow --config sim/strategy.sim.mirror.json` | All series | Manual (`&` background) |
+
+**systemd-managed bots** (`polybot`, `polybot5m`) auto-restart on crash and
+survive SSH disconnects. Use `sudo systemctl restart polybot` to restart.
+
+**Manually-started bots** (hourly sell, all buy bots) do **not** survive SSH
+disconnects unless started with `nohup` or `screen`/`tmux`. They also don't
+auto-restart on crash. To make them persistent, consider creating systemd
+services for them (see `deploy/` for templates).
+
+#### 8.5.4 Cron Jobs (VM-only)
+
+The crontab on the VM arms the buy bots by writing `MINT_REAL_PUSD` to their
+respective ARM files. Each arm permits exactly one mint:
+
+```crontab
+# 15m buy bot — armed 4×/hour (every ~15 min)
+56,11,26,41 * * * * echo "MINT_REAL_PUSD" > /home/ntemusejoel/poly-money-maker/buy_data/ARM
+
+# Hourly buy bot — armed once per hour
+56 * * * * echo "MINT_REAL_PUSD" > /home/ntemusejoel/poly-money-maker/buy_data_hourly/ARM
+```
+
+The 5m buy bot is not in the crontab — it uses a longer `arm_max_age_s` (86400s)
+and stays armed persistently.
+
+**To view:** `crontab -l`
+**To edit:** `crontab -e`
+
+#### 8.5.5 How to Restart Each Bot
+
+```bash
+# 15m sell bot (systemd)
+sudo systemctl restart polybot
+
+# 5m sell bot (systemd)
+sudo systemctl restart polybot5m
+
+# Hourly sell bot (manual)
+pkill -f bothourly.py
+cd ~/poly-money-maker && .venv/bin/python bothourly.py >> bot_hourly.log 2>&1 &
+
+# 15m buy bot (manual)
+pkill -f "python -m buy$"
+cd ~/poly-money-maker && .venv-buy/bin/python -m buy >> buy.log 2>&1 &
+
+# 5m buy bot (manual)
+pkill -f "strategy.buy.5m"
+cd ~/poly-money-maker && .venv-buy/bin/python -m buy --config strategy.buy.5m.json >> buy_5m.log 2>&1 &
+
+# Hourly buy bot (manual)
+pkill -f "strategy.buy.hourly"
+cd ~/poly-money-maker && BUY_DATA_DIR=buy_data_hourly .venv-buy/bin/python -m buy --config strategy.buy.hourly.json >> buy_hourly.log 2>&1 &
+```
+
+**Note on `pkill`:** Be specific with patterns to avoid killing the wrong buy
+bot. The 15m buy bot has no `--config` flag, so `pkill -f "python -m buy$"` only
+matches it. For the others, match on the config filename.
+
+#### 8.5.6 Changing Buy/Sell Parameters
+
+**Sell strategy** (thresholds, windows, hedge): Edit the `strategy*.json` file
+on the VM. Changes are hot-reloaded on the next tick — no restart needed.
+
+**Buy strategy** (shares, notional, max open sets): Edit the
+`strategy.buy*.json` file on the VM, then restart the corresponding buy bot.
+
+**Code changes** (bot logic, bug fixes): Push to GitHub `main` branch. CI/CD
+auto-deploys `bot.py` changes (restarts `polybot` only). For `bothourly.py` or
+other files, SSH into the VM and run `git pull origin main`, then manually
+restart affected bots.
+
+#### 8.5.7 Production Strategy Parameters (as of 2026-08-06)
+
+| Parameter | 5m | 15m | Hourly |
+|---|---|---|---|
+| **Sell threshold** | 2¢ | 3¢ | 5¢ |
+| **Sell window** | 150s (2.5min) | 180s (3min) | 300s (5min) |
+| **Hedge threshold** | 40¢ | 40¢ | 65¢ |
+| **Hedge window** | last 25s only | full sell window | full sell window |
+| **Last-chance threshold** | — | 3¢ | 10¢ |
+| **Buy shares** | 10 | 26 | 30 |
+| **Buy max notional** | $30 | $104 | $30 |
+| **Buy max open sets** | 3 | 3 | 1 |
+| **Buy cron arm** | persistent | 4×/hour | 1×/hour (:56) |
+| **Tick size** | 0.001 | 0.01 | 0.01 |
+| **Polling (sell window)** | 0.1s | 0.1s | 0.1s |
+
+### 8.6 Log Rotation
 
 ```python
 LOG_FILE = "bot.log"
@@ -879,7 +1040,7 @@ with sells happening hourly, the log can reach 100+ MB within weeks. The
 to `bot.log.1`, `.2`, `.3` when the file hits 5 MB, keeping total disk usage
 under 20 MB.
 
-### 8.6 Heartbeat File
+### 8.7 Heartbeat File
 
 Each cycle, the bot writes a JSON object with timestamp and tick count to
 `.heartbeat`:
@@ -3258,22 +3419,26 @@ Two implementation gotchas, both learned the hard way:
 
 ---
 
-*This document was last updated for the dual-bot production architecture
-(2026-08-06): `polybuy` mints complete sets live via an SDK-equivalent
-relayer PROXY flow (§20.9), paced by cron-driven one-shot arming 4×/hour (min
-56/11/26/41) to cover all four BTC 15-minute markets per hour (§20.4);
-`polybuy` allows up to 3 concurrent open sets with $150 max notional.
-`polybot` (`bot.py`) sells the loser leg at ≤5¢ in the final 90 seconds with
-100ms polling and post-latency bounce cancellation, hedges reversals at 40¢
-(20¢ limit), and redeems winners at $1.00. `polybot5m` (`bot5m.py`) manages
-5-minute BTC markets with a 2¢ sell threshold, 150-second (2.5-minute) sell
-window, and hedge restricted to the final 25 seconds. The 5m bot uses 0.001
-tick sizes and polls at 0.1s throughout the sell window. The 3¢/3m config
-was selected via tick-level backtesting against 97 markets of shadow-simulator
-bid data: it achieves a 74% sell rate with 0 reversals (vs 78% sell rate / 3
-reversals at the previous 5¢/1.5m config), maximising volume to ensure that
-rare reversal losses are dwarfed by aggregate sell revenue. The last-chance
-threshold is also 3¢ (down from 10¢), so the final 10 seconds only sell truly
-dead legs. The shadow simulators (`sim/`, §19) are currently stopped on the
-VM; their disk and memory protections remain documented for when they're
-re-enabled.*
+*This document was last updated for the three-bot production architecture
+(2026-08-06): three sell bots (`bot.py` for 15m, `bot5m.py` for 5m,
+`bothourly.py` for hourly) and three buy processes (one per series) run
+concurrently on a single GCP VM. `polybuy` mints complete sets live via an
+SDK-equivalent relayer PROXY flow (§20.9), paced by cron-driven one-shot arming
+(4×/hour for 15m, 1×/hour for hourly, persistent for 5m). The 15m buy bot mints
+26 shares ($104 max notional, 3 concurrent sets). The hourly buy bot mints 30
+shares ($30 max notional, 1 concurrent set). The 5m buy bot mints 10 shares
+($30 max notional, 3 concurrent sets). `polybot` (`bot.py`) sells the loser leg
+at ≤3¢ in the final 180 seconds with 100ms polling and post-latency bounce
+cancellation, hedges reversals at 40¢ (20¢ limit), and redeems winners at $1.00.
+`polybot5m` (`bot5m.py`) manages 5-minute BTC markets with a 2¢ sell threshold,
+150-second sell window, and hedge restricted to the final 25 seconds.
+`polybot_hourly` (`bothourly.py`) manages hourly BTC markets with a 5¢ sell
+threshold, 5-minute sell window, and hedge at 65¢ (32.5¢ limit). The 3¢/3m
+config was selected via tick-level backtesting against 97 markets of
+shadow-simulator bid data: it achieves a 74% sell rate with 0 reversals. The
+last-chance threshold is also 3¢ (down from 10¢) for 15m, so the final 10
+seconds only sell truly dead legs. The shadow simulators (`sim/`, §19) are
+currently stopped on the VM; their disk and memory protections remain
+documented for when they're re-enabled. See §8.5 for a complete guide to VM
+operations, including which files are in Git vs VM-only, how to restart each
+bot, and how to change parameters.*
