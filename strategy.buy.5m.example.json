@@ -3,7 +3,7 @@
     "enabled": true,
     "dry_run": true,
     "entry_method": "mint",
-    "series_slugs": "btc-updown-5m",
+    "series_slugs": "btc-up-or-down-5m",
     "shares": 10.0,
     "enter_min_ttm_min": 0.0,
     "enter_max_ttm_min": 60.0,
