@@ -35,14 +35,28 @@
 
 ## 1. Project Overview
 
-**Poly Money Maker** is centred on an automated **sell-side execution bot** for
-Polymarket's Bitcoin 5-minute, 15-minute, and hourly prediction markets. `bot.py`
-does not buy positions: it monitors holdings, sells the "loser leg," hedges a
-reversal, and redeems resolved positions. Entry is handled by the autonomous
-`buy/` process (`polybuy`), which atomically splits pUSD into equal UP and DOWN
-tokens via the Polymarket relayer, gated by a cron-driven arming mechanism. The
-two live processes coordinate only through wallet holdings indexed by
-Polymarket's Data API; they do not share writable state.
+**Poly Money Maker** is centred on automated **sell-side execution bots** for
+Polymarket's Bitcoin prediction markets. Two bot instances run in production:
+
+- **`bot.py`** (`polybot`) — manages **15-minute** and hourly BTC markets. Sells
+  the loser leg at ≤5¢ in the final 90-second sell window, hedges reversals at
+  40¢, and redeems winners at $1.00.
+- **`bot5m.py`** (`polybot5m`) — manages **5-minute** BTC markets. Sells the
+  loser leg at ≤2¢ in the final 150-second (2.5-minute) sell window, hedges
+  reversals at 40¢ **only in the last 25 seconds**, and redeems winners at $1.00.
+  The 5m bot uses a wider sell window (150s vs 90s) because 5-minute markets have
+  thinner books and shorter lifespans — starting earlier captures more liquidity.
+  The 2¢ threshold (vs 5¢) reflects the faster decay of 5m markets: by 150s out,
+  the loser is typically already near zero. The hedge is restricted to the final
+  25s (vs the full sell window in `bot.py`) because 5m markets reverse less in
+  the final seconds — the tighter window avoids false hedges.
+
+Neither bot buys positions. Entry is handled by the autonomous `buy/` process
+(`polybuy`), which atomically splits pUSD into equal UP and DOWN tokens via the
+Polymarket relayer, gated by a cron-driven arming mechanism. The live processes
+coordinate only through wallet holdings indexed by Polymarket's Data API; they do
+not share writable state. `bot.py` excludes 5m slugs (`btc-updown-5m`) so the two
+bots never touch the same market.
 
 ### The Core Thesis
 
@@ -191,7 +205,7 @@ order-building logic differs.
 
 ## 3. Architecture at a Glance
 
-Production runs two live systemd services plus a cron timer on one GCP VM:
+Production runs **three** live systemd services plus cron timers on one GCP VM:
 
 ```
 ┌──────┐   every 55 min    ┌────────────────────┐
@@ -212,9 +226,15 @@ Production runs two live systemd services plus a cron timer on one GCP VM:
                                  │ Data API indexes holdings
                                  ▼
 ┌────────────────────────────────────────────────────────────────┐
-│  polybot (bot.py)                                              │
+│  polybot (bot.py) — 15m + hourly markets                       │
 │  discovers set → sells loser leg (5¢, final 90s, 0.1s poll)    │
 │  → hedges reversal at 40¢ → redeems winner at $1.00 → pnl.json │
+└────────────────────────────────────────────────────────────────┘
+
+┌────────────────────────────────────────────────────────────────┐
+│  polybot5m (bot5m.py) — 5-minute markets                       │
+│  discovers set → sells loser leg (2¢, final 150s, 0.1s poll)   │
+│  → hedges reversal at 40¢ (last 25s only) → redeems → pnl.json │
 └────────────────────────────────────────────────────────────────┘
 ```
 
@@ -328,7 +348,10 @@ queues, no databases.
 
 | File | Purpose | Size |
 |---|---|---|
-| `bot.py` | The main bot — all trading logic lives here | ~1340 lines |
+| `bot.py` | The main 15m/hourly bot — all trading logic lives here | ~1340 lines |
+| `bot5m.py` | The 5-minute market bot — sell/hedge/redeem for 5m BTC markets | ~1370 lines |
+| `strategy5m.example.json` | Example strategy config for `bot5m.py` (2¢ threshold, 150s sell window, 25s hedge) | — |
+| `strategy5m.json` | Live 5m strategy config (hot-reloaded, gitignored) | — |
 | `check_book.py` | Diagnostic script for inspecting live order books | ~31 lines |
 | `sim/` | Live shadow simulator package (paper trade all BTC 5m markets) | package |
 | `sim/shadow.py` | Shadow main loop — discover, paper enter, policy, FAK fills, settle | ~600 lines |
@@ -476,8 +499,60 @@ An example file is committed as `strategy.example.json` for reference.
 | `max_redeem_age_days` | `7` days | Stop trying to redeem after 7 days past expiry. Old conditions may have been cleaned up on-chain and retries are pointless. |
 | `dry_run` | `false` | When `true`, the bot logs decisions but doesn't send orders or transactions. Used for testing. |
 | `poll_sell_window_s` | `0.1` seconds | Polling interval during the sell window (last 90s). 100ms polling catches rapid price movements; book fetches are overlapped with sleep so the effective cadence is `max(0.1s, fetch_time)`. |
-| `positions_refresh_s` | `2` seconds | How often to refresh positions from the data-api. Between refreshes, cached data is used. Prevents excessive API calls during sub-second polling. |
+| `positions_refresh_s` | `2` seconds | How often to refresh positions from the data-api. Between refreshs, cached data is used. Prevents excessive API calls during sub-second polling. |
 | `balance_refresh_s` | `15` seconds | How often to refresh the USDC balance. Between refreshes, the last known value is displayed. |
+
+### 6.2a Strategy Constants for `bot5m.py` (5-Minute Markets)
+
+`bot5m.py` has its own independent strategy file (`strategy5m.json`, hot-reloaded
+each cycle) with defaults tuned for the faster 5-minute market cadence:
+
+```python
+_STRATEGY_DEFAULTS = {
+    "sell_threshold": 0.02,          # max sell price: never sell above 2¢
+    "sell_window_s": 22,             # display-only: colours TTM red in final 22s
+    "sell_start_s": 150,             # sell window opens 150s (2.5 min) before expiry
+    "sell_start_price": 0.001,       # FAK order floor (min acceptable price)
+    "sell_grace_s": 1,               # don't sell within 1s of first seeing a position
+    "sell_cooldown_s": 1,            # 1s between sell attempts per leg
+    "hedge_enabled": True,           # hedge: sell held leg if reversal detected
+    "hedge_threshold": 0.40,         # hedge if held leg bid drops below 40¢
+    "hedge_start_s": 25,             # hedge only in last 25 seconds
+    "redeem_throttle_s": 30,         # 30s between redeem attempts
+    "max_redeem_age_days": 7,
+    "dry_run": False,
+    "poll_sell_window_s": 0.1,       # 0.1s polling in sell window
+    "positions_refresh_s": 1,        # refresh positions every 1s
+    "balance_refresh_s": 15,         # refresh balance every 15s
+    "tick_size": "0.001",            # fallback tick if market tick lookup fails
+}
+```
+
+| Constant | 5m Default | vs 15m (`bot.py`) | Rationale |
+|---|---|---|---|
+| `sell_threshold` | `0.02` (2¢) | 5¢ → 2¢ | 5m markets decay faster; loser is near-zero by 150s. Lower threshold avoids selling while outcome still uncertain. |
+| `sell_start_s` | `150` (2.5 min) | 90s → 150s | 5m markets have thinner books; wider window captures more liquidity before books dry up. |
+| `hedge_start_s` | `25` | Full window → 25s | 5m markets resolve quickly; restricting hedge to final 25s avoids false hedges from late-book volatility. |
+| `sell_cooldown_s` | `1` | 3s → 1s | Faster cadence needed in 5m markets. |
+| `sell_grace_s` | `1` | 2s → 1s | Shorter grace; 5m positions are time-critical. |
+| `positions_refresh_s` | `1` | 2s → 1s | More frequent position refresh for faster market. |
+| `tick_size` | `"0.001"` | `"0.01"` | 5m markets trade on 0.001 ticks (0.1¢ increments). |
+| `poll_sell_window_s` | `0.1` | Same | 100ms polling in both bots. |
+
+**Polling tiers in `bot5m.py`:** Since `sell_start_s` is 150, the variable sleep
+logic (`_min_ttm_s <= SELL_START_S + 5`) means the bot polls at 0.1s whenever any
+position is within 155 seconds of expiry. In 5-minute markets that expire every 5
+minutes, this is effectively **always polling at 0.1s**. The 5s and 1s tiers are
+dead code for 5m markets. This is intentional — Polymarket's `/book` endpoint
+allows 1,500 requests per 10s (150/s), and the bot uses ~50 calls/s at 0.1s
+polling, well within limits.
+
+**`sell_window_s` (22) is display-only** — it colours the TTM column red in the
+status table when within 22s of expiry. It does not affect the actual sell logic,
+which is entirely controlled by `sell_start_s` (150s). The parameter is vestigial
+from the old 30s design but kept for display consistency.
+
+An example file is committed as `strategy5m.example.json` for reference.
 
 ### 6.3 Sell Thresholds
 
@@ -3164,14 +3239,17 @@ Two implementation gotchas, both learned the hard way:
 
 ---
 
-*This document was last updated for the scaled production architecture
-(2026-08-04): `polybuy` mints 50-share complete sets live via an SDK-equivalent
+*This document was last updated for the dual-bot production architecture
+(2026-08-06): `polybuy` mints complete sets live via an SDK-equivalent
 relayer PROXY flow (§20.9), paced by cron-driven one-shot arming 4×/hour (min
 56/11/26/41) to cover all four BTC 15-minute markets per hour (§20.4);
 `polybuy` allows up to 3 concurrent open sets with $150 max notional.
-`polybot` sells the loser leg at ≤3¢ in the final 180 seconds (3-minute sell
-window) with 100ms polling and post-latency bounce cancellation, hedges
-reversals at 40¢ (20¢ limit), and redeems winners at $1.00. The 3¢/3m config
+`polybot` (`bot.py`) sells the loser leg at ≤5¢ in the final 90 seconds with
+100ms polling and post-latency bounce cancellation, hedges reversals at 40¢
+(20¢ limit), and redeems winners at $1.00. `polybot5m` (`bot5m.py`) manages
+5-minute BTC markets with a 2¢ sell threshold, 150-second (2.5-minute) sell
+window, and hedge restricted to the final 25 seconds. The 5m bot uses 0.001
+tick sizes and polls at 0.1s throughout the sell window. The 3¢/3m config
 was selected via tick-level backtesting against 97 markets of shadow-simulator
 bid data: it achieves a 74% sell rate with 0 reversals (vs 78% sell rate / 3
 reversals at the previous 5¢/1.5m config), maximising volume to ensure that
