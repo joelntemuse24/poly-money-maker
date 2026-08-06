@@ -388,7 +388,9 @@ queues, no databases.
 | `strategy.buy.5m.example.json` | Example buy config for 5m series | — |
 | `strategy.buy.hourly.example.json` | Example buy config for hourly series | — |
 | `requirements.buy.txt` | Mint-buyer dependencies (`requests`, `eth-*`, pinned relayer SDK packages); separate from bot deploy | — |
-| `deploy/polybuy.service` | Low-priority systemd template for the optional buyer | — |
+| `deploy/polybuy.service` | Low-priority systemd template for the 15m buyer | — |
+| `deploy/polybuy5m.service` | systemd template for the 5m buyer | — |
+| `deploy/polybuy-hourly.service` | systemd template for the hourly buyer | — |
 | `requirements.txt` | Existing live bot and simulator dependencies | 8 lines |
 | `strategy.example.json` | Example sell strategy config with all tunable parameters | — |
 | `.github/workflows/deploy.yml` | CI/CD pipeline — auto-deploy on push to main | — |
@@ -3289,9 +3291,9 @@ series selection, start-time filtering, duplicate suppression, caps, Data API
 holdings, RPC health, logs, heartbeat, disk use, and coexistence with both
 current services.
 
-The `deploy/polybuy.service` template runs with `Nice=15`,
+The `deploy/polybuy*.service` templates run with `Nice=15`,
 `CPUQuota=20%`, and `MemoryMax=200M`, below `polyshadow`, which is already below
-`polybot`. It is intentionally excluded from the existing GitHub auto-deploy
+`polybot`. They are intentionally excluded from the existing GitHub auto-deploy
 workflow, so adding or changing buyer code cannot restart or redeploy the sell
 bot.
 

@@ -1,0 +1,22 @@
+[Unit]
+Description=Polymarket atomic complete-set mint buyer (hourly markets)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ntemusejoel
+WorkingDirectory=/home/ntemusejoel/poly-money-maker
+Environment=PYTHONUNBUFFERED=1
+Environment=BUY_DATA_DIR=/home/ntemusejoel/poly-money-maker/buy_data_hourly
+Environment=NTFY_TOPIC_BUY=polybot-joel-btc-hourly
+EnvironmentFile=/home/ntemusejoel/poly-money-maker/.env
+Nice=15
+ExecStart=/home/ntemusejoel/poly-money-maker/.venv-buy/bin/python -m buy --config strategy.buy.hourly.json
+Restart=always
+RestartSec=10
+MemoryMax=200M
+CPUQuota=20%
+
+[Install]
+WantedBy=multi-user.target
