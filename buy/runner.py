@@ -103,6 +103,14 @@ def consume_arm() -> None:
         return
 
 
+def restore_arm() -> None:
+    try:
+        with open(ARM_FILE, "w", encoding="utf-8") as handle:
+            handle.write(ARM_PHRASE)
+    except OSError:
+        pass
+
+
 def eligible_markets(markets: list[MintMarket], config: BuyConfig, now: float) -> list[MintMarket]:
     eligible = []
     for market in markets:
@@ -271,24 +279,29 @@ def run_once(
             return {"status": "disarmed", "reason": "fresh_arm_required"}
         consume_arm()
 
-    market_gateway = market_gateway or MarketGateway(
-        gamma_url=config.gamma_url,
-        data_api_url=config.data_api_url,
-    )
-    chain = chain or ChainReader(config.rpc_url)
-    status_gateway = status_gateway or RelayerStatusGateway(config.relayer_url)
-    credentials = _credentials()
-    funder_address = credentials["funder_address"] or None
+    try:
+        market_gateway = market_gateway or MarketGateway(
+            gamma_url=config.gamma_url,
+            data_api_url=config.data_api_url,
+        )
+        chain = chain or ChainReader(config.rpc_url)
+        status_gateway = status_gateway or RelayerStatusGateway(config.relayer_url)
+        credentials = _credentials()
+        funder_address = credentials["funder_address"] or None
 
-    reconcile_intents(
-        config=config,
-        state=state,
-        funder_address=funder_address,
-        chain=chain,
-        status_gateway=status_gateway,
-        logger=logger,
-        now=now,
-    )
+        reconcile_intents(
+            config=config,
+            state=state,
+            funder_address=funder_address,
+            chain=chain,
+            status_gateway=status_gateway,
+            logger=logger,
+            now=now,
+        )
+    except Exception:
+        if not dry_run:
+            restore_arm()
+        raise
     if any(
         intent.get("status") == "ambiguous"
         for intent in state.get("intents", {}).values()
