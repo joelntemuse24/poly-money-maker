@@ -4,16 +4,16 @@
     "dry_run": true,
     "entry_method": "mint",
     "series_slugs": "btc-updown-5m",
-    "shares": 5.0,
+    "shares": 10.0,
     "enter_min_ttm_min": 0.0,
     "enter_max_ttm_min": 60.0,
     "max_set_cost": 1.0,
     "max_open_sets": 3,
-    "max_open_notional": 15.0,
+    "max_open_notional": 30.0,
     "max_daily_notional": 999999.0,
     "one_entry_per_market": true,
     "poll_s": 5.0,
     "require_funder_match": true,
-    "arm_max_age_s": 3600.0
+    "arm_max_age_s": 86400.0
   }
 }

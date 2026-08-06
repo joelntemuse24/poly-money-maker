@@ -70,7 +70,7 @@ def setup_logging() -> logging.Logger:
 
 
 def notify(title: str, message: str, priority: str = "default") -> None:
-    topic = os.getenv("NTFY_TOPIC")
+    topic = os.getenv("NTFY_TOPIC_BUY") or os.getenv("NTFY_TOPIC")
     if not topic:
         return
     try:
