@@ -60,6 +60,7 @@ _STRATEGY_DEFAULTS = {
     "sell_cooldown_s": 3,
     "sell_lastchance_threshold": 0.10,
     "sell_lastchance_s": 10,
+    "sell_max_price": 0.055,           # hard cap: never sell above 5.5¢ (threshold + 0.5¢)
     "redeem_throttle_s": 30,
     "max_redeem_age_days": 7,
     "dry_run": False,
@@ -107,6 +108,7 @@ SELL_GRACE_S = _strat["sell_grace_s"]
 SELL_COOLDOWN_S = _strat["sell_cooldown_s"]
 SELL_LASTCHANCE_THRESHOLD = _strat["sell_lastchance_threshold"]
 SELL_LASTCHANCE_S = _strat["sell_lastchance_s"]
+SELL_MAX_PRICE = _strat["sell_max_price"]
 REDEEM_THROTTLE_S = _strat["redeem_throttle_s"]
 MAX_REDEEM_AGE_DAYS = _strat["max_redeem_age_days"]
 DRY_RUN = _strat["dry_run"]
@@ -625,17 +627,30 @@ def confirm_fill_size(result, oid, requested):
     return matched
 
 
-def sell_market_with_retry(token_id, size, price_limit, tick_size="0.01", max_retries=3):
+def sell_market_with_retry(token_id, size, price_limit, tick_size="0.01", max_retries=3, max_price=None):
     total_sold = 0.0
     remaining = float(size)
-    price = max(float(price_limit or tick_size), float(tick_size))
     if DRY_RUN:
+        price = max(float(price_limit or tick_size), float(tick_size))
         console.print(f"  [bold black on yellow][DRY SELL][/] would SELL {remaining:.4f} {str(token_id)[:12]}\u2026 @ \u2265{price:.3f}")
         log_event("dry_sell", token_id=token_id, size=remaining, price_limit=price)
         return 0, None
     for attempt in range(max_retries):
         if remaining < 0.01:
             break
+        price = max(float(price_limit or tick_size), float(tick_size))
+        if max_price is not None:
+            fresh_bid, _ = get_book_bid(token_id)
+            if fresh_bid is not None:
+                if fresh_bid > max_price:
+                    log_event(
+                        "sell_skip_max_cap", token_id=token_id, attempt=attempt + 1,
+                        bid=fresh_bid, max_price=max_price, remaining=remaining,
+                    )
+                    console.print(f"  [dim yellow][SKIP][/] bid {fresh_bid:.3f} > cap {max_price:.3f} · attempt {attempt + 1}/{max_retries}")
+                    time.sleep(1)
+                    continue
+                price = max(fresh_bid, float(tick_size))
         try:
             result = safe_api_call(
                 client.create_and_post_market_order,
@@ -780,6 +795,7 @@ while not _shutdown_requested:
         SELL_COOLDOWN_S = _strat["sell_cooldown_s"]
         SELL_LASTCHANCE_THRESHOLD = _strat["sell_lastchance_threshold"]
         SELL_LASTCHANCE_S = _strat["sell_lastchance_s"]
+        SELL_MAX_PRICE = _strat["sell_max_price"]
         REDEEM_THROTTLE_S = _strat["redeem_throttle_s"]
         MAX_REDEEM_AGE_DAYS = _strat["max_redeem_age_days"]
         DRY_RUN = _strat["dry_run"]
@@ -1045,43 +1061,6 @@ while not _shutdown_requested:
             will_sell_up = sell_up and (now_ms - (meta.get("last_sell_up_at") or 0) >= SELL_COOLDOWN_S * 1000)
             will_sell_dn = sell_dn and (now_ms - (meta.get("last_sell_dn_at") or 0) >= SELL_COOLDOWN_S * 1000)
 
-            if will_sell_up:
-                fresh_up_bid, _ = get_book_bid(up_token)
-                up_cancel_threshold = SELL_THRESHOLD
-                if fresh_up_bid is not None and fresh_up_bid > up_cancel_threshold:
-                    log_event(
-                        "sell_cancel_bounce", condition_id=cond, leg="up",
-                        trigger_bid=up_price, current_bid=fresh_up_bid,
-                        threshold=up_cancel_threshold,
-                        trigger_reason=up_trigger_reason,
-                        seconds_left=round(seconds_left, 3),
-                    )
-                    console.print(f"  [dim][CANCEL][/] UP sell cancelled \u2014 bid bounced {up_price:.3f} \u2192 {fresh_up_bid:.3f}")
-                    up_trigger = False
-                    sell_up = False
-                    will_sell_up = False
-                elif fresh_up_bid is not None:
-                    up_bid = fresh_up_bid
-                    up_price, up_matched_price = quote_leg(fresh_up_bid)
-            if will_sell_dn:
-                fresh_dn_bid, _ = get_book_bid(dn_token)
-                dn_cancel_threshold = SELL_THRESHOLD
-                if fresh_dn_bid is not None and fresh_dn_bid > dn_cancel_threshold:
-                    log_event(
-                        "sell_cancel_bounce", condition_id=cond, leg="down",
-                        trigger_bid=dn_price, current_bid=fresh_dn_bid,
-                        threshold=dn_cancel_threshold,
-                        trigger_reason=dn_trigger_reason,
-                        seconds_left=round(seconds_left, 3),
-                    )
-                    console.print(f"  [dim][CANCEL][/] DN sell cancelled \u2014 bid bounced {dn_price:.3f} \u2192 {fresh_dn_bid:.3f}")
-                    dn_trigger = False
-                    sell_dn = False
-                    will_sell_dn = False
-                elif fresh_dn_bid is not None:
-                    dn_bid = fresh_dn_bid
-                    dn_price, dn_matched_price = quote_leg(fresh_dn_bid)
-
             if will_sell_up or will_sell_dn:
                 up_bid_str = f"{up_price:.3f}" if up_price is not None else "  -  "
                 dn_bid_str = f"{dn_price:.3f}" if dn_price is not None else "  -  "
@@ -1107,7 +1086,7 @@ while not _shutdown_requested:
                         seconds_left=round(seconds_left, 3),
                         up_bid=up_bid, dn_bid=dn_bid,
                     )
-                    sold, _ = sell_market_with_retry(up_token, up_size, up_matched_price or SELL_THRESHOLD)
+                    sold, _ = sell_market_with_retry(up_token, up_size, up_matched_price or SELL_THRESHOLD, max_price=SELL_MAX_PRICE)
                     if sold > 0:
                         meta["last_sell_up_at"] = now_ms
                         up_size -= sold
@@ -1160,7 +1139,7 @@ while not _shutdown_requested:
                         seconds_left=round(seconds_left, 3),
                         up_bid=up_bid, dn_bid=dn_bid,
                     )
-                    sold, _ = sell_market_with_retry(dn_token, dn_size, dn_matched_price or SELL_THRESHOLD)
+                    sold, _ = sell_market_with_retry(dn_token, dn_size, dn_matched_price or SELL_THRESHOLD, max_price=SELL_MAX_PRICE)
                     if sold > 0:
                         meta["last_sell_dn_at"] = now_ms
                         dn_size -= sold

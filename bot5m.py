@@ -59,6 +59,7 @@ _STRATEGY_DEFAULTS = {
     "sell_start_price": 0.001,       # FAK order floor (min acceptable price, not a trigger)
     "sell_grace_s": 1,               # don't sell within 1s of first seeing a position
     "sell_cooldown_s": 1,            # 1s between sell attempts per leg
+    "sell_max_price": 0.025,         # hard cap: never sell above 2.5¢ (threshold + 0.5¢)
     "hedge_enabled": True,           # hedge: sell held leg if reversal detected
     "hedge_threshold": 0.40,         # hedge if held leg bid drops below 40¢
     "hedge_start_s": 25,             # hedge only in last 25 seconds
@@ -110,6 +111,7 @@ SELL_START_S = _strat["sell_start_s"]
 SELL_START_PRICE = _strat["sell_start_price"]
 SELL_GRACE_S = _strat["sell_grace_s"]
 SELL_COOLDOWN_S = _strat["sell_cooldown_s"]
+SELL_MAX_PRICE = _strat["sell_max_price"]
 HEDGE_ENABLED = _strat["hedge_enabled"]
 HEDGE_THRESHOLD = _strat["hedge_threshold"]
 HEDGE_START_S = _strat["hedge_start_s"]
@@ -687,17 +689,30 @@ def confirm_fill_size(result, oid, requested):
     return matched
 
 
-def sell_market_with_retry(token_id, size, price_limit, tick_size="0.001", max_retries=3):
+def sell_market_with_retry(token_id, size, price_limit, tick_size="0.001", max_retries=3, max_price=None):
     total_sold = 0.0
     remaining = float(size)
-    price = max(float(price_limit or tick_size), float(tick_size))
     if DRY_RUN:
+        price = max(float(price_limit or tick_size), float(tick_size))
         console.print(f"  [bold black on yellow][DRY SELL][/] would SELL {remaining:.4f} {str(token_id)[:12]}… @ ≥{price:.3f}")
         log_event("dry_sell", token_id=token_id, size=remaining, price_limit=price)
         return 0, None
     for attempt in range(max_retries):
         if remaining < 0.01:
             break
+        price = max(float(price_limit or tick_size), float(tick_size))
+        if max_price is not None:
+            fresh_bid, _ = get_book_bid(token_id)
+            if fresh_bid is not None:
+                if fresh_bid > max_price:
+                    log_event(
+                        "sell_skip_max_cap", token_id=token_id, attempt=attempt + 1,
+                        bid=fresh_bid, max_price=max_price, remaining=remaining,
+                    )
+                    console.print(f"  [dim yellow][SKIP][/] bid {fresh_bid:.3f} > cap {max_price:.3f} · attempt {attempt + 1}/{max_retries}")
+                    time.sleep(1)
+                    continue
+                price = max(fresh_bid, float(tick_size))
         try:
             result = safe_api_call(
                 client.create_and_post_market_order,
@@ -857,6 +872,7 @@ while not _shutdown_requested:
         SELL_START_PRICE = _strat["sell_start_price"]
         SELL_GRACE_S = _strat["sell_grace_s"]
         SELL_COOLDOWN_S = _strat["sell_cooldown_s"]
+        SELL_MAX_PRICE = _strat["sell_max_price"]
         HEDGE_ENABLED = _strat["hedge_enabled"]
         HEDGE_THRESHOLD = _strat["hedge_threshold"]
         HEDGE_START_S = _strat["hedge_start_s"]
@@ -1136,18 +1152,8 @@ while not _shutdown_requested:
 
             tick = get_tick_size_cached(token)
 
-            # Post-latency bounce check: re-fetch the bid right before selling.
+            # Fresh bid fetch for no-book check; max_price cap handled in sell_market_with_retry.
             fresh_bid, _ = get_book_bid(token)
-            if fresh_bid is not None and fresh_bid > SELL_THRESHOLD:
-                log_event(
-                    "sell_cancel_bounce", condition_id=cond, leg=sell_leg,
-                    trigger_bid=stale_price, current_bid=fresh_bid,
-                    threshold=SELL_THRESHOLD,
-                    trigger_reason=trigger_reason,
-                    seconds_left=round(seconds_left, 3),
-                )
-                console.print(f"  [dim][CANCEL][/] {sell_leg.upper()} sell cancelled — bid bounced {stale_price:.3f} → {fresh_bid:.3f}")
-                continue
             if fresh_bid is None or fresh_bid <= 0:
                 log_event(
                     "sell_skip_no_book", condition_id=cond, leg=sell_leg,
@@ -1174,7 +1180,7 @@ while not _shutdown_requested:
                 seconds_left=round(seconds_left, 3),
                 up_bid=up_bid, dn_bid=dn_bid,
             )
-            sold, _ = sell_market_with_retry(token, size, price_limit, tick_size=tick)
+            sold, _ = sell_market_with_retry(token, size, price_limit, tick_size=tick, max_price=SELL_MAX_PRICE)
             if sold > 0:
                 meta[last_key] = now_ms
                 size -= sold

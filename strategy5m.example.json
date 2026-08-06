@@ -5,6 +5,7 @@
     "sell_start_price": 0.001,
     "sell_grace_s": 1,
     "sell_cooldown_s": 1,
+    "sell_max_price": 0.025,
     "hedge_enabled": true,
     "hedge_threshold": 0.40,
     "hedge_start_s": 25,

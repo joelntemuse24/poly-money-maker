@@ -495,6 +495,7 @@ _STRATEGY_DEFAULTS = {
     "sell_cooldown_s": 3,             # 3s between sell attempts per leg
     "sell_lastchance_threshold": 0.10, # only sell in final seconds if truly dead
     "sell_lastchance_s": 10,           # final 10-second fallback
+    "sell_max_price": 0.055,           # hard cap: never sell above 5.5¢ (threshold + 0.5¢)
     "redeem_throttle_s": 30,          # 30s between redeem attempts
     "max_redeem_age_days": 7,
     "dry_run": False,
@@ -523,6 +524,7 @@ An example file is committed as `strategy.example.json` for reference.
 | `sell_cooldown_s` | `3` seconds | After selling a leg, wait 3 seconds before attempting another sell on the same leg. |
 | `sell_lastchance_threshold` | `0.10` (10 cents) | In the final `sell_lastchance_s` seconds, consider a side below this only when the opposite bid confirms at or above `1 - sell_lastchance_threshold` (90¢). |
 | `sell_lastchance_s` | `10` seconds | How many seconds before expiry the confirmed last-chance fallback activates. |
+| `sell_max_price` | `0.055` (5.5 cents) | **Hard cap** on sell price. Inside `sell_market_with_retry`, the bot re-fetches the live bid on each retry attempt. If bid > `sell_max_price`, the attempt is skipped (`sell_skip_max_cap`). After 3 skipped attempts, the sell fails and the bot holds to redemption. Replaces the old post-latency bounce check. |
 | `redeem_throttle_s` | `30` seconds | After submitting a redemption, wait 30 seconds before retrying. Redemptions are on-chain transactions that take time to confirm. |
 | `max_redeem_age_days` | `7` days | Stop trying to redeem after 7 days past expiry. Old conditions may have been cleaned up on-chain and retries are pointless. |
 | `dry_run` | `false` | When `true`, the bot logs decisions but doesn't send orders or transactions. Used for testing. |
@@ -543,6 +545,7 @@ _STRATEGY_DEFAULTS = {
     "sell_start_price": 0.001,       # FAK order floor (min acceptable price)
     "sell_grace_s": 1,               # don't sell within 1s of first seeing a position
     "sell_cooldown_s": 1,            # 1s between sell attempts per leg
+    "sell_max_price": 0.025,         # hard cap: never sell above 2.5¢ (threshold + 0.5¢)
     "hedge_enabled": True,           # hedge: sell held leg if reversal detected
     "hedge_threshold": 0.40,         # hedge if held leg bid drops below 40¢
     "hedge_start_s": 25,             # hedge only in last 25 seconds
@@ -565,6 +568,7 @@ _STRATEGY_DEFAULTS = {
 | `sell_grace_s` | `1` | 2s → 1s | Shorter grace; 5m positions are time-critical. |
 | `positions_refresh_s` | `1` | 2s → 1s | More frequent position refresh for faster market. |
 | `tick_size` | `"0.001"` | `"0.01"` | 5m markets trade on 0.001 ticks (0.1¢ increments). |
+| `sell_max_price` | `0.025` (2.5¢) | 5.5¢ → 2.5¢ | Tighter cap for 5m: threshold (2¢) + 0.5¢ buffer. |
 | `poll_sell_window_s` | `0.1` | Same | 100ms polling in both bots. |
 
 **Polling tiers in `bot5m.py`:** Since `sell_start_s` is 150, the variable sleep
@@ -606,11 +610,13 @@ the normal threshold:
   12¢/88¢ does nothing. If both bids are low, or the opposite bid does not
   confirm, the bot skips the sale and records `sell_skip_ambiguous`.
 
-- **Post-latency bounce cancel:** Between trigger evaluation and execution the
-  bid is re-fetched. If the leg recovered above the applicable threshold (5¢ for
-  threshold sells, 10¢ for last-chance), the sell is cancelled
-  (`sell_cancel_bounce`) — bouncing legs are the ones that reverse. If it hasn't
-  bounced, the fresh quote replaces the stale one for the actual sell.
+- **Max price cap (`sell_max_price`):** The old post-latency bounce check has been
+  replaced by a hard price cap inside `sell_market_with_retry`. On each retry
+  attempt, the bot re-fetches the live bid. If bid > `sell_max_price` (default:
+  threshold + 0.5¢), the attempt is skipped and logged as `sell_skip_max_cap`.
+  After 3 skipped attempts, the sell fails and the bot holds to redemption. This
+  prevents the worst-case scenario where a bouncing leg fills above the trigger
+  threshold during the latency gap between trigger and execution.
 
 Across cycles, once one leg is fully sold, the normal threshold preserves the
 remaining leg for redemption. Only the explicitly enabled experimental hedge
@@ -1723,24 +1729,34 @@ The function follows a **verification cascade**:
 
 ### 12.4 `sell_market_with_retry` — The Execution Engine
 
-```@/c:/Users/ntemu/Downloads/poly money maker/bot.py:578-615
-def sell_market_with_retry(token_id, size, price_limit, tick_size="0.01", max_retries=3):
+```python
+def sell_market_with_retry(token_id, size, price_limit, tick_size="0.01", max_retries=3, max_price=None):
     total_sold = 0.0
     remaining = float(size)
-    price = max(float(price_limit or tick_size), float(tick_size))
     if DRY_RUN:
+        price = max(float(price_limit or tick_size), float(tick_size))
         console.print(f"  [bold black on yellow][DRY SELL][/] would SELL {remaining:.4f} {str(token_id)[:12]}… @ ≥{price:.3f}")
         log_event("dry_sell", token_id=token_id, size=remaining, price_limit=price)
         return 0, None
     for attempt in range(max_retries):
         if remaining < 0.01:
             break
+        price = max(float(price_limit or tick_size), float(tick_size))
+        if max_price is not None:
+            fresh_bid, _ = get_book_bid(token_id)
+            if fresh_bid is not None:
+                if fresh_bid > max_price:
+                    log_event("sell_skip_max_cap", token_id=token_id, attempt=attempt+1,
+                              bid=fresh_bid, max_price=max_price, remaining=remaining)
+                    console.print(f"  [dim yellow][SKIP][/] bid {fresh_bid:.3f} > cap {max_price:.3f} · attempt {attempt+1}/{max_retries}")
+                    time.sleep(1)
+                    continue
+                price = max(fresh_bid, float(tick_size))
         try:
-            neg_risk = safe_api_call(client.get_neg_risk, token_id)
             result = safe_api_call(
                 client.create_and_post_market_order,
                 MarketOrderArgs(token_id=token_id, amount=remaining, side=SELL, price=price),
-                options=PartialCreateOrderOptions(tick_size=tick_size, neg_risk=neg_risk),
+                options=PartialCreateOrderOptions(tick_size=tick_size, neg_risk=False),
                 order_type=OrderType.FAK,
             )
             if result:
@@ -1773,8 +1789,12 @@ shares but only 60 filled, we have 40 remaining. The loop retries up to
 `max_retries` times, each time:
 
 1. Check if we're done (`remaining < 0.01` — less than 1 cent worth).
-2. Query `get_neg_risk` — needed for the order options.
-3. Submit a FAK market order for the remaining amount.
+2. **Max price cap check:** If `max_price` is set, re-fetch the live bid. If bid >
+   `max_price`, skip this attempt (`sell_skip_max_cap`), wait 1s, and retry. This
+   prevents selling a bouncing leg above the trigger threshold. After 3 skipped
+   attempts, the sell fails and the bot holds to redemption.
+3. Submit a FAK market order for the remaining amount at the current bid (or
+   `price_limit` if no `max_price` cap).
 4. Confirm the fill size using `confirm_fill_size`.
 5. If 0 confirmed fills, **stop immediately** — the comment says "stopping to
    avoid double-sell." If the order filled but we can't confirm it, retrying
@@ -1796,6 +1816,17 @@ at or above this price, cancel whatever doesn't fill."
 
 **The `price` calculation:**
 
+When `max_price` is set and the fresh bid is below the cap, the sell price is
+set to the fresh bid (ensuring we sell at the current market price, not a stale
+trigger price):
+
+```python
+price = max(fresh_bid, float(tick_size))
+```
+
+When `max_price` is not set (e.g. hedge sells), the price falls back to the
+`price_limit` argument:
+
 ```python
 price = max(float(price_limit or tick_size), float(tick_size))
 ```
@@ -1803,6 +1834,16 @@ price = max(float(price_limit or tick_size), float(tick_size))
 This ensures the price limit is at least the tick size (the minimum price
 increment on Polymarket, typically $0.01). If `price_limit` is `None` or 0, we
 fall back to the tick size — effectively "sell at any price above $0.01."
+
+**Why `max_price` replaces the old bounce check:** The previous design had a
+separate bounce-check step in the main loop that re-fetched the bid before
+calling `sell_market_with_retry`. If the bid bounced above `SELL_THRESHOLD`, the
+sell was cancelled. However, there was still a latency gap between the bounce
+check and the actual on-chain FAK execution where the bid could recover. The
+`max_price` cap moves the check *inside* the retry loop, so it's evaluated on
+every attempt, not just once before the first attempt. This closes the latency
+gap — if the bid bounces on attempt 2, it's caught. Hedge sells do not use
+`max_price` (they have their own `HEDGE_THRESHOLD` logic).
 
 ---
 
