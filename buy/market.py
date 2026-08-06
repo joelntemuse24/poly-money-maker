@@ -87,9 +87,16 @@ def _parse_event(event: dict, series_slug: str) -> Iterable[MintMarket]:
             start_ts = slug_start
         else:
             try:
-                start_ts = _end_timestamp(str(start))
+                api_start_ts = _end_timestamp(str(start))
             except (TypeError, ValueError):
-                start_ts = end_ts
+                api_start_ts = end_ts
+            # If the API startDate is more than 2 hours before endDate, it's
+            # likely the event creation date, not the trading window start.
+            # Derive start_ts from end_ts minus the market duration (1h for hourly).
+            if end_ts - api_start_ts > 7200:
+                start_ts = end_ts - 3600
+            else:
+                start_ts = api_start_ts
         yield MintMarket(
             condition_id=str(condition_id),
             slug=slug,
