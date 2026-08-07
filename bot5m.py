@@ -566,9 +566,8 @@ def get_book_quote(token_id):
     """Return (bid_price, bid_size, ask_price, ask_size, mid_price).
 
     Uses the same SDK-first + HTTP-fallback pattern as get_book_bid. If no bids
-    exist, returns (None, 0.0, None, 0.0, None). If no asks exist, mid_price
-    falls back to the best bid. Mid is used as a sanity check against thin bids
-    that don't reflect actual market sentiment.
+    exist, returns (None, 0.0, None, 0.0, None). If no asks exist, mid_price is None — the caller must NOT trigger a sell
+    without a confirmed mid-price, since a thin bid without asks is unreliable.
     """
     try:
         book = safe_api_call(client.get_order_book, token_id)
@@ -603,7 +602,7 @@ def get_book_quote(token_id):
         else:
             ask_price = None
             ask_size = 0.0
-            mid_price = bid_price
+            mid_price = None
         return bid_price, bid_size, ask_price, ask_size, mid_price
     except Exception as e:
         log_event("book_quote_fail", token_id=token_id, error=str(e), path=path)
@@ -1136,14 +1135,13 @@ while not _shutdown_requested:
                 sell_leg = "down"
 
             # Trigger on mid-price (what the website shows) instead of just bid.
-            # A thin 1-share bid at $0.018 with ask at $0.50 → mid = $0.26 → won't
-            # trigger. Only sell when the mid-price confirms the leg is truly losing.
-            loser_mid = (up_mid if up_mid is not None else up_bid) if sell_leg == "up" else (dn_mid if dn_mid is not None else dn_bid)
+            # A thin bid with no asks is unreliable — only sell when mid confirms.
+            loser_mid = up_mid if sell_leg == "up" else dn_mid
             loser_bid = up_bid if sell_leg == "up" else dn_bid
-            if loser_mid > SELL_THRESHOLD:
+            if loser_mid is None or loser_mid > SELL_THRESHOLD:
                 continue
             # Two low mids indicate an ambiguous or illiquid book, not two losers.
-            other_mid = (dn_mid if dn_mid is not None else dn_bid) if sell_leg == "up" else (up_mid if up_mid is not None else up_bid)
+            other_mid = dn_mid if sell_leg == "up" else up_mid
             other_size = dn_size if sell_leg == "up" else up_size
             if other_size >= 0.01 and other_mid is not None and other_mid <= SELL_THRESHOLD:
                 log_event(

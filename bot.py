@@ -573,9 +573,8 @@ def get_book_quote(token_id):
     """Return (bid_price, bid_size, ask_price, ask_size, mid_price).
 
     Uses the same SDK-first + HTTP-fallback pattern as get_book_bid. If no bids
-    exist, returns (None, 0.0, None, 0.0, None). If no asks exist, mid_price
-    falls back to the best bid. Mid is used as a sanity check against thin bids
-    that don't reflect actual market sentiment.
+    exist, returns (None, 0.0, None, 0.0, None). If no asks exist, mid_price is None — the caller must NOT trigger a sell
+    without a confirmed mid-price, since a thin bid without asks is unreliable.
     """
     try:
         book = safe_api_call(client.get_order_book, token_id)
@@ -610,7 +609,7 @@ def get_book_quote(token_id):
         else:
             ask_price = None
             ask_size = 0.0
-            mid_price = bid_price
+            mid_price = None
         return bid_price, bid_size, ask_price, ask_size, mid_price
     except Exception as e:
         log_event("book_quote_fail", token_id=token_id, error=str(e), path=path)
@@ -1103,9 +1102,9 @@ while not _shutdown_requested:
             dn_price, dn_matched_price = quote_leg(dn_bid)
 
             # Trigger on mid-price (what the website shows) instead of just bid.
-            # A thin bid with a wide spread won't trigger — only sell when mid confirms.
-            up_trigger_price = up_mid if up_mid is not None else up_price
-            dn_trigger_price = dn_mid if dn_mid is not None else dn_price
+            # A thin bid with no asks is unreliable — only sell when mid confirms.
+            up_trigger_price = up_mid
+            dn_trigger_price = dn_mid
 
             # Sell at or below the configured threshold throughout the exit window.
             up_trigger = bool(
