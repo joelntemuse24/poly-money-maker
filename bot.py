@@ -65,6 +65,7 @@ _STRATEGY_DEFAULTS = {
     "sell_lastchance_threshold": 0.10, # only sell in final seconds if truly dead
     "sell_lastchance_s": 10,           # last-chance window: final 10 seconds
     "sell_max_price": 0.055,           # hard cap: never sell above 5.5¢ (threshold + 0.5¢)
+    "sell_min_bid_depth": 0,            # skip sell if best bid size < this many shares (0 = disabled)
     "redeem_throttle_s": 30,          # 30s between redeem attempts
     "max_redeem_age_days": 7,
     "dry_run": False,
@@ -115,6 +116,7 @@ SELL_COOLDOWN_S = _strat["sell_cooldown_s"]
 SELL_LASTCHANCE_THRESHOLD = _strat["sell_lastchance_threshold"]
 SELL_LASTCHANCE_S = _strat["sell_lastchance_s"]
 SELL_MAX_PRICE = _strat["sell_max_price"]
+SELL_MIN_BID_DEPTH = _strat.get("sell_min_bid_depth", 0)
 REDEEM_THROTTLE_S = _strat["redeem_throttle_s"]
 MAX_REDEEM_AGE_DAYS = _strat["max_redeem_age_days"]
 DRY_RUN = _strat["dry_run"]
@@ -1035,7 +1037,7 @@ while not _shutdown_requested:
             try:
                 _book_cache[_t] = _f.result(timeout=1)
             except Exception:
-                _book_cache[_t] = (None, 0.0)
+                _book_cache[_t] = (None, 0.0, None, 0.0, None)
                 _f.cancel()
         _pending_book_futs = {}
 
@@ -1080,8 +1082,10 @@ while not _shutdown_requested:
             if up_size < 0.01 and dn_size < 0.01:
                 continue
 
-            up_bid, _ = _book_cache.get(up_token, (None, 0.0)) if up_token else (None, 0.0)
-            dn_bid, _ = _book_cache.get(dn_token, (None, 0.0)) if dn_token else (None, 0.0)
+            up_quote = _book_cache.get(up_token, (None, 0.0, None, 0.0, None)) if up_token else (None, 0.0, None, 0.0, None)
+            dn_quote = _book_cache.get(dn_token, (None, 0.0, None, 0.0, None)) if dn_token else (None, 0.0, None, 0.0, None)
+            up_bid, up_bid_size, _, _, up_mid = up_quote
+            dn_bid, dn_bid_size, _, _, dn_mid = dn_quote
 
             # Alert if book fetch failed for either leg during the sell window
             if up_bid is None and up_size > 0:
@@ -1100,15 +1104,20 @@ while not _shutdown_requested:
             up_price, up_matched_price = quote_leg(up_bid)
             dn_price, dn_matched_price = quote_leg(dn_bid)
 
+            # Trigger on mid-price (what the website shows) instead of just bid.
+            # A thin bid with a wide spread won't trigger — only sell when mid confirms.
+            up_trigger_price = up_mid if up_mid is not None else up_price
+            dn_trigger_price = dn_mid if dn_mid is not None else dn_price
+
             # Sell at or below the configured threshold throughout the exit window.
             up_trigger = bool(
-                up_size > 0 and up_price is not None and up_price <= SELL_THRESHOLD
+                up_size > 0 and up_trigger_price is not None and up_trigger_price <= SELL_THRESHOLD
             )
             dn_trigger = bool(
-                dn_size > 0 and dn_price is not None and dn_price <= SELL_THRESHOLD
+                dn_size > 0 and dn_trigger_price is not None and dn_trigger_price <= SELL_THRESHOLD
             )
-            up_trigger_reason = "threshold" if up_trigger else None
-            dn_trigger_reason = "threshold" if dn_trigger else None
+            up_trigger_reason = "threshold_mid" if up_trigger else None
+            dn_trigger_reason = "threshold_mid" if dn_trigger else None
             seconds_left = minutes_left * 60
 
             # Two low bids indicate an ambiguous or illiquid book, not two losers.
@@ -1425,9 +1434,9 @@ while not _shutdown_requested:
         _ut = s["up"].get("asset")
         _dt = s["dn"].get("asset")
         if _ut and _us >= 0.01 and _ut not in _pending_tokens and len(_pending_book_futs) < _MAX_PENDING_BOOKS:
-            _pending_book_futs[_book_executor.submit(get_book_bid, _ut)] = _ut
+            _pending_book_futs[_book_executor.submit(get_book_quote, _ut)] = _ut
         if _dt and _ds >= 0.01 and _dt not in _pending_tokens and len(_pending_book_futs) < _MAX_PENDING_BOOKS:
-            _pending_book_futs[_book_executor.submit(get_book_bid, _dt)] = _dt
+            _pending_book_futs[_book_executor.submit(get_book_quote, _dt)] = _dt
 
     console.print(f"[dim bright_black]\u00b7 \u00b7 \u00b7  sleeping {_sleep_s}s  \u00b7 \u00b7 \u00b7[/]")
     time.sleep(_sleep_s)

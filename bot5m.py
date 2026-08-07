@@ -60,6 +60,7 @@ _STRATEGY_DEFAULTS = {
     "sell_grace_s": 1,               # don't sell within 1s of first seeing a position
     "sell_cooldown_s": 1,            # 1s between sell attempts per leg
     "sell_max_price": 0.025,         # hard cap: never sell above 2.5¢ (threshold + 0.5¢)
+    "sell_min_bid_depth": 5,          # skip sell if best bid size < this many shares (thin bid protection)
     "hedge_enabled": True,           # hedge: sell held leg if reversal detected
     "hedge_threshold": 0.40,         # hedge if held leg bid drops below 40¢
     "hedge_start_s": 25,             # hedge only in last 25 seconds
@@ -112,6 +113,7 @@ SELL_START_PRICE = _strat["sell_start_price"]
 SELL_GRACE_S = _strat["sell_grace_s"]
 SELL_COOLDOWN_S = _strat["sell_cooldown_s"]
 SELL_MAX_PRICE = _strat["sell_max_price"]
+SELL_MIN_BID_DEPTH = _strat.get("sell_min_bid_depth", 0)
 HEDGE_ENABLED = _strat["hedge_enabled"]
 HEDGE_THRESHOLD = _strat["hedge_threshold"]
 HEDGE_START_S = _strat["hedge_start_s"]
@@ -1048,7 +1050,7 @@ while not _shutdown_requested:
             try:
                 _book_cache[_t] = _f.result(timeout=1)
             except Exception:
-                _book_cache[_t] = (None, 0.0)
+                _book_cache[_t] = (None, 0.0, None, 0.0, None)
                 _f.cancel()
         _pending_book_futs = {}
 
@@ -1091,8 +1093,10 @@ while not _shutdown_requested:
             if up_size < 0.01 and dn_size < 0.01:
                 continue
 
-            up_bid, _ = _book_cache.get(up_token, (None, 0.0)) if up_token else (None, 0.0)
-            dn_bid, _ = _book_cache.get(dn_token, (None, 0.0)) if dn_token else (None, 0.0)
+            up_quote = _book_cache.get(up_token, (None, 0.0, None, 0.0, None)) if up_token else (None, 0.0, None, 0.0, None)
+            dn_quote = _book_cache.get(dn_token, (None, 0.0, None, 0.0, None)) if dn_token else (None, 0.0, None, 0.0, None)
+            up_bid, up_bid_size, _, _, up_mid = up_quote
+            dn_bid, dn_bid_size, _, _, dn_mid = dn_quote
 
             # Alert if book fetch failed for either leg during the sell window
             if up_bid is None and up_size > 0:
@@ -1133,26 +1137,45 @@ while not _shutdown_requested:
             else:
                 sell_leg = "down"
 
-            # 2¢ is the max sell price throughout the entire window (150s → 0s).
-            # The 0.1¢ start_price is only the FAK order floor, not a separate
-            # trigger — we never sell above SELL_THRESHOLD.
+            # Trigger on mid-price (what the website shows) instead of just bid.
+            # A thin 1-share bid at $0.018 with ask at $0.50 → mid = $0.26 → won't
+            # trigger. Only sell when the mid-price confirms the leg is truly losing.
+            loser_mid = (up_mid if up_mid is not None else up_bid) if sell_leg == "up" else (dn_mid if dn_mid is not None else dn_bid)
             loser_bid = up_bid if sell_leg == "up" else dn_bid
-            if loser_bid > SELL_THRESHOLD:
+            loser_bid_size = up_bid_size if sell_leg == "up" else dn_bid_size
+            if loser_mid > SELL_THRESHOLD:
                 continue
-            # Two low bids indicate an ambiguous or illiquid book, not two losers.
-            other_bid = dn_bid if sell_leg == "up" else up_bid
+            # Thin bid protection: skip if best bid can't absorb our sell size.
+            sell_size = up_size if sell_leg == "up" else dn_size
+            if SELL_MIN_BID_DEPTH > 0 and loser_bid_size < SELL_MIN_BID_DEPTH:
+                log_event(
+                    "sell_skip_thin_bid",
+                    condition_id=cond,
+                    leg=sell_leg,
+                    bid=loser_bid,
+                    bid_size=loser_bid_size,
+                    mid=loser_mid,
+                    sell_size=sell_size,
+                    min_depth=SELL_MIN_BID_DEPTH,
+                    seconds_left=round(seconds_left, 3),
+                )
+                continue
+            # Two low mids indicate an ambiguous or illiquid book, not two losers.
+            other_mid = (dn_mid if dn_mid is not None else dn_bid) if sell_leg == "up" else (up_mid if up_mid is not None else up_bid)
             other_size = dn_size if sell_leg == "up" else up_size
-            if other_size >= 0.01 and other_bid is not None and other_bid <= SELL_THRESHOLD:
+            if other_size >= 0.01 and other_mid is not None and other_mid <= SELL_THRESHOLD:
                 log_event(
                     "sell_skip_ambiguous",
                     condition_id=cond,
                     reason="both_legs_below_threshold",
                     seconds_left=round(seconds_left, 3),
+                    up_mid=up_mid,
+                    dn_mid=dn_mid,
                     up_bid=up_bid,
                     dn_bid=dn_bid,
                 )
                 continue
-            trigger_reason = "threshold"
+            trigger_reason = "threshold_mid"
 
             if sell_leg == "up":
                 token, size, stale_price = up_token, up_size, up_price
@@ -1381,9 +1404,9 @@ while not _shutdown_requested:
         _ut = s["up"].get("asset")
         _dt = s["dn"].get("asset")
         if _ut and _us >= 0.01 and _ut not in _pending_tokens and len(_pending_book_futs) < _MAX_PENDING_BOOKS:
-            _pending_book_futs[_book_executor.submit(get_book_bid, _ut)] = _ut
+            _pending_book_futs[_book_executor.submit(get_book_quote, _ut)] = _ut
         if _dt and _ds >= 0.01 and _dt not in _pending_tokens and len(_pending_book_futs) < _MAX_PENDING_BOOKS:
-            _pending_book_futs[_book_executor.submit(get_book_bid, _dt)] = _dt
+            _pending_book_futs[_book_executor.submit(get_book_quote, _dt)] = _dt
 
     console.print(f"[dim bright_black]· · ·  sleeping {_sleep_s}s  · · ·[/]")
     time.sleep(_sleep_s)
