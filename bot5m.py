@@ -60,7 +60,6 @@ _STRATEGY_DEFAULTS = {
     "sell_grace_s": 1,               # don't sell within 1s of first seeing a position
     "sell_cooldown_s": 1,            # 1s between sell attempts per leg
     "sell_max_price": 0.025,         # hard cap: never sell above 2.5¢ (threshold + 0.5¢)
-    "sell_min_bid_depth": 5,          # skip sell if best bid size < this many shares (thin bid protection)
     "hedge_enabled": True,           # hedge: sell held leg if reversal detected
     "hedge_threshold": 0.40,         # hedge if held leg bid drops below 40¢
     "hedge_start_s": 25,             # hedge only in last 25 seconds
@@ -113,7 +112,6 @@ SELL_START_PRICE = _strat["sell_start_price"]
 SELL_GRACE_S = _strat["sell_grace_s"]
 SELL_COOLDOWN_S = _strat["sell_cooldown_s"]
 SELL_MAX_PRICE = _strat["sell_max_price"]
-SELL_MIN_BID_DEPTH = _strat.get("sell_min_bid_depth", 0)
 HEDGE_ENABLED = _strat["hedge_enabled"]
 HEDGE_THRESHOLD = _strat["hedge_threshold"]
 HEDGE_START_S = _strat["hedge_start_s"]
@@ -1142,23 +1140,7 @@ while not _shutdown_requested:
             # trigger. Only sell when the mid-price confirms the leg is truly losing.
             loser_mid = (up_mid if up_mid is not None else up_bid) if sell_leg == "up" else (dn_mid if dn_mid is not None else dn_bid)
             loser_bid = up_bid if sell_leg == "up" else dn_bid
-            loser_bid_size = up_bid_size if sell_leg == "up" else dn_bid_size
             if loser_mid > SELL_THRESHOLD:
-                continue
-            # Thin bid protection: skip if best bid can't absorb our sell size.
-            sell_size = up_size if sell_leg == "up" else dn_size
-            if SELL_MIN_BID_DEPTH > 0 and loser_bid_size < SELL_MIN_BID_DEPTH:
-                log_event(
-                    "sell_skip_thin_bid",
-                    condition_id=cond,
-                    leg=sell_leg,
-                    bid=loser_bid,
-                    bid_size=loser_bid_size,
-                    mid=loser_mid,
-                    sell_size=sell_size,
-                    min_depth=SELL_MIN_BID_DEPTH,
-                    seconds_left=round(seconds_left, 3),
-                )
                 continue
             # Two low mids indicate an ambiguous or illiquid book, not two losers.
             other_mid = (dn_mid if dn_mid is not None else dn_bid) if sell_leg == "up" else (up_mid if up_mid is not None else up_bid)

@@ -65,7 +65,6 @@ _STRATEGY_DEFAULTS = {
     "sell_lastchance_threshold": 0.10, # only sell in final seconds if truly dead
     "sell_lastchance_s": 10,           # last-chance window: final 10 seconds
     "sell_max_price": 0.055,           # hard cap: never sell above 5.5¢ (threshold + 0.5¢)
-    "sell_min_bid_depth": 0,            # skip sell if best bid size < this many shares (0 = disabled)
     "redeem_throttle_s": 30,          # 30s between redeem attempts
     "max_redeem_age_days": 7,
     "dry_run": False,
@@ -116,7 +115,6 @@ SELL_COOLDOWN_S = _strat["sell_cooldown_s"]
 SELL_LASTCHANCE_THRESHOLD = _strat["sell_lastchance_threshold"]
 SELL_LASTCHANCE_S = _strat["sell_lastchance_s"]
 SELL_MAX_PRICE = _strat["sell_max_price"]
-SELL_MIN_BID_DEPTH = _strat.get("sell_min_bid_depth", 0)
 REDEEM_THROTTLE_S = _strat["redeem_throttle_s"]
 MAX_REDEEM_AGE_DAYS = _strat["max_redeem_age_days"]
 DRY_RUN = _strat["dry_run"]
