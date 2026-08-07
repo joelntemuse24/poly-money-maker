@@ -518,7 +518,7 @@ An example file is committed as `strategy.example.json` for reference.
 
 | Constant | Default (production) | Meaning |
 |---|---|---|
-| `sell_threshold` | `0.05` (5 cents) | Sell a leg when its best bid is at or below this price anywhere in the final 90-second sell window. |
+| `sell_threshold` | `0.05` (5 cents) | Sell a leg when its **mid-price** (average of best bid and best ask — the price shown on the Polymarket website) is at or below this price anywhere in the final 90-second sell window. Previously triggered on best bid alone, which caused false sells from thin 1-share bids with wide spreads. |
 | `hedge_enabled` | `true` | Enables the reversal hedge (production). A low best bid near expiry can reflect spread or illiquidity rather than a true reversal, so the threshold is deep. |
 | `hedge_threshold` | `0.40` (40 cents) | Held-leg bid threshold used only when `hedge_enabled` is true. The hedge sell's price limit is half this value (20¢). |
 | `sell_window_min` | `1.5` minutes (90 seconds) | Only sell within the last 90 seconds before market expiry. This **time-gates** the sell trigger — even if the loser leg hits 5 cents with 3 minutes left, the bot waits until the final 90 seconds. |
@@ -619,6 +619,12 @@ the normal threshold:
   After 3 skipped attempts, the sell fails and the bot holds to redemption. This
   prevents the worst-case scenario where a bouncing leg fills above the trigger
   threshold during the latency gap between trigger and execution.
+
+  After each fill, the bot also verifies the actual fill price using
+  `get_order_details`. If the fill price exceeds `sell_max_price`, a
+  `sell_cap_breach` event is logged with the fill price, max price, and order ID.
+  This post-fill verification catches any race condition where the bid bounces
+  between the pre-check and the order execution.
 
 Across cycles, once one leg is fully sold, the normal threshold preserves the
 remaining leg for redemption. Only the explicitly enabled experimental hedge
@@ -1587,32 +1593,30 @@ sizes and skip — no point managing an expired market.
 
 ## 11. Pricing — Reading the Order Book
 
-### 11.1 `get_book_bid` — Finding the Best Buyer
+### 11.1 `get_book_bid` / `get_book_quote` — Reading the Order Book
 
-```@/c:/Users/ntemu/Downloads/poly money maker/bot.py:505-515
-def get_book_bid(token_id):
-    try:
-        book = safe_api_call(client.get_order_book, token_id)
-        bids = book.get("bids", [])
-        if not bids:
-            return None, 0.0
-        best = max(bids, key=lambda x: float(x.get("price", 0)))
-        return float(best.get("price", 0)), float(best.get("size", 0))
-    except Exception:
-        return None, 0.0
-```
+The bots use two functions to read the order book:
 
-**What it does:** Fetches the live order book for a token and returns the best
-(highest) bid price and its available size.
+**`get_book_bid(token_id)`** returns `(best_bid_price, best_bid_size)` — used
+inside `sell_market_with_retry` for the max-price cap check before each FAK
+attempt.
 
-**Why REST over SDK for the order book?** Actually, this *does* use the SDK
-(`client.get_order_book`). The SDK wraps the CLOB's REST endpoint for order book
-data. We use `safe_api_call` to get error filtering.
+**`get_book_quote(token_id)`** returns the full quote tuple:
+`(bid_price, bid_size, ask_price, ask_size, mid_price)` — used by the sell
+loop's background book fetch and for hedge decisions. The **mid-price**
+((bid + ask) / 2) is what the Polymarket website displays as the market price.
 
-**Why `max(bids, key=...)`?** The `max()` function with a `key` argument finds
-the element with the highest key value. Here, the key is the bid price. This is
-more Pythonic than sorting the entire list and taking `[0]` — it's O(n) instead
-of O(n log n), and it clearly expresses "find the maximum."
+**Why mid-price for the sell trigger?** Previously, the sell trigger fired when
+the best bid alone was ≤ `SELL_THRESHOLD`. This caused a reversal on the 5m
+market "BTC Up or Down — August 7, 5:20PM-5:25PM ET": a thin 1-share bid at
+$0.018 on the Up side triggered a sell of 10 shares at $0.0186, while the ask
+was still at $0.50 (mid = $0.26). The Up side won, costing the bot ~$9.80 in
+lost redemption value. Switching to mid-price ensures the bot only sells when
+both bid and ask confirm the leg is truly losing, ignoring stray thin bids.
+
+Both functions use the same SDK-first + HTTP-fallback pattern: try
+`client.get_order_book` via `safe_api_call`, and on SDK failure, fall back to a
+plain `requests.get` to the public `/book` endpoint (no auth required).
 
 **Why return a tuple `(price, size)`?** The caller needs both: the price
 determines whether to sell, and the size determines how many shares we can
@@ -1821,9 +1825,10 @@ shares but only 60 filled, we have 40 remaining. The loop retries up to
    detection in the main loop sort it out.
 6. Update totals and continue if shares remain.
 
-**Why `time.sleep(1)` between attempts?** A small delay to avoid hammering the
-API. Even though we removed the global 300ms delay from `safe_api_call`, the
-retry loop has its own 1-second pacing.
+**Why `time.sleep(0.5)` between attempts?** A small delay to avoid hammering the
+API. Reduced from 1s to 0.5s to tighten the window between the max-price cap
+check and order submission, minimizing the race condition where a bid bounces
+above the cap between the check and the fill.
 
 **Why `MarketOrderArgs` instead of `OrderArgs`?** The current codebase uses
 `MarketOrderArgs` — a market order variant that accepts a `price` parameter as a
@@ -2280,12 +2285,20 @@ raw bid into the pricing tuple used for decisions.
 
 **Step 4: Trigger evaluation**
 
-The normal threshold applies throughout the sell window, with a confirmed
-fallback in the final 10 seconds (see §6.3):
+The sell trigger fires on **mid-price** (the average of best bid and best ask —
+the same price shown on the Polymarket website). This prevents false triggers
+from thin bids with wide spreads. The background book fetch uses
+`get_book_quote` which returns `(bid, bid_size, ask, ask_size, mid)` for each
+leg. If mid-price is unavailable (no asks on the book), the trigger falls back
+to the best bid.
 
 ```python
-up_trigger = up_size > 0 and up_price is not None and up_price <= SELL_THRESHOLD
-dn_trigger = dn_size > 0 and dn_price is not None and dn_price <= SELL_THRESHOLD
+# Trigger on mid-price (what the website shows) instead of just bid.
+up_trigger_price = up_mid if up_mid is not None else up_price
+dn_trigger_price = dn_mid if dn_mid is not None else dn_price
+
+up_trigger = up_size > 0 and up_trigger_price is not None and up_trigger_price <= SELL_THRESHOLD
+dn_trigger = dn_size > 0 and dn_trigger_price is not None and dn_trigger_price <= SELL_THRESHOLD
 
 if seconds_left <= SELL_LASTCHANCE_S and not up_trigger and not dn_trigger:
     confirmation_price = 1.0 - SELL_LASTCHANCE_THRESHOLD
@@ -2305,8 +2318,8 @@ if up_trigger and dn_trigger:
 
 **The trigger logic:**
 
-- **Normal threshold (45→0 seconds):** `price <= SELL_THRESHOLD` (any bid ≤10¢).
-  There is no lower price floor.
+- **Normal threshold (45→0 seconds):** `mid_price <= SELL_THRESHOLD` (mid ≤10¢).
+  Falls back to best bid if mid is unavailable. There is no lower price floor.
 
 - **Confirmed fallback (10→0 seconds):** When neither normal trigger fired, a
   side below 35¢ is eligible only if the opposite bid is at least 65¢.
@@ -2396,7 +2409,7 @@ the data API reflects actual on-chain holdings.
         _ml = (s["end_ts"] - _next_now) / 60000
         if _ml <= 0 or _ml > SELL_WINDOW_MIN:
             continue
-        # ... submit get_book_bid for each held leg to _book_executor ...
+        # ... submit get_book_quote for each held leg to _book_executor ...
 
     console.print(f"[dim bright_black]· · ·  sleeping {_sleep_s}s  · · ·[/]")
     time.sleep(_sleep_s)
@@ -2569,6 +2582,7 @@ Each function makes a deliberate choice about what to do on failure:
 | `get_user_positions` | Return `None` | Distinguishes "no positions" from "query failed." |
 | `check_token_balance` | Return `None` | Caller skips ghost fill check if lookup fails. |
 | `get_book_bid` | Return `(None, 0.0)` | `None` price means "skip this leg this cycle." |
+| `get_book_quote` | Return `(None, 0.0, None, 0.0, None)` | `None` mid means "skip this leg this cycle." |
 | `sell_market_with_retry` | Return `(0, None)` | No shares sold; caller tries ghost fill detection. |
 | `redeem_condition` | Return `None` | No redemption submitted; retry next cycle. |
 | `notify` | Silent `pass` | Notifications are best-effort, never crash. |
