@@ -930,25 +930,23 @@ is critical for operators and other agents working on this system.
 
 #### 8.5.3 Running Processes on the VM
 
-Seven Python processes run concurrently on the VM:
+Ten processes run concurrently on the VM (8 Python + 2 shell armers):
 
 | Process | Command | Market | Managed by |
 |---|---|---|---|
 | 15m sell | `.venv/bin/python bot.py` | `btc-updown` (15m) | systemd (`polybot`) |
 | 5m sell | `.venv/bin/python bot5m.py` | `btc-updown-5m` (5m) | systemd (`polybot5m`) |
-| Hourly sell | `.venv/bin/python bothourly.py` | `bitcoin-up-or-down` (hourly) | Manual (`&` background) |
-| 15m buy | `.venv-buy/bin/python -m buy` | `btc-up-or-down-15m` | Manual (`&` background) |
-| 5m buy | `.venv-buy/bin/python -m buy --config strategy.buy.5m.json` | `btc-up-or-down-5m` | Manual (`&` background) |
-| Hourly buy | `BUY_DATA_DIR=buy_data_hourly .venv-buy/bin/python -m buy --config strategy.buy.hourly.json` | `btc-up-or-down-hourly` | Manual (`&` background) |
-| Shadow sim | `.venv/bin/python -m sim.shadow --config sim/strategy.sim.mirror.json` | All series | Manual (`&` background) |
+| Hourly sell | `.venv/bin/python bothourly.py` | `bitcoin-up-or-down` (hourly) | systemd (`polybot-hourly`) |
+| 15m buy | `.venv-buy/bin/python -m buy` | `btc-up-or-down-15m` | systemd (`polybuy`) |
+| 5m buy | `.venv-buy/bin/python -m buy --config strategy.buy.5m.json` | `btc-up-or-down-5m` | systemd (`polybuy5m`) |
+| Hourly buy | `BUY_DATA_DIR=buy_data_hourly .venv-buy/bin/python -m buy --config strategy.buy.hourly.json` | `btc-up-or-down-hourly` | systemd (`polybuy-hourly`) |
+| 15m armer | shell loop writing `MINT_REAL_PUSD` to `buy_data/ARM` every 10s | — | systemd (`polybuy15m-arm`) |
+| Hourly armer | shell loop writing `MINT_REAL_PUSD` to `buy_data_hourly/ARM` every 30s | — | systemd (`polybuy-hourly-arm`) |
+| 5m armer | shell loop writing `MINT_REAL_PUSD` to `buy_data_5m/ARM` every 10s | — | systemd (`polybuy5m-arm`) |
+| Shadow sim | `.venv/bin/python -m sim.shadow --config sim/strategy.sim.mirror.json` | All series | systemd (`polyshadow-mirror`) |
 
-**systemd-managed bots** (`polybot`, `polybot5m`) auto-restart on crash and
-survive SSH disconnects. Use `sudo systemctl restart polybot` to restart.
-
-**Manually-started bots** (hourly sell, all buy bots) do **not** survive SSH
-disconnects unless started with `nohup` or `screen`/`tmux`. They also don't
-auto-restart on crash. To make them persistent, consider creating systemd
-services for them (see `deploy/` for templates).
+**All bots and armers are systemd-managed** with `Restart=always`. They
+auto-restart on crash and survive SSH disconnects and VM reboots.
 
 #### 8.5.4 Arming Services (VM-only)
 
@@ -999,26 +997,24 @@ sudo systemctl restart polybot
 # 5m sell bot (systemd)
 sudo systemctl restart polybot5m
 
-# Hourly sell bot (manual)
-pkill -f bothourly.py
-cd ~/poly-money-maker && .venv/bin/python bothourly.py >> bot_hourly.log 2>&1 &
+# Hourly sell bot (systemd)
+sudo systemctl restart polybot-hourly
 
-# 15m buy bot (manual)
-pkill -f "python -m buy$"
-cd ~/poly-money-maker && .venv-buy/bin/python -m buy >> buy.log 2>&1 &
+# 15m buy bot (systemd)
+sudo systemctl restart polybuy
 
-# 5m buy bot (manual)
-pkill -f "strategy.buy.5m"
-cd ~/poly-money-maker && .venv-buy/bin/python -m buy --config strategy.buy.5m.json >> buy_5m.log 2>&1 &
+# 5m buy bot (systemd)
+sudo systemctl restart polybuy5m
 
-# Hourly buy bot (manual)
-pkill -f "strategy.buy.hourly"
-cd ~/poly-money-maker && BUY_DATA_DIR=buy_data_hourly .venv-buy/bin/python -m buy --config strategy.buy.hourly.json >> buy_hourly.log 2>&1 &
+# Hourly buy bot (systemd)
+sudo systemctl restart polybuy-hourly
+
+# Arming services (systemd)
+sudo systemctl restart polybuy15m-arm polybuy-hourly-arm polybuy5m-arm
+
+# All at once
+sudo systemctl restart polybot polybot5m polybot-hourly polybuy polybuy5m polybuy-hourly polybuy15m-arm polybuy-hourly-arm polybuy5m-arm
 ```
-
-**Note on `pkill`:** Be specific with patterns to avoid killing the wrong buy
-bot. The 15m buy bot has no `--config` flag, so `pkill -f "python -m buy$"` only
-matches it. For the others, match on the config filename.
 
 #### 8.5.6 Changing Buy/Sell Parameters
 
