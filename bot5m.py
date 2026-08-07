@@ -710,7 +710,7 @@ def sell_market_with_retry(token_id, size, price_limit, tick_size="0.001", max_r
                         bid=fresh_bid, max_price=max_price, remaining=remaining,
                     )
                     console.print(f"  [dim yellow][SKIP][/] bid {fresh_bid:.3f} > cap {max_price:.3f} · attempt {attempt + 1}/{max_retries}")
-                    time.sleep(1)
+                    time.sleep(0.5)
                     continue
                 price = max(fresh_bid, float(tick_size))
         try:
@@ -728,12 +728,28 @@ def sell_market_with_retry(token_id, size, price_limit, tick_size="0.001", max_r
                     break
                 total_sold += filled
                 remaining -= filled
-                console.print(f"  [bold green][EXIT FAK][/]{filled} @ ≥{price:.3f}  [dim]id={str(oid)[:16]}...[/]")
+                fill_price = price
+                details = get_order_details(oid) if oid else None
+                if details and details.get("status") != "NOT_FOUND":
+                    sm = float(details.get("size_matched", 0) or 0)
+                    if sm > 0:
+                        ord_size = float(details.get("size", 0) or 0)
+                        if ord_size > 0:
+                            fill_price = sm / ord_size if sm / ord_size <= 1.0 else price
+                if max_price is not None and fill_price > max_price:
+                    log_event(
+                        "sell_cap_breach", token_id=token_id, attempt=attempt + 1,
+                        fill_price=fill_price, max_price=max_price, filled=filled,
+                        price_floor=price, remaining=remaining,
+                    )
+                    console.print(f"  [bold red][CAP BREACH][/] filled @ {fill_price:.3f} > cap {max_price:.3f} · {filled:.4f} shares")
+                else:
+                    console.print(f"  [bold green][EXIT FAK][/]{filled} @ ≥{price:.3f}  [dim]id={str(oid)[:16]}...[/]")
                 if remaining < 0.01:
                     return total_sold, result
         except Exception as e:
             console.print(f"  [dim red]Market sell {attempt+1}/{max_retries} failed: {e}[/]")
-        time.sleep(1)
+        time.sleep(0.5)
 
     if total_sold > 0:
         return total_sold, {"partial": True, "sold": total_sold}
