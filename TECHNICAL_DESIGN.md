@@ -950,11 +950,38 @@ disconnects unless started with `nohup` or `screen`/`tmux`. They also don't
 auto-restart on crash. To make them persistent, consider creating systemd
 services for them (see `deploy/` for templates).
 
-#### 8.5.4 Cron Jobs (VM-only)
+#### 8.5.4 Arming Services (VM-only)
 
-The crontab on the VM arms the buy bots by writing `MINT_REAL_PUSD` to their
-respective ARM files. Each arm permits exactly one mint:
+All three buy bots are armed by continuous systemd armer services that write
+`MINT_REAL_PUSD` to their respective ARM files on a tight loop. Each arm
+permits exactly one mint (consumed atomically just before submission):
 
+```bash
+# 5m buy bot — armed every 10s (long arm_max_age_s, stays armed persistently)
+deploy/polybuy5m-arm.service
+
+# 15m buy bot — armed every 10s (replaces old cron-based arming)
+deploy/polybuy15m-arm.service
+
+# Hourly buy bot — armed every 30s (replaces old cron-based arming)
+deploy/polybuy-hourly-arm.service
+```
+
+The ARM is one-shot: it is deleted (`consume_arm`) only when a valid candidate
+is found and the mint is about to be submitted. If the bot is capped, has no
+candidates, or has insufficient balance, the ARM is preserved for the next
+cycle. The armer services continuously re-write the ARM file, so the bot is
+always ready to mint when a candidate appears.
+
+**Install on VM:**
+```bash
+sudo cp deploy/polybuy15m-arm.service /etc/systemd/system/
+sudo cp deploy/polybuy-hourly-arm.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now polybuy15m-arm polybuy-hourly-arm
+```
+
+**Old cron-based arming (deprecated):**
 ```crontab
 # 15m buy bot — armed 4×/hour (every ~15 min)
 56,11,26,41 * * * * echo "MINT_REAL_PUSD" > /home/ntemusejoel/poly-money-maker/buy_data/ARM
@@ -962,12 +989,6 @@ respective ARM files. Each arm permits exactly one mint:
 # Hourly buy bot — armed once per hour
 56 * * * * echo "MINT_REAL_PUSD" > /home/ntemusejoel/poly-money-maker/buy_data_hourly/ARM
 ```
-
-The 5m buy bot is not in the crontab — it uses a longer `arm_max_age_s` (86400s)
-and stays armed persistently.
-
-**To view:** `crontab -l`
-**To edit:** `crontab -e`
 
 #### 8.5.5 How to Restart Each Bot
 

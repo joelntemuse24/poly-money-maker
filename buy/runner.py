@@ -277,31 +277,25 @@ def run_once(
     if not dry_run:
         if not is_fresh_arm(config, now):
             return {"status": "disarmed", "reason": "fresh_arm_required"}
-        consume_arm()
 
-    try:
-        market_gateway = market_gateway or MarketGateway(
-            gamma_url=config.gamma_url,
-            data_api_url=config.data_api_url,
-        )
-        chain = chain or ChainReader(config.rpc_url)
-        status_gateway = status_gateway or RelayerStatusGateway(config.relayer_url)
-        credentials = _credentials()
-        funder_address = credentials["funder_address"] or None
+    market_gateway = market_gateway or MarketGateway(
+        gamma_url=config.gamma_url,
+        data_api_url=config.data_api_url,
+    )
+    chain = chain or ChainReader(config.rpc_url)
+    status_gateway = status_gateway or RelayerStatusGateway(config.relayer_url)
+    credentials = _credentials()
+    funder_address = credentials["funder_address"] or None
 
-        reconcile_intents(
-            config=config,
-            state=state,
-            funder_address=funder_address,
-            chain=chain,
-            status_gateway=status_gateway,
-            logger=logger,
-            now=now,
-        )
-    except Exception:
-        if not dry_run:
-            restore_arm()
-        raise
+    reconcile_intents(
+        config=config,
+        state=state,
+        funder_address=funder_address,
+        chain=chain,
+        status_gateway=status_gateway,
+        logger=logger,
+        now=now,
+    )
     if any(
         intent.get("status") == "ambiguous"
         for intent in state.get("intents", {}).values()
@@ -420,6 +414,7 @@ def run_once(
         condition_id=candidate.condition_id,
         shares=config.shares,
     )
+    consume_arm()
     try:
         transaction_id = relayer.submit(calls, metadata)
         intent["transaction_id"] = transaction_id
