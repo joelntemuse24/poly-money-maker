@@ -1,6 +1,6 @@
 {
   "buy_threshold": 0.97,
-  "buy_max_price": 0.99,
+  "buy_max_price": 0.98,
   "hedge_enabled": true,
   "hedge_threshold": 0.65,
   "buy_window_min": 5.0,

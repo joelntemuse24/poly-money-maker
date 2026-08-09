@@ -10,7 +10,7 @@ Six Python trading bots on Polymarket BTC prediction markets (5m, 15m, hourly):
 | Family | Files | Strategy |
 |---|---|---|
 | Sell-side | `bot.py`, `bot5m.py`, `bothourly.py` | Sell the loser leg at ≤2–5¢, hedge reversals, redeem winners |
-| Buy-side | `buybot.py`, `buybot5m.py`, `buybothourly.py` | Buy winning leg at ≤97¢ ask, hold to expiry, hedge at 65¢ |
+| Buy-side | `buybot.py`, `buybot5m.py`, `buybothourly.py` | Buy winning leg at 97–98¢ ask, hold to expiry, hedge at 65¢ |
 
 Plus: `buy/` atomic mint package, `sim/` shadow simulator, `check_book.py` diagnostic.
 
@@ -119,7 +119,7 @@ python check_book.py
 ## Landmines
 
 1. **The two buy-side systems are completely different:**
-   - Standalone bots (`buybot*.py`) buy the winning leg at ≤97¢ via FAK on CLOB.
+   - Standalone bots (`buybot*.py`) buy the winning leg at 97–98¢ via FAK on CLOB.
    - Atomic mint (`buy/runner.py`) mints complete sets at $1.00 via on-chain relayer.
    - They share NO code, NO state, and use DIFFERENT venvs (`.venv` vs `.venv-buy`).
 
