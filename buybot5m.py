@@ -234,8 +234,7 @@ def record_pnl(condition_id, question, entry_cost, sell_proceeds, hedge_proceeds
         pnl_data["summary"]["wins"] += 1
     else:
         pnl_data["summary"]["losses"] += 1
-    with open(PNL_FILE, "w") as f:
-        json.dump(pnl_data, f, indent=2)
+    atomic_save(PNL_FILE, pnl_data)
     return net
 
 
@@ -823,8 +822,10 @@ while not _shutdown_requested:
                         state = "[bold bright_magenta]✓ REDEEM[/]"
                     elif secs <= 0:
                         state = "[dim]· closed[/]"
-                    else:
+                    elif secs <= BUY_START_S:
                         state = f"[bold yellow]● HELD · HEDGE ≤{int(HEDGE_THRESHOLD*100)}¢[/]"
+                    else:
+                        state = "[bold bright_green]● HELD[/]"
 
                     if secs >= 60:
                         ttm_str = f"{secs/60:.0f}m"
