@@ -30,7 +30,7 @@ Plus: `buy/` atomic mint package, `sim/` shadow simulator, `check_book.py` diagn
 | `buy/runner.py` | Atomic mint entry (VM-only, separate venv) | — |
 
 **Pattern:** Each bot family has 3 near-identical copies differing only in constants
-(SLUG_PREFIX, SLUG_EXCLUDES, shares, buy/sell window, tick_size). A logic change
+(SLUG_PREFIX, SLUG_EXCLUDES, buy_budget, buy/sell window, tick_size). A logic change
 to one usually needs propagation to its siblings.
 
 ### Safe to modify

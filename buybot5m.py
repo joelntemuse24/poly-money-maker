@@ -61,7 +61,7 @@ _STRATEGY_DEFAULTS = {
     "buy_start_s": 90,
     "buy_grace_s": 1,
     "buy_cooldown_s": 1,
-    "shares": 5.0,
+    "buy_budget": 8.0,
     "max_open_positions": 100,
     "max_open_notional": 10000.0,
     "max_daily_notional": 999999.0,
@@ -100,6 +100,12 @@ def load_strategy():
                         cfg[k] = v if isinstance(v, bool) else str(v).lower() in ("1", "true", "yes")
                     else:
                         cfg[k] = expected(v)
+            # Legacy alias: near $1 prices, "shares" was effectively a dollar budget
+            if "buy_budget" not in overrides and "shares" in overrides:
+                try:
+                    cfg["buy_budget"] = float(overrides["shares"])
+                except (TypeError, ValueError):
+                    pass
     except Exception as e:
         console.print(f"[bold red]▶ STRATEGY [WARN][/] [dim]failed to load {STRATEGY_FILE}: {e}[/]")
     _strat_cache = cfg
@@ -114,7 +120,7 @@ HEDGE_THRESHOLD = _strat["hedge_threshold"]
 BUY_START_S = _strat["buy_start_s"]
 BUY_GRACE_S = _strat["buy_grace_s"]
 BUY_COOLDOWN_S = _strat["buy_cooldown_s"]
-SHARES = _strat["shares"]
+BUY_BUDGET = _strat["buy_budget"]
 MAX_OPEN_POSITIONS = _strat["max_open_positions"]
 MAX_OPEN_NOTIONAL = _strat["max_open_notional"]
 MAX_DAILY_NOTIONAL = _strat["max_daily_notional"]
@@ -436,17 +442,19 @@ def confirm_fill_size(result, oid, requested):
 
 # ------------------------- BUY -------------------------
 
-def buy_market_with_retry(token_id, size, max_price, tick_size="0.001", max_retries=3, min_price=0.0):
-    """Buy `size` shares of token_id at or below max_price via FAK market order.
-    Caps each attempt at the current best ask size to avoid walking the book."""
+def buy_market_with_retry(token_id, budget, max_price, tick_size="0.001", max_retries=3, min_price=0.0):
+    """Spend up to `budget` dollars buying token_id at or below max_price via FAK.
+    Share size is budget/ask each attempt; capped to top-of-book size so we don't walk."""
     total_bought = 0.0
-    remaining = float(size)
+    spent = 0.0
+    budget = float(budget)
     if DRY_RUN:
-        console.print(f"  [bold black on yellow][DRY BUY][/] would BUY {remaining:.4f} {str(token_id)[:12]}… @ ≤{max_price:.3f}")
-        log_event("dry_buy", token_id=token_id, size=remaining, max_price=max_price)
+        console.print(f"  [bold black on yellow][DRY BUY][/] would SPEND ≤${budget:.2f} on {str(token_id)[:12]}… @ ≤{max_price:.3f}")
+        log_event("dry_buy", token_id=token_id, budget=budget, max_price=max_price)
         return 0.0
     for attempt in range(max_retries):
-        if remaining < 0.01:
+        remaining_budget = budget - spent
+        if remaining_budget < 0.01:
             break
         _, _, fresh_ask, fresh_ask_size, _ = get_book_quote(token_id)
         if fresh_ask is None:
@@ -460,7 +468,10 @@ def buy_market_with_retry(token_id, size, max_price, tick_size="0.001", max_retr
             console.print(f"  [dim yellow][SKIP][/] ask {fresh_ask:.3f} < min {min_price:.3f} · attempt {attempt + 1}/{max_retries}")
             time.sleep(0.5)
             continue
-        buy_size = min(remaining, fresh_ask_size)
+        shares_affordable = remaining_budget / fresh_ask
+        buy_size = min(shares_affordable, fresh_ask_size)
+        if buy_size < 0.01:
+            break
         price = fresh_ask
         try:
             result = safe_api_call(
@@ -475,11 +486,13 @@ def buy_market_with_retry(token_id, size, max_price, tick_size="0.001", max_retr
                 if filled <= 0:
                     console.print("  [dim yellow][FAK NULL][/] 0 confirmed fill · stopping")
                     break
+                fill_cost = filled * price
                 total_bought += filled
-                remaining -= filled
-                console.print(f"  [bold green][BUY FAK][/]{filled} @ {price:.3f}  [dim]id={str(oid)[:16]}…[/]")
-                log_event("buy_fill", token_id=token_id, filled=filled, price=price, remaining=remaining, attempt=attempt + 1)
-                if remaining < 0.01:
+                spent += fill_cost
+                remaining_budget = budget - spent
+                console.print(f"  [bold green][BUY FAK][/]{filled} @ {price:.3f} (${fill_cost:.2f})  [dim]id={str(oid)[:16]}…[/]")
+                log_event("buy_fill", token_id=token_id, filled=filled, price=price, spent=round(spent, 4), remaining_budget=round(remaining_budget, 4), attempt=attempt + 1)
+                if remaining_budget < 0.01:
                     return total_bought
         except Exception as e:
             console.print(f"  [dim red]Market buy {attempt+1}/{max_retries} failed: {e}[/]")
@@ -487,13 +500,11 @@ def buy_market_with_retry(token_id, size, max_price, tick_size="0.001", max_retr
         time.sleep(0.5)
 
     if total_bought > 0:
-        console.print(f"  [bold yellow][BUY PARTIAL][/]{total_bought:.4f}/{size:.4f} filled")
+        console.print(f"  [bold yellow][BUY PARTIAL][/]{total_bought:.4f} shares · ${spent:.2f}/${budget:.2f} spent")
         return total_bought
-    console.print(f"  [bold red][BUY FAIL][/] market buy 0/{size:.4f} filled")
+    console.print(f"  [bold red][BUY FAIL][/] spent $0.00/${budget:.2f}")
     return 0.0
 
-
-# ------------------------- SELL (for hedge only) -------------------------
 
 def sell_market_with_retry(token_id, size, price_limit, tick_size="0.001", max_retries=3):
     """Sell `size` shares via FAK. Used for hedge exits only — no max_price cap."""
@@ -716,7 +727,7 @@ while not _shutdown_requested:
         BUY_START_S = _strat["buy_start_s"]
         BUY_GRACE_S = _strat["buy_grace_s"]
         BUY_COOLDOWN_S = _strat["buy_cooldown_s"]
-        SHARES = _strat["shares"]
+        BUY_BUDGET = _strat["buy_budget"]
         MAX_OPEN_POSITIONS = _strat["max_open_positions"]
         MAX_OPEN_NOTIONAL = _strat["max_open_notional"]
         MAX_DAILY_NOTIONAL = _strat["max_daily_notional"]
@@ -1002,7 +1013,7 @@ while not _shutdown_requested:
                 for c, pm in positions_meta.items()
                 if pm.get("bought_token") and pm.get("entered_at", 0) >= _today_start_ms()
             )
-            est_cost = SHARES * BUY_THRESHOLD
+            est_cost = BUY_BUDGET
             if open_count >= MAX_OPEN_POSITIONS:
                 continue
             if open_notional + est_cost > MAX_OPEN_NOTIONAL + 1e-9:
@@ -1060,11 +1071,11 @@ while not _shutdown_requested:
 
             tick = get_tick_size_cached(buy_token)
             log_event(
-                "buy_attempt", condition_id=cond, leg=buy_leg, shares=SHARES,
+                "buy_attempt", condition_id=cond, leg=buy_leg, budget=BUY_BUDGET,
                 ask=buy_ask, threshold=BUY_THRESHOLD, seconds_left=round(seconds_left, 1),
             )
 
-            bought = buy_market_with_retry(buy_token, SHARES, BUY_MAX_PRICE, tick_size=tick, min_price=BUY_THRESHOLD)
+            bought = buy_market_with_retry(buy_token, BUY_BUDGET, BUY_MAX_PRICE, tick_size=tick, min_price=BUY_THRESHOLD)
             if bought > 0:
                 meta["last_buy_at"] = now_ms
                 meta["bought_token"] = buy_token
@@ -1084,7 +1095,7 @@ while not _shutdown_requested:
                 save_json(STATE_FILE, positions_meta)
             else:
                 meta["last_buy_at"] = now_ms
-                log_event("buy_fail", condition_id=cond, leg=buy_leg, shares=SHARES, ask=buy_ask)
+                log_event("buy_fail", condition_id=cond, leg=buy_leg, budget=BUY_BUDGET, ask=buy_ask)
                 save_json(STATE_FILE, positions_meta)
 
     except Exception:
