@@ -150,7 +150,7 @@ class MarketGateway:
                         "series_slug": series_slug,
                         "active": "true",
                         "closed": "false",
-                        "limit": "80",
+                        "limit": "200",
                     },
                     timeout=self.timeout,
                 )

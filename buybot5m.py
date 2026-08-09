@@ -647,7 +647,7 @@ try:
 except Exception as e:
     console.print(f"[bold red]▶ COLLATERAL [WARN][/] [dim]{e}[/]")
 
-market_gateway = MarketGateway(gamma_url=GAMMA_API, data_api_url=DATA_API)
+market_gateway = MarketGateway(gamma_url=GAMMA_API, data_api_url=DATA_API, discover_cache_s=5.0)
 
 banner = Panel(
     Align.center(
