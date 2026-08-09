@@ -55,6 +55,7 @@ RELAYER_API_KEY_ADDRESS = os.getenv("RELAYER_API_KEY_ADDRESS", "0x42aec4505559c0
 # ------------------------- STRATEGY CONFIG -------------------------
 _STRATEGY_DEFAULTS = {
     "buy_threshold": 0.97,
+    "buy_max_price": 0.99,
     "hedge_enabled": True,
     "hedge_threshold": 0.65,
     "buy_window_min": 5.0,
@@ -435,7 +436,7 @@ def confirm_fill_size(result, oid, requested):
 
 # ------------------------- BUY -------------------------
 
-def buy_market_with_retry(token_id, size, max_price, tick_size="0.01", max_retries=3):
+def buy_market_with_retry(token_id, size, max_price, tick_size="0.01", max_retries=3, min_price=0.0):
     """Buy `size` shares of token_id at or below max_price via FAK market order.
     Caps each attempt at the current best ask size to avoid walking the book."""
     total_bought = 0.0
@@ -453,6 +454,10 @@ def buy_market_with_retry(token_id, size, max_price, tick_size="0.01", max_retri
             break
         if fresh_ask > max_price:
             console.print(f"  [dim yellow][SKIP][/] ask {fresh_ask:.3f} > cap {max_price:.3f} · attempt {attempt + 1}/{max_retries}")
+            time.sleep(0.5)
+            continue
+        if fresh_ask < min_price:
+            console.print(f"  [dim yellow][SKIP][/] ask {fresh_ask:.3f} < min {min_price:.3f} · attempt {attempt + 1}/{max_retries}")
             time.sleep(0.5)
             continue
         buy_size = min(remaining, fresh_ask_size)
@@ -706,6 +711,7 @@ while not _shutdown_requested:
         # Hot-reload strategy
         _strat = load_strategy()
         BUY_THRESHOLD = _strat["buy_threshold"]
+        BUY_MAX_PRICE = _strat["buy_max_price"]
         HEDGE_ENABLED = _strat["hedge_enabled"]
         HEDGE_THRESHOLD = _strat["hedge_threshold"]
         BUY_WINDOW_MIN = _strat["buy_window_min"]
@@ -1030,8 +1036,8 @@ while not _shutdown_requested:
                 log_event("buy_skip_ambiguous", condition_id=cond, up_mid=up_mid, dn_mid=dn_mid)
                 continue
 
-            up_buy = up_winning and up_ask is not None and up_ask <= BUY_THRESHOLD
-            dn_buy = dn_winning and dn_ask is not None and dn_ask <= BUY_THRESHOLD
+            up_buy = up_winning and up_ask is not None and BUY_THRESHOLD <= up_ask <= BUY_MAX_PRICE
+            dn_buy = dn_winning and dn_ask is not None and BUY_THRESHOLD <= dn_ask <= BUY_MAX_PRICE
 
             if not (up_buy or dn_buy):
                 continue
@@ -1062,7 +1068,7 @@ while not _shutdown_requested:
                 ask=buy_ask, threshold=BUY_THRESHOLD, minutes_left=round(minutes_left, 2),
             )
 
-            bought = buy_market_with_retry(buy_token, SHARES, BUY_THRESHOLD, tick_size=tick)
+            bought = buy_market_with_retry(buy_token, SHARES, BUY_MAX_PRICE, tick_size=tick, min_price=BUY_THRESHOLD)
             if bought > 0:
                 meta["last_buy_at"] = now_ms
                 meta["bought_token"] = buy_token
