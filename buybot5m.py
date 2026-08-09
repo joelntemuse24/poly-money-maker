@@ -1010,11 +1010,9 @@ while not _shutdown_requested:
             if daily_notional + est_cost > MAX_DAILY_NOTIONAL + 1e-9:
                 continue
 
-            # Fetch book quotes
-            up_quote = _book_cache.get(m.up_token, (None, 0.0, None, 0.0, None))
-            dn_quote = _book_cache.get(m.dn_token, (None, 0.0, None, 0.0, None))
-            up_bid, _, up_ask, _, up_mid = up_quote
-            dn_bid, _, dn_ask, _, dn_mid = dn_quote
+            # Fresh book quotes — no stale cache for buy decisions
+            up_bid, _, up_ask, _, up_mid = get_book_quote(m.up_token)
+            dn_bid, _, dn_ask, _, dn_mid = get_book_quote(m.dn_token)
 
             if up_mid is None and dn_mid is None:
                 continue  # no sentiment
