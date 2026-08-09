@@ -34,12 +34,12 @@ HOST = "https://clob.polymarket.com"
 DATA_API = "https://data-api.polymarket.com"
 GAMMA_API = "https://gamma-api.polymarket.com"
 CHAIN_ID = 137
-STATE_FILE = "positions_buy.json"
-PNL_FILE = "pnl_buy.json"
-HEARTBEAT_FILE = ".heartbeat_buy"
-SERIES_SLUG = "btc-up-or-down-15m"
-SLUG_PREFIX = "btc-updown"
-SLUG_EXCLUDES = ("btc-updown-5m", "bitcoin-up-or-down")
+STATE_FILE = "positions_buyhourly.json"
+PNL_FILE = "pnl_buyhourly.json"
+HEARTBEAT_FILE = ".heartbeat_buyhourly"
+SERIES_SLUG = "bitcoin-up-or-down"
+SLUG_PREFIX = "bitcoin-up-or-down"
+SLUG_EXCLUDES = ("btc-updown-5m", "btc-updown")
 PUSD = "0xC011a7E12a19f7B1f670d46F03B03f3342E82DFB"
 CTF = "0x4D97DCd97eC945f40cF65F87097ACe5EA0476045"
 
@@ -57,10 +57,10 @@ _STRATEGY_DEFAULTS = {
     "buy_threshold": 0.97,
     "hedge_enabled": True,
     "hedge_threshold": 0.65,
-    "buy_window_min": 3.0,
+    "buy_window_min": 5.0,
     "buy_grace_s": 2,
     "buy_cooldown_s": 3,
-    "shares": 13.0,
+    "shares": 15.0,
     "max_open_positions": 100,
     "max_open_notional": 10000.0,
     "max_daily_notional": 999999.0,
@@ -73,7 +73,7 @@ _STRATEGY_DEFAULTS = {
     "balance_refresh_s": 15,
     "tick_size": "0.01",
 }
-STRATEGY_FILE = "strategy_buy.json"
+STRATEGY_FILE = "strategy_buyhourly.json"
 
 _strat_cache = None
 _strat_mtime = 0.0
@@ -127,11 +127,11 @@ BALANCE_REFRESH_S = _strat["balance_refresh_s"]
 TICK_SIZE_FALLBACK = _strat["tick_size"]
 
 # ------------------------- LOG ROTATION -------------------------
-LOG_FILE = "buybot.log"
+LOG_FILE = "buybothourly.log"
 LOG_MAX_BYTES = 5 * 1024 * 1024
 LOG_BACKUP_COUNT = 3
 
-_file_logger = logging.getLogger("buybot")
+_file_logger = logging.getLogger("buybothourly")
 _file_logger.setLevel(logging.INFO)
 _log_handler = RotatingFileHandler(LOG_FILE, maxBytes=LOG_MAX_BYTES, backupCount=LOG_BACKUP_COUNT)
 _log_handler.setFormatter(logging.Formatter("%(message)s"))
@@ -648,7 +648,7 @@ banner = Panel(
         "[bold bright_green]██████╗ ████████╗ ██████╗[/]   [bright_yellow]//[/]  [bold white]BUY DESK[/]\n"
         "[bold bright_green]██╔══██╗╚══██╔══╝██╔════╝[/]   [bright_yellow]//[/]  [dim]POLYMARKET CLOB · MATIC[/]\n"
         "[bold bright_green]██████╔╝   ██║   ██║     [/]   [bright_yellow]//[/]  [dim]BUY-SIDE · 97¢ WINNER TRIG[/]\n"
-        "[bold bright_green]██╔══██╗   ██║   ██║     [/]   [bright_yellow]//[/]  [dim]BTC 15M · HEDGE @ 65¢[/]\n"
+        "[bold bright_green]██████╔╝   ██║   ██║     [/]   [bright_yellow]//[/]  [dim]BTC HOURLY · HEDGE @ 65¢[/]\n"
         "[bold bright_green]██████╔╝   ██║   ╚██████╗[/]   [bright_yellow]//[/]  STATUS: [bold bright_green]● ARMED[/]\n"
         "[bold bright_green]╚═════╝    ╚═╝    ╚═════╝[/]   [bright_yellow]//[/]  [dim]v1.0 · buy · gamma discovery[/]",
         vertical="middle",
@@ -782,7 +782,7 @@ while not _shutdown_requested:
         # ================= POSITIONS TABLE =================
         if held:
             table = Table(
-                title="[bold bright_cyan]≡ HELD POSITIONS ≡[/]  [dim]BTC 15M · BUY-SIDE[/]",
+                title="[bold bright_cyan]≡ HELD POSITIONS ≡[/]  [dim]BTC HOURLY · BUY-SIDE[/]",
                 box=box.HEAVY_HEAD,
                 border_style="bright_blue",
                 title_style="bold bright_cyan",

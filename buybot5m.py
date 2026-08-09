@@ -57,10 +57,10 @@ _STRATEGY_DEFAULTS = {
     "buy_threshold": 0.97,
     "hedge_enabled": True,
     "hedge_threshold": 0.65,
-    "buy_start_s": 150,
+    "buy_start_s": 90,
     "buy_grace_s": 1,
     "buy_cooldown_s": 1,
-    "shares": 10.0,
+    "shares": 5.0,
     "max_open_positions": 100,
     "max_open_notional": 10000.0,
     "max_daily_notional": 999999.0,
@@ -1089,15 +1089,13 @@ while not _shutdown_requested:
             box=box.HEAVY_EDGE,
         ))
 
-    # Variable polling: 5s >90s, 1s ≤90s, sub-second in/around buy window
+    # Variable polling: 1s normal, sub-second in/around buy window
     _now = time.time() * 1000
     _min_ttm_s = min((m.end_ts * 1000 - _now) / 1000 for m in markets) if markets else 9999
     if _min_ttm_s <= BUY_START_S + 5:
         _sleep_s = POLL_BUY_WINDOW_S
-    elif _min_ttm_s <= 90:
-        _sleep_s = 1
     else:
-        _sleep_s = 5
+        _sleep_s = 1
 
     # ================= KICK OFF NEXT CYCLE'S BOOK FETCH =================
     _next_now = time.time() * 1000 + _sleep_s * 1000
