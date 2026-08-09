@@ -54,8 +54,8 @@ RELAYER_API_KEY_ADDRESS = os.getenv("RELAYER_API_KEY_ADDRESS", "0x42aec4505559c0
 
 # ------------------------- STRATEGY CONFIG -------------------------
 _STRATEGY_DEFAULTS = {
-    "buy_threshold": 0.97,
-    "buy_max_price": 0.98,
+    "buy_threshold": 0.96,
+    "buy_max_price": 0.99,
     "hedge_enabled": True,
     "hedge_threshold": 0.65,
     "buy_window_min": 5.0,
