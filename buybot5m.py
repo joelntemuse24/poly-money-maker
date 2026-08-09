@@ -234,6 +234,8 @@ def record_pnl(condition_id, question, entry_cost, sell_proceeds, hedge_proceeds
         pnl_data["summary"]["wins"] += 1
     else:
         pnl_data["summary"]["losses"] += 1
+    if len(pnl_data["trades"]) > 500:
+        pnl_data["trades"] = pnl_data["trades"][-500:]
     atomic_save(PNL_FILE, pnl_data)
     return net
 
