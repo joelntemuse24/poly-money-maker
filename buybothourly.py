@@ -767,6 +767,7 @@ while not _shutdown_requested:
                 if max(p.get("up", {}).get("size", 0), p.get("dn", {}).get("size", 0)) > 0.01
                 or p.get("up", {}).get("redeemable") or p.get("dn", {}).get("redeemable")
             }
+            live_conds |= {m.condition_id for m in markets}
             stale_conds = [c for c in list(positions_meta.keys()) if c not in live_conds]
             for c in stale_conds:
                 gc_meta = positions_meta[c]
