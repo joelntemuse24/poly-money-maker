@@ -65,15 +65,15 @@ Bitcoin prediction markets — **six bots** in production across three timeframe
 
 - **`buybot.py`** (`polybuybot`) — monitors **15-minute** BTC markets. In the
   final 3 minutes, buys the winning leg (determined by mid-price comparison)
-  at 96–99¢ ask price, up to $13 notional per market. Holds to expiry, hedges reversals at
+  at 96–99¢ ask price, up to $21 notional per market. Holds to expiry, hedges reversals at
   65¢, redeems winners at $1.00. Uses `positions_buy.json`, `pnl_buy.json`,
   `buybot.log`, `.heartbeat_buy`.
 - **`buybot5m.py`** (`polybuybot5m`) — monitors **5-minute** BTC markets. In the
-  final 90 seconds, buys the winning leg at 96–99¢ ask price, up to $5 notional per market.
+  final 90 seconds, buys the winning leg at 96–99¢ ask price, up to $8 notional per market.
   Holds to expiry, hedges at 65¢, redeems winners. Uses `positions_buy5m.json`,
   `pnl_buy5m.json`, `buybot5m.log`, `.heartbeat_buy5m`.
 - **`buybothourly.py`** (`polybuybothourly`) — monitors **hourly** BTC markets.
-  In the final 5 minutes, buys the winning leg at 96–99¢ ask price, up to $15 notional per
+  In the final 5 minutes, buys the winning leg at 96–99¢ ask price, up to $24 notional per
   market. Holds to expiry, hedges at 65¢, redeems winners. Uses
   `positions_buyhourly.json`, `pnl_buyhourly.json`, `buybothourly.log`,
   `.heartbeat_buyhourly`.
@@ -270,15 +270,15 @@ Production runs **nine** live processes on one GCP VM:
 │  BUY-SIDE BOTS (buy the winning leg at 96–99¢, hold to expiry)   │
 ├──────────────────────────────────────────────────────────────────┤
 │  polybuybot (buybot.py) — 15m markets                             │
-│  monitors order books → buys winning leg (96–99¢ ask, ≤$13) │
+│  monitors order books → buys winning leg (96–99¢ ask, ≤$21) │
 │  final 3min window → hedges at 65¢ → redeems → pnl_buy.json      │
 ├──────────────────────────────────────────────────────────────────┤
 │  polybuybot5m (buybot5m.py) — 5-minute markets                   │
-│  monitors order books → buys winning leg (96–99¢ ask, ≤$5)  │
+│  monitors order books → buys winning leg (96–99¢ ask, ≤$8)  │
 │  final 90s window → hedges at 65¢ → redeems → pnl_buy5m.json     │
 ├──────────────────────────────────────────────────────────────────┤
 │  polybuybothourly (buybothourly.py) — hourly markets              │
-│  monitors order books → buys winning leg (96–99¢ ask, ≤$15) │
+│  monitors order books → buys winning leg (96–99¢ ask, ≤$24) │
 │  final 5min window → hedges at 65¢ → redeems → pnl_buyhourly.json│
 └──────────────────────────────────────────────────────────────────┘
 ```
@@ -454,11 +454,11 @@ queues, no databases.
 | `strategy_hourly.json` | Live hourly strategy config (hot-reloaded, gitignored) | — |
 | **Buy-Side Bots (Standalone)** | | |
 | `buybot.py` | 15m buy-side bot — buys winning leg at 96–99¢, holds to expiry, hedges at 65¢ | ~994 lines |
-| `buybot5m.py` | 5m buy-side bot — buys winning leg at 96–99¢, ≤$5/market, 90s window | ~991 lines |
-| `buybothourly.py` | Hourly buy-side bot — buys winning leg at 96–99¢, ≤$15/market, 5min window | ~994 lines |
-| `strategy_buy.example.json` | Example buy-side config for `buybot.py` (96–99¢ band, ≤$13/market, 3min window) | — |
-| `strategy_buy5m.example.json` | Example buy-side config for `buybot5m.py` (96–99¢ band, ≤$5/market, 90s window) | — |
-| `strategy_buyhourly.example.json` | Example buy-side config for `buybothourly.py` (96–99¢ band, ≤$15/market, 5min window) | — |
+| `buybot5m.py` | 5m buy-side bot — buys winning leg at 96–99¢, ≤$8/market, 90s window | ~991 lines |
+| `buybothourly.py` | Hourly buy-side bot — buys winning leg at 96–99¢, ≤$24/market, 5min window | ~994 lines |
+| `strategy_buy.example.json` | Example buy-side config for `buybot.py` (96–99¢ band, ≤$21/market, 3min window) | — |
+| `strategy_buy5m.example.json` | Example buy-side config for `buybot5m.py` (96–99¢ band, ≤$8/market, 90s window) | — |
+| `strategy_buyhourly.example.json` | Example buy-side config for `buybothourly.py` (96–99¢ band, ≤$24/market, 5min window) | — |
 | `check_book.py` | Diagnostic script for inspecting live order books | ~30 lines |
 | `check_hourly_mint.py` | Diagnostic script for verifying hourly mint eligibility | ~167 lines |
 | `backtest_sell_window.py` | Backtest different sell threshold/window combos against shadow data | ~211 lines |
@@ -3554,7 +3554,7 @@ atomic mint buyer (which mints complete sets at $1.00), the standalone buy bots:
 |---|---|---|---|
 | Buy band | 96–99¢ ask | 96–99¢ ask | 96–99¢ ask |
 | Buy window | last 3 minutes (180s) | last 90 seconds | last 5 minutes (300s) |
-| Buy budget (USD) | $13 | $5 | $15 |
+| Buy budget (USD) | $21 | $8 | $24 |
 | Normal polling | 1s | 1s | 1s |
 | Buy-window polling | 0.1s | 0.1s | 0.1s |
 | Hedge threshold | 65¢ bid | 65¢ bid | 65¢ bid |
@@ -3590,6 +3590,10 @@ Once the winner is determined, the bot checks:
 ```
 BUY_THRESHOLD (0.96) ≤ winning_ask ≤ BUY_MAX_PRICE (0.99)
 ```
+
+Sizing uses **`buy_budget`** (USD), not a fixed share count. Each FAK attempt
+buys `min(remaining_budget / ask, top_of_book_size)` shares so spent notional
+stays ≤ the budget (defaults: $21 / $8 / $24 for 15m / 5m / hourly; sized for ~$100/day at $0.98 avg with full participation and no reversals).
 
 The buy uses **ask price** (not bid, not mid) as both the trigger and the FAK
 limit price. The `buy_market_with_retry()` function re-fetches the ask before

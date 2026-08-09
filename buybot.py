@@ -61,7 +61,7 @@ _STRATEGY_DEFAULTS = {
     "buy_window_min": 3.0,
     "buy_grace_s": 2,
     "buy_cooldown_s": 3,
-    "buy_budget": 13.0,
+    "buy_budget": 21.0,
     "max_open_positions": 100,
     "max_open_notional": 10000.0,
     "max_daily_notional": 999999.0,
