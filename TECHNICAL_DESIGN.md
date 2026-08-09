@@ -65,15 +65,15 @@ Bitcoin prediction markets — **six bots** in production across three timeframe
 
 - **`buybot.py`** (`polybuybot`) — monitors **15-minute** BTC markets. In the
   final 3 minutes, buys the winning leg (determined by mid-price comparison)
-  at 97–98¢ ask price, 13 shares per market. Holds to expiry, hedges reversals at
+  at 96–99¢ ask price, 13 shares per market. Holds to expiry, hedges reversals at
   65¢, redeems winners at $1.00. Uses `positions_buy.json`, `pnl_buy.json`,
   `buybot.log`, `.heartbeat_buy`.
 - **`buybot5m.py`** (`polybuybot5m`) — monitors **5-minute** BTC markets. In the
-  final 90 seconds, buys the winning leg at 97–98¢ ask price, 5 shares per market.
+  final 90 seconds, buys the winning leg at 96–99¢ ask price, 5 shares per market.
   Holds to expiry, hedges at 65¢, redeems winners. Uses `positions_buy5m.json`,
   `pnl_buy5m.json`, `buybot5m.log`, `.heartbeat_buy5m`.
 - **`buybothourly.py`** (`polybuybothourly`) — monitors **hourly** BTC markets.
-  In the final 5 minutes, buys the winning leg at 97–98¢ ask price, 15 shares per
+  In the final 5 minutes, buys the winning leg at 96–99¢ ask price, 15 shares per
   market. Holds to expiry, hedges at 65¢, redeems winners. Uses
   `positions_buyhourly.json`, `pnl_buyhourly.json`, `buybothourly.log`,
   `.heartbeat_buyhourly`.
@@ -116,11 +116,11 @@ threshold is deliberately deep below fair value.
 - **No portfolio rebalancing.** Each bot manages one specific market type.
 - **No set-cost gate.** The sell-side bots do not reject expensive complete-set
   entries (e.g. combined avg price > $1.02). The buy-side bots buy at a fixed
-  band (97–98¢), so entry cost is bounded by construction.
+  band (96–99¢), so entry cost is bounded by construction.
 
 **Sell-side bots** are sell-only — entry is handled by the `buy/` atomic mint
 package (§20). **Buy-side bots** are buy-and-hold — they buy the winning leg at
-97–98¢, hold to expiry, and only exit via hedge (at 65¢ bid) or redemption. Neither
+96–99¢, hold to expiry, and only exit via hedge (at 65¢ bid) or redemption. Neither
 family engages in profit-taking sells.
 
 This narrow scope is intentional — it keeps the codebase small, the failure
@@ -267,18 +267,18 @@ Production runs **nine** live processes on one GCP VM:
 └──────────────────────────────────────────────────────────────────┘
 
 ┌──────────────────────────────────────────────────────────────────┐
-│  BUY-SIDE BOTS (buy the winning leg at 97–98¢, hold to expiry)   │
+│  BUY-SIDE BOTS (buy the winning leg at 96–99¢, hold to expiry)   │
 ├──────────────────────────────────────────────────────────────────┤
 │  polybuybot (buybot.py) — 15m markets                             │
-│  monitors order books → buys winning leg (97–98¢ ask, 13 shares) │
+│  monitors order books → buys winning leg (96–99¢ ask, 13 shares) │
 │  final 3min window → hedges at 65¢ → redeems → pnl_buy.json      │
 ├──────────────────────────────────────────────────────────────────┤
 │  polybuybot5m (buybot5m.py) — 5-minute markets                   │
-│  monitors order books → buys winning leg (97–98¢ ask, 5 shares)  │
+│  monitors order books → buys winning leg (96–99¢ ask, 5 shares)  │
 │  final 90s window → hedges at 65¢ → redeems → pnl_buy5m.json     │
 ├──────────────────────────────────────────────────────────────────┤
 │  polybuybothourly (buybothourly.py) — hourly markets              │
-│  monitors order books → buys winning leg (97–98¢ ask, 15 shares) │
+│  monitors order books → buys winning leg (96–99¢ ask, 15 shares) │
 │  final 5min window → hedges at 65¢ → redeems → pnl_buyhourly.json│
 └──────────────────────────────────────────────────────────────────┘
 ```
@@ -453,12 +453,12 @@ queues, no databases.
 | `strategy_hourly.example.json` | Example strategy config for `bothourly.py` (5¢ threshold, 90s sell window, 65¢ hedge) | — |
 | `strategy_hourly.json` | Live hourly strategy config (hot-reloaded, gitignored) | — |
 | **Buy-Side Bots (Standalone)** | | |
-| `buybot.py` | 15m buy-side bot — buys winning leg at 97–98¢, holds to expiry, hedges at 65¢ | ~994 lines |
-| `buybot5m.py` | 5m buy-side bot — buys winning leg at 97–98¢, 5 shares, 90s window | ~991 lines |
-| `buybothourly.py` | Hourly buy-side bot — buys winning leg at 97–98¢, 15 shares, 5min window | ~994 lines |
-| `strategy_buy.example.json` | Example buy-side config for `buybot.py` (97–98¢ band, 13 shares, 3min window) | — |
-| `strategy_buy5m.example.json` | Example buy-side config for `buybot5m.py` (97–98¢ band, 5 shares, 90s window) | — |
-| `strategy_buyhourly.example.json` | Example buy-side config for `buybothourly.py` (97–98¢ band, 15 shares, 5min window) | — |
+| `buybot.py` | 15m buy-side bot — buys winning leg at 96–99¢, holds to expiry, hedges at 65¢ | ~994 lines |
+| `buybot5m.py` | 5m buy-side bot — buys winning leg at 96–99¢, 5 shares, 90s window | ~991 lines |
+| `buybothourly.py` | Hourly buy-side bot — buys winning leg at 96–99¢, 15 shares, 5min window | ~994 lines |
+| `strategy_buy.example.json` | Example buy-side config for `buybot.py` (96–99¢ band, 13 shares, 3min window) | — |
+| `strategy_buy5m.example.json` | Example buy-side config for `buybot5m.py` (96–99¢ band, 5 shares, 90s window) | — |
+| `strategy_buyhourly.example.json` | Example buy-side config for `buybothourly.py` (96–99¢ band, 15 shares, 5min window) | — |
 | `check_book.py` | Diagnostic script for inspecting live order books | ~30 lines |
 | `check_hourly_mint.py` | Diagnostic script for verifying hourly mint eligibility | ~167 lines |
 | `backtest_sell_window.py` | Backtest different sell threshold/window combos against shadow data | ~211 lines |
@@ -3533,7 +3533,7 @@ Two implementation gotchas, both learned the hard way:
 
 The standalone buy-side bots are a separate family from both the sell-side bots
 (§1) and the atomic mint buyer (§20). They buy the **winning leg** of BTC
-prediction markets at 97–98¢ and hold to expiry.
+prediction markets at 96–99¢ and hold to expiry.
 
 ### 21.1 Strategy Overview
 
@@ -3543,7 +3543,7 @@ atomic mint buyer (which mints complete sets at $1.00), the standalone buy bots:
 1. **Discover markets** via Gamma API using the same series slugs as the sell bots
 2. **Monitor order books** at 1s polling (0.1s inside the buy window)
 3. **Detect the winning leg** by comparing mid prices (bid+ask)/2
-4. **Buy the winning leg** via FAK market order when its ask is in 97–98¢
+4. **Buy the winning leg** via FAK market order when its ask is in 96–99¢
 5. **Hold to expiry** — no profit-taking sells
 6. **Hedge at 65¢** if the held leg's bid collapses (reversal protection)
 7. **Redeem** winning positions after market resolution
@@ -3552,7 +3552,7 @@ atomic mint buyer (which mints complete sets at $1.00), the standalone buy bots:
 
 | Parameter | `buybot.py` (15m) | `buybot5m.py` (5m) | `buybothourly.py` (hourly) |
 |---|---|---|---|
-| Buy band | 97–98¢ ask | 97–98¢ ask | 97–98¢ ask |
+| Buy band | 96–99¢ ask | 96–99¢ ask | 96–99¢ ask |
 | Buy window | last 3 minutes (180s) | last 90 seconds | last 5 minutes (300s) |
 | Shares per market | 13 | 5 | 15 |
 | Normal polling | 1s | 1s | 1s |
@@ -3588,14 +3588,14 @@ if dn_mid > up_mid → DOWN is winning
 Once the winner is determined, the bot checks:
 
 ```
-BUY_THRESHOLD (0.97) ≤ winning_ask ≤ BUY_MAX_PRICE (0.98)
+BUY_THRESHOLD (0.96) ≤ winning_ask ≤ BUY_MAX_PRICE (0.99)
 ```
 
 The buy uses **ask price** (not bid, not mid) as both the trigger and the FAK
 limit price. The `buy_market_with_retry()` function re-fetches the ask before
 each attempt and skips if the ask has moved outside `[BUY_THRESHOLD, BUY_MAX_PRICE]`.
-The upper cap (`buy_max_price: 0.98`) preserves at least 2¢ of edge to $1.00
-redemption and rejects 99¢ fills.
+The band (`buy_threshold: 0.96` … `buy_max_price: 0.99`) aims to catch the
+winner once it is nearly certain, preferably before it gaps to 99¢.
 
 ### 21.5 Buy Window Enforcement
 
@@ -3668,7 +3668,7 @@ All use `Restart=always`, `RestartSec=5`, and run from the same
 |---|---|---|
 | Entry method | FAK market order on CLOB | On-chain `splitPosition` via relayer |
 | What it buys | Winning leg only (UP or DOWN) | Both legs (complete set) |
-| Entry cost | 97–98¢ per share (market price) | Exactly $1.00 per set (on-chain) |
+| Entry cost | 96–99¢ per share (market price) | Exactly $1.00 per set (on-chain) |
 | Requires arming | No (always running) | Yes (ARM file gating) |
 | Polling | 1s / 0.1s | 15s |
 | State files | `positions_buy*.json` | `buy_data*/state.json` |
@@ -3711,7 +3711,7 @@ All use `Restart=always`, `RestartSec=5`, and run from the same
 | **set_cost** | Complete-set entry cost per share used by the shadow sim (default ~1.043 from history). Live bot does not gate on this. |
 | **polyshadow** | systemd service name for the permanent shadow simulator on GCP. |
 | **polybuy** | Live autonomous service that atomically splits pUSD into complete sets; re-armed by cron (4×/hour for 15m, 1×/hour for hourly), one mint per arm. |
-| **polybuybot** / **polybuybot5m** / **polybuybothourly** | Standalone buy-side bots that buy the winning leg at 97–98¢ ask, hold to expiry, and hedge at 65¢ (see §21). |
+| **polybuybot** / **polybuybot5m** / **polybuybothourly** | Standalone buy-side bots that buy the winning leg at 96–99¢ ask, hold to expiry, and hedge at 65¢ (see §21). |
 | **Atomic mint** | One relayer batch that approves exact pUSD and calls standard-adapter `splitPosition`, producing equal UP and DOWN inventory or reverting entirely. |
 | **Buy-side bot** | A standalone bot (`buybot.py` / `buybot5m.py` / `buybothourly.py`) that buys the winning leg of a binary market via FAK market order, as opposed to minting complete sets. |
 | **Winner detection** | The process of determining which leg (UP or DOWN) is winning by comparing mid prices: `(bid + ask) / 2`. Used by the standalone buy-side bots. |
@@ -3728,7 +3728,7 @@ All use `Restart=always`, `RestartSec=5`, and run from the same
 `bothourly.py` for hourly), three standalone buy-side bots (`buybot.py` for 15m,
 `buybot5m.py` for 5m, `buybothourly.py` for hourly), and three atomic mint
 buyers (one per series via `buy/` package) run concurrently on a single GCP VM.
-The standalone buy bots purchase the winning leg at 97–98¢ ask price using mid-price
+The standalone buy bots purchase the winning leg at 96–99¢ ask price using mid-price
 comparison, hold to expiry, hedge at 65¢, and redeem winners at $1.00 (see §21).
 The atomic mint buyers (`polybuy`) mint complete sets live via an SDK-equivalent
 relayer PROXY flow (§20.9), paced by systemd armer services. The sell bots sell
