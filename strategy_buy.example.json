@@ -8,6 +8,11 @@
   "min_underlying_edge_usd": 10.0,
   "hedge_enabled": true,
   "hedge_threshold": 0.65,
+  "hedge_min_price": 0.325,
+  "hedge_undercut_ticks": 2,
+  "hedge_quote_max_age_s": 0.25,
+  "hedge_retry_sleep_s": 0.05,
+  "hedge_ghost_sleep_s": 0.15,
   "buy_window_min": 3.0,
   "buy_grace_s": 2,
   "buy_cooldown_s": 3,
@@ -20,7 +25,9 @@
   "max_redeem_age_days": 7,
   "dry_run": false,
   "poll_buy_window_s": 0.1,
+  "poll_held_s": 0.05,
   "positions_refresh_s": 2,
   "balance_refresh_s": 15,
+  "ui_every_n_cycles": 5,
   "tick_size": "0.01"
 }

@@ -29,6 +29,8 @@ Plus: `sim/` shadow simulator (inactive), `check_book.py` diagnostic.
 | `buybot5m.py` | 5m buy bot (~1141 lines) | `buybot.py`, `buybothourly.py` |
 | `buybothourly.py` | Hourly buy bot (~1144 lines) | `buybot.py`, `buybot5m.py` |
 | `buy/market.py` | MarketGateway + MintMarket dataclass (shared by buy-side bots) | — |
+| `buy/btc_price.py` | Resolution-aligned BTC feeds (TWAP 30/60, Binance) + PTB | — |
+| `buy/clob_book_ws.py` | CLOB market-channel WS top-of-book (hedge/buy speed path) | — |
 | `buy/runner.py` | Atomic mint entry — **unused / legacy** (separate `.venv-buy`) | — |
 
 **Pattern:** Each bot family has 3 near-identical copies differing only in constants
