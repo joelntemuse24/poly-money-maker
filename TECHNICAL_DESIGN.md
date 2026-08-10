@@ -28,7 +28,7 @@
 17. [Error Handling Philosophy](#17-error-handling-philosophy)
 18. [The Diagnostic Tool: `check_book.py`](#18-the-diagnostic-tool-check_bookpy)
 19. [Live Shadow Simulator (`sim/`)](#19-live-shadow-simulator-sim)
-20. [Atomic Mint Buyer (`buy/`)](#20-atomic-mint-buyer-buy)
+20. [Atomic Mint Buyer (`buy/`) — UNUSED / LEGACY](#20-atomic-mint-buyer-buy--unused--legacy)
 21. [Standalone Buy-Side Bots](#21-standalone-buy-side-bots-buybotpy--buybot5mpy--buybothourlypy)
 22. [Glossary](#22-glossary)
 
@@ -37,54 +37,45 @@
 ## 1. Project Overview
 
 **Poly Money Maker** runs two families of automated trading bots on Polymarket's
-Bitcoin prediction markets — **six bots** in production across three timeframes:
+Bitcoin prediction markets — **three buy-side bots are live** on the VM
+(2026-08-10). Sell-side and atomic mint services are installed but **inactive**.
 
-#### Sell-Side Bots (Sell the Loser Leg)
+#### Live now — Buy-Side Bots (Buy the Winning Leg)
 
-- **`bot.py`** (`polybot`) — manages **15-minute** BTC markets. Sells
-  the loser leg at ≤5¢ in the final 90-second sell window, hedges reversals at
-  40¢, and redeems winners at $1.00.
-- **`bot5m.py`** (`polybot5m`) — manages **5-minute** BTC markets. Sells the
-  loser leg at ≤2¢ in the final 150-second (2.5-minute) sell window, hedges
-  reversals at 40¢ **only in the last 25 seconds**, and redeems winners at $1.00.
-  The 5m bot uses a wider sell window (150s vs 90s) because 5-minute markets have
-  thinner books and shorter lifespans — starting earlier captures more liquidity.
-  The 2¢ threshold (vs 5¢) reflects the faster decay of 5m markets: by 150s out,
-  the loser is typically already near zero. The hedge is restricted to the final
-  25s (vs the full sell window in `bot.py`) because 5m markets reverse less in
-  the final seconds — the tighter window avoids false hedges.
-- **`bothourly.py`** (`polybot_hourly`) — manages **hourly** BTC markets
-  (discovers positions via Data API, filtering by slug prefix
-  `bitcoin-up-or-down`, excluding `btc-updown-5m`). Sells the loser leg at ≤5¢
-  in the final 90-second sell window, hedges reversals at **65¢**, and redeems
-  winners at $1.00. Uses separate state files (`positions_hourly.json`,
-  `pnl_hourly.json`, `bot_hourly.log`, `.heartbeat_hourly`) and a separate ntfy
-  topic (`NTFY_TOPIC_HOURLY`) to avoid interfering with the 15m and 5m bots.
-
-#### Buy-Side Bots (Buy the Winning Leg)
-
-- **`buybot.py`** (`polybuybot`) — monitors **15-minute** BTC markets. In the
-  final 3 minutes, buys the winning leg (determined by mid-price comparison)
-  at 96–99¢ ask price, up to $21 notional per market. Holds to expiry, hedges reversals at
-  65¢, redeems winners at $1.00. Uses `positions_buy.json`, `pnl_buy.json`,
-  `buybot.log`, `.heartbeat_buy`.
-- **`buybot5m.py`** (`polybuybot5m`) — monitors **5-minute** BTC markets. In the
-  final 90 seconds, buys the winning leg at 96–99¢ ask price, up to $8 notional per market.
-  Holds to expiry, hedges at 65¢, redeems winners. Uses `positions_buy5m.json`,
-  `pnl_buy5m.json`, `buybot5m.log`, `.heartbeat_buy5m`.
-- **`buybothourly.py`** (`polybuybothourly`) — monitors **hourly** BTC markets.
-  In the final 5 minutes, buys the winning leg at 96–99¢ ask price, up to $24 notional per
-  market. Holds to expiry, hedges at 65¢, redeems winners. Uses
+- **`buybot.py`** (`polybuybot`) — **active**. 15-minute BTC markets. Final 3
+  minutes, winning leg at 96–99¢, up to **$21**/market. Hedge 65¢, redeem at
+  $1.00. No live `strategy_buy.json` → code defaults. State: `positions_buy.json`,
+  `pnl_buy.json`, `buybot.log`, `.heartbeat_buy`.
+- **`buybot5m.py`** (`polybuybot5m`) — **active**. 5-minute BTC markets. Final
+  90 seconds, 96–99¢, up to **$8**/market. Hedge 65¢. No live `strategy_buy5m.json`
+  → code defaults. State: `positions_buy5m.json`, `pnl_buy5m.json`,
+  `buybot5m.log`, `.heartbeat_buy5m`.
+- **`buybothourly.py`** (`polybuybothourly`) — **active**. Hourly BTC markets via
+  Gamma series `btc-up-or-down-hourly`. Final 5 minutes, 96–99¢, up to **$24**/market.
+  Hedge 65¢. No live `strategy_buyhourly.json` → code defaults. State:
   `positions_buyhourly.json`, `pnl_buyhourly.json`, `buybothourly.log`,
   `.heartbeat_buyhourly`.
 
-The sell-side bots enter via the autonomous `buy/` atomic mint process
-(`polybuy`), which splits pUSD into equal UP and DOWN tokens via the Polymarket
-relayer. The buy-side bots enter by purchasing the winning leg directly from the
-CLOB using FAK market orders — a different strategy that requires no pre-entry
-minting. All six bots coordinate only through wallet holdings indexed by
-Polymarket's Data API; they do not share writable state. Slug exclusions
-(`SLUG_EXCLUDES`) ensure no two bots ever touch the same market.
+#### Installed but inactive — Sell-Side Bots
+
+Live strategy JSON exists on the VM, but systemd units are **inactive**:
+
+- **`bot.py`** (`polybot`) — inactive. `strategy.json`: sell **3¢**, window **3 min**,
+  hedge **40¢** (differs from code defaults of 5¢ / 90s).
+- **`bot5m.py`** (`polybot5m`) — inactive. `strategy5m.json`: sell **2¢**, window
+  opens **150s** out, hedge **40¢** in last **25s**.
+- **`bothourly.py`** (`polybot-hourly`) — inactive. `strategy_hourly.json`: sell
+  **5¢**, window **5 min**, hedge **65¢** (code default window is 90s).
+
+#### Unused — Atomic Mint
+
+`polybuy` inactive, `polybuy-hourly` inactive, `polybuy5m` **failed**. Configs
+`strategy.buy*.json` still on disk (shares 26 / 10 / 30) but mint is not the live
+entry path. See §20.
+
+Active entry is the **standalone buy bots** only. Sell bots only matter if
+re-enabled against leftover wallet inventory. All bots coordinate through Data API
+holdings; they do not share writable state.
 
 ### The Core Thesis
 
@@ -120,10 +111,11 @@ sit deliberately deep below fair value.
   entries (e.g. combined avg price > $1.02). The buy-side bots buy at a fixed
   band (96–99¢), so entry cost is bounded by construction.
 
-**Sell-side bots** are sell-only — entry is handled by the `buy/` atomic mint
-package (§20). **Buy-side bots** are buy-and-hold — they buy the winning leg at
-96–99¢, hold to expiry, and only exit via hedge (at 65¢ bid) or redemption. Neither
-family engages in profit-taking sells.
+**Sell-side bots** are sell-only — they do not open new complete-set inventory
+themselves (the `buy/` atomic mint path in §20 is **legacy / unused**). **Buy-side
+bots** are buy-and-hold — they buy the winning leg at 96–99¢, hold to expiry, and
+only exit via hedge (at 65¢ bid) or redemption. Neither family engages in
+profit-taking sells.
 
 This narrow scope is intentional — it keeps the codebase small, the failure
 modes predictable, and the risk surface minimal.
@@ -154,15 +146,20 @@ they're always worth exactly $1.00 at resolution (one wins, one loses). You can
 **mint** a complete set by depositing $1.00 of USDC, or **redeem** a complete set
 to get $1.00 back after the market resolves.
 
-### 2.2.1 Entry Fill Quality (Solved by Atomic Mint)
+### 2.2.1 Entry Fill Quality (Legacy Atomic Mint)
 
-The bot is **sell-only**. Entry was originally manual, typically with
-**limit orders nominally at ~50¢ per side** so a complete set costs ~$1.00.
-Production entry is now the `buy/` atomic mint, which deposits exactly
-`$1.00 × shares` of pUSD on-chain and receives equal UP/DOWN inventory —
-deterministic $1.00 set cost by construction.
+Earlier production tried to assemble complete sets via two-leg CLOB buys (or
+~50¢/side limits) so a set cost ~$1.00. Realized fills often ran above $1.00
+(e.g. ~$1.045), which wrecked sell-side unit economics even when loser sells
+worked. The `buy/` atomic mint path was built to deposit exactly `$1.00 × shares`
+of pUSD on-chain and receive equal UP/DOWN — deterministic $1.00 set cost.
 
-**The open issue is realized fill quality, not the sell strategy.**
+**That mint path is no longer in active use.** Live entry is the standalone buy
+bots (§21), which buy only the winning leg at 96–99¢. The unit-economics notes
+below remain useful context for any leftover complete-set inventory the sell
+bots still manage, and if mint is ever re-enabled.
+
+**If set cost ≠ $1.00, sell P&L depends on entry quality:**
 
 - **Nominal limit price ≠ average fill price.** A resting 50¢ bid can still fill
   worse if the book walks, only one side fills at 50¢, or fees/slippage push the
@@ -181,10 +178,10 @@ deterministic $1.00 set cost by construction.
   | **$1.00** (true 50/50) | **$0.00** | ~$0 (only opportunity cost) |
   | **$1.045** (historical) | **~$0.045** | **−4.5¢/share** locked in |
 
-- **Why this matters more than polling.** Sub-second polling, a 45s sell window,
-  and a 10¢ threshold only help *after* entry. If set cost is $1.045, many
-  "successful" sells at 1–4¢ still lose money, and every missed sell burns the
-  entry premium. If set cost is truly ~$1.00, those same outcomes are flat or
+- **Why this matters more than polling.** Sub-second polling and a tight sell
+  window only help *after* entry. If set cost is $1.045, many "successful" sells
+  at 1–4¢ still lose money, and every missed sell burns the entry premium. If set
+  cost is truly ~$1.00, those same outcomes are flat or
   profitable.
 - **Operator checklist (any manual entry):** If a position was entered manually,
   verify `avg_up + avg_dn` (or total USDC in / shares) is **≤ ~$1.01–1.02**. Treat
@@ -236,20 +233,15 @@ order-building logic differs.
 
 ## 3. Architecture at a Glance
 
-Production runs **nine** live processes on one GCP VM:
+Production runs **six** live trading bots on one GCP VM (plus optional shadow
+sim). The atomic mint buyer (`polybuy` / `buy/runner.py`) is **not in active use**:
 
 ```
-                        ┌─────────────────────────┐      PROXY batch
-                        │  polybuy (buy/runner.py)│ ─────────────────▶
-                        │  mints complete sets    │   relayer-v2
-                        │  (VM-only, cron-armed)  │   (EIP-191 signed)
-                        └─────────────────────────┘ ─────────────────▶
-                                                                   │
-                 ┌──────────────────────────────────┐              ▼
-                 │  Polygon (chain 137)             │   approve + splitPosition
-                 │  Proxy wallet holds pUSD + UP/DN │   (atomic, $1.00/set)
-                 └───────────────┬──────────────────┘
-                                 │ Data API indexes holdings
+                        ┌─────────────────────────┐
+                        │  polybuy (buy/runner.py)│
+                        │  atomic mint — UNUSED   │
+                        │  (legacy; kept in repo) │
+                        └─────────────────────────┘
                                  ▼
 ┌──────────────────────────────────────────────────────────────────┐
 │  SELL-SIDE BOTS (sell the loser leg)                              │
@@ -394,9 +386,9 @@ Internal structure of a buy-side bot (`buybot.py` — same pattern for 5m/hourly
          └──────────────────────┘
 
          ┌──────────────────────┐
-         │  buy/runner.py       │  ← separate process (polybuy), LIVE
-         │  Atomic mint entry   │     autonomous under cron-spaced arming
-         │  writes buy_data/    │     never imports or edits bot state
+         │  buy/runner.py       │  ← atomic mint — UNUSED (legacy)
+         │  Atomic mint entry   │     kept in repo; not an active
+         │  writes buy_data/    │     production entry path
          └──────────────────────┘
 
 External Services:
@@ -1054,51 +1046,49 @@ is critical for operators and other agents working on this system.
 
 #### 8.5.3 Running Processes on the VM
 
-Nine processes run concurrently on the VM (8 Python + 1 shadow sim):
+**Deploy snapshot 2026-08-10** (`git` `fdb0588` on VM at check time):
 
-| Process | Command | Market | Managed by |
-|---|---|---|---|
-| **Sell-Side Bots** | | | |
-| 15m sell | `.venv/bin/python bot.py` | `btc-updown` (15m) | systemd (`polybot`) |
-| 5m sell | `.venv/bin/python bot5m.py` | `btc-updown-5m` (5m) | systemd (`polybot5m`) |
-| Hourly sell | `.venv/bin/python bothourly.py` | `bitcoin-up-or-down` (hourly) | systemd (`polybot-hourly`) |
-| **Standalone Buy-Side Bots** | | | |
-| 15m buy | `.venv/bin/python buybot.py` | `btc-updown` (15m) | systemd (`polybuybot`) |
-| 5m buy | `.venv/bin/python buybot5m.py` | `btc-updown-5m` (5m) | systemd (`polybuybot5m`) |
-| Hourly buy | `.venv/bin/python buybothourly.py` | `btc-up-or-down-hourly` | systemd (`polybuybothourly`) |
-| **Atomic Mint Buyers** (VM-only, service files managed on-VM) | | | |
-| 15m mint | `.venv-buy/bin/python -m buy` | `btc-up-or-down-15m` | systemd (`polybuy`) |
-| 5m mint | `.venv-buy/bin/python -m buy --config strategy.buy.5m.json` | `btc-up-or-down-5m` | systemd (`polybuy5m`) |
-| Hourly mint | `BUY_DATA_DIR=buy_data_hourly .venv-buy/bin/python -m buy --config strategy.buy.hourly.json` | `btc-up-or-down-hourly` | systemd (`polybuy-hourly`) |
-| **Shadow Simulator** | | | |
-| Shadow sim | `.venv/bin/python -m sim.shadow --config sim/strategy.sim.mirror.json` | All series | systemd (`polyshadow-mirror`) |
+| Process | systemd | Status |
+|---|---|---|
+| `polybuybot` / `buybot.py` | `polybuybot` | **active** |
+| `polybuybot5m` / `buybot5m.py` | `polybuybot5m` | **active** |
+| `polybuybothourly` / `buybothourly.py` | `polybuybothourly` | **active** |
+| `polybot` / `bot.py` | `polybot` | inactive |
+| `polybot5m` / `bot5m.py` | `polybot5m` | inactive |
+| `polybot-hourly` / `bothourly.py` | `polybot-hourly` | inactive |
+| `polybuy` (mint 15m) | `polybuy` | inactive |
+| `polybuy5m` (mint 5m) | `polybuy5m` | **failed** |
+| `polybuy-hourly` (mint hourly) | `polybuy-hourly` | inactive |
+| `polyshadow-mirror` | `polyshadow-mirror` | inactive |
 
-**All bots and armers are systemd-managed** with `Restart=always`. They
-auto-restart on crash and survive SSH disconnects and VM reboots.
+Only the three standalone buy bots are live. Sell / mint / shadow units may still
+be installed; they are not currently trading.
+
+**Commands (when used):**
+
+| Process | Command | Market |
+|---|---|---|
+| 15m buy | `.venv/bin/python buybot.py` | `btc-up-or-down-15m` |
+| 5m buy | `.venv/bin/python buybot5m.py` | `btc-up-or-down-5m` |
+| Hourly buy | `.venv/bin/python buybothourly.py` | `btc-up-or-down-hourly` |
+| 15m sell (inactive) | `.venv/bin/python bot.py` | `btc-updown` |
+| 5m sell (inactive) | `.venv/bin/python bot5m.py` | `btc-updown-5m` |
+| Hourly sell (inactive) | `.venv/bin/python bothourly.py` | `bitcoin-up-or-down` |
+
+Active buy bots are systemd-managed with `Restart=always`.
 
 #### 8.5.4 How to Restart Each Bot
 
 ```bash
-# Sell-side bots
-sudo systemctl restart polybot           # 15m sell
-sudo systemctl restart polybot5m         # 5m sell
-sudo systemctl restart polybot-hourly    # hourly sell
+# Live stack (buy-side only as of 2026-08-10)
+sudo systemctl restart polybuybot polybuybot5m polybuybothourly
 
-# Standalone buy-side bots
-sudo systemctl restart polybuybot        # 15m buy (buybot.py)
-sudo systemctl restart polybuybot5m      # 5m buy (buybot5m.py)
-sudo systemctl restart polybuybothourly  # hourly buy (buybothourly.py)
-
-# Atomic mint buyers (VM-only services)
-sudo systemctl restart polybuy           # 15m mint
-sudo systemctl restart polybuy5m         # 5m mint
-sudo systemctl restart polybuy-hourly    # hourly mint
-
-# All at once
-sudo systemctl restart polybot polybot5m polybot-hourly \
-  polybuybot polybuybot5m polybuybothourly \
-  polybuy polybuy5m polybuy-hourly
+# Sell-side (currently inactive — only if re-enabling)
+sudo systemctl restart polybot polybot5m polybot-hourly
 ```
+
+Do not restart mint services (`polybuy`, `polybuy5m`, `polybuy-hourly`) unless
+deliberately re-enabling mint. `polybuy5m` was **failed** at last check.
 
 #### 8.5.5 Changing Buy/Sell Parameters
 
@@ -1110,37 +1100,21 @@ on the VM. Changes are hot-reloaded on the next tick — no restart needed.
 no restart needed. All three standalone buy bots support hot-reload via
 `load_strategy()`.
 
-**Atomic mint strategy** (shares, notional, max open sets): Edit the
-`strategy.buy*.json` file on the VM, then restart the corresponding mint bot.
+**Atomic mint strategy** (unused): `strategy.buy*.json` / `.venv-buy` path is
+legacy. Only edit/restart if deliberately re-enabling mint.
 
 **Code changes** (bot logic, bug fixes): Push to GitHub `main` branch. CI/CD
 auto-deploys `bot.py` changes (restarts `polybot` only). For `bothourly.py` or
 other files, SSH into the VM and run `git pull origin main`, then manually
 restart affected bots.
 
-#### 8.5.7 Production Strategy Parameters (as of 2026-08-10)
+#### 8.5.7 Production Strategy Parameters (as of 2026-08-10 deploy)
 
-Values below are **code defaults** in `_STRATEGY_DEFAULTS` (used when no live
-`strategy*.json` is present). Live JSON on the VM hot-reloads and can differ;
-`strategy*.example.json` files are templates only.
-
-**Sell-side bots**
-
-| Parameter | 5m (`bot5m.py`) | 15m (`bot.py`) | Hourly (`bothourly.py`) |
-|---|---|---|---|
-| Sell threshold | 2¢ | 5¢ | 5¢ |
-| Sell window | opens 150s before expiry | last 90s (`sell_window_min: 1.5`) | last 90s (`sell_window_min: 1.5`) |
-| Sell max price | 2.5¢ | 5.5¢ | 5.5¢ |
-| Hedge threshold | 40¢ | 40¢ | 65¢ |
-| Hedge window | last 25s only | full sell window | full sell window |
-| Last-chance threshold | — (not used) | 10¢ / final 10s | 10¢ / final 10s |
-| Tick size | 0.001 | 0.01 | 0.01 |
-| Polling (sell window) | 0.1s | 0.1s | 0.1s |
-
-**Standalone buy-side bots** (CLOB FAK; not atomic mint)
+**Live buy-side (active services — no `strategy_buy*.json` on VM → code defaults)**
 
 | Parameter | 5m (`buybot5m.py`) | 15m (`buybot.py`) | Hourly (`buybothourly.py`) |
 |---|---|---|---|
+| Status | **active** | **active** | **active** |
 | Buy band | 96–99¢ ask | 96–99¢ ask | 96–99¢ ask |
 | Buy budget (USD) | $8 | $21 | $24 |
 | Buy window | last 90s | last 3 min | last 5 min |
@@ -1149,15 +1123,19 @@ Values below are **code defaults** in `_STRATEGY_DEFAULTS` (used when no live
 | Tick size | 0.001 | 0.01 | 0.01 |
 | Polling (buy window) | 0.1s | 0.1s | 0.1s |
 
-**Atomic mint buyers** (on-chain complete sets; from `strategy.buy*.example.json`)
+**Sell-side on disk but inactive** (values from live `strategy*.json` on VM — what
+would apply if the units were started; not code defaults)
 
-| Parameter | 5m | 15m | Hourly |
+| Parameter | 5m (`strategy5m.json`) | 15m (`strategy.json`) | Hourly (`strategy_hourly.json`) |
 |---|---|---|---|
-| Mint shares / set | 10 | 50 | 50 |
-| Series slug | `btc-up-or-down-5m` | `btc-up-or-down-15m` | `btc-up-or-down-hourly` |
-| Max open notional | $10,000 | $10,000 | $10,000 |
-| Max open sets | 100 | 100 | 100 |
-| Poll | 5s | 15s | 15s |
+| Status | inactive | inactive | inactive |
+| Sell threshold | 2¢ | 3¢ | 5¢ |
+| Sell window | opens 150s before expiry | last 3 min | last 5 min |
+| Hedge threshold | 40¢ | 40¢ | 65¢ |
+| Hedge window | last 25s | (per strategy / code) | (per strategy / code) |
+
+**Atomic mint** — inactive / failed; `strategy.buy*.json` still present with
+shares 10 / 26 / 30 but **not live**. See §20.
 
 ### 8.6 Log Rotation
 
@@ -3225,14 +3203,19 @@ sudo journalctl --since "24 hours ago" | grep -Ei 'memorymax|memory cgroup'
 
 ---
 
-## 20. Atomic Mint Buyer (`buy/`)
+## 20. Atomic Mint Buyer (`buy/`) — UNUSED / LEGACY
 
-The `polybuy` process replaces uncertain two-leg CLOB entry with one
-atomic Conditional Token Framework split. It deposits pUSD and receives equal UP
-and DOWN inventory for a standard binary BTC market. It runs **live and
-autonomously** in production: a cron job re-arms it at minutes 56, 11, 26, and 41
-of each hour (4 min before each BTC 15-minute market start), yielding up to 4 mints
-per hour. Each arm permits exactly one mint attempt (§20.4).
+> **Status (2026-08-10):** Atomic mint is **not in active use**. Live entry is
+> the standalone buy bots (§21). This section documents the `buy/` package that
+> remains in the repo (and may still have VM units/data) for recovery or a
+> possible future re-enable — not current production procedure.
+
+The `polybuy` process was designed to replace uncertain two-leg CLOB entry with
+one atomic Conditional Token Framework split. It deposits pUSD and receives equal
+UP and DOWN inventory for a standard binary BTC market. When it was live, a cron
+job re-armed it at minutes 56, 11, 26, and 41 of each hour (4 min before each BTC
+15-minute market start), yielding up to 4 mints per hour. Each arm permitted
+exactly one mint attempt (§20.4).
 
 ```text
 50.000000 pUSD
@@ -3694,9 +3677,11 @@ All use `Restart=always`, `RestartSec=5`, and run from the same
 `WorkingDirectory` with the shared `.env` file. They use the main `.venv`
 (not `.venv-buy` which is only for the atomic mint buyer).
 
-### 21.11 Key Differences from Atomic Mint Buyer
+### 21.11 Key Differences from Atomic Mint Buyer (legacy)
 
-| Aspect | Standalone Buy Bots | Atomic Mint Buyer (`buy/`) |
+Atomic mint is **unused**; table kept for contrast with the live standalone bots.
+
+| Aspect | Standalone Buy Bots (**live**) | Atomic Mint Buyer (`buy/` — **unused**) |
 |---|---|---|
 | Entry method | FAK market order on CLOB | On-chain `splitPosition` via relayer |
 | What it buys | Winning leg only (UP or DOWN) | Both legs (complete set) |

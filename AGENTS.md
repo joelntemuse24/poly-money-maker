@@ -5,14 +5,16 @@ Full architecture: `TECHNICAL_DESIGN.md`.
 
 ## Project at a Glance
 
-Six Python trading bots on Polymarket BTC prediction markets (5m, 15m, hourly):
+**Live on the VM (2026-08-10):** three standalone buy bots. Sell-side and atomic
+mint services are inactive / unused.
 
-| Family | Files | Strategy |
-|---|---|---|
-| Sell-side | `bot.py`, `bot5m.py`, `bothourly.py` | Sell the loser leg at ≤2–5¢, hedge reversals, redeem winners |
-| Buy-side | `buybot.py`, `buybot5m.py`, `buybothourly.py` | Buy winning leg at 96–99¢ ask, hold to expiry, hedge at 65¢ |
+| Family | Files | Deploy status | Strategy |
+|---|---|---|---|
+| Buy-side | `buybot.py`, `buybot5m.py`, `buybothourly.py` | **active** | 96–99¢ ask, budgets $21/$8/$24, hedge 65¢ |
+| Sell-side | `bot.py`, `bot5m.py`, `bothourly.py` | inactive | Live JSON on disk (3¢/3min, 2¢/150s, 5¢/5min) but units not running |
+| Atomic mint | `buy/runner.py` | unused (`polybuy5m` failed) | legacy |
 
-Plus: `buy/` atomic mint package, `sim/` shadow simulator, `check_book.py` diagnostic.
+Plus: `sim/` shadow simulator (inactive), `check_book.py` diagnostic.
 
 ## File Map
 
@@ -27,7 +29,7 @@ Plus: `buy/` atomic mint package, `sim/` shadow simulator, `check_book.py` diagn
 | `buybot5m.py` | 5m buy bot (~1141 lines) | `buybot.py`, `buybothourly.py` |
 | `buybothourly.py` | Hourly buy bot (~1144 lines) | `buybot.py`, `buybot5m.py` |
 | `buy/market.py` | MarketGateway + MintMarket dataclass (shared by buy-side bots) | — |
-| `buy/runner.py` | Atomic mint entry (VM-only, separate venv) | — |
+| `buy/runner.py` | Atomic mint entry — **unused / legacy** (separate `.venv-buy`) | — |
 
 **Pattern:** Each bot family has 3 near-identical copies differing only in constants
 (SLUG_PREFIX, SLUG_EXCLUDES, buy_budget, buy/sell window, tick_size). A logic change
@@ -48,7 +50,7 @@ to one usually needs propagation to its siblings.
 - `positions*.json`, `pnl*.json` — bot state and P&L (auto-generated)
 - `*.log` — structured JSON-line logs with rotation
 - `.heartbeat*` — uptime tick counters
-- `buy_data*/` — atomic mint runtime data
+- `buy_data*/` — atomic mint runtime data (legacy; unused)
 - `strategy*.json` (without `.example`) — live configs, hot-reloaded
 - `.env` — secrets (gitignored)
 
@@ -118,9 +120,9 @@ python check_book.py
 
 ## Landmines
 
-1. **The two buy-side systems are completely different:**
-   - Standalone bots (`buybot*.py`) buy the winning leg at 96–99¢ via FAK on CLOB.
-   - Atomic mint (`buy/runner.py`) mints complete sets at $1.00 via on-chain relayer.
+1. **The two buy-side systems are completely different (mint unused):**
+   - Standalone bots (`buybot*.py`) buy the winning leg at 96–99¢ via FAK on CLOB — **this is the live entry path**.
+   - Atomic mint (`buy/runner.py`) mints complete sets at $1.00 via on-chain relayer — **not in active use**.
    - They share NO code, NO state, and use DIFFERENT venvs (`.venv` vs `.venv-buy`).
 
 2. **The three bots in each family are near-identical copies, not shared modules.**
@@ -152,8 +154,8 @@ python check_book.py
 | `polybuybot5m.service` | `buybot5m.py` | 5m buy |
 | `polybuybothourly.service` | `buybothourly.py` | hourly buy |
 
-Note: `polybot` (15m sell) and all atomic mint services (`polybuy*`, armers) are
-VM-only — their service files are not in the repo.
+Note: `polybot` (15m sell) service file is VM-only. Atomic mint services
+(`polybuy*`, armers) are also VM-only and **unused**.
 
 ## Dependencies
 
