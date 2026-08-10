@@ -768,6 +768,8 @@ while not _shutdown_requested:
         MIN_WINNER_BID = _strat["min_winner_bid"]
         MAX_LOSER_BID = _strat["max_loser_bid"]
         MIN_BID_EDGE = _strat["min_bid_edge"]
+        UNDERLYING_GATE_ENABLED = _strat["underlying_gate_enabled"]
+        MIN_UNDERLYING_EDGE_USD = _strat["min_underlying_edge_usd"]
         HEDGE_ENABLED = _strat["hedge_enabled"]
         HEDGE_THRESHOLD = _strat["hedge_threshold"]
         BUY_WINDOW_MIN = _strat["buy_window_min"]
