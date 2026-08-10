@@ -105,8 +105,9 @@ python check_book.py
 - `buy_skip_underlying_edge` — live Chainlink BTC not ≥ `min_underlying_edge_usd` ($10) from captured PTB
 - `buy_skip_underlying_side` — book wants the opposite leg from the underlying move
 
-Research / accuracy: Chainlink RTDS ticks + PTB captures land in
-`underlying_research_buy*.jsonl` and `ptb_chainlink_buy*.json` (gitignored).
+Research / accuracy: each bot streams its **resolution oracle** (5m=Chainlink TWAP 30s,
+15m=TWAP 60s, hourly=Binance BTCUSDT) via Polymarket RTDS. PTB captures + decisions
+land in `underlying_research_buy*.jsonl` and `ptb_*_buy*.json` (gitignored).
 
 
 ## Key Conventions

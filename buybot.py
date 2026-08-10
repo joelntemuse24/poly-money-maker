@@ -26,7 +26,7 @@ from py_clob_client_v2 import (
 from py_clob_client_v2.order_builder.constants import SELL, BUY
 
 from buy.market import MarketGateway
-from buy.btc_price import get_btc_feed, append_research
+from buy.btc_price import get_btc_feed, append_research, SOURCE_TWAP_60
 
 console = Console()
 load_dotenv()
@@ -39,7 +39,8 @@ STATE_FILE = "positions_buy.json"
 PNL_FILE = "pnl_buy.json"
 HEARTBEAT_FILE = ".heartbeat_buy"
 RESEARCH_FILE = "underlying_research_buy.jsonl"
-PTB_STORE_FILE = "ptb_chainlink_buy.json"
+PTB_STORE_FILE = "ptb_twap60_buy.json"
+UNDERLYING_SOURCE = SOURCE_TWAP_60
 SERIES_SLUG = "btc-up-or-down-15m"
 SLUG_PREFIX = "btc-updown"
 SLUG_EXCLUDES = ("btc-updown-5m", "bitcoin-up-or-down")
@@ -704,7 +705,7 @@ except Exception as e:
     console.print(f"[bold red]▶ COLLATERAL [WARN][/] [dim]{e}[/]")
 
 market_gateway = MarketGateway(gamma_url=GAMMA_API, data_api_url=DATA_API, discover_cache_s=5.0)
-btc_feed = get_btc_feed(ptb_store_path=PTB_STORE_FILE)
+btc_feed = get_btc_feed(UNDERLYING_SOURCE, PTB_STORE_FILE)
 
 banner = Panel(
     Align.center(
@@ -1124,7 +1125,7 @@ while not _shutdown_requested:
                         "question": m.question,
                         "start_ts": m.start_ts,
                         "end_ts": m.end_ts,
-                        **{k: ptb_rec.get(k) for k in ("ptb", "source", "ptb_tick_ts_ms", "ptb_skew_ms", "ok")},
+                        **{k: ptb_rec.get(k) for k in ("ptb", "source", "ptb_tick_ts_ms", "ptb_skew_ms", "ok", "feed", "feed_label", "resolution_url")},
                     })
                     save_json(STATE_FILE, positions_meta)
 
@@ -1211,6 +1212,7 @@ while not _shutdown_requested:
                         **{k: uchk.get(k) for k in (
                             "ptb", "live_btc", "edge_usd", "favored", "ptb_source",
                             "live_source", "live_age_s", "ptb_skew_ms", "reason", "ok",
+                            "feed", "feed_label", "resolution_url",
                         )},
                     })
                     continue
@@ -1242,6 +1244,7 @@ while not _shutdown_requested:
                         **{k: uchk.get(k) for k in (
                             "ptb", "live_btc", "edge_usd", "favored", "ptb_source",
                             "live_source", "live_age_s", "ptb_skew_ms",
+                            "feed", "feed_label", "resolution_url",
                         )},
                     })
                     continue
@@ -1299,6 +1302,7 @@ while not _shutdown_requested:
                 **{k: (uchk or {}).get(k) for k in (
                     "ptb", "live_btc", "edge_usd", "favored", "ptb_source",
                     "live_source", "live_age_s", "ptb_skew_ms",
+                    "feed", "feed_label", "resolution_url",
                 )},
             })
 

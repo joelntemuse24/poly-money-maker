@@ -35,8 +35,8 @@ positions_buy*.json
 pnl_buy*.json
 .heartbeat_buy*
 underlying_research_buy*.jsonl
-ptb_chainlink_buy*.json
-ptb_chainlink_cache.json
+ptb_*_buy*.json
+ptb_chainlink*.json
 
 # Shadow simulator runtime data
 sim_data/

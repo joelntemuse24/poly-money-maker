@@ -3628,16 +3628,19 @@ AND underlying gate passes (see §21.4.1)
 
 ### 21.4.1 Underlying BTC edge gate
 
-Book probabilities can diverge from Bitcoin itself (the 12:15–12:30 ET 2026-08-10
-market printed **Up at 96–99¢** while spot was already **~$65 below** the Price To
-Beat, then resolved Down).
+Book probabilities can diverge from Bitcoin itself (e.g. Up printing 96–99¢ while
+BTC is still near / on the wrong side of the Price To Beat).
 
-`buy/btc_price.py` tracks:
+`buy/btc_price.py` uses **the same oracle Polymarket resolves on**, per window:
 
-| Input | Source |
-|---|---|
-| Live BTC | Polymarket RTDS `crypto_prices_chainlink` (`btc/usd`), Coinbase/Kraken spot fallback |
-| Price To Beat | Coinbase 1m candle open nearest to market `start_ts` (crypto PTB is not in the public REST API; this is close enough for a dollar edge filter) |
+| Bot | Resolution source | RTDS feed |
+|---|---|---|
+| 5m | [Chainlink BTC/USD TWAP 30s](https://data.chain.link/streams/btc-usd-twap-30s-streams) | `crypto_prices_twap_thirty` |
+| 15m | [Chainlink BTC/USD TWAP 60s](https://data.chain.link/streams/btc-usd-twap-60s-streams) | `crypto_prices_twap_sixty` |
+| Hourly | [Binance BTC/USDT spot](https://www.binance.com/en/trade/BTC_USDT?type=spot) | `crypto_prices` / `btcusdt` |
+
+Price To Beat = nearest tick from **that same feed** to market `start_ts` (≤2s skew),
+persisted in `ptb_twap30_buy5m.json` / `ptb_twap60_buy.json` / `ptb_binance_buyhourly.json`.
 
 When `underlying_gate_enabled` (default true) and `min_underlying_edge_usd` (default
 **$10**):
@@ -3650,12 +3653,9 @@ When `underlying_gate_enabled` (default true) and `min_underlying_edge_usd` (def
 
 | Input | Source | Notes |
 |---|---|---|
-| Live BTC | Polymarket RTDS `crypto_prices_chainlink` `btc/usd` | Same Chainlink pipe the UI uses; ~1 Hz; memory-only in the buy hot path |
-| Price To Beat | Nearest RTDS Chainlink tick to market `start_ts` (≤2s skew) | Captured into `ptb_chainlink_buy*.json`; **not** Coinbase. If the bot missed the open, PTB is marked missing and buys are refused |
-| Research log | `underlying_research_buy*.jsonl` | `ptb_capture`, skips, `buy_attempt`/`buy_fill`, `resolved` — for correlation/regression |
-
-Spot HTTP (Coinbase/Kraken) is emergency live fallback only and is tagged
-`spot_fallback` so it never pretends to be Chainlink PTB.
+| Live / PTB | Per-bot resolution feed above (TWAP 30 / TWAP 60 / Binance) | Same pipe Polymarket settles on; ~1 Hz via RTDS; memory-only on the buy hot path |
+| Missed window open | PTB marked missing | Buys refused — we do not invent a strike from another exchange |
+| Research log | `underlying_research_buy*.jsonl` | Includes `feed`, `feed_label`, `resolution_url`, PTB/live/edge, decisions, outcomes |
 
 **Speed:** book + last-trade quotes for both legs run in parallel via the existing
 thread pool (~1 RTT). Underlying check is pure memory (no HTTP on the decide path).
