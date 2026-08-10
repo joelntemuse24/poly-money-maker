@@ -94,20 +94,22 @@ One side will be worth $1.00 at resolution and the other $0.00. If you hold both
 you're guaranteed to redeem $1.00 per pair.
 
 The profit comes from selling the **loser leg** — the side that's heading to $0.
-If you can sell that loser leg for even 10 cents before the market resolves,
-instead of letting it expire worthless, you lock in extra profit on top of the
-$1.00 redemption. That's exactly what this bot does: it watches the order book,
-and when the losing side's best bid drops to 10 cents, it fires a sell order.
+If you can sell that loser leg for a few cents (e.g. 2–5¢ depending on timeframe)
+before the market resolves, instead of letting it expire worthless, you lock in
+extra profit on top of the $1.00 redemption. That's exactly what the sell bots
+do: they watch the order book, and when the losing side's mid/bid drops to the
+configured threshold, they fire a sell order.
 
 ### Reversal Hedge (Enabled in Production)
 
 After selling the loser leg, the bot normally retains the other leg for its $1.00
-redemption. Production runs the hedge enabled at a 40¢ threshold: if the held
-leg's bid collapses below it (a genuine reversal), the bot sells that leg too
-capping the loss instead of riding it to $0. The hedge sell uses a price limit
-of half the threshold (20¢) to avoid dumping into a momentarily empty book. A
-low held-leg bid alone is not always reliable evidence of a reversal, so the
-threshold is deliberately deep below fair value.
+redemption. Sell-side hedges are enabled in production at **40¢** (15m / 5m) or
+**65¢** (hourly): if the held leg's bid collapses below the threshold (a genuine
+reversal), the bot sells that leg too, capping the loss instead of riding it to
+$0. The 5m sell bot only hedges in the **last 25 seconds**. Standalone buy-side
+bots use a separate **65¢** hedge on the purchased winning leg. A low held-leg
+bid alone is not always reliable evidence of a reversal, so sell-side thresholds
+sit deliberately deep below fair value.
 
 ### What the Bots Do NOT Do
 
@@ -445,17 +447,18 @@ queues, no databases.
 
 | File | Purpose | Size |
 |---|---|---|
-| `bot.py` | The main 15m sell bot — all trading logic lives here | ~1304 lines |
-| `bot5m.py` | The 5-minute sell bot — sell/hedge/redeem for 5m BTC markets | ~1252 lines |
-| `bothourly.py` | The hourly sell bot — sell/hedge/redeem for hourly BTC markets (65¢ hedge) | ~1212 lines |
+| `bot.py` | The main 15m sell bot — all trading logic lives here | ~1444 lines |
+| `bot5m.py` | The 5-minute sell bot — sell/hedge/redeem for 5m BTC markets | ~1397 lines |
+| `bothourly.py` | The hourly sell bot — sell/hedge/redeem for hourly BTC markets (65¢ hedge) | ~1349 lines |
+| `strategy.example.json` | Example strategy config for `bot.py` (template; may differ from code defaults) | — |
 | `strategy5m.example.json` | Example strategy config for `bot5m.py` (2¢ threshold, 150s sell window, 25s hedge) | — |
 | `strategy5m.json` | Live 5m strategy config (hot-reloaded, gitignored) | — |
 | `strategy_hourly.example.json` | Example strategy config for `bothourly.py` (5¢ threshold, 90s sell window, 65¢ hedge) | — |
 | `strategy_hourly.json` | Live hourly strategy config (hot-reloaded, gitignored) | — |
 | **Buy-Side Bots (Standalone)** | | |
-| `buybot.py` | 15m buy-side bot — buys winning leg at 96–99¢, holds to expiry, hedges at 65¢ | ~994 lines |
-| `buybot5m.py` | 5m buy-side bot — buys winning leg at 96–99¢, ≤$8/market, 90s window | ~991 lines |
-| `buybothourly.py` | Hourly buy-side bot — buys winning leg at 96–99¢, ≤$24/market, 5min window | ~994 lines |
+| `buybot.py` | 15m buy-side bot — buys winning leg at 96–99¢, ≤$21/market, hedges at 65¢ | ~1146 lines |
+| `buybot5m.py` | 5m buy-side bot — buys winning leg at 96–99¢, ≤$8/market, 90s window | ~1141 lines |
+| `buybothourly.py` | Hourly buy-side bot — buys winning leg at 96–99¢, ≤$24/market, 5min window | ~1144 lines |
 | `strategy_buy.example.json` | Example buy-side config for `buybot.py` (96–99¢ band, ≤$21/market, 3min window) | — |
 | `strategy_buy5m.example.json` | Example buy-side config for `buybot5m.py` (96–99¢ band, ≤$8/market, 90s window) | — |
 | `strategy_buyhourly.example.json` | Example buy-side config for `buybothourly.py` (96–99¢ band, ≤$24/market, 5min window) | — |
@@ -1107,29 +1110,54 @@ on the VM. Changes are hot-reloaded on the next tick — no restart needed.
 no restart needed. All three standalone buy bots support hot-reload via
 `load_strategy()`.
 
-**Buy strategy** (shares, notional, max open sets): Edit the
-`strategy.buy*.json` file on the VM, then restart the corresponding buy bot.
+**Atomic mint strategy** (shares, notional, max open sets): Edit the
+`strategy.buy*.json` file on the VM, then restart the corresponding mint bot.
 
 **Code changes** (bot logic, bug fixes): Push to GitHub `main` branch. CI/CD
 auto-deploys `bot.py` changes (restarts `polybot` only). For `bothourly.py` or
 other files, SSH into the VM and run `git pull origin main`, then manually
 restart affected bots.
 
-#### 8.5.7 Production Strategy Parameters (as of 2026-08-06)
+#### 8.5.7 Production Strategy Parameters (as of 2026-08-10)
+
+Values below are **code defaults** in `_STRATEGY_DEFAULTS` (used when no live
+`strategy*.json` is present). Live JSON on the VM hot-reloads and can differ;
+`strategy*.example.json` files are templates only.
+
+**Sell-side bots**
+
+| Parameter | 5m (`bot5m.py`) | 15m (`bot.py`) | Hourly (`bothourly.py`) |
+|---|---|---|---|
+| Sell threshold | 2¢ | 5¢ | 5¢ |
+| Sell window | opens 150s before expiry | last 90s (`sell_window_min: 1.5`) | last 90s (`sell_window_min: 1.5`) |
+| Sell max price | 2.5¢ | 5.5¢ | 5.5¢ |
+| Hedge threshold | 40¢ | 40¢ | 65¢ |
+| Hedge window | last 25s only | full sell window | full sell window |
+| Last-chance threshold | — (not used) | 10¢ / final 10s | 10¢ / final 10s |
+| Tick size | 0.001 | 0.01 | 0.01 |
+| Polling (sell window) | 0.1s | 0.1s | 0.1s |
+
+**Standalone buy-side bots** (CLOB FAK; not atomic mint)
+
+| Parameter | 5m (`buybot5m.py`) | 15m (`buybot.py`) | Hourly (`buybothourly.py`) |
+|---|---|---|---|
+| Buy band | 96–99¢ ask | 96–99¢ ask | 96–99¢ ask |
+| Buy budget (USD) | $8 | $21 | $24 |
+| Buy window | last 90s | last 3 min | last 5 min |
+| Hedge threshold | 65¢ | 65¢ | 65¢ |
+| Series slug | `btc-up-or-down-5m` | `btc-up-or-down-15m` | `btc-up-or-down-hourly` |
+| Tick size | 0.001 | 0.01 | 0.01 |
+| Polling (buy window) | 0.1s | 0.1s | 0.1s |
+
+**Atomic mint buyers** (on-chain complete sets; from `strategy.buy*.example.json`)
 
 | Parameter | 5m | 15m | Hourly |
 |---|---|---|---|
-| **Sell threshold** | 2¢ | 3¢ | 5¢ |
-| **Sell window** | 150s (2.5min) | 180s (3min) | 300s (5min) |
-| **Hedge threshold** | 40¢ | 40¢ | 65¢ |
-| **Hedge window** | last 25s only | full sell window | full sell window |
-| **Last-chance threshold** | — | 3¢ | 10¢ |
-| **Buy shares** | 10 | 26 | 30 |
-| **Buy max notional** | $30 | $104 | $30 |
-| **Buy max open sets** | 3 | 3 | 1 |
-| **Buy cron arm** | persistent | 4×/hour | 1×/hour (:56) |
-| **Tick size** | 0.001 | 0.01 | 0.01 |
-| **Polling (sell window)** | 0.1s | 0.1s | 0.1s |
+| Mint shares / set | 10 | 50 | 50 |
+| Series slug | `btc-up-or-down-5m` | `btc-up-or-down-15m` | `btc-up-or-down-hourly` |
+| Max open notional | $10,000 | $10,000 | $10,000 |
+| Max open sets | 100 | 100 | 100 |
+| Poll | 5s | 15s | 15s |
 
 ### 8.6 Log Rotation
 
