@@ -5,8 +5,9 @@ set -euo pipefail
 
 cd "$(dirname "$0")/.."
 
-# The base image ships python3 + pip but not the venv module.
-if ! python3 -m venv --help >/dev/null 2>&1; then
+# The base image ships python3 but not ensurepip, so `python3 -m venv` fails
+# even though the venv module imports. Probe ensurepip specifically.
+if ! python3 -c "import ensurepip" >/dev/null 2>&1; then
   sudo apt-get update -qq
   sudo DEBIAN_FRONTEND=noninteractive apt-get install -y python3-venv >/dev/null
 fi
