@@ -26,6 +26,7 @@ from py_clob_client_v2 import (
 from py_clob_client_v2.order_builder.constants import SELL, BUY
 
 from buy.market import MarketGateway
+from buy.btc_price import get_btc_feed
 
 console = Console()
 load_dotenv()
@@ -60,6 +61,10 @@ _STRATEGY_DEFAULTS = {
     "min_winner_bid": 0.90,
     "max_loser_bid": 0.10,
     "min_bid_edge": 0.05,
+    # Skip buys unless live BTC is ≥ this many USD from the window Price To Beat,
+    # and only allow the side matching that underlying move.
+    "underlying_gate_enabled": True,
+    "min_underlying_edge_usd": 15.0,
     "hedge_enabled": True,
     "hedge_threshold": 0.65,
     "buy_start_s": 90,
@@ -123,6 +128,8 @@ BUY_MAX_PRICE = _strat["buy_max_price"]
 MIN_WINNER_BID = _strat["min_winner_bid"]
 MAX_LOSER_BID = _strat["max_loser_bid"]
 MIN_BID_EDGE = _strat["min_bid_edge"]
+UNDERLYING_GATE_ENABLED = _strat["underlying_gate_enabled"]
+MIN_UNDERLYING_EDGE_USD = _strat["min_underlying_edge_usd"]
 HEDGE_ENABLED = _strat["hedge_enabled"]
 HEDGE_THRESHOLD = _strat["hedge_threshold"]
 BUY_START_S = _strat["buy_start_s"]
@@ -693,6 +700,7 @@ except Exception as e:
     console.print(f"[bold red]▶ COLLATERAL [WARN][/] [dim]{e}[/]")
 
 market_gateway = MarketGateway(gamma_url=GAMMA_API, data_api_url=DATA_API, discover_cache_s=5.0)
+btc_feed = get_btc_feed()
 
 banner = Panel(
     Align.center(
@@ -1116,6 +1124,41 @@ while not _shutdown_requested:
             up_buy = up_winning and up_ask_ok and up_consensus
             dn_buy = dn_winning and dn_ask_ok and dn_consensus
 
+            # Underlying BTC vs Price To Beat: book can show 97¢ while spot is
+            # still on the other side of the strike (common late fake-outs).
+            if UNDERLYING_GATE_ENABLED and MIN_UNDERLYING_EDGE_USD > 0 and (up_buy or dn_buy):
+                ok_u, favored, ptb, live_btc, edge_usd = btc_feed.underlying_check(
+                    m.start_ts, MIN_UNDERLYING_EDGE_USD
+                )
+                if not ok_u or favored is None:
+                    log_event(
+                        "buy_skip_underlying_edge",
+                        condition_id=cond,
+                        ptb=ptb,
+                        live_btc=live_btc,
+                        edge_usd=None if edge_usd is None else round(edge_usd, 2),
+                        min_edge_usd=MIN_UNDERLYING_EDGE_USD,
+                        up_gui=up_gui,
+                        dn_gui=dn_gui,
+                    )
+                    continue
+                if favored == "up":
+                    dn_buy = False
+                else:
+                    up_buy = False
+                if not (up_buy or dn_buy):
+                    log_event(
+                        "buy_skip_underlying_side",
+                        condition_id=cond,
+                        favored=favored,
+                        ptb=ptb,
+                        live_btc=live_btc,
+                        edge_usd=round(edge_usd, 2),
+                        up_gui=up_gui,
+                        dn_gui=dn_gui,
+                    )
+                    continue
+
             if not (up_buy or dn_buy):
                 continue
 
@@ -1145,6 +1188,8 @@ while not _shutdown_requested:
                 "buy_attempt", condition_id=cond, leg=buy_leg, budget=BUY_BUDGET,
                 ask=buy_ask, gui=buy_gui, up_gui=up_gui, dn_gui=dn_gui,
                 threshold=BUY_THRESHOLD, seconds_left=round(seconds_left, 1),
+                ptb=btc_feed.price_to_beat(m.start_ts),
+                live_btc=btc_feed.live_price(),
             )
 
             bought = buy_market_with_retry(buy_token, BUY_BUDGET, BUY_MAX_PRICE, tick_size=tick, min_price=BUY_THRESHOLD)

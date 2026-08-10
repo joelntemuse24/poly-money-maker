@@ -3623,7 +3623,31 @@ Once the winner passes GUI consensus, the bot checks:
 BUY_THRESHOLD (0.96) ≤ winning_ask ≤ BUY_MAX_PRICE (0.99)
 AND winning_gui ≥ min_winner_bid (0.90)
 AND opposite_gui ≤ max_loser_bid (0.10)
+AND underlying gate passes (see §21.4.1)
 ```
+
+### 21.4.1 Underlying BTC edge gate
+
+Book probabilities can diverge from Bitcoin itself (the 12:15–12:30 ET 2026-08-10
+market printed **Up at 96–99¢** while spot was already **~$65 below** the Price To
+Beat, then resolved Down).
+
+`buy/btc_price.py` tracks:
+
+| Input | Source |
+|---|---|
+| Live BTC | Polymarket RTDS `crypto_prices_chainlink` (`btc/usd`), Coinbase/Kraken spot fallback |
+| Price To Beat | Coinbase 1m candle open nearest to market `start_ts` (crypto PTB is not in the public REST API; this is close enough for a dollar edge filter) |
+
+When `underlying_gate_enabled` (default true) and `min_underlying_edge_usd` (default
+**$15**):
+
+1. Skip if `|live_btc - ptb| < min_underlying_edge_usd` (`buy_skip_underlying_edge`)
+2. Only allow **Up** if `live_btc ≥ ptb + edge`, only **Down** if `live_btc ≤ ptb - edge`
+   (`buy_skip_underlying_side` if the book disagrees)
+
+Settlement is Chainlink TWAP, not Coinbase — treat this as a coarse anti-fake-out
+filter, not a perfect oracle replay.
 
 Sizing uses **`buy_budget`** (USD), not a fixed share count. Each FAK attempt
 buys `min(remaining_budget / ask, top_of_book_size)` shares so spent notional
