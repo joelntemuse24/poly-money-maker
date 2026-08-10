@@ -204,12 +204,15 @@ A buy fires only when **all** of these gates pass, evaluated in the final window
    `max_open_notional`, `max_daily_notional`, and available USDC balance.
 
 Execution: a FAK market buy for `buy_budget` dollars of the winning token. Size and
-limit price come from a **REST** book refresh immediately before the order. Fills
-whose average USDC/share is below `buy_threshold`, or whose share count exceeds
-`budget / buy_threshold`, are rejected and logged as `buy_reject_bad_fill`. Entry
-cost is recorded as USDC spent, not `shares × gate ask`.
+limit price come from a **force-fresh REST** book (`force_rest=True` — bypasses WS
+and the 200ms REST cache) immediately before the order. A BUY limit is a
+**maximum**, so the exchange can fill far below the gate ask (“price improvement”).
+Confirmed fills are **always persisted** (including below-band averages logged as
+`buy_fill_below_band`) — discarding them creates orphan inventory. Delayed FAKs
+are polled; zero confirms fall back to balance reconciliation (`buy_ghost_fill`).
+Entry cost is USDC spent (`makingAmount` on CLOB v2 BUY), not `shares × gate ask`.
 
-**Skip reasons logged for audit** (visible in logs and research JSONL):
+**Skip / fill reasons logged for audit** (visible in logs and research JSONL):
 
 - `buy_skip_ambiguous` — GUI display prices too close to call
 - `buy_skip_no_consensus` — ask in band but GUI/book integrity fails (includes
@@ -217,7 +220,8 @@ cost is recorded as USDC spent, not `shares × gate ask`.
 - `buy_skip_incomplete_book` — missing GUI price on a leg (no mid, no last trade)
 - `buy_skip_underlying_edge` — live oracle < $10 from PTB
 - `buy_skip_underlying_side` — book winner disagrees with the underlying move
-- `buy_reject_bad_fill` — CLOB returned shares/avg inconsistent with the gated ask
+- `buy_fill_below_band` — fill landed below the ask band; inventory still recorded
+- `buy_ghost_fill` — balance rose after a null/delayed CLOB confirm
 
 While any position is open or any market is inside the buy window, the loop runs in
 "hot mode" (`poll_held_s` / `poll_buy_window_s`, 50–100 ms); otherwise it idles at a
@@ -229,17 +233,19 @@ slow poll to save API quota.
 
 The bots never take profit. The only sell is the defensive hedge:
 
-- **Arm:** WS/cache bid ≤ `hedge_threshold` (65¢) while the position is open.
-- **Confirm (always REST):** re-fetch the full book. If bid bounced above threshold,
-  abort (`hedge_cancel_bounce`).
+- **Arm:** WS/cache bid ≤ `hedge_threshold` (65¢) while the position is open (peek
+  only — never sufficient to sell).
+- **Confirm (force-fresh REST, fail-closed):** re-fetch the full book with
+  `force_rest=True`. If either side is missing, skip (`hedge_skip_incomplete_rest`)
+  — **no WS fallback**. If bid bounced above threshold, abort (`hedge_cancel_bounce`).
 - **Book integrity:** a lone penny bid under a still-high ask is **not** a reversal
   (`hedge_skip_toxic_book`). Require bid ≤ 65¢, ask ≤ `hedge_require_ask_max` (70¢),
-  and spread ≤ `hedge_max_spread` (15¢). Same lesson as the old sell-side bots:
-  bid-alone triggers dump into illiquid books.
-- **Execution:** FAK sell priced `hedge_undercut_ticks` (2 ticks) under the top bid,
-  floored at `hedge_min_price` (0.32 / 0.325). Retry quotes also prefer REST.
-- **Outcome:** hedge proceeds are recorded per market and folded into P&L when the
-  position is garbage-collected.
+  and spread ≤ `hedge_max_spread` (15¢).
+- **Execution:** FAK sell floored at `hedge_min_price`. Every retry force-REST
+  refreshes **both** sides and re-runs the same two-sided gate
+  (`hedge_retry_abort_integrity` / incomplete REST).
+- **Outcome:** hedge proceeds are recorded; `bought_size` shrinks; full hedges set
+  `hedge_closed` so GC does not also assume par redemption.
 
 ---
 
@@ -361,8 +367,9 @@ journal is capped via `deploy/journald-size.conf`.
 - **Fail safe, not fast.** When data is missing or ambiguous (incomplete book, no
   consensus, oracle edge too small), the bot does nothing. Not trading is always the
   default.
-- **State before orders.** Entry/exit records are written so that a crash between
-  order and save is recoverable on restart from the Data API positions view.
+- **Persist fills that already happened.** A posted FAK cannot be “rejected” in
+  software — below-band buys are logged and still written to state. Crashes
+  between order and save are recovered via Data API positions / balance checks.
 - **Complete audit trail.** Every decision — buys, skips, hedges, redeems, P&L — is
   a structured log event and (for buy decisions) a research JSONL row.
 

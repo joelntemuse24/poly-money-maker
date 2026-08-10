@@ -131,8 +131,9 @@ class ClobMarketBookFeed:
 
         - None bid/ask clears that side (no stale-side retention).
         - Full book snapshots replace sizes.
-        - Price-only events (best_bid_ask / price_change) keep prior sizes when
-          the side is still present, so buy sizing is not zeroed out.
+        - Price-only events (best_bid_ask / price_change) keep prior sizes only
+          when the top price is unchanged; a price move zeroes size so callers
+          must REST-refresh before sizing an order.
         """
         if not asset_id:
             return
