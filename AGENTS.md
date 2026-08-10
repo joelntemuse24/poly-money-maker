@@ -98,8 +98,11 @@ Watch the console for `[DRY BUY]` / `[DRY SELL]` markers. Ctrl-C to stop.
   Section comment banners (`# --- PRICING ---`) act as visual boundaries.
 - **Hot-reload:** Strategy JSON files are re-read every cycle via `load_strategy()`.
   Changes take effect on the next tick — no restart needed.
-- **Atomic save:** State and P&L files use `atomic_save()` (write to `.tmp`, then
-  `os.replace`).
+- **Atomic durable save:** State and P&L files flush + `fsync` the `.tmp`, replace
+  it, then `fsync` the parent directory before an order can proceed.
+- **Fail-closed startup:** Missing strategy files default to `dry_run: true`;
+  malformed hot reloads retain the last-known-good config. A per-bot process lock
+  prevents duplicate live instances.
 - **FAK orders only:** All orders are Fill-And-Kill — no resting orders, no market
   making.
 - **Hedge is sell-only exit:** The bots never profit-take. The only sell path is the

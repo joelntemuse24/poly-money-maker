@@ -8,6 +8,7 @@ real implementations, not a duplicated fork.
 from __future__ import annotations
 
 import ast
+import json
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -344,6 +345,27 @@ class BalanceAndGcSemantics(unittest.TestCase):
 
         self.assertEqual(balance_from_positions([], "tok"), 0.0)
         self.assertEqual(balance_from_positions([{"asset": "other", "size": 1}], "tok"), 0.0)
+
+    def test_runtime_safety_defaults_in_all_bots(self):
+        for bot in (BOT, BOT5M, BOT_HR):
+            src = bot.read_text()
+            self.assertIn('"dry_run": True', src)
+            self.assertIn("fcntl.LOCK_EX | fcntl.LOCK_NB", src)
+            self.assertIn("os.fsync(f.fileno())", src)
+            self.assertIn("os.fsync(dir_fd)", src)
+            self.assertIn('RELAYER_API_KEY = os.getenv("RELAYER_API_KEY")', src)
+            self.assertNotIn("019df62f-45bc-796e-975c-3f434472b163", src)
+            self.assertIn("unknown strategy keys", src)
+            self.assertIn("return _strat_cache", src)
+
+    def test_examples_are_disarmed(self):
+        root = BOT.parent
+        for name in (
+            "strategy_buy.example.json",
+            "strategy_buy5m.example.json",
+            "strategy_buyhourly.example.json",
+        ):
+            self.assertIs(json.loads((root / name).read_text())["dry_run"], True)
 
 
 if __name__ == "__main__":

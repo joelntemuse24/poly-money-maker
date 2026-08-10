@@ -1,4 +1,5 @@
 import os
+import fcntl
 import signal
 import sys
 import time
@@ -32,6 +33,24 @@ from buy.clob_book_ws import get_book_feed
 console = Console()
 load_dotenv()
 
+
+def acquire_process_lock(path):
+    """Fail closed when another copy of this bot is already running."""
+    lock_fh = open(path, "a+")
+    try:
+        fcntl.flock(lock_fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        console.print("[bold red]Another 5m buy bot process already holds the runtime lock.[/]")
+        raise SystemExit(1)
+    lock_fh.seek(0)
+    lock_fh.truncate()
+    lock_fh.write(str(os.getpid()))
+    lock_fh.flush()
+    return lock_fh
+
+
+_PROCESS_LOCK_FH = acquire_process_lock("/tmp/poly-money-maker-buybot5m.lock")
+
 HOST = "https://clob.polymarket.com"
 DATA_API = "https://data-api.polymarket.com"
 GAMMA_API = "https://gamma-api.polymarket.com"
@@ -54,8 +73,8 @@ API_KEY = os.getenv("API_KEY")
 API_SECRET = os.getenv("API_SECRET")
 API_PASSPHRASE = os.getenv("API_PASSPHRASE")
 RELAYER_URL = os.getenv("RELAYER_URL", "https://relayer-v2.polymarket.com")
-RELAYER_API_KEY = os.getenv("RELAYER_API_KEY", "019df62f-45bc-796e-975c-3f434472b163")
-RELAYER_API_KEY_ADDRESS = os.getenv("RELAYER_API_KEY_ADDRESS", "0x42aec4505559c0613f7ce2541d9d29741bc5e195")
+RELAYER_API_KEY = os.getenv("RELAYER_API_KEY")
+RELAYER_API_KEY_ADDRESS = os.getenv("RELAYER_API_KEY_ADDRESS")
 
 # ------------------------- STRATEGY CONFIG -------------------------
 _STRATEGY_DEFAULTS = {
@@ -92,7 +111,8 @@ _STRATEGY_DEFAULTS = {
     "one_entry_per_market": True,
     "redeem_throttle_s": 30,
     "max_redeem_age_days": 7,
-    "dry_run": False,
+    # Missing configuration must never arm real-money orders.
+    "dry_run": True,
     "poll_buy_window_s": 0.1,
     "poll_held_s": 0.05,
     "positions_refresh_s": 1,
@@ -114,26 +134,49 @@ def load_strategy():
         mtime = 0
     if _strat_cache is not None and mtime == _strat_mtime:
         return _strat_cache
+    if not os.path.exists(STRATEGY_FILE):
+        cfg = dict(_STRATEGY_DEFAULTS)
+        _strat_cache = cfg
+        _strat_mtime = mtime
+        return cfg
     cfg = dict(_STRATEGY_DEFAULTS)
     try:
-        if os.path.exists(STRATEGY_FILE):
-            with open(STRATEGY_FILE, "r") as f:
-                overrides = json.load(f)
-            for k, v in overrides.items():
-                if k in cfg:
-                    expected = type(cfg[k])
-                    if expected is bool:
-                        cfg[k] = v if isinstance(v, bool) else str(v).lower() in ("1", "true", "yes")
-                    else:
-                        cfg[k] = expected(v)
-            # Legacy alias: near $1 prices, "shares" was effectively a dollar budget
-            if "buy_budget" not in overrides and "shares" in overrides:
-                try:
-                    cfg["buy_budget"] = float(overrides["shares"])
-                except (TypeError, ValueError):
-                    pass
+        with open(STRATEGY_FILE, "r") as f:
+            overrides = json.load(f)
+        if not isinstance(overrides, dict):
+            raise ValueError("strategy root must be an object")
+        unknown = set(overrides) - set(cfg) - {"shares"}
+        if unknown:
+            raise ValueError(f"unknown strategy keys: {sorted(unknown)}")
+        for k, v in overrides.items():
+            if k not in cfg:
+                continue
+            expected = type(cfg[k])
+            if expected is bool:
+                if not isinstance(v, bool):
+                    raise ValueError(f"{k} must be true or false")
+                cfg[k] = v
+            else:
+                cfg[k] = expected(v)
+        if "buy_budget" not in overrides and "shares" in overrides:
+            cfg["buy_budget"] = float(overrides["shares"])
+        if not (0 < cfg["buy_threshold"] <= cfg["buy_max_price"] <= 1):
+            raise ValueError("buy price band must satisfy 0 < threshold <= max <= 1")
+        if not (0 <= cfg["hedge_min_price"] <= cfg["hedge_threshold"] <= 1):
+            raise ValueError("hedge prices must satisfy 0 <= min <= threshold <= 1")
+        for key in (
+            "buy_budget", "max_open_positions", "max_open_notional",
+            "max_daily_notional", "poll_buy_window_s", "poll_held_s",
+            "positions_refresh_s", "balance_refresh_s",
+        ):
+            if float(cfg[key]) <= 0:
+                raise ValueError(f"{key} must be positive")
     except Exception as e:
         console.print(f"[bold red]▶ STRATEGY [WARN][/] [dim]failed to load {STRATEGY_FILE}: {e}[/]")
+        if _strat_cache is not None:
+            _strat_mtime = mtime
+            return _strat_cache
+        cfg = dict(_STRATEGY_DEFAULTS)
     _strat_cache = cfg
     _strat_mtime = mtime
     return cfg
@@ -224,7 +267,15 @@ def atomic_save(path, data):
     tmp = path + ".tmp"
     with open(tmp, "w") as f:
         json.dump(data, f, indent=2)
+        f.flush()
+        os.fsync(f.fileno())
     os.replace(tmp, path)
+    parent = os.path.dirname(os.path.abspath(path)) or "."
+    dir_fd = os.open(parent, os.O_RDONLY)
+    try:
+        os.fsync(dir_fd)
+    finally:
+        os.close(dir_fd)
 
 
 def load_json(path):
