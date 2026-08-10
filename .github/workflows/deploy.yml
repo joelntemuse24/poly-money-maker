@@ -4,10 +4,11 @@ on:
   push:
     branches: [main]
     paths:
-      - 'bot.py'
-      - 'bothourly.py'
+      - 'buybot.py'
+      - 'buybot5m.py'
+      - 'buybothourly.py'
+      - 'buy/**'
       - 'requirements.txt'
-      - 'strategy.json'
 
 jobs:
   deploy:
@@ -23,5 +24,5 @@ jobs:
             cd ~/poly-money-maker
             git pull origin main
             pip install -r requirements.txt --quiet
-            sudo systemctl restart polybot
+            sudo systemctl restart polybuybot polybuybot5m polybuybothourly
             echo "Deployed $(git rev-parse --short HEAD) at $(date)"
