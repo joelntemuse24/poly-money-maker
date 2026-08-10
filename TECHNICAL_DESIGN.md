@@ -210,6 +210,11 @@ and the 200ms REST cache) immediately before the order. A BUY limit is a
 Confirmed fills are **always persisted** (including below-band averages logged as
 `buy_fill_below_band`) — discarding them creates orphan inventory. Delayed FAKs
 are polled; zero confirms fall back to balance reconciliation (`buy_ghost_fill`).
+Before every POST, the bot atomically writes a `buy_uncertain` quarantine with the
+exact token and pre-submit balance. Any exception, falsy response, or truthy
+non-terminal response with no confirmed fill stops retries and keeps that market
+quarantined. Cross-cycle recovery only promotes the attempted token's balance
+increase above the persisted baseline; GC never deletes unresolved quarantine.
 Entry cost is USDC spent (`makingAmount` on CLOB v2 BUY), not `shares × gate ask`.
 
 **Skip / fill reasons logged for audit** (visible in logs and research JSONL):
@@ -245,7 +250,9 @@ The bots never take profit. The only sell is the defensive hedge:
   refreshes **both** sides and re-runs the same two-sided gate
   (`hedge_retry_abort_integrity` / incomplete REST).
 - **Outcome:** hedge proceeds are recorded; `bought_size` shrinks; full hedges set
-  `hedge_closed` so GC does not also assume par redemption.
+  `hedge_closed` so GC does not also assume par redemption. A single Data API
+  balance can never invent an unconfirmed sell tail; a full ghost tail requires
+  repeated successful zero-balance reads.
 
 ---
 

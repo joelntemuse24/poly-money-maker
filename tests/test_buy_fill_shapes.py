@@ -10,6 +10,7 @@ from __future__ import annotations
 import ast
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 
 BOT = Path(__file__).resolve().parents[1] / "buybot.py"
 BOT5M = Path(__file__).resolve().parents[1] / "buybot5m.py"
@@ -92,6 +93,20 @@ class BuyFillProductionHelpers(unittest.TestCase):
         # GET-order style size_matched in fixed point.
         self.assertAlmostEqual(norm("10000000", hint_cap=1e6), 10.0)
 
+    def test_get_order_details_normalizes_fixed_point(self):
+        ns = _load_funcs("_normalize_clob_amount", "get_order_details")
+        ns["client"] = SimpleNamespace(
+            get_order=lambda _oid: {
+                "status": "matched",
+                "size_matched": "10000000",
+                "size": "12000000",
+            }
+        )
+        ns["safe_api_call"] = lambda fn, *args, **kwargs: fn(*args, **kwargs)
+        details = ns["get_order_details"]("order-1")
+        self.assertAlmostEqual(details["size_matched"], 10.0)
+        self.assertAlmostEqual(details["size"], 12.0)
+
     def test_entry_rejects_wide_book(self):
         ok, why = self.ns["entry_book_ok"](0.01, 0.98, 0.05, 0.90)
         self.assertFalse(ok)
@@ -122,11 +137,12 @@ class HedgeReconcileProduction(unittest.TestCase):
         self.assertTrue(rec["lag"])
         self.assertFalse(rec["ghost_candidate"])
 
-    def test_api_may_add_unconfirmed_extra(self):
+    def test_single_low_api_cannot_add_unconfirmed_tail(self):
         rec = self.ns["reconcile_hedge_sold"](10.0, 7.0, 3.85, 0.0, 0.55)
-        self.assertAlmostEqual(rec["effective_sold"], 10.0)
-        self.assertAlmostEqual(rec["proceeds"], 3.85 + 3.0 * 0.55)
-        self.assertAlmostEqual(rec["rem"], 0.0)
+        self.assertAlmostEqual(rec["effective_sold"], 7.0)
+        self.assertAlmostEqual(rec["proceeds"], 3.85)
+        self.assertAlmostEqual(rec["rem"], 3.0)
+        self.assertTrue(rec["ghost_candidate"])
 
     def test_single_zero_is_ghost_candidate_only(self):
         # Zero CLOB confirms + one zero balance must NOT invent a full exit.
@@ -186,15 +202,95 @@ class AmbiguousCrossCyclePolicy(unittest.TestCase):
             self.assertIn("ambiguous POST — no further retries", src)
             self.assertIn("buy_abort_no_baseline", src)
             self.assertIn("aborting further buys", src)
+            self.assertIn("on_submit=_persist_buy_submit", src)
+            self.assertIn('meta["buy_uncertain_baseline"]', src)
+            self.assertIn("non-terminal 0-fill response — quarantined", src)
+            self.assertIn('not positions_meta[c].get("buy_uncertain")', src)
+            self.assertIn("held_size > uncertain_baseline + 0.01", src)
 
     def test_hedge_liveness_and_reconcile_markers(self):
         src = BOT.read_text()
         self.assertIn("HEDGE_QUOTE_MAX_AGE_S", src)
         self.assertIn("ws_fresh = quote_age is not None and quote_age <= float(HEDGE_QUOTE_MAX_AGE_S)", src)
-        self.assertIn("never erase", src.lower() if False else "Data API — may add ghosts, never erase confirms")
+        self.assertIn("one read never adds/erases confirms", src)
         self.assertIn("reconcile_hedge_sold(", src)
         self.assertIn("stable_zero_balances(", src)
         self.assertIn("gc_par_redeem(", src)
+
+
+class BuyExecutionAmbiguity(unittest.TestCase):
+    @staticmethod
+    def _namespace(response):
+        ns = _load_funcs("_result_as_dict", "buy_market_with_retry")
+        calls = {"post": 0, "submit": []}
+
+        def post(*_args, **_kwargs):
+            calls["post"] += 1
+            return response
+
+        ns.update(
+            {
+                "DRY_RUN": False,
+                "BUY": "BUY",
+                "HEDGE_GHOST_SLEEP_S": 0.0,
+                "MAX_ENTRY_SPREAD": 0.10,
+                "MIN_WINNER_BID": 0.90,
+                "console": SimpleNamespace(print=lambda *_a, **_k: None),
+                "log_event": lambda *_a, **_k: None,
+                "check_token_balance": lambda _token: 0.0,
+                "get_quote_fast": lambda *_a, **_k: (0.97, None, 0.98, 100.0, None),
+                "entry_book_ok": lambda *_a, **_k: (True, "ok"),
+                "safe_api_call": lambda fn, *a, **k: fn(*a, **k),
+                "client": SimpleNamespace(create_and_post_market_order=post),
+                "MarketOrderArgs": lambda **kwargs: kwargs,
+                "PartialCreateOrderOptions": lambda **kwargs: kwargs,
+                "OrderType": SimpleNamespace(FAK="FAK"),
+                "extract_order_id": lambda _result: "order-1",
+                "confirm_fill_size": lambda *_a, **_k: 0.0,
+                "fill_cost_usdc": lambda *_a, **_k: 0.0,
+                "time": SimpleNamespace(time=lambda: 1.0, sleep=lambda _s: None),
+            }
+        )
+        return ns, calls
+
+    def test_truthy_delayed_zero_fill_is_quarantined(self):
+        ns, calls = self._namespace(
+            {"status": "delayed", "orderID": "order-1", "makingAmount": "0", "takingAmount": "0"}
+        )
+
+        def on_submit(*args):
+            calls["submit"].append(args)
+
+        result = ns["buy_market_with_retry"](
+            "token", 8.0, 0.99, min_price=0.96, max_retries=1,
+            on_submit=on_submit,
+        )
+        self.assertEqual(result, (0.0, 0.0, "ambiguous"))
+        self.assertEqual(calls["post"], 1)
+        self.assertEqual(len(calls["submit"]), 1)
+        self.assertEqual(calls["submit"][0][0], 0.0)  # persisted baseline
+
+    def test_explicit_unmatched_zero_fill_is_terminal_empty(self):
+        ns, calls = self._namespace({"status": "unmatched", "orderID": "order-1"})
+        result = ns["buy_market_with_retry"](
+            "token", 8.0, 0.99, min_price=0.96, max_retries=1,
+            on_submit=lambda *args: calls["submit"].append(args),
+        )
+        self.assertEqual(result, (0.0, 0.0, "empty"))
+        self.assertEqual(calls["post"], 1)
+
+    def test_write_ahead_failure_prevents_post(self):
+        ns, calls = self._namespace({"status": "matched"})
+
+        def fail_submit(*_args):
+            raise OSError("disk full")
+
+        result = ns["buy_market_with_retry"](
+            "token", 8.0, 0.99, min_price=0.96, max_retries=1,
+            on_submit=fail_submit,
+        )
+        self.assertEqual(result, (0.0, 0.0, "persist_fail"))
+        self.assertEqual(calls["post"], 0)
 
     def test_5m_sell_default_tick(self):
         src = BOT5M.read_text()

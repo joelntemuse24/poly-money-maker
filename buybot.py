@@ -576,10 +576,10 @@ def hedge_book_ok(bid, ask, threshold, max_spread, require_ask_max):
 def reconcile_hedge_sold(held_size, confirmed_sold, confirmed_proceeds, api_bal, last_limit):
     """Merge CLOB-confirmed sells with a Data API balance without erasing confirms.
 
-    Data API lag after a trade is normal. Balance may only *add* unconfirmed
-    extra fills on top of CLOB confirms; it must never reduce confirmed
-    sold/proceeds. A full exit with zero CLOB confirms is only a ghost
-    *candidate* — callers must require repeated stable zeros before closing.
+    Data API lag after a trade is normal. A single low balance must never add
+    unconfirmed fills on top of CLOB confirms or reduce confirmed
+    sold/proceeds. A possible full exit is only a ghost *candidate* — callers
+    must require repeated stable zeros before promoting the unconfirmed tail.
     """
     held_size = float(held_size or 0)
     confirmed_sold = float(confirmed_sold or 0)
@@ -598,17 +598,12 @@ def reconcile_hedge_sold(held_size, confirmed_sold, confirmed_proceeds, api_bal,
         }
     api_bal = float(api_bal)
     api_sold = max(0.0, held_size - api_bal)
+    lag = confirmed_sold > api_sold + 0.01
+    # Never promote one Data API read into proceeds or a closed hedge. This is
+    # especially important after a partial CLOB confirmation: a stale zero used
+    # to fabricate the entire unconfirmed tail and disable future hedges.
     proceeds = confirmed_proceeds
-    lag = False
-    if api_sold > confirmed_sold + 0.01 and confirmed_sold > 0.01:
-        # Unconfirmed tail on top of real CLOB fills — safe to add.
-        proceeds += (api_sold - confirmed_sold) * last_limit
-        effective_sold = api_sold
-    else:
-        if confirmed_sold > api_sold + 0.01:
-            lag = True
-        # Zero confirms: never promote a single API omission into a full exit.
-        effective_sold = confirmed_sold
+    effective_sold = confirmed_sold
     rem = max(0.0, held_size - effective_sold)
     if rem < 0.01:
         rem = 0.0
@@ -619,7 +614,7 @@ def reconcile_hedge_sold(held_size, confirmed_sold, confirmed_proceeds, api_bal,
         "api_sold": api_sold,
         "lag": lag,
         "ghost_candidate": (
-            api_bal < 0.01 and confirmed_sold <= 0.01 and held_size > 0.01
+            api_bal < 0.01 and api_sold > confirmed_sold + 0.01
         ),
         "balance_unverified": False,
     }
@@ -725,15 +720,30 @@ def get_order_details(order_id):
     try:
         result = safe_api_call(client.get_order, order_id)
         if isinstance(result, dict):
+            matched_raw = (
+                result.get("size_matched")
+                or result.get("takerAmount")
+                or 0
+            )
+            size_raw = (
+                result.get("size")
+                or result.get("originalSize")
+                or result.get("makerAmount")
+                or 1
+            )
             return {
                 "status": result.get("status", "UNKNOWN"),
-                "size_matched": float(result.get("size_matched", 0) or result.get("takerAmount", 0) or 0),
-                "size": float(result.get("size", 0) or result.get("originalSize", 0) or result.get("makerAmount", 0) or 1),
+                "size_matched": _normalize_clob_amount(matched_raw, hint_cap=1000) or 0.0,
+                "size": _normalize_clob_amount(size_raw, hint_cap=1000) or 1.0,
             }
         return {
             "status": getattr(result, "status", "UNKNOWN"),
-            "size_matched": float(getattr(result, "size_matched", 0) or 0),
-            "size": float(getattr(result, "size", 1)),
+            "size_matched": _normalize_clob_amount(
+                getattr(result, "size_matched", 0), hint_cap=1000,
+            ) or 0.0,
+            "size": _normalize_clob_amount(
+                getattr(result, "size", 1), hint_cap=1000,
+            ) or 1.0,
         }
     except Exception as e:
         err = str(e).lower()
@@ -766,13 +776,13 @@ def _normalize_clob_amount(raw, *, hint_cap=None):
 def buy_shares_from_result(result):
     """BUY shares from an immediate CLOB response (size_matched or takingAmount)."""
     d = _result_as_dict(result)
-    sm = _normalize_clob_amount(d.get("size_matched"), hint_cap=1e6)
+    sm = _normalize_clob_amount(d.get("size_matched"), hint_cap=1000)
     if sm is not None and sm > 0:
         return sm
     # V2 market BUY: takingAmount = shares received.
     taking = _normalize_clob_amount(
         d.get("takingAmount", d.get("taking_amount")),
-        hint_cap=1e6,
+        hint_cap=1000,
     )
     if taking is not None and taking > 0:
         return taking
@@ -790,12 +800,12 @@ def confirm_fill_size(result, oid, requested, *, wait_delayed_s=2.0, poll_s=0.25
         matched = buy_shares_from_result(result)
     else:
         d = _result_as_dict(result)
-        matched = _normalize_clob_amount(d.get("size_matched"), hint_cap=1e6) or 0.0
+        matched = _normalize_clob_amount(d.get("size_matched"), hint_cap=1000) or 0.0
         if matched <= 0:
             # SELL: makingAmount is shares sold.
             matched = _normalize_clob_amount(
                 d.get("makingAmount", d.get("making_amount")),
-                hint_cap=1e6,
+                hint_cap=1000,
             ) or 0.0
     if matched > 0:
         return float(matched)
@@ -814,7 +824,9 @@ def confirm_fill_size(result, oid, requested, *, wait_delayed_s=2.0, poll_s=0.25
                 saw_not_found = True
             else:
                 sm = details.get("size_matched", 0)
-                matched = float(sm) if sm else 0.0
+                matched = _normalize_clob_amount(
+                    sm, hint_cap=max(float(requested or 0), 1.0),
+                ) or 0.0
                 if matched > 0:
                     return matched
                 st = last_status.lower()
@@ -893,6 +905,7 @@ def buy_market_with_retry(
     max_retries=3,
     min_price=0.0,
     on_fill=None,
+    on_submit=None,
 ):
     """Spend up to `budget` dollars buying token_id at or below max_price via FAK.
 
@@ -904,8 +917,12 @@ def buy_market_with_retry(
     the caller can durable-save state before the next retry / crash. If on_fill
     raises, no further orders are posted.
 
-    Ambiguous POST outcomes (exception or falsy response) reconcile once and
-    STOP — never retry with the full budget (accepted-then-timeout double spend).
+    on_submit(baseline, attempt, spend, price) is durable write-ahead state. It
+    runs before every POST so a process crash cannot lose an in-flight attempt.
+
+    Ambiguous POST outcomes (exception, falsy response, or non-terminal response
+    with no confirmed fill) reconcile once and STOP — never retry with the full
+    budget (accepted-then-timeout double spend).
     """
     total_bought = 0.0
     spent = 0.0
@@ -997,6 +1014,16 @@ def buy_market_with_retry(
         price = fresh_ask
         ambiguous = False
         result = None
+        if on_submit:
+            try:
+                on_submit(float(bal_baseline), attempt + 1, float(spend), float(price))
+            except Exception as e:
+                log_event(
+                    "buy_on_submit_fail", token_id=token_id, error=str(e)[:200],
+                    attempt=attempt + 1, spend=round(spend, 4),
+                )
+                console.print(f"  [bold red][PERSIST FAIL][/] BUY not submitted: {e}")
+                return total_bought, spent, "persist_fail"
         try:
             result = safe_api_call(
                 client.create_and_post_market_order,
@@ -1028,11 +1055,10 @@ def buy_market_with_retry(
                 except Exception:
                     pass
             console.print("  [bold yellow][BUY STOP][/] ambiguous POST — no further retries")
-            if total_bought > 0:
-                return total_bought, spent, "filled"
-            return 0.0, 0.0, "ambiguous"
+            return total_bought, spent, "ambiguous"
 
         oid = extract_order_id(result)
+        response_status = str(_result_as_dict(result).get("status") or "").strip().lower()
         filled = float(
             confirm_fill_size(result, oid, spend / price if price else 0, side="BUY")
         )
@@ -1048,8 +1074,24 @@ def buy_market_with_retry(
         if filled <= 0:
             filled, fill_cost = _reconcile_ghost(spend, price, attempt + 1, via="null_confirm")
         if filled <= 0:
-            console.print("  [dim yellow][FAK NULL][/] 0 confirmed fill · stopping")
-            break
+            terminal_empty = {
+                "canceled", "cancelled", "rejected", "expired", "failed", "unmatched",
+            }
+            if response_status in terminal_empty:
+                console.print(
+                    f"  [dim yellow][FAK NULL][/] explicit {response_status or 'empty'} "
+                    "with 0 confirmed fill · stopping"
+                )
+                break
+            log_event(
+                "buy_attempt_ambiguous_status", token_id=token_id,
+                status=response_status or None, order_id=oid,
+                attempt=attempt + 1, spend=round(spend, 4),
+            )
+            console.print(
+                "  [bold yellow][BUY STOP][/] non-terminal 0-fill response — quarantined"
+            )
+            return total_bought, spent, "ambiguous"
         if fill_cost <= 0:
             fill_cost = fill_cost_usdc(result, filled, price, spend)
         if fill_cost <= 0:
@@ -1482,7 +1524,14 @@ while not _shutdown_requested:
                 or p.get("up", {}).get("redeemable") or p.get("dn", {}).get("redeemable")
             }
             live_conds |= {m.condition_id for m in markets}
-            stale_conds = [c for c in list(positions_meta.keys()) if c not in live_conds]
+            # An ambiguous BUY is durable recovery state, not ordinary stale
+            # metadata. Keep it until its exact token/baseline is reconciled or
+            # an operator clears it; discovery/Data API omissions must not erase
+            # the quarantine and permit a second order.
+            stale_conds = [
+                c for c in list(positions_meta.keys())
+                if c not in live_conds and not positions_meta[c].get("buy_uncertain")
+            ]
             for c in stale_conds:
                 gc_meta = positions_meta[c]
                 if gc_meta.get("bought_token"):
@@ -1667,29 +1716,45 @@ while not _shutdown_requested:
             meta = positions_meta.setdefault(cond, {})
 
             # Ambiguous prior BUY may settle into Data API inventory before the
-            # buy-phase quarantine runs — promote so GC/hedge see bought_token.
+            # buy-phase quarantine runs. Promote only the exact attempted token
+            # and only the increase above its persisted pre-submit baseline.
+            uncertain_token = meta.get("buy_uncertain_token")
+            uncertain_baseline = float(meta.get("buy_uncertain_baseline") or 0)
             if (
                 meta.get("buy_uncertain")
                 and not meta.get("bought_token")
                 and held_size > 0.01
                 and held_token
+                and uncertain_token
+                and str(held_token) == str(uncertain_token)
+                and held_size > uncertain_baseline + 0.01
             ):
-                avg_est = float(meta.get("fill_price") or BUY_THRESHOLD)
+                uncertain_filled = held_size - uncertain_baseline
+                avg_est = float(
+                    meta.get("buy_uncertain_price")
+                    or meta.get("fill_price")
+                    or BUY_THRESHOLD
+                )
                 meta["bought_token"] = held_token
                 meta["bought_leg"] = held_leg or meta.get("buy_uncertain_leg")
-                meta["bought_size"] = held_size
+                meta["bought_size"] = uncertain_filled
                 meta["fill_price"] = round(avg_est, 4)
                 meta["pnl_entry_cost"] = round(
-                    meta.get("pnl_entry_cost") or (held_size * avg_est), 4
+                    meta.get("pnl_entry_cost") or (uncertain_filled * avg_est), 4
                 )
                 meta["toxic_fill"] = bool(avg_est + 1e-9 < float(BUY_THRESHOLD))
                 meta.pop("buy_uncertain", None)
                 meta.pop("buy_uncertain_at", None)
                 meta.pop("buy_uncertain_token", None)
                 meta.pop("buy_uncertain_leg", None)
+                meta.pop("buy_uncertain_baseline", None)
+                meta.pop("buy_uncertain_attempt", None)
+                meta.pop("buy_uncertain_spend", None)
+                meta.pop("buy_uncertain_price", None)
                 log_event(
                     "buy_uncertain_resolved", condition_id=cond, token_id=held_token,
-                    size=held_size, entry_cost=meta["pnl_entry_cost"], via="held",
+                    size=uncertain_filled, entry_cost=meta["pnl_entry_cost"],
+                    baseline=uncertain_baseline, via="held",
                 )
                 save_json(STATE_FILE, positions_meta)
 
@@ -1786,12 +1851,35 @@ while not _shutdown_requested:
                             last_limit = sell_floor
                             if isinstance(sell_res, dict) and sell_res.get("last_limit") is not None:
                                 last_limit = float(sell_res["last_limit"])
-                            # Reconcile with Data API — may add ghosts, never erase confirms.
+                            # Reconcile with Data API — one read never adds/erases confirms.
                             time.sleep(HEDGE_GHOST_SLEEP_S)
                             actual_bal = check_token_balance(held_token)
                             rec = reconcile_hedge_sold(
                                 held_size, sold, hedge_proceeds, actual_bal, last_limit,
                             )
+                            ghost_tail = 0.0
+                            if rec["ghost_candidate"]:
+                                # A single low Data API read can be stale even
+                                # when CLOB confirmed a partial. Promote only a
+                                # full unconfirmed tail after repeated zeros.
+                                extra_reads = []
+                                for _i in range(2):
+                                    time.sleep(0.5)
+                                    extra_reads.append(check_token_balance(held_token))
+                                if stable_zero_balances([actual_bal] + extra_reads):
+                                    ghost_tail = max(
+                                        0.0, held_size - float(rec["effective_sold"]),
+                                    )
+                                    rec["effective_sold"] += ghost_tail
+                                    rec["proceeds"] += ghost_tail * last_limit
+                                    rec["rem"] = 0.0
+                                else:
+                                    log_event(
+                                        "hedge_ghost_unstable", condition_id=cond,
+                                        leg=held_leg, size=held_size,
+                                        confirmed_sold=float(sold),
+                                        api_bal=None if actual_bal is None else float(actual_bal),
+                                    )
                             if rec["balance_unverified"]:
                                 log_event(
                                     "hedge_balance_fail", condition_id=cond, leg=held_leg,
@@ -1804,15 +1892,12 @@ while not _shutdown_requested:
                                     api_bal=None if actual_bal is None else float(actual_bal),
                                 )
                             if rec["effective_sold"] > 0.01:
-                                if (
-                                    rec["api_sold"] is not None
-                                    and rec["api_sold"] > float(sold) + 0.01
-                                ):
+                                if ghost_tail > 0.01:
                                     log_event(
                                         "hedge_ghost_fill", condition_id=cond, leg=held_leg,
-                                        sold=rec["api_sold"] - float(sold),
+                                        sold=ghost_tail,
                                         remaining=rec["rem"], price=last_limit,
-                                        mid=fresh_mid, via="post_sell_reconcile",
+                                        mid=fresh_mid, via="stable_zero",
                                         confirmed_sold=float(sold),
                                     )
                                 rem = rec["rem"]
@@ -1845,38 +1930,6 @@ while not _shutdown_requested:
                                     priority="urgent",
                                 )
                                 save_json(STATE_FILE, positions_meta)
-                            elif rec["ghost_candidate"]:
-                                # Full ghost with zero CLOB confirms — need repeated zeros.
-                                extra_reads = []
-                                for _i in range(2):
-                                    time.sleep(0.5)
-                                    extra_reads.append(check_token_balance(held_token))
-                                if stable_zero_balances([actual_bal] + extra_reads):
-                                    ghost_sold = held_size
-                                    ghost_proceeds = ghost_sold * last_limit
-                                    meta["pnl_hedge_proceeds"] = round(
-                                        meta.get("pnl_hedge_proceeds", 0) + ghost_proceeds, 4
-                                    )
-                                    meta["hedge_closed"] = True
-                                    meta["bought_size"] = 0.0
-                                    log_event(
-                                        "hedge_ghost_fill", condition_id=cond, leg=held_leg,
-                                        sold=ghost_sold, remaining=0.0, price=last_limit,
-                                        mid=fresh_mid, via="stable_zero",
-                                        hedge_closed=True,
-                                    )
-                                    notify(
-                                        "HEDGE FIRED (ghost)",
-                                        f"Reversal on {m.question}\n{held_leg.upper()} ghost-sold {ghost_sold:.2f}",
-                                        priority="urgent",
-                                    )
-                                    save_json(STATE_FILE, positions_meta)
-                                else:
-                                    log_event(
-                                        "hedge_ghost_unstable", condition_id=cond, leg=held_leg,
-                                        size=held_size,
-                                        api_bal=None if actual_bal is None else float(actual_bal),
-                                    )
                             else:
                                 log_event(
                                     "hedge_fail", condition_id=cond, leg=held_leg, size=held_size,
@@ -1894,27 +1947,43 @@ while not _shutdown_requested:
                 utok = meta.get("buy_uncertain_token")
                 if utok:
                     ubal = check_token_balance(utok)
-                    if ubal is not None and ubal > 0.01:
-                        avg_est = float(meta.get("fill_price") or BUY_THRESHOLD)
+                    ubaseline = float(meta.get("buy_uncertain_baseline") or 0)
+                    ufilled = (
+                        max(0.0, float(ubal) - ubaseline)
+                        if ubal is not None else 0.0
+                    )
+                    if ufilled > 0.01:
+                        avg_est = float(
+                            meta.get("buy_uncertain_price")
+                            or meta.get("fill_price")
+                            or BUY_THRESHOLD
+                        )
                         meta["bought_token"] = utok
                         meta["bought_leg"] = meta.get("buy_uncertain_leg") or meta.get("bought_leg")
-                        meta["bought_size"] = ubal
+                        meta["bought_size"] = ufilled
                         meta["fill_price"] = round(avg_est, 4)
-                        meta["pnl_entry_cost"] = round(meta.get("pnl_entry_cost") or (ubal * avg_est), 4)
+                        meta["pnl_entry_cost"] = round(
+                            meta.get("pnl_entry_cost") or (ufilled * avg_est), 4
+                        )
                         meta["toxic_fill"] = bool(avg_est + 1e-9 < float(BUY_THRESHOLD))
                         meta.pop("buy_uncertain", None)
                         meta.pop("buy_uncertain_at", None)
                         meta.pop("buy_uncertain_token", None)
                         meta.pop("buy_uncertain_leg", None)
+                        meta.pop("buy_uncertain_baseline", None)
+                        meta.pop("buy_uncertain_attempt", None)
+                        meta.pop("buy_uncertain_spend", None)
+                        meta.pop("buy_uncertain_price", None)
                         log_event(
                             "buy_uncertain_resolved", condition_id=cond, token_id=utok,
-                            size=ubal, entry_cost=meta["pnl_entry_cost"], via="balance",
+                            size=ufilled, entry_cost=meta["pnl_entry_cost"],
+                            baseline=ubaseline, balance=ubal, via="balance",
                         )
                         save_json(STATE_FILE, positions_meta)
                     else:
                         log_event(
                             "buy_uncertain_pending", condition_id=cond, token_id=utok,
-                            balance=ubal,
+                            balance=ubal, baseline=ubaseline,
                             age_s=round((time.time() * 1000 - float(meta.get("buy_uncertain_at") or 0)) / 1000, 1),
                         )
                 continue  # quarantine: no new order this market
@@ -2206,16 +2275,39 @@ while not _shutdown_requested:
                 meta["toxic_fill"] = bool(avg + 1e-9 < float(BUY_THRESHOLD))
                 save_json(STATE_FILE, positions_meta)
 
+            def _clear_buy_uncertain():
+                for key in (
+                    "buy_uncertain", "buy_uncertain_at", "buy_uncertain_token",
+                    "buy_uncertain_leg", "buy_uncertain_baseline",
+                    "buy_uncertain_attempt", "buy_uncertain_spend",
+                    "buy_uncertain_price",
+                ):
+                    meta.pop(key, None)
+
+            def _persist_buy_submit(baseline, attempt, spend_cap, submit_price):
+                # Write-ahead quarantine: this must reach disk before the POST.
+                # A crash or accepted-then-timeout can then never unlock a
+                # duplicate full-budget order on restart.
+                submit_ms = time.time() * 1000
+                meta["buy_uncertain"] = True
+                meta["buy_uncertain_at"] = submit_ms
+                meta["buy_uncertain_token"] = buy_token
+                meta["buy_uncertain_leg"] = buy_leg
+                meta["buy_uncertain_baseline"] = float(baseline)
+                meta["buy_uncertain_attempt"] = int(attempt)
+                meta["buy_uncertain_spend"] = round(float(spend_cap), 4)
+                meta["buy_uncertain_price"] = round(float(submit_price), 4)
+                meta["last_buy_at"] = submit_ms
+                save_json(STATE_FILE, positions_meta)
+
             bought, spent, buy_status = buy_market_with_retry(
                 buy_token, BUY_BUDGET, BUY_MAX_PRICE, tick_size=tick, min_price=BUY_THRESHOLD,
-                on_fill=_persist_buy_fill,
+                on_fill=_persist_buy_fill, on_submit=_persist_buy_submit,
             )
             wall_ms = time.time() * 1000
             if bought > 0:
-                meta.pop("buy_uncertain", None)
-                meta.pop("buy_uncertain_at", None)
-                meta.pop("buy_uncertain_token", None)
-                meta.pop("buy_uncertain_leg", None)
+                if buy_status != "ambiguous":
+                    _clear_buy_uncertain()
                 if spent <= 0:
                     spent = bought * float(buy_ask or BUY_THRESHOLD)
                 avg_fill = spent / bought
@@ -2255,12 +2347,16 @@ while not _shutdown_requested:
                     "ptb_source": meta.get("ptb_source"),
                 })
                 notify(
-                    "BUY FILLED",
-                    f"{m.question}\nBought {buy_leg.upper()} at ~{meta['fill_price']:.3f} ({bought:.2f} shares, ${spent:.2f})",
-                    priority="high",
+                    "BUY FILLED / UNCERTAIN" if buy_status == "ambiguous" else "BUY FILLED",
+                    f"{m.question}\nBought {buy_leg.upper()} at ~{meta['fill_price']:.3f} "
+                    f"({bought:.2f} shares, ${spent:.2f})"
+                    + ("\nFinal POST unresolved; market remains quarantined" if buy_status == "ambiguous" else ""),
+                    priority="urgent" if buy_status == "ambiguous" else "high",
                 )
                 save_json(STATE_FILE, positions_meta)
             elif buy_status == "ambiguous":
+                # on_submit already durably wrote the baseline and token before
+                # the POST. Refresh only audit fields; do not discard baseline.
                 meta["buy_uncertain"] = True
                 meta["buy_uncertain_at"] = wall_ms
                 meta["buy_uncertain_token"] = buy_token
@@ -2277,6 +2373,9 @@ while not _shutdown_requested:
                 )
                 save_json(STATE_FILE, positions_meta)
             else:
+                # Every submitted attempt was explicitly terminal (or no POST
+                # happened), so remove the temporary write-ahead quarantine.
+                _clear_buy_uncertain()
                 meta["last_buy_at"] = wall_ms
                 log_event("buy_fail", condition_id=cond, leg=buy_leg, budget=BUY_BUDGET, ask=buy_ask, status=buy_status)
                 save_json(STATE_FILE, positions_meta)
