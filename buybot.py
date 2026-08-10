@@ -56,8 +56,7 @@ RELAYER_API_KEY_ADDRESS = os.getenv("RELAYER_API_KEY_ADDRESS", "0x42aec4505559c0
 _STRATEGY_DEFAULTS = {
     "buy_threshold": 0.96,
     "buy_max_price": 0.99,
-    # Consensus gates: avoid buying a stale ~97¢ ask on the loser when the
-    # true winner's asks are cleared (old mid-based / one-mid-None path).
+    # Consensus on Polymarket GUI display price (mid if spread≤10¢ else last trade).
     "min_winner_bid": 0.90,
     "max_loser_bid": 0.10,
     "min_bid_edge": 0.05,
@@ -343,7 +342,7 @@ def get_book_bid(token_id):
 
 def get_book_quote(token_id):
     """Return (bid_price, bid_size, ask_price, ask_size, mid_price).
-    mid_price is None when no asks exist — callers must NOT trigger on None."""
+    mid_price is None when either side of the book is missing."""
     try:
         book = safe_api_call(client.get_order_book, token_id)
         path = "sdk"
@@ -360,24 +359,50 @@ def get_book_quote(token_id):
     try:
         bids = book.get("bids", [])
         asks = book.get("asks", [])
-        if not bids:
-            return None, 0.0, None, 0.0, None
-        best_bid = max(bids, key=lambda x: float(x.get("price", 0)))
-        bid_price = float(best_bid.get("price", 0))
-        bid_size = float(best_bid.get("size", 0))
+        bid_price = None
+        bid_size = 0.0
+        ask_price = None
+        ask_size = 0.0
+        mid_price = None
+        if bids:
+            best_bid = max(bids, key=lambda x: float(x.get("price", 0)))
+            bid_price = float(best_bid.get("price", 0))
+            bid_size = float(best_bid.get("size", 0))
         if asks:
             best_ask = min(asks, key=lambda x: float(x.get("price", 0)))
             ask_price = float(best_ask.get("price", 0))
             ask_size = float(best_ask.get("size", 0))
+        if bid_price is not None and ask_price is not None:
             mid_price = (bid_price + ask_price) / 2.0
-        else:
-            ask_price = None
-            ask_size = 0.0
-            mid_price = None
         return bid_price, bid_size, ask_price, ask_size, mid_price
     except Exception as e:
         log_event("book_quote_fail", token_id=token_id, error=str(e), path=path)
         return None, 0.0, None, 0.0, None
+
+
+# Polymarket UI display rule (docs.polymarket.com/concepts/prices-orderbook):
+# show midpoint when bid-ask spread <= $0.10; otherwise show last traded price.
+POLYMARKET_GUI_SPREAD = 0.10
+
+
+def get_last_trade_price(token_id):
+    """CLOB last-trade price for a token (what the UI falls back to on wide spreads)."""
+    try:
+        resp = requests.get(f"{HOST}/last-trade-price", params={"token_id": token_id}, timeout=5)
+        resp.raise_for_status()
+        data = resp.json()
+        price = data.get("price") if isinstance(data, dict) else None
+        return float(price) if price is not None else None
+    except Exception as e:
+        log_event("last_trade_fail", token_id=token_id, error=str(e)[:200])
+        return None
+
+
+def polymarket_display_price(bid, ask, last_trade):
+    """Probability a human sees on Polymarket for this outcome."""
+    if bid is not None and ask is not None and (ask - bid) <= POLYMARKET_GUI_SPREAD + 1e-12:
+        return (bid + ask) / 2.0
+    return last_trade
 
 
 # ------------------------- TICK SIZE -------------------------
@@ -1038,54 +1063,58 @@ while not _shutdown_requested:
             if daily_notional + est_cost > MAX_DAILY_NOTIONAL + 1e-9:
                 continue
 
-            # Fresh book quotes — no stale cache for buy decisions
+            # Fresh book + last trade → Polymarket GUI display price
+            # (mid if spread ≤ 10¢, else last trade — what a human sees on the site).
             up_bid, _, up_ask, _, up_mid = get_book_quote(m.up_token)
             dn_bid, _, dn_ask, _, dn_mid = get_book_quote(m.dn_token)
+            up_last = get_last_trade_price(m.up_token)
+            dn_last = get_last_trade_price(m.dn_token)
+            up_gui = polymarket_display_price(up_bid, up_ask, up_last)
+            dn_gui = polymarket_display_price(dn_bid, dn_ask, dn_last)
 
-            # Sentiment requires BOTH bids. Never infer a winner from a single
-            # mid — a wide-spread loser (bid 5¢ / ask 97¢ → mid 51¢) looked
-            # "winning" when the true winner's asks were cleared (mid=None),
-            # causing wrong-side buys at ~97¢ that later looked like "reversals".
-            if up_bid is None or dn_bid is None:
+            if up_gui is None or dn_gui is None:
                 log_event(
                     "buy_skip_incomplete_book",
                     condition_id=cond,
                     up_bid=up_bid, dn_bid=dn_bid, up_ask=up_ask, dn_ask=dn_ask,
+                    up_last=up_last, dn_last=dn_last, up_gui=up_gui, dn_gui=dn_gui,
                 )
                 continue
 
-            # Winner by BID (what the market pays), not mid (poisoned by stale asks).
-            bid_edge = abs(up_bid - dn_bid)
-            if bid_edge < MIN_BID_EDGE:
+            # Winner by GUI display price (not raw mid — wide spreads poison mid).
+            gui_edge = abs(up_gui - dn_gui)
+            if gui_edge < MIN_BID_EDGE:
                 log_event(
                     "buy_skip_ambiguous",
                     condition_id=cond,
-                    up_bid=up_bid, dn_bid=dn_bid, bid_edge=round(bid_edge, 4),
-                    up_mid=up_mid, dn_mid=dn_mid,
+                    up_gui=up_gui, dn_gui=dn_gui, gui_edge=round(gui_edge, 4),
+                    up_bid=up_bid, dn_bid=dn_bid, up_ask=up_ask, dn_ask=dn_ask,
                 )
                 continue
 
-            up_winning = up_bid > dn_bid
-            dn_winning = dn_bid > up_bid
+            up_winning = up_gui > dn_gui
+            dn_winning = dn_gui > up_gui
 
-            # Ask in band + consensus: buy-side bid elevated, opposite clearly losing.
+            # Ask in band to execute + GUI consensus (screen shows clear winner).
             up_ask_ok = up_ask is not None and BUY_THRESHOLD <= up_ask <= BUY_MAX_PRICE
             dn_ask_ok = dn_ask is not None and BUY_THRESHOLD <= dn_ask <= BUY_MAX_PRICE
-            up_consensus = up_bid >= MIN_WINNER_BID and dn_bid <= MAX_LOSER_BID
-            dn_consensus = dn_bid >= MIN_WINNER_BID and up_bid <= MAX_LOSER_BID
+            up_consensus = up_gui >= MIN_WINNER_BID and dn_gui <= MAX_LOSER_BID
+            dn_consensus = dn_gui >= MIN_WINNER_BID and up_gui <= MAX_LOSER_BID
 
             if up_winning and up_ask_ok and not up_consensus:
                 log_event(
                     "buy_skip_no_consensus",
                     condition_id=cond, leg="up",
-                    up_bid=up_bid, dn_bid=dn_bid, up_ask=up_ask,
+                    up_gui=up_gui, dn_gui=dn_gui, up_ask=up_ask,
+                    up_bid=up_bid, dn_bid=dn_bid, up_last=up_last, dn_last=dn_last,
                     min_winner_bid=MIN_WINNER_BID, max_loser_bid=MAX_LOSER_BID,
                 )
             if dn_winning and dn_ask_ok and not dn_consensus:
                 log_event(
                     "buy_skip_no_consensus",
                     condition_id=cond, leg="down",
-                    up_bid=up_bid, dn_bid=dn_bid, dn_ask=dn_ask,
+                    up_gui=up_gui, dn_gui=dn_gui, dn_ask=dn_ask,
+                    up_bid=up_bid, dn_bid=dn_bid, up_last=up_last, dn_last=dn_last,
                     min_winner_bid=MIN_WINNER_BID, max_loser_bid=MAX_LOSER_BID,
                 )
 
@@ -1098,6 +1127,7 @@ while not _shutdown_requested:
             buy_token = m.up_token if up_buy else m.dn_token
             buy_ask = up_ask if up_buy else dn_ask
             buy_leg = "up" if up_buy else "down"
+            buy_gui = up_gui if up_buy else dn_gui
 
             # Cooldown
             last_buy_at = meta.get("last_buy_at") or 0
@@ -1107,8 +1137,8 @@ while not _shutdown_requested:
             _ttm_disp = f"{minutes_left*60:>3.0f}s" if minutes_left < 1 else f"{minutes_left:>4.1f}m"
             console.print(Panel(
                 f"  [bright_white]{m.question}[/]\n"
-                f"  [bright_green]UP[/]   mid [bold]{up_mid or 0:.3f}[/]  ask [bold]{up_ask or 0:.3f}[/]   │   "
-                f"[bright_red]DN[/]  mid [bold]{dn_mid or 0:.3f}[/]  ask [bold]{dn_ask or 0:.3f}[/]   │   "
+                f"  [bright_green]UP[/]   gui [bold]{up_gui:.3f}[/]  ask [bold]{up_ask or 0:.3f}[/]   │   "
+                f"[bright_red]DN[/]  gui [bold]{dn_gui:.3f}[/]  ask [bold]{dn_ask or 0:.3f}[/]   │   "
                 f"[bold green]TTM {_ttm_disp}[/]",
                 title=f"[bold bright_green]▲ BUY TRIGGER — {buy_leg.upper()} LEG[/]",
                 border_style="bright_green",
@@ -1118,7 +1148,8 @@ while not _shutdown_requested:
             tick = get_tick_size_cached(buy_token)
             log_event(
                 "buy_attempt", condition_id=cond, leg=buy_leg, budget=BUY_BUDGET,
-                ask=buy_ask, threshold=BUY_THRESHOLD, minutes_left=round(minutes_left, 2),
+                ask=buy_ask, gui=buy_gui, up_gui=up_gui, dn_gui=dn_gui,
+                threshold=BUY_THRESHOLD, minutes_left=round(minutes_left, 2),
             )
 
             bought = buy_market_with_retry(buy_token, BUY_BUDGET, BUY_MAX_PRICE, tick_size=tick, min_price=BUY_THRESHOLD)

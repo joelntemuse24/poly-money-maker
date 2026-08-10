@@ -3576,41 +3576,53 @@ atomic mint buyer (which mints complete sets at $1.00), the standalone buy bots:
 
 ### 21.3 Winner Detection Logic
 
-The bot determines which leg is winning by comparing **best bids**:
+Winner detection uses the **same display price Polymarket shows in the UI**
+([prices & orderbook docs](https://docs.polymarket.com/concepts/prices-orderbook)):
 
 ```
-# Winner by BID (not mid). Mid is (bid+ask)/2 and is poisoned by stale asks —
-# e.g. loser bid 5¢ / ask 97¢ → mid 51¢ looked "winning" when the true
-# winner had no asks (mid=None) under the old one-mid-None fallback.
-if up_bid is None or dn_bid is None → skip (incomplete book)
-if abs(up_bid - dn_bid) < min_bid_edge (0.05) → skip (ambiguous)
+if best_bid and best_ask and (ask - bid) ≤ $0.10:
+    gui_price = (bid + ask) / 2      # midpoint
+else:
+    gui_price = last_trade_price     # CLOB /last-trade-price
+```
 
-if up_bid > dn_bid → UP is winning
-if dn_bid > up_bid → DOWN is winning
+That is what a human sees as "97%" on the site. A wide book on the loser
+(bid 5¢ / ask 97¢) does **not** display as ~51% — the UI switches to last
+trade (often a few cents). The bot now follows that rule via
+`polymarket_display_price()` + `get_last_trade_price()`.
+
+```
+if either gui_price is None → skip (buy_skip_incomplete_book)
+if abs(up_gui - dn_gui) < min_bid_edge (0.05) → skip (ambiguous)
+
+if up_gui > dn_gui → UP is winning
+if dn_gui > up_gui → DOWN is winning
 ```
 
 **Consensus gates (required before buy):**
 
-- Buy-side bid ≥ `min_winner_bid` (0.90) — real demand near our price band
-- Opposite bid ≤ `max_loser_bid` (0.10) — other side clearly losing
-- Ask still in `[buy_threshold, buy_max_price]`
+- Winning GUI price ≥ `min_winner_bid` (0.90) — screen shows a clear favorite
+- Losing GUI price ≤ `max_loser_bid` (0.10) — other side clearly losing
+- Ask still in `[buy_threshold, buy_max_price]` (execution price, not display)
 
 Skips log as `buy_skip_incomplete_book`, `buy_skip_ambiguous`, or
 `buy_skip_no_consensus`.
 
-**Why this matters:** Markets often spike one way and clear the winner's asks.
-A resting 97¢ ask can remain on the loser. The old mid / one-mid-None logic
-treated that as a buy of the wrong leg — fills that later looked like
-"reversals" on the chart even though consensus never favored that side.
+**Why this matters:** Blind mid/`one-mid-None` logic bought stale ~97¢ asks on
+the wrong leg when the true winner's asks were cleared. The GUI never looked
+like that; matching the GUI display stops those fake "reversals."
+
+Gamma `outcomePrices` is a lagged cache of similar numbers — fine for cards,
+too slow/stale for the buy window. Live CLOB book + last trade is the source.
 
 ### 21.4 Buy Trigger
 
-Once the winner passes consensus, the bot checks:
+Once the winner passes GUI consensus, the bot checks:
 
 ```
 BUY_THRESHOLD (0.96) ≤ winning_ask ≤ BUY_MAX_PRICE (0.99)
-AND winning_bid ≥ min_winner_bid (0.90)
-AND opposite_bid ≤ max_loser_bid (0.10)
+AND winning_gui ≥ min_winner_bid (0.90)
+AND opposite_gui ≤ max_loser_bid (0.10)
 ```
 
 Sizing uses **`buy_budget`** (USD), not a fixed share count. Each FAK attempt

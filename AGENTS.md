@@ -99,9 +99,9 @@ python check_book.py
 - `[DRY BUY]` / `[DRY SELL]` in dry-run — confirms trigger logic fires
 - `cycle_error` in logs — indicates an unhandled exception (bot survives but logs it)
 - `hedge_attempt` / `hedge_fill` — hedge logic triggered
-- `buy_skip_ambiguous` — winner detection skipped (bids too close)
-- `buy_skip_no_consensus` — ask in band but bids don't show clear winner/loser
-- `buy_skip_incomplete_book` — missing bid on one or both legs
+- `buy_skip_ambiguous` — GUI display prices too close
+- `buy_skip_no_consensus` — ask in band but Polymarket GUI prices don't show a clear winner/loser
+- `buy_skip_incomplete_book` — missing GUI price on one or both legs (no mid and no last trade)
 
 ## Key Conventions
 
