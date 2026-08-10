@@ -3552,11 +3552,15 @@ Unlike the sell-side bots (which sell the loser leg from a complete set) and the
 atomic mint buyer (which mints complete sets at $1.00), the standalone buy bots:
 
 1. **Discover markets** via Gamma API using the same series slugs as the sell bots
-2. **Monitor order books** at 1s polling (0.1s inside the buy window)
-3. **Detect the winning leg** by comparing mid prices (bid+ask)/2
+2. **Monitor order books** via CLOB market WebSocket (held + buy-window tokens)
+   with REST fallback; poll loop at 1s idle, **0.05s while holding**, 0.1s in
+   buy window
+3. **Detect the winning leg** via Polymarket GUI display price (mid if spread
+   ≤10¢ else last trade) + underlying edge gate
 4. **Buy the winning leg** via FAK market order when its ask is in 96–99¢
 5. **Hold to expiry** — no profit-taking sells
-6. **Hedge at 65¢** if the held leg's bid collapses (reversal protection)
+6. **Hedge at 65¢** if the held leg's bid collapses (WS-fast path; FAK undercuts
+   the bid so fills land on a falling book)
 7. **Redeem** winning positions after market resolution
 
 ### 21.2 Strategy Parameters
@@ -3568,7 +3572,11 @@ atomic mint buyer (which mints complete sets at $1.00), the standalone buy bots:
 | Buy budget (USD) | $21 | $8 | $24 |
 | Normal polling | 1s | 1s | 1s |
 | Buy-window polling | 0.1s | 0.1s | 0.1s |
+| Held-position polling | 0.05s | 0.05s | 0.05s |
 | Hedge threshold | 65¢ bid | 65¢ bid | 65¢ bid |
+| Hedge FAK floor | 32¢ (`0.32`) | 32.5¢ (`0.325`) | 32¢ (`0.32`) |
+| Hedge undercut | 2 ticks | 2 ticks | 2 ticks |
+| Book feed | CLOB WS + REST | CLOB WS + REST | CLOB WS + REST |
 | Tick size | 0.01 | 0.001 | 0.01 |
 | Series slug | `btc-up-or-down-15m` | `btc-up-or-down-5m` | `btc-up-or-down-hourly` |
 | Slug prefix | `btc-updown` | `btc-updown-5m` | `bitcoin-up-or-down` |
@@ -3690,15 +3698,28 @@ even if the position is later hedged or redeemed.
 
 ### 21.7 Hedge Logic
 
-The hedge is identical across all three buy bots:
+The hedge is identical across all three buy bots and tuned for price-time
+execution on fast reversals:
 
-1. **Trigger:** Cached bid for the held token ≤ `HEDGE_THRESHOLD` (0.65)
-2. **Fresh fetch:** Before acting, a fresh order book is fetched
-3. **Bounce protection:** If `fresh_mid > HEDGE_THRESHOLD`, the hedge is cancelled
-   (the bid recovered)
-4. **Execution:** `sell_market_with_retry()` places a FAK sell at the bid price
-5. **Ghost fill detection:** If the sell reports 0 fill but the on-chain balance
+1. **Trigger:** Held-leg best bid ≤ `HEDGE_THRESHOLD` (0.65), preferably from
+   the CLOB market WebSocket (`buy/clob_book_ws.py`)
+2. **Fast path:** If the WS quote is ≤ `hedge_quote_max_age_s` (0.25s) and mid
+   is not clearly above threshold, fire immediately (no extra REST RTT)
+3. **Stale path:** REST re-fetch; cancel only if **bid** recovered above
+   threshold (mid is not used — wide books poison mid)
+4. **Execution:** FAK sell with limit = `max(hedge_min_price, bid − N ticks)`,
+   aligned to the market tick (15m/hourly floor **0.32**; 5m **0.325**). Each
+   retry re-reads the quote; PnL uses actual fill proceeds, not the pre-call floor.
+5. **Retry sleeps:** `hedge_retry_sleep_s` (50ms) / `hedge_ghost_sleep_s` (400ms)
+6. **Ghost fill detection:** If the sell reports 0 fill but the on-chain balance
    decreased, the fill is recorded as a "ghost fill"
+
+Book WS uses documented `operation: subscribe|unsubscribe` for token rollover.
+Price-only events (`best_bid_ask` / `price_change`) **preserve prior sizes** so
+buy sizing is not zeroed; full `book` snapshots replace sizes. Missing bid/ask
+sides clear that side. REST fallback for books/last-trade is rate-limited
+(~200–250ms), including hedge bounce confirms. Research JSONL rotates at 50 MiB
+(2 backups). REST quote caches are pruned on token rollover (max 64 entries).
 
 ### 21.8 State Isolation
 

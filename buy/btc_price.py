@@ -35,6 +35,8 @@ RING_MAX_SAMPLES = 12_000
 PTB_MAX_SKEW_MS = 2000
 LIVE_STALE_S = 5.0
 PTB_CACHE_MAX = 512
+RESEARCH_MAX_BYTES = 50 * 1024 * 1024  # 50 MiB per research file
+RESEARCH_BACKUP_COUNT = 2
 
 # Canonical sources used by buy bots
 SOURCE_TWAP_30 = "twap_30"  # 5m
@@ -71,10 +73,24 @@ SOURCE_META = {
 
 
 def append_research(path: str, record: Dict[str, Any]) -> None:
-    """Append one JSON line for offline correlation / regression."""
+    """Append one JSON line for offline correlation / regression.
+
+    Rotates when the file exceeds RESEARCH_MAX_BYTES (keeps RESEARCH_BACKUP_COUNT
+    backups) so sustained skip loops cannot fill the disk.
+    """
     try:
         row = dict(record)
         row.setdefault("logged_at", time.time())
+        if path:
+            try:
+                if os.path.exists(path) and os.path.getsize(path) >= RESEARCH_MAX_BYTES:
+                    for i in range(RESEARCH_BACKUP_COUNT, 0, -1):
+                        src = path if i == 1 else f"{path}.{i - 1}"
+                        dst = f"{path}.{i}"
+                        if os.path.exists(src):
+                            os.replace(src, dst)
+            except OSError:
+                pass
         with open(path, "a", encoding="utf-8") as f:
             f.write(json.dumps(row, separators=(",", ":")) + "\n")
     except Exception as e:

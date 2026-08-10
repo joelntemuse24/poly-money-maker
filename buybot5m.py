@@ -27,6 +27,7 @@ from py_clob_client_v2.order_builder.constants import SELL, BUY
 
 from buy.market import MarketGateway
 from buy.btc_price import get_btc_feed, append_research, SOURCE_TWAP_30
+from buy.clob_book_ws import get_book_feed
 
 console = Console()
 load_dotenv()
@@ -70,6 +71,11 @@ _STRATEGY_DEFAULTS = {
     "min_underlying_edge_usd": 10.0,
     "hedge_enabled": True,
     "hedge_threshold": 0.65,
+    "hedge_min_price": 0.325,
+    "hedge_undercut_ticks": 2,
+    "hedge_quote_max_age_s": 0.25,
+    "hedge_retry_sleep_s": 0.05,
+    "hedge_ghost_sleep_s": 0.4,
     "buy_start_s": 90,
     "buy_grace_s": 1,
     "buy_cooldown_s": 1,
@@ -82,8 +88,10 @@ _STRATEGY_DEFAULTS = {
     "max_redeem_age_days": 7,
     "dry_run": False,
     "poll_buy_window_s": 0.1,
+    "poll_held_s": 0.05,
     "positions_refresh_s": 1,
     "balance_refresh_s": 15,
+    "ui_every_n_cycles": 5,
     "tick_size": "0.001",
 }
 STRATEGY_FILE = "strategy_buy5m.json"
@@ -135,6 +143,11 @@ UNDERLYING_GATE_ENABLED = _strat["underlying_gate_enabled"]
 MIN_UNDERLYING_EDGE_USD = _strat["min_underlying_edge_usd"]
 HEDGE_ENABLED = _strat["hedge_enabled"]
 HEDGE_THRESHOLD = _strat["hedge_threshold"]
+HEDGE_MIN_PRICE = _strat["hedge_min_price"]
+HEDGE_UNDERCUT_TICKS = _strat["hedge_undercut_ticks"]
+HEDGE_QUOTE_MAX_AGE_S = _strat["hedge_quote_max_age_s"]
+HEDGE_RETRY_SLEEP_S = _strat["hedge_retry_sleep_s"]
+HEDGE_GHOST_SLEEP_S = _strat["hedge_ghost_sleep_s"]
 BUY_START_S = _strat["buy_start_s"]
 BUY_GRACE_S = _strat["buy_grace_s"]
 BUY_COOLDOWN_S = _strat["buy_cooldown_s"]
@@ -147,8 +160,10 @@ REDEEM_THROTTLE_S = _strat["redeem_throttle_s"]
 MAX_REDEEM_AGE_DAYS = _strat["max_redeem_age_days"]
 DRY_RUN = _strat["dry_run"]
 POLL_BUY_WINDOW_S = _strat["poll_buy_window_s"]
+POLL_HELD_S = _strat["poll_held_s"]
 POSITIONS_REFRESH_S = _strat["positions_refresh_s"]
 BALANCE_REFRESH_S = _strat["balance_refresh_s"]
+UI_EVERY_N_CYCLES = _strat["ui_every_n_cycles"]
 TICK_SIZE_FALLBACK = _strat["tick_size"]
 
 # ------------------------- LOG ROTATION -------------------------
@@ -390,6 +405,65 @@ def get_book_quote(token_id):
         return None, 0.0, None, 0.0, None
 
 
+_rest_quote_cache = {}
+_REST_QUOTE_MIN_INTERVAL_S = 0.2
+_REST_QUOTE_CACHE_MAX = 64
+_last_trade_cache = {}
+_LAST_TRADE_MIN_INTERVAL_S = 0.25
+
+
+def prune_rest_caches(keep_tokens=None):
+    """Drop REST cache entries for tokens we no longer watch (market rollover)."""
+    keep = {str(t) for t in (keep_tokens or []) if t}
+    if keep:
+        for cache in (_rest_quote_cache, _last_trade_cache):
+            for tid in list(cache.keys()):
+                if tid not in keep:
+                    cache.pop(tid, None)
+    for cache in (_rest_quote_cache, _last_trade_cache):
+        if len(cache) > _REST_QUOTE_CACHE_MAX:
+            # Drop oldest by timestamp (value is (payload, ts))
+            ordered = sorted(cache.items(), key=lambda kv: kv[1][1] if isinstance(kv[1], tuple) and len(kv[1]) > 1 else 0)
+            for tid, _ in ordered[: max(0, len(cache) - _REST_QUOTE_CACHE_MAX)]:
+                cache.pop(tid, None)
+
+
+def get_quote_fast(token_id, max_age_s=2.0, prefer_rest=False):
+    """Prefer fresh CLOB WS top-of-book; REST fallback is rate-limited."""
+    if not prefer_rest:
+        ws_q = get_book_feed().quote(token_id, max_age_s=max_age_s)
+        if ws_q is not None and (ws_q[0] is not None or ws_q[2] is not None):
+            return ws_q
+    now = time.time()
+    cached = _rest_quote_cache.get(token_id)
+    if cached is not None:
+        q, ts = cached
+        if (now - ts) < _REST_QUOTE_MIN_INTERVAL_S:
+            return q
+    q = get_book_quote(token_id)
+    _rest_quote_cache[token_id] = (q, now)
+    if len(_rest_quote_cache) > _REST_QUOTE_CACHE_MAX:
+        prune_rest_caches()
+    return q
+
+
+def hedge_sell_price(bid, tick_size, undercut_ticks, min_price):
+    """FAK sell floor: undercut bid, align to tick, clamp to min_price."""
+    tick = float(tick_size or TICK_SIZE_FALLBACK)
+    if tick <= 0:
+        tick = 0.01
+    undercut = max(0, int(undercut_ticks)) * tick
+    raw = float(bid or 0) - undercut
+    # Floor to tick so CLOB never rejects for precision (e.g. 0.325 on 0.01).
+    aligned = (int(raw / tick + 1e-12)) * tick
+    floor = float(min_price or tick)
+    floor_aligned = (int(floor / tick + 1e-12)) * tick
+    if floor_aligned + 1e-12 < floor:
+        # min_price wasn't on-tick; round UP to next valid tick for the floor.
+        floor_aligned = (int(floor / tick + 1e-12) + 1) * tick
+    return max(floor_aligned, tick, aligned)
+
+
 # Polymarket UI display rule (docs.polymarket.com/concepts/prices-orderbook):
 # show midpoint when bid-ask spread <= $0.10; otherwise show last traded price.
 POLYMARKET_GUI_SPREAD = 0.10
@@ -397,14 +471,26 @@ POLYMARKET_GUI_SPREAD = 0.10
 
 def get_last_trade_price(token_id):
     """CLOB last-trade price for a token (what the UI falls back to on wide spreads)."""
+    now = time.time()
+    cached = _last_trade_cache.get(token_id)
+    if cached is not None:
+        price, ts = cached
+        if (now - ts) < _LAST_TRADE_MIN_INTERVAL_S:
+            return price
     try:
         resp = requests.get(f"{HOST}/last-trade-price", params={"token_id": token_id}, timeout=5)
         resp.raise_for_status()
         data = resp.json()
         price = data.get("price") if isinstance(data, dict) else None
-        return float(price) if price is not None else None
+        out = float(price) if price is not None else None
+        _last_trade_cache[token_id] = (out, now)
+        if len(_last_trade_cache) > _REST_QUOTE_CACHE_MAX:
+            prune_rest_caches()
+        return out
     except Exception as e:
         log_event("last_trade_fail", token_id=token_id, error=str(e)[:200])
+        if cached is not None:
+            return cached[0]
         return None
 
 
@@ -466,6 +552,8 @@ def get_order_details(order_id):
 
 
 def confirm_fill_size(result, oid, requested):
+    """Return confirmed matched size. Never treat order 404 as a full fill —
+    that overstates buys/sells; callers use balance reconciliation for ghosts."""
     matched = 0.0
     if isinstance(result, dict):
         sm = result.get("size_matched")
@@ -477,11 +565,60 @@ def confirm_fill_size(result, oid, requested):
         details = get_order_details(oid)
         if details:
             if details.get("status") == "NOT_FOUND":
-                matched = float(requested)
-            else:
-                sm = details.get("size_matched", 0)
-                matched = float(sm) if sm else 0.0
+                return 0.0
+            sm = details.get("size_matched", 0)
+            matched = float(sm) if sm else 0.0
     return matched
+
+
+def _result_as_dict(result):
+    if isinstance(result, dict):
+        return result
+    if result is None:
+        return {}
+    out = {}
+    for k in (
+        "average_price", "avg_price", "price", "size_matched",
+        "takingAmount", "taking_amount", "makingAmount", "making_amount",
+    ):
+        if hasattr(result, k):
+            out[k] = getattr(result, k)
+    if hasattr(result, "__dict__"):
+        out.update({k: v for k, v in vars(result).items() if not k.startswith("_")})
+    return out
+
+
+def fill_proceeds(result, filled, limit_price):
+    """USDC proceeds for a SELL fill. Prefer API avg/notional; else limit × size."""
+    filled = float(filled or 0)
+    limit_price = float(limit_price or 0)
+    if filled <= 0:
+        return 0.0
+    d = _result_as_dict(result)
+    for k in ("average_price", "avg_price"):
+        if d.get(k) is not None:
+            try:
+                return filled * float(d[k])
+            except (TypeError, ValueError):
+                pass
+    # Some CLOB responses expose making/taking amounts (shares vs USDC).
+    try:
+        taking = d.get("takingAmount", d.get("taking_amount"))
+        making = d.get("makingAmount", d.get("making_amount"))
+        if taking is not None and making is not None:
+            taking_f = float(taking)
+            making_f = float(making)
+            # Heuristic: values >> size are likely 1e6 fixed-point.
+            if taking_f > 1000 and making_f > 1000:
+                taking_f /= 1e6
+                making_f /= 1e6
+            if making_f > 0 and abs(making_f - filled) / max(filled, 1e-9) < 0.25:
+                return taking_f
+            if taking_f > 0 and abs(taking_f - filled) / max(filled, 1e-9) < 0.25:
+                return making_f
+    except (TypeError, ValueError):
+        pass
+    return filled * limit_price
 
 
 # ------------------------- BUY -------------------------
@@ -500,19 +637,26 @@ def buy_market_with_retry(token_id, budget, max_price, tick_size="0.001", max_re
         remaining_budget = budget - spent
         if remaining_budget < 0.01:
             break
-        _, _, fresh_ask, fresh_ask_size, _ = get_book_quote(token_id)
+        _, _, fresh_ask, fresh_ask_size, _ = get_quote_fast(token_id)
+        if fresh_ask is not None and (fresh_ask_size or 0) <= 0:
+            # Price-only WS updates may lack size — one throttled REST for sizing.
+            _, _, fresh_ask, fresh_ask_size, _ = get_quote_fast(token_id, prefer_rest=True)
         if fresh_ask is None:
             console.print(f"  [dim yellow][NO ASK][/] no asks available · attempt {attempt + 1}/{max_retries}")
             break
         if fresh_ask > max_price:
             console.print(f"  [dim yellow][SKIP][/] ask {fresh_ask:.3f} > cap {max_price:.3f} · attempt {attempt + 1}/{max_retries}")
-            time.sleep(0.5)
+            time.sleep(0.05)
             continue
         if fresh_ask < min_price:
             # Safety gate: ask fell below entry band mid-retry — stop (don't chase).
             console.print(f"  [dim yellow][STOP][/] ask {fresh_ask:.3f} < min {min_price:.3f} · abort retries")
             log_event("buy_retry_stop_below_min", token_id=token_id, ask=fresh_ask, min_price=min_price, attempt=attempt + 1)
             break
+        if (fresh_ask_size or 0) < 0.01:
+            console.print(f"  [dim yellow][NO SIZE][/] ask size {fresh_ask_size} · attempt {attempt + 1}/{max_retries}")
+            time.sleep(0.05)
+            continue
         shares_affordable = remaining_budget / fresh_ask
         buy_size = min(shares_affordable, fresh_ask_size)
         if buy_size < 0.01:
@@ -542,7 +686,7 @@ def buy_market_with_retry(token_id, budget, max_price, tick_size="0.001", max_re
         except Exception as e:
             console.print(f"  [dim red]Market buy {attempt+1}/{max_retries} failed: {e}[/]")
             log_event("buy_attempt_error", token_id=token_id, error=str(e)[:200], attempt=attempt + 1)
-        time.sleep(0.5)
+        time.sleep(0.05)
 
     if total_bought > 0:
         console.print(f"  [bold yellow][BUY PARTIAL][/]{total_bought:.4f} shares · ${spent:.2f}/${budget:.2f} spent")
@@ -551,19 +695,57 @@ def buy_market_with_retry(token_id, budget, max_price, tick_size="0.001", max_re
     return 0.0
 
 
-def sell_market_with_retry(token_id, size, price_limit, tick_size="0.001", max_retries=3):
-    """Sell `size` shares via FAK. Used for hedge exits only — no max_price cap."""
+def sell_market_with_retry(
+    token_id,
+    size,
+    price_limit,
+    tick_size="0.001",
+    max_retries=3,
+    min_price=None,
+    undercut_ticks=0,
+    retry_sleep_s=0.05,
+    refresh_quote=True,
+    abort_above=None,
+):
+    """Sell `size` shares via FAK. Used for hedge exits only — no max_price cap.
+
+    Re-reads top-of-book each attempt and undercuts so fills land while the book
+    is falling. `price` is the worst (lowest) price we will accept.
+    If abort_above is set and live bid recovers above it, stop retries.
+
+    Returns (total_sold, result, proceeds) where proceeds = sum(filled * price).
+    """
     total_sold = 0.0
+    total_proceeds = 0.0
     remaining = float(size)
+    floor = float(min_price) if min_price is not None else float(tick_size)
     if DRY_RUN:
-        price = max(float(price_limit or tick_size), float(tick_size))
+        price = hedge_sell_price(price_limit, tick_size, undercut_ticks, floor)
         console.print(f"  [bold black on yellow][DRY SELL][/] would SELL {remaining:.4f} {str(token_id)[:12]}… @ ≥{price:.3f}")
         log_event("dry_sell", token_id=token_id, size=remaining, price_limit=price)
-        return 0, None
+        return 0, None, 0.0
     for attempt in range(max_retries):
         if remaining < 0.01:
             break
-        price = max(float(price_limit or tick_size), float(tick_size))
+        live_bid = price_limit
+        if refresh_quote:
+            qb, _, _, _, _ = get_quote_fast(token_id, max_age_s=HEDGE_QUOTE_MAX_AGE_S)
+            if qb is not None:
+                live_bid = qb
+        if abort_above is not None and live_bid is not None and live_bid > float(abort_above):
+            log_event(
+                "hedge_retry_abort_bounce",
+                token_id=token_id,
+                live_bid=live_bid,
+                abort_above=abort_above,
+                attempt=attempt + 1,
+                sold_so_far=total_sold,
+            )
+            console.print(
+                f"  [dim][CANCEL][/] hedge retry abort — bid recovered to {live_bid:.3f} > {float(abort_above):.3f}"
+            )
+            break
+        price = hedge_sell_price(live_bid, tick_size, undercut_ticks, floor)
         try:
             result = safe_api_call(
                 client.create_and_post_market_order,
@@ -578,19 +760,20 @@ def sell_market_with_retry(token_id, size, price_limit, tick_size="0.001", max_r
                     console.print("  [dim yellow][FAK NULL][/] 0 confirmed fill · stopping")
                     break
                 total_sold += filled
+                total_proceeds += fill_proceeds(result, filled, price)
                 remaining -= filled
                 console.print(f"  [bold green][EXIT FAK][/]{filled} @ ≥{price:.3f}  [dim]id={str(oid)[:16]}…[/]")
                 log_event("sell_fill", token_id=token_id, filled=filled, price=price, remaining=remaining, attempt=attempt + 1)
                 if remaining < 0.01:
-                    return total_sold, result
+                    return total_sold, result, total_proceeds
         except Exception as e:
             console.print(f"  [dim red]Market sell {attempt+1}/{max_retries} failed: {e}[/]")
-        time.sleep(0.5)
+        time.sleep(float(retry_sleep_s))
 
     if total_sold > 0:
-        return total_sold, {"partial": True, "sold": total_sold}
+        return total_sold, {"partial": True, "sold": total_sold}, total_proceeds
     console.print(f"  [bold red][EXIT FAIL][/] market sell 0/{size:.4f} cleared")
-    return 0, None
+    return 0, None, 0.0
 
 
 # ------------------------- REDEEM -------------------------
@@ -705,6 +888,8 @@ except Exception as e:
 
 market_gateway = MarketGateway(gamma_url=GAMMA_API, data_api_url=DATA_API, discover_cache_s=5.0)
 btc_feed = get_btc_feed(UNDERLYING_SOURCE, PTB_STORE_FILE)
+book_ws = get_book_feed()
+console.print("[bold bright_cyan]▶ BOOK WS[/] [dim]CLOB market channel armed · held/buy tokens[/]")
 
 banner = Panel(
     Align.center(
@@ -763,6 +948,9 @@ while not _shutdown_requested:
         now_ms = time.time() * 1000
         now_s = time.time()
         now_str = datetime.now().strftime("%H:%M:%S")
+        _show_ui = True
+        markets = [m for m in _cached_markets if m.active and not m.closed and not m.neg_risk]
+        held = _cached_positions
 
         # Hot-reload strategy
         _strat = load_strategy()
@@ -775,6 +963,11 @@ while not _shutdown_requested:
         MIN_UNDERLYING_EDGE_USD = _strat["min_underlying_edge_usd"]
         HEDGE_ENABLED = _strat["hedge_enabled"]
         HEDGE_THRESHOLD = _strat["hedge_threshold"]
+        HEDGE_MIN_PRICE = _strat["hedge_min_price"]
+        HEDGE_UNDERCUT_TICKS = _strat["hedge_undercut_ticks"]
+        HEDGE_QUOTE_MAX_AGE_S = _strat["hedge_quote_max_age_s"]
+        HEDGE_RETRY_SLEEP_S = _strat["hedge_retry_sleep_s"]
+        HEDGE_GHOST_SLEEP_S = _strat["hedge_ghost_sleep_s"]
         BUY_START_S = _strat["buy_start_s"]
         BUY_GRACE_S = _strat["buy_grace_s"]
         BUY_COOLDOWN_S = _strat["buy_cooldown_s"]
@@ -787,8 +980,10 @@ while not _shutdown_requested:
         MAX_REDEEM_AGE_DAYS = _strat["max_redeem_age_days"]
         DRY_RUN = _strat["dry_run"]
         POLL_BUY_WINDOW_S = _strat["poll_buy_window_s"]
+        POLL_HELD_S = _strat["poll_held_s"]
         POSITIONS_REFRESH_S = _strat["positions_refresh_s"]
         BALANCE_REFRESH_S = _strat["balance_refresh_s"]
+        UI_EVERY_N_CYCLES = _strat["ui_every_n_cycles"]
         TICK_SIZE_FALLBACK = _strat["tick_size"]
 
         write_heartbeat()
@@ -812,14 +1007,22 @@ while not _shutdown_requested:
             log_event("discover_fail", error=str(e)[:200])
         markets = [m for m in _cached_markets if m.active and not m.closed and not m.neg_risk]
         held = _cached_positions
-
-        console.rule(
-            f"[bold bright_yellow]▰ TICK #{CYCLE:04d}[/] [dim]·[/] [bright_white]{now_str}[/] [dim]·[/] "
-            f"[bright_green]MKT[/] [bold]{len(markets):>2}[/] [dim]·[/] "
-            f"[bright_cyan]POS[/] [bold]{sum(1 for p in held.values() if max(p.get('up',{}).get('size',0), p.get('dn',{}).get('size',0)) > 0.01):>2}[/] [dim]·[/] "
-            f"[bright_yellow]NAV[/] [bold]${pusd_bal:>7.2f}[/] [dim]▰[/]",
-            style="bright_yellow",
+        _open_pos_n = sum(
+            1 for p in held.values()
+            if max(p.get("up", {}).get("size", 0), p.get("dn", {}).get("size", 0)) > 0.01
         )
+        _min_ttm_now = min((m.end_ts * 1000 - now_ms) / 60000 for m in markets) if markets else 999
+        _hot_mode = _open_pos_n > 0 or (_min_ttm_now * 60) <= BUY_START_S
+        _show_ui = (not _hot_mode) or (CYCLE % max(1, int(UI_EVERY_N_CYCLES)) == 0)
+
+        if _show_ui:
+            console.rule(
+                f"[bold bright_yellow]▲ TICK #{CYCLE:04d}[/] [dim]·[/] [bright_white]{now_str}[/] [dim]·[/] "
+                f"[bright_green]MKT[/] [bold]{len(markets):>2}[/] [dim]·[/] "
+                f"[bright_cyan]POS[/] [bold]{_open_pos_n:>2}[/] [dim]·[/] "
+                f"[bright_yellow]NAV[/] [bold]${pusd_bal:>7.2f}[/] [dim]▲[/]",
+                style="bright_yellow",
+            )
 
         # ================= GC META CACHE =================
         if positions_raw is not None:
@@ -868,7 +1071,7 @@ while not _shutdown_requested:
                 save_json(STATE_FILE, positions_meta)
 
         # ================= POSITIONS TABLE =================
-        if held:
+        if held and _show_ui:
             table = Table(
                 title="[bold bright_cyan]≡ HELD POSITIONS ≡[/]  [dim]BTC 5M · BUY-SIDE[/]",
                 box=box.HEAVY_HEAD,
@@ -979,12 +1182,17 @@ while not _shutdown_requested:
                 _book_cache[_t] = (None, 0.0, None, 0.0, None)
                 _f.cancel()
         _pending_book_futs = {}
+        # Overlay fresher WS top-of-book (held + buy-window tokens).
+        for _t in list(_book_cache.keys()):
+            _wq = book_ws.quote(_t, max_age_s=2.0)
+            if _wq is not None and (_wq[0] is not None or _wq[2] is not None):
+                _book_cache[_t] = _wq
 
         # ================= HEDGE + BUY PHASE =================
         for m in markets:
             end_ts_ms = m.end_ts * 1000
-            seconds_left = (end_ts_ms - now_ms) / 1000
-            if seconds_left <= 0:
+            minutes_left = (end_ts_ms - now_ms) / 60000
+            if minutes_left <= 0:
                 continue
 
             cond = m.condition_id
@@ -997,49 +1205,126 @@ while not _shutdown_requested:
 
             meta = positions_meta.setdefault(cond, {})
 
-            # --- HEDGE CHECK (for held positions — fires whenever bid drops) ---
-            if held_token and held_size > 0.01 and HEDGE_ENABLED:
-                cached_quote = _book_cache.get(held_token, (None, 0.0, None, 0.0, None))
+            # --- HEDGE CHECK (for held positions) ---
+            if held_token and held_size > 0.01 and HEDGE_ENABLED and not meta.get("hedge_closed"):
+                cached_quote = _book_cache.get(held_token)
+                if cached_quote is None:
+                    cached_quote = get_quote_fast(held_token, max_age_s=2.0)
+                    _book_cache[held_token] = cached_quote
                 cached_bid = cached_quote[0]
                 if cached_bid is not None and cached_bid <= HEDGE_THRESHOLD:
-                    # Fresh fetch before acting
-                    fresh_bid, _, fresh_ask, _, fresh_mid = get_book_quote(held_token)
-                    if fresh_mid is not None and fresh_mid > HEDGE_THRESHOLD:
-                        log_event(
-                            "hedge_cancel_bounce", condition_id=cond, leg=held_leg,
-                            trigger_bid=cached_bid, current_bid=fresh_bid,
-                            current_mid=fresh_mid, threshold=HEDGE_THRESHOLD,
+                    quote_age = book_ws.quote_age(held_token)
+                    fresh_mid = cached_quote[4]
+                    hedge_bid = None
+                    use_cached = quote_age is not None and quote_age <= HEDGE_QUOTE_MAX_AGE_S
+                    if use_cached:
+                        # Light wick guard without REST: if mid is clearly above
+                        # threshold while bid alone dipped, require REST confirm.
+                        if fresh_mid is not None and fresh_mid > HEDGE_THRESHOLD:
+                            use_cached = False
+                        else:
+                            hedge_bid = cached_bid
+                    if not use_cached:
+                        # Throttled REST confirm (never bypass the rate limit).
+                        fresh_bid, _, _, _, fresh_mid = get_quote_fast(
+                            held_token, max_age_s=0.0, prefer_rest=True,
                         )
-                        console.print(
-                            f"  [dim][CANCEL][/] {held_leg.upper()} hedge cancelled — mid bounced {cached_bid:.3f} → {fresh_mid:.3f}"
-                        )
-                    else:
-                        hedge_bid = fresh_bid if fresh_bid is not None else cached_bid
+                        # Bounce cancel on bid recovery (not mid — wide books poison mid).
+                        if fresh_bid is not None and fresh_bid > HEDGE_THRESHOLD:
+                            log_event(
+                                "hedge_cancel_bounce", condition_id=cond, leg=held_leg,
+                                trigger_bid=cached_bid, current_bid=fresh_bid,
+                                current_mid=fresh_mid, threshold=HEDGE_THRESHOLD,
+                            )
+                            console.print(
+                                f"  [dim][CANCEL][/] {held_leg.upper()} hedge cancelled — bid bounced {cached_bid:.3f} → {fresh_bid:.3f}"
+                            )
+                            hedge_bid = None
+                        else:
+                            hedge_bid = fresh_bid if fresh_bid is not None else cached_bid
+                    if hedge_bid is not None and hedge_bid <= HEDGE_THRESHOLD:
                         hedge_tick = get_tick_size_cached(held_token)
+                        sell_floor = hedge_sell_price(
+                            hedge_bid, hedge_tick, HEDGE_UNDERCUT_TICKS, HEDGE_MIN_PRICE,
+                        )
                         console.print(Panel(
                             f"  [bright_white]{m.question}[/]\n"
                             f"  [bright_red]REVERSAL DETECTED[/] — {held_leg.upper()} dropped to [bold]{hedge_bid:.3f}[/]  ·  "
-                            f"[bold red]TTM {seconds_left:>3.0f}s[/]",
+                            f"FAK ≥{sell_floor:.3f}  ·  [bold red]TTM {minutes_left:>4.1f}m[/]",
                             title="[bold bright_red]▼ HEDGE SELL — CUTTING LOSSES[/]",
                             border_style="bright_red",
                             box=box.HEAVY,
                         ))
-                        log_event("hedge_attempt", condition_id=cond, leg=held_leg, size=held_size, bid=hedge_bid, mid=fresh_mid)
-                        sold, _ = sell_market_with_retry(held_token, held_size, hedge_bid, tick_size=hedge_tick)
+                        log_event(
+                            "hedge_attempt", condition_id=cond, leg=held_leg, size=held_size,
+                            bid=hedge_bid, mid=fresh_mid, price_limit=sell_floor,
+                            quote_age_s=None if quote_age is None else round(quote_age, 3),
+                            ws_fast_path=use_cached,
+                        )
+                        sold, _, hedge_proceeds = sell_market_with_retry(
+                            held_token,
+                            held_size,
+                            hedge_bid,
+                            tick_size=hedge_tick,
+                            min_price=HEDGE_MIN_PRICE,
+                            undercut_ticks=HEDGE_UNDERCUT_TICKS,
+                            retry_sleep_s=HEDGE_RETRY_SLEEP_S,
+                            abort_above=HEDGE_THRESHOLD,
+                        )
                         if sold > 0:
-                            meta["pnl_hedge_proceeds"] = round(meta.get("pnl_hedge_proceeds", 0) + sold * (hedge_bid or 0), 4)
-                            log_event("hedge_fill", condition_id=cond, leg=held_leg, sold=sold, price=hedge_bid, mid=fresh_mid)
-                            notify("HEDGE FIRED", f"Reversal on {m.question}\nSold {held_leg.upper()} at ~{hedge_bid:.3f} ({sold:.2f} shares)", priority="urgent")
+                            fill_px = (hedge_proceeds / sold) if sold > 0 else sell_floor
+                            meta["pnl_hedge_proceeds"] = round(meta.get("pnl_hedge_proceeds", 0) + hedge_proceeds, 4)
+                            remainder = max(0.0, held_size - sold)
+                            leg_key = "up" if held_leg == "up" else "dn"
+                            if remainder < 0.01:
+                                meta["hedge_closed"] = True
+                                remainder = 0.0
+                            # Keep remainder visible so the next cycle can finish the hedge.
+                            if cond in _cached_positions and leg_key in _cached_positions[cond]:
+                                _cached_positions[cond][leg_key]["size"] = remainder
+                            log_event(
+                                "hedge_fill", condition_id=cond, leg=held_leg, sold=sold,
+                                remaining=remainder, price=fill_px, proceeds=round(hedge_proceeds, 4),
+                                mid=fresh_mid, hedge_closed=bool(meta.get("hedge_closed")),
+                            )
+                            notify(
+                                "HEDGE FIRED" if remainder < 0.01 else "HEDGE PARTIAL",
+                                f"Reversal on {m.question}\nSold {held_leg.upper()} at ~{fill_px:.3f} "
+                                f"({sold:.2f} shares, rem {remainder:.2f})",
+                                priority="urgent",
+                            )
                             save_json(STATE_FILE, positions_meta)
                         else:
-                            time.sleep(1)
+                            time.sleep(HEDGE_GHOST_SLEEP_S)
                             actual_bal = check_token_balance(held_token)
                             if actual_bal is not None and actual_bal < held_size - 0.01:
                                 ghost_sold = held_size - actual_bal
-                                meta["pnl_hedge_proceeds"] = round(meta.get("pnl_hedge_proceeds", 0) + ghost_sold * (hedge_bid or 0), 4)
-                                log_event("hedge_ghost_fill", condition_id=cond, leg=held_leg, sold=ghost_sold, price=hedge_bid, mid=fresh_mid)
-                                notify("HEDGE FIRED (ghost)", f"Reversal on {m.question}\n{held_leg.upper()} hedge ghost: {ghost_sold:.2f} shares", priority="urgent")
-                                console.print(f"  [bold yellow][GHOST FILL][/] {held_leg.upper()} hedge confirmed: {ghost_sold:.4f} sold")
+                                # Best available estimate when the CLOB response was empty.
+                                ghost_proceeds = ghost_sold * sell_floor
+                                meta["pnl_hedge_proceeds"] = round(meta.get("pnl_hedge_proceeds", 0) + ghost_proceeds, 4)
+                                rem = float(actual_bal)
+                                if rem < 0.01:
+                                    meta["hedge_closed"] = True
+                                    rem = 0.0
+                                log_event(
+                                    "hedge_ghost_fill", condition_id=cond, leg=held_leg,
+                                    sold=ghost_sold, remaining=rem, price=sell_floor, mid=fresh_mid,
+                                    hedge_closed=bool(meta.get("hedge_closed")),
+                                )
+                                notify(
+                                    "HEDGE FIRED (ghost)" if rem < 0.01 else "HEDGE PARTIAL (ghost)",
+                                    f"Reversal on {m.question}\n{held_leg.upper()} hedge ghost: "
+                                    f"{ghost_sold:.2f} sold, rem {rem:.2f}",
+                                    priority="urgent",
+                                )
+                                console.print(
+                                    f"  [bold yellow][GHOST FILL][/] {held_leg.upper()} hedge confirmed: "
+                                    f"{ghost_sold:.4f} sold · rem {rem:.4f}"
+                                )
+                                if cond in _cached_positions:
+                                    leg_key = "up" if held_leg == "up" else "dn"
+                                    if leg_key in _cached_positions[cond]:
+                                        _cached_positions[cond][leg_key]["size"] = rem
                                 save_json(STATE_FILE, positions_meta)
                             else:
                                 log_event("hedge_fail", condition_id=cond, leg=held_leg, size=held_size, bid=hedge_bid, mid=fresh_mid)
@@ -1093,8 +1378,8 @@ while not _shutdown_requested:
 
             # Fresh book + last trade in parallel (1 RTT, not 4).
             # GUI display = mid if spread ≤ 10¢ else last trade.
-            fut_up = _book_executor.submit(get_book_quote, m.up_token)
-            fut_dn = _book_executor.submit(get_book_quote, m.dn_token)
+            fut_up = _book_executor.submit(get_quote_fast, m.up_token)
+            fut_dn = _book_executor.submit(get_quote_fast, m.dn_token)
             fut_ul = _book_executor.submit(get_last_trade_price, m.up_token)
             fut_dl = _book_executor.submit(get_last_trade_price, m.dn_token)
             up_bid, _, up_ask, _, up_mid = fut_up.result()
@@ -1358,10 +1643,16 @@ while not _shutdown_requested:
             box=box.HEAVY_EDGE,
         ))
 
-    # Variable polling: 1s normal, sub-second in/around buy window
+    # Variable polling: sub-second in/around buy window OR while holding
     _now = time.time() * 1000
     _min_ttm_s = min((m.end_ts * 1000 - _now) / 1000 for m in markets) if markets else 9999
-    if _min_ttm_s <= BUY_START_S + 5:
+    _has_held = any(
+        max(p.get("up", {}).get("size", 0), p.get("dn", {}).get("size", 0)) > 0.01
+        for p in held.values()
+    )
+    if _has_held:
+        _sleep_s = min(POLL_HELD_S, POLL_BUY_WINDOW_S)
+    elif _min_ttm_s <= BUY_START_S:
         _sleep_s = POLL_BUY_WINDOW_S
     else:
         _sleep_s = 1
@@ -1370,19 +1661,32 @@ while not _shutdown_requested:
     _next_now = time.time() * 1000 + _sleep_s * 1000
     _pending_tokens = set(_pending_book_futs.values())
     _MAX_PENDING_BOOKS = 30
+    _watch_tokens = set()
     for m in markets:
-        _sl = (m.end_ts * 1000 - _next_now) / 1000
+        _ml_s = (m.end_ts * 1000 - _next_now) / 1000
         pos = held.get(m.condition_id, {})
         has_pos = max(pos.get("up", {}).get("size", 0), pos.get("dn", {}).get("size", 0)) > 0.01
-        in_window = _sl > 0 and _sl <= BUY_START_S + 5
+        in_window = _ml_s > 0 and _ml_s <= BUY_START_S + 30
         if not (in_window or has_pos):
             continue
         for token in (m.up_token, m.dn_token):
-            if token and token not in _pending_tokens and len(_pending_book_futs) < _MAX_PENDING_BOOKS:
-                _pending_book_futs[_book_executor.submit(get_book_quote, token)] = token
+            if not token:
+                continue
+            _watch_tokens.add(token)
+            if has_pos and (
+                (pos.get("up", {}).get("size", 0) > 0.01 and token == m.up_token)
+                or (pos.get("dn", {}).get("size", 0) > 0.01 and token == m.dn_token)
+            ):
+                # Always watch the held leg tightly
+                _watch_tokens.add(token)
+            if token not in _pending_tokens and len(_pending_book_futs) < _MAX_PENDING_BOOKS:
+                _pending_book_futs[_book_executor.submit(get_quote_fast, token)] = token
                 _pending_tokens.add(token)
+    book_ws.set_tokens(_watch_tokens)
+    prune_rest_caches(keep_tokens=_watch_tokens)
 
-    console.print(f"[dim bright_black]· · ·  sleeping {_sleep_s}s  · · ·[/]")
+    if _show_ui:
+        console.print(f"[dim bright_black]· · ·  sleeping {_sleep_s}s  · · ·[/]")
     time.sleep(_sleep_s)
 
 # Graceful shutdown
