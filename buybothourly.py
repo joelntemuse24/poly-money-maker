@@ -509,9 +509,10 @@ def buy_market_with_retry(token_id, budget, max_price, tick_size="0.01", max_ret
             time.sleep(0.5)
             continue
         if fresh_ask < min_price:
-            console.print(f"  [dim yellow][SKIP][/] ask {fresh_ask:.3f} < min {min_price:.3f} · attempt {attempt + 1}/{max_retries}")
-            time.sleep(0.5)
-            continue
+            # Safety gate: ask fell below entry band mid-retry — stop (don't chase).
+            console.print(f"  [dim yellow][STOP][/] ask {fresh_ask:.3f} < min {min_price:.3f} · abort retries")
+            log_event("buy_retry_stop_below_min", token_id=token_id, ask=fresh_ask, min_price=min_price, attempt=attempt + 1)
+            break
         shares_affordable = remaining_budget / fresh_ask
         buy_size = min(shares_affordable, fresh_ask_size)
         if buy_size < 0.01:
