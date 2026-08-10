@@ -219,6 +219,21 @@ class ClobMarketBookFeed:
                 )
             return
 
+    def _sock_ready(self, ws) -> bool:
+        """True only when WebSocketApp has an open underlying socket."""
+        return ws is not None and getattr(ws, "sock", None) is not None
+
+    def _safe_send(self, ws, payload) -> bool:
+        if not self._sock_ready(ws):
+            return False
+        try:
+            ws.send(payload)
+            return True
+        except Exception as e:
+            # Common during teardown/reconnect: sock already None.
+            log.debug("clob_book_ws send_fail: %s", e)
+            return False
+
     def _initial_subscribe(self, ws, tokens: Set[str]) -> None:
         if not tokens:
             self._subscribed = set()
@@ -228,7 +243,8 @@ class ClobMarketBookFeed:
             "type": "market",
             "custom_feature_enabled": True,
         }
-        ws.send(json.dumps(payload))
+        if not self._safe_send(ws, json.dumps(payload)):
+            raise RuntimeError("clob_book_ws initial_subscribe: socket not ready")
         self._subscribed = set(tokens)
         log.info("clob_book_ws initial_subscribe n=%s", len(tokens))
 
@@ -237,17 +253,19 @@ class ClobMarketBookFeed:
         to_add = tokens - self._subscribed
         to_drop = self._subscribed - tokens
         if to_drop:
-            ws.send(json.dumps({
+            if not self._safe_send(ws, json.dumps({
                 "assets_ids": list(to_drop),
                 "operation": "unsubscribe",
-            }))
+            })):
+                raise RuntimeError("clob_book_ws unsubscribe: socket not ready")
             log.info("clob_book_ws unsubscribe n=%s", len(to_drop))
         if to_add:
-            ws.send(json.dumps({
+            if not self._safe_send(ws, json.dumps({
                 "assets_ids": list(to_add),
                 "operation": "subscribe",
                 "custom_feature_enabled": True,
-            }))
+            })):
+                raise RuntimeError("clob_book_ws subscribe: socket not ready")
             log.info("clob_book_ws subscribe n=%s", len(to_add))
         self._subscribed = set(tokens)
 
@@ -272,6 +290,7 @@ class ClobMarketBookFeed:
                     self._subscribed = set()
                     self._initial_subscribe(ws, tokens)
                     last_ping[0] = time.time()
+                    opened.set()
 
                 def on_message(ws, message):
                     try:
@@ -280,10 +299,18 @@ class ClobMarketBookFeed:
                         log.debug("clob_book_ws handle_fail: %s", e)
 
                 def on_error(ws, error):
-                    log.warning("clob_book_ws error: %s", error)
+                    # websocket-client often reports AttributeError on sock during
+                    # reconnect races; demote that noise and force a clean loop.
+                    msg = str(error)
+                    if "sock" in msg and "NoneType" in msg:
+                        log.debug("clob_book_ws reconnect_race: %s", error)
+                    else:
+                        log.warning("clob_book_ws error: %s", error)
 
                 def on_close(ws, status_code, msg):
                     log.info("clob_book_ws closed code=%s msg=%s", status_code, msg)
+                    if self._ws is ws:
+                        self._ws = None
 
                 def on_pong(ws, message):
                     pass
@@ -296,7 +323,7 @@ class ClobMarketBookFeed:
                     on_close=on_close,
                     on_pong=on_pong,
                 )
-                self._ws = ws
+                # Do not publish self._ws until on_open — App exists before sock.
 
                 def runner():
                     ws.run_forever(ping_interval=None, ping_timeout=None)
@@ -306,28 +333,31 @@ class ClobMarketBookFeed:
 
                 while t.is_alive() and not self._stop.is_set():
                     now = time.time()
-                    if self._ws is not None and now - last_ping[0] >= PING_INTERVAL_S:
-                        try:
-                            self._ws.send("PING")
-                        except Exception:
+                    live = self._ws if self._sock_ready(self._ws) else None
+                    if live is not None and now - last_ping[0] >= PING_INTERVAL_S:
+                        if not self._safe_send(live, "PING"):
                             break
                         last_ping[0] = now
                     if self._want_resub.is_set():
                         self._want_resub.clear()
                         with self._lock:
                             tokens = set(self._wanted)
-                        if tokens != self._subscribed and self._ws is not None:
+                        live = self._ws if self._sock_ready(self._ws) else None
+                        if live is not None and tokens != self._subscribed:
                             try:
-                                self._diff_subscribe(self._ws, tokens)
+                                self._diff_subscribe(live, tokens)
                             except Exception as e:
                                 log.warning("clob_book_ws resub_fail: %s", e)
                                 break
                     time.sleep(0.05)
 
                 try:
-                    ws.close()
+                    if self._sock_ready(ws):
+                        ws.close()
                 except Exception:
                     pass
+                if self._ws is ws:
+                    self._ws = None
                 t.join(timeout=2)
             except Exception as e:
                 log.warning("clob_book_ws loop_fail: %s", e)
