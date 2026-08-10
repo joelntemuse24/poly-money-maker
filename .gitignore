@@ -35,6 +35,7 @@ positions_buy*.json
 pnl_buy*.json
 .heartbeat_buy*
 underlying_research_buy*.jsonl
+underlying_research_buy*.jsonl.*
 ptb_*_buy*.json
 ptb_chainlink*.json
 

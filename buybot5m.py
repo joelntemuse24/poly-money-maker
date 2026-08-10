@@ -571,6 +571,56 @@ def confirm_fill_size(result, oid, requested):
     return matched
 
 
+def _result_as_dict(result):
+    if isinstance(result, dict):
+        return result
+    if result is None:
+        return {}
+    out = {}
+    for k in (
+        "average_price", "avg_price", "price", "size_matched",
+        "takingAmount", "taking_amount", "makingAmount", "making_amount",
+    ):
+        if hasattr(result, k):
+            out[k] = getattr(result, k)
+    if hasattr(result, "__dict__"):
+        out.update({k: v for k, v in vars(result).items() if not k.startswith("_")})
+    return out
+
+
+def fill_proceeds(result, filled, limit_price):
+    """USDC proceeds for a SELL fill. Prefer API avg/notional; else limit × size."""
+    filled = float(filled or 0)
+    limit_price = float(limit_price or 0)
+    if filled <= 0:
+        return 0.0
+    d = _result_as_dict(result)
+    for k in ("average_price", "avg_price"):
+        if d.get(k) is not None:
+            try:
+                return filled * float(d[k])
+            except (TypeError, ValueError):
+                pass
+    # Some CLOB responses expose making/taking amounts (shares vs USDC).
+    try:
+        taking = d.get("takingAmount", d.get("taking_amount"))
+        making = d.get("makingAmount", d.get("making_amount"))
+        if taking is not None and making is not None:
+            taking_f = float(taking)
+            making_f = float(making)
+            # Heuristic: values >> size are likely 1e6 fixed-point.
+            if taking_f > 1000 and making_f > 1000:
+                taking_f /= 1e6
+                making_f /= 1e6
+            if making_f > 0 and abs(making_f - filled) / max(filled, 1e-9) < 0.25:
+                return taking_f
+            if taking_f > 0 and abs(taking_f - filled) / max(filled, 1e-9) < 0.25:
+                return making_f
+    except (TypeError, ValueError):
+        pass
+    return filled * limit_price
+
+
 # ------------------------- BUY -------------------------
 
 def buy_market_with_retry(token_id, budget, max_price, tick_size="0.001", max_retries=3, min_price=0.0):
@@ -710,7 +760,7 @@ def sell_market_with_retry(
                     console.print("  [dim yellow][FAK NULL][/] 0 confirmed fill · stopping")
                     break
                 total_sold += filled
-                total_proceeds += filled * price
+                total_proceeds += fill_proceeds(result, filled, price)
                 remaining -= filled
                 console.print(f"  [bold green][EXIT FAK][/]{filled} @ ≥{price:.3f}  [dim]id={str(oid)[:16]}…[/]")
                 log_event("sell_fill", token_id=token_id, filled=filled, price=price, remaining=remaining, attempt=attempt + 1)
@@ -1224,31 +1274,57 @@ while not _shutdown_requested:
                         if sold > 0:
                             fill_px = (hedge_proceeds / sold) if sold > 0 else sell_floor
                             meta["pnl_hedge_proceeds"] = round(meta.get("pnl_hedge_proceeds", 0) + hedge_proceeds, 4)
-                            meta["hedge_closed"] = True
-                            log_event("hedge_fill", condition_id=cond, leg=held_leg, sold=sold, price=fill_px, proceeds=round(hedge_proceeds, 4), mid=fresh_mid)
-                            notify("HEDGE FIRED", f"Reversal on {m.question}\nSold {held_leg.upper()} at ~{fill_px:.3f} ({sold:.2f} shares)", priority="urgent")
-                            # Locally zero held size so ghost path cannot double-count
-                            # before the next positions refresh.
-                            if cond in _cached_positions:
-                                leg_key = "up" if held_leg == "up" else "dn"
-                                if leg_key in _cached_positions[cond]:
-                                    _cached_positions[cond][leg_key]["size"] = 0.0
+                            remainder = max(0.0, held_size - sold)
+                            leg_key = "up" if held_leg == "up" else "dn"
+                            if remainder < 0.01:
+                                meta["hedge_closed"] = True
+                                remainder = 0.0
+                            # Keep remainder visible so the next cycle can finish the hedge.
+                            if cond in _cached_positions and leg_key in _cached_positions[cond]:
+                                _cached_positions[cond][leg_key]["size"] = remainder
+                            log_event(
+                                "hedge_fill", condition_id=cond, leg=held_leg, sold=sold,
+                                remaining=remainder, price=fill_px, proceeds=round(hedge_proceeds, 4),
+                                mid=fresh_mid, hedge_closed=bool(meta.get("hedge_closed")),
+                            )
+                            notify(
+                                "HEDGE FIRED" if remainder < 0.01 else "HEDGE PARTIAL",
+                                f"Reversal on {m.question}\nSold {held_leg.upper()} at ~{fill_px:.3f} "
+                                f"({sold:.2f} shares, rem {remainder:.2f})",
+                                priority="urgent",
+                            )
                             save_json(STATE_FILE, positions_meta)
                         else:
                             time.sleep(HEDGE_GHOST_SLEEP_S)
                             actual_bal = check_token_balance(held_token)
                             if actual_bal is not None and actual_bal < held_size - 0.01:
                                 ghost_sold = held_size - actual_bal
+                                # Best available estimate when the CLOB response was empty.
                                 ghost_proceeds = ghost_sold * sell_floor
                                 meta["pnl_hedge_proceeds"] = round(meta.get("pnl_hedge_proceeds", 0) + ghost_proceeds, 4)
-                                meta["hedge_closed"] = True
-                                log_event("hedge_ghost_fill", condition_id=cond, leg=held_leg, sold=ghost_sold, price=sell_floor, mid=fresh_mid)
-                                notify("HEDGE FIRED (ghost)", f"Reversal on {m.question}\n{held_leg.upper()} hedge ghost: {ghost_sold:.2f} shares", priority="urgent")
-                                console.print(f"  [bold yellow][GHOST FILL][/] {held_leg.upper()} hedge confirmed: {ghost_sold:.4f} sold")
+                                rem = float(actual_bal)
+                                if rem < 0.01:
+                                    meta["hedge_closed"] = True
+                                    rem = 0.0
+                                log_event(
+                                    "hedge_ghost_fill", condition_id=cond, leg=held_leg,
+                                    sold=ghost_sold, remaining=rem, price=sell_floor, mid=fresh_mid,
+                                    hedge_closed=bool(meta.get("hedge_closed")),
+                                )
+                                notify(
+                                    "HEDGE FIRED (ghost)" if rem < 0.01 else "HEDGE PARTIAL (ghost)",
+                                    f"Reversal on {m.question}\n{held_leg.upper()} hedge ghost: "
+                                    f"{ghost_sold:.2f} sold, rem {rem:.2f}",
+                                    priority="urgent",
+                                )
+                                console.print(
+                                    f"  [bold yellow][GHOST FILL][/] {held_leg.upper()} hedge confirmed: "
+                                    f"{ghost_sold:.4f} sold · rem {rem:.4f}"
+                                )
                                 if cond in _cached_positions:
                                     leg_key = "up" if held_leg == "up" else "dn"
                                     if leg_key in _cached_positions[cond]:
-                                        _cached_positions[cond][leg_key]["size"] = float(actual_bal)
+                                        _cached_positions[cond][leg_key]["size"] = rem
                                 save_json(STATE_FILE, positions_meta)
                             else:
                                 log_event("hedge_fail", condition_id=cond, leg=held_leg, size=held_size, bid=hedge_bid, mid=fresh_mid)
