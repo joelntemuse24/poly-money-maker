@@ -222,7 +222,11 @@ class BtcUnderlyingFeed:
             return out
         edge = float(live) - float(ptb)
         out["edge_usd"] = edge
-        if abs(edge) < min_edge_usd:
+        # Fail-closed: flat underlying never picks a side (even if min_edge is 0).
+        if edge == 0:
+            out["reason"] = "edge_zero"
+            return out
+        if abs(edge) < float(min_edge_usd or 0):
             out["reason"] = "edge_too_small"
             return out
         out["ok"] = True

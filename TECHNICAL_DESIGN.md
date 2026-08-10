@@ -3574,7 +3574,7 @@ atomic mint buyer (which mints complete sets at $1.00), the standalone buy bots:
 | Buy-window polling | 0.1s | 0.1s | 0.1s |
 | Held-position polling | 0.05s | 0.05s | 0.05s |
 | Hedge threshold | 65¢ bid | 65¢ bid | 65¢ bid |
-| Hedge FAK floor | 32.5¢ (`hedge_min_price`) | 32.5¢ | 32.5¢ |
+| Hedge FAK floor | 32¢ (`0.32`) | 32.5¢ (`0.325`) | 32¢ (`0.32`) |
 | Hedge undercut | 2 ticks | 2 ticks | 2 ticks |
 | Book feed | CLOB WS + REST | CLOB WS + REST | CLOB WS + REST |
 | Tick size | 0.01 | 0.001 | 0.01 |
@@ -3707,16 +3707,17 @@ execution on fast reversals:
    is not clearly above threshold, fire immediately (no extra REST RTT)
 3. **Stale path:** REST re-fetch; cancel only if **bid** recovered above
    threshold (mid is not used — wide books poison mid)
-4. **Execution:** FAK sell with limit = `max(hedge_min_price, bid − N ticks)`.
-   Default floor is half threshold (32.5¢); undercut defaults to 2 ticks so a
-   falling book still fills during order RTT. Each retry re-reads the quote.
-5. **Retry sleeps:** `hedge_retry_sleep_s` (50ms) / `hedge_ghost_sleep_s` (150ms)
-   instead of 0.5s / 1s
+4. **Execution:** FAK sell with limit = `max(hedge_min_price, bid − N ticks)`,
+   aligned to the market tick (15m/hourly floor **0.32**; 5m **0.325**). Each
+   retry re-reads the quote; PnL uses actual fill proceeds, not the pre-call floor.
+5. **Retry sleeps:** `hedge_retry_sleep_s` (50ms) / `hedge_ghost_sleep_s` (400ms)
 6. **Ghost fill detection:** If the sell reports 0 fill but the on-chain balance
    decreased, the fill is recorded as a "ghost fill"
 
-While any position is held, the loop polls at `poll_held_s` (50ms) and throttles
-Rich UI updates so the cycle body stays short.
+Book WS uses documented `operation: subscribe|unsubscribe` for token rollover.
+Missing bid/ask sides clear the cache side (no stale-side retention). REST
+fallback for books/last-trade is rate-limited (~200–250ms) so a 50ms hold loop
+cannot stampede the CLOB when WS is down.
 
 ### 21.8 State Isolation
 

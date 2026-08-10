@@ -1,10 +1,15 @@
 """CLOB market-channel WebSocket: live top-of-book for buy-bot speed path.
 
 Endpoint: wss://ws-subscriptions-clob.polymarket.com/ws/market
-Subscribe with assets_ids (+ custom_feature_enabled for best_bid_ask).
 
-Used to cut hedge/buy detection latency vs REST polling. REST remains the
-fallback when a quote is missing or stale.
+Initial subscribe:
+  {"assets_ids": [...], "type": "market", "custom_feature_enabled": true}
+
+Dynamic updates (required `operation`):
+  {"assets_ids": [...], "operation": "subscribe"|"unsubscribe",
+   "custom_feature_enabled": true}
+
+REST remains the fallback when a quote is missing or stale.
 """
 
 from __future__ import annotations
@@ -86,7 +91,6 @@ class ClobMarketBookFeed:
             if wanted == self._wanted:
                 return
             self._wanted = wanted
-            # Drop quotes for tokens we no longer watch
             for tid in list(self._quotes.keys()):
                 if tid not in wanted:
                     self._quotes.pop(tid, None)
@@ -114,27 +118,21 @@ class ClobMarketBookFeed:
         return time.time() - ts
 
     def _store(self, asset_id: str, bid, bid_sz, ask, ask_sz) -> None:
+        """Authoritative top-of-book replace. None clears that side — never keep
+        a previous bid/ask just because the update omitted it, and never refresh
+        the timestamp without applying the new sides (stale-fresh bug).
+        """
         if not asset_id:
             return
         mid = None
         if bid is not None and ask is not None:
             mid = (bid + ask) / 2.0
         with self._lock:
-            prev = self._quotes.get(asset_id)
-            if prev is not None:
-                if bid is None:
-                    bid, bid_sz = prev[0], prev[1]
-                if ask is None:
-                    ask, ask_sz = prev[2], prev[3]
-                if bid is not None and ask is not None:
-                    mid = (bid + ask) / 2.0
-                elif prev[4] is not None and (bid is None or ask is None):
-                    mid = prev[4]
             self._quotes[asset_id] = (
                 bid,
-                float(bid_sz or 0.0),
+                float(bid_sz or 0.0) if bid is not None else 0.0,
                 ask,
-                float(ask_sz or 0.0),
+                float(ask_sz or 0.0) if ask is not None else 0.0,
                 mid,
             )
             self._updated_at[asset_id] = time.time()
@@ -164,18 +162,34 @@ class ClobMarketBookFeed:
             return
         if et == "best_bid_ask":
             asset_id = str(msg.get("asset_id") or "")
-            self._store(asset_id, _f(msg.get("best_bid")), 0.0, _f(msg.get("best_ask")), 0.0)
+            # Both fields are authoritative; null/missing clears that side.
+            self._store(
+                asset_id,
+                _f(msg.get("best_bid")),
+                0.0,
+                _f(msg.get("best_ask")),
+                0.0,
+            )
             return
         if et == "price_change":
             for pc in msg.get("price_changes") or []:
                 if not isinstance(pc, dict):
                     continue
                 asset_id = str(pc.get("asset_id") or "")
-                self._store(asset_id, _f(pc.get("best_bid")), 0.0, _f(pc.get("best_ask")), 0.0)
+                # price_change includes best_bid/best_ask for the asset — treat
+                # as authoritative top-of-book (do not merge with previous).
+                if "best_bid" not in pc and "best_ask" not in pc:
+                    continue
+                self._store(
+                    asset_id,
+                    _f(pc.get("best_bid")),
+                    0.0,
+                    _f(pc.get("best_ask")),
+                    0.0,
+                )
             return
-        # last_trade_price / tick_size_change ignored for top-of-book cache
 
-    def _subscribe(self, ws, tokens: Set[str]) -> None:
+    def _initial_subscribe(self, ws, tokens: Set[str]) -> None:
         if not tokens:
             self._subscribed = set()
             return
@@ -186,7 +200,26 @@ class ClobMarketBookFeed:
         }
         ws.send(json.dumps(payload))
         self._subscribed = set(tokens)
-        log.info("clob_book_ws subscribed n=%s", len(tokens))
+        log.info("clob_book_ws initial_subscribe n=%s", len(tokens))
+
+    def _diff_subscribe(self, ws, tokens: Set[str]) -> None:
+        """Add/remove assets on a live socket using documented operation field."""
+        to_add = tokens - self._subscribed
+        to_drop = self._subscribed - tokens
+        if to_drop:
+            ws.send(json.dumps({
+                "assets_ids": list(to_drop),
+                "operation": "unsubscribe",
+            }))
+            log.info("clob_book_ws unsubscribe n=%s", len(to_drop))
+        if to_add:
+            ws.send(json.dumps({
+                "assets_ids": list(to_add),
+                "operation": "subscribe",
+                "custom_feature_enabled": True,
+            }))
+            log.info("clob_book_ws subscribe n=%s", len(to_add))
+        self._subscribed = set(tokens)
 
     def _run(self) -> None:
         try:
@@ -206,7 +239,8 @@ class ClobMarketBookFeed:
                     self._ws = ws
                     with self._lock:
                         tokens = set(self._wanted)
-                    self._subscribe(ws, tokens)
+                    self._subscribed = set()
+                    self._initial_subscribe(ws, tokens)
                     last_ping[0] = time.time()
 
                 def on_message(ws, message):
@@ -235,7 +269,6 @@ class ClobMarketBookFeed:
                 self._ws = ws
 
                 def runner():
-                    # ping every PING_INTERVAL_S via run_forever
                     ws.run_forever(ping_interval=None, ping_timeout=None)
 
                 t = threading.Thread(target=runner, name="clob-book-ws-io", daemon=True)
@@ -255,8 +288,7 @@ class ClobMarketBookFeed:
                             tokens = set(self._wanted)
                         if tokens != self._subscribed and self._ws is not None:
                             try:
-                                # Full re-subscribe (market channel replaces set)
-                                self._subscribe(self._ws, tokens)
+                                self._diff_subscribe(self._ws, tokens)
                             except Exception as e:
                                 log.warning("clob_book_ws resub_fail: %s", e)
                                 break

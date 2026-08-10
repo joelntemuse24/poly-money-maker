@@ -71,11 +71,11 @@ _STRATEGY_DEFAULTS = {
     "min_underlying_edge_usd": 10.0,
     "hedge_enabled": True,
     "hedge_threshold": 0.65,
-    "hedge_min_price": 0.325,
+    "hedge_min_price": 0.32,
     "hedge_undercut_ticks": 2,
     "hedge_quote_max_age_s": 0.25,
     "hedge_retry_sleep_s": 0.05,
-    "hedge_ghost_sleep_s": 0.15,
+    "hedge_ghost_sleep_s": 0.4,
     "buy_window_min": 5.0,
     "buy_grace_s": 2,
     "buy_cooldown_s": 3,
@@ -406,36 +406,68 @@ def get_book_quote(token_id):
 
 
 def get_quote_fast(token_id, max_age_s=2.0):
-    """Prefer fresh CLOB WS top-of-book; fall back to REST."""
+    """Prefer fresh CLOB WS top-of-book; REST fallback is rate-limited."""
     ws_q = get_book_feed().quote(token_id, max_age_s=max_age_s)
     if ws_q is not None and (ws_q[0] is not None or ws_q[2] is not None):
         return ws_q
-    return get_book_quote(token_id)
+    now = time.time()
+    cached = _rest_quote_cache.get(token_id)
+    if cached is not None:
+        q, ts = cached
+        if (now - ts) < _REST_QUOTE_MIN_INTERVAL_S:
+            return q
+    q = get_book_quote(token_id)
+    _rest_quote_cache[token_id] = (q, now)
+    return q
 
 
 def hedge_sell_price(bid, tick_size, undercut_ticks, min_price):
-    """FAK sell floor: undercut bid so a falling book still fills, clamp to min_price."""
+    """FAK sell floor: undercut bid, align to tick, clamp to min_price."""
     tick = float(tick_size or TICK_SIZE_FALLBACK)
+    if tick <= 0:
+        tick = 0.01
     undercut = max(0, int(undercut_ticks)) * tick
     raw = float(bid or 0) - undercut
-    return max(float(min_price or tick), tick, raw)
+    # Floor to tick so CLOB never rejects for precision (e.g. 0.325 on 0.01).
+    aligned = (int(raw / tick + 1e-12)) * tick
+    floor = float(min_price or tick)
+    floor_aligned = (int(floor / tick + 1e-12)) * tick
+    if floor_aligned + 1e-12 < floor:
+        # min_price wasn't on-tick; round UP to next valid tick for the floor.
+        floor_aligned = (int(floor / tick + 1e-12) + 1) * tick
+    return max(floor_aligned, tick, aligned)
 
 
 # Polymarket UI display rule (docs.polymarket.com/concepts/prices-orderbook):
 # show midpoint when bid-ask spread <= $0.10; otherwise show last traded price.
 POLYMARKET_GUI_SPREAD = 0.10
 
+_rest_quote_cache = {}
+_REST_QUOTE_MIN_INTERVAL_S = 0.2
+_last_trade_cache = {}
+_LAST_TRADE_MIN_INTERVAL_S = 0.25
+
 
 def get_last_trade_price(token_id):
     """CLOB last-trade price for a token (what the UI falls back to on wide spreads)."""
+    now = time.time()
+    cached = _last_trade_cache.get(token_id)
+    if cached is not None:
+        price, ts = cached
+        if (now - ts) < _LAST_TRADE_MIN_INTERVAL_S:
+            return price
     try:
         resp = requests.get(f"{HOST}/last-trade-price", params={"token_id": token_id}, timeout=5)
         resp.raise_for_status()
         data = resp.json()
         price = data.get("price") if isinstance(data, dict) else None
-        return float(price) if price is not None else None
+        out = float(price) if price is not None else None
+        _last_trade_cache[token_id] = (out, now)
+        return out
     except Exception as e:
         log_event("last_trade_fail", token_id=token_id, error=str(e)[:200])
+        if cached is not None:
+            return cached[0]
         return None
 
 
@@ -540,9 +572,10 @@ def buy_market_with_retry(token_id, budget, max_price, tick_size="0.01", max_ret
             time.sleep(0.05)
             continue
         if fresh_ask < min_price:
-            console.print(f"  [dim yellow][SKIP][/] ask {fresh_ask:.3f} < min {min_price:.3f} · attempt {attempt + 1}/{max_retries}")
-            time.sleep(0.05)
-            continue
+            # Safety gate: ask fell below entry band mid-retry — stop (don't chase).
+            console.print(f"  [dim yellow][STOP][/] ask {fresh_ask:.3f} < min {min_price:.3f} · abort retries")
+            log_event("buy_retry_stop_below_min", token_id=token_id, ask=fresh_ask, min_price=min_price, attempt=attempt + 1)
+            break
         shares_affordable = remaining_budget / fresh_ask
         buy_size = min(shares_affordable, fresh_ask_size)
         if buy_size < 0.01:
@@ -596,15 +629,18 @@ def sell_market_with_retry(
 
     Re-reads top-of-book each attempt and undercuts so fills land while the book
     is falling. `price` is the worst (lowest) price we will accept.
+
+    Returns (total_sold, result, proceeds) where proceeds = sum(filled * price).
     """
     total_sold = 0.0
+    total_proceeds = 0.0
     remaining = float(size)
     floor = float(min_price) if min_price is not None else float(tick_size)
     if DRY_RUN:
         price = hedge_sell_price(price_limit, tick_size, undercut_ticks, floor)
         console.print(f"  [bold black on yellow][DRY SELL][/] would SELL {remaining:.4f} {str(token_id)[:12]}… @ ≥{price:.3f}")
         log_event("dry_sell", token_id=token_id, size=remaining, price_limit=price)
-        return 0, None
+        return 0, None, 0.0
     for attempt in range(max_retries):
         if remaining < 0.01:
             break
@@ -628,19 +664,20 @@ def sell_market_with_retry(
                     console.print("  [dim yellow][FAK NULL][/] 0 confirmed fill · stopping")
                     break
                 total_sold += filled
+                total_proceeds += filled * price
                 remaining -= filled
                 console.print(f"  [bold green][EXIT FAK][/]{filled} @ ≥{price:.3f}  [dim]id={str(oid)[:16]}…[/]")
                 log_event("sell_fill", token_id=token_id, filled=filled, price=price, remaining=remaining, attempt=attempt + 1)
                 if remaining < 0.01:
-                    return total_sold, result
+                    return total_sold, result, total_proceeds
         except Exception as e:
             console.print(f"  [dim red]Market sell {attempt+1}/{max_retries} failed: {e}[/]")
         time.sleep(float(retry_sleep_s))
 
     if total_sold > 0:
-        return total_sold, {"partial": True, "sold": total_sold}
+        return total_sold, {"partial": True, "sold": total_sold}, total_proceeds
     console.print(f"  [bold red][EXIT FAIL][/] market sell 0/{size:.4f} cleared")
-    return 0, None
+    return 0, None, 0.0
 
 
 # ------------------------- REDEEM -------------------------
@@ -1128,7 +1165,7 @@ while not _shutdown_requested:
                             quote_age_s=None if quote_age is None else round(quote_age, 3),
                             ws_fast_path=use_cached,
                         )
-                        sold, _ = sell_market_with_retry(
+                        sold, _, hedge_proceeds = sell_market_with_retry(
                             held_token,
                             held_size,
                             hedge_bid,
@@ -1138,16 +1175,18 @@ while not _shutdown_requested:
                             retry_sleep_s=HEDGE_RETRY_SLEEP_S,
                         )
                         if sold > 0:
-                            meta["pnl_hedge_proceeds"] = round(meta.get("pnl_hedge_proceeds", 0) + sold * sell_floor, 4)
-                            log_event("hedge_fill", condition_id=cond, leg=held_leg, sold=sold, price=sell_floor, mid=fresh_mid)
-                            notify("HEDGE FIRED", f"Reversal on {m.question}\nSold {held_leg.upper()} at ≥{sell_floor:.3f} ({sold:.2f} shares)", priority="urgent")
+                            fill_px = (hedge_proceeds / sold) if sold > 0 else sell_floor
+                            meta["pnl_hedge_proceeds"] = round(meta.get("pnl_hedge_proceeds", 0) + hedge_proceeds, 4)
+                            log_event("hedge_fill", condition_id=cond, leg=held_leg, sold=sold, price=fill_px, proceeds=round(hedge_proceeds, 4), mid=fresh_mid)
+                            notify("HEDGE FIRED", f"Reversal on {m.question}\nSold {held_leg.upper()} at ~{fill_px:.3f} ({sold:.2f} shares)", priority="urgent")
                             save_json(STATE_FILE, positions_meta)
                         else:
                             time.sleep(HEDGE_GHOST_SLEEP_S)
                             actual_bal = check_token_balance(held_token)
                             if actual_bal is not None and actual_bal < held_size - 0.01:
                                 ghost_sold = held_size - actual_bal
-                                meta["pnl_hedge_proceeds"] = round(meta.get("pnl_hedge_proceeds", 0) + ghost_sold * sell_floor, 4)
+                                ghost_proceeds = ghost_sold * sell_floor
+                                meta["pnl_hedge_proceeds"] = round(meta.get("pnl_hedge_proceeds", 0) + ghost_proceeds, 4)
                                 log_event("hedge_ghost_fill", condition_id=cond, leg=held_leg, sold=ghost_sold, price=sell_floor, mid=fresh_mid)
                                 notify("HEDGE FIRED (ghost)", f"Reversal on {m.question}\n{held_leg.upper()} hedge ghost: {ghost_sold:.2f} shares", priority="urgent")
                                 console.print(f"  [bold yellow][GHOST FILL][/] {held_leg.upper()} hedge confirmed: {ghost_sold:.4f} sold")
