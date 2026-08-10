@@ -5,15 +5,16 @@ Full architecture: `TECHNICAL_DESIGN.md`.
 
 ## Project at a Glance
 
-Six Python trading bots on Polymarket BTC prediction markets (5m, 15m, hourly):
+**Live on the VM (2026-08-10):** three standalone buy bots. Sell-side and atomic
+mint services are inactive / unused.
 
-| Family | Files | Strategy |
-|---|---|---|
-| Sell-side | `bot.py`, `bot5m.py`, `bothourly.py` | Sell the loser leg at ≤2–5¢, hedge reversals, redeem winners |
-| Buy-side | `buybot.py`, `buybot5m.py`, `buybothourly.py` | Buy winning leg at 96–99¢ ask, hold to expiry, hedge at 65¢ |
+| Family | Files | Deploy status | Strategy |
+|---|---|---|---|
+| Buy-side | `buybot.py`, `buybot5m.py`, `buybothourly.py` | **active** | 96–99¢ ask, budgets $21/$8/$24, hedge 65¢ |
+| Sell-side | `bot.py`, `bot5m.py`, `bothourly.py` | inactive | Live JSON on disk (3¢/3min, 2¢/150s, 5¢/5min) but units not running |
+| Atomic mint | `buy/runner.py` | unused (`polybuy5m` failed) | legacy |
 
-Plus: `sim/` shadow simulator, `check_book.py` diagnostic. The `buy/` atomic mint
-package still exists in-repo but is **not in active use**.
+Plus: `sim/` shadow simulator (inactive), `check_book.py` diagnostic.
 
 ## File Map
 
