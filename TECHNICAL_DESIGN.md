@@ -189,9 +189,8 @@ bots still manage, and if mint is ever re-enabled.
   entries skip this concern entirely.
 - **Automated mint is isolated from the bot.** `bot.py` still only records
   `pnl_entry_cost` from Data API `avgPrice` and never places entry orders. The
-  `buy/` process closes the complete-set fill-quality gap by atomically
-  converting pUSD into equal UP/DOWN inventory at a deterministic $1.00 set cost;
-  it runs live under autonomous arming — see §20.
+  `buy/` mint package can convert pUSD into equal UP/DOWN at $1.00 set cost, but
+  it is **unused / legacy** today — see §20. Live entry is §21 standalone buys.
 
 ### 2.3 The CLOB (Central Limit Order Book)
 
@@ -352,18 +351,19 @@ Internal structure of a buy-side bot (`buybot.py` — same pattern for 5m/hourly
 │                   ▼              ┌───────────┐   │   │
 │              ┌──────────┐        │ Winner    │   │   │
 │              │  State   │        │ Detection │   │   │
-│              │  Cache   │        │ (mid cmp) │   │   │
-│              │ (json)   │        └─────┬─────┘   │   │
-│              └──────────┘              │         │   │
+│              │  Cache   │        │ (GUI +    │   │   │
+│              │ (json)   │        │  underly.)│   │   │
+│              └──────────┘        └─────┬─────┘   │   │
+│                                        │         │   │
 │                                        ▼         │   │
 │                                  ┌───────────┐   │   │
 │                                  │  Buy Exec │   │   │
-│                                  │ (FAK mkt) │   │   │
+│                                  │ (FAK USDC)│   │   │
 │                                  └─────┬─────┘   │   │
 │                                        ▼         │   │
 │                                  ┌───────────┐   │   │
 │                                  │  Hedge    │   │   │
-│                                  │  (65¢)    │   │   │
+│                                  │  (65¢ WS) │   │   │
 │                                  └─────┬─────┘   │   │
 │                                        ▼         │   │
 │                                  ┌───────────┐   │   │
@@ -393,9 +393,11 @@ Internal structure of a buy-side bot (`buybot.py` — same pattern for 5m/hourly
 
 External Services:
   • Polymarket CLOB API  (clob.polymarket.com)    — order book, order submission
+  • Polymarket CLOB WS   (ws-subscriptions-clob…) — live top-of-book (buy bots)
   • Polymarket Data API  (data-api.polymarket.com) — position tracking
-  • Polymarket Gamma API (gamma-api.polymarket.com) — market discovery (polybuy)
-  • Polymarket Relayer   (relayer-v2.polymarket.com) — on-chain mint + redemption
+  • Polymarket Gamma API (gamma-api.polymarket.com) — market discovery
+  • Polymarket RTDS      (realtime data socket)   — BTC TWAP / Binance underlying
+  • Polymarket Relayer   (relayer-v2.polymarket.com) — on-chain redemption (+ legacy mint)
   • ntfy.sh              (ntfy.sh)                 — push notifications
   • Polygon blockchain    (chain ID 137)            — settlement layer
 ```
@@ -427,11 +429,10 @@ queues, no databases.
   imports `bot.py`, and writes only under `sim_data/` (see §19). The shadow
   services are currently stopped on the VM to keep API quota and CPU for the
   live services.
-- **Atomic mint buyer (`buy/`)** discovers standard binary BTC markets and
-  submits one atomic relayer batch containing exact pUSD approval plus CTF
-  `splitPosition`. It never imports `bot.py`, never sells or redeems, owns only
-  `buy_data/`, and is lower-priority than the sell bot (see §20). It runs live
-  and autonomously: a cron job re-arms it and each arm permits exactly one mint.
+- **Atomic mint buyer (`buy/`)** is **unused / legacy**. The package can still
+  discover markets and submit an atomic relayer batch (`splitPosition`), but it
+  is not an active production entry path (see §20). Live entry is the standalone
+  buy bots only.
 
 ---
 
@@ -447,10 +448,13 @@ queues, no databases.
 | `strategy5m.json` | Live 5m strategy config (hot-reloaded, gitignored) | — |
 | `strategy_hourly.example.json` | Example strategy config for `bothourly.py` (5¢ threshold, 90s sell window, 65¢ hedge) | — |
 | `strategy_hourly.json` | Live hourly strategy config (hot-reloaded, gitignored) | — |
-| **Buy-Side Bots (Standalone)** | | |
-| `buybot.py` | 15m buy-side bot — buys winning leg at 96–99¢, ≤$21/market, hedges at 65¢ | ~1146 lines |
-| `buybot5m.py` | 5m buy-side bot — buys winning leg at 96–99¢, ≤$8/market, 90s window | ~1141 lines |
-| `buybothourly.py` | Hourly buy-side bot — buys winning leg at 96–99¢, ≤$24/market, 5min window | ~1144 lines |
+| **Buy-Side Bots (Standalone — live)** | | |
+| `buybot.py` | 15m buy-side bot — GUI winner + underlying gate, ≤$21 USDC/market, WS hedge 65¢ | ~1716 lines |
+| `buybot5m.py` | 5m buy-side bot — same strategy, ≤$8 USDC/market, 90s window, tick 0.001 | ~1705 lines |
+| `buybothourly.py` | Hourly buy-side bot — same strategy, ≤$24 USDC/market, 5min window | ~1707 lines |
+| `buy/btc_price.py` | Resolution-aligned BTC feeds (TWAP 30/60, Binance) + PTB store | ~404 lines |
+| `buy/clob_book_ws.py` | CLOB market-channel WebSocket top-of-book cache | ~351 lines |
+| `buy/market.py` | Shared Gamma/Data market discovery (`MarketGateway`) | — |
 | `strategy_buy.example.json` | Example buy-side config for `buybot.py` (96–99¢ band, ≤$21/market, 3min window) | — |
 | `strategy_buy5m.example.json` | Example buy-side config for `buybot5m.py` (96–99¢ band, ≤$8/market, 90s window) | — |
 | `strategy_buyhourly.example.json` | Example buy-side config for `buybothourly.py` (96–99¢ band, ≤$24/market, 5min window) | — |
@@ -521,7 +525,7 @@ that act as visual module boundaries.
 
 ## 5. Dependency Stack & Why Each Was Chosen
 
-```@/c:/Users/ntemu/Downloads/poly money maker/requirements.txt:1-9
+```
 py_clob_client_v2
 requests
 python-dotenv
@@ -530,6 +534,7 @@ web3
 eth-account
 eth-abi
 eth-utils
+websocket-client
 ```
 
 | Package | What It Does | Why We Use It |
@@ -542,6 +547,7 @@ eth-utils
 | `eth-account` | Ethereum account management | Used to derive the EOA address from the private key for relayer submissions. |
 | `eth-abi` | Ethereum ABI encoding | Used to encode redemption calldata (the raw bytes that tell the smart contract what to do). |
 | `eth-utils` | Ethereum utility functions | Provides `keccak` (for function selectors) and `to_checksum_address` (Ethereum addresses must be in EIP-55 checksum format). |
+| `websocket-client` | WebSocket client | Powers `buy/clob_book_ws.py` (CLOB market channel) for sub-second top-of-book on the buy bots. |
 | `hexbytes` | Hex-string/bytes type used across the eth stack | `buy/relayer.py` imports `HexBytes` from here (older `eth_utils` versions don't re-export it). |
 | `py-builder-relayer-client` / `py-builder-signing-sdk` | Pinned in `requirements.buy.txt` for provenance, but **no longer imported** | The mint relayer now replicates the SDK's PROXY signing flow directly with `eth-abi`/`eth-utils`/`eth-account` + `requests` (§20.9), using `RELAYER_API_KEY`/`RELAYER_API_KEY_ADDRESS` headers instead of builder credentials. |
 
@@ -1116,9 +1122,14 @@ restart affected bots.
 |---|---|---|---|
 | Status | **active** | **active** | **active** |
 | Buy band | 96–99¢ ask | 96–99¢ ask | 96–99¢ ask |
-| Buy budget (USD) | $8 | $21 | $24 |
-| Buy window | last 90s | last 3 min | last 5 min |
+| Buy budget (USD) | **$8** USDC notional | **$21** USDC notional | **$24** USDC notional |
+| Buy window | last 90s (`buy_start_s`) | last 3 min | last 5 min |
+| Winner | Polymarket GUI display price | same | same |
+| Consensus | winner ≥90¢ / loser ≤10¢ | same | same |
+| Underlying gate | **on** (TWAP 30s, ≥$10) | **on** (TWAP 60s, ≥$10) | **on** (Binance, ≥$10) |
 | Hedge threshold | 65¢ | 65¢ | 65¢ |
+| Book feed | CLOB WS + REST | CLOB WS + REST | CLOB WS + REST |
+| Held polling | 0.05s | 0.05s | 0.05s |
 | Series slug | `btc-up-or-down-5m` | `btc-up-or-down-15m` | `btc-up-or-down-hourly` |
 | Tick size | 0.001 | 0.01 | 0.01 |
 | Polling (buy window) | 0.1s | 0.1s | 0.1s |
@@ -1802,26 +1813,19 @@ names over time. `size_matched` might be `takerAmount` in some versions.
 priority order. This is **defensive programming against API drift** — the code
 works regardless of which field name the current API version uses.
 
-**Why return `{"status": "NOT_FOUND"}` on 404?** A 404 on an order query usually
-means the FAK order was fully filled and then archived (removed from the active
-order API). This is actually a *good* sign — it means the order completed. The
-caller (`confirm_fill_size`) uses this to infer a full fill.
+**Why return `{"status": "NOT_FOUND"}` on 404?** A 404 on an order query can mean
+the FAK was archived after matching — but it can also mean the order never
+landed. Callers must **not** treat 404 as proof of a full fill.
 
 ### 12.3 `confirm_fill_size` — Multi-Step Fill Verification
 
-```@/c:/Users/ntemu/Downloads/poly money maker/bot.py:551-575
+```python
 def confirm_fill_size(result, oid, requested):
-    """Best-effort number of shares an order actually filled.
-
-    Prefers an explicit size_matched on the response, otherwise verifies via the
-    order endpoint (a 404/NOT_FOUND means the FAK was archived after filling, so the
-    requested chunk filled). Returns 0 when the fill cannot be confirmed, so callers
-    never assume a full fill on an ambiguous response -- assuming a full fill would
-    over-report sells and silently skip real exits.
-    """
+    """Return confirmed matched size. Never treat order 404 as a full fill —
+    that overstates buys/sells; callers use balance reconciliation for ghosts."""
 ```
 
-**Why is this function so important?** When you submit a FAK sell order, the
+**Why is this function so important?** When you submit a FAK order, the
 response doesn't always tell you how many shares actually filled. Sometimes
 `size_matched` is present and accurate. Sometimes it's 0 even though the order
 did fill. Sometimes the response is just an order ID with no fill information.
@@ -1829,12 +1833,11 @@ did fill. Sometimes the response is just an order ID with no fill information.
 The function follows a **verification cascade**:
 
 1. **Check `size_matched` on the response** — if present and > 0, use it.
-2. **Query the order endpoint** — if the order is `NOT_FOUND` (archived after
-   filling), assume the full requested amount filled.
-3. **Return 0 if unconfirmed** — the docstring is explicit: "callers never
-   assume a full fill on an ambiguous response." This is a **conservative
-   default** — it's better to under-report a fill (and retry next cycle) than to
-   over-report (and think we've sold shares we still hold).
+2. **Query the order endpoint** — if the order is `NOT_FOUND` (404), return **0**
+   (do not assume a full fill). Hedge/buy callers may then reconcile via token
+   balance ("ghost fill") on the next step.
+3. **Return 0 if unconfirmed** — better to under-report and retry than to
+   over-report and skip a real exit or invent size.
 
 ### 12.4 `sell_market_with_retry` — The Execution Engine
 
@@ -3576,6 +3579,8 @@ atomic mint buyer (which mints complete sets at $1.00), the standalone buy bots:
 | Hedge threshold | 65¢ bid | 65¢ bid | 65¢ bid |
 | Hedge FAK floor | 32¢ (`0.32`) | 32.5¢ (`0.325`) | 32¢ (`0.32`) |
 | Hedge undercut | 2 ticks | 2 ticks | 2 ticks |
+| Underlying gate | on · TWAP 30s · ≥$10 | on · TWAP 60s · ≥$10 | on · Binance · ≥$10 |
+| FAK buy `amount` | USDC dollars | USDC dollars | USDC dollars |
 | Book feed | CLOB WS + REST | CLOB WS + REST | CLOB WS + REST |
 | Tick size | 0.01 | 0.001 | 0.01 |
 | Series slug | `btc-up-or-down-15m` | `btc-up-or-down-5m` | `btc-up-or-down-hourly` |
@@ -3650,10 +3655,12 @@ BTC is still near / on the wrong side of the Price To Beat).
 Price To Beat = nearest tick from **that same feed** to market `start_ts` (≤2s skew),
 persisted in `ptb_twap30_buy5m.json` / `ptb_twap60_buy.json` / `ptb_binance_buyhourly.json`.
 
-When `underlying_gate_enabled` (default true) and `min_underlying_edge_usd` (default
-**$10**):
+When `underlying_gate_enabled` (default **true**) — including when
+`min_underlying_edge_usd` is set to **0** — the check still runs and **fail-closes**
+on missing/stale/flat edge (`edge_zero`). Default edge is **$10**:
 
-1. Skip if `|live_btc - ptb| < min_underlying_edge_usd` (`buy_skip_underlying_edge`)
+1. Skip if the check is not `ok` or there is no favored side
+   (`buy_skip_underlying_edge`) — includes `|live − ptb| < min_edge` and flat BTC
 2. Only allow **Up** if `live_btc ≥ ptb + edge`, only **Down** if `live_btc ≤ ptb - edge`
    (`buy_skip_underlying_side` if the book disagrees)
 
@@ -3667,10 +3674,32 @@ When `underlying_gate_enabled` (default true) and `min_underlying_edge_usd` (def
 
 **Speed:** book + last-trade quotes for both legs run in parallel via the existing
 thread pool (~1 RTT). Underlying check is pure memory (no HTTP on the decide path).
+Held + buy-window tokens stay warm on the CLOB market WebSocket.
 
-Sizing uses **`buy_budget`** (USD), not a fixed share count. Each FAK attempt
-buys `min(remaining_budget / ask, top_of_book_size)` shares so spent notional
-stays ≤ the budget (defaults: $21 / $8 / $24 for 15m / 5m / hourly; sized for ~$100/day at $0.98 avg with full participation and no reversals).
+### 21.4.2 Buy sizing (`buy_budget` = USDC notional)
+
+Sizing uses **`buy_budget` in USDC dollars**, not a fixed share count.
+
+CLOB `MarketOrderArgs` semantics:
+
+| Side | `amount` means |
+|---|---|
+| **BUY** | USDC (pUSD) to spend |
+| **SELL** | Shares to sell |
+
+Each FAK buy attempt therefore posts:
+
+```
+spend = min(remaining_budget, ask × top_of_book_ask_size)
+MarketOrderArgs(..., amount=spend, side=BUY, price=ask)
+```
+
+so spent notional stays ≤ the budget (defaults: **$21 / $8 / $24** for 15m / 5m /
+hourly). Cap to top-of-book notional so the order does not walk deeper asks.
+
+Older code passed `budget/ask` (a **share** count) as `amount`. Near $1 that
+accidentally spent ~$21–22 instead of $21 (`remaining_budget` went slightly
+negative in logs). Fixed 2026-08-10 (#54).
 
 The buy uses **ask price** (not bid, not mid) as both the trigger and the FAK
 limit price. The `buy_market_with_retry()` function re-fetches the ask before
@@ -3688,7 +3717,9 @@ winner once it is nearly certain, preferably before it gaps to 99¢.
 
 The 5m bot uses a seconds-based window (`buy_start_s`) while the 15m and hourly
 use minutes-based (`buy_window_min`). This is because 5m markets have sub-2-minute
-remaining times where minute granularity is too coarse.
+remaining times where minute granularity is too coarse. The 5m loop must compute
+`seconds_left = (end_ts_ms - now_ms) / 1000` alongside `minutes_left` — omitting
+that assignment raises `NameError` and aborts the cycle (fixed 2026-08-10, #53).
 
 ### 21.6 One Entry Per Market
 
@@ -3742,6 +3773,12 @@ reloads on change. Type casting is handled correctly: booleans have special
 parsing (`"true"`, `"1"`, `"yes"`), and numeric values are cast via
 `type(expected)(value)`.
 
+**VM note (2026-08-10):** there are currently **no** live `strategy_buy*.json`
+files on the instance. Missing files → full `_STRATEGY_DEFAULTS` apply, including
+`underlying_gate_enabled: true`, `min_underlying_edge_usd: 10`, and the per-bot
+`buy_budget` values above. Copy from `strategy_buy*.example.json` if you want
+hot-tunable overrides without editing code.
+
 ### 21.10 Systemd Services
 
 Each standalone buy bot has its own systemd service:
@@ -3792,13 +3829,14 @@ Atomic mint is **unused**; table kept for contrast with the live standalone bots
 | **Hedge** | Selling the held (winner) leg after a market reversal, to cut losses before the shares go to $0. |
 | **Keccak-256** | The hash function used in Ethereum (a variant of SHA-3). |
 | **Loser leg** | The side of a binary market that will resolve to $0. |
-| **MarketOrderArgs** | SDK argument class for constructing market orders with a price limit. |
+| **MarketOrderArgs** | SDK market-order args. **BUY `amount` = USDC to spend**; **SELL `amount` = shares to sell**. |
 | **Neg-risk** | A gas-efficient on-chain representation for multi-outcome markets on Polymarket. |
 | **Nonce** | A sequential number that prevents transaction replay attacks on Ethereum. |
 | **ntfy.sh** | A free push notification service used for operator alerts. |
 | **Polygon** | An Ethereum Layer 2 blockchain (chain ID 137) where Polymarket operates. |
 | **Proxy wallet** | A smart contract wallet that executes transactions on behalf of an EOA. Polymarket uses this pattern for security. |
 | **pUSD** | Polymarket's USDC token contract on Polygon. |
+| **PTB** | Price To Beat — BTC level at market window open from the resolution oracle; buy bots gate on live BTC vs PTB. |
 | **Redemption** | The process of returning a complete set (UP + DOWN tokens) to the smart contract to receive $1.00 USDC after market resolution. |
 | **Relayer** | A Polymarket-operated service that submits on-chain transactions on behalf of users, paying the gas fees. |
 | **Reversal** | When the market flips direction — the side that was winning starts losing. Triggers the hedge phase. |
@@ -3806,31 +3844,25 @@ Atomic mint is **unused**; table kept for contrast with the live standalone bots
 | **Shadow simulator** | Paper-trading process (`sim/shadow.py`) that applies a configurable sell policy to every market in a series (5m/15m) using public books; never places real orders. |
 | **set_cost** | Complete-set entry cost per share used by the shadow sim (default ~1.043 from history). Live bot does not gate on this. |
 | **polyshadow** | systemd service name for the permanent shadow simulator on GCP. |
-| **polybuy** | Live autonomous service that atomically splits pUSD into complete sets; re-armed by cron (4×/hour for 15m, 1×/hour for hourly), one mint per arm. |
+| **polybuy** | Legacy atomic-mint service (inactive / unused). Not the live entry path. |
 | **polybuybot** / **polybuybot5m** / **polybuybothourly** | Standalone buy-side bots that buy the winning leg at 96–99¢ ask, hold to expiry, and hedge at 65¢ (see §21). |
-| **Atomic mint** | One relayer batch that approves exact pUSD and calls standard-adapter `splitPosition`, producing equal UP and DOWN inventory or reverting entirely. |
+| **Atomic mint** | One relayer batch that approves exact pUSD and calls standard-adapter `splitPosition`, producing equal UP and DOWN inventory or reverting entirely. **Unused** in current production. |
 | **Buy-side bot** | A standalone bot (`buybot.py` / `buybot5m.py` / `buybothourly.py`) that buys the winning leg of a binary market via FAK market order, as opposed to minting complete sets. |
-| **Winner detection** | The process of determining which leg (UP or DOWN) is winning by comparing mid prices: `(bid + ask) / 2`. Used by the standalone buy-side bots. |
+| **GUI display price** | Probability Polymarket shows: midpoint when spread ≤ 10¢, otherwise last trade. Used for buy-bot winner detection. |
+| **Winner detection** | Choosing UP vs DOWN from GUI display prices, then requiring consensus (≈90¢/10¢) plus underlying edge before buying. |
 | **ENOSPC** | OS errno 28 — no space left on device. On the bot VM (2026-07) this was caused mainly by `/var/log` growth, not by `sim_data`. |
 | **Slug** | A human-readable URL fragment identifying a market (e.g., `btc-updown-5m-1783218000`). |
-| **Tick size** | The minimum price increment for a market. On Polymarket, typically $0.01. |
+| **Tick size** | The minimum price increment for a market. On Polymarket, typically $0.01 (5m BTC uses $0.001). |
 | **Token ID** | The ERC-1155 token identifier for a specific outcome in a market. Each binary market has two (UP and DOWN). |
 | **TTM** | Time To Maturity — how much time remains until the market expires. Displayed in seconds when under 1 minute, otherwise in minutes. |
 
 ---
 
-*This document was last updated for the six-bot production architecture
-(2026-08-09): three sell bots (`bot.py` for 15m, `bot5m.py` for 5m,
-`bothourly.py` for hourly), three standalone buy-side bots (`buybot.py` for 15m,
-`buybot5m.py` for 5m, `buybothourly.py` for hourly), and three atomic mint
-buyers (one per series via `buy/` package) run concurrently on a single GCP VM.
-The standalone buy bots purchase the winning leg at 96–99¢ ask price using mid-price
-comparison, hold to expiry, hedge at 65¢, and redeem winners at $1.00 (see §21).
-The atomic mint buyers (`polybuy`) mint complete sets live via an SDK-equivalent
-relayer PROXY flow (§20.9), paced by systemd armer services. The sell bots sell
-the loser leg at configured thresholds, hedge reversals, and redeem winners.
-All six bot families use separate state files, logs, and heartbeats with mutually
-exclusive slug exclusions to prevent cross-bot interference. The shadow
-simulators (`sim/`, §19) are currently stopped on the VM. See §8.5 for a complete
-guide to VM operations, including which files are in Git vs VM-only, how to
-restart each bot, and how to change parameters.*
+*This document was last updated 2026-08-10 for the **live buy-side stack** on the
+VM: `polybuybot` / `polybuybot5m` / `polybuybothourly` only. Sell-side units and
+atomic mint (`polybuy*`) are inactive / unused. Buy bots: Polymarket GUI winner +
+consensus gates, resolution-aligned underlying edge (TWAP 30/60 or Binance),
+CLOB WebSocket books, FAK buys sized in **USDC** (`buy_budget` $21 / $8 / $24),
+hedge at 65¢ with tick-aligned floors, redeem winners at $1.00 (see §21). No
+live `strategy_buy*.json` → code defaults. Shadow simulators (`sim/`, §19) remain
+stopped. See §8.5 for VM operations.*
