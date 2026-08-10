@@ -1062,7 +1062,7 @@ Nine processes run concurrently on the VM (8 Python + 1 shadow sim):
 | **Standalone Buy-Side Bots** | | | |
 | 15m buy | `.venv/bin/python buybot.py` | `btc-updown` (15m) | systemd (`polybuybot`) |
 | 5m buy | `.venv/bin/python buybot5m.py` | `btc-updown-5m` (5m) | systemd (`polybuybot5m`) |
-| Hourly buy | `.venv/bin/python buybothourly.py` | `bitcoin-up-or-down` (hourly) | systemd (`polybuybothourly`) |
+| Hourly buy | `.venv/bin/python buybothourly.py` | `btc-up-or-down-hourly` | systemd (`polybuybothourly`) |
 | **Atomic Mint Buyers** (VM-only, service files managed on-VM) | | | |
 | 15m mint | `.venv-buy/bin/python -m buy` | `btc-up-or-down-15m` | systemd (`polybuy`) |
 | 5m mint | `.venv-buy/bin/python -m buy --config strategy.buy.5m.json` | `btc-up-or-down-5m` | systemd (`polybuy5m`) |
@@ -3559,7 +3559,7 @@ atomic mint buyer (which mints complete sets at $1.00), the standalone buy bots:
 | Buy-window polling | 0.1s | 0.1s | 0.1s |
 | Hedge threshold | 65¢ bid | 65¢ bid | 65¢ bid |
 | Tick size | 0.01 | 0.001 | 0.01 |
-| Series slug | `btc-up-or-down-15m` | `btc-up-or-down-5m` | `bitcoin-up-or-down` |
+| Series slug | `btc-up-or-down-15m` | `btc-up-or-down-5m` | `btc-up-or-down-hourly` |
 | Slug prefix | `btc-updown` | `btc-updown-5m` | `bitcoin-up-or-down` |
 | Slug excludes | `btc-updown-5m`, `bitcoin-up-or-down` | `bitcoin-up-or-down` | `btc-updown-5m`, `btc-updown` |
 
