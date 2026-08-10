@@ -26,6 +26,7 @@ from py_clob_client_v2 import (
 from py_clob_client_v2.order_builder.constants import SELL, BUY
 
 from buy.market import MarketGateway
+from buy.btc_price import get_btc_feed, append_research, SOURCE_BINANCE
 
 console = Console()
 load_dotenv()
@@ -37,6 +38,9 @@ CHAIN_ID = 137
 STATE_FILE = "positions_buyhourly.json"
 PNL_FILE = "pnl_buyhourly.json"
 HEARTBEAT_FILE = ".heartbeat_buyhourly"
+RESEARCH_FILE = "underlying_research_buyhourly.jsonl"
+PTB_STORE_FILE = "ptb_binance_buyhourly.json"
+UNDERLYING_SOURCE = SOURCE_BINANCE
 SERIES_SLUG = "btc-up-or-down-hourly"
 SLUG_PREFIX = "bitcoin-up-or-down"
 SLUG_EXCLUDES = ("btc-updown-5m", "btc-updown")
@@ -56,6 +60,14 @@ RELAYER_API_KEY_ADDRESS = os.getenv("RELAYER_API_KEY_ADDRESS", "0x42aec4505559c0
 _STRATEGY_DEFAULTS = {
     "buy_threshold": 0.96,
     "buy_max_price": 0.99,
+    # Consensus on Polymarket GUI display price (mid if spread≤10¢ else last trade).
+    "min_winner_bid": 0.90,
+    "max_loser_bid": 0.10,
+    "min_bid_edge": 0.05,
+    # Skip buys unless live BTC is ≥ this many USD from the window Price To Beat,
+    # and only allow the side matching that underlying move.
+    "underlying_gate_enabled": True,
+    "min_underlying_edge_usd": 10.0,
     "hedge_enabled": True,
     "hedge_threshold": 0.65,
     "buy_window_min": 5.0,
@@ -115,6 +127,12 @@ def load_strategy():
 
 _strat = load_strategy()
 BUY_THRESHOLD = _strat["buy_threshold"]
+BUY_MAX_PRICE = _strat["buy_max_price"]
+MIN_WINNER_BID = _strat["min_winner_bid"]
+MAX_LOSER_BID = _strat["max_loser_bid"]
+MIN_BID_EDGE = _strat["min_bid_edge"]
+UNDERLYING_GATE_ENABLED = _strat["underlying_gate_enabled"]
+MIN_UNDERLYING_EDGE_USD = _strat["min_underlying_edge_usd"]
 HEDGE_ENABLED = _strat["hedge_enabled"]
 HEDGE_THRESHOLD = _strat["hedge_threshold"]
 BUY_WINDOW_MIN = _strat["buy_window_min"]
@@ -334,7 +352,7 @@ def get_book_bid(token_id):
 
 def get_book_quote(token_id):
     """Return (bid_price, bid_size, ask_price, ask_size, mid_price).
-    mid_price is None when no asks exist — callers must NOT trigger on None."""
+    mid_price is None when either side of the book is missing."""
     try:
         book = safe_api_call(client.get_order_book, token_id)
         path = "sdk"
@@ -351,24 +369,50 @@ def get_book_quote(token_id):
     try:
         bids = book.get("bids", [])
         asks = book.get("asks", [])
-        if not bids:
-            return None, 0.0, None, 0.0, None
-        best_bid = max(bids, key=lambda x: float(x.get("price", 0)))
-        bid_price = float(best_bid.get("price", 0))
-        bid_size = float(best_bid.get("size", 0))
+        bid_price = None
+        bid_size = 0.0
+        ask_price = None
+        ask_size = 0.0
+        mid_price = None
+        if bids:
+            best_bid = max(bids, key=lambda x: float(x.get("price", 0)))
+            bid_price = float(best_bid.get("price", 0))
+            bid_size = float(best_bid.get("size", 0))
         if asks:
             best_ask = min(asks, key=lambda x: float(x.get("price", 0)))
             ask_price = float(best_ask.get("price", 0))
             ask_size = float(best_ask.get("size", 0))
+        if bid_price is not None and ask_price is not None:
             mid_price = (bid_price + ask_price) / 2.0
-        else:
-            ask_price = None
-            ask_size = 0.0
-            mid_price = None
         return bid_price, bid_size, ask_price, ask_size, mid_price
     except Exception as e:
         log_event("book_quote_fail", token_id=token_id, error=str(e), path=path)
         return None, 0.0, None, 0.0, None
+
+
+# Polymarket UI display rule (docs.polymarket.com/concepts/prices-orderbook):
+# show midpoint when bid-ask spread <= $0.10; otherwise show last traded price.
+POLYMARKET_GUI_SPREAD = 0.10
+
+
+def get_last_trade_price(token_id):
+    """CLOB last-trade price for a token (what the UI falls back to on wide spreads)."""
+    try:
+        resp = requests.get(f"{HOST}/last-trade-price", params={"token_id": token_id}, timeout=5)
+        resp.raise_for_status()
+        data = resp.json()
+        price = data.get("price") if isinstance(data, dict) else None
+        return float(price) if price is not None else None
+    except Exception as e:
+        log_event("last_trade_fail", token_id=token_id, error=str(e)[:200])
+        return None
+
+
+def polymarket_display_price(bid, ask, last_trade):
+    """Probability a human sees on Polymarket for this outcome."""
+    if bid is not None and ask is not None and (ask - bid) <= POLYMARKET_GUI_SPREAD + 1e-12:
+        return (bid + ask) / 2.0
+    return last_trade
 
 
 # ------------------------- TICK SIZE -------------------------
@@ -465,9 +509,10 @@ def buy_market_with_retry(token_id, budget, max_price, tick_size="0.01", max_ret
             time.sleep(0.5)
             continue
         if fresh_ask < min_price:
-            console.print(f"  [dim yellow][SKIP][/] ask {fresh_ask:.3f} < min {min_price:.3f} · attempt {attempt + 1}/{max_retries}")
-            time.sleep(0.5)
-            continue
+            # Safety gate: ask fell below entry band mid-retry — stop (don't chase).
+            console.print(f"  [dim yellow][STOP][/] ask {fresh_ask:.3f} < min {min_price:.3f} · abort retries")
+            log_event("buy_retry_stop_below_min", token_id=token_id, ask=fresh_ask, min_price=min_price, attempt=attempt + 1)
+            break
         shares_affordable = remaining_budget / fresh_ask
         buy_size = min(shares_affordable, fresh_ask_size)
         if buy_size < 0.01:
@@ -659,6 +704,7 @@ except Exception as e:
     console.print(f"[bold red]▶ COLLATERAL [WARN][/] [dim]{e}[/]")
 
 market_gateway = MarketGateway(gamma_url=GAMMA_API, data_api_url=DATA_API, discover_cache_s=5.0)
+btc_feed = get_btc_feed(UNDERLYING_SOURCE, PTB_STORE_FILE)
 
 banner = Panel(
     Align.center(
@@ -723,6 +769,11 @@ while not _shutdown_requested:
         _strat = load_strategy()
         BUY_THRESHOLD = _strat["buy_threshold"]
         BUY_MAX_PRICE = _strat["buy_max_price"]
+        MIN_WINNER_BID = _strat["min_winner_bid"]
+        MAX_LOSER_BID = _strat["max_loser_bid"]
+        MIN_BID_EDGE = _strat["min_bid_edge"]
+        UNDERLYING_GATE_ENABLED = _strat["underlying_gate_enabled"]
+        MIN_UNDERLYING_EDGE_USD = _strat["min_underlying_edge_usd"]
         HEDGE_ENABLED = _strat["hedge_enabled"]
         HEDGE_THRESHOLD = _strat["hedge_threshold"]
         BUY_WINDOW_MIN = _strat["buy_window_min"]
@@ -793,6 +844,25 @@ while not _shutdown_requested:
                     outcome = "hedge" if hedge_proceeds > 0 else ("win" if redeem_value > 0 else "loss")
                     net = record_pnl(c, gc_meta.get("question", "?"), entry_cost, redeem_value, hedge_proceeds, outcome)
                     log_event("pnl_recorded", condition_id=c, entry=entry_cost, hedge=hedge_proceeds, redeem=redeem_value, net=round(net, 4), outcome=outcome)
+                    append_research(RESEARCH_FILE, {
+                        "event": "resolved",
+                        "condition_id": c,
+                        "slug": gc_meta.get("slug"),
+                        "question": gc_meta.get("question"),
+                        "start_ts": gc_meta.get("start_ts"),
+                        "end_ts": gc_meta.get("end_ts"),
+                        "bought_leg": gc_meta.get("bought_leg"),
+                        "fill_price": gc_meta.get("fill_price"),
+                        "ptb": gc_meta.get("ptb"),
+                        "ptb_source": gc_meta.get("ptb_source"),
+                        "entry_live_btc": gc_meta.get("entry_live_btc"),
+                        "entry_edge_usd": gc_meta.get("entry_edge_usd"),
+                        "outcome": outcome,
+                        "entry_cost": entry_cost,
+                        "hedge_proceeds": hedge_proceeds,
+                        "redeem_value": redeem_value,
+                        "net": round(net, 4),
+                    })
                 del positions_meta[c]
             if stale_conds:
                 log_event("gc", stale_conditions=stale_conds)
@@ -1024,30 +1094,159 @@ while not _shutdown_requested:
             if daily_notional + est_cost > MAX_DAILY_NOTIONAL + 1e-9:
                 continue
 
-            # Fresh book quotes — no stale cache for buy decisions
-            up_bid, _, up_ask, _, up_mid = get_book_quote(m.up_token)
-            dn_bid, _, dn_ask, _, dn_mid = get_book_quote(m.dn_token)
+            # Fresh book + last trade in parallel (1 RTT, not 4).
+            # GUI display = mid if spread ≤ 10¢ else last trade.
+            fut_up = _book_executor.submit(get_book_quote, m.up_token)
+            fut_dn = _book_executor.submit(get_book_quote, m.dn_token)
+            fut_ul = _book_executor.submit(get_last_trade_price, m.up_token)
+            fut_dl = _book_executor.submit(get_last_trade_price, m.dn_token)
+            up_bid, _, up_ask, _, up_mid = fut_up.result()
+            dn_bid, _, dn_ask, _, dn_mid = fut_dn.result()
+            up_last = fut_ul.result()
+            dn_last = fut_dl.result()
+            up_gui = polymarket_display_price(up_bid, up_ask, up_last)
+            dn_gui = polymarket_display_price(dn_bid, dn_ask, dn_last)
 
-            if up_mid is None and dn_mid is None:
-                continue  # no sentiment
+            # Lock Chainlink PTB as soon as the window is open (memory/disk only).
+            if m.start_ts and time.time() >= m.start_ts:
+                ptb_rec = btc_feed.capture_ptb(m.start_ts)
+                if ptb_rec and ptb_rec.get("ok") and not meta.get("ptb"):
+                    meta["ptb"] = ptb_rec.get("ptb")
+                    meta["ptb_source"] = ptb_rec.get("source")
+                    meta["ptb_tick_ts_ms"] = ptb_rec.get("ptb_tick_ts_ms")
+                    meta["start_ts"] = m.start_ts
+                    meta["end_ts"] = m.end_ts
+                    meta["slug"] = getattr(m, "slug", None)
+                    append_research(RESEARCH_FILE, {
+                        "event": "ptb_capture",
+                        "condition_id": cond,
+                        "slug": meta.get("slug"),
+                        "question": m.question,
+                        "start_ts": m.start_ts,
+                        "end_ts": m.end_ts,
+                        **{k: ptb_rec.get(k) for k in ("ptb", "source", "ptb_tick_ts_ms", "ptb_skew_ms", "ok", "feed", "feed_label", "resolution_url")},
+                    })
+                    save_json(STATE_FILE, positions_meta)
 
-            # Determine winner by mid
-            up_winning = up_mid is not None and dn_mid is not None and up_mid > dn_mid
-            dn_winning = up_mid is not None and dn_mid is not None and dn_mid > up_mid
-
-            # Handle one-mid-None edge case
-            if up_mid is not None and dn_mid is None:
-                up_winning = up_mid > 0.50
-            if dn_mid is not None and up_mid is None:
-                dn_winning = dn_mid > 0.50
-
-            # Ambiguous — mids too close
-            if up_mid is not None and dn_mid is not None and abs(up_mid - dn_mid) < 0.01:
-                log_event("buy_skip_ambiguous", condition_id=cond, up_mid=up_mid, dn_mid=dn_mid)
+            if up_gui is None or dn_gui is None:
+                log_event(
+                    "buy_skip_incomplete_book",
+                    condition_id=cond,
+                    up_bid=up_bid, dn_bid=dn_bid, up_ask=up_ask, dn_ask=dn_ask,
+                    up_last=up_last, dn_last=dn_last, up_gui=up_gui, dn_gui=dn_gui,
+                )
                 continue
 
-            up_buy = up_winning and up_ask is not None and BUY_THRESHOLD <= up_ask <= BUY_MAX_PRICE
-            dn_buy = dn_winning and dn_ask is not None and BUY_THRESHOLD <= dn_ask <= BUY_MAX_PRICE
+            # Winner by GUI display price (not raw mid — wide spreads poison mid).
+            gui_edge = abs(up_gui - dn_gui)
+            if gui_edge < MIN_BID_EDGE:
+                log_event(
+                    "buy_skip_ambiguous",
+                    condition_id=cond,
+                    up_gui=up_gui, dn_gui=dn_gui, gui_edge=round(gui_edge, 4),
+                    up_bid=up_bid, dn_bid=dn_bid, up_ask=up_ask, dn_ask=dn_ask,
+                )
+                continue
+
+            up_winning = up_gui > dn_gui
+            dn_winning = dn_gui > up_gui
+
+            # Ask in band to execute + GUI consensus (screen shows clear winner).
+            up_ask_ok = up_ask is not None and BUY_THRESHOLD <= up_ask <= BUY_MAX_PRICE
+            dn_ask_ok = dn_ask is not None and BUY_THRESHOLD <= dn_ask <= BUY_MAX_PRICE
+            up_consensus = up_gui >= MIN_WINNER_BID and dn_gui <= MAX_LOSER_BID
+            dn_consensus = dn_gui >= MIN_WINNER_BID and up_gui <= MAX_LOSER_BID
+
+            if up_winning and up_ask_ok and not up_consensus:
+                log_event(
+                    "buy_skip_no_consensus",
+                    condition_id=cond, leg="up",
+                    up_gui=up_gui, dn_gui=dn_gui, up_ask=up_ask,
+                    up_bid=up_bid, dn_bid=dn_bid, up_last=up_last, dn_last=dn_last,
+                    min_winner_bid=MIN_WINNER_BID, max_loser_bid=MAX_LOSER_BID,
+                )
+            if dn_winning and dn_ask_ok and not dn_consensus:
+                log_event(
+                    "buy_skip_no_consensus",
+                    condition_id=cond, leg="down",
+                    up_gui=up_gui, dn_gui=dn_gui, dn_ask=dn_ask,
+                    up_bid=up_bid, dn_bid=dn_bid, up_last=up_last, dn_last=dn_last,
+                    min_winner_bid=MIN_WINNER_BID, max_loser_bid=MAX_LOSER_BID,
+                )
+
+            up_buy = up_winning and up_ask_ok and up_consensus
+            dn_buy = dn_winning and dn_ask_ok and dn_consensus
+
+            # Underlying BTC (Chainlink RTDS) vs Price To Beat at window open.
+            uchk = None
+            if UNDERLYING_GATE_ENABLED and (up_buy or dn_buy):
+                uchk = btc_feed.underlying_check(m.start_ts, MIN_UNDERLYING_EDGE_USD)
+                favored = uchk.get("favored")
+                if not uchk.get("ok") or not favored:
+                    log_event(
+                        "buy_skip_underlying_edge",
+                        condition_id=cond,
+                        ptb=uchk.get("ptb"),
+                        live_btc=uchk.get("live_btc"),
+                        edge_usd=None if uchk.get("edge_usd") is None else round(uchk["edge_usd"], 2),
+                        min_edge_usd=MIN_UNDERLYING_EDGE_USD,
+                        ptb_source=uchk.get("ptb_source"),
+                        live_source=uchk.get("live_source"),
+                        live_age_s=uchk.get("live_age_s"),
+                        reason=uchk.get("reason"),
+                        up_gui=up_gui,
+                        dn_gui=dn_gui,
+                    )
+                    append_research(RESEARCH_FILE, {
+                        "event": "decision_skip_underlying",
+                        "condition_id": cond,
+                        "slug": getattr(m, "slug", None),
+                        "question": m.question,
+                        "start_ts": m.start_ts,
+                        "end_ts": m.end_ts,
+                        "up_gui": up_gui,
+                        "dn_gui": dn_gui,
+                        "up_ask": up_ask,
+                        "dn_ask": dn_ask,
+                        **{k: uchk.get(k) for k in (
+                            "ptb", "live_btc", "edge_usd", "favored", "ptb_source",
+                            "live_source", "live_age_s", "ptb_skew_ms", "reason", "ok",
+                            "feed", "feed_label", "resolution_url",
+                        )},
+                    })
+                    continue
+                if favored == "up":
+                    dn_buy = False
+                else:
+                    up_buy = False
+                if not (up_buy or dn_buy):
+                    log_event(
+                        "buy_skip_underlying_side",
+                        condition_id=cond,
+                        favored=favored,
+                        ptb=uchk.get("ptb"),
+                        live_btc=uchk.get("live_btc"),
+                        edge_usd=round(uchk["edge_usd"], 2),
+                        up_gui=up_gui,
+                        dn_gui=dn_gui,
+                    )
+                    append_research(RESEARCH_FILE, {
+                        "event": "decision_skip_side",
+                        "condition_id": cond,
+                        "slug": getattr(m, "slug", None),
+                        "question": m.question,
+                        "start_ts": m.start_ts,
+                        "end_ts": m.end_ts,
+                        "up_gui": up_gui,
+                        "dn_gui": dn_gui,
+                        "book_wanted": "up" if up_winning else "down",
+                        **{k: uchk.get(k) for k in (
+                            "ptb", "live_btc", "edge_usd", "favored", "ptb_source",
+                            "live_source", "live_age_s", "ptb_skew_ms",
+                            "feed", "feed_label", "resolution_url",
+                        )},
+                    })
+                    continue
 
             if not (up_buy or dn_buy):
                 continue
@@ -1055,6 +1254,7 @@ while not _shutdown_requested:
             buy_token = m.up_token if up_buy else m.dn_token
             buy_ask = up_ask if up_buy else dn_ask
             buy_leg = "up" if up_buy else "down"
+            buy_gui = up_gui if up_buy else dn_gui
 
             # Cooldown
             last_buy_at = meta.get("last_buy_at") or 0
@@ -1064,8 +1264,8 @@ while not _shutdown_requested:
             _ttm_disp = f"{minutes_left*60:>3.0f}s" if minutes_left < 1 else f"{minutes_left:>4.1f}m"
             console.print(Panel(
                 f"  [bright_white]{m.question}[/]\n"
-                f"  [bright_green]UP[/]   mid [bold]{up_mid or 0:.3f}[/]  ask [bold]{up_ask or 0:.3f}[/]   │   "
-                f"[bright_red]DN[/]  mid [bold]{dn_mid or 0:.3f}[/]  ask [bold]{dn_ask or 0:.3f}[/]   │   "
+                f"  [bright_green]UP[/]   gui [bold]{up_gui:.3f}[/]  ask [bold]{up_ask or 0:.3f}[/]   │   "
+                f"[bright_red]DN[/]  gui [bold]{dn_gui:.3f}[/]  ask [bold]{dn_ask or 0:.3f}[/]   │   "
                 f"[bold green]TTM {_ttm_disp}[/]",
                 title=f"[bold bright_green]▲ BUY TRIGGER — {buy_leg.upper()} LEG[/]",
                 border_style="bright_green",
@@ -1073,10 +1273,37 @@ while not _shutdown_requested:
             ))
 
             tick = get_tick_size_cached(buy_token)
+            if uchk is None and m.start_ts:
+                uchk = btc_feed.underlying_check(m.start_ts, 0)  # snapshot only
             log_event(
                 "buy_attempt", condition_id=cond, leg=buy_leg, budget=BUY_BUDGET,
-                ask=buy_ask, threshold=BUY_THRESHOLD, minutes_left=round(minutes_left, 2),
+                ask=buy_ask, gui=buy_gui, up_gui=up_gui, dn_gui=dn_gui,
+                threshold=BUY_THRESHOLD, minutes_left=round(minutes_left, 2),
+                ptb=(uchk or {}).get("ptb"),
+                live_btc=(uchk or {}).get("live_btc"),
+                edge_usd=(uchk or {}).get("edge_usd"),
+                ptb_source=(uchk or {}).get("ptb_source"),
+                live_source=(uchk or {}).get("live_source"),
             )
+            append_research(RESEARCH_FILE, {
+                "event": "buy_attempt",
+                "condition_id": cond,
+                "slug": getattr(m, "slug", None),
+                "question": m.question,
+                "start_ts": m.start_ts,
+                "end_ts": m.end_ts,
+                "leg": buy_leg,
+                "ask": buy_ask,
+                "gui": buy_gui,
+                "up_gui": up_gui,
+                "dn_gui": dn_gui,
+                "minutes_left": round(minutes_left, 2),
+                **{k: (uchk or {}).get(k) for k in (
+                    "ptb", "live_btc", "edge_usd", "favored", "ptb_source",
+                    "live_source", "live_age_s", "ptb_skew_ms",
+                    "feed", "feed_label", "resolution_url",
+                )},
+            })
 
             bought = buy_market_with_retry(buy_token, BUY_BUDGET, BUY_MAX_PRICE, tick_size=tick, min_price=BUY_THRESHOLD)
             if bought > 0:
@@ -1086,10 +1313,33 @@ while not _shutdown_requested:
                 meta["bought_size"] = bought
                 meta["fill_price"] = buy_ask
                 meta["pnl_entry_cost"] = round(bought * buy_ask, 4)
+                if uchk:
+                    meta["ptb"] = uchk.get("ptb")
+                    meta["ptb_source"] = uchk.get("ptb_source")
+                    meta["entry_live_btc"] = uchk.get("live_btc")
+                    meta["entry_edge_usd"] = uchk.get("edge_usd")
                 log_event(
                     "buy_success", condition_id=cond, leg=buy_leg, bought=bought,
                     price=buy_ask, entry_cost=meta["pnl_entry_cost"],
+                    ptb=meta.get("ptb"), live_btc=meta.get("entry_live_btc"),
+                    edge_usd=meta.get("entry_edge_usd"),
                 )
+                append_research(RESEARCH_FILE, {
+                    "event": "buy_fill",
+                    "condition_id": cond,
+                    "slug": getattr(m, "slug", None),
+                    "question": m.question,
+                    "start_ts": m.start_ts,
+                    "end_ts": m.end_ts,
+                    "leg": buy_leg,
+                    "bought": bought,
+                    "price": buy_ask,
+                    "entry_cost": meta["pnl_entry_cost"],
+                    "ptb": meta.get("ptb"),
+                    "live_btc": meta.get("entry_live_btc"),
+                    "edge_usd": meta.get("entry_edge_usd"),
+                    "ptb_source": meta.get("ptb_source"),
+                })
                 notify(
                     "BUY FILLED",
                     f"{m.question}\nBought {buy_leg.upper()} at ~{buy_ask:.3f} ({bought:.2f} shares)",

@@ -6,3 +6,4 @@ web3
 eth-account
 eth-abi
 eth-utils
+websocket-client

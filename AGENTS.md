@@ -99,7 +99,16 @@ python check_book.py
 - `[DRY BUY]` / `[DRY SELL]` in dry-run — confirms trigger logic fires
 - `cycle_error` in logs — indicates an unhandled exception (bot survives but logs it)
 - `hedge_attempt` / `hedge_fill` — hedge logic triggered
-- `buy_skip_ambiguous` — winner detection skipped (mids too close)
+- `buy_skip_ambiguous` — GUI display prices too close
+- `buy_skip_no_consensus` — ask in band but Polymarket GUI prices don't show a clear winner/loser
+- `buy_skip_incomplete_book` — missing GUI price on one or both legs (no mid and no last trade)
+- `buy_skip_underlying_edge` — live Chainlink BTC not ≥ `min_underlying_edge_usd` ($10) from captured PTB
+- `buy_skip_underlying_side` — book wants the opposite leg from the underlying move
+
+Research / accuracy: each bot streams its **resolution oracle** (5m=Chainlink TWAP 30s,
+15m=TWAP 60s, hourly=Binance BTCUSDT) via Polymarket RTDS. PTB captures + decisions
+land in `underlying_research_buy*.jsonl` and `ptb_*_buy*.json` (gitignored).
+
 
 ## Key Conventions
 

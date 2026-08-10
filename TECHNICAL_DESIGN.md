@@ -3576,31 +3576,89 @@ atomic mint buyer (which mints complete sets at $1.00), the standalone buy bots:
 
 ### 21.3 Winner Detection Logic
 
-The bot determines which leg is winning by comparing **mid prices**:
+Winner detection uses the **same display price Polymarket shows in the UI**
+([prices & orderbook docs](https://docs.polymarket.com/concepts/prices-orderbook)):
 
 ```
-up_mid = (up_bid + up_ask) / 2
-dn_mid = (dn_bid + dn_ask) / 2
-
-if up_mid > dn_mid → UP is winning
-if dn_mid > up_mid → DOWN is winning
+if best_bid and best_ask and (ask - bid) ≤ $0.10:
+    gui_price = (bid + ask) / 2      # midpoint
+else:
+    gui_price = last_trade_price     # CLOB /last-trade-price
 ```
 
-**Edge cases handled:**
+That is what a human sees as "97%" on the site. A wide book on the loser
+(bid 5¢ / ask 97¢) does **not** display as ~51% — the UI switches to last
+trade (often a few cents). The bot now follows that rule via
+`polymarket_display_price()` + `get_last_trade_price()`.
 
-- **Ambiguous skip:** If mids are within 1¢ of each other (`abs(up_mid - dn_mid) < 0.01`),
-  the bot skips the market — no clear winner.
-- **One-mid-None:** If only one leg has a mid price (other has no asks), that leg
-  must have mid > 0.50 to qualify as winning.
-- **Both mids None:** No data — skip.
+```
+if either gui_price is None → skip (buy_skip_incomplete_book)
+if abs(up_gui - dn_gui) < min_bid_edge (0.05) → skip (ambiguous)
+
+if up_gui > dn_gui → UP is winning
+if dn_gui > up_gui → DOWN is winning
+```
+
+**Consensus gates (required before buy):**
+
+- Winning GUI price ≥ `min_winner_bid` (0.90) — screen shows a clear favorite
+- Losing GUI price ≤ `max_loser_bid` (0.10) — other side clearly losing
+- Ask still in `[buy_threshold, buy_max_price]` (execution price, not display)
+
+Skips log as `buy_skip_incomplete_book`, `buy_skip_ambiguous`, or
+`buy_skip_no_consensus`.
+
+**Why this matters:** Blind mid/`one-mid-None` logic bought stale ~97¢ asks on
+the wrong leg when the true winner's asks were cleared. The GUI never looked
+like that; matching the GUI display stops those fake "reversals."
+
+Gamma `outcomePrices` is a lagged cache of similar numbers — fine for cards,
+too slow/stale for the buy window. Live CLOB book + last trade is the source.
 
 ### 21.4 Buy Trigger
 
-Once the winner is determined, the bot checks:
+Once the winner passes GUI consensus, the bot checks:
 
 ```
 BUY_THRESHOLD (0.96) ≤ winning_ask ≤ BUY_MAX_PRICE (0.99)
+AND winning_gui ≥ min_winner_bid (0.90)
+AND opposite_gui ≤ max_loser_bid (0.10)
+AND underlying gate passes (see §21.4.1)
 ```
+
+### 21.4.1 Underlying BTC edge gate
+
+Book probabilities can diverge from Bitcoin itself (e.g. Up printing 96–99¢ while
+BTC is still near / on the wrong side of the Price To Beat).
+
+`buy/btc_price.py` uses **the same oracle Polymarket resolves on**, per window:
+
+| Bot | Resolution source | RTDS feed |
+|---|---|---|
+| 5m | [Chainlink BTC/USD TWAP 30s](https://data.chain.link/streams/btc-usd-twap-30s-streams) | `crypto_prices_twap_thirty` |
+| 15m | [Chainlink BTC/USD TWAP 60s](https://data.chain.link/streams/btc-usd-twap-60s-streams) | `crypto_prices_twap_sixty` |
+| Hourly | [Binance BTC/USDT spot](https://www.binance.com/en/trade/BTC_USDT?type=spot) | `crypto_prices` / `btcusdt` |
+
+Price To Beat = nearest tick from **that same feed** to market `start_ts` (≤2s skew),
+persisted in `ptb_twap30_buy5m.json` / `ptb_twap60_buy.json` / `ptb_binance_buyhourly.json`.
+
+When `underlying_gate_enabled` (default true) and `min_underlying_edge_usd` (default
+**$10**):
+
+1. Skip if `|live_btc - ptb| < min_underlying_edge_usd` (`buy_skip_underlying_edge`)
+2. Only allow **Up** if `live_btc ≥ ptb + edge`, only **Down** if `live_btc ≤ ptb - edge`
+   (`buy_skip_underlying_side` if the book disagrees)
+
+**Accuracy (important for research):**
+
+| Input | Source | Notes |
+|---|---|---|
+| Live / PTB | Per-bot resolution feed above (TWAP 30 / TWAP 60 / Binance) | Same pipe Polymarket settles on; ~1 Hz via RTDS; memory-only on the buy hot path |
+| Missed window open | PTB marked missing | Buys refused — we do not invent a strike from another exchange |
+| Research log | `underlying_research_buy*.jsonl` | Includes `feed`, `feed_label`, `resolution_url`, PTB/live/edge, decisions, outcomes |
+
+**Speed:** book + last-trade quotes for both legs run in parallel via the existing
+thread pool (~1 RTT). Underlying check is pure memory (no HTTP on the decide path).
 
 Sizing uses **`buy_budget`** (USD), not a fixed share count. Each FAK attempt
 buys `min(remaining_budget / ask, top_of_book_size)` shares so spent notional

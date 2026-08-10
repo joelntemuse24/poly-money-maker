@@ -31,6 +31,12 @@ pnl_hourly.json
 strategy.json
 strategy5m.json
 strategy_hourly.json
+positions_buy*.json
+pnl_buy*.json
+.heartbeat_buy*
+underlying_research_buy*.jsonl
+ptb_*_buy*.json
+ptb_chainlink*.json
 
 # Shadow simulator runtime data
 sim_data/
