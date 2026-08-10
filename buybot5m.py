@@ -1192,6 +1192,7 @@ while not _shutdown_requested:
         for m in markets:
             end_ts_ms = m.end_ts * 1000
             minutes_left = (end_ts_ms - now_ms) / 60000
+            seconds_left = (end_ts_ms - now_ms) / 1000
             if minutes_left <= 0:
                 continue
 
