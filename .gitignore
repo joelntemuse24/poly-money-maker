@@ -15,34 +15,31 @@ build/
 venv/
 env/
 
-# Bot state
+# Live buy-bot state
+*.log
+.heartbeat*
+positions_buy*.json
+pnl_buy*.json
+strategy_buy.json
+strategy_buy5m.json
+strategy_buyhourly.json
+underlying_research_buy*.jsonl
+underlying_research_buy*.jsonl.*
+ptb_*_buy*.json
+ptb_chainlink*.json
+
+# Legacy state that still exists on the VM (sell bots / mint / sim were removed
+# from the repo in 2026-08, but their runtime files remain on disk — keep ignored)
 positions.json
 positions5m.json
 positions_hourly.json
-bot.log
-bot.log.*
-*.log
-.heartbeat
-.heartbeat5m
-.heartbeat_hourly
 pnl.json
 pnl5m.json
 pnl_hourly.json
 strategy.json
 strategy5m.json
 strategy_hourly.json
-positions_buy*.json
-pnl_buy*.json
-.heartbeat_buy*
-underlying_research_buy*.jsonl
-underlying_research_buy*.jsonl.*
-ptb_*_buy*.json
-ptb_chainlink*.json
-
-# Shadow simulator runtime data
 sim_data/
-
-# Atomic mint buyer runtime data and live config
 buy_data/
 buy_data_5m/
 buy_data_hourly/
