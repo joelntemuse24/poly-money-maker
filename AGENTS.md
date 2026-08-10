@@ -20,12 +20,12 @@ Plus: `buy/` atomic mint package, `sim/` shadow simulator, `check_book.py` diagn
 
 | File | What it does | Mirrors |
 |---|---|---|
-| `bot.py` | 15m sell bot (~1304 lines) | `bot5m.py`, `bothourly.py` |
-| `bot5m.py` | 5m sell bot (~1252 lines) | `bot.py`, `bothourly.py` |
-| `bothourly.py` | Hourly sell bot (~1212 lines) | `bot.py`, `bot5m.py` |
-| `buybot.py` | 15m buy bot (~994 lines) | `buybot5m.py`, `buybothourly.py` |
-| `buybot5m.py` | 5m buy bot (~991 lines) | `buybot.py`, `buybothourly.py` |
-| `buybothourly.py` | Hourly buy bot (~994 lines) | `buybot.py`, `buybot5m.py` |
+| `bot.py` | 15m sell bot (~1444 lines) | `bot5m.py`, `bothourly.py` |
+| `bot5m.py` | 5m sell bot (~1397 lines) | `bot.py`, `bothourly.py` |
+| `bothourly.py` | Hourly sell bot (~1349 lines) | `bot.py`, `bot5m.py` |
+| `buybot.py` | 15m buy bot (~1146 lines) | `buybot5m.py`, `buybothourly.py` |
+| `buybot5m.py` | 5m buy bot (~1141 lines) | `buybot.py`, `buybothourly.py` |
+| `buybothourly.py` | Hourly buy bot (~1144 lines) | `buybot.py`, `buybot5m.py` |
 | `buy/market.py` | MarketGateway + MintMarket dataclass (shared by buy-side bots) | — |
 | `buy/runner.py` | Atomic mint entry (VM-only, separate venv) | — |
 
