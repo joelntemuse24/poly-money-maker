@@ -625,7 +625,10 @@ def fill_proceeds(result, filled, limit_price):
 
 def buy_market_with_retry(token_id, budget, max_price, tick_size="0.001", max_retries=3, min_price=0.0):
     """Spend up to `budget` dollars buying token_id at or below max_price via FAK.
-    Share size is budget/ask each attempt; capped to top-of-book size so we don't walk."""
+
+    CLOB market BUY `amount` is USDC notional (not shares). Cap notional to the
+    top-of-book ask size so we don't walk deeper levels.
+    """
     total_bought = 0.0
     spent = 0.0
     budget = float(budget)
@@ -657,30 +660,36 @@ def buy_market_with_retry(token_id, budget, max_price, tick_size="0.001", max_re
             console.print(f"  [dim yellow][NO SIZE][/] ask size {fresh_ask_size} · attempt {attempt + 1}/{max_retries}")
             time.sleep(0.05)
             continue
-        shares_affordable = remaining_budget / fresh_ask
-        buy_size = min(shares_affordable, fresh_ask_size)
-        if buy_size < 0.01:
+        # BUY market amount = USDC to spend (SELL uses shares).
+        book_notional = fresh_ask * float(fresh_ask_size)
+        spend = min(remaining_budget, book_notional)
+        if spend < 0.01:
             break
         price = fresh_ask
         try:
             result = safe_api_call(
                 client.create_and_post_market_order,
-                MarketOrderArgs(token_id=token_id, amount=buy_size, side=BUY, price=price),
+                MarketOrderArgs(token_id=token_id, amount=spend, side=BUY, price=price),
                 options=PartialCreateOrderOptions(tick_size=tick_size, neg_risk=False),
                 order_type=OrderType.FAK,
             )
             if result:
                 oid = extract_order_id(result)
-                filled = float(confirm_fill_size(result, oid, buy_size))
+                filled = float(confirm_fill_size(result, oid, spend / price if price else 0))
                 if filled <= 0:
                     console.print("  [dim yellow][FAK NULL][/] 0 confirmed fill · stopping")
                     break
-                fill_cost = filled * price
+                # Prefer notional we intended; share*limit can drift on price improvement.
+                fill_cost = min(spend, filled * price) if filled * price > 0 else spend
                 total_bought += filled
                 spent += fill_cost
                 remaining_budget = budget - spent
                 console.print(f"  [bold green][BUY FAK][/]{filled} @ {price:.3f} (${fill_cost:.2f})  [dim]id={str(oid)[:16]}…[/]")
-                log_event("buy_fill", token_id=token_id, filled=filled, price=price, spent=round(spent, 4), remaining_budget=round(remaining_budget, 4), attempt=attempt + 1)
+                log_event(
+                    "buy_fill", token_id=token_id, filled=filled, price=price,
+                    spend=round(spend, 4), spent=round(spent, 4),
+                    remaining_budget=round(remaining_budget, 4), attempt=attempt + 1,
+                )
                 if remaining_budget < 0.01:
                     return total_bought
         except Exception as e:
