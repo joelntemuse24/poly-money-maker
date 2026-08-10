@@ -25,9 +25,9 @@ Plus: `sim/` shadow simulator (inactive), `check_book.py` diagnostic.
 | `bot.py` | 15m sell bot (~1444 lines) | `bot5m.py`, `bothourly.py` |
 | `bot5m.py` | 5m sell bot (~1397 lines) | `bot.py`, `bothourly.py` |
 | `bothourly.py` | Hourly sell bot (~1349 lines) | `bot.py`, `bot5m.py` |
-| `buybot.py` | 15m buy bot (~1146 lines) | `buybot5m.py`, `buybothourly.py` |
-| `buybot5m.py` | 5m buy bot (~1141 lines) | `buybot.py`, `buybothourly.py` |
-| `buybothourly.py` | Hourly buy bot (~1144 lines) | `buybot.py`, `buybot5m.py` |
+| `buybot.py` | 15m buy bot (~1716 lines) | `buybot5m.py`, `buybothourly.py` |
+| `buybot5m.py` | 5m buy bot (~1705 lines) | `buybot.py`, `buybothourly.py` |
+| `buybothourly.py` | Hourly buy bot (~1707 lines) | `buybot.py`, `buybot5m.py` |
 | `buy/market.py` | MarketGateway + MintMarket dataclass (shared by buy-side bots) | — |
 | `buy/btc_price.py` | Resolution-aligned BTC feeds (TWAP 30/60, Binance) + PTB | — |
 | `buy/clob_book_ws.py` | CLOB market-channel WS top-of-book (hedge/buy speed path) | — |
@@ -145,7 +145,8 @@ land in `underlying_research_buy*.jsonl` and `ptb_*_buy*.json` (gitignored).
 
 4. **The 5m buy bot uses seconds-based window checks** (`BUY_START_S = 90`) while
    the 15m and hourly buy bots use minutes-based (`BUY_WINDOW_MIN = 3.0 / 5.0`).
-   Don't mix them up when propagating changes.
+   Don't mix them up when propagating changes. The 5m loop must define
+   `seconds_left` (not only `minutes_left`) or it NameErrors every cycle.
 
 5. **PNL fallback in GC assumes par redemption** — if `pnl_redeem_value == 0` and
    `bought_size > 0`, the GC code sets `redeem_value = bought_size` (full $1.00 per
