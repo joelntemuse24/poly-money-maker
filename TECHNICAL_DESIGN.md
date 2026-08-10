@@ -3576,30 +3576,41 @@ atomic mint buyer (which mints complete sets at $1.00), the standalone buy bots:
 
 ### 21.3 Winner Detection Logic
 
-The bot determines which leg is winning by comparing **mid prices**:
+The bot determines which leg is winning by comparing **best bids**:
 
 ```
-up_mid = (up_bid + up_ask) / 2
-dn_mid = (dn_bid + dn_ask) / 2
+# Winner by BID (not mid). Mid is (bid+ask)/2 and is poisoned by stale asks —
+# e.g. loser bid 5¢ / ask 97¢ → mid 51¢ looked "winning" when the true
+# winner had no asks (mid=None) under the old one-mid-None fallback.
+if up_bid is None or dn_bid is None → skip (incomplete book)
+if abs(up_bid - dn_bid) < min_bid_edge (0.05) → skip (ambiguous)
 
-if up_mid > dn_mid → UP is winning
-if dn_mid > up_mid → DOWN is winning
+if up_bid > dn_bid → UP is winning
+if dn_bid > up_bid → DOWN is winning
 ```
 
-**Edge cases handled:**
+**Consensus gates (required before buy):**
 
-- **Ambiguous skip:** If mids are within 1¢ of each other (`abs(up_mid - dn_mid) < 0.01`),
-  the bot skips the market — no clear winner.
-- **One-mid-None:** If only one leg has a mid price (other has no asks), that leg
-  must have mid > 0.50 to qualify as winning.
-- **Both mids None:** No data — skip.
+- Buy-side bid ≥ `min_winner_bid` (0.90) — real demand near our price band
+- Opposite bid ≤ `max_loser_bid` (0.10) — other side clearly losing
+- Ask still in `[buy_threshold, buy_max_price]`
+
+Skips log as `buy_skip_incomplete_book`, `buy_skip_ambiguous`, or
+`buy_skip_no_consensus`.
+
+**Why this matters:** Markets often spike one way and clear the winner's asks.
+A resting 97¢ ask can remain on the loser. The old mid / one-mid-None logic
+treated that as a buy of the wrong leg — fills that later looked like
+"reversals" on the chart even though consensus never favored that side.
 
 ### 21.4 Buy Trigger
 
-Once the winner is determined, the bot checks:
+Once the winner passes consensus, the bot checks:
 
 ```
 BUY_THRESHOLD (0.96) ≤ winning_ask ≤ BUY_MAX_PRICE (0.99)
+AND winning_bid ≥ min_winner_bid (0.90)
+AND opposite_bid ≤ max_loser_bid (0.10)
 ```
 
 Sizing uses **`buy_budget`** (USD), not a fixed share count. Each FAK attempt

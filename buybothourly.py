@@ -56,6 +56,11 @@ RELAYER_API_KEY_ADDRESS = os.getenv("RELAYER_API_KEY_ADDRESS", "0x42aec4505559c0
 _STRATEGY_DEFAULTS = {
     "buy_threshold": 0.96,
     "buy_max_price": 0.99,
+    # Consensus gates: avoid buying a stale ~97¢ ask on the loser when the
+    # true winner's asks are cleared (old mid-based / one-mid-None path).
+    "min_winner_bid": 0.90,
+    "max_loser_bid": 0.10,
+    "min_bid_edge": 0.05,
     "hedge_enabled": True,
     "hedge_threshold": 0.65,
     "buy_window_min": 5.0,
@@ -115,6 +120,10 @@ def load_strategy():
 
 _strat = load_strategy()
 BUY_THRESHOLD = _strat["buy_threshold"]
+BUY_MAX_PRICE = _strat["buy_max_price"]
+MIN_WINNER_BID = _strat["min_winner_bid"]
+MAX_LOSER_BID = _strat["max_loser_bid"]
+MIN_BID_EDGE = _strat["min_bid_edge"]
 HEDGE_ENABLED = _strat["hedge_enabled"]
 HEDGE_THRESHOLD = _strat["hedge_threshold"]
 BUY_WINDOW_MIN = _strat["buy_window_min"]
@@ -723,6 +732,9 @@ while not _shutdown_requested:
         _strat = load_strategy()
         BUY_THRESHOLD = _strat["buy_threshold"]
         BUY_MAX_PRICE = _strat["buy_max_price"]
+        MIN_WINNER_BID = _strat["min_winner_bid"]
+        MAX_LOSER_BID = _strat["max_loser_bid"]
+        MIN_BID_EDGE = _strat["min_bid_edge"]
         HEDGE_ENABLED = _strat["hedge_enabled"]
         HEDGE_THRESHOLD = _strat["hedge_threshold"]
         BUY_WINDOW_MIN = _strat["buy_window_min"]
@@ -1028,26 +1040,55 @@ while not _shutdown_requested:
             up_bid, _, up_ask, _, up_mid = get_book_quote(m.up_token)
             dn_bid, _, dn_ask, _, dn_mid = get_book_quote(m.dn_token)
 
-            if up_mid is None and dn_mid is None:
-                continue  # no sentiment
-
-            # Determine winner by mid
-            up_winning = up_mid is not None and dn_mid is not None and up_mid > dn_mid
-            dn_winning = up_mid is not None and dn_mid is not None and dn_mid > up_mid
-
-            # Handle one-mid-None edge case
-            if up_mid is not None and dn_mid is None:
-                up_winning = up_mid > 0.50
-            if dn_mid is not None and up_mid is None:
-                dn_winning = dn_mid > 0.50
-
-            # Ambiguous — mids too close
-            if up_mid is not None and dn_mid is not None and abs(up_mid - dn_mid) < 0.01:
-                log_event("buy_skip_ambiguous", condition_id=cond, up_mid=up_mid, dn_mid=dn_mid)
+            # Sentiment requires BOTH bids. Never infer a winner from a single
+            # mid — a wide-spread loser (bid 5¢ / ask 97¢ → mid 51¢) looked
+            # "winning" when the true winner's asks were cleared (mid=None),
+            # causing wrong-side buys at ~97¢ that later looked like "reversals".
+            if up_bid is None or dn_bid is None:
+                log_event(
+                    "buy_skip_incomplete_book",
+                    condition_id=cond,
+                    up_bid=up_bid, dn_bid=dn_bid, up_ask=up_ask, dn_ask=dn_ask,
+                )
                 continue
 
-            up_buy = up_winning and up_ask is not None and BUY_THRESHOLD <= up_ask <= BUY_MAX_PRICE
-            dn_buy = dn_winning and dn_ask is not None and BUY_THRESHOLD <= dn_ask <= BUY_MAX_PRICE
+            # Winner by BID (what the market pays), not mid (poisoned by stale asks).
+            bid_edge = abs(up_bid - dn_bid)
+            if bid_edge < MIN_BID_EDGE:
+                log_event(
+                    "buy_skip_ambiguous",
+                    condition_id=cond,
+                    up_bid=up_bid, dn_bid=dn_bid, bid_edge=round(bid_edge, 4),
+                    up_mid=up_mid, dn_mid=dn_mid,
+                )
+                continue
+
+            up_winning = up_bid > dn_bid
+            dn_winning = dn_bid > up_bid
+
+            # Ask in band + consensus: buy-side bid elevated, opposite clearly losing.
+            up_ask_ok = up_ask is not None and BUY_THRESHOLD <= up_ask <= BUY_MAX_PRICE
+            dn_ask_ok = dn_ask is not None and BUY_THRESHOLD <= dn_ask <= BUY_MAX_PRICE
+            up_consensus = up_bid >= MIN_WINNER_BID and dn_bid <= MAX_LOSER_BID
+            dn_consensus = dn_bid >= MIN_WINNER_BID and up_bid <= MAX_LOSER_BID
+
+            if up_winning and up_ask_ok and not up_consensus:
+                log_event(
+                    "buy_skip_no_consensus",
+                    condition_id=cond, leg="up",
+                    up_bid=up_bid, dn_bid=dn_bid, up_ask=up_ask,
+                    min_winner_bid=MIN_WINNER_BID, max_loser_bid=MAX_LOSER_BID,
+                )
+            if dn_winning and dn_ask_ok and not dn_consensus:
+                log_event(
+                    "buy_skip_no_consensus",
+                    condition_id=cond, leg="down",
+                    up_bid=up_bid, dn_bid=dn_bid, dn_ask=dn_ask,
+                    min_winner_bid=MIN_WINNER_BID, max_loser_bid=MAX_LOSER_BID,
+                )
+
+            up_buy = up_winning and up_ask_ok and up_consensus
+            dn_buy = dn_winning and dn_ask_ok and dn_consensus
 
             if not (up_buy or dn_buy):
                 continue
