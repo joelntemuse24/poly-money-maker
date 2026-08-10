@@ -38,13 +38,15 @@ already obvious — the winning leg trades at 96–99¢ but has not yet settled.
 buy that near-certain winner with a Fill-And-Kill (FAK) market order and redeem it at
 $1.00, capturing the 1–4¢ spread per share.
 
-**The risk:** BTC can reverse in the final seconds. If the leg we bought starts
-collapsing, the bot **hedges**: it market-sells the held leg once its bid drops to
-65¢, cutting the loss to ~35¢/share instead of ~97¢/share. There is no profit-taking
-sell — the only sell path is the hedge; everything else rides to redemption.
+**The risk:** BTC can reverse in the final seconds. If the leg we bought truly
+collapses (bid **and** ask both drop — not a lone 1¢ bid under a still-high ask),
+the bot **hedges**: it market-sells the held leg, floored at `hedge_min_price`
+(~32¢). There is no profit-taking sell — the only sell path is the hedge;
+everything else rides to redemption.
 
 **Economics per share (no reversal):** buy at ~97¢, redeem at $1.00 → ~3¢ gross.
-**Economics per share (hedged reversal):** buy at ~97¢, sell at ~65¢ → ~32¢ loss.
+**Economics per share (hedged reversal):** buy at ~97¢, sell near the collapsed
+book (≥ floor) → bounded loss instead of riding a wrong side to $0.
 
 ---
 
@@ -63,7 +65,7 @@ trades a different market cadence and uses a different resolution oracle.
 | Buy window | final 3.0 min (`buy_window_min`) | final 90 s (`buy_start_s`) | final 5.0 min (`buy_window_min`) |
 | Ask band | 96–99¢ | 96–99¢ | 96–99¢ |
 | Budget / market | $21 USDC | $8 USDC | $24 USDC |
-| Hedge trigger | bid ≤ 65¢ | bid ≤ 65¢ | bid ≤ 65¢ |
+| Hedge trigger | bid ≤ 65¢ **and** ask ≤ 70¢, spread ≤ 15¢ | same | same |
 | Tick size | 0.01 | 0.001 | 0.01 |
 | Strategy file | `strategy_buy.json` | `strategy_buy5m.json` | `strategy_buyhourly.json` |
 | State file | `positions_buy.json` | `positions_buy5m.json` | `positions_buyhourly.json` |
@@ -185,29 +187,37 @@ A buy fires only when **all** of these gates pass, evaluated in the final window
    elapsed.
 2. **GUI consensus.** The Polymarket UI display price (mid when spread ≤ 10¢, else
    last trade) must show a clear winner and loser: winner ≥ `min_winner_bid` (90¢),
-   loser ≤ `max_loser_bid` (10¢), and the gap ≥ `min_bid_edge` (5¢). This protects
-   against buying into an ambiguous or thin book.
-3. **Ask band.** The best ask of the winning leg is within `buy_threshold`–
+   loser ≤ `max_loser_bid` (10¢), and the gap ≥ `min_bid_edge` (5¢).
+3. **Tight real book (critical).** The winning leg's **REST** top-of-book must have
+   bid ≥ `min_winner_bid` and `ask − bid` ≤ `max_entry_spread` (5¢). A 98¢ ask over
+   a 1¢ bid is a fake price — last-trade GUI can still look like a winner while
+   there is no real bid under the ask. WS quotes alone are never used to arm entry.
+4. **Ask band.** The best ask of the winning leg is within `buy_threshold`–
    `buy_max_price` (96–99¢). Below 96¢ the outcome isn't certain enough; at/above
    99¢ there's no spread left.
-4. **Underlying gate.** If `underlying_gate_enabled`, the live oracle price must be
+5. **Underlying gate.** If `underlying_gate_enabled`, the live oracle price must be
    at least `min_underlying_edge_usd` ($10) away from the captured PTB, **and** the
    book's winning side must match the direction of the underlying move. This blocks
    buying a "winner" that the resolution oracle itself disagrees with (stale-book
    trap).
-5. **Risk caps.** `buy_budget` USDC per market ($21/$8/$24), `max_open_positions`,
+6. **Risk caps.** `buy_budget` USDC per market ($21/$8/$24), `max_open_positions`,
    `max_open_notional`, `max_daily_notional`, and available USDC balance.
 
-Execution: a FAK market buy for `buy_budget` dollars of the winning token, priced
-from the WS top-of-book cache (`buy/clob_book_ws.py`) with REST fallback.
+Execution: a FAK market buy for `buy_budget` dollars of the winning token. Size and
+limit price come from a **REST** book refresh immediately before the order. Fills
+whose average USDC/share is below `buy_threshold`, or whose share count exceeds
+`budget / buy_threshold`, are rejected and logged as `buy_reject_bad_fill`. Entry
+cost is recorded as USDC spent, not `shares × gate ask`.
 
 **Skip reasons logged for audit** (visible in logs and research JSONL):
 
 - `buy_skip_ambiguous` — GUI display prices too close to call
-- `buy_skip_no_consensus` — ask in band but no clear winner/loser from GUI prices
+- `buy_skip_no_consensus` — ask in band but GUI/book integrity fails (includes
+  `up_book_why` / `dn_book_why`: `wide_spread`, `bid_too_low`, …)
 - `buy_skip_incomplete_book` — missing GUI price on a leg (no mid, no last trade)
 - `buy_skip_underlying_edge` — live oracle < $10 from PTB
 - `buy_skip_underlying_side` — book winner disagrees with the underlying move
+- `buy_reject_bad_fill` — CLOB returned shares/avg inconsistent with the gated ask
 
 While any position is open or any market is inside the buy window, the loop runs in
 "hot mode" (`poll_held_s` / `poll_buy_window_s`, 50–100 ms); otherwise it idles at a
@@ -219,14 +229,15 @@ slow poll to save API quota.
 
 The bots never take profit. The only sell is the defensive hedge:
 
-- **Trigger:** held leg's bid ≤ `hedge_threshold` (65¢) while the position is open.
-- **Confirmation:** if the cached/WS quote is older than `hedge_quote_max_age_s`
-  (250 ms), re-fetch over REST to confirm the collapse is real (a stale quote or a
-  single vanished bid — a "ghost" — must not trigger a sell). If the fresh quote is
-  back above threshold, the hedge is aborted.
+- **Arm:** WS/cache bid ≤ `hedge_threshold` (65¢) while the position is open.
+- **Confirm (always REST):** re-fetch the full book. If bid bounced above threshold,
+  abort (`hedge_cancel_bounce`).
+- **Book integrity:** a lone penny bid under a still-high ask is **not** a reversal
+  (`hedge_skip_toxic_book`). Require bid ≤ 65¢, ask ≤ `hedge_require_ask_max` (70¢),
+  and spread ≤ `hedge_max_spread` (15¢). Same lesson as the old sell-side bots:
+  bid-alone triggers dump into illiquid books.
 - **Execution:** FAK sell priced `hedge_undercut_ticks` (2 ticks) under the top bid,
-  floored at `hedge_min_price` (0.32, a valid tick multiple). The undercut lets the
-  order cross a falling book during order round-trip time instead of missing it.
+  floored at `hedge_min_price` (0.32 / 0.325). Retry quotes also prefer REST.
 - **Outcome:** hedge proceeds are recorded per market and folded into P&L when the
   position is garbage-collected.
 
@@ -291,8 +302,10 @@ the default's type. Templates are `strategy_buy.example.json`,
 |---|---|---|
 | `buy_threshold` / `buy_max_price` | 0.96 / 0.99 | Ask band for entry |
 | `min_winner_bid` / `max_loser_bid` / `min_bid_edge` | 0.90 / 0.10 / 0.05 | GUI consensus gate |
+| `max_entry_spread` | 0.05 | Max ask−bid on winner at entry |
 | `underlying_gate_enabled` / `min_underlying_edge_usd` | true / 10.0 | Oracle alignment gate |
-| `hedge_enabled` / `hedge_threshold` / `hedge_min_price` | true / 0.65 / 0.32 | Hedge trigger & floor |
+| `hedge_enabled` / `hedge_threshold` / `hedge_min_price` | true / 0.65 / 0.32 | Hedge arm & floor |
+| `hedge_max_spread` / `hedge_require_ask_max` | 0.15 / 0.70 | Hedge book must actually collapse |
 | `buy_window_min` (15m, hr) / `buy_start_s` (5m) | 3.0 / 90 / 5.0 | Entry window before close |
 | `buy_budget` | 21 / 8 / 24 | USDC per market |
 | `max_open_positions` / `max_open_notional` / `max_daily_notional` | 100 / 10k / ~∞ | Risk caps |

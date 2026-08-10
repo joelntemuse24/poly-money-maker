@@ -139,20 +139,18 @@ class ClobMarketBookFeed:
         with self._lock:
             prev = self._quotes.get(asset_id)
             if preserve_sizes and prev is not None:
+                # Price-only events omit size. Keep prior size ONLY when the
+                # top-of-book price is unchanged. If the price moved, size from
+                # the old level is a lie — zero it so callers REST-refresh.
                 if bid is not None:
                     if bid_sz is None or float(bid_sz or 0) <= 0:
-                        # Keep prior size only if price unchanged or we have no new size.
                         if prev[0] is not None and abs(float(prev[0]) - float(bid)) < 1e-12:
                             bid_sz = prev[1]
-                        elif prev[0] is not None:
-                            bid_sz = prev[1]  # best effort until next book snapshot
                         else:
                             bid_sz = 0.0
                 if ask is not None:
                     if ask_sz is None or float(ask_sz or 0) <= 0:
                         if prev[2] is not None and abs(float(prev[2]) - float(ask)) < 1e-12:
-                            ask_sz = prev[3]
-                        elif prev[2] is not None:
                             ask_sz = prev[3]
                         else:
                             ask_sz = 0.0
@@ -290,7 +288,6 @@ class ClobMarketBookFeed:
                     self._subscribed = set()
                     self._initial_subscribe(ws, tokens)
                     last_ping[0] = time.time()
-                    opened.set()
 
                 def on_message(ws, message):
                     try:

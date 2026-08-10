@@ -80,9 +80,11 @@ Watch the console for `[DRY BUY]` / `[DRY SELL]` markers. Ctrl-C to stop.
 
 - `[DRY BUY]` / `[DRY SELL]` in dry-run — confirms trigger logic fires
 - `cycle_error` in logs — unhandled exception (bot survives but logs it)
-- `hedge_attempt` / `hedge_fill` — hedge logic triggered
+- `hedge_attempt` / `hedge_fill` — hedge fired after REST + book integrity
+- `hedge_skip_toxic_book` — bid dipped but ask/spread still say "not reversed"
 - `buy_skip_ambiguous` — GUI display prices too close
-- `buy_skip_no_consensus` — ask in band but GUI prices don't show a clear winner/loser
+- `buy_skip_no_consensus` — ask in band but GUI/tight-book gate failed
+- `buy_reject_bad_fill` — fill avg or share count inconsistent with gated ask
 - `buy_skip_incomplete_book` — missing GUI price on a leg (no mid and no last trade)
 - `buy_skip_underlying_edge` — live oracle not ≥ `min_underlying_edge_usd` ($10) from PTB
 - `buy_skip_underlying_side` — book wants the opposite leg from the underlying move
@@ -98,7 +100,8 @@ Watch the console for `[DRY BUY]` / `[DRY SELL]` markers. Ctrl-C to stop.
 - **FAK orders only:** All orders are Fill-And-Kill — no resting orders, no market
   making.
 - **Hedge is sell-only exit:** The bots never profit-take. The only sell path is the
-  hedge (bid ≤ 65¢); everything else rides to redemption at $1.00.
+  hedge (bid ≤ 65¢ **and** ask ≤ 70¢ with tight spread); everything else
+  rides to redemption at $1.00. Never arm entry or hedge off a lone WS bid.
 - **Tick sizes:** 5m markets use `0.001`, 15m and hourly use `0.01`.
 - **One entry per market:** Enforced via `meta.get("bought_token")` in state cache.
 - **Notifications:** Fire-and-forget via ntfy.sh (topic `polybot-joel-btc`).
