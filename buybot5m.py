@@ -670,9 +670,7 @@ def fill_cost_usdc(result, filled, limit_price, spend_cap):
     try:
         making = d.get("makingAmount", d.get("making_amount"))
         if making is not None:
-            making_f = float(making)
-            if making_f > 1000 and (spend_cap <= 0 or making_f > spend_cap * 50):
-                making_f /= 1e6
+            making_f = _decode_clob_fixed6(making) or 0.0
             if making_f > 1e-12:
                 return min(spend_cap, making_f) if spend_cap > 0 else making_f
     except (TypeError, ValueError):
@@ -716,27 +714,26 @@ def get_order_details(order_id):
         if isinstance(result, dict):
             matched_raw = (
                 result.get("size_matched")
-                or result.get("takerAmount")
                 or 0
             )
             size_raw = (
-                result.get("size")
+                result.get("original_size")
                 or result.get("originalSize")
-                or result.get("makerAmount")
+                or result.get("size")
                 or 1
             )
             return {
                 "status": result.get("status", "UNKNOWN"),
-                "size_matched": _normalize_clob_amount(matched_raw, hint_cap=1000) or 0.0,
-                "size": _normalize_clob_amount(size_raw, hint_cap=1000) or 1.0,
+                "size_matched": _decode_clob_fixed6(matched_raw) or 0.0,
+                "size": _decode_clob_fixed6(size_raw) or 1.0,
             }
         return {
             "status": getattr(result, "status", "UNKNOWN"),
-            "size_matched": _normalize_clob_amount(
-                getattr(result, "size_matched", 0), hint_cap=1000,
+            "size_matched": _decode_clob_fixed6(
+                getattr(result, "size_matched", 0),
             ) or 0.0,
-            "size": _normalize_clob_amount(
-                getattr(result, "size", 1), hint_cap=1000,
+            "size": _decode_clob_fixed6(
+                getattr(result, "original_size", getattr(result, "size", 0)),
             ) or 1.0,
         }
     except Exception as e:
@@ -746,38 +743,24 @@ def get_order_details(order_id):
         return None
 
 
-def _normalize_clob_amount(raw, *, hint_cap=None):
-    """Parse CLOB amount; undo 1e6 fixed-point when clearly inflated."""
+def _decode_clob_fixed6(raw):
+    """Decode a CLOB v2 wire amount (integer string with six decimals)."""
     if raw is None or raw == "":
         return None
     try:
-        v = float(raw)
+        return float(raw) / 1e6
     except (TypeError, ValueError):
         return None
-    # Polymarket often returns integer micro-units (5 shares → "5000000").
-    if v >= 1_000_000:
-        scaled = v / 1e6
-        if hint_cap is None or scaled <= float(hint_cap) * 50:
-            return scaled
-    if hint_cap is not None and v > float(hint_cap) * 50 and v > 1000:
-        return v / 1e6
-    if hint_cap is None and v > 1000:
-        # Shares on these bots are typically << 1000; USDC budgets also << 1000.
-        return v / 1e6
-    return v
 
 
 def buy_shares_from_result(result):
     """BUY shares from an immediate CLOB response (size_matched or takingAmount)."""
     d = _result_as_dict(result)
-    sm = _normalize_clob_amount(d.get("size_matched"), hint_cap=1000)
+    sm = _decode_clob_fixed6(d.get("size_matched"))
     if sm is not None and sm > 0:
         return sm
     # V2 market BUY: takingAmount = shares received.
-    taking = _normalize_clob_amount(
-        d.get("takingAmount", d.get("taking_amount")),
-        hint_cap=1000,
-    )
+    taking = _decode_clob_fixed6(d.get("takingAmount", d.get("taking_amount")))
     if taking is not None and taking > 0:
         return taking
     return 0.0
@@ -794,15 +777,21 @@ def confirm_fill_size(result, oid, requested, *, wait_delayed_s=2.0, poll_s=0.25
         matched = buy_shares_from_result(result)
     else:
         d = _result_as_dict(result)
-        matched = _normalize_clob_amount(d.get("size_matched"), hint_cap=1000) or 0.0
+        matched = _decode_clob_fixed6(d.get("size_matched")) or 0.0
         if matched <= 0:
             # SELL: makingAmount is shares sold.
-            matched = _normalize_clob_amount(
+            matched = _decode_clob_fixed6(
                 d.get("makingAmount", d.get("making_amount")),
-                hint_cap=1000,
             ) or 0.0
     if matched > 0:
-        return float(matched)
+        matched = float(matched)
+        if requested and matched > float(requested) * 1.01 + 1e-6:
+            log_event(
+                "order_fill_size_invalid", order_id=str(oid or "")[:24],
+                matched=matched, requested=requested, side=side, source="post",
+            )
+            return 0.0
+        return matched
     if not oid:
         return 0.0
 
@@ -818,10 +807,15 @@ def confirm_fill_size(result, oid, requested, *, wait_delayed_s=2.0, poll_s=0.25
                 saw_not_found = True
             else:
                 sm = details.get("size_matched", 0)
-                matched = _normalize_clob_amount(
-                    sm, hint_cap=max(float(requested or 0), 1.0),
-                ) or 0.0
+                matched = float(sm) if sm else 0.0
                 if matched > 0:
+                    if requested and matched > float(requested) * 1.01 + 1e-6:
+                        log_event(
+                            "order_fill_size_invalid", order_id=str(oid)[:24],
+                            matched=matched, requested=requested, side=side,
+                            source="get_order",
+                        )
+                        return 0.0
                     return matched
                 st = last_status.lower()
                 if st in ("canceled", "cancelled", "rejected", "expired", "failed"):
@@ -874,12 +868,8 @@ def fill_proceeds(result, filled, limit_price):
         taking = d.get("takingAmount", d.get("taking_amount"))
         making = d.get("makingAmount", d.get("making_amount"))
         if taking is not None and making is not None:
-            taking_f = float(taking)
-            making_f = float(making)
-            # Heuristic: values >> size are likely 1e6 fixed-point.
-            if taking_f > 1000 and making_f > 1000:
-                taking_f /= 1e6
-                making_f /= 1e6
+            taking_f = _decode_clob_fixed6(taking) or 0.0
+            making_f = _decode_clob_fixed6(making) or 0.0
             if making_f > 0 and abs(making_f - filled) / max(filled, 1e-9) < 0.25:
                 return taking_f
             if taking_f > 0 and abs(taking_f - filled) / max(filled, 1e-9) < 0.25:
@@ -1053,24 +1043,27 @@ def buy_market_with_retry(
 
         oid = extract_order_id(result)
         response_status = str(_result_as_dict(result).get("status") or "").strip().lower()
+        terminal_filled = {"matched", "order_status_matched"}
+        terminal_empty = {
+            "canceled", "cancelled", "rejected", "expired", "failed", "unmatched",
+            "order_status_invalid", "order_status_canceled",
+            "order_status_canceled_market_resolved",
+        }
         filled = float(
-            confirm_fill_size(result, oid, spend / price if price else 0, side="BUY")
+            confirm_fill_size(result, oid, max_shares, side="BUY")
         )
         fill_cost = 0.0
         if filled <= 0:
             time.sleep(float(HEDGE_GHOST_SLEEP_S))
             filled = float(
                 confirm_fill_size(
-                    result, oid, spend / price if price else 0,
+                    result, oid, max_shares,
                     wait_delayed_s=1.0, side="BUY",
                 )
             )
         if filled <= 0:
             filled, fill_cost = _reconcile_ghost(spend, price, attempt + 1, via="null_confirm")
         if filled <= 0:
-            terminal_empty = {
-                "canceled", "cancelled", "rejected", "expired", "failed", "unmatched",
-            }
             if response_status in terminal_empty:
                 console.print(
                     f"  [dim yellow][FAK NULL][/] explicit {response_status or 'empty'} "
@@ -1106,6 +1099,16 @@ def buy_market_with_retry(
             _persist()
         except Exception:
             break
+        if response_status not in terminal_filled:
+            log_event(
+                "buy_partial_ambiguous_status", token_id=token_id,
+                status=response_status or None, order_id=oid,
+                filled=filled, spent=round(spent, 4), attempt=attempt + 1,
+            )
+            console.print(
+                "  [bold yellow][BUY STOP][/] positive non-terminal fill — quarantined"
+            )
+            return total_bought, spent, "ambiguous"
         if below_band:
             console.print(
                 f"  [bold red][BUY BELOW BAND][/] filled={filled:.4f} avg={avg:.3f} "

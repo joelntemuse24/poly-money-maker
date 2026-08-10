@@ -34,7 +34,7 @@ def _load_funcs(*names: str, bot: Path = BOT):
 
 
 HELPERS = (
-    "_normalize_clob_amount",
+    "_decode_clob_fixed6",
     "buy_shares_from_result",
     "_result_as_dict",
     "fill_cost_usdc",
@@ -54,7 +54,11 @@ class BuyFillProductionHelpers(unittest.TestCase):
     def test_matched_without_size_matched_uses_taking_amount(self):
         buy_shares = self.ns["buy_shares_from_result"]
         fill_cost = self.ns["fill_cost_usdc"]
-        result = {"makingAmount": "4.90", "takingAmount": "5", "status": "matched"}
+        result = {
+            "makingAmount": "4900000",
+            "takingAmount": "5000000",
+            "status": "matched",
+        }
         shares = buy_shares(result)
         self.assertAlmostEqual(shares, 5.0)
         self.assertAlmostEqual(fill_cost(result, shares, 0.98, 8.0), 4.90)
@@ -64,7 +68,7 @@ class BuyFillProductionHelpers(unittest.TestCase):
         fill_cost = self.ns["fill_cost_usdc"]
         result = {"makingAmount": "0", "takingAmount": "0", "status": "delayed"}
         self.assertEqual(buy_shares(result), 0.0)
-        result2 = {"makingAmount": "0", "takingAmount": "5"}
+        result2 = {"makingAmount": "0", "takingAmount": "5000000"}
         shares = buy_shares(result2)
         self.assertAlmostEqual(shares, 5.0)
         cost = fill_cost(result2, shares, 0.98, 8.0)
@@ -73,11 +77,11 @@ class BuyFillProductionHelpers(unittest.TestCase):
 
     def test_fixed_point_taking_amount_from_raw_post(self):
         """Captured-style 1e6 fixed-point amounts must normalize to shares."""
-        norm = self.ns["_normalize_clob_amount"]
+        decode = self.ns["_decode_clob_fixed6"]
         buy_shares = self.ns["buy_shares_from_result"]
         fill_cost = self.ns["fill_cost_usdc"]
-        self.assertAlmostEqual(norm("5000000", hint_cap=100), 5.0)
-        self.assertAlmostEqual(norm(4900000, hint_cap=100), 4.9)
+        self.assertAlmostEqual(decode("5000000"), 5.0)
+        self.assertAlmostEqual(decode(4900000), 4.9)
         # Immediate POST with fixed-point taking/making (no size_matched).
         result = {
             "takingAmount": "5000000",
@@ -89,12 +93,13 @@ class BuyFillProductionHelpers(unittest.TestCase):
         self.assertAlmostEqual(fill_cost(result, shares, 0.98, 8.0), 4.9)
 
     def test_get_order_size_matched_fixed_point(self):
-        norm = self.ns["_normalize_clob_amount"]
+        decode = self.ns["_decode_clob_fixed6"]
         # GET-order style size_matched in fixed point.
-        self.assertAlmostEqual(norm("10000000", hint_cap=1e6), 10.0)
+        self.assertAlmostEqual(decode("10000000"), 10.0)
+        self.assertAlmostEqual(decode("11000"), 0.011)
 
     def test_get_order_details_normalizes_fixed_point(self):
-        ns = _load_funcs("_normalize_clob_amount", "get_order_details")
+        ns = _load_funcs("_decode_clob_fixed6", "get_order_details")
         ns["client"] = SimpleNamespace(
             get_order=lambda _oid: {
                 "status": "matched",
@@ -106,6 +111,17 @@ class BuyFillProductionHelpers(unittest.TestCase):
         details = ns["get_order_details"]("order-1")
         self.assertAlmostEqual(details["size_matched"], 10.0)
         self.assertAlmostEqual(details["size"], 12.0)
+
+    def test_tiny_sell_wire_fill_cannot_become_thousands_of_shares(self):
+        ns = _load_funcs("_decode_clob_fixed6", "_result_as_dict", "confirm_fill_size")
+        ns["log_event"] = lambda *_a, **_k: None
+        filled = ns["confirm_fill_size"](
+            {"status": "matched", "makingAmount": "11000"},
+            "order-1",
+            0.011,
+            side="SELL",
+        )
+        self.assertAlmostEqual(filled, 0.011)
 
     def test_entry_rejects_wide_book(self):
         ok, why = self.ns["entry_book_ok"](0.01, 0.98, 0.05, 0.90)
@@ -291,6 +307,22 @@ class BuyExecutionAmbiguity(unittest.TestCase):
         )
         self.assertEqual(result, (0.0, 0.0, "persist_fail"))
         self.assertEqual(calls["post"], 0)
+
+    def test_positive_delayed_fill_stays_quarantined(self):
+        ns, calls = self._namespace(
+            {"status": "delayed", "orderID": "order-1", "takingAmount": "5000000"}
+        )
+        ns["confirm_fill_size"] = lambda *_a, **_k: 5.0
+        ns["fill_cost_usdc"] = lambda *_a, **_k: 4.9
+        persisted = []
+        result = ns["buy_market_with_retry"](
+            "token", 8.0, 0.99, min_price=0.96, max_retries=2,
+            on_submit=lambda *args: calls["submit"].append(args),
+            on_fill=lambda bought, spent: persisted.append((bought, spent)),
+        )
+        self.assertEqual(result, (5.0, 4.9, "ambiguous"))
+        self.assertEqual(calls["post"], 1)
+        self.assertEqual(persisted, [(5.0, 4.9)])
 
     def test_5m_sell_default_tick(self):
         src = BOT5M.read_text()
