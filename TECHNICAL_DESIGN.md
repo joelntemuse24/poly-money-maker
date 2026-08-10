@@ -388,6 +388,12 @@ journal is capped via `deploy/journald-size.conf`.
 7. **State files are sacred.** `positions_buy*.json`, `pnl_buy*.json`, logs,
    heartbeats, PTB stores, research JSONL, `.env`, and live `strategy_buy*.json`
    are gitignored runtime data. Never delete, truncate, or commit them.
+8. **Ask ≠ price.** Gate/WS ask can sit at 97¢ over a 1¢ bid. That is not a
+   tradable near-certain winner. Entry requires a tight REST book; fills are
+   checked against avg USDC/share. Never trust last-trade GUI alone on a wide book.
+9. **Bid-alone hedge dumps.** A 1¢ bid under a 99¢ ask is illiquidity, not a
+   reversal. Hedge requires ask ≤ `hedge_require_ask_max` and a tight spread, and
+   always REST-confirms before selling.
 
 ---
 
@@ -413,7 +419,7 @@ path described above.
 | **PTB** | Price To Beat — oracle price at window open; resolution compares close vs PTB |
 | **Oracle / RTDS** | The data feed that resolves the market (Chainlink TWAP or Binance), streamed over Polymarket's real-time data socket |
 | **GUI consensus** | Winner/loser inferred from the Polymarket UI display price (mid or last trade) |
-| **Hedge** | Defensive market-sell of the held leg when its bid collapses to 65¢ |
+| **Hedge** | Defensive market-sell when the held book actually collapses (bid ≤ 65¢, ask ≤ 70¢, tight spread) |
 | **Redeem** | On-chain settlement of a resolved winning leg at $1.00 via the relayer |
 | **Hot mode** | Sub-second polling while a position is open or a market is in the buy window |
 | **GC** | Garbage collection of resolved/settled market state into the P&L file |
