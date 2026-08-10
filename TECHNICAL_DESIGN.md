@@ -3715,9 +3715,11 @@ execution on fast reversals:
    decreased, the fill is recorded as a "ghost fill"
 
 Book WS uses documented `operation: subscribe|unsubscribe` for token rollover.
-Missing bid/ask sides clear the cache side (no stale-side retention). REST
-fallback for books/last-trade is rate-limited (~200–250ms) so a 50ms hold loop
-cannot stampede the CLOB when WS is down.
+Price-only events (`best_bid_ask` / `price_change`) **preserve prior sizes** so
+buy sizing is not zeroed; full `book` snapshots replace sizes. Missing bid/ask
+sides clear that side. REST fallback for books/last-trade is rate-limited
+(~200–250ms), including hedge bounce confirms. Research JSONL rotates at 50 MiB
+(2 backups). REST quote caches are pruned on token rollover (max 64 entries).
 
 ### 21.8 State Isolation
 

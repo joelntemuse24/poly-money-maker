@@ -117,17 +117,48 @@ class ClobMarketBookFeed:
             return None
         return time.time() - ts
 
-    def _store(self, asset_id: str, bid, bid_sz, ask, ask_sz) -> None:
-        """Authoritative top-of-book replace. None clears that side — never keep
-        a previous bid/ask just because the update omitted it, and never refresh
-        the timestamp without applying the new sides (stale-fresh bug).
+    def _store(
+        self,
+        asset_id: str,
+        bid,
+        bid_sz,
+        ask,
+        ask_sz,
+        *,
+        preserve_sizes: bool = False,
+    ) -> None:
+        """Store top-of-book.
+
+        - None bid/ask clears that side (no stale-side retention).
+        - Full book snapshots replace sizes.
+        - Price-only events (best_bid_ask / price_change) keep prior sizes when
+          the side is still present, so buy sizing is not zeroed out.
         """
         if not asset_id:
             return
-        mid = None
-        if bid is not None and ask is not None:
-            mid = (bid + ask) / 2.0
         with self._lock:
+            prev = self._quotes.get(asset_id)
+            if preserve_sizes and prev is not None:
+                if bid is not None:
+                    if bid_sz is None or float(bid_sz or 0) <= 0:
+                        # Keep prior size only if price unchanged or we have no new size.
+                        if prev[0] is not None and abs(float(prev[0]) - float(bid)) < 1e-12:
+                            bid_sz = prev[1]
+                        elif prev[0] is not None:
+                            bid_sz = prev[1]  # best effort until next book snapshot
+                        else:
+                            bid_sz = 0.0
+                if ask is not None:
+                    if ask_sz is None or float(ask_sz or 0) <= 0:
+                        if prev[2] is not None and abs(float(prev[2]) - float(ask)) < 1e-12:
+                            ask_sz = prev[3]
+                        elif prev[2] is not None:
+                            ask_sz = prev[3]
+                        else:
+                            ask_sz = 0.0
+            mid = None
+            if bid is not None and ask is not None:
+                mid = (bid + ask) / 2.0
             self._quotes[asset_id] = (
                 bid,
                 float(bid_sz or 0.0) if bid is not None else 0.0,
@@ -158,17 +189,17 @@ class ClobMarketBookFeed:
             asset_id = str(msg.get("asset_id") or "")
             bid, bid_sz = _best_from_levels(msg.get("bids") or [], "bid")
             ask, ask_sz = _best_from_levels(msg.get("asks") or [], "ask")
-            self._store(asset_id, bid, bid_sz, ask, ask_sz)
+            self._store(asset_id, bid, bid_sz, ask, ask_sz, preserve_sizes=False)
             return
         if et == "best_bid_ask":
             asset_id = str(msg.get("asset_id") or "")
-            # Both fields are authoritative; null/missing clears that side.
             self._store(
                 asset_id,
                 _f(msg.get("best_bid")),
-                0.0,
+                None,
                 _f(msg.get("best_ask")),
-                0.0,
+                None,
+                preserve_sizes=True,
             )
             return
         if et == "price_change":
@@ -176,16 +207,15 @@ class ClobMarketBookFeed:
                 if not isinstance(pc, dict):
                     continue
                 asset_id = str(pc.get("asset_id") or "")
-                # price_change includes best_bid/best_ask for the asset — treat
-                # as authoritative top-of-book (do not merge with previous).
                 if "best_bid" not in pc and "best_ask" not in pc:
                     continue
                 self._store(
                     asset_id,
                     _f(pc.get("best_bid")),
-                    0.0,
+                    None,
                     _f(pc.get("best_ask")),
-                    0.0,
+                    None,
+                    preserve_sizes=True,
                 )
             return
 
