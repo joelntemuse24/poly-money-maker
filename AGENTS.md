@@ -134,7 +134,8 @@ Watch the console for `[DRY BUY]` / `[DRY SELL]` markers. Ctrl-C to stop.
 | `polybuybothourly.service` | `buybothourly.py` (hourly) |
 
 CI: pushes to `main` touching the buy bots, `buy/`, or `requirements.txt` deploy to
-the VM via SSH (git pull + pip install + restart the three services).
+the VM via SSH (`git pull` + `pip install` only). Services are **not** auto-restarted —
+start/restart deliberately after validation (`systemctl start` / `restart`).
 
 ## Dependencies
 

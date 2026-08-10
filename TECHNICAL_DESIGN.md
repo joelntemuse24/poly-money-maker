@@ -330,14 +330,16 @@ the default's type. Templates are `strategy_buy.example.json`,
 
 ```bash
 sudo systemctl status polybuybot polybuybot5m polybuybothourly
-sudo systemctl restart polybuybot5m        # after deploying code
+# After validating a deploy, start/restart deliberately (CI does not restart):
+sudo systemctl restart polybuybot5m
 sudo journalctl -u polybuybot -f           # live logs (stdout)
 ```
 
 Code deploys via GitHub Actions (`.github/workflows/deploy.yml`): pushes to `main`
 that touch the buy bots, `buy/`, or `requirements.txt` SSH to the VM, `git pull`,
-`pip install -r requirements.txt`, and restart the three services. Strategy JSON
-changes need no deploy and no restart (hot reload).
+and `pip install -r requirements.txt`. **Services are not restarted by CI** (a blind
+restart would start force-stopped/disabled units). Operators restart after validation.
+Strategy JSON changes need no deploy and no restart (hot reload).
 
 **Audit on the VM:**
 
