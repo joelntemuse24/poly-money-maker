@@ -1179,7 +1179,7 @@ while not _shutdown_requested:
 
             # Underlying BTC (Chainlink RTDS) vs Price To Beat at window open.
             uchk = None
-            if UNDERLYING_GATE_ENABLED and MIN_UNDERLYING_EDGE_USD > 0 and (up_buy or dn_buy):
+            if UNDERLYING_GATE_ENABLED and (up_buy or dn_buy):
                 uchk = btc_feed.underlying_check(m.start_ts, MIN_UNDERLYING_EDGE_USD)
                 favored = uchk.get("favored")
                 if not uchk.get("ok") or not favored:
