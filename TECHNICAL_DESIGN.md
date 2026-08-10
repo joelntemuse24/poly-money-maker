@@ -3640,14 +3640,25 @@ Beat, then resolved Down).
 | Price To Beat | Coinbase 1m candle open nearest to market `start_ts` (crypto PTB is not in the public REST API; this is close enough for a dollar edge filter) |
 
 When `underlying_gate_enabled` (default true) and `min_underlying_edge_usd` (default
-**$15**):
+**$10**):
 
 1. Skip if `|live_btc - ptb| < min_underlying_edge_usd` (`buy_skip_underlying_edge`)
 2. Only allow **Up** if `live_btc ≥ ptb + edge`, only **Down** if `live_btc ≤ ptb - edge`
    (`buy_skip_underlying_side` if the book disagrees)
 
-Settlement is Chainlink TWAP, not Coinbase — treat this as a coarse anti-fake-out
-filter, not a perfect oracle replay.
+**Accuracy (important for research):**
+
+| Input | Source | Notes |
+|---|---|---|
+| Live BTC | Polymarket RTDS `crypto_prices_chainlink` `btc/usd` | Same Chainlink pipe the UI uses; ~1 Hz; memory-only in the buy hot path |
+| Price To Beat | Nearest RTDS Chainlink tick to market `start_ts` (≤2s skew) | Captured into `ptb_chainlink_buy*.json`; **not** Coinbase. If the bot missed the open, PTB is marked missing and buys are refused |
+| Research log | `underlying_research_buy*.jsonl` | `ptb_capture`, skips, `buy_attempt`/`buy_fill`, `resolved` — for correlation/regression |
+
+Spot HTTP (Coinbase/Kraken) is emergency live fallback only and is tagged
+`spot_fallback` so it never pretends to be Chainlink PTB.
+
+**Speed:** book + last-trade quotes for both legs run in parallel via the existing
+thread pool (~1 RTT). Underlying check is pure memory (no HTTP on the decide path).
 
 Sizing uses **`buy_budget`** (USD), not a fixed share count. Each FAK attempt
 buys `min(remaining_budget / ask, top_of_book_size)` shares so spent notional

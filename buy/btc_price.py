@@ -1,26 +1,28 @@
-"""BTC underlying price helpers for Up/Down buy gates.
+"""BTC underlying prices aligned to Polymarket Up/Down markets.
 
-Polymarket BTC Up/Down markets resolve on Chainlink BTC/USD TWAP vs the
-window's Price To Beat (PTB = BTC at event start). Crypto PTB is not in the
-public REST API, so we approximate:
+Resolution (Polymarket rules): Chainlink BTC/USD TWAP vs Price To Beat (BTC at
+window open). Crypto PTB is not exposed on public REST — the accurate approach
+is to record Polymarket's own Chainlink RTDS stream at `start_ts`.
 
-- Live: Polymarket RTDS `crypto_prices_chainlink` (btc/usd), with Coinbase
-  spot as fallback.
-- PTB: Coinbase 1-minute candle open nearest to market `start_ts` (same
-  ballpark as Chainlink for a $15+ edge gate).
-
-This is intentionally a coarse filter: if spot is not clearly above/below
-PTB, do not buy a 96–99¢ ask just because the CLOB looks decided.
+- Live + history: `wss://ws-live-data.polymarket.com` topic
+  `crypto_prices_chainlink` filter `{"symbol":"btc/usd"}` (same pipe the UI uses).
+- PTB: nearest Chainlink tick to market `start_ts` from an in-memory ring buffer
+  (persisted to disk when captured). If we missed the open (bot down), PTB is
+  marked missing and the trade gate refuses — we will not invent a Coinbase
+  substitute for trading decisions.
+- Hot path is memory-only (no HTTP). Spot HTTP is emergency live fallback only
+  and is tagged so research logs stay honest about source quality.
 """
 
 from __future__ import annotations
 
 import json
 import logging
+import os
 import threading
 import time
-from datetime import datetime, timezone
-from typing import Optional, Tuple
+from collections import deque
+from typing import Any, Deque, Dict, Optional, Tuple
 
 import requests
 
@@ -28,152 +30,250 @@ log = logging.getLogger("btc_price")
 
 RTDS_URL = "wss://ws-live-data.polymarket.com"
 COINBASE_SPOT_URL = "https://api.coinbase.com/v2/prices/BTC-USD/spot"
-COINBASE_CANDLES_URL = "https://api.exchange.coinbase.com/products/BTC-USD/candles"
 KRAKEN_TICKER_URL = "https://api.kraken.com/0/public/Ticker"
 
-LIVE_STALE_S = 30.0
-PTB_CACHE_MAX = 256
+# Keep ~3h of ~1Hz ticks so 15m/hourly windows still resolve PTB after brief blips.
+RING_MAX_SAMPLES = 12_000
+# PTB tick must land within this many ms of market start_ts.
+PTB_MAX_SKEW_MS = 2000
+# Live Chainlink older than this → treat as stale for trading.
+LIVE_STALE_S = 5.0
+PTB_CACHE_MAX = 512
+DEFAULT_PTB_STORE = "ptb_chainlink_cache.json"
 
 
 def _coinbase_spot() -> Optional[float]:
     try:
-        resp = requests.get(COINBASE_SPOT_URL, timeout=5)
+        resp = requests.get(COINBASE_SPOT_URL, timeout=2)
         resp.raise_for_status()
         return float(resp.json()["data"]["amount"])
-    except Exception as e:
-        log.debug("coinbase_spot_fail: %s", e)
+    except Exception:
         return None
 
 
 def _kraken_spot() -> Optional[float]:
     try:
-        resp = requests.get(KRAKEN_TICKER_URL, params={"pair": "XBTUSD"}, timeout=5)
+        resp = requests.get(KRAKEN_TICKER_URL, params={"pair": "XBTUSD"}, timeout=2)
         resp.raise_for_status()
         result = resp.json().get("result") or {}
         book = next(iter(result.values()), None) or {}
         last = (book.get("c") or [None])[0]
         return float(last) if last is not None else None
-    except Exception as e:
-        log.debug("kraken_spot_fail: %s", e)
+    except Exception:
         return None
 
 
-def fetch_spot_price() -> Optional[float]:
+def fetch_spot_fallback() -> Optional[float]:
     return _coinbase_spot() or _kraken_spot()
 
 
-def fetch_price_at(start_ts: float) -> Optional[float]:
-    """Approximate BTC USD at window open via Coinbase 1m candle open."""
-    ts = int(start_ts)
-    start_iso = datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-    end_iso = datetime.fromtimestamp(ts + 120, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+def append_research(path: str, record: Dict[str, Any]) -> None:
+    """Append one JSON line for offline correlation / regression."""
     try:
-        resp = requests.get(
-            COINBASE_CANDLES_URL,
-            params={"start": start_iso, "end": end_iso, "granularity": 60},
-            timeout=8,
-        )
-        resp.raise_for_status()
-        rows = resp.json() or []
-        if not rows:
-            return None
-        # Coinbase returns [time, low, high, open, close, volume], newest first.
-        best = min(rows, key=lambda r: abs(int(r[0]) - ts))
-        return float(best[3])
+        row = dict(record)
+        row.setdefault("logged_at", time.time())
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(row, separators=(",", ":")) + "\n")
     except Exception as e:
-        log.debug("coinbase_candle_fail: %s", e)
-        return None
+        log.debug("research_log_fail: %s", e)
 
 
 class BtcUnderlyingFeed:
-    """Background live BTC price + cached price-to-beat lookups."""
+    """Chainlink RTDS ring buffer + PTB capture for Up/Down windows."""
 
-    def __init__(self):
+    def __init__(self, ptb_store_path: str = DEFAULT_PTB_STORE):
         self._live: Optional[float] = None
-        self._live_ts: float = 0.0
-        self._ptb_cache: dict[int, float] = {}
+        self._live_ts: float = 0.0  # unix seconds (wall)
+        self._live_src: str = "none"
+        self._ticks: Deque[Tuple[int, float]] = deque(maxlen=RING_MAX_SAMPLES)  # (ts_ms, px)
+        self._ptb: Dict[int, Dict[str, Any]] = {}  # start_ts_int -> record
+        self._ptb_store_path = ptb_store_path
         self._lock = threading.Lock()
         self._stop = threading.Event()
         self._thread: Optional[threading.Thread] = None
         self._started = False
+        self._load_ptb_store()
 
     def start(self) -> None:
         if self._started:
             return
         self._started = True
-        # Seed immediately so first cycle isn't empty.
-        spot = fetch_spot_price()
-        if spot is not None:
-            with self._lock:
-                self._live = spot
-                self._live_ts = time.time()
-        self._thread = threading.Thread(target=self._run, name="btc-underlying-feed", daemon=True)
+        self._thread = threading.Thread(target=self._run, name="btc-chainlink-rtds", daemon=True)
         self._thread.start()
 
     def stop(self) -> None:
         self._stop.set()
 
-    def live_price(self) -> Optional[float]:
+    def live_quote(self) -> Tuple[Optional[float], str, Optional[float]]:
+        """Return (price, source, age_s). Memory only — never blocks on HTTP."""
         with self._lock:
-            live, ts = self._live, self._live_ts
-        if live is not None and (time.time() - ts) <= LIVE_STALE_S:
-            return live
-        spot = fetch_spot_price()
-        if spot is not None:
-            with self._lock:
-                self._live = spot
-                self._live_ts = time.time()
-            return spot
-        return live  # possibly stale; better than nothing for logging
+            live, ts, src = self._live, self._live_ts, self._live_src
+        if live is None:
+            return None, "none", None
+        age = time.time() - ts
+        return live, src, age
+
+    def live_price(self, *, allow_stale: bool = False) -> Optional[float]:
+        px, src, age = self.live_quote()
+        if px is None:
+            return None
+        if age is not None and age > LIVE_STALE_S and not allow_stale:
+            return None
+        return px
 
     def price_to_beat(self, start_ts: float) -> Optional[float]:
+        rec = self.ptb_record(start_ts)
+        if not rec or not rec.get("ok"):
+            return None
+        return float(rec["ptb"])
+
+    def ptb_record(self, start_ts: float) -> Optional[Dict[str, Any]]:
+        """Return cached PTB record; try capture from ring buffer if missing."""
         key = int(start_ts)
         with self._lock:
-            cached = self._ptb_cache.get(key)
+            cached = self._ptb.get(key)
         if cached is not None:
-            return cached
-        ptb = fetch_price_at(start_ts)
-        if ptb is None:
+            return dict(cached)
+        return self.capture_ptb(start_ts)
+
+    def capture_ptb(self, start_ts: float) -> Optional[Dict[str, Any]]:
+        """Lock PTB from Chainlink ticks nearest to start_ts.
+
+        Call this as soon as a market's window opens (or when discovered if
+        start is already past but still inside the ring buffer).
+        """
+        key = int(start_ts)
+        target_ms = key * 1000
+        now = time.time()
+        # Too early — window not open yet
+        if now + 0.05 < start_ts:
             return None
+
         with self._lock:
-            if len(self._ptb_cache) >= PTB_CACHE_MAX:
-                # Drop an arbitrary old entry
-                self._ptb_cache.pop(next(iter(self._ptb_cache)))
-            self._ptb_cache[key] = ptb
-        return ptb
+            if key in self._ptb:
+                return dict(self._ptb[key])
+            if not self._ticks:
+                rec = {
+                    "ok": False,
+                    "reason": "no_ticks",
+                    "start_ts": key,
+                    "source": "missing",
+                    "captured_at": now,
+                }
+                self._ptb[key] = rec
+                self._trim_ptb_unlocked()
+                self._save_ptb_store_unlocked()
+                return dict(rec)
+
+            # Nearest tick by |ts_ms - start_ms|
+            best_ts, best_px = min(self._ticks, key=lambda t: abs(t[0] - target_ms))
+            skew_ms = abs(best_ts - target_ms)
+            ok = skew_ms <= PTB_MAX_SKEW_MS
+            rec = {
+                "ok": ok,
+                "ptb": float(best_px),
+                "ptb_tick_ts_ms": int(best_ts),
+                "ptb_skew_ms": int(skew_ms),
+                "start_ts": key,
+                "source": "chainlink_rtds" if ok else "chainlink_rtds_skewed",
+                "reason": None if ok else "skew_too_large",
+                "captured_at": now,
+            }
+            # Only persist usable PTBs as authoritative; skewed kept for research
+            self._ptb[key] = rec
+            self._trim_ptb_unlocked()
+            self._save_ptb_store_unlocked()
+            return dict(rec)
 
     def underlying_check(
         self, start_ts: float, min_edge_usd: float
-    ) -> Tuple[bool, Optional[str], Optional[float], Optional[float], Optional[float]]:
-        """Return (ok, favored_leg, ptb, live, edge).
-
-        favored_leg is 'up' / 'down' when |live - ptb| >= min_edge_usd.
-        ok is False when data missing or edge too small.
-        """
-        ptb = self.price_to_beat(start_ts)
-        live = self.live_price()
+    ) -> Dict[str, Any]:
+        """Fast memory-only gate result for the buy loop."""
+        ptb_rec = self.ptb_record(start_ts) or {}
+        live, live_src, live_age = self.live_quote()
+        ptb = ptb_rec.get("ptb") if ptb_rec.get("ok") else None
+        out: Dict[str, Any] = {
+            "ok": False,
+            "favored": None,
+            "ptb": ptb,
+            "live_btc": live,
+            "edge_usd": None,
+            "ptb_source": ptb_rec.get("source", "missing"),
+            "ptb_skew_ms": ptb_rec.get("ptb_skew_ms"),
+            "ptb_ok": bool(ptb_rec.get("ok")),
+            "live_source": live_src,
+            "live_age_s": live_age,
+        }
         if ptb is None or live is None:
-            return False, None, ptb, live, None
-        edge = live - ptb
+            out["reason"] = "missing_ptb" if ptb is None else "missing_live"
+            return out
+        if live_age is not None and live_age > LIVE_STALE_S:
+            out["reason"] = "live_stale"
+            return out
+        edge = float(live) - float(ptb)
+        out["edge_usd"] = edge
         if abs(edge) < min_edge_usd:
-            return False, None, ptb, live, edge
-        favored = "up" if edge > 0 else "down"
-        return True, favored, ptb, live, edge
+            out["reason"] = "edge_too_small"
+            return out
+        out["ok"] = True
+        out["favored"] = "up" if edge > 0 else "down"
+        out["reason"] = None
+        return out
 
-    def _set_live(self, value: float, ts_ms: Optional[float] = None) -> None:
+    def _trim_ptb_unlocked(self) -> None:
+        while len(self._ptb) > PTB_CACHE_MAX:
+            self._ptb.pop(next(iter(self._ptb)))
+
+    def _load_ptb_store(self) -> None:
+        path = self._ptb_store_path
+        if not path or not os.path.exists(path):
+            return
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, dict):
+                for k, v in data.items():
+                    try:
+                        self._ptb[int(k)] = v
+                    except (TypeError, ValueError):
+                        continue
+        except Exception as e:
+            log.debug("ptb_store_load_fail: %s", e)
+
+    def _save_ptb_store_unlocked(self) -> None:
+        path = self._ptb_store_path
+        if not path:
+            return
+        try:
+            tmp = path + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(self._ptb, f, separators=(",", ":"))
+            os.replace(tmp, path)
+        except Exception as e:
+            log.debug("ptb_store_save_fail: %s", e)
+
+    def _push_tick(self, ts_ms: int, value: float) -> None:
+        with self._lock:
+            self._ticks.append((int(ts_ms), float(value)))
+            self._live = float(value)
+            self._live_ts = ts_ms / 1000.0
+            self._live_src = "chainlink_rtds"
+
+    def _set_live_fallback(self, value: float, source: str) -> None:
         with self._lock:
             self._live = float(value)
-            self._live_ts = (ts_ms / 1000.0) if ts_ms else time.time()
+            self._live_ts = time.time()
+            self._live_src = source
 
     def _run(self) -> None:
         while not self._stop.is_set():
             if self._run_rtds_once():
                 continue
-            # Fallback poll if websocket unavailable / drops
-            spot = fetch_spot_price()
+            # Emergency only — tagged so we never confuse with Chainlink PTB.
+            spot = fetch_spot_fallback()
             if spot is not None:
-                self._set_live(spot)
-            self._stop.wait(2.0)
+                self._set_live_fallback(spot, "spot_fallback")
+            self._stop.wait(1.0)
 
     def _run_rtds_once(self) -> bool:
         try:
@@ -181,7 +281,7 @@ class BtcUnderlyingFeed:
         except ImportError:
             return False
 
-        connected = {"ok": False}
+        got_chainlink = {"ok": False}
 
         def on_message(ws, message):
             if message == "PONG" or not message:
@@ -191,23 +291,25 @@ class BtcUnderlyingFeed:
             except Exception:
                 return
             payload = data.get("payload") or {}
-            # Live update
+            topic = data.get("topic") or ""
+            # Prefer chainlink topic; also accept dumps that carry symbol btc/usd
             if "value" in payload and "data" not in payload:
                 try:
-                    self._set_live(float(payload["value"]), payload.get("timestamp"))
-                    connected["ok"] = True
+                    ts_ms = int(payload.get("timestamp") or time.time() * 1000)
+                    self._push_tick(ts_ms, float(payload["value"]))
+                    got_chainlink["ok"] = True
                 except (TypeError, ValueError):
                     pass
                 return
-            # Initial historical dump — take newest point
             hist = payload.get("data")
             if isinstance(hist, list) and hist:
-                try:
-                    last = hist[-1]
-                    self._set_live(float(last["value"]), last.get("timestamp"))
-                    connected["ok"] = True
-                except (TypeError, ValueError, KeyError):
-                    pass
+                for point in hist:
+                    try:
+                        ts_ms = int(point["timestamp"])
+                        self._push_tick(ts_ms, float(point["value"]))
+                        got_chainlink["ok"] = True
+                    except (TypeError, ValueError, KeyError):
+                        continue
 
         def on_open(ws):
             ws.send(
@@ -244,8 +346,7 @@ class BtcUnderlyingFeed:
                 if self._stop.wait(5.0):
                     break
 
-        ping_thread = threading.Thread(target=pinger, name="btc-rtds-ping", daemon=True)
-        ping_thread.start()
+        threading.Thread(target=pinger, name="btc-rtds-ping", daemon=True).start()
         try:
             ws.run_forever(ping_interval=None)
         except Exception as e:
@@ -254,18 +355,17 @@ class BtcUnderlyingFeed:
             ws.close()
         except Exception:
             pass
-        return connected["ok"]
+        return got_chainlink["ok"]
 
 
-# Process-wide feed used by buy bots
 _FEED: Optional[BtcUnderlyingFeed] = None
 _FEED_LOCK = threading.Lock()
 
 
-def get_btc_feed() -> BtcUnderlyingFeed:
+def get_btc_feed(ptb_store_path: str = DEFAULT_PTB_STORE) -> BtcUnderlyingFeed:
     global _FEED
     with _FEED_LOCK:
         if _FEED is None:
-            _FEED = BtcUnderlyingFeed()
+            _FEED = BtcUnderlyingFeed(ptb_store_path=ptb_store_path)
             _FEED.start()
         return _FEED

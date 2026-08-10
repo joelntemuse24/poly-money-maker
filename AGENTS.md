@@ -102,8 +102,12 @@ python check_book.py
 - `buy_skip_ambiguous` — GUI display prices too close
 - `buy_skip_no_consensus` — ask in band but Polymarket GUI prices don't show a clear winner/loser
 - `buy_skip_incomplete_book` — missing GUI price on one or both legs (no mid and no last trade)
-- `buy_skip_underlying_edge` — live BTC not ≥ `min_underlying_edge_usd` from Price To Beat
+- `buy_skip_underlying_edge` — live Chainlink BTC not ≥ `min_underlying_edge_usd` ($10) from captured PTB
 - `buy_skip_underlying_side` — book wants the opposite leg from the underlying move
+
+Research / accuracy: Chainlink RTDS ticks + PTB captures land in
+`underlying_research_buy*.jsonl` and `ptb_chainlink_buy*.json` (gitignored).
+
 
 ## Key Conventions
 
