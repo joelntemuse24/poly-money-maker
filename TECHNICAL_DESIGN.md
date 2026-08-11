@@ -200,10 +200,10 @@ A buy fires only when **all** of these gates pass, evaluated in the final window
    `buy_max_price` (96–99¢). Below 96¢ the outcome isn't certain enough; at/above
    99¢ there's no spread left.
 5. **Underlying gate.** If `underlying_gate_enabled`, the live oracle price must be
-   at least `min_underlying_edge_usd` ($10) away from the captured PTB, **and** the
-   book's winning side must match the direction of the underlying move. This blocks
-   buying a "winner" that the resolution oracle itself disagrees with (stale-book
-   trap).
+   at least `min_underlying_edge_usd` away from the captured PTB ($5 on 5m, $10 on
+   15m/hourly), **and** the book's winning side must match the direction of the
+   underlying move. This blocks buying a "winner" that the resolution oracle itself
+   disagrees with (stale-book trap).
 6. **Risk caps.** `buy_budget` USDC per market ($21/$8/$24), `max_open_positions`,
    `max_open_notional`, `max_daily_notional`, and available USDC balance.
 

@@ -134,10 +134,11 @@ _STRATEGY_DEFAULTS = {
     # Explicit hot-reloadable entry arm. A missing/invalid file disables new
     # entries while existing positions continue through the hedge path.
     "entry_enabled": False,
-    "buy_threshold": 0.96,
+    # Slightly wider than 5m/15m, but still high-90s; keep size modest vs reversals.
+    "buy_threshold": 0.965,
     "buy_max_price": 0.99,
     # Consensus on Polymarket GUI display price (mid if spread≤10¢ else last trade).
-    "min_winner_bid": 0.90,
+    "min_winner_bid": 0.92,
     "max_loser_bid": 0.10,
     "min_bid_edge": 0.05,
     # Skip buys unless live BTC is ≥ this many USD from the window Price To Beat,
@@ -161,10 +162,10 @@ _STRATEGY_DEFAULTS = {
     # and ask also collapsed (same lesson sell-side already learned on mids).
     "hedge_max_spread": 0.15,
     "hedge_require_ask_max": 0.70,
-    "buy_window_min": 5.0,
+    "buy_window_min": 3.5,
     "buy_grace_s": 2,
     "buy_cooldown_s": 3,
-    "buy_budget": 24.0,
+    "buy_budget": 15.0,
     "max_open_positions": 100,
     "max_open_notional": 10000.0,
     "max_daily_notional": 999999.0,

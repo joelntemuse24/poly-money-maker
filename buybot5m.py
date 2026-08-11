@@ -131,10 +131,11 @@ for _rounding in ROUNDING_CONFIG.values():
 # ------------------------- STRATEGY CONFIG -------------------------
 _STRATEGY_DEFAULTS = {
     "entry_enabled": False,
-    "buy_threshold": 0.96,
+    # High-90s only: cheaper fills in history were dominated by false-book entries.
+    "buy_threshold": 0.97,
     "buy_max_price": 0.99,
     # Consensus on Polymarket GUI display price (mid if spread≤10¢ else last trade).
-    "min_winner_bid": 0.90,
+    "min_winner_bid": 0.92,
     "max_loser_bid": 0.10,
     "min_bid_edge": 0.05,
     # Skip buys unless live BTC is ≥ this many USD from the window Price To Beat,
@@ -154,7 +155,7 @@ _STRATEGY_DEFAULTS = {
     # and ask also collapsed (same lesson sell-side already learned on mids).
     "hedge_max_spread": 0.15,
     "hedge_require_ask_max": 0.70,
-    "buy_start_s": 90,
+    "buy_start_s": 60,
     "buy_grace_s": 1,
     "buy_cooldown_s": 1,
     "buy_budget": 8.0,

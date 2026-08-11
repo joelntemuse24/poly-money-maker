@@ -11,9 +11,9 @@ window, hedge at 65¢ on reversal, and redeem winners at $1.00.
 
 | File | Service | Markets | Oracle | Budget | Window |
 |---|---|---|---|---|---|
-| `buybot.py` | `polybuybot` | 15m | Chainlink TWAP 60s | $21 | final 3.0 min |
-| `buybot5m.py` | `polybuybot5m` | 5m | Chainlink TWAP 30s | $8 | final 90 s |
-| `buybothourly.py` | `polybuybothourly` | hourly | Binance BTCUSDT | $24 | final 5.0 min |
+| `buybot.py` | `polybuybot` | 15m | Chainlink TWAP 60s | $18 | final 2.5 min |
+| `buybot5m.py` | `polybuybot5m` | 5m | Chainlink TWAP 30s | $8 | final 60 s |
+| `buybothourly.py` | `polybuybothourly` | hourly | Binance BTCUSDT | $15 | final 3.5 min |
 
 Plus: `check_book.py` diagnostic.
 
@@ -121,8 +121,8 @@ Watch the console for `[DRY BUY]` / `[DRY SELL]` markers. Ctrl-C to stop.
 
 1. **The three bots are near-identical copies, not shared modules.** A bug fix in
    `buybot.py` probably also applies to `buybot5m.py` and `buybothourly.py`.
-2. **The 5m bot uses seconds-based window checks** (`buy_start_s = 90`) while the
-   15m and hourly bots use minutes (`buy_window_min = 3.0 / 5.0`). Don't mix them
+2. **The 5m bot uses seconds-based window checks** (`buy_start_s = 60`) while the
+   15m and hourly bots use minutes (`buy_window_min = 2.5 / 3.5`). Don't mix them
    when propagating changes. The 5m loop must define `seconds_left` (not only
    `minutes_left`) or it NameErrors every cycle.
 3. **Settlement is confirmation-gated.** A relayer submission is not P&L.
