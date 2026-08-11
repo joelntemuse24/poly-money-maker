@@ -397,8 +397,9 @@ journal is capped via `deploy/journald-size.conf`.
   consensus, oracle edge too small), the bot does nothing. Not trading is always the
   default.
 - **Persist fills that already happened.** A posted FAK cannot be “rejected” in
-  software — below-band buys are logged and still written to state. Crashes
-  between order and save are recovered via Data API positions / balance checks.
+  software — below-band buys are logged, written to state with `toxic_fill`, and
+  force-exited (not ridden to redemption). Crashes between order and save are
+  recovered via Data API positions / balance checks.
 - **Complete audit trail.** Every decision — buys, skips, hedges, redeems, P&L — is
   a structured log event and (for buy decisions) a research JSONL row.
 
