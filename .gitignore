@@ -28,6 +28,8 @@ underlying_research_buy*.jsonl.*
 ptb_*_buy*.json
 ptb_chainlink*.json
 *.json.tmp
+*.json.bak
+*.json.bak.tmp
 
 # Legacy state that still exists on the VM (sell bots / mint / sim were removed
 # from the repo in 2026-08, but their runtime files remain on disk — keep ignored)

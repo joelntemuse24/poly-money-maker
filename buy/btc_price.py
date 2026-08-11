@@ -283,8 +283,26 @@ class BtcUnderlyingFeed:
             if isinstance(data, dict):
                 for k, v in data.items():
                     try:
-                        self._ptb[int(k)] = v
-                    except (TypeError, ValueError):
+                        key = int(k)
+                        if not isinstance(v, dict) or v.get("ok") is not True:
+                            continue
+                        ptb = float(v.get("ptb"))
+                        tick_ts_ms = int(v.get("ptb_tick_ts_ms"))
+                        start_ts = int(v.get("start_ts"))
+                        if (
+                            not math.isfinite(ptb)
+                            or not 100 <= ptb <= 10_000_000
+                            or key != start_ts
+                            or abs(tick_ts_ms - key * 1000) > PTB_MAX_SKEW_MS
+                            or v.get("source") != self.meta["label"]
+                            or (
+                                v.get("feed") is not None
+                                and v.get("feed") != self.source
+                            )
+                        ):
+                            continue
+                        self._ptb[key] = dict(v)
+                    except (TypeError, ValueError, OverflowError):
                         continue
         except Exception as e:
             log.debug("ptb_store_load_fail: %s", e)
@@ -296,7 +314,9 @@ class BtcUnderlyingFeed:
         try:
             tmp = path + ".tmp"
             with open(tmp, "w", encoding="utf-8") as f:
-                json.dump(self._ptb, f, separators=(",", ":"))
+                json.dump(
+                    self._ptb, f, separators=(",", ":"), allow_nan=False,
+                )
                 f.flush()
                 os.fsync(f.fileno())
             os.replace(tmp, path)
@@ -313,7 +333,7 @@ class BtcUnderlyingFeed:
         try:
             ts_ms = int(ts_ms)
             value = float(value)
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
             return False
         now_ms = int(time.time() * 1000)
         if (
@@ -377,7 +397,7 @@ class BtcUnderlyingFeed:
                     if self._push_tick(ts_ms, float(payload["value"]), live=True):
                         got["ok"] = True
                         last_valid_mono["value"] = time.monotonic()
-                except (TypeError, ValueError):
+                except (TypeError, ValueError, OverflowError):
                     pass
                 return
 
@@ -389,15 +409,19 @@ class BtcUnderlyingFeed:
                 dump_sym = str(payload.get("symbol") or "").lower()
                 if dump_sym != want_symbol:
                     return
-                for point in sorted(
-                    (point for point in hist if isinstance(point, dict)),
-                    key=lambda point: int(point.get("timestamp") or 0),
-                ):
+                sortable = []
+                for point in hist:
+                    if not isinstance(point, dict):
+                        continue
                     try:
-                        ts_ms = int(point["timestamp"])
+                        sortable.append((int(point["timestamp"]), point))
+                    except (TypeError, ValueError, OverflowError, KeyError):
+                        continue
+                for ts_ms, point in sorted(sortable, key=lambda item: item[0]):
+                    try:
                         if self._push_tick(ts_ms, float(point["value"]), live=False):
                             got["ok"] = True
-                    except (TypeError, ValueError, KeyError):
+                    except (TypeError, ValueError, OverflowError, KeyError):
                         continue
                 return
 

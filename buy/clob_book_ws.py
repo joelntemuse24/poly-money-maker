@@ -286,11 +286,21 @@ class ClobMarketBookFeed:
             return
         if et == "best_bid_ask":
             asset_id = str(msg.get("asset_id") or "")
+            # Preserve the omitted side. Price-only events often update one
+            # side; clearing the other would fabricate a one-sided book.
+            with self._lock:
+                prev = self._quotes.get(asset_id)
+            bid = msg.get("best_bid") if "best_bid" in msg else (
+                prev[0] if prev is not None else None
+            )
+            ask = msg.get("best_ask") if "best_ask" in msg else (
+                prev[2] if prev is not None else None
+            )
             self._store(
                 asset_id,
-                _f(msg.get("best_bid")),
+                _f(bid) if bid is not None else None,
                 None,
-                _f(msg.get("best_ask")),
+                _f(ask) if ask is not None else None,
                 None,
                 preserve_sizes=True,
                 generation=generation,
@@ -304,11 +314,19 @@ class ClobMarketBookFeed:
                 asset_id = str(pc.get("asset_id") or "")
                 if "best_bid" not in pc and "best_ask" not in pc:
                     continue
+                with self._lock:
+                    prev = self._quotes.get(asset_id)
+                bid = pc.get("best_bid") if "best_bid" in pc else (
+                    prev[0] if prev is not None else None
+                )
+                ask = pc.get("best_ask") if "best_ask" in pc else (
+                    prev[2] if prev is not None else None
+                )
                 self._store(
                     asset_id,
-                    _f(pc.get("best_bid")),
+                    _f(bid) if bid is not None else None,
                     None,
-                    _f(pc.get("best_ask")),
+                    _f(ask) if ask is not None else None,
                     None,
                     preserve_sizes=True,
                     generation=generation,

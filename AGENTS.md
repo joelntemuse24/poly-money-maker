@@ -66,7 +66,8 @@ change to one usually needs propagation to its siblings.
 ## How to Verify a Change
 
 ```bash
-# Dry-run (no real orders when dry_run: true) — safe to run anytime
+# First verify the selected strategy file has dry_run=true and entry_enabled=false.
+# Never assume these commands are dry-run merely because they are launched manually.
 python buybot.py        # 15m, uses strategy_buy.json
 python buybot5m.py      # 5m,  uses strategy_buy5m.json
 python buybothourly.py  # hr,  uses strategy_buyhourly.json
@@ -94,15 +95,17 @@ Watch the console for `[DRY BUY]` / `[DRY SELL]` markers. Ctrl-C to stop.
 
 ## Key Conventions
 
-- **All bots are single-file polling loops** — no async, no modules, no database.
+- **All bots are single-file polling loops** — no `asyncio` or database. Small
+  thread pools isolate book, refresh, notification, and redemption-status I/O.
   Section comment banners (`# --- PRICING ---`) act as visual boundaries.
 - **Hot-reload:** Strategy JSON files are re-read every cycle via `load_strategy()`.
   Changes take effect on the next tick — no restart needed.
 - **Atomic durable save:** State and P&L files flush + `fsync` the `.tmp`, replace
   it, then `fsync` the parent directory before an order can proceed.
-- **Fail-closed startup:** Missing strategy files default to `dry_run: true`;
-  malformed hot reloads retain the last-known-good config. A per-bot process lock
-  prevents duplicate live instances.
+- **Fail-closed startup:** A valid strategy file is required at startup. A
+  missing/malformed hot reload disables new entries while retaining the
+  last-known-good hedge parameters. A per-bot process lock prevents duplicate
+  live instances.
 - **FAK orders only:** All orders are Fill-And-Kill — no resting orders, no market
   making.
 - **Hedge is sell-only exit:** The bots never profit-take. The only sell path is the
@@ -122,10 +125,9 @@ Watch the console for `[DRY BUY]` / `[DRY SELL]` markers. Ctrl-C to stop.
    15m and hourly bots use minutes (`buy_window_min = 3.0 / 5.0`). Don't mix them
    when propagating changes. The 5m loop must define `seconds_left` (not only
    `minutes_left`) or it NameErrors every cycle.
-3. **PNL fallback in GC assumes par redemption** — if `pnl_redeem_value == 0` and
-   `bought_size > 0`, GC sets `redeem_value = bought_size` (full $1.00/share).
-   Correct when the bot buys the winning leg; would overstate P&L if it ever bought
-   the wrong leg.
+3. **Settlement is confirmation-gated.** A relayer submission is not P&L.
+   Redemption is credited only after relayer confirmation and a complete Data API
+   snapshot shows the inventory gone; GC never invents par value.
 4. **No `if __name__ == "__main__"` guard** — these scripts execute at module level.
    They cannot be imported.
 
@@ -145,6 +147,8 @@ start/restart deliberately after validation (`systemctl start` / `restart`).
 
 ```
 py_clob_client_v2   # Polymarket CLOB SDK
+py-builder-relayer-client  # Relayer proxy transaction builder/signing
+py-builder-signing-sdk     # POLY_BUILDER_* HMAC authentication headers
 requests            # HTTP for Data API, Gamma API, ntfy, relayer
 python-dotenv       # .env loading
 rich                # Terminal UI (tables, panels)

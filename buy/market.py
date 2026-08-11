@@ -46,7 +46,12 @@ def _list(value: Any) -> list:
 
 
 def _end_timestamp(value: str) -> float:
-    timestamp = datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp()
+    try:
+        timestamp = datetime.fromisoformat(
+            value.replace("Z", "+00:00")
+        ).timestamp()
+    except (TypeError, ValueError, OverflowError, OSError) as exc:
+        raise ValueError("invalid timestamp") from exc
     if not math.isfinite(timestamp):
         raise ValueError("non-finite timestamp")
     return timestamp
@@ -112,8 +117,11 @@ def _parse_event(event: dict, series_slug: str) -> Iterable[MintMarket]:
             except (TypeError, ValueError):
                 api_start_ts = end_ts
             # Gamma sometimes exposes event creation time as startDate. Derive
-            # the actual window from the requested series instead of assuming 1h.
-            if end_ts - api_start_ts > max(7200, duration_s * 2):
+            # the actual window from the requested series whenever the supplied
+            # duration is inconsistent, not only when it is hours too old.
+            api_duration = end_ts - api_start_ts
+            duration_tolerance = max(5.0, duration_s * 0.05)
+            if abs(api_duration - duration_s) > duration_tolerance:
                 start_ts = end_ts - duration_s
             else:
                 start_ts = api_start_ts

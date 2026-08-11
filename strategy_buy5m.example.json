@@ -1,4 +1,5 @@
 {
+  "entry_enabled": false,
   "buy_threshold": 0.96,
   "buy_max_price": 0.99,
   "min_winner_bid": 0.9,
