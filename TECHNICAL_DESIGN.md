@@ -269,9 +269,9 @@ Winning shares don't sell — they redeem on-chain at $1.00 via Polymarket's rel
 2. The bot builds `redeemPositions(address,bytes32,bytes32,uint256[])` calldata for
    the CTF contract (`0x4D97…6045`), uses
    `py-builder-relayer-client` to build and sign the PROXY request, verifies the
-   derived proxy equals `FUNDER_ADDRESS`, and uses
-   `py-builder-signing-sdk` to generate the official per-request
-   `POLY_BUILDER_*` HMAC headers for `POST /submit`.
+   derived proxy equals `FUNDER_ADDRESS`, and authenticates `POST /submit` with
+   either Relayer API key headers (`RELAYER_API_KEY` + `RELAYER_API_KEY_ADDRESS`)
+   or Builder HMAC (`POLY_BUILDER_*` via `py-builder-signing-sdk`).
 3. Submissions are throttled per condition (`redeem_throttle_s`, 30 s) and abandoned
    after `max_redeem_age_days` (7 days). Conditions that permanently fail are kept in
    an in-memory blocklist so the bot doesn't burn gas on a reverting call.
@@ -312,7 +312,8 @@ crash between P&L and state saves cannot double-count.
 | `PRIVATE_KEY`, `FUNDER_ADDRESS` | Trading account (key + funder/proxy address) |
 | `API_KEY`, `API_SECRET`, `API_PASSPHRASE` | CLOB API credentials (L2 auth) |
 | `RELAYER_URL` | Redeem relayer URL (defaults to Polymarket production) |
-| `POLY_BUILDER_API_KEY`, `POLY_BUILDER_SECRET`, `POLY_BUILDER_PASSPHRASE` | Builder authentication for redeem submission |
+| `RELAYER_API_KEY`, `RELAYER_API_KEY_ADDRESS` | Relayer API key auth for redeem (preferred; Settings → API Keys) |
+| `POLY_BUILDER_API_KEY`, `POLY_BUILDER_SECRET`, `POLY_BUILDER_PASSPHRASE` | Alternate Builder HMAC auth for redeem (Settings → Builders) |
 
 **Strategy JSON** — a valid file is required at startup. Each bot re-reads it every
 cycle (`load_strategy()` checks mtime), so ordinary parameter changes take effect on

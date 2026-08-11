@@ -107,10 +107,13 @@ API_KEY = os.getenv("API_KEY")
 API_SECRET = os.getenv("API_SECRET")
 API_PASSPHRASE = os.getenv("API_PASSPHRASE")
 RELAYER_URL = os.getenv("RELAYER_URL", "https://relayer-v2.polymarket.com")
+# Relayer API key auth (Settings → API Keys → Relayer): key + owner address.
+RELAYER_API_KEY = os.getenv("RELAYER_API_KEY")
+RELAYER_API_KEY_ADDRESS = os.getenv("RELAYER_API_KEY_ADDRESS")
+# Builder HMAC auth (Settings → Builders): key + secret + passphrase.
 POLY_BUILDER_API_KEY = (
     os.getenv("POLY_BUILDER_API_KEY")
     or os.getenv("BUILDER_API_KEY")
-    or os.getenv("RELAYER_API_KEY")
 )
 POLY_BUILDER_SECRET = (
     os.getenv("POLY_BUILDER_SECRET")
@@ -2565,7 +2568,14 @@ _redeem_permanent_failures = set()
 
 
 def get_relayer_headers(body):
-    """Generate the official per-request HMAC builder authentication headers."""
+    """Auth headers for relayer submit: Relayer API key OR Builder HMAC."""
+    # Prefer Relayer API key auth (Settings → API Keys) when present.
+    if RELAYER_API_KEY and RELAYER_API_KEY_ADDRESS:
+        return {
+            "Content-Type": "application/json",
+            "RELAYER_API_KEY": str(RELAYER_API_KEY),
+            "RELAYER_API_KEY_ADDRESS": str(RELAYER_API_KEY_ADDRESS),
+        }
     if not (
         POLY_BUILDER_API_KEY
         and POLY_BUILDER_SECRET
@@ -2617,17 +2627,26 @@ def submit_proxy_tx(target, data, tx_type="PROXY"):
         return None, f"unsupported relayer transaction type {tx_type}"
     if not PRIVATE_KEY or not FUNDER_ADDRESS:
         return None, "missing PRIVATE_KEY or FUNDER_ADDRESS"
-    if not (
+    has_relayer_key = bool(RELAYER_API_KEY and RELAYER_API_KEY_ADDRESS)
+    has_builder = bool(
         POLY_BUILDER_API_KEY
         and POLY_BUILDER_SECRET
         and POLY_BUILDER_PASSPHRASE
-    ):
-        return None, "missing Polymarket builder credentials"
+    )
+    if not (has_relayer_key or has_builder):
+        return None, "missing Polymarket relayer/builder credentials"
 
     try:
         relayer_url = RELAYER_URL.rstrip("/")
         signer = RelayerSigner(PRIVATE_KEY, CHAIN_ID)
         eoa = signer.address()
+        if (
+            has_relayer_key
+            and str(RELAYER_API_KEY_ADDRESS).lower() != str(eoa).lower()
+        ):
+            return None, (
+                "RELAYER_API_KEY_ADDRESS does not match PRIVATE_KEY signer"
+            )
         nonce_r = requests.get(
             f"{relayer_url}/relay-payload",
             params={"address": eoa, "type": tx_type},
@@ -2670,7 +2689,7 @@ def submit_proxy_tx(target, data, tx_type="PROXY"):
             return None, "derived proxyWallet does not match FUNDER_ADDRESS"
         relayer_headers = get_relayer_headers(body)
         if relayer_headers is None:
-            return None, "could not generate builder authentication headers"
+            return None, "could not generate relayer authentication headers"
 
         submit_r = requests.post(
             f"{relayer_url}/submit",
@@ -2719,7 +2738,9 @@ def redeem_condition(condition_id, label=""):
         if err and (
             "proxyWallet" in err
             or "invalid api key" in err.lower()
+            or "invalid authorization" in err.lower()
             or "unauthorized" in err.lower()
+            or "RELAYER_API_KEY_ADDRESS does not match" in err
         ):
             _redeem_permanent_failures.add(condition_id)
             console.print(f"  [dim red][SETTLE SKIP][/] {label}  [dim]permanent failure — will not retry[/]")
