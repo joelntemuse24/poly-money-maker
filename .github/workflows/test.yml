@@ -13,6 +13,8 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+      - name: Install runtime dependencies
+        run: python3 -m pip install -r requirements.txt
       - name: Compile buy bots
         run: python3 -m py_compile buybot.py buybot5m.py buybothourly.py
       - name: Run unit tests

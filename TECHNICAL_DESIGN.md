@@ -20,9 +20,10 @@
 10. [Configuration & Hot Reload](#10-configuration--hot-reload)
 11. [Operations on the VM](#11-operations-on-the-vm)
 12. [Error Handling Philosophy](#12-error-handling-philosophy)
-13. [Landmines](#13-landmines)
-14. [Removed / Historical](#14-removed--historical)
-15. [Glossary](#15-glossary)
+13. [Latency & Optional AI Validation](#13-latency--optional-ai-validation)
+14. [Landmines](#14-landmines)
+15. [Removed / Historical](#15-removed--historical)
+16. [Glossary](#16-glossary)
 
 ---
 
@@ -34,9 +35,9 @@ or 1 hour)? A market has two legs (UP and DOWN). Exactly one leg wins and redeem
 $1.00; the other redeems at $0.
 
 **The strategy:** in the final moments before resolution, the outcome is usually
-already obvious — the winning leg trades at 96–99¢ but has not yet settled. The bots
+already obvious — the winning leg trades at 98–99¢ but has not yet settled. The bots
 buy that near-certain winner with a Fill-And-Kill (FAK) market order and redeem it at
-$1.00, capturing the 1–4¢ spread per share.
+$1.00, capturing ~1–2¢ per share.
 
 **The risk:** BTC can reverse in the final seconds. If the leg we bought truly
 collapses (bid **and** ask both drop — not a lone 1¢ bid under a still-high ask),
@@ -44,8 +45,8 @@ the bot **hedges**: it market-sells the held leg, floored at `hedge_min_price`
 (~32¢). There is no profit-taking sell — the only sell path is the hedge;
 everything else rides to redemption.
 
-**Economics per share (no reversal):** buy at ~97¢, redeem at $1.00 → ~3¢ gross.
-**Economics per share (hedged reversal):** buy at ~97¢, sell near the collapsed
+**Economics per share (no reversal):** buy at ~98–99¢, redeem at $1.00 → ~1–2¢ gross.
+**Economics per share (hedged reversal):** buy at ~98–99¢, sell near the collapsed
 book (≥ floor) → bounded loss instead of riding a wrong side to $0.
 
 ---
@@ -62,9 +63,9 @@ trades a different market cadence and uses a different resolution oracle.
 | Series slug | `btc-up-or-down-15m` | `btc-up-or-down-5m` | `btc-up-or-down-hourly` |
 | Slug prefix / excludes | `btc-updown` (excl. `btc-updown-5m`, `bitcoin-up-or-down`) | `btc-updown-5m` (excl. `bitcoin-up-or-down`) | `bitcoin-up-or-down` (excl. `btc-updown`, `btc-updown-5m`) |
 | Resolution oracle | Chainlink BTC TWAP 60s | Chainlink BTC TWAP 30s | Binance BTCUSDT |
-| Buy window | final 3.0 min (`buy_window_min`) | final 90 s (`buy_start_s`) | final 5.0 min (`buy_window_min`) |
-| Ask band | 96–99¢ | 96–99¢ | 96–99¢ |
-| Budget / market | $21 USDC | $8 USDC | $24 USDC |
+| Buy window | final 3.0 min (`buy_window_min`) | final 90 s (`buy_start_s`) | final 4.0 min (`buy_window_min`) |
+| Ask band | 98–99¢ | 98–99¢ | 98–99¢ |
+| Budget / market | $5 USDC | $5 USDC | $5 USDC |
 | Hedge trigger | bid ≤ 65¢ **and** ask ≤ 70¢, spread ≤ 15¢ | same | same |
 | Tick size | 0.01 | 0.001 | 0.01 |
 | Strategy file | `strategy_buy.json` | `strategy_buy5m.json` | `strategy_buyhourly.json` |
@@ -106,11 +107,13 @@ gitignored and must never be committed or deleted.
 
 **Design rules:**
 
-- **Single-file bots.** Each bot is one self-contained polling loop — no async, no
-  database, no message queue. Section banners (`# --- PRICING ---`) are the visual
-  structure. The three bots are near-identical copies that differ only in constants
-  (slug prefix/excludes, oracle source, window, budget, tick size). A logic change in
-  one almost always needs to be propagated to the other two.
+- **Single-file bots.** Each bot is one self-contained polling loop — no `asyncio`,
+  database, or message queue. Small thread pools isolate refresh, book,
+  notification, entry, and redemption-status I/O. Section banners
+  (`# --- PRICING ---`) are the visual structure. The three bots are near-identical
+  copies that differ only in constants (slug prefix/excludes, oracle source,
+  window, budget, tick size). A logic change in one almost always needs to be
+  propagated to the other two.
 - **Shared helpers live in `buy/`.** Only three modules are used by the live bots:
   - `buy/market.py` — `MarketGateway`: Gamma API discovery and market metadata
     (token IDs, tick size, end dates).
@@ -122,8 +125,9 @@ gitignored and must never be committed or deleted.
 - **No `if __name__ == "__main__"` guard.** The scripts execute at module level; they
   cannot be imported. Tests therefore don't import them.
 - **JSON files are the database.** Positions, P&L, heartbeat, and config are JSON
-  files in the working directory, written with `atomic_save()` (write `.tmp`, then
-  `os.replace`) so a crash mid-write never corrupts state.
+  files in the working directory. `atomic_save()` writes and `fsync`s `.tmp`, keeps
+  a validated `.bak`, replaces the primary, then `fsync`s the directory. Non-finite
+  JSON is rejected.
 - **FAK orders only.** All orders are Fill-And-Kill: fill immediately at the top of
   book or die. No resting orders, no market making.
 
@@ -179,7 +183,7 @@ are the ground truth for post-hoc accuracy analysis; they are gitignored.
 ## 6. The Buy Decision
 
 A buy fires only when **all** of these gates pass, evaluated in the final window
-(3 min / 90 s / 5 min before close):
+(3.0 min / 90 s / 4.0 min before close):
 
 1. **Window.** Market is inside the buy window and past the `buy_grace_s` buffer; the
    bot has not already entered this market (`one_entry_per_market`, enforced via
@@ -193,14 +197,14 @@ A buy fires only when **all** of these gates pass, evaluated in the final window
    a 1¢ bid is a fake price — last-trade GUI can still look like a winner while
    there is no real bid under the ask. WS quotes alone are never used to arm entry.
 4. **Ask band.** The best ask of the winning leg is within `buy_threshold`–
-   `buy_max_price` (96–99¢). Below 96¢ the outcome isn't certain enough; at/above
-   99¢ there's no spread left.
+   `buy_max_price` (98–99¢). Floor is 98¢ so latency can still catch a fill before
+   a 99¢ ask disappears; history showed the fewest reversals in this pocket.
 5. **Underlying gate.** If `underlying_gate_enabled`, the live oracle price must be
-   at least `min_underlying_edge_usd` ($10) away from the captured PTB, **and** the
-   book's winning side must match the direction of the underlying move. This blocks
-   buying a "winner" that the resolution oracle itself disagrees with (stale-book
-   trap).
-6. **Risk caps.** `buy_budget` USDC per market ($21/$8/$24), `max_open_positions`,
+   at least `min_underlying_edge_usd` away from the captured PTB ($5 on 5m, $10 on
+   15m/hourly), **and** the book's winning side must match the direction of the
+   underlying move. This blocks buying a "winner" that the resolution oracle itself
+   disagrees with (stale-book trap).
+6. **Risk caps.** `buy_budget` USDC per market ($5), `max_open_positions`,
    `max_open_notional`, `max_daily_notional`, and available USDC balance.
 
 Execution: a FAK market buy for `buy_budget` dollars of the winning token. Size and
@@ -210,6 +214,12 @@ and the 200ms REST cache) immediately before the order. A BUY limit is a
 Confirmed fills are **always persisted** (including below-band averages logged as
 `buy_fill_below_band`) — discarding them creates orphan inventory. Delayed FAKs
 are polled; zero confirms fall back to balance reconciliation (`buy_ghost_fill`).
+Before every POST, the bot atomically writes a `buy_uncertain` quarantine with the
+exact signed order ID, token, amounts, and pre-submit balance. Any exception, falsy
+response, or non-terminal response stops replacement orders and keeps that market
+quarantined. Cross-cycle recovery first reconciles that exact order and its trades;
+stable balance observations are only a fallback. Recovery continues after market
+expiry, and GC never deletes unresolved quarantine.
 Entry cost is USDC spent (`makingAmount` on CLOB v2 BUY), not `shares × gate ask`.
 
 **Skip / fill reasons logged for audit** (visible in logs and research JSONL):
@@ -244,8 +254,10 @@ The bots never take profit. The only sell is the defensive hedge:
 - **Execution:** FAK sell floored at `hedge_min_price`. Every retry force-REST
   refreshes **both** sides and re-runs the same two-sided gate
   (`hedge_retry_abort_integrity` / incomplete REST).
-- **Outcome:** hedge proceeds are recorded; `bought_size` shrinks; full hedges set
-  `hedge_closed` so GC does not also assume par redemption.
+- **Outcome:** every POST has a crash-durable deterministic order ID. Only
+  settlement-confirmed fills shrink `bought_size` or add proceeds; ambiguous
+  outcomes remain in `hedge_uncertain` until exact-order reconciliation. Full
+  hedges set `hedge_closed`. Data API balances never invent a sell fill.
 
 ---
 
@@ -255,17 +267,21 @@ Winning shares don't sell — they redeem on-chain at $1.00 via Polymarket's rel
 
 1. The Data API marks a position leg `redeemable` after resolution.
 2. The bot builds `redeemPositions(address,bytes32,bytes32,uint256[])` calldata for
-   the CTF contract (`0x4D97…6045`) using `eth_abi`/`eth_utils`, wraps it in the
-   proxy `execute(address,uint256,bytes)` call, and submits it to the relayer HTTP
-   API (`relayer-v2.polymarket.com`) with the relayer API-key headers.
+   the CTF contract (`0x4D97…6045`), uses
+   `py-builder-relayer-client` to build and sign the PROXY request, verifies the
+   derived proxy equals `FUNDER_ADDRESS`, and uses
+   `py-builder-signing-sdk` to generate the official per-request
+   `POLY_BUILDER_*` HMAC headers for `POST /submit`.
 3. Submissions are throttled per condition (`redeem_throttle_s`, 30 s) and abandoned
    after `max_redeem_age_days` (7 days). Conditions that permanently fail are kept in
    an in-memory blocklist so the bot doesn't burn gas on a reverting call.
-4. On successful submission the bot records `pnl_redeem_value` = held size (par,
-   $1.00/share) for later P&L settlement.
+4. Submission only sets `redeem_pending`. The bot polls `GET /transaction`; par is
+   credited only after `STATE_CONFIRMED` and a complete fresh Data API snapshot
+   shows the inventory has disappeared.
 
-No local private key signs on-chain transactions for redemption — the relayer flow
-uses the relayer API key; `eth_account` is used only to derive/verify addresses.
+The local private key signs the relayer's EIP-712 proxy request; builder/relayer
+credentials authenticate the HTTP submission. The key does not directly broadcast
+or pay gas for an on-chain transaction.
 
 ---
 
@@ -280,11 +296,10 @@ bot resume hedging and redeeming without re-buying. **Never delete or truncate.*
 `entry_cost`, `redeem_value`, `hedge_proceeds`, `net`, `outcome`
 (`win` / `hedge` / `loss`). Written with `atomic_save()`.
 
-**Garbage collection:** once a market has resolved, been redeemed, and has no
-residual balance, its state entry is folded into P&L and removed. Known quirk: if
-`pnl_redeem_value == 0` but `bought_size > 0`, GC assumes par redemption
-(`redeem_value = bought_size`). That is correct when the bot bought the winning leg
-but would overstate P&L if it ever held the loser.
+**Garbage collection:** only terminal evidence (`pnl_redeem_value`, or a confirmed
+closed hedge with no remainder) allows an entered market to be folded into P&L and
+removed. GC never assumes par. `record_pnl()` is idempotent by condition ID so a
+crash between P&L and state saves cannot double-count.
 
 ---
 
@@ -296,27 +311,31 @@ but would overstate P&L if it ever held the loser.
 |---|---|
 | `PRIVATE_KEY`, `FUNDER_ADDRESS` | Trading account (key + funder/proxy address) |
 | `API_KEY`, `API_SECRET`, `API_PASSPHRASE` | CLOB API credentials (L2 auth) |
-| `RELAYER_URL`, `RELAYER_API_KEY`, `RELAYER_API_KEY_ADDRESS` | Redeem relayer |
+| `RELAYER_URL` | Redeem relayer URL (defaults to Polymarket production) |
+| `POLY_BUILDER_API_KEY`, `POLY_BUILDER_SECRET`, `POLY_BUILDER_PASSPHRASE` | Builder authentication for redeem submission |
 
-**Strategy JSON** — each bot re-reads its file every cycle (`load_strategy()` checks
-mtime), so parameter changes take effect on the next tick with **no restart**.
-Missing file → code defaults. Unknown keys are ignored; known keys are coerced to
-the default's type. Templates are `strategy_buy.example.json`,
+**Strategy JSON** — a valid file is required at startup. Each bot re-reads it every
+cycle (`load_strategy()` checks mtime), so ordinary parameter changes take effect on
+the next tick with **no restart**. A missing/malformed hot reload disables entries
+and retains the last-known-good hedge settings. Unknown keys and invalid types or
+ranges are rejected. `dry_run` is startup-only because it selects different state
+paths. Templates are `strategy_buy.example.json`,
 `strategy_buy5m.example.json`, `strategy_buyhourly.example.json`. Key parameters:
 
 | Key | Default (15m/5m/hr) | Meaning |
 |---|---|---|
-| `buy_threshold` / `buy_max_price` | 0.96 / 0.99 | Ask band for entry |
-| `min_winner_bid` / `max_loser_bid` / `min_bid_edge` | 0.90 / 0.10 / 0.05 | GUI consensus gate |
+| `buy_threshold` / `buy_max_price` | 0.98 / 0.99 | Ask band for entry (98–99¢ probe) |
+| `min_winner_bid` / `max_loser_bid` / `min_bid_edge` | 0.92 / 0.10 / 0.05 | GUI consensus gate |
 | `max_entry_spread` | 0.05 | Max ask−bid on winner at entry |
-| `underlying_gate_enabled` / `min_underlying_edge_usd` | true / 10.0 | Oracle alignment gate |
+| `underlying_gate_enabled` / `min_underlying_edge_usd` | true / 5.0 (5m), 10.0 (15m/hr) | Oracle alignment gate |
 | `hedge_enabled` / `hedge_threshold` / `hedge_min_price` | true / 0.65 / 0.32 | Hedge arm & floor |
 | `hedge_max_spread` / `hedge_require_ask_max` | 0.15 / 0.70 | Hedge book must actually collapse |
-| `buy_window_min` (15m, hr) / `buy_start_s` (5m) | 3.0 / 90 / 5.0 | Entry window before close |
-| `buy_budget` | 21 / 8 / 24 | USDC per market |
+| `buy_window_min` (15m, hr) / `buy_start_s` (5m) | 3.0 / 90 / 4.0 | Entry window before close |
+| `buy_budget` | 5 / 5 / 5 | USDC per market |
 | `max_open_positions` / `max_open_notional` / `max_daily_notional` | 100 / 10k / ~∞ | Risk caps |
 | `redeem_throttle_s` / `max_redeem_age_days` | 30 / 7 | Redeem pacing |
-| `dry_run` | false | Log `[DRY BUY]`/`[DRY SELL]`, no real orders |
+| `entry_enabled` | false | Explicit hot-reloadable arm for new entries |
+| `dry_run` | true | Startup-only; log `[DRY BUY]`/`[DRY SELL]`, no real orders |
 | `poll_buy_window_s` / `poll_held_s` | 0.1 / 0.05 | Hot-loop cadence |
 | `tick_size` | 0.01 / 0.001 / 0.01 | Fallback tick size |
 
@@ -377,7 +396,31 @@ journal is capped via `deploy/journald-size.conf`.
 
 ---
 
-## 13. Landmines
+## 13. Latency & Optional AI Validation
+
+**Will a bigger VM meaningfully improve buy/hedge speed?**
+Usually no. The hot path is dominated by network RTT to Polymarket CLOB/Gamma,
+REST confirmation, durable `atomic_save` fsync, and SDK round-trips — not local
+CPU. Prefer a non-burstable instance in a region with low measured latency to
+Polymarket endpoints, and keep hedge work off competing I/O. CPU upgrades alone
+do not transform FAK fill latency; some crypto markets may also impose exchange
+taker delay that no VM size can remove.
+
+**Can a small open-weight / fast external AI model validate each buy/hedge?**
+Not on the synchronous buy/hedge path. Even a fast hosted or local LLM adds
+unbounded tail latency and a new failure mode. Deterministic gates (book
+integrity, oracle edge, settlement finality, quarantine) remain authoritative.
+
+**Best architecture if AI is desired later:**
+1. Keep the current deterministic gates as the only hard blockers for live orders.
+2. Run a shadow async scorer (tabular model or tiny classifier) that logs
+   agree/disagree with buy decisions without delaying POST.
+3. Optionally promote a buy-only veto/downsize after shadow validation; never delay
+   or veto hedges — hedge is a safety exit and must stay latency-critical.
+
+---
+
+## 14. Landmines
 
 1. **Three copies, not a library.** A bug fix in `buybot.py` almost certainly applies
    to `buybot5m.py` and `buybothourly.py`. Diff the siblings after any logic change.
@@ -406,7 +449,7 @@ journal is capped via `deploy/journald-size.conf`.
 
 ---
 
-## 14. Removed / Historical
+## 15. Removed / Historical
 
 This repo previously contained a sell-side bot family (`bot*.py`), an on-chain
 atomic-mint buyer (`buy/runner.py` + relayer/contracts modules), a shadow
@@ -417,7 +460,7 @@ path described above.
 
 ---
 
-## 15. Glossary
+## 16. Glossary
 
 | Term | Meaning |
 |---|---|

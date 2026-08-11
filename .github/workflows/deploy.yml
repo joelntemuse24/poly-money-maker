@@ -24,7 +24,7 @@ jobs:
             set -e
             cd ~/poly-money-maker
             git pull origin main
-            pip install -r requirements.txt --quiet
+            .venv/bin/python -m pip install -r requirements.txt --quiet
             # Do NOT systemctl restart here. A blind restart starts disabled units
             # and can re-enable bleeding bots after a force-stop. Code is pulled;
             # operators start/restart services deliberately after validation.
