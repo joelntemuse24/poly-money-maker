@@ -1304,9 +1304,7 @@ def fill_cost_usdc(
     else:
         fee = _fill_fee_usdc(filled, execution_price, fee_schedule)
     if fee is None:
-        # Production callers pass a schedule. If it became unavailable after
-        # submission, reserve the entire all-in cap rather than undercounting.
-        cost = spend_cap if fee_schedule is not None and spend_cap > 0 else gross
+        cost = gross
     else:
         cost = gross + fee
     return min(spend_cap, cost) if spend_cap > 0 else cost
