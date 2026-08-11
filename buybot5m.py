@@ -155,7 +155,7 @@ _STRATEGY_DEFAULTS = {
     # and ask also collapsed (same lesson sell-side already learned on mids).
     "hedge_max_spread": 0.15,
     "hedge_require_ask_max": 0.70,
-    "buy_start_s": 60,
+    "buy_start_s": 90,
     "buy_grace_s": 1,
     "buy_cooldown_s": 1,
     "buy_budget": 5.0,
