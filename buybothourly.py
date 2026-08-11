@@ -2260,7 +2260,7 @@ def buy_market_with_retry(
         if below_band:
             console.print(
                 f"  [bold red][BUY BELOW BAND][/] filled={filled:.4f} avg={avg:.3f} "
-                f"(min_px={min_price:.3f}) — persisting inventory"
+                f"(min_px={min_price:.3f}) — toxic_fill armed (force exit, no ride)"
             )
             log_event(
                 "buy_fill_below_band", token_id=token_id, filled=filled, avg_price=round(avg, 4),
@@ -3604,6 +3604,10 @@ while not _shutdown_requested:
 
             # --- HEDGE CHECK (for held positions) ---
             if held_token and held_size > 0.01 and HEDGE_ENABLED and not meta.get("hedge_closed"):
+                # Below-band buys set toxic_fill: dump ASAP at any bid (no ride to $1,
+                # no bounce cancel, no hedge_min_price floor). Normal entries still
+                # require bid ≤ hedge_threshold and book-integrity gates.
+                toxic_fill = bool(meta.get("toxic_fill"))
                 # Skip REST only when a *fresh* WS bid is clearly above threshold.
                 # Stale-high WS must not suppress the check (hedge_quote_max_age_s).
                 quote_age = book_ws.quote_age(held_token)
@@ -3618,7 +3622,12 @@ while not _shutdown_requested:
                 if cached_bid is None:
                     cached_bid = peek_bid
 
-                if peek_bid is not None and peek_bid > HEDGE_THRESHOLD and ws_fresh:
+                if (
+                    not toxic_fill
+                    and peek_bid is not None
+                    and peek_bid > HEDGE_THRESHOLD
+                    and ws_fresh
+                ):
                     pass  # fresh WS still above threshold
                 else:
                     fresh_bid, _, fresh_ask, _, fresh_mid = get_quote_fast(
@@ -3634,8 +3643,9 @@ while not _shutdown_requested:
                             trigger_bid=cached_bid, current_bid=fresh_bid, current_ask=fresh_ask,
                             current_mid=fresh_mid,
                             quote_age_s=None if quote_age is None else round(quote_age, 3),
+                            toxic_fill=toxic_fill,
                         )
-                    elif fresh_bid > HEDGE_THRESHOLD:
+                    elif not toxic_fill and fresh_bid > HEDGE_THRESHOLD:
                         log_event(
                             "hedge_cancel_bounce", condition_id=cond, leg=held_leg,
                             trigger_bid=cached_bid, current_bid=fresh_bid,
@@ -3649,9 +3659,12 @@ while not _shutdown_requested:
                     else:
                         hedge_bid = fresh_bid
                         hedge_ask = fresh_ask
-                        ok, why = hedge_book_ok(
-                            hedge_bid, hedge_ask, HEDGE_THRESHOLD, HEDGE_MAX_SPREAD, HEDGE_REQUIRE_ASK_MAX,
-                        )
+                        if toxic_fill:
+                            ok, why = True, "toxic_force_exit"
+                        else:
+                            ok, why = hedge_book_ok(
+                                hedge_bid, hedge_ask, HEDGE_THRESHOLD, HEDGE_MAX_SPREAD, HEDGE_REQUIRE_ASK_MAX,
+                            )
                         if not ok:
                             meta["hedge_blocked_toxic"] = True
                             save_json(STATE_FILE, positions_meta)
@@ -3662,17 +3675,30 @@ while not _shutdown_requested:
                                 require_ask_max=HEDGE_REQUIRE_ASK_MAX,
                                 trigger_bid=cached_bid,
                             )
-                        elif hedge_bid <= HEDGE_THRESHOLD:
+                        elif toxic_fill or hedge_bid <= HEDGE_THRESHOLD:
                             hedge_tick = get_tick_size_cached(held_token)
+                            # Toxic dumps use one tick as floor so FAK can match a
+                            # collapsed book (e.g. 28¢ bid vs hedge_min_price 32.5¢).
+                            hedge_floor = (
+                                float(hedge_tick) if toxic_fill else float(HEDGE_MIN_PRICE)
+                            )
                             sell_floor = hedge_sell_price(
-                                hedge_bid, hedge_tick, HEDGE_UNDERCUT_TICKS, HEDGE_MIN_PRICE,
+                                hedge_bid, hedge_tick, HEDGE_UNDERCUT_TICKS, hedge_floor,
+                            )
+                            hedge_title = (
+                                "[bold bright_red]▼ TOXIC FILL — FORCE EXIT[/]"
+                                if toxic_fill
+                                else "[bold bright_red]▼ HEDGE SELL — CUTTING LOSSES[/]"
+                            )
+                            hedge_label = (
+                                "TOXIC FILL EXIT" if toxic_fill else "REVERSAL DETECTED"
                             )
                             console.print(Panel(
                                 f"  [bright_white]{m.question}[/]\n"
-                                f"  [bright_red]REVERSAL DETECTED[/] — {held_leg.upper()} "
+                                f"  [bright_red]{hedge_label}[/] — {held_leg.upper()} "
                                 f"bid [bold]{hedge_bid:.3f}[/] ask [bold]{(hedge_ask or 0):.3f}[/]  ·  "
                                 f"FAK ≥{sell_floor:.3f}  ·  [bold red]TTM {minutes_left:>4.1f}m[/]",
-                                title="[bold bright_red]▼ HEDGE SELL — CUTTING LOSSES[/]",
+                                title=hedge_title,
                                 border_style="bright_red",
                                 box=box.HEAVY,
                             ))
@@ -3683,6 +3709,8 @@ while not _shutdown_requested:
                                 bid=hedge_bid, ask=hedge_ask, mid=fresh_mid, price_limit=sell_floor,
                                 quote_age_s=None if quote_age is None else round(quote_age, 3),
                                 ws_fast_path=False,
+                                toxic_fill=toxic_fill,
+                                hedge_floor=hedge_floor,
                             )
                             prior_hedge_proceeds = float(
                                 meta.get("pnl_hedge_proceeds", 0) or 0
@@ -3750,12 +3778,13 @@ while not _shutdown_requested:
                                 held_size,
                                 hedge_bid,
                                 tick_size=hedge_tick,
-                                min_price=HEDGE_MIN_PRICE,
+                                min_price=hedge_floor,
                                 undercut_ticks=HEDGE_UNDERCUT_TICKS,
                                 retry_sleep_s=HEDGE_RETRY_SLEEP_S,
-                                abort_above=HEDGE_THRESHOLD,
-                                require_ask_max=HEDGE_REQUIRE_ASK_MAX,
-                                max_spread=HEDGE_MAX_SPREAD,
+                                # Toxic: never abort on bounce / integrity — dump inventory.
+                                abort_above=None if toxic_fill else HEDGE_THRESHOLD,
+                                require_ask_max=None if toxic_fill else HEDGE_REQUIRE_ASK_MAX,
+                                max_spread=None if toxic_fill else HEDGE_MAX_SPREAD,
                                 on_submit=_persist_hedge_submit,
                                 on_fill=_persist_hedge_fill,
                                 condition_id=cond,
@@ -4289,6 +4318,7 @@ while not _shutdown_requested:
                     price=meta["fill_price"], ask_gate=buy_ask, entry_cost=meta["pnl_entry_cost"],
                     ptb=meta.get("ptb"), live_btc=meta.get("entry_live_btc"),
                     edge_usd=meta.get("entry_edge_usd"),
+                    toxic_fill=bool(meta.get("toxic_fill")),
                 )
                 append_research(RESEARCH_FILE, {
                     "event": "buy_fill",
@@ -4306,14 +4336,24 @@ while not _shutdown_requested:
                     "live_btc": meta.get("entry_live_btc"),
                     "edge_usd": meta.get("entry_edge_usd"),
                     "ptb_source": meta.get("ptb_source"),
+                    "toxic_fill": bool(meta.get("toxic_fill")),
                 })
-                notify(
-                    "BUY FILLED / UNCERTAIN" if buy_status == "ambiguous" else "BUY FILLED",
-                    f"{m.question}\nBought {buy_leg.upper()} at ~{meta['fill_price']:.3f} "
-                    f"({bought:.2f} shares, ${spent:.2f})"
-                    + ("\nFinal POST unresolved; market remains quarantined" if buy_status == "ambiguous" else ""),
-                    priority="urgent" if buy_status == "ambiguous" else "high",
-                )
+                if meta.get("toxic_fill"):
+                    notify(
+                        "TOXIC BUY — FORCE EXIT",
+                        f"{m.question}\nBelow-band fill {buy_leg.upper()} at "
+                        f"~{meta['fill_price']:.3f} ({bought:.2f} shares, ${spent:.2f})\n"
+                        "Will not ride to $1 — dumping at next usable bid",
+                        priority="urgent",
+                    )
+                else:
+                    notify(
+                        "BUY FILLED / UNCERTAIN" if buy_status == "ambiguous" else "BUY FILLED",
+                        f"{m.question}\nBought {buy_leg.upper()} at ~{meta['fill_price']:.3f} "
+                        f"({bought:.2f} shares, ${spent:.2f})"
+                        + ("\nFinal POST unresolved; market remains quarantined" if buy_status == "ambiguous" else ""),
+                        priority="urgent" if buy_status == "ambiguous" else "high",
+                    )
                 save_json(STATE_FILE, positions_meta)
             elif buy_status == "ambiguous":
                 # on_submit already durably wrote the baseline and token before

@@ -212,8 +212,10 @@ limit price come from a **force-fresh REST** book (`force_rest=True` — bypasse
 and the 200ms REST cache) immediately before the order. A BUY limit is a
 **maximum**, so the exchange can fill far below the gate ask (“price improvement”).
 Confirmed fills are **always persisted** (including below-band averages logged as
-`buy_fill_below_band`) — discarding them creates orphan inventory. Delayed FAKs
-are polled; zero confirms fall back to balance reconciliation (`buy_ghost_fill`).
+`buy_fill_below_band`) — discarding them creates orphan inventory. Those fills set
+`toxic_fill` and are **not** ridden to $1: the hedge path force-exits at the next
+usable bid (no bounce cancel, no `hedge_min_price` floor). Delayed FAKs are polled;
+zero confirms fall back to balance reconciliation (`buy_ghost_fill`).
 Before every POST, the bot atomically writes a `buy_uncertain` quarantine with the
 exact signed order ID, token, amounts, and pre-submit balance. Any exception, falsy
 response, or non-terminal response stops replacement orders and keeps that market
@@ -230,7 +232,7 @@ Entry cost is USDC spent (`makingAmount` on CLOB v2 BUY), not `shares × gate as
 - `buy_skip_incomplete_book` — missing GUI price on a leg (no mid, no last trade)
 - `buy_skip_underlying_edge` — live oracle < $10 from PTB
 - `buy_skip_underlying_side` — book winner disagrees with the underlying move
-- `buy_fill_below_band` — fill landed below the ask band; inventory still recorded
+- `buy_fill_below_band` — fill landed below the ask band; inventory recorded + `toxic_fill`
 - `buy_ghost_fill` — balance rose after a null/delayed CLOB confirm
 
 While any position is open or any market is inside the buy window, the loop runs in
@@ -241,19 +243,24 @@ slow poll to save API quota.
 
 ## 7. The Hedge (Sell-Only Exit)
 
-The bots never take profit. The only sell is the defensive hedge:
+The bots never take profit. The only sell is the defensive hedge (or a toxic-fill
+force exit):
 
-- **Arm:** WS/cache bid ≤ `hedge_threshold` (65¢) while the position is open (peek
-  only — never sufficient to sell).
+- **Arm (normal):** WS/cache bid ≤ `hedge_threshold` (65¢) while the position is open
+  (peek only — never sufficient to sell).
+- **Arm (toxic_fill):** any below-band entry (`avg < buy_threshold`) arms an immediate
+  dump — do not wait for a 65¢ reversal and do not cancel on bounce.
 - **Confirm (force-fresh REST, fail-closed):** re-fetch the full book with
   `force_rest=True`. If either side is missing, skip (`hedge_skip_incomplete_rest`)
-  — **no WS fallback**. If bid bounced above threshold, abort (`hedge_cancel_bounce`).
-- **Book integrity:** a lone penny bid under a still-high ask is **not** a reversal
-  (`hedge_skip_toxic_book`). Require bid ≤ 65¢, ask ≤ `hedge_require_ask_max` (70¢),
-  and spread ≤ `hedge_max_spread` (15¢).
-- **Execution:** FAK sell floored at `hedge_min_price`. Every retry force-REST
-  refreshes **both** sides and re-runs the same two-sided gate
-  (`hedge_retry_abort_integrity` / incomplete REST).
+  — **no WS fallback**. If bid bounced above threshold on a *normal* entry, abort
+  (`hedge_cancel_bounce`); toxic fills skip this cancel.
+- **Book integrity (normal only):** a lone penny bid under a still-high ask is **not**
+  a reversal (`hedge_skip_toxic_book`). Require bid ≤ 65¢, ask ≤
+  `hedge_require_ask_max` (70¢), and spread ≤ `hedge_max_spread` (15¢). Toxic dumps
+  skip integrity / `abort_above` so a collapsed book can still exit.
+- **Execution:** FAK sell floored at `hedge_min_price` for normal hedges; toxic dumps
+  floor at one tick so a 28¢ bid is not blocked by a 32.5¢ min. Every retry
+  force-REST refreshes **both** sides (normal path also re-runs the two-sided gate).
 - **Outcome:** every POST has a crash-durable deterministic order ID. Only
   settlement-confirmed fills shrink `bought_size` or add proceeds; ambiguous
   outcomes remain in `hedge_uncertain` until exact-order reconciliation. Full
