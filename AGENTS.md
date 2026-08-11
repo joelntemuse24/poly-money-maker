@@ -6,14 +6,14 @@ Full architecture: `TECHNICAL_DESIGN.md`.
 ## Project at a Glance
 
 **Live on the VM (2026-08-10):** three standalone buy bots — nothing else. They buy
-the winning leg of Polymarket BTC "Up or Down" markets at 96–99¢ in the final
+the winning leg of Polymarket BTC "Up or Down" markets at 99¢ in the final
 window, hedge at 65¢ on reversal, and redeem winners at $1.00.
 
 | File | Service | Markets | Oracle | Budget | Window |
 |---|---|---|---|---|---|
-| `buybot.py` | `polybuybot` | 15m | Chainlink TWAP 60s | $18 | final 2.5 min |
-| `buybot5m.py` | `polybuybot5m` | 5m | Chainlink TWAP 30s | $8 | final 60 s |
-| `buybothourly.py` | `polybuybothourly` | hourly | Binance BTCUSDT | $15 | final 3.5 min |
+| `buybot.py` | `polybuybot` | 15m | Chainlink TWAP 60s | $5 | final 2.5 min |
+| `buybot5m.py` | `polybuybot5m` | 5m | Chainlink TWAP 30s | $5 | final 60 s |
+| `buybothourly.py` | `polybuybothourly` | hourly | Binance BTCUSDT | $5 | final 3.5 min |
 
 Plus: `check_book.py` diagnostic.
 

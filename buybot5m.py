@@ -132,7 +132,7 @@ for _rounding in ROUNDING_CONFIG.values():
 _STRATEGY_DEFAULTS = {
     "entry_enabled": False,
     # High-90s only: cheaper fills in history were dominated by false-book entries.
-    "buy_threshold": 0.97,
+    "buy_threshold": 0.99,
     "buy_max_price": 0.99,
     # Consensus on Polymarket GUI display price (mid if spread≤10¢ else last trade).
     "min_winner_bid": 0.92,
@@ -158,7 +158,7 @@ _STRATEGY_DEFAULTS = {
     "buy_start_s": 60,
     "buy_grace_s": 1,
     "buy_cooldown_s": 1,
-    "buy_budget": 8.0,
+    "buy_budget": 5.0,
     "max_open_positions": 100,
     "max_open_notional": 10000.0,
     "max_daily_notional": 999999.0,

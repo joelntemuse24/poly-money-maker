@@ -35,9 +35,9 @@ or 1 hour)? A market has two legs (UP and DOWN). Exactly one leg wins and redeem
 $1.00; the other redeems at $0.
 
 **The strategy:** in the final moments before resolution, the outcome is usually
-already obvious — the winning leg trades at 96–99¢ but has not yet settled. The bots
+already obvious — the winning leg trades at 99¢ but has not yet settled. The bots
 buy that near-certain winner with a Fill-And-Kill (FAK) market order and redeem it at
-$1.00, capturing the 1–4¢ spread per share.
+$1.00, capturing ~1¢ per share.
 
 **The risk:** BTC can reverse in the final seconds. If the leg we bought truly
 collapses (bid **and** ask both drop — not a lone 1¢ bid under a still-high ask),
@@ -45,8 +45,8 @@ the bot **hedges**: it market-sells the held leg, floored at `hedge_min_price`
 (~32¢). There is no profit-taking sell — the only sell path is the hedge;
 everything else rides to redemption.
 
-**Economics per share (no reversal):** buy at ~97¢, redeem at $1.00 → ~3¢ gross.
-**Economics per share (hedged reversal):** buy at ~97¢, sell near the collapsed
+**Economics per share (no reversal):** buy at 99¢, redeem at $1.00 → ~1¢ gross.
+**Economics per share (hedged reversal):** buy at 99¢, sell near the collapsed
 book (≥ floor) → bounded loss instead of riding a wrong side to $0.
 
 ---
@@ -64,8 +64,8 @@ trades a different market cadence and uses a different resolution oracle.
 | Slug prefix / excludes | `btc-updown` (excl. `btc-updown-5m`, `bitcoin-up-or-down`) | `btc-updown-5m` (excl. `bitcoin-up-or-down`) | `bitcoin-up-or-down` (excl. `btc-updown`, `btc-updown-5m`) |
 | Resolution oracle | Chainlink BTC TWAP 60s | Chainlink BTC TWAP 30s | Binance BTCUSDT |
 | Buy window | final 2.5 min (`buy_window_min`) | final 60 s (`buy_start_s`) | final 3.5 min (`buy_window_min`) |
-| Ask band | 96–99¢ | 96–99¢ | 96–99¢ |
-| Budget / market | $18 USDC | $8 USDC | $15 USDC |
+| Ask band | 99¢ | 99¢ | 99¢ |
+| Budget / market | $5 USDC | $5 USDC | $5 USDC |
 | Hedge trigger | bid ≤ 65¢ **and** ask ≤ 70¢, spread ≤ 15¢ | same | same |
 | Tick size | 0.01 | 0.001 | 0.01 |
 | Strategy file | `strategy_buy.json` | `strategy_buy5m.json` | `strategy_buyhourly.json` |
@@ -197,14 +197,14 @@ A buy fires only when **all** of these gates pass, evaluated in the final window
    a 1¢ bid is a fake price — last-trade GUI can still look like a winner while
    there is no real bid under the ask. WS quotes alone are never used to arm entry.
 4. **Ask band.** The best ask of the winning leg is within `buy_threshold`–
-   `buy_max_price` (96–99¢). Below 96¢ the outcome isn't certain enough; at/above
-   99¢ there's no spread left.
+   `buy_max_price` (99¢). The probe band is tight on purpose: history showed the
+   fewest reversals near 98–99¢; edge is ~1¢ to redemption.
 5. **Underlying gate.** If `underlying_gate_enabled`, the live oracle price must be
    at least `min_underlying_edge_usd` away from the captured PTB ($5 on 5m, $10 on
    15m/hourly), **and** the book's winning side must match the direction of the
    underlying move. This blocks buying a "winner" that the resolution oracle itself
    disagrees with (stale-book trap).
-6. **Risk caps.** `buy_budget` USDC per market ($18/$8/$15), `max_open_positions`,
+6. **Risk caps.** `buy_budget` USDC per market ($5), `max_open_positions`,
    `max_open_notional`, `max_daily_notional`, and available USDC balance.
 
 Execution: a FAK market buy for `buy_budget` dollars of the winning token. Size and
@@ -324,14 +324,14 @@ paths. Templates are `strategy_buy.example.json`,
 
 | Key | Default (15m/5m/hr) | Meaning |
 |---|---|---|
-| `buy_threshold` / `buy_max_price` | 0.97 / 0.99 (hourly 0.965) | Ask band for entry |
-| `min_winner_bid` / `max_loser_bid` / `min_bid_edge` | 0.90 / 0.10 / 0.05 | GUI consensus gate |
+| `buy_threshold` / `buy_max_price` | 0.99 / 0.99 | Ask band for entry (99¢ probe) |
+| `min_winner_bid` / `max_loser_bid` / `min_bid_edge` | 0.92 / 0.10 / 0.05 | GUI consensus gate |
 | `max_entry_spread` | 0.05 | Max ask−bid on winner at entry |
 | `underlying_gate_enabled` / `min_underlying_edge_usd` | true / 5.0 (5m), 10.0 (15m/hr) | Oracle alignment gate |
 | `hedge_enabled` / `hedge_threshold` / `hedge_min_price` | true / 0.65 / 0.32 | Hedge arm & floor |
 | `hedge_max_spread` / `hedge_require_ask_max` | 0.15 / 0.70 | Hedge book must actually collapse |
 | `buy_window_min` (15m, hr) / `buy_start_s` (5m) | 2.5 / 60 / 3.5 | Entry window before close |
-| `buy_budget` | 18 / 8 / 15 | USDC per market |
+| `buy_budget` | 5 / 5 / 5 | USDC per market |
 | `max_open_positions` / `max_open_notional` / `max_daily_notional` | 100 / 10k / ~∞ | Risk caps |
 | `redeem_throttle_s` / `max_redeem_age_days` | 30 / 7 | Redeem pacing |
 | `entry_enabled` | false | Explicit hot-reloadable arm for new entries |
