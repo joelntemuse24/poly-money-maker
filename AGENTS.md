@@ -39,6 +39,7 @@ change to one usually needs propagation to its siblings.
 | File | Purpose |
 |---|---|
 | `check_book.py` | Diagnostic — inspect a live order book |
+| `check_edge_counterfactual.py` | Diagnostic — resolution win rate if edge skips had filled |
 | `strategy_buy*.example.json` | Config templates — not loaded by bots |
 
 ### Read-only / auto-generated — never edit
