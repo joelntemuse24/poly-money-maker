@@ -140,7 +140,7 @@ _STRATEGY_DEFAULTS = {
     # Skip buys unless live BTC is ≥ this many USD from the window Price To Beat,
     # and only allow the side matching that underlying move.
     "underlying_gate_enabled": True,
-    "min_underlying_edge_usd": 10.0,
+    "min_underlying_edge_usd": 5.0,
     "hedge_enabled": True,
     "hedge_threshold": 0.65,
     "hedge_min_price": 0.325,

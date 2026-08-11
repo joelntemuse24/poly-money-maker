@@ -327,7 +327,7 @@ paths. Templates are `strategy_buy.example.json`,
 | `buy_threshold` / `buy_max_price` | 0.96 / 0.99 | Ask band for entry |
 | `min_winner_bid` / `max_loser_bid` / `min_bid_edge` | 0.90 / 0.10 / 0.05 | GUI consensus gate |
 | `max_entry_spread` | 0.05 | Max ask−bid on winner at entry |
-| `underlying_gate_enabled` / `min_underlying_edge_usd` | true / 10.0 | Oracle alignment gate |
+| `underlying_gate_enabled` / `min_underlying_edge_usd` | true / 5.0 (5m), 10.0 (15m/hr) | Oracle alignment gate |
 | `hedge_enabled` / `hedge_threshold` / `hedge_min_price` | true / 0.65 / 0.32 | Hedge arm & floor |
 | `hedge_max_spread` / `hedge_require_ask_max` | 0.15 / 0.70 | Hedge book must actually collapse |
 | `buy_window_min` (15m, hr) / `buy_start_s` (5m) | 3.0 / 90 / 5.0 | Entry window before close |
