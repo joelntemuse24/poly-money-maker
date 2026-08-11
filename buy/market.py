@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 import re
 import time
 from dataclasses import dataclass
@@ -36,13 +37,19 @@ def _list(value: Any) -> list:
     if isinstance(value, list):
         return value
     if isinstance(value, str):
-        parsed = json.loads(value)
-        return parsed if isinstance(parsed, list) else []
+        try:
+            parsed = json.loads(value)
+            return parsed if isinstance(parsed, list) else []
+        except (TypeError, ValueError):
+            return []
     return []
 
 
 def _end_timestamp(value: str) -> float:
-    return datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp()
+    timestamp = datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp()
+    if not math.isfinite(timestamp):
+        raise ValueError("non-finite timestamp")
+    return timestamp
 
 
 def _bool(value: Any) -> bool:
@@ -52,6 +59,11 @@ def _bool(value: Any) -> bool:
 
 
 _SLUG_TS_RE = re.compile(r"-(\d{10,})$")
+_SERIES_DURATION_S = {
+    "btc-up-or-down-5m": 5 * 60,
+    "btc-up-or-down-15m": 15 * 60,
+    "btc-up-or-down-hourly": 60 * 60,
+}
 
 
 def _slug_start_ts(slug: str) -> Optional[float]:
@@ -72,7 +84,13 @@ def _parse_event(event: dict, series_slug: str) -> Iterable[MintMarket]:
         condition_id = market.get("conditionId") or market.get("condition_id")
         tokens = _list(market.get("clobTokenIds"))
         outcomes = [str(value).lower() for value in _list(market.get("outcomes"))]
-        if not end or not condition_id or len(tokens) != 2 or len(outcomes) != 2:
+        if (
+            not end
+            or not condition_id
+            or len(tokens) != 2
+            or len(set(str(token) for token in tokens)) != 2
+            or len(outcomes) != 2
+        ):
             continue
         mapping = dict(zip(outcomes, (str(token) for token in tokens)))
         if "up" not in mapping or "down" not in mapping:
@@ -82,6 +100,9 @@ def _parse_event(event: dict, series_slug: str) -> Iterable[MintMarket]:
         except (TypeError, ValueError):
             continue
         slug = str(market.get("slug") or event.get("slug") or condition_id)
+        duration_s = _SERIES_DURATION_S.get(series_slug)
+        if duration_s is None:
+            continue
         slug_start = _slug_start_ts(slug)
         if slug_start is not None:
             start_ts = slug_start
@@ -90,13 +111,22 @@ def _parse_event(event: dict, series_slug: str) -> Iterable[MintMarket]:
                 api_start_ts = _end_timestamp(str(start))
             except (TypeError, ValueError):
                 api_start_ts = end_ts
-            # If the API startDate is more than 2 hours before endDate, it's
-            # likely the event creation date, not the trading window start.
-            # Derive start_ts from end_ts minus the market duration (1h for hourly).
-            if end_ts - api_start_ts > 7200:
-                start_ts = end_ts - 3600
+            # Gamma sometimes exposes event creation time as startDate. Derive
+            # the actual window from the requested series instead of assuming 1h.
+            if end_ts - api_start_ts > max(7200, duration_s * 2):
+                start_ts = end_ts - duration_s
             else:
                 start_ts = api_start_ts
+        # A wrong series/slug association changes the Price-To-Beat window.
+        # Reject metadata that cannot represent the requested cadence.
+        observed_duration = end_ts - start_ts
+        if (
+            not math.isfinite(start_ts)
+            or start_ts <= 0
+            or end_ts <= start_ts
+            or abs(observed_duration - duration_s) > max(5.0, duration_s * 0.05)
+        ):
+            continue
         yield MintMarket(
             condition_id=str(condition_id),
             slug=slug,
@@ -122,6 +152,7 @@ class MarketGateway:
         timeout: float = 15.0,
         session: requests.Session | None = None,
         discover_cache_s: float = 25.0,
+        stale_cache_s: float = 120.0,
     ):
         self.gamma_url = gamma_url.rstrip("/")
         self.data_api_url = data_api_url.rstrip("/")
@@ -130,6 +161,8 @@ class MarketGateway:
         self.session.headers.update({"User-Agent": "poly-money-maker-mint-buyer/0.1"})
         self._discover_cache: dict = {"ts": 0.0, "key": "", "markets": []}
         self.discover_cache_s = discover_cache_s
+        self.stale_cache_s = stale_cache_s
+        self.discovery_fresh = False
 
     def discover(self, series_slugs: list[str]) -> list[MintMarket]:
         cache_key = ",".join(series_slugs)
@@ -139,6 +172,7 @@ class MarketGateway:
             and self._discover_cache["key"] == cache_key
             and (now - self._discover_cache["ts"]) < self.discover_cache_s
         ):
+            self.discovery_fresh = True
             return list(self._discover_cache["markets"])
 
         markets: Dict[str, MintMarket] = {}
@@ -165,11 +199,20 @@ class MarketGateway:
             except Exception:
                 pass
 
-        if not markets and self._discover_cache["markets"]:
+        if not markets and (
+            self._discover_cache["markets"]
+            and self._discover_cache["key"] == cache_key
+            and (now - self._discover_cache["ts"]) <= self.stale_cache_s
+        ):
+            self.discovery_fresh = False
             return list(self._discover_cache["markets"])
 
         result = sorted(markets.values(), key=lambda market: market.end_ts)
-        self._discover_cache = {"ts": now, "key": cache_key, "markets": result}
+        if result:
+            self._discover_cache = {"ts": now, "key": cache_key, "markets": result}
+            self.discovery_fresh = True
+        else:
+            self.discovery_fresh = False
         return result
 
     def positions(self, funder_address: str) -> Dict[str, float]:

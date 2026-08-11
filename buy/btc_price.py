@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 import threading
 import time
@@ -107,7 +108,9 @@ class BtcUnderlyingFeed:
         self.meta = SOURCE_META[source]
         self._live: Optional[float] = None
         self._live_ts: float = 0.0
+        self._live_received_mono: float = 0.0
         self._live_src: str = "none"
+        self._latest_observation_ms: int = 0
         self._ticks: Deque[Tuple[int, float]] = deque(maxlen=RING_MAX_SAMPLES)
         self._ptb: Dict[int, Dict[str, Any]] = {}
         self._ptb_store_path = ptb_store_path
@@ -134,10 +137,13 @@ class BtcUnderlyingFeed:
     def live_quote(self) -> Tuple[Optional[float], str, Optional[float]]:
         """Return (price, source_label, age_s). Memory only."""
         with self._lock:
-            live, ts, src = self._live, self._live_ts, self._live_src
+            live = self._live
+            received_mono = self._live_received_mono
+            src = self._live_src
         if live is None:
             return None, "none", None
-        return live, src, time.time() - ts
+        age = time.monotonic() - received_mono
+        return live, src, age if age >= 0 else None
 
     def live_price(self, *, allow_stale: bool = False) -> Optional[float]:
         px, _src, age = self.live_quote()
@@ -183,9 +189,9 @@ class BtcUnderlyingFeed:
                     "resolution_url": self.meta["resolution_url"],
                     "captured_at": now,
                 }
-                self._ptb[key] = rec
-                self._trim_ptb_unlocked()
-                self._save_ptb_store_unlocked()
+                # RTDS has no snapshot/replay for TWAP streams. A feed that
+                # connects just after market open can briefly have no tick;
+                # do not permanently poison this market's PTB cache.
                 return dict(rec)
 
             best_ts, best_px = min(self._ticks, key=lambda t: abs(t[0] - target_ms))
@@ -205,9 +211,10 @@ class BtcUnderlyingFeed:
                 "reason": None if ok else "skew_too_large",
                 "captured_at": now,
             }
-            self._ptb[key] = rec
-            self._trim_ptb_unlocked()
-            self._save_ptb_store_unlocked()
+            if ok:
+                self._ptb[key] = rec
+                self._trim_ptb_unlocked()
+                self._save_ptb_store_unlocked()
             return dict(rec)
 
     def underlying_check(self, start_ts: float, min_edge_usd: float) -> Dict[str, Any]:
@@ -233,10 +240,22 @@ class BtcUnderlyingFeed:
         if ptb is None or live is None:
             out["reason"] = "missing_ptb" if ptb is None else "missing_live"
             return out
-        if live_age is not None and live_age > LIVE_STALE_S:
+        try:
+            ptb_f = float(ptb)
+            live_f = float(live)
+        except (TypeError, ValueError):
+            out["reason"] = "non_finite_price"
+            return out
+        if not math.isfinite(ptb_f) or not math.isfinite(live_f):
+            out["reason"] = "non_finite_price"
+            return out
+        if live_age is None or not math.isfinite(live_age) or live_age < 0:
+            out["reason"] = "invalid_live_age"
+            return out
+        if live_age > LIVE_STALE_S:
             out["reason"] = "live_stale"
             return out
-        edge = float(live) - float(ptb)
+        edge = live_f - ptb_f
         out["edge_usd"] = edge
         # Fail-closed: flat underlying never picks a side (even if min_edge is 0).
         if edge == 0:
@@ -278,16 +297,43 @@ class BtcUnderlyingFeed:
             tmp = path + ".tmp"
             with open(tmp, "w", encoding="utf-8") as f:
                 json.dump(self._ptb, f, separators=(",", ":"))
+                f.flush()
+                os.fsync(f.fileno())
             os.replace(tmp, path)
+            parent = os.path.dirname(os.path.abspath(path)) or "."
+            dir_fd = os.open(parent, os.O_RDONLY)
+            try:
+                os.fsync(dir_fd)
+            finally:
+                os.close(dir_fd)
         except Exception as e:
             log.debug("ptb_store_save_fail: %s", e)
 
-    def _push_tick(self, ts_ms: int, value: float) -> None:
+    def _push_tick(self, ts_ms: int, value: float, *, live: bool) -> bool:
+        try:
+            ts_ms = int(ts_ms)
+            value = float(value)
+        except (TypeError, ValueError):
+            return False
+        now_ms = int(time.time() * 1000)
+        if (
+            not math.isfinite(value)
+            or not 100 <= value <= 10_000_000
+            or ts_ms <= 0
+            or ts_ms > now_ms + 2_000
+            or ts_ms < now_ms - (4 * 60 * 60 * 1000)
+            or (live and ts_ms < now_ms - 10_000)
+        ):
+            return False
         with self._lock:
-            self._ticks.append((int(ts_ms), float(value)))
-            self._live = float(value)
-            self._live_ts = ts_ms / 1000.0
-            self._live_src = self.meta["label"]
+            self._ticks.append((ts_ms, value))
+            if live and ts_ms >= self._latest_observation_ms:
+                self._latest_observation_ms = ts_ms
+                self._live = value
+                self._live_ts = ts_ms / 1000.0
+                self._live_received_mono = time.monotonic()
+                self._live_src = self.meta["label"]
+        return True
 
     def _run(self) -> None:
         while not self._stop.is_set():
@@ -305,6 +351,9 @@ class BtcUnderlyingFeed:
         meta = self.meta
         got = {"ok": False}
         want_symbol = meta["symbol"]
+        opened_mono = {"value": 0.0}
+        last_valid_mono = {"value": 0.0}
+        ping_stop = threading.Event()
 
         def on_message(ws, message):
             if message == "PONG" or not message:
@@ -318,15 +367,16 @@ class BtcUnderlyingFeed:
 
             # Live update
             if "value" in payload and "data" not in payload:
-                if topic and topic != meta["rtds_topic"]:
+                if topic != meta["rtds_topic"]:
                     return
                 sym = str(payload.get("symbol") or "").lower()
-                if sym and sym != want_symbol:
+                if sym != want_symbol:
                     return
                 try:
-                    ts_ms = int(payload.get("timestamp") or time.time() * 1000)
-                    self._push_tick(ts_ms, float(payload["value"]))
-                    got["ok"] = True
+                    ts_ms = int(payload["timestamp"])
+                    if self._push_tick(ts_ms, float(payload["value"]), live=True):
+                        got["ok"] = True
+                        last_valid_mono["value"] = time.monotonic()
                 except (TypeError, ValueError):
                     pass
                 return
@@ -334,21 +384,26 @@ class BtcUnderlyingFeed:
             # Historical dump on subscribe
             hist = payload.get("data")
             if isinstance(hist, list) and hist:
-                if topic and topic != meta["rtds_topic"]:
+                if topic != meta["rtds_topic"]:
                     return
-                dump_sym = str(payload.get("symbol") or want_symbol).lower()
+                dump_sym = str(payload.get("symbol") or "").lower()
                 if dump_sym != want_symbol:
                     return
-                for point in hist:
+                for point in sorted(
+                    (point for point in hist if isinstance(point, dict)),
+                    key=lambda point: int(point.get("timestamp") or 0),
+                ):
                     try:
                         ts_ms = int(point["timestamp"])
-                        self._push_tick(ts_ms, float(point["value"]))
-                        got["ok"] = True
+                        if self._push_tick(ts_ms, float(point["value"]), live=False):
+                            got["ok"] = True
                     except (TypeError, ValueError, KeyError):
                         continue
                 return
 
         def on_open(ws):
+            opened_mono["value"] = time.monotonic()
+            last_valid_mono["value"] = opened_mono["value"]
             sub = {
                 "topic": meta["rtds_topic"],
                 "type": meta["rtds_type"],
@@ -356,6 +411,23 @@ class BtcUnderlyingFeed:
             if meta.get("filters") is not None:
                 sub["filters"] = meta["filters"]
             ws.send(json.dumps({"action": "subscribe", "subscriptions": [sub]}))
+
+            def pinger():
+                while not self._stop.is_set() and not ping_stop.wait(5.0):
+                    try:
+                        now_mono = time.monotonic()
+                        if now_mono - last_valid_mono["value"] > 15.0:
+                            ws.close()
+                            break
+                        ws.send("PING")
+                    except Exception:
+                        break
+
+            threading.Thread(
+                target=pinger,
+                name=f"btc-ping-{self.source}",
+                daemon=True,
+            ).start()
 
         def on_error(ws, error):
             log.debug("rtds_error[%s]: %s", self.source, error)
@@ -367,20 +439,11 @@ class BtcUnderlyingFeed:
             on_error=on_error,
         )
 
-        def pinger():
-            while not self._stop.is_set():
-                try:
-                    ws.send("PING")
-                except Exception:
-                    break
-                if self._stop.wait(5.0):
-                    break
-
-        threading.Thread(target=pinger, name=f"btc-ping-{self.source}", daemon=True).start()
         try:
             ws.run_forever(ping_interval=None)
         except Exception as e:
             log.debug("rtds_run_fail[%s]: %s", self.source, e)
+        ping_stop.set()
         try:
             ws.close()
         except Exception:

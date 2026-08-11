@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import threading
 import time
 from typing import Dict, Iterable, Optional, Set, Tuple
@@ -36,20 +37,50 @@ def _f(v) -> Optional[float]:
     if v is None or v == "":
         return None
     try:
-        return float(v)
+        value = float(v)
     except (TypeError, ValueError):
         return None
+    return value if math.isfinite(value) else None
+
+
+def _event_ts_ms(value) -> Optional[int]:
+    """Parse an exchange event timestamp without trusting future/invalid values."""
+    parsed = _f(value)
+    if parsed is None or parsed <= 0:
+        return None
+    # The market stream normally uses milliseconds, but tolerate seconds.
+    if parsed < 10_000_000_000:
+        parsed *= 1000
+    now_ms = time.time() * 1000
+    if parsed > now_ms + 2_000 or now_ms - parsed > 10_000:
+        return None
+    return int(parsed)
 
 
 def _best_from_levels(levels, side: str) -> Tuple[Optional[float], float]:
     if not levels:
         return None, 0.0
     try:
+        valid = []
+        for level in levels:
+            if not isinstance(level, dict):
+                continue
+            price = _f(level.get("price"))
+            size = _f(level.get("size"))
+            if (
+                price is None
+                or size is None
+                or not 0 < price < 1
+                or size <= 0
+            ):
+                continue
+            valid.append((price, size))
+        if not valid:
+            return None, 0.0
         if side == "bid":
-            best = max(levels, key=lambda x: float(x.get("price", 0) or 0))
+            return max(valid, key=lambda level: level[0])
         else:
-            best = min(levels, key=lambda x: float(x.get("price", 0) or 0))
-        return _f(best.get("price")), float(best.get("size", 0) or 0)
+            return min(valid, key=lambda level: level[0])
     except Exception:
         return None, 0.0
 
@@ -61,6 +92,8 @@ class ClobMarketBookFeed:
         self._lock = threading.Lock()
         self._quotes: Dict[str, Quote] = {}
         self._updated_at: Dict[str, float] = {}
+        self._server_ts_ms: Dict[str, int] = {}
+        self._tick_sizes: Dict[str, str] = {}
         self._wanted: Set[str] = set()
         self._subscribed: Set[str] = set()
         self._stop = threading.Event()
@@ -68,6 +101,7 @@ class ClobMarketBookFeed:
         self._started = False
         self._ws = None
         self._want_resub = threading.Event()
+        self._generation = 0
 
     def start(self) -> None:
         if self._started:
@@ -95,6 +129,8 @@ class ClobMarketBookFeed:
                 if tid not in wanted:
                     self._quotes.pop(tid, None)
                     self._updated_at.pop(tid, None)
+                    self._server_ts_ms.pop(tid, None)
+                    self._tick_sizes.pop(tid, None)
         self._want_resub.set()
 
     def quote(self, token_id: str, max_age_s: float = STALE_S) -> Optional[Quote]:
@@ -105,7 +141,8 @@ class ClobMarketBookFeed:
             ts = self._updated_at.get(tid)
         if q is None or ts is None:
             return None
-        if (time.time() - ts) > max_age_s:
+        age = time.monotonic() - ts
+        if age < 0 or age > max_age_s:
             return None
         return q
 
@@ -115,7 +152,12 @@ class ClobMarketBookFeed:
             ts = self._updated_at.get(tid)
         if ts is None:
             return None
-        return time.time() - ts
+        age = time.monotonic() - ts
+        return age if age >= 0 else None
+
+    def tick_size(self, token_id: str) -> Optional[str]:
+        with self._lock:
+            return self._tick_sizes.get(str(token_id))
 
     def _store(
         self,
@@ -126,6 +168,8 @@ class ClobMarketBookFeed:
         ask_sz,
         *,
         preserve_sizes: bool = False,
+        generation: Optional[int] = None,
+        server_ts_ms: Optional[int] = None,
     ) -> None:
         """Store top-of-book.
 
@@ -138,23 +182,59 @@ class ClobMarketBookFeed:
         if not asset_id:
             return
         with self._lock:
+            if generation is not None and generation != self._generation:
+                return
+            if asset_id not in self._wanted:
+                return
+            previous_server_ts = self._server_ts_ms.get(asset_id)
+            if (
+                server_ts_ms is not None
+                and previous_server_ts is not None
+                and server_ts_ms < previous_server_ts
+            ):
+                return
             prev = self._quotes.get(asset_id)
             if preserve_sizes and prev is not None:
                 # Price-only events omit size. Keep prior size ONLY when the
-                # top-of-book price is unchanged. If the price moved, size from
-                # the old level is a lie — zero it so callers REST-refresh.
+                # top-of-book price is unchanged and the prior update is recent.
+                # Otherwise the old level's size is a lie.
+                previous_received = self._updated_at.get(asset_id)
+                sizes_fresh = (
+                    previous_received is not None
+                    and 0 <= time.monotonic() - previous_received <= 1.0
+                )
                 if bid is not None:
                     if bid_sz is None or float(bid_sz or 0) <= 0:
-                        if prev[0] is not None and abs(float(prev[0]) - float(bid)) < 1e-12:
+                        if (
+                            sizes_fresh
+                            and prev[0] is not None
+                            and abs(float(prev[0]) - float(bid)) < 1e-12
+                        ):
                             bid_sz = prev[1]
                         else:
                             bid_sz = 0.0
                 if ask is not None:
                     if ask_sz is None or float(ask_sz or 0) <= 0:
-                        if prev[2] is not None and abs(float(prev[2]) - float(ask)) < 1e-12:
+                        if (
+                            sizes_fresh
+                            and prev[2] is not None
+                            and abs(float(prev[2]) - float(ask)) < 1e-12
+                        ):
                             ask_sz = prev[3]
                         else:
                             ask_sz = 0.0
+            bid = _f(bid)
+            ask = _f(ask)
+            bid_sz = _f(bid_sz)
+            ask_sz = _f(ask_sz)
+            if bid is not None and not 0 < bid < 1:
+                bid = None
+            if ask is not None and not 0 < ask < 1:
+                ask = None
+            if bid_sz is None or bid_sz <= 0:
+                bid_sz = 0.0
+            if ask_sz is None or ask_sz <= 0:
+                ask_sz = 0.0
             mid = None
             if bid is not None and ask is not None:
                 mid = (bid + ask) / 2.0
@@ -165,9 +245,11 @@ class ClobMarketBookFeed:
                 float(ask_sz or 0.0) if ask is not None else 0.0,
                 mid,
             )
-            self._updated_at[asset_id] = time.time()
+            self._updated_at[asset_id] = time.monotonic()
+            if server_ts_ms is not None:
+                self._server_ts_ms[asset_id] = server_ts_ms
 
-    def _handle_message(self, raw: str) -> None:
+    def _handle_message(self, raw: str, generation: Optional[int] = None) -> None:
         if not raw or raw == "PONG":
             return
         try:
@@ -177,18 +259,30 @@ class ClobMarketBookFeed:
         if isinstance(msg, list):
             for item in msg:
                 if isinstance(item, dict):
-                    self._handle_event(item)
+                    self._handle_event(item, generation)
             return
         if isinstance(msg, dict):
-            self._handle_event(msg)
+            self._handle_event(msg, generation)
 
-    def _handle_event(self, msg: dict) -> None:
+    def _handle_event(self, msg: dict, generation: Optional[int] = None) -> None:
         et = msg.get("event_type") or msg.get("type") or ""
+        server_ts_ms = _event_ts_ms(msg.get("timestamp"))
+        if et in {"book", "best_bid_ask", "price_change"} and server_ts_ms is None:
+            return
         if et == "book":
             asset_id = str(msg.get("asset_id") or "")
             bid, bid_sz = _best_from_levels(msg.get("bids") or [], "bid")
             ask, ask_sz = _best_from_levels(msg.get("asks") or [], "ask")
-            self._store(asset_id, bid, bid_sz, ask, ask_sz, preserve_sizes=False)
+            self._store(
+                asset_id,
+                bid,
+                bid_sz,
+                ask,
+                ask_sz,
+                preserve_sizes=False,
+                generation=generation,
+                server_ts_ms=server_ts_ms,
+            )
             return
         if et == "best_bid_ask":
             asset_id = str(msg.get("asset_id") or "")
@@ -199,6 +293,8 @@ class ClobMarketBookFeed:
                 _f(msg.get("best_ask")),
                 None,
                 preserve_sizes=True,
+                generation=generation,
+                server_ts_ms=server_ts_ms,
             )
             return
         if et == "price_change":
@@ -215,7 +311,21 @@ class ClobMarketBookFeed:
                     _f(pc.get("best_ask")),
                     None,
                     preserve_sizes=True,
+                    generation=generation,
+                    server_ts_ms=_event_ts_ms(pc.get("timestamp")) or server_ts_ms,
                 )
+            return
+        if et == "tick_size_change":
+            asset_id = str(msg.get("asset_id") or "")
+            tick_size = str(msg.get("new_tick_size") or msg.get("tick_size") or "")
+            if tick_size not in {"0.1", "0.01", "0.005", "0.0025", "0.001", "0.0001"}:
+                return
+            with self._lock:
+                if (
+                    (generation is None or generation == self._generation)
+                    and asset_id in self._wanted
+                ):
+                    self._tick_sizes[asset_id] = tick_size
             return
 
     def _sock_ready(self, ws) -> bool:
@@ -278,6 +388,14 @@ class ClobMarketBookFeed:
         backoff = RECONNECT_BASE_S
         while not self._stop.is_set():
             try:
+                with self._lock:
+                    self._generation += 1
+                    generation = self._generation
+                    # Quotes from a dead socket are not valid on its replacement.
+                    self._quotes.clear()
+                    self._updated_at.clear()
+                    self._server_ts_ms.clear()
+                    self._tick_sizes.clear()
                 last_ping = [0.0]
 
                 def on_open(ws):
@@ -288,11 +406,11 @@ class ClobMarketBookFeed:
                         tokens = set(self._wanted)
                     self._subscribed = set()
                     self._initial_subscribe(ws, tokens)
-                    last_ping[0] = time.time()
+                    last_ping[0] = time.monotonic()
 
                 def on_message(ws, message):
                     try:
-                        self._handle_message(message)
+                        self._handle_message(message, generation)
                     except Exception as e:
                         log.debug("clob_book_ws handle_fail: %s", e)
 
@@ -330,7 +448,7 @@ class ClobMarketBookFeed:
                 t.start()
 
                 while t.is_alive() and not self._stop.is_set():
-                    now = time.time()
+                    now = time.monotonic()
                     live = self._ws if self._sock_ready(self._ws) else None
                     if live is not None and now - last_ping[0] >= PING_INTERVAL_S:
                         if not self._safe_send(live, "PING"):
