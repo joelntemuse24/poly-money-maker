@@ -312,7 +312,8 @@ crash between P&L and state saves cannot double-count.
 | `PRIVATE_KEY`, `FUNDER_ADDRESS` | Trading account (key + funder/proxy address) |
 | `API_KEY`, `API_SECRET`, `API_PASSPHRASE` | CLOB API credentials (L2 auth) |
 | `RELAYER_URL` | Redeem relayer URL (defaults to Polymarket production) |
-| `POLY_BUILDER_API_KEY`, `POLY_BUILDER_SECRET`, `POLY_BUILDER_PASSPHRASE` | Builder authentication for redeem submission |
+| `RELAYER_API_KEY`, `RELAYER_API_KEY_ADDRESS` | Relayer API key auth for redeem (preferred; Settings → API Keys) |
+| `POLY_BUILDER_API_KEY`, `POLY_BUILDER_SECRET`, `POLY_BUILDER_PASSPHRASE` | Alternate Builder HMAC auth for redeem (Settings → Builders) |
 
 **Strategy JSON** — a valid file is required at startup. Each bot re-reads it every
 cycle (`load_strategy()` checks mtime), so ordinary parameter changes take effect on
