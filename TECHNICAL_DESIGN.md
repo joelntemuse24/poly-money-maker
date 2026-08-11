@@ -35,9 +35,9 @@ or 1 hour)? A market has two legs (UP and DOWN). Exactly one leg wins and redeem
 $1.00; the other redeems at $0.
 
 **The strategy:** in the final moments before resolution, the outcome is usually
-already obvious — the winning leg trades at 99¢ but has not yet settled. The bots
+already obvious — the winning leg trades at 98–99¢ but has not yet settled. The bots
 buy that near-certain winner with a Fill-And-Kill (FAK) market order and redeem it at
-$1.00, capturing ~1¢ per share.
+$1.00, capturing ~1–2¢ per share.
 
 **The risk:** BTC can reverse in the final seconds. If the leg we bought truly
 collapses (bid **and** ask both drop — not a lone 1¢ bid under a still-high ask),
@@ -45,8 +45,8 @@ the bot **hedges**: it market-sells the held leg, floored at `hedge_min_price`
 (~32¢). There is no profit-taking sell — the only sell path is the hedge;
 everything else rides to redemption.
 
-**Economics per share (no reversal):** buy at 99¢, redeem at $1.00 → ~1¢ gross.
-**Economics per share (hedged reversal):** buy at 99¢, sell near the collapsed
+**Economics per share (no reversal):** buy at ~98–99¢, redeem at $1.00 → ~1–2¢ gross.
+**Economics per share (hedged reversal):** buy at ~98–99¢, sell near the collapsed
 book (≥ floor) → bounded loss instead of riding a wrong side to $0.
 
 ---
@@ -64,7 +64,7 @@ trades a different market cadence and uses a different resolution oracle.
 | Slug prefix / excludes | `btc-updown` (excl. `btc-updown-5m`, `bitcoin-up-or-down`) | `btc-updown-5m` (excl. `bitcoin-up-or-down`) | `bitcoin-up-or-down` (excl. `btc-updown`, `btc-updown-5m`) |
 | Resolution oracle | Chainlink BTC TWAP 60s | Chainlink BTC TWAP 30s | Binance BTCUSDT |
 | Buy window | final 2.5 min (`buy_window_min`) | final 60 s (`buy_start_s`) | final 3.5 min (`buy_window_min`) |
-| Ask band | 99¢ | 99¢ | 99¢ |
+| Ask band | 98–99¢ | 98–99¢ | 98–99¢ |
 | Budget / market | $5 USDC | $5 USDC | $5 USDC |
 | Hedge trigger | bid ≤ 65¢ **and** ask ≤ 70¢, spread ≤ 15¢ | same | same |
 | Tick size | 0.01 | 0.001 | 0.01 |
@@ -197,8 +197,8 @@ A buy fires only when **all** of these gates pass, evaluated in the final window
    a 1¢ bid is a fake price — last-trade GUI can still look like a winner while
    there is no real bid under the ask. WS quotes alone are never used to arm entry.
 4. **Ask band.** The best ask of the winning leg is within `buy_threshold`–
-   `buy_max_price` (99¢). The probe band is tight on purpose: history showed the
-   fewest reversals near 98–99¢; edge is ~1¢ to redemption.
+   `buy_max_price` (98–99¢). Floor is 98¢ so latency can still catch a fill before
+   a 99¢ ask disappears; history showed the fewest reversals in this pocket.
 5. **Underlying gate.** If `underlying_gate_enabled`, the live oracle price must be
    at least `min_underlying_edge_usd` away from the captured PTB ($5 on 5m, $10 on
    15m/hourly), **and** the book's winning side must match the direction of the
@@ -324,7 +324,7 @@ paths. Templates are `strategy_buy.example.json`,
 
 | Key | Default (15m/5m/hr) | Meaning |
 |---|---|---|
-| `buy_threshold` / `buy_max_price` | 0.99 / 0.99 | Ask band for entry (99¢ probe) |
+| `buy_threshold` / `buy_max_price` | 0.98 / 0.99 | Ask band for entry (98–99¢ probe) |
 | `min_winner_bid` / `max_loser_bid` / `min_bid_edge` | 0.92 / 0.10 / 0.05 | GUI consensus gate |
 | `max_entry_spread` | 0.05 | Max ask−bid on winner at entry |
 | `underlying_gate_enabled` / `min_underlying_edge_usd` | true / 5.0 (5m), 10.0 (15m/hr) | Oracle alignment gate |

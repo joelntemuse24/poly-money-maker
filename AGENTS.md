@@ -6,7 +6,7 @@ Full architecture: `TECHNICAL_DESIGN.md`.
 ## Project at a Glance
 
 **Live on the VM (2026-08-10):** three standalone buy bots — nothing else. They buy
-the winning leg of Polymarket BTC "Up or Down" markets at 99¢ in the final
+the winning leg of Polymarket BTC "Up or Down" markets at 98–99¢ in the final
 window, hedge at 65¢ on reversal, and redeem winners at $1.00.
 
 | File | Service | Markets | Oracle | Budget | Window |

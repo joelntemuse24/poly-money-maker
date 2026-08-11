@@ -135,7 +135,7 @@ _STRATEGY_DEFAULTS = {
     # entries while existing positions continue through the hedge path.
     "entry_enabled": False,
     # High-90s only: cheaper fills in history were dominated by false-book entries.
-    "buy_threshold": 0.99,
+    "buy_threshold": 0.98,
     "buy_max_price": 0.99,
     # Consensus on Polymarket GUI display price (mid if spread≤10¢ else last trade).
     "min_winner_bid": 0.92,
