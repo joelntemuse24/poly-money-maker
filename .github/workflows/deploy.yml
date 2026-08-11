@@ -21,8 +21,15 @@ jobs:
           username: ${{ secrets.GCP_USER }}
           key: ${{ secrets.GCP_SSH_KEY }}
           script: |
+            set -e
             cd ~/poly-money-maker
             git pull origin main
-            pip install -r requirements.txt --quiet
-            sudo systemctl restart polybuybot polybuybot5m polybuybothourly
-            echo "Deployed $(git rev-parse --short HEAD) at $(date)"
+            .venv/bin/python -m pip install -r requirements.txt --quiet
+            # Do NOT systemctl restart here. A blind restart starts disabled units
+            # and can re-enable bleeding bots after a force-stop. Code is pulled;
+            # operators start/restart services deliberately after validation.
+            echo "Pulled $(git rev-parse --short HEAD) at $(date)"
+            echo "Services NOT restarted. Active:"
+            systemctl is-active polybuybot polybuybot5m polybuybothourly || true
+            echo "Enabled:"
+            systemctl is-enabled polybuybot polybuybot5m polybuybothourly || true
