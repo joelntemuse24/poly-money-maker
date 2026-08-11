@@ -386,7 +386,6 @@ class AmbiguousCrossCyclePolicy(unittest.TestCase):
             self.assertIn("inspect_uncertain_order(", src)
             self.assertIn("buy_uncertain_order_id", src)
             self.assertIn("hedge_uncertain_order_id", src)
-            self.assertIn("get_market_fee_schedule", src)
             self.assertIn("buy_uncertain_trade_ids", src)
             self.assertIn("hedge_skip_ambiguous_legs", src)
             self.assertIn("STATE_MINED", src)
@@ -474,7 +473,6 @@ class BuyExecutionAmbiguity(unittest.TestCase):
                 "log_event": lambda *_a, **_k: None,
                 "check_token_balance": lambda *_args: 0.0,
                 "check_clob_token_balance": lambda *_args, **_kwargs: 0.0,
-                "get_market_fee_schedule": lambda *_args, **_kwargs: None,
                 "_fill_fee_usdc": lambda *_args, **_kwargs: None,
                 "get_quote_fast": lambda *_a, **_k: (0.97, None, 0.98, 100.0, None),
                 "entry_book_ok": lambda *_a, **_k: (True, "ok"),

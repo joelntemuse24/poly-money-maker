@@ -1235,39 +1235,9 @@ def gc_can_finalize(gc_meta):
     )
 
 
-_market_fee_cache = {}
 _trade_detail_cache = {}
 
 
-def get_market_fee_schedule(condition_id):
-    """Return the CLOB V2 taker fee schedule for one condition."""
-    condition_id = str(condition_id or "")
-    if not condition_id:
-        return None
-    cached = _market_fee_cache.get(condition_id)
-    if cached is not None:
-        return dict(cached)
-    try:
-        info = safe_api_call(client.get_clob_market_info, condition_id)
-        fee_details = info.get("fd") if isinstance(info, dict) else None
-        if not isinstance(fee_details, dict):
-            raise ValueError("market info omitted fee details")
-        rate = finite_float(fee_details.get("r"), minimum=0, maximum=1)
-        exponent = finite_float(
-            fee_details.get("e"), minimum=0, maximum=10,
-        )
-        if rate is None or exponent is None:
-            raise ValueError("invalid market fee schedule")
-        schedule = {"rate": rate, "exponent": exponent}
-        _market_fee_cache[condition_id] = schedule
-        return dict(schedule)
-    except Exception as exc:
-        log_event(
-            "market_fee_schedule_fail",
-            condition_id=condition_id,
-            error=str(exc)[:200],
-        )
-        return None
 
 def _fill_fee_usdc(filled, price, fee_schedule):
     """Calculate the CLOB V2 taker fee, rounded to protocol precision."""
@@ -1998,9 +1968,7 @@ def buy_market_with_retry(
         console.print(f"  [bold black on yellow][DRY BUY][/] would SPEND ≤${budget:.2f} on {str(token_id)[:12]}… @ ≤{max_price:.3f}")
         log_event("dry_buy", token_id=token_id, budget=budget, max_price=max_price)
         return 0.0, 0.0, "dry"
-    fee_schedule = (
-        get_market_fee_schedule(condition_id) if condition_id else None
-    )
+    fee_schedule = None
 
     def _token_balance():
         clob_balance = check_clob_token_balance(token_id, refresh=True)
@@ -2356,9 +2324,7 @@ def sell_market_with_retry(
         console.print(f"  [bold black on yellow][DRY SELL][/] would SELL {remaining:.4f} {str(token_id)[:12]}… @ ≥{price:.3f}")
         log_event("dry_sell", token_id=token_id, size=remaining, price_limit=price)
         return 0, {"bot_status": "dry", "last_limit": price}, 0.0
-    fee_schedule = (
-        get_market_fee_schedule(condition_id) if condition_id else None
-    )
+    fee_schedule = None
     for attempt in range(max_retries):
         if remaining < 0.01:
             break
@@ -3360,7 +3326,6 @@ while not _shutdown_requested:
                     token_id=uncertain_token,
                     condition_id=cond,
                     limit_price=meta.get("buy_uncertain_price", 0),
-                fee_schedule=get_market_fee_schedule(cond),
                 spend_cap=max(0.0, float(BUY_BUDGET) - known_cost),
                 trade_ids=meta.get("buy_uncertain_trade_ids"),
                 )
@@ -3514,7 +3479,6 @@ while not _shutdown_requested:
                         token_id=meta.get("hedge_uncertain_token"),
                         condition_id=cond,
                         limit_price=meta.get("hedge_uncertain_price", 0),
-                    fee_schedule=get_market_fee_schedule(cond),
                     trade_ids=meta.get("hedge_uncertain_trade_ids"),
                     )
                     hedge_state = inspected["state"]
