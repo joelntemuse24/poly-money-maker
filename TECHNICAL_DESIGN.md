@@ -213,9 +213,11 @@ and the 200ms REST cache) immediately before the order. A BUY limit is a
 **maximum**, so the exchange can fill far below the gate ask (“price improvement”).
 Confirmed fills are **always persisted** (including below-band averages logged as
 `buy_fill_below_band`) — discarding them creates orphan inventory. Those fills set
-`toxic_fill` and are **not** ridden to $1: the hedge path force-exits at the next
-usable bid (no bounce cancel, no `hedge_min_price` floor). Delayed FAKs are polled;
-zero confirms fall back to balance reconciliation (`buy_ghost_fill`).
+`toxic_fill` when the average is below `toxic_force_exit_below` (default 90¢) and
+are **not** ridden to $1: the hedge path force-exits at the next usable bid (no
+bounce cancel, no `hedge_min_price` floor). Milder below-band fills (e.g. 95¢)
+stay on the normal ≤65¢ hedge path. Delayed FAKs are polled; zero confirms fall
+back to balance reconciliation (`buy_ghost_fill`).
 Before every POST, the bot atomically writes a `buy_uncertain` quarantine with the
 exact signed order ID, token, amounts, and pre-submit balance. Any exception, falsy
 response, or non-terminal response stops replacement orders and keeps that market
@@ -248,8 +250,9 @@ force exit):
 
 - **Arm (normal):** WS/cache bid ≤ `hedge_threshold` (65¢) while the position is open
   (peek only — never sufficient to sell).
-- **Arm (toxic_fill):** any below-band entry (`avg < buy_threshold`) arms an immediate
-  dump — do not wait for a 65¢ reversal and do not cancel on bounce.
+- **Arm (toxic_fill):** entry average `< toxic_force_exit_below` (90¢) arms an
+  immediate dump — do not wait for a 65¢ reversal and do not cancel on bounce.
+  Below-band but ≥90¢ uses the normal hedge.
 - **Confirm (force-fresh REST, fail-closed):** re-fetch the full book with
   `force_rest=True`. If either side is missing, skip (`hedge_skip_incomplete_rest`)
   — **no WS fallback**. If bid bounced above threshold on a *normal* entry, abort

@@ -148,6 +148,9 @@ _STRATEGY_DEFAULTS = {
     # and only allow the side matching that underlying move.
     "underlying_gate_enabled": True,
     "min_underlying_edge_usd": 10.0,
+    # Force-dump only when FAK avg is worse than this. Fills in
+    # [toxic_force_exit_below, buy_threshold) stay on the normal hedge path.
+    "toxic_force_exit_below": 0.90,
     "hedge_enabled": True,
     "hedge_threshold": 0.65,
     # FAK sell floor while hedging. Must be a valid tick multiple:
@@ -246,6 +249,8 @@ def load_strategy():
             cfg["buy_budget"] = float(overrides["shares"])
         if not (0 < cfg["buy_threshold"] <= cfg["buy_max_price"] <= 1):
             raise ValueError("buy price band must satisfy 0 < threshold <= max <= 1")
+        if not (0 < cfg["toxic_force_exit_below"] <= cfg["buy_threshold"]):
+            raise ValueError("toxic_force_exit_below must satisfy 0 < below <= buy_threshold")
         if not (0 <= cfg["hedge_min_price"] <= cfg["hedge_threshold"] <= 1):
             raise ValueError("hedge prices must satisfy 0 <= min <= threshold <= 1")
         for key, value in cfg.items():
@@ -314,6 +319,7 @@ MAX_LOSER_BID = _strat["max_loser_bid"]
 MIN_BID_EDGE = _strat["min_bid_edge"]
 UNDERLYING_GATE_ENABLED = _strat["underlying_gate_enabled"]
 MIN_UNDERLYING_EDGE_USD = _strat["min_underlying_edge_usd"]
+TOXIC_FORCE_EXIT_BELOW = _strat["toxic_force_exit_below"]
 HEDGE_ENABLED = _strat["hedge_enabled"]
 HEDGE_THRESHOLD = _strat["hedge_threshold"]
 HEDGE_MIN_PRICE = _strat["hedge_min_price"]
@@ -2260,9 +2266,15 @@ def buy_market_with_retry(
             )
             return total_bought, spent, "ambiguous"
         if below_band:
+            force_exit = avg + 1e-9 < float(TOXIC_FORCE_EXIT_BELOW)
             console.print(
                 f"  [bold red][BUY BELOW BAND][/] filled={filled:.4f} avg={avg:.3f} "
-                f"(min_px={min_price:.3f}) — toxic_fill armed (force exit, no ride)"
+                f"(min_px={min_price:.3f}) — "
+                + (
+                    "toxic_fill armed (force exit, no ride)"
+                    if force_exit
+                    else f"above {float(TOXIC_FORCE_EXIT_BELOW):.2f} dump floor — normal hedge"
+                )
             )
             log_event(
                 "buy_fill_below_band", token_id=token_id, filled=filled, avg_price=round(avg, 4),
@@ -2878,6 +2890,7 @@ while not _shutdown_requested:
         MIN_BID_EDGE = _strat["min_bid_edge"]
         UNDERLYING_GATE_ENABLED = _strat["underlying_gate_enabled"]
         MIN_UNDERLYING_EDGE_USD = _strat["min_underlying_edge_usd"]
+        TOXIC_FORCE_EXIT_BELOW = _strat["toxic_force_exit_below"]
         HEDGE_ENABLED = _strat["hedge_enabled"]
         HEDGE_THRESHOLD = _strat["hedge_threshold"]
         HEDGE_MIN_PRICE = _strat["hedge_min_price"]
@@ -3382,7 +3395,7 @@ while not _shutdown_requested:
                     meta["fill_price"] = round(avg_fill, 4)
                     meta["pnl_entry_cost"] = round(resolved_cost, 4)
                     meta["toxic_fill"] = bool(
-                        avg_fill + 1e-9 < float(BUY_THRESHOLD)
+                        avg_fill + 1e-9 < float(TOXIC_FORCE_EXIT_BELOW)
                     )
                     leg_key = (
                         "up"
@@ -3476,7 +3489,7 @@ while not _shutdown_requested:
                     meta["bought_size"] = resolved_size
                     meta["fill_price"] = round(avg_fill, 4)
                     meta["pnl_entry_cost"] = round(entry_cost, 4)
-                    meta["toxic_fill"] = bool(avg_fill + 1e-9 < float(BUY_THRESHOLD))
+                    meta["toxic_fill"] = bool(avg_fill + 1e-9 < float(TOXIC_FORCE_EXIT_BELOW))
                     clear_uncertain_fields(meta, _BUY_UNCERTAIN_KEYS)
                     log_event(
                         "buy_uncertain_resolved", condition_id=cond, token_id=held_token,
@@ -3606,9 +3619,9 @@ while not _shutdown_requested:
 
             # --- HEDGE CHECK (for held positions) ---
             if held_token and held_size > 0.01 and HEDGE_ENABLED and not meta.get("hedge_closed"):
-                # Below-band buys set toxic_fill: dump ASAP at any bid (no ride to $1,
-                # no bounce cancel, no hedge_min_price floor). Normal entries still
-                # require bid ≤ hedge_threshold and book-integrity gates.
+                # FAK avg < toxic_force_exit_below sets toxic_fill: dump ASAP at any
+                # bid (no ride to $1, no bounce cancel, no hedge_min_price floor).
+                # Mild below-band fills (≥ that floor) use the normal hedge path.
                 toxic_fill = bool(meta.get("toxic_fill"))
                 # Skip REST only when a *fresh* WS bid is clearly above threshold.
                 # Stale-high WS must not suppress the check (hedge_quote_max_age_s).
@@ -4241,7 +4254,7 @@ while not _shutdown_requested:
                 meta["bought_size"] = filled_total
                 meta["fill_price"] = round(avg, 4)
                 meta["pnl_entry_cost"] = round(spent_total, 4)
-                meta["toxic_fill"] = bool(avg + 1e-9 < float(BUY_THRESHOLD))
+                meta["toxic_fill"] = bool(avg + 1e-9 < float(TOXIC_FORCE_EXIT_BELOW))
                 leg_key = "up" if buy_leg == "up" else "dn"
                 _cached_positions.setdefault(cond, {})[leg_key] = {
                     "asset": buy_token,
@@ -4309,7 +4322,7 @@ while not _shutdown_requested:
                 meta["bought_size"] = bought
                 meta["fill_price"] = round(avg_fill, 4)
                 meta["pnl_entry_cost"] = round(spent, 4)
-                meta["toxic_fill"] = bool(avg_fill + 1e-9 < float(BUY_THRESHOLD))
+                meta["toxic_fill"] = bool(avg_fill + 1e-9 < float(TOXIC_FORCE_EXIT_BELOW))
                 if uchk:
                     meta["ptb"] = uchk.get("ptb")
                     meta["ptb_source"] = uchk.get("ptb_source")

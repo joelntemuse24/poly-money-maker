@@ -7,6 +7,7 @@
   "min_bid_edge": 0.05,
   "underlying_gate_enabled": true,
   "min_underlying_edge_usd": 5.0,
+  "toxic_force_exit_below": 0.9,
   "hedge_enabled": true,
   "hedge_threshold": 0.65,
   "hedge_min_price": 0.325,
