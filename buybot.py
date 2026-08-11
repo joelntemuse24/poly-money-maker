@@ -2733,14 +2733,17 @@ def redeem_condition(condition_id, label=""):
             console.print(f"  [bold bright_green][SETTLE ▶][/] {label}  [dim]tx={str(tx_id)[:18]}…[/]")
             return tx_id
         console.print(f"  [dim red][SETTLE FAIL][/] {label}  [dim]{err}[/]")
-        # Only blacklist definitive wallet/auth configuration failures.
-        # Generic "invalid" in a transient HTTP body must remain retryable.
+        # Blacklist definitive auth failures and empty/already-settled redeems.
+        # Transient 429/5xx must remain retryable.
+        err_l = (err or "").lower()
         if err and (
-            "proxyWallet" in err
-            or "invalid api key" in err.lower()
-            or "invalid authorization" in err.lower()
-            or "unauthorized" in err.lower()
-            or "RELAYER_API_KEY_ADDRESS does not match" in err
+            "proxywallet" in err_l
+            or "invalid api key" in err_l
+            or "invalid authorization" in err_l
+            or "unauthorized" in err_l
+            or "relayer_api_key_address does not match" in err_l
+            or "precheck_skipped" in err_l
+            or "redeem skipped: zero" in err_l
         ):
             _redeem_permanent_failures.add(condition_id)
             console.print(f"  [dim red][SETTLE SKIP][/] {label}  [dim]permanent failure — will not retry[/]")
@@ -3213,18 +3216,23 @@ while not _shutdown_requested:
             )
             save_json(STATE_FILE, positions_meta)
             tx = redeem_condition(cond, label=(meta.get("question", "?"))[:32])
+            # Always stamp the attempt so REDEEM_THROTTLE_S applies on failures
+            # too (otherwise zero-payout 400s spam the relayer every cycle).
+            meta["redeem_submitted_at"] = now_ms
             if tx:
-                meta["redeem_submitted_at"] = now_ms
                 meta["redeem_pending"] = True
                 meta["redeem_tx_id"] = str(tx)
                 meta.pop("redeem_intent_at", None)
                 log_event("redeem_submit", condition_id=cond, tx_id=str(tx))
                 save_json(STATE_FILE, positions_meta)
             else:
-                # Leave intent so the next cycle can retry unless permanently
+                # Leave intent so a later cycle can retry unless permanently
                 # blacklisted by redeem_condition.
                 meta.pop("redeem_pending", None)
                 meta.pop("redeem_tx_id", None)
+                if cond in _redeem_permanent_failures:
+                    meta.pop("redeem_intent_at", None)
+                    meta["redeem_abandoned"] = True
                 save_json(STATE_FILE, positions_meta)
 
         # ================= COLLECT PRE-FETCHED BOOKS =================
