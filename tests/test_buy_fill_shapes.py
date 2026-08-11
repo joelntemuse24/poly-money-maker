@@ -44,6 +44,7 @@ HELPERS = (
     "reconcile_hedge_sold",
     "stable_zero_balances",
     "gc_par_redeem",
+    "gc_can_finalize",
 )
 
 
@@ -200,11 +201,18 @@ class GcParRedeemProduction(unittest.TestCase):
         self.assertEqual(gc({"hedge_attempted": True, "bought_size": 20}, 0, 0), 0.0)
         self.assertEqual(gc({"hedge_blocked_toxic": True, "bought_size": 20}, 0, 0), 0.0)
         self.assertEqual(gc({"buy_uncertain": True, "bought_size": 20}, 0, 0), 0.0)
-        self.assertEqual(gc({"bought_size": 20}, 0, 0), 20.0)
+        self.assertEqual(gc({"bought_size": 20}, 0, 0), 0.0)
 
     def test_explicit_redeem_preserved(self):
         gc = self.ns["gc_par_redeem"]
         self.assertEqual(gc({"hedge_attempted": True, "bought_size": 20}, 0, 15.0), 15.0)
+
+    def test_gc_requires_terminal_execution_evidence(self):
+        can_finalize = self.ns["gc_can_finalize"]
+        self.assertFalse(can_finalize({"bought_size": 20}))
+        self.assertFalse(can_finalize({"buy_uncertain": True, "bought_size": 20}))
+        self.assertTrue(can_finalize({"hedge_closed": True, "bought_size": 0}))
+        self.assertTrue(can_finalize({"pnl_redeem_value": 20.0}))
 
 
 class AmbiguousCrossCyclePolicy(unittest.TestCase):
@@ -215,7 +223,7 @@ class AmbiguousCrossCyclePolicy(unittest.TestCase):
             self.assertIn('meta["buy_uncertain"] = True', src)
             self.assertIn("buy_uncertain_token", src)
             self.assertIn("quarantine: no new order this market", src)
-            self.assertIn('via="held"', src)
+            self.assertIn('via="stable_held"', src)
             self.assertIn("ambiguous POST — no further retries", src)
             self.assertIn("buy_abort_no_baseline", src)
             self.assertIn("aborting further buys", src)
@@ -224,6 +232,11 @@ class AmbiguousCrossCyclePolicy(unittest.TestCase):
             self.assertIn("non-terminal 0-fill response — quarantined", src)
             self.assertIn('not positions_meta[c].get("buy_uncertain")', src)
             self.assertIn("held_size > uncertain_baseline + 0.01", src)
+            self.assertIn("if meta.get(\"buy_uncertain\"):", src)
+            self.assertIn("on_submit=_persist_hedge_submit", src)
+            self.assertIn("on_fill=_persist_hedge_fill", src)
+            self.assertIn("fetch_all_position_rows()", src)
+            self.assertIn("hedge_ghost_unconfirmed", src)
 
     def test_hedge_liveness_and_reconcile_markers(self):
         src = BOT.read_text()
@@ -331,6 +344,80 @@ class BuyExecutionAmbiguity(unittest.TestCase):
         start = src.index("def sell_market_with_retry(")
         chunk = src[start : start + 250]
         self.assertIn('tick_size="0.001"', chunk)
+
+
+class SellExecutionAmbiguity(unittest.TestCase):
+    @staticmethod
+    def _namespace(response=None, post_error=None, confirmed=0.0):
+        ns = _load_funcs("_result_as_dict", "sell_market_with_retry")
+        calls = {"post": 0, "submit": [], "fill": []}
+
+        def post(*_args, **_kwargs):
+            calls["post"] += 1
+            if post_error:
+                raise post_error
+            return response
+
+        ns.update(
+            {
+                "DRY_RUN": False,
+                "SELL": "SELL",
+                "console": SimpleNamespace(print=lambda *_a, **_k: None),
+                "log_event": lambda *_a, **_k: None,
+                "hedge_sell_price": lambda _bid, _tick, _under, _floor: 0.50,
+                "get_quote_fast": lambda *_a, **_k: (0.55, 10.0, 0.60, 10.0, 0.575),
+                "hedge_book_ok": lambda *_a, **_k: (True, "ok"),
+                "safe_api_call": lambda fn, *a, **k: fn(*a, **k),
+                "client": SimpleNamespace(create_and_post_market_order=post),
+                "MarketOrderArgs": lambda **kwargs: kwargs,
+                "PartialCreateOrderOptions": lambda **kwargs: kwargs,
+                "OrderType": SimpleNamespace(FAK="FAK"),
+                "extract_order_id": lambda _result: "order-sell",
+                "confirm_fill_size": lambda *_a, **_k: confirmed,
+                "fill_proceeds": lambda *_a, **_k: confirmed * 0.50,
+                "time": SimpleNamespace(sleep=lambda _s: None),
+            }
+        )
+        return ns, calls
+
+    def test_sell_exception_stops_without_retry(self):
+        ns, calls = self._namespace(post_error=TimeoutError("accepted maybe"))
+        sold, result, proceeds = ns["sell_market_with_retry"](
+            "token", 10.0, 0.55, max_retries=3,
+            on_submit=lambda *args: calls["submit"].append(args),
+        )
+        self.assertEqual((sold, proceeds), (0.0, 0.0))
+        self.assertEqual(result["bot_status"], "ambiguous")
+        self.assertEqual(calls["post"], 1)
+        self.assertEqual(len(calls["submit"]), 1)
+
+    def test_positive_delayed_sell_is_persisted_then_quarantined(self):
+        ns, calls = self._namespace(
+            response={"status": "delayed", "orderID": "order-sell"},
+            confirmed=4.0,
+        )
+        sold, result, proceeds = ns["sell_market_with_retry"](
+            "token", 10.0, 0.55, max_retries=3,
+            on_submit=lambda *args: calls["submit"].append(args),
+            on_fill=lambda *args: calls["fill"].append(args),
+        )
+        self.assertEqual((sold, proceeds), (4.0, 2.0))
+        self.assertEqual(result["bot_status"], "ambiguous")
+        self.assertEqual(calls["post"], 1)
+        self.assertEqual(calls["fill"], [(4.0, 2.0)])
+
+    def test_sell_write_ahead_failure_prevents_post(self):
+        ns, calls = self._namespace(response={"status": "matched"})
+
+        def fail_submit(*_args):
+            raise OSError("disk full")
+
+        sold, result, proceeds = ns["sell_market_with_retry"](
+            "token", 10.0, 0.55, on_submit=fail_submit,
+        )
+        self.assertEqual((sold, proceeds), (0.0, 0.0))
+        self.assertEqual(result["bot_status"], "persist_fail")
+        self.assertEqual(calls["post"], 0)
 
 
 class BalanceAndGcSemantics(unittest.TestCase):

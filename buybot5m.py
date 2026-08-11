@@ -4,10 +4,14 @@ import signal
 import sys
 import time
 import json
+import math
+import shutil
+import threading
 import traceback
 import logging
 from logging.handlers import RotatingFileHandler
 from datetime import datetime, timezone
+from decimal import Decimal, InvalidOperation
 import requests
 from concurrent.futures import ThreadPoolExecutor
 from dotenv import load_dotenv
@@ -23,10 +27,25 @@ from py_clob_client_v2 import (
     OrderType,
     PartialCreateOrderOptions,
     ApiCreds,
+    AssetType,
+    BalanceAllowanceParams,
+    TradeParams,
 )
 from py_clob_client_v2.order_builder.constants import SELL, BUY
+from py_clob_client_v2.config import get_contract_config
+from py_clob_client_v2.order_utils.exchange_order_builder_v2 import ExchangeOrderBuilderV2
+from py_clob_client_v2.order_builder.builder import ROUNDING_CONFIG
+from py_builder_relayer_client.builder.proxy import build_proxy_transaction_request
+from py_builder_relayer_client.config import get_contract_config as get_relayer_contract_config
+from py_builder_relayer_client.encode.proxy import encode_proxy_transaction_data
+from py_builder_relayer_client.models import (
+    CallType,
+    ProxyTransaction,
+    ProxyTransactionArgs,
+)
+from py_builder_relayer_client.signer import Signer as RelayerSigner
 
-from buy.market import MarketGateway
+from buy.market import MarketGateway, MintMarket
 from buy.btc_price import get_btc_feed, append_research, SOURCE_TWAP_30
 from buy.clob_book_ws import get_book_feed
 
@@ -75,9 +94,16 @@ API_PASSPHRASE = os.getenv("API_PASSPHRASE")
 RELAYER_URL = os.getenv("RELAYER_URL", "https://relayer-v2.polymarket.com")
 RELAYER_API_KEY = os.getenv("RELAYER_API_KEY")
 RELAYER_API_KEY_ADDRESS = os.getenv("RELAYER_API_KEY_ADDRESS")
+EXPECTED_TICK_SIZE = "0.001"
+
+# CLOB market orders reject taker amounts with more than four decimal places.
+for _rounding in ROUNDING_CONFIG.values():
+    if _rounding.amount > 4:
+        _rounding.amount = 4
 
 # ------------------------- STRATEGY CONFIG -------------------------
 _STRATEGY_DEFAULTS = {
+    "entry_enabled": False,
     "buy_threshold": 0.96,
     "buy_max_price": 0.99,
     # Consensus on Polymarket GUI display price (mid if spread≤10¢ else last trade).
@@ -128,17 +154,26 @@ _strat_mtime = 0.0
 
 def load_strategy():
     global _strat_cache, _strat_mtime
+    exists = os.path.exists(STRATEGY_FILE)
     try:
-        mtime = os.path.getmtime(STRATEGY_FILE) if os.path.exists(STRATEGY_FILE) else 0
+        mtime = os.path.getmtime(STRATEGY_FILE) if exists else 0
     except OSError:
         mtime = 0
-    if _strat_cache is not None and mtime == _strat_mtime:
-        return _strat_cache
-    if not os.path.exists(STRATEGY_FILE):
-        cfg = dict(_STRATEGY_DEFAULTS)
+        exists = False
+
+    def _entries_disabled(base):
+        safe = dict(base)
+        safe["entry_enabled"] = False
+        safe["hedge_enabled"] = True
+        return safe
+
+    if not exists:
+        cfg = _entries_disabled(_strat_cache or _STRATEGY_DEFAULTS)
         _strat_cache = cfg
         _strat_mtime = mtime
         return cfg
+    if _strat_cache is not None and mtime == _strat_mtime:
+        return _strat_cache
     cfg = dict(_STRATEGY_DEFAULTS)
     try:
         with open(STRATEGY_FILE, "r") as f:
@@ -164,25 +199,59 @@ def load_strategy():
             raise ValueError("buy price band must satisfy 0 < threshold <= max <= 1")
         if not (0 <= cfg["hedge_min_price"] <= cfg["hedge_threshold"] <= 1):
             raise ValueError("hedge prices must satisfy 0 <= min <= threshold <= 1")
+        for key, value in cfg.items():
+            if isinstance(value, bool) or key == "tick_size":
+                continue
+            if not math.isfinite(float(value)):
+                raise ValueError(f"{key} must be finite")
+        for key in (
+            "min_winner_bid", "max_loser_bid", "min_bid_edge",
+            "max_entry_spread", "hedge_max_spread", "hedge_require_ask_max",
+        ):
+            if not 0 <= float(cfg[key]) <= 1:
+                raise ValueError(f"{key} must be between 0 and 1")
+        if float(cfg["hedge_require_ask_max"]) < float(cfg["hedge_threshold"]):
+            raise ValueError("hedge_require_ask_max must be >= hedge_threshold")
+        if str(cfg["tick_size"]) not in {
+            "0.1", "0.01", "0.005", "0.0025", "0.001", "0.0001",
+        }:
+            raise ValueError("tick_size is not supported by the CLOB")
+        if str(cfg["tick_size"]) != EXPECTED_TICK_SIZE:
+            raise ValueError(
+                f"tick_size for this bot must be {EXPECTED_TICK_SIZE}"
+            )
+        if float(cfg["hedge_min_price"]) < float(cfg["tick_size"]):
+            raise ValueError("hedge_min_price must be at least one tick")
+        if not cfg["one_entry_per_market"]:
+            raise ValueError("one_entry_per_market must remain true")
+        if not cfg["dry_run"] and not cfg["hedge_enabled"]:
+            raise ValueError("live mode requires hedge_enabled=true")
         for key in (
             "buy_budget", "max_open_positions", "max_open_notional",
             "max_daily_notional", "poll_buy_window_s", "poll_held_s",
-            "positions_refresh_s", "balance_refresh_s",
+            "positions_refresh_s", "balance_refresh_s", "buy_start_s",
+            "ui_every_n_cycles",
         ):
             if float(cfg[key]) <= 0:
                 raise ValueError(f"{key} must be positive")
+        for key in (
+            "min_underlying_edge_usd", "hedge_undercut_ticks",
+            "hedge_quote_max_age_s", "hedge_retry_sleep_s",
+            "hedge_ghost_sleep_s", "buy_grace_s", "buy_cooldown_s",
+            "redeem_throttle_s", "max_redeem_age_days",
+        ):
+            if float(cfg[key]) < 0:
+                raise ValueError(f"{key} must be non-negative")
     except Exception as e:
         console.print(f"[bold red]▶ STRATEGY [WARN][/] [dim]failed to load {STRATEGY_FILE}: {e}[/]")
-        if _strat_cache is not None:
-            _strat_mtime = mtime
-            return _strat_cache
-        cfg = dict(_STRATEGY_DEFAULTS)
+        cfg = _entries_disabled(_strat_cache or _STRATEGY_DEFAULTS)
     _strat_cache = cfg
     _strat_mtime = mtime
     return cfg
 
 
 _strat = load_strategy()
+ENTRY_ENABLED = _strat["entry_enabled"]
 BUY_THRESHOLD = _strat["buy_threshold"]
 BUY_MAX_PRICE = _strat["buy_max_price"]
 MIN_WINNER_BID = _strat["min_winner_bid"]
@@ -210,7 +279,8 @@ MAX_DAILY_NOTIONAL = _strat["max_daily_notional"]
 ONE_ENTRY_PER_MARKET = _strat["one_entry_per_market"]
 REDEEM_THROTTLE_S = _strat["redeem_throttle_s"]
 MAX_REDEEM_AGE_DAYS = _strat["max_redeem_age_days"]
-DRY_RUN = _strat["dry_run"]
+STARTUP_DRY_RUN = bool(_strat["dry_run"])
+DRY_RUN = STARTUP_DRY_RUN
 POLL_BUY_WINDOW_S = _strat["poll_buy_window_s"]
 POLL_HELD_S = _strat["poll_held_s"]
 POSITIONS_REFRESH_S = _strat["positions_refresh_s"]
@@ -218,8 +288,15 @@ BALANCE_REFRESH_S = _strat["balance_refresh_s"]
 UI_EVERY_N_CYCLES = _strat["ui_every_n_cycles"]
 TICK_SIZE_FALLBACK = _strat["tick_size"]
 
+if DRY_RUN:
+    STATE_FILE = "positions_buy5m.dryrun.json"
+    PNL_FILE = "pnl_buy5m.dryrun.json"
+    HEARTBEAT_FILE = ".heartbeat_buy5m_dryrun"
+    RESEARCH_FILE = "underlying_research_buy5m_dryrun.jsonl"
+    PTB_STORE_FILE = "ptb_twap30_buy5m_dryrun.json"
+
 # ------------------------- LOG ROTATION -------------------------
-LOG_FILE = "buybot5m.log"
+LOG_FILE = "buybot5m.dryrun.log" if DRY_RUN else "buybot5m.log"
 LOG_MAX_BYTES = 5 * 1024 * 1024
 LOG_BACKUP_COUNT = 3
 
@@ -230,9 +307,10 @@ _log_handler.setFormatter(logging.Formatter("%(message)s"))
 _file_logger.addHandler(_log_handler)
 
 NTFY_TOPIC = os.getenv("NTFY_TOPIC", "polybot-joel-btc")
+_notify_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="ntfy")
 
 
-def notify(title, message, priority="default"):
+def _send_notification(title, message, priority):
     try:
         requests.post(
             f"https://ntfy.sh/{NTFY_TOPIC}",
@@ -240,6 +318,14 @@ def notify(title, message, priority="default"):
             headers={"Title": title, "Priority": priority},
             timeout=5,
         )
+    except Exception:
+        pass
+
+
+def notify(title, message, priority="default"):
+    """Queue notifications off the order/hedge critical path."""
+    try:
+        _notify_executor.submit(_send_notification, title, message, priority)
     except Exception:
         pass
 
@@ -254,21 +340,49 @@ def safe_api_call(func, *args, **kwargs):
         raise
 
 
+def finite_float(value, *, minimum=None, maximum=None):
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(parsed):
+        return None
+    if minimum is not None and parsed < minimum:
+        return None
+    if maximum is not None and parsed > maximum:
+        return None
+    return parsed
+
+
 def get_balance():
     try:
-        from py_clob_client_v2.client import BalanceAllowanceParams
-        bal_info = safe_api_call(client.get_balance_allowance, BalanceAllowanceParams(asset_type="COLLATERAL"))
-        return float(bal_info.balance) / 1e6 if hasattr(bal_info, "balance") else 0.0
+        bal_info = safe_api_call(
+            client.get_balance_allowance,
+            BalanceAllowanceParams(asset_type=AssetType.COLLATERAL),
+        )
+        raw = (
+            bal_info.get("balance")
+            if isinstance(bal_info, dict)
+            else getattr(bal_info, "balance", None)
+        )
+        return _decode_clob_fixed6(raw)
     except Exception:
-        return 0.0
+        return None
 
 
 def atomic_save(path, data):
     tmp = path + ".tmp"
+    backup = path + ".bak"
     with open(tmp, "w") as f:
         json.dump(data, f, indent=2)
         f.flush()
         os.fsync(f.fileno())
+    if os.path.exists(path):
+        backup_tmp = backup + ".tmp"
+        shutil.copy2(path, backup_tmp)
+        with open(backup_tmp, "rb") as backup_f:
+            os.fsync(backup_f.fileno())
+        os.replace(backup_tmp, backup)
     os.replace(tmp, path)
     parent = os.path.dirname(os.path.abspath(path)) or "."
     dir_fd = os.open(parent, os.O_RDONLY)
@@ -278,10 +392,25 @@ def atomic_save(path, data):
         os.close(dir_fd)
 
 
-def load_json(path):
-    if os.path.exists(path):
-        with open(path, "r") as f:
-            return json.load(f)
+def load_json(path, *, required=False):
+    errors = []
+    for candidate in (path, path + ".bak"):
+        if not os.path.exists(candidate):
+            continue
+        try:
+            with open(candidate, "r") as f:
+                data = json.load(f)
+            if not isinstance(data, dict):
+                raise ValueError("JSON root must be an object")
+            return data
+        except Exception as exc:
+            errors.append(f"{candidate}: {exc}")
+    if errors:
+        raise RuntimeError("state recovery failed: " + " | ".join(errors))
+    if required:
+        raise RuntimeError(
+            f"required live state file {path} is missing; refuse to arm"
+        )
     return {}
 
 
@@ -306,17 +435,25 @@ def write_heartbeat():
 # ------------------------- P&L -------------------------
 
 def load_pnl():
-    if os.path.exists(PNL_FILE):
-        try:
-            with open(PNL_FILE, "r") as f:
-                return json.load(f)
-        except Exception:
-            pass
-    return {"trades": [], "summary": {"total_pnl": 0.0, "total_trades": 0, "wins": 0, "losses": 0}}
+    loaded = load_json(PNL_FILE)
+    if loaded:
+        return loaded
+    return {
+        "trades": [],
+        "summary": {
+            "total_pnl": 0.0,
+            "total_trades": 0,
+            "wins": 0,
+            "losses": 0,
+        },
+    }
 
 
 def record_pnl(condition_id, question, entry_cost, sell_proceeds, hedge_proceeds, outcome):
     pnl_data = load_pnl()
+    for trade in pnl_data.get("trades", []):
+        if trade.get("condition_id") == condition_id:
+            return float(trade.get("net", 0) or 0)
     net = sell_proceeds + hedge_proceeds - entry_cost
     pnl_data["trades"].append({
         "condition_id": condition_id,
@@ -342,43 +479,89 @@ def record_pnl(condition_id, question, entry_cost, sell_proceeds, hedge_proceeds
 
 # ------------------------- POSITIONS -------------------------
 
-def get_user_positions():
-    try:
+POSITIONS_PAGE_SIZE = 500
+POSITIONS_MAX_OFFSET = 10_000
+
+
+def fetch_all_position_rows(condition_id=None):
+    """Fetch every Data API position page or raise; partial pages are unsafe."""
+    rows = []
+    offset = 0
+    while offset <= POSITIONS_MAX_OFFSET:
+        params = {
+            "user": FUNDER_ADDRESS,
+            "limit": POSITIONS_PAGE_SIZE,
+            "offset": offset,
+            "sizeThreshold": 0,
+            "includeArchived": "true",
+            "sortBy": "TOKENS",
+            "sortDirection": "DESC",
+        }
+        if condition_id:
+            params["market"] = str(condition_id)
         resp = requests.get(
             f"{DATA_API}/positions",
-            params={"user": FUNDER_ADDRESS, "limit": 500},
+            params=params,
             timeout=10,
         )
         resp.raise_for_status()
-        return resp.json()
+        page = resp.json()
+        if not isinstance(page, list):
+            raise ValueError("positions response was not a list")
+        rows.extend(page)
+        if len(page) < POSITIONS_PAGE_SIZE:
+            return rows
+        offset += len(page)
+    raise RuntimeError("positions pagination exceeded API offset limit")
+
+
+def get_user_positions():
+    try:
+        return fetch_all_position_rows()
     except Exception as e:
         log_event("positions_fetch_fail", error=str(e)[:200])
         return None
 
 
-def check_token_balance(token_id):
+def check_token_balance(token_id, condition_id=None):
     """Return share balance for token_id.
 
     On a successful Data API response, a missing token means **0**, not None.
     None is reserved for request/parse failure so callers can fail closed.
     """
     try:
-        resp = requests.get(
-            f"{DATA_API}/positions",
-            params={"user": FUNDER_ADDRESS, "limit": 500},
-            timeout=10,
-        )
-        resp.raise_for_status()
-        rows = resp.json()
-        if not isinstance(rows, list):
-            return None
+        rows = fetch_all_position_rows(condition_id)
         for p in rows:
-            if p.get("asset") == token_id:
-                return float(p.get("size", 0) or 0)
+            if str(p.get("asset") or "") == str(token_id):
+                return finite_float(p.get("size", 0), minimum=0)
         return 0.0
     except Exception:
         return None
 
+
+
+def check_clob_token_balance(token_id, *, refresh=False):
+    params = BalanceAllowanceParams(
+        asset_type=AssetType.CONDITIONAL,
+        token_id=str(token_id),
+    )
+    try:
+        if refresh:
+            client.update_balance_allowance(params)
+        result = client.get_balance_allowance(params)
+        raw = (
+            result.get("balance")
+            if isinstance(result, dict)
+            else getattr(result, "balance", None)
+        )
+        return _decode_clob_fixed6(raw)
+    except Exception as exc:
+        log_event(
+            "conditional_balance_fail",
+            token_id=str(token_id),
+            error=str(exc)[:200],
+        )
+        return None
 
 
 def build_held_positions(positions_raw):
@@ -391,20 +574,131 @@ def build_held_positions(positions_raw):
             continue
         if not (slug.startswith(SLUG_PREFIX) or event_slug.startswith(SLUG_PREFIX)):
             continue
-        cond = p.get("conditionId")
+        cond = str(p.get("conditionId") or "")
         if not cond:
             continue
         oc = (p.get("outcome") or "").lower()
         if oc not in ("up", "down", "yes", "no"):
             continue
-        leg = "up" if oc in ("up", "yes") else "down"
+        if oc in ("up", "yes"):
+            leg = "up"
+        elif oc in ("down", "no"):
+            leg = "dn"
+        else:
+            continue
+        size = finite_float(p.get("size", 0), minimum=0)
+        avg_price = finite_float(p.get("avgPrice", 0), minimum=0, maximum=1)
+        asset = str(p.get("asset") or "")
+        if size is None or avg_price is None or not asset:
+            continue
         held.setdefault(cond, {})[leg] = {
-            "asset": p.get("asset"),
-            "size": float(p.get("size", 0) or 0),
+            "asset": asset,
+            "size": size,
             "redeemable": bool(p.get("redeemable", False)),
-            "avgPrice": float(p.get("avgPrice", 0) or 0),
+            "avgPrice": avg_price,
         }
     return held
+
+
+def merge_tracked_positions(api_held, tracked_meta):
+    """Keep confirmed local inventory hedgeable through Data API lag.
+
+    The execution ledger is authoritative for bot-confirmed fills and sells.
+    A successful but stale Data API omission must not erase a just-bought
+    position from the hedge loop.
+    """
+    held = {
+        str(cond): {
+            str(leg): dict(info)
+            for leg, info in (legs or {}).items()
+            if isinstance(info, dict)
+        }
+        for cond, legs in (api_held or {}).items()
+        if isinstance(legs, dict)
+    }
+    for cond, meta in tracked_meta.items():
+        token = meta.get("bought_token")
+        size_value = finite_float(meta.get("bought_size", 0), minimum=0)
+        size = size_value if size_value is not None else 0.0
+        if (
+            not token
+            or size <= 0.01
+            or meta.get("hedge_closed")
+            or meta.get("redeem_pending")
+            or meta.get("redeem_confirmed")
+        ):
+            continue
+        bought_leg = str(meta.get("bought_leg") or "").lower()
+        if bought_leg == "up":
+            leg = "up"
+        elif bought_leg in {"down", "dn"}:
+            leg = "dn"
+        elif str(token) == str(meta.get("up_token") or ""):
+            leg = "up"
+        elif str(token) == str(meta.get("dn_token") or ""):
+            leg = "dn"
+        else:
+            continue
+        current = held.setdefault(cond, {}).get(leg) or {}
+        current_size = finite_float(current.get("size", 0), minimum=0) or 0.0
+        if current_size + 0.01 < size:
+            held[cond][leg] = {
+                "asset": str(token),
+                "size": size,
+                "redeemable": bool(current.get("redeemable", False)),
+                "avgPrice": float(
+                    finite_float(current.get("avgPrice"), minimum=0, maximum=1)
+                    or finite_float(meta.get("fill_price"), minimum=0, maximum=1)
+                    or 0
+                ),
+            }
+    return held
+
+
+def add_tracked_market_stubs(markets, held, tracked_meta, now_s):
+    """Add hedge-only market metadata when Gamma discovery is unavailable."""
+    by_condition = {market.condition_id: market for market in markets}
+    for cond, pos in held.items():
+        if cond in by_condition:
+            continue
+        up = pos.get("up", {})
+        dn = pos.get("dn", {})
+        if up.get("redeemable") or dn.get("redeemable"):
+            continue
+        up_size = finite_float(up.get("size", 0), minimum=0) or 0.0
+        dn_size = finite_float(dn.get("size", 0), minimum=0) or 0.0
+        if max(up_size, dn_size) <= 0.01:
+            continue
+        meta = tracked_meta.get(cond, {})
+        end_ts = finite_float(meta.get("end_ts", 0), minimum=0) or 0.0
+        if end_ts <= 0 and meta.get("end_date"):
+            try:
+                end_ts = datetime.fromisoformat(
+                    str(meta["end_date"]).replace("Z", "+00:00")
+                ).timestamp()
+            except (TypeError, ValueError):
+                end_ts = 0.0
+        if end_ts > 0 and end_ts <= now_s:
+            continue
+        if end_ts <= 0:
+            end_ts = now_s + 86400
+        up_token = str(meta.get("up_token") or up.get("asset") or "")
+        dn_token = str(meta.get("dn_token") or dn.get("asset") or "")
+        by_condition[cond] = MintMarket(
+            condition_id=str(cond),
+            slug=str(meta.get("slug") or cond),
+            question=str(meta.get("question") or f"Tracked position {cond}"),
+            end_ts=end_ts,
+            series_slug=SERIES_SLUG,
+            up_token=up_token,
+            dn_token=dn_token,
+            active=True,
+            closed=False,
+            accepting_orders=True,
+            neg_risk=False,
+            start_ts=finite_float(meta.get("start_ts", 0), minimum=0) or 0.0,
+        )
+    return sorted(by_condition.values(), key=lambda market: market.end_ts)
 
 
 # ------------------------- PRICING -------------------------
@@ -434,7 +728,45 @@ def get_book_bid(token_id):
         return None, 0.0
 
 
-def get_book_quote(token_id):
+_book_snapshot_meta = {}
+_BOOK_SNAPSHOT_MAX_AGE_S = 2.0
+_http_local = threading.local()
+
+
+def _http_get(url, **kwargs):
+    session = getattr(_http_local, "session", None)
+    if session is None:
+        session = requests.Session()
+        _http_local.session = session
+    return session.get(url, **kwargs)
+
+
+def _book_timestamp_s(raw):
+    value = finite_float(raw, minimum=0)
+    if value is None:
+        return None
+    if value > 10_000_000_000:
+        value /= 1000.0
+    now = time.time()
+    if value > now + 2.0 or now - value > _BOOK_SNAPSHOT_MAX_AGE_S:
+        return None
+    return value
+
+
+def _valid_book_levels(levels):
+    valid = []
+    for level in levels or []:
+        if not isinstance(level, dict):
+            continue
+        price = finite_float(level.get("price"), minimum=0, maximum=1)
+        size = finite_float(level.get("size"), minimum=0)
+        if price is None or size is None or not 0 < price < 1 or size <= 0:
+            continue
+        valid.append((price, size))
+    return valid
+
+
+def get_book_quote(token_id, expected_condition_id=None):
     """Return (bid_price, bid_size, ask_price, ask_size, mid_price).
     mid_price is None when either side of the book is missing."""
     try:
@@ -442,7 +774,9 @@ def get_book_quote(token_id):
         path = "sdk"
     except Exception as sdk_err:
         try:
-            resp = requests.get(f"{HOST}/book", params={"token_id": token_id}, timeout=5)
+            resp = _http_get(
+                f"{HOST}/book", params={"token_id": token_id}, timeout=5,
+            )
             resp.raise_for_status()
             book = resp.json()
             path = "http"
@@ -451,23 +785,50 @@ def get_book_quote(token_id):
             log_event("book_quote_fail", token_id=token_id, sdk_error=str(sdk_err)[:200], http_error=str(http_err)[:200])
             return None, 0.0, None, 0.0, None
     try:
-        bids = book.get("bids", [])
-        asks = book.get("asks", [])
+        if not isinstance(book, dict):
+            raise ValueError("book response was not an object")
+        asset_id = str(book.get("asset_id") or "")
+        market_id = str(book.get("market") or "")
+        if not asset_id or asset_id != str(token_id):
+            raise ValueError("book asset_id mismatch")
+        if (
+            expected_condition_id
+            and (
+                not market_id
+                or market_id.lower() != str(expected_condition_id).lower()
+            )
+        ):
+            raise ValueError("book market mismatch")
+        server_ts = _book_timestamp_s(book.get("timestamp"))
+        if server_ts is None:
+            raise ValueError("book timestamp missing or stale")
+        bids = _valid_book_levels(book.get("bids"))
+        asks = _valid_book_levels(book.get("asks"))
         bid_price = None
         bid_size = 0.0
         ask_price = None
         ask_size = 0.0
         mid_price = None
         if bids:
-            best_bid = max(bids, key=lambda x: float(x.get("price", 0)))
-            bid_price = float(best_bid.get("price", 0))
-            bid_size = float(best_bid.get("size", 0))
+            bid_price, bid_size = max(bids, key=lambda level: level[0])
         if asks:
-            best_ask = min(asks, key=lambda x: float(x.get("price", 0)))
-            ask_price = float(best_ask.get("price", 0))
-            ask_size = float(best_ask.get("size", 0))
+            ask_price, ask_size = min(asks, key=lambda level: level[0])
         if bid_price is not None and ask_price is not None:
             mid_price = (bid_price + ask_price) / 2.0
+        _book_snapshot_meta[str(token_id)] = {
+            "asset_id": asset_id,
+            "market": market_id,
+            "server_ts": server_ts,
+            "received_mono": time.monotonic(),
+            "last_trade": finite_float(
+                book.get("last_trade_price"), minimum=0, maximum=1,
+            ),
+            "min_order_size": finite_float(
+                book.get("min_order_size"), minimum=0,
+            ),
+            "tick_size": str(book.get("tick_size") or ""),
+            "hash": book.get("hash"),
+        }
         return bid_price, bid_size, ask_price, ask_size, mid_price
     except Exception as e:
         log_event("book_quote_fail", token_id=token_id, error=str(e), path=path)
@@ -497,7 +858,13 @@ def prune_rest_caches(keep_tokens=None):
                 cache.pop(tid, None)
 
 
-def get_quote_fast(token_id, max_age_s=2.0, prefer_rest=False, force_rest=False):
+def get_quote_fast(
+    token_id,
+    max_age_s=2.0,
+    prefer_rest=False,
+    force_rest=False,
+    expected_condition_id=None,
+):
     """Prefer fresh CLOB WS top-of-book; REST fallback is rate-limited.
 
     force_rest=True: bypass WS and the 200ms REST cache — use only at order
@@ -514,13 +881,7 @@ def get_quote_fast(token_id, max_age_s=2.0, prefer_rest=False, force_rest=False)
             q, ts = cached
             if (now - ts) < _REST_QUOTE_MIN_INTERVAL_S:
                 return q
-    q = get_book_quote(token_id)
-    _rest_quote_cache[token_id] = (q, now)
-    if len(_rest_quote_cache) > _REST_QUOTE_CACHE_MAX:
-        prune_rest_caches()
-    return q
-
-    q = get_book_quote(token_id)
+    q = get_book_quote(token_id, expected_condition_id=expected_condition_id)
     _rest_quote_cache[token_id] = (q, now)
     if len(_rest_quote_cache) > _REST_QUOTE_CACHE_MAX:
         prune_rest_caches()
@@ -558,11 +919,13 @@ def get_last_trade_price(token_id):
         if (now - ts) < _LAST_TRADE_MIN_INTERVAL_S:
             return price
     try:
-        resp = requests.get(f"{HOST}/last-trade-price", params={"token_id": token_id}, timeout=5)
+        resp = _http_get(
+            f"{HOST}/last-trade-price", params={"token_id": token_id}, timeout=5,
+        )
         resp.raise_for_status()
         data = resp.json()
         price = data.get("price") if isinstance(data, dict) else None
-        out = float(price) if price is not None else None
+        out = finite_float(price, minimum=0, maximum=1)
         _last_trade_cache[token_id] = (out, now)
         if len(_last_trade_cache) > _REST_QUOTE_CACHE_MAX:
             prune_rest_caches()
@@ -574,10 +937,27 @@ def get_last_trade_price(token_id):
         return None
 
 
+def get_book_snapshot_last_trade(token_id):
+    meta = _book_snapshot_meta.get(str(token_id)) or {}
+    received = meta.get("received_mono")
+    if received is None:
+        return None
+    age = time.monotonic() - float(received)
+    if age < 0 or age > _BOOK_SNAPSHOT_MAX_AGE_S:
+        return None
+    return finite_float(meta.get("last_trade"), minimum=0, maximum=1)
+
+
 def polymarket_display_price(bid, ask, last_trade):
     """Probability a human sees on Polymarket for this outcome."""
-    if bid is not None and ask is not None and (ask - bid) <= POLYMARKET_GUI_SPREAD + 1e-12:
-        return (bid + ask) / 2.0
+    bid = finite_float(bid, minimum=0, maximum=1)
+    ask = finite_float(ask, minimum=0, maximum=1)
+    last_trade = finite_float(last_trade, minimum=0, maximum=1)
+    if bid is not None and ask is not None:
+        if ask < bid:
+            return None
+        if (ask - bid) <= POLYMARKET_GUI_SPREAD + 1e-12:
+            return (bid + ask) / 2.0
     return last_trade
 
 
@@ -587,14 +967,18 @@ def entry_book_ok(bid, ask, max_spread, min_bid):
     Wide books (ask 98¢ / bid 1¢) produce fake gate prices — last-trade GUI can
     still look like a winner while there is no real bid under the ask.
     """
-    if bid is None or ask is None:
+    bid = finite_float(bid, minimum=0, maximum=1)
+    ask = finite_float(ask, minimum=0, maximum=1)
+    max_spread = finite_float(max_spread, minimum=0, maximum=1)
+    min_bid = finite_float(min_bid, minimum=0, maximum=1)
+    if bid is None or ask is None or max_spread is None or min_bid is None:
         return False, "missing_side"
     if ask < bid:
         return False, "crossed"
     spread = ask - bid
-    if spread > float(max_spread) + 1e-12:
+    if spread > max_spread + 1e-12:
         return False, "wide_spread"
-    if bid + 1e-12 < float(min_bid):
+    if bid + 1e-12 < min_bid:
         return False, "bid_too_low"
     return True, "ok"
 
@@ -605,15 +989,26 @@ def hedge_book_ok(bid, ask, threshold, max_spread, require_ask_max):
     A 1¢ bid under a 99¢ ask is illiquidity/spoof, not a reversal. Require:
       bid ≤ threshold, ask ≤ require_ask_max, and spread ≤ max_spread.
     """
-    if bid is None or ask is None:
+    bid = finite_float(bid, minimum=0, maximum=1)
+    ask = finite_float(ask, minimum=0, maximum=1)
+    threshold = finite_float(threshold, minimum=0, maximum=1)
+    max_spread = finite_float(max_spread, minimum=0, maximum=1)
+    require_ask_max = finite_float(require_ask_max, minimum=0, maximum=1)
+    if (
+        bid is None
+        or ask is None
+        or threshold is None
+        or max_spread is None
+        or require_ask_max is None
+    ):
         return False, "missing_side"
-    if bid > float(threshold) + 1e-12:
+    if bid > threshold + 1e-12:
         return False, "bid_above"
-    if ask > float(require_ask_max) + 1e-12:
+    if ask > require_ask_max + 1e-12:
         return False, "ask_too_high"
     if ask < bid:
         return False, "crossed"
-    if (ask - bid) > float(max_spread) + 1e-12:
+    if (ask - bid) > max_spread + 1e-12:
         return False, "wide_spread"
     return True, "ok"
 
@@ -677,23 +1072,26 @@ def stable_zero_balances(reads):
 
 
 def gc_par_redeem(gc_meta, hedge_proceeds, redeem_value):
-    """GC par-redemption fallback. Never invent $1 after hedge/toxic/uncertain."""
+    """Return only explicitly verified redemption value; never invent par."""
     if float(redeem_value or 0) != 0:
         return float(redeem_value)
-    if gc_meta.get("hedge_closed"):
-        return 0.0
-    if float(hedge_proceeds or 0) > 0:
-        return 0.0
-    if gc_meta.get("toxic_fill"):
-        return 0.0
-    if gc_meta.get("hedge_attempted") or gc_meta.get("hedge_blocked_toxic"):
-        return 0.0
-    if gc_meta.get("buy_uncertain"):
-        return 0.0
-    rem = float(gc_meta.get("bought_size", 0) or 0)
-    if rem > 0:
-        return round(rem, 4)
     return 0.0
+
+
+def gc_can_finalize(gc_meta):
+    """Only terminal execution evidence may delete durable market state."""
+    if (
+        gc_meta.get("buy_uncertain")
+        or gc_meta.get("hedge_uncertain")
+        or gc_meta.get("redeem_pending")
+    ):
+        return False
+    if float(gc_meta.get("pnl_redeem_value", 0) or 0) > 0:
+        return True
+    return bool(
+        gc_meta.get("hedge_closed")
+        and float(gc_meta.get("bought_size", 0) or 0) <= 0.01
+    )
 
 
 def fill_cost_usdc(result, filled, limit_price, spend_cap):
@@ -711,17 +1109,18 @@ def fill_cost_usdc(result, filled, limit_price, spend_cap):
     d = _result_as_dict(result)
     for k in ("average_price", "avg_price"):
         if d.get(k) is not None:
-            try:
-                avg = float(d[k])
-                if avg > 0:
-                    cost = filled * avg
-                    return min(spend_cap, cost) if spend_cap > 0 else cost
-            except (TypeError, ValueError):
-                pass
+            avg = finite_float(d[k], minimum=0, maximum=1)
+            if avg is not None and avg > 0:
+                cost = filled * avg
+                return min(spend_cap, cost) if spend_cap > 0 else cost
     try:
         making = d.get("makingAmount", d.get("making_amount"))
         if making is not None:
-            making_f = _decode_clob_fixed6(making) or 0.0
+            making_f = _decode_clob_response_amount(
+                making,
+                expected=min(spend_cap, filled * limit_price)
+                if spend_cap > 0 else filled * limit_price,
+            ) or 0.0
             if making_f > 1e-12:
                 return min(spend_cap, making_f) if spend_cap > 0 else making_f
     except (TypeError, ValueError):
@@ -736,13 +1135,25 @@ _tick_size_cache = {}
 
 
 def get_tick_size_cached(token_id):
+    ws_tick = book_ws.tick_size(token_id)
+    if ws_tick:
+        _tick_size_cache[token_id] = ws_tick
+        return ws_tick
+    snapshot_tick = str(
+        (_book_snapshot_meta.get(str(token_id)) or {}).get("tick_size") or ""
+    )
+    if snapshot_tick in {"0.1", "0.01", "0.005", "0.0025", "0.001", "0.0001"}:
+        _tick_size_cache[token_id] = snapshot_tick
+        return snapshot_tick
     if token_id in _tick_size_cache:
         return _tick_size_cache[token_id]
     tick = str(TICK_SIZE_FALLBACK)
     try:
         result = client.get_tick_size(token_id)
-        if result:
+        if str(result) in {"0.1", "0.01", "0.005", "0.0025", "0.001", "0.0001"}:
             tick = str(result)
+        elif result:
+            raise ValueError(f"unsupported tick size {result}")
     except Exception as e:
         log_event("tick_size_lookup_fail", token_id=token_id, error=str(e)[:200], fallback=tick)
     _tick_size_cache[token_id] = tick
@@ -757,7 +1168,7 @@ def extract_order_id(order_obj):
     return getattr(order_obj, "orderID", None) or getattr(order_obj, "id", None) or (str(order_obj) if order_obj is not None else None)
 
 
-def get_order_details(order_id):
+def get_order_details(order_id, expected_size=None):
     if not order_id:
         return None
     try:
@@ -775,17 +1186,45 @@ def get_order_details(order_id):
             )
             return {
                 "status": result.get("status", "UNKNOWN"),
-                "size_matched": _decode_clob_fixed6(matched_raw) or 0.0,
-                "size": _decode_clob_fixed6(size_raw) or 1.0,
+                "size_matched": _decode_clob_response_amount(
+                    matched_raw, expected=expected_size,
+                ) or 0.0,
+                "size": _decode_clob_response_amount(
+                    size_raw, expected=expected_size,
+                ) or 0.0,
+                "trade_ids": _string_list(
+                    result.get("associate_trades") or result.get("associateTrades")
+                ),
+                "asset_id": result.get("asset_id"),
+                "market": result.get("market"),
+                "side": result.get("side"),
+                "price": finite_float(
+                    result.get("price"), minimum=0, maximum=1,
+                ),
             }
         return {
             "status": getattr(result, "status", "UNKNOWN"),
-            "size_matched": _decode_clob_fixed6(
+            "size_matched": _decode_clob_response_amount(
                 getattr(result, "size_matched", 0),
+                expected=expected_size,
             ) or 0.0,
-            "size": _decode_clob_fixed6(
+            "size": _decode_clob_response_amount(
                 getattr(result, "original_size", getattr(result, "size", 0)),
-            ) or 1.0,
+                expected=expected_size,
+            ) or 0.0,
+            "trade_ids": _string_list(
+                getattr(
+                    result,
+                    "associate_trades",
+                    getattr(result, "associateTrades", []),
+                )
+            ),
+            "asset_id": getattr(result, "asset_id", None),
+            "market": getattr(result, "market", None),
+            "side": getattr(result, "side", None),
+            "price": finite_float(
+                getattr(result, "price", None), minimum=0, maximum=1,
+            ),
         }
     except Exception as e:
         err = str(e).lower()
@@ -795,23 +1234,95 @@ def get_order_details(order_id):
 
 
 def _decode_clob_fixed6(raw):
-    """Decode a CLOB v2 wire amount (integer string with six decimals)."""
+    """Decode a documented fixed-math CLOB amount with six decimals."""
     if raw is None or raw == "":
         return None
     try:
-        return float(raw) / 1e6
-    except (TypeError, ValueError):
+        value = Decimal(str(raw)) / Decimal(1_000_000)
+    except (InvalidOperation, TypeError, ValueError):
         return None
+    if not value.is_finite() or value < 0:
+        return None
+    return float(value)
 
 
-def buy_shares_from_result(result):
+def _decode_clob_response_amount(raw, *, expected=None):
+    if raw is None or raw == "":
+        return None
+    try:
+        value = Decimal(str(raw))
+    except (InvalidOperation, TypeError, ValueError):
+        return None
+    if not value.is_finite() or value < 0:
+        return None
+    human = float(value)
+    fixed = float(value / Decimal(1_000_000))
+    expected_f = finite_float(expected, minimum=0)
+    if expected_f is not None and expected_f > 0:
+        return min(
+            (human, fixed),
+            key=lambda candidate: abs(candidate - expected_f) / expected_f,
+        )
+    raw_text = str(raw).strip().lower()
+    if "." in raw_text or "e" in raw_text:
+        return human
+    return fixed if abs(human) >= 10_000 else human
+
+
+def _string_list(value):
+    if value is None or value == "":
+        return []
+    if isinstance(value, (list, tuple, set)):
+        return [str(item) for item in value if item]
+    return [str(value)]
+
+
+def _trade_settlement_state(trade_ids):
+    ids = _string_list(trade_ids)
+    if not ids:
+        return "pending"
+    for trade_id in dict.fromkeys(ids):
+        try:
+            trades = safe_api_call(
+                client.get_trades,
+                TradeParams(id=trade_id),
+                only_first_page=True,
+            )
+        except Exception:
+            return "pending"
+        trade = next(
+            (
+                row for row in (trades or [])
+                if isinstance(row, dict) and str(row.get("id") or "") == trade_id
+            ),
+            None,
+        )
+        if trade is None:
+            return "pending"
+        status = str(trade.get("status") or "").upper()
+        if status in {"FAILED", "TRADE_STATUS_FAILED"}:
+            return "failed"
+        if (
+            status != "TRADE_STATUS_CONFIRMED"
+            or not (trade.get("transaction_hash") or trade.get("transactionHash"))
+        ):
+            return "pending"
+    return "confirmed"
+
+
+def buy_shares_from_result(result, expected=None):
     """BUY shares from an immediate CLOB response (size_matched or takingAmount)."""
     d = _result_as_dict(result)
-    sm = _decode_clob_fixed6(d.get("size_matched"))
+    sm = _decode_clob_response_amount(
+        d.get("size_matched"), expected=expected,
+    )
     if sm is not None and sm > 0:
         return sm
     # V2 market BUY: takingAmount = shares received.
-    taking = _decode_clob_fixed6(d.get("takingAmount", d.get("taking_amount")))
+    taking = _decode_clob_response_amount(
+        d.get("takingAmount", d.get("taking_amount")),
+        expected=expected,
+    )
     if taking is not None and taking > 0:
         return taking
     return 0.0
@@ -820,20 +1331,35 @@ def buy_shares_from_result(result):
 def confirm_fill_size(result, oid, requested, *, wait_delayed_s=2.0, poll_s=0.25, side="BUY"):
     """Return confirmed matched size.
 
-    Prefers amounts on the immediate response (BUY: takingAmount / size_matched).
+    Immediate making/taking amounts are fill evidence only for a terminal
+    ``matched`` response. A ``delayed`` response can carry the full signed
+    order amounts before any matching has happened.
+
+    For non-terminal responses, only GET-order ``size_matched`` is trusted.
     Transient get_order 404s are polled through — not treated as terminal empty —
     because matched FAKs often 404 briefly before the order index catches up.
     """
-    if side == "BUY":
-        matched = buy_shares_from_result(result)
-    else:
-        d = _result_as_dict(result)
-        matched = _decode_clob_fixed6(d.get("size_matched")) or 0.0
-        if matched <= 0:
-            # SELL: makingAmount is shares sold.
-            matched = _decode_clob_fixed6(
-                d.get("makingAmount", d.get("making_amount")),
+    d = _result_as_dict(result)
+    post_status = str(d.get("status") or "").strip().lower()
+    matched = 0.0
+    post_trade_ids = _string_list(d.get("tradeIDs") or d.get("trade_ids"))
+    post_settlement = _trade_settlement_state(post_trade_ids)
+    if (
+        post_status in {"matched", "order_status_matched"}
+        and post_settlement == "confirmed"
+    ):
+        if side == "BUY":
+            matched = buy_shares_from_result(result, expected=requested)
+        else:
+            matched = _decode_clob_response_amount(
+                d.get("size_matched"), expected=requested,
             ) or 0.0
+            if matched <= 0:
+                # SELL: makingAmount is shares sold.
+                matched = _decode_clob_response_amount(
+                    d.get("makingAmount", d.get("making_amount")),
+                    expected=requested,
+                ) or 0.0
     if matched > 0:
         matched = float(matched)
         if requested and matched > float(requested) * 1.01 + 1e-6:
@@ -850,7 +1376,7 @@ def confirm_fill_size(result, oid, requested, *, wait_delayed_s=2.0, poll_s=0.25
     last_status = None
     saw_not_found = False
     while True:
-        details = get_order_details(oid)
+        details = get_order_details(oid, expected_size=requested)
         if details:
             last_status = str(details.get("status") or "")
             if last_status == "NOT_FOUND":
@@ -858,7 +1384,10 @@ def confirm_fill_size(result, oid, requested, *, wait_delayed_s=2.0, poll_s=0.25
                 saw_not_found = True
             else:
                 sm = details.get("size_matched", 0)
-                matched = float(sm) if sm else 0.0
+                settlement = _trade_settlement_state(details.get("trade_ids"))
+                if settlement == "failed":
+                    return 0.0
+                matched = float(sm) if sm and settlement == "confirmed" else 0.0
                 if matched > 0:
                     if requested and matched > float(requested) * 1.01 + 1e-6:
                         log_event(
@@ -891,6 +1420,8 @@ def _result_as_dict(result):
         return {}
     out = {}
     for k in (
+        "status", "success", "errorMsg", "orderID",
+        "transactionsHashes", "tradeIDs",
         "average_price", "avg_price", "price", "size_matched",
         "takingAmount", "taking_amount", "makingAmount", "making_amount",
     ):
@@ -910,17 +1441,20 @@ def fill_proceeds(result, filled, limit_price):
     d = _result_as_dict(result)
     for k in ("average_price", "avg_price"):
         if d.get(k) is not None:
-            try:
-                return filled * float(d[k])
-            except (TypeError, ValueError):
-                pass
+            avg_price = finite_float(d[k], minimum=0, maximum=1)
+            if avg_price is not None:
+                return filled * avg_price
     # Some CLOB responses expose making/taking amounts (shares vs USDC).
     try:
         taking = d.get("takingAmount", d.get("taking_amount"))
         making = d.get("makingAmount", d.get("making_amount"))
         if taking is not None and making is not None:
-            taking_f = _decode_clob_fixed6(taking) or 0.0
-            making_f = _decode_clob_fixed6(making) or 0.0
+            taking_f = _decode_clob_response_amount(
+                taking, expected=filled * limit_price,
+            ) or 0.0
+            making_f = _decode_clob_response_amount(
+                making, expected=filled,
+            ) or 0.0
             if making_f > 0 and abs(making_f - filled) / max(filled, 1e-9) < 0.25:
                 return taking_f
             if taking_f > 0 and abs(taking_f - filled) / max(filled, 1e-9) < 0.25:
@@ -928,6 +1462,100 @@ def fill_proceeds(result, filled, limit_price):
     except (TypeError, ValueError):
         pass
     return filled * limit_price
+
+
+def signed_order_id(signed_order, *, neg_risk=False):
+    config = get_contract_config(CHAIN_ID)
+    exchange = (
+        config.neg_risk_exchange_v2 if neg_risk else config.exchange_v2
+    )
+    builder = ExchangeOrderBuilderV2(exchange, CHAIN_ID, client.signer)
+    typed_data = builder.build_order_typed_data(signed_order)
+    return builder.build_order_hash(typed_data)
+
+
+def definitive_order_rejection(exc):
+    status = getattr(exc, "status_code", None)
+    return isinstance(status, int) and status in {400, 401, 403, 404, 422}
+
+
+def inspect_uncertain_order(
+    order_id,
+    *,
+    side,
+    requested,
+    token_id=None,
+    condition_id=None,
+    limit_price=0.0,
+):
+    details = get_order_details(order_id, expected_size=requested)
+    if not details:
+        return {"state": "pending"}
+    status = str(details.get("status") or "").lower()
+    if status == "not_found":
+        return {"state": "not_found"}
+    if (
+        token_id
+        and details.get("asset_id")
+        and str(details["asset_id"]) != str(token_id)
+    ):
+        return {"state": "identity_mismatch"}
+    if (
+        condition_id
+        and details.get("market")
+        and str(details["market"]).lower() != str(condition_id).lower()
+    ):
+        return {"state": "identity_mismatch"}
+    if details.get("side") and str(details["side"]).upper() != str(side).upper():
+        return {"state": "identity_mismatch"}
+    settlement = _trade_settlement_state(details.get("trade_ids"))
+    if settlement == "failed":
+        return {"state": "failed"}
+    filled = finite_float(details.get("size_matched"), minimum=0) or 0.0
+    if settlement == "confirmed" and filled > 0:
+        price = (
+            finite_float(details.get("price"), minimum=0, maximum=1)
+            or finite_float(limit_price, minimum=0, maximum=1)
+            or 0.0
+        )
+        return {
+            "state": "confirmed",
+            "filled": min(float(requested), filled),
+            "value": min(float(requested), filled) * price,
+        }
+    terminal_empty = (
+        "invalid" in status
+        or "cancel" in status
+        or status in {"rejected", "expired", "failed", "unmatched"}
+    )
+    if terminal_empty and filled <= 0:
+        return {"state": "empty"}
+    return {"state": "pending", "matched": filled}
+
+
+_BUY_UNCERTAIN_KEYS = (
+    "buy_uncertain", "buy_uncertain_at", "buy_uncertain_token",
+    "buy_uncertain_leg", "buy_uncertain_baseline", "buy_uncertain_attempt",
+    "buy_uncertain_spend", "buy_uncertain_price", "buy_uncertain_order_id",
+    "buy_uncertain_order_size", "buy_uncertain_known_size",
+    "buy_uncertain_known_cost", "buy_uncertain_observed_size",
+    "buy_uncertain_observed_at", "buy_uncertain_observed_count",
+)
+
+_HEDGE_UNCERTAIN_KEYS = (
+    "hedge_uncertain", "hedge_uncertain_at", "hedge_uncertain_token",
+    "hedge_uncertain_attempt", "hedge_uncertain_remaining",
+    "hedge_uncertain_price", "hedge_uncertain_confirmed_sold",
+    "hedge_uncertain_confirmed_proceeds", "hedge_uncertain_order_id",
+    "hedge_uncertain_order_size", "hedge_uncertain_status",
+    "hedge_uncertain_sold_before", "hedge_uncertain_proceeds_before",
+    "hedge_uncertain_position_size", "hedge_uncertain_pnl_before",
+)
+
+
+def clear_uncertain_fields(meta, keys):
+    for key in keys:
+        meta.pop(key, None)
 
 
 # ------------------------- BUY -------------------------
@@ -941,6 +1569,8 @@ def buy_market_with_retry(
     min_price=0.0,
     on_fill=None,
     on_submit=None,
+    condition_id=None,
+    pre_submit=None,
 ):
     """Spend up to `budget` dollars buying token_id at or below max_price via FAK.
 
@@ -967,7 +1597,12 @@ def buy_market_with_retry(
         log_event("dry_buy", token_id=token_id, budget=budget, max_price=max_price)
         return 0.0, 0.0, "dry"
 
-    bal_baseline = check_token_balance(token_id)
+    def _token_balance():
+        if condition_id:
+            return check_token_balance(token_id, condition_id)
+        return check_token_balance(token_id)
+
+    bal_baseline = _token_balance()
     if bal_baseline is None:
         # Cannot ghost-reconcile safely without a baseline — refuse to post.
         log_event("buy_abort_no_baseline", token_id=token_id)
@@ -992,7 +1627,7 @@ def buy_market_with_retry(
         """Pull delayed inventory once. Returns (filled, fill_cost) or (0, 0)."""
         for wait_s in (float(HEDGE_GHOST_SLEEP_S), 1.0, 2.0):
             time.sleep(wait_s)
-            bal_after = check_token_balance(token_id)
+            bal_after = _token_balance()
             if bal_after is None:
                 continue
             expected = float(bal_baseline) + total_bought
@@ -1014,7 +1649,10 @@ def buy_market_with_retry(
         if remaining_budget < 0.01:
             break
         fresh_bid, _, fresh_ask, fresh_ask_size, _ = get_quote_fast(
-            token_id, prefer_rest=True, force_rest=True,
+            token_id,
+            prefer_rest=True,
+            force_rest=True,
+            expected_condition_id=condition_id,
         )
         if fresh_ask is None:
             console.print(f"  [dim yellow][NO ASK][/] no asks available · attempt {attempt + 1}/{max_retries}")
@@ -1037,7 +1675,8 @@ def buy_market_with_retry(
                 reason=why, max_spread=MAX_ENTRY_SPREAD, attempt=attempt + 1,
             )
             break
-        if (fresh_ask_size or 0) < 0.01:
+        fresh_ask_size = finite_float(fresh_ask_size, minimum=0)
+        if fresh_ask_size is None or fresh_ask_size < 0.01:
             console.print(f"  [dim yellow][NO SIZE][/] ask size {fresh_ask_size} · attempt {attempt + 1}/{max_retries}")
             time.sleep(0.05)
             continue
@@ -1049,9 +1688,60 @@ def buy_market_with_retry(
         price = fresh_ask
         ambiguous = False
         result = None
+        if pre_submit:
+            try:
+                allowed, reason = pre_submit(
+                    float(fresh_bid), float(fresh_ask), attempt + 1,
+                )
+            except Exception as exc:
+                allowed, reason = False, f"validator_error:{exc}"
+            if not allowed:
+                log_event(
+                    "buy_pre_submit_rejected",
+                    token_id=token_id,
+                    condition_id=condition_id,
+                    attempt=attempt + 1,
+                    reason=str(reason)[:160],
+                )
+                break
+        try:
+            signed_order = safe_api_call(
+                client.create_market_order,
+                MarketOrderArgs(
+                    token_id=token_id,
+                    amount=spend,
+                    side=BUY,
+                    price=price,
+                    user_usdc_balance=remaining_budget,
+                ),
+                options=PartialCreateOrderOptions(
+                    tick_size=tick_size, neg_risk=False,
+                ),
+            )
+            expected_order_id = signed_order_id(signed_order, neg_risk=False)
+            intent = {
+                "order_id": expected_order_id,
+                "token_id": str(token_id),
+                "side": "BUY",
+                "maker_amount": str(signed_order.makerAmount),
+                "taker_amount": str(signed_order.takerAmount),
+                "timestamp": str(signed_order.timestamp),
+            }
+        except Exception as e:
+            log_event(
+                "buy_build_rejected", token_id=token_id, error=str(e)[:200],
+                attempt=attempt + 1, spend=round(spend, 4),
+            )
+            break
         if on_submit:
             try:
-                on_submit(float(bal_baseline), attempt + 1, float(spend), float(price))
+                on_submit(
+                    float(bal_baseline),
+                    attempt + 1,
+                    float(spend),
+                    float(price),
+                    intent,
+                )
             except Exception as e:
                 log_event(
                     "buy_on_submit_fail", token_id=token_id, error=str(e)[:200],
@@ -1061,12 +1751,18 @@ def buy_market_with_retry(
                 return total_bought, spent, "persist_fail"
         try:
             result = safe_api_call(
-                client.create_and_post_market_order,
-                MarketOrderArgs(token_id=token_id, amount=spend, side=BUY, price=price),
-                options=PartialCreateOrderOptions(tick_size=tick_size, neg_risk=False),
+                client.post_order,
+                signed_order,
                 order_type=OrderType.FAK,
             )
         except Exception as e:
+            if definitive_order_rejection(e):
+                log_event(
+                    "buy_attempt_rejected", token_id=token_id,
+                    order_id=expected_order_id, error=str(e)[:200],
+                    attempt=attempt + 1, spend=round(spend, 4),
+                )
+                break
             console.print(f"  [dim red]Market buy {attempt+1}/{max_retries} failed: {e}[/]")
             log_event(
                 "buy_attempt_ambiguous", token_id=token_id, error=str(e)[:200],
@@ -1093,6 +1789,15 @@ def buy_market_with_retry(
             return total_bought, spent, "ambiguous"
 
         oid = extract_order_id(result)
+        if oid and str(oid).lower() != str(expected_order_id).lower():
+            log_event(
+                "buy_order_id_mismatch",
+                expected_order_id=expected_order_id,
+                response_order_id=oid,
+                token_id=token_id,
+            )
+            return total_bought, spent, "ambiguous"
+        oid = oid or expected_order_id
         response_status = str(_result_as_dict(result).get("status") or "").strip().lower()
         terminal_filled = {"matched", "order_status_matched"}
         terminal_empty = {
@@ -1205,6 +1910,10 @@ def sell_market_with_retry(
     abort_above=None,
     require_ask_max=None,
     max_spread=None,
+    on_submit=None,
+    on_fill=None,
+    condition_id=None,
+    initial_quote=None,
 ):
     """Sell `size` shares via FAK. Used for hedge exits only — no max_price cap.
 
@@ -1212,7 +1921,8 @@ def sell_market_with_retry(
     when require_ask_max/max_spread are set. Incomplete REST fails closed (no WS
     fallback). `price` is the worst (lowest) price we will accept.
 
-    Returns (total_sold, result, proceeds) where proceeds = sum(filled * price).
+    Returns (total_sold, result, proceeds) where result["bot_status"] is
+    filled|empty|ambiguous|persist_fail|dry. Unknown POST outcomes stop retries.
     """
     total_sold = 0.0
     total_proceeds = 0.0
@@ -1223,15 +1933,37 @@ def sell_market_with_retry(
         price = hedge_sell_price(price_limit, tick_size, undercut_ticks, floor)
         console.print(f"  [bold black on yellow][DRY SELL][/] would SELL {remaining:.4f} {str(token_id)[:12]}… @ ≥{price:.3f}")
         log_event("dry_sell", token_id=token_id, size=remaining, price_limit=price)
-        return 0, None, 0.0
+        return 0, {"bot_status": "dry", "last_limit": price}, 0.0
     for attempt in range(max_retries):
         if remaining < 0.01:
             break
         live_bid = price_limit
         live_ask = None
-        if refresh_quote:
+        if attempt == 0 and initial_quote is not None:
+            try:
+                live_bid, live_ask = initial_quote
+            except (TypeError, ValueError):
+                live_bid, live_ask = None, None
+            if require_ask_max is not None and max_spread is not None and abort_above is not None:
+                ok, why = hedge_book_ok(
+                    live_bid, live_ask, abort_above, max_spread, require_ask_max,
+                )
+                if not ok:
+                    log_event(
+                        "hedge_initial_quote_invalid",
+                        token_id=token_id,
+                        live_bid=live_bid,
+                        live_ask=live_ask,
+                        reason=why,
+                    )
+                    break
+        elif refresh_quote:
             qb, _, qa, _, _ = get_quote_fast(
-                token_id, max_age_s=0.0, prefer_rest=True, force_rest=True,
+                token_id,
+                max_age_s=0.0,
+                prefer_rest=True,
+                force_rest=True,
+                expected_condition_id=condition_id,
             )
             if qb is None or qa is None:
                 log_event(
@@ -1281,35 +2013,143 @@ def sell_market_with_retry(
         price = hedge_sell_price(live_bid, tick_size, undercut_ticks, floor)
         last_limit = price
         try:
+            signed_order = safe_api_call(
+                client.create_market_order,
+                MarketOrderArgs(
+                    token_id=token_id,
+                    amount=remaining,
+                    side=SELL,
+                    price=price,
+                ),
+                options=PartialCreateOrderOptions(
+                    tick_size=tick_size, neg_risk=False,
+                ),
+            )
+            expected_order_id = signed_order_id(signed_order, neg_risk=False)
+            intent = {
+                "order_id": expected_order_id,
+                "token_id": str(token_id),
+                "side": "SELL",
+                "maker_amount": str(signed_order.makerAmount),
+                "taker_amount": str(signed_order.takerAmount),
+                "timestamp": str(signed_order.timestamp),
+            }
+        except Exception as e:
+            log_event(
+                "sell_build_rejected", token_id=token_id,
+                error=str(e)[:200], attempt=attempt + 1,
+            )
+            break
+        if on_submit:
+            try:
+                on_submit(
+                    float(total_sold), float(total_proceeds), float(remaining),
+                    attempt + 1, float(price), intent,
+                )
+            except Exception as e:
+                log_event(
+                    "sell_on_submit_fail", token_id=token_id,
+                    error=str(e)[:200], attempt=attempt + 1,
+                )
+                return total_sold, {
+                    "bot_status": "persist_fail", "last_limit": last_limit,
+                }, total_proceeds
+        try:
             result = safe_api_call(
-                client.create_and_post_market_order,
-                MarketOrderArgs(token_id=token_id, amount=remaining, side=SELL, price=price),
-                options=PartialCreateOrderOptions(tick_size=tick_size, neg_risk=False),
+                client.post_order,
+                signed_order,
                 order_type=OrderType.FAK,
             )
             if result:
                 oid = extract_order_id(result)
+                if oid and str(oid).lower() != str(expected_order_id).lower():
+                    return total_sold, {
+                        "bot_status": "ambiguous",
+                        "last_limit": last_limit,
+                        "order_id": expected_order_id,
+                        "status": "order_id_mismatch",
+                    }, total_proceeds
+                oid = oid or expected_order_id
+                response_status = str(
+                    _result_as_dict(result).get("status") or ""
+                ).strip().lower()
                 filled = float(confirm_fill_size(result, oid, remaining, side="SELL"))
                 if filled <= 0:
-                    console.print("  [dim yellow][FAK NULL][/] 0 confirmed fill · stopping")
-                    break
+                    terminal_empty = {
+                        "canceled", "cancelled", "rejected", "expired", "failed",
+                        "unmatched", "order_status_invalid", "order_status_canceled",
+                        "order_status_canceled_market_resolved",
+                    }
+                    if response_status in terminal_empty:
+                        console.print(
+                            f"  [dim yellow][FAK NULL][/] explicit {response_status} "
+                            "with 0 confirmed fill"
+                        )
+                        break
+                    return total_sold, {
+                        "bot_status": "ambiguous", "last_limit": last_limit,
+                        "order_id": oid, "status": response_status,
+                    }, total_proceeds
                 fills_px = fill_proceeds(result, filled, price)
                 total_sold += filled
                 total_proceeds += fills_px
                 remaining -= filled
+                if on_fill:
+                    try:
+                        on_fill(float(total_sold), float(total_proceeds))
+                    except Exception as e:
+                        log_event(
+                            "sell_on_fill_fail", token_id=token_id,
+                            error=str(e)[:200], sold=total_sold,
+                            proceeds=total_proceeds,
+                        )
+                        return total_sold, {
+                            "bot_status": "persist_fail", "last_limit": last_limit,
+                            "order_id": oid,
+                        }, total_proceeds
                 console.print(f"  [bold green][EXIT FAK][/]{filled} @ ≥{price:.3f}  [dim]id={str(oid)[:16]}…[/]")
                 log_event("sell_fill", token_id=token_id, filled=filled, price=price, remaining=remaining, attempt=attempt + 1)
+                if response_status not in {"matched", "order_status_matched"}:
+                    return total_sold, {
+                        "bot_status": "ambiguous", "last_limit": last_limit,
+                        "order_id": oid, "status": response_status,
+                    }, total_proceeds
                 if remaining < 0.01:
-                    return total_sold, result, total_proceeds
+                    out = dict(result) if isinstance(result, dict) else {}
+                    out.update({"bot_status": "filled", "last_limit": last_limit})
+                    return total_sold, out, total_proceeds
+            else:
+                return total_sold, {
+                    "bot_status": "ambiguous", "last_limit": last_limit,
+                }, total_proceeds
         except Exception as e:
+            if definitive_order_rejection(e):
+                log_event(
+                    "sell_attempt_rejected", token_id=token_id,
+                    order_id=expected_order_id, error=str(e)[:200],
+                    attempt=attempt + 1, remaining=remaining,
+                )
+                break
             console.print(f"  [dim red]Market sell {attempt+1}/{max_retries} failed: {e}[/]")
+            log_event(
+                "sell_attempt_ambiguous", token_id=token_id,
+                error=str(e)[:200], attempt=attempt + 1,
+                remaining=remaining,
+            )
+            return total_sold, {
+                "bot_status": "ambiguous", "last_limit": last_limit,
+                "order_id": expected_order_id,
+            }, total_proceeds
         time.sleep(float(retry_sleep_s))
 
     if total_sold > 0:
-        return total_sold, {"partial": True, "sold": total_sold, "last_limit": last_limit}, total_proceeds
+        return total_sold, {
+            "partial": True, "sold": total_sold, "last_limit": last_limit,
+            "bot_status": "filled",
+        }, total_proceeds
     console.print(f"  [bold red][EXIT FAIL][/] market sell 0/{size:.4f} cleared")
     # Preserve last_limit so ghost reconciliation prices at the actual retry floor.
-    return 0, {"sold": 0, "last_limit": last_limit}, 0.0
+    return 0, {"sold": 0, "last_limit": last_limit, "bot_status": "empty"}, 0.0
 
 
 # ------------------------- REDEEM -------------------------
@@ -1326,26 +2166,84 @@ def get_relayer_headers():
     return RELAYER_URL, relayer_headers
 
 
+def get_relayer_transaction(transaction_id):
+    """Return a relayer transaction record, or None on a transient failure."""
+    if not transaction_id:
+        return None
+    try:
+        relayer_url, relayer_headers = get_relayer_headers()
+        response = requests.get(
+            f"{relayer_url}/transaction",
+            params={"id": transaction_id},
+            headers=relayer_headers,
+            timeout=5,
+        )
+        response.raise_for_status()
+        payload = response.json()
+        if isinstance(payload, list):
+            return payload[0] if payload and isinstance(payload[0], dict) else None
+        return payload if isinstance(payload, dict) else None
+    except Exception as e:
+        log_event(
+            "redeem_status_fail",
+            transaction_id=str(transaction_id)[:36],
+            error=str(e)[:200],
+        )
+        return None
+
+
 def submit_proxy_tx(target, data, tx_type="PROXY"):
-    from eth_account import Account
+    if tx_type != "PROXY":
+        return None, f"unsupported relayer transaction type {tx_type}"
+    if not PRIVATE_KEY or not FUNDER_ADDRESS:
+        return None, "missing PRIVATE_KEY or FUNDER_ADDRESS"
+    if not RELAYER_API_KEY or not RELAYER_API_KEY_ADDRESS:
+        return None, "missing relayer API credentials"
     relayer_url, relayer_headers = get_relayer_headers()
-    eoa = Account.from_key(PRIVATE_KEY).address
+    signer = RelayerSigner(PRIVATE_KEY, CHAIN_ID)
+    eoa = signer.address()
+    if str(RELAYER_API_KEY_ADDRESS).lower() != eoa.lower():
+        return None, "RELAYER_API_KEY_ADDRESS does not match signer"
     nonce_r = requests.get(
-        f"{relayer_url}/nonce",
+        f"{relayer_url}/relay-payload",
         params={"address": eoa, "type": tx_type},
         headers=relayer_headers,
         timeout=10,
     )
     if nonce_r.status_code != 200:
-        return None, f"nonce fetch fail HTTP {nonce_r.status_code}"
-    body = {
-        "type": tx_type,
-        "from": eoa,
-        "to": target,
-        "nonce": nonce_r.json().get("nonce", "0"),
-        "data": "0x" + data.hex(),
-        "value": "0",
-    }
+        return None, f"relay payload fetch fail HTTP {nonce_r.status_code}"
+    relay_payload = nonce_r.json()
+    if not isinstance(relay_payload, dict):
+        return None, "invalid relay payload"
+    nonce = relay_payload.get("nonce")
+    relay = relay_payload.get("address")
+    if nonce is None or not relay:
+        return None, "relay payload missing nonce/address"
+    data_hex = data if isinstance(data, str) else "0x" + bytes(data).hex()
+    config = get_relayer_contract_config(CHAIN_ID)
+    encoded_data = encode_proxy_transaction_data([
+        ProxyTransaction(
+            to=str(target),
+            type_code=CallType.Call,
+            data=data_hex,
+            value="0",
+        )
+    ])
+    request = build_proxy_transaction_request(
+        signer=signer,
+        args=ProxyTransactionArgs(
+            from_address=eoa,
+            nonce=str(nonce),
+            gas_price="0",
+            data=encoded_data,
+            relay=str(relay),
+        ),
+        config=config,
+        metadata="poly-money-maker redeem",
+    )
+    body = request.to_dict()
+    if str(body.get("proxyWallet") or "").lower() != str(FUNDER_ADDRESS).lower():
+        return None, "derived proxyWallet does not match FUNDER_ADDRESS"
     submit_r = requests.post(
         f"{relayer_url}/submit",
         json=body,
@@ -1353,7 +2251,13 @@ def submit_proxy_tx(target, data, tx_type="PROXY"):
         timeout=10,
     )
     if submit_r.status_code == 200:
-        return submit_r.json().get("transactionID") or "?", None
+        payload = submit_r.json()
+        transaction_id = (
+            payload.get("transactionID") if isinstance(payload, dict) else None
+        )
+        if transaction_id:
+            return str(transaction_id), None
+        return None, "relayer response missing transactionID"
     return None, f"HTTP {submit_r.status_code} · {submit_r.text[:80]}"
 
 
@@ -1368,21 +2272,13 @@ def redeem_condition(condition_id, label=""):
 
         pUSD = to_checksum_address(PUSD)
         CTF_CONTRACT = to_checksum_address(CTF)
-        proxy = to_checksum_address(FUNDER_ADDRESS)
-
         redeem_sel = keccak(b"redeemPositions(address,bytes32,bytes32,uint256[])")[:4]
         redeem_data = redeem_sel + encode(
             ["address", "bytes32", "bytes32", "uint256[]"],
             [pUSD, bytes(32), bytes.fromhex(condition_id.lower().removeprefix("0x")), [1, 2]],
         )
 
-        execute_sel = keccak(b"execute(address,uint256,bytes)")[:4]
-        proxy_data = execute_sel + encode(
-            ["address", "uint256", "bytes"],
-            [CTF_CONTRACT, 0, redeem_data],
-        )
-
-        tx_id, err = submit_proxy_tx(proxy, proxy_data)
+        tx_id, err = submit_proxy_tx(CTF_CONTRACT, redeem_data)
         if tx_id:
             console.print(f"  [bold bright_green][SETTLE ▶][/] {label}  [dim]tx={str(tx_id)[:18]}…[/]")
             return tx_id
@@ -1467,10 +2363,13 @@ positions_meta = load_json(STATE_FILE)
 CYCLE = 0
 _last_positions_refresh = 0.0
 _last_balance_refresh = 0.0
-_cached_positions = {}
+pusd_bal = 0.0
+_cached_positions = merge_tracked_positions({}, positions_meta)
 _cached_markets = []
 _book_executor = ThreadPoolExecutor(max_workers=4)
 _pending_book_futs = {}
+_redeem_executor = ThreadPoolExecutor(max_workers=1)
+_redeem_status_futures = {}
 
 
 def _today_start_ms():
@@ -1517,7 +2416,7 @@ while not _shutdown_requested:
         ONE_ENTRY_PER_MARKET = _strat["one_entry_per_market"]
         REDEEM_THROTTLE_S = _strat["redeem_throttle_s"]
         MAX_REDEEM_AGE_DAYS = _strat["max_redeem_age_days"]
-        DRY_RUN = _strat["dry_run"]
+        DRY_RUN = STARTUP_DRY_RUN  # arming/disarming requires restart (state paths differ)
         POLL_BUY_WINDOW_S = _strat["poll_buy_window_s"]
         POLL_HELD_S = _strat["poll_held_s"]
         POSITIONS_REFRESH_S = _strat["positions_refresh_s"]
@@ -1534,7 +2433,10 @@ while not _shutdown_requested:
 
         if _now_f - _last_positions_refresh >= POSITIONS_REFRESH_S:
             positions_raw = get_user_positions()
-            _cached_positions = build_held_positions(positions_raw) if positions_raw is not None else _cached_positions
+            if positions_raw is not None:
+                _cached_positions = merge_tracked_positions(
+                    build_held_positions(positions_raw), positions_meta,
+                )
             _last_positions_refresh = _now_f
         else:
             positions_raw = None
@@ -1546,6 +2448,19 @@ while not _shutdown_requested:
             log_event("discover_fail", error=str(e)[:200])
         markets = [m for m in _cached_markets if m.active and not m.closed and not m.neg_risk]
         held = _cached_positions
+        markets = add_tracked_market_stubs(markets, held, positions_meta, now_s)
+        held_conditions = {
+            cond for cond, pos in held.items()
+            if max(
+                float(pos.get("up", {}).get("size", 0) or 0),
+                float(pos.get("dn", {}).get("size", 0) or 0),
+            ) > 0.01
+        }
+        # Never let an unheld market's entry I/O run before an active hedge.
+        markets.sort(key=lambda market: (
+            market.condition_id not in held_conditions,
+            market.end_ts,
+        ))
         _open_pos_n = sum(
             1 for p in held.values()
             if max(p.get("up", {}).get("size", 0), p.get("dn", {}).get("size", 0)) > 0.01
@@ -1577,7 +2492,12 @@ while not _shutdown_requested:
             # the quarantine and permit a second order.
             stale_conds = [
                 c for c in list(positions_meta.keys())
-                if c not in live_conds and not positions_meta[c].get("buy_uncertain")
+                if (
+                    c not in live_conds
+                    and not positions_meta[c].get("buy_uncertain")
+                    and not positions_meta[c].get("hedge_uncertain")
+                    and gc_can_finalize(positions_meta[c])
+                )
             ]
             for c in stale_conds:
                 gc_meta = positions_meta[c]
@@ -1687,7 +2607,20 @@ while not _shutdown_requested:
             console.print(table)
 
         # ================= REDEEM PHASE =================
+        _has_active_hedge_inventory = any(
+            max(
+                float(pos.get("up", {}).get("size", 0) or 0),
+                float(pos.get("dn", {}).get("size", 0) or 0),
+            ) > 0.01
+            and not (
+                pos.get("up", {}).get("redeemable")
+                or pos.get("dn", {}).get("redeemable")
+            )
+            for pos in held.values()
+        )
         for cond, pos in held.items():
+            if _has_active_hedge_inventory:
+                break  # redemption HTTP must never delay an active hedge
             up_redeemable = pos.get("up", {}).get("redeemable", False)
             dn_redeemable = pos.get("dn", {}).get("redeemable", False)
             if not (up_redeemable or dn_redeemable):
@@ -1695,6 +2628,8 @@ while not _shutdown_requested:
             if cond in _redeem_permanent_failures:
                 continue
             meta = positions_meta.setdefault(cond, {})
+            if meta.get("redeem_pending"):
+                continue  # submission is not settlement; operator/receipt reconciliation required
             last = meta.get("redeem_submitted_at") or 0
             if now_ms - last < REDEEM_THROTTLE_S * 1000:
                 continue
@@ -1715,20 +2650,30 @@ while not _shutdown_requested:
             tx = redeem_condition(cond, label=(meta.get("question", "?"))[:32])
             if tx:
                 meta["redeem_submitted_at"] = now_ms
-                held_size = max(pos.get("up", {}).get("size", 0), pos.get("dn", {}).get("size", 0))
-                meta["pnl_redeem_value"] = round(held_size, 4)
+                meta["redeem_pending"] = True
+                meta["redeem_tx_id"] = str(tx)
+                meta["redeem_expected_value"] = round(
+                    max(
+                        float(pos.get("up", {}).get("size", 0) or 0),
+                        float(pos.get("dn", {}).get("size", 0) or 0),
+                    ),
+                    4,
+                )
                 log_event("redeem_submit", condition_id=cond, tx_id=str(tx))
                 save_json(STATE_FILE, positions_meta)
 
         # ================= COLLECT PRE-FETCHED BOOKS =================
         _book_cache = {}
+        _still_pending_book_futs = {}
         for _f, _t in list(_pending_book_futs.items()):
+            if not _f.done():
+                _still_pending_book_futs[_f] = _t
+                continue
             try:
-                _book_cache[_t] = _f.result(timeout=1)
+                _book_cache[_t] = _f.result()
             except Exception:
                 _book_cache[_t] = (None, 0.0, None, 0.0, None)
-                _f.cancel()
-        _pending_book_futs = {}
+        _pending_book_futs = _still_pending_book_futs
         # Overlay WS top-of-book. Held tokens use hedge_quote_max_age_s so a
         # stale-high WS quote cannot overwrite REST and suppress hedge checks.
         _held_tokens = set()
@@ -1760,6 +2705,24 @@ while not _shutdown_requested:
             held_leg = "up" if up_size > 0.01 else ("down" if dn_size > 0.01 else None)
 
             meta = positions_meta.setdefault(cond, {})
+            tracked_token = meta.get("bought_token")
+            if (
+                held_token
+                and tracked_token
+                and str(held_token) == str(tracked_token)
+                and "bought_size" in meta
+                and not meta.get("buy_uncertain")
+            ):
+                tracked_size = max(0.0, float(meta.get("bought_size") or 0))
+                if held_size > tracked_size + 0.01:
+                    # Data API can lag a confirmed partial SELL and show the old
+                    # larger balance. Never resurrect inventory above the
+                    # durable local remainder.
+                    held_size = tracked_size
+                    if held_leg == "up":
+                        up_size = tracked_size
+                    elif held_leg == "down":
+                        dn_size = tracked_size
 
             # Ambiguous prior BUY may settle into Data API inventory before the
             # buy-phase quarantine runs. Promote only the exact attempted token
@@ -1768,7 +2731,7 @@ while not _shutdown_requested:
             uncertain_baseline = float(meta.get("buy_uncertain_baseline") or 0)
             if (
                 meta.get("buy_uncertain")
-                and not meta.get("bought_token")
+                and positions_raw is not None
                 and held_size > 0.01
                 and held_token
                 and uncertain_token
@@ -1776,33 +2739,74 @@ while not _shutdown_requested:
                 and held_size > uncertain_baseline + 0.01
             ):
                 uncertain_filled = held_size - uncertain_baseline
-                avg_est = float(
-                    meta.get("buy_uncertain_price")
-                    or meta.get("fill_price")
-                    or BUY_THRESHOLD
-                )
-                meta["bought_token"] = held_token
-                meta["bought_leg"] = held_leg or meta.get("buy_uncertain_leg")
-                meta["bought_size"] = uncertain_filled
-                meta["fill_price"] = round(avg_est, 4)
-                meta["pnl_entry_cost"] = round(
-                    meta.get("pnl_entry_cost") or (uncertain_filled * avg_est), 4
-                )
-                meta["toxic_fill"] = bool(avg_est + 1e-9 < float(BUY_THRESHOLD))
-                meta.pop("buy_uncertain", None)
-                meta.pop("buy_uncertain_at", None)
-                meta.pop("buy_uncertain_token", None)
-                meta.pop("buy_uncertain_leg", None)
-                meta.pop("buy_uncertain_baseline", None)
-                meta.pop("buy_uncertain_attempt", None)
-                meta.pop("buy_uncertain_spend", None)
-                meta.pop("buy_uncertain_price", None)
-                log_event(
-                    "buy_uncertain_resolved", condition_id=cond, token_id=held_token,
-                    size=uncertain_filled, entry_cost=meta["pnl_entry_cost"],
-                    baseline=uncertain_baseline, via="held",
-                )
-                save_json(STATE_FILE, positions_meta)
+                observed_ms = time.time() * 1000
+                last_observed_ms = float(meta.get("buy_uncertain_observed_at") or 0)
+                if observed_ms - last_observed_ms >= float(POSITIONS_REFRESH_S) * 1000:
+                    prior_observed = meta.get("buy_uncertain_observed_size")
+                    stable = (
+                        prior_observed is not None
+                        and abs(float(prior_observed) - uncertain_filled) <= 0.01
+                    )
+                    meta["buy_uncertain_observed_size"] = uncertain_filled
+                    meta["buy_uncertain_observed_at"] = observed_ms
+                    meta["buy_uncertain_observed_count"] = (
+                        int(meta.get("buy_uncertain_observed_count") or 0) + 1
+                        if stable else 1
+                    )
+                    save_json(STATE_FILE, positions_meta)
+                uncertain_age_s = (
+                    observed_ms - float(meta.get("buy_uncertain_at") or observed_ms)
+                ) / 1000
+                if (
+                    int(meta.get("buy_uncertain_observed_count") or 0) >= 2
+                    and uncertain_age_s >= max(10.0, 2 * float(POSITIONS_REFRESH_S))
+                ):
+                    avg_est = float(
+                        meta.get("buy_uncertain_price")
+                        or meta.get("fill_price")
+                        or BUY_THRESHOLD
+                    )
+                    known_size = float(meta.get("bought_size") or 0)
+                    known_cost = float(meta.get("pnl_entry_cost") or 0)
+                    extra_size = max(0.0, uncertain_filled - known_size)
+                    entry_cost = known_cost + (extra_size * avg_est)
+                    if entry_cost <= 0:
+                        entry_cost = uncertain_filled * avg_est
+                    avg_fill = entry_cost / uncertain_filled
+                    meta["bought_token"] = held_token
+                    meta["bought_leg"] = held_leg or meta.get("buy_uncertain_leg")
+                    meta["bought_size"] = uncertain_filled
+                    meta["fill_price"] = round(avg_fill, 4)
+                    meta["pnl_entry_cost"] = round(entry_cost, 4)
+                    meta["toxic_fill"] = bool(avg_fill + 1e-9 < float(BUY_THRESHOLD))
+                    for key in (
+                        "buy_uncertain", "buy_uncertain_at", "buy_uncertain_token",
+                        "buy_uncertain_leg", "buy_uncertain_baseline",
+                        "buy_uncertain_attempt", "buy_uncertain_spend",
+                        "buy_uncertain_price", "buy_uncertain_observed_size",
+                        "buy_uncertain_observed_at", "buy_uncertain_observed_count",
+                    ):
+                        meta.pop(key, None)
+                    log_event(
+                        "buy_uncertain_resolved", condition_id=cond, token_id=held_token,
+                        size=uncertain_filled, extra_size=extra_size,
+                        entry_cost=meta["pnl_entry_cost"],
+                        baseline=uncertain_baseline, via="stable_held",
+                    )
+                    save_json(STATE_FILE, positions_meta)
+
+            # An accepted-then-timeout SELL may already have consumed shares.
+            # Never submit another sell until the exact order is reconciled.
+            if meta.get("hedge_uncertain"):
+                if CYCLE % max(1, int(5 / max(float(POLL_HELD_S), 0.01))) == 0:
+                    log_event(
+                        "hedge_uncertain_pending",
+                        condition_id=cond,
+                        token_id=meta.get("hedge_uncertain_token"),
+                        order_id=meta.get("hedge_uncertain_order_id"),
+                        confirmed_sold=meta.get("hedge_uncertain_confirmed_sold", 0),
+                    )
+                continue
 
             # --- HEDGE CHECK (for held positions) ---
             if held_token and held_size > 0.01 and HEDGE_ENABLED and not meta.get("hedge_closed"):
@@ -1882,6 +2886,52 @@ while not _shutdown_requested:
                                 quote_age_s=None if quote_age is None else round(quote_age, 3),
                                 ws_fast_path=False,
                             )
+                            prior_hedge_proceeds = float(
+                                meta.get("pnl_hedge_proceeds", 0) or 0
+                            )
+
+                            def _clear_hedge_uncertain():
+                                for key in (
+                                    "hedge_uncertain", "hedge_uncertain_at",
+                                    "hedge_uncertain_token", "hedge_uncertain_attempt",
+                                    "hedge_uncertain_remaining", "hedge_uncertain_price",
+                                    "hedge_uncertain_confirmed_sold",
+                                    "hedge_uncertain_confirmed_proceeds",
+                                    "hedge_uncertain_order_id", "hedge_uncertain_status",
+                                ):
+                                    meta.pop(key, None)
+
+                            def _persist_hedge_submit(
+                                sold_total, proceeds_total, remaining_size,
+                                attempt_no, submit_price,
+                            ):
+                                meta["hedge_uncertain"] = True
+                                meta["hedge_uncertain_at"] = time.time() * 1000
+                                meta["hedge_uncertain_token"] = held_token
+                                meta["hedge_uncertain_attempt"] = int(attempt_no)
+                                meta["hedge_uncertain_remaining"] = float(remaining_size)
+                                meta["hedge_uncertain_price"] = float(submit_price)
+                                meta["hedge_uncertain_confirmed_sold"] = float(sold_total)
+                                meta["hedge_uncertain_confirmed_proceeds"] = float(proceeds_total)
+                                save_json(STATE_FILE, positions_meta)
+
+                            def _persist_hedge_fill(sold_total, proceeds_total):
+                                rem_now = max(0.0, held_size - float(sold_total))
+                                if rem_now < 0.01:
+                                    rem_now = 0.0
+                                    meta["hedge_closed"] = True
+                                meta["bought_size"] = rem_now
+                                meta["pnl_hedge_proceeds"] = round(
+                                    prior_hedge_proceeds + float(proceeds_total), 4
+                                )
+                                meta["hedge_uncertain_confirmed_sold"] = float(sold_total)
+                                meta["hedge_uncertain_confirmed_proceeds"] = float(proceeds_total)
+                                meta["hedge_uncertain_remaining"] = rem_now
+                                leg_key = "up" if held_leg == "up" else "dn"
+                                if cond in _cached_positions and leg_key in _cached_positions[cond]:
+                                    _cached_positions[cond][leg_key]["size"] = rem_now
+                                save_json(STATE_FILE, positions_meta)
+
                             sold, sell_res, hedge_proceeds = sell_market_with_retry(
                                 held_token,
                                 held_size,
@@ -1893,39 +2943,50 @@ while not _shutdown_requested:
                                 abort_above=HEDGE_THRESHOLD,
                                 require_ask_max=HEDGE_REQUIRE_ASK_MAX,
                                 max_spread=HEDGE_MAX_SPREAD,
+                                on_submit=_persist_hedge_submit,
+                                on_fill=_persist_hedge_fill,
                             )
+                            sell_status = (
+                                sell_res.get("bot_status")
+                                if isinstance(sell_res, dict) else None
+                            )
+                            if sell_status in ("ambiguous", "persist_fail"):
+                                if isinstance(sell_res, dict):
+                                    meta["hedge_uncertain_order_id"] = sell_res.get("order_id")
+                                    meta["hedge_uncertain_status"] = sell_res.get("status")
+                                meta["hedge_uncertain_confirmed_sold"] = float(sold)
+                                meta["hedge_uncertain_confirmed_proceeds"] = float(hedge_proceeds)
+                                meta["hedge_uncertain_remaining"] = max(
+                                    0.0, held_size - float(sold),
+                                )
+                                save_json(STATE_FILE, positions_meta)
+                                notify(
+                                    "HEDGE UNCERTAIN",
+                                    f"{m.question}\nSELL outcome unresolved; quarantined "
+                                    "until the exact order is reconciled",
+                                    priority="urgent",
+                                )
+                            else:
+                                _clear_hedge_uncertain()
                             last_limit = sell_floor
                             if isinstance(sell_res, dict) and sell_res.get("last_limit") is not None:
                                 last_limit = float(sell_res["last_limit"])
                             # Reconcile with Data API — one read never adds/erases confirms.
                             time.sleep(HEDGE_GHOST_SLEEP_S)
-                            actual_bal = check_token_balance(held_token)
+                            actual_bal = check_token_balance(held_token, cond)
                             rec = reconcile_hedge_sold(
                                 held_size, sold, hedge_proceeds, actual_bal, last_limit,
                             )
-                            ghost_tail = 0.0
                             if rec["ghost_candidate"]:
-                                # A single low Data API read can be stale even
-                                # when CLOB confirmed a partial. Promote only a
-                                # full unconfirmed tail after repeated zeros.
-                                extra_reads = []
-                                for _i in range(2):
-                                    time.sleep(0.5)
-                                    extra_reads.append(check_token_balance(held_token))
-                                if stable_zero_balances([actual_bal] + extra_reads):
-                                    ghost_tail = max(
-                                        0.0, held_size - float(rec["effective_sold"]),
-                                    )
-                                    rec["effective_sold"] += ghost_tail
-                                    rec["proceeds"] += ghost_tail * last_limit
-                                    rec["rem"] = 0.0
-                                else:
-                                    log_event(
-                                        "hedge_ghost_unstable", condition_id=cond,
-                                        leg=held_leg, size=held_size,
-                                        confirmed_sold=float(sold),
-                                        api_bal=None if actual_bal is None else float(actual_bal),
-                                    )
+                                # Data API is eventually consistent. Even
+                                # repeated omissions cannot prove a sale; only
+                                # CLOB/order evidence may close the hedge.
+                                log_event(
+                                    "hedge_ghost_unconfirmed", condition_id=cond,
+                                    leg=held_leg, size=held_size,
+                                    confirmed_sold=float(sold),
+                                    api_bal=None if actual_bal is None else float(actual_bal),
+                                )
                             if rec["balance_unverified"]:
                                 log_event(
                                     "hedge_balance_fail", condition_id=cond, leg=held_leg,
@@ -1938,17 +2999,9 @@ while not _shutdown_requested:
                                     api_bal=None if actual_bal is None else float(actual_bal),
                                 )
                             if rec["effective_sold"] > 0.01:
-                                if ghost_tail > 0.01:
-                                    log_event(
-                                        "hedge_ghost_fill", condition_id=cond, leg=held_leg,
-                                        sold=ghost_tail,
-                                        remaining=rec["rem"], price=last_limit,
-                                        mid=fresh_mid, via="stable_zero",
-                                        confirmed_sold=float(sold),
-                                    )
                                 rem = rec["rem"]
                                 meta["pnl_hedge_proceeds"] = round(
-                                    meta.get("pnl_hedge_proceeds", 0) + rec["proceeds"], 4
+                                    prior_hedge_proceeds + rec["proceeds"], 4
                                 )
                                 if rem < 0.01:
                                     meta["hedge_closed"] = True
@@ -1969,14 +3022,16 @@ while not _shutdown_requested:
                                     hedge_closed=bool(meta.get("hedge_closed")),
                                     balance_unverified=bool(rec["balance_unverified"]),
                                 )
+                                save_json(STATE_FILE, positions_meta)
                                 notify(
                                     "HEDGE FIRED" if rem < 0.01 else "HEDGE PARTIAL",
                                     f"Reversal on {m.question}\nSold {held_leg.upper()} at ~{fill_px:.3f} "
                                     f"({rec['effective_sold']:.2f} shares, rem {rem:.2f})",
                                     priority="urgent",
                                 )
-                                save_json(STATE_FILE, positions_meta)
                             else:
+                                if sell_status not in ("ambiguous", "persist_fail"):
+                                    save_json(STATE_FILE, positions_meta)
                                 log_event(
                                     "hedge_fail", condition_id=cond, leg=held_leg, size=held_size,
                                     bid=hedge_bid, ask=hedge_ask, mid=fresh_mid,
@@ -1988,51 +3043,11 @@ while not _shutdown_requested:
             if seconds_left > BUY_START_S:
                 continue  # not in buy window yet
 
-            # Ambiguous prior POST: try to promote inventory; never re-buy while uncertain.
-            if meta.get("buy_uncertain") and not meta.get("bought_token"):
-                utok = meta.get("buy_uncertain_token")
-                if utok:
-                    ubal = check_token_balance(utok)
-                    ubaseline = float(meta.get("buy_uncertain_baseline") or 0)
-                    ufilled = (
-                        max(0.0, float(ubal) - ubaseline)
-                        if ubal is not None else 0.0
-                    )
-                    if ufilled > 0.01:
-                        avg_est = float(
-                            meta.get("buy_uncertain_price")
-                            or meta.get("fill_price")
-                            or BUY_THRESHOLD
-                        )
-                        meta["bought_token"] = utok
-                        meta["bought_leg"] = meta.get("buy_uncertain_leg") or meta.get("bought_leg")
-                        meta["bought_size"] = ufilled
-                        meta["fill_price"] = round(avg_est, 4)
-                        meta["pnl_entry_cost"] = round(
-                            meta.get("pnl_entry_cost") or (ufilled * avg_est), 4
-                        )
-                        meta["toxic_fill"] = bool(avg_est + 1e-9 < float(BUY_THRESHOLD))
-                        meta.pop("buy_uncertain", None)
-                        meta.pop("buy_uncertain_at", None)
-                        meta.pop("buy_uncertain_token", None)
-                        meta.pop("buy_uncertain_leg", None)
-                        meta.pop("buy_uncertain_baseline", None)
-                        meta.pop("buy_uncertain_attempt", None)
-                        meta.pop("buy_uncertain_spend", None)
-                        meta.pop("buy_uncertain_price", None)
-                        log_event(
-                            "buy_uncertain_resolved", condition_id=cond, token_id=utok,
-                            size=ufilled, entry_cost=meta["pnl_entry_cost"],
-                            baseline=ubaseline, balance=ubal, via="balance",
-                        )
-                        save_json(STATE_FILE, positions_meta)
-                    else:
-                        log_event(
-                            "buy_uncertain_pending", condition_id=cond, token_id=utok,
-                            balance=ubal, baseline=ubaseline,
-                            age_s=round((time.time() * 1000 - float(meta.get("buy_uncertain_at") or 0)) / 1000, 1),
-                        )
-                continue  # quarantine: no new order this market
+            # Quarantine is unconditional, including when an earlier attempt in
+            # the same call already set bought_token. Stable held-state
+            # reconciliation above resolves it; this path never posts again.
+            if meta.get("buy_uncertain"):
+                continue
 
             # One entry per market
             if ONE_ENTRY_PER_MARKET and meta.get("bought_token"):
@@ -2053,19 +3068,32 @@ while not _shutdown_requested:
                 continue
 
             # Notional caps (in dollars, not shares)
-            open_count = sum(
-                1 for c, p in held.items()
+            open_conditions = {
+                c for c, p in held.items()
                 if max(p.get("up", {}).get("size", 0), p.get("dn", {}).get("size", 0)) > 0.01
-            )
+            }
+            open_conditions |= {
+                c for c, pm in positions_meta.items() if pm.get("buy_uncertain")
+            }
+            open_count = len(open_conditions)
             open_notional = sum(
-                pm.get("pnl_entry_cost", 0)
-                for c, pm in positions_meta.items()
-                if pm.get("bought_token")
+                float(pm.get("pnl_entry_cost", 0) or 0)
+                + (
+                    float(pm.get("buy_uncertain_spend", 0) or 0)
+                    if pm.get("buy_uncertain") else 0
+                )
+                for pm in positions_meta.values()
+                if pm.get("bought_token") or pm.get("buy_uncertain")
             )
             daily_notional = sum(
-                pm.get("pnl_entry_cost", 0)
-                for c, pm in positions_meta.items()
-                if pm.get("bought_token") and pm.get("entered_at", 0) >= _today_start_ms()
+                float(pm.get("pnl_entry_cost", 0) or 0)
+                + (
+                    float(pm.get("buy_uncertain_spend", 0) or 0)
+                    if pm.get("buy_uncertain") else 0
+                )
+                for pm in positions_meta.values()
+                if (pm.get("bought_token") or pm.get("buy_uncertain"))
+                and pm.get("entered_at", 0) >= _today_start_ms()
             )
             est_cost = BUY_BUDGET
             if open_count >= MAX_OPEN_POSITIONS:
@@ -2073,6 +3101,12 @@ while not _shutdown_requested:
             if open_notional + est_cost > MAX_OPEN_NOTIONAL + 1e-9:
                 continue
             if daily_notional + est_cost > MAX_DAILY_NOTIONAL + 1e-9:
+                continue
+            if float(pusd_bal or 0) + 1e-9 < est_cost:
+                log_event(
+                    "buy_skip_balance", condition_id=cond,
+                    balance=pusd_bal, budget=est_cost,
+                )
                 continue
 
             # Fresh REST book + last trade in parallel.
@@ -2318,6 +3352,13 @@ while not _shutdown_requested:
                 meta["fill_price"] = round(avg, 4)
                 meta["pnl_entry_cost"] = round(spent_total, 4)
                 meta["toxic_fill"] = bool(avg + 1e-9 < float(BUY_THRESHOLD))
+                leg_key = "up" if buy_leg == "up" else "dn"
+                _cached_positions.setdefault(cond, {})[leg_key] = {
+                    "asset": buy_token,
+                    "size": float(filled_total),
+                    "redeemable": False,
+                    "avgPrice": float(avg),
+                }
                 save_json(STATE_FILE, positions_meta)
 
             def _clear_buy_uncertain():
@@ -2325,7 +3366,8 @@ while not _shutdown_requested:
                     "buy_uncertain", "buy_uncertain_at", "buy_uncertain_token",
                     "buy_uncertain_leg", "buy_uncertain_baseline",
                     "buy_uncertain_attempt", "buy_uncertain_spend",
-                    "buy_uncertain_price",
+                    "buy_uncertain_price", "buy_uncertain_observed_size",
+                    "buy_uncertain_observed_at", "buy_uncertain_observed_count",
                 ):
                     meta.pop(key, None)
 
@@ -2348,6 +3390,7 @@ while not _shutdown_requested:
             bought, spent, buy_status = buy_market_with_retry(
                 buy_token, BUY_BUDGET, BUY_MAX_PRICE, tick_size=tick, min_price=BUY_THRESHOLD,
                 on_fill=_persist_buy_fill, on_submit=_persist_buy_submit,
+                condition_id=cond,
             )
             wall_ms = time.time() * 1000
             if bought > 0:
@@ -2424,6 +3467,101 @@ while not _shutdown_requested:
                 meta["last_buy_at"] = wall_ms
                 log_event("buy_fail", condition_id=cond, leg=buy_leg, budget=BUY_BUDGET, ask=buy_ask, status=buy_status)
                 save_json(STATE_FILE, positions_meta)
+
+        # ================= REDEEM STATUS (ASYNC / LOW PRIORITY) =================
+        _redeem_dirty = False
+        for _future, _cond in list(_redeem_status_futures.items()):
+            if not _future.done():
+                continue
+            _redeem_status_futures.pop(_future, None)
+            _meta = positions_meta.get(_cond)
+            if not _meta or not _meta.get("redeem_pending"):
+                continue
+            try:
+                _tx_record = _future.result()
+            except Exception:
+                _tx_record = None
+            _meta["redeem_status_checked_at"] = now_ms
+            if not isinstance(_tx_record, dict):
+                _redeem_dirty = True
+                continue
+            _tx_state = str(_tx_record.get("state") or "").upper()
+            _meta["redeem_tx_state"] = _tx_state
+            if _tx_record.get("transactionHash"):
+                _meta["redeem_tx_hash"] = str(_tx_record["transactionHash"])
+            if _tx_state == "STATE_CONFIRMED":
+                _meta["redeem_confirmed"] = True
+                _meta["redeem_confirmed_at"] = now_ms
+                log_event(
+                    "redeem_confirmed",
+                    condition_id=_cond,
+                    tx_id=_meta.get("redeem_tx_id"),
+                    tx_hash=_meta.get("redeem_tx_hash"),
+                )
+            elif _tx_state in {"STATE_FAILED", "STATE_INVALID"}:
+                log_event(
+                    "redeem_terminal_fail",
+                    condition_id=_cond,
+                    tx_id=_meta.get("redeem_tx_id"),
+                    state=_tx_state,
+                )
+                for _key in (
+                    "redeem_pending", "redeem_tx_id", "redeem_tx_state",
+                    "redeem_confirmed", "redeem_confirmed_at",
+                    "redeem_tx_hash", "redeem_expected_value",
+                ):
+                    _meta.pop(_key, None)
+            _redeem_dirty = True
+
+        # Credit par only after both relayer confirmation and a complete fresh
+        # Data API snapshot showing that the redeemed inventory disappeared.
+        if positions_raw is not None:
+            for _cond, _meta in positions_meta.items():
+                if not (
+                    _meta.get("redeem_pending")
+                    and _meta.get("redeem_confirmed")
+                ):
+                    continue
+                _pos = held.get(_cond, {})
+                _remaining = max(
+                    float(_pos.get("up", {}).get("size", 0) or 0),
+                    float(_pos.get("dn", {}).get("size", 0) or 0),
+                )
+                if _remaining > 0.01:
+                    continue
+                _redeem_value = float(
+                    _meta.get("redeem_expected_value")
+                    or _meta.get("bought_size")
+                    or 0
+                )
+                if _redeem_value <= 0:
+                    continue
+                _meta["pnl_redeem_value"] = round(_redeem_value, 4)
+                _meta["bought_size"] = 0.0
+                _meta.pop("redeem_pending", None)
+                log_event(
+                    "redeem_settled",
+                    condition_id=_cond,
+                    tx_id=_meta.get("redeem_tx_id"),
+                    redeem_value=_meta["pnl_redeem_value"],
+                )
+                _redeem_dirty = True
+
+        _pending_redeem_conditions = set(_redeem_status_futures.values())
+        for _cond, _meta in positions_meta.items():
+            if not _meta.get("redeem_pending") or _cond in _pending_redeem_conditions:
+                continue
+            _last_check = float(_meta.get("redeem_status_checked_at") or 0)
+            if now_ms - _last_check < REDEEM_THROTTLE_S * 1000:
+                continue
+            _tx_id = _meta.get("redeem_tx_id")
+            if _tx_id:
+                _future = _redeem_executor.submit(get_relayer_transaction, _tx_id)
+                _redeem_status_futures[_future] = _cond
+                _meta["redeem_status_checked_at"] = now_ms
+                _redeem_dirty = True
+        if _redeem_dirty:
+            save_json(STATE_FILE, positions_meta)
 
     except Exception:
         log_event("cycle_error", traceback=traceback.format_exc())
