@@ -63,9 +63,9 @@ trades a different market cadence and uses a different resolution oracle.
 | Series slug | `btc-up-or-down-15m` | `btc-up-or-down-5m` | `btc-up-or-down-hourly` |
 | Slug prefix / excludes | `btc-updown` (excl. `btc-updown-5m`, `bitcoin-up-or-down`) | `btc-updown-5m` (excl. `bitcoin-up-or-down`) | `bitcoin-up-or-down` (excl. `btc-updown`, `btc-updown-5m`) |
 | Resolution oracle | Chainlink BTC TWAP 60s | Chainlink BTC TWAP 30s | Binance BTCUSDT |
-| Buy window | final 3.0 min (`buy_window_min`) | final 90 s (`buy_start_s`) | final 5.0 min (`buy_window_min`) |
+| Buy window | final 2.5 min (`buy_window_min`) | final 60 s (`buy_start_s`) | final 3.5 min (`buy_window_min`) |
 | Ask band | 96–99¢ | 96–99¢ | 96–99¢ |
-| Budget / market | $21 USDC | $8 USDC | $24 USDC |
+| Budget / market | $18 USDC | $8 USDC | $15 USDC |
 | Hedge trigger | bid ≤ 65¢ **and** ask ≤ 70¢, spread ≤ 15¢ | same | same |
 | Tick size | 0.01 | 0.001 | 0.01 |
 | Strategy file | `strategy_buy.json` | `strategy_buy5m.json` | `strategy_buyhourly.json` |
@@ -183,7 +183,7 @@ are the ground truth for post-hoc accuracy analysis; they are gitignored.
 ## 6. The Buy Decision
 
 A buy fires only when **all** of these gates pass, evaluated in the final window
-(3 min / 90 s / 5 min before close):
+(2.5 min / 60 s / 3.5 min before close):
 
 1. **Window.** Market is inside the buy window and past the `buy_grace_s` buffer; the
    bot has not already entered this market (`one_entry_per_market`, enforced via
@@ -204,7 +204,7 @@ A buy fires only when **all** of these gates pass, evaluated in the final window
    15m/hourly), **and** the book's winning side must match the direction of the
    underlying move. This blocks buying a "winner" that the resolution oracle itself
    disagrees with (stale-book trap).
-6. **Risk caps.** `buy_budget` USDC per market ($21/$8/$24), `max_open_positions`,
+6. **Risk caps.** `buy_budget` USDC per market ($18/$8/$15), `max_open_positions`,
    `max_open_notional`, `max_daily_notional`, and available USDC balance.
 
 Execution: a FAK market buy for `buy_budget` dollars of the winning token. Size and
@@ -324,14 +324,14 @@ paths. Templates are `strategy_buy.example.json`,
 
 | Key | Default (15m/5m/hr) | Meaning |
 |---|---|---|
-| `buy_threshold` / `buy_max_price` | 0.96 / 0.99 | Ask band for entry |
+| `buy_threshold` / `buy_max_price` | 0.97 / 0.99 (hourly 0.965) | Ask band for entry |
 | `min_winner_bid` / `max_loser_bid` / `min_bid_edge` | 0.90 / 0.10 / 0.05 | GUI consensus gate |
 | `max_entry_spread` | 0.05 | Max ask−bid on winner at entry |
 | `underlying_gate_enabled` / `min_underlying_edge_usd` | true / 5.0 (5m), 10.0 (15m/hr) | Oracle alignment gate |
 | `hedge_enabled` / `hedge_threshold` / `hedge_min_price` | true / 0.65 / 0.32 | Hedge arm & floor |
 | `hedge_max_spread` / `hedge_require_ask_max` | 0.15 / 0.70 | Hedge book must actually collapse |
-| `buy_window_min` (15m, hr) / `buy_start_s` (5m) | 3.0 / 90 / 5.0 | Entry window before close |
-| `buy_budget` | 21 / 8 / 24 | USDC per market |
+| `buy_window_min` (15m, hr) / `buy_start_s` (5m) | 2.5 / 60 / 3.5 | Entry window before close |
+| `buy_budget` | 18 / 8 / 15 | USDC per market |
 | `max_open_positions` / `max_open_notional` / `max_daily_notional` | 100 / 10k / ~∞ | Risk caps |
 | `redeem_throttle_s` / `max_redeem_age_days` | 30 / 7 | Redeem pacing |
 | `entry_enabled` | false | Explicit hot-reloadable arm for new entries |
@@ -425,7 +425,7 @@ integrity, oracle edge, settlement finality, quarantine) remain authoritative.
 1. **Three copies, not a library.** A bug fix in `buybot.py` almost certainly applies
    to `buybot5m.py` and `buybothourly.py`. Diff the siblings after any logic change.
 2. **5m uses seconds; 15m/hourly use minutes.** The 5m loop keys on
-   `seconds_left`/`buy_start_s` (90 s), the others on `minutes_left`/`buy_window_min`.
+   `seconds_left`/`buy_start_s` (60 s), the others on `minutes_left`/`buy_window_min`.
    Propagating window logic across families without converting units has caused
    production NameErrors.
 3. **Slug excludes are load-bearing.** `btc-updown` is a prefix of `btc-updown-5m`;
