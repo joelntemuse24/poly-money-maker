@@ -137,12 +137,15 @@ _STRATEGY_DEFAULTS = {
     # Explicit hot-reloadable entry arm. A missing/invalid file disables new
     # entries while existing positions continue through the hedge path.
     "entry_enabled": False,
-    # Slightly wider than 5m/15m, but still high-90s; keep size modest vs reversals.
-    "buy_threshold": 0.98,
-    "buy_max_price": 0.99,
+    # Trigger at 75¢: buy as soon as the winning ask is ≥ 75¢, priced at the
+    # live ask (so early catches ≈ 75¢). buy_max_price is a hard ceiling only —
+    # never pay above 90¢; we do not wait for or target the top of the band.
+    "buy_threshold": 0.75,
+    "buy_max_price": 0.90,
     # Consensus on Polymarket GUI display price (mid if spread≤10¢ else last trade).
-    "min_winner_bid": 0.92,
-    "max_loser_bid": 0.10,
+    # Tuned for the 75¢ band (old 92¢/10¢ gates could never arm a 75¢ ask).
+    "min_winner_bid": 0.70,
+    "max_loser_bid": 0.30,
     "min_bid_edge": 0.05,
     # Skip buys unless live BTC is ≥ this many USD from the window Price To Beat,
     # and only allow the side matching that underlying move.
@@ -150,9 +153,10 @@ _STRATEGY_DEFAULTS = {
     "min_underlying_edge_usd": 10.0,
     # Force-dump only when FAK avg is worse than this. Fills in
     # [toxic_force_exit_below, buy_threshold) stay on the normal hedge path.
-    "toxic_force_exit_below": 0.90,
+    # Must be <= buy_threshold (validator); 65¢ ≈ walk well below the 75¢ floor.
+    "toxic_force_exit_below": 0.65,
     "hedge_enabled": True,
-    "hedge_threshold": 0.65,
+    "hedge_threshold": 0.35,
     # FAK sell floor while hedging. Must be a valid tick multiple:
     # 15m/hourly tick=0.01 → 0.32; 5m tick=0.001 can use 0.325.
     "hedge_min_price": 0.32,
@@ -167,11 +171,11 @@ _STRATEGY_DEFAULTS = {
     # Hedge: penny bids under a still-high ask are fake — require a tight book
     # and ask also collapsed (same lesson sell-side already learned on mids).
     "hedge_max_spread": 0.15,
-    "hedge_require_ask_max": 0.70,
-    "buy_window_min": 4.0,
+    "hedge_require_ask_max": 0.40,
+    "buy_window_min": 13.0,
     "buy_grace_s": 2,
     "buy_cooldown_s": 3,
-    "buy_budget": 5.0,
+    "buy_budget": 2.5,
     "max_open_positions": 0,  # 0 = unlimited
     "max_open_notional": 10000.0,
     "max_daily_notional": 999999.0,

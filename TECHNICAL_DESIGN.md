@@ -34,19 +34,22 @@ market asks: will BTC be up or down at the end of the window (5 minutes, 15 minu
 or 1 hour)? A market has two legs (UP and DOWN). Exactly one leg wins and redeems at
 $1.00; the other redeems at $0.
 
-**The strategy:** in the final moments before resolution, the outcome is usually
-already obvious — the winning leg trades at 98–99¢ but has not yet settled. The bots
-buy that near-certain winner with a Fill-And-Kill (FAK) market order and redeem it at
-$1.00, capturing ~1–2¢ per share.
+**The strategy:** enter earlier and more often — once the winning leg's ask is in
+the **75–90¢** band inside each bot's buy window — with a Fill-And-Kill (FAK)
+market order, then redeem winners at $1.00. The probe deliberately trades some
+extra reversal risk for higher market participation (missing markets made it hard
+to earn back losses from the few hedges that fired).
 
-**The risk:** BTC can reverse in the final seconds. If the leg we bought truly
-collapses (bid **and** ask both drop — not a lone 1¢ bid under a still-high ask),
-the bot **hedges**: it market-sells the held leg, floored at `hedge_min_price`
-(~32¢). There is no profit-taking sell — the only sell path is the hedge;
-everything else rides to redemption.
+**The risk:** BTC can reverse after entry. If the leg we bought truly collapses
+(bid **and** ask both drop — not a lone 1¢ bid under a still-high ask), the bot
+**hedges**: it market-sells the held leg when bid ≤ 35¢ (and ask ≤ 40¢ with a
+tight spread), floored at `hedge_min_price` (~32¢). There is no profit-taking
+sell — the only sell path is the hedge; everything else rides to redemption.
 
-**Economics per share (no reversal):** buy at ~98–99¢, redeem at $1.00 → ~1–2¢ gross.
-**Economics per share (hedged reversal):** buy at ~98–99¢, sell near the collapsed
+**Economics per share (no reversal):** buy at ~75–90¢, redeem at $1.00 → ~10–25¢
+gross (wider band than the old 98–99¢ probe; more fill opportunity, more reversal
+exposure).
+**Economics per share (hedged reversal):** buy at ~75–90¢, sell near the collapsed
 book (≥ floor) → bounded loss instead of riding a wrong side to $0.
 
 ---
@@ -63,10 +66,10 @@ trades a different market cadence and uses a different resolution oracle.
 | Series slug | `btc-up-or-down-15m` | `btc-up-or-down-5m` | `btc-up-or-down-hourly` |
 | Slug prefix / excludes | `btc-updown` (excl. `btc-updown-5m`, `bitcoin-up-or-down`) | `btc-updown-5m` (excl. `bitcoin-up-or-down`) | `bitcoin-up-or-down` (excl. `btc-updown`, `btc-updown-5m`) |
 | Resolution oracle | Chainlink BTC TWAP 60s | Chainlink BTC TWAP 30s | Binance BTCUSDT |
-| Buy window | final 3.0 min (`buy_window_min`) | final 90 s (`buy_start_s`) | final 4.0 min (`buy_window_min`) |
-| Ask band | 98–99¢ | 98–99¢ | 98–99¢ |
-| Budget / market | $5 USDC | $5 USDC | $5 USDC |
-| Hedge trigger | bid ≤ 65¢ **and** ask ≤ 70¢, spread ≤ 15¢ | same | same |
+| Buy window | final 4.0 min (`buy_window_min`) | final 120 s (`buy_start_s`) | final 13.0 min (`buy_window_min`) |
+| Ask band | 75–90¢ | 75–90¢ | 75–90¢ |
+| Budget / market | $2.50 USDC | $2.50 USDC | $2.50 USDC |
+| Hedge trigger | bid ≤ 35¢ **and** ask ≤ 40¢, spread ≤ 15¢ | same | same |
 | Tick size | 0.01 | 0.001 | 0.01 |
 | Strategy file | `strategy_buy.json` | `strategy_buy5m.json` | `strategy_buyhourly.json` |
 | State file | `positions_buy.json` | `positions_buy5m.json` | `positions_buyhourly.json` |
@@ -182,29 +185,31 @@ are the ground truth for post-hoc accuracy analysis; they are gitignored.
 
 ## 6. The Buy Decision
 
-A buy fires only when **all** of these gates pass, evaluated in the final window
-(3.0 min / 90 s / 4.0 min before close):
+A buy fires only when **all** of these gates pass, evaluated in the buy window
+(4.0 min / 120 s / 13.0 min before close):
 
 1. **Window.** Market is inside the buy window and past the `buy_grace_s` buffer; the
    bot has not already entered this market (`one_entry_per_market`, enforced via
    `meta["bought_token"]` in state), and the `buy_cooldown_s` per-market cooldown has
    elapsed.
 2. **GUI consensus.** The Polymarket UI display price (mid when spread ≤ 10¢, else
-   last trade) must show a clear winner and loser: winner ≥ `min_winner_bid` (90¢),
-   loser ≤ `max_loser_bid` (10¢), and the gap ≥ `min_bid_edge` (5¢).
+   last trade) must show a clear winner and loser: winner ≥ `min_winner_bid` (70¢),
+   loser ≤ `max_loser_bid` (30¢), and the gap ≥ `min_bid_edge` (5¢).
 3. **Tight real book (critical).** The winning leg's **REST** top-of-book must have
-   bid ≥ `min_winner_bid` and `ask − bid` ≤ `max_entry_spread` (5¢). A 98¢ ask over
+   bid ≥ `min_winner_bid` and `ask − bid` ≤ `max_entry_spread` (5¢). A high ask over
    a 1¢ bid is a fake price — last-trade GUI can still look like a winner while
    there is no real bid under the ask. WS quotes alone are never used to arm entry.
-4. **Ask band.** The best ask of the winning leg is within `buy_threshold`–
-   `buy_max_price` (98–99¢). Floor is 98¢ so latency can still catch a fill before
-   a 99¢ ask disappears; history showed the fewest reversals in this pocket.
+4. **Ask band / 75¢ trigger.** The best ask of the winning leg is within
+   `buy_threshold`–`buy_max_price` (75–90¢). **75¢ is the trigger**, not a target
+   mid-band: the bot buys as soon as ask ≥ 75¢ (other gates passing) and posts the
+   FAK at the *live* ask — so catching the print early yields fills near 75¢.
+   90¢ is only a hard ceiling (never enter if ask is already above it).
 5. **Underlying gate.** If `underlying_gate_enabled`, the live oracle price must be
    at least `min_underlying_edge_usd` away from the captured PTB ($5 on 5m, $10 on
    15m/hourly), **and** the book's winning side must match the direction of the
    underlying move. This blocks buying a "winner" that the resolution oracle itself
    disagrees with (stale-book trap).
-6. **Risk caps.** `buy_budget` USDC per market ($5), `max_open_positions`,
+6. **Risk caps.** `buy_budget` USDC per market ($2.50), `max_open_positions`,
    `max_open_notional`, `max_daily_notional`, and available USDC balance.
 
 Execution: a FAK market buy for `buy_budget` dollars of the winning token. Size and
@@ -213,10 +218,10 @@ and the 200ms REST cache) immediately before the order. A BUY limit is a
 **maximum**, so the exchange can fill far below the gate ask (“price improvement”).
 Confirmed fills are **always persisted** (including below-band averages logged as
 `buy_fill_below_band`) — discarding them creates orphan inventory. Those fills set
-`toxic_fill` when the average is below `toxic_force_exit_below` (default 90¢) and
+`toxic_fill` when the average is below `toxic_force_exit_below` (default 65¢) and
 are **not** ridden to $1: the hedge path force-exits at the next usable bid (no
-bounce cancel, no `hedge_min_price` floor). Milder below-band fills (e.g. 95¢)
-stay on the normal ≤65¢ hedge path. Delayed FAKs are polled; zero confirms fall
+bounce cancel, no `hedge_min_price` floor). Milder below-band fills (e.g. 70¢)
+stay on the normal ≤35¢ hedge path. Delayed FAKs are polled; zero confirms fall
 back to balance reconciliation (`buy_ghost_fill`).
 Before every POST, the bot atomically writes a `buy_uncertain` quarantine with the
 exact signed order ID, token, amounts, and pre-submit balance. Any exception, falsy
@@ -248,18 +253,18 @@ slow poll to save API quota.
 The bots never take profit. The only sell is the defensive hedge (or a toxic-fill
 force exit):
 
-- **Arm (normal):** WS/cache bid ≤ `hedge_threshold` (65¢) while the position is open
+- **Arm (normal):** WS/cache bid ≤ `hedge_threshold` (35¢) while the position is open
   (peek only — never sufficient to sell).
-- **Arm (toxic_fill):** entry average `< toxic_force_exit_below` (90¢) arms an
-  immediate dump — do not wait for a 65¢ reversal and do not cancel on bounce.
-  Below-band but ≥90¢ uses the normal hedge.
+- **Arm (toxic_fill):** entry average `< toxic_force_exit_below` (65¢) arms an
+  immediate dump — do not wait for a 35¢ reversal and do not cancel on bounce.
+  Below-band but ≥65¢ uses the normal hedge.
 - **Confirm (force-fresh REST, fail-closed):** re-fetch the full book with
   `force_rest=True`. If either side is missing, skip (`hedge_skip_incomplete_rest`)
   — **no WS fallback**. If bid bounced above threshold on a *normal* entry, abort
   (`hedge_cancel_bounce`); toxic fills skip this cancel.
 - **Book integrity (normal only):** a lone penny bid under a still-high ask is **not**
-  a reversal (`hedge_skip_toxic_book`). Require bid ≤ 65¢, ask ≤
-  `hedge_require_ask_max` (70¢), and spread ≤ `hedge_max_spread` (15¢). Toxic dumps
+  a reversal (`hedge_skip_toxic_book`). Require bid ≤ 35¢, ask ≤
+  `hedge_require_ask_max` (40¢), and spread ≤ `hedge_max_spread` (15¢). Toxic dumps
   skip integrity / `abort_above` so a collapsed book can still exit.
 - **Execution:** FAK sell floored at `hedge_min_price` for normal hedges; toxic dumps
   floor at one tick so a 28¢ bid is not blocked by a 32.5¢ min. Every retry
@@ -335,14 +340,15 @@ paths. Templates are `strategy_buy.example.json`,
 
 | Key | Default (15m/5m/hr) | Meaning |
 |---|---|---|
-| `buy_threshold` / `buy_max_price` | 0.98 / 0.99 | Ask band for entry (98–99¢ probe) |
-| `min_winner_bid` / `max_loser_bid` / `min_bid_edge` | 0.92 / 0.10 / 0.05 | GUI consensus gate |
+| `buy_threshold` / `buy_max_price` | 0.75 / 0.90 | Trigger ≥75¢; hard ceiling 90¢ (prefer fills near 75¢) |
+| `min_winner_bid` / `max_loser_bid` / `min_bid_edge` | 0.70 / 0.30 / 0.05 | GUI consensus gate (aligned to 75¢ band) |
 | `max_entry_spread` | 0.05 | Max ask−bid on winner at entry |
 | `underlying_gate_enabled` / `min_underlying_edge_usd` | true / 5.0 (5m), 10.0 (15m/hr) | Oracle alignment gate |
-| `hedge_enabled` / `hedge_threshold` / `hedge_min_price` | true / 0.65 / 0.32 | Hedge arm & floor |
-| `hedge_max_spread` / `hedge_require_ask_max` | 0.15 / 0.70 | Hedge book must actually collapse |
-| `buy_window_min` (15m, hr) / `buy_start_s` (5m) | 3.0 / 90 / 4.0 | Entry window before close |
-| `buy_budget` | 5 / 5 / 5 | USDC per market |
+| `toxic_force_exit_below` | 0.65 | Force-dump if FAK avg &lt; 65¢ (must be ≤ buy_threshold) |
+| `hedge_enabled` / `hedge_threshold` / `hedge_min_price` | true / 0.35 / 0.32 | Hedge arm & floor |
+| `hedge_max_spread` / `hedge_require_ask_max` | 0.15 / 0.40 | Hedge book must actually collapse |
+| `buy_window_min` (15m, hr) / `buy_start_s` (5m) | 4.0 / 120 / 13.0 | Entry window before close |
+| `buy_budget` | 2.5 / 2.5 / 2.5 | USDC per market |
 | `max_open_positions` / `max_open_notional` / `max_daily_notional` | 0 (=unlimited) / 10k / ~∞ | Risk caps |
 | `redeem_throttle_s` / `max_redeem_age_days` | 30 / 7 | Redeem pacing |
 | `entry_enabled` | false | Explicit hot-reloadable arm for new entries |
@@ -437,7 +443,7 @@ integrity, oracle edge, settlement finality, quarantine) remain authoritative.
 1. **Three copies, not a library.** A bug fix in `buybot.py` almost certainly applies
    to `buybot5m.py` and `buybothourly.py`. Diff the siblings after any logic change.
 2. **5m uses seconds; 15m/hourly use minutes.** The 5m loop keys on
-   `seconds_left`/`buy_start_s` (90 s), the others on `minutes_left`/`buy_window_min`.
+   `seconds_left`/`buy_start_s` (120 s), the others on `minutes_left`/`buy_window_min`.
    Propagating window logic across families without converting units has caused
    production NameErrors.
 3. **Slug excludes are load-bearing.** `btc-updown` is a prefix of `btc-updown-5m`;
@@ -483,7 +489,7 @@ path described above.
 | **PTB** | Price To Beat — oracle price at window open; resolution compares close vs PTB |
 | **Oracle / RTDS** | The data feed that resolves the market (Chainlink TWAP or Binance), streamed over Polymarket's real-time data socket |
 | **GUI consensus** | Winner/loser inferred from the Polymarket UI display price (mid or last trade) |
-| **Hedge** | Defensive market-sell when the held book actually collapses (bid ≤ 65¢, ask ≤ 70¢, tight spread) |
+| **Hedge** | Defensive market-sell when the held book actually collapses (bid ≤ 35¢, ask ≤ 40¢, tight spread) |
 | **Redeem** | On-chain settlement of a resolved winning leg at $1.00 via the relayer |
 | **Hot mode** | Sub-second polling while a position is open or a market is in the buy window |
 | **GC** | Garbage collection of resolved/settled market state into the P&L file |

@@ -134,12 +134,15 @@ for _rounding in ROUNDING_CONFIG.values():
 # ------------------------- STRATEGY CONFIG -------------------------
 _STRATEGY_DEFAULTS = {
     "entry_enabled": False,
-    # High-90s only: cheaper fills in history were dominated by false-book entries.
-    "buy_threshold": 0.98,
-    "buy_max_price": 0.99,
+    # Trigger at 75¢: buy as soon as the winning ask is ≥ 75¢, priced at the
+    # live ask (so early catches ≈ 75¢). buy_max_price is a hard ceiling only —
+    # never pay above 90¢; we do not wait for or target the top of the band.
+    "buy_threshold": 0.75,
+    "buy_max_price": 0.90,
     # Consensus on Polymarket GUI display price (mid if spread≤10¢ else last trade).
-    "min_winner_bid": 0.92,
-    "max_loser_bid": 0.10,
+    # Tuned for the 75¢ band (old 92¢/10¢ gates could never arm a 75¢ ask).
+    "min_winner_bid": 0.70,
+    "max_loser_bid": 0.30,
     "min_bid_edge": 0.05,
     # Skip buys unless live BTC is ≥ this many USD from the window Price To Beat,
     # and only allow the side matching that underlying move.
@@ -147,9 +150,10 @@ _STRATEGY_DEFAULTS = {
     "min_underlying_edge_usd": 5.0,
     # Force-dump only when FAK avg is worse than this. Fills in
     # [toxic_force_exit_below, buy_threshold) stay on the normal hedge path.
-    "toxic_force_exit_below": 0.90,
+    # Must be <= buy_threshold (validator); 65¢ ≈ walk well below the 75¢ floor.
+    "toxic_force_exit_below": 0.65,
     "hedge_enabled": True,
-    "hedge_threshold": 0.65,
+    "hedge_threshold": 0.35,
     "hedge_min_price": 0.325,
     "hedge_undercut_ticks": 2,
     "hedge_quote_max_age_s": 0.25,
@@ -160,11 +164,11 @@ _STRATEGY_DEFAULTS = {
     # Hedge: penny bids under a still-high ask are fake — require a tight book
     # and ask also collapsed (same lesson sell-side already learned on mids).
     "hedge_max_spread": 0.15,
-    "hedge_require_ask_max": 0.70,
-    "buy_start_s": 90,
+    "hedge_require_ask_max": 0.40,
+    "buy_start_s": 120,
     "buy_grace_s": 1,
     "buy_cooldown_s": 1,
-    "buy_budget": 5.0,
+    "buy_budget": 2.5,
     "max_open_positions": 0,  # 0 = unlimited
     "max_open_notional": 10000.0,
     "max_daily_notional": 999999.0,
