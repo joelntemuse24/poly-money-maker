@@ -7,15 +7,15 @@ Full architecture: `TECHNICAL_DESIGN.md`.
 ## Project at a Glance
 
 **Live on the VM:** three standalone buy bots — nothing else. They buy the winning
-leg of Polymarket BTC "Up or Down" markets at 98–99¢ in the final window, hedge at
-65¢ on reversal, and redeem winners at $1.00. See `CURRENT.md` for the active
-probe budget, edge/toxic knobs, and near-term goals.
+leg of Polymarket BTC "Up or Down" markets at 75–90¢ in each bot's buy window,
+hedge at 35¢ on reversal, and redeem winners at $1.00. See `CURRENT.md` for the
+active probe budget, edge/toxic knobs, and near-term goals.
 
 | File | Service | Markets | Oracle | Budget | Window |
 |---|---|---|---|---|---|
-| `buybot.py` | `polybuybot` | 15m | Chainlink TWAP 60s | $5 | final 3.0 min |
-| `buybot5m.py` | `polybuybot5m` | 5m | Chainlink TWAP 30s | $5 | final 90 s |
-| `buybothourly.py` | `polybuybothourly` | hourly | Binance BTCUSDT | $5 | final 4.0 min |
+| `buybot.py` | `polybuybot` | 15m | Chainlink TWAP 60s | $2.50 | final 4.0 min |
+| `buybot5m.py` | `polybuybot5m` | 5m | Chainlink TWAP 30s | $2.50 | final 120 s |
+| `buybothourly.py` | `polybuybothourly` | hourly | Binance BTCUSDT | $2.50 | final 47.0 min |
 
 Plus: `check_book.py` diagnostic.
 
@@ -115,7 +115,7 @@ Watch the console for `[DRY BUY]` / `[DRY SELL]` markers. Ctrl-C to stop.
 - **FAK orders only:** All orders are Fill-And-Kill — no resting orders, no market
   making.
 - **Hedge is sell-only exit:** The bots never profit-take. The only sell path is the
-  hedge (bid ≤ 65¢ **and** ask ≤ 70¢ with tight spread, force-fresh REST
+  hedge (bid ≤ 35¢ **and** ask ≤ 40¢ with tight spread, force-fresh REST
   fail-closed); everything else rides to redemption at $1.00. WS may *arm*
   a hedge check; selling requires two-sided REST integrity on every attempt.
 - **Tick sizes:** 5m markets use `0.001`, 15m and hourly use `0.01`.
@@ -127,10 +127,10 @@ Watch the console for `[DRY BUY]` / `[DRY SELL]` markers. Ctrl-C to stop.
 
 1. **The three bots are near-identical copies, not shared modules.** A bug fix in
    `buybot.py` probably also applies to `buybot5m.py` and `buybothourly.py`.
-2. **The 5m bot uses seconds-based window checks** (`buy_start_s = 90`) while the
-   15m and hourly bots use minutes (`buy_window_min = 3.0 / 4.0`). Don't mix them
-   when propagating changes. The 5m loop must define `seconds_left` (not only
-   `minutes_left`) or it NameErrors every cycle.
+2. **The 5m bot uses seconds-based window checks** (`buy_start_s = 120`) while the
+ 15m and hourly bots use minutes (`buy_window_min = 4.0 / 47.0`). Don't mix them
+ when propagating changes. The 5m loop must define `seconds_left` (not only
+ `minutes_left`) or it NameErrors every cycle.
 3. **Settlement is confirmation-gated.** A relayer submission is not P&L.
    Redemption is credited only after relayer confirmation and a complete Data API
    snapshot shows the inventory gone; GC never invents par value.
