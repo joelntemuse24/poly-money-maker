@@ -3,7 +3,7 @@
 **Agents: read this after `AGENTS.md`.** Update this file when ops/strategy decisions change.
 Do not put secrets, API keys, or live wallet material here.
 
-Last updated: **2026-08-12** (ET / agent session).
+Last updated: **2026-08-12** (~01:30 UTC agent session).
 
 ---
 
@@ -67,8 +67,16 @@ manual restart — CI “Deploy to GCP” frequently SSH-times-out).
 
 ---
 
+## Incidents
+
+- **2026-08-12 ~4h no 5m buys:** UI showed `POS 100` with `max_open_positions=100`.
+  Cap counted Data-API sizes (incl. redeemable) → silent skip of every entry.
+  **Decision: disable the cap** (`max_open_positions: 0` = unlimited). Code also
+  ignores redeemable when a positive cap is set, and logs `buy_skip_max_positions`.
+
 ## Open / next
 
+- [ ] Land max-open redeemable-exclusion fix; confirm 5m buys resume.
 - [ ] Merge/land repo default `min_underlying_edge_usd: 0` if not already on `main` (live JSON may already be 0).
 - [ ] Watch fill count vs hedge rate for a few days at edge=$0.
 - [ ] Then reconsider size ($20–25/market) once fill density supports ~$100/day with margin.
