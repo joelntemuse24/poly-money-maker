@@ -232,7 +232,8 @@ Entry cost is USDC spent (`makingAmount` on CLOB v2 BUY), not `shares × gate as
 - `buy_skip_no_consensus` — ask in band but GUI/book integrity fails (includes
   `up_book_why` / `dn_book_why`: `wide_spread`, `bid_too_low`, …)
 - `buy_skip_incomplete_book` — missing GUI price on a leg (no mid, no last trade)
-- `buy_skip_underlying_edge` — live oracle < $10 from PTB
+- `buy_skip_underlying_edge` — underlying check failed (missing/stale/flat vs PTB;
+  with min edge $0, “too small” is no longer the usual reason)
 - `buy_skip_underlying_side` — book winner disagrees with the underlying move
 - `buy_fill_below_band` — fill landed below the ask band; inventory recorded + `toxic_fill`
 - `buy_ghost_fill` — balance rose after a null/delayed CLOB confirm
