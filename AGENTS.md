@@ -7,17 +7,17 @@ Full architecture: `TECHNICAL_DESIGN.md`.
 ## Project at a Glance
 
 **Live on the VM:** three standalone buy bots plus a no-order path recorder.
-They buy the winning leg of Polymarket BTC "Up or Down" markets at **98–99¢**
-in the final window ($2.50 / market), hedge at **65¢** on reversal, and redeem
+They buy the winning leg of Polymarket BTC "Up or Down" markets at **75–90¢**
+in the final window ($2.50 / market), hedge at **35¢** on reversal, and redeem
 winners at $1.00. See `CURRENT.md` for the active probe budget and knobs.
 
 Mint-only helper (`mintbot.py`) is **paused** — do not run it live.
 
 | File | Service | Markets | Oracle | Budget | Window |
 |---|---|---|---|---|---|
-| `buybot.py` | `polybuybot` | 15m | Chainlink TWAP 60s | $2.50 | final 3.0 min |
-| `buybot5m.py` | `polybuybot5m` | 5m | Chainlink TWAP 30s | $2.50 | final 90 s |
-| `buybothourly.py` | `polybuybothourly` | hourly | Binance BTCUSDT | $2.50 | final 4.0 min |
+| `buybot.py` | `polybuybot` | 15m | Chainlink TWAP 60s | $2.50 | final 4.0 min |
+| `buybot5m.py` | `polybuybot5m` | 5m | Chainlink TWAP 30s | $2.50 | final 120 s |
+| `buybothourly.py` | `polybuybothourly` | hourly | Binance BTCUSDT | $2.50 | final 13.0 min |
 | `pathlog.py` | `polypathlog` | all three | — (CLOB books only) | — | late-window ticks |
 
 Plus: `check_book.py`, `check_participation.py`, `check_path_backtest.py`.
@@ -105,8 +105,7 @@ Watch the console for `[DRY BUY]` / `[DRY SELL]` markers. Ctrl-C to stop.
 - `buy_ghost_fill` — balance reconciliation after null/delayed BUY confirm
 - `buy_uncertain` — POST outcome unresolved; durable token/baseline quarantine blocks re-buy
 - `buy_skip_incomplete_book` — missing GUI price on a leg (no mid and no last trade)
-- `buy_skip_underlying_edge` — underlying gate failed (missing/stale/flat vs PTB;
-  probe uses `min_underlying_edge_usd: 0` — see `CURRENT.md`)
+- `buy_skip_underlying_edge` — underlying gate failed (missing/stale/flat vs PTB)
 - `buy_skip_underlying_side` — book wants the opposite leg from the underlying move
 - `buy_skip_max_positions` — only if `max_open_positions > 0` (probe uses **0 = unlimited**)
 
@@ -126,7 +125,7 @@ Watch the console for `[DRY BUY]` / `[DRY SELL]` markers. Ctrl-C to stop.
 - **FAK orders only:** All orders are Fill-And-Kill — no resting orders, no market
   making.
 - **Hedge is sell-only exit:** The bots never profit-take. The only sell path is the
-  hedge (bid ≤ 65¢ **and** ask ≤ 70¢ with tight spread, force-fresh REST
+  hedge (bid ≤ 35¢ **and** ask ≤ 40¢ with tight spread, force-fresh REST
   fail-closed); everything else rides to redemption at $1.00. WS may *arm*
   a hedge check; selling requires two-sided REST integrity on every attempt.
 - **Tick sizes:** 5m markets use `0.001`, 15m and hourly use `0.01`.
@@ -138,8 +137,8 @@ Watch the console for `[DRY BUY]` / `[DRY SELL]` markers. Ctrl-C to stop.
 
 1. **The three bots are near-identical copies, not shared modules.** A bug fix in
    `buybot.py` probably also applies to `buybot5m.py` and `buybothourly.py`.
-2. **The 5m bot uses seconds-based window checks** (`buy_start_s = 90`) while the
-   15m and hourly bots use minutes (`buy_window_min = 3.0 / 4.0`). Don't mix them
+2. **The 5m bot uses seconds-based window checks** (`buy_start_s = 120`) while the
+   15m and hourly bots use minutes (`buy_window_min = 4.0 / 13.0`). Don't mix them
    when propagating changes. The 5m loop must define `seconds_left` (not only
    `minutes_left`) or it NameErrors every cycle.
 3. **Settlement is confirmation-gated.** A relayer submission is not P&L.

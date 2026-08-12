@@ -39,7 +39,7 @@ BOTS = {
         "log": "buybot5m.log",
         "research": "underlying_research_buy5m.jsonl",
         "pnl": "pnl_buy5m.json",
-        "window_s": 90.0,
+        "window_s": 120.0,
         "duration_s": 5 * 60,
     },
     "15m": {
@@ -47,7 +47,7 @@ BOTS = {
         "log": "buybot.log",
         "research": "underlying_research_buy.jsonl",
         "pnl": "pnl_buy.json",
-        "window_s": 3.0 * 60,
+        "window_s": 4.0 * 60,
         "duration_s": 15 * 60,
     },
     "hr": {
@@ -55,7 +55,7 @@ BOTS = {
         "log": "buybothourly.log",
         "research": "underlying_research_buyhourly.jsonl",
         "pnl": "pnl_buyhourly.json",
-        "window_s": 4.0 * 60,
+        "window_s": 13.0 * 60,
         "duration_s": 60 * 60,
     },
 }
@@ -644,8 +644,8 @@ def main() -> None:
     ap.add_argument("--start-ts", type=float, default=None)
     ap.add_argument("--end-ts", type=float, default=None)
     ap.add_argument("--csv", type=str, default=None, help="Polymarket history CSV path")
-    ap.add_argument("--threshold", type=float, default=0.98)
-    ap.add_argument("--max-price", type=float, default=0.99)
+    ap.add_argument("--threshold", type=float, default=0.75)
+    ap.add_argument("--max-price", type=float, default=0.90)
     ap.add_argument("--fidelity", type=int, default=1, help="prices-history fidelity minutes")
     ap.add_argument("--sleep", type=float, default=0.05, help="pause between HTTP calls")
     ap.add_argument("--show", type=int, default=15, help="sample rows to print")
