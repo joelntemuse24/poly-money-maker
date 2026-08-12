@@ -200,10 +200,10 @@ A buy fires only when **all** of these gates pass, evaluated in the final window
    `buy_max_price` (98–99¢). Floor is 98¢ so latency can still catch a fill before
    a 99¢ ask disappears; history showed the fewest reversals in this pocket.
 5. **Underlying gate.** If `underlying_gate_enabled`, the live oracle price must be
-   at least `min_underlying_edge_usd` away from the captured PTB ($5 on 5m, $10 on
-   15m/hourly), **and** the book's winning side must match the direction of the
-   underlying move. This blocks buying a "winner" that the resolution oracle itself
-   disagrees with (stale-book trap).
+   at least `min_underlying_edge_usd` away from the captured PTB (probe default
+   **$0** — any non-zero move counts), **and** the book's winning side must match
+   the direction of the underlying move. This blocks buying a "winner" that the
+   resolution oracle itself disagrees with (stale-book trap).
 6. **Risk caps.** `buy_budget` USDC per market ($5), `max_open_positions`,
    `max_open_notional`, `max_daily_notional`, and available USDC balance.
 
@@ -232,7 +232,8 @@ Entry cost is USDC spent (`makingAmount` on CLOB v2 BUY), not `shares × gate as
 - `buy_skip_no_consensus` — ask in band but GUI/book integrity fails (includes
   `up_book_why` / `dn_book_why`: `wide_spread`, `bid_too_low`, …)
 - `buy_skip_incomplete_book` — missing GUI price on a leg (no mid, no last trade)
-- `buy_skip_underlying_edge` — live oracle < $10 from PTB
+- `buy_skip_underlying_edge` — underlying check failed (missing/stale/flat vs PTB;
+  with min edge $0, “too small” is no longer the usual reason)
 - `buy_skip_underlying_side` — book winner disagrees with the underlying move
 - `buy_fill_below_band` — fill landed below the ask band; inventory recorded + `toxic_fill`
 - `buy_ghost_fill` — balance rose after a null/delayed CLOB confirm
@@ -338,7 +339,7 @@ paths. Templates are `strategy_buy.example.json`,
 | `buy_threshold` / `buy_max_price` | 0.98 / 0.99 | Ask band for entry (98–99¢ probe) |
 | `min_winner_bid` / `max_loser_bid` / `min_bid_edge` | 0.92 / 0.10 / 0.05 | GUI consensus gate |
 | `max_entry_spread` | 0.05 | Max ask−bid on winner at entry |
-| `underlying_gate_enabled` / `min_underlying_edge_usd` | true / 5.0 (5m), 10.0 (15m/hr) | Oracle alignment gate |
+| `underlying_gate_enabled` / `min_underlying_edge_usd` | true / 0.0 | Oracle alignment (direction; $0 min move in probe) |
 | `hedge_enabled` / `hedge_threshold` / `hedge_min_price` | true / 0.65 / 0.32 | Hedge arm & floor |
 | `hedge_max_spread` / `hedge_require_ask_max` | 0.15 / 0.70 | Hedge book must actually collapse |
 | `buy_window_min` (15m, hr) / `buy_start_s` (5m) | 3.0 / 90 / 4.0 | Entry window before close |

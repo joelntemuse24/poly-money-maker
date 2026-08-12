@@ -91,7 +91,8 @@ Watch the console for `[DRY BUY]` / `[DRY SELL]` markers. Ctrl-C to stop.
 - `buy_ghost_fill` — balance reconciliation after null/delayed BUY confirm
 - `buy_uncertain` — POST outcome unresolved; durable token/baseline quarantine blocks re-buy
 - `buy_skip_incomplete_book` — missing GUI price on a leg (no mid and no last trade)
-- `buy_skip_underlying_edge` — live oracle not ≥ `min_underlying_edge_usd` ($5 on 5m, $10 on 15m/hourly) from PTB
+- `buy_skip_underlying_edge` — underlying gate failed (missing/stale oracle, or
+  flat BTC vs PTB when `min_underlying_edge_usd` is 0; previously also “move too small”)
 - `buy_skip_underlying_side` — book wants the opposite leg from the underlying move
 
 ## Key Conventions
