@@ -1,0 +1,17 @@
+[Unit]
+Description=Polymarket mint-only bot (complete-set split for manual sells)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ntemusejoel
+WorkingDirectory=/home/ntemusejoel/poly-money-maker
+Environment=PYTHONUNBUFFERED=1
+EnvironmentFile=/home/ntemusejoel/poly-money-maker/.env
+ExecStart=/home/ntemusejoel/poly-money-maker/.venv/bin/python mintbot.py
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

@@ -23,6 +23,10 @@ pnl_buy*.json
 strategy_buy.json
 strategy_buy5m.json
 strategy_buyhourly.json
+strategy_mint.json
+positions_mint.json
+STOP_MINT
+.mintbot.lock
 underlying_research_buy*.jsonl
 underlying_research_buy*.jsonl.*
 ptb_*_buy*.json
