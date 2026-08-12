@@ -3,7 +3,7 @@
 **Agents: read this after `AGENTS.md`.** Update this file when ops/strategy decisions change.
 Do not put secrets, API keys, or live wallet material here.
 
-Last updated: **2026-08-12** — mint only **not-yet-open** markets (opens within 70m).
+Last updated: **2026-08-12** — mint bot: raise relayer gas + stop fail-retry loop.
 
 ---
 
@@ -21,6 +21,27 @@ Last updated: **2026-08-12** — mint only **not-yet-open** markets (opens withi
 Thesis unchanged (trade the decided leg / cut obvious reversals by hand); automation
 was not catching enough markets or hedges reliably.
 
+### Incident (2026-08-12): `STATE_FAILED` spam
+
+Live mints were submitted with the SDK default **`gas_limit=500000`**. Approve +
+pUSD unwrap + CTF split + ERC1155 transfer needs more; traces show the adapter
+call **out-of-gas** near the end → relayer `STATE_FAILED` /
+`relay hub: internal transaction failure`. Because `failed` was not treated as
+done, the bot **retried the same condition every ~10s**.
+
+**Fix:** `relayer_gas_limit: "1500000"`; `failed`/`invalid` are terminal under
+`one_entry_per_market`; daily notional is refunded on fail; log `errorMsg`.
+
+**Ops after deploy:**
+```bash
+sudo systemctl stop polymintbot   # if still looping
+cd ~/poly-money-maker && git pull
+# optional: remove failed intents you want to retry from positions_mint.json
+# ensure strategy_mint.json has "relayer_gas_limit": "1500000" (or rely on code default)
+sudo systemctl restart polymintbot
+journalctl -u polymintbot -f
+```
+
 ---
 
 ## Mint bot settings (intended)
@@ -29,6 +50,7 @@ was not catching enough markets or hedges reliably.
 |---|---|---|
 | `shares` | **6.0** | $6 collateral → 6 Up + 6 Down |
 | `enter_max_ttm_min` | **70** | minutes-until-**start** (not end); skip already-open |
+| `relayer_gas_limit` | **1500000** | required; SDK default 500k OOGs on split |
 | Series | 5m + 15m + hourly | same Gamma series as buy bots |
 | `dry_run` | start **true** | set false only when ready |
 | `entry_enabled` | start **false** | must be true to mint (incl. dry) |
@@ -50,7 +72,7 @@ Live file: `strategy_mint.json` (gitignored). Template: `strategy_mint.example.j
   python mintbot.py
   # or: sudo systemctl enable --now polymintbot   # after unit installed
   ```
-- **Kill switch:** `touch STOP_MINT` in the repo root.
+- **Kill switch:** `touch STOP_MINT` in the repo root (or `systemctl stop polymintbot`).
 - **Secrets:** `.env` (PRIVATE_KEY, FUNDER_ADDRESS, RELAYER_* or POLY_BUILDER_*).
 
 ---
@@ -58,7 +80,8 @@ Live file: `strategy_mint.json` (gitignored). Template: `strategy_mint.example.j
 ## Open / next
 
 - [x] Stop + disable buy bot systemd units.
-- [ ] Deploy mintbot: `strategy_mint.json`, dry-run verify, then live mint.
+- [x] Mint only not-yet-open markets (≤70m to start).
+- [ ] Deploy gas/fail-loop fix; confirm `[MINT OK]` on a fresh upcoming market.
 - [ ] Manual sell workflow on Polymarket UI.
 - [ ] Revisit automation only if mint inventory + manual sells prove the thesis.
 
