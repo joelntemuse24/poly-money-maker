@@ -97,6 +97,8 @@ Watch the console for `[DRY BUY]` / `[DRY SELL]` markers. Ctrl-C to stop.
 - `buy_skip_underlying_edge` — underlying gate failed (missing/stale/flat vs PTB;
   probe uses `min_underlying_edge_usd: 0` — see `CURRENT.md`)
 - `buy_skip_underlying_side` — book wants the opposite leg from the underlying move
+- `buy_skip_max_positions` — active non-redeemable opens at `max_open_positions`
+  (UI `POS` can be high from redeemable backlog; that must not freeze entries)
 
 ## Key Conventions
 
