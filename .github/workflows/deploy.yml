@@ -7,6 +7,8 @@ on:
       - 'buybot.py'
       - 'buybot5m.py'
       - 'buybothourly.py'
+      - 'pathlog.py'
+      - 'check_path_backtest.py'
       - 'buy/**'
       - 'requirements.txt'
 
@@ -30,6 +32,6 @@ jobs:
             # operators start/restart services deliberately after validation.
             echo "Pulled $(git rev-parse --short HEAD) at $(date)"
             echo "Services NOT restarted. Active:"
-            systemctl is-active polybuybot polybuybot5m polybuybothourly || true
+            systemctl is-active polybuybot polybuybot5m polybuybothourly polymintbot polypathlog || true
             echo "Enabled:"
-            systemctl is-enabled polybuybot polybuybot5m polybuybothourly || true
+            systemctl is-enabled polybuybot polybuybot5m polybuybothourly polymintbot polypathlog || true
