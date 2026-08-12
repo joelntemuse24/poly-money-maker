@@ -343,7 +343,7 @@ paths. Templates are `strategy_buy.example.json`,
 | `hedge_max_spread` / `hedge_require_ask_max` | 0.15 / 0.70 | Hedge book must actually collapse |
 | `buy_window_min` (15m, hr) / `buy_start_s` (5m) | 3.0 / 90 / 4.0 | Entry window before close |
 | `buy_budget` | 5 / 5 / 5 | USDC per market |
-| `max_open_positions` / `max_open_notional` / `max_daily_notional` | 100 / 10k / ~∞ | Risk caps |
+| `max_open_positions` / `max_open_notional` / `max_daily_notional` | 0 (=unlimited) / 10k / ~∞ | Risk caps |
 | `redeem_throttle_s` / `max_redeem_age_days` | 30 / 7 | Redeem pacing |
 | `entry_enabled` | false | Explicit hot-reloadable arm for new entries |
 | `dry_run` | true | Startup-only; log `[DRY BUY]`/`[DRY SELL]`, no real orders |
