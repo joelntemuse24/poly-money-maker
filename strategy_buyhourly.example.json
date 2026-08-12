@@ -6,7 +6,7 @@
   "max_loser_bid": 0.1,
   "min_bid_edge": 0.05,
   "underlying_gate_enabled": true,
-  "min_underlying_edge_usd": 10.0,
+  "min_underlying_edge_usd": 0.0,
   "toxic_force_exit_below": 0.9,
   "hedge_enabled": true,
   "hedge_threshold": 0.65,

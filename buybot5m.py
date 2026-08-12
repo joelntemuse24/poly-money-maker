@@ -144,7 +144,9 @@ _STRATEGY_DEFAULTS = {
     # Skip buys unless live BTC is ≥ this many USD from the window Price To Beat,
     # and only allow the side matching that underlying move.
     "underlying_gate_enabled": True,
-    "min_underlying_edge_usd": 5.0,
+    # Probe: no minimum dollar move vs PTB (0). Gate still requires a
+    # non-zero BTC direction and buys only that side.
+    "min_underlying_edge_usd": 0.0,
     # Force-dump only when FAK avg is worse than this. Fills in
     # [toxic_force_exit_below, buy_threshold) stay on the normal hedge path.
     "toxic_force_exit_below": 0.90,
