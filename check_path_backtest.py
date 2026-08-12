@@ -5,7 +5,7 @@ Reads pathlog/ticks/*.jsonl written by pathlog.py. Does not place orders.
 
 Examples (on the VM):
   python check_path_backtest.py --ask-min 0.80 --ask-max 0.85 --ttm-max 120
-  python check_path_backtest.py --grid --budget 3
+  python check_path_backtest.py --grid --budget 2.5
   python check_path_backtest.py --export-market btc-updown-5m-1786528500 --csv /tmp/m.csv
   python check_path_backtest.py --ask-min 0.98 --ask-max 0.99 --ttm-max 90 --csv /tmp/hits.csv
 """
@@ -303,7 +303,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     ap.add_argument("--ask-max", type=float, default=0.99)
     ap.add_argument("--ttm-min", type=float, default=0.0, help="seconds left, inclusive")
     ap.add_argument("--ttm-max", type=float, default=120.0, help="seconds left, inclusive")
-    ap.add_argument("--budget", type=float, default=3.0)
+    ap.add_argument("--budget", type=float, default=2.5)
     ap.add_argument("--max-spread", type=float, default=None)
     ap.add_argument("--series", default="", help="substring filter, e.g. 5m")
     ap.add_argument("--csv", type=Path, default=None, help="write per-market hit rows")

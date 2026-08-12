@@ -36,7 +36,7 @@ $1.00; the other redeems at $0.
 
 **The strategy:** buy the winning leg once its ask is in the **98–99¢** band
 inside each bot's buy window — with a Fill-And-Kill (FAK)
-market order, then redeem winners at $1.00. Size is **$3** USDC per market.
+market order, then redeem winners at $1.00. Size is **$2.50** USDC per market.
 
 **The risk:** BTC can reverse after entry. If the leg we bought truly collapses
 (bid **and** ask both drop — not a lone 1¢ bid under a still-high ask), the bot
@@ -65,7 +65,7 @@ trades a different market cadence and uses a different resolution oracle.
 | Resolution oracle | Chainlink BTC TWAP 60s | Chainlink BTC TWAP 30s | Binance BTCUSDT |
 | Buy window | final 3.0 min (`buy_window_min`) | final 90 s (`buy_start_s`) | final 4.0 min (`buy_window_min`) |
 | Ask band | 98–99¢ | 98–99¢ | 98–99¢ |
-| Budget / market | $3.00 USDC | $3.00 USDC | $3.00 USDC |
+| Budget / market | $2.50 USDC | $2.50 USDC | $2.50 USDC |
 | Hedge trigger | bid ≤ 65¢ **and** ask ≤ 70¢, spread ≤ 15¢ | same | same |
 | Tick size | 0.01 | 0.001 | 0.01 |
 | Strategy file | `strategy_buy.json` | `strategy_buy5m.json` | `strategy_buyhourly.json` |
@@ -205,7 +205,7 @@ A buy fires only when **all** of these gates pass, evaluated in the buy window
    **and** the book's winning side must match the direction of the
    underlying move. This blocks buying a "winner" that the resolution oracle itself
    disagrees with (stale-book trap).
-6. **Risk caps.** `buy_budget` USDC per market ($3.00), `max_open_positions`,
+6. **Risk caps.** `buy_budget` USDC per market ($2.50), `max_open_positions`,
    `max_open_notional`, `max_daily_notional`, and available USDC balance.
 
 Execution: a FAK market buy for `buy_budget` dollars of the winning token. Size and
@@ -344,7 +344,7 @@ paths. Templates are `strategy_buy.example.json`,
 | `hedge_enabled` / `hedge_threshold` / `hedge_min_price` | true / 0.65 / 0.32 | Hedge arm & floor |
 | `hedge_max_spread` / `hedge_require_ask_max` | 0.15 / 0.70 | Hedge book must actually collapse |
 | `buy_window_min` (15m, hr) / `buy_start_s` (5m) | 3.0 / 90 / 4.0 | Entry window before close |
-| `buy_budget` | 3.0 / 3.0 / 3.0 | USDC per market |
+| `buy_budget` | 2.5 / 2.5 / 2.5 | USDC per market |
 | `max_open_positions` / `max_open_notional` / `max_daily_notional` | 0 (=unlimited) / 10k / ~∞ | Risk caps |
 | `redeem_throttle_s` / `max_redeem_age_days` | 30 / 7 | Redeem pacing |
 | `entry_enabled` | false | Explicit hot-reloadable arm for new entries |
@@ -382,7 +382,7 @@ Strategy JSON changes need no deploy and no restart (hot reload).
   is wedged.
 - `positions_buy*.json` / `pnl_buy*.json` — open entries and settled P&L.
 - `underlying_research_buy*.jsonl` / `ptb_*_buy*.json` — oracle/PTB decision audit.
-- `python check_path_backtest.py --grid --budget 3` — hypothetical entries from
+- `python check_path_backtest.py --grid --budget 2.5` — hypothetical entries from
   `pathlog/ticks/` (ask × seconds-left).
 - `python check_book.py` — ad-hoc diagnostic: prints book/price data for the current
   hourly market (useful sanity check for book shape).

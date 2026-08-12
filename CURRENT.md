@@ -3,7 +3,7 @@
 **Agents: read this after `AGENTS.md`.** Update this file when ops/strategy decisions change.
 Do not put secrets, API keys, or live wallet material here.
 
-Last updated: **2026-08-12** — revert to **$3 / 98–99¢** CLOB buys; mint paused;
+Last updated: **2026-08-12** — revert to **$2.50 / 98–99¢** CLOB buys; mint paused;
 pathlog records books for entry backtests.
 
 ---
@@ -17,7 +17,7 @@ mint complete sets. Operator still sells leftover mint inventory by hand.
 
 | Knob | Value |
 |---|---|
-| `buy_budget` | **$3.00** / market |
+| `buy_budget` | **$2.50** / market |
 | Ask band | **98–99¢** (`buy_threshold` 0.98, `buy_max_price` 0.99) |
 | GUI consensus | winner ≥ 92¢, loser ≤ 10¢ |
 | Windows | 5m **90 s** · 15m **3.0 min** · hourly **4.0 min** |
@@ -51,14 +51,14 @@ sudo systemctl enable --now polypathlog
 journalctl -u polypathlog -f
 
 # after some markets have resolved:
-python check_path_backtest.py --ask-min 0.80 --ask-max 0.85 --ttm-max 120 --budget 3
-python check_path_backtest.py --grid --budget 3
+python check_path_backtest.py --ask-min 0.80 --ask-max 0.85 --ttm-max 120 --budget 2.5
+python check_path_backtest.py --grid --budget 2.5
 python check_path_backtest.py --export-market btc-updown-5m-1786528500 --csv /tmp/m.csv
 python check_path_backtest.py --ask-min 0.98 --ask-max 0.99 --ttm-max 90 --csv /tmp/hits.csv
 ```
 
 `--grid` is the Excel-shaped table: ask × seconds-left, hit count, win rate,
-hypothetical $3 PnL (win = redeem $1, loss = −$3, no hedge model).
+hypothetical $2.50 PnL (win = redeem $1, loss = −$2.50, no hedge model).
 
 Kill switch: `touch STOP_PATHLOG`.
 
@@ -68,7 +68,7 @@ Kill switch: `touch STOP_PATHLOG`.
 
 - **VM:** `~/poly-money-maker` on `instance-20260516-185922`.
 - **Mint:** `sudo systemctl stop polymintbot && sudo systemctl disable polymintbot`
-- **Buy bots — live JSON must be edited.** Code defaults are 98–99 / $3, but
+- **Buy bots — live JSON must be edited.** Code defaults are 98–99 / $2.50, but
   `strategy_buy*.json` on disk overlays them. Copy examples or patch knobs:
   ```bash
   cd ~/poly-money-maker && git pull
@@ -85,7 +85,7 @@ Kill switch: `touch STOP_PATHLOG`.
           "min_winner_bid": 0.92, "max_loser_bid": 0.10,
           "min_underlying_edge_usd": 0.0, "toxic_force_exit_below": 0.90,
           "hedge_threshold": 0.65, "hedge_require_ask_max": 0.70,
-          "buy_budget": 3.0,
+          "buy_budget": 2.5,
       })
       if "buy_start_s" in d:
           d["buy_start_s"] = 90
@@ -103,7 +103,7 @@ Kill switch: `touch STOP_PATHLOG`.
 
 ## Open / next
 
-- [x] Pause minting; restore $3 / 98–99¢ CLOB probe knobs.
+- [x] Pause minting; restore $2.50 / 98–99¢ CLOB probe knobs.
 - [x] Path recorder + `check_path_backtest.py` (first-touch ask × time-left).
 - [ ] On VM: stop mint, overlay live strategy JSON, restart buy bots + pathlog.
 - [ ] Let pathlog collect resolved markets, then run `--grid` before changing bands again.

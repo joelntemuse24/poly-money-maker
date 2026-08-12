@@ -66,8 +66,8 @@ class WinnerAndPnlTests(unittest.TestCase):
         self.assertEqual(infer_winner(ticks), "up")
 
     def test_pnl_win_and_loss(self):
-        self.assertAlmostEqual(hypothetical_pnl(0.80, True, 3.0), 3.0 / 0.80 - 3.0)
-        self.assertEqual(hypothetical_pnl(0.80, False, 3.0), -3.0)
+        self.assertAlmostEqual(hypothetical_pnl(0.80, True, 2.5), 2.5 / 0.80 - 2.5)
+        self.assertEqual(hypothetical_pnl(0.80, False, 2.5), -2.5)
 
 
 class FileAndRuleTests(unittest.TestCase):
@@ -96,7 +96,7 @@ class FileAndRuleTests(unittest.TestCase):
                 ask_max=0.85,
                 ttm_min=0,
                 ttm_max=120,
-                budget=3.0,
+                budget=2.5,
             )
             stats = summarize(results)
             self.assertEqual(stats["hits"], 1)

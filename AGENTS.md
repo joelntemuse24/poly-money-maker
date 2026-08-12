@@ -8,16 +8,16 @@ Full architecture: `TECHNICAL_DESIGN.md`.
 
 **Live on the VM:** three standalone buy bots plus a no-order path recorder.
 They buy the winning leg of Polymarket BTC "Up or Down" markets at **98–99¢**
-in the final window ($3 / market), hedge at **65¢** on reversal, and redeem
+in the final window ($2.50 / market), hedge at **65¢** on reversal, and redeem
 winners at $1.00. See `CURRENT.md` for the active probe budget and knobs.
 
 Mint-only helper (`mintbot.py`) is **paused** — do not run it live.
 
 | File | Service | Markets | Oracle | Budget | Window |
 |---|---|---|---|---|---|
-| `buybot.py` | `polybuybot` | 15m | Chainlink TWAP 60s | $3 | final 3.0 min |
-| `buybot5m.py` | `polybuybot5m` | 5m | Chainlink TWAP 30s | $3 | final 90 s |
-| `buybothourly.py` | `polybuybothourly` | hourly | Binance BTCUSDT | $3 | final 4.0 min |
+| `buybot.py` | `polybuybot` | 15m | Chainlink TWAP 60s | $2.50 | final 3.0 min |
+| `buybot5m.py` | `polybuybot5m` | 5m | Chainlink TWAP 30s | $2.50 | final 90 s |
+| `buybothourly.py` | `polybuybothourly` | hourly | Binance BTCUSDT | $2.50 | final 4.0 min |
 | `pathlog.py` | `polypathlog` | all three | — (CLOB books only) | — | late-window ticks |
 
 Plus: `check_book.py`, `check_participation.py`, `check_path_backtest.py`.
@@ -86,7 +86,7 @@ python buybot5m.py        # 5m, uses strategy_buy5m.json
 python buybothourly.py    # hr, uses strategy_buyhourly.json
 
 python pathlog.py         # recorder only — no orders
-python check_path_backtest.py --grid --budget 3
+python check_path_backtest.py --grid --budget 2.5
 python check_book.py
 ```
 
