@@ -2,8 +2,9 @@
 """Mint-only bot: split pUSD into Up+Down complete sets for manual selling.
 
 No CLOB buys. No hedges/sells. Discovers BTC Up/Down markets (5m/15m/hourly),
-mints `shares` (default 6) when 0 < TTM ≤ enter_max_ttm_min (default 70) and
-collateral is available.
+mints `shares` (default 6) only for markets that are **not yet open**
+(start_ts in the future) and open within enter_max_ttm_min (default 70)
+minutes, if collateral is available.
 
 Usage:
   # dry-run (default when strategy_mint.json has dry_run true / entry_enabled false)
@@ -217,19 +218,26 @@ def add_daily(state: dict, now: float, amount: float) -> None:
 
 
 def eligible_markets(markets: List[MintMarket], cfg: dict, now: float) -> List[MintMarket]:
+    """Only markets that have not opened yet, starting within the configured window.
+
+    enter_min/max_ttm_min are minutes-until-start (legacy key names), not time-to-end.
+    """
     lo = float(cfg["enter_min_ttm_min"])
     hi = float(cfg["enter_max_ttm_min"])
     out: List[MintMarket] = []
     for market in markets:
-        ttm = market.ttm_minutes(now)
-        if not (lo < ttm <= hi):
+        # Crucially: never mint a market that is already open.
+        if market.start_ts <= now or market.minutes_to_start(now) <= 0:
+            continue
+        mts = market.minutes_to_start(now)
+        if not (lo < mts <= hi):
             continue
         if not market.active or market.closed or market.neg_risk:
             continue
         if cfg.get("require_accepting_orders") and not market.accepting_orders:
             continue
         out.append(market)
-    return sorted(out, key=lambda m: m.end_ts)
+    return sorted(out, key=lambda m: m.start_ts)
 
 
 def open_intent_count(state: dict) -> int:
@@ -542,19 +550,19 @@ def run_cycle(
         return "idle_owned"
 
     shares = float(cfg["shares"])
-    ttm = pick.ttm_minutes(now)
+    mts = pick.minutes_to_start(now)
 
     if cfg.get("dry_run"):
         console.print(
             f"  [bold black on yellow][DRY MINT][/] {pick.slug}  "
-            f"shares={shares:.2f}  ttm={ttm:.1f}m  cost=${shares:.2f}"
+            f"shares={shares:.2f}  opens_in={mts:.1f}m  cost=${shares:.2f}"
         )
         log_event(
             "dry_mint",
             condition_id=pick.condition_id,
             slug=pick.slug,
             shares=shares,
-            ttm_min=round(ttm, 2),
+            opens_in_min=round(mts, 2),
             question=pick.question,
         )
         # Record dry intent so we don't spam the same market every poll.
@@ -643,7 +651,7 @@ def run_cycle(
         Panel(
             f"  [bright_white]{pick.question}[/]\n"
             f"  shares [bold]{shares:.2f}[/] Up+Down  ·  cost [bold]${shares:.2f}[/]  ·  "
-            f"TTM [bold]{ttm:.1f}m[/]",
+            f"opens in [bold]{mts:.1f}m[/]",
             title="[bold bright_cyan]◆ MINT COMPLETE SET[/]",
             border_style="bright_cyan",
             box=box.HEAVY,
@@ -654,7 +662,8 @@ def run_cycle(
         condition_id=pick.condition_id,
         slug=pick.slug,
         shares=shares,
-        ttm_min=round(ttm, 2),
+        opens_in_min=round(mts, 2),
+        start_ts=pick.start_ts,
         balance=balance,
     )
 
@@ -707,7 +716,8 @@ def main() -> int:
         Panel(
             Align.center(
                 "[bold bright_cyan]MINT DESK[/]\n"
-                f"[dim]shares={cfg['shares']} · TTM ≤ {cfg['enter_max_ttm_min']}m · "
+                f"[dim]shares={cfg['shares']} · not-yet-open · opens within "
+                f"{cfg['enter_max_ttm_min']}m · "
                 f"dry_run={cfg['dry_run']} · entry_enabled={cfg['entry_enabled']}[/]\n"
                 "[dim]no CLOB buys · no auto-sells · you sell manually[/]",
                 vertical="middle",
