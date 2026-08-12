@@ -172,7 +172,7 @@ _STRATEGY_DEFAULTS = {
     "buy_grace_s": 2,
     "buy_cooldown_s": 3,
     "buy_budget": 5.0,
-    "max_open_positions": 100,
+    "max_open_positions": 0,  # 0 = unlimited
     "max_open_notional": 10000.0,
     "max_daily_notional": 999999.0,
     "one_entry_per_market": True,
@@ -281,13 +281,16 @@ def load_strategy():
         if not cfg["dry_run"] and not cfg["hedge_enabled"]:
             raise ValueError("live mode requires hedge_enabled=true")
         for key in (
-            "buy_budget", "max_open_positions", "max_open_notional",
+            "buy_budget", "max_open_notional",
             "max_daily_notional", "poll_buy_window_s", "poll_held_s",
             "positions_refresh_s", "balance_refresh_s", "buy_window_min",
             "ui_every_n_cycles",
         ):
             if float(cfg[key]) <= 0:
                 raise ValueError(f"{key} must be positive")
+        # 0 = unlimited open markets (probe: redeem lag must not freeze entries).
+        if float(cfg["max_open_positions"]) < 0:
+            raise ValueError("max_open_positions must be >= 0 (0 = unlimited)")
         for key in (
             "min_underlying_edge_usd", "hedge_undercut_ticks",
             "hedge_quote_max_age_s", "hedge_retry_sleep_s",
@@ -4001,7 +4004,7 @@ while not _shutdown_requested:
                 and pm.get("entered_at", 0) >= _today_start_ms()
             )
             est_cost = BUY_BUDGET
-            if open_count >= MAX_OPEN_POSITIONS:
+            if MAX_OPEN_POSITIONS > 0 and open_count >= MAX_OPEN_POSITIONS:
                 log_event(
                     "buy_skip_max_positions",
                     condition_id=cond,

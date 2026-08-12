@@ -70,9 +70,9 @@ manual restart — CI “Deploy to GCP” frequently SSH-times-out).
 ## Incidents
 
 - **2026-08-12 ~4h no 5m buys:** UI showed `POS 100` with `max_open_positions=100`.
-  Cap counted **all** Data-API sizes including redeemable backlog → silent skip of every
-  entry. Fix: exclude redeemable from open-count + log `buy_skip_max_positions`.
-  Immediate unblock: raise live `max_open_positions` and/or clear redeem backlog.
+  Cap counted Data-API sizes (incl. redeemable) → silent skip of every entry.
+  **Decision: disable the cap** (`max_open_positions: 0` = unlimited). Code also
+  ignores redeemable when a positive cap is set, and logs `buy_skip_max_positions`.
 
 ## Open / next
 
