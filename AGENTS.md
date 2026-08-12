@@ -97,6 +97,9 @@ Ctrl-C to stop.
 
 - `[DRY MINT]` — mintbot would split a complete set (slug, shares, opens_in)
 - `mint_submitted` / `mint_confirmed` — live relayer path
+- `mint_failed` — relayer `STATE_FAILED`/`STATE_INVALID` (terminal; includes `errorMsg`)
+  - Common cause previously: default 500k gas OOG on adapter split — fixed via
+    `relayer_gas_limit` (1.5M). Do not leave a live bot retrying the same fail.
 - `mint_skip_balance` — not enough pUSD
 - `[DRY BUY]` / `[DRY SELL]` in buy-bot dry-run — confirms trigger logic fires
 - `cycle_error` in logs — unhandled exception (bot survives but logs it)

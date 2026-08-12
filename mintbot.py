@@ -68,6 +68,9 @@ DEFAULTS = {
     "poll_s": 10.0,
     "position_tolerance": 0.01,
     "require_accepting_orders": True,
+    # Relayer PROXY default is 500k — approve + pUSD unwrap + CTF split +
+    # ERC1155 batch transfer needs more (failed txs OOG'd at ~413k on split).
+    "relayer_gas_limit": "1500000",
     "rpc_url": "https://polygon.drpc.org",
     "gamma_url": "https://gamma-api.polymarket.com",
     "data_api_url": "https://data-api.polymarket.com",
@@ -88,6 +91,9 @@ ACTIVE_STATUSES = frozenset(
         "confirmed",
     }
 )
+
+# Terminal for one_entry_per_market — do not resubmit forever.
+DONE_STATUSES = frozenset({"completed", "failed", "invalid"})
 
 _shutdown = False
 
@@ -201,6 +207,9 @@ def validate_strategy(cfg: dict) -> None:
         raise ValueError("max_daily_notional must cover one mint")
     if float(cfg["poll_s"]) < 2:
         raise ValueError("poll_s must be >= 2")
+    gas_limit = str(cfg.get("relayer_gas_limit") or "").strip()
+    if not gas_limit.isdigit() or int(gas_limit) < 500_000:
+        raise ValueError("relayer_gas_limit must be an integer >= 500000")
 
 
 def today_key(now: float) -> str:
@@ -215,6 +224,15 @@ def add_daily(state: dict, now: float, amount: float) -> None:
     key = today_key(now)
     daily = state.setdefault("daily", {})
     daily[key] = float(daily.get(key, 0) or 0) + amount
+
+
+def refund_daily(state: dict, now: float, amount: float) -> None:
+    """Undo a notional reservation after a failed relayer mint."""
+    if amount <= 0:
+        return
+    key = today_key(now)
+    daily = state.setdefault("daily", {})
+    daily[key] = max(0.0, float(daily.get(key, 0) or 0) - amount)
 
 
 def eligible_markets(markets: List[MintMarket], cfg: dict, now: float) -> List[MintMarket]:
@@ -254,7 +272,7 @@ def already_minted(state: dict, condition_id: str, cfg: dict) -> bool:
     intent = state.get("intents", {}).get(condition_id)
     if not intent:
         return False
-    return intent.get("status") in ACTIVE_STATUSES | {"completed"}
+    return intent.get("status") in ACTIVE_STATUSES | DONE_STATUSES
 
 
 def get_relayer_headers(body: dict) -> Optional[dict]:
@@ -293,7 +311,12 @@ def get_relayer_headers(body: dict) -> Optional[dict]:
     return headers
 
 
-def submit_mint_batch(calls: List[ContractCall], metadata: str) -> Tuple[Optional[str], Optional[str]]:
+def submit_mint_batch(
+    calls: List[ContractCall],
+    metadata: str,
+    *,
+    gas_limit: str = "1500000",
+) -> Tuple[Optional[str], Optional[str]]:
     """Submit approve+split as one PROXY batch via Polymarket relayer."""
     private_key = os.getenv("PRIVATE_KEY") or ""
     funder = os.getenv("FUNDER_ADDRESS") or ""
@@ -352,6 +375,7 @@ def submit_mint_batch(calls: List[ContractCall], metadata: str) -> Tuple[Optiona
                 from_address=eoa,
                 nonce=str(nonce),
                 gas_price="0",
+                gas_limit=str(gas_limit),
                 data=encoded_data,
                 relay=str(relay),
             ),
@@ -420,8 +444,43 @@ def reconcile_intents(
                 intent["relayer_state"] = relayer_state
                 intent["updated_at"] = now
                 if relayer_state in ("STATE_FAILED", "STATE_INVALID"):
-                    intent["status"] = "failed"
-                    log_event("mint_failed", condition_id=cid, state=relayer_state, slug=intent.get("slug"))
+                    err = str(
+                        record.get("errorMsg")
+                        or record.get("error")
+                        or record.get("message")
+                        or ""
+                    )[:240]
+                    tx_hash = str(record.get("transactionHash") or "")[:66]
+                    was_pending = intent.get("status") in (
+                        "pending",
+                        "executed",
+                        "mined",
+                        "submitting",
+                    )
+                    intent["status"] = "failed" if relayer_state == "STATE_FAILED" else "invalid"
+                    intent["error"] = err or relayer_state
+                    intent["transaction_hash"] = tx_hash or intent.get("transaction_hash")
+                    if was_pending and not intent.get("daily_refunded"):
+                        refund_daily(state, now, float(intent.get("shares") or 0))
+                        intent["daily_refunded"] = True
+                    log_event(
+                        "mint_failed",
+                        condition_id=cid,
+                        state=relayer_state,
+                        slug=intent.get("slug"),
+                        error=err or None,
+                        transaction_hash=tx_hash or None,
+                        transaction_id=str(tx_id)[:36],
+                    )
+                    console.print(
+                        f"  [bold red][MINT FAIL][/] {intent.get('slug')}  "
+                        f"{relayer_state}  {err or 'no errorMsg'}"
+                    )
+                    notify(
+                        "Mint failed",
+                        f"{intent.get('slug')}\n{relayer_state}\n{err or 'see logs'}",
+                        priority="high",
+                    )
                 elif relayer_state == "STATE_CONFIRMED":
                     intent["status"] = "confirmed_waiting_inventory"
                 elif relayer_state == "STATE_MINED":
@@ -667,7 +726,11 @@ def run_cycle(
         balance=balance,
     )
 
-    tx_id, err = submit_mint_batch(calls, metadata=f"mintbot:split:{pick.condition_id}:{int(now)}")
+    tx_id, err = submit_mint_batch(
+        calls,
+        metadata=f"mintbot:split:{pick.condition_id}:{int(now)}",
+        gas_limit=str(cfg["relayer_gas_limit"]),
+    )
     intent = state["intents"][pick.condition_id]
     intent["updated_at"] = time.time()
     if not tx_id:
