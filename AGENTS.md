@@ -8,7 +8,8 @@ Full architecture: `TECHNICAL_DESIGN.md`.
 
 **Current ops posture (see `CURRENT.md`):** CLOB buy/hedge bots are **stopped**.
 Active helper is **`mintbot.py`** — mints complete sets (default 6 Up+Down / $6)
-on BTC Up/Down markets with TTM ≤ 70m; operator **sells manually**.
+on BTC Up/Down markets that are **not yet open** and start within 70m; operator
+**sells manually**.
 
 | File | Service | Role |
 |---|---|---|
@@ -94,7 +95,7 @@ Ctrl-C to stop.
 
 ### What to look for
 
-- `[DRY MINT]` — mintbot would split a complete set (slug, shares, TTM)
+- `[DRY MINT]` — mintbot would split a complete set (slug, shares, opens_in)
 - `mint_submitted` / `mint_confirmed` — live relayer path
 - `mint_skip_balance` — not enough pUSD
 - `[DRY BUY]` / `[DRY SELL]` in buy-bot dry-run — confirms trigger logic fires

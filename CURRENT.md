@@ -3,7 +3,7 @@
 **Agents: read this after `AGENTS.md`.** Update this file when ops/strategy decisions change.
 Do not put secrets, API keys, or live wallet material here.
 
-Last updated: **2026-08-12** — buy bots stopped; mint-only helper for manual sells.
+Last updated: **2026-08-12** — mint only **not-yet-open** markets (opens within 70m).
 
 ---
 
@@ -14,8 +14,9 @@ Last updated: **2026-08-12** — buy bots stopped; mint-only helper for manual s
 `polybuybothourly`). Operator will **sell manually**.
 
 **Active helper:** `mintbot.py` (`polymintbot`) — mint complete sets (default
-**6 Up + 6 Down** = **$6** pUSD) on BTC Up/Down 5m/15m/hourly markets with
-**0 < TTM ≤ 70 min**, if collateral allows. **No CLOB buys. No auto-hedges.**
+**6 Up + 6 Down** = **$6** pUSD) on BTC Up/Down 5m/15m/hourly markets that are
+**not yet open** and **open within ≤ 70 min**, if collateral allows.
+**No CLOB buys. No auto-hedges. Never mint an already-open market.**
 
 Thesis unchanged (trade the decided leg / cut obvious reversals by hand); automation
 was not catching enough markets or hedges reliably.
@@ -27,7 +28,7 @@ was not catching enough markets or hedges reliably.
 | Knob | Value | Notes |
 |---|---|---|
 | `shares` | **6.0** | $6 collateral → 6 Up + 6 Down |
-| `enter_max_ttm_min` | **70** | only markets ending within 70 minutes |
+| `enter_max_ttm_min` | **70** | minutes-until-**start** (not end); skip already-open |
 | Series | 5m + 15m + hourly | same Gamma series as buy bots |
 | `dry_run` | start **true** | set false only when ready |
 | `entry_enabled` | start **false** | must be true to mint (incl. dry) |
