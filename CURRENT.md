@@ -78,7 +78,9 @@ underlying side-match / quarantine unchanged.
 - **Deploy:** prefer manual `git pull` + `systemctl restart polybuybot polybuybot5m polybuybothourly` when CI deploy fails.
 - **Redeem:** Relayer API key path (`RELAYER_API_KEY` + address); PRECHECK_SKIPPED/zero
   positions are blacklisted so they don’t 429-spam.
-- **Diagnostics:** `check_book.py`, `check_edge_counterfactual.py` (read-only).
+- **Diagnostics:** `check_book.py`, `check_edge_counterfactual.py`,
+  `check_participation.py` (read-only participation autopsy — CSV + logs +
+  CLOB price history; no bot changes).
 - **Secrets:** were pasted in chat historically — rotate if not already done. Never commit `.env`.
 
 ---
@@ -93,8 +95,10 @@ underlying side-match / quarantine unchanged.
 ## Open / next
 
 - [x] Max-open freeze fixed + deployed (`d659693`); live `max_open_positions=0`.
-- [ ] Apply widened 75–90¢ / $2.50 / new windows / 35¢ hedge to **live** strategy JSON on the VM.
+- [x] Apply widened 75–90¢ / $2.50 / new windows / 35¢ hedge to **live** strategy JSON on the VM.
 - [ ] Watch fill count vs hedge rate under the wider band (expect more of both).
+- [ ] Use `check_participation.py` on the VM to explain bought vs missed
+  (trust CSV + bot logs; label misses via prices-history in the buy window).
 - [ ] Merge PR #66 so *repo defaults* also use `min_underlying_edge_usd: 0` (live JSON already 0).
 - [ ] Revisit size once participation and hedge rate look acceptable.
 - [ ] Optional later: retry empty FAKs in-window; redeem backlog.

@@ -42,6 +42,7 @@ change to one usually needs propagation to its siblings.
 |---|---|
 | `check_book.py` | Diagnostic — inspect a live order book |
 | `check_edge_counterfactual.py` | Diagnostic — resolution win rate if edge skips had filled |
+| `check_participation.py` | Diagnostic — post-facto bought vs missed + band exposure |
 | `CURRENT.md` | Living ops/probe status — update when decisions change |
 | `strategy_buy*.example.json` | Config templates — not loaded by bots |
 
