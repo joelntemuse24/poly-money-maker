@@ -3,7 +3,7 @@
 **Agents: read this after `AGENTS.md`.** Update this file when ops/strategy decisions change.
 Do not put secrets, API keys, or live wallet material here.
 
-Last updated: **2026-08-12** (~01:30 UTC agent session).
+Last updated: **2026-08-12** (~01:42 UTC) — VM on `d659693`, bots restarted.
 
 ---
 
