@@ -3965,11 +3965,18 @@ while not _shutdown_requested:
             if now_ms - meta["entered_at"] < BUY_GRACE_S * 1000:
                 continue
 
-            # Notional caps (in dollars, not shares)
-            open_conditions = {
-                c for c, p in held.items()
-                if max(p.get("up", {}).get("size", 0), p.get("dn", {}).get("size", 0)) > 0.01
-            }
+            # Risk caps (in dollars / active markets). Redeemable Data-API
+            # leftovers are settlement backlog — they must NOT consume the
+            # max_open_positions budget or a redeem lag freezes all entries
+            # (silent continue). Only non-redeemable size counts as open risk.
+            open_conditions = set()
+            for c, p in held.items():
+                up_sz = float(p.get("up", {}).get("size", 0) or 0)
+                dn_sz = float(p.get("dn", {}).get("size", 0) or 0)
+                up_live = up_sz > 0.01 and not p.get("up", {}).get("redeemable")
+                dn_live = dn_sz > 0.01 and not p.get("dn", {}).get("redeemable")
+                if up_live or dn_live:
+                    open_conditions.add(c)
             open_conditions |= {
                 c for c, pm in positions_meta.items() if pm.get("buy_uncertain")
             }
@@ -3995,10 +4002,37 @@ while not _shutdown_requested:
             )
             est_cost = BUY_BUDGET
             if open_count >= MAX_OPEN_POSITIONS:
+                log_event(
+                    "buy_skip_max_positions",
+                    condition_id=cond,
+                    open_count=open_count,
+                    max_open_positions=MAX_OPEN_POSITIONS,
+                    held_reported=sum(
+                        1 for p in held.values()
+                        if max(
+                            float(p.get("up", {}).get("size", 0) or 0),
+                            float(p.get("dn", {}).get("size", 0) or 0),
+                        ) > 0.01
+                    ),
+                )
                 continue
             if open_notional + est_cost > MAX_OPEN_NOTIONAL + 1e-9:
+                log_event(
+                    "buy_skip_max_notional",
+                    condition_id=cond,
+                    open_notional=round(open_notional, 4),
+                    max_open_notional=MAX_OPEN_NOTIONAL,
+                    budget=est_cost,
+                )
                 continue
             if daily_notional + est_cost > MAX_DAILY_NOTIONAL + 1e-9:
+                log_event(
+                    "buy_skip_max_daily_notional",
+                    condition_id=cond,
+                    daily_notional=round(daily_notional, 4),
+                    max_daily_notional=MAX_DAILY_NOTIONAL,
+                    budget=est_cost,
+                )
                 continue
             if float(pusd_bal or 0) + 1e-9 < est_cost:
                 log_event(
