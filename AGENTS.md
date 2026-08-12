@@ -15,7 +15,7 @@ active probe budget, edge/toxic knobs, and near-term goals.
 |---|---|---|---|---|---|
 | `buybot.py` | `polybuybot` | 15m | Chainlink TWAP 60s | $2.50 | final 4.0 min |
 | `buybot5m.py` | `polybuybot5m` | 5m | Chainlink TWAP 30s | $2.50 | final 120 s |
-| `buybothourly.py` | `polybuybothourly` | hourly | Binance BTCUSDT | $2.50 | final 47.0 min |
+| `buybothourly.py` | `polybuybothourly` | hourly | Binance BTCUSDT | $2.50 | final 13.0 min |
 
 Plus: `check_book.py` diagnostic.
 
@@ -128,7 +128,7 @@ Watch the console for `[DRY BUY]` / `[DRY SELL]` markers. Ctrl-C to stop.
 1. **The three bots are near-identical copies, not shared modules.** A bug fix in
    `buybot.py` probably also applies to `buybot5m.py` and `buybothourly.py`.
 2. **The 5m bot uses seconds-based window checks** (`buy_start_s = 120`) while the
- 15m and hourly bots use minutes (`buy_window_min = 4.0 / 47.0`). Don't mix them
+ 15m and hourly bots use minutes (`buy_window_min = 4.0 / 13.0`). Don't mix them
  when propagating changes. The 5m loop must define `seconds_left` (not only
  `minutes_left`) or it NameErrors every cycle.
 3. **Settlement is confirmation-gated.** A relayer submission is not P&L.

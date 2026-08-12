@@ -66,7 +66,7 @@ trades a different market cadence and uses a different resolution oracle.
 | Series slug | `btc-up-or-down-15m` | `btc-up-or-down-5m` | `btc-up-or-down-hourly` |
 | Slug prefix / excludes | `btc-updown` (excl. `btc-updown-5m`, `bitcoin-up-or-down`) | `btc-updown-5m` (excl. `bitcoin-up-or-down`) | `bitcoin-up-or-down` (excl. `btc-updown`, `btc-updown-5m`) |
 | Resolution oracle | Chainlink BTC TWAP 60s | Chainlink BTC TWAP 30s | Binance BTCUSDT |
-| Buy window | final 4.0 min (`buy_window_min`) | final 120 s (`buy_start_s`) | final 47.0 min (`buy_window_min`) |
+| Buy window | final 4.0 min (`buy_window_min`) | final 120 s (`buy_start_s`) | final 13.0 min (`buy_window_min`) |
 | Ask band | 75–90¢ | 75–90¢ | 75–90¢ |
 | Budget / market | $2.50 USDC | $2.50 USDC | $2.50 USDC |
 | Hedge trigger | bid ≤ 35¢ **and** ask ≤ 40¢, spread ≤ 15¢ | same | same |
@@ -186,7 +186,7 @@ are the ground truth for post-hoc accuracy analysis; they are gitignored.
 ## 6. The Buy Decision
 
 A buy fires only when **all** of these gates pass, evaluated in the buy window
-(4.0 min / 120 s / 47.0 min before close):
+(4.0 min / 120 s / 13.0 min before close):
 
 1. **Window.** Market is inside the buy window and past the `buy_grace_s` buffer; the
    bot has not already entered this market (`one_entry_per_market`, enforced via
@@ -199,9 +199,11 @@ A buy fires only when **all** of these gates pass, evaluated in the buy window
    bid ≥ `min_winner_bid` and `ask − bid` ≤ `max_entry_spread` (5¢). A high ask over
    a 1¢ bid is a fake price — last-trade GUI can still look like a winner while
    there is no real bid under the ask. WS quotes alone are never used to arm entry.
-4. **Ask band.** The best ask of the winning leg is within `buy_threshold`–
-   `buy_max_price` (75–90¢). Floor is 75¢ (earlier participation); ceiling is 90¢
-   so the bot never pays above that for an entry.
+4. **Ask band / 75¢ trigger.** The best ask of the winning leg is within
+   `buy_threshold`–`buy_max_price` (75–90¢). **75¢ is the trigger**, not a target
+   mid-band: the bot buys as soon as ask ≥ 75¢ (other gates passing) and posts the
+   FAK at the *live* ask — so catching the print early yields fills near 75¢.
+   90¢ is only a hard ceiling (never enter if ask is already above it).
 5. **Underlying gate.** If `underlying_gate_enabled`, the live oracle price must be
    at least `min_underlying_edge_usd` away from the captured PTB ($5 on 5m, $10 on
    15m/hourly), **and** the book's winning side must match the direction of the
@@ -338,14 +340,14 @@ paths. Templates are `strategy_buy.example.json`,
 
 | Key | Default (15m/5m/hr) | Meaning |
 |---|---|---|
-| `buy_threshold` / `buy_max_price` | 0.75 / 0.90 | Ask band for entry (75–90¢; never pay above 90¢) |
+| `buy_threshold` / `buy_max_price` | 0.75 / 0.90 | Trigger ≥75¢; hard ceiling 90¢ (prefer fills near 75¢) |
 | `min_winner_bid` / `max_loser_bid` / `min_bid_edge` | 0.70 / 0.30 / 0.05 | GUI consensus gate (aligned to 75¢ band) |
 | `max_entry_spread` | 0.05 | Max ask−bid on winner at entry |
 | `underlying_gate_enabled` / `min_underlying_edge_usd` | true / 5.0 (5m), 10.0 (15m/hr) | Oracle alignment gate |
 | `toxic_force_exit_below` | 0.65 | Force-dump if FAK avg &lt; 65¢ (must be ≤ buy_threshold) |
 | `hedge_enabled` / `hedge_threshold` / `hedge_min_price` | true / 0.35 / 0.32 | Hedge arm & floor |
 | `hedge_max_spread` / `hedge_require_ask_max` | 0.15 / 0.40 | Hedge book must actually collapse |
-| `buy_window_min` (15m, hr) / `buy_start_s` (5m) | 4.0 / 120 / 47.0 | Entry window before close |
+| `buy_window_min` (15m, hr) / `buy_start_s` (5m) | 4.0 / 120 / 13.0 | Entry window before close |
 | `buy_budget` | 2.5 / 2.5 / 2.5 | USDC per market |
 | `max_open_positions` / `max_open_notional` / `max_daily_notional` | 0 (=unlimited) / 10k / ~∞ | Risk caps |
 | `redeem_throttle_s` / `max_redeem_age_days` | 30 / 7 | Redeem pacing |

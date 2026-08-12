@@ -137,7 +137,9 @@ _STRATEGY_DEFAULTS = {
     # Explicit hot-reloadable entry arm. A missing/invalid file disables new
     # entries while existing positions continue through the hedge path.
     "entry_enabled": False,
-    # Wider participation band: buy once ask ≥ 75¢, never above 90¢.
+    # Trigger at 75¢: buy as soon as the winning ask is ≥ 75¢, priced at the
+    # live ask (so early catches ≈ 75¢). buy_max_price is a hard ceiling only —
+    # never pay above 90¢; we do not wait for or target the top of the band.
     "buy_threshold": 0.75,
     "buy_max_price": 0.90,
     # Consensus on Polymarket GUI display price (mid if spread≤10¢ else last trade).
@@ -170,7 +172,7 @@ _STRATEGY_DEFAULTS = {
     # and ask also collapsed (same lesson sell-side already learned on mids).
     "hedge_max_spread": 0.15,
     "hedge_require_ask_max": 0.40,
-    "buy_window_min": 47.0,
+    "buy_window_min": 13.0,
     "buy_grace_s": 2,
     "buy_cooldown_s": 3,
     "buy_budget": 2.5,

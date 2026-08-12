@@ -18,7 +18,7 @@
   "max_entry_spread": 0.05,
   "hedge_max_spread": 0.15,
   "hedge_require_ask_max": 0.40,
-  "buy_window_min": 47.0,
+  "buy_window_min": 13.0,
   "buy_grace_s": 2,
   "buy_cooldown_s": 3,
   "buy_budget": 2.5,
