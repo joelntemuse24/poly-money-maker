@@ -32,8 +32,9 @@ needing ~$50/market at today’s thin fill rate.
 | Hourly window | final **4.0 min** | Thin participation historically |
 | Hedge | bid ≤ **65¢**, sell-only | False hedges accepted as cost of safety |
 | `toxic_force_exit_below` | **0.90** | Force-dump only if FAK avg **&lt; 90¢**; 90–98¢ uses normal hedge |
-| `min_underlying_edge_usd` | **0.0** | No $5/$10 *minimum move* (live JSON already 0 on VM) |
+| `min_underlying_edge_usd` | **0.0** | Live JSON = 0; repo defaults may still say 5/10 until PR #66 |
 | `underlying_gate_enabled` | **true** | Still need PTB+live, non-zero BTC direction, side match |
+| `max_open_positions` | **0** | **Unlimited** (`0`); was freezing buys at 100 |
 
 Bots hot-reload `strategy_buy.json` / `strategy_buy5m.json` / `strategy_buyhourly.json`.
 Changing those files is enough for most knobs; code deploys need `git pull` (+ often
@@ -76,11 +77,12 @@ manual restart — CI “Deploy to GCP” frequently SSH-times-out).
 
 ## Open / next
 
-- [ ] Land max-open redeemable-exclusion fix; confirm 5m buys resume.
-- [ ] Merge/land repo default `min_underlying_edge_usd: 0` if not already on `main` (live JSON may already be 0).
-- [ ] Watch fill count vs hedge rate for a few days at edge=$0.
+- [x] Max-open freeze fixed + deployed (`d659693`); live `max_open_positions=0`.
+- [ ] Confirm 5m buys resume after the cap unblock (watch `buy_attempt` / `buy_success`).
+- [ ] Merge PR #66 so *repo defaults* also use `min_underlying_edge_usd: 0` (live JSON already 0).
+- [ ] Watch fill count vs hedge rate for a few days at edge=$0 + uncapped opens.
 - [ ] Then reconsider size ($20–25/market) once fill density supports ~$100/day with margin.
-- [ ] Optional later: retry empty FAKs in-window; hourly under-participation.
+- [ ] Optional later: retry empty FAKs in-window; hourly under-participation; redeem backlog.
 
 ---
 
