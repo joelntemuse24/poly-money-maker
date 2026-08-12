@@ -78,6 +78,7 @@ python buybot5m.py      # 5m,  uses strategy_buy5m.json
 python buybothourly.py  # hr,  uses strategy_buyhourly.json
 
 python check_book.py    # quick order book check
+python check_participation.py --hours 3 --csv /path/to/history.csv  # post-facto misses
 ```
 
 Watch the console for `[DRY BUY]` / `[DRY SELL]` markers. Ctrl-C to stop.
