@@ -2,12 +2,14 @@
 
 Quick-reference for AI agents working on this codebase.
 Full architecture: `TECHNICAL_DESIGN.md`.
+**Live probe / ops decisions:** read `CURRENT.md` first (update it when strategy changes).
 
 ## Project at a Glance
 
-**Live on the VM (2026-08-10):** three standalone buy bots — nothing else. They buy
-the winning leg of Polymarket BTC "Up or Down" markets at 98–99¢ in the final
-window, hedge at 65¢ on reversal, and redeem winners at $1.00.
+**Live on the VM:** three standalone buy bots — nothing else. They buy the winning
+leg of Polymarket BTC "Up or Down" markets at 98–99¢ in the final window, hedge at
+65¢ on reversal, and redeem winners at $1.00. See `CURRENT.md` for the active
+probe budget, edge/toxic knobs, and near-term goals.
 
 | File | Service | Markets | Oracle | Budget | Window |
 |---|---|---|---|---|---|
@@ -40,6 +42,7 @@ change to one usually needs propagation to its siblings.
 |---|---|
 | `check_book.py` | Diagnostic — inspect a live order book |
 | `check_edge_counterfactual.py` | Diagnostic — resolution win rate if edge skips had filled |
+| `CURRENT.md` | Living ops/probe status — update when decisions change |
 | `strategy_buy*.example.json` | Config templates — not loaded by bots |
 
 ### Read-only / auto-generated — never edit
