@@ -28,6 +28,19 @@ bot data matters.
 
 3. **Prefer a larger boot disk** (20–30GB) if running the bots long-term.
 
+4. **Pathlog ticks are capped in-app** (`pathlog.py`: 14 days / **400 MB**, oldest
+   JSONL first). That is sized for this ~10GB VM (~15 MB/day of ticks ≈ 210 MB
+   in 14 days). Journal cap ≠ pathlog cap. **Export before prune:**
+
+   ```bash
+   cd ~/poly-money-maker
+   .venv/bin/python check_path_backtest.py --grid --budget 2.5 --series 5m --csv /tmp/hits.csv
+   .venv/bin/python check_path_backtest.py --export-market <slug> --csv /tmp/m.csv
+   # scp /tmp/hits.csv off the VM, or: scp -r pathlog/ticks ./pathlog-export-$(date -u +%Y%m%d)
+   ```
+
+   Do not `rm` `pathlog/ticks` by hand. Look for `pathlog_prune` in `pathlog.log`.
+
 ## Recovery if 100% full
 
 ```bash
@@ -39,6 +52,8 @@ sudo find /var/log -type f \( -name '*.gz' -o -name '*.1' -o -name '*.old' \) -d
 sudo find /var/log -type f -size +50M -exec truncate -s 0 {} \;
 sudo apt-get clean
 df -h /
+# Export pathlog ticks BEFORE any manual delete — prune already caps them at 400 MB
+# scp -r ~/poly-money-maker/pathlog/ticks ./pathlog-export-$(date -u +%Y%m%d)
 cd ~/poly-money-maker && git pull
-sudo systemctl start polybuybot polybuybot5m polybuybothourly
+sudo systemctl start polybuybot polybuybot5m polybuybothourly polypathlog
 ```

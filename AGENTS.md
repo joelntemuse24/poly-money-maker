@@ -58,7 +58,8 @@ change to one usually needs propagation to its siblings.
 - `*.log` — structured JSON-line logs with rotation
 - `.heartbeat*` — uptime tick counters
 - `underlying_research_buy*.jsonl`, `ptb_*_buy*.json` — oracle/PTB decision audit
-- `pathlog/ticks/*.jsonl` — recorded CLOB paths
+- `pathlog/ticks/*.jsonl` — recorded CLOB paths (**auto-pruned**: 14 days / 400 MB;
+  export before prune deletes them — see below)
 - `strategy_buy*.json` / `strategy_mint.json` (without `.example`) — live configs
 - `positions_mint.json` — mint intents / daily spend
 - `.env` — secrets (gitignored)
@@ -66,7 +67,10 @@ change to one usually needs propagation to its siblings.
 ## Never Do
 
 - **Never delete or truncate state files** (`positions_buy*.json`, `pnl_buy*.json`,
-  `positions_mint.json`, logs, heartbeats, research/PTB/pathlog files).
+  `positions_mint.json`, logs, heartbeats, research/PTB files). Pathlog ticks are
+  the exception: `pathlog.py` auto-prunes `pathlog/ticks/*.jsonl` (14 days / 400 MB)
+  so they fit the small VM. Do **not** `rm` them by hand. **Do export** them
+  (CSV or `scp` the ticks dir) before prune deletes old JSONL.
 - **Never change `SLUG_PREFIX` or `SLUG_EXCLUDES` without checking all three bots** —
   `btc-updown` is a prefix of `btc-updown-5m`; mismatched exclusions cause
   cross-bot interference on the same market.
@@ -86,8 +90,17 @@ python buybot5m.py        # 5m, uses strategy_buy5m.json
 python buybothourly.py    # hr, uses strategy_buyhourly.json
 
 python pathlog.py         # recorder only — no orders
-python check_path_backtest.py --grid --budget 2.5
+python check_path_backtest.py --grid --budget 2.5 --series 5m --csv /tmp/hits.csv
 python check_book.py
+```
+
+**Export pathlog ticks off the VM.** The recorder deletes oldest JSONL after
+14 days or 400 MB. Prune is permanent. On the VM:
+
+```bash
+.venv/bin/python check_path_backtest.py --grid --budget 2.5 --series 5m --csv /tmp/hits.csv
+.venv/bin/python check_path_backtest.py --export-market <slug> --csv /tmp/m.csv
+# then scp /tmp/hits.csv (or scp -r pathlog/ticks) off the box
 ```
 
 Watch the console for `[DRY BUY]` / `[DRY SELL]` markers. Ctrl-C to stop.
@@ -108,6 +121,7 @@ Watch the console for `[DRY BUY]` / `[DRY SELL]` markers. Ctrl-C to stop.
 - `buy_skip_underlying_edge` — underlying gate failed (missing/stale/flat vs PTB)
 - `buy_skip_underlying_side` — book wants the opposite leg from the underlying move
 - `buy_skip_max_positions` — only if `max_open_positions > 0` (probe uses **0 = unlimited**)
+- `pathlog_prune` — oldest tick JSONL removed (14d / 400 MB cap); export first
 
 ## Key Conventions
 

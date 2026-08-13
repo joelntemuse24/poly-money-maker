@@ -5,6 +5,10 @@ No orders. One JSONL file per market under pathlog/ticks/. Later,
 check_path_backtest.py answers: if we had entered at price X with Y
 seconds left, would that leg have won?
 
+Ticks are auto-pruned (14 days / 400 MB, oldest first) so they fit the
+small VM disk. Export with check_path_backtest.py (or scp the ticks
+dir) before prune deletes them — pruned JSONL is gone.
+
 Usage:
     python pathlog.py
 Kill switch: touch STOP_PATHLOG
@@ -21,7 +25,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import requests
 from rich.console import Console
@@ -56,6 +60,13 @@ RECORD_BEFORE_END_S = {
 POLL_S = 1.0
 BOOK_WORKERS = 8
 RESOLVE_GRACE_S = 20.0
+
+# Disk cap sized for the ~10GB e2 boot disk (see deploy/DISK_OPS.md).
+# ~15 MB/day of ticks → ~210 MB in 14 days; 400 MB is the hard ceiling.
+RETAIN_S = 14 * 24 * 3600
+MAX_TICK_BYTES = 400 * 1024 * 1024
+PRUNE_EVERY_S = 60.0
+PROTECT_RECENT_S = 120.0  # skip files still being written
 
 _shutdown = False
 
@@ -117,6 +128,87 @@ def append_jsonl(path: Path, row: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with open(path, "a", encoding="utf-8") as handle:
         handle.write(json.dumps(row, separators=(",", ":")) + "\n")
+
+
+def files_to_prune(
+    files: Sequence[Tuple[str, float, int]],
+    now: float,
+    retain_s: float,
+    max_bytes: int,
+    protect_recent_s: float,
+) -> List[str]:
+    """Return tick paths to delete, oldest first.
+
+    ``files`` is ``(path, mtime, size_bytes)``. Files with mtime newer than
+    ``protect_recent_s`` are never returned (active writes). Age prune runs
+    first; then oldest remaining files until total size (including protected)
+    is at most ``max_bytes``.
+    """
+    protect_after = now - protect_recent_s
+    eligible = [
+        (path, mtime, size)
+        for path, mtime, size in files
+        if mtime <= protect_after
+    ]
+    eligible.sort(key=lambda item: (item[1], item[0]))
+    protected_bytes = sum(
+        size for _, mtime, size in files if mtime > protect_after
+    )
+
+    to_delete: List[str] = []
+    kept: List[Tuple[str, float, int]] = []
+    cutoff = now - retain_s
+    for path, mtime, size in eligible:
+        if mtime < cutoff:
+            to_delete.append(path)
+        else:
+            kept.append((path, mtime, size))
+
+    total = protected_bytes + sum(size for _, _, size in kept)
+    for path, _mtime, size in kept:
+        if total <= max_bytes:
+            break
+        to_delete.append(path)
+        total -= size
+    return to_delete
+
+
+def prune_tick_dir(now: Optional[float] = None) -> int:
+    """Delete old/oversized tick JSONL. Returns number of files removed."""
+    now = time.time() if now is None else now
+    if not TICK_DIR.exists():
+        return 0
+    listed: List[Tuple[str, float, int]] = []
+    for path in TICK_DIR.glob("*.jsonl"):
+        try:
+            stat = path.stat()
+        except OSError:
+            continue
+        listed.append((str(path), stat.st_mtime, stat.st_size))
+    victims = files_to_prune(
+        listed, now, RETAIN_S, MAX_TICK_BYTES, PROTECT_RECENT_S
+    )
+    deleted = 0
+    bytes_freed = 0
+    for raw in victims:
+        path = Path(raw)
+        try:
+            size = path.stat().st_size
+            path.unlink()
+        except OSError as exc:
+            log_event("pathlog_prune_fail", path=str(path), error=str(exc)[:160])
+            continue
+        deleted += 1
+        bytes_freed += size
+    if deleted:
+        log_event(
+            "pathlog_prune",
+            count=deleted,
+            bytes=bytes_freed,
+            retain_s=RETAIN_S,
+            max_bytes=MAX_TICK_BYTES,
+        )
+    return deleted
 
 
 def file_has_event(path: Path, event: str) -> bool:
@@ -350,8 +442,15 @@ def main() -> int:
     session.headers["User-Agent"] = "poly-money-maker-pathlog/1.0"
 
     console.print("[bold cyan]pathlog[/] recording CLOB ticks → pathlog/ticks/")
-    log_event("startup", series=SERIES, poll_s=POLL_S)
+    log_event(
+        "startup",
+        series=SERIES,
+        poll_s=POLL_S,
+        retain_s=RETAIN_S,
+        max_tick_bytes=MAX_TICK_BYTES,
+    )
 
+    last_prune = 0.0
     while not _shutdown:
         if STOP_FILE.exists():
             break
@@ -362,6 +461,13 @@ def main() -> int:
         except Exception as exc:
             log_event("cycle_error", error=str(exc)[:300])
             write_heartbeat("error", error=str(exc)[:120])
+        now = time.time()
+        if now - last_prune >= PRUNE_EVERY_S:
+            try:
+                prune_tick_dir(now)
+            except Exception as exc:
+                log_event("pathlog_prune_error", error=str(exc)[:300])
+            last_prune = now
         time.sleep(POLL_S)
 
     console.print("[dim]pathlog stopped[/]")

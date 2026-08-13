@@ -3,8 +3,8 @@
 **Agents: read this after `AGENTS.md`.** Update this file when ops/strategy decisions change.
 Do not put secrets, API keys, or live wallet material here.
 
-Last updated: **2026-08-12** — keep the **$2.50 / 75–90¢** CLOB buy triggers;
-pause minting; pathlog records books for entry backtests.
+Last updated: **2026-08-13** — keep the **$2.50 / 75–90¢** CLOB buy triggers;
+pause minting; pathlog records books for entry backtests (14-day / 400 MB cap).
 
 ---
 
@@ -38,6 +38,11 @@ per market under `pathlog/ticks/` so we can ask “if we had bought at 80¢ with
 Recorder samples CLOB top-of-book ~1/s in the late window (whole 5m; last 8m of
 15m; last 15m of hourly). After expiry it stamps `winner` from Gamma.
 
+**Disk cap (small ~10GB VM):** keep ticks **14 days** and at most **400 MB**.
+Oldest JSONL is deleted first; files written in the last 2 minutes are skipped.
+Look for `pathlog_prune` in `pathlog.log`. This is **not** bot state — prune
+**deletes** the files. **Export before that.**
+
 On the VM:
 
 ```bash
@@ -46,9 +51,11 @@ sudo systemctl daemon-reload
 sudo systemctl enable --now polypathlog
 journalctl -u polypathlog -f
 
-python check_path_backtest.py --ask-min 0.80 --ask-max 0.85 --ttm-max 120 --budget 2.5
-python check_path_backtest.py --grid --budget 2.5
-python check_path_backtest.py --export-market btc-updown-5m-1786528500 --csv /tmp/m.csv
+# Export regularly (copy CSVs off the VM; prune will delete the JSONL)
+.venv/bin/python check_path_backtest.py --grid --budget 2.5 --series 5m --csv /tmp/hits.csv
+.venv/bin/python check_path_backtest.py --export-market btc-updown-5m-1786528500 --csv /tmp/m.csv
+scp ntemusejoel@<vm>:/tmp/hits.csv .
+# or: scp -r ntemusejoel@<vm>:~/poly-money-maker/pathlog/ticks ./pathlog-export-$(date -u +%Y%m%d)
 ```
 
 `--grid` is the Excel-shaped table: ask × seconds-left, hit count, win rate,
@@ -78,7 +85,7 @@ Kill switch: `touch STOP_PATHLOG`.
 - [x] Pause minting; keep $2.50 / 75–90¢ CLOB triggers.
 - [x] Path recorder + `check_path_backtest.py` (first-touch ask × time-left).
 - [ ] On VM: stop mint, restart buy bots + pathlog after reviewing live JSON.
-- [ ] Let pathlog collect resolved markets, then run `--grid` before changing bands.
+- [ ] Let pathlog collect resolved markets, then `--grid` / export CSV **off the VM** before prune.
 
 ---
 
@@ -86,5 +93,8 @@ Kill switch: `touch STOP_PATHLOG`.
 
 1. Read `AGENTS.md` + this file before changing mint/buy/hedge logic.
 2. Do **not** restart minting unless the operator asks.
-3. Never truncate state/PnL/log/pathlog files; never commit live strategy/state/`.env`.
+3. Never truncate state/PnL/log files; never commit live strategy/state/`.env`.
+   Pathlog ticks are **auto-pruned** (14d / 400 MB) — do not `rm` them by hand,
+   but **do export** (`check_path_backtest.py --csv` or `scp` the ticks dir)
+   before the cap deletes old JSONL.
 4. When an ops decision changes, **update this file in the same PR/commit**.
