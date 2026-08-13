@@ -6,7 +6,8 @@ Full architecture: `TECHNICAL_DESIGN.md`.
 
 ## Project at a Glance
 
-**Live on the VM:** three standalone buy bots plus a no-order path recorder.
+**Live on the VM:** the **5m** buy bot plus a no-order path recorder (15m and
+hourly buy bots exist but are **stopped** unless the operator starts them).
 They buy the winning leg of Polymarket BTC "Up or Down" markets at **75–90¢**
 in the final window ($2.50 / market), hedge at **35¢** on reversal, and redeem
 winners at $1.00. See `CURRENT.md` for the active probe budget and knobs.
@@ -21,6 +22,7 @@ Mint-only helper (`mintbot.py`) is **paused** — do not run it live.
 | `pathlog.py` | `polypathlog` | all three | — (CLOB books only) | — | late-window ticks |
 
 Plus: `check_book.py`, `check_participation.py`, `check_path_backtest.py`.
+Full-system audit prompt (correctness + fill speed + infra): `docs/AUDIT_AND_BRAINSTORM_PROMPT.md`.
 
 ## File Map
 
@@ -49,6 +51,7 @@ change to one usually needs propagation to its siblings.
 | `check_edge_counterfactual.py` | Diagnostic — resolution win rate if edge skips had filled |
 | `check_participation.py` | Diagnostic — post-facto bought vs missed + band exposure |
 | `CURRENT.md` | Living ops/probe status — update when decisions change |
+| `docs/AUDIT_AND_BRAINSTORM_PROMPT.md` | Paste-ready audit of gates, contradictions, fill speed |
 | `strategy_buy*.example.json` | Buy-bot config templates — not loaded by bots |
 | `mintbot.py` / `strategy_mint.example.json` | Paused mint helper — do not run live |
 
