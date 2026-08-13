@@ -386,6 +386,8 @@ Strategy JSON changes need no deploy and no restart (hot reload).
   is wedged.
 - `positions_buy*.json` / `pnl_buy*.json` — open entries and settled P&L.
 - `underlying_research_buy*.jsonl` / `ptb_*_buy*.json` — oracle/PTB decision audit.
+- `python check_path_backtest.py --grid --budget 2.5` — hypothetical entries from
+  `pathlog/ticks/` (ask × seconds-left).
 - `python check_book.py` — ad-hoc diagnostic: prints book/price data for the current
   hourly market (useful sanity check for book shape).
 - Notifications: fire-and-forget ntfy.sh pushes on buys, hedges, redeems, and fatal

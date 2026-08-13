@@ -1,0 +1,16 @@
+[Unit]
+Description=Polymarket BTC Up/Down CLOB path recorder (no orders)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ntemusejoel
+WorkingDirectory=/home/ntemusejoel/poly-money-maker
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/home/ntemusejoel/poly-money-maker/.venv/bin/python pathlog.py
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

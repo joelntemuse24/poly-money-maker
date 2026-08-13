@@ -27,6 +27,9 @@ strategy_mint.json
 positions_mint.json
 STOP_MINT
 .mintbot.lock
+STOP_PATHLOG
+.pathlog.lock
+pathlog/
 underlying_research_buy*.jsonl
 underlying_research_buy*.jsonl.*
 ptb_*_buy*.json

@@ -6,19 +6,21 @@ Full architecture: `TECHNICAL_DESIGN.md`.
 
 ## Project at a Glance
 
-**Current ops posture (see `CURRENT.md`):** CLOB buy/hedge bots are **stopped**.
-Active helper is **`mintbot.py`** — mints complete sets (default 6 Up+Down / $6)
-on BTC Up/Down markets that are **not yet open** and start within 70m; operator
-**sells manually**.
+**Live on the VM:** three standalone buy bots plus a no-order path recorder.
+They buy the winning leg of Polymarket BTC "Up or Down" markets at **75–90¢**
+in the final window ($2.50 / market), hedge at **35¢** on reversal, and redeem
+winners at $1.00. See `CURRENT.md` for the active probe budget and knobs.
 
-| File | Service | Role |
-|---|---|---|
-| `mintbot.py` | `polymintbot` | Mint-only (CTF split); no CLOB buy/sell |
-| `buybot.py` | `polybuybot` | 15m CLOB buy bot (**paused**) |
-| `buybot5m.py` | `polybuybot5m` | 5m CLOB buy bot (**paused**) |
-| `buybothourly.py` | `polybuybothourly` | Hourly CLOB buy bot (**paused**) |
+Mint-only helper (`mintbot.py`) is **paused** — do not run it live.
 
-Plus: `check_book.py`, `check_participation.py` diagnostics.
+| File | Service | Markets | Oracle | Budget | Window |
+|---|---|---|---|---|---|
+| `buybot.py` | `polybuybot` | 15m | Chainlink TWAP 60s | $2.50 | final 4.0 min |
+| `buybot5m.py` | `polybuybot5m` | 5m | Chainlink TWAP 30s | $2.50 | final 120 s |
+| `buybothourly.py` | `polybuybothourly` | hourly | Binance BTCUSDT | $2.50 | final 13.0 min |
+| `pathlog.py` | `polypathlog` | all three | — (CLOB books only) | — | late-window ticks |
+
+Plus: `check_book.py`, `check_participation.py`, `check_path_backtest.py`.
 
 ## File Map
 
@@ -29,10 +31,7 @@ Plus: `check_book.py`, `check_participation.py` diagnostics.
 | `buybot.py` | 15m buy bot (~1716 lines) | `buybot5m.py`, `buybothourly.py` |
 | `buybot5m.py` | 5m buy bot (~1705 lines) | `buybot.py`, `buybothourly.py` |
 | `buybothourly.py` | Hourly buy bot (~1707 lines) | `buybot.py`, `buybot5m.py` |
-| `mintbot.py` | Mint-only complete-set splitter (manual-sell workflow) | — |
 | `buy/market.py` | MarketGateway — Gamma discovery + market metadata | — |
-| `buy/contracts.py` | CTF approve + splitPosition calldata | — |
-| `buy/chain.py` | Polygon eth_call balance / slot prechecks | — |
 | `buy/btc_price.py` | Resolution-aligned BTC feeds (TWAP 30/60, Binance) + PTB capture | — |
 | `buy/clob_book_ws.py` | CLOB market-channel WS top-of-book (buy/hedge speed path) | — |
 
@@ -44,12 +43,14 @@ change to one usually needs propagation to its siblings.
 
 | File | Purpose |
 |---|---|
+| `pathlog.py` | CLOB path recorder (no orders) |
+| `check_path_backtest.py` | Query pathlog: enter at price X with Y seconds left |
 | `check_book.py` | Diagnostic — inspect a live order book |
 | `check_edge_counterfactual.py` | Diagnostic — resolution win rate if edge skips had filled |
 | `check_participation.py` | Diagnostic — post-facto bought vs missed + band exposure |
 | `CURRENT.md` | Living ops/probe status — update when decisions change |
 | `strategy_buy*.example.json` | Buy-bot config templates — not loaded by bots |
-| `strategy_mint.example.json` | Mint-bot config template |
+| `mintbot.py` / `strategy_mint.example.json` | Paused mint helper — do not run live |
 
 ### Read-only / auto-generated — never edit
 
@@ -57,6 +58,7 @@ change to one usually needs propagation to its siblings.
 - `*.log` — structured JSON-line logs with rotation
 - `.heartbeat*` — uptime tick counters
 - `underlying_research_buy*.jsonl`, `ptb_*_buy*.json` — oracle/PTB decision audit
+- `pathlog/ticks/*.jsonl` — recorded CLOB paths
 - `strategy_buy*.json` / `strategy_mint.json` (without `.example`) — live configs
 - `positions_mint.json` — mint intents / daily spend
 - `.env` — secrets (gitignored)
@@ -64,7 +66,7 @@ change to one usually needs propagation to its siblings.
 ## Never Do
 
 - **Never delete or truncate state files** (`positions_buy*.json`, `pnl_buy*.json`,
-  `positions_mint.json`, logs, heartbeats, research/PTB files).
+  `positions_mint.json`, logs, heartbeats, research/PTB/pathlog files).
 - **Never change `SLUG_PREFIX` or `SLUG_EXCLUDES` without checking all three bots** —
   `btc-updown` is a prefix of `btc-updown-5m`; mismatched exclusions cause
   cross-bot interference on the same market.
@@ -72,33 +74,27 @@ change to one usually needs propagation to its siblings.
   there is no confirmation prompt.
 - **Never commit live `strategy_*.json`, `.env`, or state files** — they are
   gitignored but double-check before `git add .`.
-- **Do not re-enable buy bots while mint+manual-sell is the active posture** unless
-  the operator asks.
+- **Do not restart `polymintbot` unless the operator asks.**
 
 ## How to Verify a Change
 
 ```bash
-# Mint helper — copy example first; keep dry_run=true until ready.
-cp -n strategy_mint.example.json strategy_mint.json
-# Set entry_enabled=true (and dry_run=true) to see [DRY MINT] lines.
-python mintbot.py
+# First verify the selected strategy file has dry_run=true and entry_enabled=false.
+# Never assume these commands are dry-run merely because they are launched manually.
+python buybot.py          # 15m, uses strategy_buy.json
+python buybot5m.py        # 5m, uses strategy_buy5m.json
+python buybothourly.py    # hr, uses strategy_buyhourly.json
 
-# Buy bots (paused on VM) — only if explicitly re-enabled; verify dry_run first.
-python buybot.py / buybot5m.py / buybothourly.py
-
+python pathlog.py         # recorder only — no orders
+python check_path_backtest.py --grid --budget 2.5
 python check_book.py
-python check_participation.py --hours 3 --csv /path/to/history.csv
 ```
 
-Watch the console for `[DRY MINT]` (mintbot) or `[DRY BUY]` / `[DRY SELL]` (buy bots).
-Ctrl-C to stop.
+Watch the console for `[DRY BUY]` / `[DRY SELL]` markers. Ctrl-C to stop.
 
 ### What to look for
 
-- `[DRY MINT]` — mintbot would split a complete set (slug, shares, opens_in)
-- `mint_submitted` / `mint_confirmed` — live relayer path
-- `mint_skip_balance` — not enough pUSD
-- `[DRY BUY]` / `[DRY SELL]` in buy-bot dry-run — confirms trigger logic fires
+- `[DRY BUY]` / `[DRY SELL]` in dry-run — confirms trigger logic fires
 - `cycle_error` in logs — unhandled exception (bot survives but logs it)
 - `hedge_attempt` / `hedge_fill` — hedge fired after force-fresh REST + book integrity
 - `hedge_skip_toxic_book` — bid dipped but ask/spread still say "not reversed"
@@ -109,8 +105,7 @@ Ctrl-C to stop.
 - `buy_ghost_fill` — balance reconciliation after null/delayed BUY confirm
 - `buy_uncertain` — POST outcome unresolved; durable token/baseline quarantine blocks re-buy
 - `buy_skip_incomplete_book` — missing GUI price on a leg (no mid and no last trade)
-- `buy_skip_underlying_edge` — underlying gate failed (missing/stale/flat vs PTB;
-  probe uses `min_underlying_edge_usd: 0` — see `CURRENT.md`)
+- `buy_skip_underlying_edge` — underlying gate failed (missing/stale/flat vs PTB)
 - `buy_skip_underlying_side` — book wants the opposite leg from the underlying move
 - `buy_skip_max_positions` — only if `max_open_positions > 0` (probe uses **0 = unlimited**)
 
@@ -143,27 +138,29 @@ Ctrl-C to stop.
 1. **The three bots are near-identical copies, not shared modules.** A bug fix in
    `buybot.py` probably also applies to `buybot5m.py` and `buybothourly.py`.
 2. **The 5m bot uses seconds-based window checks** (`buy_start_s = 120`) while the
- 15m and hourly bots use minutes (`buy_window_min = 4.0 / 13.0`). Don't mix them
- when propagating changes. The 5m loop must define `seconds_left` (not only
- `minutes_left`) or it NameErrors every cycle.
+   15m and hourly bots use minutes (`buy_window_min = 4.0 / 13.0`). Don't mix them
+   when propagating changes. The 5m loop must define `seconds_left` (not only
+   `minutes_left`) or it NameErrors every cycle.
 3. **Settlement is confirmation-gated.** A relayer submission is not P&L.
    Redemption is credited only after relayer confirmation and a complete Data API
    snapshot shows the inventory gone; GC never invents par value.
-4. **No `if __name__ == "__main__"` guard** — these scripts execute at module level.
-   They cannot be imported.
+4. **No `if __name__ == "__main__"` guard** — buy-bot scripts execute at module
+   level. They cannot be imported. `pathlog.py` and `check_path_backtest.py` can.
 
 ## Systemd Services (in `deploy/`)
 
 | Service file | Bot |
 |---|---|
-| `polymintbot.service` | `mintbot.py` (mint-only; active helper) |
-| `polybuybot.service` | `buybot.py` (15m; **paused**) |
-| `polybuybot5m.service` | `buybot5m.py` (5m; **paused**) |
-| `polybuybothourly.service` | `buybothourly.py` (hourly; **paused**) |
+| `polybuybot.service` | `buybot.py` (15m) |
+| `polybuybot5m.service` | `buybot5m.py` (5m) |
+| `polybuybothourly.service` | `buybothourly.py` (hourly) |
+| `polypathlog.service` | `pathlog.py` (CLOB path recorder; no orders) |
+| `polymintbot.service` | `mintbot.py` (**paused**) |
 
-CI: pushes to `main` touching the buy bots, `buy/`, or `requirements.txt` deploy to
-the VM via SSH (`git pull` + `pip install` only). Services are **not** auto-restarted —
-start/restart deliberately after validation (`systemctl start` / `restart`).
+CI: pushes to `main` touching the buy bots, `pathlog.py`, `buy/`, or
+`requirements.txt` deploy to the VM via SSH (`git pull` + `pip install` only).
+Services are **not** auto-restarted — start/restart deliberately after
+validation (`systemctl start` / `restart`).
 
 ## Dependencies
 

@@ -3,71 +3,88 @@
 **Agents: read this after `AGENTS.md`.** Update this file when ops/strategy decisions change.
 Do not put secrets, API keys, or live wallet material here.
 
-Last updated: **2026-08-12** — mint only **not-yet-open** markets (opens within 70m).
+Last updated: **2026-08-12** — keep the **$2.50 / 75–90¢** CLOB buy triggers;
+pause minting; pathlog records books for entry backtests.
 
 ---
 
 ## What we’re doing
 
-**Automated CLOB buy/hedge probe is paused.** All three buy services are
-**stopped + disabled** on the VM (`polybuybot` / `polybuybot5m` /
-`polybuybothourly`). Operator will **sell manually**.
+**Mint-only helper is paused.** Stop `polymintbot` and leave it disabled. Do not
+mint complete sets. Operator still sells leftover mint inventory by hand.
 
-**Active helper:** `mintbot.py` (`polymintbot`) — mint complete sets (default
-**6 Up + 6 Down** = **$6** pUSD) on BTC Up/Down 5m/15m/hourly markets that are
-**not yet open** and **open within ≤ 70 min**, if collateral allows.
-**No CLOB buys. No auto-hedges. Never mint an already-open market.**
+**Active strategy:** the three CLOB buy bots with the **$2.50 widen-band
+triggers** (not the old 98–99¢ probe):
 
-Thesis unchanged (trade the decided leg / cut obvious reversals by hand); automation
-was not catching enough markets or hedges reliably.
+| Knob | Value |
+|---|---|
+| `buy_budget` | **$2.50** / market |
+| Ask band | **75–90¢** — trigger as soon as winning ask ≥ 75¢; 90¢ is a hard ceiling |
+| GUI consensus | winner ≥ 70¢, loser ≤ 30¢ |
+| Windows | 5m **120 s** · 15m **4.0 min** · hourly **13.0 min** |
+| Hedge | bid ≤ **35¢** and ask ≤ **40¢**, spread ≤ 15¢ |
+| Underlying edge | **$5** (5m) / **$10** (15m, hourly); side must match |
+| `max_open_positions` | **0 = unlimited** |
+| `toxic_force_exit_below` | **65¢** |
+
+**Also running (no orders):** `pathlog.py` (`polypathlog`) writes one JSONL file
+per market under `pathlog/ticks/` so we can ask “if we had bought at 80¢ with
+2 minutes left, would we have won?”
 
 ---
 
-## Mint bot settings (intended)
+## Pathlog / backtest
 
-| Knob | Value | Notes |
-|---|---|---|
-| `shares` | **6.0** | $6 collateral → 6 Up + 6 Down |
-| `enter_max_ttm_min` | **70** | minutes-until-**start** (not end); skip already-open |
-| Series | 5m + 15m + hourly | same Gamma series as buy bots |
-| `dry_run` | start **true** | set false only when ready |
-| `entry_enabled` | start **false** | must be true to mint (incl. dry) |
-| `max_open_sets` | 40 | safety cap |
-| `max_daily_notional` | 500 | ~83 mints/day cap |
+Recorder samples CLOB top-of-book ~1/s in the late window (whole 5m; last 8m of
+15m; last 15m of hourly). After expiry it stamps `winner` from Gamma.
 
-Live file: `strategy_mint.json` (gitignored). Template: `strategy_mint.example.json`.
+On the VM:
+
+```bash
+sudo cp deploy/polypathlog.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now polypathlog
+journalctl -u polypathlog -f
+
+python check_path_backtest.py --ask-min 0.80 --ask-max 0.85 --ttm-max 120 --budget 2.5
+python check_path_backtest.py --grid --budget 2.5
+python check_path_backtest.py --export-market btc-updown-5m-1786528500 --csv /tmp/m.csv
+```
+
+`--grid` is the Excel-shaped table: ask × seconds-left, hit count, win rate,
+hypothetical $2.50 PnL (win = redeem $1, loss = −$2.50, no hedge model).
+
+Kill switch: `touch STOP_PATHLOG`.
 
 ---
 
 ## Ops
 
 - **VM:** `~/poly-money-maker` on `instance-20260516-185922`.
-- **Buy bots:** keep disabled unless explicitly re-enabled.
-- **Mint bot:**
+- **Mint:** `sudo systemctl stop polymintbot && sudo systemctl disable polymintbot`
+- **Buy bots:** live `strategy_buy*.json` already had these 75–90 / $2.50 knobs
+  before minting. After pull, confirm they still match the table above, then:
   ```bash
-  cp strategy_mint.example.json strategy_mint.json
-  # edit: entry_enabled true for dry; later dry_run false for live
-  python mintbot.py
-  # or: sudo systemctl enable --now polymintbot   # after unit installed
+  cd ~/poly-money-maker && git pull
+  sudo systemctl restart polybuybot polybuybot5m polybuybothourly
   ```
-- **Kill switch:** `touch STOP_MINT` in the repo root.
-- **Secrets:** `.env` (PRIVATE_KEY, FUNDER_ADDRESS, RELAYER_* or POLY_BUILDER_*).
+  Confirm `dry_run` / `entry_enabled` before restarting live.
+- **Pathlog:** start `polypathlog` as above (no `.env` required).
 
 ---
 
 ## Open / next
 
-- [x] Stop + disable buy bot systemd units.
-- [ ] Deploy mintbot: `strategy_mint.json`, dry-run verify, then live mint.
-- [ ] Manual sell workflow on Polymarket UI.
-- [ ] Revisit automation only if mint inventory + manual sells prove the thesis.
+- [x] Pause minting; keep $2.50 / 75–90¢ CLOB triggers.
+- [x] Path recorder + `check_path_backtest.py` (first-touch ask × time-left).
+- [ ] On VM: stop mint, restart buy bots + pathlog after reviewing live JSON.
+- [ ] Let pathlog collect resolved markets, then run `--grid` before changing bands.
 
 ---
 
 ## Agent instructions
 
 1. Read `AGENTS.md` + this file before changing mint/buy/hedge logic.
-2. Do **not** re-enable buy bots unless the operator asks.
-3. Mint path must not place CLOB buys or sells.
-4. Never truncate state/PnL/log files; never commit live strategy/state/`.env`.
-5. When an ops decision changes, **update this file in the same PR/commit**.
+2. Do **not** restart minting unless the operator asks.
+3. Never truncate state/PnL/log/pathlog files; never commit live strategy/state/`.env`.
+4. When an ops decision changes, **update this file in the same PR/commit**.
