@@ -4,8 +4,8 @@
 Reads pathlog/ticks/*.jsonl written by pathlog.py. Does not place orders.
 
 Examples (on the VM):
-  python check_path_backtest.py --ask-min 0.80 --ask-max 0.85 --ttm-max 120
-  python check_path_backtest.py --grid --budget 2.5
+  python check_path_backtest.py --ask-min 0.80 --ask-max 0.85 --ttm-max 120 --series 5m
+  python check_path_backtest.py --grid --budget 2.5 --series 5m
   python check_path_backtest.py --export-market btc-updown-5m-1786528500 --csv /tmp/m.csv
   python check_path_backtest.py --ask-min 0.98 --ask-max 0.99 --ttm-max 90 --csv /tmp/hits.csv
 """

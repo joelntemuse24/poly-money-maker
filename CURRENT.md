@@ -3,8 +3,8 @@
 **Agents: read this after `AGENTS.md`.** Update this file when ops/strategy decisions change.
 Do not put secrets, API keys, or live wallet material here.
 
-Last updated: **2026-08-12** — keep the **$2.50 / 75–90¢** CLOB buy triggers;
-pause minting; pathlog records books for entry backtests.
+Last updated: **2026-08-13** — **$2.50 / 75–90¢ live on 5m only**; pathlog still
+records 5m + 15m + hourly; minting paused.
 
 ---
 
@@ -13,17 +13,20 @@ pause minting; pathlog records books for entry backtests.
 **Mint-only helper is paused.** Stop `polymintbot` and leave it disabled. Do not
 mint complete sets. Operator still sells leftover mint inventory by hand.
 
-**Active strategy:** the three CLOB buy bots with the **$2.50 widen-band
-triggers** (not the old 98–99¢ probe):
+**Live $2.50 run: 5m only** (`polybuybot5m`). Same widen-band triggers as before.
+**Do not start** `polybuybot` (15m) or `polybuybothourly`. Those stay stopped.
 
-| Knob | Value |
+**Pathlog keeps polling all three cadences** (5m, 15m, hourly) so we still get
+price paths on the markets we are not trading.
+
+| Knob | 5m live |
 |---|---|
 | `buy_budget` | **$2.50** / market |
 | Ask band | **75–90¢** — trigger as soon as winning ask ≥ 75¢; 90¢ is a hard ceiling |
 | GUI consensus | winner ≥ 70¢, loser ≤ 30¢ |
-| Windows | 5m **120 s** · 15m **4.0 min** · hourly **13.0 min** |
+| Window | **120 s** |
 | Hedge | bid ≤ **35¢** and ask ≤ **40¢**, spread ≤ 15¢ |
-| Underlying edge | **$5** (5m) / **$10** (15m, hourly); side must match |
+| Underlying edge | **$5**; side must match |
 | `max_open_positions` | **0 = unlimited** |
 | `toxic_force_exit_below` | **65¢** |
 
@@ -46,8 +49,9 @@ sudo systemctl daemon-reload
 sudo systemctl enable --now polypathlog
 journalctl -u polypathlog -f
 
-python check_path_backtest.py --ask-min 0.80 --ask-max 0.85 --ttm-max 120 --budget 2.5
-python check_path_backtest.py --grid --budget 2.5
+python check_path_backtest.py --ask-min 0.80 --ask-max 0.85 --ttm-max 120 --budget 2.5 --series 5m
+python check_path_backtest.py --grid --budget 2.5 --series 5m
+python check_path_backtest.py --grid --budget 2.5 --series 15m
 python check_path_backtest.py --export-market btc-updown-5m-1786528500 --csv /tmp/m.csv
 ```
 
@@ -62,14 +66,19 @@ Kill switch: `touch STOP_PATHLOG`.
 
 - **VM:** `~/poly-money-maker` on `instance-20260516-185922`.
 - **Mint:** `sudo systemctl stop polymintbot && sudo systemctl disable polymintbot`
-- **Buy bots:** live `strategy_buy*.json` already had these 75–90 / $2.50 knobs
-  before minting. After pull, confirm they still match the table above, then:
+- **15m / hourly buy bots:** stay **stopped + disabled** (pathlog still records them).
+  ```bash
+  sudo systemctl stop polybuybot polybuybothourly
+  sudo systemctl disable polybuybot polybuybothourly
+  ```
+- **5m buy bot only** for the $2.50 run. Confirm `strategy_buy5m.json` is 75–90 /
+  $2.50, `dry_run`/`entry_enabled` as intended, then:
   ```bash
   cd ~/poly-money-maker && git pull
-  sudo systemctl restart polybuybot polybuybot5m polybuybothourly
+  sudo systemctl restart polybuybot5m
   ```
-  Confirm `dry_run` / `entry_enabled` before restarting live.
-- **Pathlog:** start `polypathlog` as above (no `.env` required).
+- **Pathlog:** start `polypathlog` as above (no `.env` required). It records 5m,
+  15m, and hourly even while only 5m is trading.
 
 ---
 
@@ -77,7 +86,7 @@ Kill switch: `touch STOP_PATHLOG`.
 
 - [x] Pause minting; keep $2.50 / 75–90¢ CLOB triggers.
 - [x] Path recorder + `check_path_backtest.py` (first-touch ask × time-left).
-- [ ] On VM: stop mint, restart buy bots + pathlog after reviewing live JSON.
+- [ ] On VM: stop mint + 15m/hourly buy bots; start pathlog; restart **5m only**.
 - [ ] Let pathlog collect resolved markets, then run `--grid` before changing bands.
 
 ---
@@ -85,6 +94,6 @@ Kill switch: `touch STOP_PATHLOG`.
 ## Agent instructions
 
 1. Read `AGENTS.md` + this file before changing mint/buy/hedge logic.
-2. Do **not** restart minting unless the operator asks.
+2. Do **not** restart minting or the 15m/hourly buy bots unless the operator asks.
 3. Never truncate state/PnL/log/pathlog files; never commit live strategy/state/`.env`.
 4. When an ops decision changes, **update this file in the same PR/commit**.

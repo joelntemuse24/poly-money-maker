@@ -6,19 +6,19 @@ Full architecture: `TECHNICAL_DESIGN.md`.
 
 ## Project at a Glance
 
-**Live on the VM:** three standalone buy bots plus a no-order path recorder.
-They buy the winning leg of Polymarket BTC "Up or Down" markets at **75–90¢**
-in the final window ($2.50 / market), hedge at **35¢** on reversal, and redeem
-winners at $1.00. See `CURRENT.md` for the active probe budget and knobs.
+**Live on the VM:** the **5m** buy bot only (`polybuybot5m`) plus a no-order
+path recorder. 15m and hourly buy bots stay **stopped**; pathlog still polls
+those markets for backtests. The 5m bot buys the winning leg at **75–90¢**
+($2.50 / market), hedges at **35¢** on reversal, and redeems winners at $1.00.
 
 Mint-only helper (`mintbot.py`) is **paused** — do not run it live.
 
-| File | Service | Markets | Oracle | Budget | Window |
-|---|---|---|---|---|---|
-| `buybot.py` | `polybuybot` | 15m | Chainlink TWAP 60s | $2.50 | final 4.0 min |
-| `buybot5m.py` | `polybuybot5m` | 5m | Chainlink TWAP 30s | $2.50 | final 120 s |
-| `buybothourly.py` | `polybuybothourly` | hourly | Binance BTCUSDT | $2.50 | final 13.0 min |
-| `pathlog.py` | `polypathlog` | all three | — (CLOB books only) | — | late-window ticks |
+| File | Service | Markets | Role |
+|---|---|---|---|
+| `buybot5m.py` | `polybuybot5m` | 5m | **Live** $2.50 / 75–90¢ |
+| `buybot.py` | `polybuybot` | 15m | **Stopped** (pathlog still records) |
+| `buybothourly.py` | `polybuybothourly` | hourly | **Stopped** (pathlog still records) |
+| `pathlog.py` | `polypathlog` | 5m + 15m + hourly | CLOB ticks, no orders |
 
 Plus: `check_book.py`, `check_participation.py`, `check_path_backtest.py`.
 
@@ -74,7 +74,8 @@ change to one usually needs propagation to its siblings.
   there is no confirmation prompt.
 - **Never commit live `strategy_*.json`, `.env`, or state files** — they are
   gitignored but double-check before `git add .`.
-- **Do not restart `polymintbot` unless the operator asks.**
+- **Do not restart `polymintbot`, `polybuybot`, or `polybuybothourly` unless the
+  operator asks.** Live $2.50 trading is **5m only**.
 
 ## How to Verify a Change
 
@@ -151,10 +152,10 @@ Watch the console for `[DRY BUY]` / `[DRY SELL]` markers. Ctrl-C to stop.
 
 | Service file | Bot |
 |---|---|
-| `polybuybot.service` | `buybot.py` (15m) |
-| `polybuybot5m.service` | `buybot5m.py` (5m) |
-| `polybuybothourly.service` | `buybothourly.py` (hourly) |
-| `polypathlog.service` | `pathlog.py` (CLOB path recorder; no orders) |
+| `polybuybot5m.service` | `buybot5m.py` (5m; **live $2.50**) |
+| `polybuybot.service` | `buybot.py` (15m; **stopped**) |
+| `polybuybothourly.service` | `buybothourly.py` (hourly; **stopped**) |
+| `polypathlog.service` | `pathlog.py` (records 5m+15m+hourly; no orders) |
 | `polymintbot.service` | `mintbot.py` (**paused**) |
 
 CI: pushes to `main` touching the buy bots, `pathlog.py`, `buy/`, or
