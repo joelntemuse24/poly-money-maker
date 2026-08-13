@@ -4,7 +4,8 @@
 Do not put secrets, API keys, or live wallet material here.
 
 Last updated: **2026-08-13** — keep the **$2.50 / 75–90¢** CLOB buy triggers;
-pause minting; pathlog records books for entry backtests (14-day / 400 MB cap).
+pause minting; pathlog records books (14-day / 400 MB cap). Audit prompt:
+`docs/AUDIT_AND_BRAINSTORM_PROMPT.md`.
 
 ---
 
@@ -13,8 +14,8 @@ pause minting; pathlog records books for entry backtests (14-day / 400 MB cap).
 **Mint-only helper is paused.** Stop `polymintbot` and leave it disabled. Do not
 mint complete sets. Operator still sells leftover mint inventory by hand.
 
-**Active strategy:** the three CLOB buy bots with the **$2.50 widen-band
-triggers** (not the old 98–99¢ probe):
+**Active strategy knobs** (live money: **5m only**; 15m/hourly bots stay stopped
+but keep the same $2.50 widen-band triggers in code/examples):
 
 | Knob | Value |
 |---|---|
@@ -69,13 +70,14 @@ Kill switch: `touch STOP_PATHLOG`.
 
 - **VM:** `~/poly-money-maker` on `instance-20260516-185922`.
 - **Mint:** `sudo systemctl stop polymintbot && sudo systemctl disable polymintbot`
-- **Buy bots:** live `strategy_buy*.json` already had these 75–90 / $2.50 knobs
-  before minting. After pull, confirm they still match the table above, then:
+- **Buy bots:** live money is **`polybuybot5m` only**. Do not start 15m/hourly
+  unless asked. After pull, confirm live `strategy_buy5m.json` still matches the
+  table above (`dry_run` / `entry_enabled`), then:
   ```bash
   cd ~/poly-money-maker && git pull
-  sudo systemctl restart polybuybot polybuybot5m polybuybothourly
+  sudo systemctl restart polybuybot5m
   ```
-  Confirm `dry_run` / `entry_enabled` before restarting live.
+  Pathlog still records 15m/hourly books without those buy bots running.
 - **Pathlog:** start `polypathlog` as above (no `.env` required).
 
 ---
@@ -84,7 +86,8 @@ Kill switch: `touch STOP_PATHLOG`.
 
 - [x] Pause minting; keep $2.50 / 75–90¢ CLOB triggers.
 - [x] Path recorder + `check_path_backtest.py` (first-touch ask × time-left).
-- [ ] On VM: stop mint, restart buy bots + pathlog after reviewing live JSON.
+- [x] On VM: mint stopped; 5m buy bot + pathlog running (15m/hourly buy bots off).
+- [ ] Run `docs/AUDIT_AND_BRAINSTORM_PROMPT.md` (correctness + unmatched FAK + infra).
 - [ ] Let pathlog collect resolved markets, then `--grid` / export CSV **off the VM** before prune.
 
 ---
