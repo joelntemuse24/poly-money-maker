@@ -21,6 +21,7 @@ Mint-only helper (`mintbot.py`) is **paused** — do not run it live.
 | `pathlog.py` | `polypathlog` | all three | — (CLOB books only) | — | late-window ticks |
 
 Plus: `check_book.py`, `check_participation.py`, `check_path_backtest.py`.
+Local glance (not a bot): `widget/polydesk.py` — always-on-top balance / HOLDING.
 
 ## File Map
 
@@ -48,6 +49,7 @@ change to one usually needs propagation to its siblings.
 | `check_book.py` | Diagnostic — inspect a live order book |
 | `check_edge_counterfactual.py` | Diagnostic — resolution win rate if edge skips had filled |
 | `check_participation.py` | Diagnostic — post-facto bought vs missed + band exposure |
+| `widget/polydesk.py` | Local always-on-top Polymarket value / HOLDING glance (no orders) |
 | `CURRENT.md` | Living ops/probe status — update when decisions change |
 | `strategy_buy*.example.json` | Buy-bot config templates — not loaded by bots |
 | `mintbot.py` / `strategy_mint.example.json` | Paused mint helper — do not run live |

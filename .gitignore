@@ -30,6 +30,7 @@ STOP_MINT
 STOP_PATHLOG
 .pathlog.lock
 pathlog/
+widget/.address
 underlying_research_buy*.jsonl
 underlying_research_buy*.jsonl.*
 ptb_*_buy*.json
