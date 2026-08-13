@@ -3,8 +3,8 @@
 
 Public Data API only — no private key, no orders. Drag it to a screen corner.
 
-    python widget/polydesk.py
-    python widget/polydesk.py --address 0xYourProxy
+    python widget/polydesk.py --address 0xYOUR_REAL_PROXY
+    python widget\\polydesk.py --address 0xYOUR_REAL_PROXY   # Windows
     python widget/polydesk.py --once
 
 Reads FUNDER_ADDRESS from the environment or repo .env. Position *value* is
@@ -46,8 +46,19 @@ class Snapshot:
     ts: float = 0.0
 
 
+PLACEHOLDER_ADDRESSES = {
+    "0xyourproxywallet",
+    "0xyourproxy",
+    "0xyour_real_proxy",
+    "0x0000000000000000000000000000000000000000",
+}
+
+
 def looks_like_address(value: str) -> bool:
-    return bool(ADDRESS_RE.match((value or "").strip()))
+    text = (value or "").strip()
+    if not ADDRESS_RE.match(text):
+        return False
+    return text.lower() not in PLACEHOLDER_ADDRESSES
 
 
 def load_saved_address() -> str:

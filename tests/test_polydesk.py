@@ -23,6 +23,8 @@ class AddressTests(unittest.TestCase):
         self.assertFalse(looks_like_address(""))
         self.assertFalse(looks_like_address("0x1234"))
         self.assertFalse(looks_like_address("56687bf447db6ffa42ffe2204a05edaa20f55839"))
+        self.assertFalse(looks_like_address("0xYourProxyWallet"))
+        self.assertFalse(looks_like_address("0x0000000000000000000000000000000000000000"))
 
 
 class ParseValueTests(unittest.TestCase):
