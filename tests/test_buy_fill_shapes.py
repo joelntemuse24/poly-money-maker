@@ -391,6 +391,16 @@ class AmbiguousCrossCyclePolicy(unittest.TestCase):
             self.assertIn("STATE_MINED", src)
             self.assertIn("_clob_lock", src)
 
+    def test_known_cost_assigned_before_buy_uncertain_spend_cap(self):
+        needle = "spend_cap=max(0.0, float(BUY_BUDGET) - known_cost)"
+        assign = 'known_cost = float(meta.get("buy_uncertain_known_cost")'
+        for bot in (BOT, BOT5M, BOT_HR):
+            src = bot.read_text()
+            use = src.find(needle)
+            self.assertGreater(use, -1, bot.name)
+            defined = src.rfind(assign, 0, use)
+            self.assertGreater(defined, -1, bot.name)
+
     def test_hedge_liveness_and_reconcile_markers(self):
         src = BOT.read_text()
         self.assertIn("HEDGE_QUOTE_MAX_AGE_S", src)

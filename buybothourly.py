@@ -3360,6 +3360,8 @@ while not _shutdown_requested:
             uncertain_baseline = float(meta.get("buy_uncertain_baseline") or 0)
             uncertain_order_id = meta.get("buy_uncertain_order_id")
             if meta.get("buy_uncertain") and uncertain_order_id:
+                known_size = float(meta.get("buy_uncertain_known_size") or 0)
+                known_cost = float(meta.get("buy_uncertain_known_cost") or 0)
                 requested = (
                     finite_float(meta.get("buy_uncertain_order_size"), minimum=0)
                     or (
@@ -3374,13 +3376,11 @@ while not _shutdown_requested:
                     token_id=uncertain_token,
                     condition_id=cond,
                     limit_price=meta.get("buy_uncertain_price", 0),
-                spend_cap=max(0.0, float(BUY_BUDGET) - known_cost),
-                trade_ids=meta.get("buy_uncertain_trade_ids"),
+                    spend_cap=max(0.0, float(BUY_BUDGET) - known_cost),
+                    trade_ids=meta.get("buy_uncertain_trade_ids"),
                 )
                 inspected_state = inspected["state"]
                 if inspected_state == "confirmed":
-                    known_size = float(meta.get("buy_uncertain_known_size") or 0)
-                    known_cost = float(meta.get("buy_uncertain_known_cost") or 0)
                     resolved_size = known_size + float(inspected["filled"])
                     resolved_cost = known_cost + float(inspected["value"])
                     current_size = float(meta.get("bought_size") or 0)
