@@ -20,7 +20,7 @@ Mint-only helper (`mintbot.py`) is **paused** — do not run it live.
 | `buybothourly.py` | `polybuybothourly` | hourly | Binance BTCUSDT | $2.50 | final 13.0 min |
 | `pathlog.py` | `polypathlog` | all three | — (CLOB books only) | — | late-window ticks |
 
-Plus: `check_book.py`, `check_participation.py`, `check_path_backtest.py`.
+Plus: `check_book.py`, `check_participation.py`, `check_path_backtest.py`, `check_fetch_trades.py`.
 Local glance (not a bot): `widget/polydesk.py` — always-on-top balance / HOLDING.
 
 ## File Map
@@ -49,6 +49,7 @@ change to one usually needs propagation to its siblings.
 | `check_book.py` | Diagnostic — inspect a live order book |
 | `check_edge_counterfactual.py` | Diagnostic — resolution win rate if edge skips had filled |
 | `check_participation.py` | Diagnostic — post-facto bought vs missed + band exposure |
+| `check_fetch_trades.py` | Diagnostic — full-wallet Data API trade history → CSV |
 | `widget/polydesk.py` | Local always-on-top Polymarket value / HOLDING glance (no orders) |
 | `CURRENT.md` | Living ops/probe status — update when decisions change |
 | `strategy_buy*.example.json` | Buy-bot config templates — not loaded by bots |
@@ -94,6 +95,12 @@ python buybothourly.py    # hr, uses strategy_buyhourly.json
 python pathlog.py         # recorder only — no orders
 python check_path_backtest.py --grid --budget 2.5 --series 5m --csv /tmp/hits.csv
 python check_book.py
+
+# Full wallet fills (past the UI ~500-row export). Wallet: --user or FUNDER_ADDRESS.
+# CSV columns match load_csv_buys: timestamp (unix), action, usdcAmount, tokenAmount,
+# marketName, tokenName. Re-run merges/dedupes. Do not commit exports/.
+python check_fetch_trades.py --user 0xYOUR... --out exports/trades.csv
+python check_participation.py --hours 72 --csv exports/trades.csv
 ```
 
 **Export pathlog ticks off the VM.** The recorder deletes oldest JSONL after
@@ -165,7 +172,8 @@ Watch the console for `[DRY BUY]` / `[DRY SELL]` markers. Ctrl-C to stop.
    Redemption is credited only after relayer confirmation and a complete Data API
    snapshot shows the inventory gone; GC never invents par value.
 4. **No `if __name__ == "__main__"` guard** — buy-bot scripts execute at module
-   level. They cannot be imported. `pathlog.py` and `check_path_backtest.py` can.
+   level. They cannot be imported. `pathlog.py`, `check_path_backtest.py`, and
+   `check_fetch_trades.py` can.
 
 ## Systemd Services (in `deploy/`)
 

@@ -63,5 +63,8 @@ strategy.buy.hourly.json
 .idea/
 *.swp
 
-# Data exports
+# Data exports (wallet trade dumps — do not commit)
 Polymarket-History-*.csv
+exports/*.csv
+exports/*.parquet
+exports/*.json
