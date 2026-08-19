@@ -5,8 +5,9 @@ Do not put secrets, API keys, or live wallet material here.
 
 Last updated: **2026-08-19** — keep the **$2.50 / 75–90¢** CLOB buy triggers
 (band unchanged); pin FAK buys to share-capped limits at the quoted ask so leftover
-USDC cannot walk into 9¢ junk. Pause minting; pathlog records books for entry
-backtests (14-day / 400 MB cap).
+USDC cannot walk into 9¢ junk. Hedge **trigger** is still 35/40; the sell follows
+the live bid after that (no 32¢ FAK floor). Pause minting; pathlog records books
+for entry backtests (14-day / 400 MB cap).
 
 ---
 
@@ -25,7 +26,7 @@ triggers** (not the old 98–99¢ probe):
 | Execution | FAK **limit** at the quoted ask, size `min(budget/ask, ask_size)` shares — **not** a USDC market order |
 | GUI consensus | winner ≥ 70¢, loser ≤ 30¢ |
 | Windows | 5m **120 s** · 15m **4.0 min** · hourly **13.0 min** |
-| Hedge | bid ≤ **35¢** and ask ≤ **40¢**, spread ≤ 15¢ |
+| Hedge | **Trigger** bid ≤ **35¢** and ask ≤ **40¢**, spread ≤ 15¢ (real book, not a glitch). **Then sell at whatever the bid is** — no 32¢ floor. |
 | Underlying edge | **$5** (5m) / **$10** (15m, hourly); side must match |
 | `max_open_positions` | **0 = unlimited** |
 | `toxic_force_exit_below` | **65¢** |
@@ -88,6 +89,7 @@ Kill switch: `touch STOP_PATHLOG`.
 - [x] Pause minting; keep $2.50 / 75–90¢ CLOB triggers.
 - [x] Pin BUY FAKs to share-capped limits at the quoted ask (band unchanged).
 - [x] Path recorder + `check_path_backtest.py` (first-touch ask × time-left).
+- [x] Hedge FAK follows live bid after 35/40 integrity (no 32¢ fill refusal).
 - [ ] On VM: stop mint, restart buy bots + pathlog after reviewing live JSON.
 - [ ] Let pathlog collect resolved markets, then `--grid` / export CSV **off the VM** before prune.
 

@@ -143,10 +143,11 @@ Watch the console for `[DRY BUY]` / `[DRY SELL]` markers. Ctrl-C to stop.
   making. Buys are share-capped **limit** FAKs at the quoted ask; sells stay
   share-denominated market FAKs.
 - **Hedge is sell-only exit:** The bots never profit-take. The only sell path is the
-  hedge (bid ≤ 35¢ **and** ask ≤ 40¢ with tight spread, force-fresh REST
-  fail-closed) or a `toxic_fill` dump (avg < 65¢ or walked size). Everything else
-  rides to redemption at $1.00. WS may *arm* a hedge check; normal sells need
-  two-sided REST; toxic dumps may sell on bid-only REST.
+  hedge: REST shows bid ≤ 35¢ **and** ask ≤ 40¢ with tight spread (a real
+  collapse, not a spoof penny), or a `toxic_fill` dump (avg < 65¢ or walked
+  size). After that, the FAK sells at the **live bid** even if it is 20¢.
+  Everything else rides to redemption at $1.00. WS may *arm* a hedge check;
+  normal sells need two-sided REST; toxic dumps may sell on bid-only REST.
 - **Tick sizes:** 5m markets use `0.001`, 15m and hourly use `0.01`.
 - **One entry per market:** Enforced via `meta.get("bought_token")` in state cache.
 - **Notifications:** Fire-and-forget via ntfy.sh (topic `polybot-joel-btc`).
