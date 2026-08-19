@@ -176,6 +176,7 @@ _STRATEGY_DEFAULTS = {
     "buy_window_min": 13.0,
     "buy_grace_s": 2,
     "buy_cooldown_s": 3,
+    "empty_fak_cooldown_s": 0.15,
     "buy_budget": 2.5,
     # Hard ceiling on USDC sent per market. Strategy is $2.50; never more than $3.
     "buy_max_spend": 3.0,
@@ -314,6 +315,7 @@ def load_strategy():
             "min_underlying_edge_usd", "hedge_undercut_ticks",
             "hedge_quote_max_age_s", "hedge_retry_sleep_s",
             "hedge_ghost_sleep_s", "buy_grace_s", "buy_cooldown_s",
+            "empty_fak_cooldown_s",
             "redeem_throttle_s", "max_redeem_age_days",
         ):
             if float(cfg[key]) < 0:
@@ -355,6 +357,7 @@ HEDGE_REQUIRE_ASK_MAX = _strat["hedge_require_ask_max"]
 BUY_WINDOW_MIN = _strat["buy_window_min"]
 BUY_GRACE_S = _strat["buy_grace_s"]
 BUY_COOLDOWN_S = _strat["buy_cooldown_s"]
+EMPTY_FAK_COOLDOWN_S = _strat["empty_fak_cooldown_s"]
 BUY_BUDGET = _strat["buy_budget"]
 BUY_MAX_SPEND = _strat["buy_max_spend"]
 BUY_MAX_SHARES = _strat["buy_max_shares"]
@@ -1920,6 +1923,17 @@ def definitive_order_rejection(exc):
     return isinstance(status, int) and status in {400, 401, 403, 404, 422}
 
 
+def unmatched_fak_rejection(exc):
+    """True when CLOB 400 means the FAK crossed nothing (safe to re-quote).
+
+    Other 400s (invalid amounts, balance) must not retry the same order.
+    """
+    status = getattr(exc, "status_code", None)
+    if status != 400:
+        return False
+    return "no orders found to match" in str(exc).lower()
+
+
 def inspect_uncertain_order(
     order_id,
     *,
@@ -2298,7 +2312,54 @@ def buy_market_with_retry(
                 order_type=OrderType.FAK,
             )
         except Exception as e:
-            if definitive_order_rejection(e):
+            if unmatched_fak_rejection(e):
+                can_retry = attempt + 1 < max_retries
+                log_event(
+                    "buy_attempt_rejected", token_id=token_id,
+                    order_id=expected_order_id, error=str(e)[:200],
+                    attempt=attempt + 1, spend=round(spend, 4),
+                    unmatched_retry=can_retry,
+                )
+                # Fail closed if inventory appeared despite the unmatched 400.
+                # CLOB only — Data API fallback can lag and look empty.
+                guard = check_clob_token_balance(token_id, refresh=True)
+                if (
+                    guard is not None
+                    and guard > float(bal_baseline) + total_bought + 0.01
+                ):
+                    delta = guard - float(bal_baseline) - total_bought
+                    fill_cost = float(spend)
+                    total_bought += delta
+                    spent += fill_cost
+                    try:
+                        _persist()
+                    except Exception:
+                        pass
+                    log_event(
+                        "buy_ghost_fill", token_id=token_id, filled=delta,
+                        fill_cost=round(fill_cost, 4), ask=price,
+                        attempt=attempt + 1, bal_after=guard,
+                        via="unmatched_400_guard",
+                    )
+                    return total_bought, spent, "filled"
+                if guard is None:
+                    # Cannot prove empty; do not fire another FAK.
+                    log_event(
+                        "buy_attempt_ambiguous", token_id=token_id,
+                        error=str(e)[:200],
+                        attempt=attempt + 1, spend=round(spend, 4),
+                        via="unmatched_400_no_balance",
+                    )
+                    ambiguous = True
+                elif can_retry:
+                    console.print(
+                        f"  [dim yellow][FAK EMPTY][/] no match · re-quote "
+                        f"{attempt + 2}/{max_retries}"
+                    )
+                    continue
+                else:
+                    break
+            elif definitive_order_rejection(e):
                 console.print(
                     f"  [dim yellow][BUY REJECTED][/] explicit HTTP rejection: {e}"
                 )
@@ -3056,6 +3117,7 @@ while not _shutdown_requested:
         BUY_WINDOW_MIN = _strat["buy_window_min"]
         BUY_GRACE_S = _strat["buy_grace_s"]
         BUY_COOLDOWN_S = _strat["buy_cooldown_s"]
+        EMPTY_FAK_COOLDOWN_S = _strat["empty_fak_cooldown_s"]
         BUY_BUDGET = _strat["buy_budget"]
         BUY_MAX_SPEND = _strat["buy_max_spend"]
         BUY_MAX_SHARES = _strat["buy_max_shares"]
@@ -4435,9 +4497,14 @@ while not _shutdown_requested:
             buy_leg = "up" if up_buy else "down"
             buy_gui = up_gui if up_buy else dn_gui
 
-            # Cooldown
+            # Cooldown (empty FAKs use the short empty_fak_cooldown_s).
             last_buy_at = meta.get("last_buy_at") or 0
-            if now_ms - last_buy_at < BUY_COOLDOWN_S * 1000:
+            cooldown_s = (
+                float(EMPTY_FAK_COOLDOWN_S)
+                if meta.get("last_buy_empty")
+                else float(BUY_COOLDOWN_S)
+            )
+            if now_ms - last_buy_at < cooldown_s * 1000:
                 continue
 
             _ttm_disp = f"{minutes_left*60:>3.0f}s" if minutes_left < 1 else f"{minutes_left:>4.1f}m"
@@ -4500,6 +4567,7 @@ while not _shutdown_requested:
                 )
                 meta["last_buy_at"] = time.time() * 1000
                 meta["bought_token"] = buy_token
+                meta.pop("last_buy_empty", None)
                 meta["bought_leg"] = buy_leg
                 meta["bought_size"] = filled_total
                 meta["fill_price"] = round(avg, 4)
@@ -4577,6 +4645,7 @@ while not _shutdown_requested:
                 )
                 meta["last_buy_at"] = wall_ms
                 meta["bought_token"] = buy_token
+                meta.pop("last_buy_empty", None)
                 meta["bought_leg"] = buy_leg
                 meta["bought_size"] = bought
                 meta["fill_price"] = round(avg_fill, 4)
@@ -4637,6 +4706,7 @@ while not _shutdown_requested:
                 meta["buy_uncertain_token"] = buy_token
                 meta["buy_uncertain_leg"] = buy_leg
                 meta["last_buy_at"] = wall_ms
+                meta.pop("last_buy_empty", None)
                 log_event(
                     "buy_uncertain", condition_id=cond, leg=buy_leg, budget=spend_usd,
                     ask=buy_ask, token_id=buy_token,
@@ -4652,6 +4722,10 @@ while not _shutdown_requested:
                 # happened), so remove the temporary write-ahead quarantine.
                 _clear_buy_uncertain()
                 meta["last_buy_at"] = wall_ms
+                if buy_status == "empty":
+                    meta["last_buy_empty"] = True
+                else:
+                    meta.pop("last_buy_empty", None)
                 log_event("buy_fail", condition_id=cond, leg=buy_leg, budget=spend_usd, ask=buy_ask, status=buy_status)
                 save_json(STATE_FILE, positions_meta)
 

@@ -125,6 +125,9 @@ Watch the console for `[DRY BUY]` / `[DRY SELL]` markers. Ctrl-C to stop.
 ### What to look for
 
 - `[DRY BUY]` / `[DRY SELL]` in dry-run — confirms trigger logic fires
+- `[FAK EMPTY]` / `buy_attempt_rejected` with `unmatched_retry: true` — empty FAK re-quoted in the same trigger (up to 3 POSTs)
+- `buy_ghost_fill` `via=unmatched_400_guard` — unmatched 400 but inventory appeared; no second FAK
+- `buy_attempt_ambiguous` `via=unmatched_400_no_balance` — unmatched 400 and CLOB balance unreadable; quarantine, no retry
 - `cycle_error` in logs — unhandled exception. The bot process stays up, but
   **that poll is aborted** (later markets in the same `for m in markets` loop
   do not buy or hedge). Banner does **not** sleep 5s. Structured `error` field
@@ -184,7 +187,9 @@ see TECHNICAL_DESIGN.md “Research loop.”
 - **FAK orders only:** All orders are Fill-And-Kill — no resting orders, no market
   making. Buys are **limit** FAKs at the quoted ask sized `budget/ask`
   (hard `buy_max_spend` $3, `buy_max_shares` 5; not displayed top size); sells stay
-  share-denominated market FAKs.
+  share-denominated market FAKs. A 400 **"no orders found to match"** re-quotes and
+  POSTs again (up to 3) in the same trigger; invalid-amount / auth 400s and unclear
+  POSTs do not. After a fully empty trigger, wait `empty_fak_cooldown_s` (0.15 s).
 - **Hedge is sell-only exit:** The bots never profit-take. The only sell path is the
   hedge: REST shows bid ≤ 35¢ **and** ask ≤ 40¢ with tight spread (a real
   collapse, not a spoof penny), or a `toxic_fill` dump (avg < 65¢ or walked

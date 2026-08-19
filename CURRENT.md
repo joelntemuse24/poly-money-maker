@@ -33,7 +33,7 @@ triggers** (not the old 98–99¢ probe):
 | `buy_max_spend` | **$3.00** hard ceiling (strategy is $2.50; never more than ~$3) |
 | `buy_max_shares` | **5** buffer (~3.3 sh at $2.50/75¢) |
 | Ask band | **75–90¢** — trigger as soon as winning ask ≥ 75¢; 90¢ is a hard ceiling |
-| Execution | FAK **limit** at the quoted ask, size `min(budget/ask, buy_max_shares)` — **not** a USDC market order, **not** capped to displayed top size |
+| Execution | FAK **limit** at the quoted ask, size `min(budget/ask, buy_max_shares)`. A clean **unmatched 400** re-quotes up to **3** FAKs in one trigger; then **0.15 s** cooldown. Unclear POSTs still quarantine (no second $2.50). |
 | GUI consensus | winner ≥ 70¢, loser ≤ 30¢ |
 | Windows | 5m **120 s** (15m / hourly bots **not running**) |
 | Hedge | **Trigger** bid ≤ **35¢** and ask ≤ **40¢**, spread ≤ 15¢ (real book, not a glitch). **Then sell at whatever the bid is** — no 32¢ floor. |
@@ -173,6 +173,9 @@ amount / HTTP 400), not this NameError.
 - [x] 5m `known_cost` NameError (#80) — **code** fixed 13 Aug; live process
       needed restart. Confirm `check_buy_skips.py --since 2026-08-19T09:42:23`
       shows **0** `NameError` cycle_errors.
+- [x] Faster **proven-empty** FAK retries (unmatched 400 only; 0.15 s empty cooldown).
+      After merge: `git pull` + `sudo systemctl restart polybuybot5m` (5m only).
+      Live JSON does **not** need a new key — `empty_fak_cooldown_s` defaults to 0.15.
 - [ ] Let pathlog collect resolved markets, then `--anatomy` / `--compare` / `--grid` **off the VM** before prune.
 
 ---

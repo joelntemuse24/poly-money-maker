@@ -221,7 +221,11 @@ Execution: a FAK **limit** buy sized in **shares** at the quoted ask —
 market order and **not** capped to displayed top size. A dollar-denominated
 market FAK still walks cheaper levels (gate quotes 80¢, leftover cash lifts 9¢).
 Thin tops log `[THIN ASK]` and still post the dollar size (clipped only by the
-share rail); unmatched remainder dies on the FAK. The 75–90¢ **band is
+share rail); unmatched remainder dies on the FAK. A CLOB 400 **"no orders found
+to match"** is treated as proven empty: re-quote and POST again (up to 3) in the
+same trigger, then `empty_fak_cooldown_s` (0.15 s) before the next outer attempt.
+Invalid-amount / auth 400s still stop. Unclear POSTs still quarantine — never a
+second full budget. The 75–90¢ **band is
 unchanged**; this only pins the limit price to the level that passed the gate.
 Re-quote already aborts if the fresh ask left the band. A BUY limit is a
 **maximum**, so the exchange can still price-improve; confirmed fills are

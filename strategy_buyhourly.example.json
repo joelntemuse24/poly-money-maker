@@ -21,6 +21,7 @@
   "buy_window_min": 13.0,
   "buy_grace_s": 2,
   "buy_cooldown_s": 3,
+  "empty_fak_cooldown_s": 0.15,
   "buy_budget": 2.5,
   "buy_max_spend": 3.0,
   "buy_max_shares": 5.0,
