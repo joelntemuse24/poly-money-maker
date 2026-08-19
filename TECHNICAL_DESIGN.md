@@ -267,11 +267,11 @@ force exit):
   a reversal (`hedge_skip_toxic_book`). Require bid ≤ 35¢, ask ≤
   `hedge_require_ask_max` (40¢), and spread ≤ `hedge_max_spread` (15¢). Toxic dumps
   skip integrity / `abort_above` so a collapsed book can still exit.
-- **Execution:** FAK sell at the **live bid** (minus undercut, one tick minimum)
-  after the 35/40 integrity check. Do not raise the limit to `hedge_min_price`
-  (~32¢) — that is how a valid 20¢ bid became a $0 wipe. Toxic dumps use the same
-  live-bid FAK (they skip integrity / bounce cancel). Every retry force-REST
-  refreshes **both** sides (normal path also re-runs the two-sided gate).
+- **Execution:** After the 35/40 check, FAK at the **live bid** (minus undercut).
+  There is no “won't sell below 32¢.” 20¢ or 1¢ on a still-tight collapsed book
+  is a fill. One tick is only the exchange minimum. Toxic dumps skip integrity /
+  bounce cancel and also sell at the live bid. Retries force-REST both sides
+  (normal path re-runs the two-sided gate so a spoof 1¢/99¢ still aborts).
 - **Outcome:** every POST has a crash-durable deterministic order ID. Only
   settlement-confirmed fills shrink `bought_size` or add proceeds; ambiguous
   outcomes remain in `hedge_uncertain` until exact-order reconciliation. Full

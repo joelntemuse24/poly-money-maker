@@ -265,15 +265,18 @@ class BuyFillProductionHelpers(unittest.TestCase):
         ok, why = self.ns["hedge_book_ok"](0.20, 0.30, 0.35, 0.15, 0.40)
         self.assertTrue(ok)
         self.assertEqual(why, "ok")
+        ok, why = self.ns["hedge_book_ok"](0.01, 0.10, 0.35, 0.15, 0.40)
+        self.assertTrue(ok)
 
     def test_hedge_sell_follows_live_bid_not_32c_floor(self):
         ns = _load_funcs("hedge_sell_price")
         ns["TICK_SIZE_FALLBACK"] = "0.001"
         sell = ns["hedge_sell_price"]
-        # Tick floor + 20¢ bid → take ~20¢. 32.5¢ floor would match nothing.
         self.assertAlmostEqual(sell(0.20, 0.001, 0, 0.001), 0.20)
         self.assertAlmostEqual(sell(0.20, 0.001, 2, 0.001), 0.198)
-        self.assertGreater(sell(0.20, 0.001, 0, 0.325), 0.30)
+        # A leftover 32.5¢ config must not refuse the live bid.
+        self.assertAlmostEqual(sell(0.20, 0.001, 0, 0.325), 0.20)
+        self.assertAlmostEqual(sell(0.01, 0.001, 0, 0.325), 0.01)
 
 
 class HedgeReconcileProduction(unittest.TestCase):

@@ -1036,25 +1036,20 @@ def get_quote_fast(
     return q
 
 
-def hedge_sell_price(bid, tick_size, undercut_ticks, min_price):
-    """FAK sell limit: undercut the live bid, align to tick, clamp to min_price.
+def hedge_sell_price(bid, tick_size, undercut_ticks, min_price=None):
+    """FAK sell at the live bid (undercut, tick-aligned).
 
-    Pass one tick as min_price. Passing hedge_min_price (32–32.5¢) raises the
-    limit above a 20¢ bid and the FAK matches nothing.
+    After 35/40 integrity, take whatever bid is there. min_price is ignored so
+    a leftover 32¢ config cannot refuse a 20¢ or 1¢ print. One tick is only
+    the exchange minimum, not a strategy floor.
     """
     tick = float(tick_size or TICK_SIZE_FALLBACK)
     if tick <= 0:
         tick = 0.01
     undercut = max(0, int(undercut_ticks)) * tick
     raw = float(bid or 0) - undercut
-    # Floor to tick so CLOB never rejects for precision (e.g. 0.325 on 0.01).
     aligned = (int(raw / tick + 1e-12)) * tick
-    floor = float(min_price or tick)
-    floor_aligned = (int(floor / tick + 1e-12)) * tick
-    if floor_aligned + 1e-12 < floor:
-        # min_price wasn't on-tick; round UP to next valid tick for the floor.
-        floor_aligned = (int(floor / tick + 1e-12) + 1) * tick
-    return max(floor_aligned, tick, aligned)
+    return max(tick, aligned)
 
 
 # Polymarket UI display rule (docs.polymarket.com/concepts/prices-orderbook):
@@ -3703,10 +3698,9 @@ while not _shutdown_requested:
                             )
                         elif toxic_fill or hedge_bid <= HEDGE_THRESHOLD:
                             hedge_tick = get_tick_size_cached(held_token)
-                            # 35/40 (or toxic) already decided this is a real exit.
-                            # FAK at the live bid — a 20¢ bid on a tight collapsed
-                            # book must fill. hedge_min_price must not raise the
-                            # limit and leave us with $0.
+                            # 35/40 already said this book is a real reversal.
+                            # Sell at the live bid — 20¢, 5¢, one tick, whatever
+                            # is there. No strategy "won't take less than X".
                             hedge_floor = float(hedge_tick)
                             sell_floor = hedge_sell_price(
                                 hedge_bid, hedge_tick, HEDGE_UNDERCUT_TICKS, hedge_floor,
