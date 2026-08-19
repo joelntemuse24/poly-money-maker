@@ -114,6 +114,36 @@ def _f(value: Any) -> Optional[float]:
         return None
 
 
+def matches_series(series: str, slug: str, needle: str) -> bool:
+    """Filter pathlog markets by cadence. ``5m`` must not match ``15m``."""
+    n = (needle or "").strip().lower()
+    series_s = (series or "").strip().lower()
+    slug_s = (slug or "").strip().lower()
+    if not n:
+        return True
+    if n in {"5m", "5"}:
+        if series_s == "btc-up-or-down-5m":
+            return True
+        if series_s == "btc-up-or-down-15m":
+            return False
+        if "15m" in series_s or "15m" in slug_s:
+            return False
+        return "5m" in series_s or "5m" in slug_s
+    if n in {"15m", "15"}:
+        return (
+            series_s == "btc-up-or-down-15m"
+            or "15m" in series_s
+            or "15m" in slug_s
+        )
+    if n in {"hourly", "hour", "1h", "hr"}:
+        return (
+            series_s == "btc-up-or-down-hourly"
+            or "hourly" in series_s
+            or "hourly" in slug_s
+        )
+    return n in series_s or n in slug_s
+
+
 def first_entry(
     ticks: Sequence[dict],
     *,
@@ -644,7 +674,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     ap.add_argument("--ttm-max", type=float, default=120.0, help="seconds left, inclusive")
     ap.add_argument("--budget", type=float, default=2.5)
     ap.add_argument("--max-spread", type=float, default=None)
-    ap.add_argument("--series", default="", help="substring filter, e.g. 5m")
+    ap.add_argument("--series", default="", help="5m | 15m | hourly (5m does not match 15m)")
     ap.add_argument("--csv", type=Path, default=None, help="write per-market hit or anatomy rows")
     ap.add_argument("--export-market", default="", help="slug to dump as tick CSV")
     ap.add_argument("--grid", action="store_true", help="print ask × ttm_max win-rate table")
@@ -668,8 +698,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     markets = list(iter_markets(args.dir))
     if args.series:
-        needle = args.series.lower()
-        markets = [m for m in markets if needle in m.series.lower() or needle in m.slug.lower()]
+        markets = [
+            m for m in markets
+            if matches_series(m.series, m.slug, args.series)
+        ]
 
     if args.export_market:
         slug = args.export_market

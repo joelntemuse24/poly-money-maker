@@ -100,9 +100,10 @@ same ticks, then change live JSON:
 
 `--anatomy` buckets: `decided_before_in_band` / `above_band` / `below_band`
 (clear winner before the window), `tight_through_window` (never 5¢ apart),
-`cleared_in_window` (first became obvious only after T-120). Pathlog has no
-last-trade GUI and no BTC/PTB — those still need `check_buy_skips.py` /
-`check_edge_counterfactual.py`.
+`cleared_in_window` (first became obvious only after T-120). `--series 5m`
+is **only** 5-minute markets (`15m` contains the letters `5m` — do not use a
+raw substring). Pathlog has no last-trade GUI and no BTC/PTB — those still
+need `check_buy_skips.py` / `check_edge_counterfactual.py`.
 
 Kill switch: `touch STOP_PATHLOG`.
 
