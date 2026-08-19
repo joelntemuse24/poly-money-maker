@@ -14,7 +14,7 @@ import os
 import shutil
 import tempfile
 import unittest
-from decimal import Decimal, InvalidOperation
+from decimal import Decimal, InvalidOperation, ROUND_DOWN
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -36,6 +36,7 @@ def _load_funcs(*names: str, bot: Path = BOT):
         raise RuntimeError(f"missing functions in {bot.name}: {sorted(wanted)}")
     ns: dict = {
         "Decimal": Decimal,
+        "ROUND_DOWN": ROUND_DOWN,
         "InvalidOperation": InvalidOperation,
         "json": json,
         "math": math,
@@ -266,15 +267,28 @@ class BuyFillProductionHelpers(unittest.TestCase):
 
     def test_quoted_buy_shares_is_budget_over_ask_not_top_size(self):
         quoted = self.ns["quoted_buy_shares"]
-        # $2.50 at 80¢ → ~3.12 shares (limit at that ask), not a $2.50 walk.
-        self.assertAlmostEqual(quoted(2.50, 0.80), 3.125)
-        self.assertAlmostEqual(quoted(2.50, 0.80, 5.0), 3.125)
-        # Displayed top size is not an argument — a 1-sh book still sizes 3.125.
+        # $2.50 at 80¢ → 3.10 shares ($2.48). 3.125 sh is $2.50 but the
+        # SDK round_downs size to 2 dp → 3.12 * 80¢ = $2.496 (CLOB 400).
+        self.assertAlmostEqual(quoted(2.50, 0.80), 3.10)
+        self.assertAlmostEqual(quoted(2.50, 0.80, 5.0), 3.10)
+        # Displayed top size is not an argument — a 1-sh book still sizes 3.10.
         # share_cap=1.0 is the tunable rail, not the book.
         self.assertAlmostEqual(quoted(2.50, 0.80, 1.0), 1.0)
         # $2.50 at 40¢ would be 6.25 sh — rail clips to 5.
         self.assertAlmostEqual(quoted(2.50, 0.40, 5.0), 5.0)
         self.assertEqual(quoted(2.50, 0.0, 5.0), 0.0)
+
+    def test_quoted_buy_shares_maker_usdc_is_two_decimals(self):
+        quoted = self.ns["quoted_buy_shares"]
+        # Live 5m rejections: 3.0487 sh * 82¢ = $2.4999 (maker > 2 dp).
+        for ask in (0.75, 0.79, 0.81, 0.82, 0.85, 0.86, 0.87, 0.89, 0.90):
+            shares = quoted(2.50, ask, 5.0)
+            self.assertGreaterEqual(shares, 0.01, ask)
+            self.assertAlmostEqual(shares, round(shares, 2), places=9, msg=ask)
+            maker = Decimal(str(shares)) * Decimal(str(ask))
+            self.assertEqual(maker.quantize(Decimal("0.01")), maker, ask)
+        self.assertLess(quoted(2.50, 0.82, 5.0) * 0.82, 2.5000001)
+        self.assertAlmostEqual(quoted(2.50, 0.82), 3.0)
 
     def test_classify_buy_fill_walk_and_cheap_avg_are_toxic(self):
         classify = self.ns["classify_buy_fill"]
@@ -740,7 +754,7 @@ class BuyExecutionAmbiguity(unittest.TestCase):
         )
         self.assertEqual(result, (0.0, 0.0, "empty"))
         self.assertEqual(len(calls["orders"]), 1)
-        self.assertAlmostEqual(calls["orders"][0]["size"], 3.125)
+        self.assertAlmostEqual(calls["orders"][0]["size"], 3.10)
         self.assertAlmostEqual(calls["orders"][0]["price"], 0.80)
 
     def test_explicit_unmatched_zero_fill_is_terminal_empty(self):
