@@ -532,7 +532,7 @@ class AmbiguousCrossCyclePolicy(unittest.TestCase):
             self.assertIn("_clob_lock", src)
 
     def test_known_cost_assigned_before_buy_uncertain_spend_cap(self):
-        needle = "spend_cap=max(0.0, float(BUY_BUDGET) - known_cost)"
+        needle = "min(float(BUY_BUDGET), float(BUY_MAX_SPEND)) - known_cost"
         assign = 'known_cost = float(meta.get("buy_uncertain_known_cost")'
         for bot in (BOT, BOT5M, BOT_HR):
             src = bot.read_text()
