@@ -206,7 +206,7 @@ A buy fires only when **all** of these gates pass, evaluated in the buy window
    FAK at the *live* ask — so catching the print early yields fills near 75¢.
    90¢ is only a hard ceiling (never enter if ask is already above it).
 5. **Underlying gate.** If `underlying_gate_enabled`, the live oracle price must be
-   at least `min_underlying_edge_usd` away from the captured PTB ($5 on 5m, $10 on
+   at least `min_underlying_edge_usd` away from the captured PTB ($2 on 5m, $10 on
    15m/hourly), **and** the book's winning side must match the direction of the
    underlying move. This blocks buying a "winner" that the resolution oracle itself
    disagrees with (stale-book trap).
@@ -358,7 +358,7 @@ paths. Templates are `strategy_buy.example.json`,
 | `buy_threshold` / `buy_max_price` | 0.75 / 0.90 | Trigger ≥75¢; hard ceiling 90¢ (prefer fills near 75¢) |
 | `min_winner_bid` / `max_loser_bid` / `min_bid_edge` | 0.70 / 0.30 / 0.05 | GUI consensus gate (aligned to 75¢ band) |
 | `max_entry_spread` | 0.05 | Max ask−bid on winner at entry |
-| `underlying_gate_enabled` / `min_underlying_edge_usd` | true / 5.0 (5m), 10.0 (15m/hr) | Oracle alignment gate |
+| `underlying_gate_enabled` / `min_underlying_edge_usd` | true / 2.0 (5m), 10.0 (15m/hr) | Oracle alignment gate |
 | `toxic_force_exit_below` | 0.65 | Force-dump if FAK avg &lt; 65¢ (must be ≤ buy_threshold) |
 | `hedge_enabled` / `hedge_threshold` / `hedge_min_price` | true / 0.35 / unused floor | Arm at 35¢; `hedge_min_price` kept in JSON, not a FAK floor |
 | `hedge_max_spread` / `hedge_require_ask_max` | 0.15 / 0.40 | Hedge book must actually collapse |

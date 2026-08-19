@@ -4,7 +4,8 @@
 Do not put secrets, API keys, or live wallet material here.
 
 Last updated: **2026-08-19** — **only the 5m CLOB bot is live.** Stop/disable
-15m and hourly. Keep the **$2.50 / 75–90¢** triggers on 5m. Buys are **limit
+15m and hourly. Keep the **$2.50 / 75–90¢** triggers on 5m. Chainlink TWAP
+gate is **$2** (not $5). Buys are **limit
 FAKs at the quoted ask** sized `budget/ask` (~3.3 shares at 75¢), clipped to
 `buy_max_shares` **5** (buffer). Hard spend ceiling `buy_max_spend` **$3**.
 Leftover USDC cannot walk into 9¢ junk. Displayed top size is **not** a cap.
@@ -35,7 +36,7 @@ triggers** (not the old 98–99¢ probe):
 | GUI consensus | winner ≥ 70¢, loser ≤ 30¢ |
 | Windows | 5m **120 s** (15m / hourly bots **not running**) |
 | Hedge | **Trigger** bid ≤ **35¢** and ask ≤ **40¢**, spread ≤ 15¢ (real book, not a glitch). **Then sell at whatever the bid is** — no 32¢ floor. |
-| Underlying edge | **$5** (5m) / **$10** (15m, hourly); side must match |
+| Underlying edge | **$2** (5m) / **$10** (15m, hourly); side must match |
 | `max_open_positions` | **0 = unlimited** |
 | `toxic_force_exit_below` | **65¢** |
 
@@ -90,15 +91,19 @@ Kill switch: `touch STOP_PATHLOG`.
 - **Mint:** `sudo systemctl stop polymintbot && sudo systemctl disable polymintbot`
 - **Buy bots:** **5m only.** Leave 15m/hourly stopped. `buy_max_spend` /
   `buy_max_shares` may be omitted from live JSON — defaults **$3** / **5 shares**
-  apply. After pulling this FAK change, restart **5m only**:
+  apply. Live JSON **must** set `min_underlying_edge_usd` to **2.0** (hot
+  reload, no restart). Code default is 2.0 only when the key is omitted.
+  After pulling bot code, restart **5m only**:
   ```bash
   sudo systemctl stop polybuybot polybuybothourly
   sudo systemctl disable polybuybot polybuybothourly
   cd ~/poly-money-maker && git pull
+  python3 -c 'import json; from pathlib import Path; p=Path("strategy_buy5m.json"); d=json.loads(p.read_text()); d["min_underlying_edge_usd"]=2.0; p.write_text(json.dumps(d, indent=2)+"\n"); print("min_underlying_edge_usd", d["min_underlying_edge_usd"])'
   sudo systemctl restart polybuybot5m
   sudo systemctl enable polybuybot5m
   systemctl is-active polybuybot polybuybot5m polybuybothourly
   # expect: inactive  active  inactive
+  .venv/bin/python check_buy_skips.py --since "$(date -u -d '2 hours ago' '+%Y-%m-%dT%H:%M:%S')"
   ```
   Confirm `strategy_buy5m.json` `dry_run` / `entry_enabled` before the 5m restart.
   Do **not** start 15m or hourly unless the operator asks.
@@ -116,6 +121,7 @@ Kill switch: `touch STOP_PATHLOG`.
   ticks record TOB size; backtest is share-capped FAK, not infinite ask size).
 - [x] Hedge FAK follows live bid after 35/40 integrity (no 32¢ fill refusal).
 - [x] On VM: pathlog restarted onto size-aware ticks; 15m/hourly buy bots stopped.
+- [x] 5m underlying gate **$2** (was $5); live JSON must set `min_underlying_edge_usd`.
 - [ ] Let pathlog collect resolved markets, then `--grid` / export CSV **off the VM** before prune.
 
 ---
