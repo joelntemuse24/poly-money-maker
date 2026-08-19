@@ -159,8 +159,9 @@ python check_buy_skips.py --since 2026-08-19T08:02:00
 
 `--anatomy` answers “already decided at T-120 vs 50/50 until the end.”
 `--compare` scores live 75–90/120s vs earlier windows and wider bands.
-`--grid` is ask × time. `--budget` is size. Pathlog cannot replay GUI last-trade,
-BTC/PTB, or POST latency — see TECHNICAL_DESIGN.md “Research loop.”
+`--grid` is ask × time. `--budget` is size. **`--series 5m` matches only 5m**
+(not 15m). Pathlog cannot replay GUI last-trade, BTC/PTB, or POST latency —
+see TECHNICAL_DESIGN.md “Research loop.”
 
 ## Key Conventions
 

@@ -13,6 +13,7 @@ from check_path_backtest import (
     hypothetical_pnl,
     infer_winner,
     load_market_file,
+    matches_series,
     simulate_fak_buy,
     summarize,
 )
@@ -242,6 +243,16 @@ class SizeAwareRuleTests(unittest.TestCase):
             self.assertEqual(stats["zero"], 1)
             self.assertEqual(stats["decided"], 0)
             self.assertIsNone(stats["pnl_sum"])
+
+
+class SeriesFilterTests(unittest.TestCase):
+    def test_5m_does_not_match_15m(self):
+        self.assertTrue(matches_series("btc-up-or-down-5m", "btc-updown-5m-1", "5m"))
+        self.assertFalse(matches_series("btc-up-or-down-15m", "btc-updown-15m-1", "5m"))
+        self.assertTrue(matches_series("btc-up-or-down-15m", "btc-updown-15m-1", "15m"))
+        self.assertFalse(matches_series("btc-up-or-down-5m", "btc-updown-5m-1", "15m"))
+        self.assertTrue(matches_series("btc-up-or-down-hourly", "btc-updown-hourly-1", "hourly"))
+        self.assertFalse(matches_series("btc-up-or-down-5m", "btc-updown-5m-1", "hourly"))
 
 
 class WindowAnatomyTests(unittest.TestCase):
