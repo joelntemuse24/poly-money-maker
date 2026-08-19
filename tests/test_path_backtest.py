@@ -13,12 +13,22 @@ from check_path_backtest import (
     hypothetical_pnl,
     infer_winner,
     load_market_file,
+    simulate_fak_buy,
     summarize,
 )
 
 
-def _tick(ts: float, ttm: float, ua: float, da: float, ub: float | None = None, db: float | None = None):
-    return {
+def _tick(
+    ts: float,
+    ttm: float,
+    ua: float,
+    da: float,
+    ub: float | None = None,
+    db: float | None = None,
+    uas: float | None = None,
+    das: float | None = None,
+):
+    row = {
         "e": "tick",
         "ts": ts,
         "ttm": ttm,
@@ -27,6 +37,11 @@ def _tick(ts: float, ttm: float, ua: float, da: float, ub: float | None = None, 
         "ub": ua - 0.01 if ub is None else ub,
         "db": da - 0.01 if db is None else db,
     }
+    if uas is not None:
+        row["uas"] = uas
+    if das is not None:
+        row["das"] = das
+    return row
 
 
 class FirstEntryTests(unittest.TestCase):
@@ -102,6 +117,135 @@ class FileAndRuleTests(unittest.TestCase):
             self.assertEqual(stats["hits"], 1)
             self.assertEqual(stats["wins"], 1)
             self.assertGreater(stats["pnl_sum"], 0)
+            self.assertEqual(results[0]["fill"], "full")
+            self.assertEqual(stats["full"], 1)
+            self.assertEqual(stats["partial"], 0)
+            self.assertEqual(stats["zero"], 0)
+
+
+class SimulateFakTests(unittest.TestCase):
+    def test_legacy_none_size_is_full_budget(self):
+        fill = simulate_fak_buy(2.5, 0.80, None)
+        self.assertEqual(fill["status"], "full")
+        self.assertAlmostEqual(fill["notional"], 2.5)
+        self.assertAlmostEqual(fill["shares"], 2.5 / 0.80)
+        self.assertAlmostEqual(fill["avg"], 0.80)
+
+    def test_enough_size_is_full(self):
+        fill = simulate_fak_buy(2.5, 0.80, 100.0)
+        self.assertEqual(fill["status"], "full")
+        self.assertAlmostEqual(fill["shares"], 3.125)
+
+    def test_thin_book_partial(self):
+        fill = simulate_fak_buy(15.0, 0.80, 3.0)
+        self.assertEqual(fill["status"], "partial")
+        self.assertAlmostEqual(fill["shares"], 3.0)
+        self.assertAlmostEqual(fill["notional"], 2.4)
+        self.assertAlmostEqual(fill["avg"], 0.80)
+
+    def test_zero_size(self):
+        fill = simulate_fak_buy(15.0, 0.80, 0.0)
+        self.assertEqual(fill["status"], "zero")
+        self.assertEqual(fill["shares"], 0.0)
+        self.assertEqual(fill["notional"], 0.0)
+
+    def test_does_not_walk_below_ask(self):
+        # Only the displayed top size is available — leftover USDC is unfilled.
+        fill = simulate_fak_buy(20.0, 0.80, 1.0)
+        self.assertEqual(fill["status"], "partial")
+        self.assertAlmostEqual(fill["shares"], 1.0)
+        self.assertAlmostEqual(fill["notional"], 0.80)
+
+
+class SizeAwareRuleTests(unittest.TestCase):
+    def test_larger_budget_partials_same_path(self):
+        ticks = [_tick(1, 90, 0.82, 0.18, uas=4.0, das=40.0)]
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "btc-updown-5m-2.jsonl"
+            rows = [
+                {
+                    "e": "open",
+                    "slug": "btc-updown-5m-2",
+                    "series": "btc-up-or-down-5m",
+                    "start": 1,
+                    "end": 301,
+                    "q": "test",
+                },
+                ticks[0],
+                {"e": "resolved", "winner": "up"},
+            ]
+            path.write_text("".join(json.dumps(r) + "\n" for r in rows))
+            market = load_market_file(path)
+            small = evaluate_rule(
+                [market],
+                ask_min=0.75,
+                ask_max=0.90,
+                ttm_min=0,
+                ttm_max=120,
+                budget=2.5,
+            )
+            big = evaluate_rule(
+                [market],
+                ask_min=0.75,
+                ask_max=0.90,
+                ttm_min=0,
+                ttm_max=120,
+                budget=15.0,
+            )
+            self.assertEqual(small[0]["fill"], "full")
+            self.assertEqual(big[0]["fill"], "partial")
+            self.assertAlmostEqual(small[0]["notional"], 2.5, places=3)
+            self.assertLess(big[0]["notional"], 15.0)
+            self.assertAlmostEqual(big[0]["shares"], 4.0)
+            self.assertAlmostEqual(big[0]["notional"], 4.0 * 0.82)
+
+    def test_first_entry_returns_ask_size(self):
+        hit = first_entry(
+            [_tick(1, 60, 0.81, 0.19, uas=4.25, das=10)],
+            ask_min=0.80,
+            ask_max=0.90,
+            ttm_min=0,
+            ttm_max=120,
+        )
+        self.assertIsNotNone(hit)
+        self.assertEqual(hit["ask_size"], 4.25)
+
+    def test_zero_fill_not_counted_as_loss(self):
+        market_rows = [
+            {
+                "e": "open",
+                "slug": "btc-updown-5m-3",
+                "series": "btc-up-or-down-5m",
+                "start": 1,
+                "end": 301,
+                "q": "test",
+            },
+            _tick(1, 90, 0.81, 0.19, uas=0.0, das=0.0),
+            {"e": "resolved", "winner": "up"},
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "btc-updown-5m-3.jsonl"
+            path.write_text("".join(json.dumps(r) + "\n" for r in market_rows))
+            market = load_market_file(path)
+            results = evaluate_rule(
+                [market],
+                ask_min=0.75,
+                ask_max=0.90,
+                ttm_min=0,
+                ttm_max=120,
+                budget=15.0,
+            )
+            stats = summarize(results)
+            self.assertTrue(results[0]["hit"])
+            self.assertEqual(results[0]["fill"], "zero")
+            self.assertIsNone(results[0]["won"])
+            self.assertEqual(stats["zero"], 1)
+            self.assertEqual(stats["decided"], 0)
+            self.assertIsNone(stats["pnl_sum"])
+
+
+if __name__ == "__main__":
+    unittest.main()
 
 
 if __name__ == "__main__":

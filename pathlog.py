@@ -3,7 +3,8 @@
 
 No orders. One JSONL file per market under pathlog/ticks/. Later,
 check_path_backtest.py answers: if we had entered at price X with Y
-seconds left, would that leg have won?
+seconds left, would that leg have won? New ticks also store displayed
+top-of-book size so the backtest can share-cap FAK fills.
 
 Ticks are auto-pruned (14 days / 400 MB, oldest first) so they fit the
 small VM disk. Export with check_path_backtest.py (or scp the ticks
@@ -30,6 +31,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 import requests
 from rich.console import Console
 
+from buy.book import best_from_levels
 from buy.market import MarketGateway, MintMarket
 
 console = Console()
@@ -231,29 +233,8 @@ def file_has_event(path: Path, event: str) -> bool:
     return False
 
 
-def _best(levels: Any, side: str) -> Tuple[Optional[float], float]:
-    valid: List[Tuple[float, float]] = []
-    for level in levels or []:
-        if not isinstance(level, dict):
-            continue
-        try:
-            price = float(level.get("price"))
-            size = float(level.get("size"))
-        except (TypeError, ValueError):
-            continue
-        if not (0 < price < 1) or size <= 0:
-            continue
-        valid.append((price, size))
-    if not valid:
-        return None, 0.0
-    if side == "bid":
-        price, size = max(valid, key=lambda item: item[0])
-    else:
-        price, size = min(valid, key=lambda item: item[0])
-    return price, size
-
-
-def fetch_book(token_id: str) -> Tuple[Optional[float], Optional[float]]:
+def fetch_book(token_id: str) -> Tuple[Optional[float], float, Optional[float], float]:
+    """REST `/book` → (bid, bid_size, ask, ask_size). Same parser as the WS path."""
     try:
         response = requests.get(
             f"{CLOB}/book",
@@ -264,17 +245,21 @@ def fetch_book(token_id: str) -> Tuple[Optional[float], Optional[float]]:
         response.raise_for_status()
         book = response.json()
     except Exception:
-        return None, None
+        return None, 0.0, None, 0.0
     if not isinstance(book, dict):
-        return None, None
-    bid, _ = _best(book.get("bids"), "bid")
-    ask, _ = _best(book.get("asks"), "ask")
-    return bid, ask
+        return None, 0.0, None, 0.0
+    bid, bid_sz = best_from_levels(book.get("bids"), "bid")
+    ask, ask_sz = best_from_levels(book.get("asks"), "ask")
+    return bid, bid_sz, ask, ask_sz
+
+
+def _round_size(size: float) -> float:
+    return round(float(size or 0.0), 4)
 
 
 def sample_market(market: MintMarket, now: float) -> Optional[dict]:
-    up_bid, up_ask = fetch_book(market.up_token)
-    dn_bid, dn_ask = fetch_book(market.dn_token)
+    up_bid, up_bid_sz, up_ask, up_ask_sz = fetch_book(market.up_token)
+    dn_bid, dn_bid_sz, dn_ask, dn_ask_sz = fetch_book(market.dn_token)
     if up_ask is None and dn_ask is None:
         return None
     return {
@@ -285,6 +270,12 @@ def sample_market(market: MintMarket, now: float) -> Optional[dict]:
         "ua": up_ask,
         "db": dn_bid,
         "da": dn_ask,
+        # Displayed top-of-book size (shares). Keys always present on new ticks
+        # so the backtest can tell them from legacy price-only JSONL.
+        "ubs": _round_size(up_bid_sz),
+        "uas": _round_size(up_ask_sz),
+        "dbs": _round_size(dn_bid_sz),
+        "das": _round_size(dn_ask_sz),
     }
 
 

@@ -10,6 +10,7 @@ from unittest.mock import patch
 
 import pathlog
 from pathlog import files_to_prune
+from buy.market import MintMarket
 
 
 NOW = 1_000_000.0
@@ -115,6 +116,43 @@ class PruneTickDirTests(unittest.TestCase):
             self.assertEqual(removed, 1)
             self.assertFalse(old.exists())
             self.assertTrue(keep.exists())
+
+
+class SampleMarketSizeTests(unittest.TestCase):
+    def test_no_local_best_parser(self):
+        self.assertFalse(hasattr(pathlog, "_best"))
+        from buy.book import best_from_levels
+
+        self.assertIs(pathlog.best_from_levels, best_from_levels)
+
+    def test_tick_includes_top_of_book_size(self):
+        market = MintMarket(
+            condition_id="0x1",
+            slug="btc-updown-5m-1",
+            question="q",
+            end_ts=200.0,
+            series_slug="btc-up-or-down-5m",
+            up_token="up",
+            dn_token="dn",
+            active=True,
+            closed=False,
+            accepting_orders=True,
+            neg_risk=False,
+            start_ts=0.0,
+        )
+        with patch.object(
+            pathlog,
+            "fetch_book",
+            side_effect=[(0.79, 10.0, 0.80, 3.5), (0.19, 8.0, 0.20, 40.0)],
+        ):
+            tick = pathlog.sample_market(market, 100.0)
+        self.assertIsNotNone(tick)
+        self.assertEqual(tick["ua"], 0.80)
+        self.assertEqual(tick["da"], 0.20)
+        self.assertEqual(tick["uas"], 3.5)
+        self.assertEqual(tick["das"], 40.0)
+        self.assertEqual(tick["ubs"], 10.0)
+        self.assertEqual(tick["dbs"], 8.0)
 
 
 if __name__ == "__main__":
