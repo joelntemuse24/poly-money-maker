@@ -244,8 +244,52 @@ class SizeAwareRuleTests(unittest.TestCase):
             self.assertIsNone(stats["pnl_sum"])
 
 
-if __name__ == "__main__":
-    unittest.main()
+class WindowAnatomyTests(unittest.TestCase):
+    def test_decided_before_window(self):
+        from check_path_backtest import classify_window
+
+        ticks = [
+            _tick(1, 180, 0.86, 0.14),
+            _tick(2, 90, 0.88, 0.12),
+            _tick(3, 10, 0.99, 0.01),
+        ]
+        row = classify_window(ticks, ttm_max=120, min_edge=0.05, ask_min=0.75, ask_max=0.90)
+        self.assertEqual(row["bucket"], "decided_before_in_band")
+        self.assertEqual(row["open_winning"], "up")
+
+    def test_decided_before_already_above_90(self):
+        from check_path_backtest import classify_window
+
+        ticks = [
+            _tick(1, 150, 0.94, 0.06),
+            _tick(2, 60, 0.97, 0.03),
+        ]
+        row = classify_window(ticks, ttm_max=120, min_edge=0.05)
+        self.assertEqual(row["bucket"], "decided_before_above_band")
+
+    def test_tight_through_window(self):
+        from check_path_backtest import classify_window
+
+        ticks = [
+            _tick(1, 180, 0.51, 0.49),
+            _tick(2, 90, 0.52, 0.48),
+            _tick(3, 5, 0.51, 0.49),
+        ]
+        row = classify_window(ticks, ttm_max=120, min_edge=0.05)
+        self.assertEqual(row["bucket"], "tight_through_window")
+        self.assertEqual(row["ambiguous_ticks"], 2)
+
+    def test_cleared_in_window(self):
+        from check_path_backtest import classify_window
+
+        ticks = [
+            _tick(1, 180, 0.51, 0.49),
+            _tick(2, 90, 0.80, 0.20),
+        ]
+        row = classify_window(ticks, ttm_max=120, min_edge=0.05, ask_min=0.75, ask_max=0.90)
+        self.assertEqual(row["bucket"], "cleared_in_window")
+        self.assertEqual(row["first_in_band_leg"], "up")
+        self.assertEqual(row["first_in_band_ttm"], 90)
 
 
 if __name__ == "__main__":

@@ -27,7 +27,7 @@ BOTS = {
     "5m": {
         "research": "underlying_research_buy5m.jsonl",
         "log": "buybot5m.log",
-        "min_edge": 5.0,
+        "min_edge": 0.0,
     },
     "15m": {
         "research": "underlying_research_buy.jsonl",

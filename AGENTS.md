@@ -46,7 +46,7 @@ change to one usually needs propagation to its siblings.
 | File | Purpose |
 |---|---|
 | `pathlog.py` | CLOB path recorder (no orders; TOB price **and** size) |
-| `check_path_backtest.py` | Query pathlog: enter at price X with Y seconds left (FAK size-capped when ticks have size) |
+| `check_path_backtest.py` | Pathlog: entry grid, window anatomy, named strategy compare (no orders) |
 | `check_book.py` | Diagnostic — inspect a live order book |
 | `check_edge_counterfactual.py` | Diagnostic — resolution win rate if edge skips had filled |
 | `check_participation.py` | Diagnostic — post-facto bought vs missed + band exposure |
@@ -114,7 +114,8 @@ python check_participation.py --hours 72 --csv exports/trades.csv
 
 ```bash
 .venv/bin/python check_path_backtest.py --grid --budget 2.5 --series 5m --csv /tmp/hits.csv
-.venv/bin/python check_path_backtest.py --grid --budget 15 --series 5m
+.venv/bin/python check_path_backtest.py --compare --series 5m --budget 2.5
+.venv/bin/python check_path_backtest.py --anatomy --series 5m --ttm-max 120 --csv /tmp/anatomy.csv
 .venv/bin/python check_path_backtest.py --export-market <slug> --csv /tmp/m.csv
 # then scp /tmp/hits.csv (or scp -r pathlog/ticks) off the box
 ```
@@ -128,19 +129,38 @@ Watch the console for `[DRY BUY]` / `[DRY SELL]` markers. Ctrl-C to stop.
 - `hedge_attempt` / `hedge_fill` — hedge fired after force-fresh REST + book integrity
 - `hedge_skip_toxic_book` — bid dipped but ask/spread still say "not reversed"
 - `hedge_skip_incomplete_rest` — REST missing a side; fail closed (no WS sell)
-- `buy_skip_ambiguous` — GUI display prices too close
+- `buy_skip_ambiguous` — GUI display prices too close (throttled 8s; **not** one event per market)
 - `buy_skip_no_consensus` — ask in band but GUI/tight-book gate failed
 - `buy_fill_below_band` — fill avg below band; inventory persisted + `toxic_fill` force-exit
 - `buy_fill_walk` — confirmed BUY shares exceeded the quoted budget/ask size (junk walk)
 - `buy_ghost_fill` — balance reconciliation after null/delayed BUY confirm
 - `buy_uncertain` — POST outcome unresolved; durable token/baseline quarantine blocks re-buy
 - `buy_skip_incomplete_book` — missing GUI price on a leg (no mid and no last trade)
-- `buy_skip_underlying_edge` — underlying gate failed (missing/stale/flat vs PTB; 5m needs **$2**)
+- `buy_skip_underlying_edge` — underlying gate failed (missing/stale/flat vs PTB; 5m is **$0** = any non-zero tick)
 - `buy_skip_underlying_side` — book wants the opposite leg from the underlying move
 - `buy_window` — market first entered the last 120s (one line per market)
 - `buy_skip` `ask_below_band` / `ask_above_band` / `no_ask` — in window, winning ask not 75–90¢ (throttled 8s)
 - `buy_skip_max_positions` — only if `max_open_positions > 0` (probe uses **0 = unlimited**)
 - `pathlog_prune` — oldest tick JSONL removed (14d / 400 MB cap); export first
+
+## Research loop (before changing live knobs)
+
+Live JSON is one point in the space. Pathlog records **all three** series even
+when 15m/hourly are not posting. Score alternatives on those ticks **before**
+editing `strategy_buy5m.json`:
+
+```bash
+python check_path_backtest.py --compare --series 5m --budget 2.5
+python check_path_backtest.py --compare --series 5m --budget 15
+python check_path_backtest.py --anatomy --series 5m --ttm-max 120 --csv /tmp/anatomy.csv
+python check_path_backtest.py --grid --budget 2.5 --series 5m
+python check_buy_skips.py --since 2026-08-19T08:02:00
+```
+
+`--anatomy` answers “already decided at T-120 vs 50/50 until the end.”
+`--compare` scores live 75–90/120s vs earlier windows and wider bands.
+`--grid` is ask × time. `--budget` is size. Pathlog cannot replay GUI last-trade,
+BTC/PTB, or POST latency — see TECHNICAL_DESIGN.md “Research loop.”
 
 ## Key Conventions
 

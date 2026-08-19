@@ -15,6 +15,8 @@ Examples (on the VM):
   python check_path_backtest.py --grid --budget 2.5 --series 5m
   python check_path_backtest.py --grid --budget 15 --series 5m
   python check_path_backtest.py --ask-min 0.75 --ask-max 0.90 --ttm-max 120 --budget 15 --series 5m --csv /tmp/hits_15.csv
+  python check_path_backtest.py --anatomy --series 5m --ttm-max 120
+  python check_path_backtest.py --compare --series 5m --budget 2.5
   python check_path_backtest.py --export-market btc-updown-5m-1786528500 --csv /tmp/m.csv
   python check_path_backtest.py --ask-min 0.98 --ask-max 0.99 --ttm-max 90 --csv /tmp/hits.csv
 """
@@ -157,6 +159,180 @@ def first_entry(
             "ask_size": ask_size,
         }
     return None
+
+
+# Pathlog has no last-trade. Tight books use mid (same 10¢ GUI rule as the bots);
+# wide books fall back to the ask so |up-dn| still means "coin flip vs decided".
+PATHLOG_GUI_SPREAD = 0.10
+
+# Named alternatives vs the live 5m probe. Same ticks, no live orders.
+COMPARE_PRESETS: List[Tuple[str, float, float, float]] = [
+    ("live_5m", 0.75, 0.90, 120.0),
+    ("window_180s", 0.75, 0.90, 180.0),
+    ("window_240s", 0.75, 0.90, 240.0),
+    ("whole_5m", 0.75, 0.90, 300.0),
+    ("band_70_90", 0.70, 0.90, 120.0),
+    ("band_75_95", 0.75, 0.95, 120.0),
+]
+
+
+def path_display_price(bid: Any, ask: Any) -> Optional[float]:
+    bid_f = _f(bid)
+    ask_f = _f(ask)
+    if bid_f is not None and ask_f is not None:
+        if ask_f < bid_f:
+            return None
+        if (ask_f - bid_f) <= PATHLOG_GUI_SPREAD + 1e-12:
+            return (bid_f + ask_f) / 2.0
+    return ask_f
+
+
+def tick_sides(row: dict, min_edge: float) -> Optional[dict]:
+    ttm = _f(row.get("ttm"))
+    ua = _f(row.get("ua"))
+    da = _f(row.get("da"))
+    if ttm is None or ua is None or da is None:
+        return None
+    up_gui = path_display_price(row.get("ub"), ua)
+    dn_gui = path_display_price(row.get("db"), da)
+    if up_gui is None:
+        up_gui = ua
+    if dn_gui is None:
+        dn_gui = da
+    edge = abs(up_gui - dn_gui)
+    if up_gui > dn_gui:
+        winning = "up"
+        win_ask = ua
+    elif dn_gui > up_gui:
+        winning = "down"
+        win_ask = da
+    else:
+        winning = None
+        win_ask = None
+    return {
+        "ttm": ttm,
+        "up_gui": up_gui,
+        "dn_gui": dn_gui,
+        "ua": ua,
+        "da": da,
+        "edge": edge,
+        "winning": winning,
+        "win_ask": win_ask,
+        "ambiguous": edge < float(min_edge) - 1e-12 or winning is None,
+    }
+
+
+def classify_window(
+    ticks: Sequence[dict],
+    *,
+    ttm_max: float = 120.0,
+    min_edge: float = 0.05,
+    ask_min: float = 0.75,
+    ask_max: float = 0.90,
+) -> dict:
+    """Was the book already decided before the buy window, or tight until the end?
+
+    ``decided_before_*`` — last tick with ttm > ttm_max already had ≥ min_edge.
+    ``tight_through_window`` — every in-window tick stayed inside min_edge.
+    ``cleared_in_window`` — first became unambiguous only after the window opened.
+    """
+    pre: List[dict] = []
+    window: List[dict] = []
+    for row in ticks:
+        snap = tick_sides(row, min_edge)
+        if snap is None:
+            continue
+        if snap["ttm"] > float(ttm_max) + 1e-12:
+            pre.append(snap)
+        elif snap["ttm"] > 0:
+            window.append(snap)
+
+    at_open = pre[-1] if pre else None
+    decided_before = bool(
+        at_open and not at_open["ambiguous"] and at_open.get("winning")
+    )
+    in_window_clear = [
+        snap for snap in window
+        if not snap["ambiguous"] and snap.get("winning")
+    ]
+    in_band = [
+        snap for snap in in_window_clear
+        if snap["win_ask"] is not None
+        and float(ask_min) - 1e-12 <= float(snap["win_ask"]) <= float(ask_max) + 1e-12
+    ]
+
+    if not window and not pre:
+        bucket = "no_ticks"
+    elif not window:
+        bucket = "no_window_ticks"
+    elif decided_before:
+        win_ask = at_open["win_ask"] if at_open else None
+        if win_ask is None:
+            bucket = "decided_before_in_band"
+        elif float(win_ask) > float(ask_max) + 1e-12:
+            bucket = "decided_before_above_band"
+        elif float(win_ask) < float(ask_min) - 1e-12:
+            bucket = "decided_before_below_band"
+        else:
+            bucket = "decided_before_in_band"
+    elif not in_window_clear:
+        bucket = "tight_through_window"
+    else:
+        bucket = "cleared_in_window"
+
+    first_clear = in_window_clear[0] if in_window_clear else None
+    first_band = in_band[0] if in_band else None
+    amb_n = sum(1 for snap in window if snap["ambiguous"])
+    return {
+        "bucket": bucket,
+        "open_ttm": None if at_open is None else at_open["ttm"],
+        "open_edge": None if at_open is None else round(float(at_open["edge"]), 4),
+        "open_win_ask": None if at_open is None else at_open.get("win_ask"),
+        "open_winning": None if at_open is None else at_open.get("winning"),
+        "window_ticks": len(window),
+        "ambiguous_ticks": amb_n,
+        "first_clear_ttm": None if first_clear is None else first_clear["ttm"],
+        "first_in_band_ttm": None if first_band is None else first_band["ttm"],
+        "first_in_band_ask": None if first_band is None else first_band.get("win_ask"),
+        "first_in_band_leg": None if first_band is None else first_band.get("winning"),
+    }
+
+
+def anatomy_rows(
+    markets: Sequence[MarketPath],
+    *,
+    ttm_max: float,
+    min_edge: float,
+    ask_min: float,
+    ask_max: float,
+) -> List[dict]:
+    rows: List[dict] = []
+    for market in markets:
+        row = classify_window(
+            market.ticks,
+            ttm_max=ttm_max,
+            min_edge=min_edge,
+            ask_min=ask_min,
+            ask_max=ask_max,
+        )
+        winner = market.winner or infer_winner(market.ticks)
+        row.update(
+            {
+                "slug": market.slug,
+                "series": market.series,
+                "winner": winner,
+            }
+        )
+        rows.append(row)
+    return rows
+
+
+def summarize_anatomy(rows: Sequence[dict]) -> dict:
+    buckets: Dict[str, int] = {}
+    for row in rows:
+        name = str(row.get("bucket") or "unknown")
+        buckets[name] = buckets.get(name, 0) + 1
+    return {"markets": len(rows), "buckets": buckets}
 
 
 MIN_FAK_SHARES = 0.01
@@ -397,6 +573,31 @@ def export_market_csv(market: MarketPath, dest: Path) -> None:
             )
 
 
+def export_anatomy_csv(rows: Sequence[dict], dest: Path) -> None:
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    fields = [
+        "slug",
+        "series",
+        "winner",
+        "bucket",
+        "open_ttm",
+        "open_edge",
+        "open_win_ask",
+        "open_winning",
+        "window_ticks",
+        "ambiguous_ticks",
+        "first_clear_ttm",
+        "first_in_band_ttm",
+        "first_in_band_ask",
+        "first_in_band_leg",
+    ]
+    with open(dest, "w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fields, extrasaction="ignore")
+        writer.writeheader()
+        for row in rows:
+            writer.writerow(row)
+
+
 def export_hits_csv(rows: Sequence[dict], dest: Path) -> None:
     dest.parent.mkdir(parents=True, exist_ok=True)
     fields = [
@@ -444,9 +645,25 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     ap.add_argument("--budget", type=float, default=2.5)
     ap.add_argument("--max-spread", type=float, default=None)
     ap.add_argument("--series", default="", help="substring filter, e.g. 5m")
-    ap.add_argument("--csv", type=Path, default=None, help="write per-market hit rows")
+    ap.add_argument("--csv", type=Path, default=None, help="write per-market hit or anatomy rows")
     ap.add_argument("--export-market", default="", help="slug to dump as tick CSV")
     ap.add_argument("--grid", action="store_true", help="print ask × ttm_max win-rate table")
+    ap.add_argument(
+        "--anatomy",
+        action="store_true",
+        help="classify each market: decided before window vs tight through the window",
+    )
+    ap.add_argument(
+        "--compare",
+        action="store_true",
+        help="score named alternative windows/bands on the same ticks (no live orders)",
+    )
+    ap.add_argument(
+        "--min-edge",
+        type=float,
+        default=0.05,
+        help="GUI/ask gap that counts as unambiguous (anatomy; default 5¢)",
+    )
     args = ap.parse_args(argv)
 
     markets = list(iter_markets(args.dir))
@@ -476,6 +693,75 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 f"{row.get('full', 0)}\t{row.get('partial', 0)}\t{row.get('zero', 0)}\t"
                 f"{row['decided']}\t{row['wins']}\t{wr_s}\t{row['pnl_sum']}"
             )
+        return 0
+
+    if args.anatomy:
+        ask_min, ask_max = args.ask_min, args.ask_max
+        if ask_min == 0.80 and ask_max == 0.99:
+            ask_min, ask_max = 0.75, 0.90
+        rows = anatomy_rows(
+            markets,
+            ttm_max=args.ttm_max,
+            min_edge=args.min_edge,
+            ask_min=ask_min,
+            ask_max=ask_max,
+        )
+        stats = summarize_anatomy(rows)
+        print(
+            f"markets={stats['markets']}  ttm_max={args.ttm_max:g}  "
+            f"min_edge={args.min_edge:g}  band={ask_min:g}-{ask_max:g}"
+        )
+        order = [
+            "decided_before_in_band",
+            "decided_before_above_band",
+            "decided_before_below_band",
+            "tight_through_window",
+            "cleared_in_window",
+            "no_window_ticks",
+            "no_ticks",
+        ]
+        buckets = stats["buckets"]
+        for name in order:
+            if name in buckets:
+                print(f"  {buckets[name]:4d}  {name}")
+        for name, n in sorted(buckets.items()):
+            if name not in order:
+                print(f"  {n:4d}  {name}")
+        print(
+            "decided_before_* = already unambiguous when the last-120s window opened.\n"
+            "tight_through_window = stayed inside min_edge until expiry.\n"
+            "cleared_in_window = first became a clear side only after the window opened."
+        )
+        if args.csv:
+            export_anatomy_csv(rows, args.csv)
+            print(f"wrote {len(rows)} rows → {args.csv}")
+        return 0
+
+    if args.compare:
+        print("preset\task_min\task_max\tttm_max\thits\tfull\tpartial\tzero\tdecided\twins\twin_rate\tpnl")
+        for name, ask_min, ask_max, ttm_max in COMPARE_PRESETS:
+            rows = evaluate_rule(
+                markets,
+                ask_min=ask_min,
+                ask_max=ask_max,
+                ttm_min=0.0,
+                ttm_max=ttm_max,
+                budget=args.budget,
+                max_spread=args.max_spread,
+            )
+            stats = summarize(rows)
+            wr = stats["win_rate"]
+            wr_s = f"{wr:.3f}" if wr is not None else ""
+            print(
+                f"{name}\t{ask_min:.2f}\t{ask_max:.2f}\t{ttm_max:g}\t"
+                f"{stats['hits']}\t{stats.get('full', 0)}\t{stats.get('partial', 0)}\t"
+                f"{stats.get('zero', 0)}\t{stats['decided']}\t{stats['wins']}\t"
+                f"{wr_s}\t{stats['pnl_sum']}"
+            )
+        print(
+            "Same recorded paths, no live orders. Size: rerun with --budget 15. "
+            "Spread: add --max-spread 0.05. Grid: --grid."
+        )
         return 0
 
     rows = evaluate_rule(

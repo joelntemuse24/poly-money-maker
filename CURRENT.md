@@ -5,7 +5,8 @@ Do not put secrets, API keys, or live wallet material here.
 
 Last updated: **2026-08-19** — **only the 5m CLOB bot is live.** Stop/disable
 15m and hourly. Keep the **$2.50 / 75–90¢** triggers on 5m. Chainlink TWAP
-gate is **$2** (not $5). Buys are **limit
+gate is **$0** (any non-zero tick vs PTB; side must match; flat is still
+refused). Buys are **limit
 FAKs at the quoted ask** sized `budget/ask` (~3.3 shares at 75¢), clipped to
 `buy_max_shares` **5** (buffer). Hard spend ceiling `buy_max_spend` **$3**.
 Leftover USDC cannot walk into 9¢ junk. Displayed top size is **not** a cap.
@@ -36,7 +37,7 @@ triggers** (not the old 98–99¢ probe):
 | GUI consensus | winner ≥ 70¢, loser ≤ 30¢ |
 | Windows | 5m **120 s** (15m / hourly bots **not running**) |
 | Hedge | **Trigger** bid ≤ **35¢** and ask ≤ **40¢**, spread ≤ 15¢ (real book, not a glitch). **Then sell at whatever the bid is** — no 32¢ floor. |
-| Underlying edge | **$2** (5m) / **$10** (15m, hourly); side must match |
+| Underlying edge | **$0** (5m: any non-zero TWAP vs PTB) / **$10** (15m, hourly); side must match |
 | `max_open_positions` | **0 = unlimited** |
 | `toxic_force_exit_below` | **65¢** |
 
@@ -81,6 +82,28 @@ partial / zero fills**, win rate, hypothetical PnL on **filled notional**
 (win = redeem $1 per share, loss = −spent, no hedge model). Compare
 `--budget 2.5` vs `--budget 15` on the same paths.
 
+**Do not change live knobs by gut.** Pathlog records all three series whether
+or not that bot is posting. Score the current rule and alternatives on the
+same ticks, then change live JSON:
+
+```bash
+# Current 75–90¢ / last 120s vs earlier windows / wider bands
+.venv/bin/python check_path_backtest.py --compare --series 5m --budget 2.5
+.venv/bin/python check_path_backtest.py --compare --series 5m --budget 15
+
+# Why we didn't buy: already decided at T-120 vs 50/50 until the end
+.venv/bin/python check_path_backtest.py --anatomy --series 5m --ttm-max 120 --csv /tmp/anatomy.csv
+
+# Live skip reasons (not a backtest — what this process actually logged)
+.venv/bin/python check_buy_skips.py --since "$(date -u -d '6 hours ago' '+%Y-%m-%dT%H:%M:%S')"
+```
+
+`--anatomy` buckets: `decided_before_in_band` / `above_band` / `below_band`
+(clear winner before the window), `tight_through_window` (never 5¢ apart),
+`cleared_in_window` (first became obvious only after T-120). Pathlog has no
+last-trade GUI and no BTC/PTB — those still need `check_buy_skips.py` /
+`check_edge_counterfactual.py`.
+
 Kill switch: `touch STOP_PATHLOG`.
 
 ---
@@ -91,14 +114,14 @@ Kill switch: `touch STOP_PATHLOG`.
 - **Mint:** `sudo systemctl stop polymintbot && sudo systemctl disable polymintbot`
 - **Buy bots:** **5m only.** Leave 15m/hourly stopped. `buy_max_spend` /
   `buy_max_shares` may be omitted from live JSON — defaults **$3** / **5 shares**
-  apply. Live JSON **must** set `min_underlying_edge_usd` to **2.0** (hot
-  reload, no restart). Code default is 2.0 only when the key is omitted.
+  apply. Live JSON **must** set `min_underlying_edge_usd` to **0.0** (hot
+  reload, no restart). Code default is 0.0 only when the key is omitted.
   After pulling bot code, restart **5m only**:
   ```bash
   sudo systemctl stop polybuybot polybuybothourly
   sudo systemctl disable polybuybot polybuybothourly
   cd ~/poly-money-maker && git pull
-  python3 -c 'import json; from pathlib import Path; p=Path("strategy_buy5m.json"); d=json.loads(p.read_text()); d["min_underlying_edge_usd"]=2.0; p.write_text(json.dumps(d, indent=2)+"\n"); print("min_underlying_edge_usd", d["min_underlying_edge_usd"])'
+  python3 -c 'import json; from pathlib import Path; p=Path("strategy_buy5m.json"); d=json.loads(p.read_text()); d["min_underlying_edge_usd"]=0.0; p.write_text(json.dumps(d, indent=2)+"\n"); print("min_underlying_edge_usd", d["min_underlying_edge_usd"])'
   sudo systemctl restart polybuybot5m
   sudo systemctl enable polybuybot5m
   systemctl is-active polybuybot polybuybot5m polybuybothourly
@@ -121,8 +144,9 @@ Kill switch: `touch STOP_PATHLOG`.
   ticks record TOB size; backtest is share-capped FAK, not infinite ask size).
 - [x] Hedge FAK follows live bid after 35/40 integrity (no 32¢ fill refusal).
 - [x] On VM: pathlog restarted onto size-aware ticks; 15m/hourly buy bots stopped.
-- [x] 5m underlying gate **$2** (was $5); live JSON must set `min_underlying_edge_usd`.
-- [ ] Let pathlog collect resolved markets, then `--grid` / export CSV **off the VM** before prune.
+- [x] 5m underlying gate **$0** (any non-zero TWAP vs PTB; side must match).
+- [x] Pathlog `--anatomy` / `--compare` so window/band/size alts are scored offline.
+- [ ] Let pathlog collect resolved markets, then `--anatomy` / `--compare` / `--grid` **off the VM** before prune.
 
 ---
 
