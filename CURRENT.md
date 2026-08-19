@@ -6,8 +6,9 @@ Do not put secrets, API keys, or live wallet material here.
 Last updated: **2026-08-19** — keep the **$2.50 / 75–90¢** CLOB buy triggers
 (band unchanged); pin FAK buys to share-capped limits at the quoted ask so leftover
 USDC cannot walk into 9¢ junk. Hedge **trigger** is still 35/40; the sell follows
-the live bid after that (no 32¢ FAK floor). Pause minting; pathlog records books
-for entry backtests (14-day / 400 MB cap).
+the live bid after that (no 32¢ FAK floor). Pause minting. Pathlog ticks now store
+**top-of-book size** (`ubs`/`uas`/`dbs`/`das`) so `--budget 2.5` vs `15` backtests
+are size-capped, not infinite liquidity at the best ask (14-day / 400 MB cap).
 
 ---
 
@@ -33,7 +34,9 @@ triggers** (not the old 98–99¢ probe):
 
 **Also running (no orders):** `pathlog.py` (`polypathlog`) writes one JSONL file
 per market under `pathlog/ticks/` so we can ask “if we had bought at 80¢ with
-2 minutes left, would we have won?”
+2 minutes left, would we have won?” New ticks include displayed top size; the
+backtest fills `min(budget/ask, ask_size)` like live FAKs. Legacy ticks without
+size still assume a full fill at the best ask.
 
 ---
 
@@ -57,13 +60,17 @@ journalctl -u polypathlog -f
 
 # Export regularly (copy CSVs off the VM; prune will delete the JSONL)
 .venv/bin/python check_path_backtest.py --grid --budget 2.5 --series 5m --csv /tmp/hits.csv
+.venv/bin/python check_path_backtest.py --grid --budget 15 --series 5m
+.venv/bin/python check_path_backtest.py --ask-min 0.75 --ask-max 0.90 --ttm-max 120 --budget 15 --series 5m --csv /tmp/hits_15.csv
 .venv/bin/python check_path_backtest.py --export-market btc-updown-5m-1786528500 --csv /tmp/m.csv
 scp ntemusejoel@<vm>:/tmp/hits.csv .
 # or: scp -r ntemusejoel@<vm>:~/poly-money-maker/pathlog/ticks ./pathlog-export-$(date -u +%Y%m%d)
 ```
 
-`--grid` is the Excel-shaped table: ask × seconds-left, hit count, win rate,
-hypothetical $2.50 PnL (win = redeem $1, loss = −$2.50, no hedge model).
+`--grid` is the Excel-shaped table: ask × seconds-left, hit count, **full /
+partial / zero fills**, win rate, hypothetical PnL on **filled notional**
+(win = redeem $1 per share, loss = −spent, no hedge model). Compare
+`--budget 2.5` vs `--budget 15` on the same paths.
 
 Kill switch: `touch STOP_PATHLOG`.
 
@@ -88,7 +95,8 @@ Kill switch: `touch STOP_PATHLOG`.
 
 - [x] Pause minting; keep $2.50 / 75–90¢ CLOB triggers.
 - [x] Pin BUY FAKs to share-capped limits at the quoted ask (band unchanged).
-- [x] Path recorder + `check_path_backtest.py` (first-touch ask × time-left).
+- [x] Path recorder + `check_path_backtest.py` (first-touch ask × time-left;
+  ticks record TOB size; backtest is share-capped FAK, not infinite ask size).
 - [x] Hedge FAK follows live bid after 35/40 integrity (no 32¢ fill refusal).
 - [ ] On VM: stop mint, restart buy bots + pathlog after reviewing live JSON.
 - [ ] Let pathlog collect resolved markets, then `--grid` / export CSV **off the VM** before prune.

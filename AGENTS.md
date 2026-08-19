@@ -44,8 +44,8 @@ change to one usually needs propagation to its siblings.
 
 | File | Purpose |
 |---|---|
-| `pathlog.py` | CLOB path recorder (no orders) |
-| `check_path_backtest.py` | Query pathlog: enter at price X with Y seconds left |
+| `pathlog.py` | CLOB path recorder (no orders; TOB price **and** size) |
+| `check_path_backtest.py` | Query pathlog: enter at price X with Y seconds left (FAK size-capped when ticks have size) |
 | `check_book.py` | Diagnostic — inspect a live order book |
 | `check_edge_counterfactual.py` | Diagnostic — resolution win rate if edge skips had filled |
 | `check_participation.py` | Diagnostic — post-facto bought vs missed + band exposure |
@@ -93,7 +93,9 @@ python buybot5m.py        # 5m, uses strategy_buy5m.json
 python buybothourly.py    # hr, uses strategy_buyhourly.json
 
 python pathlog.py         # recorder only — no orders
-python check_path_backtest.py --grid --budget 2.5 --series 5m --csv /tmp/hits.csv
+python check_path_backtest.py --grid --budget 2.5 --series 5m
+python check_path_backtest.py --grid --budget 15 --series 5m
+python check_path_backtest.py --ask-min 0.75 --ask-max 0.90 --ttm-max 120 --budget 15 --series 5m --csv /tmp/hits_15.csv
 python check_book.py
 
 # Full wallet fills (past the UI ~500-row export). Wallet: --user or FUNDER_ADDRESS.
@@ -108,6 +110,7 @@ python check_participation.py --hours 72 --csv exports/trades.csv
 
 ```bash
 .venv/bin/python check_path_backtest.py --grid --budget 2.5 --series 5m --csv /tmp/hits.csv
+.venv/bin/python check_path_backtest.py --grid --budget 15 --series 5m
 .venv/bin/python check_path_backtest.py --export-market <slug> --csv /tmp/m.csv
 # then scp /tmp/hits.csv (or scp -r pathlog/ticks) off the box
 ```

@@ -16,10 +16,12 @@ from __future__ import annotations
 
 import json
 import logging
-import math
 import threading
 import time
 from typing import Dict, Iterable, Optional, Set, Tuple
+
+from buy.book import best_from_levels as _best_from_levels
+from buy.book import finite_float as _f
 
 log = logging.getLogger("clob_book_ws")
 
@@ -31,16 +33,6 @@ RECONNECT_MAX_S = 8.0
 
 # (bid, bid_size, ask, ask_size, mid)
 Quote = Tuple[Optional[float], float, Optional[float], float, Optional[float]]
-
-
-def _f(v) -> Optional[float]:
-    if v is None or v == "":
-        return None
-    try:
-        value = float(v)
-    except (TypeError, ValueError):
-        return None
-    return value if math.isfinite(value) else None
 
 
 def _event_ts_ms(value) -> Optional[int]:
@@ -55,34 +47,6 @@ def _event_ts_ms(value) -> Optional[int]:
     if parsed > now_ms + 2_000 or now_ms - parsed > 10_000:
         return None
     return int(parsed)
-
-
-def _best_from_levels(levels, side: str) -> Tuple[Optional[float], float]:
-    if not levels:
-        return None, 0.0
-    try:
-        valid = []
-        for level in levels:
-            if not isinstance(level, dict):
-                continue
-            price = _f(level.get("price"))
-            size = _f(level.get("size"))
-            if (
-                price is None
-                or size is None
-                or not 0 < price < 1
-                or size <= 0
-            ):
-                continue
-            valid.append((price, size))
-        if not valid:
-            return None, 0.0
-        if side == "bid":
-            return max(valid, key=lambda level: level[0])
-        else:
-            return min(valid, key=lambda level: level[0])
-    except Exception:
-        return None, 0.0
 
 
 class ClobMarketBookFeed:

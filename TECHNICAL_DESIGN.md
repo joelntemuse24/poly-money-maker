@@ -398,9 +398,11 @@ Strategy JSON changes need no deploy and no restart (hot reload).
 - `positions_buy*.json` / `pnl_buy*.json` — open entries and settled P&L.
 - `underlying_research_buy*.jsonl` / `ptb_*_buy*.json` — oracle/PTB decision audit.
 - `python check_path_backtest.py --grid --budget 2.5` — hypothetical entries from
-  `pathlog/ticks/` (ask × seconds-left). **Export CSVs / copy the ticks dir off
-  the VM regularly** — `pathlog.py` auto-prunes ticks (14 days / 400 MB) so they
-  fit the small boot disk. Pruned JSONL is deleted.
+  `pathlog/ticks/` (ask × seconds-left). New ticks include top-of-book **size**;
+  the backtest share-caps the FAK (`min(budget/ask, ask_size)`). Legacy ticks
+  without size still fill the full budget at the best ask. **Export CSVs / copy
+  the ticks dir off the VM regularly** — `pathlog.py` auto-prunes ticks
+  (14 days / 400 MB) so they fit the small boot disk. Pruned JSONL is deleted.
 - `python check_book.py` — ad-hoc diagnostic: prints book/price data for the current
   hourly market (useful sanity check for book shape).
 - Notifications: fire-and-forget ntfy.sh pushes on buys, hedges, redeems, and fatal
