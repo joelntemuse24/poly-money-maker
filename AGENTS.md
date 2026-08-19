@@ -21,7 +21,7 @@ Mint-only helper (`mintbot.py`) is **paused** — do not run it live.
 | `buybothourly.py` | `polybuybothourly` | hourly | Binance BTCUSDT | $2.50 | final 13.0 min |
 | `pathlog.py` | `polypathlog` | all three | — (CLOB books only) | — | late-window ticks |
 
-Plus: `check_book.py`, `check_participation.py`, `check_path_backtest.py`, `check_fetch_trades.py`.
+Plus: `check_book.py`, `check_participation.py`, `check_path_backtest.py`, `check_fetch_trades.py`, `check_buy_skips.py`.
 Local glance (not a bot): `widget/polydesk.py` — always-on-top balance / HOLDING.
 
 ## File Map
@@ -51,6 +51,7 @@ change to one usually needs propagation to its siblings.
 | `check_edge_counterfactual.py` | Diagnostic — resolution win rate if edge skips had filled |
 | `check_participation.py` | Diagnostic — post-facto bought vs missed + band exposure |
 | `check_fetch_trades.py` | Diagnostic — full-wallet Data API trade history → CSV |
+| `check_buy_skips.py` | Diagnostic — why 5m did not buy (JSON log skip/attempt/fill counts) |
 | `widget/polydesk.py` | Local always-on-top Polymarket value / HOLDING glance (no orders) |
 | `CURRENT.md` | Living ops/probe status — update when decisions change |
 | `strategy_buy*.example.json` | Buy-bot config templates — not loaded by bots |
@@ -134,8 +135,10 @@ Watch the console for `[DRY BUY]` / `[DRY SELL]` markers. Ctrl-C to stop.
 - `buy_ghost_fill` — balance reconciliation after null/delayed BUY confirm
 - `buy_uncertain` — POST outcome unresolved; durable token/baseline quarantine blocks re-buy
 - `buy_skip_incomplete_book` — missing GUI price on a leg (no mid and no last trade)
-- `buy_skip_underlying_edge` — underlying gate failed (missing/stale/flat vs PTB)
+- `buy_skip_underlying_edge` — underlying gate failed (missing/stale/flat vs PTB; 5m needs **$2**)
 - `buy_skip_underlying_side` — book wants the opposite leg from the underlying move
+- `buy_window` — market first entered the last 120s (one line per market)
+- `buy_skip` `ask_below_band` / `ask_above_band` / `no_ask` — in window, winning ask not 75–90¢ (throttled 8s)
 - `buy_skip_max_positions` — only if `max_open_positions > 0` (probe uses **0 = unlimited**)
 - `pathlog_prune` — oldest tick JSONL removed (14d / 400 MB cap); export first
 

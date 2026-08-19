@@ -51,6 +51,7 @@ from py_builder_signing_sdk.sdk_types import BuilderApiKeyCreds
 from buy.market import MarketGateway, MintMarket
 from buy.btc_price import get_btc_feed, append_research, SOURCE_TWAP_30
 from buy.clob_book_ws import get_book_feed
+from buy.entry_skip import window_no_buy_reason
 
 
 class ImmediateResponseClobClient(ClobClient):
@@ -146,9 +147,9 @@ _STRATEGY_DEFAULTS = {
     "max_loser_bid": 0.30,
     "min_bid_edge": 0.05,
     # Skip buys unless live BTC is ≥ this many USD from the window Price To Beat,
-    # and only allow the side matching that underlying move.
+    # and only allow the side matching that underlying move. $2 on 5m; 15m/hourly stay $10.
     "underlying_gate_enabled": True,
-    "min_underlying_edge_usd": 5.0,
+    "min_underlying_edge_usd": 2.0,
     # Force-dump only when FAK avg is worse than this. Fills in
     # [toxic_force_exit_below, buy_threshold) stay on the normal hedge path.
     # Must be <= buy_threshold (validator); 65¢ ≈ walk well below the 75¢ floor.
@@ -531,6 +532,45 @@ def log_event(event, **kwargs):
     entry = {"ts": datetime.now().isoformat(), "event": event}
     entry.update(kwargs)
     _file_logger.info(json.dumps(entry))
+
+
+_SKIP_LOG_EVERY_S = 8.0
+_skip_log_mono = {}
+_buy_window_logged = {}
+
+
+def log_buy_skip_throttled(reason, condition_id, **kwargs):
+    """In-window skip without flooding 0.1s polls (one line per reason / 8s)."""
+    key = (str(condition_id), str(reason))
+    now_mono = time.monotonic()
+    prev = _skip_log_mono.get(key, 0.0)
+    if now_mono - prev < _SKIP_LOG_EVERY_S:
+        return
+    _skip_log_mono[key] = now_mono
+    if len(_skip_log_mono) > 256:
+        for stale, _ts in sorted(_skip_log_mono.items(), key=lambda kv: kv[1])[:64]:
+            _skip_log_mono.pop(stale, None)
+    log_event("buy_skip", reason=reason, condition_id=condition_id, **kwargs)
+
+
+def note_buy_window(condition_id, end_ts, seconds_left, slug=None):
+    """One buy_window line the first time a market enters the last 120s."""
+    cid = str(condition_id)
+    if cid in _buy_window_logged:
+        return
+    _buy_window_logged[cid] = float(end_ts or 0)
+    now_s = time.time()
+    for old_cid, market_end in list(_buy_window_logged.items()):
+        if old_cid == cid:
+            continue
+        if market_end and market_end < now_s - 60:
+            _buy_window_logged.pop(old_cid, None)
+    log_event(
+        "buy_window",
+        condition_id=cid,
+        seconds_left=round(float(seconds_left), 1),
+        slug=slug,
+    )
 
 
 def write_heartbeat():
@@ -4088,6 +4128,9 @@ while not _shutdown_requested:
                 continue  # already hold this market
             if seconds_left > BUY_START_S:
                 continue  # not in buy window yet
+            note_buy_window(
+                cond, m.end_ts, seconds_left, slug=getattr(m, "slug", None),
+            )
             if not ENTRY_ENABLED:
                 continue  # explicit operator arm is required for every live entry
             if not _discovery_fresh:
@@ -4383,6 +4426,30 @@ while not _shutdown_requested:
                     continue
 
             if not (up_buy or dn_buy):
+                skip_why = window_no_buy_reason(
+                    up_ask=up_ask,
+                    dn_ask=dn_ask,
+                    up_winning=up_winning,
+                    dn_winning=dn_winning,
+                    up_ask_ok=up_ask_ok,
+                    dn_ask_ok=dn_ask_ok,
+                    up_consensus=up_consensus,
+                    dn_consensus=dn_consensus,
+                    up_buy=up_buy,
+                    dn_buy=dn_buy,
+                    threshold=BUY_THRESHOLD,
+                    max_price=BUY_MAX_PRICE,
+                )
+                if skip_why in {"ask_below_band", "ask_above_band", "no_ask"}:
+                    log_buy_skip_throttled(
+                        skip_why,
+                        cond,
+                        up_ask=up_ask,
+                        dn_ask=dn_ask,
+                        up_gui=up_gui,
+                        dn_gui=dn_gui,
+                        seconds_left=round(seconds_left, 1),
+                    )
                 continue
 
             buy_token = m.up_token if up_buy else m.dn_token
