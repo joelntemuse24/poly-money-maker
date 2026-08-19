@@ -147,9 +147,10 @@ _STRATEGY_DEFAULTS = {
     "max_loser_bid": 0.30,
     "min_bid_edge": 0.05,
     # Skip buys unless live BTC is ≥ this many USD from the window Price To Beat,
-    # and only allow the side matching that underlying move. $2 on 5m; 15m/hourly stay $10.
+    # and only allow the side matching that underlying move. $0 on 5m = any
+    # non-zero TWAP tick (flat still fail-closed). 15m/hourly stay $10.
     "underlying_gate_enabled": True,
-    "min_underlying_edge_usd": 2.0,
+    "min_underlying_edge_usd": 0.0,
     # Force-dump only when FAK avg is worse than this. Fills in
     # [toxic_force_exit_below, buy_threshold) stay on the normal hedge path.
     # Must be <= buy_threshold (validator); 65¢ ≈ walk well below the 75¢ floor.
@@ -539,7 +540,7 @@ _skip_log_mono = {}
 _buy_window_logged = {}
 
 
-def log_buy_skip_throttled(reason, condition_id, **kwargs):
+def log_buy_skip_throttled(reason, condition_id, event="buy_skip", **kwargs):
     """In-window skip without flooding 0.1s polls (one line per reason / 8s)."""
     key = (str(condition_id), str(reason))
     now_mono = time.monotonic()
@@ -550,7 +551,7 @@ def log_buy_skip_throttled(reason, condition_id, **kwargs):
     if len(_skip_log_mono) > 256:
         for stale, _ts in sorted(_skip_log_mono.items(), key=lambda kv: kv[1])[:64]:
             _skip_log_mono.pop(stale, None)
-    log_event("buy_skip", reason=reason, condition_id=condition_id, **kwargs)
+    log_event(event, reason=reason, condition_id=condition_id, **kwargs)
 
 
 def note_buy_window(condition_id, end_ts, seconds_left, slug=None):
@@ -4303,9 +4304,10 @@ while not _shutdown_requested:
             # Winner by GUI display price (not raw mid — wide spreads poison mid).
             gui_edge = abs(up_gui - dn_gui)
             if gui_edge < MIN_BID_EDGE:
-                log_event(
-                    "buy_skip_ambiguous",
-                    condition_id=cond,
+                log_buy_skip_throttled(
+                    "ambiguous",
+                    cond,
+                    event="buy_skip_ambiguous",
                     up_gui=up_gui, dn_gui=dn_gui, gui_edge=round(gui_edge, 4),
                     up_bid=up_bid, dn_bid=dn_bid, up_ask=up_ask, dn_ask=dn_ask,
                 )

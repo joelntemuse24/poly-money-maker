@@ -206,10 +206,11 @@ A buy fires only when **all** of these gates pass, evaluated in the buy window
    FAK at the *live* ask — so catching the print early yields fills near 75¢.
    90¢ is only a hard ceiling (never enter if ask is already above it).
 5. **Underlying gate.** If `underlying_gate_enabled`, the live oracle price must be
-   at least `min_underlying_edge_usd` away from the captured PTB ($2 on 5m, $10 on
-   15m/hourly), **and** the book's winning side must match the direction of the
-   underlying move. This blocks buying a "winner" that the resolution oracle itself
-   disagrees with (stale-book trap).
+   at least `min_underlying_edge_usd` away from the captured PTB ($0 on 5m = any
+   non-zero TWAP tick, still fail-closed when flat; $10 on 15m/hourly), **and**
+   the book's winning side must match the direction of the underlying move. This
+   blocks buying a "winner" that the resolution oracle itself disagrees with
+   (stale-book trap).
 6. **Risk caps.** `buy_budget` USDC per market ($2.50), `buy_max_spend` hard
    ceiling ($3), `buy_max_shares` sanity rail (default 5; raise it when you
    raise the dollar size), `max_open_positions`, `max_open_notional`,
@@ -358,7 +359,7 @@ paths. Templates are `strategy_buy.example.json`,
 | `buy_threshold` / `buy_max_price` | 0.75 / 0.90 | Trigger ≥75¢; hard ceiling 90¢ (prefer fills near 75¢) |
 | `min_winner_bid` / `max_loser_bid` / `min_bid_edge` | 0.70 / 0.30 / 0.05 | GUI consensus gate (aligned to 75¢ band) |
 | `max_entry_spread` | 0.05 | Max ask−bid on winner at entry |
-| `underlying_gate_enabled` / `min_underlying_edge_usd` | true / 2.0 (5m), 10.0 (15m/hr) | Oracle alignment gate |
+| `underlying_gate_enabled` / `min_underlying_edge_usd` | true / 0.0 (5m), 10.0 (15m/hr) | Oracle alignment gate |
 | `toxic_force_exit_below` | 0.65 | Force-dump if FAK avg &lt; 65¢ (must be ≤ buy_threshold) |
 | `hedge_enabled` / `hedge_threshold` / `hedge_min_price` | true / 0.35 / unused floor | Arm at 35¢; `hedge_min_price` kept in JSON, not a FAK floor |
 | `hedge_max_spread` / `hedge_require_ask_max` | 0.15 / 0.40 | Hedge book must actually collapse |
@@ -408,6 +409,15 @@ Strategy JSON changes need no deploy and no restart (hot reload).
   without size still fill the full budget at the best ask. **Export CSVs / copy
   the ticks dir off the VM regularly** — `pathlog.py` auto-prunes ticks
   (14 days / 400 MB) so they fit the small boot disk. Pruned JSONL is deleted.
+- `python check_path_backtest.py --anatomy --series 5m` — per-market window
+  anatomy: already decided before T-120 vs tight through the window vs first
+  cleared only inside the window. CSV via `--csv`.
+- `python check_path_backtest.py --compare --series 5m --budget 2.5` — named
+  alternatives (earlier window, wider band) on the **same** ticks. Rerun with
+  `--budget 15` for size. This is how knobs are compared; do not retune live
+  JSON from a single session of watching the site.
+- `python check_buy_skips.py` — what the live 5m process actually logged
+  (attempts, empty FAKs, skip reasons). Event counts are not unique markets.
 - `python check_book.py` — ad-hoc diagnostic: prints book/price data for the current
   hourly market (useful sanity check for book shape).
 - Notifications: fire-and-forget ntfy.sh pushes on buys, hedges, redeems, and fatal
@@ -417,6 +427,26 @@ Strategy JSON changes need no deploy and no restart (hot reload).
 **Disk:** host logs filled the disk once (2026-07); see `deploy/DISK_OPS.md`. The
 journal is capped via `deploy/journald-size.conf`. Pathlog ticks are capped in
 `pathlog.py` (14 days / 400 MB); export before prune.
+
+### Research loop
+
+The live bot is **one** (window, band, size, BTC gate) tuple. Pathlog records
+CLOB paths for 5m, 15m, and hourly whether or not that service is posting.
+**Compare alternatives on those ticks before changing live JSON.** Watching the
+site is not a sample; `--anatomy` / `--compare` / `--grid` are.
+
+| Question | Command |
+|---|---|
+| Already decided at T-120, or 50/50 until the end? | `check_path_backtest.py --anatomy --series 5m` |
+| Earlier window / wider band vs live 75–90 / 120s? | `--compare --series 5m --budget 2.5` |
+| Size ($2.50 vs $15) on the same paths? | `--compare` / `--grid` with `--budget 15` |
+| Ask × seconds-left heat map | `--grid --series 5m --budget 2.5` |
+| What this process actually skipped | `check_buy_skips.py` (counts ≠ unique markets) |
+| BTC-gate counterfactual | `check_edge_counterfactual.py --bot 5m` |
+
+Pathlog **cannot** replay: Polymarket last-trade GUI, Chainlink PTB, POST RTT,
+or empty FAKs beyond displayed top size. Those stay in live logs / research
+JSONL. Export ticks off the VM before prune deletes them.
 
 ---
 
