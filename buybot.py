@@ -4770,12 +4770,16 @@ while not _shutdown_requested:
         if _redeem_dirty:
             save_json(STATE_FILE, positions_meta)
 
-    except Exception:
-        log_event("cycle_error", traceback=traceback.format_exc())
+    except Exception as exc:
+        log_event(
+            "cycle_error",
+            error=f"{type(exc).__name__}: {exc}"[:180],
+            traceback=traceback.format_exc(),
+        )
         console.print(Panel(
             traceback.format_exc(),
             title="[bold bright_red]■■  SYSTEM FAULT  ■■[/]",
-            subtitle="[dim]auto-restart in 5s · cycle aborted[/]",
+            subtitle="[dim]cycle aborted · remaining markets skipped this poll[/]",
             border_style="bright_red",
             box=box.HEAVY_EDGE,
         ))

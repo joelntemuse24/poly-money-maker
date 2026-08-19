@@ -7,7 +7,7 @@ in 75–90" ticks were silent — those cannot be recovered.
 
 Usage (VM, repo root):
   python check_buy_skips.py
-  python check_buy_skips.py --since 2026-08-19T08:02:00
+  python check_buy_skips.py --since 2026-08-19T09:42:23
   python check_buy_skips.py --log buybot5m.log
 """
 
@@ -41,6 +41,8 @@ SKIP_EVENTS = {
     "buy_success",
 }
 
+FAULT_EVENTS = {"cycle_error"}
+
 
 def iter_log_paths(primary: Path) -> List[Path]:
     paths: List[Path] = []
@@ -72,7 +74,7 @@ def load_events(paths: Iterable[Path], since: str = "") -> List[dict]:
                 if not isinstance(event, dict):
                     continue
                 name = event.get("event")
-                if name not in SKIP_EVENTS:
+                if name not in SKIP_EVENTS and name not in FAULT_EVENTS:
                     continue
                 ts = str(event.get("ts") or "")
                 if since and ts < since:
@@ -80,6 +82,17 @@ def load_events(paths: Iterable[Path], since: str = "") -> List[dict]:
                 rows.append(event)
     rows.sort(key=lambda row: str(row.get("ts") or ""))
     return rows
+
+
+def cycle_error_label(event: dict) -> str:
+    """Prefer the structured ``error`` field; fall back to the last traceback line."""
+    err = str(event.get("error") or "").strip()
+    if err:
+        return err[:180]
+    tb = str(event.get("traceback") or "").strip()
+    if not tb:
+        return "(empty)"
+    return tb.splitlines()[-1][:180]
 
 
 def skip_reason(event: dict) -> Optional[str]:
@@ -100,6 +113,7 @@ def skip_reason(event: dict) -> Optional[str]:
 
 def summarize(events: List[dict]) -> Dict[str, Any]:
     reasons = Counter()
+    cycle_errors = Counter()
     windows = 0
     attempts = 0
     fills = 0
@@ -123,6 +137,9 @@ def summarize(events: List[dict]) -> Dict[str, Any]:
     for event in events:
         name = event.get("event")
         ts = event.get("ts")
+        if name == "cycle_error":
+            cycle_errors[cycle_error_label(event)] += 1
+            continue
         cid = str(event.get("condition_id") or event.get("token_id") or "")
         reason = skip_reason(event)
         if cid:
@@ -151,6 +168,7 @@ def summarize(events: List[dict]) -> Dict[str, Any]:
         "attempts": attempts,
         "fills": fills,
         "reasons": reasons,
+        "cycle_errors": cycle_errors,
         "markets": list(markets.values()),
     }
 
@@ -170,11 +188,16 @@ def main() -> int:
     print(
         f"logs: {', '.join(p.name for p in paths)}\n"
         f"since: {args.since or '(all)'}\n"
+        f"cycle_error: {sum(stats['cycle_errors'].values())}\n"
         f"buy_window (entered last 120s): {stats['windows']}\n"
         f"buy_attempt: {stats['attempts']}\n"
         f"fills: {stats['fills']}\n"
         f"unique markets with any skip/attempt: {len(stats['markets'])}"
     )
+    if stats["cycle_errors"]:
+        print("\ncycle_error types (each aborts remaining buys/hedges that poll):")
+        for label, n in stats["cycle_errors"].most_common(15):
+            print(f"  {n:5d}  {label}")
     print(
         "\nSilent pre-patch ticks (not in last 120s, or ask out of band "
         "before buy_skip logging) cannot be recovered."

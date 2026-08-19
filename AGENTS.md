@@ -125,7 +125,12 @@ Watch the console for `[DRY BUY]` / `[DRY SELL]` markers. Ctrl-C to stop.
 ### What to look for
 
 - `[DRY BUY]` / `[DRY SELL]` in dry-run — confirms trigger logic fires
-- `cycle_error` in logs — unhandled exception (bot survives but logs it)
+- `cycle_error` in logs — unhandled exception. The bot process stays up, but
+  **that poll is aborted** (later markets in the same `for m in markets` loop
+  do not buy or hedge). Banner does **not** sleep 5s. Structured `error` field
+  is the exception type+message; `check_buy_skips.py` prints the breakdown.
+  Aug 13–19 live 5m: **3294/3294** were `NameError: known_cost` until the
+  19 Aug 09:42 restart picked up #80.
 - `hedge_attempt` / `hedge_fill` — hedge fired after force-fresh REST + book integrity
 - `hedge_skip_toxic_book` — bid dipped but ask/spread still say "not reversed"
 - `hedge_skip_incomplete_rest` — REST missing a side; fail closed (no WS sell)
@@ -219,7 +224,8 @@ see TECHNICAL_DESIGN.md “Research loop.”
 CI: pushes to `main` touching the buy bots, `pathlog.py`, `buy/`, or
 `requirements.txt` deploy to the VM via SSH (`git pull` + `pip install` only).
 Services are **not** auto-restarted — start/restart deliberately after
-validation (`systemctl start` / `restart`).
+validation (`systemctl start` / `restart`). A merged NameError fix does
+nothing until `polybuybot5m` is restarted (13–19 Aug `known_cost` stall).
 
 ## Dependencies
 

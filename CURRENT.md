@@ -109,6 +109,29 @@ Kill switch: `touch STOP_PATHLOG`.
 
 ---
 
+## Cycle abort (Aug 13–19)
+
+Since **2026-08-13T04:33Z** the 5m log has **3294 `cycle_error`s**, all one
+exception: `NameError: name 'known_cost' is not defined`. Disk was not full.
+That exception is the outer poll `except`: **the rest of that cycle’s buys and
+hedges are skipped.** One quarantined `buy_uncertain` market was enough.
+
+The assignment-order fix is **#80** (`be22662`, merged 05:28Z the same morning).
+CI `git pull`s bot code but **does not restart systemd**. The running 5m
+process kept the old bytecode until the operator restart at **09:42Z on
+2026-08-19**. After that restart, `known_cost` is assigned before `spend_cap`
+uses it. Confirm with:
+
+```bash
+# After 09:42Z restart — expect 0 NameError lines
+.venv/bin/python check_buy_skips.py --since 2026-08-19T09:42:23
+```
+
+`buy_attempt_rejected` (828 since Aug 13) is a **separate** bucket (invalid
+amount / HTTP 400), not this NameError.
+
+---
+
 ## Ops
 
 - **VM:** `~/poly-money-maker` on `instance-20260516-185922`.
@@ -147,6 +170,9 @@ Kill switch: `touch STOP_PATHLOG`.
 - [x] On VM: pathlog restarted onto size-aware ticks; 15m/hourly buy bots stopped.
 - [x] 5m underlying gate **$0** (any non-zero TWAP vs PTB; side must match).
 - [x] Pathlog `--anatomy` / `--compare` so window/band/size alts are scored offline.
+- [x] 5m `known_cost` NameError (#80) — **code** fixed 13 Aug; live process
+      needed restart. Confirm `check_buy_skips.py --since 2026-08-19T09:42:23`
+      shows **0** `NameError` cycle_errors.
 - [ ] Let pathlog collect resolved markets, then `--anatomy` / `--compare` / `--grid` **off the VM** before prune.
 
 ---
