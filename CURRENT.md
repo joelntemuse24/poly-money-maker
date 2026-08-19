@@ -3,8 +3,10 @@
 **Agents: read this after `AGENTS.md`.** Update this file when ops/strategy decisions change.
 Do not put secrets, API keys, or live wallet material here.
 
-Last updated: **2026-08-13** — keep the **$2.50 / 75–90¢** CLOB buy triggers;
-pause minting; pathlog records books for entry backtests (14-day / 400 MB cap).
+Last updated: **2026-08-19** — keep the **$2.50 / 75–90¢** CLOB buy triggers;
+hedge **trigger** is still 35/40, but the sell follows the live bid after that
+(no 32¢ FAK floor). Pause minting; pathlog records books for entry backtests
+(14-day / 400 MB cap).
 
 ---
 
@@ -22,7 +24,7 @@ triggers** (not the old 98–99¢ probe):
 | Ask band | **75–90¢** — trigger as soon as winning ask ≥ 75¢; 90¢ is a hard ceiling |
 | GUI consensus | winner ≥ 70¢, loser ≤ 30¢ |
 | Windows | 5m **120 s** · 15m **4.0 min** · hourly **13.0 min** |
-| Hedge | bid ≤ **35¢** and ask ≤ **40¢**, spread ≤ 15¢ |
+| Hedge | **Trigger** bid ≤ **35¢** and ask ≤ **40¢**, spread ≤ 15¢ (real book, not a glitch). **Then sell at whatever the bid is** — no 32¢ floor. |
 | Underlying edge | **$5** (5m) / **$10** (15m, hourly); side must match |
 | `max_open_positions` | **0 = unlimited** |
 | `toxic_force_exit_below` | **65¢** |
@@ -84,6 +86,7 @@ Kill switch: `touch STOP_PATHLOG`.
 
 - [x] Pause minting; keep $2.50 / 75–90¢ CLOB triggers.
 - [x] Path recorder + `check_path_backtest.py` (first-touch ask × time-left).
+- [x] Hedge FAK follows live bid after 35/40 integrity (no 32¢ fill refusal).
 - [ ] On VM: stop mint, restart buy bots + pathlog after reviewing live JSON.
 - [ ] Let pathlog collect resolved markets, then `--grid` / export CSV **off the VM** before prune.
 

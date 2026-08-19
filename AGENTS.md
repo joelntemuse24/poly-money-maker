@@ -141,9 +141,9 @@ Watch the console for `[DRY BUY]` / `[DRY SELL]` markers. Ctrl-C to stop.
 - **FAK orders only:** All orders are Fill-And-Kill — no resting orders, no market
   making.
 - **Hedge is sell-only exit:** The bots never profit-take. The only sell path is the
-  hedge (bid ≤ 35¢ **and** ask ≤ 40¢ with tight spread, force-fresh REST
-  fail-closed); everything else rides to redemption at $1.00. WS may *arm*
-  a hedge check; selling requires two-sided REST integrity on every attempt.
+  hedge: REST shows bid ≤ 35¢ **and** ask ≤ 40¢ with tight spread (a real
+  collapse, not a spoof penny). After that, the FAK sells at the **live bid**
+  even if it is 20¢. Everything else rides to redemption at $1.00.
 - **Tick sizes:** 5m markets use `0.001`, 15m and hourly use `0.01`.
 - **One entry per market:** Enforced via `meta.get("bought_token")` in state cache.
 - **Notifications:** Fire-and-forget via ntfy.sh (topic `polybot-joel-btc`).
