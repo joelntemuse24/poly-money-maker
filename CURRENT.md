@@ -4,11 +4,13 @@
 Do not put secrets, API keys, or live wallet material here.
 
 Last updated: **2026-08-19** — keep the **$2.50 / 75–90¢** CLOB buy triggers
-(band unchanged); pin FAK buys to share-capped limits at the quoted ask so leftover
-USDC cannot walk into 9¢ junk. Hedge **trigger** is still 35/40; the sell follows
-the live bid after that (no 32¢ FAK floor). Pause minting. Pathlog ticks now store
-**top-of-book size** (`ubs`/`uas`/`dbs`/`das`) so `--budget 2.5` vs `15` backtests
-are size-capped, not infinite liquidity at the best ask (14-day / 400 MB cap).
+(band unchanged). Buys are **limit FAKs at the quoted ask** sized `budget/ask`
+(~3.3 shares at 75¢), **not** capped to displayed top size. Hard spend ceiling
+`buy_max_spend` **$3**. Leftover USDC cannot walk into 9¢ junk. Hedge **trigger**
+is still 35/40; the sell follows the live bid after that (no 32¢ FAK floor).
+Pause minting. Pathlog ticks store **top-of-book size** (`ubs`/`uas`/`dbs`/`das`)
+so `--budget 2.5` vs `15` backtests can model how much of that ask would fill
+(14-day / 400 MB cap).
 
 ---
 
@@ -23,8 +25,9 @@ triggers** (not the old 98–99¢ probe):
 | Knob | Value |
 |---|---|
 | `buy_budget` | **$2.50** / market |
+| `buy_max_spend` | **$3.00** hard ceiling (strategy is $2.50; never more than ~$3) |
 | Ask band | **75–90¢** — trigger as soon as winning ask ≥ 75¢; 90¢ is a hard ceiling |
-| Execution | FAK **limit** at the quoted ask, size `min(budget/ask, ask_size)` shares — **not** a USDC market order |
+| Execution | FAK **limit** at the quoted ask, size `budget/ask` shares — **not** a USDC market order, **not** capped to displayed top size |
 | GUI consensus | winner ≥ 70¢, loser ≤ 30¢ |
 | Windows | 5m **120 s** · 15m **4.0 min** · hourly **13.0 min** |
 | Hedge | **Trigger** bid ≤ **35¢** and ask ≤ **40¢**, spread ≤ 15¢ (real book, not a glitch). **Then sell at whatever the bid is** — no 32¢ floor. |
@@ -35,8 +38,9 @@ triggers** (not the old 98–99¢ probe):
 **Also running (no orders):** `pathlog.py` (`polypathlog`) writes one JSONL file
 per market under `pathlog/ticks/` so we can ask “if we had bought at 80¢ with
 2 minutes left, would we have won?” New ticks include displayed top size; the
-backtest fills `min(budget/ask, ask_size)` like live FAKs. Legacy ticks without
-size still assume a full fill at the best ask.
+backtest still *fills* `min(budget/ask, ask_size)` as a liquidity model (live
+posts the full dollar size at that ask; unmatched remainder dies on the FAK).
+Legacy ticks without size still assume a full fill at the best ask.
 
 ---
 
@@ -81,7 +85,8 @@ Kill switch: `touch STOP_PATHLOG`.
 - **VM:** `~/poly-money-maker` on `instance-20260516-185922`.
 - **Mint:** `sudo systemctl stop polymintbot && sudo systemctl disable polymintbot`
 - **Buy bots:** live `strategy_buy*.json` already had these 75–90 / $2.50 knobs
-  before minting. After pull, confirm they still match the table above, then:
+  before minting. `buy_max_spend` may be omitted — default **$3** applies.
+  After pull, confirm they still match the table above, then:
   ```bash
   cd ~/poly-money-maker && git pull
   sudo systemctl restart polybuybot polybuybot5m polybuybothourly
@@ -94,7 +99,8 @@ Kill switch: `touch STOP_PATHLOG`.
 ## Open / next
 
 - [x] Pause minting; keep $2.50 / 75–90¢ CLOB triggers.
-- [x] Pin BUY FAKs to share-capped limits at the quoted ask (band unchanged).
+- [x] Pin BUY FAKs to **budget/ask limit** at the quoted ask (band unchanged;
+  displayed top size is not a cap; `buy_max_spend` $3).
 - [x] Path recorder + `check_path_backtest.py` (first-touch ask × time-left;
   ticks record TOB size; backtest is share-capped FAK, not infinite ask size).
 - [x] Hedge FAK follows live bid after 35/40 integrity (no 32¢ fill refusal).

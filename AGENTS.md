@@ -127,7 +127,7 @@ Watch the console for `[DRY BUY]` / `[DRY SELL]` markers. Ctrl-C to stop.
 - `buy_skip_ambiguous` — GUI display prices too close
 - `buy_skip_no_consensus` — ask in band but GUI/tight-book gate failed
 - `buy_fill_below_band` — fill avg below band; inventory persisted + `toxic_fill` force-exit
-- `buy_fill_walk` — confirmed BUY shares exceeded the quoted top size (junk walk)
+- `buy_fill_walk` — confirmed BUY shares exceeded the quoted budget/ask size (junk walk)
 - `buy_ghost_fill` — balance reconciliation after null/delayed BUY confirm
 - `buy_uncertain` — POST outcome unresolved; durable token/baseline quarantine blocks re-buy
 - `buy_skip_incomplete_book` — missing GUI price on a leg (no mid and no last trade)
@@ -150,7 +150,8 @@ Watch the console for `[DRY BUY]` / `[DRY SELL]` markers. Ctrl-C to stop.
   last-known-good hedge parameters. A per-bot process lock prevents duplicate
   live instances.
 - **FAK orders only:** All orders are Fill-And-Kill — no resting orders, no market
-  making. Buys are share-capped **limit** FAKs at the quoted ask; sells stay
+  making. Buys are **limit** FAKs at the quoted ask sized `budget/ask`
+  (hard `buy_max_spend` $3, not displayed top size); sells stay
   share-denominated market FAKs.
 - **Hedge is sell-only exit:** The bots never profit-take. The only sell path is the
   hedge: REST shows bid ≤ 35¢ **and** ask ≤ 40¢ with tight spread (a real

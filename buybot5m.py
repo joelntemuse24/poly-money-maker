@@ -172,6 +172,8 @@ _STRATEGY_DEFAULTS = {
     "buy_grace_s": 1,
     "buy_cooldown_s": 1,
     "buy_budget": 2.5,
+    # Hard ceiling on USDC sent per market. Strategy is $2.50; never more than $3.
+    "buy_max_spend": 3.0,
     "max_open_positions": 0,  # 0 = unlimited
     "max_open_notional": 10000.0,
     "max_daily_notional": 999999.0,
@@ -275,13 +277,15 @@ def load_strategy():
         if not cfg["dry_run"] and not cfg["hedge_enabled"]:
             raise ValueError("live mode requires hedge_enabled=true")
         for key in (
-            "buy_budget", "max_open_notional",
+            "buy_budget", "buy_max_spend", "max_open_notional",
             "max_daily_notional", "poll_buy_window_s", "poll_held_s",
             "positions_refresh_s", "balance_refresh_s", "buy_start_s",
             "ui_every_n_cycles",
         ):
             if float(cfg[key]) <= 0:
                 raise ValueError(f"{key} must be positive")
+        if float(cfg["buy_max_spend"]) + 1e-9 < float(cfg["buy_budget"]):
+            raise ValueError("buy_max_spend must be >= buy_budget")
         # 0 = unlimited open markets (probe: redeem lag must not freeze entries).
         if float(cfg["max_open_positions"]) < 0:
             raise ValueError("max_open_positions must be >= 0 (0 = unlimited)")
@@ -329,6 +333,7 @@ BUY_START_S = _strat["buy_start_s"]
 BUY_GRACE_S = _strat["buy_grace_s"]
 BUY_COOLDOWN_S = _strat["buy_cooldown_s"]
 BUY_BUDGET = _strat["buy_budget"]
+BUY_MAX_SPEND = _strat["buy_max_spend"]
 MAX_OPEN_POSITIONS = _strat["max_open_positions"]
 MAX_OPEN_NOTIONAL = _strat["max_open_notional"]
 MAX_DAILY_NOTIONAL = _strat["max_daily_notional"]
@@ -1149,27 +1154,28 @@ def hedge_book_ok(bid, ask, threshold, max_spread, require_ask_max):
 
 
 
-def quoted_buy_shares(budget, ask, ask_size):
-    """Shares to lift at the quoted ask — leftover USDC must not walk cheaper levels.
+def quoted_buy_shares(budget, ask, ask_size=None):
+    """Shares to buy at the quoted ask for this dollar budget.
 
-    A USDC market buy of min(budget, ask*size) still spends that cash down the
-    book. Cap in shares at the displayed top size instead.
+    Posts a **limit** FAK at ``ask`` sized ``budget/ask``. Leftover USDC
+    cannot walk cheaper levels (that was the 39-share / 6¢ blow-up).
+    Displayed ``ask_size`` is not a cap — a thin top still posts the
+    dollar size; unmatched remainder dies on the FAK.
     """
     budget = finite_float(budget, minimum=0)
     ask = finite_float(ask, minimum=0, maximum=1)
-    ask_size = finite_float(ask_size, minimum=0)
-    if budget is None or ask is None or ask_size is None:
+    if budget is None or ask is None:
         return 0.0
-    if budget < 0.01 or ask <= 0 or ask_size < 0.01:
+    if budget < 0.01 or ask <= 0:
         return 0.0
-    shares = min(budget / ask, ask_size)
+    shares = budget / ask
     # CLOB taker amounts allow at most four decimal places.
     shares = math.floor(shares * 10000 + 1e-12) / 10000
     return shares if shares >= 0.01 else 0.0
 
 
 def buy_fill_walked(filled, quoted_shares, ratio=1.05):
-    """True when confirmed shares exceed the quoted top-of-book size."""
+    """True when confirmed shares exceed the quoted budget/ask size."""
     filled = finite_float(filled, minimum=0) or 0.0
     quoted = finite_float(quoted_shares, minimum=0) or 0.0
     if filled <= 0:
@@ -2005,10 +2011,13 @@ def buy_market_with_retry(
 ):
     """Buy token_id via FAK, sized in shares at the quoted ask.
 
-    Does not send a USDC market order: leftover dollars would walk cheaper
-    asks (9¢ junk under an 80¢ quote). Size is min(budget/ask, ask_size).
-    Band is still min_price–max_price; this only pins execution to the level
-    that passed the gate.
+    Sends ``budget/ask`` shares as a **limit** FAK at the live ask (capped
+    by ``buy_max_spend``). This is not a USDC market order: leftover dollars
+    would walk cheaper asks (9¢ junk under an 80¢ quote). Displayed top size
+    does not shrink the order — a thin book fills what it can at that ask.
+
+    Band is still min_price–max_price; this only pins execution to an
+    in-band ask. Max shares at $2.50 / 75¢ is ~3.3, never a 39-share 6¢ bag.
 
     Returns (shares_bought, usdc_spent, status). status is filled|ambiguous|empty|aborted|persist_fail|dry.
     spent may be estimated when the exchange
@@ -2131,9 +2140,10 @@ def buy_market_with_retry(
             break
         fresh_ask_size = finite_float(fresh_ask_size, minimum=0)
         if fresh_ask_size is None or fresh_ask_size < 0.01:
-            console.print(f"  [dim yellow][NO SIZE][/] ask size {fresh_ask_size} · attempt {attempt + 1}/{max_retries}")
-            time.sleep(0.05)
-            continue
+            console.print(
+                f"  [dim yellow][THIN ASK][/] displayed size {fresh_ask_size} · "
+                f"posting budget/ask anyway · attempt {attempt + 1}/{max_retries}"
+            )
         shares = quoted_buy_shares(remaining_budget, fresh_ask, fresh_ask_size)
         if shares < 0.01:
             break
@@ -2966,6 +2976,7 @@ while not _shutdown_requested:
         BUY_GRACE_S = _strat["buy_grace_s"]
         BUY_COOLDOWN_S = _strat["buy_cooldown_s"]
         BUY_BUDGET = _strat["buy_budget"]
+        BUY_MAX_SPEND = _strat["buy_max_spend"]
         MAX_OPEN_POSITIONS = _strat["max_open_positions"]
         MAX_OPEN_NOTIONAL = _strat["max_open_notional"]
         MAX_DAILY_NOTIONAL = _strat["max_daily_notional"]
@@ -3434,7 +3445,10 @@ while not _shutdown_requested:
                     token_id=uncertain_token,
                     condition_id=cond,
                     limit_price=meta.get("buy_uncertain_price", 0),
-                    spend_cap=max(0.0, float(BUY_BUDGET) - known_cost),
+                    spend_cap=max(
+                        0.0,
+                        min(float(BUY_BUDGET), float(BUY_MAX_SPEND)) - known_cost,
+                    ),
                     trade_ids=meta.get("buy_uncertain_trade_ids"),
                 )
                 inspected_state = inspected["state"]
@@ -3552,7 +3566,11 @@ while not _shutdown_requested:
                     # Walked inventory did not cost extra_size × gate ask — same USDC.
                     entry_cost = known_cost if known_cost > 0 else spend_est
                     if entry_cost <= 0:
-                        entry_cost = min(float(BUY_BUDGET), resolved_size * avg_est)
+                        entry_cost = min(
+                            float(BUY_BUDGET),
+                            float(BUY_MAX_SPEND),
+                            resolved_size * avg_est,
+                        )
                     quoted = meta.get("quoted_buy_shares")
                     avg_fill = implied_buy_average(entry_cost, resolved_size, avg_est)
                     _, force_exit = classify_buy_fill(
@@ -4109,7 +4127,7 @@ while not _shutdown_requested:
                 if (pm.get("bought_token") or pm.get("buy_uncertain"))
                 and pm.get("entered_at", 0) >= _today_start_ms()
             )
-            est_cost = BUY_BUDGET
+            est_cost = min(float(BUY_BUDGET), float(BUY_MAX_SPEND))
             if MAX_OPEN_POSITIONS > 0 and open_count >= MAX_OPEN_POSITIONS:
                 log_event(
                     "buy_skip_max_positions",
@@ -4352,10 +4370,11 @@ while not _shutdown_requested:
             ))
 
             tick = get_tick_size_cached(buy_token)
+            spend_usd = min(float(BUY_BUDGET), float(BUY_MAX_SPEND))
             if uchk is None and m.start_ts:
                 uchk = btc_feed.underlying_check(m.start_ts, 0)  # snapshot only
             log_event(
-                "buy_attempt", condition_id=cond, leg=buy_leg, budget=BUY_BUDGET,
+                "buy_attempt", condition_id=cond, leg=buy_leg, budget=spend_usd,
                 ask=buy_ask, gui=buy_gui, up_gui=up_gui, dn_gui=dn_gui,
                 threshold=BUY_THRESHOLD, seconds_left=round(seconds_left, 1),
                 ptb=(uchk or {}).get("ptb"),
@@ -4389,7 +4408,7 @@ while not _shutdown_requested:
                 avg = (spent_total / filled_total) if filled_total > 0 else float(buy_ask or 0)
                 if spent_total <= 0 and filled_total > 0:
                     spent_total = min(
-                        float(BUY_BUDGET),
+                        float(spend_usd),
                         filled_total * float(buy_ask or BUY_THRESHOLD),
                     )
                     avg = spent_total / filled_total if filled_total else avg
@@ -4456,7 +4475,7 @@ while not _shutdown_requested:
                 save_json(STATE_FILE, positions_meta)
 
             bought, spent, buy_status = buy_market_with_retry(
-                buy_token, BUY_BUDGET, BUY_MAX_PRICE, tick_size=tick, min_price=BUY_THRESHOLD,
+                buy_token, spend_usd, BUY_MAX_PRICE, tick_size=tick, min_price=BUY_THRESHOLD,
                 on_fill=_persist_buy_fill, on_submit=_persist_buy_submit,
                 condition_id=cond,
             )
@@ -4466,7 +4485,7 @@ while not _shutdown_requested:
                     _clear_buy_uncertain()
                 if spent <= 0:
                     spent = min(
-                        float(BUY_BUDGET),
+                        float(spend_usd),
                         bought * float(buy_ask or BUY_THRESHOLD),
                     )
                 avg_fill = implied_buy_average(spent, bought, buy_ask)
@@ -4537,7 +4556,7 @@ while not _shutdown_requested:
                 meta["buy_uncertain_leg"] = buy_leg
                 meta["last_buy_at"] = wall_ms
                 log_event(
-                    "buy_uncertain", condition_id=cond, leg=buy_leg, budget=BUY_BUDGET,
+                    "buy_uncertain", condition_id=cond, leg=buy_leg, budget=spend_usd,
                     ask=buy_ask, token_id=buy_token,
                 )
                 notify(
@@ -4551,7 +4570,7 @@ while not _shutdown_requested:
                 # happened), so remove the temporary write-ahead quarantine.
                 _clear_buy_uncertain()
                 meta["last_buy_at"] = wall_ms
-                log_event("buy_fail", condition_id=cond, leg=buy_leg, budget=BUY_BUDGET, ask=buy_ask, status=buy_status)
+                log_event("buy_fail", condition_id=cond, leg=buy_leg, budget=spend_usd, ask=buy_ask, status=buy_status)
                 save_json(STATE_FILE, positions_meta)
 
         # ================= REDEEM STATUS (ASYNC / LOW PRIORITY) =================

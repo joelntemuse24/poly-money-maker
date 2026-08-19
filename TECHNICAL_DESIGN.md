@@ -210,21 +210,23 @@ A buy fires only when **all** of these gates pass, evaluated in the buy window
    15m/hourly), **and** the book's winning side must match the direction of the
    underlying move. This blocks buying a "winner" that the resolution oracle itself
    disagrees with (stale-book trap).
-6. **Risk caps.** `buy_budget` USDC per market ($2.50), `max_open_positions`,
-   `max_open_notional`, `max_daily_notional`, and available USDC balance.
+6. **Risk caps.** `buy_budget` USDC per market ($2.50), `buy_max_spend` hard
+   ceiling ($3), `max_open_positions`, `max_open_notional`, `max_daily_notional`,
+   and available USDC balance.
 
 Execution: a FAK **limit** buy sized in **shares** at the quoted ask —
-`min(budget/ask, ask_size)` via `OrderArgs` + `create_order` — not a USDC market
-order. A dollar-denominated market FAK of `min(budget, ask×ask_size)` still walks
-cheaper levels (gate quotes 80¢, leftover cash lifts 9¢). The 75–90¢ **band is
-unchanged**; this only pins size to the level that passed the gate. Re-quote
-already aborts if the fresh ask left the band. A BUY limit is a **maximum**, so
-the exchange can still price-improve inside that share cap; confirmed fills are
+`budget/ask` via `OrderArgs` + `create_order` — not a USDC market order and **not**
+capped to displayed top size. A dollar-denominated market FAK still walks cheaper
+levels (gate quotes 80¢, leftover cash lifts 9¢). Thin tops log `[THIN ASK]` and
+still post the dollar size; unmatched remainder dies on the FAK. The 75–90¢ **band
+is unchanged**; this only pins the limit price to the level that passed the gate.
+Re-quote already aborts if the fresh ask left the band. A BUY limit is a
+**maximum**, so the exchange can still price-improve; confirmed fills are
 **always persisted** (including below-band averages logged as `buy_fill_below_band`
 and walks as `buy_fill_walk`). True average is **USDC / shares**, not extra shares
 priced at the gate ask. Those fills set `toxic_fill` when the average is below
 `toxic_force_exit_below` (default 65¢) **or** filled shares exceed 1.05× quoted
-size, and are **not** ridden to $1: the hedge path force-exits at the next usable
+`budget/ask` size, and are **not** ridden to $1: the hedge path force-exits at the next usable
 bid (no bounce cancel, no `hedge_min_price` floor; REST may be bid-only). Milder
 below-band fills (e.g. 70¢) stay on the normal ≤35¢ hedge path. Delayed FAKs are
 polled; zero confirms fall back to balance reconciliation (`buy_ghost_fill`) using
@@ -246,7 +248,7 @@ Entry cost is USDC spent (`makingAmount` on CLOB v2 BUY), not `shares × gate as
 - `buy_skip_underlying_edge` — live oracle < $10 from PTB
 - `buy_skip_underlying_side` — book winner disagrees with the underlying move
 - `buy_fill_below_band` — fill landed below the ask band; inventory recorded + `toxic_fill`
-- `buy_fill_walk` — confirmed BUY shares exceeded the quoted top-of-book size
+- `buy_fill_walk` — confirmed BUY shares exceeded the quoted budget/ask size
 - `buy_ghost_fill` — balance rose after a null/delayed CLOB confirm
 
 While any position is open or any market is inside the buy window, the loop runs in
@@ -399,7 +401,8 @@ Strategy JSON changes need no deploy and no restart (hot reload).
 - `underlying_research_buy*.jsonl` / `ptb_*_buy*.json` — oracle/PTB decision audit.
 - `python check_path_backtest.py --grid --budget 2.5` — hypothetical entries from
   `pathlog/ticks/` (ask × seconds-left). New ticks include top-of-book **size**;
-  the backtest share-caps the FAK (`min(budget/ask, ask_size)`). Legacy ticks
+  the backtest models fillable size (`min(budget/ask, ask_size)`). Live bots
+  post the full dollar size at that ask. Legacy ticks
   without size still fill the full budget at the best ask. **Export CSVs / copy
   the ticks dir off the VM regularly** — `pathlog.py` auto-prunes ticks
   (14 days / 400 MB) so they fit the small boot disk. Pruned JSONL is deleted.

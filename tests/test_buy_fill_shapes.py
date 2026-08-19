@@ -264,13 +264,14 @@ class BuyFillProductionHelpers(unittest.TestCase):
         self.assertTrue(ok)
         self.assertEqual(why, "ok")
 
-    def test_quoted_buy_shares_caps_at_top_size_not_budget_dollars(self):
+    def test_quoted_buy_shares_is_budget_over_ask_not_top_size(self):
         quoted = self.ns["quoted_buy_shares"]
-        # $2.50 at 80¢ with 100 sh on the ask → ~3.12 shares, not a $2.50 walk.
+        # $2.50 at 80¢ → ~3.12 shares (limit at that ask), not a $2.50 walk.
         self.assertAlmostEqual(quoted(2.50, 0.80, 100.0), 3.125)
-        # Thin 80¢ level: never size past displayed ask_size.
-        self.assertAlmostEqual(quoted(2.50, 0.80, 1.0), 1.0)
-        self.assertEqual(quoted(2.50, 0.80, 0.0), 0.0)
+        # Displayed top size is not a cap — thin books still post budget/ask.
+        self.assertAlmostEqual(quoted(2.50, 0.80, 1.0), 3.125)
+        self.assertAlmostEqual(quoted(2.50, 0.80, 0.0), 3.125)
+        self.assertAlmostEqual(quoted(2.50, 0.80, None), 3.125)
         self.assertEqual(quoted(2.50, 0.0, 10.0), 0.0)
 
     def test_classify_buy_fill_walk_and_cheap_avg_are_toxic(self):
@@ -576,7 +577,7 @@ class AmbiguousCrossCyclePolicy(unittest.TestCase):
             self.assertIn("expected_condition_id=cond", src, bot.name)
             self.assertIn('ENTRY_ENABLED = _strat["entry_enabled"]', src, bot.name)
 
-    def test_buy_is_share_capped_limit_sell_stays_market(self):
+    def test_buy_is_budget_limit_fak_not_top_capped(self):
         for bot in (BOT, BOT5M, BOT_HR):
             src = bot.read_text()
             self.assertEqual(src.count("client.create_order"), 1, bot.name)
@@ -587,6 +588,10 @@ class AmbiguousCrossCyclePolicy(unittest.TestCase):
             self.assertIn("toxic_fill_armed_from_inventory", src, bot.name)
             self.assertIn('reason="no_bid"', src, bot.name)
             self.assertIn('quoted = meta.get("quoted_buy_shares")', src, bot.name)
+            self.assertIn('"buy_max_spend": 3.0', src, bot.name)
+            self.assertIn("[THIN ASK]", src, bot.name)
+            self.assertNotIn("min(budget / ask, ask_size)", src, bot.name)
+            self.assertNotIn("[NO SIZE]", src, bot.name)
             self.assertNotIn(
                 'quoted = meta.get("quoted_buy_shares") or meta.get(',
                 src,
@@ -702,6 +707,18 @@ class BuyExecutionAmbiguity(unittest.TestCase):
         self.assertEqual(len(calls["orders"]), 1)
         self.assertIn("size", calls["orders"][0])
         self.assertNotIn("amount", calls["orders"][0])
+
+    def test_thin_displayed_ask_still_posts_budget_shares(self):
+        ns, calls = self._namespace({"status": "unmatched", "orderID": "order-1"})
+        ns["get_quote_fast"] = lambda *_a, **_k: (0.79, 0.5, 0.80, 0.01, None)
+        result = ns["buy_market_with_retry"](
+            "token", 2.50, 0.90, min_price=0.75, max_retries=1,
+            on_submit=lambda *args: calls["submit"].append(args),
+        )
+        self.assertEqual(result, (0.0, 0.0, "empty"))
+        self.assertEqual(len(calls["orders"]), 1)
+        self.assertAlmostEqual(calls["orders"][0]["size"], 3.125)
+        self.assertAlmostEqual(calls["orders"][0]["price"], 0.80)
 
     def test_explicit_unmatched_zero_fill_is_terminal_empty(self):
         ns, calls = self._namespace({"status": "unmatched", "orderID": "order-1"})
