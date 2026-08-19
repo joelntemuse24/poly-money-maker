@@ -11,7 +11,7 @@ import traceback
 import logging
 from logging.handlers import RotatingFileHandler
 from datetime import datetime, timezone
-from decimal import Decimal, InvalidOperation
+from decimal import Decimal, InvalidOperation, ROUND_DOWN
 import requests
 from concurrent.futures import ThreadPoolExecutor
 from dotenv import load_dotenv
@@ -1187,6 +1187,11 @@ def quoted_buy_shares(budget, ask, share_cap=None):
     ``share_cap`` (strategy ``buy_max_shares`` — a tunable "that's too
     many shares, wrong price" rail). Leftover USDC cannot walk cheaper
     levels. Displayed top size is not a cap.
+
+    CLOB FAK BUY rejects amounts that are not **2 dp USDC** (maker) and
+    **4 dp shares** (taker). The SDK also ``round_down``s size to **2 dp**
+    for our tick sizes, so 4 dp shares still sign as ``$2.4999`` (HTTP 400).
+    Use 2 dp shares and shrink until notional is exact cents.
     """
     budget = finite_float(budget, minimum=0)
     ask = finite_float(ask, minimum=0, maximum=1)
@@ -1194,13 +1199,27 @@ def quoted_buy_shares(budget, ask, share_cap=None):
         return 0.0
     if budget < 0.01 or ask <= 0:
         return 0.0
-    shares = budget / ask
+    spend = Decimal(str(budget)).quantize(Decimal("0.01"), rounding=ROUND_DOWN)
+    ask_d = Decimal(str(ask))
+    if spend < Decimal("0.01") or ask_d <= 0:
+        return 0.0
+    share_tick = Decimal("0.01")
+    min_shares = Decimal("0.01")
+    cent = Decimal("0.01")
+    shares = (spend / ask_d).quantize(share_tick, rounding=ROUND_DOWN)
     cap = finite_float(share_cap, minimum=0)
     if cap is not None:
-        shares = min(shares, cap)
-    # CLOB taker amounts allow at most four decimal places.
-    shares = math.floor(shares * 10000 + 1e-12) / 10000
-    return shares if shares >= 0.01 else 0.0
+        shares = min(
+            shares,
+            Decimal(str(cap)).quantize(share_tick, rounding=ROUND_DOWN),
+        )
+    while shares >= min_shares:
+        maker = shares * ask_d
+        if maker.quantize(cent) == maker:
+            return float(shares)
+        shares -= share_tick
+        shares = shares.quantize(share_tick, rounding=ROUND_DOWN)
+    return 0.0
 
 
 def buy_fill_walked(filled, quoted_shares, ratio=1.05):
@@ -2064,10 +2083,11 @@ def buy_market_with_retry(
     """Buy token_id via FAK, sized in shares at the quoted ask.
 
     Sends ``budget/ask`` shares as a **limit** FAK at the live ask (capped
-    by ``buy_max_spend`` and ``buy_max_shares``). This is not a USDC market
-    order: leftover dollars would walk cheaper asks (9¢ junk under an 80¢
-    quote). Displayed top size does not shrink the order — a thin book fills
-    what it can at that ask.
+    by ``buy_max_spend`` and ``buy_max_shares``). Maker USDC is exact cents
+    (2 dp) and taker shares 4 dp — otherwise CLOB FAK BUY returns 400
+    ``invalid amounts``. This is not a USDC market order: leftover dollars
+    would walk cheaper asks (9¢ junk under an 80¢ quote). Displayed top size
+    does not shrink the order — a thin book fills what it can at that ask.
 
     Band is still min_price–max_price; this only pins execution to an
     in-band ask. $2.50 / 75¢ is ~3.3 shares; ``buy_max_shares`` (default 5)
