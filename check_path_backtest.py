@@ -168,11 +168,12 @@ def simulate_fak_buy(
     ask: float,
     ask_size: Optional[float] = None,
 ) -> dict:
-    """Share-capped limit FAK at the quoted ask — recorded levels only.
+    """Limit FAK at the quoted ask — recorded levels only.
 
-    Matches live buys: ``min(budget/ask, ask_size)`` shares, no walking into
-    cheaper asks. ``ask_size is None`` (legacy ticks) = infinite size at
-    ``ask``, same as the old full-fill-at-best-ask P&L.
+    Live bots post ``budget/ask`` shares at that ask (displayed size is not a
+    cap). This helper models **fillable** size: ``min(budget/ask, ask_size)``,
+    no walking into cheaper asks. ``ask_size is None`` (legacy ticks) =
+    infinite size at ``ask``, same as the old full-fill-at-best-ask P&L.
     """
     out = {
         "status": "zero",

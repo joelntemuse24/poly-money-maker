@@ -4,9 +4,12 @@
 Do not put secrets, API keys, or live wallet material here.
 
 Last updated: **2026-08-19** — **only the 5m CLOB bot is live.** Stop/disable
-15m and hourly. Keep the **$2.50 / 75–90¢** triggers on 5m (share-capped limit
-FAK at the quoted ask). Hedge **trigger** is still 35/40; sell follows the live
-bid. Pause minting. Pathlog still records all three series (no orders).
+15m and hourly. Keep the **$2.50 / 75–90¢** triggers on 5m. Buys are **limit
+FAKs at the quoted ask** sized `budget/ask` (~3.3 shares at 75¢), clipped to
+`buy_max_shares` **5** (buffer). Hard spend ceiling `buy_max_spend` **$3**.
+Leftover USDC cannot walk into 9¢ junk. Displayed top size is **not** a cap.
+Hedge **trigger** is still 35/40; the sell follows the live bid. Pause minting.
+Pathlog still records all three series (no orders; 14-day / 400 MB cap).
 
 ---
 
@@ -25,8 +28,10 @@ triggers** (not the old 98–99¢ probe):
 | Knob | Value |
 |---|---|
 | `buy_budget` | **$2.50** / market |
+| `buy_max_spend` | **$3.00** hard ceiling (strategy is $2.50; never more than ~$3) |
+| `buy_max_shares` | **5** buffer (~3.3 sh at $2.50/75¢) |
 | Ask band | **75–90¢** — trigger as soon as winning ask ≥ 75¢; 90¢ is a hard ceiling |
-| Execution | FAK **limit** at the quoted ask, size `min(budget/ask, ask_size)` shares — **not** a USDC market order |
+| Execution | FAK **limit** at the quoted ask, size `min(budget/ask, buy_max_shares)` — **not** a USDC market order, **not** capped to displayed top size |
 | GUI consensus | winner ≥ 70¢, loser ≤ 30¢ |
 | Windows | 5m **120 s** (15m / hourly bots **not running**) |
 | Hedge | **Trigger** bid ≤ **35¢** and ask ≤ **40¢**, spread ≤ 15¢ (real book, not a glitch). **Then sell at whatever the bid is** — no 32¢ floor. |
@@ -37,8 +42,9 @@ triggers** (not the old 98–99¢ probe):
 **Also running (no orders):** `pathlog.py` (`polypathlog`) writes one JSONL file
 per market under `pathlog/ticks/` so we can ask “if we had bought at 80¢ with
 2 minutes left, would we have won?” New ticks include displayed top size; the
-backtest fills `min(budget/ask, ask_size)` like live FAKs. Legacy ticks without
-size still assume a full fill at the best ask.
+backtest still *fills* `min(budget/ask, ask_size)` as a liquidity model (live
+posts the full dollar size at that ask; unmatched remainder dies on the FAK).
+Legacy ticks without size still assume a full fill at the best ask.
 
 ---
 
@@ -82,16 +88,20 @@ Kill switch: `touch STOP_PATHLOG`.
 
 - **VM:** `~/poly-money-maker` on `instance-20260516-185922`.
 - **Mint:** `sudo systemctl stop polymintbot && sudo systemctl disable polymintbot`
-- **Buy bots:** **5m only.** Leave `polybuybot5m` running. Stop the others:
+- **Buy bots:** **5m only.** Leave 15m/hourly stopped. `buy_max_spend` /
+  `buy_max_shares` may be omitted from live JSON — defaults **$3** / **5 shares**
+  apply. After pulling this FAK change, restart **5m only**:
   ```bash
   sudo systemctl stop polybuybot polybuybothourly
   sudo systemctl disable polybuybot polybuybothourly
-  sudo systemctl enable polybuybot5m   # survive reboot; already running is fine
+  cd ~/poly-money-maker && git pull
+  sudo systemctl restart polybuybot5m
+  sudo systemctl enable polybuybot5m
   systemctl is-active polybuybot polybuybot5m polybuybothourly
   # expect: inactive  active  inactive
   ```
-  Do **not** restart 5m unless the operator asks. Confirm `strategy_buy5m.json`
-  `dry_run` / `entry_enabled` before any 5m restart.
+  Confirm `strategy_buy5m.json` `dry_run` / `entry_enabled` before the 5m restart.
+  Do **not** start 15m or hourly unless the operator asks.
 - **Pathlog:** start `polypathlog` as above (no `.env` required).
 
 ---
@@ -100,7 +110,8 @@ Kill switch: `touch STOP_PATHLOG`.
 
 - [x] Pause minting; keep $2.50 / 75–90¢ CLOB triggers.
 - [x] **5m-only live trading** — 15m and hourly buy services stopped/disabled.
-- [x] Pin BUY FAKs to share-capped limits at the quoted ask (band unchanged).
+- [x] Pin BUY FAKs to **budget/ask limit** at the quoted ask (band unchanged;
+  displayed top size is not a cap; `buy_max_spend` $3; `buy_max_shares` 5 buffer).
 - [x] Path recorder + `check_path_backtest.py` (first-touch ask × time-left;
   ticks record TOB size; backtest is share-capped FAK, not infinite ask size).
 - [x] Hedge FAK follows live bid after 35/40 integrity (no 32¢ fill refusal).

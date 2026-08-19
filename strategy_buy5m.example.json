@@ -22,6 +22,8 @@
   "buy_grace_s": 1,
   "buy_cooldown_s": 1,
   "buy_budget": 2.5,
+  "buy_max_spend": 3.0,
+  "buy_max_shares": 5.0,
   "max_open_positions": 0,
   "max_open_notional": 10000.0,
   "max_daily_notional": 999999.0,
