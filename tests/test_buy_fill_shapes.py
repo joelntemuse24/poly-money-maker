@@ -672,6 +672,8 @@ class BuyExecutionAmbiguity(unittest.TestCase):
             "classify_buy_fill",
             "implied_buy_average",
             "buy_market_with_retry",
+            "unmatched_fak_rejection",
+            "definitive_order_rejection",
         )
         calls = {"post": 0, "submit": [], "orders": []}
         signed_order = SimpleNamespace(
@@ -713,7 +715,6 @@ class BuyExecutionAmbiguity(unittest.TestCase):
                 "PartialCreateOrderOptions": lambda **kwargs: kwargs,
                 "OrderType": SimpleNamespace(FAK="FAK"),
                 "signed_order_id": lambda *_a, **_k: "order-1",
-                "definitive_order_rejection": lambda _exc: False,
                 "extract_order_id": lambda _result: "order-1",
                 "confirm_fill_size": lambda *_a, **_k: 0.0,
                 "fill_cost_usdc": lambda *_a, **_k: 0.0,
@@ -804,6 +805,161 @@ class BuyExecutionAmbiguity(unittest.TestCase):
         self.assertEqual(result, (5.0, 4.9, "ambiguous"))
         self.assertEqual(calls["post"], 1)
         self.assertEqual(persisted, [(5.0, 4.9)])
+
+    def test_unmatched_fak_rejection_only_matches_empty_fak_400(self):
+        ns = _load_funcs("unmatched_fak_rejection")
+
+        class Fake(Exception):
+            def __init__(self, status, msg):
+                super().__init__(msg)
+                self.status_code = status
+
+        self.assertTrue(
+            ns["unmatched_fak_rejection"](
+                Fake(
+                    400,
+                    "no orders found to match with FAK order. "
+                    "FAK orders are partially filled or killed if no match is found.",
+                )
+            )
+        )
+        self.assertFalse(
+            ns["unmatched_fak_rejection"](
+                Fake(400, "invalid amounts, max accuracy of 2 decimals")
+            )
+        )
+        self.assertFalse(ns["unmatched_fak_rejection"](Fake(401, "no orders found to match")))
+        self.assertFalse(ns["unmatched_fak_rejection"](Fake(400, "not enough balance")))
+
+    def test_unmatched_fak_400_retries_up_to_max(self):
+        ns, calls = self._namespace({"status": "unmatched"})
+
+        class Unmatched(Exception):
+            status_code = 400
+
+            def __str__(self):
+                return (
+                    "PolyApiException[status_code=400, error_message="
+                    "{'error': 'no orders found to match with FAK order'}]"
+                )
+
+        def post(*_a, **_k):
+            calls["post"] += 1
+            raise Unmatched()
+
+        ns["client"] = SimpleNamespace(
+            create_order=ns["client"].create_order,
+            post_order=post,
+        )
+        ns["get_quote_fast"] = lambda *_a, **_k: (0.79, 0.5, 0.80, 10.0, None)
+        result = ns["buy_market_with_retry"](
+            "token", 2.50, 0.90, min_price=0.75, max_retries=3,
+            on_submit=lambda *args: calls["submit"].append(args),
+        )
+        self.assertEqual(result, (0.0, 0.0, "empty"))
+        self.assertEqual(calls["post"], 3)
+        self.assertEqual(len(calls["submit"]), 3)
+
+    def test_invalid_amount_400_does_not_retry(self):
+        ns, calls = self._namespace({"status": "unmatched"})
+
+        class InvalidAmt(Exception):
+            status_code = 400
+
+            def __str__(self):
+                return "invalid amounts, the market buy orders maker amount supports a max accuracy of 2 decimals"
+
+        def post(*_a, **_k):
+            calls["post"] += 1
+            raise InvalidAmt()
+
+        ns["client"] = SimpleNamespace(
+            create_order=ns["client"].create_order,
+            post_order=post,
+        )
+        ns["get_quote_fast"] = lambda *_a, **_k: (0.79, 0.5, 0.80, 10.0, None)
+        result = ns["buy_market_with_retry"](
+            "token", 2.50, 0.90, min_price=0.75, max_retries=3,
+            on_submit=lambda *args: calls["submit"].append(args),
+        )
+        self.assertEqual(result, (0.0, 0.0, "empty"))
+        self.assertEqual(calls["post"], 1)
+
+    def test_unmatched_400_stops_if_balance_appeared(self):
+        ns, calls = self._namespace({"status": "unmatched"})
+
+        class Unmatched(Exception):
+            status_code = 400
+
+            def __str__(self):
+                return "no orders found to match with FAK order"
+
+        def post(*_a, **_k):
+            calls["post"] += 1
+            raise Unmatched()
+
+        ns["client"] = SimpleNamespace(
+            create_order=ns["client"].create_order,
+            post_order=post,
+        )
+        ns["get_quote_fast"] = lambda *_a, **_k: (0.79, 0.5, 0.80, 10.0, None)
+        bal_calls = {"n": 0}
+
+        def bal(*_a, **_k):
+            bal_calls["n"] += 1
+            return 0.0 if bal_calls["n"] == 1 else 3.05
+
+        ns["check_clob_token_balance"] = bal
+        result = ns["buy_market_with_retry"](
+            "token", 2.50, 0.90, min_price=0.75, max_retries=3,
+            on_submit=lambda *args: calls["submit"].append(args),
+            on_fill=lambda *_a: calls.setdefault("fills", []).append(_a),
+        )
+        self.assertEqual(result[2], "filled")
+        self.assertEqual(calls["post"], 1)
+        self.assertGreater(result[0], 0)
+
+    def test_unmatched_400_no_balance_does_not_retry(self):
+        ns, calls = self._namespace({"status": "unmatched"})
+
+        class Unmatched(Exception):
+            status_code = 400
+
+            def __str__(self):
+                return "no orders found to match with FAK order"
+
+        def post(*_a, **_k):
+            calls["post"] += 1
+            raise Unmatched()
+
+        ns["client"] = SimpleNamespace(
+            create_order=ns["client"].create_order,
+            post_order=post,
+        )
+        ns["get_quote_fast"] = lambda *_a, **_k: (0.79, 0.5, 0.80, 10.0, None)
+        bal_calls = {"n": 0}
+
+        def bal(*_a, **_k):
+            bal_calls["n"] += 1
+            return 0.0 if bal_calls["n"] == 1 else None
+
+        ns["check_clob_token_balance"] = bal
+        result = ns["buy_market_with_retry"](
+            "token", 2.50, 0.90, min_price=0.75, max_retries=3,
+            on_submit=lambda *args: calls["submit"].append(args),
+        )
+        self.assertEqual(result, (0.0, 0.0, "ambiguous"))
+        self.assertEqual(calls["post"], 1)
+
+    def test_all_siblings_retry_unmatched_fak_400(self):
+        for bot in (BOT, BOT5M, BOT_HR):
+            src = bot.read_text()
+            self.assertIn("def unmatched_fak_rejection(exc):", src, bot.name)
+            self.assertIn("unmatched_retry=can_retry", src, bot.name)
+            self.assertIn('via="unmatched_400_no_balance"', src, bot.name)
+            self.assertIn("empty_fak_cooldown_s", src, bot.name)
+            self.assertIn("last_buy_empty", src, bot.name)
+            self.assertIn("[FAK EMPTY]", src, bot.name)
 
     def test_5m_sell_default_tick(self):
         src = BOT5M.read_text()
