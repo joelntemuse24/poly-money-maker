@@ -24,6 +24,7 @@ from rich import box
 from py_clob_client_v2 import (
     ClobClient,
     MarketOrderArgs,
+    OrderArgs,
     OrderType,
     PartialCreateOrderOptions,
     ApiCreds,
@@ -1146,6 +1147,61 @@ def hedge_book_ok(bid, ask, threshold, max_spread, require_ask_max):
     return True, "ok"
 
 
+
+def quoted_buy_shares(budget, ask, ask_size):
+    """Shares to lift at the quoted ask — leftover USDC must not walk cheaper levels.
+
+    A USDC market buy of min(budget, ask*size) still spends that cash down the
+    book. Cap in shares at the displayed top size instead.
+    """
+    budget = finite_float(budget, minimum=0)
+    ask = finite_float(ask, minimum=0, maximum=1)
+    ask_size = finite_float(ask_size, minimum=0)
+    if budget is None or ask is None or ask_size is None:
+        return 0.0
+    if budget < 0.01 or ask <= 0 or ask_size < 0.01:
+        return 0.0
+    shares = min(budget / ask, ask_size)
+    # CLOB taker amounts allow at most four decimal places.
+    shares = math.floor(shares * 10000 + 1e-12) / 10000
+    return shares if shares >= 0.01 else 0.0
+
+
+def buy_fill_walked(filled, quoted_shares, ratio=1.05):
+    """True when confirmed shares exceed the quoted top-of-book size."""
+    filled = finite_float(filled, minimum=0) or 0.0
+    quoted = finite_float(quoted_shares, minimum=0) or 0.0
+    if filled <= 0:
+        return False
+    if quoted < 0.01:
+        return False
+    return filled > quoted * float(ratio) + 1e-9
+
+
+def classify_buy_fill(avg, filled, quoted_shares, min_price, toxic_below):
+    """below_band / toxic_fill from true average and share-walk."""
+    avg = finite_float(avg, minimum=0, maximum=1) or 0.0
+    filled = finite_float(filled, minimum=0) or 0.0
+    min_price = finite_float(min_price, minimum=0, maximum=1) or 0.0
+    toxic_below = finite_float(toxic_below, minimum=0, maximum=1) or 0.0
+    walked = buy_fill_walked(filled, quoted_shares)
+    below_band = walked or (min_price > 0 and avg + 1e-9 < min_price)
+    toxic = walked or (toxic_below > 0 and avg + 1e-9 < toxic_below)
+    return below_band, toxic
+
+
+def implied_buy_average(cost, shares, fallback_price=None):
+    """USDC spent / shares. Extra shares from a walk do not cost extra gate-ask."""
+    cost = finite_float(cost, minimum=0) or 0.0
+    shares = finite_float(shares, minimum=0) or 0.0
+    if shares <= 0:
+        return finite_float(fallback_price, minimum=0, maximum=1) or 0.0
+    if cost > 0:
+        return cost / shares
+    fb = finite_float(fallback_price, minimum=0, maximum=1)
+    return float(fb or 0.0)
+
+
 def reconcile_hedge_sold(held_size, confirmed_sold, confirmed_proceeds, api_bal, last_limit):
     """Merge CLOB-confirmed sells with a Data API balance without erasing confirms.
 
@@ -1441,10 +1497,15 @@ def _decode_clob_response_amount(raw, *, expected=None):
     fixed = float(value / Decimal(1_000_000))
     expected_f = finite_float(expected, minimum=0)
     if expected_f is not None and expected_f > 0:
-        return min(
-            (human, fixed),
-            key=lambda candidate: abs(candidate - expected_f) / expected_f,
+        human_err = abs(human - expected_f) / expected_f
+        fixed_err = abs(fixed - expected_f) / expected_f
+        best, best_err = (
+            (human, human_err) if human_err <= fixed_err else (fixed, fixed_err)
         )
+        # Walks (27 sh vs a 3-sh quote) are far from expected — do not pick the
+        # "less wrong" 1e-6-fixed candidate. Fall through to the heuristic.
+        if best_err <= 0.5:
+            return best
     raw_text = str(raw).strip().lower()
     if "." in raw_text or "e" in raw_text:
         return human
@@ -1528,7 +1589,9 @@ def _confirmed_trade_financials(trade_ids, *, expected_size, fee_schedule):
     shares = sum(size for size, _ in confirmed)
     if expected is not None and expected > 0:
         tolerance = max(0.01, expected * 0.01)
-        if abs(shares - expected) > tolerance:
+        # Undersize vs quoted is still a decode-safety reject. Oversize is a
+        # BUY walk (USDC market leftover / extra fills) — keep the true VWAP.
+        if shares + 1e-9 < expected - tolerance:
             return None
     gross = sum(size * price for size, price in confirmed)
     fees = [
@@ -1628,6 +1691,12 @@ def confirm_fill_size(result, oid, requested, *, wait_delayed_s=2.0, poll_s=0.25
     if matched > 0:
         matched = float(matched)
         if requested and matched > float(requested) * 1.01 + 1e-6:
+            if str(side).upper() == "BUY":
+                log_event(
+                    "buy_fill_walk", order_id=str(oid or "")[:24],
+                    matched=matched, requested=requested, source="post",
+                )
+                return matched
             log_event(
                 "order_fill_size_invalid", order_id=str(oid or "")[:24],
                 matched=matched, requested=requested, side=side, source="post",
@@ -1667,6 +1736,13 @@ def confirm_fill_size(result, oid, requested, *, wait_delayed_s=2.0, poll_s=0.25
                     matched = 0.0
                 if matched > 0:
                     if requested and matched > float(requested) * 1.01 + 1e-6:
+                        if str(side).upper() == "BUY":
+                            log_event(
+                                "buy_fill_walk", order_id=str(oid)[:24],
+                                matched=matched, requested=requested,
+                                source="get_order",
+                            )
+                            return matched
                         log_event(
                             "order_fill_size_invalid", order_id=str(oid)[:24],
                             matched=matched, requested=requested, side=side,
@@ -1833,7 +1909,12 @@ def inspect_uncertain_order(
         elif settlement == "partial":
             return {"state": "identity_mismatch"}
     requested_f = finite_float(requested, minimum=0) or 0.0
-    if requested_f <= 0 or filled > requested_f * 1.01 + 1e-6:
+    buy_walk = (
+        str(side).upper() == "BUY"
+        and requested_f > 0
+        and filled > requested_f * 1.01 + 1e-6
+    )
+    if requested_f <= 0 or (filled > requested_f * 1.01 + 1e-6 and not buy_walk):
         return {"state": "identity_mismatch"}
     if settlement in {"confirmed", "partial"} and filled > 0:
         price = (
@@ -1841,7 +1922,7 @@ def inspect_uncertain_order(
             or finite_float(limit_price, minimum=0, maximum=1)
             or 0.0
         )
-        confirmed_filled = min(requested_f, filled)
+        confirmed_filled = filled if buy_walk else min(requested_f, filled)
         if trade_financials is not None:
             gross = trade_financials["gross"]
             fee = trade_financials["fee"]
@@ -1849,12 +1930,17 @@ def inspect_uncertain_order(
             gross = confirmed_filled * price
             fee = _fill_fee_usdc(confirmed_filled, price, fee_schedule)
         if str(side).upper() == "BUY":
-            if fee is None and fee_schedule is not None:
-                cap = finite_float(spend_cap, minimum=0)
+            cap = finite_float(spend_cap, minimum=0)
+            if trade_financials is not None:
+                value = gross if fee is None else gross + fee
+            elif buy_walk and cap is not None and cap > 0:
+                # No trade VWAP: walked fills spent the posted USDC, not
+                # shares × gate ask.
+                value = cap
+            elif fee is None and fee_schedule is not None:
                 value = cap if cap is not None else gross
             else:
                 value = gross + (fee or 0.0)
-            cap = finite_float(spend_cap, minimum=0)
             if cap is not None and cap > 0:
                 value = min(cap, value)
         else:
@@ -1916,7 +2002,12 @@ def buy_market_with_retry(
     condition_id=None,
     pre_submit=None,
 ):
-    """Spend up to `budget` dollars buying token_id at or below max_price via FAK.
+    """Buy token_id via FAK, sized in shares at the quoted ask.
+
+    Does not send a USDC market order: leftover dollars would walk cheaper
+    asks (9¢ junk under an 80¢ quote). Size is min(budget/ask, ask_size).
+    Band is still min_price–max_price; this only pins execution to the level
+    that passed the gate.
 
     Returns (shares_bought, usdc_spent, status). status is filled|ambiguous|empty|aborted|persist_fail|dry.
     spent may be estimated when the exchange
@@ -1937,8 +2028,11 @@ def buy_market_with_retry(
     spent = 0.0
     budget = float(budget)
     if DRY_RUN:
-        console.print(f"  [bold black on yellow][DRY BUY][/] would SPEND ≤${budget:.2f} on {str(token_id)[:12]}… @ ≤{max_price:.3f}")
-        log_event("dry_buy", token_id=token_id, budget=budget, max_price=max_price)
+        console.print(
+            f"  [bold black on yellow][DRY BUY][/] would BUY ≤{budget:.2f} USDC of "
+            f"{str(token_id)[:12]}… at the quoted ask (band {min_price:.3f}–{max_price:.3f})"
+        )
+        log_event("dry_buy", token_id=token_id, budget=budget, max_price=max_price, min_price=min_price)
         return 0.0, 0.0, "dry"
     fee_schedule = None
 
@@ -1958,6 +2052,7 @@ def buy_market_with_retry(
         return 0.0, 0.0, "aborted"
 
     persist_failed = False
+    max_shares = 0.0
 
     def _persist():
         nonlocal persist_failed
@@ -1981,16 +2076,21 @@ def buy_market_with_retry(
             expected = float(bal_baseline) + total_bought
             delta = bal_after - expected
             if delta > 0.01:
-                gross = delta * float(price)
-                fee = _fill_fee_usdc(delta, price, fee_schedule)
-                fill_cost = min(
-                    float(spend_cap),
-                    gross + (fee or 0.0),
-                )
+                # Walked bags spent the posted USDC, not extra shares × gate ask.
+                if buy_fill_walked(delta, max_shares):
+                    fill_cost = float(spend_cap)
+                else:
+                    gross = delta * float(price)
+                    fee = _fill_fee_usdc(delta, price, fee_schedule)
+                    fill_cost = min(
+                        float(spend_cap),
+                        gross + (fee or 0.0),
+                    )
                 log_event(
                     "buy_ghost_fill", token_id=token_id, filled=delta,
                     fill_cost=round(fill_cost, 4), ask=price, attempt=attempt,
                     bal_after=bal_after, expected=expected, via=via,
+                    quoted_shares=max_shares,
                 )
                 return delta, fill_cost
         return 0.0, 0.0
@@ -2033,12 +2133,12 @@ def buy_market_with_retry(
             console.print(f"  [dim yellow][NO SIZE][/] ask size {fresh_ask_size} · attempt {attempt + 1}/{max_retries}")
             time.sleep(0.05)
             continue
-        book_notional = fresh_ask * float(fresh_ask_size)
-        spend = min(remaining_budget, book_notional)
-        if spend < 0.01:
+        shares = quoted_buy_shares(remaining_budget, fresh_ask, fresh_ask_size)
+        if shares < 0.01:
             break
-        max_shares = spend / float(min_price) if min_price > 0 else spend / fresh_ask
         price = fresh_ask
+        spend = shares * price
+        max_shares = shares
         ambiguous = False
         result = None
         if pre_submit:
@@ -2059,12 +2159,12 @@ def buy_market_with_retry(
                 break
         try:
             signed_order = safe_api_call(
-                client.create_market_order,
-                MarketOrderArgs(
+                client.create_order,
+                OrderArgs(
                     token_id=token_id,
-                    amount=spend,
-                    side=BUY,
                     price=price,
+                    size=shares,
+                    side=BUY,
                     user_usdc_balance=remaining_budget,
                 ),
                 options=PartialCreateOrderOptions(
@@ -2079,6 +2179,7 @@ def buy_market_with_retry(
                 "maker_amount": str(signed_order.makerAmount),
                 "taker_amount": str(signed_order.takerAmount),
                 "timestamp": str(signed_order.timestamp),
+                "quoted_shares": shares,
             }
         except Exception as e:
             log_event(
@@ -2197,15 +2298,17 @@ def buy_market_with_retry(
                 fee_schedule=fee_schedule,
             )
         if fill_cost <= 0:
-            fill_cost = min(spend, filled * price)
+            if buy_fill_walked(filled, max_shares):
+                fill_cost = min(spend, remaining_budget)
+            else:
+                fill_cost = min(spend, filled * price)
             log_event(
                 "buy_fill_cost_estimated", token_id=token_id, filled=filled,
                 fill_cost=round(fill_cost, 4), ask=price, attempt=attempt + 1,
             )
-        avg = (fill_cost / filled) if filled > 0 else 0.0
-        below_band = (
-            filled > max_shares * 1.05 + 1e-9
-            or (min_price > 0 and avg + 1e-9 < float(min_price))
+        avg = implied_buy_average(fill_cost, filled, price)
+        below_band, force_exit = classify_buy_fill(
+            avg, filled, max_shares, min_price, TOXIC_FORCE_EXIT_BELOW,
         )
         total_bought += filled
         spent += fill_cost
@@ -2225,7 +2328,6 @@ def buy_market_with_retry(
             )
             return total_bought, spent, "ambiguous"
         if below_band:
-            force_exit = avg + 1e-9 < float(TOXIC_FORCE_EXIT_BELOW)
             console.print(
                 f"  [bold red][BUY BELOW BAND][/] filled={filled:.4f} avg={avg:.3f} "
                 f"(min_px={min_price:.3f}) — "
@@ -3317,7 +3419,8 @@ while not _shutdown_requested:
                 known_size = float(meta.get("buy_uncertain_known_size") or 0)
                 known_cost = float(meta.get("buy_uncertain_known_cost") or 0)
                 requested = (
-                    finite_float(meta.get("buy_uncertain_order_size"), minimum=0)
+                    finite_float(meta.get("quoted_buy_shares"), minimum=0)
+                    or finite_float(meta.get("buy_uncertain_order_size"), minimum=0)
                     or (
                         float(meta.get("buy_uncertain_spend") or 0)
                         / max(float(meta.get("buy_uncertain_price") or 0), 1e-9)
@@ -3343,7 +3446,14 @@ while not _shutdown_requested:
                     if current_size >= resolved_size - 0.01:
                         resolved_size = current_size
                         resolved_cost = max(resolved_cost, current_cost)
-                    avg_fill = resolved_cost / resolved_size
+                    avg_fill = implied_buy_average(
+                        resolved_cost, resolved_size, meta.get("buy_uncertain_price"),
+                    )
+                    quoted = meta.get("quoted_buy_shares")
+                    _, force_exit = classify_buy_fill(
+                        avg_fill, resolved_size, quoted,
+                        BUY_THRESHOLD, TOXIC_FORCE_EXIT_BELOW,
+                    )
                     meta["bought_token"] = uncertain_token
                     meta["bought_leg"] = (
                         meta.get("buy_uncertain_leg")
@@ -3353,9 +3463,7 @@ while not _shutdown_requested:
                     meta["bought_size"] = resolved_size
                     meta["fill_price"] = round(avg_fill, 4)
                     meta["pnl_entry_cost"] = round(resolved_cost, 4)
-                    meta["toxic_fill"] = bool(
-                        avg_fill + 1e-9 < float(TOXIC_FORCE_EXIT_BELOW)
-                    )
+                    meta["toxic_fill"] = bool(force_exit or meta.get("toxic_fill"))
                     leg_key = (
                         "up"
                         if str(meta["bought_leg"]).lower() == "up"
@@ -3439,16 +3547,22 @@ while not _shutdown_requested:
                     known_cost = float(meta.get("pnl_entry_cost") or 0)
                     resolved_size = held_size
                     extra_size = max(0.0, resolved_size - known_size)
-                    entry_cost = known_cost + (extra_size * avg_est)
+                    spend_est = float(meta.get("buy_uncertain_spend") or 0)
+                    # Walked inventory did not cost extra_size × gate ask — same USDC.
+                    entry_cost = known_cost if known_cost > 0 else spend_est
                     if entry_cost <= 0:
-                        entry_cost = resolved_size * avg_est
-                    avg_fill = entry_cost / resolved_size
+                        entry_cost = min(float(BUY_BUDGET), resolved_size * avg_est)
+                    quoted = meta.get("quoted_buy_shares")
+                    avg_fill = implied_buy_average(entry_cost, resolved_size, avg_est)
+                    _, force_exit = classify_buy_fill(
+                        avg_fill, resolved_size, quoted, BUY_THRESHOLD, TOXIC_FORCE_EXIT_BELOW,
+                    )
                     meta["bought_token"] = held_token
                     meta["bought_leg"] = held_leg or meta.get("buy_uncertain_leg")
                     meta["bought_size"] = resolved_size
                     meta["fill_price"] = round(avg_fill, 4)
                     meta["pnl_entry_cost"] = round(entry_cost, 4)
-                    meta["toxic_fill"] = bool(avg_fill + 1e-9 < float(TOXIC_FORCE_EXIT_BELOW))
+                    meta["toxic_fill"] = bool(force_exit or meta.get("toxic_fill"))
                     clear_uncertain_fields(meta, _BUY_UNCERTAIN_KEYS)
                     log_event(
                         "buy_uncertain_resolved", condition_id=cond, token_id=held_token,
@@ -3576,6 +3690,26 @@ while not _shutdown_requested:
             if seconds_left <= 0:
                 continue
 
+            if held_size > 0.01 and not meta.get("hedge_closed"):
+                quoted = meta.get("quoted_buy_shares")
+                cost = float(meta.get("pnl_entry_cost") or meta.get("buy_uncertain_spend") or 0)
+                implied = implied_buy_average(
+                    cost, held_size, meta.get("fill_price") or meta.get("buy_uncertain_price"),
+                )
+                _, force_exit = classify_buy_fill(
+                    implied, held_size, quoted, BUY_THRESHOLD, TOXIC_FORCE_EXIT_BELOW,
+                )
+                if force_exit and not meta.get("toxic_fill"):
+                    meta["toxic_fill"] = True
+                    log_event(
+                        "toxic_fill_armed_from_inventory",
+                        condition_id=cond,
+                        held_size=held_size,
+                        implied_avg=round(implied, 4),
+                        quoted_shares=quoted,
+                    )
+                    save_json(STATE_FILE, positions_meta)
+
             # --- HEDGE CHECK (for held positions) ---
             if held_token and held_size > 0.01 and HEDGE_ENABLED and not meta.get("hedge_closed"):
                 # FAK avg < toxic_force_exit_below sets toxic_fill: dump ASAP at any
@@ -3611,13 +3745,29 @@ while not _shutdown_requested:
                         force_rest=True,
                         expected_condition_id=cond,
                     )
-                    if fresh_bid is None or fresh_ask is None:
+                    if fresh_bid is None and (not toxic_fill or fresh_ask is None):
                         log_event(
                             "hedge_skip_incomplete_rest", condition_id=cond, leg=held_leg,
                             trigger_bid=cached_bid, current_bid=fresh_bid, current_ask=fresh_ask,
                             current_mid=fresh_mid,
                             quote_age_s=None if quote_age is None else round(quote_age, 3),
                             toxic_fill=toxic_fill,
+                        )
+                    elif toxic_fill and fresh_bid is None:
+                        log_event(
+                            "hedge_skip_incomplete_rest", condition_id=cond, leg=held_leg,
+                            trigger_bid=cached_bid, current_bid=fresh_bid, current_ask=fresh_ask,
+                            current_mid=fresh_mid,
+                            quote_age_s=None if quote_age is None else round(quote_age, 3),
+                            toxic_fill=True, reason="no_bid",
+                        )
+                    elif (not toxic_fill) and (fresh_bid is None or fresh_ask is None):
+                        log_event(
+                            "hedge_skip_incomplete_rest", condition_id=cond, leg=held_leg,
+                            trigger_bid=cached_bid, current_bid=fresh_bid, current_ask=fresh_ask,
+                            current_mid=fresh_mid,
+                            quote_age_s=None if quote_age is None else round(quote_age, 3),
+                            toxic_fill=False,
                         )
                     elif not toxic_fill and fresh_bid > HEDGE_THRESHOLD:
                         log_event(
@@ -4238,15 +4388,22 @@ while not _shutdown_requested:
                 # Durable save after every confirmed attempt (crash between retries).
                 avg = (spent_total / filled_total) if filled_total > 0 else float(buy_ask or 0)
                 if spent_total <= 0 and filled_total > 0:
-                    spent_total = filled_total * float(buy_ask or BUY_THRESHOLD)
-                    avg = spent_total / filled_total
+                    spent_total = min(
+                        float(BUY_BUDGET),
+                        filled_total * float(buy_ask or BUY_THRESHOLD),
+                    )
+                    avg = spent_total / filled_total if filled_total else avg
+                quoted = meta.get("quoted_buy_shares")
+                _, force_exit = classify_buy_fill(
+                    avg, filled_total, quoted, BUY_THRESHOLD, TOXIC_FORCE_EXIT_BELOW,
+                )
                 meta["last_buy_at"] = time.time() * 1000
                 meta["bought_token"] = buy_token
                 meta["bought_leg"] = buy_leg
                 meta["bought_size"] = filled_total
                 meta["fill_price"] = round(avg, 4)
                 meta["pnl_entry_cost"] = round(spent_total, 4)
-                meta["toxic_fill"] = bool(avg + 1e-9 < float(TOXIC_FORCE_EXIT_BELOW))
+                meta["toxic_fill"] = bool(force_exit)
                 leg_key = "up" if buy_leg == "up" else "dn"
                 _cached_positions.setdefault(cond, {})[leg_key] = {
                     "asset": buy_token,
@@ -4275,13 +4432,15 @@ while not _shutdown_requested:
                 meta["buy_uncertain_spend"] = round(float(spend_cap), 4)
                 meta["buy_uncertain_price"] = round(float(submit_price), 4)
                 meta["buy_uncertain_order_id"] = intent["order_id"]
-                meta["buy_uncertain_order_size"] = (
-                    _decode_clob_fixed6(intent.get("taker_amount"))
-                    or (
-                        float(spend_cap)
-                        / max(float(submit_price), 1e-9)
+                # Never decode taker_amount as share size — BUY taker can be
+                # USDC and a 2.50 "share" quote false-toxics a real 3-sh fill.
+                quoted_shares = finite_float(intent.get("quoted_shares"), minimum=0)
+                if quoted_shares is None or quoted_shares < 0.01:
+                    quoted_shares = (
+                        float(spend_cap) / max(float(submit_price), 1e-9)
                     )
-                )
+                meta["quoted_buy_shares"] = float(quoted_shares)
+                meta["buy_uncertain_order_size"] = float(quoted_shares)
                 trade_ids = _string_list(
                     intent.get("trade_ids") or intent.get("tradeIDs")
                 )
@@ -4306,15 +4465,22 @@ while not _shutdown_requested:
                 if buy_status != "ambiguous":
                     _clear_buy_uncertain()
                 if spent <= 0:
-                    spent = bought * float(buy_ask or BUY_THRESHOLD)
-                avg_fill = spent / bought
+                    spent = min(
+                        float(BUY_BUDGET),
+                        bought * float(buy_ask or BUY_THRESHOLD),
+                    )
+                avg_fill = implied_buy_average(spent, bought, buy_ask)
+                quoted = meta.get("quoted_buy_shares")
+                _, force_exit = classify_buy_fill(
+                    avg_fill, bought, quoted, BUY_THRESHOLD, TOXIC_FORCE_EXIT_BELOW,
+                )
                 meta["last_buy_at"] = wall_ms
                 meta["bought_token"] = buy_token
                 meta["bought_leg"] = buy_leg
                 meta["bought_size"] = bought
                 meta["fill_price"] = round(avg_fill, 4)
                 meta["pnl_entry_cost"] = round(spent, 4)
-                meta["toxic_fill"] = bool(avg_fill + 1e-9 < float(TOXIC_FORCE_EXIT_BELOW))
+                meta["toxic_fill"] = bool(force_exit)
                 if uchk:
                     meta["ptb"] = uchk.get("ptb")
                     meta["ptb_source"] = uchk.get("ptb_source")
