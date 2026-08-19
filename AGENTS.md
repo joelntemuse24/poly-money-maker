@@ -151,7 +151,7 @@ Watch the console for `[DRY BUY]` / `[DRY SELL]` markers. Ctrl-C to stop.
   live instances.
 - **FAK orders only:** All orders are Fill-And-Kill — no resting orders, no market
   making. Buys are **limit** FAKs at the quoted ask sized `budget/ask`
-  (hard `buy_max_spend` $3, not displayed top size); sells stay
+  (hard `buy_max_spend` $3, `buy_max_shares` 5; not displayed top size); sells stay
   share-denominated market FAKs.
 - **Hedge is sell-only exit:** The bots never profit-take. The only sell path is the
   hedge: REST shows bid ≤ 35¢ **and** ask ≤ 40¢ with tight spread (a real

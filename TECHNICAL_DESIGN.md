@@ -211,15 +211,17 @@ A buy fires only when **all** of these gates pass, evaluated in the buy window
    underlying move. This blocks buying a "winner" that the resolution oracle itself
    disagrees with (stale-book trap).
 6. **Risk caps.** `buy_budget` USDC per market ($2.50), `buy_max_spend` hard
-   ceiling ($3), `max_open_positions`, `max_open_notional`, `max_daily_notional`,
-   and available USDC balance.
+   ceiling ($3), `buy_max_shares` sanity rail (default 5; raise it when you
+   raise the dollar size), `max_open_positions`, `max_open_notional`,
+   `max_daily_notional`, and available USDC balance.
 
 Execution: a FAK **limit** buy sized in **shares** at the quoted ask —
-`budget/ask` via `OrderArgs` + `create_order` — not a USDC market order and **not**
-capped to displayed top size. A dollar-denominated market FAK still walks cheaper
-levels (gate quotes 80¢, leftover cash lifts 9¢). Thin tops log `[THIN ASK]` and
-still post the dollar size; unmatched remainder dies on the FAK. The 75–90¢ **band
-is unchanged**; this only pins the limit price to the level that passed the gate.
+`min(budget/ask, buy_max_shares)` via `OrderArgs` + `create_order` — not a USDC
+market order and **not** capped to displayed top size. A dollar-denominated
+market FAK still walks cheaper levels (gate quotes 80¢, leftover cash lifts 9¢).
+Thin tops log `[THIN ASK]` and still post the dollar size (clipped only by the
+share rail); unmatched remainder dies on the FAK. The 75–90¢ **band is
+unchanged**; this only pins the limit price to the level that passed the gate.
 Re-quote already aborts if the fresh ask left the band. A BUY limit is a
 **maximum**, so the exchange can still price-improve; confirmed fills are
 **always persisted** (including below-band averages logged as `buy_fill_below_band`

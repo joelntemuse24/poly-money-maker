@@ -5,12 +5,13 @@ Do not put secrets, API keys, or live wallet material here.
 
 Last updated: **2026-08-19** — keep the **$2.50 / 75–90¢** CLOB buy triggers
 (band unchanged). Buys are **limit FAKs at the quoted ask** sized `budget/ask`
-(~3.3 shares at 75¢), **not** capped to displayed top size. Hard spend ceiling
-`buy_max_spend` **$3**. Leftover USDC cannot walk into 9¢ junk. Hedge **trigger**
-is still 35/40; the sell follows the live bid after that (no 32¢ FAK floor).
-Pause minting. Pathlog ticks store **top-of-book size** (`ubs`/`uas`/`dbs`/`das`)
-so `--budget 2.5` vs `15` backtests can model how much of that ask would fill
-(14-day / 400 MB cap).
+(~3.3 shares at 75¢), clipped to `buy_max_shares` **5** (raise that knob when
+you raise the dollar size). Hard spend ceiling `buy_max_spend` **$3**. Leftover
+USDC cannot walk into 9¢ junk. Displayed top size is **not** a cap. Hedge
+**trigger** is still 35/40; the sell follows the live bid after that (no 32¢
+FAK floor). Pause minting. Pathlog ticks store **top-of-book size**
+(`ubs`/`uas`/`dbs`/`das`) so `--budget 2.5` vs `15` backtests can model how
+much of that ask would fill (14-day / 400 MB cap).
 
 ---
 
@@ -26,8 +27,9 @@ triggers** (not the old 98–99¢ probe):
 |---|---|
 | `buy_budget` | **$2.50** / market |
 | `buy_max_spend` | **$3.00** hard ceiling (strategy is $2.50; never more than ~$3) |
+| `buy_max_shares` | **5** sanity rail (~3.3 sh at $2.50/75¢). Raise this when you raise the dollar size. |
 | Ask band | **75–90¢** — trigger as soon as winning ask ≥ 75¢; 90¢ is a hard ceiling |
-| Execution | FAK **limit** at the quoted ask, size `budget/ask` shares — **not** a USDC market order, **not** capped to displayed top size |
+| Execution | FAK **limit** at the quoted ask, size `min(budget/ask, buy_max_shares)` — **not** a USDC market order, **not** capped to displayed top size |
 | GUI consensus | winner ≥ 70¢, loser ≤ 30¢ |
 | Windows | 5m **120 s** · 15m **4.0 min** · hourly **13.0 min** |
 | Hedge | **Trigger** bid ≤ **35¢** and ask ≤ **40¢**, spread ≤ 15¢ (real book, not a glitch). **Then sell at whatever the bid is** — no 32¢ floor. |
@@ -85,8 +87,9 @@ Kill switch: `touch STOP_PATHLOG`.
 - **VM:** `~/poly-money-maker` on `instance-20260516-185922`.
 - **Mint:** `sudo systemctl stop polymintbot && sudo systemctl disable polymintbot`
 - **Buy bots:** live `strategy_buy*.json` already had these 75–90 / $2.50 knobs
-  before minting. `buy_max_spend` may be omitted — default **$3** applies.
-  After pull, confirm they still match the table above, then:
+  before minting. `buy_max_spend` / `buy_max_shares` may be omitted — defaults
+  **$3** / **5 shares** apply. After pull, confirm they still match the table
+  above, then:
   ```bash
   cd ~/poly-money-maker && git pull
   sudo systemctl restart polybuybot polybuybot5m polybuybothourly
@@ -100,7 +103,7 @@ Kill switch: `touch STOP_PATHLOG`.
 
 - [x] Pause minting; keep $2.50 / 75–90¢ CLOB triggers.
 - [x] Pin BUY FAKs to **budget/ask limit** at the quoted ask (band unchanged;
-  displayed top size is not a cap; `buy_max_spend` $3).
+  displayed top size is not a cap; `buy_max_spend` $3; `buy_max_shares` 5).
 - [x] Path recorder + `check_path_backtest.py` (first-touch ask × time-left;
   ticks record TOB size; backtest is share-capped FAK, not infinite ask size).
 - [x] Hedge FAK follows live bid after 35/40 integrity (no 32¢ fill refusal).

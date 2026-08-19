@@ -179,6 +179,8 @@ _STRATEGY_DEFAULTS = {
     "buy_budget": 2.5,
     # Hard ceiling on USDC sent per market. Strategy is $2.50; never more than $3.
     "buy_max_spend": 3.0,
+    # Sanity rail: ~3.3 sh at $2.50/75¢. Raise this when you raise the dollar size.
+    "buy_max_shares": 5.0,
     "max_open_positions": 0,  # 0 = unlimited
     "max_open_notional": 10000.0,
     "max_daily_notional": 999999.0,
@@ -288,7 +290,7 @@ def load_strategy():
         if not cfg["dry_run"] and not cfg["hedge_enabled"]:
             raise ValueError("live mode requires hedge_enabled=true")
         for key in (
-            "buy_budget", "buy_max_spend", "max_open_notional",
+            "buy_budget", "buy_max_spend", "buy_max_shares", "max_open_notional",
             "max_daily_notional", "poll_buy_window_s", "poll_held_s",
             "positions_refresh_s", "balance_refresh_s", "buy_window_min",
             "ui_every_n_cycles",
@@ -297,6 +299,14 @@ def load_strategy():
                 raise ValueError(f"{key} must be positive")
         if float(cfg["buy_max_spend"]) + 1e-9 < float(cfg["buy_budget"]):
             raise ValueError("buy_max_spend must be >= buy_budget")
+        _need_shares = max(
+            float(cfg["buy_budget"]), float(cfg["buy_max_spend"]),
+        ) / float(cfg["buy_threshold"])
+        if float(cfg["buy_max_shares"]) + 1e-9 < _need_shares:
+            raise ValueError(
+                "buy_max_shares must be >= max(buy_budget, buy_max_spend) "
+                "/ buy_threshold (raise it when you raise the dollar size)"
+            )
         # 0 = unlimited open markets (probe: redeem lag must not freeze entries).
         if float(cfg["max_open_positions"]) < 0:
             raise ValueError("max_open_positions must be >= 0 (0 = unlimited)")
@@ -347,6 +357,7 @@ BUY_GRACE_S = _strat["buy_grace_s"]
 BUY_COOLDOWN_S = _strat["buy_cooldown_s"]
 BUY_BUDGET = _strat["buy_budget"]
 BUY_MAX_SPEND = _strat["buy_max_spend"]
+BUY_MAX_SHARES = _strat["buy_max_shares"]
 MAX_OPEN_POSITIONS = _strat["max_open_positions"]
 MAX_OPEN_NOTIONAL = _strat["max_open_notional"]
 MAX_DAILY_NOTIONAL = _strat["max_daily_notional"]
@@ -1169,13 +1180,13 @@ def hedge_book_ok(bid, ask, threshold, max_spread, require_ask_max):
 
 
 
-def quoted_buy_shares(budget, ask, ask_size=None):
+def quoted_buy_shares(budget, ask, share_cap=None):
     """Shares to buy at the quoted ask for this dollar budget.
 
-    Posts a **limit** FAK at ``ask`` sized ``budget/ask``. Leftover USDC
-    cannot walk cheaper levels (that was the 39-share / 6¢ blow-up).
-    Displayed ``ask_size`` is not a cap — a thin top still posts the
-    dollar size; unmatched remainder dies on the FAK.
+    Posts a **limit** FAK at ``ask`` sized ``budget/ask``, clipped to
+    ``share_cap`` (strategy ``buy_max_shares`` — a tunable "that's too
+    many shares, wrong price" rail). Leftover USDC cannot walk cheaper
+    levels. Displayed top size is not a cap.
     """
     budget = finite_float(budget, minimum=0)
     ask = finite_float(ask, minimum=0, maximum=1)
@@ -1184,6 +1195,9 @@ def quoted_buy_shares(budget, ask, ask_size=None):
     if budget < 0.01 or ask <= 0:
         return 0.0
     shares = budget / ask
+    cap = finite_float(share_cap, minimum=0)
+    if cap is not None:
+        shares = min(shares, cap)
     # CLOB taker amounts allow at most four decimal places.
     shares = math.floor(shares * 10000 + 1e-12) / 10000
     return shares if shares >= 0.01 else 0.0
@@ -2052,12 +2066,14 @@ def buy_market_with_retry(
     """Buy token_id via FAK, sized in shares at the quoted ask.
 
     Sends ``budget/ask`` shares as a **limit** FAK at the live ask (capped
-    by ``buy_max_spend``). This is not a USDC market order: leftover dollars
-    would walk cheaper asks (9¢ junk under an 80¢ quote). Displayed top size
-    does not shrink the order — a thin book fills what it can at that ask.
+    by ``buy_max_spend`` and ``buy_max_shares``). This is not a USDC market
+    order: leftover dollars would walk cheaper asks (9¢ junk under an 80¢
+    quote). Displayed top size does not shrink the order — a thin book fills
+    what it can at that ask.
 
     Band is still min_price–max_price; this only pins execution to an
-    in-band ask. Max shares at $2.50 / 75¢ is ~3.3, never a 39-share 6¢ bag.
+    in-band ask. $2.50 / 75¢ is ~3.3 shares; ``buy_max_shares`` (default 5)
+    is the "wrong price" rail, not a displayed-size cap.
 
     Returns (shares_bought, usdc_spent, status). status is filled|ambiguous|empty|aborted|persist_fail|dry.
     spent may be estimated when the exchange
@@ -2185,7 +2201,7 @@ def buy_market_with_retry(
                 f"  [dim yellow][THIN ASK][/] displayed size {fresh_ask_size} · "
                 f"posting budget/ask anyway · attempt {attempt + 1}/{max_retries}"
             )
-        shares = quoted_buy_shares(remaining_budget, fresh_ask, fresh_ask_size)
+        shares = quoted_buy_shares(remaining_budget, fresh_ask, BUY_MAX_SHARES)
         if shares < 0.01:
             break
         price = fresh_ask
@@ -3022,6 +3038,7 @@ while not _shutdown_requested:
         BUY_COOLDOWN_S = _strat["buy_cooldown_s"]
         BUY_BUDGET = _strat["buy_budget"]
         BUY_MAX_SPEND = _strat["buy_max_spend"]
+        BUY_MAX_SHARES = _strat["buy_max_shares"]
         MAX_OPEN_POSITIONS = _strat["max_open_positions"]
         MAX_OPEN_NOTIONAL = _strat["max_open_notional"]
         MAX_DAILY_NOTIONAL = _strat["max_daily_notional"]

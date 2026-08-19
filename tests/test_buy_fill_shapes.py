@@ -267,12 +267,14 @@ class BuyFillProductionHelpers(unittest.TestCase):
     def test_quoted_buy_shares_is_budget_over_ask_not_top_size(self):
         quoted = self.ns["quoted_buy_shares"]
         # $2.50 at 80¢ → ~3.12 shares (limit at that ask), not a $2.50 walk.
-        self.assertAlmostEqual(quoted(2.50, 0.80, 100.0), 3.125)
-        # Displayed top size is not a cap — thin books still post budget/ask.
-        self.assertAlmostEqual(quoted(2.50, 0.80, 1.0), 3.125)
-        self.assertAlmostEqual(quoted(2.50, 0.80, 0.0), 3.125)
-        self.assertAlmostEqual(quoted(2.50, 0.80, None), 3.125)
-        self.assertEqual(quoted(2.50, 0.0, 10.0), 0.0)
+        self.assertAlmostEqual(quoted(2.50, 0.80), 3.125)
+        self.assertAlmostEqual(quoted(2.50, 0.80, 5.0), 3.125)
+        # Displayed top size is not an argument — a 1-sh book still sizes 3.125.
+        # share_cap=1.0 is the tunable rail, not the book.
+        self.assertAlmostEqual(quoted(2.50, 0.80, 1.0), 1.0)
+        # $2.50 at 40¢ would be 6.25 sh — rail clips to 5.
+        self.assertAlmostEqual(quoted(2.50, 0.40, 5.0), 5.0)
+        self.assertEqual(quoted(2.50, 0.0, 5.0), 0.0)
 
     def test_classify_buy_fill_walk_and_cheap_avg_are_toxic(self):
         classify = self.ns["classify_buy_fill"]
@@ -589,6 +591,13 @@ class AmbiguousCrossCyclePolicy(unittest.TestCase):
             self.assertIn('reason="no_bid"', src, bot.name)
             self.assertIn('quoted = meta.get("quoted_buy_shares")', src, bot.name)
             self.assertIn('"buy_max_spend": 3.0', src, bot.name)
+            self.assertIn('"buy_max_shares": 5.0', src, bot.name)
+            self.assertIn("BUY_MAX_SHARES", src, bot.name)
+            self.assertIn(
+                "quoted_buy_shares(remaining_budget, fresh_ask, BUY_MAX_SHARES)",
+                src,
+                bot.name,
+            )
             self.assertIn("[THIN ASK]", src, bot.name)
             self.assertNotIn("min(budget / ask, ask_size)", src, bot.name)
             self.assertNotIn("[NO SIZE]", src, bot.name)
@@ -659,6 +668,7 @@ class BuyExecutionAmbiguity(unittest.TestCase):
             {
                 "DRY_RUN": False,
                 "BUY": "BUY",
+                "BUY_MAX_SHARES": 5.0,
                 "HEDGE_GHOST_SLEEP_S": 0.0,
                 "MAX_ENTRY_SPREAD": 0.10,
                 "MIN_WINNER_BID": 0.90,
@@ -707,6 +717,19 @@ class BuyExecutionAmbiguity(unittest.TestCase):
         self.assertEqual(len(calls["orders"]), 1)
         self.assertIn("size", calls["orders"][0])
         self.assertNotIn("amount", calls["orders"][0])
+
+    def test_share_cap_clips_oversized_budget_at_ask(self):
+        ns, calls = self._namespace({"status": "unmatched", "orderID": "order-1"})
+        ns["BUY_MAX_SHARES"] = 5.0
+        ns["get_quote_fast"] = lambda *_a, **_k: (0.79, 0.5, 0.80, 100.0, None)
+        result = ns["buy_market_with_retry"](
+            "token", 20.0, 0.90, min_price=0.75, max_retries=1,
+            on_submit=lambda *args: calls["submit"].append(args),
+        )
+        self.assertEqual(result, (0.0, 0.0, "empty"))
+        self.assertEqual(len(calls["orders"]), 1)
+        self.assertAlmostEqual(calls["orders"][0]["size"], 5.0)
+        self.assertAlmostEqual(calls["orders"][0]["price"], 0.80)
 
     def test_thin_displayed_ask_still_posts_budget_shares(self):
         ns, calls = self._namespace({"status": "unmatched", "orderID": "order-1"})
