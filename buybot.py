@@ -157,8 +157,8 @@ _STRATEGY_DEFAULTS = {
     "toxic_force_exit_below": 0.65,
     "hedge_enabled": True,
     "hedge_threshold": 0.35,
-    # FAK sell floor while hedging. Must be a valid tick multiple:
-    # 15m/hourly tick=0.01 → 0.32; 5m tick=0.001 can use 0.325.
+    # Kept in config (live JSON still sends it). Not a FAK floor: after 35/40
+    # integrity, the sell follows the live bid so a 20¢ print is not $0.
     "hedge_min_price": 0.32,
     # Undercut top bid by N ticks so FAK crosses a falling book during order RTT.
     "hedge_undercut_ticks": 2,
@@ -1037,7 +1037,11 @@ def get_quote_fast(
 
 
 def hedge_sell_price(bid, tick_size, undercut_ticks, min_price):
-    """FAK sell floor: undercut bid, align to tick, clamp to min_price."""
+    """FAK sell limit: undercut the live bid, align to tick, clamp to min_price.
+
+    Pass one tick as min_price. Passing hedge_min_price (32–32.5¢) raises the
+    limit above a 20¢ bid and the FAK matches nothing.
+    """
     tick = float(tick_size or TICK_SIZE_FALLBACK)
     if tick <= 0:
         tick = 0.01
@@ -3699,11 +3703,11 @@ while not _shutdown_requested:
                             )
                         elif toxic_fill or hedge_bid <= HEDGE_THRESHOLD:
                             hedge_tick = get_tick_size_cached(held_token)
-                            # Toxic dumps use one tick as floor so FAK can match a
-                            # collapsed book (e.g. 28¢ bid vs hedge_min_price 32.5¢).
-                            hedge_floor = (
-                                float(hedge_tick) if toxic_fill else float(HEDGE_MIN_PRICE)
-                            )
+                            # 35/40 (or toxic) already decided this is a real exit.
+                            # FAK at the live bid — a 20¢ bid on a tight collapsed
+                            # book must fill. hedge_min_price must not raise the
+                            # limit and leave us with $0.
+                            hedge_floor = float(hedge_tick)
                             sell_floor = hedge_sell_price(
                                 hedge_bid, hedge_tick, HEDGE_UNDERCUT_TICKS, hedge_floor,
                             )

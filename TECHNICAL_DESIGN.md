@@ -43,14 +43,15 @@ to earn back losses from the few hedges that fired).
 **The risk:** BTC can reverse after entry. If the leg we bought truly collapses
 (bid **and** ask both drop — not a lone 1¢ bid under a still-high ask), the bot
 **hedges**: it market-sells the held leg when bid ≤ 35¢ (and ask ≤ 40¢ with a
-tight spread), floored at `hedge_min_price` (~32¢). There is no profit-taking
+tight spread). After that check, the FAK follows the **live bid** (a 20¢ print
+on a still-tight book is a fill, not $0). There is no profit-taking
 sell — the only sell path is the hedge; everything else rides to redemption.
 
 **Economics per share (no reversal):** buy at ~75–90¢, redeem at $1.00 → ~10–25¢
 gross (wider band than the old 98–99¢ probe; more fill opportunity, more reversal
 exposure).
-**Economics per share (hedged reversal):** buy at ~75–90¢, sell near the collapsed
-book (≥ floor) → bounded loss instead of riding a wrong side to $0.
+**Economics per share (hedged reversal):** buy at ~75–90¢, sell at the collapsed
+bid → bounded loss instead of riding a wrong side to $0.
 
 ---
 
@@ -266,9 +267,11 @@ force exit):
   a reversal (`hedge_skip_toxic_book`). Require bid ≤ 35¢, ask ≤
   `hedge_require_ask_max` (40¢), and spread ≤ `hedge_max_spread` (15¢). Toxic dumps
   skip integrity / `abort_above` so a collapsed book can still exit.
-- **Execution:** FAK sell floored at `hedge_min_price` for normal hedges; toxic dumps
-  floor at one tick so a 28¢ bid is not blocked by a 32.5¢ min. Every retry
-  force-REST refreshes **both** sides (normal path also re-runs the two-sided gate).
+- **Execution:** FAK sell at the **live bid** (minus undercut, one tick minimum)
+  after the 35/40 integrity check. Do not raise the limit to `hedge_min_price`
+  (~32¢) — that is how a valid 20¢ bid became a $0 wipe. Toxic dumps use the same
+  live-bid FAK (they skip integrity / bounce cancel). Every retry force-REST
+  refreshes **both** sides (normal path also re-runs the two-sided gate).
 - **Outcome:** every POST has a crash-durable deterministic order ID. Only
   settlement-confirmed fills shrink `bought_size` or add proceeds; ambiguous
   outcomes remain in `hedge_uncertain` until exact-order reconciliation. Full
@@ -345,7 +348,7 @@ paths. Templates are `strategy_buy.example.json`,
 | `max_entry_spread` | 0.05 | Max ask−bid on winner at entry |
 | `underlying_gate_enabled` / `min_underlying_edge_usd` | true / 5.0 (5m), 10.0 (15m/hr) | Oracle alignment gate |
 | `toxic_force_exit_below` | 0.65 | Force-dump if FAK avg &lt; 65¢ (must be ≤ buy_threshold) |
-| `hedge_enabled` / `hedge_threshold` / `hedge_min_price` | true / 0.35 / 0.32 | Hedge arm & floor |
+| `hedge_enabled` / `hedge_threshold` / `hedge_min_price` | true / 0.35 / unused floor | Arm at 35¢; `hedge_min_price` kept in JSON, not a FAK floor |
 | `hedge_max_spread` / `hedge_require_ask_max` | 0.15 / 0.40 | Hedge book must actually collapse |
 | `buy_window_min` (15m, hr) / `buy_start_s` (5m) | 4.0 / 120 / 13.0 | Entry window before close |
 | `buy_budget` | 2.5 / 2.5 / 2.5 | USDC per market |

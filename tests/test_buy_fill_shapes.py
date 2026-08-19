@@ -260,6 +260,21 @@ class BuyFillProductionHelpers(unittest.TestCase):
         self.assertTrue(ok)
         self.assertEqual(why, "ok")
 
+    def test_hedge_accepts_collapsed_20c_book(self):
+        # 35/40 already passed conceptually: 20¢/30¢ is a real tight collapse.
+        ok, why = self.ns["hedge_book_ok"](0.20, 0.30, 0.35, 0.15, 0.40)
+        self.assertTrue(ok)
+        self.assertEqual(why, "ok")
+
+    def test_hedge_sell_follows_live_bid_not_32c_floor(self):
+        ns = _load_funcs("hedge_sell_price")
+        ns["TICK_SIZE_FALLBACK"] = "0.001"
+        sell = ns["hedge_sell_price"]
+        # Tick floor + 20¢ bid → take ~20¢. 32.5¢ floor would match nothing.
+        self.assertAlmostEqual(sell(0.20, 0.001, 0, 0.001), 0.20)
+        self.assertAlmostEqual(sell(0.20, 0.001, 2, 0.001), 0.198)
+        self.assertGreater(sell(0.20, 0.001, 0, 0.325), 0.30)
+
 
 class HedgeReconcileProduction(unittest.TestCase):
     @classmethod
@@ -409,6 +424,16 @@ class AmbiguousCrossCyclePolicy(unittest.TestCase):
         self.assertIn("reconcile_hedge_sold(", src)
         self.assertIn("stable_zero_balances(", src)
         self.assertIn("gc_par_redeem(", src)
+
+    def test_hedge_fak_follows_live_bid_after_integrity(self):
+        for bot in (BOT, BOT5M, BOT_HR):
+            src = bot.read_text()
+            self.assertIn("hedge_floor = float(hedge_tick)", src, bot.name)
+            self.assertNotIn(
+                "else float(HEDGE_MIN_PRICE)",
+                src,
+                bot.name,
+            )
 
     def test_all_siblings_persist_exact_order_intent_before_post(self):
         for bot in (BOT, BOT5M, BOT_HR):
