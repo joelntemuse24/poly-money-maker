@@ -59,6 +59,10 @@ HELPERS = (
     "fill_cost_usdc",
     "entry_book_ok",
     "hedge_book_ok",
+    "quoted_buy_shares",
+    "buy_fill_walked",
+    "classify_buy_fill",
+    "implied_buy_average",
     "reconcile_hedge_sold",
     "stable_zero_balances",
     "gc_par_redeem",
@@ -260,6 +264,123 @@ class BuyFillProductionHelpers(unittest.TestCase):
         self.assertTrue(ok)
         self.assertEqual(why, "ok")
 
+    def test_quoted_buy_shares_caps_at_top_size_not_budget_dollars(self):
+        quoted = self.ns["quoted_buy_shares"]
+        # $2.50 at 80¢ with 100 sh on the ask → ~3.12 shares, not a $2.50 walk.
+        self.assertAlmostEqual(quoted(2.50, 0.80, 100.0), 3.125)
+        # Thin 80¢ level: never size past displayed ask_size.
+        self.assertAlmostEqual(quoted(2.50, 0.80, 1.0), 1.0)
+        self.assertEqual(quoted(2.50, 0.80, 0.0), 0.0)
+        self.assertEqual(quoted(2.50, 0.0, 10.0), 0.0)
+
+    def test_classify_buy_fill_walk_and_cheap_avg_are_toxic(self):
+        classify = self.ns["classify_buy_fill"]
+        below, toxic = classify(0.80, 3.12, 3.12, 0.75, 0.65)
+        self.assertFalse(below)
+        self.assertFalse(toxic)
+        below, toxic = classify(0.09, 27.3, 3.12, 0.75, 0.65)
+        self.assertTrue(below)
+        self.assertTrue(toxic)
+        below, toxic = classify(0.70, 3.12, 3.12, 0.75, 0.65)
+        self.assertTrue(below)
+        self.assertFalse(toxic)
+        # Missing quote must not false-toxic a 3-sh fill.
+        self.assertFalse(self.ns["buy_fill_walked"](3.12, None))
+        self.assertFalse(self.ns["buy_fill_walked"](3.12, 0.0))
+        self.assertFalse(self.ns["buy_fill_walked"](3.12, 3.125))
+        # A USDC leftover decoded as 2.50 "shares" looks like a walk — callers
+        # must persist quoted_buy_shares, not taker USDC.
+        self.assertTrue(self.ns["buy_fill_walked"](3.12, 2.50))
+
+    def test_implied_average_is_usdc_over_shares_not_gate_ask(self):
+        implied = self.ns["implied_buy_average"]
+        self.assertAlmostEqual(implied(2.50, 27.3, 0.80), 2.50 / 27.3)
+        self.assertAlmostEqual(implied(0.0, 27.3, 0.80), 0.80)
+
+    def test_decode_does_not_crush_walked_human_shares_to_fixed_dust(self):
+        decode = self.ns["_decode_clob_response_amount"]
+        self.assertAlmostEqual(decode("27.3", expected=3.125), 27.3)
+        self.assertAlmostEqual(decode("27300000", expected=3.125), 27.3)
+        self.assertAlmostEqual(decode("3125000", expected=3.125), 3.125)
+        self.assertAlmostEqual(decode("11000", expected=0.011), 0.011)
+
+    def test_trade_financials_keep_buy_walk_vwap(self):
+        ns = _load_funcs(
+            "finite_float",
+            "_decode_clob_response_amount",
+            "_confirmed_trade_financials",
+            "_fill_fee_usdc",
+        )
+        ns["_load_trade_details"] = lambda _ids: [{
+            "status": "CONFIRMED",
+            "transaction_hash": "0xabc",
+            "size": "27.3",
+            "price": 0.09,
+        }]
+        out = ns["_confirmed_trade_financials"](
+            ["t1"], expected_size=3.125, fee_schedule=None,
+        )
+        self.assertAlmostEqual(out["shares"], 27.3)
+        self.assertAlmostEqual(out["gross"], 27.3 * 0.09)
+
+    def test_confirm_fill_size_accepts_buy_walk(self):
+        ns = _load_funcs(
+            "finite_float",
+            "_decode_clob_response_amount",
+            "_string_list",
+            "_result_as_dict",
+            "buy_shares_from_result",
+            "confirm_fill_size",
+        )
+        ns["log_event"] = lambda *_a, **_k: None
+        ns["_trade_settlement_state"] = lambda _ids: "confirmed"
+        ns["_confirmed_trade_financials"] = lambda *_a, **_k: None
+        filled = ns["confirm_fill_size"](
+            {
+                "status": "matched",
+                "takingAmount": "27.3",
+                "tradeIDs": ["trade-1"],
+            },
+            "order-1",
+            3.125,
+            side="BUY",
+        )
+        self.assertAlmostEqual(filled, 27.3)
+
+    def test_inspect_uncertain_buy_walk_is_confirmed_not_mismatch(self):
+        ns = _load_funcs(
+            "finite_float",
+            "_decode_clob_response_amount",
+            "_string_list",
+            "inspect_uncertain_order",
+        )
+        ns["get_order_details"] = lambda *_a, **_k: {
+            "status": "matched",
+            "size_matched": 27.3,
+            "asset_id": "tok",
+            "market": "cond",
+            "side": "BUY",
+            "price": 0.09,
+            "trade_ids": ["t1"],
+        }
+        ns["_trade_settlement_state"] = lambda _ids: "confirmed"
+        ns["_confirmed_trade_financials"] = lambda *_a, **_k: {
+            "shares": 27.3, "gross": 2.457, "fee": 0.0,
+        }
+        ns["_fill_fee_usdc"] = lambda *_a, **_k: 0.0
+        out = ns["inspect_uncertain_order"](
+            "oid",
+            side="BUY",
+            requested=3.125,
+            token_id="tok",
+            condition_id="cond",
+            limit_price=0.80,
+            spend_cap=2.50,
+        )
+        self.assertEqual(out["state"], "confirmed")
+        self.assertAlmostEqual(out["filled"], 27.3)
+        self.assertAlmostEqual(out["value"], 2.457)
+
     def test_hedge_accepts_collapsed_20c_book(self):
         # 35/40 already passed conceptually: 20¢/30¢ is a real tight collapse.
         ok, why = self.ns["hedge_book_ok"](0.20, 0.30, 0.35, 0.15, 0.40)
@@ -455,6 +576,23 @@ class AmbiguousCrossCyclePolicy(unittest.TestCase):
             self.assertIn("expected_condition_id=cond", src, bot.name)
             self.assertIn('ENTRY_ENABLED = _strat["entry_enabled"]', src, bot.name)
 
+    def test_buy_is_share_capped_limit_sell_stays_market(self):
+        for bot in (BOT, BOT5M, BOT_HR):
+            src = bot.read_text()
+            self.assertEqual(src.count("client.create_order"), 1, bot.name)
+            self.assertEqual(src.count("client.create_market_order"), 1, bot.name)
+            self.assertIn("quoted_buy_shares(", src, bot.name)
+            self.assertIn("size=shares", src, bot.name)
+            self.assertIn("buy_fill_walk", src, bot.name)
+            self.assertIn("toxic_fill_armed_from_inventory", src, bot.name)
+            self.assertIn('reason="no_bid"', src, bot.name)
+            self.assertIn('quoted = meta.get("quoted_buy_shares")', src, bot.name)
+            self.assertNotIn(
+                'quoted = meta.get("quoted_buy_shares") or meta.get(',
+                src,
+                bot.name,
+            )
+
     def test_all_siblings_isolate_refresh_and_entry_io(self):
         for bot in (BOT, BOT5M, BOT_HR):
             src = bot.read_text()
@@ -488,8 +626,16 @@ class AmbiguousCrossCyclePolicy(unittest.TestCase):
 class BuyExecutionAmbiguity(unittest.TestCase):
     @staticmethod
     def _namespace(response):
-        ns = _load_funcs("finite_float", "_result_as_dict", "buy_market_with_retry")
-        calls = {"post": 0, "submit": []}
+        ns = _load_funcs(
+            "finite_float",
+            "_result_as_dict",
+            "quoted_buy_shares",
+            "buy_fill_walked",
+            "classify_buy_fill",
+            "implied_buy_average",
+            "buy_market_with_retry",
+        )
+        calls = {"post": 0, "submit": [], "orders": []}
         signed_order = SimpleNamespace(
             makerAmount="8000000",
             takerAmount="8163265",
@@ -500,6 +646,10 @@ class BuyExecutionAmbiguity(unittest.TestCase):
             calls["post"] += 1
             return response
 
+        def create_order(args, **_kwargs):
+            calls["orders"].append(args)
+            return signed_order
+
         ns.update(
             {
                 "DRY_RUN": False,
@@ -507,6 +657,7 @@ class BuyExecutionAmbiguity(unittest.TestCase):
                 "HEDGE_GHOST_SLEEP_S": 0.0,
                 "MAX_ENTRY_SPREAD": 0.10,
                 "MIN_WINNER_BID": 0.90,
+                "TOXIC_FORCE_EXIT_BELOW": 0.65,
                 "console": SimpleNamespace(print=lambda *_a, **_k: None),
                 "log_event": lambda *_a, **_k: None,
                 "check_token_balance": lambda *_args: 0.0,
@@ -516,10 +667,10 @@ class BuyExecutionAmbiguity(unittest.TestCase):
                 "entry_book_ok": lambda *_a, **_k: (True, "ok"),
                 "safe_api_call": lambda fn, *a, **k: fn(*a, **k),
                 "client": SimpleNamespace(
-                    create_market_order=lambda *_a, **_k: signed_order,
+                    create_order=create_order,
                     post_order=post,
                 ),
-                "MarketOrderArgs": lambda **kwargs: kwargs,
+                "OrderArgs": lambda **kwargs: kwargs,
                 "PartialCreateOrderOptions": lambda **kwargs: kwargs,
                 "OrderType": SimpleNamespace(FAK="FAK"),
                 "signed_order_id": lambda *_a, **_k: "order-1",
@@ -548,6 +699,9 @@ class BuyExecutionAmbiguity(unittest.TestCase):
         self.assertEqual(calls["post"], 1)
         self.assertEqual(len(calls["submit"]), 1)
         self.assertEqual(calls["submit"][0][0], 0.0)  # persisted baseline
+        self.assertEqual(len(calls["orders"]), 1)
+        self.assertIn("size", calls["orders"][0])
+        self.assertNotIn("amount", calls["orders"][0])
 
     def test_explicit_unmatched_zero_fill_is_terminal_empty(self):
         ns, calls = self._namespace({"status": "unmatched", "orderID": "order-1"})

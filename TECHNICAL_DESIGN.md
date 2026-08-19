@@ -213,22 +213,27 @@ A buy fires only when **all** of these gates pass, evaluated in the buy window
 6. **Risk caps.** `buy_budget` USDC per market ($2.50), `max_open_positions`,
    `max_open_notional`, `max_daily_notional`, and available USDC balance.
 
-Execution: a FAK market buy for `buy_budget` dollars of the winning token. Size and
-limit price come from a **force-fresh REST** book (`force_rest=True` — bypasses WS
-and the 200ms REST cache) immediately before the order. A BUY limit is a
-**maximum**, so the exchange can fill far below the gate ask (“price improvement”).
-Confirmed fills are **always persisted** (including below-band averages logged as
-`buy_fill_below_band`) — discarding them creates orphan inventory. Those fills set
-`toxic_fill` when the average is below `toxic_force_exit_below` (default 65¢) and
-are **not** ridden to $1: the hedge path force-exits at the next usable bid (no
-bounce cancel, no `hedge_min_price` floor). Milder below-band fills (e.g. 70¢)
-stay on the normal ≤35¢ hedge path. Delayed FAKs are polled; zero confirms fall
-back to balance reconciliation (`buy_ghost_fill`).
+Execution: a FAK **limit** buy sized in **shares** at the quoted ask —
+`min(budget/ask, ask_size)` via `OrderArgs` + `create_order` — not a USDC market
+order. A dollar-denominated market FAK of `min(budget, ask×ask_size)` still walks
+cheaper levels (gate quotes 80¢, leftover cash lifts 9¢). The 75–90¢ **band is
+unchanged**; this only pins size to the level that passed the gate. Re-quote
+already aborts if the fresh ask left the band. A BUY limit is a **maximum**, so
+the exchange can still price-improve inside that share cap; confirmed fills are
+**always persisted** (including below-band averages logged as `buy_fill_below_band`
+and walks as `buy_fill_walk`). True average is **USDC / shares**, not extra shares
+priced at the gate ask. Those fills set `toxic_fill` when the average is below
+`toxic_force_exit_below` (default 65¢) **or** filled shares exceed 1.05× quoted
+size, and are **not** ridden to $1: the hedge path force-exits at the next usable
+bid (no bounce cancel, no `hedge_min_price` floor; REST may be bid-only). Milder
+below-band fills (e.g. 70¢) stay on the normal ≤35¢ hedge path. Delayed FAKs are
+polled; zero confirms fall back to balance reconciliation (`buy_ghost_fill`) using
+posted USDC as cost when the bag walked.
 Before every POST, the bot atomically writes a `buy_uncertain` quarantine with the
-exact signed order ID, token, amounts, and pre-submit balance. Any exception, falsy
+exact signed order ID, token, amounts, quoted share size, and pre-submit balance. Any exception, falsy
 response, or non-terminal response stops replacement orders and keeps that market
 quarantined. Cross-cycle recovery first reconciles that exact order and its trades;
-stable balance observations are only a fallback. Recovery continues after market
+BUY walks are accepted (not `identity_mismatch`). Stable balance observations are only a fallback. Recovery continues after market
 expiry, and GC never deletes unresolved quarantine.
 Entry cost is USDC spent (`makingAmount` on CLOB v2 BUY), not `shares × gate ask`.
 
@@ -241,6 +246,7 @@ Entry cost is USDC spent (`makingAmount` on CLOB v2 BUY), not `shares × gate as
 - `buy_skip_underlying_edge` — live oracle < $10 from PTB
 - `buy_skip_underlying_side` — book winner disagrees with the underlying move
 - `buy_fill_below_band` — fill landed below the ask band; inventory recorded + `toxic_fill`
+- `buy_fill_walk` — confirmed BUY shares exceeded the quoted top-of-book size
 - `buy_ghost_fill` — balance rose after a null/delayed CLOB confirm
 
 While any position is open or any market is inside the buy window, the loop runs in
@@ -260,9 +266,11 @@ force exit):
   immediate dump — do not wait for a 35¢ reversal and do not cancel on bounce.
   Below-band but ≥65¢ uses the normal hedge.
 - **Confirm (force-fresh REST, fail-closed):** re-fetch the full book with
-  `force_rest=True`. If either side is missing, skip (`hedge_skip_incomplete_rest`)
-  — **no WS fallback**. If bid bounced above threshold on a *normal* entry, abort
-  (`hedge_cancel_bounce`); toxic fills skip this cancel.
+  `force_rest=True`. Normal hedges skip if either side is missing
+  (`hedge_skip_incomplete_rest`) — **no WS fallback**. Toxic dumps may sell when
+  REST has a **bid** but no ask; no bid still skips the cycle. If bid bounced
+  above threshold on a *normal* entry, abort (`hedge_cancel_bounce`); toxic fills
+  skip this cancel.
 - **Book integrity (normal only):** a lone penny bid under a still-high ask is **not**
   a reversal (`hedge_skip_toxic_book`). Require bid ≤ 35¢, ask ≤
   `hedge_require_ask_max` (40¢), and spread ≤ `hedge_max_spread` (15¢). Toxic dumps

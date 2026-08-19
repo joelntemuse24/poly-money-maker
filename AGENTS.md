@@ -117,6 +117,7 @@ Watch the console for `[DRY BUY]` / `[DRY SELL]` markers. Ctrl-C to stop.
 - `buy_skip_ambiguous` — GUI display prices too close
 - `buy_skip_no_consensus` — ask in band but GUI/tight-book gate failed
 - `buy_fill_below_band` — fill avg below band; inventory persisted + `toxic_fill` force-exit
+- `buy_fill_walk` — confirmed BUY shares exceeded the quoted top size (junk walk)
 - `buy_ghost_fill` — balance reconciliation after null/delayed BUY confirm
 - `buy_uncertain` — POST outcome unresolved; durable token/baseline quarantine blocks re-buy
 - `buy_skip_incomplete_book` — missing GUI price on a leg (no mid and no last trade)
@@ -139,11 +140,14 @@ Watch the console for `[DRY BUY]` / `[DRY SELL]` markers. Ctrl-C to stop.
   last-known-good hedge parameters. A per-bot process lock prevents duplicate
   live instances.
 - **FAK orders only:** All orders are Fill-And-Kill — no resting orders, no market
-  making.
+  making. Buys are share-capped **limit** FAKs at the quoted ask; sells stay
+  share-denominated market FAKs.
 - **Hedge is sell-only exit:** The bots never profit-take. The only sell path is the
   hedge: REST shows bid ≤ 35¢ **and** ask ≤ 40¢ with tight spread (a real
-  collapse, not a spoof penny). After that, the FAK sells at the **live bid**
-  even if it is 20¢. Everything else rides to redemption at $1.00.
+  collapse, not a spoof penny), or a `toxic_fill` dump (avg < 65¢ or walked
+  size). After that, the FAK sells at the **live bid** even if it is 20¢.
+  Everything else rides to redemption at $1.00. WS may *arm* a hedge check;
+  normal sells need two-sided REST; toxic dumps may sell on bid-only REST.
 - **Tick sizes:** 5m markets use `0.001`, 15m and hourly use `0.01`.
 - **One entry per market:** Enforced via `meta.get("bought_token")` in state cache.
 - **Notifications:** Fire-and-forget via ntfy.sh (topic `polybot-joel-btc`).
