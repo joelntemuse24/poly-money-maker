@@ -3,12 +3,10 @@
 **Agents: read this after `AGENTS.md`.** Update this file when ops/strategy decisions change.
 Do not put secrets, API keys, or live wallet material here.
 
-Last updated: **2026-08-19** — keep the **$2.50 / 75–90¢** CLOB buy triggers
-(band unchanged); pin FAK buys to share-capped limits at the quoted ask so leftover
-USDC cannot walk into 9¢ junk. Hedge **trigger** is still 35/40; the sell follows
-the live bid after that (no 32¢ FAK floor). Pause minting. Pathlog ticks now store
-**top-of-book size** (`ubs`/`uas`/`dbs`/`das`) so `--budget 2.5` vs `15` backtests
-are size-capped, not infinite liquidity at the best ask (14-day / 400 MB cap).
+Last updated: **2026-08-19** — **only the 5m CLOB bot is live.** Stop/disable
+15m and hourly. Keep the **$2.50 / 75–90¢** triggers on 5m (share-capped limit
+FAK at the quoted ask). Hedge **trigger** is still 35/40; sell follows the live
+bid. Pause minting. Pathlog still records all three series (no orders).
 
 ---
 
@@ -17,7 +15,11 @@ are size-capped, not infinite liquidity at the best ask (14-day / 400 MB cap).
 **Mint-only helper is paused.** Stop `polymintbot` and leave it disabled. Do not
 mint complete sets. Operator still sells leftover mint inventory by hand.
 
-**Active strategy:** the three CLOB buy bots with the **$2.50 widen-band
+**15m and hourly CLOB bots are stopped.** Do not start `polybuybot` or
+`polybuybothourly` unless the operator asks. Open 15m/hourly inventory (if any)
+will not be auto-hedged or redeemed by those processes.
+
+**Active strategy:** **5m only** (`polybuybot5m`) with the **$2.50 widen-band
 triggers** (not the old 98–99¢ probe):
 
 | Knob | Value |
@@ -26,7 +28,7 @@ triggers** (not the old 98–99¢ probe):
 | Ask band | **75–90¢** — trigger as soon as winning ask ≥ 75¢; 90¢ is a hard ceiling |
 | Execution | FAK **limit** at the quoted ask, size `min(budget/ask, ask_size)` shares — **not** a USDC market order |
 | GUI consensus | winner ≥ 70¢, loser ≤ 30¢ |
-| Windows | 5m **120 s** · 15m **4.0 min** · hourly **13.0 min** |
+| Windows | 5m **120 s** (15m / hourly bots **not running**) |
 | Hedge | **Trigger** bid ≤ **35¢** and ask ≤ **40¢**, spread ≤ 15¢ (real book, not a glitch). **Then sell at whatever the bid is** — no 32¢ floor. |
 | Underlying edge | **$5** (5m) / **$10** (15m, hourly); side must match |
 | `max_open_positions` | **0 = unlimited** |
@@ -80,13 +82,16 @@ Kill switch: `touch STOP_PATHLOG`.
 
 - **VM:** `~/poly-money-maker` on `instance-20260516-185922`.
 - **Mint:** `sudo systemctl stop polymintbot && sudo systemctl disable polymintbot`
-- **Buy bots:** live `strategy_buy*.json` already had these 75–90 / $2.50 knobs
-  before minting. After pull, confirm they still match the table above, then:
+- **Buy bots:** **5m only.** Leave `polybuybot5m` running. Stop the others:
   ```bash
-  cd ~/poly-money-maker && git pull
-  sudo systemctl restart polybuybot polybuybot5m polybuybothourly
+  sudo systemctl stop polybuybot polybuybothourly
+  sudo systemctl disable polybuybot polybuybothourly
+  sudo systemctl enable polybuybot5m   # survive reboot; already running is fine
+  systemctl is-active polybuybot polybuybot5m polybuybothourly
+  # expect: inactive  active  inactive
   ```
-  Confirm `dry_run` / `entry_enabled` before restarting live.
+  Do **not** restart 5m unless the operator asks. Confirm `strategy_buy5m.json`
+  `dry_run` / `entry_enabled` before any 5m restart.
 - **Pathlog:** start `polypathlog` as above (no `.env` required).
 
 ---
@@ -94,11 +99,12 @@ Kill switch: `touch STOP_PATHLOG`.
 ## Open / next
 
 - [x] Pause minting; keep $2.50 / 75–90¢ CLOB triggers.
+- [x] **5m-only live trading** — 15m and hourly buy services stopped/disabled.
 - [x] Pin BUY FAKs to share-capped limits at the quoted ask (band unchanged).
 - [x] Path recorder + `check_path_backtest.py` (first-touch ask × time-left;
   ticks record TOB size; backtest is share-capped FAK, not infinite ask size).
 - [x] Hedge FAK follows live bid after 35/40 integrity (no 32¢ fill refusal).
-- [ ] On VM: stop mint, restart buy bots + pathlog after reviewing live JSON.
+- [x] On VM: pathlog restarted onto size-aware ticks; 15m/hourly buy bots stopped.
 - [ ] Let pathlog collect resolved markets, then `--grid` / export CSV **off the VM** before prune.
 
 ---
@@ -106,7 +112,8 @@ Kill switch: `touch STOP_PATHLOG`.
 ## Agent instructions
 
 1. Read `AGENTS.md` + this file before changing mint/buy/hedge logic.
-2. Do **not** restart minting unless the operator asks.
+2. Do **not** restart minting unless the operator asks. Do **not** start
+   `polybuybot` / `polybuybothourly` unless the operator asks.
 3. Never truncate state/PnL/log files; never commit live strategy/state/`.env`.
    Pathlog ticks are **auto-pruned** (14d / 400 MB) — do not `rm` them by hand,
    but **do export** (`check_path_backtest.py --csv` or `scp` the ticks dir)

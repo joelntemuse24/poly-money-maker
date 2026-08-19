@@ -6,10 +6,11 @@ Full architecture: `TECHNICAL_DESIGN.md`.
 
 ## Project at a Glance
 
-**Live on the VM:** three standalone buy bots plus a no-order path recorder.
-They buy the winning leg of Polymarket BTC "Up or Down" markets at **75–90¢**
-in the final window ($2.50 / market), hedge at **35¢** on reversal, and redeem
-winners at $1.00. See `CURRENT.md` for the active probe budget and knobs.
+**Live on the VM:** **5m buy bot only** (`polybuybot5m`) plus a no-order path
+recorder. 15m and hourly buy services are **stopped**. The 5m bot buys the
+winning leg of Polymarket BTC "Up or Down" markets at **75–90¢** in the final
+120s ($2.50 / market), hedges at **35¢** on reversal, and redeems winners at
+$1.00. See `CURRENT.md` for the active probe budget and knobs.
 
 Mint-only helper (`mintbot.py`) is **paused** — do not run it live.
 
@@ -82,6 +83,8 @@ change to one usually needs propagation to its siblings.
 - **Never commit live `strategy_*.json`, `.env`, or state files** — they are
   gitignored but double-check before `git add .`.
 - **Do not restart `polymintbot` unless the operator asks.**
+- **Do not start `polybuybot` / `polybuybothourly` unless the operator asks** —
+  live trading is 5m-only (`polybuybot5m`).
 
 ## How to Verify a Change
 
