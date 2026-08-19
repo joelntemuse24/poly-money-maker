@@ -557,6 +557,16 @@ class AmbiguousCrossCyclePolicy(unittest.TestCase):
             defined = src.rfind(assign, 0, use)
             self.assertGreater(defined, -1, bot.name)
 
+    def test_cycle_error_logs_error_field(self):
+        for bot in (BOT, BOT5M, BOT_HR):
+            src = bot.read_text()
+            idx = src.find('"cycle_error"')
+            self.assertGreater(idx, -1, bot.name)
+            chunk = src[max(0, idx - 220): idx + 280]
+            self.assertIn("except Exception as exc:", chunk, bot.name)
+            self.assertIn('error=f"{type(exc).__name__}: {exc}"[:180]', chunk, bot.name)
+            self.assertIn("traceback=traceback.format_exc()", chunk, bot.name)
+
     def test_hedge_liveness_and_reconcile_markers(self):
         src = BOT.read_text()
         self.assertIn("HEDGE_QUOTE_MAX_AGE_S", src)

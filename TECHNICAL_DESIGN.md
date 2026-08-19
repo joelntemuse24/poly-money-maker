@@ -452,8 +452,10 @@ JSONL. Export ticks off the VM before prune deletes them.
 
 ## 12. Error Handling Philosophy
 
-- **Never crash the loop.** Every cycle is wrapped; unexpected exceptions are logged
-  as `cycle_error` with a traceback and the loop continues. `safe_api_call` filters
+- **Never crash the process.** Every cycle is wrapped; unexpected exceptions are
+  logged as `cycle_error` (`error` + traceback) and the **loop continues on the
+  next poll**. The faulting poll is aborted: remaining markets do not buy or
+  hedge that tick. The console banner does not sleep 5s. `safe_api_call` filters
   transient API noise (rate limits, 5xx, timeouts) into retries/skips.
 - **Fail safe, not fast.** When data is missing or ambiguous (incomplete book, no
   consensus, oracle edge too small), the bot does nothing. Not trading is always the
@@ -517,6 +519,11 @@ integrity, oracle edge, settlement finality, quarantine) remain authoritative.
 9. **Bid-alone hedge dumps.** A 1¢ bid under a 99¢ ask is illiquidity, not a
    reversal. Hedge requires ask ≤ `hedge_require_ask_max` and a tight spread, and
    always REST-confirms before selling.
+10. **`buy_uncertain` `known_cost` must be assigned before `spend_cap`.** On 13 Aug
+    the 5m/hourly copies used `known_cost` before it was set (`#80` / `be22662`).
+    Every quarantined BUY then `cycle_error`’d and skipped the rest of that poll.
+    `git pull` does not restart systemd — a merged fix is inert until
+    `systemctl restart polybuybot5m`.
 
 ---
 
