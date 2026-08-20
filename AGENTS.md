@@ -179,7 +179,7 @@ two-slice $2.50+$2.50 add.
 - `buy_ghost_fill` `via=unmatched_400_guard` — unmatched 400 but inventory appeared; no second FAK
 - `buy_attempt_ambiguous` `via=unmatched_400_no_balance` — unmatched 400 and CLOB balance unreadable; quarantine, no retry
 - `cycle_error` in logs — unhandled exception. The bot process stays up.
-  A fault **inside** `for m in markets` logs `condition_id` and **continues
+  A fault **inside** `for m in _loop_markets` logs `condition_id` and **continues
   to the next market** (held-first order unchanged). A fault **outside** that
   loop (refresh, GC, redeem, UI) still aborts the rest of that poll. Banner
   does **not** sleep 5s. Structured `error` field is the exception
@@ -187,6 +187,10 @@ two-slice $2.50+$2.50 add.
   Aug 13–19 live 5m: **3294/3294** were `NameError: known_cost` until the
   19 Aug 09:42 restart picked up #80 (that NameError aborted every later
   market in the same poll; isolation is the fix for the next one).
+  20 Aug: a 0.05s sleep with **POS 704** was leftover unredeemed 5m shares
+  (Data API), not 704 live markets. Banner **POS** is live hedges only;
+  **WAIT** is dust. Look interval is **0.01s**. Live JSON poll keys
+  hot-reload; the loop-body fix needs `sudo systemctl restart polybuybot5m`.
 - `hedge_attempt` / `hedge_fill` — hedge fired after force-fresh REST + book integrity + GUI consensus (normal path)
 - `hedge_skip_toxic_book` — bid dipped but ask/spread still say "not reversed"
 - `hedge_skip_no_consensus` — 50/55 (5m) or 35/40 book passed but GUI/last-trade still say the held side has not actually fallen (same class of check as buy)
@@ -205,6 +209,10 @@ two-slice $2.50+$2.50 add.
 - `buy_skip` `ask_below_band` / `ask_above_band` / `ask_out_of_band` / `no_ask` — in window, winning ask not in any open band (throttled 8s)
 - `buy_skip_max_positions` — only if `max_open_positions > 0` (probe uses **0 = unlimited**)
 - `pathlog_prune` — oldest tick JSONL removed (14d / 400 MB cap); export first
+- Banner `POS` — live (unexpired) hedges only. `WAIT n` is unredeemed leftover
+  5m shares still in the wallet; they are **not** quoted every tick
+- `sleeping 0.01s` — look interval after a short cycle. If wall clock is still
+  seconds, the cycle body is still fat (do not “fix” that by sleeping less)
 
 ## Research loop (before changing live knobs)
 
@@ -242,6 +250,10 @@ Cloud agents: `CLOUD_RESEARCH.md`.
   startup-only (selects `*.dryrun.*` state paths).
 - **5m look-ahead:** `BUY_HORIZON_S = max(buy_start_s, early_buy_start_s,
   early_95_start_s)` (300s). Hot poll / WS subscribe use that, not 120s alone.
+  Sleep is **0.01s** in that window or while a **live** hedge is open.
+  Data API leftover 5m shares (hundreds) are **WAIT** / background redeem —
+  they must not be stubbed, printed, or REST-quoted every tick. Live JSON
+  `poll_*` hot-reloads; the loop-body filter needs a 5m restart.
 - **Atomic durable save:** State and P&L files flush + `fsync` the `.tmp`, replace
   it, then `fsync` the parent directory before an order can proceed.
 - **Fail-closed startup:** A valid strategy file is required at startup. A
@@ -301,6 +313,9 @@ Cloud agents: `CLOUD_RESEARCH.md`.
    `check_fetch_trades.py` can.
 5. **Ask ≠ price.** 97¢ ask over 1¢ bid is not a tradable favorite. Entry needs
    a tight REST book; hedge needs the whole book + GUI to look lost.
+6. **POS ≠ wallet bags.** Data API returns every unredeemed 5m share. A 0.01s
+   sleep with a 5s wall clock means the cycle walked dust (Rich table, REST
+   404s, fake stubs). Do not "fix" that by sleeping less.
 
 ## Systemd Services (in `deploy/`)
 
@@ -323,7 +338,7 @@ After this branch merges, on the VM (5m only):
 
 ```bash
 cd ~/poly-money-maker && git pull
-python3 -c 'import json; from pathlib import Path; p=Path("strategy_buy5m.json"); d=json.loads(p.read_text()); d["hedge_threshold"]=0.50; d["hedge_require_ask_max"]=0.55; d["buy_budget"]=2.5; d["late_buy_budget"]=2.5; d["buy_max_price"]=0.90; p.write_text(json.dumps(d, indent=2)+"\n")'
+python3 -c 'import json; from pathlib import Path; p=Path("strategy_buy5m.json"); d=json.loads(p.read_text()); d["hedge_threshold"]=0.50; d["hedge_require_ask_max"]=0.55; d["buy_budget"]=2.5; d["late_buy_budget"]=2.5; d["buy_max_price"]=0.90; d["poll_buy_window_s"]=0.01; d["poll_held_s"]=0.01; d["ui_every_n_cycles"]=50; p.write_text(json.dumps(d, indent=2)+"\n")'
 sudo systemctl restart polybuybot5m
 ```
 

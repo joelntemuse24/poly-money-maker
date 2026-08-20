@@ -825,11 +825,13 @@ After import, `while not _shutdown_requested:`:
    discovery (staggered by `positions_refresh_s` / `balance_refresh_s`).
 5. Heartbeat file.
 6. Rich table every `ui_every_n_cycles` in hot mode (cosmetic).
-7. Redeem phase (skipped if hedging or entries are live).
+7. Redeem phase: write-ahead, then **at most one** relayer POST per ~1s on
+   the background redeem executor (even while a 5m buy window is open).
+   Leftover unredeemed bags must drain; they are not live hedges.
 8. GC / redeem-status poll.
-9. **Sort markets held-first** so a reversal is checked before a new buy
-   in the same cycle.
-10. `for m in markets:` **try/except per market**. Fault logs
+9. **Sort watchable markets held-first** so a reversal is checked before a new buy
+   in the same cycle. Far Gamma slates are skipped.
+10. `for m in _loop_markets:` **try/except per market**. Fault logs
     `condition_id` and **continues**. This is what stopped a single
     `NameError` from skipping every later hedge (see §25).
 11. Inside the try: seconds_left; merge held sizes; resolve `buy_uncertain`
@@ -837,9 +839,9 @@ After import, `while not _shutdown_requested:`:
     **buy check** if not held and bands open.
 12. Outer `except` → `cycle_error` (refresh/GC/UI/redeem failed). Process
     stays up. Banner does not sleep 5s.
-13. Sleep: 0.05s if holding, 0.1s if something is inside `BUY_HORIZON_S`,
-    else 1s.
-14. Submit background REST quotes for tokens in horizon or held; 
+13. Sleep: **0.01s** if holding a live hedge or something is inside
+    `BUY_HORIZON_S`, else 1s. Unredeemed leftover shares do not count as held.
+14. Submit background REST quotes for tokens in horizon or live-held;
     `book_ws.set_tokens(watch_set)` (horizon + 30s slack).
 
 That is the whole runtime. There is no second scheduler.

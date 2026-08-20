@@ -14,6 +14,7 @@ import os
 import shutil
 import tempfile
 import unittest
+from datetime import datetime
 from decimal import Decimal, InvalidOperation, ROUND_DOWN
 from pathlib import Path
 from types import SimpleNamespace
@@ -43,6 +44,7 @@ def _load_funcs(*names: str, bot: Path = BOT):
         "os": os,
         "shutil": shutil,
         "POLYMARKET_GUI_SPREAD": 0.10,
+        "datetime": datetime,
     }
     exec(compile("\n\n".join(chunks), str(bot), "exec"), ns, ns)
     return ns
@@ -669,11 +671,13 @@ class AmbiguousCrossCyclePolicy(unittest.TestCase):
                 and isinstance(node.target, ast.Name)
                 and node.target.id == "m"
                 and isinstance(node.iter, ast.Name)
-                and node.iter.id == "markets"
+                and node.iter.id in {"markets", "_loop_markets"}
                 and node.end_lineno
                 and (node.end_lineno - node.lineno) > 500
             ]
             self.assertEqual(len(market_fors), 1, bot.name)
+            if bot == BOT5M:
+                self.assertEqual(market_fors[0].iter.id, "_loop_markets")
             try_nodes = [
                 stmt for stmt in market_fors[0].body if isinstance(stmt, ast.Try)
             ]
@@ -1430,6 +1434,9 @@ class BalanceAndGcSemantics(unittest.TestCase):
         self.assertEqual(five["buy_max_price"], 0.90)
         self.assertEqual(five["buy_budget"], 2.5)
         self.assertEqual(five["late_buy_budget"], 2.5)
+        self.assertEqual(five["poll_buy_window_s"], 0.01)
+        self.assertEqual(five["poll_held_s"], 0.01)
+        self.assertEqual(five["ui_every_n_cycles"], 50)
         hourly = json.loads((root / "strategy_buyhourly.example.json").read_text())
         fifteen = json.loads((root / "strategy_buy.example.json").read_text())
         self.assertNotIn("early_buy_start_s", hourly)
@@ -1440,6 +1447,136 @@ class BalanceAndGcSemantics(unittest.TestCase):
         self.assertNotIn("late_buy_budget", fifteen)
         self.assertEqual(hourly["hedge_threshold"], 0.35)
         self.assertEqual(fifteen["hedge_threshold"], 0.35)
+
+
+class FiveMFastPollHelpers(unittest.TestCase):
+    """Leftover 5m wallet bags must not be treated as live hedges."""
+
+    @classmethod
+    def setUpClass(cls):
+        from buy.market import MintMarket
+
+        cls.ns = _load_funcs(
+            "finite_float",
+            "meta_end_ts",
+            "position_is_live_hedge",
+            "should_stub_tracked_market",
+            "market_needs_fast_path",
+            "bag_size",
+            "count_wallet_bags",
+            "count_live_hedges",
+            "add_tracked_market_stubs",
+            bot=BOT5M,
+        )
+        cls.ns["MintMarket"] = MintMarket
+        cls.ns["SERIES_SLUG"] = "btc-updown-5m"
+
+    def _bag(self, size=2.0, redeemable=False, token="up-tok"):
+        return {
+            "up": {
+                "asset": token,
+                "size": size,
+                "redeemable": redeemable,
+                "avgPrice": 0.9,
+            },
+            "dn": {
+                "asset": "dn-tok",
+                "size": 0.0,
+                "redeemable": False,
+                "avgPrice": 0.0,
+            },
+        }
+
+    def test_redeemable_is_not_live_hedge(self):
+        now = 1_700_000_000.0
+        pos = self._bag(redeemable=True)
+        meta = {"bought_token": "up-tok", "end_ts": now + 60}
+        self.assertFalse(self.ns["position_is_live_hedge"](pos, meta, now))
+        self.assertFalse(self.ns["should_stub_tracked_market"](pos, meta, now))
+
+    def test_expired_dust_is_not_live_hedge(self):
+        now = 1_700_000_000.0
+        pos = self._bag()
+        meta = {"bought_token": "up-tok", "end_ts": now - 120}
+        self.assertFalse(self.ns["position_is_live_hedge"](pos, meta, now))
+        self.assertFalse(self.ns["should_stub_tracked_market"](pos, meta, now))
+
+    def test_no_meta_wallet_dust_is_not_live_hedge(self):
+        now = 1_700_000_000.0
+        pos = self._bag()
+        self.assertFalse(self.ns["position_is_live_hedge"](pos, {}, now))
+        self.assertFalse(self.ns["should_stub_tracked_market"](pos, {}, now))
+
+    def test_this_bot_bag_in_window_is_live_hedge(self):
+        now = 1_700_000_000.0
+        pos = self._bag()
+        meta = {"bought_token": "up-tok", "end_ts": now + 90}
+        self.assertTrue(self.ns["position_is_live_hedge"](pos, meta, now))
+        self.assertTrue(self.ns["should_stub_tracked_market"](pos, meta, now))
+
+    def test_just_expired_stays_live_for_grace(self):
+        now = 1_700_000_000.0
+        pos = self._bag()
+        meta = {"bought_token": "up-tok", "end_ts": now - 10}
+        self.assertTrue(self.ns["position_is_live_hedge"](pos, meta, now))
+
+    def test_uncertain_is_stubbed_even_if_expired(self):
+        now = 1_700_000_000.0
+        pos = self._bag(size=0.0)
+        meta = {
+            "buy_uncertain": True,
+            "buy_uncertain_token": "up-tok",
+            "end_ts": now - 5,
+        }
+        self.assertFalse(self.ns["position_is_live_hedge"](pos, meta, now))
+        self.assertTrue(self.ns["should_stub_tracked_market"](pos, meta, now))
+
+    def test_stubs_skip_hundreds_of_dust_bags(self):
+        now = 1_700_000_000.0
+        held = {f"c{i:03d}": self._bag() for i in range(704)}
+        out = self.ns["add_tracked_market_stubs"]([], held, {}, now)
+        self.assertEqual(out, [])
+        self.assertEqual(self.ns["count_wallet_bags"](held), 704)
+        self.assertEqual(self.ns["count_live_hedges"](held, {}, now), 0)
+
+    def test_stubs_keep_live_hedge_and_not_dust(self):
+        now = 1_700_000_000.0
+        held = {
+            "dust": self._bag(),
+            "live": self._bag(token="live-up"),
+        }
+        meta = {
+            "live": {
+                "bought_token": "live-up",
+                "end_ts": now + 45,
+                "up_token": "live-up",
+                "dn_token": "live-dn",
+                "question": "BTC Up or Down 5m",
+            },
+        }
+        out = self.ns["add_tracked_market_stubs"]([], held, meta, now)
+        self.assertEqual([m.condition_id for m in out], ["live"])
+        self.assertGreater(out[0].end_ts, now)
+        self.assertEqual(self.ns["count_live_hedges"](held, meta, now), 1)
+        self.assertEqual(self.ns["count_wallet_bags"](held), 2)
+
+    def test_fast_path_skips_far_gamma_slate(self):
+        now = 1_700_000_000.0
+        far = SimpleNamespace(end_ts=now + 3600, condition_id="far")
+        near = SimpleNamespace(end_ts=now + 80, condition_id="near")
+        self.assertFalse(
+            self.ns["market_needs_fast_path"](far, {}, {}, now, 300.0)
+        )
+        self.assertTrue(
+            self.ns["market_needs_fast_path"](near, {}, {}, now, 300.0)
+        )
+
+    def test_5m_source_poll_defaults_are_one_centisecond(self):
+        src = BOT5M.read_text()
+        self.assertIn('"poll_buy_window_s": 0.01', src)
+        self.assertIn('"poll_held_s": 0.01', src)
+        self.assertIn("for m in _loop_markets:", src)
+        self.assertIn("_REDEEM_ENQUEUE_MIN_S", src)
 
 
 if __name__ == "__main__":

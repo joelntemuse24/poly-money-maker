@@ -219,11 +219,13 @@ _STRATEGY_DEFAULTS = {
     "max_redeem_age_days": 7,
     # Missing configuration must never arm real-money orders.
     "dry_run": True,
-    "poll_buy_window_s": 0.1,
-    "poll_held_s": 0.05,
+    # Sleep *after* a short cycle. 0.01s is the look interval; leftover
+    # unredeemed 5m bags must not be walked or this sleep is a lie.
+    "poll_buy_window_s": 0.01,
+    "poll_held_s": 0.01,
     "positions_refresh_s": 1,
     "balance_refresh_s": 15,
-    "ui_every_n_cycles": 5,
+    "ui_every_n_cycles": 50,
     "tick_size": "0.001",
 }
 STRATEGY_FILE = "strategy_buy5m.json"
@@ -891,14 +893,118 @@ def merge_tracked_positions(api_held, tracked_meta):
     return held
 
 
-def add_tracked_market_stubs(markets, held, tracked_meta, now_s):
-    """Add hedge/recovery metadata when Gamma discovery is unavailable.
+def meta_end_ts(meta):
+    """Market end time from durable state (unix seconds)."""
+    meta = meta or {}
+    end_ts = finite_float(meta.get("end_ts", 0), minimum=0) or 0.0
+    if end_ts > 0:
+        return float(end_ts)
+    end_date = meta.get("end_date")
+    if not end_date:
+        return 0.0
+    try:
+        return datetime.fromisoformat(
+            str(end_date).replace("Z", "+00:00")
+        ).timestamp()
+    except (TypeError, ValueError):
+        return 0.0
 
-    Exact-order recovery must continue after market expiry and even when an
-    ambiguous BUY has not appeared in the positions API yet.
+
+def position_is_live_hedge(pos, meta, now_s, expiry_grace_s=30.0):
+    """True if this bag can still be quoted/hedged (not redeem dust).
+
+    Data API returns every unredeemed 5m share in the wallet (hundreds).
+    Those are settlement inventory. The buy/hedge loop must only see a
+    position that is still in the market window (or just expired) and is
+    not already marked redeemable.
+    """
+    pos = pos or {}
+    meta = meta or {}
+    up = pos.get("up") or {}
+    dn = pos.get("dn") or {}
+    size = max(
+        finite_float(up.get("size", 0), minimum=0) or 0.0,
+        finite_float(dn.get("size", 0), minimum=0) or 0.0,
+    )
+    if size <= 0.01:
+        return False
+    if up.get("redeemable") or dn.get("redeemable"):
+        return False
+    if (
+        meta.get("hedge_closed")
+        or meta.get("redeem_pending")
+        or meta.get("redeem_confirmed")
+    ):
+        return False
+    end_ts = meta_end_ts(meta)
+    if end_ts > 0 and float(now_s) - end_ts > float(expiry_grace_s):
+        return False
+    if end_ts <= 0 and not meta.get("bought_token") and not meta.get("buy_uncertain"):
+        return False
+    return True
+
+
+def should_stub_tracked_market(pos, meta, now_s):
+    """Gamma stubs are for live hedges and quarantines, not wallet dust."""
+    meta = meta or {}
+    if meta.get("buy_uncertain") or meta.get("hedge_uncertain"):
+        return True
+    return position_is_live_hedge(pos, meta, now_s)
+
+
+def market_needs_fast_path(market, pos, meta, now_s, horizon_s, extra_s=30.0):
+    """Quote/hedge/buy this 5m event; skip the rest of the Gamma slate."""
+    meta = meta or {}
+    if meta.get("buy_uncertain") or meta.get("hedge_uncertain"):
+        return True
+    if position_is_live_hedge(pos, meta, now_s):
+        return True
+    end_ts = getattr(market, "end_ts", None)
+    if end_ts is None and isinstance(market, dict):
+        end_ts = market.get("end_ts")
+    try:
+        ttm = float(end_ts) - float(now_s)
+    except (TypeError, ValueError):
+        return False
+    return 0 < ttm <= float(horizon_s) + float(extra_s)
+
+
+def bag_size(pos):
+    pos = pos or {}
+    up = pos.get("up") or {}
+    dn = pos.get("dn") or {}
+    return max(
+        finite_float(up.get("size", 0), minimum=0) or 0.0,
+        finite_float(dn.get("size", 0), minimum=0) or 0.0,
+    )
+
+
+def count_wallet_bags(held):
+    return sum(1 for pos in (held or {}).values() if bag_size(pos) > 0.01)
+
+
+def count_live_hedges(held, tracked_meta, now_s):
+    tracked_meta = tracked_meta or {}
+    n = 0
+    for cid, pos in (held or {}).items():
+        if position_is_live_hedge(pos, tracked_meta.get(cid), now_s):
+            n += 1
+    return n
+
+
+def add_tracked_market_stubs(markets, held, tracked_meta, now_s):
+    """Keep live hedges and quarantines in the poll after Gamma drops them.
+
+    Data API leftover 5m shares (hundreds of closed bags) stay in `held` for
+    background redeem. They must not become fake live markets — that used to
+    inflate POS, print a 700-row table, and make a 0.01s sleep take seconds.
     """
     by_condition = {market.condition_id: market for market in markets}
-    recovery_conditions = set(held)
+    recovery_conditions = {
+        cond
+        for cond, pos in held.items()
+        if should_stub_tracked_market(pos, tracked_meta.get(cond, {}), now_s)
+    }
     recovery_conditions.update(
         str(cond)
         for cond, meta in tracked_meta.items()
@@ -929,14 +1035,22 @@ def add_tracked_market_stubs(markets, held, tracked_meta, now_s):
                 ).timestamp()
             except (TypeError, ValueError):
                 end_ts = 0.0
-        if end_ts > 0 and end_ts <= now_s and not uncertain:
+        # Live-hedge grace (just expired) still needs a stub. Wallet dust is
+        # already excluded from recovery_conditions.
+        if (
+            end_ts > 0
+            and end_ts <= now_s
+            and not uncertain
+            and not position_is_live_hedge(pos, meta, now_s)
+        ):
             continue
         if end_ts <= 0:
-            # Preserve an actually-held position's hedge path. A pure recovery
-            # stub stays expired so clearing its quarantine cannot arm entry.
+            # Missing clock: keep hedge quoting without arming the buy window
+            # (TTM ~24h is outside BUY_HORIZON_S). Uncertain-only stubs expire
+            # immediately so clearing quarantine cannot buy.
             end_ts = (
                 now_s + 86400
-                if max(up_size, dn_size) > 0.01
+                if position_is_live_hedge(pos, meta, now_s)
                 else now_s
             )
         up_token = str(meta.get("up_token") or up.get("asset") or "")
@@ -3279,6 +3393,11 @@ _cached_discovery_fresh = False
 _positions_received_mono = 0.0
 _balance_received_mono = 0.0
 _markets_received_mono = 0.0
+markets = []
+held = {}
+_loop_markets = []
+_show_ui = False
+now_s = time.time()
 _book_executor = ThreadPoolExecutor(max_workers=4)
 _entry_executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="entry")
 _pending_book_futs = {}
@@ -3288,6 +3407,9 @@ _balance_future = None
 _markets_future = None
 _redeem_executor = ThreadPoolExecutor(max_workers=1)
 _redeem_status_futures = {}
+_redeem_submit_futures = {}
+_last_redeem_enqueue_mono = 0.0
+_REDEEM_ENQUEUE_MIN_S = 1.0
 
 
 def _discover_markets_snapshot():
@@ -3439,13 +3561,20 @@ while not _shutdown_requested:
         markets = add_tracked_market_stubs(markets, held, positions_meta, now_s)
         held_conditions = {
             cond for cond, pos in held.items()
-            if max(
-                float(pos.get("up", {}).get("size", 0) or 0),
-                float(pos.get("dn", {}).get("size", 0) or 0),
-            ) > 0.01
+            if position_is_live_hedge(pos, positions_meta.get(cond), now_s)
         }
+        _loop_markets = [
+            m for m in markets
+            if market_needs_fast_path(
+                m,
+                held.get(m.condition_id),
+                positions_meta.get(m.condition_id),
+                now_s,
+                BUY_HORIZON_S,
+            )
+        ]
         # Never let an unheld market's entry I/O run before an active hedge.
-        markets.sort(key=lambda market: (
+        _loop_markets.sort(key=lambda market: (
             market.condition_id not in held_conditions,
             not bool(
                 positions_meta.get(market.condition_id, {}).get("buy_uncertain")
@@ -3453,19 +3582,22 @@ while not _shutdown_requested:
             ),
             market.end_ts,
         ))
-        _open_pos_n = sum(
-            1 for p in held.values()
-            if max(p.get("up", {}).get("size", 0), p.get("dn", {}).get("size", 0)) > 0.01
-        )
+        _open_pos_n = count_live_hedges(held, positions_meta, now_s)
+        _wait_pos_n = max(0, count_wallet_bags(held) - _open_pos_n)
         _min_ttm_now = min((m.end_ts * 1000 - now_ms) / 60000 for m in markets) if markets else 999
         _hot_mode = _open_pos_n > 0 or (_min_ttm_now * 60) <= BUY_HORIZON_S
         _show_ui = (not _hot_mode) or (CYCLE % max(1, int(UI_EVERY_N_CYCLES)) == 0)
 
         if _show_ui:
+            _wait_bit = (
+                f"[dim]WAIT[/] [bold]{_wait_pos_n}[/] [dim]·[/] "
+                if _wait_pos_n else ""
+            )
             console.rule(
                 f"[bold bright_yellow]▲ TICK #{CYCLE:04d}[/] [dim]·[/] [bright_white]{now_str}[/] [dim]·[/] "
-                f"[bright_green]MKT[/] [bold]{len(markets):>2}[/] [dim]·[/] "
+                f"[bright_green]MKT[/] [bold]{len(_loop_markets)}[/][dim]/{len(markets)}[/] [dim]·[/] "
                 f"[bright_cyan]POS[/] [bold]{_open_pos_n:>2}[/] [dim]·[/] "
+                f"{_wait_bit}"
                 f"[bright_yellow]NAV[/] [bold]${pusd_bal:>7.2f}[/] [dim]▲[/]",
                 style="bright_yellow",
             )
@@ -3542,13 +3674,13 @@ while not _shutdown_requested:
                 save_json(STATE_FILE, positions_meta)
 
         # ================= POSITIONS TABLE =================
-        if held and _show_ui:
+        if _open_pos_n and _show_ui:
             table = Table(
-                title="[bold bright_cyan]≡ HELD POSITIONS ≡[/]  [dim]BTC 5M · BUY-SIDE[/]",
+                title="[bold bright_cyan]≡ HELD POSITIONS ≡[/]  [dim]BTC 5M · LIVE HEDGE[/]",
                 box=box.HEAVY_HEAD,
                 border_style="bright_blue",
                 title_style="bold bright_cyan",
-                show_lines=True,
+                show_lines=False,
             )
             table.add_column("INSTRUMENT", style="white", max_width=40)
             table.add_column("TTM", justify="right")
@@ -3564,9 +3696,9 @@ while not _shutdown_requested:
                     up_sz = up_p.get("size", 0)
                     dn_sz = dn_p.get("size", 0)
                     held_size = max(up_sz, dn_sz)
-                    if held_size < 0.01 and not up_p.get("redeemable") and not dn_p.get("redeemable"):
-                        continue
                     meta = positions_meta.get(cond, {})
+                    if not position_is_live_hedge(pos, meta, now_s):
+                        continue
                     leg = "up" if up_sz > 0.01 else "down" if dn_sz > 0.01 else "—"
                     entry = meta.get("fill_price", 0)
                     m = next((m for m in markets if m.condition_id == cond), None)
@@ -3611,86 +3743,80 @@ while not _shutdown_requested:
             console.print(table)
 
         # ================= REDEEM PHASE =================
-        _has_active_hedge_inventory = any(
-            max(
-                float(pos.get("up", {}).get("size", 0) or 0),
-                float(pos.get("dn", {}).get("size", 0) or 0),
-            ) > 0.01
-            and not (
-                pos.get("up", {}).get("redeemable")
-                or pos.get("dn", {}).get("redeemable")
-            )
-            for pos in held.values()
-        )
-        _entry_window_open = bool(
-            ENTRY_ENABLED
-            and _discovery_fresh
-            and any(
-                0 < market.end_ts - now_s <= float(BUY_HORIZON_S)
-                for market in markets
-            )
-        )
-        for cond, pos in held.items():
-            if _has_active_hedge_inventory or _entry_window_open:
-                break  # redemption HTTP must never delay a hedge or live entry
-            up_redeemable = pos.get("up", {}).get("redeemable", False)
-            dn_redeemable = pos.get("dn", {}).get("redeemable", False)
-            if not (up_redeemable or dn_redeemable):
+        # 5m windows are always open, so waiting for "idle" starved the pile
+        # (POS 700 leftover shares). Write-ahead on this thread, POST on the
+        # single-worker redeem executor — never block the 0.01s buy/hedge look.
+        _redeem_submit_dirty = False
+        for _fut in list(_redeem_submit_futures):
+            if not _fut.done():
                 continue
-            if cond in _redeem_permanent_failures:
-                continue
-            meta = positions_meta.setdefault(cond, {})
-            if meta.get("buy_uncertain") or meta.get("hedge_uncertain"):
-                continue  # reconcile execution and entry cost before redemption
-            if meta.get("redeem_pending"):
-                continue  # submission is not settlement; operator/receipt reconciliation required
-            last = meta.get("redeem_submitted_at") or 0
-            if now_ms - last < REDEEM_THROTTLE_S * 1000:
-                continue
-            m = next((m for m in markets if m.condition_id == cond), None)
-            if m:
-                end_ts_ms = m.end_ts * 1000
-            else:
-                end_date = meta.get("end_date", "")
-                end_ts_ms = now_ms
-                if end_date:
-                    try:
-                        end_dt = datetime.fromisoformat(end_date.replace("Z", "+00:00"))
-                        end_ts_ms = end_dt.timestamp() * 1000
-                    except Exception:
-                        pass
-            if now_ms - end_ts_ms > MAX_REDEEM_AGE_DAYS * 86400 * 1000:
-                continue
-            # Write-ahead before relayer POST so a crash cannot lose the intent
-            # and submit a duplicate redeem on restart.
-            meta["redeem_intent_at"] = now_ms
-            meta["redeem_expected_value"] = round(
-                max(
-                    float(pos.get("up", {}).get("size", 0) or 0),
-                    float(pos.get("dn", {}).get("size", 0) or 0),
-                ),
-                4,
-            )
-            save_json(STATE_FILE, positions_meta)
-            tx = redeem_condition(cond, label=(meta.get("question", "?"))[:32])
-            # Always stamp the attempt so REDEEM_THROTTLE_S applies on failures
-            # too (otherwise zero-payout 400s spam the relayer every cycle).
-            meta["redeem_submitted_at"] = now_ms
+            _payload = _redeem_submit_futures.pop(_fut)
+            _cond = _payload["cond"]
+            _meta = positions_meta.setdefault(_cond, {})
+            try:
+                tx = _fut.result()
+            except Exception as exc:
+                tx = None
+                log_event(
+                    "redeem_submit_fail",
+                    condition_id=_cond,
+                    error=f"{type(exc).__name__}: {exc}"[:180],
+                )
+            _meta["redeem_submitted_at"] = now_ms
             if tx:
-                meta["redeem_pending"] = True
-                meta["redeem_tx_id"] = str(tx)
-                meta.pop("redeem_intent_at", None)
-                log_event("redeem_submit", condition_id=cond, tx_id=str(tx))
-                save_json(STATE_FILE, positions_meta)
+                _meta["redeem_pending"] = True
+                _meta["redeem_tx_id"] = str(tx)
+                _meta.pop("redeem_intent_at", None)
+                log_event("redeem_submit", condition_id=_cond, tx_id=str(tx))
             else:
-                # Leave intent so a later cycle can retry unless permanently
-                # blacklisted by redeem_condition.
-                meta.pop("redeem_pending", None)
-                meta.pop("redeem_tx_id", None)
+                _meta.pop("redeem_pending", None)
+                _meta.pop("redeem_tx_id", None)
+                if _cond in _redeem_permanent_failures:
+                    _meta.pop("redeem_intent_at", None)
+                    _meta["redeem_abandoned"] = True
+            _redeem_submit_dirty = True
+        if _redeem_submit_dirty:
+            save_json(STATE_FILE, positions_meta)
+
+        _redeem_busy = any(not f.done() for f in _redeem_submit_futures)
+        if (
+            not _redeem_busy
+            and (_now_mono - _last_redeem_enqueue_mono) >= _REDEEM_ENQUEUE_MIN_S
+        ):
+            for cond, pos in held.items():
+                if position_is_live_hedge(pos, positions_meta.get(cond), now_s):
+                    continue
+                up_redeemable = pos.get("up", {}).get("redeemable", False)
+                dn_redeemable = pos.get("dn", {}).get("redeemable", False)
+                if not (up_redeemable or dn_redeemable):
+                    continue
                 if cond in _redeem_permanent_failures:
-                    meta.pop("redeem_intent_at", None)
-                    meta["redeem_abandoned"] = True
+                    continue
+                meta = positions_meta.setdefault(cond, {})
+                if meta.get("buy_uncertain") or meta.get("hedge_uncertain"):
+                    continue
+                if meta.get("redeem_pending"):
+                    continue
+                last = meta.get("redeem_submitted_at") or 0
+                if now_ms - last < REDEEM_THROTTLE_S * 1000:
+                    continue
+                m = next((m for m in markets if m.condition_id == cond), None)
+                if m:
+                    end_ts_ms = m.end_ts * 1000
+                else:
+                    end_ts = meta_end_ts(meta)
+                    end_ts_ms = (end_ts * 1000) if end_ts > 0 else now_ms
+                if now_ms - end_ts_ms > MAX_REDEEM_AGE_DAYS * 86400 * 1000:
+                    continue
+                meta["redeem_intent_at"] = now_ms
+                meta["redeem_expected_value"] = round(bag_size(pos), 4)
                 save_json(STATE_FILE, positions_meta)
+                _fut = _redeem_executor.submit(
+                    redeem_condition, cond, (meta.get("question", "?"))[:32],
+                )
+                _redeem_submit_futures[_fut] = {"cond": cond}
+                _last_redeem_enqueue_mono = _now_mono
+                break
 
         # ================= COLLECT PRE-FETCHED BOOKS =================
         _book_cache = {}
@@ -3707,7 +3833,9 @@ while not _shutdown_requested:
         # Overlay WS top-of-book. Held tokens use hedge_quote_max_age_s so a
         # stale-high WS quote cannot overwrite REST and suppress hedge checks.
         _held_tokens = set()
-        for _p in held.values():
+        for _cid, _p in held.items():
+            if not position_is_live_hedge(_p, positions_meta.get(_cid), now_s):
+                continue
             for _leg in ("up", "dn"):
                 _info = _p.get(_leg) or {}
                 if float(_info.get("size", 0) or 0) > 0.01 and _info.get("asset"):
@@ -3719,7 +3847,7 @@ while not _shutdown_requested:
                 _book_cache[_t] = _wq
 
         # ================= HEDGE + BUY PHASE =================
-        for m in markets:
+        for m in _loop_markets:
             cond = getattr(m, "condition_id", None)
             try:
                 end_ts_ms = m.end_ts * 1000
@@ -4600,11 +4728,7 @@ while not _shutdown_requested:
                 # (silent continue). Only non-redeemable size counts as open risk.
                 open_conditions = set()
                 for c, p in held.items():
-                    up_sz = float(p.get("up", {}).get("size", 0) or 0)
-                    dn_sz = float(p.get("dn", {}).get("size", 0) or 0)
-                    up_live = up_sz > 0.01 and not p.get("up", {}).get("redeemable")
-                    dn_live = dn_sz > 0.01 and not p.get("dn", {}).get("redeemable")
-                    if up_live or dn_live:
+                    if position_is_live_hedge(p, positions_meta.get(c), now_s):
                         open_conditions.add(c)
                 open_conditions |= {
                     c for c, pm in positions_meta.items() if pm.get("buy_uncertain")
@@ -5338,12 +5462,13 @@ while not _shutdown_requested:
             box=box.HEAVY_EDGE,
         ))
 
-    # Variable polling: sub-second in/around buy window OR while holding
+    # Variable polling: 0.01s in/around buy window OR while holding a *live*
+    # hedge. Leftover unredeemed bags are WAIT, not held.
     _now = time.time() * 1000
     _min_ttm_s = min((m.end_ts * 1000 - _now) / 1000 for m in markets) if markets else 9999
     _has_held = any(
-        max(p.get("up", {}).get("size", 0), p.get("dn", {}).get("size", 0)) > 0.01
-        for p in held.values()
+        position_is_live_hedge(p, positions_meta.get(c), now_s)
+        for c, p in held.items()
     )
     if _has_held:
         _sleep_s = min(POLL_HELD_S, POLL_BUY_WINDOW_S)
@@ -5355,14 +5480,19 @@ while not _shutdown_requested:
     # ================= KICK OFF NEXT CYCLE'S BOOK FETCH =================
     _next_now = time.time() * 1000 + _sleep_s * 1000
     _pending_tokens = set(_pending_book_futs.values())
-    _MAX_PENDING_BOOKS = 30
+    _MAX_PENDING_BOOKS = 8
     _watch_tokens = set()
     for m in markets:
-        _ml_s = (m.end_ts * 1000 - _next_now) / 1000
         pos = held.get(m.condition_id, {})
-        has_pos = max(pos.get("up", {}).get("size", 0), pos.get("dn", {}).get("size", 0)) > 0.01
+        meta = positions_meta.get(m.condition_id, {})
+        if not market_needs_fast_path(
+            m, pos, meta, now_s, BUY_HORIZON_S,
+        ):
+            continue
+        has_pos = position_is_live_hedge(pos, meta, now_s)
+        _ml_s = (m.end_ts * 1000 - _next_now) / 1000
         in_window = _ml_s > 0 and _ml_s <= BUY_HORIZON_S + 30
-        if not (in_window or has_pos):
+        if not (in_window or has_pos or meta.get("buy_uncertain") or meta.get("hedge_uncertain")):
             continue
         for token in (m.up_token, m.dn_token):
             if not token:
@@ -5372,7 +5502,6 @@ while not _shutdown_requested:
                 (pos.get("up", {}).get("size", 0) > 0.01 and token == m.up_token)
                 or (pos.get("dn", {}).get("size", 0) > 0.01 and token == m.dn_token)
             ):
-                # Always watch the held leg tightly
                 _watch_tokens.add(token)
             if token not in _pending_tokens and len(_pending_book_futs) < _MAX_PENDING_BOOKS:
                 _pending_book_futs[_book_executor.submit(get_quote_fast, token)] = token
