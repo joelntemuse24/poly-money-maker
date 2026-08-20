@@ -454,13 +454,20 @@ journal is capped via `deploy/journald-size.conf`. Pathlog ticks are capped in
 The live bot is **one** (window, band, size, BTC gate) tuple. Pathlog records
 CLOB paths for 5m, 15m, and hourly whether or not that service is posting.
 **Compare alternatives on those ticks before changing live JSON.** Watching the
-site is not a sample; `--anatomy` / `--compare` / `--grid` are.
+site is not a sample; `--anatomy` / `--compare` / `--grid` / `--sweep` are.
+`--paper` walks ticks after the fill for a 35/40/15 hedge using mid as GUI
+when spread ≤ 10¢ (no last-trade in the recorder). `--sweep` uses
+`strategy_buy5m.example.json` as the live template and varies one knob at a
+time. Cloud agents: `CLOUD_RESEARCH.md` (ticks must be on the snapshot; never
+`.env`).
 
 | Question | Command |
 |---|---|
 | Already decided at T-120, or 50/50 until the end? | `check_path_backtest.py --anatomy --series 5m` |
 | Earlier window / wider band vs live 75–90 / 120s? | `--compare --series 5m --budget 2.5` |
-| Size ($2.50 vs $15) on the same paths? | `--compare` / `--grid` with `--budget 15` |
+| Same presets with paper hedge (not ride-to-$1/0)? | `--compare --paper --series 5m --budget 2.5` |
+| Template + one-at-a-time variants (research agents) | `--sweep --series 5m` |
+| Size ($2.50 vs $15) on the same paths? | `--compare` / `--grid` / `--sweep` `budget_15` |
 | Ask × seconds-left heat map | `--grid --series 5m --budget 2.5` |
 | What this process actually skipped | `check_buy_skips.py` (counts ≠ unique markets) |
 | BTC-gate counterfactual | `check_edge_counterfactual.py --bot 5m` |

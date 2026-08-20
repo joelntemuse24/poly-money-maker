@@ -14,8 +14,11 @@ from check_path_backtest import (
     infer_winner,
     load_market_file,
     matches_series,
+    paper_settle,
     simulate_fak_buy,
     summarize,
+    sweep_variants,
+    template_from_strategy,
 )
 
 
@@ -303,5 +306,86 @@ class WindowAnatomyTests(unittest.TestCase):
         self.assertEqual(row["first_in_band_ttm"], 90)
 
 
+class PaperExitTests(unittest.TestCase):
+    def test_gui_proxy_hedges_tight_reversal(self):
+        fill = simulate_fak_buy(2.5, 0.80, None)
+        hit = {"ts": 1, "ttm": 90, "leg": "up", "ask": 0.80}
+        ticks = [
+            _tick(1, 90, 0.80, 0.20),
+            _tick(2, 40, 0.32, 0.72, ub=0.25, db=0.68),
+        ]
+        out = paper_settle(ticks, hit, fill, winner="down")
+        self.assertEqual(out["exit"], "hedge")
+        self.assertAlmostEqual(out["exit_bid"], 0.25)
+        self.assertLess(out["pnl"], 0)
+        self.assertGreater(out["pnl"], -2.5)
+
+    def test_wide_book_does_not_hedge_without_last_trade(self):
+        fill = simulate_fak_buy(2.5, 0.80, None)
+        hit = {"ts": 1, "ttm": 90, "leg": "up", "ask": 0.80}
+        ticks = [
+            _tick(1, 90, 0.80, 0.20),
+            _tick(2, 40, 0.32, 0.99, ub=0.01, db=0.01),
+        ]
+        out = paper_settle(ticks, hit, fill, winner="down")
+        self.assertEqual(out["exit"], "redeem_loss")
+        self.assertAlmostEqual(out["pnl"], -2.5)
+
+    def test_toxic_recovered_book_rides(self):
+        fill = simulate_fak_buy(2.5, 0.60, None)
+        hit = {"ts": 1, "ttm": 90, "leg": "up", "ask": 0.60}
+        ticks = [
+            _tick(1, 90, 0.60, 0.40),
+            _tick(2, 50, 0.97, 0.03, ub=0.97, db=0.02),
+        ]
+        out = paper_settle(ticks, hit, fill, winner="up", toxic_force_exit_below=0.65)
+        self.assertEqual(out["exit"], "redeem_win")
+        self.assertGreater(out["pnl"], 0)
+
+    def test_toxic_dead_book_dumps_without_gui(self):
+        fill = simulate_fak_buy(2.5, 0.60, None)
+        hit = {"ts": 1, "ttm": 90, "leg": "up", "ask": 0.60}
+        ticks = [
+            _tick(1, 90, 0.60, 0.40),
+            _tick(2, 50, 0.99, 0.11, ub=0.11, db=0.01),
+        ]
+        out = paper_settle(ticks, hit, fill, winner="up", toxic_force_exit_below=0.65)
+        self.assertEqual(out["exit"], "toxic_dump")
+        self.assertAlmostEqual(out["exit_bid"], 0.11)
+
+
+class SweepTemplateTests(unittest.TestCase):
+    def test_template_reads_5m_example(self):
+        tmpl = template_from_strategy(
+            Path(__file__).resolve().parents[1] / "strategy_buy5m.example.json"
+        )
+        self.assertEqual(tmpl["ask_min"], 0.75)
+        self.assertEqual(tmpl["ask_max"], 0.90)
+        self.assertEqual(tmpl["ttm_max"], 120.0)
+        self.assertEqual(tmpl["budget"], 2.5)
+        self.assertTrue(tmpl["hedge_require_gui"])
+        self.assertEqual(tmpl["hedge_threshold"], 0.35)
+
+    def test_sweep_starts_from_live_template(self):
+        tmpl = template_from_strategy(
+            Path(__file__).resolve().parents[1] / "strategy_buy5m.example.json"
+        )
+        names = [row["name"] for row in sweep_variants(tmpl)]
+        self.assertEqual(names[0], "live_5m_paper")
+        self.assertIn("live_5m_ride", names)
+        self.assertIn("window_180s", names)
+        self.assertIn("band_70_90", names)
+        self.assertIn("budget_15", names)
+        self.assertIn("no_spread_cap", names)
+
+    def test_sweep_without_ticks_exits_2(self):
+        from check_path_backtest import main
+
+        with tempfile.TemporaryDirectory() as tmp:
+            rc = main(["--sweep", "--series", "5m", "--dir", tmp])
+        self.assertEqual(rc, 2)
+
+
 if __name__ == "__main__":
     unittest.main()
+
