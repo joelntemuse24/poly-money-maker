@@ -94,25 +94,24 @@ it **redeems** on-chain for $1.00 per share. There is **no** “take profit at
 even make $0.30 before $1.00, and on an 80¢ fill selling at 90¢ throws away
 the rest of the ride to $1.00.
 
-**Live 5m entries (union of windows):**
+**Live 5m entries (two $2.50 slices, up to $5 if both fill):**
 
-| Time left until close (TTM) | Winning ask the bot will consider |
-|---|---|
-| More than 300 seconds | none — too early |
-| 120s < TTM ≤ 300s (first ~3 minutes) | **90¢ through 99¢** |
-| 60s ≤ TTM ≤ 300s (first ~4 minutes) | **also 95¢ through 99¢** |
-| TTM ≤ 120s (last 2 minutes) | **75¢ through 99¢** |
+| Time left until close (TTM) | Winning ask | Slice |
+|---|---|---|
+| More than 300 seconds | none — too early | — |
+| 120s < TTM ≤ 300s (first ~3 minutes) | **90¢ through 99¢** (and ≥95 overlay) | **$2.50** early |
+| TTM ≤ 120s (last 2 minutes) | **75¢ through 90¢** | **$2.50** late |
 
-Last 120s is the full 75–99¢ range. There is **no** 91–94¢ hole. The ≥95
-window still overlaps TTM 60–120s, but late already covers those asks.
-First 3 minutes stay **90–99¢** (not 75¢). Do not raise live `buy_max_price`
-to 0.99 — that knob is the early ≥90 floor; last-120s cap is
-`early_buy_max_price`.
+Last 120s is **75–90¢ only**. There **is** a 91–99¢ hole after T-120 on
+purpose: that is the vol the second slice refuses to pay. The ≥95 overlay
+does **not** fire in the last 120s. First 3 minutes stay **90–99¢**.
+`buy_max_price` 0.90 is the late cap and the early ≥90 floor; early FAK
+limit is `early_buy_max_price` 0.99.
 
-**Budget:** $2.50 per market, hard cap $3, share rail 5 shares. At 75¢ that is
-about 3.3 shares. If that ride wins, profit is roughly
-`(1.00 − 0.75) × 3.3 ≈ $0.83` before fees. A 95¢ fill that wins is only about
-5¢ per share.
+**Budget:** $2.50 per slice, hard cap $3 **per FAK**, share rail 5 shares
+per FAK. Missed early does not roll into a $5 late buy. A late add is
+**same-leg only** (holding Down and seeing Up at 80¢ skips). Hedge sells
+the combined bag.
 
 **Hedge (5m):** sell only when the **held** book looks collapsed — bid ≤ 50¢
 **and** ask ≤ 55¢, spread tight — **and** the website-style prices agree that
@@ -460,7 +459,7 @@ hard exit (you will fail later on POST if allowance is actually missing).
 
 Then: `MarketGateway`, `get_btc_feed(...)`, `get_book_feed()`. Those start
 background threads. Then the ASCII banner (the 97¢ / 65¢ text in the banner
-is **cosmetic leftover** — live knobs are 75–99 / 50/55). Then
+is **cosmetic leftover** — live knobs are two $2.50 slices / 50/55). Then
 `load_json(STATE_FILE)` and the `while` loop.
 
 ---
@@ -617,8 +616,9 @@ bid.
 exclusive, and a name (`late` / `early` / `early_95`).
 
 `applicable_entry_bands(seconds_left, ...)` appends every band whose TTM
-window contains `seconds_left`. **Union, not first-match-wins.** Last 90s
-can be late 75–99 **and** early_95 ≥95 at the same time.
+window contains `seconds_left`. **Union, not first-match-wins**, except the
+last 120s is **late 75–90 only** (early_95 does not overlay T-120). First
+3 min can be early ≥90 **and** early_95 ≥95 at the same time.
 
 `ask_in_any_band` is the gate.
 
@@ -628,24 +628,29 @@ last 120s matches **late** (floor 75¢), not ≥95 — a walk to 91¢ stays in-b
 
 `union_ask_band_reason` labels skips: below the lowest floor →
 `ask_below_band`; above the highest cap → `ask_above_band`. Live last-120s
-75–99 has no hole; `ask_out_of_band` is for prices between disjoint bands
-if those return.
+75–90 has no hole inside that band; 91¢ in the last 120s is
+`ask_above_band`.
 
 `buybot5m.current_entry_bands` is a one-liner wrapper. Last-120s
-`late_max` is `EARLY_BUY_MAX_PRICE` (0.99), **not** `BUY_MAX_PRICE` (0.90).
-`BUY_MAX_PRICE` remains the first-3-min ≥90 floor. `BUY_HORIZON_S =
-max(120, 300, 300) = 300` so hot polling and websocket subscribe actually
-run in the first 3–4 minutes. If horizon were still 120, the early bands
-would exist in JSON and never be looked at.
+`late_max` is `BUY_MAX_PRICE` (0.90), **not** `EARLY_BUY_MAX_PRICE` (0.99).
+`BUY_MAX_PRICE` is both the late cap and the first-3-min ≥90 floor.
+`BUY_HORIZON_S = max(120, 300, 300) = 300` so hot polling and websocket
+subscribe actually run in the first 3 minutes.
 
-**Other gates (all must pass), in the loop after “we do not already hold”:**
+**Two slices:** `buy_budget` $2.50 early, `late_buy_budget` $2.50 late.
+`early_bought` / `late_bought` in state. Same-token add; `buy_skip_other_leg`
+if the late winner is the other side. Hedge is unchanged on the combined
+size.
+
+**Other gates (all must pass):**
 
 1. `ENTRY_ENABLED`
 2. Fresh Gamma discovery (stale catalog → hedge-only)
 3. Fresh positions snapshot and fresh USDC balance (never spend against
    unknown collateral)
 4. Not `buy_uncertain` (quarantine)
-5. Not `bought_token` (one entry)
+5. Not this slice already filled (`early_bought` / `late_bought`); same-leg
+   late add is allowed
 6. Past `buy_grace_s` after first sighting
 7. Risk caps
 8. Cooldown after empty FAK
@@ -707,7 +712,7 @@ No client call.
      save fails → **do not POST** (`persist_fail`).
    - Sign order; `signed_order_id` hashes EIP-712 typed data so the id is
      **determined before** the network — crash recovery can look it up.
-   - POST FAK limit at the **band max** (5m: 99¢). Size is still `budget/ask`.
+    - POST FAK limit at the **band max** (5m late 90¢, early 99¢). Size is still `budget/ask`.
 3. `confirm_fill_size` decides matched shares:
    - Terminal `matched` + confirmed trades → trust making/taking.
    - `delayed` POST can echo the **unsigned full size** before any match —
@@ -907,12 +912,11 @@ window is a “hit.” Paper hedge walks later ticks with the **example JSON**
 hedge (5m: 50/55/15) using mid as GUI when spread ≤ 10¢. Pathlog has **no**
 last-trade, **no** BTC/PTB, **no** POST latency.
 
-**`--sweep` / `--compare` do not replay the early ≥90 / ≥95 union.** They
-use `buy_threshold` / `early_buy_max_price` / `buy_start_s` (late 75–99 /
-120s) plus paper hedge keys. `buy_max_price` 0.90 is the early ≥90 floor,
-not the paper late cap. `live_5m_paper` is that late rule, not the full live
-bot. Extra combos (`band_75_90`, `window_240s`) are one-knob variants, still
-not the union.
+**`--sweep` / `--compare` do not replay the early ≥90 / ≥95 union or two
+slices.** They use `buy_threshold` / `buy_max_price` / `buy_start_s` (late
+75–90 / 120s) plus paper hedge keys. `live_5m_paper` is that late rule, not
+the full live bot. Extra combos (`band_75_90` is now the baseline,
+`window_240s`) are one-knob variants, still not the union.
 
 `--series 5m` must not match filenames containing `15m` (the letters `5m`
 appear inside `15m`). The filter is exact-series, not a substring.

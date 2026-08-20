@@ -610,12 +610,18 @@ class AmbiguousCrossCyclePolicy(unittest.TestCase):
     def test_known_cost_assigned_before_buy_uncertain_spend_cap(self):
         needle = "min(float(BUY_BUDGET), float(BUY_MAX_SPEND)) - known_cost"
         assign = 'known_cost = float(meta.get("buy_uncertain_known_cost")'
-        for bot in (BOT, BOT5M, BOT_HR):
+        for bot in (BOT, BOT_HR):
             src = bot.read_text()
             use = src.find(needle)
             self.assertGreater(use, -1, bot.name)
             defined = src.rfind(assign, 0, use)
             self.assertGreater(defined, -1, bot.name)
+        five = BOT5M.read_text()
+        self.assertIn("uncertain_buy_spend_cap(", five)
+        five_assign = five.find(assign)
+        five_use = five.find("spend_cap=uncertain_buy_spend_cap(", five_assign)
+        self.assertGreater(five_assign, -1)
+        self.assertGreater(five_use, five_assign)
 
     def test_cycle_error_logs_error_field(self):
         for bot in (BOT, BOT5M, BOT_HR):
@@ -675,8 +681,12 @@ class AmbiguousCrossCyclePolicy(unittest.TestCase):
         self.assertIn("applicable_entry_bands", five)
         self.assertIn("EARLY_BUY_START_S", five)
         self.assertIn("EARLY_95_START_S", five)
-        self.assertIn("late_max=EARLY_BUY_MAX_PRICE", five)
-        self.assertNotIn("late_max=BUY_MAX_PRICE", five)
+        self.assertIn("late_max=BUY_MAX_PRICE", five)
+        self.assertNotIn("late_max=EARLY_BUY_MAX_PRICE", five)
+        self.assertIn("LATE_BUY_BUDGET", five)
+        self.assertIn("stamp_slice_bought", five)
+        self.assertIn("accumulate_buy_inventory", five)
+        self.assertIn("buy_skip_other_leg", five)
         self.assertIn('"hedge_threshold": 0.50', five)
         self.assertIn('"hedge_require_ask_max": 0.55', five)
         self.assertNotIn(
@@ -1107,7 +1117,7 @@ class BuyExecutionAmbiguity(unittest.TestCase):
 
 
 class FiveMinuteBandLimitFakTests(unittest.TestCase):
-    """5m FAK limit is the open band max (99¢); size stays budget/live ask."""
+    """5m FAK limit is the open band max (90¢ late, 99¢ early); size stays budget/ask."""
 
     def test_sizes_at_ask_maker_valid_at_band_max(self):
         ns = _load_funcs(
@@ -1119,10 +1129,10 @@ class FiveMinuteBandLimitFakTests(unittest.TestCase):
         fn = ns["quoted_buy_shares_up_to_limit"]
         at_ask = ns["quoted_buy_shares"]
         cases = (
-            (0.75, 0.99),   # last 120s
-            (0.83, 0.99),   # last 120s, live miss at 83¢
+            (0.75, 0.90),   # last 120s 75–90
+            (0.83, 0.90),   # last 120s, live miss at 83¢
             (0.91, 0.99),   # first 3 min ≥90
-            (0.96, 0.99),   # first 4 min ≥95
+            (0.96, 0.99),   # ≥95 overlay
         )
         for ask, limit in cases:
             shares = fn(2.50, ask, limit, 5.0, spend_cap=3.0)
@@ -1209,18 +1219,18 @@ class FiveMinuteBandLimitFakTests(unittest.TestCase):
         )
         return ns, calls
 
-    def test_late_window_posts_99_limit_sized_at_83_ask(self):
+    def test_late_window_posts_90_limit_sized_at_83_ask(self):
         ns, calls = self._namespace()
         ns["get_quote_fast"] = lambda *_a, **_k: (0.82, 0.5, 0.83, 10.0, None)
         result = ns["buy_market_with_retry"](
-            "token", 2.50, 0.99, min_price=0.75, max_retries=1,
+            "token", 2.50, 0.90, min_price=0.75, max_retries=1,
             on_submit=lambda *args: calls["submit"].append(args),
         )
         self.assertEqual(result, (0.0, 0.0, "empty"))
         self.assertEqual(len(calls["orders"]), 1)
-        self.assertAlmostEqual(calls["orders"][0]["price"], 0.99)
+        self.assertAlmostEqual(calls["orders"][0]["price"], 0.90)
         self.assertGreater(calls["orders"][0]["size"], 2.5)
-        self.assertLessEqual(calls["orders"][0]["size"] * 0.99, 3.0 + 1e-9)
+        self.assertLessEqual(calls["orders"][0]["size"] * 0.90, 3.0 + 1e-9)
 
     def test_early_90_and_95_windows_also_limit_at_99(self):
         ns, calls = self._namespace()
@@ -1378,12 +1388,16 @@ class BalanceAndGcSemantics(unittest.TestCase):
         self.assertEqual(five["hedge_require_ask_max"], 0.55)
         self.assertEqual(five["buy_threshold"], 0.75)
         self.assertEqual(five["buy_max_price"], 0.90)
+        self.assertEqual(five["buy_budget"], 2.5)
+        self.assertEqual(five["late_buy_budget"], 2.5)
         hourly = json.loads((root / "strategy_buyhourly.example.json").read_text())
         fifteen = json.loads((root / "strategy_buy.example.json").read_text())
         self.assertNotIn("early_buy_start_s", hourly)
         self.assertNotIn("early_buy_start_s", fifteen)
         self.assertNotIn("early_95_start_s", hourly)
         self.assertNotIn("early_95_start_s", fifteen)
+        self.assertNotIn("late_buy_budget", hourly)
+        self.assertNotIn("late_buy_budget", fifteen)
         self.assertEqual(hourly["hedge_threshold"], 0.35)
         self.assertEqual(fifteen["hedge_threshold"], 0.35)
 

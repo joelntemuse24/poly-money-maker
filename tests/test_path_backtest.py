@@ -364,7 +364,7 @@ class SweepTemplateTests(unittest.TestCase):
             Path(__file__).resolve().parents[1] / "strategy_buy5m.example.json"
         )
         self.assertEqual(tmpl["ask_min"], 0.75)
-        self.assertEqual(tmpl["ask_max"], 0.99)
+        self.assertEqual(tmpl["ask_max"], 0.90)
         self.assertEqual(tmpl["ttm_max"], 120.0)
         self.assertEqual(tmpl["budget"], 2.5)
         self.assertTrue(tmpl["hedge_require_gui"])
@@ -383,7 +383,7 @@ class SweepTemplateTests(unittest.TestCase):
         )
         names = [row["name"] for row in sweep_variants(tmpl)]
         self.assertEqual(names[0], "live_5m_paper")
-        self.assertEqual(sweep_variants(tmpl)[0]["ask_max"], 0.99)
+        self.assertEqual(sweep_variants(tmpl)[0]["ask_max"], 0.90)
         self.assertIn("live_5m_ride", names)
         self.assertIn("window_180s", names)
         self.assertIn("band_70_99", names)

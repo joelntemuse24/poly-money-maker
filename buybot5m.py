@@ -52,9 +52,16 @@ from buy.market import MarketGateway, MintMarket
 from buy.btc_price import get_btc_feed, append_research, SOURCE_TWAP_30
 from buy.clob_book_ws import get_book_feed
 from buy.entry_skip import (
+    accumulate_buy_inventory,
     applicable_entry_bands,
     ask_in_any_band,
+    can_arm_entry_slice,
+    entry_slice_budget,
+    is_late_entry_window,
+    same_token,
     select_entry_band,
+    stamp_slice_bought,
+    uncertain_buy_spend_cap,
     window_no_buy_reason,
 )
 
@@ -141,12 +148,11 @@ for _rounding in ROUNDING_CONFIG.values():
 # ------------------------- STRATEGY CONFIG -------------------------
 _STRATEGY_DEFAULTS = {
     "entry_enabled": False,
-    # Trigger at 75¢: buy as soon as the winning ask is ≥ 75¢, priced at the
-    # live ask (so early catches ≈ 75¢). Last 120s cap is early_buy_max_price
-    # (0.99) — 75–99¢. buy_max_price 0.90 is the first-3-min ≥90 floor, not
-    # the late-window ceiling. First 4 minutes (TTM 60–300s) may also buy at
-    # 95¢ or greater. BUY FAK size is budget/ask; limit is the open band max
-    # (99¢) so the order can take depth behind the touch.
+    # Two $2.50 slices, $5 total if both fill. Last 120s is 75–90¢
+    # (buy_max_price). First 3 min (TTM 120–300s) is ≥90¢ to 99¢; ≥95¢ is an
+    # early overlay only (not last 120s). Late FAK limit is 90¢; early is 99¢.
+    # Size is still budget/ask, clipped so size × limit ≤ buy_max_spend ($3)
+    # per FAK, not $6 across both slices.
     "buy_threshold": 0.75,
     "buy_max_price": 0.90,
     # Consensus on Polymarket GUI display price (mid if spread≤10¢ else last trade).
@@ -182,10 +188,10 @@ _STRATEGY_DEFAULTS = {
     # alone is not consensus (same lesson as not buying a random ask).
     "hedge_require_gui": True,
     "buy_start_s": 120,
-    # Whole 5m market: last 120s is 75–99¢; TTM (120, 300] buys ask ≥ 90¢.
+    # Whole 5m market: last 120s is 75–90¢; TTM (120, 300] buys ask ≥ 90¢.
     "early_buy_start_s": 300,
     "early_buy_max_price": 0.99,
-    # First 4 minutes of a 5m market: TTM [60, 300], ask >= 95¢.
+    # ≥95 overlay for TTM (120, 300] only. Last 120s stays 75–90.
     "early_95_start_s": 300,
     "early_95_min_s": 60,
     "early_95_min_price": 0.95,
@@ -195,9 +201,14 @@ _STRATEGY_DEFAULTS = {
     # Inner unmatched 400s re-quote immediately (up to max_retries).
     "empty_fak_cooldown_s": 0.15,
     "buy_budget": 2.5,
-    # Hard ceiling on USDC sent per market. Strategy is $2.50; never more than $3.
+    # Second $2.50 only in the last 120s (75–90). Missed early does not roll
+    # into late — late is still $2.50, not $5.
+    "late_buy_budget": 2.5,
+    # Hard ceiling on USDC sent per FAK. Each slice is $2.50; never more than $3
+    # on one POST. Two slices can spend ~$5 total.
     "buy_max_spend": 3.0,
-    # Sanity rail: ~3.3 sh at $2.50/75¢. Raise this when you raise the dollar size.
+    # Sanity rail per FAK: ~3.3 sh at $2.50/75¢. Two slices may exceed 5 shares
+    # combined; this cap is not a lifetime share limit.
     "buy_max_shares": 5.0,
     "max_open_positions": 0,  # 0 = unlimited
     "max_open_notional": 10000.0,
@@ -320,23 +331,27 @@ def load_strategy():
         if not cfg["dry_run"] and not cfg["hedge_enabled"]:
             raise ValueError("live mode requires hedge_enabled=true")
         for key in (
-            "buy_budget", "buy_max_spend", "buy_max_shares", "max_open_notional",
-            "max_daily_notional", "poll_buy_window_s", "poll_held_s",
-            "positions_refresh_s", "balance_refresh_s", "buy_start_s",
-            "early_buy_start_s", "early_95_start_s",
+            "buy_budget", "late_buy_budget", "buy_max_spend", "buy_max_shares",
+            "max_open_notional", "max_daily_notional", "poll_buy_window_s",
+            "poll_held_s", "positions_refresh_s", "balance_refresh_s",
+            "buy_start_s", "early_buy_start_s", "early_95_start_s",
             "ui_every_n_cycles",
         ):
             if float(cfg[key]) <= 0:
                 raise ValueError(f"{key} must be positive")
-        if float(cfg["buy_max_spend"]) + 1e-9 < float(cfg["buy_budget"]):
-            raise ValueError("buy_max_spend must be >= buy_budget")
+        _slice_budget = max(float(cfg["buy_budget"]), float(cfg["late_buy_budget"]))
+        if float(cfg["buy_max_spend"]) + 1e-9 < _slice_budget:
+            raise ValueError(
+                "buy_max_spend must be >= max(buy_budget, late_buy_budget)"
+            )
         _need_shares = max(
-            float(cfg["buy_budget"]), float(cfg["buy_max_spend"]),
+            _slice_budget, float(cfg["buy_max_spend"]),
         ) / float(cfg["buy_threshold"])
         if float(cfg["buy_max_shares"]) + 1e-9 < _need_shares:
             raise ValueError(
-                "buy_max_shares must be >= max(buy_budget, buy_max_spend) "
-                "/ buy_threshold (raise it when you raise the dollar size)"
+                "buy_max_shares must be >= max(buy_budget, late_buy_budget, "
+                "buy_max_spend) / buy_threshold (raise it when you raise "
+                "the dollar size)"
             )
         # 0 = unlimited open markets (probe: redeem lag must not freeze entries).
         if float(cfg["max_open_positions"]) < 0:
@@ -396,6 +411,7 @@ BUY_GRACE_S = _strat["buy_grace_s"]
 BUY_COOLDOWN_S = _strat["buy_cooldown_s"]
 EMPTY_FAK_COOLDOWN_S = _strat["empty_fak_cooldown_s"]
 BUY_BUDGET = _strat["buy_budget"]
+LATE_BUY_BUDGET = _strat["late_buy_budget"]
 BUY_MAX_SPEND = _strat["buy_max_spend"]
 BUY_MAX_SHARES = _strat["buy_max_shares"]
 MAX_OPEN_POSITIONS = _strat["max_open_positions"]
@@ -606,12 +622,12 @@ def log_buy_skip_throttled(reason, condition_id, event="buy_skip", **kwargs):
 
 
 def current_entry_bands(seconds_left):
-    """Open 5m buy bands at this TTM (late 75–99, early ≥90, first-4-min ≥95)."""
+    """Open 5m buy bands at this TTM (late 75–90, early ≥90, ≥95 overlay)."""
     return applicable_entry_bands(
         seconds_left,
         late_start_s=BUY_START_S,
         late_min=BUY_THRESHOLD,
-        late_max=EARLY_BUY_MAX_PRICE,
+        late_max=BUY_MAX_PRICE,
         early_start_s=EARLY_BUY_START_S,
         early_min=BUY_MAX_PRICE,
         early_max=EARLY_BUY_MAX_PRICE,
@@ -1379,7 +1395,7 @@ def quoted_buy_shares_up_to_limit(budget, ask, limit, share_cap=None, spend_cap=
     Count starts as ``budget/ask`` (same as ``quoted_buy_shares``). The CLOB
     maker amount is ``size × limit``, so shrink until that USDC is exact
     cents and at most ``spend_cap`` (``buy_max_spend``). The FAK then walks
-    asks from the touch up to the open band max (5m: 99¢ in every window).
+    asks from the touch up to the open band max (late 90¢, early 99¢).
     """
     shares = quoted_buy_shares(budget, ask, share_cap)
     limit_f = finite_float(limit, minimum=0, maximum=1)
@@ -2219,6 +2235,9 @@ _BUY_UNCERTAIN_KEYS = (
     "buy_uncertain_known_size",
     "buy_uncertain_known_cost", "buy_uncertain_observed_size",
     "buy_uncertain_observed_at", "buy_uncertain_observed_count",
+    "buy_uncertain_slice_prior_size", "buy_uncertain_slice_prior_cost",
+    "buy_uncertain_slice_prior_quoted", "buy_uncertain_slice_budget",
+    "buy_uncertain_late_slice",
 )
 
 _HEDGE_UNCERTAIN_KEYS = (
@@ -2255,7 +2274,7 @@ def buy_market_with_retry(
     """Buy token_id via FAK, sized in shares at the quoted ask.
 
     Sends ``budget/ask`` shares as a **limit** FAK at the **open band max**
-    (5m late / early / early_95 all cap at 99¢). Maker USDC is exact cents
+    (5m late 90¢, early / early_95 99¢). Maker USDC is exact cents
     (2 dp) at that limit and taker shares 4 dp — otherwise CLOB FAK BUY
     returns 400 ``invalid amounts``. This is not a USDC market order:
     leftover dollars would walk cheaper asks (9¢ junk under an 80¢ quote).
@@ -2264,8 +2283,9 @@ def buy_market_with_retry(
 
     Band is still min_price–max_price for *whether* to fire. The limit is
     max_price so the FAK can take depth behind the touch (83¢ clip gone,
-    84–99¢ still fills). $2.50 / 75¢ is ~3.3 shares; ``buy_max_shares``
-    (default 5) is the "wrong price" rail, not a displayed-size cap.
+    84–90¢ still fills in the late window). $2.50 / 75¢ is ~3.3 shares;
+    ``buy_max_shares`` (default 5) is the per-FAK "wrong price" rail, not a
+    displayed-size cap or a lifetime share limit.
 
     Returns (shares_bought, usdc_spent, status). status is filled|ambiguous|empty|aborted|persist_fail|dry.
     spent may be estimated when the exchange
@@ -3292,6 +3312,7 @@ while not _shutdown_requested:
         BUY_COOLDOWN_S = _strat["buy_cooldown_s"]
         EMPTY_FAK_COOLDOWN_S = _strat["empty_fak_cooldown_s"]
         BUY_BUDGET = _strat["buy_budget"]
+        LATE_BUY_BUDGET = _strat["late_buy_budget"]
         BUY_MAX_SPEND = _strat["buy_max_spend"]
         BUY_MAX_SHARES = _strat["buy_max_shares"]
         MAX_OPEN_POSITIONS = _strat["max_open_positions"]
@@ -3757,6 +3778,13 @@ while not _shutdown_requested:
                             / max(float(meta.get("buy_uncertain_price") or 0), 1e-9)
                         )
                     )
+                    slice_budget = float(
+                        meta.get("buy_uncertain_slice_budget")
+                        or BUY_BUDGET
+                    )
+                    slice_prior_cost = float(
+                        meta.get("buy_uncertain_slice_prior_cost") or 0
+                    )
                     inspected = inspect_uncertain_order(
                         uncertain_order_id,
                         side="BUY",
@@ -3764,9 +3792,11 @@ while not _shutdown_requested:
                         token_id=uncertain_token,
                         condition_id=cond,
                         limit_price=meta.get("buy_uncertain_price", 0),
-                        spend_cap=max(
-                            0.0,
-                            min(float(BUY_BUDGET), float(BUY_MAX_SPEND)) - known_cost,
+                        spend_cap=uncertain_buy_spend_cap(
+                            known_cost,
+                            slice_budget,
+                            BUY_MAX_SPEND,
+                            slice_prior_cost,
                         ),
                         trade_ids=meta.get("buy_uncertain_trade_ids"),
                     )
@@ -3783,7 +3813,10 @@ while not _shutdown_requested:
                         avg_fill = implied_buy_average(
                             resolved_cost, resolved_size, meta.get("buy_uncertain_price"),
                         )
-                        quoted = meta.get("quoted_buy_shares")
+                        quoted = meta.get("quoted_buy_shares_total") or (
+                            float(meta.get("buy_uncertain_slice_prior_quoted") or 0)
+                            + float(meta.get("quoted_buy_shares") or 0)
+                        ) or meta.get("quoted_buy_shares")
                         _, force_exit = classify_buy_fill(
                             avg_fill, resolved_size, quoted,
                             BUY_THRESHOLD, TOXIC_FORCE_EXIT_BELOW,
@@ -3798,6 +3831,7 @@ while not _shutdown_requested:
                         meta["fill_price"] = round(avg_fill, 4)
                         meta["pnl_entry_cost"] = round(resolved_cost, 4)
                         meta["toxic_fill"] = bool(force_exit or meta.get("toxic_fill"))
+                        stamp_slice_bought(meta, bool(meta.get("buy_uncertain_late_slice")))
                         leg_key = (
                             "up"
                             if str(meta["bought_leg"]).lower() == "up"
@@ -3886,11 +3920,14 @@ while not _shutdown_requested:
                         entry_cost = known_cost if known_cost > 0 else spend_est
                         if entry_cost <= 0:
                             entry_cost = min(
-                                float(BUY_BUDGET),
-                                float(BUY_MAX_SPEND),
+                                float(BUY_BUDGET) + float(LATE_BUY_BUDGET),
+                                float(BUY_MAX_SPEND) * 2,
                                 resolved_size * avg_est,
                             )
-                        quoted = meta.get("quoted_buy_shares")
+                        quoted = meta.get("quoted_buy_shares_total") or (
+                            float(meta.get("buy_uncertain_slice_prior_quoted") or 0)
+                            + float(meta.get("quoted_buy_shares") or 0)
+                        ) or meta.get("quoted_buy_shares")
                         avg_fill = implied_buy_average(entry_cost, resolved_size, avg_est)
                         _, force_exit = classify_buy_fill(
                             avg_fill, resolved_size, quoted, BUY_THRESHOLD, TOXIC_FORCE_EXIT_BELOW,
@@ -3901,6 +3938,7 @@ while not _shutdown_requested:
                         meta["fill_price"] = round(avg_fill, 4)
                         meta["pnl_entry_cost"] = round(entry_cost, 4)
                         meta["toxic_fill"] = bool(force_exit or meta.get("toxic_fill"))
+                        stamp_slice_bought(meta, bool(meta.get("buy_uncertain_late_slice")))
                         clear_uncertain_fields(meta, _BUY_UNCERTAIN_KEYS)
                         log_event(
                             "buy_uncertain_resolved", condition_id=cond, token_id=held_token,
@@ -4029,7 +4067,9 @@ while not _shutdown_requested:
                     continue
 
                 if held_size > 0.01 and not meta.get("hedge_closed"):
-                    quoted = meta.get("quoted_buy_shares")
+                    quoted = meta.get("quoted_buy_shares_total") or meta.get(
+                        "quoted_buy_shares"
+                    )
                     cost = float(meta.get("pnl_entry_cost") or meta.get("buy_uncertain_spend") or 0)
                     implied = implied_buy_average(
                         cost, held_size, meta.get("fill_price") or meta.get("buy_uncertain_price"),
@@ -4442,12 +4482,15 @@ while not _shutdown_requested:
                                             bid=hedge_bid, ask=hedge_ask, mid=fresh_mid,
                                         )
 
-                # --- BUY CHECK (for markets we don't hold) ---
-                if held_size > 0.01:
-                    continue  # already hold this market
+                # --- BUY CHECK (unheld, or same-leg late $2.50 add) ---
+                late_slice = is_late_entry_window(seconds_left, BUY_START_S)
+                if held_size > 0.01 and not late_slice:
+                    continue  # already hold; early slice cannot add
+                if held_size > 0.01 and meta.get("late_bought"):
+                    continue  # late $2.50 already used
                 bands = current_entry_bands(seconds_left)
                 if not bands:
-                    continue  # not in late 75–99¢, early ≥90¢, or first-4-min ≥95¢
+                    continue  # not in late 75–90¢, early ≥90¢, or ≥95¢ overlay
                 note_buy_window(
                     cond, m.end_ts, seconds_left, slug=getattr(m, "slug", None),
                     window=",".join(b.name for b in bands),
@@ -4475,8 +4518,30 @@ while not _shutdown_requested:
                 if meta.get("buy_uncertain"):
                     continue
 
-                # One entry per market
-                if ONE_ENTRY_PER_MARKET and meta.get("bought_token"):
+                slice_ok, slice_why = can_arm_entry_slice(
+                    meta,
+                    seconds_left=seconds_left,
+                    late_start_s=BUY_START_S,
+                    held_size=held_size,
+                    hedge_closed=bool(meta.get("hedge_closed")),
+                )
+                if not slice_ok:
+                    if slice_why == "slice_filled":
+                        continue
+                    if slice_why == "already_held":
+                        continue
+                    continue
+
+                # One fill per slice. bought_token still blocks a second early
+                # fill; a late add on the same token is the allowed exception.
+                if (
+                    ONE_ENTRY_PER_MARKET
+                    and meta.get("bought_token")
+                    and not late_slice
+                    and not meta.get("hedge_closed")
+                ):
+                    continue
+                if late_slice and meta.get("late_bought"):
                     continue
 
                 # Initialize meta for first sighting
@@ -4528,8 +4593,21 @@ while not _shutdown_requested:
                     if (pm.get("bought_token") or pm.get("buy_uncertain"))
                     and pm.get("entered_at", 0) >= _today_start_ms()
                 )
-                est_cost = min(float(BUY_BUDGET), float(BUY_MAX_SPEND))
-                if MAX_OPEN_POSITIONS > 0 and open_count >= MAX_OPEN_POSITIONS:
+                est_cost = min(
+                    entry_slice_budget(
+                        seconds_left,
+                        late_start_s=BUY_START_S,
+                        early_budget=BUY_BUDGET,
+                        late_budget=LATE_BUY_BUDGET,
+                    ),
+                    float(BUY_MAX_SPEND),
+                )
+                already_open = (
+                    cond in open_conditions
+                    or held_size > 0.01
+                    or bool(meta.get("bought_token"))
+                )
+                if MAX_OPEN_POSITIONS > 0 and open_count >= MAX_OPEN_POSITIONS and not already_open:
                     log_event(
                         "buy_skip_max_positions",
                         condition_id=cond,
@@ -4789,6 +4867,18 @@ while not _shutdown_requested:
                 if band is None:
                     continue
 
+                held_id = held_token or meta.get("bought_token")
+                if held_size > 0.01 and not same_token(held_id, buy_token):
+                    log_buy_skip_throttled(
+                        "other_leg",
+                        cond,
+                        event="buy_skip_other_leg",
+                        held_leg=held_leg or meta.get("bought_leg"),
+                        buy_leg=buy_leg,
+                        seconds_left=round(seconds_left, 1),
+                    )
+                    continue
+
                 # Cooldown (empty FAKs use the short empty_fak_cooldown_s).
                 last_buy_at = meta.get("last_buy_at") or 0
                 cooldown_s = (
@@ -4811,7 +4901,20 @@ while not _shutdown_requested:
                 ))
 
                 tick = get_tick_size_cached(buy_token)
-                spend_usd = min(float(BUY_BUDGET), float(BUY_MAX_SPEND))
+                spend_usd = min(
+                    entry_slice_budget(
+                        seconds_left,
+                        late_start_s=BUY_START_S,
+                        early_budget=BUY_BUDGET,
+                        late_budget=LATE_BUY_BUDGET,
+                    ),
+                    float(BUY_MAX_SPEND),
+                )
+                slice_prior_size = float(meta.get("bought_size") or 0)
+                slice_prior_cost = float(meta.get("pnl_entry_cost") or 0)
+                slice_prior_quoted = float(meta.get("quoted_buy_shares_total") or 0)
+                if slice_prior_quoted < 0.01 and slice_prior_size > 0.01:
+                    slice_prior_quoted = float(meta.get("quoted_buy_shares") or 0)
                 if uchk is None and m.start_ts:
                     uchk = btc_feed.underlying_check(m.start_ts, 0)  # snapshot only
                 log_event(
@@ -4819,6 +4922,8 @@ while not _shutdown_requested:
                     ask=buy_ask, gui=buy_gui, up_gui=up_gui, dn_gui=dn_gui,
                     threshold=band.min_price, max_price=band.max_price,
                     band=band.name, seconds_left=round(seconds_left, 1),
+                    slice="late" if late_slice else "early",
+                    add=slice_prior_size > 0.01,
                     ptb=(uchk or {}).get("ptb"),
                     live_btc=(uchk or {}).get("live_btc"),
                     edge_usd=(uchk or {}).get("edge_usd"),
@@ -4841,6 +4946,8 @@ while not _shutdown_requested:
                     "band": band.name,
                     "entry_min": band.min_price,
                     "entry_max": band.max_price,
+                    "slice": "late" if late_slice else "early",
+                    "add": slice_prior_size > 0.01,
                     **{k: (uchk or {}).get(k) for k in (
                         "ptb", "live_btc", "edge_usd", "favored", "ptb_source",
                         "live_source", "live_age_s", "ptb_skew_ms",
@@ -4857,24 +4964,30 @@ while not _shutdown_requested:
                             filled_total * float(buy_ask or BUY_THRESHOLD),
                         )
                         avg = spent_total / filled_total if filled_total else avg
-                    quoted = meta.get("quoted_buy_shares")
+                    this_quoted = meta.get("quoted_buy_shares")
                     _, force_exit = classify_buy_fill(
-                        avg, filled_total, quoted, BUY_THRESHOLD, TOXIC_FORCE_EXIT_BELOW,
+                        avg, filled_total, this_quoted, BUY_THRESHOLD, TOXIC_FORCE_EXIT_BELOW,
+                    )
+                    total_size, total_cost, total_quoted, vwap = accumulate_buy_inventory(
+                        slice_prior_size, slice_prior_cost, filled_total, spent_total,
+                        slice_prior_quoted, this_quoted,
                     )
                     meta["last_buy_at"] = time.time() * 1000
                     meta["bought_token"] = buy_token
                     meta.pop("last_buy_empty", None)
                     meta["bought_leg"] = buy_leg
-                    meta["bought_size"] = filled_total
-                    meta["fill_price"] = round(avg, 4)
-                    meta["pnl_entry_cost"] = round(spent_total, 4)
-                    meta["toxic_fill"] = bool(force_exit)
+                    meta["bought_size"] = total_size
+                    meta["fill_price"] = round(vwap or avg, 4)
+                    meta["pnl_entry_cost"] = round(total_cost, 4)
+                    meta["quoted_buy_shares_total"] = float(total_quoted or 0)
+                    meta["toxic_fill"] = bool(force_exit or meta.get("toxic_fill"))
+                    stamp_slice_bought(meta, late_slice)
                     leg_key = "up" if buy_leg == "up" else "dn"
                     _cached_positions.setdefault(cond, {})[leg_key] = {
                         "asset": buy_token,
-                        "size": float(filled_total),
+                        "size": float(total_size),
                         "redeemable": False,
-                        "avgPrice": float(avg),
+                        "avgPrice": float(vwap or avg),
                     }
                     save_json(STATE_FILE, positions_meta)
 
@@ -4911,6 +5024,12 @@ while not _shutdown_requested:
                     )
                     if trade_ids:
                         meta["buy_uncertain_trade_ids"] = trade_ids
+                    if not meta.get("buy_uncertain_slice_budget"):
+                        meta["buy_uncertain_slice_prior_size"] = float(slice_prior_size)
+                        meta["buy_uncertain_slice_prior_cost"] = float(slice_prior_cost)
+                        meta["buy_uncertain_slice_prior_quoted"] = float(slice_prior_quoted)
+                        meta["buy_uncertain_slice_budget"] = float(spend_usd)
+                        meta["buy_uncertain_late_slice"] = bool(late_slice)
                     meta["buy_uncertain_known_size"] = float(
                         meta.get("bought_size") or 0
                     )
@@ -4936,18 +5055,24 @@ while not _shutdown_requested:
                             bought * float(buy_ask or BUY_THRESHOLD),
                         )
                     avg_fill = implied_buy_average(spent, bought, buy_ask)
-                    quoted = meta.get("quoted_buy_shares")
+                    this_quoted = meta.get("quoted_buy_shares")
                     _, force_exit = classify_buy_fill(
-                        avg_fill, bought, quoted, BUY_THRESHOLD, TOXIC_FORCE_EXIT_BELOW,
+                        avg_fill, bought, this_quoted, BUY_THRESHOLD, TOXIC_FORCE_EXIT_BELOW,
+                    )
+                    total_size, total_cost, total_quoted, vwap = accumulate_buy_inventory(
+                        slice_prior_size, slice_prior_cost, bought, spent,
+                        slice_prior_quoted, this_quoted,
                     )
                     meta["last_buy_at"] = wall_ms
                     meta["bought_token"] = buy_token
                     meta.pop("last_buy_empty", None)
                     meta["bought_leg"] = buy_leg
-                    meta["bought_size"] = bought
-                    meta["fill_price"] = round(avg_fill, 4)
-                    meta["pnl_entry_cost"] = round(spent, 4)
-                    meta["toxic_fill"] = bool(force_exit)
+                    meta["bought_size"] = total_size
+                    meta["fill_price"] = round(vwap or avg_fill, 4)
+                    meta["pnl_entry_cost"] = round(total_cost, 4)
+                    meta["quoted_buy_shares_total"] = float(total_quoted or 0)
+                    meta["toxic_fill"] = bool(force_exit or meta.get("toxic_fill"))
+                    stamp_slice_bought(meta, late_slice)
                     if uchk:
                         meta["ptb"] = uchk.get("ptb")
                         meta["ptb_source"] = uchk.get("ptb_source")
@@ -4955,7 +5080,10 @@ while not _shutdown_requested:
                         meta["entry_edge_usd"] = uchk.get("edge_usd")
                     log_event(
                         "buy_success", condition_id=cond, leg=buy_leg, bought=bought,
+                        size=total_size,
                         price=meta["fill_price"], ask_gate=buy_ask, entry_cost=meta["pnl_entry_cost"],
+                        slice="late" if late_slice else "early",
+                        add=slice_prior_size > 0.01,
                         ptb=meta.get("ptb"), live_btc=meta.get("entry_live_btc"),
                         edge_usd=meta.get("entry_edge_usd"),
                         toxic_fill=bool(meta.get("toxic_fill")),
@@ -4969,9 +5097,12 @@ while not _shutdown_requested:
                         "end_ts": m.end_ts,
                         "leg": buy_leg,
                         "bought": bought,
+                        "size": total_size,
                         "price": meta["fill_price"],
                         "ask_gate": buy_ask,
                         "entry_cost": meta["pnl_entry_cost"],
+                        "slice": "late" if late_slice else "early",
+                        "add": slice_prior_size > 0.01,
                         "ptb": meta.get("ptb"),
                         "live_btc": meta.get("entry_live_btc"),
                         "edge_usd": meta.get("entry_edge_usd"),
@@ -4982,7 +5113,8 @@ while not _shutdown_requested:
                         notify(
                             "TOXIC BUY — FORCE EXIT",
                             f"{m.question}\nBelow-band fill {buy_leg.upper()} at "
-                            f"~{meta['fill_price']:.3f} ({bought:.2f} shares, ${spent:.2f})\n"
+                            f"~{meta['fill_price']:.3f} ({bought:.2f} this slice, "
+                            f"{total_size:.2f} total, ${spent:.2f})\n"
                             "Will not ride to $1 — dumping at next usable bid",
                             priority="urgent",
                         )
@@ -4990,7 +5122,7 @@ while not _shutdown_requested:
                         notify(
                             "BUY FILLED / UNCERTAIN" if buy_status == "ambiguous" else "BUY FILLED",
                             f"{m.question}\nBought {buy_leg.upper()} at ~{meta['fill_price']:.3f} "
-                            f"({bought:.2f} shares, ${spent:.2f})"
+                            f"({bought:.2f} this slice, {total_size:.2f} total, ${spent:.2f})"
                             + ("\nFinal POST unresolved; market remains quarantined" if buy_status == "ambiguous" else ""),
                             priority="urgent" if buy_status == "ambiguous" else "high",
                         )
@@ -5007,6 +5139,7 @@ while not _shutdown_requested:
                     log_event(
                         "buy_uncertain", condition_id=cond, leg=buy_leg, budget=spend_usd,
                         ask=buy_ask, token_id=buy_token,
+                        slice="late" if late_slice else "early",
                     )
                     notify(
                         "BUY UNCERTAIN",
@@ -5023,7 +5156,7 @@ while not _shutdown_requested:
                         meta["last_buy_empty"] = True
                     else:
                         meta.pop("last_buy_empty", None)
-                    log_event("buy_fail", condition_id=cond, leg=buy_leg, budget=spend_usd, ask=buy_ask, status=buy_status)
+                    log_event("buy_fail", condition_id=cond, leg=buy_leg, budget=spend_usd, ask=buy_ask, status=buy_status, slice="late" if late_slice else "early")
                     save_json(STATE_FILE, positions_meta)
             except Exception as exc:
                 log_event(
