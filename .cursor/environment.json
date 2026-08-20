@@ -1,3 +1,3 @@
 {
-  "install": "python3 -m venv .venv\n.venv/bin/pip install -U pip\n.venv/bin/pip install -r requirements.txt"
+  "install": "sudo apt-get update\nsudo apt-get install -y python3.12-venv\npython3 -m venv .venv\n.venv/bin/pip install -U pip\n.venv/bin/pip install -r requirements.txt"
 }
