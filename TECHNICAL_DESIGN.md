@@ -682,9 +682,13 @@ shrinks until `size × band_max` is exact cents and ≤ `buy_max_spend`.
 `Decimal(str(x))` not `Decimal(x)`: `float(2.5)` is already binary-fuzzy;
 going through the string of the intended decimal is the usual money pattern.
 
-`buy_fill_walked`: confirmed shares > 1.05 × quoted. That means the bag
-walked cheaper levels. `classify_buy_fill` then sets `toxic_fill` if average
-`< toxic_force_exit_below` (65¢) **or** walked. Average is
+`buy_fill_walked`: confirmed shares > 1.05 × quoted. That still logs
+`buy_fill_walk` and, when fill cost is missing, attributes the full maker
+USDC. It does **not** arm `toxic_fill`. A 5m limit FAK sized at the 99¢
+(or 90¢) cap yields more shares when it prints cheaper than the cap; that
+is the intended fill, not a junk walk. `classify_buy_fill` sets
+`toxic_fill` only when average `< toxic_force_exit_below` (65¢), and
+`below_band` only when average `<` the open band min. Average is
 `USDC / shares` (`implied_buy_average`), never “extra shares × gate ask.”
 
 Fees: `_fill_fee_usdc` is the CLOB v2 taker curve

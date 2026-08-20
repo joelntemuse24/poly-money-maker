@@ -347,13 +347,22 @@ class BuyFillProductionHelpers(unittest.TestCase):
         below, toxic = classify(0.70, 3.12, 3.12, 0.75, 0.65)
         self.assertTrue(below)
         self.assertFalse(toxic)
+        # Extra shares vs the posted quote are not a dump while avg stays
+        # above the 65¢ floor (limit FAK at a better price).
+        below, toxic = classify(0.91, 2.175822, 2.00, 0.90, 0.65)
+        self.assertFalse(below)
+        self.assertFalse(toxic)
         # Missing quote must not false-toxic a 3-sh fill.
         self.assertFalse(self.ns["buy_fill_walked"](3.12, None))
         self.assertFalse(self.ns["buy_fill_walked"](3.12, 0.0))
         self.assertFalse(self.ns["buy_fill_walked"](3.12, 3.125))
         # A USDC leftover decoded as 2.50 "shares" looks like a walk — callers
-        # must persist quoted_buy_shares, not taker USDC.
+        # still persist quoted_buy_shares, not taker USDC, for buy_fill_walk
+        # logs. That walk no longer arms toxic_fill.
         self.assertTrue(self.ns["buy_fill_walked"](3.12, 2.50))
+        below, toxic = classify(0.80, 3.12, 2.50, 0.75, 0.65)
+        self.assertFalse(below)
+        self.assertFalse(toxic)
 
     def test_implied_average_is_usdc_over_shares_not_gate_ask(self):
         implied = self.ns["implied_buy_average"]
@@ -1247,6 +1256,35 @@ class FiveMinuteBandLimitFakTests(unittest.TestCase):
             on_submit=lambda *args: calls["submit"].append(args),
         )
         self.assertAlmostEqual(calls["orders"][0]["price"], 0.99)
+
+    def test_early_90_limit_fill_at_91_is_not_toxic(self):
+        """Live 20 Aug 19:42: $1.98 at 91¢ → 2.18 sh vs ~2.00 posted at 99¢."""
+        ns = _load_funcs(
+            "finite_float",
+            "quoted_buy_shares",
+            "quoted_buy_shares_up_to_limit",
+            "buy_fill_walked",
+            "classify_buy_fill",
+            bot=BOT5M,
+        )
+        posted = ns["quoted_buy_shares_up_to_limit"](
+            2.50, 0.90, 0.99, 5.0, spend_cap=3.0,
+        )
+        self.assertAlmostEqual(posted, 2.0)
+        filled = 1.98 / 0.91
+        self.assertTrue(ns["buy_fill_walked"](filled, posted))
+        below, toxic = ns["classify_buy_fill"](0.91, filled, posted, 0.90, 0.65)
+        self.assertFalse(below)
+        self.assertFalse(toxic)
+        late_posted = ns["quoted_buy_shares_up_to_limit"](
+            2.50, 0.75, 0.90, 5.0, spend_cap=3.0,
+        )
+        late_filled = 1.98 / 0.75
+        below, toxic = ns["classify_buy_fill"](
+            0.75, late_filled, late_posted, 0.75, 0.65,
+        )
+        self.assertFalse(below)
+        self.assertFalse(toxic)
 
 
 class SellExecutionAmbiguity(unittest.TestCase):

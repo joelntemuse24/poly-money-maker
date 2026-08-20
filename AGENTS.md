@@ -194,8 +194,8 @@ two-slice $2.50+$2.50 add.
 - `hedge_skip_incomplete_rest` — REST missing a side; fail closed (no WS sell)
 - `buy_skip_ambiguous` — GUI display prices too close (throttled 8s; **not** one event per market)
 - `buy_skip_no_consensus` — ask in band but GUI/tight-book gate failed
-- `buy_fill_below_band` — fill avg below band; inventory persisted + `toxic_fill` force-exit
-- `buy_fill_walk` — confirmed BUY shares exceeded the quoted budget/ask size (junk walk)
+- `buy_fill_below_band` — fill avg below the open band min; inventory persisted. `toxic_fill` only if avg also < 65¢
+- `buy_fill_walk` — confirmed shares > 1.05 × posted FAK size (normal when a 99¢/90¢ limit fills cheaper). Does **not** arm `toxic_fill` by itself
 - `buy_ghost_fill` — balance reconciliation after null/delayed BUY confirm
 - `buy_uncertain` — POST outcome unresolved; durable token/baseline quarantine blocks re-buy
 - `buy_skip_incomplete_book` — missing GUI price on a leg (no mid and no last trade)
