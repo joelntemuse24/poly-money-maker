@@ -18,15 +18,17 @@ cd ~/poly-money-maker
 tar czf /tmp/poly-research.tgz pathlog/ticks buybot5m.log
 ```
 
-Copy `/tmp/poly-research.tgz` off the box, unpack it at the repo root of a
-Cursor Cloud Environment so you have `pathlog/ticks/*.jsonl` and
-`buybot5m.log`, then **save a snapshot**. Refresh the snapshot when you want
-a newer sample.
+Copy `/tmp/poly-research.tgz` off the box. The Cloud Agent **cannot** read
+your laptop Downloads folder. Attach `poly-research.tgz` to the Cloud Agent
+chat (paperclip), then ask it to unpack at the repo root so you have
+`pathlog/ticks/*.jsonl` and `buybot5m.log`, then **save a snapshot**. Refresh
+the snapshot when you want a newer sample.
 
 Do **not** copy `.env`, `strategy_buy5m.json`, or `positions_buy*.json`.
 
-Environment install (already in `.cursor/environment.json`): venv +
-`pip install -r requirements.txt`. Leave **Start** empty.
+Environment install (`.cursor/environment.json`): `python3.12-venv`, then
+venv + `pip install -r requirements.txt`. Leave **Start** empty so agents
+never launch the live bots.
 
 ## 2. Launch prompt (paste into a new Cloud Agent)
 
