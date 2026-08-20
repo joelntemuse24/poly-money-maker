@@ -8,10 +8,11 @@ Last updated: **2026-08-20** — **only the 5m CLOB bot is live.** Stop/disable
 or above (to 99¢) in the first 3 minutes**, and **≥95¢ in the first 4 minutes**.
 Hedge is **50/55**. Chainlink TWAP
 gate is **$0** (any non-zero tick vs PTB; side must match; flat is still
-refused). Buys are **limit
-FAKs at the quoted ask** sized `budget/ask` (~3.3 shares at 75¢), clipped to
-`buy_max_shares` **5** (buffer). Hard spend ceiling `buy_max_spend` **$3**.
-Leftover USDC cannot walk into 9¢ junk. Displayed top size is **not** a cap.
+refused). Buys are **limit FAKs at the open band max (99¢)** sized
+`budget/ask` (~3.3 shares at 75¢), clipped so `size × 99¢` cannot exceed
+`buy_max_spend` **$3**. Share count still uses the live ask; the limit walks
+83¢→99¢ instead of dying when the top clip vanishes. Leftover USDC cannot
+walk into 9¢ junk. Displayed top size is **not** a cap.
 Hedge **trigger** is **50/55**, then the **same GUI/last-trade consensus as
 buy** (not a random TOB fill), then sell at the live bid. `toxic_fill` dumps
 without GUI only while bid ≤ 50¢. Pause minting.
@@ -38,7 +39,7 @@ first 4 minutes:
 | `buy_max_spend` | **$3.00** hard ceiling (strategy is $2.50; never more than ~$3) |
 | `buy_max_shares` | **5** buffer (~3.3 sh at $2.50/75¢) |
 | Ask band | **75–99¢** in the last **120s**. First **3 min** (`120 < TTM ≤ 300`): winning ask **≥ 90¢** up to 99¢. First **4 min** (`60 ≤ TTM ≤ 300`): also **≥ 95¢**. Same GUI / book / underlying gates. `buy_max_price` stays **0.90** (early ≥90 floor). Last-120s cap is `early_buy_max_price` **0.99**. |
-| Execution | FAK **limit** at the quoted ask, size `min(budget/ask, buy_max_shares)`. A clean **unmatched 400** re-quotes up to **3** FAKs in one trigger; then **0.15 s** cooldown. Unclear POSTs still quarantine (no second $2.50). |
+| Execution | FAK **limit at 99¢** (open band max) for late / early / ≥95, size `budget/ask` clipped so `size × 99¢` ≤ `$3`. Walks depth behind the touch. Unmatched 400 re-quotes up to **3** FAKs; then **0.15 s** cooldown. Unclear POSTs still quarantine. |
 | GUI consensus | winner ≥ 70¢, loser ≤ 30¢ |
 | Windows | 5m **whole market**: early ≥90¢ for TTM (120, 300]; ≥95¢ for TTM [60, 300]; late 75–99¢ for TTM ≤ 120s (15m / hourly bots **not running**) |
 | Hedge | **Trigger** bid ≤ **50¢** and ask ≤ **55¢**, spread ≤ 15¢, **plus** inverted buy GUI (held last trade ≤ 55¢, held GUI ≤ 30¢, other GUI ≥ 70¢). **Then sell at whatever the bid is** — no 32¢ floor. `toxic_fill` still dumps without GUI **only while held bid ≤ 50¢**; recovered books log `hedge_skip_toxic_recovered` and stay armed. |
@@ -186,14 +187,10 @@ amount / HTTP 400), not this NameError.
       After merge: `git pull` + `sudo systemctl restart polybuybot5m` (5m only).
       Live JSON does **not** need a new key — `empty_fak_cooldown_s` defaults to 0.15.
 - [ ] After merge: `git pull` then `sudo systemctl restart polybuybot5m` only.
-      Last 120s is **75–99¢** in code (`late_max = early_buy_max_price`). Live
-      JSON can keep `buy_max_price=0.90` (early ≥90 floor) — do **not** set it
-      to 0.99. Still patch hedge keys if missing (`hedge_threshold=0.50`,
-      `hedge_require_ask_max=0.55`; early-band keys default if omitted).
-      Watch `buy_attempt` `band=late` on 91–99¢ in the last 120s, `band=early`
-      / `early_95` earlier, and `hedge_attempt` once held bid ≤ 50¢. Live JSON
-      **must** set the hedge keys — otherwise the old 35/40 values stay
-      hot-reloaded.
+      5m BUY FAKs size `budget/ask` and **limit at 99¢** (all three windows).
+      No live JSON change. Watch `buy_fill` `limit=0.99` vs `ask` at the touch.
+      Empty 83¢-only FAKs should drop when 84–99¢ size exists. Do **not** start
+      15m / hourly / mint.
 - [ ] Cloud paper P&L: paste `CLOUD_RESEARCH.md` section 2 (live `pathlog.py`
       + `--sweep --paper`, rank by `pnl_sum` vs `live_5m_paper`). No `.env`.
       Optional: attach `poly-research.zip` for the historical tape. Not live

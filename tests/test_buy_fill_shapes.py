@@ -743,11 +743,22 @@ class AmbiguousCrossCyclePolicy(unittest.TestCase):
             self.assertIn('"buy_max_spend": 3.0', src, bot.name)
             self.assertIn('"buy_max_shares": 5.0', src, bot.name)
             self.assertIn("BUY_MAX_SHARES", src, bot.name)
-            self.assertIn(
-                "quoted_buy_shares(remaining_budget, fresh_ask, BUY_MAX_SHARES)",
-                src,
-                bot.name,
-            )
+            if bot == BOT5M:
+                self.assertIn("quoted_buy_shares_up_to_limit(", src, bot.name)
+                self.assertIn("price=limit_price", src, bot.name)
+                self.assertNotIn(
+                    "quoted_buy_shares(remaining_budget, fresh_ask, BUY_MAX_SHARES)",
+                    src,
+                    bot.name,
+                )
+            else:
+                self.assertIn(
+                    "quoted_buy_shares(remaining_budget, fresh_ask, BUY_MAX_SHARES)",
+                    src,
+                    bot.name,
+                )
+                self.assertIn("price = fresh_ask", src, bot.name)
+                self.assertNotIn("quoted_buy_shares_up_to_limit(", src, bot.name)
             self.assertIn("[THIN ASK]", src, bot.name)
             self.assertNotIn("min(budget / ask, ask_size)", src, bot.name)
             self.assertNotIn("[NO SIZE]", src, bot.name)
@@ -1093,6 +1104,139 @@ class BuyExecutionAmbiguity(unittest.TestCase):
         start = src.index("def sell_market_with_retry(")
         chunk = src[start : start + 250]
         self.assertIn('tick_size="0.001"', chunk)
+
+
+class FiveMinuteBandLimitFakTests(unittest.TestCase):
+    """5m FAK limit is the open band max (99¢); size stays budget/live ask."""
+
+    def test_sizes_at_ask_maker_valid_at_band_max(self):
+        ns = _load_funcs(
+            "finite_float",
+            "quoted_buy_shares",
+            "quoted_buy_shares_up_to_limit",
+            bot=BOT5M,
+        )
+        fn = ns["quoted_buy_shares_up_to_limit"]
+        at_ask = ns["quoted_buy_shares"]
+        cases = (
+            (0.75, 0.99),   # last 120s
+            (0.83, 0.99),   # last 120s, live miss at 83¢
+            (0.91, 0.99),   # first 3 min ≥90
+            (0.96, 0.99),   # first 4 min ≥95
+        )
+        for ask, limit in cases:
+            shares = fn(2.50, ask, limit, 5.0, spend_cap=3.0)
+            self.assertGreaterEqual(shares, 2.0, ask)
+            self.assertLessEqual(shares, at_ask(2.50, ask, 5.0) + 1e-12, ask)
+            self.assertLessEqual(shares * limit, 3.0 + 1e-9, ask)
+            maker = Decimal(str(shares)) * Decimal(str(limit))
+            self.assertEqual(maker.quantize(Decimal("0.01")), maker, ask)
+
+    def test_worst_case_spend_clips_to_buy_max_spend(self):
+        ns = _load_funcs(
+            "finite_float",
+            "quoted_buy_shares",
+            "quoted_buy_shares_up_to_limit",
+            bot=BOT5M,
+        )
+        shares = ns["quoted_buy_shares_up_to_limit"](
+            2.50, 0.75, 0.99, 5.0, spend_cap=3.0,
+        )
+        unclipped = ns["quoted_buy_shares"](2.50, 0.75, 5.0)
+        self.assertLess(shares, unclipped)
+        self.assertLessEqual(shares * 0.99, 3.0 + 1e-9)
+
+    @staticmethod
+    def _namespace():
+        ns = _load_funcs(
+            "finite_float",
+            "_result_as_dict",
+            "quoted_buy_shares",
+            "quoted_buy_shares_up_to_limit",
+            "buy_fill_walked",
+            "classify_buy_fill",
+            "implied_buy_average",
+            "buy_market_with_retry",
+            "unmatched_fak_rejection",
+            "definitive_order_rejection",
+            bot=BOT5M,
+        )
+        calls = {"post": 0, "submit": [], "orders": []}
+        signed_order = SimpleNamespace(
+            makerAmount="8000000",
+            takerAmount="8163265",
+            timestamp="1",
+        )
+
+        def post(*_args, **_kwargs):
+            calls["post"] += 1
+            return {"status": "unmatched", "orderID": "order-1"}
+
+        def create_order(args, **_kwargs):
+            calls["orders"].append(args)
+            return signed_order
+
+        ns.update(
+            {
+                "DRY_RUN": False,
+                "BUY": "BUY",
+                "BUY_MAX_SHARES": 5.0,
+                "BUY_MAX_SPEND": 3.0,
+                "HEDGE_GHOST_SLEEP_S": 0.0,
+                "MAX_ENTRY_SPREAD": 0.10,
+                "MIN_WINNER_BID": 0.70,
+                "TOXIC_FORCE_EXIT_BELOW": 0.65,
+                "console": SimpleNamespace(print=lambda *_a, **_k: None),
+                "log_event": lambda *_a, **_k: None,
+                "check_token_balance": lambda *_args: 0.0,
+                "check_clob_token_balance": lambda *_args, **_kwargs: 0.0,
+                "_fill_fee_usdc": lambda *_args, **_kwargs: None,
+                "entry_book_ok": lambda *_a, **_k: (True, "ok"),
+                "safe_api_call": lambda fn, *a, **k: fn(*a, **k),
+                "client": SimpleNamespace(
+                    create_order=create_order,
+                    post_order=post,
+                ),
+                "OrderArgs": lambda **kwargs: kwargs,
+                "PartialCreateOrderOptions": lambda **kwargs: kwargs,
+                "OrderType": SimpleNamespace(FAK="FAK"),
+                "signed_order_id": lambda *_a, **_k: "order-1",
+                "extract_order_id": lambda _result: "order-1",
+                "confirm_fill_size": lambda *_a, **_k: 0.0,
+                "fill_cost_usdc": lambda *_a, **_k: 0.0,
+                "time": SimpleNamespace(time=lambda: 1.0, sleep=lambda _s: None),
+            }
+        )
+        return ns, calls
+
+    def test_late_window_posts_99_limit_sized_at_83_ask(self):
+        ns, calls = self._namespace()
+        ns["get_quote_fast"] = lambda *_a, **_k: (0.82, 0.5, 0.83, 10.0, None)
+        result = ns["buy_market_with_retry"](
+            "token", 2.50, 0.99, min_price=0.75, max_retries=1,
+            on_submit=lambda *args: calls["submit"].append(args),
+        )
+        self.assertEqual(result, (0.0, 0.0, "empty"))
+        self.assertEqual(len(calls["orders"]), 1)
+        self.assertAlmostEqual(calls["orders"][0]["price"], 0.99)
+        self.assertGreater(calls["orders"][0]["size"], 2.5)
+        self.assertLessEqual(calls["orders"][0]["size"] * 0.99, 3.0 + 1e-9)
+
+    def test_early_90_and_95_windows_also_limit_at_99(self):
+        ns, calls = self._namespace()
+        ns["get_quote_fast"] = lambda *_a, **_k: (0.90, 0.5, 0.91, 10.0, None)
+        ns["buy_market_with_retry"](
+            "token", 2.50, 0.99, min_price=0.90, max_retries=1,
+            on_submit=lambda *args: calls["submit"].append(args),
+        )
+        self.assertAlmostEqual(calls["orders"][0]["price"], 0.99)
+        calls["orders"].clear()
+        ns["get_quote_fast"] = lambda *_a, **_k: (0.95, 0.5, 0.96, 10.0, None)
+        ns["buy_market_with_retry"](
+            "token", 2.50, 0.99, min_price=0.95, max_retries=1,
+            on_submit=lambda *args: calls["submit"].append(args),
+        )
+        self.assertAlmostEqual(calls["orders"][0]["price"], 0.99)
 
 
 class SellExecutionAmbiguity(unittest.TestCase):

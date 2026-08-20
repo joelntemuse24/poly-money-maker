@@ -235,14 +235,13 @@ away.
 
 **Why a limit buy, not a “market buy in dollars”:** a dollar market FAK spends
 leftover USDC down the book. Quote 80¢, leftover cash lifts a 9¢ ask, you own
-junk. The bot sizes **shares** = `budget / ask` and posts a **limit at that
-ask**. Unfilled dollars die with the FAK.
+junk. The 5m bot sizes **shares** = `budget / ask` and posts a **limit at the
+open band max (99¢)** so the FAK can take 84–99¢ if the 83¢ clip is gone.
+Unfilled dollars still die. 15m/hourly (stopped) still limit at the touch.
 
 **Displayed size is not a cap.** If the top ask shows 0.4 shares, the bot
-still posts ~3 shares at that price. The exchange fills what exists. Thin
-books log `[THIN ASK]`. Live unmatched remainder is gone; pathlog’s paper
-model instead pretends fillable size is `min(budget/ask, displayed size)` —
-that is a research approximation, not what live posts.
+still posts ~3 shares at the **99¢ limit**. The exchange fills what exists
+between the touch and that cap. Thin books log `[THIN ASK]`.
 
 ---
 
@@ -663,7 +662,10 @@ the oracle might disagree with.
 
 ## 16. Sizing a buy (Decimal, 2 cents, 4 dp shares)
 
-`quoted_buy_shares(budget, ask, share_cap)`:
+`quoted_buy_shares(budget, ask, share_cap)` sizes the share count.
+
+`quoted_buy_shares_up_to_limit` (5m only) starts from that count, then
+shrinks until `size × band_max` is exact cents and ≤ `buy_max_spend`.
 
 1. Quantize budget down to **cents** (`Decimal("0.01")`, `ROUND_DOWN`).
 2. `shares = spend / ask`, quantized to **0.01 shares** (2 dp), round down.
@@ -705,7 +707,7 @@ No client call.
      save fails → **do not POST** (`persist_fail`).
    - Sign order; `signed_order_id` hashes EIP-712 typed data so the id is
      **determined before** the network — crash recovery can look it up.
-   - POST FAK limit at the ask.
+   - POST FAK limit at the **band max** (5m: 99¢). Size is still `budget/ask`.
 3. `confirm_fill_size` decides matched shares:
    - Terminal `matched` + confirmed trades → trust making/taking.
    - `delayed` POST can echo the **unsigned full size** before any match —
