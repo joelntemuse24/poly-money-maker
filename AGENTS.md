@@ -7,23 +7,34 @@ Full architecture: `TECHNICAL_DESIGN.md`.
 ## Project at a Glance
 
 **Live on the VM:** **5m buy bot only** (`polybuybot5m`) plus a no-order path
-recorder. 15m and hourly buy services are **stopped**. The 5m bot buys the
-winning leg of Polymarket BTC "Up or Down" markets at **75–90¢** in the final
-120s, **90¢ or above** in the first 3 minutes, or **≥95¢** in the first 4 minutes
-($2.50 / market), hedges at **50¢** on reversal, and redeems winners at $1.00.
-See `CURRENT.md` for the active probe budget and knobs.
+recorder (`polypathlog`). 15m and hourly buy services are **stopped**. Mint
+(`polymintbot`) is **paused**.
 
-Mint-only helper (`mintbot.py`) is **paused** — do not run it live.
+The 5m bot buys the winning leg of Polymarket BTC "Up or Down" markets:
+
+| When (time to close) | Winning ask |
+|---|---|
+| Last **120s** | **75–90¢** |
+| First **3 min** (TTM 120–300s) | **90–99¢** |
+| First **4 min** (TTM 60–300s) | **≥95¢** (overlaps last 120s) |
+
+Budget **$2.50**/market (hard $3, share rail 5). Hedge **50/55** on reversal
+(plus inverted GUI). Winners redeem at $1.00. **No profit-take sell.**
+See `CURRENT.md` for the active probe knobs.
+
+**Overlap / hole:** last 120s while TTM ≥ 60s → 75–90¢ **or** ≥95¢. **91–94¢
+in the last 120s** is out of band. Last 60s is 75–90¢ only.
 
 | File | Service | Markets | Oracle | Budget | Window |
 |---|---|---|---|---|---|
-| `buybot.py` | `polybuybot` | 15m | Chainlink TWAP 60s | $2.50 | final 4.0 min |
-| `buybot5m.py` | `polybuybot5m` | 5m | Chainlink TWAP 30s | $2.50 | last 120s 75–90¢; first 3 min ≥90¢; first 4 min ≥95¢ |
-| `buybothourly.py` | `polybuybothourly` | hourly | Binance BTCUSDT | $2.50 | final 13.0 min |
-| `pathlog.py` | `polypathlog` | all three | — (CLOB books only) | — | late-window ticks |
+| `buybot.py` | `polybuybot` **stopped** | 15m | Chainlink TWAP 60s | $2.50 | final 4.0 min, 75–90¢, hedge 35/40 |
+| `buybot5m.py` | `polybuybot5m` **live** | 5m | Chainlink TWAP 30s | $2.50 | bands above; hedge **50/55** |
+| `buybothourly.py` | `polybuybothourly` **stopped** | hourly | Binance BTCUSDT | $2.50 | final 13.0 min, 75–90¢, hedge 35/40 |
+| `pathlog.py` | `polypathlog` **live** | all three | — (CLOB books only) | — | whole 5m; last 8m of 15m; last 15m of hourly |
 
-Plus: `check_book.py`, `check_participation.py`, `check_path_backtest.py`, `check_fetch_trades.py`, `check_buy_skips.py`.
-Local glance (not a bot): `widget/polydesk.py` — always-on-top balance / HOLDING.
+Plus: `check_book.py`, `check_participation.py`, `check_path_backtest.py`,
+`check_fetch_trades.py`, `check_buy_skips.py`, `check_buy_rejects.py`,
+`check_edge_counterfactual.py`. Laptop glance (not a bot): `widget/polydesk.py`.
 
 ## File Map
 
@@ -31,33 +42,46 @@ Local glance (not a bot): `widget/polydesk.py` — always-on-top balance / HOLDI
 
 | File | What it does | Mirrors |
 |---|---|---|
-| `buybot.py` | 15m buy bot (~1716 lines) | `buybot5m.py`, `buybothourly.py` |
-| `buybot5m.py` | 5m buy bot (~1705 lines) | `buybot.py`, `buybothourly.py` |
-| `buybothourly.py` | Hourly buy bot (~1707 lines) | `buybot.py`, `buybot5m.py` |
-| `buy/market.py` | MarketGateway — Gamma discovery + market metadata | — |
-| `buy/btc_price.py` | Resolution-aligned BTC feeds (TWAP 30/60, Binance) + PTB capture | — |
+| `buybot.py` (~5063 lines) | 15m buy bot | `buybot5m.py`, `buybothourly.py` |
+| `buybot5m.py` (~5177 lines) | 5m buy bot (**live**) | `buybot.py`, `buybothourly.py` |
+| `buybothourly.py` (~5061 lines) | Hourly buy bot | `buybot.py`, `buybot5m.py` |
+| `buy/market.py` | MarketGateway — Gamma discovery + metadata | — |
+| `buy/btc_price.py` | Resolution-aligned BTC feeds (TWAP 30/60, Binance) + PTB | — |
 | `buy/clob_book_ws.py` | CLOB market-channel WS top-of-book (buy/hedge speed path) | — |
+| `buy/entry_skip.py` | **5m only:** band union, skip labels | not imported by 15m/hourly |
+| `buy/book.py` | Shared TOB price+size parse (WS cache + pathlog) | — |
 
-**Pattern:** The three bots are near-identical copies differing only in constants
-(SLUG_PREFIX, SLUG_EXCLUDES, oracle source, buy budget/window, tick_size). A logic
-change to one usually needs propagation to its siblings.
+**Pattern:** The three bots are near-identical copies (slug, oracle, window
+units, tick, defaults). A logic change to one usually needs the siblings.
+**Exception:** early bands and `BUY_HORIZON_S` live in 5m + `buy/entry_skip.py`.
+Do not copy 5m seconds-windows into 15m as minutes without converting.
+
+`buy/chain.py` / `buy/contracts.py` are **mintbot only** (paused). Not on the
+CLOB buy path.
+
+Bots have **no** `if __name__ == "__main__"` — they run at import. Tests must
+not `import buybot5m`. Import `buy/` / `check_*.py` / `pathlog.py`, or extract
+functions with `ast` (`tests/test_buy_fill_shapes.py`).
 
 ### Safe to modify
 
 | File | Purpose |
 |---|---|
 | `pathlog.py` | CLOB path recorder (no orders; TOB price **and** size) |
-| `check_path_backtest.py` | Pathlog: entry grid, anatomy, compare, **paper hedge**, template `--sweep` (no orders) |
-| `CLOUD_RESEARCH.md` | Cloud prompts: live paper P&L via public books + `--sweep` (no `.env`) |
+| `check_path_backtest.py` | Pathlog: grid, anatomy, compare, **paper hedge**, `--sweep` (no orders) |
+| `CLOUD_RESEARCH.md` | Cloud prompts: paper P&L on public books + `--sweep` (no `.env`) |
 | `check_book.py` | Diagnostic — inspect a live order book |
 | `check_edge_counterfactual.py` | Diagnostic — resolution win rate if edge skips had filled |
 | `check_participation.py` | Diagnostic — post-facto bought vs missed + band exposure |
 | `check_fetch_trades.py` | Diagnostic — full-wallet Data API trade history → CSV |
 | `check_buy_skips.py` | Diagnostic — why 5m did not buy (JSON log skip/attempt/fill counts) |
+| `check_buy_rejects.py` | Diagnostic — CLOB `invalid amounts` 400s that passed every gate |
 | `widget/polydesk.py` | Local always-on-top Polymarket value / HOLDING glance (no orders) |
 | `CURRENT.md` | Living ops/probe status — update when decisions change |
-| `strategy_buy*.example.json` | Buy-bot config templates — not loaded by bots |
+| `TECHNICAL_DESIGN.md` | Architecture for humans — update when the system changes |
+| `strategy_buy*.example.json` | Buy-bot config templates — **not** loaded by bots |
 | `mintbot.py` / `strategy_mint.example.json` | Paused mint helper — do not run live |
+| `tests/test_*.py` | unittest suite (CI on PR + push to `main`) |
 
 ### Read-only / auto-generated — never edit
 
@@ -88,6 +112,9 @@ change to one usually needs propagation to its siblings.
 - **Do not restart `polymintbot` unless the operator asks.**
 - **Do not start `polybuybot` / `polybuybothourly` unless the operator asks** —
   live trading is 5m-only (`polybuybot5m`).
+- **Do not add a profit-take sell** unless the operator asks. Hedge is the only
+  sell path. Take-profit was evaluated and dropped (unreachable on ≥90¢ fills;
+  cuts $1.00 rides on 75–85¢ fills).
 
 ## How to Verify a Change
 
@@ -103,6 +130,12 @@ python check_path_backtest.py --grid --budget 2.5 --series 5m
 python check_path_backtest.py --grid --budget 15 --series 5m
 python check_path_backtest.py --ask-min 0.75 --ask-max 0.90 --ttm-max 120 --budget 15 --series 5m --csv /tmp/hits_15.csv
 python check_book.py
+
+# CI-equivalent (no network to Polymarket required for unit tests)
+python3 -m py_compile buybot.py buybot5m.py buybothourly.py pathlog.py \
+  check_path_backtest.py mintbot.py buy/book.py buy/clob_book_ws.py \
+  buy/entry_skip.py check_fetch_trades.py check_participation.py check_buy_skips.py
+python3 -m unittest discover -s tests -p 'test_*.py' -v
 
 # Full wallet fills (past the UI ~500-row export). Wallet: --user or FUNDER_ADDRESS.
 # CSV columns match load_csv_buys: timestamp (unix), action, usdcAmount, tokenAmount,
@@ -126,9 +159,15 @@ python check_participation.py --hours 72 --csv exports/trades.csv
 
 Watch the console for `[DRY BUY]` / `[DRY SELL]` markers. Ctrl-C to stop.
 
+`--sweep` / `--compare` read **late** keys from `strategy_buy5m.example.json`
+(75–90 / 120s / $2.50) and paper-hedge at the template's **50/55**. They do
+**not** replay the early ≥90 / ≥95 union. `--series 5m` matches **only** 5m
+(not 15m — the string `15m` contains `5m`).
+
 ### What to look for
 
 - `[DRY BUY]` / `[DRY SELL]` in dry-run — confirms trigger logic fires
+- `buy_attempt` `band=late` / `early` / `early_95` — which 5m window armed
 - `[FAK EMPTY]` / `buy_attempt_rejected` with `unmatched_retry: true` — empty FAK re-quoted in the same trigger (up to 3 POSTs)
 - `buy_ghost_fill` `via=unmatched_400_guard` — unmatched 400 but inventory appeared; no second FAK
 - `buy_attempt_ambiguous` `via=unmatched_400_no_balance` — unmatched 400 and CLOB balance unreadable; quarantine, no retry
@@ -175,21 +214,27 @@ python check_path_backtest.py --grid --budget 2.5 --series 5m
 python check_buy_skips.py --since 2026-08-19T08:02:00
 ```
 
-`--sweep` scores the live 5m **example** template (75–90 / 120s / $2.50) plus
-one-at-a-time window/band/size variants, with a **paper** hedge on recorded
-books (not live). `--anatomy` answers “already decided at T-120 vs 50/50 until
-the end.” `--compare` is the named-preset table; add `--paper` to walk later
-ticks for 35/40/15 + GUI-proxy. `--grid` is ask × time. **`--series 5m` matches
-only 5m** (not 15m). Pathlog cannot replay last-trade, BTC/PTB, or POST latency.
+`--sweep` scores the live 5m **example** late template (75–90 / 120s / $2.50)
+plus one-at-a-time window/band/size variants, with a **paper** hedge from that
+JSON (**50/55/15** + mid-as-GUI when spread ≤ 10¢). It does **not** union the
+early ≥90 / ≥95 windows. `--anatomy` answers “already decided at T-120 vs
+50/50 until the end.” `--compare` is the named-preset table; add `--paper` to
+walk later ticks. `--grid` is ask × time. **`--series 5m` matches only 5m**
+(not 15m). Pathlog cannot replay last-trade, BTC/PTB, or POST latency.
 Cloud agents: `CLOUD_RESEARCH.md`.
 
 ## Key Conventions
 
 - **All bots are single-file polling loops** — no `asyncio` or database. Small
   thread pools isolate book, refresh, notification, and redemption-status I/O.
+  CLOB book WS and BTC RTDS each have a daemon thread + in-memory cache.
   Section comment banners (`# --- PRICING ---`) act as visual boundaries.
+  Process lock: `/tmp/poly-money-maker-buybot5m.lock` (and siblings).
 - **Hot-reload:** Strategy JSON files are re-read every cycle via `load_strategy()`.
-  Changes take effect on the next tick — no restart needed.
+  Changes take effect on the next tick — no restart needed. `dry_run` is
+  startup-only (selects `*.dryrun.*` state paths).
+- **5m look-ahead:** `BUY_HORIZON_S = max(buy_start_s, early_buy_start_s,
+  early_95_start_s)` (300s). Hot poll / WS subscribe use that, not 120s alone.
 - **Atomic durable save:** State and P&L files flush + `fsync` the `.tmp`, replace
   it, then `fsync` the parent directory before an order can proceed.
 - **Fail-closed startup:** A valid strategy file is required at startup. A
@@ -215,15 +260,21 @@ Cloud agents: `CLOUD_RESEARCH.md`.
   both normal and toxic. After a dump is allowed, the FAK sells at the
   **live bid** even if it is 20¢. Everything else rides to redemption at
   $1.00. WS may *arm* a hedge check; normal sells need two-sided REST.
+  **Live `strategy_buy5m.json` must set the hedge keys** or an old 35/40 file
+  keeps the old hedge after hot reload.
 - **Tick sizes:** 5m markets use `0.001`, 15m and hourly use `0.01`.
 - **One entry per market:** Enforced via `meta.get("bought_token")` in state cache.
 - **Notifications:** Fire-and-forget via ntfy.sh (topic `polybot-joel-btc`).
   Never let notification failures crash the bot.
+- **GCP VM:** `~/poly-money-maker` on a small ~10GB e2 disk. Journal filled it
+  once (`deploy/DISK_OPS.md`). Pathlog is capped in-app. CI `git pull`s; it
+  does **not** restart systemd.
 
 ## Landmines
 
 1. **The three bots are near-identical copies, not shared modules.** A bug fix in
    `buybot.py` probably also applies to `buybot5m.py` and `buybothourly.py`.
+   `buy/entry_skip.py` is the 5m-only exception.
 2. **The 5m bot uses seconds-based window checks** (`buy_start_s = 120` late
    75–90¢; `early_buy_start_s = 300` for ask ≥ 90¢; `early_95_min_s = 60` /
    `early_95_start_s = 300` for ask ≥ 95¢) while the
@@ -236,33 +287,44 @@ Cloud agents: `CLOUD_RESEARCH.md`.
 4. **No `if __name__ == "__main__"` guard** — buy-bot scripts execute at module
    level. They cannot be imported. `pathlog.py`, `check_path_backtest.py`, and
    `check_fetch_trades.py` can.
+5. **Ask ≠ price.** 97¢ ask over 1¢ bid is not a tradable favorite. Entry needs
+   a tight REST book; hedge needs the whole book + GUI to look lost.
 
 ## Systemd Services (in `deploy/`)
 
-| Service file | Bot |
-|---|---|
-| `polybuybot.service` | `buybot.py` (15m) |
-| `polybuybot5m.service` | `buybot5m.py` (5m) |
-| `polybuybothourly.service` | `buybothourly.py` (hourly) |
-| `polypathlog.service` | `pathlog.py` (CLOB path recorder; no orders) |
-| `polymintbot.service` | `mintbot.py` (**paused**) |
+| Service file | Bot | Live? |
+|---|---|---|
+| `polybuybot.service` | `buybot.py` (15m) | **stopped** |
+| `polybuybot5m.service` | `buybot5m.py` (5m) | **yes** |
+| `polybuybothourly.service` | `buybothourly.py` (hourly) | **stopped** |
+| `polypathlog.service` | `pathlog.py` (CLOB path recorder; no orders) | **yes** |
+| `polymintbot.service` | `mintbot.py` | **paused** |
 
-CI: pushes to `main` touching the buy bots, `pathlog.py`, `buy/`, or
-`requirements.txt` deploy to the VM via SSH (`git pull` + `pip install` only).
-Services are **not** auto-restarted — start/restart deliberately after
-validation (`systemctl start` / `restart`). A merged NameError fix does
-nothing until `polybuybot5m` is restarted (13–19 Aug `known_cost` stall).
+CI: pushes to `main` touching the buy bots, `pathlog.py`,
+`check_path_backtest.py`, `buy/`, or `requirements.txt` deploy to the VM via
+SSH (`git pull` + `pip install` only). Services are **not** auto-restarted —
+start/restart deliberately after validation (`systemctl start` / `restart`).
+A merged NameError fix does nothing until `polybuybot5m` is restarted
+(13–19 Aug `known_cost` stall).
+
+After this branch merges, on the VM (5m only):
+
+```bash
+cd ~/poly-money-maker && git pull
+python3 -c 'import json; from pathlib import Path; p=Path("strategy_buy5m.json"); d=json.loads(p.read_text()); d["hedge_threshold"]=0.50; d["hedge_require_ask_max"]=0.55; p.write_text(json.dumps(d, indent=2)+"\n")'
+sudo systemctl restart polybuybot5m
+```
 
 ## Dependencies
 
 ```
-py_clob_client_v2   # Polymarket CLOB SDK
-py-builder-relayer-client  # Relayer proxy transaction builder/signing
-py-builder-signing-sdk     # POLY_BUILDER_* HMAC authentication headers
-requests            # HTTP for Data API, Gamma API, ntfy, relayer
-python-dotenv       # .env loading
-rich                # Terminal UI (tables, panels)
+py_clob_client_v2            # Polymarket CLOB SDK
+py-builder-relayer-client    # Relayer proxy transaction builder/signing
+py-builder-signing-sdk       # POLY_BUILDER_* HMAC authentication headers
+requests                     # HTTP for Data API, Gamma API, ntfy, relayer
+python-dotenv                # .env loading
+rich                         # Terminal UI (tables, panels)
 eth-abi, eth-utils, eth-account  # Redeem calldata encoding
-websocket-client    # CLOB market-channel WS (buy/clob_book_ws.py)
-web3                # transitive of the CLOB client stack
+websocket-client             # CLOB market-channel WS (buy/clob_book_ws.py)
+web3                         # transitive of the CLOB client stack
 ```
