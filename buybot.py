@@ -1294,14 +1294,18 @@ def buy_fill_walked(filled, quoted_shares, ratio=1.05):
 
 
 def classify_buy_fill(avg, filled, quoted_shares, min_price, toxic_below):
-    """below_band / toxic_fill from true average and share-walk."""
+    """below_band from average vs the open band; toxic_fill from average only.
+
+    Extra shares vs a limit-clipped FAK quote are normal when the fill is
+    cheaper than the cap (same USDC buys more). ``buy_fill_walked`` still
+    logs ``buy_fill_walk`` and estimates fill cost; it does not arm a dump.
+    Junk walks show up as ``avg < toxic_below``.
+    """
     avg = finite_float(avg, minimum=0, maximum=1) or 0.0
-    filled = finite_float(filled, minimum=0) or 0.0
     min_price = finite_float(min_price, minimum=0, maximum=1) or 0.0
     toxic_below = finite_float(toxic_below, minimum=0, maximum=1) or 0.0
-    walked = buy_fill_walked(filled, quoted_shares)
-    below_band = walked or (min_price > 0 and avg + 1e-9 < min_price)
-    toxic = walked or (toxic_below > 0 and avg + 1e-9 < toxic_below)
+    below_band = min_price > 0 and avg + 1e-9 < min_price
+    toxic = toxic_below > 0 and avg + 1e-9 < toxic_below
     return below_band, toxic
 
 

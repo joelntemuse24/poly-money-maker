@@ -12,7 +12,8 @@ Chainlink TWAP gate is **$0** (any non-zero tick vs PTB; side must match;
 flat is still refused). Late FAKs **limit at 90¢**; early FAKs **limit at
 99¢**. Size is still `budget/ask` per slice, clipped so `size × limit`
 cannot exceed `buy_max_spend` **$3 per FAK**. Displayed top size is **not**
-a cap. `toxic_fill` dumps without GUI only while bid ≤ 50¢. Pause minting.
+a cap. `toxic_fill` arms from fill average < 65¢ (not extra shares vs the
+99¢-sized quote) and dumps without GUI only while bid ≤ 50¢. Pause minting.
 Pathlog still records all three series (no orders; 14-day / 400 MB cap).
 
 ---
@@ -42,7 +43,7 @@ overlay on that same window. Late: **75–90¢** in the last **120s** only
 | Execution | Size `budget/ask` per slice. Unmatched 400 re-quotes up to **3** FAKs; then **0.15 s** cooldown. Unclear POSTs still quarantine. |
 | GUI consensus | winner ≥ 70¢, loser ≤ 30¢ |
 | Windows | 5m **whole market**: early ≥90 / ≥95 for TTM (120, 300]; late 75–90 for TTM ≤ 120s (15m / hourly bots **not running**) |
-| Hedge | **Trigger** bid ≤ **50¢** and ask ≤ **55¢**, spread ≤ 15¢, **plus** inverted buy GUI. Combined early+late inventory. `toxic_fill` still dumps without GUI **only while held bid ≤ 50¢**. |
+| Hedge | **Trigger** bid ≤ **50¢** and ask ≤ **55¢**, spread ≤ 15¢, **plus** inverted buy GUI. Combined early+late inventory. `toxic_fill` arms only when FAK **average** < 65¢ (not extra shares vs a 99¢-sized quote) and still dumps without GUI **only while held bid ≤ 50¢**. |
 | Underlying edge | **$0** (5m: any non-zero TWAP vs PTB) / **$10** (15m, hourly); side must match |
 | `max_open_positions` | **0 = unlimited** |
 | `toxic_force_exit_below` | **65¢** |
