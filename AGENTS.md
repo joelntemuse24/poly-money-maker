@@ -134,8 +134,9 @@ Watch the console for `[DRY BUY]` / `[DRY SELL]` markers. Ctrl-C to stop.
   is the exception type+message; `check_buy_skips.py` prints the breakdown.
   Aug 13–19 live 5m: **3294/3294** were `NameError: known_cost` until the
   19 Aug 09:42 restart picked up #80.
-- `hedge_attempt` / `hedge_fill` — hedge fired after force-fresh REST + book integrity
+- `hedge_attempt` / `hedge_fill` — hedge fired after force-fresh REST + book integrity + GUI consensus (normal path)
 - `hedge_skip_toxic_book` — bid dipped but ask/spread still say "not reversed"
+- `hedge_skip_no_consensus` — 35/40 book passed but GUI/last-trade still say the held side has not actually fallen (same class of check as buy)
 - `hedge_skip_incomplete_rest` — REST missing a side; fail closed (no WS sell)
 - `buy_skip_ambiguous` — GUI display prices too close (throttled 8s; **not** one event per market)
 - `buy_skip_no_consensus` — ask in band but GUI/tight-book gate failed
@@ -191,9 +192,12 @@ see TECHNICAL_DESIGN.md “Research loop.”
   POSTs again (up to 3) in the same trigger; invalid-amount / auth 400s and unclear
   POSTs do not. After a fully empty trigger, wait `empty_fak_cooldown_s` (0.15 s).
 - **Hedge is sell-only exit:** The bots never profit-take. The only sell path is the
-  hedge: REST shows bid ≤ 35¢ **and** ask ≤ 40¢ with tight spread (a real
-  collapse, not a spoof penny), or a `toxic_fill` dump (avg < 65¢ or walked
-  size). After that, the FAK sells at the **live bid** even if it is 20¢.
+  hedge: REST shows bid ≤ 35¢ **and** ask ≤ 40¢ with tight spread, **and**
+  Polymarket GUI + last trade agree the held side actually lost (held last
+  print ≤ 40¢, held GUI ≤ 30¢, other GUI ≥ 70¢ — same display rule as buy).
+  A random TOB clip is not enough; a last print of 85¢ on a 32/38 book will
+  `hedge_skip_no_consensus`. `toxic_fill` dumps still skip the GUI gate.
+  After that, the FAK sells at the **live bid** even if it is 20¢.
   Everything else rides to redemption at $1.00. WS may *arm* a hedge check;
   normal sells need two-sided REST; toxic dumps may sell on bid-only REST.
 - **Tick sizes:** 5m markets use `0.001`, 15m and hourly use `0.01`.

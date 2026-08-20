@@ -42,9 +42,10 @@ to earn back losses from the few hedges that fired).
 
 **The risk:** BTC can reverse after entry. If the leg we bought truly collapses
 (bid **and** ask both drop — not a lone 1¢ bid under a still-high ask), the bot
-**hedges**: it market-sells the held leg when bid ≤ 35¢ (and ask ≤ 40¢ with a
-tight spread). After that check, the FAK follows the **live bid** (a 20¢ print
-on a still-tight book is a fill, not $0). There is no profit-taking
+**hedges**: it market-sells the held leg when bid ≤ 35¢ and ask ≤ 40¢ with a
+tight spread **and** website-style GUI/last-trade prices say that side actually
+lost (not a random TOB clip). After that check, the FAK follows the **live bid**
+(a 20¢ print on a still-tight book is a fill, not $0). There is no profit-taking
 sell — the only sell path is the hedge; everything else rides to redemption.
 
 **Economics per share (no reversal):** buy at ~75–90¢, redeem at $1.00 → ~10–25¢
@@ -70,7 +71,7 @@ trades a different market cadence and uses a different resolution oracle.
 | Buy window | final 4.0 min (`buy_window_min`) | final 120 s (`buy_start_s`) | final 13.0 min (`buy_window_min`) |
 | Ask band | 75–90¢ | 75–90¢ | 75–90¢ |
 | Budget / market | $2.50 USDC | $2.50 USDC | $2.50 USDC |
-| Hedge trigger | bid ≤ 35¢ **and** ask ≤ 40¢, spread ≤ 15¢ | same | same |
+| Hedge trigger | 35/40/15 book **+** inverted GUI/last trade | same | same |
 | Tick size | 0.01 | 0.001 | 0.01 |
 | Strategy file | `strategy_buy.json` | `strategy_buy5m.json` | `strategy_buyhourly.json` |
 | State file | `positions_buy.json` | `positions_buy5m.json` | `positions_buyhourly.json` |
@@ -284,10 +285,17 @@ force exit):
   a reversal (`hedge_skip_toxic_book`). Require bid ≤ 35¢, ask ≤
   `hedge_require_ask_max` (40¢), and spread ≤ `hedge_max_spread` (15¢). Toxic dumps
   skip integrity / `abort_above` so a collapsed book can still exit.
-- **Execution:** After the 35/40 check, FAK at the **live bid** (minus undercut).
+- **GUI consensus (normal only, `hedge_require_gui` default true):** the 35/40
+  book can still be a random clip. Buy already uses Polymarket display (mid if
+  spread ≤ 10¢ else last trade) plus 70/30. Hedge inverts that: held last
+  print ≤ `hedge_require_ask_max`, held GUI ≤ `max_loser_bid`, other GUI ≥
+  `min_winner_bid`, edge ≥ `min_bid_edge`. Missing last trade or other-leg
+  quote fails closed (`hedge_skip_no_consensus`). A 32/38 spoof with last
+  trade 85¢ does not sell. **`toxic_fill` skips this gate** and still dumps.
+- **Execution:** After 35/40 **and** GUI, FAK at the **live bid** (minus undercut).
   There is no “won't sell below 32¢.” 20¢ or 1¢ on a still-tight collapsed book
   is a fill. One tick is only the exchange minimum. Toxic dumps skip integrity /
-  bounce cancel and also sell at the live bid. Retries force-REST both sides
+  bounce cancel / GUI and also sell at the live bid. Retries force-REST both sides
   (normal path re-runs the two-sided gate so a spoof 1¢/99¢ still aborts).
 - **Outcome:** every POST has a crash-durable deterministic order ID. Only
   settlement-confirmed fills shrink `bought_size` or add proceeds; ambiguous
@@ -367,6 +375,7 @@ paths. Templates are `strategy_buy.example.json`,
 | `toxic_force_exit_below` | 0.65 | Force-dump if FAK avg &lt; 65¢ (must be ≤ buy_threshold) |
 | `hedge_enabled` / `hedge_threshold` / `hedge_min_price` | true / 0.35 / unused floor | Arm at 35¢; `hedge_min_price` kept in JSON, not a FAK floor |
 | `hedge_max_spread` / `hedge_require_ask_max` | 0.15 / 0.40 | Hedge book must actually collapse |
+| `hedge_require_gui` | true | Also require inverted buy GUI + held last trade ≤ 40¢ |
 | `buy_window_min` (15m, hr) / `buy_start_s` (5m) | 4.0 / 120 / 13.0 | Entry window before close |
 | `buy_budget` | 2.5 / 2.5 / 2.5 | USDC per market |
 | `max_open_positions` / `max_open_notional` / `max_daily_notional` | 0 (=unlimited) / 10k / ~∞ | Risk caps |
@@ -521,8 +530,9 @@ integrity, oracle edge, settlement finality, quarantine) remain authoritative.
    tradable near-certain winner. Entry requires a tight REST book; fills are
    checked against avg USDC/share. Never trust last-trade GUI alone on a wide book.
 9. **Bid-alone hedge dumps.** A 1¢ bid under a 99¢ ask is illiquidity, not a
-   reversal. Hedge requires ask ≤ `hedge_require_ask_max` and a tight spread, and
-   always REST-confirms before selling.
+   reversal. A 32/38 clip with last trade still 85¢ is also not a reversal.
+   Hedge requires ask ≤ `hedge_require_ask_max`, a tight spread, inverted GUI,
+   and REST-confirms before selling.
 10. **`buy_uncertain` `known_cost` must be assigned before `spend_cap`.** On 13 Aug
     the 5m/hourly copies used `known_cost` before it was set (`#80` / `be22662`).
     Every quarantined BUY then `cycle_error`’d and skipped the rest of that poll.

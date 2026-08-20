@@ -18,6 +18,7 @@
   "max_entry_spread": 0.05,
   "hedge_max_spread": 0.15,
   "hedge_require_ask_max": 0.40,
+  "hedge_require_gui": true,
   "buy_window_min": 4.0,
   "buy_grace_s": 2,
   "buy_cooldown_s": 3,
