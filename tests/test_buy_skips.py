@@ -8,11 +8,17 @@ import unittest
 from pathlib import Path
 
 from buy.entry_skip import (
+    accumulate_buy_inventory,
     applicable_entry_bands,
     ask_in_any_band,
     ask_in_entry_band,
+    can_arm_entry_slice,
     entry_band_for_seconds,
+    entry_slice_budget,
+    is_late_entry_window,
     select_entry_band,
+    stamp_slice_bought,
+    uncertain_buy_spend_cap,
     union_ask_band_reason,
     window_no_buy_reason,
 )
@@ -102,23 +108,22 @@ class EarlyAboveNinetyBandTests(unittest.TestCase):
             seconds_left,
             late_start_s=120,
             late_min=0.75,
-            late_max=0.99,
+            late_max=0.90,
             early_start_s=300,
             early_min=0.90,
             early_max=0.99,
         )
 
-    def test_late_window_keeps_75_99_inclusive(self):
+    def test_late_window_keeps_75_90_inclusive(self):
         band = self._band(90)
         self.assertIsNotNone(band)
         self.assertEqual(band.name, "late")
         self.assertFalse(band.min_exclusive)
         self.assertTrue(ask_in_entry_band(0.75, *band[:2], min_exclusive=band.min_exclusive))
         self.assertTrue(ask_in_entry_band(0.90, *band[:2], min_exclusive=band.min_exclusive))
-        self.assertTrue(ask_in_entry_band(0.91, *band[:2], min_exclusive=band.min_exclusive))
-        self.assertTrue(ask_in_entry_band(0.99, *band[:2], min_exclusive=band.min_exclusive))
+        self.assertFalse(ask_in_entry_band(0.91, *band[:2], min_exclusive=band.min_exclusive))
+        self.assertFalse(ask_in_entry_band(0.99, *band[:2], min_exclusive=band.min_exclusive))
         self.assertFalse(ask_in_entry_band(0.74, *band[:2], min_exclusive=band.min_exclusive))
-        self.assertFalse(ask_in_entry_band(1.00, *band[:2], min_exclusive=band.min_exclusive))
 
     def test_ttm_120_is_late_not_early(self):
         band = self._band(120)
@@ -151,7 +156,7 @@ class EarlyAboveNinetyBandTests(unittest.TestCase):
                 200,
                 late_start_s=120,
                 late_min=0.75,
-                late_max=0.99,
+                late_max=0.90,
                 early_start_s=120,
                 early_min=0.90,
                 early_max=0.99,
@@ -185,7 +190,7 @@ class FirstFourMinutesAt95Tests(unittest.TestCase):
             seconds_left,
             late_start_s=120,
             late_min=0.75,
-            late_max=0.99,
+            late_max=0.90,
             early_start_s=300,
             early_min=0.90,
             early_max=0.99,
@@ -202,41 +207,145 @@ class FirstFourMinutesAt95Tests(unittest.TestCase):
         self.assertFalse(ask_in_any_band(0.89, bands))
         self.assertFalse(ask_in_any_band(0.80, bands))
 
-    def test_last_120s_allows_75_99(self):
+    def test_last_120s_is_75_90_only(self):
         bands = self._bands(90)
-        names = [b.name for b in bands]
-        self.assertIn("late", names)
-        self.assertIn("early_95", names)
+        self.assertEqual([b.name for b in bands], ["late"])
         self.assertTrue(ask_in_any_band(0.80, bands))
         self.assertTrue(ask_in_any_band(0.90, bands))
-        self.assertTrue(ask_in_any_band(0.91, bands))
-        self.assertTrue(ask_in_any_band(0.95, bands))
-        self.assertTrue(ask_in_any_band(0.99, bands))
+        self.assertFalse(ask_in_any_band(0.91, bands))
+        self.assertFalse(ask_in_any_band(0.95, bands))
+        self.assertFalse(ask_in_any_band(0.99, bands))
         self.assertFalse(ask_in_any_band(0.74, bands))
-        self.assertFalse(ask_in_any_band(1.00, bands))
 
-    def test_four_minute_mark_still_allows_95(self):
+    def test_ttm_60_is_late_not_early_95(self):
         bands = self._bands(60)
-        self.assertIn("early_95", [b.name for b in bands])
-        self.assertTrue(ask_in_any_band(0.95, bands))
+        self.assertEqual([b.name for b in bands], ["late"])
+        self.assertTrue(ask_in_any_band(0.80, bands))
+        self.assertFalse(ask_in_any_band(0.95, bands))
 
-    def test_last_minute_keeps_95_via_late_75_99(self):
+    def test_last_minute_is_late_75_90(self):
         bands = self._bands(50)
         self.assertEqual([b.name for b in bands], ["late"])
         self.assertTrue(ask_in_any_band(0.80, bands))
-        self.assertTrue(ask_in_any_band(0.91, bands))
-        self.assertTrue(ask_in_any_band(0.95, bands))
-        self.assertTrue(ask_in_any_band(0.99, bands))
-        self.assertFalse(ask_in_any_band(1.00, bands))
+        self.assertFalse(ask_in_any_band(0.91, bands))
+        self.assertFalse(ask_in_any_band(0.95, bands))
+        self.assertFalse(ask_in_any_band(0.99, bands))
 
     def test_select_widest_matching_band_for_retry(self):
         early = select_entry_band(0.96, self._bands(180))
         self.assertIsNotNone(early)
         self.assertEqual(early.name, "early")
-        late_96 = select_entry_band(0.96, self._bands(90))
-        self.assertIsNotNone(late_96)
-        self.assertEqual(late_96.name, "late")
-        self.assertEqual(late_96.retry_min_price, 0.75)
+        late_80 = select_entry_band(0.80, self._bands(90))
+        self.assertIsNotNone(late_80)
+        self.assertEqual(late_80.name, "late")
+        self.assertEqual(late_80.retry_min_price, 0.75)
+        self.assertIsNone(select_entry_band(0.96, self._bands(90)))
+
+    def test_early_95_still_open_before_t120(self):
+        bands = self._bands(180)
+        self.assertIn("early_95", [b.name for b in bands])
+        self.assertTrue(ask_in_any_band(0.95, bands))
+
+
+class TwoSliceBudgetTests(unittest.TestCase):
+    def test_late_window_is_ttm_le_120(self):
+        self.assertTrue(is_late_entry_window(90, 120))
+        self.assertTrue(is_late_entry_window(120, 120))
+        self.assertFalse(is_late_entry_window(121, 120))
+        self.assertFalse(is_late_entry_window(0, 120))
+
+    def test_slice_budget_is_2_50_not_5(self):
+        self.assertEqual(
+            entry_slice_budget(
+                180, late_start_s=120, early_budget=2.5, late_budget=2.5,
+            ),
+            2.5,
+        )
+        self.assertEqual(
+            entry_slice_budget(
+                90, late_start_s=120, early_budget=2.5, late_budget=2.5,
+            ),
+            2.5,
+        )
+
+    def test_early_fill_does_not_block_late_same_leg(self):
+        meta = {"early_bought": True, "bought_token": "down"}
+        ok, why = can_arm_entry_slice(
+            meta, seconds_left=90, late_start_s=120, held_size=2.6,
+            buy_token="down",
+        )
+        self.assertTrue(ok)
+        self.assertIsNone(why)
+        ok_early, why_early = can_arm_entry_slice(
+            meta, seconds_left=180, late_start_s=120, held_size=2.6,
+        )
+        self.assertFalse(ok_early)
+        self.assertEqual(why_early, "slice_filled")
+
+    def test_late_other_leg_is_blocked_while_holding(self):
+        meta = {"early_bought": True, "bought_token": "down"}
+        ok, why = can_arm_entry_slice(
+            meta, seconds_left=90, late_start_s=120, held_size=2.6,
+            buy_token="up",
+        )
+        self.assertFalse(ok)
+        self.assertEqual(why, "other_leg")
+
+    def test_late_still_fires_after_full_hedge(self):
+        meta = {
+            "early_bought": True, "bought_token": "down", "hedge_closed": True,
+        }
+        ok, why = can_arm_entry_slice(
+            meta, seconds_left=90, late_start_s=120, held_size=0.0,
+            buy_token="up", hedge_closed=True,
+        )
+        self.assertTrue(ok)
+        self.assertIsNone(why)
+
+    def test_late_bought_blocks_second_late(self):
+        meta = {"late_bought": True, "bought_token": "up"}
+        ok, why = can_arm_entry_slice(
+            meta, seconds_left=60, late_start_s=120, held_size=3.0,
+            buy_token="up",
+        )
+        self.assertFalse(ok)
+        self.assertEqual(why, "slice_filled")
+
+    def test_uncertain_blocks_all_slices(self):
+        meta = {"buy_uncertain": True}
+        ok, why = can_arm_entry_slice(
+            meta, seconds_left=180, late_start_s=120,
+        )
+        self.assertFalse(ok)
+        self.assertEqual(why, "buy_uncertain")
+
+    def test_accumulate_adds_size_and_cost(self):
+        size, cost, quoted, avg = accumulate_buy_inventory(
+            2.5, 2.375, 3.0, 2.40, 2.6, 3.1,
+        )
+        self.assertAlmostEqual(size, 5.5)
+        self.assertAlmostEqual(cost, 4.775)
+        self.assertAlmostEqual(quoted, 5.7)
+        self.assertAlmostEqual(avg, 4.775 / 5.5)
+
+    def test_late_spend_cap_ignores_early_cost(self):
+        cap = uncertain_buy_spend_cap(
+            known_cost=2.50, slice_budget=2.50, max_spend=3.0,
+            slice_prior_cost=2.50,
+        )
+        self.assertEqual(cap, 2.50)
+        remaining = uncertain_buy_spend_cap(
+            known_cost=3.50, slice_budget=2.50, max_spend=3.0,
+            slice_prior_cost=2.50,
+        )
+        self.assertEqual(remaining, 1.50)
+
+    def test_stamp_slice_flags(self):
+        meta = {}
+        stamp_slice_bought(meta, False)
+        self.assertTrue(meta["early_bought"])
+        stamp_slice_bought(meta, True)
+        self.assertTrue(meta["late_bought"])
 
 
 class SkipSummarizeTests(unittest.TestCase):

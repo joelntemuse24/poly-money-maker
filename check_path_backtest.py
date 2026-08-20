@@ -199,7 +199,7 @@ PATHLOG_GUI_SPREAD = 0.10
 
 # Named alternatives vs the live 5m probe. Same ticks, no live orders.
 COMPARE_PRESETS: List[Tuple[str, float, float, float]] = [
-    ("live_5m", 0.75, 0.99, 120.0),
+    ("live_5m", 0.75, 0.90, 120.0),
     ("window_180s", 0.75, 0.99, 180.0),
     ("window_240s", 0.75, 0.99, 240.0),
     ("whole_5m", 0.75, 0.99, 300.0),
@@ -387,9 +387,9 @@ def template_from_strategy(path: Path) -> dict:
     spread = data.get("max_entry_spread")
     return {
         "ask_min": float(data["buy_threshold"]),
-        # 5m last-120s cap is early_buy_max_price (0.99). buy_max_price 0.90
-        # is the first-3-min ≥90 floor. 15m/hourly omit the early key.
-        "ask_max": float(data.get("early_buy_max_price", data["buy_max_price"])),
+        # 5m last-120s cap is buy_max_price (0.90). early_buy_max_price 0.99
+        # is the early-window ceiling. Sweep still scores one late touch.
+        "ask_max": float(data["buy_max_price"]),
         "ttm_max": ttm_max,
         "budget": float(data["buy_budget"]),
         "max_spread": None if spread is None else float(spread),

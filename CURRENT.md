@@ -4,18 +4,15 @@
 Do not put secrets, API keys, or live wallet material here.
 
 Last updated: **2026-08-20** — **only the 5m CLOB bot is live.** Stop/disable
-15m and hourly. Keep the **$2.50** 5m triggers: **75–99¢ in the last 120s**, **90¢
-or above (to 99¢) in the first 3 minutes**, and **≥95¢ in the first 4 minutes**.
-Hedge is **50/55**. Chainlink TWAP
-gate is **$0** (any non-zero tick vs PTB; side must match; flat is still
-refused). Buys are **limit FAKs at the open band max (99¢)** sized
-`budget/ask` (~3.3 shares at 75¢), clipped so `size × 99¢` cannot exceed
-`buy_max_spend` **$3**. Share count still uses the live ask; the limit walks
-83¢→99¢ instead of dying when the top clip vanishes. Leftover USDC cannot
-walk into 9¢ junk. Displayed top size is **not** a cap.
-Hedge **trigger** is **50/55**, then the **same GUI/last-trade consensus as
-buy** (not a random TOB fill), then sell at the live bid. `toxic_fill` dumps
-without GUI only while bid ≤ 50¢. Pause minting.
+15m and hourly. Split the 5m stake into **two $2.50 slices** (**$5** if both
+fill): **early ≥90¢ (to 99¢) in the first 3 minutes** and **≥95¢ overlay**
+there, then **$2.50 only in the last 120s at the old 75–90¢ band**. Missed
+early does **not** roll into late. Hedge is **50/55** on the combined bag.
+Chainlink TWAP gate is **$0** (any non-zero tick vs PTB; side must match;
+flat is still refused). Late FAKs **limit at 90¢**; early FAKs **limit at
+99¢**. Size is still `budget/ask` per slice, clipped so `size × limit`
+cannot exceed `buy_max_spend` **$3 per FAK**. Displayed top size is **not**
+a cap. `toxic_fill` dumps without GUI only while bid ≤ 50¢. Pause minting.
 Pathlog still records all three series (no orders; 14-day / 400 MB cap).
 
 ---
@@ -29,20 +26,23 @@ mint complete sets. Operator still sells leftover mint inventory by hand.
 `polybuybothourly` unless the operator asks. Open 15m/hourly inventory (if any)
 will not be auto-hedged or redeemed by those processes.
 
-**Active strategy:** **5m only** (`polybuybot5m`) with the **$2.50** late
-**75–99¢** band, early **≥90¢** in the first 3 minutes, and **≥95¢** in the
-first 4 minutes:
+**Active strategy:** **5m only** (`polybuybot5m`) with **two $2.50 slices**
+(up to **$5** per market). Early: **≥90¢** in the first 3 minutes, **≥95¢**
+overlay on that same window. Late: **75–90¢** in the last **120s** only
+(do **not** buy 91–99¢ after T-120). Same-leg add only; hedge is unchanged
+50/55 on the combined bag:
 
 | Knob | Value |
 |---|---|
-| `buy_budget` | **$2.50** / market |
-| `buy_max_spend` | **$3.00** hard ceiling (strategy is $2.50; never more than ~$3) |
-| `buy_max_shares` | **5** buffer (~3.3 sh at $2.50/75¢) |
-| Ask band | **75–99¢** in the last **120s**. First **3 min** (`120 < TTM ≤ 300`): winning ask **≥ 90¢** up to 99¢. First **4 min** (`60 ≤ TTM ≤ 300`): also **≥ 95¢**. Same GUI / book / underlying gates. `buy_max_price` stays **0.90** (early ≥90 floor). Last-120s cap is `early_buy_max_price` **0.99**. |
-| Execution | FAK **limit at 99¢** (open band max) for late / early / ≥95, size `budget/ask` clipped so `size × 99¢` ≤ `$3`. Walks depth behind the touch. Unmatched 400 re-quotes up to **3** FAKs; then **0.15 s** cooldown. Unclear POSTs still quarantine. |
+| `buy_budget` | **$2.50** early slice (TTM > 120s) |
+| `late_buy_budget` | **$2.50** last-120s slice (75–90¢). Missed early ≠ $5 late. |
+| `buy_max_spend` | **$3.00** hard ceiling **per FAK** (not $6 across both slices) |
+| `buy_max_shares` | **5** per FAK (~3.3 sh at $2.50/75¢). Two slices may exceed 5 shares total. |
+| Ask band | Last **120s**: **75–90¢**, FAK limit **90¢**. First **3 min** (`120 < TTM ≤ 300`): **≥ 90¢** to 99¢, FAK limit **99¢**. **≥95¢** overlay on that early window only. `buy_max_price` **0.90** is the late cap **and** the early ≥90 floor. |
+| Execution | Size `budget/ask` per slice. Unmatched 400 re-quotes up to **3** FAKs; then **0.15 s** cooldown. Unclear POSTs still quarantine. |
 | GUI consensus | winner ≥ 70¢, loser ≤ 30¢ |
-| Windows | 5m **whole market**: early ≥90¢ for TTM (120, 300]; ≥95¢ for TTM [60, 300]; late 75–99¢ for TTM ≤ 120s (15m / hourly bots **not running**) |
-| Hedge | **Trigger** bid ≤ **50¢** and ask ≤ **55¢**, spread ≤ 15¢, **plus** inverted buy GUI (held last trade ≤ 55¢, held GUI ≤ 30¢, other GUI ≥ 70¢). **Then sell at whatever the bid is** — no 32¢ floor. `toxic_fill` still dumps without GUI **only while held bid ≤ 50¢**; recovered books log `hedge_skip_toxic_recovered` and stay armed. |
+| Windows | 5m **whole market**: early ≥90 / ≥95 for TTM (120, 300]; late 75–90 for TTM ≤ 120s (15m / hourly bots **not running**) |
+| Hedge | **Trigger** bid ≤ **50¢** and ask ≤ **55¢**, spread ≤ 15¢, **plus** inverted buy GUI. Combined early+late inventory. `toxic_fill` still dumps without GUI **only while held bid ≤ 50¢**. |
 | Underlying edge | **$0** (5m: any non-zero TWAP vs PTB) / **$10** (15m, hourly); side must match |
 | `max_open_positions` | **0 = unlimited** |
 | `toxic_force_exit_below` | **65¢** |
@@ -93,7 +93,7 @@ or not that bot is posting. Score the current rule and alternatives on the
 same ticks, then change live JSON:
 
 ```bash
-# Current 75–99¢ / last 120s vs earlier windows / wider bands
+# Current late 75–90¢ / last 120s vs earlier windows / wider bands
 .venv/bin/python check_path_backtest.py --compare --series 5m --budget 2.5
 .venv/bin/python check_path_backtest.py --compare --series 5m --budget 15
 
@@ -154,7 +154,7 @@ amount / HTTP 400), not this NameError.
   sudo systemctl stop polybuybot polybuybothourly
   sudo systemctl disable polybuybot polybuybothourly
   cd ~/poly-money-maker && git pull
-  python3 -c 'import json; from pathlib import Path; p=Path("strategy_buy5m.json"); d=json.loads(p.read_text()); d["min_underlying_edge_usd"]=0.0; d["hedge_threshold"]=0.50; d["hedge_require_ask_max"]=0.55; p.write_text(json.dumps(d, indent=2)+"\n"); print("hedge", d["hedge_threshold"], d["hedge_require_ask_max"])'
+  python3 -c 'import json; from pathlib import Path; p=Path("strategy_buy5m.json"); d=json.loads(p.read_text()); d["min_underlying_edge_usd"]=0.0; d["hedge_threshold"]=0.50; d["hedge_require_ask_max"]=0.55; d["buy_budget"]=2.5; d["late_buy_budget"]=2.5; d["buy_max_price"]=0.90; p.write_text(json.dumps(d, indent=2)+"\n"); print("budget", d["buy_budget"], "late", d["late_buy_budget"], "hedge", d["hedge_threshold"], d["hedge_require_ask_max"])'
   sudo systemctl restart polybuybot5m
   sudo systemctl enable polybuybot5m
   systemctl is-active polybuybot polybuybot5m polybuybothourly
@@ -169,7 +169,7 @@ amount / HTTP 400), not this NameError.
 
 ## Open / next
 
-- [x] Pause minting; keep $2.50 / 75–99¢ CLOB triggers.
+- [x] Pause minting; keep CLOB triggers (now two $2.50 slices, late 75–90).
 - [x] **5m-only live trading** — 15m and hourly buy services stopped/disabled.
 - [x] Pin BUY FAKs to **budget/ask limit** at the quoted ask (band unchanged;
   displayed top size is not a cap; `buy_max_spend` $3; `buy_max_shares` 5 buffer).
@@ -186,11 +186,13 @@ amount / HTTP 400), not this NameError.
 - [x] Faster **proven-empty** FAK retries (unmatched 400 only; 0.15 s empty cooldown).
       After merge: `git pull` + `sudo systemctl restart polybuybot5m` (5m only).
       Live JSON does **not** need a new key — `empty_fak_cooldown_s` defaults to 0.15.
-- [ ] After merge: `git pull` then `sudo systemctl restart polybuybot5m` only.
-      5m BUY FAKs size `budget/ask` and **limit at 99¢** (all three windows).
-      No live JSON change. Watch `buy_fill` `limit=0.99` vs `ask` at the touch.
-      Empty 83¢-only FAKs should drop when 84–99¢ size exists. Do **not** start
-      15m / hourly / mint.
+- [x] 5m BUY FAKs size `budget/ask` and limit at the **open band max**
+      (99¢ early, then 90¢ late after the two-slice change).
+- [ ] After merge: `git pull`, set live `late_buy_budget=2.5` (keep
+      `buy_budget=2.5`, `buy_max_price=0.90`), then
+      `sudo systemctl restart polybuybot5m` only. Watch `buy_attempt`
+      `slice=early|late` and `add=true` on the second $2.50. Do **not**
+      start 15m / hourly / mint. Do **not** set `buy_budget` to 5.
 - [ ] Cloud paper P&L: paste `CLOUD_RESEARCH.md` section 2 (live `pathlog.py`
       + `--sweep --paper`, rank by `pnl_sum` vs `live_5m_paper`). No `.env`.
       Optional: attach `poly-research.zip` for the historical tape. Not live

@@ -11,27 +11,28 @@ and why the non-boilerplate code exists — is `TECHNICAL_DESIGN.md`.
 recorder (`polypathlog`). 15m and hourly buy services are **stopped**. Mint
 (`polymintbot`) is **paused**.
 
-The 5m bot buys the winning leg of Polymarket BTC "Up or Down" markets:
+The 5m bot buys the winning leg of Polymarket BTC "Up or Down" markets in
+**two $2.50 slices** (up to **$5** if both fill):
 
-| When (time to close) | Winning ask |
-|---|---|
-| Last **120s** (`TTM ≤ 120`) | **75–99¢** |
-| First **3 min** (`120 < TTM ≤ 300`) | **90–99¢** |
-| First **4 min** (`60 ≤ TTM ≤ 300`) | **≥95¢** (overlaps last 120s) |
+| When (time to close) | Winning ask | Slice |
+|---|---|---|
+| Last **120s** (`TTM ≤ 120`) | **75–90¢** | **$2.50** late (`late_buy_budget`) |
+| First **3 min** (`120 < TTM ≤ 300`) | **90–99¢** | **$2.50** early (`buy_budget`) |
+| Same early window | **≥95¢** overlay | uses the early $2.50, not a third slice |
 
-Budget **$2.50**/market (hard $3, share rail 5). Hedge **50/55** on reversal
-(plus inverted GUI). Winners redeem at $1.00. **No profit-take sell.**
-See `CURRENT.md` for the active probe knobs.
+Missed early does **not** become a $5 late buy. Same-leg add only (no
+straddle). Hedge **50/55** on the combined bag (plus inverted GUI). Winners
+redeem at $1.00. **No profit-take sell.** See `CURRENT.md` for the active
+probe knobs.
 
-**Overlap:** last 120s while TTM ≥ 60s is already 75–99¢, so the ≥95 path
-is redundant there. For `TTM < 60` only the late 75–99¢ band is open.
-Do not set live `buy_max_price` to 0.99 — that value is the first-3-min
-≥90 floor. Last-120s cap is `early_buy_max_price` (0.99).
+Last 120s is **75–90¢ only** — do not buy 91–99¢ after T-120. `buy_max_price`
+0.90 is the late cap and the early ≥90 floor. Early FAK limit is
+`early_buy_max_price` (0.99).
 
 | File | Service | Markets | Oracle | Budget | Window |
 |---|---|---|---|---|---|
 | `buybot.py` | `polybuybot` **stopped** | 15m | Chainlink TWAP 60s | $2.50 | final 4.0 min, 75–90¢, hedge 35/40 |
-| `buybot5m.py` | `polybuybot5m` **live** | 5m | Chainlink TWAP 30s | $2.50 | bands above; hedge **50/55** |
+| `buybot5m.py` | `polybuybot5m` **live** | 5m | Chainlink TWAP 30s | $2.50+$2.50 | bands above; hedge **50/55** |
 | `buybothourly.py` | `polybuybothourly` **stopped** | hourly | Binance BTCUSDT | $2.50 | final 13.0 min, 75–90¢, hedge 35/40 |
 | `pathlog.py` | `polypathlog` **live** | all three | — (CLOB books only) | — | whole 5m; last 8m of 15m; last 15m of hourly |
 
@@ -162,16 +163,18 @@ python check_participation.py --hours 72 --csv exports/trades.csv
 
 Watch the console for `[DRY BUY]` / `[DRY SELL]` markers. Ctrl-C to stop.
 
-`--sweep` reads **late** keys from `strategy_buy5m.example.json` (75–99 /
-120s / $2.50; cap is `early_buy_max_price`) and paper-hedges at that file's **50/55**. `--compare` uses
+`--sweep` reads **late** keys from `strategy_buy5m.example.json` (75–90 /
+120s / $2.50). `--compare` uses
 hardcoded late-band presets; `--paper` hedge knobs still come from the
-example JSON. Neither command replays the early ≥90 / ≥95 union.
+example JSON. Neither command replays the early ≥90 / ≥95 union **or** the
+two-slice $2.50+$2.50 add.
 `--series 5m` matches **only** 5m (not 15m — the string `15m` contains `5m`).
 
 ### What to look for
 
 - `[DRY BUY]` / `[DRY SELL]` in dry-run — confirms trigger logic fires
-- `buy_attempt` `band=late` / `early` / `early_95` — which 5m window armed
+- `buy_attempt` `band=late` / `early` / `early_95` and `slice=early|late` — which 5m window armed
+- `buy_skip_other_leg` — late winner is the other side of an early fill (no straddle)
 - `[FAK EMPTY]` / `buy_attempt_rejected` with `unmatched_retry: true` — empty FAK re-quoted in the same trigger (up to 3 POSTs)
 - `buy_ghost_fill` `via=unmatched_400_guard` — unmatched 400 but inventory appeared; no second FAK
 - `buy_attempt_ambiguous` `via=unmatched_400_no_balance` — unmatched 400 and CLOB balance unreadable; quarantine, no retry
@@ -198,7 +201,7 @@ example JSON. Neither command replays the early ≥90 / ≥95 union.
 - `buy_skip_incomplete_book` — missing GUI price on a leg (no mid and no last trade)
 - `buy_skip_underlying_edge` — underlying gate failed (missing/stale/flat vs PTB; 5m is **$0** = any non-zero tick)
 - `buy_skip_underlying_side` — book wants the opposite leg from the underlying move
-- `buy_window` — market first entered a 5m buy window (late 75–99, early ≥90, or ≥95; one line per market)
+- `buy_window` — market first entered a 5m buy window (late 75–90, early ≥90, or ≥95; one line per market)
 - `buy_skip` `ask_below_band` / `ask_above_band` / `ask_out_of_band` / `no_ask` — in window, winning ask not in any open band (throttled 8s)
 - `buy_skip_max_positions` — only if `max_open_positions > 0` (probe uses **0 = unlimited**)
 - `pathlog_prune` — oldest tick JSONL removed (14d / 400 MB cap); export first
@@ -218,10 +221,10 @@ python check_path_backtest.py --grid --budget 2.5 --series 5m
 python check_buy_skips.py --since 2026-08-19T08:02:00
 ```
 
-`--sweep` scores the live 5m **example** late template (75–99 / 120s / $2.50)
+`--sweep` scores the live 5m **example** late template (75–90 / 120s / $2.50)
 plus one-at-a-time window/band/size variants, with a **paper** hedge from that
 JSON (**50/55/15** + mid-as-GUI when spread ≤ 10¢). It does **not** union the
-early ≥90 / ≥95 windows. `--anatomy` answers “already decided at T-120 vs
+early ≥90 / ≥95 windows and does **not** model two $2.50 slices. `--anatomy` answers “already decided at T-120 vs
 50/50 until the end.” `--compare` is the named-preset table; add `--paper` to
 walk later ticks. `--grid` is ask × time. **`--series 5m` matches only 5m**
 (not 15m). Pathlog cannot replay last-trade, BTC/PTB, or POST latency.
@@ -246,9 +249,9 @@ Cloud agents: `CLOUD_RESEARCH.md`.
   last-known-good hedge parameters. A per-bot process lock prevents duplicate
   live instances.
 - **FAK orders only:** All orders are Fill-And-Kill — no resting orders, no market
-  making. 5m buys are **limit** FAKs at the **open band max (99¢)** sized
-  `budget/ask` (hard `buy_max_spend` $3, `buy_max_shares` 5; not displayed top
-  size). The matcher walks the ask book from the touch up to 99¢. 15m/hourly
+  making. 5m buys are **limit** FAKs at the **open band max** (late **90¢**,
+  early **99¢**) sized `budget/ask` per slice (hard `buy_max_spend` $3,
+  `buy_max_shares` 5; not displayed top size). 15m/hourly
   (stopped) still pin the limit to the quoted ask. Sells stay
   share-denominated market FAKs. A 400 **"no orders found to match"** re-quotes and
   POSTs again (up to 3) in the same trigger; invalid-amount / auth 400s and unclear
@@ -269,7 +272,9 @@ Cloud agents: `CLOUD_RESEARCH.md`.
   **Live `strategy_buy5m.json` must set the hedge keys** or an old 35/40 file
   keeps the old hedge after hot reload.
 - **Tick sizes:** 5m markets use `0.001`, 15m and hourly use `0.01`.
-- **One entry per market:** Enforced via `meta.get("bought_token")` in state cache.
+- **One fill per slice:** `early_bought` / `late_bought` in state. `bought_token`
+  still means the held leg. A late $2.50 may **add** to the same token; the
+  other leg is `buy_skip_other_leg`. `one_entry_per_market` stays true.
 - **Notifications:** Fire-and-forget via ntfy.sh (topic `polybot-joel-btc`).
   Never let notification failures crash the bot.
 - **GCP VM:** `~/poly-money-maker` on a small ~10GB e2 disk. Journal filled it
@@ -282,8 +287,8 @@ Cloud agents: `CLOUD_RESEARCH.md`.
    `buybot.py` probably also applies to `buybot5m.py` and `buybothourly.py`.
    `buy/entry_skip.py` is the 5m-only exception.
 2. **The 5m bot uses seconds-based window checks** (`buy_start_s = 120` late
-   75–99¢; `early_buy_start_s = 300` for ask ≥ 90¢; `early_95_min_s = 60` /
-   `early_95_start_s = 300` for ask ≥ 95¢) while the
+   75–90¢; `early_buy_start_s = 300` for ask ≥ 90¢; `early_95` overlay only
+   when TTM > 120) while the
    15m and hourly bots use minutes (`buy_window_min = 4.0 / 13.0`). Don't mix them
    when propagating changes. The 5m loop must define `seconds_left` (not only
    `minutes_left`) or it NameErrors every cycle.
@@ -317,7 +322,7 @@ After this branch merges, on the VM (5m only):
 
 ```bash
 cd ~/poly-money-maker && git pull
-python3 -c 'import json; from pathlib import Path; p=Path("strategy_buy5m.json"); d=json.loads(p.read_text()); d["hedge_threshold"]=0.50; d["hedge_require_ask_max"]=0.55; p.write_text(json.dumps(d, indent=2)+"\n")'
+python3 -c 'import json; from pathlib import Path; p=Path("strategy_buy5m.json"); d=json.loads(p.read_text()); d["hedge_threshold"]=0.50; d["hedge_require_ask_max"]=0.55; d["buy_budget"]=2.5; d["late_buy_budget"]=2.5; d["buy_max_price"]=0.90; p.write_text(json.dumps(d, indent=2)+"\n")'
 sudo systemctl restart polybuybot5m
 ```
 
