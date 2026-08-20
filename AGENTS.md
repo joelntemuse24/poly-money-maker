@@ -46,7 +46,8 @@ change to one usually needs propagation to its siblings.
 | File | Purpose |
 |---|---|
 | `pathlog.py` | CLOB path recorder (no orders; TOB price **and** size) |
-| `check_path_backtest.py` | Pathlog: entry grid, window anatomy, named strategy compare (no orders) |
+| `check_path_backtest.py` | Pathlog: entry grid, anatomy, compare, **paper hedge**, template `--sweep` (no orders) |
+| `CLOUD_RESEARCH.md` | Cloud-agent prompts + how to snapshot ticks (no live keys) |
 | `check_book.py` | Diagnostic — inspect a live order book |
 | `check_edge_counterfactual.py` | Diagnostic — resolution win rate if edge skips had filled |
 | `check_participation.py` | Diagnostic — post-facto bought vs missed + band exposure |
@@ -115,6 +116,8 @@ python check_participation.py --hours 72 --csv exports/trades.csv
 ```bash
 .venv/bin/python check_path_backtest.py --grid --budget 2.5 --series 5m --csv /tmp/hits.csv
 .venv/bin/python check_path_backtest.py --compare --series 5m --budget 2.5
+.venv/bin/python check_path_backtest.py --compare --paper --series 5m --budget 2.5
+.venv/bin/python check_path_backtest.py --sweep --series 5m
 .venv/bin/python check_path_backtest.py --anatomy --series 5m --ttm-max 120 --csv /tmp/anatomy.csv
 .venv/bin/python check_path_backtest.py --export-market <slug> --csv /tmp/m.csv
 # then scp /tmp/hits.csv (or scp -r pathlog/ticks) off the box
@@ -164,17 +167,20 @@ editing `strategy_buy5m.json`:
 
 ```bash
 python check_path_backtest.py --compare --series 5m --budget 2.5
-python check_path_backtest.py --compare --series 5m --budget 15
+python check_path_backtest.py --compare --paper --series 5m --budget 2.5
+python check_path_backtest.py --sweep --series 5m
 python check_path_backtest.py --anatomy --series 5m --ttm-max 120 --csv /tmp/anatomy.csv
 python check_path_backtest.py --grid --budget 2.5 --series 5m
 python check_buy_skips.py --since 2026-08-19T08:02:00
 ```
 
-`--anatomy` answers “already decided at T-120 vs 50/50 until the end.”
-`--compare` scores live 75–90/120s vs earlier windows and wider bands.
-`--grid` is ask × time. `--budget` is size. **`--series 5m` matches only 5m**
-(not 15m). Pathlog cannot replay GUI last-trade, BTC/PTB, or POST latency —
-see TECHNICAL_DESIGN.md “Research loop.”
+`--sweep` scores the live 5m **example** template (75–90 / 120s / $2.50) plus
+one-at-a-time window/band/size variants, with a **paper** hedge on recorded
+books (not live). `--anatomy` answers “already decided at T-120 vs 50/50 until
+the end.” `--compare` is the named-preset table; add `--paper` to walk later
+ticks for 35/40/15 + GUI-proxy. `--grid` is ask × time. **`--series 5m` matches
+only 5m** (not 15m). Pathlog cannot replay last-trade, BTC/PTB, or POST latency.
+Cloud agents: `CLOUD_RESEARCH.md`.
 
 ## Key Conventions
 

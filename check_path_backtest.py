@@ -16,8 +16,10 @@ Examples (on the VM):
   python check_path_backtest.py --grid --budget 15 --series 5m
   python check_path_backtest.py --ask-min 0.75 --ask-max 0.90 --ttm-max 120 --budget 15 --series 5m --csv /tmp/hits_15.csv
   python check_path_backtest.py --anatomy --series 5m --ttm-max 120
-  python check_path_backtest.py --compare --series 5m --budget 2.5
-  python check_path_backtest.py --export-market btc-updown-5m-1786528500 --csv /tmp/m.csv
+    python check_path_backtest.py --compare --series 5m --budget 2.5
+    python check_path_backtest.py --compare --paper --series 5m --budget 2.5
+    python check_path_backtest.py --sweep --series 5m
+    python check_path_backtest.py --export-market btc-updown-5m-1786528500 --csv /tmp/m.csv
   python check_path_backtest.py --ask-min 0.98 --ask-max 0.99 --ttm-max 90 --csv /tmp/hits.csv
 """
 
@@ -215,6 +217,212 @@ def path_display_price(bid: Any, ask: Any) -> Optional[float]:
         if (ask_f - bid_f) <= PATHLOG_GUI_SPREAD + 1e-12:
             return (bid_f + ask_f) / 2.0
     return ask_f
+
+
+def _after_entry(row: dict, hit: dict) -> bool:
+    hit_ts = _f(hit.get("ts"))
+    row_ts = _f(row.get("ts"))
+    if hit_ts is not None and row_ts is not None:
+        return row_ts > hit_ts + 1e-9
+    hit_ttm = _f(hit.get("ttm"))
+    row_ttm = _f(row.get("ttm"))
+    if hit_ttm is not None and row_ttm is not None:
+        return row_ttm < hit_ttm - 1e-9
+    return False
+
+
+def _leg_quote(row: dict, leg: str) -> Tuple[Optional[float], Optional[float], Optional[float]]:
+    if leg == "up":
+        return _f(row.get("ub")), _f(row.get("ua")), _f(row.get("ubs"))
+    return _f(row.get("db")), _f(row.get("da")), _f(row.get("dbs"))
+
+
+def _tight_mid(bid: Optional[float], ask: Optional[float]) -> Optional[float]:
+    """Mid only when spread ≤ 10¢. Wide books have no last-trade in pathlog."""
+    if bid is None or ask is None or ask < bid:
+        return None
+    if (ask - bid) <= PATHLOG_GUI_SPREAD + 1e-12:
+        return (bid + ask) / 2.0
+    return None
+
+
+def paper_settle(
+    ticks: Sequence[dict],
+    hit: dict,
+    fill: dict,
+    winner: Optional[str],
+    *,
+    hedge_threshold: float = 0.35,
+    hedge_require_ask_max: float = 0.40,
+    hedge_max_spread: float = 0.15,
+    hedge_require_gui: bool = True,
+    min_winner_bid: float = 0.70,
+    max_loser_bid: float = 0.30,
+    min_bid_edge: float = 0.05,
+    last_trade_max: float = 0.40,
+    toxic_force_exit_below: float = 0.65,
+) -> dict:
+    """Walk ticks after a fill. No orders. Not a live replay.
+
+    Pathlog has no last-trade print. Tight books (spread ≤ 10¢) use mid as
+    GUI *and* last-print proxy. Wide books fail closed (no hedge), same class
+    as live ``hedge_skip_no_consensus`` / missing last trade.
+
+    ``toxic_fill`` (avg < 65¢) dumps only while held bid ≤ 35¢ — recovered
+    97¢ books ride. Normal hedges still need 35/40/15 plus the GUI proxy.
+    """
+    shares = float(fill.get("shares") or 0.0)
+    notional = float(fill.get("notional") or 0.0)
+    avg = _f(fill.get("avg"))
+    held = hit.get("leg")
+    if shares <= 0 or notional <= 0 or held not in ("up", "down"):
+        return {
+            "exit": "no_fill",
+            "exit_bid": None,
+            "exit_ttm": None,
+            "won": None,
+            "pnl": 0.0 if winner else None,
+        }
+
+    toxic = avg is not None and avg < toxic_force_exit_below - 1e-12
+    other = "down" if held == "up" else "up"
+
+    def _redeem() -> dict:
+        if winner is None:
+            return {
+                "exit": "unresolved",
+                "exit_bid": None,
+                "exit_ttm": None,
+                "won": None,
+                "pnl": None,
+            }
+        won = held == winner
+        return {
+            "exit": "redeem_win" if won else "redeem_loss",
+            "exit_bid": None,
+            "exit_ttm": None,
+            "won": won,
+            "pnl": fill_pnl(fill, won),
+        }
+
+    for row in ticks:
+        if not _after_entry(row, hit):
+            continue
+        bid, ask, bid_sz = _leg_quote(row, held)
+        if bid is None:
+            continue
+        if toxic:
+            if bid > hedge_threshold + 1e-12:
+                continue
+        else:
+            if ask is None:
+                continue
+            if bid > hedge_threshold + 1e-12:
+                continue
+            if ask > hedge_require_ask_max + 1e-12:
+                continue
+            if ask < bid:
+                continue
+            if (ask - bid) > hedge_max_spread + 1e-12:
+                continue
+            if hedge_require_gui:
+                other_bid, other_ask, _ = _leg_quote(row, other)
+                held_gui = _tight_mid(bid, ask)
+                other_gui = _tight_mid(other_bid, other_ask)
+                if held_gui is None or other_gui is None:
+                    continue
+                if held_gui > max_loser_bid + 1e-12:
+                    continue
+                if other_gui + 1e-12 < min_winner_bid:
+                    continue
+                if (other_gui - held_gui) + 1e-12 < min_bid_edge:
+                    continue
+                if held_gui > last_trade_max + 1e-12:
+                    continue
+        sell = shares
+        if bid_sz is not None:
+            sell = min(shares, bid_sz)
+        sell = math.floor(sell * 10000 + 1e-12) / 10000
+        if sell <= 0:
+            continue
+        proceeds = sell * bid
+        remain = max(0.0, shares - sell)
+        label = "toxic_dump" if toxic else "hedge"
+        if remain < 0.01:
+            return {
+                "exit": label,
+                "exit_bid": bid,
+                "exit_ttm": _f(row.get("ttm")),
+                "won": False,
+                "pnl": round(proceeds - notional, 4),
+            }
+        if winner is None:
+            return {
+                "exit": f"{label}_partial_unresolved",
+                "exit_bid": bid,
+                "exit_ttm": _f(row.get("ttm")),
+                "won": None,
+                "pnl": None,
+            }
+        remain_val = remain if held == winner else 0.0
+        return {
+            "exit": label,
+            "exit_bid": bid,
+            "exit_ttm": _f(row.get("ttm")),
+            "won": bool(held == winner and remain > 0),
+            "pnl": round(proceeds + remain_val - notional, 4),
+        }
+    return _redeem()
+
+
+def template_from_strategy(path: Path) -> dict:
+    """Map example/live-shaped strategy JSON to backtest knobs. Never loads secrets."""
+    data = json.loads(path.read_text())
+    if data.get("buy_start_s") is not None:
+        ttm_max = float(data["buy_start_s"])
+    else:
+        ttm_max = float(data.get("buy_window_min") or 4.0) * 60.0
+    spread = data.get("max_entry_spread")
+    return {
+        "ask_min": float(data["buy_threshold"]),
+        "ask_max": float(data["buy_max_price"]),
+        "ttm_max": ttm_max,
+        "budget": float(data["buy_budget"]),
+        "max_spread": None if spread is None else float(spread),
+        "hedge_threshold": float(data.get("hedge_threshold") or 0.35),
+        "hedge_require_ask_max": float(data.get("hedge_require_ask_max") or 0.40),
+        "hedge_max_spread": float(data.get("hedge_max_spread") or 0.15),
+        "hedge_require_gui": bool(data.get("hedge_require_gui", True)),
+        "min_winner_bid": float(data.get("min_winner_bid") or 0.70),
+        "max_loser_bid": float(data.get("max_loser_bid") or 0.30),
+        "min_bid_edge": float(data.get("min_bid_edge") or 0.05),
+        "last_trade_max": float(data.get("hedge_require_ask_max") or 0.40),
+        "toxic_force_exit_below": float(data.get("toxic_force_exit_below") or 0.65),
+    }
+
+
+def sweep_variants(tmpl: dict) -> List[dict]:
+    """One-at-a-time deviations from the live template. Not a full cartesian."""
+    tag = "5m" if abs(float(tmpl["ttm_max"]) - 120.0) < 1e-6 else "template"
+    rows: List[dict] = []
+
+    def add(name: str, **overrides: Any) -> None:
+        row = dict(tmpl)
+        row.update(overrides)
+        row["name"] = name
+        rows.append(row)
+
+    add(f"live_{tag}_paper", paper=True)
+    add(f"live_{tag}_ride", paper=False)
+    for ttm in (60, 90, 180, 240):
+        add(f"window_{ttm}s", ttm_max=float(ttm), paper=True)
+    add("band_70_90", ask_min=0.70, paper=True)
+    add("band_80_90", ask_min=0.80, paper=True)
+    add("band_75_85", ask_max=0.85, paper=True)
+    add("band_75_95", ask_max=0.95, paper=True)
+    add("budget_15", budget=15.0, paper=True)
+    add("no_spread_cap", max_spread=None, paper=True)
+    return rows
 
 
 def tick_sides(row: dict, min_edge: float) -> Optional[dict]:
@@ -464,8 +672,11 @@ def evaluate_rule(
     ttm_max: float,
     budget: float,
     max_spread: Optional[float] = None,
+    paper: bool = False,
+    paper_kwargs: Optional[dict] = None,
 ) -> List[dict]:
     rows: List[dict] = []
+    pk = paper_kwargs or {}
     for market in markets:
         winner = market.winner or infer_winner(market.ticks)
         hit = first_entry(
@@ -493,18 +704,33 @@ def evaluate_rule(
                     "avg": None,
                     "won": None,
                     "pnl": None,
+                    "exit": None,
+                    "exit_bid": None,
                 }
             )
             continue
         fill = simulate_fak_buy(budget, float(hit["ask"]), hit.get("ask_size"))
         filled = fill["status"] != "zero"
-        won = winner is not None and filled and hit["leg"] == winner
         if not filled:
             pnl = 0.0 if winner else None
             won_out: Optional[bool] = None
+            exit_kind: Optional[str] = "zero"
+            exit_bid = None
+        elif paper:
+            settled = paper_settle(market.ticks, hit, fill, winner, **pk)
+            won_out = settled.get("won")
+            pnl = settled.get("pnl")
+            exit_kind = settled.get("exit")
+            exit_bid = settled.get("exit_bid")
         else:
+            won = winner is not None and hit["leg"] == winner
             pnl = fill_pnl(fill, bool(won)) if winner else None
             won_out = won if winner else None
+            if winner is None:
+                exit_kind = "unresolved"
+            else:
+                exit_kind = "redeem_win" if won else "redeem_loss"
+            exit_bid = None
         rows.append(
             {
                 "slug": market.slug,
@@ -521,6 +747,8 @@ def evaluate_rule(
                 "avg": None if fill["avg"] is None else round(float(fill["avg"]), 4),
                 "won": won_out,
                 "pnl": None if pnl is None else round(pnl, 4),
+                "exit": exit_kind,
+                "exit_bid": None if exit_bid is None else round(float(exit_bid), 4),
             }
         )
     return rows
@@ -551,6 +779,10 @@ def summarize(rows: Sequence[dict]) -> dict:
         "zero": zero,
         "avg_notional": round(sum(notionals) / len(notionals), 4) if notionals else None,
         "avg_fill_px": round(sum(avgs) / len(avgs), 4) if avgs else None,
+        "hedges": sum(1 for r in hits if r.get("exit") == "hedge"),
+        "toxic_dumps": sum(1 for r in hits if r.get("exit") == "toxic_dump"),
+        "redeem_wins": sum(1 for r in hits if r.get("exit") == "redeem_win"),
+        "redeem_losses": sum(1 for r in hits if r.get("exit") == "redeem_loss"),
     }
 
 
@@ -645,6 +877,8 @@ def export_hits_csv(rows: Sequence[dict], dest: Path) -> None:
         "winner",
         "won",
         "pnl",
+        "exit",
+        "exit_bid",
     ]
     with open(dest, "w", newline="", encoding="utf-8") as handle:
         writer = csv.DictWriter(handle, fieldnames=fields, extrasaction="ignore")
@@ -661,6 +895,7 @@ def _print_summary(stats: dict) -> None:
         f"full={stats.get('full', 0)}  partial={stats.get('partial', 0)}  "
         f"zero={stats.get('zero', 0)}  decided={stats['decided']}  "
         f"wins={stats['wins']}  win_rate={wr_s}  pnl={stats['pnl_sum']}  "
+        f"hedges={stats.get('hedges', 0)}  toxic_dumps={stats.get('toxic_dumps', 0)}  "
         f"misses={stats['misses']}  unresolved={stats['unresolved']}"
     )
 
@@ -689,6 +924,22 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         help="score named alternative windows/bands on the same ticks (no live orders)",
     )
     ap.add_argument(
+        "--paper",
+        action="store_true",
+        help="after a fill, walk later ticks for 35/40/15 + GUI-proxy hedge / toxic dump",
+    )
+    ap.add_argument(
+        "--sweep",
+        action="store_true",
+        help="one-at-a-time variants of --template (default strategy_buy5m.example.json)",
+    )
+    ap.add_argument(
+        "--template",
+        type=Path,
+        default=REPO / "strategy_buy5m.example.json",
+        help="example strategy JSON used as the sweep/paper template (not live JSON)",
+    )
+    ap.add_argument(
         "--min-edge",
         type=float,
         default=0.05,
@@ -702,6 +953,31 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             m for m in markets
             if matches_series(m.series, m.slug, args.series)
         ]
+
+    tmpl = template_from_strategy(args.template) if args.template.exists() else {}
+    paper_kwargs = {
+        k: tmpl[k]
+        for k in (
+            "hedge_threshold",
+            "hedge_require_ask_max",
+            "hedge_max_spread",
+            "hedge_require_gui",
+            "min_winner_bid",
+            "max_loser_bid",
+            "min_bid_edge",
+            "last_trade_max",
+            "toxic_force_exit_below",
+        )
+        if k in tmpl
+    }
+
+    if not markets and (args.sweep or args.compare or args.grid or args.anatomy):
+        print(
+            f"no pathlog ticks in {args.dir} (series={args.series or 'all'}). "
+            "Export pathlog/ticks from the VM — see CLOUD_RESEARCH.md. No live orders.",
+            file=sys.stderr,
+        )
+        return 2
 
     if args.export_market:
         slug = args.export_market
@@ -769,8 +1045,52 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             print(f"wrote {len(rows)} rows → {args.csv}")
         return 0
 
+    if args.sweep:
+        if not tmpl:
+            print(f"missing template {args.template}", file=sys.stderr)
+            return 1
+        print(
+            "name\tpaper\task_min\task_max\tttm_max\tbudget\tmax_spread\t"
+            "hits\tfull\tpartial\tzero\tdecided\twins\twin_rate\tpnl\thedges\ttoxic_dumps"
+        )
+        for variant in sweep_variants(tmpl):
+            rows = evaluate_rule(
+                markets,
+                ask_min=float(variant["ask_min"]),
+                ask_max=float(variant["ask_max"]),
+                ttm_min=0.0,
+                ttm_max=float(variant["ttm_max"]),
+                budget=float(variant["budget"]),
+                max_spread=variant.get("max_spread"),
+                paper=bool(variant.get("paper")),
+                paper_kwargs=paper_kwargs,
+            )
+            stats = summarize(rows)
+            wr = stats["win_rate"]
+            wr_s = f"{wr:.3f}" if wr is not None else ""
+            spread = variant.get("max_spread")
+            spread_s = "" if spread is None else f"{float(spread):.2f}"
+            print(
+                f"{variant['name']}\t{int(bool(variant.get('paper')))}\t"
+                f"{float(variant['ask_min']):.2f}\t{float(variant['ask_max']):.2f}\t"
+                f"{float(variant['ttm_max']):g}\t{float(variant['budget']):g}\t{spread_s}\t"
+                f"{stats['hits']}\t{stats.get('full', 0)}\t{stats.get('partial', 0)}\t"
+                f"{stats.get('zero', 0)}\t{stats['decided']}\t{stats['wins']}\t"
+                f"{wr_s}\t{stats['pnl_sum']}\t{stats.get('hedges', 0)}\t"
+                f"{stats.get('toxic_dumps', 0)}"
+            )
+        print(
+            "Paper = recorded CLOB path + GUI-proxy hedge (no last-trade, no BTC/PTB, "
+            "no POST latency). Ride = fill then $1 or $0. Not live. "
+            "Template: " + str(args.template)
+        )
+        return 0
+
     if args.compare:
-        print("preset\task_min\task_max\tttm_max\thits\tfull\tpartial\tzero\tdecided\twins\twin_rate\tpnl")
+        print(
+            "preset\task_min\task_max\tttm_max\thits\tfull\tpartial\tzero\t"
+            "decided\twins\twin_rate\tpnl\thedges\ttoxic_dumps"
+        )
         for name, ask_min, ask_max, ttm_max in COMPARE_PRESETS:
             rows = evaluate_rule(
                 markets,
@@ -780,6 +1100,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 ttm_max=ttm_max,
                 budget=args.budget,
                 max_spread=args.max_spread,
+                paper=args.paper,
+                paper_kwargs=paper_kwargs,
             )
             stats = summarize(rows)
             wr = stats["win_rate"]
@@ -788,11 +1110,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 f"{name}\t{ask_min:.2f}\t{ask_max:.2f}\t{ttm_max:g}\t"
                 f"{stats['hits']}\t{stats.get('full', 0)}\t{stats.get('partial', 0)}\t"
                 f"{stats.get('zero', 0)}\t{stats['decided']}\t{stats['wins']}\t"
-                f"{wr_s}\t{stats['pnl_sum']}"
+                f"{wr_s}\t{stats['pnl_sum']}\t{stats.get('hedges', 0)}\t"
+                f"{stats.get('toxic_dumps', 0)}"
             )
         print(
             "Same recorded paths, no live orders. Size: rerun with --budget 15. "
-            "Spread: add --max-spread 0.05. Grid: --grid."
+            "Spread: add --max-spread 0.05. Hedge model: --paper. Grid: --grid. "
+            "Template sweep: --sweep."
         )
         return 0
 
@@ -804,6 +1128,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         ttm_max=args.ttm_max,
         budget=args.budget,
         max_spread=args.max_spread,
+        paper=args.paper,
+        paper_kwargs=paper_kwargs,
     )
     _print_summary(summarize(rows))
     if args.csv:
