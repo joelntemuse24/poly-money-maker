@@ -1136,20 +1136,21 @@ class FiveMinuteBandLimitFakTests(unittest.TestCase):
             bot=BOT5M,
         )
         fn = ns["quoted_buy_shares_up_to_limit"]
-        at_ask = ns["quoted_buy_shares"]
         cases = (
             (0.75, 0.90),   # last 120s 75–90
             (0.83, 0.90),   # last 120s, live miss at 83¢
-            (0.91, 0.99),   # first 3 min ≥90
+            (0.88, 0.90),   # live 20 Aug 19:58 (was 2.00 sh / $1.80)
+            (0.90, 0.99),   # first 3 min ≥90 (was 2.00 sh / $1.98)
+            (0.91, 0.99),
             (0.96, 0.99),   # ≥95 overlay
         )
         for ask, limit in cases:
             shares = fn(2.50, ask, limit, 5.0, spend_cap=3.0)
-            self.assertGreaterEqual(shares, 2.0, ask)
-            self.assertLessEqual(shares, at_ask(2.50, ask, 5.0) + 1e-12, ask)
+            self.assertGreaterEqual(shares, 3.0, ask)
             self.assertLessEqual(shares * limit, 3.0 + 1e-9, ask)
             maker = Decimal(str(shares)) * Decimal(str(limit))
             self.assertEqual(maker.quantize(Decimal("0.01")), maker, ask)
+            self.assertGreaterEqual(float(maker), 2.50, ask)
 
     def test_worst_case_spend_clips_to_buy_max_spend(self):
         ns = _load_funcs(
@@ -1238,7 +1239,7 @@ class FiveMinuteBandLimitFakTests(unittest.TestCase):
         self.assertEqual(result, (0.0, 0.0, "empty"))
         self.assertEqual(len(calls["orders"]), 1)
         self.assertAlmostEqual(calls["orders"][0]["price"], 0.90)
-        self.assertGreater(calls["orders"][0]["size"], 2.5)
+        self.assertGreaterEqual(calls["orders"][0]["size"], 3.0)
         self.assertLessEqual(calls["orders"][0]["size"] * 0.90, 3.0 + 1e-9)
 
     def test_early_90_and_95_windows_also_limit_at_99(self):
@@ -1249,6 +1250,7 @@ class FiveMinuteBandLimitFakTests(unittest.TestCase):
             on_submit=lambda *args: calls["submit"].append(args),
         )
         self.assertAlmostEqual(calls["orders"][0]["price"], 0.99)
+        self.assertAlmostEqual(calls["orders"][0]["size"], 3.0)
         calls["orders"].clear()
         ns["get_quote_fast"] = lambda *_a, **_k: (0.95, 0.5, 0.96, 10.0, None)
         ns["buy_market_with_retry"](
@@ -1256,9 +1258,10 @@ class FiveMinuteBandLimitFakTests(unittest.TestCase):
             on_submit=lambda *args: calls["submit"].append(args),
         )
         self.assertAlmostEqual(calls["orders"][0]["price"], 0.99)
+        self.assertAlmostEqual(calls["orders"][0]["size"], 3.0)
 
     def test_early_90_limit_fill_at_91_is_not_toxic(self):
-        """Live 20 Aug 19:42: $1.98 at 91¢ → 2.18 sh vs ~2.00 posted at 99¢."""
+        """Live 20 Aug 19:42 was 2.00 sh / $1.98; new sizer posts 3.00 / $2.97."""
         ns = _load_funcs(
             "finite_float",
             "quoted_buy_shares",
@@ -1270,18 +1273,17 @@ class FiveMinuteBandLimitFakTests(unittest.TestCase):
         posted = ns["quoted_buy_shares_up_to_limit"](
             2.50, 0.90, 0.99, 5.0, spend_cap=3.0,
         )
-        self.assertAlmostEqual(posted, 2.0)
-        filled = 1.98 / 0.91
-        self.assertTrue(ns["buy_fill_walked"](filled, posted))
+        self.assertAlmostEqual(posted, 3.0)
+        filled = 2.97 / 0.91
         below, toxic = ns["classify_buy_fill"](0.91, filled, posted, 0.90, 0.65)
         self.assertFalse(below)
         self.assertFalse(toxic)
         late_posted = ns["quoted_buy_shares_up_to_limit"](
-            2.50, 0.75, 0.90, 5.0, spend_cap=3.0,
+            2.50, 0.88, 0.90, 5.0, spend_cap=3.0,
         )
-        late_filled = 1.98 / 0.75
+        self.assertAlmostEqual(late_posted, 3.0)
         below, toxic = ns["classify_buy_fill"](
-            0.75, late_filled, late_posted, 0.75, 0.65,
+            0.90, late_posted, late_posted, 0.75, 0.65,
         )
         self.assertFalse(below)
         self.assertFalse(toxic)

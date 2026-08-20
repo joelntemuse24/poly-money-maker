@@ -250,8 +250,9 @@ Cloud agents: `CLOUD_RESEARCH.md`.
   live instances.
 - **FAK orders only:** All orders are Fill-And-Kill — no resting orders, no market
   making. 5m buys are **limit** FAKs at the **open band max** (late **90¢**,
-  early **99¢**) sized `budget/ask` per slice (hard `buy_max_spend` $3,
-  `buy_max_shares` 5; not displayed top size). 15m/hourly
+  early **99¢**) sized `budget/ask` per slice, **at least 3 shares** when
+  `3 × limit` fits in `buy_max_spend` $3 (early 3.00 sh / $2.97, not 2.00 /
+  $1.98; `buy_max_shares` 5; not displayed top size). 15m/hourly
   (stopped) still pin the limit to the quoted ask. Sells stay
   share-denominated market FAKs. A 400 **"no orders found to match"** re-quotes and
   POSTs again (up to 3) in the same trigger; invalid-amount / auth 400s and unclear
