@@ -44,7 +44,8 @@ Hard rules:
 - Do not read, write, or ask for .env. Do not set dry_run false.
 - Do not edit strategy_buy.json / strategy_buy5m.json / strategy_buyhourly.json
   (non-example). Template file is strategy_buy5m.example.json. `--sweep`
-  scores the **late** keys only (75–90¢ / last 120s / $2.50) plus paper
+  scores the **late** keys only (75–99¢ / last 120s / $2.50; cap is
+  `early_buy_max_price`) plus paper
   hedge 50/55/15. It does **not** replay the live early ≥90 / ≥95 union.
 - pathlog.py is allowed (recorder only). check_book.py is allowed.
 - Gamma GET and CLOB GET only: gamma-api.polymarket.com, clob.polymarket.com.
@@ -58,7 +59,7 @@ Never scrape a substitute for missing ticks by placing orders.
 NOW snapshot (30 seconds, public APIs):
 - Find the current btc-up-or-down-5m market (and 15m/hourly if open).
 - Print slug, seconds left, up/down best bid/ask/size.
-- Print whether the live 5m template WOULD BUY on this tick (ask in 75–90,
+- Print whether the live 5m template WOULD BUY on this tick (ask in 75–99,
   ttm ≤ 120, spread ≤ 5¢, one winning leg). This is a call, not P&L yet.
 
 LIVE recorder (markets that are happening):
@@ -91,7 +92,7 @@ After the tables: at most 5 extra 5m combos that anatomy/grid suggest
 (not a cartesian bomb). --paper --series 5m --max-spread 0.05.
 
 How to pick a winner (this is the whole exercise):
-- Baseline = live_5m_paper (75–90, 120s, $2.50, paper hedge).
+- Baseline = live_5m_paper (75–99, 120s, $2.50, paper hedge).
 - Rank by pnl_sum first, then win_rate, then hits.
 - Ignore a variant with fewer than 5 hits on HISTORICAL or fewer than 3
   fills on SESSION. Lucky n=1 is not an edge.
@@ -107,7 +108,7 @@ How to pick a winner (this is the whole exercise):
 Write a draft PR that:
 - does NOT change live JSON or bots unless a test/docs bug blocks the sweep
 - pastes HISTORICAL and SESSION tables in the PR body
-- recommends at most one next live experiment, or “keep 75–90/120s”
+- recommends at most one next live experiment, or “keep 75–99/120s”
 - says operator must git pull + systemctl restart polybuybot5m to go live
 ```
 
@@ -123,7 +124,7 @@ Hard rules:
 - Do not edit strategy_buy.json / strategy_buy5m.json / strategy_buyhourly.json (non-example).
 - Do not read or write .env. Do not set dry_run false. Do not place orders.
 - Template file is strategy_buy5m.example.json. `--sweep` scores late
-  75–90¢ / 120s / $2.50 plus paper 50/55 — not the early ≥90 / ≥95 union.
+  75–99¢ / 120s / $2.50 plus paper 50/55 — not the early ≥90 / ≥95 union.
 - Rank by paper pnl_sum vs live_5m_paper, not by hit count. If pathlog/ticks
   is missing, run pathlog.py (no orders) instead of inventing books.
 

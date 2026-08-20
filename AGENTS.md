@@ -15,7 +15,7 @@ The 5m bot buys the winning leg of Polymarket BTC "Up or Down" markets:
 
 | When (time to close) | Winning ask |
 |---|---|
-| Last **120s** (`TTM ≤ 120`) | **75–90¢** |
+| Last **120s** (`TTM ≤ 120`) | **75–99¢** |
 | First **3 min** (`120 < TTM ≤ 300`) | **90–99¢** |
 | First **4 min** (`60 ≤ TTM ≤ 300`) | **≥95¢** (overlaps last 120s) |
 
@@ -23,8 +23,10 @@ Budget **$2.50**/market (hard $3, share rail 5). Hedge **50/55** on reversal
 (plus inverted GUI). Winners redeem at $1.00. **No profit-take sell.**
 See `CURRENT.md` for the active probe knobs.
 
-**Overlap / hole:** last 120s while TTM ≥ 60s → 75–90¢ **or** ≥95¢. **91–94¢
-in the last 120s** is out of band. For `TTM < 60` the ≥95 path is off.
+**Overlap:** last 120s while TTM ≥ 60s is already 75–99¢, so the ≥95 path
+is redundant there. For `TTM < 60` only the late 75–99¢ band is open.
+Do not set live `buy_max_price` to 0.99 — that value is the first-3-min
+≥90 floor. Last-120s cap is `early_buy_max_price` (0.99).
 
 | File | Service | Markets | Oracle | Budget | Window |
 |---|---|---|---|---|---|
@@ -129,7 +131,7 @@ python buybothourly.py    # hr, uses strategy_buyhourly.json
 python pathlog.py         # recorder only — no orders
 python check_path_backtest.py --grid --budget 2.5 --series 5m
 python check_path_backtest.py --grid --budget 15 --series 5m
-python check_path_backtest.py --ask-min 0.75 --ask-max 0.90 --ttm-max 120 --budget 15 --series 5m --csv /tmp/hits_15.csv
+python check_path_backtest.py --ask-min 0.75 --ask-max 0.99 --ttm-max 120 --budget 15 --series 5m --csv /tmp/hits_15.csv
 python check_book.py
 
 # CI-equivalent (no network to Polymarket required for unit tests)
@@ -160,8 +162,8 @@ python check_participation.py --hours 72 --csv exports/trades.csv
 
 Watch the console for `[DRY BUY]` / `[DRY SELL]` markers. Ctrl-C to stop.
 
-`--sweep` reads **late** keys from `strategy_buy5m.example.json` (75–90 /
-120s / $2.50) and paper-hedges at that file's **50/55**. `--compare` uses
+`--sweep` reads **late** keys from `strategy_buy5m.example.json` (75–99 /
+120s / $2.50; cap is `early_buy_max_price`) and paper-hedges at that file's **50/55**. `--compare` uses
 hardcoded late-band presets; `--paper` hedge knobs still come from the
 example JSON. Neither command replays the early ≥90 / ≥95 union.
 `--series 5m` matches **only** 5m (not 15m — the string `15m` contains `5m`).
@@ -196,7 +198,7 @@ example JSON. Neither command replays the early ≥90 / ≥95 union.
 - `buy_skip_incomplete_book` — missing GUI price on a leg (no mid and no last trade)
 - `buy_skip_underlying_edge` — underlying gate failed (missing/stale/flat vs PTB; 5m is **$0** = any non-zero tick)
 - `buy_skip_underlying_side` — book wants the opposite leg from the underlying move
-- `buy_window` — market first entered a 5m buy window (late 75–90, early ≥90, or ≥95; one line per market)
+- `buy_window` — market first entered a 5m buy window (late 75–99, early ≥90, or ≥95; one line per market)
 - `buy_skip` `ask_below_band` / `ask_above_band` / `ask_out_of_band` / `no_ask` — in window, winning ask not in any open band (throttled 8s)
 - `buy_skip_max_positions` — only if `max_open_positions > 0` (probe uses **0 = unlimited**)
 - `pathlog_prune` — oldest tick JSONL removed (14d / 400 MB cap); export first
@@ -216,7 +218,7 @@ python check_path_backtest.py --grid --budget 2.5 --series 5m
 python check_buy_skips.py --since 2026-08-19T08:02:00
 ```
 
-`--sweep` scores the live 5m **example** late template (75–90 / 120s / $2.50)
+`--sweep` scores the live 5m **example** late template (75–99 / 120s / $2.50)
 plus one-at-a-time window/band/size variants, with a **paper** hedge from that
 JSON (**50/55/15** + mid-as-GUI when spread ≤ 10¢). It does **not** union the
 early ≥90 / ≥95 windows. `--anatomy` answers “already decided at T-120 vs
@@ -278,7 +280,7 @@ Cloud agents: `CLOUD_RESEARCH.md`.
    `buybot.py` probably also applies to `buybot5m.py` and `buybothourly.py`.
    `buy/entry_skip.py` is the 5m-only exception.
 2. **The 5m bot uses seconds-based window checks** (`buy_start_s = 120` late
-   75–90¢; `early_buy_start_s = 300` for ask ≥ 90¢; `early_95_min_s = 60` /
+   75–99¢; `early_buy_start_s = 300` for ask ≥ 90¢; `early_95_min_s = 60` /
    `early_95_start_s = 300` for ask ≥ 95¢) while the
    15m and hourly bots use minutes (`buy_window_min = 4.0 / 13.0`). Don't mix them
    when propagating changes. The 5m loop must define `seconds_left` (not only

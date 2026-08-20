@@ -4,7 +4,7 @@
 Do not put secrets, API keys, or live wallet material here.
 
 Last updated: **2026-08-20** — **only the 5m CLOB bot is live.** Stop/disable
-15m and hourly. Keep the **$2.50** 5m triggers: **75–90¢ in the last 120s**, **90¢
+15m and hourly. Keep the **$2.50** 5m triggers: **75–99¢ in the last 120s**, **90¢
 or above (to 99¢) in the first 3 minutes**, and **≥95¢ in the first 4 minutes**.
 Hedge is **50/55**. Chainlink TWAP
 gate is **$0** (any non-zero tick vs PTB; side must match; flat is still
@@ -29,7 +29,7 @@ mint complete sets. Operator still sells leftover mint inventory by hand.
 will not be auto-hedged or redeemed by those processes.
 
 **Active strategy:** **5m only** (`polybuybot5m`) with the **$2.50** late
-**75–90¢** band, early **≥90¢** in the first 3 minutes, and **≥95¢** in the
+**75–99¢** band, early **≥90¢** in the first 3 minutes, and **≥95¢** in the
 first 4 minutes:
 
 | Knob | Value |
@@ -37,10 +37,10 @@ first 4 minutes:
 | `buy_budget` | **$2.50** / market |
 | `buy_max_spend` | **$3.00** hard ceiling (strategy is $2.50; never more than ~$3) |
 | `buy_max_shares` | **5** buffer (~3.3 sh at $2.50/75¢) |
-| Ask band | **75–90¢** in the last **120s**. First **3 min** (`120 < TTM ≤ 300`): winning ask **≥ 90¢** up to 99¢. First **4 min** (`60 ≤ TTM ≤ 300`): also **≥ 95¢**. **91–94¢ in the last 120s** is out of band. Same GUI / book / underlying gates. |
+| Ask band | **75–99¢** in the last **120s**. First **3 min** (`120 < TTM ≤ 300`): winning ask **≥ 90¢** up to 99¢. First **4 min** (`60 ≤ TTM ≤ 300`): also **≥ 95¢**. Same GUI / book / underlying gates. `buy_max_price` stays **0.90** (early ≥90 floor). Last-120s cap is `early_buy_max_price` **0.99**. |
 | Execution | FAK **limit** at the quoted ask, size `min(budget/ask, buy_max_shares)`. A clean **unmatched 400** re-quotes up to **3** FAKs in one trigger; then **0.15 s** cooldown. Unclear POSTs still quarantine (no second $2.50). |
 | GUI consensus | winner ≥ 70¢, loser ≤ 30¢ |
-| Windows | 5m **whole market**: early ≥90¢ for TTM (120, 300]; ≥95¢ for TTM [60, 300]; late 75–90¢ for TTM ≤ 120s (15m / hourly bots **not running**) |
+| Windows | 5m **whole market**: early ≥90¢ for TTM (120, 300]; ≥95¢ for TTM [60, 300]; late 75–99¢ for TTM ≤ 120s (15m / hourly bots **not running**) |
 | Hedge | **Trigger** bid ≤ **50¢** and ask ≤ **55¢**, spread ≤ 15¢, **plus** inverted buy GUI (held last trade ≤ 55¢, held GUI ≤ 30¢, other GUI ≥ 70¢). **Then sell at whatever the bid is** — no 32¢ floor. `toxic_fill` still dumps without GUI **only while held bid ≤ 50¢**; recovered books log `hedge_skip_toxic_recovered` and stay armed. |
 | Underlying edge | **$0** (5m: any non-zero TWAP vs PTB) / **$10** (15m, hourly); side must match |
 | `max_open_positions` | **0 = unlimited** |
@@ -76,7 +76,7 @@ journalctl -u polypathlog -f
 # Export regularly (copy CSVs off the VM; prune will delete the JSONL)
 .venv/bin/python check_path_backtest.py --grid --budget 2.5 --series 5m --csv /tmp/hits.csv
 .venv/bin/python check_path_backtest.py --grid --budget 15 --series 5m
-.venv/bin/python check_path_backtest.py --ask-min 0.75 --ask-max 0.90 --ttm-max 120 --budget 15 --series 5m --csv /tmp/hits_15.csv
+.venv/bin/python check_path_backtest.py --ask-min 0.75 --ask-max 0.99 --ttm-max 120 --budget 15 --series 5m --csv /tmp/hits_15.csv
 .venv/bin/python check_path_backtest.py --export-market btc-updown-5m-1786528500 --csv /tmp/m.csv
 scp ntemusejoel@<vm>:/tmp/hits.csv .
 # or: scp -r ntemusejoel@<vm>:~/poly-money-maker/pathlog/ticks ./pathlog-export-$(date -u +%Y%m%d)
@@ -92,7 +92,7 @@ or not that bot is posting. Score the current rule and alternatives on the
 same ticks, then change live JSON:
 
 ```bash
-# Current 75–90¢ / last 120s vs earlier windows / wider bands
+# Current 75–99¢ / last 120s vs earlier windows / wider bands
 .venv/bin/python check_path_backtest.py --compare --series 5m --budget 2.5
 .venv/bin/python check_path_backtest.py --compare --series 5m --budget 15
 
@@ -168,7 +168,7 @@ amount / HTTP 400), not this NameError.
 
 ## Open / next
 
-- [x] Pause minting; keep $2.50 / 75–90¢ CLOB triggers.
+- [x] Pause minting; keep $2.50 / 75–99¢ CLOB triggers.
 - [x] **5m-only live trading** — 15m and hourly buy services stopped/disabled.
 - [x] Pin BUY FAKs to **budget/ask limit** at the quoted ask (band unchanged;
   displayed top size is not a cap; `buy_max_spend` $3; `buy_max_shares` 5 buffer).
@@ -185,12 +185,15 @@ amount / HTTP 400), not this NameError.
 - [x] Faster **proven-empty** FAK retries (unmatched 400 only; 0.15 s empty cooldown).
       After merge: `git pull` + `sudo systemctl restart polybuybot5m` (5m only).
       Live JSON does **not** need a new key — `empty_fak_cooldown_s` defaults to 0.15.
-- [ ] After merge: `git pull` then patch live `strategy_buy5m.json`
-      (`hedge_threshold=0.50`, `hedge_require_ask_max=0.55`; early-band keys
-      default if omitted) then `sudo systemctl restart polybuybot5m` only.
-      Watch `buy_attempt` `band=early` / `early_95`, last-120s 75–90¢ still
-      filling, and `hedge_attempt` once held bid ≤ 50¢. Live JSON **must**
-      set the hedge keys — otherwise the old 35/40 values stay hot-reloaded.
+- [ ] After merge: `git pull` then `sudo systemctl restart polybuybot5m` only.
+      Last 120s is **75–99¢** in code (`late_max = early_buy_max_price`). Live
+      JSON can keep `buy_max_price=0.90` (early ≥90 floor) — do **not** set it
+      to 0.99. Still patch hedge keys if missing (`hedge_threshold=0.50`,
+      `hedge_require_ask_max=0.55`; early-band keys default if omitted).
+      Watch `buy_attempt` `band=late` on 91–99¢ in the last 120s, `band=early`
+      / `early_95` earlier, and `hedge_attempt` once held bid ≤ 50¢. Live JSON
+      **must** set the hedge keys — otherwise the old 35/40 values stay
+      hot-reloaded.
 - [ ] Cloud paper P&L: paste `CLOUD_RESEARCH.md` section 2 (live `pathlog.py`
       + `--sweep --paper`, rank by `pnl_sum` vs `live_5m_paper`). No `.env`.
       Optional: attach `poly-research.zip` for the historical tape. Not live

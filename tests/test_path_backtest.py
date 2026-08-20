@@ -278,8 +278,12 @@ class WindowAnatomyTests(unittest.TestCase):
             _tick(1, 150, 0.94, 0.06),
             _tick(2, 60, 0.97, 0.03),
         ]
-        row = classify_window(ticks, ttm_max=120, min_edge=0.05)
+        row = classify_window(
+            ticks, ttm_max=120, min_edge=0.05, ask_min=0.75, ask_max=0.90,
+        )
         self.assertEqual(row["bucket"], "decided_before_above_band")
+        live = classify_window(ticks, ttm_max=120, min_edge=0.05)
+        self.assertEqual(live["bucket"], "decided_before_in_band")
 
     def test_tight_through_window(self):
         from check_path_backtest import classify_window
@@ -360,12 +364,18 @@ class SweepTemplateTests(unittest.TestCase):
             Path(__file__).resolve().parents[1] / "strategy_buy5m.example.json"
         )
         self.assertEqual(tmpl["ask_min"], 0.75)
-        self.assertEqual(tmpl["ask_max"], 0.90)
+        self.assertEqual(tmpl["ask_max"], 0.99)
         self.assertEqual(tmpl["ttm_max"], 120.0)
         self.assertEqual(tmpl["budget"], 2.5)
         self.assertTrue(tmpl["hedge_require_gui"])
         self.assertEqual(tmpl["hedge_threshold"], 0.50)
         self.assertEqual(tmpl["hedge_require_ask_max"], 0.55)
+
+    def test_template_15m_example_stays_buy_max_price(self):
+        tmpl = template_from_strategy(
+            Path(__file__).resolve().parents[1] / "strategy_buy.example.json"
+        )
+        self.assertEqual(tmpl["ask_max"], 0.90)
 
     def test_sweep_starts_from_live_template(self):
         tmpl = template_from_strategy(
@@ -373,9 +383,11 @@ class SweepTemplateTests(unittest.TestCase):
         )
         names = [row["name"] for row in sweep_variants(tmpl)]
         self.assertEqual(names[0], "live_5m_paper")
+        self.assertEqual(sweep_variants(tmpl)[0]["ask_max"], 0.99)
         self.assertIn("live_5m_ride", names)
         self.assertIn("window_180s", names)
-        self.assertIn("band_70_90", names)
+        self.assertIn("band_70_99", names)
+        self.assertIn("band_75_90", names)
         self.assertIn("budget_15", names)
         self.assertIn("no_spread_cap", names)
 
