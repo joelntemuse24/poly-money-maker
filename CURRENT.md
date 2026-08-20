@@ -11,7 +11,8 @@ FAKs at the quoted ask** sized `budget/ask` (~3.3 shares at 75¢), clipped to
 `buy_max_shares` **5** (buffer). Hard spend ceiling `buy_max_spend` **$3**.
 Leftover USDC cannot walk into 9¢ junk. Displayed top size is **not** a cap.
 Hedge **trigger** is still 35/40, then the **same GUI/last-trade consensus as
-buy** (not a random TOB fill), then sell at the live bid. Pause minting.
+buy** (not a random TOB fill), then sell at the live bid. `toxic_fill` dumps
+without GUI only while bid ≤ 35¢. Pause minting.
 Pathlog still records all three series (no orders; 14-day / 400 MB cap).
 
 ---
@@ -37,7 +38,7 @@ triggers** (not the old 98–99¢ probe):
 | Execution | FAK **limit** at the quoted ask, size `min(budget/ask, buy_max_shares)`. A clean **unmatched 400** re-quotes up to **3** FAKs in one trigger; then **0.15 s** cooldown. Unclear POSTs still quarantine (no second $2.50). |
 | GUI consensus | winner ≥ 70¢, loser ≤ 30¢ |
 | Windows | 5m **120 s** (15m / hourly bots **not running**) |
-| Hedge | **Trigger** bid ≤ **35¢** and ask ≤ **40¢**, spread ≤ 15¢, **plus** inverted buy GUI (held last trade ≤ 40¢, held GUI ≤ 30¢, other GUI ≥ 70¢). **Then sell at whatever the bid is** — no 32¢ floor. `toxic_fill` still dumps without GUI. |
+| Hedge | **Trigger** bid ≤ **35¢** and ask ≤ **40¢**, spread ≤ 15¢, **plus** inverted buy GUI (held last trade ≤ 40¢, held GUI ≤ 30¢, other GUI ≥ 70¢). **Then sell at whatever the bid is** — no 32¢ floor. `toxic_fill` still dumps without GUI **only while held bid ≤ 35¢**; recovered books log `hedge_skip_toxic_recovered` and stay armed. |
 | Underlying edge | **$0** (5m: any non-zero TWAP vs PTB) / **$10** (15m, hourly); side must match |
 | `max_open_positions` | **0 = unlimited** |
 | `toxic_force_exit_below` | **65¢** |
@@ -110,12 +111,15 @@ Kill switch: `touch STOP_PATHLOG`.
 
 ---
 
-## Cycle abort (Aug 13–19)
+## Cycle abort (Aug 13–19) — now isolated per market
 
 Since **2026-08-13T04:33Z** the 5m log has **3294 `cycle_error`s**, all one
 exception: `NameError: name 'known_cost' is not defined`. Disk was not full.
-That exception is the outer poll `except`: **the rest of that cycle’s buys and
-hedges are skipped.** One quarantined `buy_uncertain` market was enough.
+That exception was the outer poll `except`: **the rest of that cycle’s buys
+and hedges were skipped.** One quarantined `buy_uncertain` market was enough.
+Hedge/buy work is now wrapped **per market**; a later `cycle_error` logs
+`condition_id` and continues the poll. Outer `cycle_error` still means
+refresh/GC/redeem/UI failed, not “remaining markets skipped.”
 
 The assignment-order fix is **#80** (`be22662`, merged 05:28Z the same morning).
 CI `git pull`s bot code but **does not restart systemd**. The running 5m
@@ -177,6 +181,10 @@ amount / HTTP 400), not this NameError.
 - [x] Faster **proven-empty** FAK retries (unmatched 400 only; 0.15 s empty cooldown).
       After merge: `git pull` + `sudo systemctl restart polybuybot5m` (5m only).
       Live JSON does **not** need a new key — `empty_fak_cooldown_s` defaults to 0.15.
+- [ ] After merge: `git pull` then `sudo systemctl restart polybuybot5m` only
+      (toxic recovered-book skip + per-market `cycle_error` isolation). Watch
+      `hedge_skip_toxic_recovered`, `hedge_skip_no_consensus`, `cycle_error`
+      **with** `condition_id` and later `buy_fill`s in the same second.
 - [ ] Let pathlog collect resolved markets, then `--anatomy` / `--compare` / `--grid` **off the VM** before prune.
 
 ---

@@ -61,6 +61,7 @@ HELPERS = (
     "fill_cost_usdc",
     "entry_book_ok",
     "hedge_book_ok",
+    "toxic_dump_book_ok",
     "polymarket_display_price",
     "hedge_consensus_ok",
     "quoted_buy_shares",
@@ -451,6 +452,17 @@ class BuyFillProductionHelpers(unittest.TestCase):
         ok, why = self.ns["hedge_book_ok"](0.01, 0.10, 0.35, 0.15, 0.40)
         self.assertTrue(ok)
 
+    def test_toxic_dump_skips_recovered_book(self):
+        dump_ok = self.ns["toxic_dump_book_ok"]
+        # 01:13 case: winner bid 97¢ must not dump.
+        self.assertFalse(dump_ok(0.97, 0.35))
+        # 04:43 junk: 11¢ bid (even under a 99¢ ask) must still dump.
+        self.assertTrue(dump_ok(0.11, 0.35))
+        self.assertTrue(dump_ok(0.01, 0.35))
+        self.assertTrue(dump_ok(0.35, 0.35))
+        # Missing bid is fail-closed — no sell.
+        self.assertFalse(dump_ok(None, 0.35))
+
     def test_hedge_sell_follows_live_bid_not_32c_floor(self):
         ns = _load_funcs("hedge_sell_price")
         ns["TICK_SIZE_FALLBACK"] = "0.001"
@@ -608,12 +620,63 @@ class AmbiguousCrossCyclePolicy(unittest.TestCase):
     def test_cycle_error_logs_error_field(self):
         for bot in (BOT, BOT5M, BOT_HR):
             src = bot.read_text()
-            idx = src.find('"cycle_error"')
-            self.assertGreater(idx, -1, bot.name)
-            chunk = src[max(0, idx - 220): idx + 280]
-            self.assertIn("except Exception as exc:", chunk, bot.name)
-            self.assertIn('error=f"{type(exc).__name__}: {exc}"[:180]', chunk, bot.name)
-            self.assertIn("traceback=traceback.format_exc()", chunk, bot.name)
+            idx = 0
+            found = 0
+            while True:
+                idx = src.find('"cycle_error"', idx)
+                if idx < 0:
+                    break
+                found += 1
+                chunk = src[max(0, idx - 280): idx + 320]
+                self.assertIn("except Exception as exc:", chunk, bot.name)
+                self.assertIn('error=f"{type(exc).__name__}: {exc}"[:180]', chunk, bot.name)
+                self.assertIn("traceback=traceback.format_exc()", chunk, bot.name)
+                idx += len('"cycle_error"')
+            self.assertGreaterEqual(found, 2, bot.name)
+
+    def test_toxic_recovered_and_market_cycle_isolation(self):
+        for bot in (BOT, BOT5M, BOT_HR):
+            src = bot.read_text()
+            self.assertIn("hedge_skip_toxic_recovered", src, bot.name)
+            self.assertIn("def toxic_dump_book_ok", src, bot.name)
+            self.assertGreaterEqual(src.count("toxic_dump_book_ok("), 3, bot.name)
+            self.assertIn("condition_id=cond", src, bot.name)
+            self.assertNotIn(
+                "remaining markets skipped this poll",
+                src,
+                bot.name,
+            )
+
+            tree = ast.parse(src)
+            market_fors = [
+                node for node in ast.walk(tree)
+                if isinstance(node, ast.For)
+                and isinstance(node.target, ast.Name)
+                and node.target.id == "m"
+                and isinstance(node.iter, ast.Name)
+                and node.iter.id == "markets"
+                and node.end_lineno
+                and (node.end_lineno - node.lineno) > 500
+            ]
+            self.assertEqual(len(market_fors), 1, bot.name)
+            try_nodes = [
+                stmt for stmt in market_fors[0].body if isinstance(stmt, ast.Try)
+            ]
+            self.assertTrue(try_nodes, bot.name)
+            handler_src = ast.get_source_segment(src, try_nodes[0].handlers[0])
+            self.assertIsNotNone(handler_src, bot.name)
+            self.assertIn('"cycle_error"', handler_src, bot.name)
+            self.assertIn("condition_id=cond", handler_src, bot.name)
+            self.assertIn('error=f"{type(exc).__name__}: {exc}"[:180]', handler_src, bot.name)
+            self.assertNotIn("remaining markets skipped this poll", handler_src, bot.name)
+
+        five = BOT5M.read_text()
+        self.assertIn("seconds_left = (end_ts_ms - now_ms) / 1000", five)
+        self.assertIn("if seconds_left > BUY_START_S:", five)
+        for bot in (BOT, BOT_HR):
+            src = bot.read_text()
+            self.assertNotIn("seconds_left = (end_ts_ms - now_ms) / 1000", src, bot.name)
+            self.assertIn("minutes_left = (end_ts_ms - now_ms) / 60000", src, bot.name)
 
     def test_hedge_liveness_and_reconcile_markers(self):
         src = BOT.read_text()

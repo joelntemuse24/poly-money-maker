@@ -128,15 +128,19 @@ Watch the console for `[DRY BUY]` / `[DRY SELL]` markers. Ctrl-C to stop.
 - `[FAK EMPTY]` / `buy_attempt_rejected` with `unmatched_retry: true` — empty FAK re-quoted in the same trigger (up to 3 POSTs)
 - `buy_ghost_fill` `via=unmatched_400_guard` — unmatched 400 but inventory appeared; no second FAK
 - `buy_attempt_ambiguous` `via=unmatched_400_no_balance` — unmatched 400 and CLOB balance unreadable; quarantine, no retry
-- `cycle_error` in logs — unhandled exception. The bot process stays up, but
-  **that poll is aborted** (later markets in the same `for m in markets` loop
-  do not buy or hedge). Banner does **not** sleep 5s. Structured `error` field
-  is the exception type+message; `check_buy_skips.py` prints the breakdown.
+- `cycle_error` in logs — unhandled exception. The bot process stays up.
+  A fault **inside** `for m in markets` logs `condition_id` and **continues
+  to the next market** (held-first order unchanged). A fault **outside** that
+  loop (refresh, GC, redeem, UI) still aborts the rest of that poll. Banner
+  does **not** sleep 5s. Structured `error` field is the exception
+  type+message; `check_buy_skips.py` prints the breakdown.
   Aug 13–19 live 5m: **3294/3294** were `NameError: known_cost` until the
-  19 Aug 09:42 restart picked up #80.
+  19 Aug 09:42 restart picked up #80 (that NameError aborted every later
+  market in the same poll; isolation is the fix for the next one).
 - `hedge_attempt` / `hedge_fill` — hedge fired after force-fresh REST + book integrity + GUI consensus (normal path)
 - `hedge_skip_toxic_book` — bid dipped but ask/spread still say "not reversed"
 - `hedge_skip_no_consensus` — 35/40 book passed but GUI/last-trade still say the held side has not actually fallen (same class of check as buy)
+- `hedge_skip_toxic_recovered` — `toxic_fill` is armed but held bid > 35¢ (winner book); dump stays armed, no sell
 - `hedge_skip_incomplete_rest` — REST missing a side; fail closed (no WS sell)
 - `buy_skip_ambiguous` — GUI display prices too close (throttled 8s; **not** one event per market)
 - `buy_skip_no_consensus` — ask in band but GUI/tight-book gate failed
@@ -196,10 +200,13 @@ see TECHNICAL_DESIGN.md “Research loop.”
   Polymarket GUI + last trade agree the held side actually lost (held last
   print ≤ 40¢, held GUI ≤ 30¢, other GUI ≥ 70¢ — same display rule as buy).
   A random TOB clip is not enough; a last print of 85¢ on a 32/38 book will
-  `hedge_skip_no_consensus`. `toxic_fill` dumps still skip the GUI gate.
-  After that, the FAK sells at the **live bid** even if it is 20¢.
-  Everything else rides to redemption at $1.00. WS may *arm* a hedge check;
-  normal sells need two-sided REST; toxic dumps may sell on bid-only REST.
+  `hedge_skip_no_consensus`. `toxic_fill` stays armed and still skips GUI /
+  35/40/15, but **sells only while held bid ≤ 35¢**. A recovered 97¢ book
+  logs `hedge_skip_toxic_recovered` and rides; a 6¢ junk bid (even under a
+  99¢ ask) still dumps on bid-only REST. Fresh WS bid > 35¢ skips REST for
+  both normal and toxic. After a dump is allowed, the FAK sells at the
+  **live bid** even if it is 20¢. Everything else rides to redemption at
+  $1.00. WS may *arm* a hedge check; normal sells need two-sided REST.
 - **Tick sizes:** 5m markets use `0.001`, 15m and hourly use `0.01`.
 - **One entry per market:** Enforced via `meta.get("bought_token")` in state cache.
 - **Notifications:** Fire-and-forget via ntfy.sh (topic `polybot-joel-btc`).
