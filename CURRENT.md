@@ -185,9 +185,10 @@ amount / HTTP 400), not this NameError.
       (toxic recovered-book skip + per-market `cycle_error` isolation). Watch
       `hedge_skip_toxic_recovered`, `hedge_skip_no_consensus`, `cycle_error`
       **with** `condition_id` and later `buy_fill`s in the same second.
-- [ ] Snapshot `pathlog/ticks` (+ `buybot5m.log`) into a Cursor Cloud
-      Environment and run the prompts in `CLOUD_RESEARCH.md` (`--sweep`,
-      paper hedge). Not live. Refresh the snapshot before prune.
+- [ ] Cloud paper P&L: paste `CLOUD_RESEARCH.md` section 2 (live `pathlog.py`
+      + `--sweep --paper`, rank by `pnl_sum` vs `live_5m_paper`). No `.env`.
+      Optional: attach `poly-research.zip` for the historical tape. Not live
+      JSON and not `polybuybot5m`.
 - [ ] Let pathlog collect resolved markets, then `--anatomy` / `--compare` / `--sweep` **off the VM** before prune.
 
 ---

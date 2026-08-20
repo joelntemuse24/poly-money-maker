@@ -47,7 +47,7 @@ change to one usually needs propagation to its siblings.
 |---|---|
 | `pathlog.py` | CLOB path recorder (no orders; TOB price **and** size) |
 | `check_path_backtest.py` | Pathlog: entry grid, anatomy, compare, **paper hedge**, template `--sweep` (no orders) |
-| `CLOUD_RESEARCH.md` | Cloud-agent prompts + how to snapshot ticks (no live keys) |
+| `CLOUD_RESEARCH.md` | Cloud prompts: live paper P&L via public books + `--sweep` (no `.env`) |
 | `check_book.py` | Diagnostic — inspect a live order book |
 | `check_edge_counterfactual.py` | Diagnostic — resolution win rate if edge skips had filled |
 | `check_participation.py` | Diagnostic — post-facto bought vs missed + band exposure |
