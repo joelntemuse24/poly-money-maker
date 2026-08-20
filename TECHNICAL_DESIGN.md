@@ -158,8 +158,9 @@ There is **no asyncio, no database, no message queue**. The loop:
    gates if in window. A fault **inside** this loop logs `condition_id` and
    **continues**. A fault **outside** (refresh/GC/redeem/UI) still aborts the
    rest of **that** poll.
-7. Rich UI every N cycles. Sleep `poll_held_s` (0.05s) in hot mode, else a
-   slower idle poll.
+7. Rich UI every N cycles. Sleep `poll_held_s` (0.05s) while any position is
+   held, `poll_buy_window_s` (0.1s) while a market is in the buy horizon with
+   no inventory, else ~1s idle.
 
 **Hot mode** is on when any position is open **or** any market is inside
 `BUY_HORIZON_S`. On 5m that horizon is
@@ -337,11 +338,12 @@ and one band (75–90¢). 5m uses a **union of time×price bands** (seconds).
 
 ### 6.2 5m band union (`buy/entry_skip.py`)
 
-`current_entry_bands(seconds_left)` returns **every** band open at that TTM
-(a market can match more than one). `ask_in_any_band` is the gate.
-`select_entry_band` pins the FAK min/max to the **widest matching band**
-(lowest retry floor) so a 95¢ print in the last 120s is not rejected for
-being above the late 90¢ cap.
+`buybot5m.current_entry_bands(seconds_left)` wraps
+`applicable_entry_bands` in `buy/entry_skip.py` and returns **every** band
+open at that TTM (a market can match more than one). `ask_in_any_band` is
+the gate. `select_entry_band` pins the FAK min/max to the **widest matching
+band** (lowest retry floor) so a 95¢ print in the last 120s is not rejected
+for being above the late 90¢ cap.
 
 | Band | When (TTM = seconds left) | Winning ask |
 |---|---|---|
@@ -351,8 +353,8 @@ being above the late 90¢ cap.
 
 **Overlap:** last 120s while TTM ≥ 60s → 75–90¢ **or** ≥95¢.
 **Hole:** **91–94¢ in the last 120s** is not in any open band
-(`ask_out_of_band`). Last **60s** is late 75–90¢ only (95 path requires
-TTM ≥ 60).
+(`ask_out_of_band`). For `TTM < 60` the ≥95 path is off (late 75–90¢ only).
+At **TTM = 60s** exactly, ≥95 is still open.
 
 Hot poll / WS subscribe / redeem-delay horizon is `BUY_HORIZON_S` (300s), not
 `buy_start_s` alone. Otherwise the first three minutes would never be looked

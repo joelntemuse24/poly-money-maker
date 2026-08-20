@@ -14,16 +14,16 @@ The 5m bot buys the winning leg of Polymarket BTC "Up or Down" markets:
 
 | When (time to close) | Winning ask |
 |---|---|
-| Last **120s** | **75–90¢** |
-| First **3 min** (TTM 120–300s) | **90–99¢** |
-| First **4 min** (TTM 60–300s) | **≥95¢** (overlaps last 120s) |
+| Last **120s** (`TTM ≤ 120`) | **75–90¢** |
+| First **3 min** (`120 < TTM ≤ 300`) | **90–99¢** |
+| First **4 min** (`60 ≤ TTM ≤ 300`) | **≥95¢** (overlaps last 120s) |
 
 Budget **$2.50**/market (hard $3, share rail 5). Hedge **50/55** on reversal
 (plus inverted GUI). Winners redeem at $1.00. **No profit-take sell.**
 See `CURRENT.md` for the active probe knobs.
 
 **Overlap / hole:** last 120s while TTM ≥ 60s → 75–90¢ **or** ≥95¢. **91–94¢
-in the last 120s** is out of band. Last 60s is 75–90¢ only.
+in the last 120s** is out of band. For `TTM < 60` the ≥95 path is off.
 
 | File | Service | Markets | Oracle | Budget | Window |
 |---|---|---|---|---|---|
@@ -159,10 +159,11 @@ python check_participation.py --hours 72 --csv exports/trades.csv
 
 Watch the console for `[DRY BUY]` / `[DRY SELL]` markers. Ctrl-C to stop.
 
-`--sweep` / `--compare` read **late** keys from `strategy_buy5m.example.json`
-(75–90 / 120s / $2.50) and paper-hedge at the template's **50/55**. They do
-**not** replay the early ≥90 / ≥95 union. `--series 5m` matches **only** 5m
-(not 15m — the string `15m` contains `5m`).
+`--sweep` reads **late** keys from `strategy_buy5m.example.json` (75–90 /
+120s / $2.50) and paper-hedges at that file's **50/55**. `--compare` uses
+hardcoded late-band presets; `--paper` hedge knobs still come from the
+example JSON. Neither command replays the early ≥90 / ≥95 union.
+`--series 5m` matches **only** 5m (not 15m — the string `15m` contains `5m`).
 
 ### What to look for
 

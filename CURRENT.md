@@ -37,7 +37,7 @@ first 4 minutes:
 | `buy_budget` | **$2.50** / market |
 | `buy_max_spend` | **$3.00** hard ceiling (strategy is $2.50; never more than ~$3) |
 | `buy_max_shares` | **5** buffer (~3.3 sh at $2.50/75¢) |
-| Ask band | **75–90¢** in the last **120s**. First **3 min** (TTM 120–300s): winning ask **≥ 90¢** up to 99¢. First **4 min** (TTM 60–300s): also **≥ 95¢**. Same GUI / book / underlying gates. |
+| Ask band | **75–90¢** in the last **120s**. First **3 min** (`120 < TTM ≤ 300`): winning ask **≥ 90¢** up to 99¢. First **4 min** (`60 ≤ TTM ≤ 300`): also **≥ 95¢**. **91–94¢ in the last 120s** is out of band. Same GUI / book / underlying gates. |
 | Execution | FAK **limit** at the quoted ask, size `min(budget/ask, buy_max_shares)`. A clean **unmatched 400** re-quotes up to **3** FAKs in one trigger; then **0.15 s** cooldown. Unclear POSTs still quarantine (no second $2.50). |
 | GUI consensus | winner ≥ 70¢, loser ≤ 30¢ |
 | Windows | 5m **whole market**: early ≥90¢ for TTM (120, 300]; ≥95¢ for TTM [60, 300]; late 75–90¢ for TTM ≤ 120s (15m / hourly bots **not running**) |
@@ -174,7 +174,8 @@ amount / HTTP 400), not this NameError.
   displayed top size is not a cap; `buy_max_spend` $3; `buy_max_shares` 5 buffer).
 - [x] Path recorder + `check_path_backtest.py` (first-touch ask × time-left;
   ticks record TOB size; backtest is share-capped FAK, not infinite ask size).
-- [x] Hedge FAK follows live bid after 35/40 integrity (no 32¢ fill refusal).
+- [x] Hedge FAK follows live bid after book integrity (no 32¢ fill refusal).
+      5m trigger is now **50/55**; 15m/hourly stay 35/40 (stopped).
 - [x] On VM: pathlog restarted onto size-aware ticks; 15m/hourly buy bots stopped.
 - [x] 5m underlying gate **$0** (any non-zero TWAP vs PTB; side must match).
 - [x] Pathlog `--anatomy` / `--compare` so window/band/size alts are scored offline.
