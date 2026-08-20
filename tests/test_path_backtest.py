@@ -354,6 +354,109 @@ class PaperExitTests(unittest.TestCase):
         self.assertAlmostEqual(out["exit_bid"], 0.11)
 
 
+class RebuyAfterHedgeTests(unittest.TestCase):
+    def _market(self, ticks, winner="down"):
+        from check_path_backtest import MarketPath
+
+        return MarketPath(
+            slug="btc-updown-5m-rebuy",
+            series="btc-up-or-down-5m",
+            start_ts=1,
+            end_ts=301,
+            question="test",
+            ticks=ticks,
+            winner=winner,
+        )
+
+    def test_first_entry_skips_ticks_before_after(self):
+        ticks = [
+            _tick(1, 150, 0.81, 0.19),
+            _tick(2, 90, 0.84, 0.16),
+        ]
+        hit = first_entry(
+            ticks,
+            ask_min=0.80,
+            ask_max=0.90,
+            ttm_min=0,
+            ttm_max=180,
+            after={"ts": 1, "ttm": 150},
+        )
+        self.assertIsNotNone(hit)
+        self.assertEqual(hit["ttm"], 90)
+        self.assertEqual(hit["ask"], 0.84)
+
+    def test_180s_80_floor_hits_earlier_than_live(self):
+        ticks = [
+            _tick(1, 160, 0.82, 0.18),
+            _tick(2, 90, 0.93, 0.07),
+        ]
+        live = first_entry(ticks, ask_min=0.75, ask_max=0.90, ttm_min=0, ttm_max=120)
+        wide = first_entry(ticks, ask_min=0.80, ask_max=0.90, ttm_min=0, ttm_max=180)
+        self.assertIsNone(live)
+        self.assertIsNotNone(wide)
+        self.assertEqual(wide["ttm"], 160)
+
+    def test_rebuy_flips_to_other_side_after_complete_hedge(self):
+        ticks = [
+            _tick(1, 170, 0.82, 0.18),
+            _tick(2, 80, 0.32, 0.72, ub=0.25, db=0.68),
+            _tick(3, 70, 0.18, 0.82, ub=0.15, db=0.80),
+            _tick(4, 5, 0.02, 0.98, ub=0.01, db=0.97),
+        ]
+        market = self._market(ticks, winner="down")
+        one = evaluate_rule(
+            [market],
+            ask_min=0.80,
+            ask_max=0.90,
+            ttm_min=0,
+            ttm_max=180,
+            budget=2.5,
+            paper=True,
+        )
+        two = evaluate_rule(
+            [market],
+            ask_min=0.80,
+            ask_max=0.90,
+            ttm_min=0,
+            ttm_max=180,
+            budget=2.5,
+            paper=True,
+            rebuy_after_hedge=True,
+        )
+        self.assertEqual(one[0]["exit"], "hedge")
+        self.assertEqual(one[0]["entries"], 1)
+        self.assertFalse(one[0]["flip"])
+        self.assertEqual(two[0]["entries"], 2)
+        self.assertTrue(two[0]["flip"])
+        self.assertEqual(two[0]["rebuy_leg"], "down")
+        self.assertIn("hedge", two[0]["exits"])
+        self.assertTrue(two[0]["exits"].endswith("redeem_win"))
+        self.assertGreater(two[0]["pnl"], one[0]["pnl"])
+        stats = summarize(two)
+        self.assertEqual(stats["rebuy_markets"], 1)
+        self.assertEqual(stats["flips"], 1)
+        self.assertEqual(stats["hedges"], 1)
+
+    def test_no_rebuy_on_redeem(self):
+        ticks = [
+            _tick(1, 90, 0.82, 0.18),
+            _tick(2, 5, 0.99, 0.01, ub=0.98, db=0.01),
+        ]
+        market = self._market(ticks, winner="up")
+        rows = evaluate_rule(
+            [market],
+            ask_min=0.80,
+            ask_max=0.90,
+            ttm_min=0,
+            ttm_max=180,
+            budget=2.5,
+            paper=True,
+            rebuy_after_hedge=True,
+        )
+        self.assertEqual(rows[0]["entries"], 1)
+        self.assertEqual(rows[0]["exit"], "redeem_win")
+
+
 class SweepTemplateTests(unittest.TestCase):
     def test_template_reads_5m_example(self):
         tmpl = template_from_strategy(
@@ -375,6 +478,9 @@ class SweepTemplateTests(unittest.TestCase):
         self.assertIn("live_5m_ride", names)
         self.assertIn("window_180s", names)
         self.assertIn("band_70_90", names)
+        self.assertIn("window_180s_80_90", names)
+        self.assertIn("live_5m_paper_rebuy", names)
+        self.assertIn("window_180s_80_90_rebuy", names)
         self.assertIn("budget_15", names)
         self.assertIn("no_spread_cap", names)
 
