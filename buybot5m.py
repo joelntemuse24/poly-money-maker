@@ -145,7 +145,8 @@ _STRATEGY_DEFAULTS = {
     # live ask (so early catches ≈ 75¢). Last 120s cap is early_buy_max_price
     # (0.99) — 75–99¢. buy_max_price 0.90 is the first-3-min ≥90 floor, not
     # the late-window ceiling. First 4 minutes (TTM 60–300s) may also buy at
-    # 95¢ or greater.
+    # 95¢ or greater. BUY FAK size is budget/ask; limit is the open band max
+    # (99¢) so the order can take depth behind the touch.
     "buy_threshold": 0.75,
     "buy_max_price": 0.90,
     # Consensus on Polymarket GUI display price (mid if spread≤10¢ else last trade).
@@ -1372,6 +1373,39 @@ def quoted_buy_shares(budget, ask, share_cap=None):
     return 0.0
 
 
+def quoted_buy_shares_up_to_limit(budget, ask, limit, share_cap=None, spend_cap=None):
+    """Shares sized at the live ask, valid as a FAK limit at ``limit``.
+
+    Count starts as ``budget/ask`` (same as ``quoted_buy_shares``). The CLOB
+    maker amount is ``size × limit``, so shrink until that USDC is exact
+    cents and at most ``spend_cap`` (``buy_max_spend``). The FAK then walks
+    asks from the touch up to the open band max (5m: 99¢ in every window).
+    """
+    shares = quoted_buy_shares(budget, ask, share_cap)
+    limit_f = finite_float(limit, minimum=0, maximum=1)
+    if shares < 0.01 or limit_f is None or limit_f <= 0:
+        return 0.0
+    ceiling = finite_float(spend_cap, minimum=0)
+    if ceiling is not None and ceiling >= 0.01:
+        cap_shares = quoted_buy_shares(ceiling, limit_f, share_cap)
+        if cap_shares > 0:
+            shares = min(shares, cap_shares)
+        elif shares * limit_f > ceiling + 1e-12:
+            return 0.0
+    share_tick = Decimal("0.01")
+    min_shares = Decimal("0.01")
+    cent = Decimal("0.01")
+    sh = Decimal(str(shares)).quantize(share_tick, rounding=ROUND_DOWN)
+    lim = Decimal(str(limit_f))
+    while sh >= min_shares:
+        maker = sh * lim
+        if maker.quantize(cent) == maker:
+            return float(sh)
+        sh -= share_tick
+        sh = sh.quantize(share_tick, rounding=ROUND_DOWN)
+    return 0.0
+
+
 def buy_fill_walked(filled, quoted_shares, ratio=1.05):
     """True when confirmed shares exceed the quoted budget/ask size."""
     filled = finite_float(filled, minimum=0) or 0.0
@@ -2220,16 +2254,18 @@ def buy_market_with_retry(
 ):
     """Buy token_id via FAK, sized in shares at the quoted ask.
 
-    Sends ``budget/ask`` shares as a **limit** FAK at the live ask (capped
-    by ``buy_max_spend`` and ``buy_max_shares``). Maker USDC is exact cents
-    (2 dp) and taker shares 4 dp — otherwise CLOB FAK BUY returns 400
-    ``invalid amounts``. This is not a USDC market order: leftover dollars
-    would walk cheaper asks (9¢ junk under an 80¢ quote). Displayed top size
-    does not shrink the order — a thin book fills what it can at that ask.
+    Sends ``budget/ask`` shares as a **limit** FAK at the **open band max**
+    (5m late / early / early_95 all cap at 99¢). Maker USDC is exact cents
+    (2 dp) at that limit and taker shares 4 dp — otherwise CLOB FAK BUY
+    returns 400 ``invalid amounts``. This is not a USDC market order:
+    leftover dollars would walk cheaper asks (9¢ junk under an 80¢ quote).
+    Share size is still ``budget/ask``, clipped so ``size × limit`` cannot
+    exceed ``buy_max_spend``. Displayed top size does not shrink the order.
 
-    Band is still min_price–max_price; this only pins execution to an
-    in-band ask. $2.50 / 75¢ is ~3.3 shares; ``buy_max_shares`` (default 5)
-    is the "wrong price" rail, not a displayed-size cap.
+    Band is still min_price–max_price for *whether* to fire. The limit is
+    max_price so the FAK can take depth behind the touch (83¢ clip gone,
+    84–99¢ still fills). $2.50 / 75¢ is ~3.3 shares; ``buy_max_shares``
+    (default 5) is the "wrong price" rail, not a displayed-size cap.
 
     Returns (shares_bought, usdc_spent, status). status is filled|ambiguous|empty|aborted|persist_fail|dry.
     spent may be estimated when the exchange
@@ -2252,7 +2288,7 @@ def buy_market_with_retry(
     if DRY_RUN:
         console.print(
             f"  [bold black on yellow][DRY BUY][/] would BUY ≤{budget:.2f} USDC of "
-            f"{str(token_id)[:12]}… at the quoted ask (band {min_price:.3f}–{max_price:.3f})"
+            f"{str(token_id)[:12]}… limit {max_price:.3f} (band {min_price:.3f}–{max_price:.3f})"
         )
         log_event("dry_buy", token_id=token_id, budget=budget, max_price=max_price, min_price=min_price)
         return 0.0, 0.0, "dry"
@@ -2356,10 +2392,17 @@ def buy_market_with_retry(
                 f"  [dim yellow][THIN ASK][/] displayed size {fresh_ask_size} · "
                 f"posting budget/ask anyway · attempt {attempt + 1}/{max_retries}"
             )
-        shares = quoted_buy_shares(remaining_budget, fresh_ask, BUY_MAX_SHARES)
+        shares = quoted_buy_shares_up_to_limit(
+            remaining_budget,
+            fresh_ask,
+            float(max_price),
+            BUY_MAX_SHARES,
+            spend_cap=max(0.0, float(BUY_MAX_SPEND) - spent),
+        )
         if shares < 0.01:
             break
-        price = fresh_ask
+        limit_price = float(max_price)
+        price = limit_price
         spend = shares * price
         max_shares = shares
         ambiguous = False
@@ -2385,7 +2428,7 @@ def buy_market_with_retry(
                 client.create_order,
                 OrderArgs(
                     token_id=token_id,
-                    price=price,
+                    price=limit_price,
                     size=shares,
                     side=BUY,
                     user_usdc_balance=remaining_budget,
@@ -2613,12 +2656,13 @@ def buy_market_with_retry(
             log_event(
                 "buy_fill_below_band", token_id=token_id, filled=filled, avg_price=round(avg, 4),
                 fill_cost=round(fill_cost, 4), spend=round(spend, 4), max_shares=round(max_shares, 4),
-                min_price=min_price, ask=price, attempt=attempt + 1,
+                min_price=min_price, ask=fresh_ask, limit=limit_price, attempt=attempt + 1,
             )
             break
         console.print(f"  [bold green][BUY FAK][/]{filled} @ avg {avg:.3f} (${fill_cost:.2f})  [dim]id={str(oid)[:16]}…[/]")
         log_event(
             "buy_fill", token_id=token_id, filled=filled, price=price, avg_price=round(avg, 4),
+            ask=fresh_ask, limit=limit_price,
             spend=round(spend, 4), spent=round(spent, 4),
             remaining_budget=round(remaining_budget, 4), attempt=attempt + 1,
         )

@@ -246,8 +246,10 @@ Cloud agents: `CLOUD_RESEARCH.md`.
   last-known-good hedge parameters. A per-bot process lock prevents duplicate
   live instances.
 - **FAK orders only:** All orders are Fill-And-Kill — no resting orders, no market
-  making. Buys are **limit** FAKs at the quoted ask sized `budget/ask`
-  (hard `buy_max_spend` $3, `buy_max_shares` 5; not displayed top size); sells stay
+  making. 5m buys are **limit** FAKs at the **open band max (99¢)** sized
+  `budget/ask` (hard `buy_max_spend` $3, `buy_max_shares` 5; not displayed top
+  size). The matcher walks the ask book from the touch up to 99¢. 15m/hourly
+  (stopped) still pin the limit to the quoted ask. Sells stay
   share-denominated market FAKs. A 400 **"no orders found to match"** re-quotes and
   POSTs again (up to 3) in the same trigger; invalid-amount / auth 400s and unclear
   POSTs do not. After a fully empty trigger, wait `empty_fak_cooldown_s` (0.15 s).
