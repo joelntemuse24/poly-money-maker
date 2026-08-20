@@ -669,8 +669,11 @@ the oracle might disagree with.
 
 `quoted_buy_shares(budget, ask, share_cap)` sizes the share count.
 
-`quoted_buy_shares_up_to_limit` (5m only) starts from that count, then
-shrinks until `size × band_max` is exact cents and ≤ `buy_max_spend`.
+`quoted_buy_shares_up_to_limit` (5m only) starts from that count, floors
+at **3.00 shares** when `3 × band_max ≤ buy_max_spend`, then snaps to a
+size whose `size × band_max` is exact cents and ≤ `$3`. That is why early
+99¢ posts **3.00 sh / $2.97** instead of 2.00 / $1.98 (the only legal
+makers at 99¢ under $3 are $0.99 / $1.98 / $2.97).
 
 1. Quantize budget down to **cents** (`Decimal("0.01")`, `ROUND_DOWN`).
 2. `shares = spend / ask`, quantized to **0.01 shares** (2 dp), round down.

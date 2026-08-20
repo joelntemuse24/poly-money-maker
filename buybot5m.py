@@ -151,8 +151,9 @@ _STRATEGY_DEFAULTS = {
     # Two $2.50 slices, $5 total if both fill. Last 120s is 75–90¢
     # (buy_max_price). First 3 min (TTM 120–300s) is ≥90¢ to 99¢; ≥95¢ is an
     # early overlay only (not last 120s). Late FAK limit is 90¢; early is 99¢.
-    # Size is still budget/ask, clipped so size × limit ≤ buy_max_spend ($3)
-    # per FAK, not $6 across both slices.
+    # Size starts at budget/ask and is at least 3 shares when size × limit
+    # fits in buy_max_spend ($3) — early 99¢ posts 3.00 / $2.97, not 2.00 /
+    # $1.98. Per FAK, not $6 across both slices.
     "buy_threshold": 0.75,
     "buy_max_price": 0.90,
     # Consensus on Polymarket GUI display price (mid if spread≤10¢ else last trade).
@@ -1390,35 +1391,63 @@ def quoted_buy_shares(budget, ask, share_cap=None):
 
 
 def quoted_buy_shares_up_to_limit(budget, ask, limit, share_cap=None, spend_cap=None):
-    """Shares sized at the live ask, valid as a FAK limit at ``limit``.
+    """Shares for a FAK at ``limit`` that can spend the slice budget.
 
-    Count starts as ``budget/ask`` (same as ``quoted_buy_shares``). The CLOB
-    maker amount is ``size × limit``, so shrink until that USDC is exact
-    cents and at most ``spend_cap`` (``buy_max_spend``). The FAK then walks
-    asks from the touch up to the open band max (late 90¢, early 99¢).
+    Starts at ``budget/ask``. A 99¢ (or 90¢) maker must be exact cents, so
+    rounding **down** landed on 2.00 sh / $1.98. Prefer at least 3.00 sh
+    when ``3 × limit ≤ spend_cap`` (early $2.97, late $2.70), then snap to
+    the nearest legal size that is still ≤ ``buy_max_spend``. ``ask`` still
+    has to be in band; the FAK walks from the touch up to the cap.
     """
     shares = quoted_buy_shares(budget, ask, share_cap)
     limit_f = finite_float(limit, minimum=0, maximum=1)
-    if shares < 0.01 or limit_f is None or limit_f <= 0:
+    if limit_f is None or limit_f <= 0:
         return 0.0
     ceiling = finite_float(spend_cap, minimum=0)
-    if ceiling is not None and ceiling >= 0.01:
-        cap_shares = quoted_buy_shares(ceiling, limit_f, share_cap)
-        if cap_shares > 0:
-            shares = min(shares, cap_shares)
-        elif shares * limit_f > ceiling + 1e-12:
-            return 0.0
+    if ceiling is None or ceiling < 0.01:
+        ceiling = finite_float(budget, minimum=0)
+    if ceiling is None or ceiling < 0.01:
+        return 0.0
     share_tick = Decimal("0.01")
     min_shares = Decimal("0.01")
     cent = Decimal("0.01")
-    sh = Decimal(str(shares)).quantize(share_tick, rounding=ROUND_DOWN)
     lim = Decimal(str(limit_f))
-    while sh >= min_shares:
+    cap_d = Decimal(str(ceiling)).quantize(cent, rounding=ROUND_DOWN)
+    max_sh = (cap_d / lim).quantize(share_tick, rounding=ROUND_DOWN)
+    cap = finite_float(share_cap, minimum=0)
+    if cap is not None:
+        max_sh = min(
+            max_sh,
+            Decimal(str(cap)).quantize(share_tick, rounding=ROUND_DOWN),
+        )
+    target = Decimal(str(shares if shares >= 0.01 else 0))
+    three = Decimal("3.00")
+    if three <= max_sh and three * lim <= cap_d:
+        target = max(target, three)
+    if target < min_shares:
+        return 0.0
+
+    def _valid(sh):
+        if sh < min_shares or sh > max_sh:
+            return False
         maker = sh * lim
-        if maker.quantize(cent) == maker:
-            return float(sh)
-        sh -= share_tick
-        sh = sh.quantize(share_tick, rounding=ROUND_DOWN)
+        return maker.quantize(cent) == maker and maker <= cap_d
+
+    up = target.quantize(share_tick, rounding=ROUND_DOWN)
+    if up < target:
+        up += share_tick
+        up = up.quantize(share_tick, rounding=ROUND_DOWN)
+    while up <= max_sh:
+        if _valid(up):
+            return float(up)
+        up += share_tick
+        up = up.quantize(share_tick, rounding=ROUND_DOWN)
+    down = min(target, max_sh).quantize(share_tick, rounding=ROUND_DOWN)
+    while down >= min_shares:
+        if _valid(down):
+            return float(down)
+        down -= share_tick
+        down = down.quantize(share_tick, rounding=ROUND_DOWN)
     return 0.0
 
 
@@ -2455,7 +2484,10 @@ def buy_market_with_retry(
                     price=limit_price,
                     size=shares,
                     side=BUY,
-                    user_usdc_balance=remaining_budget,
+                    user_usdc_balance=min(
+                        max(0.0, float(BUY_MAX_SPEND) - float(spent)),
+                        max(float(remaining_budget), float(spend)),
+                    ),
                 ),
                 options=PartialCreateOrderOptions(
                     tick_size=tick_size, neg_risk=False,

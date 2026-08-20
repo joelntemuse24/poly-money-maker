@@ -10,9 +10,11 @@ there, then **$2.50 only in the last 120s at the old 75–90¢ band**. Missed
 early does **not** roll into late. Hedge is **50/55** on the combined bag.
 Chainlink TWAP gate is **$0** (any non-zero tick vs PTB; side must match;
 flat is still refused). Late FAKs **limit at 90¢**; early FAKs **limit at
-99¢**. Size is still `budget/ask` per slice, clipped so `size × limit`
-cannot exceed `buy_max_spend` **$3 per FAK**. Displayed top size is **not**
-a cap. `toxic_fill` arms from fill average < 65¢ (not extra shares vs the
+99¢**. Size starts at `budget/ask` and is **at least 3 shares** when
+`3 × limit` fits in `buy_max_spend` **$3 per FAK** (early 3.00 sh / $2.97
+at 99¢, late 3.00 sh / $2.70 at 90¢; 75¢ ask can still be ~3.3 sh). Do not
+round down to 2.00 sh / $1.98. Displayed top size is **not** a cap.
+`toxic_fill` arms from fill average < 65¢ (not extra shares vs the
 99¢-sized quote) and dumps without GUI only while bid ≤ 50¢. Pause minting.
 Pathlog still records all three series (no orders; 14-day / 400 MB cap).
 
@@ -40,7 +42,7 @@ overlay on that same window. Late: **75–90¢** in the last **120s** only
 | `buy_max_spend` | **$3.00** hard ceiling **per FAK** (not $6 across both slices) |
 | `buy_max_shares` | **5** per FAK (~3.3 sh at $2.50/75¢). Two slices may exceed 5 shares total. |
 | Ask band | Last **120s**: **75–90¢**, FAK limit **90¢**. First **3 min** (`120 < TTM ≤ 300`): **≥ 90¢** to 99¢, FAK limit **99¢**. **≥95¢** overlay on that early window only. `buy_max_price` **0.90** is the late cap **and** the early ≥90 floor. |
-| Execution | Size `budget/ask` per slice. Unmatched 400 re-quotes up to **3** FAKs; then **0.15 s** cooldown. Unclear POSTs still quarantine. |
+| Execution | Size `budget/ask`, **floor 3 shares** when `3 × limit ≤ $3`. Unmatched 400 re-quotes up to **3** FAKs; then **0.15 s** cooldown. Unclear POSTs still quarantine. |
 | GUI consensus | winner ≥ 70¢, loser ≤ 30¢ |
 | Windows | 5m **whole market**: early ≥90 / ≥95 for TTM (120, 300]; late 75–90 for TTM ≤ 120s (15m / hourly bots **not running**) |
 | Hedge | **Trigger** bid ≤ **50¢** and ask ≤ **55¢**, spread ≤ 15¢, **plus** inverted buy GUI. Combined early+late inventory. `toxic_fill` arms only when FAK **average** < 65¢ (not extra shares vs a 99¢-sized quote) and still dumps without GUI **only while held bid ≤ 50¢**. |
