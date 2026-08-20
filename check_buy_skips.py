@@ -189,7 +189,7 @@ def main() -> int:
         f"logs: {', '.join(p.name for p in paths)}\n"
         f"since: {args.since or '(all)'}\n"
         f"cycle_error: {sum(stats['cycle_errors'].values())}\n"
-        f"buy_window (entered last 120s): {stats['windows']}\n"
+        f"buy_window (entered a 5m buy window): {stats['windows']}\n"
         f"buy_attempt: {stats['attempts']}\n"
         f"fills: {stats['fills']}\n"
         f"unique markets with any skip/attempt: {len(stats['markets'])}"
@@ -199,7 +199,7 @@ def main() -> int:
         for label, n in stats["cycle_errors"].most_common(15):
             print(f"  {n:5d}  {label}")
     print(
-        "\nSilent pre-patch ticks (not in last 120s, or ask out of band "
+        "\nSilent pre-patch ticks (outside both 5m buy windows, or ask out of band "
         "before buy_skip logging) cannot be recovered."
     )
     print("\nreason counts:")

@@ -20,6 +20,8 @@
   "hedge_require_ask_max": 0.40,
   "hedge_require_gui": true,
   "buy_start_s": 120,
+  "early_buy_start_s": 300,
+  "early_buy_max_price": 0.99,
   "buy_grace_s": 1,
   "buy_cooldown_s": 1,
   "empty_fak_cooldown_s": 0.15,

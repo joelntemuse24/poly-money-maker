@@ -7,7 +7,11 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from buy.entry_skip import window_no_buy_reason
+from buy.entry_skip import (
+    ask_in_entry_band,
+    entry_band_for_seconds,
+    window_no_buy_reason,
+)
 from check_buy_skips import cycle_error_label, load_events, skip_reason, summarize
 
 
@@ -85,6 +89,86 @@ class WindowNoBuyReasonTests(unittest.TestCase):
                 max_price=0.90,
             ),
             "no_consensus",
+        )
+
+
+class EarlyAboveNinetyBandTests(unittest.TestCase):
+    def _band(self, seconds_left):
+        return entry_band_for_seconds(
+            seconds_left,
+            late_start_s=120,
+            late_min=0.75,
+            late_max=0.90,
+            early_start_s=300,
+            early_min=0.90,
+            early_max=0.99,
+        )
+
+    def test_late_window_keeps_75_90_inclusive(self):
+        band = self._band(90)
+        self.assertIsNotNone(band)
+        self.assertEqual(band.name, "late")
+        self.assertFalse(band.min_exclusive)
+        self.assertTrue(ask_in_entry_band(0.75, *band[:2], min_exclusive=band.min_exclusive))
+        self.assertTrue(ask_in_entry_band(0.90, *band[:2], min_exclusive=band.min_exclusive))
+        self.assertFalse(ask_in_entry_band(0.74, *band[:2], min_exclusive=band.min_exclusive))
+        self.assertFalse(ask_in_entry_band(0.91, *band[:2], min_exclusive=band.min_exclusive))
+
+    def test_ttm_120_is_late_not_early(self):
+        band = self._band(120)
+        self.assertEqual(band.name, "late")
+
+    def test_first_three_minutes_buy_only_above_90(self):
+        band = self._band(240)
+        self.assertEqual(band.name, "early")
+        self.assertTrue(band.min_exclusive)
+        self.assertFalse(ask_in_entry_band(0.80, *band[:2], min_exclusive=True))
+        self.assertFalse(ask_in_entry_band(0.90, *band[:2], min_exclusive=True))
+        self.assertTrue(ask_in_entry_band(0.901, *band[:2], min_exclusive=True))
+        self.assertTrue(ask_in_entry_band(0.99, *band[:2], min_exclusive=True))
+        self.assertFalse(ask_in_entry_band(0.991, *band[:2], min_exclusive=True))
+
+    def test_ttm_300_is_early_horizon(self):
+        self.assertEqual(self._band(300).name, "early")
+        self.assertIsNone(self._band(301))
+
+    def test_retry_min_rejects_exactly_90_in_early_window(self):
+        band = self._band(180)
+        self.assertGreater(band.retry_min_price, 0.90)
+        self.assertFalse(0.90 >= band.retry_min_price)
+        self.assertTrue(0.901 >= band.retry_min_price)
+
+    def test_equal_horizons_disable_early_window(self):
+        self.assertIsNone(
+            entry_band_for_seconds(
+                200,
+                late_start_s=120,
+                late_min=0.75,
+                late_max=0.90,
+                early_start_s=120,
+                early_min=0.90,
+                early_max=0.99,
+            )
+        )
+
+    def test_early_90_ask_is_below_band_not_above(self):
+        self.assertEqual(
+            window_no_buy_reason(
+                up_ask=0.90,
+                dn_ask=0.10,
+                up_winning=True,
+                dn_winning=False,
+                up_ask_ok=False,
+                dn_ask_ok=False,
+                up_consensus=False,
+                dn_consensus=False,
+                up_buy=False,
+                dn_buy=False,
+                threshold=0.90,
+                max_price=0.99,
+                min_exclusive=True,
+            ),
+            "ask_below_band",
         )
 
 

@@ -9,15 +9,16 @@ Full architecture: `TECHNICAL_DESIGN.md`.
 **Live on the VM:** **5m buy bot only** (`polybuybot5m`) plus a no-order path
 recorder. 15m and hourly buy services are **stopped**. The 5m bot buys the
 winning leg of Polymarket BTC "Up or Down" markets at **75–90¢** in the final
-120s ($2.50 / market), hedges at **35¢** on reversal, and redeems winners at
-$1.00. See `CURRENT.md` for the active probe budget and knobs.
+120s, or **above 90¢** in the first 3 minutes ($2.50 / market), hedges at
+**35¢** on reversal, and redeems winners at $1.00. See `CURRENT.md` for the
+active probe budget and knobs.
 
 Mint-only helper (`mintbot.py`) is **paused** — do not run it live.
 
 | File | Service | Markets | Oracle | Budget | Window |
 |---|---|---|---|---|---|
 | `buybot.py` | `polybuybot` | 15m | Chainlink TWAP 60s | $2.50 | final 4.0 min |
-| `buybot5m.py` | `polybuybot5m` | 5m | Chainlink TWAP 30s | $2.50 | final 120 s |
+| `buybot5m.py` | `polybuybot5m` | 5m | Chainlink TWAP 30s | $2.50 | last 120s 75–90¢; first 3 min >90¢ |
 | `buybothourly.py` | `polybuybothourly` | hourly | Binance BTCUSDT | $2.50 | final 13.0 min |
 | `pathlog.py` | `polypathlog` | all three | — (CLOB books only) | — | late-window ticks |
 
@@ -154,7 +155,7 @@ Watch the console for `[DRY BUY]` / `[DRY SELL]` markers. Ctrl-C to stop.
 - `buy_skip_incomplete_book` — missing GUI price on a leg (no mid and no last trade)
 - `buy_skip_underlying_edge` — underlying gate failed (missing/stale/flat vs PTB; 5m is **$0** = any non-zero tick)
 - `buy_skip_underlying_side` — book wants the opposite leg from the underlying move
-- `buy_window` — market first entered the last 120s (one line per market)
+- `buy_window` — market first entered a 5m buy window (late 120s or early >90¢; one line per market)
 - `buy_skip` `ask_below_band` / `ask_above_band` / `no_ask` — in window, winning ask not 75–90¢ (throttled 8s)
 - `buy_skip_max_positions` — only if `max_open_positions > 0` (probe uses **0 = unlimited**)
 - `pathlog_prune` — oldest tick JSONL removed (14d / 400 MB cap); export first
@@ -222,7 +223,8 @@ Cloud agents: `CLOUD_RESEARCH.md`.
 
 1. **The three bots are near-identical copies, not shared modules.** A bug fix in
    `buybot.py` probably also applies to `buybot5m.py` and `buybothourly.py`.
-2. **The 5m bot uses seconds-based window checks** (`buy_start_s = 120`) while the
+2. **The 5m bot uses seconds-based window checks** (`buy_start_s = 120` late
+   75–90¢; `early_buy_start_s = 300` for ask > 90¢) while the
    15m and hourly bots use minutes (`buy_window_min = 4.0 / 13.0`). Don't mix them
    when propagating changes. The 5m loop must define `seconds_left` (not only
    `minutes_left`) or it NameErrors every cycle.

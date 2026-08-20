@@ -51,7 +51,7 @@ from py_builder_signing_sdk.sdk_types import BuilderApiKeyCreds
 from buy.market import MarketGateway, MintMarket
 from buy.btc_price import get_btc_feed, append_research, SOURCE_TWAP_30
 from buy.clob_book_ws import get_book_feed
-from buy.entry_skip import window_no_buy_reason
+from buy.entry_skip import ask_in_entry_band, entry_band_for_seconds, window_no_buy_reason
 
 
 class ImmediateResponseClobClient(ClobClient):
@@ -137,8 +137,9 @@ for _rounding in ROUNDING_CONFIG.values():
 _STRATEGY_DEFAULTS = {
     "entry_enabled": False,
     # Trigger at 75¢: buy as soon as the winning ask is ≥ 75¢, priced at the
-    # live ask (so early catches ≈ 75¢). buy_max_price is a hard ceiling only —
-    # never pay above 90¢; we do not wait for or target the top of the band.
+    # live ask (so early catches ≈ 75¢). buy_max_price is a hard ceiling only
+    # in the last 120s — never pay above 90¢ there. First 3 minutes of a 5m
+    # market (TTM 120–300s) may buy *above* 90¢ up to early_buy_max_price.
     "buy_threshold": 0.75,
     "buy_max_price": 0.90,
     # Consensus on Polymarket GUI display price (mid if spread≤10¢ else last trade).
@@ -174,6 +175,9 @@ _STRATEGY_DEFAULTS = {
     # alone is not consensus (same lesson as not buying a random ask).
     "hedge_require_gui": True,
     "buy_start_s": 120,
+    # Whole 5m market: last 120s stays 75–90¢; TTM (120, 300] buys ask > 90¢.
+    "early_buy_start_s": 300,
+    "early_buy_max_price": 0.99,
     "buy_grace_s": 1,
     "buy_cooldown_s": 1,
     # After a proven-empty FAK, wait this long before another outer attempt.
@@ -255,6 +259,12 @@ def load_strategy():
             cfg["buy_budget"] = float(overrides["shares"])
         if not (0 < cfg["buy_threshold"] <= cfg["buy_max_price"] <= 1):
             raise ValueError("buy price band must satisfy 0 < threshold <= max <= 1")
+        if not (0 < cfg["buy_max_price"] < cfg["early_buy_max_price"] <= 1):
+            raise ValueError(
+                "early_buy_max_price must satisfy buy_max_price < early_max <= 1"
+            )
+        if float(cfg["early_buy_start_s"]) < float(cfg["buy_start_s"]):
+            raise ValueError("early_buy_start_s must be >= buy_start_s")
         if not (0 < cfg["toxic_force_exit_below"] <= cfg["buy_threshold"]):
             raise ValueError("toxic_force_exit_below must satisfy 0 < below <= buy_threshold")
         if not (0 <= cfg["hedge_min_price"] <= cfg["hedge_threshold"] <= 1):
@@ -267,6 +277,7 @@ def load_strategy():
         for key in (
             "min_winner_bid", "max_loser_bid", "min_bid_edge",
             "max_entry_spread", "hedge_max_spread", "hedge_require_ask_max",
+            "early_buy_max_price",
         ):
             if not 0 <= float(cfg[key]) <= 1:
                 raise ValueError(f"{key} must be between 0 and 1")
@@ -290,6 +301,7 @@ def load_strategy():
             "buy_budget", "buy_max_spend", "buy_max_shares", "max_open_notional",
             "max_daily_notional", "poll_buy_window_s", "poll_held_s",
             "positions_refresh_s", "balance_refresh_s", "buy_start_s",
+            "early_buy_start_s",
             "ui_every_n_cycles",
         ):
             if float(cfg[key]) <= 0:
@@ -350,6 +362,9 @@ HEDGE_MAX_SPREAD = _strat["hedge_max_spread"]
 HEDGE_REQUIRE_ASK_MAX = _strat["hedge_require_ask_max"]
 HEDGE_REQUIRE_GUI = _strat["hedge_require_gui"]
 BUY_START_S = _strat["buy_start_s"]
+EARLY_BUY_START_S = _strat["early_buy_start_s"]
+EARLY_BUY_MAX_PRICE = _strat["early_buy_max_price"]
+BUY_HORIZON_S = max(float(BUY_START_S), float(EARLY_BUY_START_S))
 BUY_GRACE_S = _strat["buy_grace_s"]
 BUY_COOLDOWN_S = _strat["buy_cooldown_s"]
 EMPTY_FAK_COOLDOWN_S = _strat["empty_fak_cooldown_s"]
@@ -563,8 +578,8 @@ def log_buy_skip_throttled(reason, condition_id, event="buy_skip", **kwargs):
     log_event(event, reason=reason, condition_id=condition_id, **kwargs)
 
 
-def note_buy_window(condition_id, end_ts, seconds_left, slug=None):
-    """One buy_window line the first time a market enters the last 120s."""
+def note_buy_window(condition_id, end_ts, seconds_left, slug=None, window=None):
+    """One buy_window line the first time a market enters a 5m buy window."""
     cid = str(condition_id)
     if cid in _buy_window_logged:
         return
@@ -575,12 +590,14 @@ def note_buy_window(condition_id, end_ts, seconds_left, slug=None):
             continue
         if market_end and market_end < now_s - 60:
             _buy_window_logged.pop(old_cid, None)
-    log_event(
-        "buy_window",
-        condition_id=cid,
-        seconds_left=round(float(seconds_left), 1),
-        slug=slug,
-    )
+    payload = {
+        "condition_id": cid,
+        "seconds_left": round(float(seconds_left), 1),
+        "slug": slug,
+    }
+    if window:
+        payload["window"] = window
+    log_event("buy_window", **payload)
 
 
 def write_heartbeat():
@@ -3177,6 +3194,9 @@ while not _shutdown_requested:
         HEDGE_REQUIRE_ASK_MAX = _strat["hedge_require_ask_max"]
         HEDGE_REQUIRE_GUI = _strat["hedge_require_gui"]
         BUY_START_S = _strat["buy_start_s"]
+        EARLY_BUY_START_S = _strat["early_buy_start_s"]
+        EARLY_BUY_MAX_PRICE = _strat["early_buy_max_price"]
+        BUY_HORIZON_S = max(float(BUY_START_S), float(EARLY_BUY_START_S))
         BUY_GRACE_S = _strat["buy_grace_s"]
         BUY_COOLDOWN_S = _strat["buy_cooldown_s"]
         EMPTY_FAK_COOLDOWN_S = _strat["empty_fak_cooldown_s"]
@@ -3290,7 +3310,7 @@ while not _shutdown_requested:
             if max(p.get("up", {}).get("size", 0), p.get("dn", {}).get("size", 0)) > 0.01
         )
         _min_ttm_now = min((m.end_ts * 1000 - now_ms) / 60000 for m in markets) if markets else 999
-        _hot_mode = _open_pos_n > 0 or (_min_ttm_now * 60) <= BUY_START_S
+        _hot_mode = _open_pos_n > 0 or (_min_ttm_now * 60) <= BUY_HORIZON_S
         _show_ui = (not _hot_mode) or (CYCLE % max(1, int(UI_EVERY_N_CYCLES)) == 0)
 
         if _show_ui:
@@ -3458,7 +3478,7 @@ while not _shutdown_requested:
             ENTRY_ENABLED
             and _discovery_fresh
             and any(
-                0 < market.end_ts - now_s <= float(BUY_START_S)
+                0 < market.end_ts - now_s <= float(BUY_HORIZON_S)
                 for market in markets
             )
         )
@@ -4334,10 +4354,20 @@ while not _shutdown_requested:
                 # --- BUY CHECK (for markets we don't hold) ---
                 if held_size > 0.01:
                     continue  # already hold this market
-                if seconds_left > BUY_START_S:
-                    continue  # not in buy window yet
+                band = entry_band_for_seconds(
+                    seconds_left,
+                    late_start_s=BUY_START_S,
+                    late_min=BUY_THRESHOLD,
+                    late_max=BUY_MAX_PRICE,
+                    early_start_s=EARLY_BUY_START_S,
+                    early_min=BUY_MAX_PRICE,
+                    early_max=EARLY_BUY_MAX_PRICE,
+                )
+                if band is None:
+                    continue  # not in late 75–90¢ or early >90¢ window
                 note_buy_window(
                     cond, m.end_ts, seconds_left, slug=getattr(m, "slug", None),
+                    window=band.name,
                 )
                 if not ENTRY_ENABLED:
                     continue  # explicit operator arm is required for every live entry
@@ -4524,8 +4554,14 @@ while not _shutdown_requested:
                 dn_winning = dn_gui > up_gui
 
                 # Ask in band + GUI consensus + tight real book (bid under the ask).
-                up_ask_ok = up_ask is not None and BUY_THRESHOLD <= up_ask <= BUY_MAX_PRICE
-                dn_ask_ok = dn_ask is not None and BUY_THRESHOLD <= dn_ask <= BUY_MAX_PRICE
+                up_ask_ok = ask_in_entry_band(
+                    up_ask, band.min_price, band.max_price,
+                    min_exclusive=band.min_exclusive,
+                )
+                dn_ask_ok = ask_in_entry_band(
+                    dn_ask, band.min_price, band.max_price,
+                    min_exclusive=band.min_exclusive,
+                )
                 up_book_ok, up_book_why = entry_book_ok(up_bid, up_ask, MAX_ENTRY_SPREAD, MIN_WINNER_BID)
                 dn_book_ok, dn_book_why = entry_book_ok(dn_bid, dn_ask, MAX_ENTRY_SPREAD, MIN_WINNER_BID)
                 up_consensus = (
@@ -4646,8 +4682,9 @@ while not _shutdown_requested:
                         dn_consensus=dn_consensus,
                         up_buy=up_buy,
                         dn_buy=dn_buy,
-                        threshold=BUY_THRESHOLD,
-                        max_price=BUY_MAX_PRICE,
+                        threshold=band.min_price,
+                        max_price=band.max_price,
+                        min_exclusive=band.min_exclusive,
                     )
                     if skip_why in {"ask_below_band", "ask_above_band", "no_ask"}:
                         log_buy_skip_throttled(
@@ -4658,6 +4695,9 @@ while not _shutdown_requested:
                             up_gui=up_gui,
                             dn_gui=dn_gui,
                             seconds_left=round(seconds_left, 1),
+                            band=band.name,
+                            entry_min=band.min_price,
+                            entry_max=band.max_price,
                         )
                     continue
 
@@ -4694,7 +4734,8 @@ while not _shutdown_requested:
                 log_event(
                     "buy_attempt", condition_id=cond, leg=buy_leg, budget=spend_usd,
                     ask=buy_ask, gui=buy_gui, up_gui=up_gui, dn_gui=dn_gui,
-                    threshold=BUY_THRESHOLD, seconds_left=round(seconds_left, 1),
+                    threshold=band.min_price, max_price=band.max_price,
+                    band=band.name, seconds_left=round(seconds_left, 1),
                     ptb=(uchk or {}).get("ptb"),
                     live_btc=(uchk or {}).get("live_btc"),
                     edge_usd=(uchk or {}).get("edge_usd"),
@@ -4714,6 +4755,9 @@ while not _shutdown_requested:
                     "up_gui": up_gui,
                     "dn_gui": dn_gui,
                     "seconds_left": round(seconds_left, 1),
+                    "band": band.name,
+                    "entry_min": band.min_price,
+                    "entry_max": band.max_price,
                     **{k: (uchk or {}).get(k) for k in (
                         "ptb", "live_btc", "edge_usd", "favored", "ptb_source",
                         "live_source", "live_age_s", "ptb_skew_ms",
@@ -4794,7 +4838,8 @@ while not _shutdown_requested:
                     save_json(STATE_FILE, positions_meta)
 
                 bought, spent, buy_status = buy_market_with_retry(
-                    buy_token, spend_usd, BUY_MAX_PRICE, tick_size=tick, min_price=BUY_THRESHOLD,
+                    buy_token, spend_usd, band.max_price, tick_size=tick,
+                    min_price=band.retry_min_price,
                     on_fill=_persist_buy_fill, on_submit=_persist_buy_submit,
                     condition_id=cond,
                 )
@@ -5050,7 +5095,7 @@ while not _shutdown_requested:
     )
     if _has_held:
         _sleep_s = min(POLL_HELD_S, POLL_BUY_WINDOW_S)
-    elif _min_ttm_s <= BUY_START_S:
+    elif _min_ttm_s <= BUY_HORIZON_S:
         _sleep_s = POLL_BUY_WINDOW_S
     else:
         _sleep_s = 1
@@ -5064,7 +5109,7 @@ while not _shutdown_requested:
         _ml_s = (m.end_ts * 1000 - _next_now) / 1000
         pos = held.get(m.condition_id, {})
         has_pos = max(pos.get("up", {}).get("size", 0), pos.get("dn", {}).get("size", 0)) > 0.01
-        in_window = _ml_s > 0 and _ml_s <= BUY_START_S + 30
+        in_window = _ml_s > 0 and _ml_s <= BUY_HORIZON_S + 30
         if not (in_window or has_pos):
             continue
         for token in (m.up_token, m.dn_token):

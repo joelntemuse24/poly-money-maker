@@ -4,7 +4,8 @@
 Do not put secrets, API keys, or live wallet material here.
 
 Last updated: **2026-08-20** — **only the 5m CLOB bot is live.** Stop/disable
-15m and hourly. Keep the **$2.50 / 75–90¢** triggers on 5m. Chainlink TWAP
+15m and hourly. Keep the **$2.50** 5m triggers: **75–90¢ in the last 120s**, and **above 90¢
+(to 99¢) in the first 3 minutes**. Chainlink TWAP
 gate is **$0** (any non-zero tick vs PTB; side must match; flat is still
 refused). Buys are **limit
 FAKs at the quoted ask** sized `budget/ask` (~3.3 shares at 75¢), clipped to
@@ -26,18 +27,18 @@ mint complete sets. Operator still sells leftover mint inventory by hand.
 `polybuybothourly` unless the operator asks. Open 15m/hourly inventory (if any)
 will not be auto-hedged or redeemed by those processes.
 
-**Active strategy:** **5m only** (`polybuybot5m`) with the **$2.50 widen-band
-triggers** (not the old 98–99¢ probe):
+**Active strategy:** **5m only** (`polybuybot5m`) with the **$2.50** late
+**75–90¢** band plus an early **>90¢** path in the first 3 minutes:
 
 | Knob | Value |
 |---|---|
 | `buy_budget` | **$2.50** / market |
 | `buy_max_spend` | **$3.00** hard ceiling (strategy is $2.50; never more than ~$3) |
 | `buy_max_shares` | **5** buffer (~3.3 sh at $2.50/75¢) |
-| Ask band | **75–90¢** — trigger as soon as winning ask ≥ 75¢; 90¢ is a hard ceiling |
+| Ask band | **75–90¢** in the last **120s** (90¢ hard ceiling there). First **3 min** (TTM 120–300s): winning ask **> 90¢** up to `early_buy_max_price` **99¢**. Same GUI / book / underlying gates. |
 | Execution | FAK **limit** at the quoted ask, size `min(budget/ask, buy_max_shares)`. A clean **unmatched 400** re-quotes up to **3** FAKs in one trigger; then **0.15 s** cooldown. Unclear POSTs still quarantine (no second $2.50). |
 | GUI consensus | winner ≥ 70¢, loser ≤ 30¢ |
-| Windows | 5m **120 s** (15m / hourly bots **not running**) |
+| Windows | 5m **whole market**: early >90¢ for TTM (120, 300]; late 75–90¢ for TTM ≤ 120s (15m / hourly bots **not running**) |
 | Hedge | **Trigger** bid ≤ **35¢** and ask ≤ **40¢**, spread ≤ 15¢, **plus** inverted buy GUI (held last trade ≤ 40¢, held GUI ≤ 30¢, other GUI ≥ 70¢). **Then sell at whatever the bid is** — no 32¢ floor. `toxic_fill` still dumps without GUI **only while held bid ≤ 35¢**; recovered books log `hedge_skip_toxic_recovered` and stay armed. |
 | Underlying edge | **$0** (5m: any non-zero TWAP vs PTB) / **$10** (15m, hourly); side must match |
 | `max_open_positions` | **0 = unlimited** |
@@ -182,9 +183,10 @@ amount / HTTP 400), not this NameError.
       After merge: `git pull` + `sudo systemctl restart polybuybot5m` (5m only).
       Live JSON does **not** need a new key — `empty_fak_cooldown_s` defaults to 0.15.
 - [ ] After merge: `git pull` then `sudo systemctl restart polybuybot5m` only
-      (toxic recovered-book skip + per-market `cycle_error` isolation). Watch
-      `hedge_skip_toxic_recovered`, `hedge_skip_no_consensus`, `cycle_error`
-      **with** `condition_id` and later `buy_fill`s in the same second.
+      so the early >90¢ / first-3-min path is loaded (code change; live JSON
+      may omit the new keys — defaults `early_buy_start_s=300`,
+      `early_buy_max_price=0.99`). Watch `buy_window` `window=early`,
+      `buy_attempt` `band=early`, and that last-120s fills stay 75–90¢.
 - [ ] Cloud paper P&L: paste `CLOUD_RESEARCH.md` section 2 (live `pathlog.py`
       + `--sweep --paper`, rank by `pnl_sum` vs `live_5m_paper`). No `.env`.
       Optional: attach `poly-research.zip` for the historical tape. Not live

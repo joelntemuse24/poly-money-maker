@@ -672,11 +672,21 @@ class AmbiguousCrossCyclePolicy(unittest.TestCase):
 
         five = BOT5M.read_text()
         self.assertIn("seconds_left = (end_ts_ms - now_ms) / 1000", five)
-        self.assertIn("if seconds_left > BUY_START_S:", five)
+        self.assertIn("entry_band_for_seconds", five)
+        self.assertIn("EARLY_BUY_START_S", five)
+        self.assertNotIn(
+            "up_ask_ok = up_ask is not None and BUY_THRESHOLD <= up_ask <= BUY_MAX_PRICE",
+            five,
+        )
         for bot in (BOT, BOT_HR):
             src = bot.read_text()
             self.assertNotIn("seconds_left = (end_ts_ms - now_ms) / 1000", src, bot.name)
             self.assertIn("minutes_left = (end_ts_ms - now_ms) / 60000", src, bot.name)
+            self.assertIn(
+                "up_ask_ok = up_ask is not None and BUY_THRESHOLD <= up_ask <= BUY_MAX_PRICE",
+                src,
+                bot.name,
+            )
 
     def test_hedge_liveness_and_reconcile_markers(self):
         src = BOT.read_text()
@@ -1205,7 +1215,19 @@ class BalanceAndGcSemantics(unittest.TestCase):
             "strategy_buy5m.example.json",
             "strategy_buyhourly.example.json",
         ):
-            self.assertIs(json.loads((root / name).read_text())["dry_run"], True)
+            data = json.loads((root / name).read_text())
+            self.assertIs(data["dry_run"], True)
+            self.assertIs(data["entry_enabled"], False)
+        five = json.loads((root / "strategy_buy5m.example.json").read_text())
+        self.assertEqual(five["buy_start_s"], 120)
+        self.assertEqual(five["early_buy_start_s"], 300)
+        self.assertEqual(five["early_buy_max_price"], 0.99)
+        self.assertEqual(five["buy_threshold"], 0.75)
+        self.assertEqual(five["buy_max_price"], 0.90)
+        hourly = json.loads((root / "strategy_buyhourly.example.json").read_text())
+        fifteen = json.loads((root / "strategy_buy.example.json").read_text())
+        self.assertNotIn("early_buy_start_s", hourly)
+        self.assertNotIn("early_buy_start_s", fifteen)
 
 
 if __name__ == "__main__":
