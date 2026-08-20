@@ -364,7 +364,8 @@ class SweepTemplateTests(unittest.TestCase):
         self.assertEqual(tmpl["ttm_max"], 120.0)
         self.assertEqual(tmpl["budget"], 2.5)
         self.assertTrue(tmpl["hedge_require_gui"])
-        self.assertEqual(tmpl["hedge_threshold"], 0.35)
+        self.assertEqual(tmpl["hedge_threshold"], 0.50)
+        self.assertEqual(tmpl["hedge_require_ask_max"], 0.55)
 
     def test_sweep_starts_from_live_template(self):
         tmpl = template_from_strategy(

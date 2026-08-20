@@ -51,7 +51,12 @@ from py_builder_signing_sdk.sdk_types import BuilderApiKeyCreds
 from buy.market import MarketGateway, MintMarket
 from buy.btc_price import get_btc_feed, append_research, SOURCE_TWAP_30
 from buy.clob_book_ws import get_book_feed
-from buy.entry_skip import ask_in_entry_band, entry_band_for_seconds, window_no_buy_reason
+from buy.entry_skip import (
+    applicable_entry_bands,
+    ask_in_any_band,
+    select_entry_band,
+    window_no_buy_reason,
+)
 
 
 class ImmediateResponseClobClient(ClobClient):
@@ -140,6 +145,7 @@ _STRATEGY_DEFAULTS = {
     # live ask (so early catches ≈ 75¢). buy_max_price is a hard ceiling only
     # in the last 120s — never pay above 90¢ there. First 3 minutes of a 5m
     # market (TTM 120–300s) may buy *above* 90¢ up to early_buy_max_price.
+    # First 4 minutes (TTM 60–300s) may also buy at 95¢ or greater.
     "buy_threshold": 0.75,
     "buy_max_price": 0.90,
     # Consensus on Polymarket GUI display price (mid if spread≤10¢ else last trade).
@@ -157,8 +163,8 @@ _STRATEGY_DEFAULTS = {
     # Must be <= buy_threshold (validator); 65¢ ≈ walk well below the 75¢ floor.
     "toxic_force_exit_below": 0.65,
     "hedge_enabled": True,
-    "hedge_threshold": 0.35,
-    # Kept in config (live JSON still sends it). Not a FAK floor: after 35/40
+    "hedge_threshold": 0.50,
+    # Kept in config (live JSON still sends it). Not a FAK floor: after 50/55
     # integrity, the sell follows the live bid so a 20¢ print is not $0.
     "hedge_min_price": 0.325,
     "hedge_undercut_ticks": 2,
@@ -170,14 +176,18 @@ _STRATEGY_DEFAULTS = {
     # Hedge: penny bids under a still-high ask are fake — require a tight book
     # and ask also collapsed (same lesson sell-side already learned on mids).
     "hedge_max_spread": 0.15,
-    "hedge_require_ask_max": 0.40,
-    # Invert the buy GUI 70/30 plus last-trade on the held token. TOB 35/40
+    "hedge_require_ask_max": 0.55,
+    # Invert the buy GUI 70/30 plus last-trade on the held token. TOB 50/55
     # alone is not consensus (same lesson as not buying a random ask).
     "hedge_require_gui": True,
     "buy_start_s": 120,
     # Whole 5m market: last 120s stays 75–90¢; TTM (120, 300] buys ask > 90¢.
     "early_buy_start_s": 300,
     "early_buy_max_price": 0.99,
+    # First 4 minutes of a 5m market: TTM [60, 300], ask >= 95¢.
+    "early_95_start_s": 300,
+    "early_95_min_s": 60,
+    "early_95_min_price": 0.95,
     "buy_grace_s": 1,
     "buy_cooldown_s": 1,
     # After a proven-empty FAK, wait this long before another outer attempt.
@@ -265,6 +275,17 @@ def load_strategy():
             )
         if float(cfg["early_buy_start_s"]) < float(cfg["buy_start_s"]):
             raise ValueError("early_buy_start_s must be >= buy_start_s")
+        if float(cfg["early_95_min_s"]) < 0:
+            raise ValueError("early_95_min_s must be >= 0")
+        if float(cfg["early_95_start_s"]) < float(cfg["early_95_min_s"]):
+            raise ValueError("early_95_start_s must be >= early_95_min_s")
+        if not (
+            0 < cfg["buy_max_price"] < cfg["early_95_min_price"]
+            <= cfg["early_buy_max_price"] <= 1
+        ):
+            raise ValueError(
+                "early_95_min_price must satisfy buy_max_price < min95 <= early_max <= 1"
+            )
         if not (0 < cfg["toxic_force_exit_below"] <= cfg["buy_threshold"]):
             raise ValueError("toxic_force_exit_below must satisfy 0 < below <= buy_threshold")
         if not (0 <= cfg["hedge_min_price"] <= cfg["hedge_threshold"] <= 1):
@@ -277,7 +298,7 @@ def load_strategy():
         for key in (
             "min_winner_bid", "max_loser_bid", "min_bid_edge",
             "max_entry_spread", "hedge_max_spread", "hedge_require_ask_max",
-            "early_buy_max_price",
+            "early_buy_max_price", "early_95_min_price",
         ):
             if not 0 <= float(cfg[key]) <= 1:
                 raise ValueError(f"{key} must be between 0 and 1")
@@ -301,7 +322,7 @@ def load_strategy():
             "buy_budget", "buy_max_spend", "buy_max_shares", "max_open_notional",
             "max_daily_notional", "poll_buy_window_s", "poll_held_s",
             "positions_refresh_s", "balance_refresh_s", "buy_start_s",
-            "early_buy_start_s",
+            "early_buy_start_s", "early_95_start_s",
             "ui_every_n_cycles",
         ):
             if float(cfg[key]) <= 0:
@@ -323,7 +344,7 @@ def load_strategy():
             "min_underlying_edge_usd", "hedge_undercut_ticks",
             "hedge_quote_max_age_s", "hedge_retry_sleep_s",
             "hedge_ghost_sleep_s", "buy_grace_s", "buy_cooldown_s",
-            "empty_fak_cooldown_s",
+            "empty_fak_cooldown_s", "early_95_min_s",
             "redeem_throttle_s", "max_redeem_age_days",
         ):
             if float(cfg[key]) < 0:
@@ -364,7 +385,12 @@ HEDGE_REQUIRE_GUI = _strat["hedge_require_gui"]
 BUY_START_S = _strat["buy_start_s"]
 EARLY_BUY_START_S = _strat["early_buy_start_s"]
 EARLY_BUY_MAX_PRICE = _strat["early_buy_max_price"]
-BUY_HORIZON_S = max(float(BUY_START_S), float(EARLY_BUY_START_S))
+EARLY_95_START_S = _strat["early_95_start_s"]
+EARLY_95_MIN_S = _strat["early_95_min_s"]
+EARLY_95_MIN_PRICE = _strat["early_95_min_price"]
+BUY_HORIZON_S = max(
+    float(BUY_START_S), float(EARLY_BUY_START_S), float(EARLY_95_START_S),
+)
 BUY_GRACE_S = _strat["buy_grace_s"]
 BUY_COOLDOWN_S = _strat["buy_cooldown_s"]
 EMPTY_FAK_COOLDOWN_S = _strat["empty_fak_cooldown_s"]
@@ -576,6 +602,22 @@ def log_buy_skip_throttled(reason, condition_id, event="buy_skip", **kwargs):
         for stale, _ts in sorted(_skip_log_mono.items(), key=lambda kv: kv[1])[:64]:
             _skip_log_mono.pop(stale, None)
     log_event(event, reason=reason, condition_id=condition_id, **kwargs)
+
+
+def current_entry_bands(seconds_left):
+    """Open 5m buy bands at this TTM (late 75–90, early >90, first-4-min ≥95)."""
+    return applicable_entry_bands(
+        seconds_left,
+        late_start_s=BUY_START_S,
+        late_min=BUY_THRESHOLD,
+        late_max=BUY_MAX_PRICE,
+        early_start_s=EARLY_BUY_START_S,
+        early_min=BUY_MAX_PRICE,
+        early_max=EARLY_BUY_MAX_PRICE,
+        early_95_start_s=EARLY_95_START_S,
+        early_95_min_s=EARLY_95_MIN_S,
+        early_95_min=EARLY_95_MIN_PRICE,
+    )
 
 
 def note_buy_window(condition_id, end_ts, seconds_left, slug=None, window=None):
@@ -1108,7 +1150,7 @@ def get_quote_fast(
 def hedge_sell_price(bid, tick_size, undercut_ticks, min_price=None):
     """FAK sell at the live bid (undercut, tick-aligned).
 
-    After 35/40 integrity, take whatever bid is there. min_price is ignored so
+    After 50/55 integrity, take whatever bid is there. min_price is ignored so
     a leftover 32¢ config cannot refuse a 20¢ or 1¢ print. One tick is only
     the exchange minimum, not a strategy floor.
     """
@@ -1236,7 +1278,7 @@ def toxic_dump_book_ok(bid, threshold):
 
     Recovered book (bid > hedge_threshold, e.g. 97¢ after a junk fill) must
     not dump. Missing bid is fail-closed. Wide 1¢/99¢ still dumps — this
-    gate is bid-only and does not require 35/40/15 or GUI.
+    gate is bid-only and does not require 50/55/15 or GUI.
     """
     bid = finite_float(bid, minimum=0, maximum=1)
     threshold = finite_float(threshold, minimum=0, maximum=1)
@@ -1259,7 +1301,7 @@ def hedge_consensus_ok(
     A 32/38 clip can be a random TOB. Buy already uses Polymarket display
     (mid if spread ≤ 10¢ else last trade) plus 70/30. Hedge inverts that,
     and also requires a last print on the held token ≤ last_trade_max so a
-    spoofed tight book cannot manufacture a 35¢ mid while last trade is 85¢.
+    spoofed tight book cannot manufacture a 50¢ mid while last trade is 85¢.
     """
     held_last = finite_float(held_last, minimum=0, maximum=1)
     last_trade_max = finite_float(last_trade_max, minimum=0, maximum=1)
@@ -3196,7 +3238,12 @@ while not _shutdown_requested:
         BUY_START_S = _strat["buy_start_s"]
         EARLY_BUY_START_S = _strat["early_buy_start_s"]
         EARLY_BUY_MAX_PRICE = _strat["early_buy_max_price"]
-        BUY_HORIZON_S = max(float(BUY_START_S), float(EARLY_BUY_START_S))
+        EARLY_95_START_S = _strat["early_95_start_s"]
+        EARLY_95_MIN_S = _strat["early_95_min_s"]
+        EARLY_95_MIN_PRICE = _strat["early_95_min_price"]
+        BUY_HORIZON_S = max(
+            float(BUY_START_S), float(EARLY_BUY_START_S), float(EARLY_95_START_S),
+        )
         BUY_GRACE_S = _strat["buy_grace_s"]
         BUY_COOLDOWN_S = _strat["buy_cooldown_s"]
         EMPTY_FAK_COOLDOWN_S = _strat["empty_fak_cooldown_s"]
@@ -3960,8 +4007,8 @@ while not _shutdown_requested:
                 # --- HEDGE CHECK (for held positions) ---
                 if held_token and held_size > 0.01 and HEDGE_ENABLED and not meta.get("hedge_closed"):
                     # FAK avg < toxic_force_exit_below arms toxic_fill. Dump only while
-                    # held bid ≤ hedge_threshold (no GUI / 35/40/15). Recovered book
-                    # (bid > 35¢) logs hedge_skip_toxic_recovered and stays armed.
+                    # held bid ≤ hedge_threshold (no GUI / 50/55/15). Recovered book
+                    # (bid > 50¢) logs hedge_skip_toxic_recovered and stays armed.
                     # Mild below-band fills (≥ that floor) use the normal hedge path.
                     toxic_fill = bool(meta.get("toxic_fill"))
                     # Skip REST when a *fresh* WS bid is clearly above threshold
@@ -4124,7 +4171,7 @@ while not _shutdown_requested:
                                     (not toxic_fill) and hedge_bid <= HEDGE_THRESHOLD
                                 ):
                                     hedge_tick = get_tick_size_cached(held_token)
-                                    # 35/40 is only a tight book. GUI + last trade
+                                    # 50/55 is only a tight book. GUI + last trade
                                     # must also say the held side actually lost.
                                     # Sell at the live bid — 20¢, 5¢, one tick, whatever
                                     # is there. No strategy "won't take less than X".
@@ -4354,20 +4401,12 @@ while not _shutdown_requested:
                 # --- BUY CHECK (for markets we don't hold) ---
                 if held_size > 0.01:
                     continue  # already hold this market
-                band = entry_band_for_seconds(
-                    seconds_left,
-                    late_start_s=BUY_START_S,
-                    late_min=BUY_THRESHOLD,
-                    late_max=BUY_MAX_PRICE,
-                    early_start_s=EARLY_BUY_START_S,
-                    early_min=BUY_MAX_PRICE,
-                    early_max=EARLY_BUY_MAX_PRICE,
-                )
-                if band is None:
-                    continue  # not in late 75–90¢ or early >90¢ window
+                bands = current_entry_bands(seconds_left)
+                if not bands:
+                    continue  # not in late 75–90¢, early >90¢, or first-4-min ≥95¢
                 note_buy_window(
                     cond, m.end_ts, seconds_left, slug=getattr(m, "slug", None),
-                    window=band.name,
+                    window=",".join(b.name for b in bands),
                 )
                 if not ENTRY_ENABLED:
                     continue  # explicit operator arm is required for every live entry
@@ -4554,14 +4593,8 @@ while not _shutdown_requested:
                 dn_winning = dn_gui > up_gui
 
                 # Ask in band + GUI consensus + tight real book (bid under the ask).
-                up_ask_ok = ask_in_entry_band(
-                    up_ask, band.min_price, band.max_price,
-                    min_exclusive=band.min_exclusive,
-                )
-                dn_ask_ok = ask_in_entry_band(
-                    dn_ask, band.min_price, band.max_price,
-                    min_exclusive=band.min_exclusive,
-                )
+                up_ask_ok = ask_in_any_band(up_ask, bands)
+                dn_ask_ok = ask_in_any_band(dn_ask, bands)
                 up_book_ok, up_book_why = entry_book_ok(up_bid, up_ask, MAX_ENTRY_SPREAD, MIN_WINNER_BID)
                 dn_book_ok, dn_book_why = entry_book_ok(dn_bid, dn_ask, MAX_ENTRY_SPREAD, MIN_WINNER_BID)
                 up_consensus = (
@@ -4682,11 +4715,14 @@ while not _shutdown_requested:
                         dn_consensus=dn_consensus,
                         up_buy=up_buy,
                         dn_buy=dn_buy,
-                        threshold=band.min_price,
-                        max_price=band.max_price,
-                        min_exclusive=band.min_exclusive,
+                        threshold=min(b.min_price for b in bands),
+                        max_price=max(b.max_price for b in bands),
+                        min_exclusive=any(b.min_exclusive for b in bands),
+                        bands=bands,
                     )
-                    if skip_why in {"ask_below_band", "ask_above_band", "no_ask"}:
+                    if skip_why in {
+                        "ask_below_band", "ask_above_band", "ask_out_of_band", "no_ask",
+                    }:
                         log_buy_skip_throttled(
                             skip_why,
                             cond,
@@ -4695,9 +4731,9 @@ while not _shutdown_requested:
                             up_gui=up_gui,
                             dn_gui=dn_gui,
                             seconds_left=round(seconds_left, 1),
-                            band=band.name,
-                            entry_min=band.min_price,
-                            entry_max=band.max_price,
+                            band=",".join(b.name for b in bands),
+                            entry_min=min(b.min_price for b in bands),
+                            entry_max=max(b.max_price for b in bands),
                         )
                     continue
 
@@ -4705,6 +4741,9 @@ while not _shutdown_requested:
                 buy_ask = up_ask if up_buy else dn_ask
                 buy_leg = "up" if up_buy else "down"
                 buy_gui = up_gui if up_buy else dn_gui
+                band = select_entry_band(buy_ask, bands)
+                if band is None:
+                    continue
 
                 # Cooldown (empty FAKs use the short empty_fak_cooldown_s).
                 last_buy_at = meta.get("last_buy_at") or 0

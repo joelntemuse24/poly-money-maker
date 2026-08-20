@@ -9,16 +9,16 @@ Full architecture: `TECHNICAL_DESIGN.md`.
 **Live on the VM:** **5m buy bot only** (`polybuybot5m`) plus a no-order path
 recorder. 15m and hourly buy services are **stopped**. The 5m bot buys the
 winning leg of Polymarket BTC "Up or Down" markets at **75–90¢** in the final
-120s, or **above 90¢** in the first 3 minutes ($2.50 / market), hedges at
-**35¢** on reversal, and redeems winners at $1.00. See `CURRENT.md` for the
-active probe budget and knobs.
+120s, **above 90¢** in the first 3 minutes, or **≥95¢** in the first 4 minutes
+($2.50 / market), hedges at **50¢** on reversal, and redeems winners at $1.00.
+See `CURRENT.md` for the active probe budget and knobs.
 
 Mint-only helper (`mintbot.py`) is **paused** — do not run it live.
 
 | File | Service | Markets | Oracle | Budget | Window |
 |---|---|---|---|---|---|
 | `buybot.py` | `polybuybot` | 15m | Chainlink TWAP 60s | $2.50 | final 4.0 min |
-| `buybot5m.py` | `polybuybot5m` | 5m | Chainlink TWAP 30s | $2.50 | last 120s 75–90¢; first 3 min >90¢ |
+| `buybot5m.py` | `polybuybot5m` | 5m | Chainlink TWAP 30s | $2.50 | last 120s 75–90¢; first 3 min >90¢; first 4 min ≥95¢ |
 | `buybothourly.py` | `polybuybothourly` | hourly | Binance BTCUSDT | $2.50 | final 13.0 min |
 | `pathlog.py` | `polypathlog` | all three | — (CLOB books only) | — | late-window ticks |
 
@@ -143,8 +143,8 @@ Watch the console for `[DRY BUY]` / `[DRY SELL]` markers. Ctrl-C to stop.
   market in the same poll; isolation is the fix for the next one).
 - `hedge_attempt` / `hedge_fill` — hedge fired after force-fresh REST + book integrity + GUI consensus (normal path)
 - `hedge_skip_toxic_book` — bid dipped but ask/spread still say "not reversed"
-- `hedge_skip_no_consensus` — 35/40 book passed but GUI/last-trade still say the held side has not actually fallen (same class of check as buy)
-- `hedge_skip_toxic_recovered` — `toxic_fill` is armed but held bid > 35¢ (winner book); dump stays armed, no sell
+- `hedge_skip_no_consensus` — 50/55 (5m) or 35/40 book passed but GUI/last-trade still say the held side has not actually fallen (same class of check as buy)
+- `hedge_skip_toxic_recovered` — `toxic_fill` is armed but held bid > hedge threshold (winner book); dump stays armed, no sell
 - `hedge_skip_incomplete_rest` — REST missing a side; fail closed (no WS sell)
 - `buy_skip_ambiguous` — GUI display prices too close (throttled 8s; **not** one event per market)
 - `buy_skip_no_consensus` — ask in band but GUI/tight-book gate failed
@@ -155,8 +155,8 @@ Watch the console for `[DRY BUY]` / `[DRY SELL]` markers. Ctrl-C to stop.
 - `buy_skip_incomplete_book` — missing GUI price on a leg (no mid and no last trade)
 - `buy_skip_underlying_edge` — underlying gate failed (missing/stale/flat vs PTB; 5m is **$0** = any non-zero tick)
 - `buy_skip_underlying_side` — book wants the opposite leg from the underlying move
-- `buy_window` — market first entered a 5m buy window (late 120s or early >90¢; one line per market)
-- `buy_skip` `ask_below_band` / `ask_above_band` / `no_ask` — in window, winning ask not 75–90¢ (throttled 8s)
+- `buy_window` — market first entered a 5m buy window (late 75–90, early >90, or ≥95; one line per market)
+- `buy_skip` `ask_below_band` / `ask_above_band` / `ask_out_of_band` / `no_ask` — in window, winning ask not in any open band (throttled 8s)
 - `buy_skip_max_positions` — only if `max_open_positions > 0` (probe uses **0 = unlimited**)
 - `pathlog_prune` — oldest tick JSONL removed (14d / 400 MB cap); export first
 
@@ -203,14 +203,15 @@ Cloud agents: `CLOUD_RESEARCH.md`.
   POSTs again (up to 3) in the same trigger; invalid-amount / auth 400s and unclear
   POSTs do not. After a fully empty trigger, wait `empty_fak_cooldown_s` (0.15 s).
 - **Hedge is sell-only exit:** The bots never profit-take. The only sell path is the
-  hedge: REST shows bid ≤ 35¢ **and** ask ≤ 40¢ with tight spread, **and**
-  Polymarket GUI + last trade agree the held side actually lost (held last
-  print ≤ 40¢, held GUI ≤ 30¢, other GUI ≥ 70¢ — same display rule as buy).
-  A random TOB clip is not enough; a last print of 85¢ on a 32/38 book will
+  hedge: REST shows bid ≤ threshold **and** ask ≤ require_ask_max with tight
+  spread, **and** Polymarket GUI + last trade agree the held side actually lost
+  (held last print ≤ require_ask_max, held GUI ≤ 30¢, other GUI ≥ 70¢ — same
+  display rule as buy). Live 5m is **50/55**; 15m/hourly remain 35/40.
+  A random TOB clip is not enough; a last print of 85¢ on a 48/52 book will
   `hedge_skip_no_consensus`. `toxic_fill` stays armed and still skips GUI /
-  35/40/15, but **sells only while held bid ≤ 35¢**. A recovered 97¢ book
+  50/55/15 on 5m, but **sells only while held bid ≤ 50¢**. A recovered 97¢ book
   logs `hedge_skip_toxic_recovered` and rides; a 6¢ junk bid (even under a
-  99¢ ask) still dumps on bid-only REST. Fresh WS bid > 35¢ skips REST for
+  99¢ ask) still dumps on bid-only REST. Fresh WS bid > 50¢ skips REST for
   both normal and toxic. After a dump is allowed, the FAK sells at the
   **live bid** even if it is 20¢. Everything else rides to redemption at
   $1.00. WS may *arm* a hedge check; normal sells need two-sided REST.
@@ -224,7 +225,8 @@ Cloud agents: `CLOUD_RESEARCH.md`.
 1. **The three bots are near-identical copies, not shared modules.** A bug fix in
    `buybot.py` probably also applies to `buybot5m.py` and `buybothourly.py`.
 2. **The 5m bot uses seconds-based window checks** (`buy_start_s = 120` late
-   75–90¢; `early_buy_start_s = 300` for ask > 90¢) while the
+   75–90¢; `early_buy_start_s = 300` for ask > 90¢; `early_95_min_s = 60` /
+   `early_95_start_s = 300` for ask ≥ 95¢) while the
    15m and hourly bots use minutes (`buy_window_min = 4.0 / 13.0`). Don't mix them
    when propagating changes. The 5m loop must define `seconds_left` (not only
    `minutes_left`) or it NameErrors every cycle.

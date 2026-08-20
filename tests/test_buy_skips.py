@@ -8,8 +8,12 @@ import unittest
 from pathlib import Path
 
 from buy.entry_skip import (
+    applicable_entry_bands,
+    ask_in_any_band,
     ask_in_entry_band,
     entry_band_for_seconds,
+    select_entry_band,
+    union_ask_band_reason,
     window_no_buy_reason,
 )
 from check_buy_skips import cycle_error_label, load_events, skip_reason, summarize
@@ -170,6 +174,61 @@ class EarlyAboveNinetyBandTests(unittest.TestCase):
             ),
             "ask_below_band",
         )
+
+
+class FirstFourMinutesAt95Tests(unittest.TestCase):
+    def _bands(self, seconds_left):
+        return applicable_entry_bands(
+            seconds_left,
+            late_start_s=120,
+            late_min=0.75,
+            late_max=0.90,
+            early_start_s=300,
+            early_min=0.90,
+            early_max=0.99,
+            early_95_start_s=300,
+            early_95_min_s=60,
+            early_95_min=0.95,
+        )
+
+    def test_first_three_minutes_still_allow_above_90(self):
+        bands = self._bands(240)
+        self.assertTrue(ask_in_any_band(0.91, bands))
+        self.assertTrue(ask_in_any_band(0.95, bands))
+        self.assertFalse(ask_in_any_band(0.90, bands))
+        self.assertFalse(ask_in_any_band(0.80, bands))
+
+    def test_last_120s_allows_75_90_or_95_plus(self):
+        bands = self._bands(90)
+        names = [b.name for b in bands]
+        self.assertIn("late", names)
+        self.assertIn("early_95", names)
+        self.assertTrue(ask_in_any_band(0.80, bands))
+        self.assertTrue(ask_in_any_band(0.90, bands))
+        self.assertFalse(ask_in_any_band(0.91, bands))
+        self.assertTrue(ask_in_any_band(0.95, bands))
+        self.assertEqual(union_ask_band_reason(0.91, bands), "ask_out_of_band")
+
+    def test_four_minute_mark_still_allows_95(self):
+        bands = self._bands(60)
+        self.assertIn("early_95", [b.name for b in bands])
+        self.assertTrue(ask_in_any_band(0.95, bands))
+
+    def test_last_minute_drops_the_95_path(self):
+        bands = self._bands(50)
+        self.assertEqual([b.name for b in bands], ["late"])
+        self.assertTrue(ask_in_any_band(0.80, bands))
+        self.assertFalse(ask_in_any_band(0.95, bands))
+        self.assertEqual(union_ask_band_reason(0.95, bands), "ask_above_band")
+
+    def test_select_widest_matching_band_for_retry(self):
+        early = select_entry_band(0.96, self._bands(180))
+        self.assertIsNotNone(early)
+        self.assertEqual(early.name, "early")
+        late_95 = select_entry_band(0.96, self._bands(90))
+        self.assertIsNotNone(late_95)
+        self.assertEqual(late_95.name, "early_95")
+        self.assertGreaterEqual(late_95.retry_min_price, 0.95)
 
 
 class SkipSummarizeTests(unittest.TestCase):

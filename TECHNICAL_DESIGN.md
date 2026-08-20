@@ -68,10 +68,10 @@ trades a different market cadence and uses a different resolution oracle.
 | Series slug | `btc-up-or-down-15m` | `btc-up-or-down-5m` | `btc-up-or-down-hourly` |
 | Slug prefix / excludes | `btc-updown` (excl. `btc-updown-5m`, `bitcoin-up-or-down`) | `btc-updown-5m` (excl. `bitcoin-up-or-down`) | `bitcoin-up-or-down` (excl. `btc-updown`, `btc-updown-5m`) |
 | Resolution oracle | Chainlink BTC TWAP 60s | Chainlink BTC TWAP 30s | Binance BTCUSDT |
-| Buy window | final 4.0 min (`buy_window_min`) | last 120s 75–90¢; first 3 min >90¢ (`buy_start_s` / `early_buy_start_s`) | final 13.0 min (`buy_window_min`) |
-| Ask band | 75–90¢ | 75–90¢ late; >90–99¢ early | 75–90¢ |
+| Buy window | final 4.0 min (`buy_window_min`) | last 120s 75–90¢; first 3 min >90¢; first 4 min ≥95¢ | final 13.0 min (`buy_window_min`) |
+| Ask band | 75–90¢ | 75–90¢ late; >90–99¢ first 3 min; ≥95–99¢ first 4 min | 75–90¢ |
 | Budget / market | $2.50 USDC | $2.50 USDC | $2.50 USDC |
-| Hedge trigger | 35/40/15 book **+** inverted GUI/last trade | same | same |
+| Hedge trigger | 35/40/15 book **+** inverted GUI/last trade | **50/55/15** + inverted GUI | 35/40/15 book **+** inverted GUI/last trade |
 | Tick size | 0.01 | 0.001 | 0.01 |
 | Strategy file | `strategy_buy.json` | `strategy_buy5m.json` | `strategy_buyhourly.json` |
 | State file | `positions_buy.json` | `positions_buy5m.json` | `positions_buyhourly.json` |
@@ -378,13 +378,14 @@ paths. Templates are `strategy_buy.example.json`,
 |---|---|---|
 | `buy_threshold` / `buy_max_price` | 0.75 / 0.90 | Trigger ≥75¢; hard ceiling 90¢ in the late window (prefer fills near 75¢) |
 | `early_buy_start_s` / `early_buy_max_price` (5m) | 300 / 0.99 | First 3 min of a 5m market: buy winning ask **above** 90¢, cap 99¢. Same GUI/book/underlying gates. Empty if `early_buy_start_s` equals `buy_start_s`. |
+| `early_95_start_s` / `early_95_min_s` / `early_95_min_price` (5m) | 300 / 60 / 0.95 | First 4 min: buy winning ask **≥ 95¢** while TTM is [60, 300]. Overlaps the late window so 95¢+ can buy in the last 120s too. |
 | `min_winner_bid` / `max_loser_bid` / `min_bid_edge` | 0.70 / 0.30 / 0.05 | GUI consensus gate (aligned to 75¢ band) |
 | `max_entry_spread` | 0.05 | Max ask−bid on winner at entry |
 | `underlying_gate_enabled` / `min_underlying_edge_usd` | true / 0.0 (5m), 10.0 (15m/hr) | Oracle alignment gate |
 | `toxic_force_exit_below` | 0.65 | Force-dump if FAK avg &lt; 65¢ (must be ≤ buy_threshold) |
-| `hedge_enabled` / `hedge_threshold` / `hedge_min_price` | true / 0.35 / unused floor | Arm at 35¢; `hedge_min_price` kept in JSON, not a FAK floor |
-| `hedge_max_spread` / `hedge_require_ask_max` | 0.15 / 0.40 | Hedge book must actually collapse |
-| `hedge_require_gui` | true | Also require inverted buy GUI + held last trade ≤ 40¢ |
+| `hedge_enabled` / `hedge_threshold` / `hedge_min_price` | true / **0.50 (5m)** / 0.35 (15m, hr) / unused floor | 5m arms at 50¢; 15m/hourly stay 35¢ |
+| `hedge_max_spread` / `hedge_require_ask_max` | 0.15 / **0.55 (5m)** / 0.40 (15m, hr) | Hedge book must actually collapse; ask cap must be ≥ threshold |
+| `hedge_require_gui` | true | Also require inverted buy GUI + held last trade ≤ ask-max (55¢ on 5m, 40¢ on 15m/hr) |
 | `buy_window_min` (15m, hr) / `buy_start_s` (5m) | 4.0 / 120 / 13.0 | Late entry window before close (5m last 120s is still 75–90¢) |
 | `buy_budget` | 2.5 / 2.5 / 2.5 | USDC per market |
 | `max_open_positions` / `max_open_notional` / `max_daily_notional` | 0 (=unlimited) / 10k / ~∞ | Risk caps |

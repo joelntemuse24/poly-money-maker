@@ -9,8 +9,8 @@ clicked.” Hits without `pnl` are incomplete.
 
 Pathlog **cannot** replay Polymarket last-trade GUI, Chainlink/PTB, or POST
 latency. Paper mode: fill at the recorded ask, walk later ticks for a
-35/40/15 hedge using mid-as-GUI when spread ≤ 10¢. Wide books fail closed.
-Toxic dumps only while bid ≤ 35¢.
+50/55/15 hedge (live 5m template) using mid-as-GUI when spread ≤ 10¢. Wide books fail closed.
+Toxic dumps only while bid ≤ 50¢.
 
 Live books are **public** (Gamma + CLOB). `pathlog.py` records them with no
 keys. Do not put `PRIVATE_KEY` on a Cloud Agent.
@@ -43,8 +43,8 @@ Hard rules:
 - Do not create ClobClient with a private key. No POST /order. No relayer.
 - Do not read, write, or ask for .env. Do not set dry_run false.
 - Do not edit strategy_buy.json / strategy_buy5m.json / strategy_buyhourly.json
-  (non-example). Template is strategy_buy5m.example.json (75–90¢, 120s,
-  $2.50, 35/40/15, GUI on, spread cap 5¢).
+  (non-example). Template is strategy_buy5m.example.json (75–90¢ last 120s,
+  >90 first 3 min, ≥95 first 4 min, $2.50, 50/55/15, GUI on, spread cap 5¢).
 - pathlog.py is allowed (recorder only). check_book.py is allowed.
 - Gamma GET and CLOB GET only: gamma-api.polymarket.com, clob.polymarket.com.
 
@@ -121,7 +121,7 @@ Hard rules:
 - Do not start polybuybot, polybuybot5m, polybuybothourly, or polymintbot.
 - Do not edit strategy_buy.json / strategy_buy5m.json / strategy_buyhourly.json (non-example).
 - Do not read or write .env. Do not set dry_run false. Do not place orders.
-- Template is strategy_buy5m.example.json (75–90¢, 120s, $2.50, 35/40/15, GUI on).
+- Template is strategy_buy5m.example.json (75–90¢ last 120s, ≥95 first 4 min, $2.50, 50/55/15, GUI on).
 - Rank by paper pnl_sum vs live_5m_paper, not by hit count. If pathlog/ticks
   is missing, run pathlog.py (no orders) instead of inventing books.
 
