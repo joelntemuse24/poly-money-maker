@@ -42,6 +42,7 @@ def _load_funcs(*names: str, bot: Path = BOT):
         "math": math,
         "os": os,
         "shutil": shutil,
+        "POLYMARKET_GUI_SPREAD": 0.10,
     }
     exec(compile("\n\n".join(chunks), str(bot), "exec"), ns, ns)
     return ns
@@ -60,6 +61,8 @@ HELPERS = (
     "fill_cost_usdc",
     "entry_book_ok",
     "hedge_book_ok",
+    "polymarket_display_price",
+    "hedge_consensus_ok",
     "quoted_buy_shares",
     "buy_fill_walked",
     "classify_buy_fill",
@@ -262,6 +265,48 @@ class BuyFillProductionHelpers(unittest.TestCase):
 
     def test_hedge_accepts_tight_reversal(self):
         ok, why = self.ns["hedge_book_ok"](0.55, 0.62, 0.65, 0.15, 0.70)
+        self.assertTrue(ok)
+        self.assertEqual(why, "ok")
+
+    def test_hedge_consensus_rejects_high_last_trade(self):
+        # Tight 32/38 book looks reversed; last print 85¢ says it is not.
+        ok, why = self.ns["hedge_consensus_ok"](
+            0.32, 0.38, 0.85,
+            0.62, 0.68, 0.65,
+            held_gui_max=0.30, other_gui_min=0.70,
+            min_edge=0.05, last_trade_max=0.40,
+        )
+        self.assertFalse(ok)
+        self.assertEqual(why, "last_trade_too_high")
+
+    def test_hedge_consensus_rejects_incomplete_gui(self):
+        ok, why = self.ns["hedge_consensus_ok"](
+            0.25, 0.32, 0.25,
+            None, None, None,
+            held_gui_max=0.30, other_gui_min=0.70,
+            min_edge=0.05, last_trade_max=0.40,
+        )
+        self.assertFalse(ok)
+        self.assertEqual(why, "incomplete_gui")
+
+    def test_hedge_consensus_rejects_spoof_tight_book_high_print(self):
+        ok, why = self.ns["hedge_consensus_ok"](
+            0.32, 0.38, 0.85,
+            0.70, 0.75, 0.72,
+            held_gui_max=0.30, other_gui_min=0.70,
+            min_edge=0.05, last_trade_max=0.40,
+        )
+        self.assertFalse(ok)
+        self.assertEqual(why, "last_trade_too_high")
+
+    def test_hedge_consensus_accepts_real_reversal(self):
+        # Last trade 25¢ + GUI 70/30 on the other/held legs.
+        ok, why = self.ns["hedge_consensus_ok"](
+            0.25, 0.32, 0.25,
+            0.68, 0.72, 0.70,
+            held_gui_max=0.30, other_gui_min=0.70,
+            min_edge=0.05, last_trade_max=0.40,
+        )
         self.assertTrue(ok)
         self.assertEqual(why, "ok")
 
@@ -544,6 +589,9 @@ class AmbiguousCrossCyclePolicy(unittest.TestCase):
             self.assertIn("hedge_uncertain_order_id", src)
             self.assertIn("buy_uncertain_trade_ids", src)
             self.assertIn("hedge_skip_ambiguous_legs", src)
+            self.assertIn("def hedge_consensus_ok", src)
+            self.assertIn("hedge_skip_no_consensus", src)
+            self.assertIn('"hedge_require_gui": True', src)
             self.assertIn("STATE_MINED", src)
             self.assertIn("_clob_lock", src)
 

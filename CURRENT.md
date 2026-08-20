@@ -3,14 +3,15 @@
 **Agents: read this after `AGENTS.md`.** Update this file when ops/strategy decisions change.
 Do not put secrets, API keys, or live wallet material here.
 
-Last updated: **2026-08-19** — **only the 5m CLOB bot is live.** Stop/disable
+Last updated: **2026-08-20** — **only the 5m CLOB bot is live.** Stop/disable
 15m and hourly. Keep the **$2.50 / 75–90¢** triggers on 5m. Chainlink TWAP
 gate is **$0** (any non-zero tick vs PTB; side must match; flat is still
 refused). Buys are **limit
 FAKs at the quoted ask** sized `budget/ask` (~3.3 shares at 75¢), clipped to
 `buy_max_shares` **5** (buffer). Hard spend ceiling `buy_max_spend` **$3**.
 Leftover USDC cannot walk into 9¢ junk. Displayed top size is **not** a cap.
-Hedge **trigger** is still 35/40; the sell follows the live bid. Pause minting.
+Hedge **trigger** is still 35/40, then the **same GUI/last-trade consensus as
+buy** (not a random TOB fill), then sell at the live bid. Pause minting.
 Pathlog still records all three series (no orders; 14-day / 400 MB cap).
 
 ---
@@ -36,7 +37,7 @@ triggers** (not the old 98–99¢ probe):
 | Execution | FAK **limit** at the quoted ask, size `min(budget/ask, buy_max_shares)`. A clean **unmatched 400** re-quotes up to **3** FAKs in one trigger; then **0.15 s** cooldown. Unclear POSTs still quarantine (no second $2.50). |
 | GUI consensus | winner ≥ 70¢, loser ≤ 30¢ |
 | Windows | 5m **120 s** (15m / hourly bots **not running**) |
-| Hedge | **Trigger** bid ≤ **35¢** and ask ≤ **40¢**, spread ≤ 15¢ (real book, not a glitch). **Then sell at whatever the bid is** — no 32¢ floor. |
+| Hedge | **Trigger** bid ≤ **35¢** and ask ≤ **40¢**, spread ≤ 15¢, **plus** inverted buy GUI (held last trade ≤ 40¢, held GUI ≤ 30¢, other GUI ≥ 70¢). **Then sell at whatever the bid is** — no 32¢ floor. `toxic_fill` still dumps without GUI. |
 | Underlying edge | **$0** (5m: any non-zero TWAP vs PTB) / **$10** (15m, hourly); side must match |
 | `max_open_positions` | **0 = unlimited** |
 | `toxic_force_exit_below` | **65¢** |
