@@ -195,7 +195,7 @@ def main() -> int:
         f"unique markets with any skip/attempt: {len(stats['markets'])}"
     )
     if stats["cycle_errors"]:
-        print("\ncycle_error types (each aborts remaining buys/hedges that poll):")
+        print("\ncycle_error types (per-market in hedge/buy; outer still aborts pre/post-market work):")
         for label, n in stats["cycle_errors"].most_common(15):
             print(f"  {n:5d}  {label}")
     print(

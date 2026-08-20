@@ -234,9 +234,10 @@ Re-quote already aborts if the fresh ask left the band. A BUY limit is a
 and walks as `buy_fill_walk`). True average is **USDC / shares**, not extra shares
 priced at the gate ask. Those fills set `toxic_fill` when the average is below
 `toxic_force_exit_below` (default 65¢) **or** filled shares exceed 1.05× quoted
-`budget/ask` size, and are **not** ridden to $1: the hedge path force-exits at the next usable
-bid (no bounce cancel, no `hedge_min_price` floor; REST may be bid-only). Milder
-below-band fills (e.g. 70¢) stay on the normal ≤35¢ hedge path. Delayed FAKs are
+`budget/ask` size. The flag stays armed; the hedge path dumps **only while held
+bid ≤ 35¢** (no GUI / 35/40/15; REST may be bid-only). A recovered book logs
+`hedge_skip_toxic_recovered` and rides. Milder below-band fills (e.g. 70¢) stay
+on the normal ≤35¢ hedge path. Delayed FAKs are
 polled; zero confirms fall back to balance reconciliation (`buy_ghost_fill`) using
 posted USDC as cost when the bag walked.
 Before every POST, the bot atomically writes a `buy_uncertain` quarantine with the
@@ -272,30 +273,37 @@ force exit):
 
 - **Arm (normal):** WS/cache bid ≤ `hedge_threshold` (35¢) while the position is open
   (peek only — never sufficient to sell).
-- **Arm (toxic_fill):** entry average `< toxic_force_exit_below` (65¢) arms an
-  immediate dump — do not wait for a 35¢ reversal and do not cancel on bounce.
-  Below-band but ≥65¢ uses the normal hedge.
+- **Arm (toxic_fill):** entry average `< toxic_force_exit_below` (65¢) arms a
+  dump that stays on `meta`. Sell **only while held bid ≤ `hedge_threshold`
+  (35¢)**. A recovered book (97¢ after a junk fill) logs
+  `hedge_skip_toxic_recovered` and keeps the flag armed for a later collapse.
+  Do not wait for 35/40/15 or GUI. Wide 1¢/99¢ still dumps. Below-band but
+  ≥65¢ uses the normal hedge.
 - **Confirm (force-fresh REST, fail-closed):** re-fetch the full book with
   `force_rest=True`. Normal hedges skip if either side is missing
   (`hedge_skip_incomplete_rest`) — **no WS fallback**. Toxic dumps may sell when
-  REST has a **bid** but no ask; no bid still skips the cycle. If bid bounced
-  above threshold on a *normal* entry, abort (`hedge_cancel_bounce`); toxic fills
-  skip this cancel.
+  REST has a **bid** but no ask; no bid still skips (`reason=no_bid`). Fresh WS
+  bid > 35¢ skips REST for **both** normal and toxic (toxic logs recovered).
+  If bid bounced above threshold on a *normal* entry, abort
+  (`hedge_cancel_bounce`).
 - **Book integrity (normal only):** a lone penny bid under a still-high ask is **not**
   a reversal (`hedge_skip_toxic_book`). Require bid ≤ 35¢, ask ≤
   `hedge_require_ask_max` (40¢), and spread ≤ `hedge_max_spread` (15¢). Toxic dumps
-  skip integrity / `abort_above` so a collapsed book can still exit.
+  skip integrity / `abort_above` so a still-dead book (bid ≤ 35¢) can exit; they
+  do **not** skip the recovered-bid gate.
 - **GUI consensus (normal only, `hedge_require_gui` default true):** the 35/40
   book can still be a random clip. Buy already uses Polymarket display (mid if
   spread ≤ 10¢ else last trade) plus 70/30. Hedge inverts that: held last
   print ≤ `hedge_require_ask_max`, held GUI ≤ `max_loser_bid`, other GUI ≥
   `min_winner_bid`, edge ≥ `min_bid_edge`. Missing last trade or other-leg
   quote fails closed (`hedge_skip_no_consensus`). A 32/38 spoof with last
-  trade 85¢ does not sell. **`toxic_fill` skips this gate** and still dumps.
+  trade 85¢ does not sell. **`toxic_fill` skips this gate** and still dumps
+  **when bid ≤ 35¢**.
 - **Execution:** After 35/40 **and** GUI, FAK at the **live bid** (minus undercut).
   There is no “won't sell below 32¢.” 20¢ or 1¢ on a still-tight collapsed book
   is a fill. One tick is only the exchange minimum. Toxic dumps skip integrity /
-  bounce cancel / GUI and also sell at the live bid. Retries force-REST both sides
+  GUI and also sell at the live bid **once the recovered-book gate allows the
+  dump** (`abort_above=None` on those retries). Retries force-REST both sides
   (normal path re-runs the two-sided gate so a spoof 1¢/99¢ still aborts).
 - **Outcome:** every POST has a crash-durable deterministic order ID. Only
   settlement-confirmed fills shrink `bought_size` or add proceeds; ambiguous
@@ -465,17 +473,20 @@ JSONL. Export ticks off the VM before prune deletes them.
 
 ## 12. Error Handling Philosophy
 
-- **Never crash the process.** Every cycle is wrapped; unexpected exceptions are
-  logged as `cycle_error` (`error` + traceback) and the **loop continues on the
-  next poll**. The faulting poll is aborted: remaining markets do not buy or
-  hedge that tick. The console banner does not sleep 5s. `safe_api_call` filters
-  transient API noise (rate limits, 5xx, timeouts) into retries/skips.
+- **Never crash the process.** Unexpected exceptions are logged as `cycle_error`
+  (`error` as `{type}: {msg}`[:180] + traceback). Each market’s hedge+buy body
+  is wrapped: that fault logs `condition_id` and the poll **continues to the
+  next market** (held-first sort unchanged). The outer cycle `except` still
+  covers work outside that loop (refresh, GC, redeem, UI) and can abort the
+  rest of **that** poll — there may be no markets left, or they never started.
+  The console banner does not sleep 5s. `safe_api_call` filters transient API
+  noise (rate limits, 5xx, timeouts) into retries/skips.
 - **Fail safe, not fast.** When data is missing or ambiguous (incomplete book, no
   consensus, oracle edge too small), the bot does nothing. Not trading is always the
   default.
 - **Persist fills that already happened.** A posted FAK cannot be “rejected” in
   software — below-band buys are logged, written to state with `toxic_fill`, and
-  force-exited (not ridden to redemption). Crashes between order and save are
+  force-exited **while held bid ≤ 35¢** (recovered books ride). Crashes between order and save are
   recovered via Data API positions / balance checks.
 - **Complete audit trail.** Every decision — buys, skips, hedges, redeems, P&L — is
   a structured log event and (for buy decisions) a research JSONL row.
@@ -531,12 +542,14 @@ integrity, oracle edge, settlement finality, quarantine) remain authoritative.
    checked against avg USDC/share. Never trust last-trade GUI alone on a wide book.
 9. **Bid-alone hedge dumps.** A 1¢ bid under a 99¢ ask is illiquidity, not a
    reversal. A 32/38 clip with last trade still 85¢ is also not a reversal.
-   Hedge requires ask ≤ `hedge_require_ask_max`, a tight spread, inverted GUI,
-   and REST-confirms before selling.
+   Normal hedges require ask ≤ `hedge_require_ask_max`, a tight spread, inverted
+   GUI, and REST-confirms before selling. `toxic_fill` may still dump a wide
+   1¢/99¢ book **only if bid ≤ 35¢**; a recovered 97¢ bid must not dump.
 10. **`buy_uncertain` `known_cost` must be assigned before `spend_cap`.** On 13 Aug
     the 5m/hourly copies used `known_cost` before it was set (`#80` / `be22662`).
     Every quarantined BUY then `cycle_error`’d and skipped the rest of that poll.
-    `git pull` does not restart systemd — a merged fix is inert until
+    Hedge/buy is now isolated per market so the next NameError cannot stall the
+    morning. `git pull` does not restart systemd — a merged fix is inert until
     `systemctl restart polybuybot5m`.
 
 ---

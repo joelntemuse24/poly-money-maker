@@ -1184,6 +1184,20 @@ def hedge_book_ok(bid, ask, threshold, max_spread, require_ask_max):
     return True, "ok"
 
 
+def toxic_dump_book_ok(bid, threshold):
+    """True iff a toxic_fill dump may sell: held bid exists and is still dead.
+
+    Recovered book (bid > hedge_threshold, e.g. 97¢ after a junk fill) must
+    not dump. Missing bid is fail-closed. Wide 1¢/99¢ still dumps — this
+    gate is bid-only and does not require 35/40/15 or GUI.
+    """
+    bid = finite_float(bid, minimum=0, maximum=1)
+    threshold = finite_float(threshold, minimum=0, maximum=1)
+    if bid is None or threshold is None:
+        return False
+    return bid <= threshold + 1e-12
+
+
 def hedge_consensus_ok(
     held_bid, held_ask, held_last,
     other_bid, other_ask, other_last,
@@ -3538,1291 +3552,1337 @@ while not _shutdown_requested:
 
         # ================= HEDGE + BUY PHASE =================
         for m in markets:
-            end_ts_ms = m.end_ts * 1000
-            minutes_left = (end_ts_ms - now_ms) / 60000
+            cond = getattr(m, "condition_id", None)
+            try:
+                end_ts_ms = m.end_ts * 1000
+                minutes_left = (end_ts_ms - now_ms) / 60000
 
-            cond = m.condition_id
-            pos = held.get(cond, {})
-            up_size = pos.get("up", {}).get("size", 0)
-            dn_size = pos.get("dn", {}).get("size", 0)
-            held_size = max(up_size, dn_size)
-            held_info = (
-                pos.get("up", {})
-                if up_size > 0.01
-                else (pos.get("dn", {}) if dn_size > 0.01 else {})
-            )
-            held_token = held_info.get("asset")
-            held_leg = "up" if up_size > 0.01 else ("down" if dn_size > 0.01 else None)
-
-            meta = positions_meta.setdefault(cond, {})
-            tracked_token = meta.get("bought_token")
-            tracked_leg = str(meta.get("bought_leg") or "").lower()
-            # Durable entry identity wins over Data API leg size when both
-            # legs briefly appear held (partial hedge lag, wrong-leg dust).
-            if tracked_token:
-                up_asset = str((pos.get("up") or {}).get("asset") or "")
-                dn_asset = str((pos.get("dn") or {}).get("asset") or "")
-                if up_asset and str(tracked_token) == up_asset and up_size > 0.01:
-                    held_token = up_asset
-                    held_leg = "up"
-                    held_size = up_size
-                    held_info = pos.get("up", {})
-                elif dn_asset and str(tracked_token) == dn_asset and dn_size > 0.01:
-                    held_token = dn_asset
-                    held_leg = "down"
-                    held_size = dn_size
-                    held_info = pos.get("dn", {})
-                elif up_size > 0.01 and dn_size > 0.01:
-                    log_event(
-                        "hedge_skip_ambiguous_legs",
-                        condition_id=cond,
-                        bought_token=tracked_token,
-                        up_size=up_size,
-                        dn_size=dn_size,
-                    )
-                    held_token = None
-                    held_leg = None
-                    held_size = 0.0
-                elif tracked_leg == "up" and up_size > 0.01:
-                    held_token = up_asset or tracked_token
-                    held_leg = "up"
-                    held_size = up_size
-                    held_info = pos.get("up", {})
-                elif tracked_leg in {"down", "dn"} and dn_size > 0.01:
-                    held_token = dn_asset or tracked_token
-                    held_leg = "down"
-                    held_size = dn_size
-                    held_info = pos.get("dn", {})
-            if (
-                held_token
-                and tracked_token
-                and str(held_token) == str(tracked_token)
-                and "bought_size" in meta
-                and not meta.get("buy_uncertain")
-            ):
-                tracked_size = max(0.0, float(meta.get("bought_size") or 0))
-                if held_size > tracked_size + 0.01:
-                    # Data API can lag a confirmed partial SELL and show the old
-                    # larger balance. Never resurrect inventory above the
-                    # durable local remainder.
-                    held_size = tracked_size
-                    if held_leg == "up":
-                        up_size = tracked_size
-                    elif held_leg == "down":
-                        dn_size = tracked_size
-
-            # Resolve an ambiguous BUY by its deterministic signed order id
-            # before consulting eventually-consistent balance snapshots.
-            uncertain_token = meta.get("buy_uncertain_token")
-            uncertain_baseline = float(meta.get("buy_uncertain_baseline") or 0)
-            uncertain_order_id = meta.get("buy_uncertain_order_id")
-            if meta.get("buy_uncertain") and uncertain_order_id:
-                known_size = float(meta.get("buy_uncertain_known_size") or 0)
-                known_cost = float(meta.get("buy_uncertain_known_cost") or 0)
-                requested = (
-                    finite_float(meta.get("quoted_buy_shares"), minimum=0)
-                    or finite_float(meta.get("buy_uncertain_order_size"), minimum=0)
-                    or (
-                        float(meta.get("buy_uncertain_spend") or 0)
-                        / max(float(meta.get("buy_uncertain_price") or 0), 1e-9)
-                    )
+                cond = m.condition_id
+                pos = held.get(cond, {})
+                up_size = pos.get("up", {}).get("size", 0)
+                dn_size = pos.get("dn", {}).get("size", 0)
+                held_size = max(up_size, dn_size)
+                held_info = (
+                    pos.get("up", {})
+                    if up_size > 0.01
+                    else (pos.get("dn", {}) if dn_size > 0.01 else {})
                 )
-                inspected = inspect_uncertain_order(
-                    uncertain_order_id,
-                    side="BUY",
-                    requested=requested,
-                    token_id=uncertain_token,
-                    condition_id=cond,
-                    limit_price=meta.get("buy_uncertain_price", 0),
-                    spend_cap=max(
-                        0.0,
-                        min(float(BUY_BUDGET), float(BUY_MAX_SPEND)) - known_cost,
-                    ),
-                    trade_ids=meta.get("buy_uncertain_trade_ids"),
-                )
-                inspected_state = inspected["state"]
-                if inspected_state == "confirmed":
-                    resolved_size = known_size + float(inspected["filled"])
-                    resolved_cost = known_cost + float(inspected["value"])
-                    current_size = float(meta.get("bought_size") or 0)
-                    current_cost = float(meta.get("pnl_entry_cost") or 0)
-                    # on_fill may already have persisted this exact fill.
-                    if current_size >= resolved_size - 0.01:
-                        resolved_size = current_size
-                        resolved_cost = max(resolved_cost, current_cost)
-                    avg_fill = implied_buy_average(
-                        resolved_cost, resolved_size, meta.get("buy_uncertain_price"),
-                    )
-                    quoted = meta.get("quoted_buy_shares")
-                    _, force_exit = classify_buy_fill(
-                        avg_fill, resolved_size, quoted,
-                        BUY_THRESHOLD, TOXIC_FORCE_EXIT_BELOW,
-                    )
-                    meta["bought_token"] = uncertain_token
-                    meta["bought_leg"] = (
-                        meta.get("buy_uncertain_leg")
-                        or held_leg
-                        or meta.get("bought_leg")
-                    )
-                    meta["bought_size"] = resolved_size
-                    meta["fill_price"] = round(avg_fill, 4)
-                    meta["pnl_entry_cost"] = round(resolved_cost, 4)
-                    meta["toxic_fill"] = bool(force_exit or meta.get("toxic_fill"))
-                    leg_key = (
-                        "up"
-                        if str(meta["bought_leg"]).lower() == "up"
-                        else "dn"
-                    )
-                    _cached_positions.setdefault(cond, {})[leg_key] = {
-                        "asset": str(uncertain_token),
-                        "size": resolved_size,
-                        "redeemable": False,
-                        "avgPrice": avg_fill,
-                    }
-                    clear_uncertain_fields(meta, _BUY_UNCERTAIN_KEYS)
-                    log_event(
-                        "buy_uncertain_resolved",
-                        condition_id=cond,
-                        token_id=uncertain_token,
-                        order_id=uncertain_order_id,
-                        size=resolved_size,
-                        entry_cost=meta["pnl_entry_cost"],
-                        via="exact_order",
-                    )
-                    save_json(STATE_FILE, positions_meta)
-                elif inspected_state in {"empty", "failed"}:
-                    clear_uncertain_fields(meta, _BUY_UNCERTAIN_KEYS)
-                    log_event(
-                        "buy_uncertain_empty",
-                        condition_id=cond,
-                        token_id=uncertain_token,
-                        order_id=uncertain_order_id,
-                        state=inspected_state,
-                    )
-                    save_json(STATE_FILE, positions_meta)
-                elif inspected_state == "identity_mismatch":
-                    log_event(
-                        "buy_uncertain_identity_mismatch",
-                        condition_id=cond,
-                        token_id=uncertain_token,
-                        order_id=uncertain_order_id,
-                    )
+                held_token = held_info.get("asset")
+                held_leg = "up" if up_size > 0.01 else ("down" if dn_size > 0.01 else None)
 
-            # Older write-ahead state may not contain an order id. Promote only
-            # after repeated, stable, complete Data API observations.
-            if (
-                meta.get("buy_uncertain")
-                and positions_raw is not None
-                and held_size > 0.01
-                and held_token
-                and uncertain_token
-                and str(held_token) == str(uncertain_token)
-                and held_size > uncertain_baseline + 0.01
-            ):
-                uncertain_filled = held_size - uncertain_baseline
-                observed_ms = time.time() * 1000
-                last_observed_ms = float(meta.get("buy_uncertain_observed_at") or 0)
-                if observed_ms - last_observed_ms >= float(POSITIONS_REFRESH_S) * 1000:
-                    prior_observed = meta.get("buy_uncertain_observed_size")
-                    stable = (
-                        prior_observed is not None
-                        and abs(float(prior_observed) - uncertain_filled) <= 0.01
-                    )
-                    meta["buy_uncertain_observed_size"] = uncertain_filled
-                    meta["buy_uncertain_observed_at"] = observed_ms
-                    meta["buy_uncertain_observed_count"] = (
-                        int(meta.get("buy_uncertain_observed_count") or 0) + 1
-                        if stable else 1
-                    )
-                    save_json(STATE_FILE, positions_meta)
-                uncertain_age_s = (
-                    observed_ms - float(meta.get("buy_uncertain_at") or observed_ms)
-                ) / 1000
-                if (
-                    int(meta.get("buy_uncertain_observed_count") or 0) >= 2
-                    and uncertain_age_s >= max(10.0, 2 * float(POSITIONS_REFRESH_S))
-                ):
-                    avg_est = float(
-                        meta.get("buy_uncertain_price")
-                        or meta.get("fill_price")
-                        or BUY_THRESHOLD
-                    )
-                    known_size = float(meta.get("bought_size") or 0)
-                    known_cost = float(meta.get("pnl_entry_cost") or 0)
-                    resolved_size = held_size
-                    extra_size = max(0.0, resolved_size - known_size)
-                    spend_est = float(meta.get("buy_uncertain_spend") or 0)
-                    # Walked inventory did not cost extra_size × gate ask — same USDC.
-                    entry_cost = known_cost if known_cost > 0 else spend_est
-                    if entry_cost <= 0:
-                        entry_cost = min(
-                            float(BUY_BUDGET),
-                            float(BUY_MAX_SPEND),
-                            resolved_size * avg_est,
-                        )
-                    quoted = meta.get("quoted_buy_shares")
-                    avg_fill = implied_buy_average(entry_cost, resolved_size, avg_est)
-                    _, force_exit = classify_buy_fill(
-                        avg_fill, resolved_size, quoted, BUY_THRESHOLD, TOXIC_FORCE_EXIT_BELOW,
-                    )
-                    meta["bought_token"] = held_token
-                    meta["bought_leg"] = held_leg or meta.get("buy_uncertain_leg")
-                    meta["bought_size"] = resolved_size
-                    meta["fill_price"] = round(avg_fill, 4)
-                    meta["pnl_entry_cost"] = round(entry_cost, 4)
-                    meta["toxic_fill"] = bool(force_exit or meta.get("toxic_fill"))
-                    clear_uncertain_fields(meta, _BUY_UNCERTAIN_KEYS)
-                    log_event(
-                        "buy_uncertain_resolved", condition_id=cond, token_id=held_token,
-                        size=resolved_size, extra_size=extra_size,
-                        entry_cost=meta["pnl_entry_cost"],
-                        baseline=uncertain_baseline, via="stable_held",
-                    )
-                    save_json(STATE_FILE, positions_meta)
-
-            # An accepted-then-timeout SELL may already have consumed shares.
-            # Reconcile the exact order; pending/unknown outcomes remain
-            # quarantined, while confirmed/terminal-empty outcomes recover.
-            if meta.get("hedge_uncertain"):
-                hedge_order_id = meta.get("hedge_uncertain_order_id")
-                hedge_state = "pending"
-                inspected = None
-                if hedge_order_id:
-                    inspected = inspect_uncertain_order(
-                        hedge_order_id,
-                        side="SELL",
-                        requested=(
-                            finite_float(
-                                meta.get("hedge_uncertain_order_size"), minimum=0,
-                            )
-                            or finite_float(
-                                meta.get("hedge_uncertain_remaining"), minimum=0,
-                            )
-                            or held_size
-                        ),
-                        token_id=meta.get("hedge_uncertain_token"),
-                        condition_id=cond,
-                        limit_price=meta.get("hedge_uncertain_price", 0),
-                            trade_ids=meta.get("hedge_uncertain_trade_ids"),
-                    )
-                    hedge_state = inspected["state"]
-                elif meta.get("hedge_uncertain_status") == "persist_fail":
-                    # The durable pre-submit callback failed, so post_order was
-                    # never called and there is no exchange order to reconcile.
-                    hedge_state = "empty"
-
-                if hedge_state == "confirmed":
-                    sold_before = float(
-                        meta.get("hedge_uncertain_sold_before") or 0
-                    )
-                    proceeds_before = float(
-                        meta.get("hedge_uncertain_proceeds_before") or 0
-                    )
-                    position_size = float(
-                        meta.get("hedge_uncertain_position_size")
-                        or meta.get("bought_size")
-                        or held_size
-                    )
-                    pnl_before = float(
-                        meta.get("hedge_uncertain_pnl_before")
-                        or meta.get("pnl_hedge_proceeds")
-                        or 0
-                    )
-                    total_sold = sold_before + float(inspected["filled"])
-                    total_proceeds = proceeds_before + float(inspected["value"])
-                    rem = max(0.0, position_size - total_sold)
-                    if rem < 0.01:
-                        rem = 0.0
-                        meta["hedge_closed"] = True
-                    meta["bought_size"] = rem
-                    meta["pnl_hedge_proceeds"] = round(
-                        max(
-                            float(meta.get("pnl_hedge_proceeds") or 0),
-                            pnl_before + total_proceeds,
-                        ),
-                        4,
-                    )
-                    leg_key = "up" if held_leg == "up" else "dn"
-                    if (
-                        cond in _cached_positions
-                        and leg_key in _cached_positions[cond]
-                    ):
-                        _cached_positions[cond][leg_key]["size"] = rem
-                    clear_uncertain_fields(meta, _HEDGE_UNCERTAIN_KEYS)
-                    log_event(
-                        "hedge_uncertain_resolved",
-                        condition_id=cond,
-                        token_id=held_token,
-                        order_id=hedge_order_id,
-                        sold=total_sold,
-                        remaining=rem,
-                        via="exact_order",
-                    )
-                    save_json(STATE_FILE, positions_meta)
-                    continue
-                if hedge_state in {"empty", "failed"}:
-                    clear_uncertain_fields(meta, _HEDGE_UNCERTAIN_KEYS)
-                    log_event(
-                        "hedge_uncertain_empty",
-                        condition_id=cond,
-                        token_id=held_token,
-                        order_id=hedge_order_id,
-                        state=hedge_state,
-                    )
-                    save_json(STATE_FILE, positions_meta)
-                else:
-                    if hedge_state == "identity_mismatch":
-                        notify(
-                            "HEDGE IDENTITY MISMATCH",
-                            f"{m.question}\nOrder {hedge_order_id} did not match "
-                            "the persisted hedge intent",
-                            priority="urgent",
-                        )
-                    if CYCLE % max(
-                        1, int(5 / max(float(POLL_HELD_S), 0.01))
-                    ) == 0:
+                meta = positions_meta.setdefault(cond, {})
+                tracked_token = meta.get("bought_token")
+                tracked_leg = str(meta.get("bought_leg") or "").lower()
+                # Durable entry identity wins over Data API leg size when both
+                # legs briefly appear held (partial hedge lag, wrong-leg dust).
+                if tracked_token:
+                    up_asset = str((pos.get("up") or {}).get("asset") or "")
+                    dn_asset = str((pos.get("dn") or {}).get("asset") or "")
+                    if up_asset and str(tracked_token) == up_asset and up_size > 0.01:
+                        held_token = up_asset
+                        held_leg = "up"
+                        held_size = up_size
+                        held_info = pos.get("up", {})
+                    elif dn_asset and str(tracked_token) == dn_asset and dn_size > 0.01:
+                        held_token = dn_asset
+                        held_leg = "down"
+                        held_size = dn_size
+                        held_info = pos.get("dn", {})
+                    elif up_size > 0.01 and dn_size > 0.01:
                         log_event(
-                            "hedge_uncertain_pending",
+                            "hedge_skip_ambiguous_legs",
                             condition_id=cond,
+                            bought_token=tracked_token,
+                            up_size=up_size,
+                            dn_size=dn_size,
+                        )
+                        held_token = None
+                        held_leg = None
+                        held_size = 0.0
+                    elif tracked_leg == "up" and up_size > 0.01:
+                        held_token = up_asset or tracked_token
+                        held_leg = "up"
+                        held_size = up_size
+                        held_info = pos.get("up", {})
+                    elif tracked_leg in {"down", "dn"} and dn_size > 0.01:
+                        held_token = dn_asset or tracked_token
+                        held_leg = "down"
+                        held_size = dn_size
+                        held_info = pos.get("dn", {})
+                if (
+                    held_token
+                    and tracked_token
+                    and str(held_token) == str(tracked_token)
+                    and "bought_size" in meta
+                    and not meta.get("buy_uncertain")
+                ):
+                    tracked_size = max(0.0, float(meta.get("bought_size") or 0))
+                    if held_size > tracked_size + 0.01:
+                        # Data API can lag a confirmed partial SELL and show the old
+                        # larger balance. Never resurrect inventory above the
+                        # durable local remainder.
+                        held_size = tracked_size
+                        if held_leg == "up":
+                            up_size = tracked_size
+                        elif held_leg == "down":
+                            dn_size = tracked_size
+
+                # Resolve an ambiguous BUY by its deterministic signed order id
+                # before consulting eventually-consistent balance snapshots.
+                uncertain_token = meta.get("buy_uncertain_token")
+                uncertain_baseline = float(meta.get("buy_uncertain_baseline") or 0)
+                uncertain_order_id = meta.get("buy_uncertain_order_id")
+                if meta.get("buy_uncertain") and uncertain_order_id:
+                    known_size = float(meta.get("buy_uncertain_known_size") or 0)
+                    known_cost = float(meta.get("buy_uncertain_known_cost") or 0)
+                    requested = (
+                        finite_float(meta.get("quoted_buy_shares"), minimum=0)
+                        or finite_float(meta.get("buy_uncertain_order_size"), minimum=0)
+                        or (
+                            float(meta.get("buy_uncertain_spend") or 0)
+                            / max(float(meta.get("buy_uncertain_price") or 0), 1e-9)
+                        )
+                    )
+                    inspected = inspect_uncertain_order(
+                        uncertain_order_id,
+                        side="BUY",
+                        requested=requested,
+                        token_id=uncertain_token,
+                        condition_id=cond,
+                        limit_price=meta.get("buy_uncertain_price", 0),
+                        spend_cap=max(
+                            0.0,
+                            min(float(BUY_BUDGET), float(BUY_MAX_SPEND)) - known_cost,
+                        ),
+                        trade_ids=meta.get("buy_uncertain_trade_ids"),
+                    )
+                    inspected_state = inspected["state"]
+                    if inspected_state == "confirmed":
+                        resolved_size = known_size + float(inspected["filled"])
+                        resolved_cost = known_cost + float(inspected["value"])
+                        current_size = float(meta.get("bought_size") or 0)
+                        current_cost = float(meta.get("pnl_entry_cost") or 0)
+                        # on_fill may already have persisted this exact fill.
+                        if current_size >= resolved_size - 0.01:
+                            resolved_size = current_size
+                            resolved_cost = max(resolved_cost, current_cost)
+                        avg_fill = implied_buy_average(
+                            resolved_cost, resolved_size, meta.get("buy_uncertain_price"),
+                        )
+                        quoted = meta.get("quoted_buy_shares")
+                        _, force_exit = classify_buy_fill(
+                            avg_fill, resolved_size, quoted,
+                            BUY_THRESHOLD, TOXIC_FORCE_EXIT_BELOW,
+                        )
+                        meta["bought_token"] = uncertain_token
+                        meta["bought_leg"] = (
+                            meta.get("buy_uncertain_leg")
+                            or held_leg
+                            or meta.get("bought_leg")
+                        )
+                        meta["bought_size"] = resolved_size
+                        meta["fill_price"] = round(avg_fill, 4)
+                        meta["pnl_entry_cost"] = round(resolved_cost, 4)
+                        meta["toxic_fill"] = bool(force_exit or meta.get("toxic_fill"))
+                        leg_key = (
+                            "up"
+                            if str(meta["bought_leg"]).lower() == "up"
+                            else "dn"
+                        )
+                        _cached_positions.setdefault(cond, {})[leg_key] = {
+                            "asset": str(uncertain_token),
+                            "size": resolved_size,
+                            "redeemable": False,
+                            "avgPrice": avg_fill,
+                        }
+                        clear_uncertain_fields(meta, _BUY_UNCERTAIN_KEYS)
+                        log_event(
+                            "buy_uncertain_resolved",
+                            condition_id=cond,
+                            token_id=uncertain_token,
+                            order_id=uncertain_order_id,
+                            size=resolved_size,
+                            entry_cost=meta["pnl_entry_cost"],
+                            via="exact_order",
+                        )
+                        save_json(STATE_FILE, positions_meta)
+                    elif inspected_state in {"empty", "failed"}:
+                        clear_uncertain_fields(meta, _BUY_UNCERTAIN_KEYS)
+                        log_event(
+                            "buy_uncertain_empty",
+                            condition_id=cond,
+                            token_id=uncertain_token,
+                            order_id=uncertain_order_id,
+                            state=inspected_state,
+                        )
+                        save_json(STATE_FILE, positions_meta)
+                    elif inspected_state == "identity_mismatch":
+                        log_event(
+                            "buy_uncertain_identity_mismatch",
+                            condition_id=cond,
+                            token_id=uncertain_token,
+                            order_id=uncertain_order_id,
+                        )
+
+                # Older write-ahead state may not contain an order id. Promote only
+                # after repeated, stable, complete Data API observations.
+                if (
+                    meta.get("buy_uncertain")
+                    and positions_raw is not None
+                    and held_size > 0.01
+                    and held_token
+                    and uncertain_token
+                    and str(held_token) == str(uncertain_token)
+                    and held_size > uncertain_baseline + 0.01
+                ):
+                    uncertain_filled = held_size - uncertain_baseline
+                    observed_ms = time.time() * 1000
+                    last_observed_ms = float(meta.get("buy_uncertain_observed_at") or 0)
+                    if observed_ms - last_observed_ms >= float(POSITIONS_REFRESH_S) * 1000:
+                        prior_observed = meta.get("buy_uncertain_observed_size")
+                        stable = (
+                            prior_observed is not None
+                            and abs(float(prior_observed) - uncertain_filled) <= 0.01
+                        )
+                        meta["buy_uncertain_observed_size"] = uncertain_filled
+                        meta["buy_uncertain_observed_at"] = observed_ms
+                        meta["buy_uncertain_observed_count"] = (
+                            int(meta.get("buy_uncertain_observed_count") or 0) + 1
+                            if stable else 1
+                        )
+                        save_json(STATE_FILE, positions_meta)
+                    uncertain_age_s = (
+                        observed_ms - float(meta.get("buy_uncertain_at") or observed_ms)
+                    ) / 1000
+                    if (
+                        int(meta.get("buy_uncertain_observed_count") or 0) >= 2
+                        and uncertain_age_s >= max(10.0, 2 * float(POSITIONS_REFRESH_S))
+                    ):
+                        avg_est = float(
+                            meta.get("buy_uncertain_price")
+                            or meta.get("fill_price")
+                            or BUY_THRESHOLD
+                        )
+                        known_size = float(meta.get("bought_size") or 0)
+                        known_cost = float(meta.get("pnl_entry_cost") or 0)
+                        resolved_size = held_size
+                        extra_size = max(0.0, resolved_size - known_size)
+                        spend_est = float(meta.get("buy_uncertain_spend") or 0)
+                        # Walked inventory did not cost extra_size × gate ask — same USDC.
+                        entry_cost = known_cost if known_cost > 0 else spend_est
+                        if entry_cost <= 0:
+                            entry_cost = min(
+                                float(BUY_BUDGET),
+                                float(BUY_MAX_SPEND),
+                                resolved_size * avg_est,
+                            )
+                        quoted = meta.get("quoted_buy_shares")
+                        avg_fill = implied_buy_average(entry_cost, resolved_size, avg_est)
+                        _, force_exit = classify_buy_fill(
+                            avg_fill, resolved_size, quoted, BUY_THRESHOLD, TOXIC_FORCE_EXIT_BELOW,
+                        )
+                        meta["bought_token"] = held_token
+                        meta["bought_leg"] = held_leg or meta.get("buy_uncertain_leg")
+                        meta["bought_size"] = resolved_size
+                        meta["fill_price"] = round(avg_fill, 4)
+                        meta["pnl_entry_cost"] = round(entry_cost, 4)
+                        meta["toxic_fill"] = bool(force_exit or meta.get("toxic_fill"))
+                        clear_uncertain_fields(meta, _BUY_UNCERTAIN_KEYS)
+                        log_event(
+                            "buy_uncertain_resolved", condition_id=cond, token_id=held_token,
+                            size=resolved_size, extra_size=extra_size,
+                            entry_cost=meta["pnl_entry_cost"],
+                            baseline=uncertain_baseline, via="stable_held",
+                        )
+                        save_json(STATE_FILE, positions_meta)
+
+                # An accepted-then-timeout SELL may already have consumed shares.
+                # Reconcile the exact order; pending/unknown outcomes remain
+                # quarantined, while confirmed/terminal-empty outcomes recover.
+                if meta.get("hedge_uncertain"):
+                    hedge_order_id = meta.get("hedge_uncertain_order_id")
+                    hedge_state = "pending"
+                    inspected = None
+                    if hedge_order_id:
+                        inspected = inspect_uncertain_order(
+                            hedge_order_id,
+                            side="SELL",
+                            requested=(
+                                finite_float(
+                                    meta.get("hedge_uncertain_order_size"), minimum=0,
+                                )
+                                or finite_float(
+                                    meta.get("hedge_uncertain_remaining"), minimum=0,
+                                )
+                                or held_size
+                            ),
                             token_id=meta.get("hedge_uncertain_token"),
+                            condition_id=cond,
+                            limit_price=meta.get("hedge_uncertain_price", 0),
+                                trade_ids=meta.get("hedge_uncertain_trade_ids"),
+                        )
+                        hedge_state = inspected["state"]
+                    elif meta.get("hedge_uncertain_status") == "persist_fail":
+                        # The durable pre-submit callback failed, so post_order was
+                        # never called and there is no exchange order to reconcile.
+                        hedge_state = "empty"
+
+                    if hedge_state == "confirmed":
+                        sold_before = float(
+                            meta.get("hedge_uncertain_sold_before") or 0
+                        )
+                        proceeds_before = float(
+                            meta.get("hedge_uncertain_proceeds_before") or 0
+                        )
+                        position_size = float(
+                            meta.get("hedge_uncertain_position_size")
+                            or meta.get("bought_size")
+                            or held_size
+                        )
+                        pnl_before = float(
+                            meta.get("hedge_uncertain_pnl_before")
+                            or meta.get("pnl_hedge_proceeds")
+                            or 0
+                        )
+                        total_sold = sold_before + float(inspected["filled"])
+                        total_proceeds = proceeds_before + float(inspected["value"])
+                        rem = max(0.0, position_size - total_sold)
+                        if rem < 0.01:
+                            rem = 0.0
+                            meta["hedge_closed"] = True
+                        meta["bought_size"] = rem
+                        meta["pnl_hedge_proceeds"] = round(
+                            max(
+                                float(meta.get("pnl_hedge_proceeds") or 0),
+                                pnl_before + total_proceeds,
+                            ),
+                            4,
+                        )
+                        leg_key = "up" if held_leg == "up" else "dn"
+                        if (
+                            cond in _cached_positions
+                            and leg_key in _cached_positions[cond]
+                        ):
+                            _cached_positions[cond][leg_key]["size"] = rem
+                        clear_uncertain_fields(meta, _HEDGE_UNCERTAIN_KEYS)
+                        log_event(
+                            "hedge_uncertain_resolved",
+                            condition_id=cond,
+                            token_id=held_token,
+                            order_id=hedge_order_id,
+                            sold=total_sold,
+                            remaining=rem,
+                            via="exact_order",
+                        )
+                        save_json(STATE_FILE, positions_meta)
+                        continue
+                    if hedge_state in {"empty", "failed"}:
+                        clear_uncertain_fields(meta, _HEDGE_UNCERTAIN_KEYS)
+                        log_event(
+                            "hedge_uncertain_empty",
+                            condition_id=cond,
+                            token_id=held_token,
                             order_id=hedge_order_id,
                             state=hedge_state,
-                            confirmed_sold=meta.get(
-                                "hedge_uncertain_confirmed_sold", 0,
-                            ),
                         )
+                        save_json(STATE_FILE, positions_meta)
+                    else:
+                        if hedge_state == "identity_mismatch":
+                            notify(
+                                "HEDGE IDENTITY MISMATCH",
+                                f"{m.question}\nOrder {hedge_order_id} did not match "
+                                "the persisted hedge intent",
+                                priority="urgent",
+                            )
+                        if CYCLE % max(
+                            1, int(5 / max(float(POLL_HELD_S), 0.01))
+                        ) == 0:
+                            log_event(
+                                "hedge_uncertain_pending",
+                                condition_id=cond,
+                                token_id=meta.get("hedge_uncertain_token"),
+                                order_id=hedge_order_id,
+                                state=hedge_state,
+                                confirmed_sold=meta.get(
+                                    "hedge_uncertain_confirmed_sold", 0,
+                                ),
+                            )
+                        continue
+
+                # Recovery above must run even after expiry. New hedge/order actions
+                # remain forbidden once the market window has closed.
+                if minutes_left <= 0:
                     continue
 
-            # Recovery above must run even after expiry. New hedge/order actions
-            # remain forbidden once the market window has closed.
-            if minutes_left <= 0:
-                continue
-
-            if held_size > 0.01 and not meta.get("hedge_closed"):
-                quoted = meta.get("quoted_buy_shares")
-                cost = float(meta.get("pnl_entry_cost") or meta.get("buy_uncertain_spend") or 0)
-                implied = implied_buy_average(
-                    cost, held_size, meta.get("fill_price") or meta.get("buy_uncertain_price"),
-                )
-                _, force_exit = classify_buy_fill(
-                    implied, held_size, quoted, BUY_THRESHOLD, TOXIC_FORCE_EXIT_BELOW,
-                )
-                if force_exit and not meta.get("toxic_fill"):
-                    meta["toxic_fill"] = True
-                    log_event(
-                        "toxic_fill_armed_from_inventory",
-                        condition_id=cond,
-                        held_size=held_size,
-                        implied_avg=round(implied, 4),
-                        quoted_shares=quoted,
+                if held_size > 0.01 and not meta.get("hedge_closed"):
+                    quoted = meta.get("quoted_buy_shares")
+                    cost = float(meta.get("pnl_entry_cost") or meta.get("buy_uncertain_spend") or 0)
+                    implied = implied_buy_average(
+                        cost, held_size, meta.get("fill_price") or meta.get("buy_uncertain_price"),
                     )
-                    save_json(STATE_FILE, positions_meta)
-
-            # --- HEDGE CHECK (for held positions) ---
-            if held_token and held_size > 0.01 and HEDGE_ENABLED and not meta.get("hedge_closed"):
-                # FAK avg < toxic_force_exit_below sets toxic_fill: dump ASAP at any
-                # bid (no ride to $1, no bounce cancel, no hedge_min_price floor).
-                # Mild below-band fills (≥ that floor) use the normal hedge path.
-                toxic_fill = bool(meta.get("toxic_fill"))
-                # Skip REST only when a *fresh* WS bid is clearly above threshold.
-                # Stale-high WS must not suppress the check (hedge_quote_max_age_s).
-                quote_age = book_ws.quote_age(held_token)
-                ws_fresh = quote_age is not None and quote_age <= float(HEDGE_QUOTE_MAX_AGE_S)
-                peek_bid = None
-                if ws_fresh:
-                    _wq = book_ws.quote(held_token, max_age_s=float(HEDGE_QUOTE_MAX_AGE_S))
-                    if _wq is not None:
-                        peek_bid = _wq[0]
-                cached_quote = _book_cache.get(held_token)
-                cached_bid = (cached_quote[0] if cached_quote else None)
-                if cached_bid is None:
-                    cached_bid = peek_bid
-
-                if (
-                    not toxic_fill
-                    and peek_bid is not None
-                    and peek_bid > HEDGE_THRESHOLD
-                    and ws_fresh
-                ):
-                    pass  # fresh WS still above threshold
-                else:
-                    fresh_bid, _, fresh_ask, _, fresh_mid = get_quote_fast(
-                        held_token,
-                        max_age_s=0.0,
-                        prefer_rest=True,
-                        force_rest=True,
-                        expected_condition_id=cond,
+                    _, force_exit = classify_buy_fill(
+                        implied, held_size, quoted, BUY_THRESHOLD, TOXIC_FORCE_EXIT_BELOW,
                     )
-                    if fresh_bid is None and (not toxic_fill or fresh_ask is None):
+                    if force_exit and not meta.get("toxic_fill"):
+                        meta["toxic_fill"] = True
                         log_event(
-                            "hedge_skip_incomplete_rest", condition_id=cond, leg=held_leg,
-                            trigger_bid=cached_bid, current_bid=fresh_bid, current_ask=fresh_ask,
-                            current_mid=fresh_mid,
-                            quote_age_s=None if quote_age is None else round(quote_age, 3),
-                            toxic_fill=toxic_fill,
+                            "toxic_fill_armed_from_inventory",
+                            condition_id=cond,
+                            held_size=held_size,
+                            implied_avg=round(implied, 4),
+                            quoted_shares=quoted,
                         )
-                    elif toxic_fill and fresh_bid is None:
-                        log_event(
-                            "hedge_skip_incomplete_rest", condition_id=cond, leg=held_leg,
-                            trigger_bid=cached_bid, current_bid=fresh_bid, current_ask=fresh_ask,
-                            current_mid=fresh_mid,
-                            quote_age_s=None if quote_age is None else round(quote_age, 3),
-                            toxic_fill=True, reason="no_bid",
-                        )
-                    elif (not toxic_fill) and (fresh_bid is None or fresh_ask is None):
-                        log_event(
-                            "hedge_skip_incomplete_rest", condition_id=cond, leg=held_leg,
-                            trigger_bid=cached_bid, current_bid=fresh_bid, current_ask=fresh_ask,
-                            current_mid=fresh_mid,
-                            quote_age_s=None if quote_age is None else round(quote_age, 3),
-                            toxic_fill=False,
-                        )
-                    elif not toxic_fill and fresh_bid > HEDGE_THRESHOLD:
-                        log_event(
-                            "hedge_cancel_bounce", condition_id=cond, leg=held_leg,
-                            trigger_bid=cached_bid, current_bid=fresh_bid,
-                            current_ask=fresh_ask, current_mid=fresh_mid,
-                            threshold=HEDGE_THRESHOLD,
-                        )
-                        console.print(
-                            f"  [dim][CANCEL][/] {held_leg.upper()} hedge cancelled — bid bounced "
-                            f"{(cached_bid if cached_bid is not None else fresh_bid):.3f} → {fresh_bid:.3f}"
-                        )
-                    else:
-                        hedge_bid = fresh_bid
-                        hedge_ask = fresh_ask
+                        save_json(STATE_FILE, positions_meta)
+
+                # --- HEDGE CHECK (for held positions) ---
+                if held_token and held_size > 0.01 and HEDGE_ENABLED and not meta.get("hedge_closed"):
+                    # FAK avg < toxic_force_exit_below arms toxic_fill. Dump only while
+                    # held bid ≤ hedge_threshold (no GUI / 35/40/15). Recovered book
+                    # (bid > 35¢) logs hedge_skip_toxic_recovered and stays armed.
+                    # Mild below-band fills (≥ that floor) use the normal hedge path.
+                    toxic_fill = bool(meta.get("toxic_fill"))
+                    # Skip REST when a *fresh* WS bid is clearly above threshold
+                    # (normal hedge and toxic recovered). Stale-high WS must not
+                    # suppress the check (hedge_quote_max_age_s).
+                    quote_age = book_ws.quote_age(held_token)
+                    ws_fresh = quote_age is not None and quote_age <= float(HEDGE_QUOTE_MAX_AGE_S)
+                    peek_bid = peek_ask = peek_mid = None
+                    if ws_fresh:
+                        _wq = book_ws.quote(held_token, max_age_s=float(HEDGE_QUOTE_MAX_AGE_S))
+                        if _wq is not None:
+                            peek_bid = _wq[0]
+                            peek_ask = _wq[2]
+                            peek_mid = _wq[4]
+                    cached_quote = _book_cache.get(held_token)
+                    cached_bid = (cached_quote[0] if cached_quote else None)
+                    if cached_bid is None:
+                        cached_bid = peek_bid
+
+                    if (
+                        ws_fresh
+                        and peek_bid is not None
+                        and not toxic_dump_book_ok(peek_bid, HEDGE_THRESHOLD)
+                    ):
                         if toxic_fill:
-                            ok, why = True, "toxic_force_exit"
-                        else:
-                            ok, why = hedge_book_ok(
-                                hedge_bid, hedge_ask, HEDGE_THRESHOLD, HEDGE_MAX_SPREAD, HEDGE_REQUIRE_ASK_MAX,
-                            )
-                        if not ok:
-                            meta["hedge_blocked_toxic"] = True
-                            save_json(STATE_FILE, positions_meta)
                             log_event(
-                                "hedge_skip_toxic_book", condition_id=cond, leg=held_leg,
-                                bid=hedge_bid, ask=hedge_ask, mid=fresh_mid, reason=why,
-                                threshold=HEDGE_THRESHOLD, max_spread=HEDGE_MAX_SPREAD,
-                                require_ask_max=HEDGE_REQUIRE_ASK_MAX,
-                                trigger_bid=cached_bid,
+                                "hedge_skip_toxic_recovered",
+                                condition_id=cond, leg=held_leg,
+                                bid=peek_bid, ask=peek_ask, mid=peek_mid,
+                            )
+                            console.print(
+                                f"  [dim][TOXIC SKIP][/] {str(held_leg or '?').upper()} recovered "
+                                f"bid {peek_bid:.3f} — dump stays armed, no sell"
+                            )
+                        # fresh WS still above threshold — do not REST / do not dump
+                    else:
+                        fresh_bid, _, fresh_ask, _, fresh_mid = get_quote_fast(
+                            held_token,
+                            max_age_s=0.0,
+                            prefer_rest=True,
+                            force_rest=True,
+                            expected_condition_id=cond,
+                        )
+                        if fresh_bid is None and (not toxic_fill or fresh_ask is None):
+                            log_event(
+                                "hedge_skip_incomplete_rest", condition_id=cond, leg=held_leg,
+                                trigger_bid=cached_bid, current_bid=fresh_bid, current_ask=fresh_ask,
+                                current_mid=fresh_mid,
+                                quote_age_s=None if quote_age is None else round(quote_age, 3),
+                                toxic_fill=toxic_fill,
+                            )
+                        elif toxic_fill and fresh_bid is None:
+                            log_event(
+                                "hedge_skip_incomplete_rest", condition_id=cond, leg=held_leg,
+                                trigger_bid=cached_bid, current_bid=fresh_bid, current_ask=fresh_ask,
+                                current_mid=fresh_mid,
+                                quote_age_s=None if quote_age is None else round(quote_age, 3),
+                                toxic_fill=True, reason="no_bid",
+                            )
+                        elif (not toxic_fill) and (fresh_bid is None or fresh_ask is None):
+                            log_event(
+                                "hedge_skip_incomplete_rest", condition_id=cond, leg=held_leg,
+                                trigger_bid=cached_bid, current_bid=fresh_bid, current_ask=fresh_ask,
+                                current_mid=fresh_mid,
+                                quote_age_s=None if quote_age is None else round(quote_age, 3),
+                                toxic_fill=False,
+                            )
+                        elif toxic_fill and not toxic_dump_book_ok(fresh_bid, HEDGE_THRESHOLD):
+                            log_event(
+                                "hedge_skip_toxic_recovered",
+                                condition_id=cond, leg=held_leg,
+                                bid=fresh_bid, ask=fresh_ask, mid=fresh_mid,
+                            )
+                            console.print(
+                                f"  [dim][TOXIC SKIP][/] {str(held_leg or '?').upper()} recovered "
+                                f"bid {fresh_bid:.3f} — dump stays armed, no sell"
+                            )
+                        elif not toxic_fill and fresh_bid > HEDGE_THRESHOLD:
+                            log_event(
+                                "hedge_cancel_bounce", condition_id=cond, leg=held_leg,
+                                trigger_bid=cached_bid, current_bid=fresh_bid,
+                                current_ask=fresh_ask, current_mid=fresh_mid,
+                                threshold=HEDGE_THRESHOLD,
+                            )
+                            console.print(
+                                f"  [dim][CANCEL][/] {held_leg.upper()} hedge cancelled — bid bounced "
+                                f"{(cached_bid if cached_bid is not None else fresh_bid):.3f} → {fresh_bid:.3f}"
                             )
                         else:
-                            gui_ok, gui_why = True, "skipped"
-                            held_gui = other_gui = held_last = other_last = None
-                            other_bid = other_ask = None
-                            if not toxic_fill and HEDGE_REQUIRE_GUI:
-                                other_token = (
-                                    m.dn_token if held_leg == "up" else m.up_token
+                            hedge_bid = fresh_bid
+                            hedge_ask = fresh_ask
+                            if toxic_fill:
+                                ok, why = True, "toxic_force_exit"
+                            else:
+                                ok, why = hedge_book_ok(
+                                    hedge_bid, hedge_ask, HEDGE_THRESHOLD, HEDGE_MAX_SPREAD, HEDGE_REQUIRE_ASK_MAX,
                                 )
-                                if other_token:
-                                    other_bid, _, other_ask, _, _ = get_quote_fast(
-                                        other_token,
-                                        max_age_s=0.0,
-                                        prefer_rest=True,
-                                        force_rest=True,
-                                        expected_condition_id=cond,
-                                    )
-                                held_last = get_last_trade_price(held_token)
-                                other_last = (
-                                    get_last_trade_price(other_token)
-                                    if other_token else None
-                                )
-                                gui_ok, gui_why = hedge_consensus_ok(
-                                    hedge_bid, hedge_ask, held_last,
-                                    other_bid, other_ask, other_last,
-                                    held_gui_max=MAX_LOSER_BID,
-                                    other_gui_min=MIN_WINNER_BID,
-                                    min_edge=MIN_BID_EDGE,
-                                    last_trade_max=HEDGE_REQUIRE_ASK_MAX,
-                                )
-                                held_gui = polymarket_display_price(
-                                    hedge_bid, hedge_ask, held_last,
-                                )
-                                other_gui = polymarket_display_price(
-                                    other_bid, other_ask, other_last,
-                                )
-                            if not gui_ok:
-                                log_event(
-                                    "hedge_skip_no_consensus",
-                                    condition_id=cond, leg=held_leg,
-                                    bid=hedge_bid, ask=hedge_ask, mid=fresh_mid,
-                                    held_last=held_last, other_last=other_last,
-                                    held_gui=held_gui, other_gui=other_gui,
-                                    other_bid=other_bid, other_ask=other_ask,
-                                    reason=gui_why,
-                                    held_gui_max=MAX_LOSER_BID,
-                                    other_gui_min=MIN_WINNER_BID,
-                                    last_trade_max=HEDGE_REQUIRE_ASK_MAX,
-                                )
-                            elif toxic_fill or hedge_bid <= HEDGE_THRESHOLD:
-                                hedge_tick = get_tick_size_cached(held_token)
-                                # 35/40 is only a tight book. GUI + last trade
-                                # must also say the held side actually lost.
-                                # Sell at the live bid — 20¢, 5¢, one tick, whatever
-                                # is there. No strategy "won't take less than X".
-                                hedge_floor = float(hedge_tick)
-                                sell_floor = hedge_sell_price(
-                                    hedge_bid, hedge_tick, HEDGE_UNDERCUT_TICKS, hedge_floor,
-                                )
-                                hedge_title = (
-                                    "[bold bright_red]▼ TOXIC FILL — FORCE EXIT[/]"
-                                    if toxic_fill
-                                    else "[bold bright_red]▼ HEDGE SELL — CUTTING LOSSES[/]"
-                                )
-                                hedge_label = (
-                                    "TOXIC FILL EXIT" if toxic_fill else "REVERSAL DETECTED"
-                                )
-                                console.print(Panel(
-                                    f"  [bright_white]{m.question}[/]\n"
-                                    f"  [bright_red]{hedge_label}[/] — {held_leg.upper()} "
-                                    f"bid [bold]{hedge_bid:.3f}[/] ask [bold]{(hedge_ask or 0):.3f}[/]  ·  "
-                                    f"FAK ≥{sell_floor:.3f}  ·  [bold red]TTM {minutes_left:>4.1f}m[/]",
-                                    title=hedge_title,
-                                    border_style="bright_red",
-                                    box=box.HEAVY,
-                                ))
-                                meta["hedge_attempted"] = True
+                            if not ok:
+                                meta["hedge_blocked_toxic"] = True
                                 save_json(STATE_FILE, positions_meta)
                                 log_event(
-                                    "hedge_attempt", condition_id=cond, leg=held_leg, size=held_size,
-                                    bid=hedge_bid, ask=hedge_ask, mid=fresh_mid, price_limit=sell_floor,
-                                    quote_age_s=None if quote_age is None else round(quote_age, 3),
-                                    ws_fast_path=False,
-                                    toxic_fill=toxic_fill,
-                                    hedge_floor=hedge_floor,
+                                    "hedge_skip_toxic_book", condition_id=cond, leg=held_leg,
+                                    bid=hedge_bid, ask=hedge_ask, mid=fresh_mid, reason=why,
+                                    threshold=HEDGE_THRESHOLD, max_spread=HEDGE_MAX_SPREAD,
+                                    require_ask_max=HEDGE_REQUIRE_ASK_MAX,
+                                    trigger_bid=cached_bid,
                                 )
-                                prior_hedge_proceeds = float(
-                                    meta.get("pnl_hedge_proceeds", 0) or 0
-                                )
-
-                                def _clear_hedge_uncertain():
-                                    clear_uncertain_fields(
-                                        meta, _HEDGE_UNCERTAIN_KEYS,
+                            else:
+                                gui_ok, gui_why = True, "skipped"
+                                held_gui = other_gui = held_last = other_last = None
+                                other_bid = other_ask = None
+                                if not toxic_fill and HEDGE_REQUIRE_GUI:
+                                    other_token = (
+                                        m.dn_token if held_leg == "up" else m.up_token
                                     )
-
-                                def _persist_hedge_submit(
-                                    sold_total, proceeds_total, remaining_size,
-                                    attempt_no, submit_price, intent,
+                                    if other_token:
+                                        other_bid, _, other_ask, _, _ = get_quote_fast(
+                                            other_token,
+                                            max_age_s=0.0,
+                                            prefer_rest=True,
+                                            force_rest=True,
+                                            expected_condition_id=cond,
+                                        )
+                                    held_last = get_last_trade_price(held_token)
+                                    other_last = (
+                                        get_last_trade_price(other_token)
+                                        if other_token else None
+                                    )
+                                    gui_ok, gui_why = hedge_consensus_ok(
+                                        hedge_bid, hedge_ask, held_last,
+                                        other_bid, other_ask, other_last,
+                                        held_gui_max=MAX_LOSER_BID,
+                                        other_gui_min=MIN_WINNER_BID,
+                                        min_edge=MIN_BID_EDGE,
+                                        last_trade_max=HEDGE_REQUIRE_ASK_MAX,
+                                    )
+                                    held_gui = polymarket_display_price(
+                                        hedge_bid, hedge_ask, held_last,
+                                    )
+                                    other_gui = polymarket_display_price(
+                                        other_bid, other_ask, other_last,
+                                    )
+                                if not gui_ok:
+                                    log_event(
+                                        "hedge_skip_no_consensus",
+                                        condition_id=cond, leg=held_leg,
+                                        bid=hedge_bid, ask=hedge_ask, mid=fresh_mid,
+                                        held_last=held_last, other_last=other_last,
+                                        held_gui=held_gui, other_gui=other_gui,
+                                        other_bid=other_bid, other_ask=other_ask,
+                                        reason=gui_why,
+                                        held_gui_max=MAX_LOSER_BID,
+                                        other_gui_min=MIN_WINNER_BID,
+                                        last_trade_max=HEDGE_REQUIRE_ASK_MAX,
+                                    )
+                                elif (
+                                    toxic_fill
+                                    and toxic_dump_book_ok(hedge_bid, HEDGE_THRESHOLD)
+                                ) or (
+                                    (not toxic_fill) and hedge_bid <= HEDGE_THRESHOLD
                                 ):
-                                    meta["hedge_uncertain"] = True
-                                    meta["hedge_uncertain_at"] = time.time() * 1000
-                                    meta["hedge_uncertain_token"] = held_token
-                                    meta["hedge_uncertain_attempt"] = int(attempt_no)
-                                    meta["hedge_uncertain_remaining"] = float(remaining_size)
-                                    meta["hedge_uncertain_price"] = float(submit_price)
-                                    meta["hedge_uncertain_confirmed_sold"] = float(sold_total)
-                                    meta["hedge_uncertain_confirmed_proceeds"] = float(proceeds_total)
-                                    meta["hedge_uncertain_order_id"] = intent["order_id"]
-                                    meta["hedge_uncertain_order_size"] = (
-                                        _decode_clob_fixed6(intent.get("maker_amount"))
-                                        or float(remaining_size)
+                                    hedge_tick = get_tick_size_cached(held_token)
+                                    # 35/40 is only a tight book. GUI + last trade
+                                    # must also say the held side actually lost.
+                                    # Sell at the live bid — 20¢, 5¢, one tick, whatever
+                                    # is there. No strategy "won't take less than X".
+                                    hedge_floor = float(hedge_tick)
+                                    sell_floor = hedge_sell_price(
+                                        hedge_bid, hedge_tick, HEDGE_UNDERCUT_TICKS, hedge_floor,
                                     )
-                                    trade_ids = _string_list(
-                                        intent.get("trade_ids")
-                                        or intent.get("tradeIDs")
+                                    hedge_title = (
+                                        "[bold bright_red]▼ TOXIC FILL — FORCE EXIT[/]"
+                                        if toxic_fill
+                                        else "[bold bright_red]▼ HEDGE SELL — CUTTING LOSSES[/]"
                                     )
-                                    if trade_ids:
-                                        meta["hedge_uncertain_trade_ids"] = trade_ids
-                                    meta["hedge_uncertain_sold_before"] = float(sold_total)
-                                    meta["hedge_uncertain_proceeds_before"] = float(
-                                        proceeds_total
+                                    hedge_label = (
+                                        "TOXIC FILL EXIT" if toxic_fill else "REVERSAL DETECTED"
                                     )
-                                    meta["hedge_uncertain_position_size"] = float(
-                                        held_size
-                                    )
-                                    meta["hedge_uncertain_pnl_before"] = float(
-                                        prior_hedge_proceeds
-                                    )
+                                    console.print(Panel(
+                                        f"  [bright_white]{m.question}[/]\n"
+                                        f"  [bright_red]{hedge_label}[/] — {held_leg.upper()} "
+                                        f"bid [bold]{hedge_bid:.3f}[/] ask [bold]{(hedge_ask or 0):.3f}[/]  ·  "
+                                        f"FAK ≥{sell_floor:.3f}  ·  [bold red]TTM {minutes_left:>4.1f}m[/]",
+                                        title=hedge_title,
+                                        border_style="bright_red",
+                                        box=box.HEAVY,
+                                    ))
+                                    meta["hedge_attempted"] = True
                                     save_json(STATE_FILE, positions_meta)
-
-                                def _persist_hedge_fill(sold_total, proceeds_total):
-                                    rem_now = max(0.0, held_size - float(sold_total))
-                                    if rem_now < 0.01:
-                                        rem_now = 0.0
-                                        meta["hedge_closed"] = True
-                                    meta["bought_size"] = rem_now
-                                    meta["pnl_hedge_proceeds"] = round(
-                                        prior_hedge_proceeds + float(proceeds_total), 4
+                                    log_event(
+                                        "hedge_attempt", condition_id=cond, leg=held_leg, size=held_size,
+                                        bid=hedge_bid, ask=hedge_ask, mid=fresh_mid, price_limit=sell_floor,
+                                        quote_age_s=None if quote_age is None else round(quote_age, 3),
+                                        ws_fast_path=False,
+                                        toxic_fill=toxic_fill,
+                                        hedge_floor=hedge_floor,
                                     )
-                                    meta["hedge_uncertain_confirmed_sold"] = float(sold_total)
-                                    meta["hedge_uncertain_confirmed_proceeds"] = float(proceeds_total)
-                                    meta["hedge_uncertain_remaining"] = rem_now
-                                    leg_key = "up" if held_leg == "up" else "dn"
-                                    if cond in _cached_positions and leg_key in _cached_positions[cond]:
-                                        _cached_positions[cond][leg_key]["size"] = rem_now
-                                    save_json(STATE_FILE, positions_meta)
+                                    prior_hedge_proceeds = float(
+                                        meta.get("pnl_hedge_proceeds", 0) or 0
+                                    )
 
-                                sold, sell_res, hedge_proceeds = sell_market_with_retry(
-                                    held_token,
-                                    held_size,
-                                    hedge_bid,
-                                    tick_size=hedge_tick,
-                                    min_price=hedge_floor,
-                                    undercut_ticks=HEDGE_UNDERCUT_TICKS,
-                                    retry_sleep_s=HEDGE_RETRY_SLEEP_S,
-                                    # Toxic: never abort on bounce / integrity — dump inventory.
-                                    abort_above=None if toxic_fill else HEDGE_THRESHOLD,
-                                    require_ask_max=None if toxic_fill else HEDGE_REQUIRE_ASK_MAX,
-                                    max_spread=None if toxic_fill else HEDGE_MAX_SPREAD,
-                                    on_submit=_persist_hedge_submit,
-                                    on_fill=_persist_hedge_fill,
-                                    condition_id=cond,
-                                    initial_quote=(hedge_bid, hedge_ask),
-                                )
-                                sell_status = (
-                                    sell_res.get("bot_status")
-                                    if isinstance(sell_res, dict) else None
-                                )
-                                if sell_status == "ambiguous":
-                                    if isinstance(sell_res, dict):
-                                        if sell_res.get("order_id"):
-                                            meta["hedge_uncertain_order_id"] = (
-                                                sell_res["order_id"]
-                                            )
+                                    def _clear_hedge_uncertain():
+                                        clear_uncertain_fields(
+                                            meta, _HEDGE_UNCERTAIN_KEYS,
+                                        )
+
+                                    def _persist_hedge_submit(
+                                        sold_total, proceeds_total, remaining_size,
+                                        attempt_no, submit_price, intent,
+                                    ):
+                                        meta["hedge_uncertain"] = True
+                                        meta["hedge_uncertain_at"] = time.time() * 1000
+                                        meta["hedge_uncertain_token"] = held_token
+                                        meta["hedge_uncertain_attempt"] = int(attempt_no)
+                                        meta["hedge_uncertain_remaining"] = float(remaining_size)
+                                        meta["hedge_uncertain_price"] = float(submit_price)
+                                        meta["hedge_uncertain_confirmed_sold"] = float(sold_total)
+                                        meta["hedge_uncertain_confirmed_proceeds"] = float(proceeds_total)
+                                        meta["hedge_uncertain_order_id"] = intent["order_id"]
+                                        meta["hedge_uncertain_order_size"] = (
+                                            _decode_clob_fixed6(intent.get("maker_amount"))
+                                            or float(remaining_size)
+                                        )
                                         trade_ids = _string_list(
-                                            sell_res.get("trade_ids")
+                                            intent.get("trade_ids")
+                                            or intent.get("tradeIDs")
                                         )
                                         if trade_ids:
-                                            meta["hedge_uncertain_trade_ids"] = (
-                                                trade_ids
-                                            )
-                                        meta["hedge_uncertain_status"] = (
-                                            sell_res.get("status") or "ambiguous"
+                                            meta["hedge_uncertain_trade_ids"] = trade_ids
+                                        meta["hedge_uncertain_sold_before"] = float(sold_total)
+                                        meta["hedge_uncertain_proceeds_before"] = float(
+                                            proceeds_total
                                         )
-                                    meta["hedge_uncertain_confirmed_sold"] = float(sold)
-                                    meta["hedge_uncertain_confirmed_proceeds"] = float(hedge_proceeds)
-                                    meta["hedge_uncertain_remaining"] = max(
-                                        0.0, held_size - float(sold),
-                                    )
-                                    save_json(STATE_FILE, positions_meta)
-                                    notify(
-                                        "HEDGE UNCERTAIN",
-                                        f"{m.question}\nSELL outcome unresolved; quarantined "
-                                        "until the exact order is reconciled",
-                                        priority="urgent",
-                                    )
-                                elif sell_status == "persist_fail":
-                                    # on_submit failed before post_order. Its callback
-                                    # may have mutated in-memory metadata, but no
-                                    # exchange order exists, so quarantine is unsafe.
-                                    _clear_hedge_uncertain()
-                                    log_event(
-                                        "hedge_submit_persist_fail",
-                                        condition_id=cond,
-                                        token_id=held_token,
-                                    )
-                                    save_json(STATE_FILE, positions_meta)
-                                else:
-                                    _clear_hedge_uncertain()
-                                last_limit = sell_floor
-                                if isinstance(sell_res, dict) and sell_res.get("last_limit") is not None:
-                                    last_limit = float(sell_res["last_limit"])
-                                # Reconcile with Data API — one read never adds/erases confirms.
-                                time.sleep(HEDGE_GHOST_SLEEP_S)
-                                actual_bal = check_token_balance(held_token, cond)
-                                rec = reconcile_hedge_sold(
-                                    held_size, sold, hedge_proceeds, actual_bal, last_limit,
-                                )
-                                if rec["ghost_candidate"]:
-                                    # Data API is eventually consistent. Even
-                                    # repeated omissions cannot prove a sale; only
-                                    # CLOB/order evidence may close the hedge.
-                                    log_event(
-                                        "hedge_ghost_unconfirmed", condition_id=cond,
-                                        leg=held_leg, size=held_size,
-                                        confirmed_sold=float(sold),
-                                        api_bal=None if actual_bal is None else float(actual_bal),
-                                    )
-                                if rec["balance_unverified"]:
-                                    log_event(
-                                        "hedge_balance_fail", condition_id=cond, leg=held_leg,
-                                        size=held_size, bid=hedge_bid, ask=hedge_ask, sold=sold,
-                                    )
-                                if rec["lag"]:
-                                    log_event(
-                                        "hedge_balance_lag", condition_id=cond, leg=held_leg,
-                                        confirmed_sold=float(sold), api_sold=rec["api_sold"],
-                                        api_bal=None if actual_bal is None else float(actual_bal),
-                                    )
-                                if rec["effective_sold"] > 0.01:
-                                    rem = rec["rem"]
-                                    meta["pnl_hedge_proceeds"] = round(
-                                        prior_hedge_proceeds + rec["proceeds"], 4
-                                    )
-                                    if rem < 0.01:
-                                        meta["hedge_closed"] = True
-                                        rem = 0.0
-                                    meta["bought_size"] = rem
-                                    leg_key = "up" if held_leg == "up" else "dn"
-                                    if cond in _cached_positions and leg_key in _cached_positions[cond]:
-                                        _cached_positions[cond][leg_key]["size"] = rem
-                                    fill_px = (
-                                        (rec["proceeds"] / rec["effective_sold"])
-                                        if rec["effective_sold"] > 0 else last_limit
-                                    )
-                                    log_event(
-                                        "hedge_fill", condition_id=cond, leg=held_leg,
-                                        sold=rec["effective_sold"], remaining=rem, price=fill_px,
-                                        proceeds=round(rec["proceeds"], 4),
-                                        mid=fresh_mid, ask=hedge_ask,
-                                        hedge_closed=bool(meta.get("hedge_closed")),
-                                        balance_unverified=bool(rec["balance_unverified"]),
-                                    )
-                                    save_json(STATE_FILE, positions_meta)
-                                    notify(
-                                        "HEDGE FIRED" if rem < 0.01 else "HEDGE PARTIAL",
-                                        f"Reversal on {m.question}\nSold {held_leg.upper()} at ~{fill_px:.3f} "
-                                        f"({rec['effective_sold']:.2f} shares, rem {rem:.2f})",
-                                        priority="urgent",
-                                    )
-                                else:
-                                    if sell_status not in ("ambiguous", "persist_fail"):
+                                        meta["hedge_uncertain_position_size"] = float(
+                                            held_size
+                                        )
+                                        meta["hedge_uncertain_pnl_before"] = float(
+                                            prior_hedge_proceeds
+                                        )
                                         save_json(STATE_FILE, positions_meta)
-                                    log_event(
-                                        "hedge_fail", condition_id=cond, leg=held_leg, size=held_size,
-                                        bid=hedge_bid, ask=hedge_ask, mid=fresh_mid,
+
+                                    def _persist_hedge_fill(sold_total, proceeds_total):
+                                        rem_now = max(0.0, held_size - float(sold_total))
+                                        if rem_now < 0.01:
+                                            rem_now = 0.0
+                                            meta["hedge_closed"] = True
+                                        meta["bought_size"] = rem_now
+                                        meta["pnl_hedge_proceeds"] = round(
+                                            prior_hedge_proceeds + float(proceeds_total), 4
+                                        )
+                                        meta["hedge_uncertain_confirmed_sold"] = float(sold_total)
+                                        meta["hedge_uncertain_confirmed_proceeds"] = float(proceeds_total)
+                                        meta["hedge_uncertain_remaining"] = rem_now
+                                        leg_key = "up" if held_leg == "up" else "dn"
+                                        if cond in _cached_positions and leg_key in _cached_positions[cond]:
+                                            _cached_positions[cond][leg_key]["size"] = rem_now
+                                        save_json(STATE_FILE, positions_meta)
+
+                                    sold, sell_res, hedge_proceeds = sell_market_with_retry(
+                                        held_token,
+                                        held_size,
+                                        hedge_bid,
+                                        tick_size=hedge_tick,
+                                        min_price=hedge_floor,
+                                        undercut_ticks=HEDGE_UNDERCUT_TICKS,
+                                        retry_sleep_s=HEDGE_RETRY_SLEEP_S,
+                                        # Toxic: never abort on bounce / integrity — dump inventory.
+                                        abort_above=None if toxic_fill else HEDGE_THRESHOLD,
+                                        require_ask_max=None if toxic_fill else HEDGE_REQUIRE_ASK_MAX,
+                                        max_spread=None if toxic_fill else HEDGE_MAX_SPREAD,
+                                        on_submit=_persist_hedge_submit,
+                                        on_fill=_persist_hedge_fill,
+                                        condition_id=cond,
+                                        initial_quote=(hedge_bid, hedge_ask),
                                     )
+                                    sell_status = (
+                                        sell_res.get("bot_status")
+                                        if isinstance(sell_res, dict) else None
+                                    )
+                                    if sell_status == "ambiguous":
+                                        if isinstance(sell_res, dict):
+                                            if sell_res.get("order_id"):
+                                                meta["hedge_uncertain_order_id"] = (
+                                                    sell_res["order_id"]
+                                                )
+                                            trade_ids = _string_list(
+                                                sell_res.get("trade_ids")
+                                            )
+                                            if trade_ids:
+                                                meta["hedge_uncertain_trade_ids"] = (
+                                                    trade_ids
+                                                )
+                                            meta["hedge_uncertain_status"] = (
+                                                sell_res.get("status") or "ambiguous"
+                                            )
+                                        meta["hedge_uncertain_confirmed_sold"] = float(sold)
+                                        meta["hedge_uncertain_confirmed_proceeds"] = float(hedge_proceeds)
+                                        meta["hedge_uncertain_remaining"] = max(
+                                            0.0, held_size - float(sold),
+                                        )
+                                        save_json(STATE_FILE, positions_meta)
+                                        notify(
+                                            "HEDGE UNCERTAIN",
+                                            f"{m.question}\nSELL outcome unresolved; quarantined "
+                                            "until the exact order is reconciled",
+                                            priority="urgent",
+                                        )
+                                    elif sell_status == "persist_fail":
+                                        # on_submit failed before post_order. Its callback
+                                        # may have mutated in-memory metadata, but no
+                                        # exchange order exists, so quarantine is unsafe.
+                                        _clear_hedge_uncertain()
+                                        log_event(
+                                            "hedge_submit_persist_fail",
+                                            condition_id=cond,
+                                            token_id=held_token,
+                                        )
+                                        save_json(STATE_FILE, positions_meta)
+                                    else:
+                                        _clear_hedge_uncertain()
+                                    last_limit = sell_floor
+                                    if isinstance(sell_res, dict) and sell_res.get("last_limit") is not None:
+                                        last_limit = float(sell_res["last_limit"])
+                                    # Reconcile with Data API — one read never adds/erases confirms.
+                                    time.sleep(HEDGE_GHOST_SLEEP_S)
+                                    actual_bal = check_token_balance(held_token, cond)
+                                    rec = reconcile_hedge_sold(
+                                        held_size, sold, hedge_proceeds, actual_bal, last_limit,
+                                    )
+                                    if rec["ghost_candidate"]:
+                                        # Data API is eventually consistent. Even
+                                        # repeated omissions cannot prove a sale; only
+                                        # CLOB/order evidence may close the hedge.
+                                        log_event(
+                                            "hedge_ghost_unconfirmed", condition_id=cond,
+                                            leg=held_leg, size=held_size,
+                                            confirmed_sold=float(sold),
+                                            api_bal=None if actual_bal is None else float(actual_bal),
+                                        )
+                                    if rec["balance_unverified"]:
+                                        log_event(
+                                            "hedge_balance_fail", condition_id=cond, leg=held_leg,
+                                            size=held_size, bid=hedge_bid, ask=hedge_ask, sold=sold,
+                                        )
+                                    if rec["lag"]:
+                                        log_event(
+                                            "hedge_balance_lag", condition_id=cond, leg=held_leg,
+                                            confirmed_sold=float(sold), api_sold=rec["api_sold"],
+                                            api_bal=None if actual_bal is None else float(actual_bal),
+                                        )
+                                    if rec["effective_sold"] > 0.01:
+                                        rem = rec["rem"]
+                                        meta["pnl_hedge_proceeds"] = round(
+                                            prior_hedge_proceeds + rec["proceeds"], 4
+                                        )
+                                        if rem < 0.01:
+                                            meta["hedge_closed"] = True
+                                            rem = 0.0
+                                        meta["bought_size"] = rem
+                                        leg_key = "up" if held_leg == "up" else "dn"
+                                        if cond in _cached_positions and leg_key in _cached_positions[cond]:
+                                            _cached_positions[cond][leg_key]["size"] = rem
+                                        fill_px = (
+                                            (rec["proceeds"] / rec["effective_sold"])
+                                            if rec["effective_sold"] > 0 else last_limit
+                                        )
+                                        log_event(
+                                            "hedge_fill", condition_id=cond, leg=held_leg,
+                                            sold=rec["effective_sold"], remaining=rem, price=fill_px,
+                                            proceeds=round(rec["proceeds"], 4),
+                                            mid=fresh_mid, ask=hedge_ask,
+                                            hedge_closed=bool(meta.get("hedge_closed")),
+                                            balance_unverified=bool(rec["balance_unverified"]),
+                                        )
+                                        save_json(STATE_FILE, positions_meta)
+                                        notify(
+                                            "HEDGE FIRED" if rem < 0.01 else "HEDGE PARTIAL",
+                                            f"Reversal on {m.question}\nSold {held_leg.upper()} at ~{fill_px:.3f} "
+                                            f"({rec['effective_sold']:.2f} shares, rem {rem:.2f})",
+                                            priority="urgent",
+                                        )
+                                    else:
+                                        if sell_status not in ("ambiguous", "persist_fail"):
+                                            save_json(STATE_FILE, positions_meta)
+                                        log_event(
+                                            "hedge_fail", condition_id=cond, leg=held_leg, size=held_size,
+                                            bid=hedge_bid, ask=hedge_ask, mid=fresh_mid,
+                                        )
 
-            # --- BUY CHECK (for markets we don't hold) ---
-            if held_size > 0.01:
-                continue  # already hold this market
-            if minutes_left > BUY_WINDOW_MIN:
-                continue  # not in buy window yet
-            if not ENTRY_ENABLED:
-                continue  # explicit operator arm is required for every live entry
-            if not _discovery_fresh:
-                continue  # stale Gamma metadata is hedge-only
-            if (
-                _positions_received_mono <= 0
-                or _now_mono - _positions_received_mono
-                > max(5.0, float(POSITIONS_REFRESH_S) * 3)
-            ):
-                continue  # open-position/notional checks require a recent snapshot
-            if (
-                _balance_received_mono <= 0
-                or _now_mono - _balance_received_mono
-                > max(30.0, float(BALANCE_REFRESH_S) * 3)
-            ):
-                continue  # never spend against an unknown/stale collateral balance
+                # --- BUY CHECK (for markets we don't hold) ---
+                if held_size > 0.01:
+                    continue  # already hold this market
+                if minutes_left > BUY_WINDOW_MIN:
+                    continue  # not in buy window yet
+                if not ENTRY_ENABLED:
+                    continue  # explicit operator arm is required for every live entry
+                if not _discovery_fresh:
+                    continue  # stale Gamma metadata is hedge-only
+                if (
+                    _positions_received_mono <= 0
+                    or _now_mono - _positions_received_mono
+                    > max(5.0, float(POSITIONS_REFRESH_S) * 3)
+                ):
+                    continue  # open-position/notional checks require a recent snapshot
+                if (
+                    _balance_received_mono <= 0
+                    or _now_mono - _balance_received_mono
+                    > max(30.0, float(BALANCE_REFRESH_S) * 3)
+                ):
+                    continue  # never spend against an unknown/stale collateral balance
 
-            # Quarantine is unconditional, including when an earlier attempt in
-            # the same call already set bought_token. Stable held-state
-            # reconciliation above resolves it; this path never posts again.
-            if meta.get("buy_uncertain"):
-                continue
+                # Quarantine is unconditional, including when an earlier attempt in
+                # the same call already set bought_token. Stable held-state
+                # reconciliation above resolves it; this path never posts again.
+                if meta.get("buy_uncertain"):
+                    continue
 
-            # One entry per market
-            if ONE_ENTRY_PER_MARKET and meta.get("bought_token"):
-                continue
+                # One entry per market
+                if ONE_ENTRY_PER_MARKET and meta.get("bought_token"):
+                    continue
 
-            # Initialize meta for first sighting
-            if "entered_at" not in meta:
-                meta["entered_at"] = now_ms
-                meta["up_token"] = m.up_token
-                meta["dn_token"] = m.dn_token
-                meta["question"] = m.question
-                meta["end_date"] = datetime.fromtimestamp(m.end_ts, tz=datetime.now().astimezone().tzinfo).isoformat()
-                meta["pnl_entry_cost"] = 0.0
-                meta["pnl_hedge_proceeds"] = 0.0
-                meta["pnl_redeem_value"] = 0.0
-                save_json(STATE_FILE, positions_meta)
-            if now_ms - meta["entered_at"] < BUY_GRACE_S * 1000:
-                continue
-
-            # Risk caps (in dollars / active markets). Redeemable Data-API
-            # leftovers are settlement backlog — they must NOT consume the
-            # max_open_positions budget or a redeem lag freezes all entries
-            # (silent continue). Only non-redeemable size counts as open risk.
-            open_conditions = set()
-            for c, p in held.items():
-                up_sz = float(p.get("up", {}).get("size", 0) or 0)
-                dn_sz = float(p.get("dn", {}).get("size", 0) or 0)
-                up_live = up_sz > 0.01 and not p.get("up", {}).get("redeemable")
-                dn_live = dn_sz > 0.01 and not p.get("dn", {}).get("redeemable")
-                if up_live or dn_live:
-                    open_conditions.add(c)
-            open_conditions |= {
-                c for c, pm in positions_meta.items() if pm.get("buy_uncertain")
-            }
-            open_count = len(open_conditions)
-            open_notional = sum(
-                float(pm.get("pnl_entry_cost", 0) or 0)
-                + (
-                    float(pm.get("buy_uncertain_spend", 0) or 0)
-                    if pm.get("buy_uncertain") else 0
-                )
-                for pm in positions_meta.values()
-                if pm.get("bought_token") or pm.get("buy_uncertain")
-            )
-            daily_notional = sum(
-                float(pm.get("pnl_entry_cost", 0) or 0)
-                + (
-                    float(pm.get("buy_uncertain_spend", 0) or 0)
-                    if pm.get("buy_uncertain") else 0
-                )
-                for pm in positions_meta.values()
-                if (pm.get("bought_token") or pm.get("buy_uncertain"))
-                and pm.get("entered_at", 0) >= _today_start_ms()
-            )
-            est_cost = min(float(BUY_BUDGET), float(BUY_MAX_SPEND))
-            if MAX_OPEN_POSITIONS > 0 and open_count >= MAX_OPEN_POSITIONS:
-                log_event(
-                    "buy_skip_max_positions",
-                    condition_id=cond,
-                    open_count=open_count,
-                    max_open_positions=MAX_OPEN_POSITIONS,
-                    held_reported=sum(
-                        1 for p in held.values()
-                        if max(
-                            float(p.get("up", {}).get("size", 0) or 0),
-                            float(p.get("dn", {}).get("size", 0) or 0),
-                        ) > 0.01
-                    ),
-                )
-                continue
-            if open_notional + est_cost > MAX_OPEN_NOTIONAL + 1e-9:
-                log_event(
-                    "buy_skip_max_notional",
-                    condition_id=cond,
-                    open_notional=round(open_notional, 4),
-                    max_open_notional=MAX_OPEN_NOTIONAL,
-                    budget=est_cost,
-                )
-                continue
-            if daily_notional + est_cost > MAX_DAILY_NOTIONAL + 1e-9:
-                log_event(
-                    "buy_skip_max_daily_notional",
-                    condition_id=cond,
-                    daily_notional=round(daily_notional, 4),
-                    max_daily_notional=MAX_DAILY_NOTIONAL,
-                    budget=est_cost,
-                )
-                continue
-            if float(pusd_bal or 0) + 1e-9 < est_cost:
-                log_event(
-                    "buy_skip_balance", condition_id=cond,
-                    balance=pusd_bal, budget=est_cost,
-                )
-                continue
-
-            # Fresh REST book + last trade in parallel.
-            # Entry decisions must not trust WS alone (stale/phantom sizes).
-            # GUI display = mid if spread ≤ 10¢ else last trade.
-            fut_up = _entry_executor.submit(
-                get_quote_fast, m.up_token, 2.0, True, True,
-            )  # prefer_rest, force_rest — no 200ms cache at entry gate
-            fut_dn = _entry_executor.submit(
-                get_quote_fast, m.dn_token, 2.0, True, True,
-            )
-            fut_ul = _entry_executor.submit(get_last_trade_price, m.up_token)
-            fut_dl = _entry_executor.submit(get_last_trade_price, m.dn_token)
-            up_bid, _, up_ask, _, up_mid = fut_up.result()
-            dn_bid, _, dn_ask, _, dn_mid = fut_dn.result()
-            up_last = fut_ul.result()
-            dn_last = fut_dl.result()
-            if up_last is None:
-                up_last = get_book_snapshot_last_trade(m.up_token)
-            if dn_last is None:
-                dn_last = get_book_snapshot_last_trade(m.dn_token)
-            up_gui = polymarket_display_price(up_bid, up_ask, up_last)
-            dn_gui = polymarket_display_price(dn_bid, dn_ask, dn_last)
-
-            # Lock Chainlink PTB as soon as the window is open (memory/disk only).
-            if m.start_ts and time.time() >= m.start_ts:
-                ptb_rec = btc_feed.capture_ptb(m.start_ts)
-                if ptb_rec and ptb_rec.get("ok") and not meta.get("ptb"):
-                    meta["ptb"] = ptb_rec.get("ptb")
-                    meta["ptb_source"] = ptb_rec.get("source")
-                    meta["ptb_tick_ts_ms"] = ptb_rec.get("ptb_tick_ts_ms")
-                    meta["start_ts"] = m.start_ts
-                    meta["end_ts"] = m.end_ts
-                    meta["slug"] = getattr(m, "slug", None)
-                    append_research(RESEARCH_FILE, {
-                        "event": "ptb_capture",
-                        "condition_id": cond,
-                        "slug": meta.get("slug"),
-                        "question": m.question,
-                        "start_ts": m.start_ts,
-                        "end_ts": m.end_ts,
-                        **{k: ptb_rec.get(k) for k in ("ptb", "source", "ptb_tick_ts_ms", "ptb_skew_ms", "ok", "feed", "feed_label", "resolution_url")},
-                    })
+                # Initialize meta for first sighting
+                if "entered_at" not in meta:
+                    meta["entered_at"] = now_ms
+                    meta["up_token"] = m.up_token
+                    meta["dn_token"] = m.dn_token
+                    meta["question"] = m.question
+                    meta["end_date"] = datetime.fromtimestamp(m.end_ts, tz=datetime.now().astimezone().tzinfo).isoformat()
+                    meta["pnl_entry_cost"] = 0.0
+                    meta["pnl_hedge_proceeds"] = 0.0
+                    meta["pnl_redeem_value"] = 0.0
                     save_json(STATE_FILE, positions_meta)
-
-            if up_gui is None or dn_gui is None:
-                log_event(
-                    "buy_skip_incomplete_book",
-                    condition_id=cond,
-                    up_bid=up_bid, dn_bid=dn_bid, up_ask=up_ask, dn_ask=dn_ask,
-                    up_last=up_last, dn_last=dn_last, up_gui=up_gui, dn_gui=dn_gui,
-                )
-                continue
-
-            # Winner by GUI display price (not raw mid — wide spreads poison mid).
-            gui_edge = abs(up_gui - dn_gui)
-            if gui_edge < MIN_BID_EDGE:
-                log_event(
-                    "buy_skip_ambiguous",
-                    condition_id=cond,
-                    up_gui=up_gui, dn_gui=dn_gui, gui_edge=round(gui_edge, 4),
-                    up_bid=up_bid, dn_bid=dn_bid, up_ask=up_ask, dn_ask=dn_ask,
-                )
-                continue
-
-            up_winning = up_gui > dn_gui
-            dn_winning = dn_gui > up_gui
-
-            # Ask in band + GUI consensus + tight real book (bid under the ask).
-            up_ask_ok = up_ask is not None and BUY_THRESHOLD <= up_ask <= BUY_MAX_PRICE
-            dn_ask_ok = dn_ask is not None and BUY_THRESHOLD <= dn_ask <= BUY_MAX_PRICE
-            up_book_ok, up_book_why = entry_book_ok(up_bid, up_ask, MAX_ENTRY_SPREAD, MIN_WINNER_BID)
-            dn_book_ok, dn_book_why = entry_book_ok(dn_bid, dn_ask, MAX_ENTRY_SPREAD, MIN_WINNER_BID)
-            up_consensus = (
-                up_gui is not None and dn_gui is not None
-                and up_gui >= MIN_WINNER_BID and dn_gui <= MAX_LOSER_BID
-                and up_book_ok
-            )
-            dn_consensus = (
-                up_gui is not None and dn_gui is not None
-                and dn_gui >= MIN_WINNER_BID and up_gui <= MAX_LOSER_BID
-                and dn_book_ok
-            )
-
-            if up_winning and up_ask_ok and not up_consensus:
-                log_event(
-                    "buy_skip_no_consensus",
-                    condition_id=cond, leg="up",
-                    up_gui=up_gui, dn_gui=dn_gui, up_ask=up_ask,
-                    up_bid=up_bid, dn_bid=dn_bid, up_last=up_last, dn_last=dn_last,
-                    up_book_ok=up_book_ok, up_book_why=up_book_why,
-                    max_entry_spread=MAX_ENTRY_SPREAD,
-                    min_winner_bid=MIN_WINNER_BID, max_loser_bid=MAX_LOSER_BID,
-                )
-            if dn_winning and dn_ask_ok and not dn_consensus:
-                log_event(
-                    "buy_skip_no_consensus",
-                    condition_id=cond, leg="down",
-                    up_gui=up_gui, dn_gui=dn_gui, dn_ask=dn_ask,
-                    up_bid=up_bid, dn_bid=dn_bid, up_last=up_last, dn_last=dn_last,
-                    dn_book_ok=dn_book_ok, dn_book_why=dn_book_why,
-                    max_entry_spread=MAX_ENTRY_SPREAD,
-                    min_winner_bid=MIN_WINNER_BID, max_loser_bid=MAX_LOSER_BID,
-                )
-
-            up_buy = up_winning and up_ask_ok and up_consensus
-            dn_buy = dn_winning and dn_ask_ok and dn_consensus
-
-            # Underlying BTC vs Price To Beat. When enabled, always run the check —
-            # even if min_edge is 0 (still fail-closed on flat/missing/stale).
-            uchk = None
-            if UNDERLYING_GATE_ENABLED and (up_buy or dn_buy):
-                uchk = btc_feed.underlying_check(m.start_ts, MIN_UNDERLYING_EDGE_USD)
-                favored = uchk.get("favored")
-                if not uchk.get("ok") or not favored:
-                    log_event(
-                        "buy_skip_underlying_edge",
-                        condition_id=cond,
-                        ptb=uchk.get("ptb"),
-                        live_btc=uchk.get("live_btc"),
-                        edge_usd=None if uchk.get("edge_usd") is None else round(uchk["edge_usd"], 2),
-                        min_edge_usd=MIN_UNDERLYING_EDGE_USD,
-                        ptb_source=uchk.get("ptb_source"),
-                        live_source=uchk.get("live_source"),
-                        live_age_s=uchk.get("live_age_s"),
-                        reason=uchk.get("reason"),
-                        up_gui=up_gui,
-                        dn_gui=dn_gui,
-                    )
-                    append_research(RESEARCH_FILE, {
-                        "event": "decision_skip_underlying",
-                        "condition_id": cond,
-                        "slug": getattr(m, "slug", None),
-                        "question": m.question,
-                        "start_ts": m.start_ts,
-                        "end_ts": m.end_ts,
-                        "up_gui": up_gui,
-                        "dn_gui": dn_gui,
-                        "up_ask": up_ask,
-                        "dn_ask": dn_ask,
-                        **{k: uchk.get(k) for k in (
-                            "ptb", "live_btc", "edge_usd", "favored", "ptb_source",
-                            "live_source", "live_age_s", "ptb_skew_ms", "reason", "ok",
-                            "feed", "feed_label", "resolution_url",
-                        )},
-                    })
-                    continue
-                if favored == "up":
-                    dn_buy = False
-                else:
-                    up_buy = False
-                if not (up_buy or dn_buy):
-                    log_event(
-                        "buy_skip_underlying_side",
-                        condition_id=cond,
-                        favored=favored,
-                        ptb=uchk.get("ptb"),
-                        live_btc=uchk.get("live_btc"),
-                        edge_usd=round(uchk["edge_usd"], 2),
-                        up_gui=up_gui,
-                        dn_gui=dn_gui,
-                    )
-                    append_research(RESEARCH_FILE, {
-                        "event": "decision_skip_side",
-                        "condition_id": cond,
-                        "slug": getattr(m, "slug", None),
-                        "question": m.question,
-                        "start_ts": m.start_ts,
-                        "end_ts": m.end_ts,
-                        "up_gui": up_gui,
-                        "dn_gui": dn_gui,
-                        "book_wanted": "up" if up_winning else "down",
-                        **{k: uchk.get(k) for k in (
-                            "ptb", "live_btc", "edge_usd", "favored", "ptb_source",
-                            "live_source", "live_age_s", "ptb_skew_ms",
-                            "feed", "feed_label", "resolution_url",
-                        )},
-                    })
+                if now_ms - meta["entered_at"] < BUY_GRACE_S * 1000:
                     continue
 
-            if not (up_buy or dn_buy):
-                continue
-
-            buy_token = m.up_token if up_buy else m.dn_token
-            buy_ask = up_ask if up_buy else dn_ask
-            buy_leg = "up" if up_buy else "down"
-            buy_gui = up_gui if up_buy else dn_gui
-
-            # Cooldown (empty FAKs use the short empty_fak_cooldown_s).
-            last_buy_at = meta.get("last_buy_at") or 0
-            cooldown_s = (
-                float(EMPTY_FAK_COOLDOWN_S)
-                if meta.get("last_buy_empty")
-                else float(BUY_COOLDOWN_S)
-            )
-            if now_ms - last_buy_at < cooldown_s * 1000:
-                continue
-
-            _ttm_disp = f"{minutes_left*60:>3.0f}s" if minutes_left < 1 else f"{minutes_left:>4.1f}m"
-            console.print(Panel(
-                f"  [bright_white]{m.question}[/]\n"
-                f"  [bright_green]UP[/]   gui [bold]{up_gui:.3f}[/]  ask [bold]{up_ask or 0:.3f}[/]   │   "
-                f"[bright_red]DN[/]  gui [bold]{dn_gui:.3f}[/]  ask [bold]{dn_ask or 0:.3f}[/]   │   "
-                f"[bold green]TTM {_ttm_disp}[/]",
-                title=f"[bold bright_green]▲ BUY TRIGGER — {buy_leg.upper()} LEG[/]",
-                border_style="bright_green",
-                box=box.HEAVY,
-            ))
-
-            tick = get_tick_size_cached(buy_token)
-            spend_usd = min(float(BUY_BUDGET), float(BUY_MAX_SPEND))
-            if uchk is None and m.start_ts:
-                uchk = btc_feed.underlying_check(m.start_ts, 0)  # snapshot only
-            log_event(
-                "buy_attempt", condition_id=cond, leg=buy_leg, budget=spend_usd,
-                ask=buy_ask, gui=buy_gui, up_gui=up_gui, dn_gui=dn_gui,
-                threshold=BUY_THRESHOLD, minutes_left=round(minutes_left, 2),
-                ptb=(uchk or {}).get("ptb"),
-                live_btc=(uchk or {}).get("live_btc"),
-                edge_usd=(uchk or {}).get("edge_usd"),
-                ptb_source=(uchk or {}).get("ptb_source"),
-                live_source=(uchk or {}).get("live_source"),
-            )
-            append_research(RESEARCH_FILE, {
-                "event": "buy_attempt",
-                "condition_id": cond,
-                "slug": getattr(m, "slug", None),
-                "question": m.question,
-                "start_ts": m.start_ts,
-                "end_ts": m.end_ts,
-                "leg": buy_leg,
-                "ask": buy_ask,
-                "gui": buy_gui,
-                "up_gui": up_gui,
-                "dn_gui": dn_gui,
-                "minutes_left": round(minutes_left, 2),
-                **{k: (uchk or {}).get(k) for k in (
-                    "ptb", "live_btc", "edge_usd", "favored", "ptb_source",
-                    "live_source", "live_age_s", "ptb_skew_ms",
-                    "feed", "feed_label", "resolution_url",
-                )},
-            })
-
-            def _persist_buy_fill(filled_total, spent_total):
-                # Durable save after every confirmed attempt (crash between retries).
-                avg = (spent_total / filled_total) if filled_total > 0 else float(buy_ask or 0)
-                if spent_total <= 0 and filled_total > 0:
-                    spent_total = min(
-                        float(spend_usd),
-                        filled_total * float(buy_ask or BUY_THRESHOLD),
-                    )
-                    avg = spent_total / filled_total if filled_total else avg
-                quoted = meta.get("quoted_buy_shares")
-                _, force_exit = classify_buy_fill(
-                    avg, filled_total, quoted, BUY_THRESHOLD, TOXIC_FORCE_EXIT_BELOW,
-                )
-                meta["last_buy_at"] = time.time() * 1000
-                meta["bought_token"] = buy_token
-                meta.pop("last_buy_empty", None)
-                meta["bought_leg"] = buy_leg
-                meta["bought_size"] = filled_total
-                meta["fill_price"] = round(avg, 4)
-                meta["pnl_entry_cost"] = round(spent_total, 4)
-                meta["toxic_fill"] = bool(force_exit)
-                leg_key = "up" if buy_leg == "up" else "dn"
-                _cached_positions.setdefault(cond, {})[leg_key] = {
-                    "asset": buy_token,
-                    "size": float(filled_total),
-                    "redeemable": False,
-                    "avgPrice": float(avg),
+                # Risk caps (in dollars / active markets). Redeemable Data-API
+                # leftovers are settlement backlog — they must NOT consume the
+                # max_open_positions budget or a redeem lag freezes all entries
+                # (silent continue). Only non-redeemable size counts as open risk.
+                open_conditions = set()
+                for c, p in held.items():
+                    up_sz = float(p.get("up", {}).get("size", 0) or 0)
+                    dn_sz = float(p.get("dn", {}).get("size", 0) or 0)
+                    up_live = up_sz > 0.01 and not p.get("up", {}).get("redeemable")
+                    dn_live = dn_sz > 0.01 and not p.get("dn", {}).get("redeemable")
+                    if up_live or dn_live:
+                        open_conditions.add(c)
+                open_conditions |= {
+                    c for c, pm in positions_meta.items() if pm.get("buy_uncertain")
                 }
-                save_json(STATE_FILE, positions_meta)
-
-            def _clear_buy_uncertain():
-                clear_uncertain_fields(meta, _BUY_UNCERTAIN_KEYS)
-
-            def _persist_buy_submit(
-                baseline, attempt, spend_cap, submit_price, intent,
-            ):
-                # Write-ahead quarantine: this must reach disk before the POST.
-                # A crash or accepted-then-timeout can then never unlock a
-                # duplicate full-budget order on restart.
-                submit_ms = time.time() * 1000
-                meta["buy_uncertain"] = True
-                meta["buy_uncertain_at"] = submit_ms
-                meta["buy_uncertain_token"] = buy_token
-                meta["buy_uncertain_leg"] = buy_leg
-                meta["buy_uncertain_baseline"] = float(baseline)
-                meta["buy_uncertain_attempt"] = int(attempt)
-                meta["buy_uncertain_spend"] = round(float(spend_cap), 4)
-                meta["buy_uncertain_price"] = round(float(submit_price), 4)
-                meta["buy_uncertain_order_id"] = intent["order_id"]
-                # Never decode taker_amount as share size — BUY taker can be
-                # USDC and a 2.50 "share" quote false-toxics a real 3-sh fill.
-                quoted_shares = finite_float(intent.get("quoted_shares"), minimum=0)
-                if quoted_shares is None or quoted_shares < 0.01:
-                    quoted_shares = (
-                        float(spend_cap) / max(float(submit_price), 1e-9)
+                open_count = len(open_conditions)
+                open_notional = sum(
+                    float(pm.get("pnl_entry_cost", 0) or 0)
+                    + (
+                        float(pm.get("buy_uncertain_spend", 0) or 0)
+                        if pm.get("buy_uncertain") else 0
                     )
-                meta["quoted_buy_shares"] = float(quoted_shares)
-                meta["buy_uncertain_order_size"] = float(quoted_shares)
-                trade_ids = _string_list(
-                    intent.get("trade_ids") or intent.get("tradeIDs")
+                    for pm in positions_meta.values()
+                    if pm.get("bought_token") or pm.get("buy_uncertain")
                 )
-                if trade_ids:
-                    meta["buy_uncertain_trade_ids"] = trade_ids
-                meta["buy_uncertain_known_size"] = float(
-                    meta.get("bought_size") or 0
-                )
-                meta["buy_uncertain_known_cost"] = float(
-                    meta.get("pnl_entry_cost") or 0
-                )
-                meta["last_buy_at"] = submit_ms
-                save_json(STATE_FILE, positions_meta)
-
-            bought, spent, buy_status = buy_market_with_retry(
-                buy_token, spend_usd, BUY_MAX_PRICE, tick_size=tick, min_price=BUY_THRESHOLD,
-                on_fill=_persist_buy_fill, on_submit=_persist_buy_submit,
-                condition_id=cond,
-            )
-            wall_ms = time.time() * 1000
-            if bought > 0:
-                if buy_status != "ambiguous":
-                    _clear_buy_uncertain()
-                if spent <= 0:
-                    spent = min(
-                        float(spend_usd),
-                        bought * float(buy_ask or BUY_THRESHOLD),
+                daily_notional = sum(
+                    float(pm.get("pnl_entry_cost", 0) or 0)
+                    + (
+                        float(pm.get("buy_uncertain_spend", 0) or 0)
+                        if pm.get("buy_uncertain") else 0
                     )
-                avg_fill = implied_buy_average(spent, bought, buy_ask)
-                quoted = meta.get("quoted_buy_shares")
-                _, force_exit = classify_buy_fill(
-                    avg_fill, bought, quoted, BUY_THRESHOLD, TOXIC_FORCE_EXIT_BELOW,
+                    for pm in positions_meta.values()
+                    if (pm.get("bought_token") or pm.get("buy_uncertain"))
+                    and pm.get("entered_at", 0) >= _today_start_ms()
                 )
-                meta["last_buy_at"] = wall_ms
-                meta["bought_token"] = buy_token
-                meta.pop("last_buy_empty", None)
-                meta["bought_leg"] = buy_leg
-                meta["bought_size"] = bought
-                meta["fill_price"] = round(avg_fill, 4)
-                meta["pnl_entry_cost"] = round(spent, 4)
-                meta["toxic_fill"] = bool(force_exit)
-                if uchk:
-                    meta["ptb"] = uchk.get("ptb")
-                    meta["ptb_source"] = uchk.get("ptb_source")
-                    meta["entry_live_btc"] = uchk.get("live_btc")
-                    meta["entry_edge_usd"] = uchk.get("edge_usd")
+                est_cost = min(float(BUY_BUDGET), float(BUY_MAX_SPEND))
+                if MAX_OPEN_POSITIONS > 0 and open_count >= MAX_OPEN_POSITIONS:
+                    log_event(
+                        "buy_skip_max_positions",
+                        condition_id=cond,
+                        open_count=open_count,
+                        max_open_positions=MAX_OPEN_POSITIONS,
+                        held_reported=sum(
+                            1 for p in held.values()
+                            if max(
+                                float(p.get("up", {}).get("size", 0) or 0),
+                                float(p.get("dn", {}).get("size", 0) or 0),
+                            ) > 0.01
+                        ),
+                    )
+                    continue
+                if open_notional + est_cost > MAX_OPEN_NOTIONAL + 1e-9:
+                    log_event(
+                        "buy_skip_max_notional",
+                        condition_id=cond,
+                        open_notional=round(open_notional, 4),
+                        max_open_notional=MAX_OPEN_NOTIONAL,
+                        budget=est_cost,
+                    )
+                    continue
+                if daily_notional + est_cost > MAX_DAILY_NOTIONAL + 1e-9:
+                    log_event(
+                        "buy_skip_max_daily_notional",
+                        condition_id=cond,
+                        daily_notional=round(daily_notional, 4),
+                        max_daily_notional=MAX_DAILY_NOTIONAL,
+                        budget=est_cost,
+                    )
+                    continue
+                if float(pusd_bal or 0) + 1e-9 < est_cost:
+                    log_event(
+                        "buy_skip_balance", condition_id=cond,
+                        balance=pusd_bal, budget=est_cost,
+                    )
+                    continue
+
+                # Fresh REST book + last trade in parallel.
+                # Entry decisions must not trust WS alone (stale/phantom sizes).
+                # GUI display = mid if spread ≤ 10¢ else last trade.
+                fut_up = _entry_executor.submit(
+                    get_quote_fast, m.up_token, 2.0, True, True,
+                )  # prefer_rest, force_rest — no 200ms cache at entry gate
+                fut_dn = _entry_executor.submit(
+                    get_quote_fast, m.dn_token, 2.0, True, True,
+                )
+                fut_ul = _entry_executor.submit(get_last_trade_price, m.up_token)
+                fut_dl = _entry_executor.submit(get_last_trade_price, m.dn_token)
+                up_bid, _, up_ask, _, up_mid = fut_up.result()
+                dn_bid, _, dn_ask, _, dn_mid = fut_dn.result()
+                up_last = fut_ul.result()
+                dn_last = fut_dl.result()
+                if up_last is None:
+                    up_last = get_book_snapshot_last_trade(m.up_token)
+                if dn_last is None:
+                    dn_last = get_book_snapshot_last_trade(m.dn_token)
+                up_gui = polymarket_display_price(up_bid, up_ask, up_last)
+                dn_gui = polymarket_display_price(dn_bid, dn_ask, dn_last)
+
+                # Lock Chainlink PTB as soon as the window is open (memory/disk only).
+                if m.start_ts and time.time() >= m.start_ts:
+                    ptb_rec = btc_feed.capture_ptb(m.start_ts)
+                    if ptb_rec and ptb_rec.get("ok") and not meta.get("ptb"):
+                        meta["ptb"] = ptb_rec.get("ptb")
+                        meta["ptb_source"] = ptb_rec.get("source")
+                        meta["ptb_tick_ts_ms"] = ptb_rec.get("ptb_tick_ts_ms")
+                        meta["start_ts"] = m.start_ts
+                        meta["end_ts"] = m.end_ts
+                        meta["slug"] = getattr(m, "slug", None)
+                        append_research(RESEARCH_FILE, {
+                            "event": "ptb_capture",
+                            "condition_id": cond,
+                            "slug": meta.get("slug"),
+                            "question": m.question,
+                            "start_ts": m.start_ts,
+                            "end_ts": m.end_ts,
+                            **{k: ptb_rec.get(k) for k in ("ptb", "source", "ptb_tick_ts_ms", "ptb_skew_ms", "ok", "feed", "feed_label", "resolution_url")},
+                        })
+                        save_json(STATE_FILE, positions_meta)
+
+                if up_gui is None or dn_gui is None:
+                    log_event(
+                        "buy_skip_incomplete_book",
+                        condition_id=cond,
+                        up_bid=up_bid, dn_bid=dn_bid, up_ask=up_ask, dn_ask=dn_ask,
+                        up_last=up_last, dn_last=dn_last, up_gui=up_gui, dn_gui=dn_gui,
+                    )
+                    continue
+
+                # Winner by GUI display price (not raw mid — wide spreads poison mid).
+                gui_edge = abs(up_gui - dn_gui)
+                if gui_edge < MIN_BID_EDGE:
+                    log_event(
+                        "buy_skip_ambiguous",
+                        condition_id=cond,
+                        up_gui=up_gui, dn_gui=dn_gui, gui_edge=round(gui_edge, 4),
+                        up_bid=up_bid, dn_bid=dn_bid, up_ask=up_ask, dn_ask=dn_ask,
+                    )
+                    continue
+
+                up_winning = up_gui > dn_gui
+                dn_winning = dn_gui > up_gui
+
+                # Ask in band + GUI consensus + tight real book (bid under the ask).
+                up_ask_ok = up_ask is not None and BUY_THRESHOLD <= up_ask <= BUY_MAX_PRICE
+                dn_ask_ok = dn_ask is not None and BUY_THRESHOLD <= dn_ask <= BUY_MAX_PRICE
+                up_book_ok, up_book_why = entry_book_ok(up_bid, up_ask, MAX_ENTRY_SPREAD, MIN_WINNER_BID)
+                dn_book_ok, dn_book_why = entry_book_ok(dn_bid, dn_ask, MAX_ENTRY_SPREAD, MIN_WINNER_BID)
+                up_consensus = (
+                    up_gui is not None and dn_gui is not None
+                    and up_gui >= MIN_WINNER_BID and dn_gui <= MAX_LOSER_BID
+                    and up_book_ok
+                )
+                dn_consensus = (
+                    up_gui is not None and dn_gui is not None
+                    and dn_gui >= MIN_WINNER_BID and up_gui <= MAX_LOSER_BID
+                    and dn_book_ok
+                )
+
+                if up_winning and up_ask_ok and not up_consensus:
+                    log_event(
+                        "buy_skip_no_consensus",
+                        condition_id=cond, leg="up",
+                        up_gui=up_gui, dn_gui=dn_gui, up_ask=up_ask,
+                        up_bid=up_bid, dn_bid=dn_bid, up_last=up_last, dn_last=dn_last,
+                        up_book_ok=up_book_ok, up_book_why=up_book_why,
+                        max_entry_spread=MAX_ENTRY_SPREAD,
+                        min_winner_bid=MIN_WINNER_BID, max_loser_bid=MAX_LOSER_BID,
+                    )
+                if dn_winning and dn_ask_ok and not dn_consensus:
+                    log_event(
+                        "buy_skip_no_consensus",
+                        condition_id=cond, leg="down",
+                        up_gui=up_gui, dn_gui=dn_gui, dn_ask=dn_ask,
+                        up_bid=up_bid, dn_bid=dn_bid, up_last=up_last, dn_last=dn_last,
+                        dn_book_ok=dn_book_ok, dn_book_why=dn_book_why,
+                        max_entry_spread=MAX_ENTRY_SPREAD,
+                        min_winner_bid=MIN_WINNER_BID, max_loser_bid=MAX_LOSER_BID,
+                    )
+
+                up_buy = up_winning and up_ask_ok and up_consensus
+                dn_buy = dn_winning and dn_ask_ok and dn_consensus
+
+                # Underlying BTC vs Price To Beat. When enabled, always run the check —
+                # even if min_edge is 0 (still fail-closed on flat/missing/stale).
+                uchk = None
+                if UNDERLYING_GATE_ENABLED and (up_buy or dn_buy):
+                    uchk = btc_feed.underlying_check(m.start_ts, MIN_UNDERLYING_EDGE_USD)
+                    favored = uchk.get("favored")
+                    if not uchk.get("ok") or not favored:
+                        log_event(
+                            "buy_skip_underlying_edge",
+                            condition_id=cond,
+                            ptb=uchk.get("ptb"),
+                            live_btc=uchk.get("live_btc"),
+                            edge_usd=None if uchk.get("edge_usd") is None else round(uchk["edge_usd"], 2),
+                            min_edge_usd=MIN_UNDERLYING_EDGE_USD,
+                            ptb_source=uchk.get("ptb_source"),
+                            live_source=uchk.get("live_source"),
+                            live_age_s=uchk.get("live_age_s"),
+                            reason=uchk.get("reason"),
+                            up_gui=up_gui,
+                            dn_gui=dn_gui,
+                        )
+                        append_research(RESEARCH_FILE, {
+                            "event": "decision_skip_underlying",
+                            "condition_id": cond,
+                            "slug": getattr(m, "slug", None),
+                            "question": m.question,
+                            "start_ts": m.start_ts,
+                            "end_ts": m.end_ts,
+                            "up_gui": up_gui,
+                            "dn_gui": dn_gui,
+                            "up_ask": up_ask,
+                            "dn_ask": dn_ask,
+                            **{k: uchk.get(k) for k in (
+                                "ptb", "live_btc", "edge_usd", "favored", "ptb_source",
+                                "live_source", "live_age_s", "ptb_skew_ms", "reason", "ok",
+                                "feed", "feed_label", "resolution_url",
+                            )},
+                        })
+                        continue
+                    if favored == "up":
+                        dn_buy = False
+                    else:
+                        up_buy = False
+                    if not (up_buy or dn_buy):
+                        log_event(
+                            "buy_skip_underlying_side",
+                            condition_id=cond,
+                            favored=favored,
+                            ptb=uchk.get("ptb"),
+                            live_btc=uchk.get("live_btc"),
+                            edge_usd=round(uchk["edge_usd"], 2),
+                            up_gui=up_gui,
+                            dn_gui=dn_gui,
+                        )
+                        append_research(RESEARCH_FILE, {
+                            "event": "decision_skip_side",
+                            "condition_id": cond,
+                            "slug": getattr(m, "slug", None),
+                            "question": m.question,
+                            "start_ts": m.start_ts,
+                            "end_ts": m.end_ts,
+                            "up_gui": up_gui,
+                            "dn_gui": dn_gui,
+                            "book_wanted": "up" if up_winning else "down",
+                            **{k: uchk.get(k) for k in (
+                                "ptb", "live_btc", "edge_usd", "favored", "ptb_source",
+                                "live_source", "live_age_s", "ptb_skew_ms",
+                                "feed", "feed_label", "resolution_url",
+                            )},
+                        })
+                        continue
+
+                if not (up_buy or dn_buy):
+                    continue
+
+                buy_token = m.up_token if up_buy else m.dn_token
+                buy_ask = up_ask if up_buy else dn_ask
+                buy_leg = "up" if up_buy else "down"
+                buy_gui = up_gui if up_buy else dn_gui
+
+                # Cooldown (empty FAKs use the short empty_fak_cooldown_s).
+                last_buy_at = meta.get("last_buy_at") or 0
+                cooldown_s = (
+                    float(EMPTY_FAK_COOLDOWN_S)
+                    if meta.get("last_buy_empty")
+                    else float(BUY_COOLDOWN_S)
+                )
+                if now_ms - last_buy_at < cooldown_s * 1000:
+                    continue
+
+                _ttm_disp = f"{minutes_left*60:>3.0f}s" if minutes_left < 1 else f"{minutes_left:>4.1f}m"
+                console.print(Panel(
+                    f"  [bright_white]{m.question}[/]\n"
+                    f"  [bright_green]UP[/]   gui [bold]{up_gui:.3f}[/]  ask [bold]{up_ask or 0:.3f}[/]   │   "
+                    f"[bright_red]DN[/]  gui [bold]{dn_gui:.3f}[/]  ask [bold]{dn_ask or 0:.3f}[/]   │   "
+                    f"[bold green]TTM {_ttm_disp}[/]",
+                    title=f"[bold bright_green]▲ BUY TRIGGER — {buy_leg.upper()} LEG[/]",
+                    border_style="bright_green",
+                    box=box.HEAVY,
+                ))
+
+                tick = get_tick_size_cached(buy_token)
+                spend_usd = min(float(BUY_BUDGET), float(BUY_MAX_SPEND))
+                if uchk is None and m.start_ts:
+                    uchk = btc_feed.underlying_check(m.start_ts, 0)  # snapshot only
                 log_event(
-                    "buy_success", condition_id=cond, leg=buy_leg, bought=bought,
-                    price=meta["fill_price"], ask_gate=buy_ask, entry_cost=meta["pnl_entry_cost"],
-                    ptb=meta.get("ptb"), live_btc=meta.get("entry_live_btc"),
-                    edge_usd=meta.get("entry_edge_usd"),
-                    toxic_fill=bool(meta.get("toxic_fill")),
+                    "buy_attempt", condition_id=cond, leg=buy_leg, budget=spend_usd,
+                    ask=buy_ask, gui=buy_gui, up_gui=up_gui, dn_gui=dn_gui,
+                    threshold=BUY_THRESHOLD, minutes_left=round(minutes_left, 2),
+                    ptb=(uchk or {}).get("ptb"),
+                    live_btc=(uchk or {}).get("live_btc"),
+                    edge_usd=(uchk or {}).get("edge_usd"),
+                    ptb_source=(uchk or {}).get("ptb_source"),
+                    live_source=(uchk or {}).get("live_source"),
                 )
                 append_research(RESEARCH_FILE, {
-                    "event": "buy_fill",
+                    "event": "buy_attempt",
                     "condition_id": cond,
                     "slug": getattr(m, "slug", None),
                     "question": m.question,
                     "start_ts": m.start_ts,
                     "end_ts": m.end_ts,
                     "leg": buy_leg,
-                    "bought": bought,
-                    "price": meta["fill_price"],
-                    "ask_gate": buy_ask,
-                    "entry_cost": meta["pnl_entry_cost"],
-                    "ptb": meta.get("ptb"),
-                    "live_btc": meta.get("entry_live_btc"),
-                    "edge_usd": meta.get("entry_edge_usd"),
-                    "ptb_source": meta.get("ptb_source"),
-                    "toxic_fill": bool(meta.get("toxic_fill")),
+                    "ask": buy_ask,
+                    "gui": buy_gui,
+                    "up_gui": up_gui,
+                    "dn_gui": dn_gui,
+                    "minutes_left": round(minutes_left, 2),
+                    **{k: (uchk or {}).get(k) for k in (
+                        "ptb", "live_btc", "edge_usd", "favored", "ptb_source",
+                        "live_source", "live_age_s", "ptb_skew_ms",
+                        "feed", "feed_label", "resolution_url",
+                    )},
                 })
-                if meta.get("toxic_fill"):
+
+                def _persist_buy_fill(filled_total, spent_total):
+                    # Durable save after every confirmed attempt (crash between retries).
+                    avg = (spent_total / filled_total) if filled_total > 0 else float(buy_ask or 0)
+                    if spent_total <= 0 and filled_total > 0:
+                        spent_total = min(
+                            float(spend_usd),
+                            filled_total * float(buy_ask or BUY_THRESHOLD),
+                        )
+                        avg = spent_total / filled_total if filled_total else avg
+                    quoted = meta.get("quoted_buy_shares")
+                    _, force_exit = classify_buy_fill(
+                        avg, filled_total, quoted, BUY_THRESHOLD, TOXIC_FORCE_EXIT_BELOW,
+                    )
+                    meta["last_buy_at"] = time.time() * 1000
+                    meta["bought_token"] = buy_token
+                    meta.pop("last_buy_empty", None)
+                    meta["bought_leg"] = buy_leg
+                    meta["bought_size"] = filled_total
+                    meta["fill_price"] = round(avg, 4)
+                    meta["pnl_entry_cost"] = round(spent_total, 4)
+                    meta["toxic_fill"] = bool(force_exit)
+                    leg_key = "up" if buy_leg == "up" else "dn"
+                    _cached_positions.setdefault(cond, {})[leg_key] = {
+                        "asset": buy_token,
+                        "size": float(filled_total),
+                        "redeemable": False,
+                        "avgPrice": float(avg),
+                    }
+                    save_json(STATE_FILE, positions_meta)
+
+                def _clear_buy_uncertain():
+                    clear_uncertain_fields(meta, _BUY_UNCERTAIN_KEYS)
+
+                def _persist_buy_submit(
+                    baseline, attempt, spend_cap, submit_price, intent,
+                ):
+                    # Write-ahead quarantine: this must reach disk before the POST.
+                    # A crash or accepted-then-timeout can then never unlock a
+                    # duplicate full-budget order on restart.
+                    submit_ms = time.time() * 1000
+                    meta["buy_uncertain"] = True
+                    meta["buy_uncertain_at"] = submit_ms
+                    meta["buy_uncertain_token"] = buy_token
+                    meta["buy_uncertain_leg"] = buy_leg
+                    meta["buy_uncertain_baseline"] = float(baseline)
+                    meta["buy_uncertain_attempt"] = int(attempt)
+                    meta["buy_uncertain_spend"] = round(float(spend_cap), 4)
+                    meta["buy_uncertain_price"] = round(float(submit_price), 4)
+                    meta["buy_uncertain_order_id"] = intent["order_id"]
+                    # Never decode taker_amount as share size — BUY taker can be
+                    # USDC and a 2.50 "share" quote false-toxics a real 3-sh fill.
+                    quoted_shares = finite_float(intent.get("quoted_shares"), minimum=0)
+                    if quoted_shares is None or quoted_shares < 0.01:
+                        quoted_shares = (
+                            float(spend_cap) / max(float(submit_price), 1e-9)
+                        )
+                    meta["quoted_buy_shares"] = float(quoted_shares)
+                    meta["buy_uncertain_order_size"] = float(quoted_shares)
+                    trade_ids = _string_list(
+                        intent.get("trade_ids") or intent.get("tradeIDs")
+                    )
+                    if trade_ids:
+                        meta["buy_uncertain_trade_ids"] = trade_ids
+                    meta["buy_uncertain_known_size"] = float(
+                        meta.get("bought_size") or 0
+                    )
+                    meta["buy_uncertain_known_cost"] = float(
+                        meta.get("pnl_entry_cost") or 0
+                    )
+                    meta["last_buy_at"] = submit_ms
+                    save_json(STATE_FILE, positions_meta)
+
+                bought, spent, buy_status = buy_market_with_retry(
+                    buy_token, spend_usd, BUY_MAX_PRICE, tick_size=tick, min_price=BUY_THRESHOLD,
+                    on_fill=_persist_buy_fill, on_submit=_persist_buy_submit,
+                    condition_id=cond,
+                )
+                wall_ms = time.time() * 1000
+                if bought > 0:
+                    if buy_status != "ambiguous":
+                        _clear_buy_uncertain()
+                    if spent <= 0:
+                        spent = min(
+                            float(spend_usd),
+                            bought * float(buy_ask or BUY_THRESHOLD),
+                        )
+                    avg_fill = implied_buy_average(spent, bought, buy_ask)
+                    quoted = meta.get("quoted_buy_shares")
+                    _, force_exit = classify_buy_fill(
+                        avg_fill, bought, quoted, BUY_THRESHOLD, TOXIC_FORCE_EXIT_BELOW,
+                    )
+                    meta["last_buy_at"] = wall_ms
+                    meta["bought_token"] = buy_token
+                    meta.pop("last_buy_empty", None)
+                    meta["bought_leg"] = buy_leg
+                    meta["bought_size"] = bought
+                    meta["fill_price"] = round(avg_fill, 4)
+                    meta["pnl_entry_cost"] = round(spent, 4)
+                    meta["toxic_fill"] = bool(force_exit)
+                    if uchk:
+                        meta["ptb"] = uchk.get("ptb")
+                        meta["ptb_source"] = uchk.get("ptb_source")
+                        meta["entry_live_btc"] = uchk.get("live_btc")
+                        meta["entry_edge_usd"] = uchk.get("edge_usd")
+                    log_event(
+                        "buy_success", condition_id=cond, leg=buy_leg, bought=bought,
+                        price=meta["fill_price"], ask_gate=buy_ask, entry_cost=meta["pnl_entry_cost"],
+                        ptb=meta.get("ptb"), live_btc=meta.get("entry_live_btc"),
+                        edge_usd=meta.get("entry_edge_usd"),
+                        toxic_fill=bool(meta.get("toxic_fill")),
+                    )
+                    append_research(RESEARCH_FILE, {
+                        "event": "buy_fill",
+                        "condition_id": cond,
+                        "slug": getattr(m, "slug", None),
+                        "question": m.question,
+                        "start_ts": m.start_ts,
+                        "end_ts": m.end_ts,
+                        "leg": buy_leg,
+                        "bought": bought,
+                        "price": meta["fill_price"],
+                        "ask_gate": buy_ask,
+                        "entry_cost": meta["pnl_entry_cost"],
+                        "ptb": meta.get("ptb"),
+                        "live_btc": meta.get("entry_live_btc"),
+                        "edge_usd": meta.get("entry_edge_usd"),
+                        "ptb_source": meta.get("ptb_source"),
+                        "toxic_fill": bool(meta.get("toxic_fill")),
+                    })
+                    if meta.get("toxic_fill"):
+                        notify(
+                            "TOXIC BUY — FORCE EXIT",
+                            f"{m.question}\nBelow-band fill {buy_leg.upper()} at "
+                            f"~{meta['fill_price']:.3f} ({bought:.2f} shares, ${spent:.2f})\n"
+                            "Will not ride to $1 — dumping at next usable bid",
+                            priority="urgent",
+                        )
+                    else:
+                        notify(
+                            "BUY FILLED / UNCERTAIN" if buy_status == "ambiguous" else "BUY FILLED",
+                            f"{m.question}\nBought {buy_leg.upper()} at ~{meta['fill_price']:.3f} "
+                            f"({bought:.2f} shares, ${spent:.2f})"
+                            + ("\nFinal POST unresolved; market remains quarantined" if buy_status == "ambiguous" else ""),
+                            priority="urgent" if buy_status == "ambiguous" else "high",
+                        )
+                    save_json(STATE_FILE, positions_meta)
+                elif buy_status == "ambiguous":
+                    # on_submit already durably wrote the baseline and token before
+                    # the POST. Refresh only audit fields; do not discard baseline.
+                    meta["buy_uncertain"] = True
+                    meta["buy_uncertain_at"] = wall_ms
+                    meta["buy_uncertain_token"] = buy_token
+                    meta["buy_uncertain_leg"] = buy_leg
+                    meta["last_buy_at"] = wall_ms
+                    meta.pop("last_buy_empty", None)
+                    log_event(
+                        "buy_uncertain", condition_id=cond, leg=buy_leg, budget=spend_usd,
+                        ask=buy_ask, token_id=buy_token,
+                    )
                     notify(
-                        "TOXIC BUY — FORCE EXIT",
-                        f"{m.question}\nBelow-band fill {buy_leg.upper()} at "
-                        f"~{meta['fill_price']:.3f} ({bought:.2f} shares, ${spent:.2f})\n"
-                        "Will not ride to $1 — dumping at next usable bid",
+                        "BUY UNCERTAIN",
+                        f"{m.question}\nAmbiguous POST on {buy_leg.upper()} — quarantined until reconciled",
                         priority="urgent",
                     )
+                    save_json(STATE_FILE, positions_meta)
                 else:
-                    notify(
-                        "BUY FILLED / UNCERTAIN" if buy_status == "ambiguous" else "BUY FILLED",
-                        f"{m.question}\nBought {buy_leg.upper()} at ~{meta['fill_price']:.3f} "
-                        f"({bought:.2f} shares, ${spent:.2f})"
-                        + ("\nFinal POST unresolved; market remains quarantined" if buy_status == "ambiguous" else ""),
-                        priority="urgent" if buy_status == "ambiguous" else "high",
-                    )
-                save_json(STATE_FILE, positions_meta)
-            elif buy_status == "ambiguous":
-                # on_submit already durably wrote the baseline and token before
-                # the POST. Refresh only audit fields; do not discard baseline.
-                meta["buy_uncertain"] = True
-                meta["buy_uncertain_at"] = wall_ms
-                meta["buy_uncertain_token"] = buy_token
-                meta["buy_uncertain_leg"] = buy_leg
-                meta["last_buy_at"] = wall_ms
-                meta.pop("last_buy_empty", None)
+                    # Every submitted attempt was explicitly terminal (or no POST
+                    # happened), so remove the temporary write-ahead quarantine.
+                    _clear_buy_uncertain()
+                    meta["last_buy_at"] = wall_ms
+                    if buy_status == "empty":
+                        meta["last_buy_empty"] = True
+                    else:
+                        meta.pop("last_buy_empty", None)
+                    log_event("buy_fail", condition_id=cond, leg=buy_leg, budget=spend_usd, ask=buy_ask, status=buy_status)
+                    save_json(STATE_FILE, positions_meta)
+            except Exception as exc:
                 log_event(
-                    "buy_uncertain", condition_id=cond, leg=buy_leg, budget=spend_usd,
-                    ask=buy_ask, token_id=buy_token,
+                    "cycle_error",
+                    condition_id=cond,
+                    error=f"{type(exc).__name__}: {exc}"[:180],
+                    traceback=traceback.format_exc(),
                 )
-                notify(
-                    "BUY UNCERTAIN",
-                    f"{m.question}\nAmbiguous POST on {buy_leg.upper()} — quarantined until reconciled",
-                    priority="urgent",
-                )
-                save_json(STATE_FILE, positions_meta)
-            else:
-                # Every submitted attempt was explicitly terminal (or no POST
-                # happened), so remove the temporary write-ahead quarantine.
-                _clear_buy_uncertain()
-                meta["last_buy_at"] = wall_ms
-                if buy_status == "empty":
-                    meta["last_buy_empty"] = True
-                else:
-                    meta.pop("last_buy_empty", None)
-                log_event("buy_fail", condition_id=cond, leg=buy_leg, budget=spend_usd, ask=buy_ask, status=buy_status)
-                save_json(STATE_FILE, positions_meta)
+                console.print(Panel(
+                    f"[bright_white]{type(exc).__name__}: {exc}[/]\n"
+                    f"[dim]condition_id={cond}[/]",
+                    title="[bold bright_red]■■  MARKET FAULT  ■■[/]",
+                    subtitle="[dim]this market skipped · continuing poll[/]",
+                    border_style="bright_red",
+                    box=box.HEAVY_EDGE,
+                ))
+                continue
 
         # ================= REDEEM STATUS (ASYNC / LOW PRIORITY) =================
         _redeem_dirty = False
@@ -4946,7 +5006,7 @@ while not _shutdown_requested:
         console.print(Panel(
             traceback.format_exc(),
             title="[bold bright_red]■■  SYSTEM FAULT  ■■[/]",
-            subtitle="[dim]cycle aborted · remaining markets skipped this poll[/]",
+            subtitle="[dim]cycle aborted · exception outside per-market hedge/buy loop[/]",
             border_style="bright_red",
             box=box.HEAVY_EDGE,
         ))
