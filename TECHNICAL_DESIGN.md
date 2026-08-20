@@ -68,8 +68,8 @@ trades a different market cadence and uses a different resolution oracle.
 | Series slug | `btc-up-or-down-15m` | `btc-up-or-down-5m` | `btc-up-or-down-hourly` |
 | Slug prefix / excludes | `btc-updown` (excl. `btc-updown-5m`, `bitcoin-up-or-down`) | `btc-updown-5m` (excl. `bitcoin-up-or-down`) | `bitcoin-up-or-down` (excl. `btc-updown`, `btc-updown-5m`) |
 | Resolution oracle | Chainlink BTC TWAP 60s | Chainlink BTC TWAP 30s | Binance BTCUSDT |
-| Buy window | final 4.0 min (`buy_window_min`) | last 120s 75–90¢; first 3 min >90¢; first 4 min ≥95¢ | final 13.0 min (`buy_window_min`) |
-| Ask band | 75–90¢ | 75–90¢ late; >90–99¢ first 3 min; ≥95–99¢ first 4 min | 75–90¢ |
+| Buy window | final 4.0 min (`buy_window_min`) | last 120s 75–90¢; first 3 min ≥90¢; first 4 min ≥95¢ | final 13.0 min (`buy_window_min`) |
+| Ask band | 75–90¢ | 75–90¢ late; 90–99¢ first 3 min; ≥95–99¢ first 4 min | 75–90¢ |
 | Budget / market | $2.50 USDC | $2.50 USDC | $2.50 USDC |
 | Hedge trigger | 35/40/15 book **+** inverted GUI/last trade | **50/55/15** + inverted GUI | 35/40/15 book **+** inverted GUI/last trade |
 | Tick size | 0.01 | 0.001 | 0.01 |
@@ -377,7 +377,7 @@ paths. Templates are `strategy_buy.example.json`,
 | Key | Default (15m/5m/hr) | Meaning |
 |---|---|---|
 | `buy_threshold` / `buy_max_price` | 0.75 / 0.90 | Trigger ≥75¢; hard ceiling 90¢ in the late window (prefer fills near 75¢) |
-| `early_buy_start_s` / `early_buy_max_price` (5m) | 300 / 0.99 | First 3 min of a 5m market: buy winning ask **above** 90¢, cap 99¢. Same GUI/book/underlying gates. Empty if `early_buy_start_s` equals `buy_start_s`. |
+| `early_buy_start_s` / `early_buy_max_price` (5m) | 300 / 0.99 | First 3 min of a 5m market: buy winning ask **≥ 90¢**, cap 99¢. Same GUI/book/underlying gates. Empty if `early_buy_start_s` equals `buy_start_s`. |
 | `early_95_start_s` / `early_95_min_s` / `early_95_min_price` (5m) | 300 / 60 / 0.95 | First 4 min: buy winning ask **≥ 95¢** while TTM is [60, 300]. Overlaps the late window so 95¢+ can buy in the last 120s too. |
 | `min_winner_bid` / `max_loser_bid` / `min_bid_edge` | 0.70 / 0.30 / 0.05 | GUI consensus gate (aligned to 75¢ band) |
 | `max_entry_spread` | 0.05 | Max ask−bid on winner at entry |
@@ -531,7 +531,7 @@ integrity, oracle edge, settlement finality, quarantine) remain authoritative.
 1. **Three copies, not a library.** A bug fix in `buybot.py` almost certainly applies
    to `buybot5m.py` and `buybothourly.py`. Diff the siblings after any logic change.
 2. **5m uses seconds; 15m/hourly use minutes.** The 5m loop keys on
-   `seconds_left`/`buy_start_s` (120 s late) / `early_buy_start_s` (300 s, ask > 90¢), the others on `minutes_left`/`buy_window_min`.
+   `seconds_left`/`buy_start_s` (120 s late) / `early_buy_start_s` (300 s, ask ≥ 90¢), the others on `minutes_left`/`buy_window_min`.
    Propagating window logic across families without converting units has caused
    production NameErrors.
 3. **Slug excludes are load-bearing.** `btc-updown` is a prefix of `btc-updown-5m`;

@@ -144,7 +144,7 @@ _STRATEGY_DEFAULTS = {
     # Trigger at 75¢: buy as soon as the winning ask is ≥ 75¢, priced at the
     # live ask (so early catches ≈ 75¢). buy_max_price is a hard ceiling only
     # in the last 120s — never pay above 90¢ there. First 3 minutes of a 5m
-    # market (TTM 120–300s) may buy *above* 90¢ up to early_buy_max_price.
+    # market (TTM 120–300s) may buy at 90¢ or above up to early_buy_max_price.
     # First 4 minutes (TTM 60–300s) may also buy at 95¢ or greater.
     "buy_threshold": 0.75,
     "buy_max_price": 0.90,
@@ -181,7 +181,7 @@ _STRATEGY_DEFAULTS = {
     # alone is not consensus (same lesson as not buying a random ask).
     "hedge_require_gui": True,
     "buy_start_s": 120,
-    # Whole 5m market: last 120s stays 75–90¢; TTM (120, 300] buys ask > 90¢.
+    # Whole 5m market: last 120s stays 75–90¢; TTM (120, 300] buys ask ≥ 90¢.
     "early_buy_start_s": 300,
     "early_buy_max_price": 0.99,
     # First 4 minutes of a 5m market: TTM [60, 300], ask >= 95¢.
@@ -605,7 +605,7 @@ def log_buy_skip_throttled(reason, condition_id, event="buy_skip", **kwargs):
 
 
 def current_entry_bands(seconds_left):
-    """Open 5m buy bands at this TTM (late 75–90, early >90, first-4-min ≥95)."""
+    """Open 5m buy bands at this TTM (late 75–90, early ≥90, first-4-min ≥95)."""
     return applicable_entry_bands(
         seconds_left,
         late_start_s=BUY_START_S,
@@ -4403,7 +4403,7 @@ while not _shutdown_requested:
                     continue  # already hold this market
                 bands = current_entry_bands(seconds_left)
                 if not bands:
-                    continue  # not in late 75–90¢, early >90¢, or first-4-min ≥95¢
+                    continue  # not in late 75–90¢, early ≥90¢, or first-4-min ≥95¢
                 note_buy_window(
                     cond, m.end_ts, seconds_left, slug=getattr(m, "slug", None),
                     window=",".join(b.name for b in bands),

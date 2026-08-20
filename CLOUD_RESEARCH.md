@@ -44,7 +44,7 @@ Hard rules:
 - Do not read, write, or ask for .env. Do not set dry_run false.
 - Do not edit strategy_buy.json / strategy_buy5m.json / strategy_buyhourly.json
   (non-example). Template is strategy_buy5m.example.json (75–90¢ last 120s,
-  >90 first 3 min, ≥95 first 4 min, $2.50, 50/55/15, GUI on, spread cap 5¢).
+  ≥90 first 3 min, ≥95 first 4 min, $2.50, 50/55/15, GUI on, spread cap 5¢).
 - pathlog.py is allowed (recorder only). check_book.py is allowed.
 - Gamma GET and CLOB GET only: gamma-api.polymarket.com, clob.polymarket.com.
 

@@ -122,25 +122,26 @@ class EarlyAboveNinetyBandTests(unittest.TestCase):
         band = self._band(120)
         self.assertEqual(band.name, "late")
 
-    def test_first_three_minutes_buy_only_above_90(self):
+    def test_first_three_minutes_buy_90_or_above(self):
         band = self._band(240)
         self.assertEqual(band.name, "early")
-        self.assertTrue(band.min_exclusive)
-        self.assertFalse(ask_in_entry_band(0.80, *band[:2], min_exclusive=True))
-        self.assertFalse(ask_in_entry_band(0.90, *band[:2], min_exclusive=True))
-        self.assertTrue(ask_in_entry_band(0.901, *band[:2], min_exclusive=True))
-        self.assertTrue(ask_in_entry_band(0.99, *band[:2], min_exclusive=True))
-        self.assertFalse(ask_in_entry_band(0.991, *band[:2], min_exclusive=True))
+        self.assertFalse(band.min_exclusive)
+        self.assertFalse(ask_in_entry_band(0.80, *band[:2], min_exclusive=False))
+        self.assertFalse(ask_in_entry_band(0.89, *band[:2], min_exclusive=False))
+        self.assertTrue(ask_in_entry_band(0.90, *band[:2], min_exclusive=False))
+        self.assertTrue(ask_in_entry_band(0.91, *band[:2], min_exclusive=False))
+        self.assertTrue(ask_in_entry_band(0.99, *band[:2], min_exclusive=False))
+        self.assertFalse(ask_in_entry_band(0.991, *band[:2], min_exclusive=False))
 
     def test_ttm_300_is_early_horizon(self):
         self.assertEqual(self._band(300).name, "early")
         self.assertIsNone(self._band(301))
 
-    def test_retry_min_rejects_exactly_90_in_early_window(self):
+    def test_retry_min_allows_exactly_90_in_early_window(self):
         band = self._band(180)
-        self.assertGreater(band.retry_min_price, 0.90)
-        self.assertFalse(0.90 >= band.retry_min_price)
-        self.assertTrue(0.901 >= band.retry_min_price)
+        self.assertEqual(band.retry_min_price, 0.90)
+        self.assertFalse(0.90 < band.retry_min_price)
+        self.assertTrue(0.89 < band.retry_min_price)
 
     def test_equal_horizons_disable_early_window(self):
         self.assertIsNone(
@@ -155,11 +156,11 @@ class EarlyAboveNinetyBandTests(unittest.TestCase):
             )
         )
 
-    def test_early_90_ask_is_below_band_not_above(self):
+    def test_early_89_ask_is_below_band(self):
         self.assertEqual(
             window_no_buy_reason(
-                up_ask=0.90,
-                dn_ask=0.10,
+                up_ask=0.89,
+                dn_ask=0.11,
                 up_winning=True,
                 dn_winning=False,
                 up_ask_ok=False,
@@ -170,7 +171,7 @@ class EarlyAboveNinetyBandTests(unittest.TestCase):
                 dn_buy=False,
                 threshold=0.90,
                 max_price=0.99,
-                min_exclusive=True,
+                min_exclusive=False,
             ),
             "ask_below_band",
         )
@@ -191,11 +192,12 @@ class FirstFourMinutesAt95Tests(unittest.TestCase):
             early_95_min=0.95,
         )
 
-    def test_first_three_minutes_still_allow_above_90(self):
+    def test_first_three_minutes_allow_90_or_above(self):
         bands = self._bands(240)
+        self.assertTrue(ask_in_any_band(0.90, bands))
         self.assertTrue(ask_in_any_band(0.91, bands))
         self.assertTrue(ask_in_any_band(0.95, bands))
-        self.assertFalse(ask_in_any_band(0.90, bands))
+        self.assertFalse(ask_in_any_band(0.89, bands))
         self.assertFalse(ask_in_any_band(0.80, bands))
 
     def test_last_120s_allows_75_90_or_95_plus(self):

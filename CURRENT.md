@@ -4,8 +4,8 @@
 Do not put secrets, API keys, or live wallet material here.
 
 Last updated: **2026-08-20** — **only the 5m CLOB bot is live.** Stop/disable
-15m and hourly. Keep the **$2.50** 5m triggers: **75–90¢ in the last 120s**, **above 90¢
-(to 99¢) in the first 3 minutes**, and **≥95¢ in the first 4 minutes**.
+15m and hourly. Keep the **$2.50** 5m triggers: **75–90¢ in the last 120s**, **90¢
+or above (to 99¢) in the first 3 minutes**, and **≥95¢ in the first 4 minutes**.
 Hedge is **50/55**. Chainlink TWAP
 gate is **$0** (any non-zero tick vs PTB; side must match; flat is still
 refused). Buys are **limit
@@ -29,7 +29,7 @@ mint complete sets. Operator still sells leftover mint inventory by hand.
 will not be auto-hedged or redeemed by those processes.
 
 **Active strategy:** **5m only** (`polybuybot5m`) with the **$2.50** late
-**75–90¢** band, early **>90¢** in the first 3 minutes, and **≥95¢** in the
+**75–90¢** band, early **≥90¢** in the first 3 minutes, and **≥95¢** in the
 first 4 minutes:
 
 | Knob | Value |
@@ -37,10 +37,10 @@ first 4 minutes:
 | `buy_budget` | **$2.50** / market |
 | `buy_max_spend` | **$3.00** hard ceiling (strategy is $2.50; never more than ~$3) |
 | `buy_max_shares` | **5** buffer (~3.3 sh at $2.50/75¢) |
-| Ask band | **75–90¢** in the last **120s**. First **3 min** (TTM 120–300s): winning ask **> 90¢** up to 99¢. First **4 min** (TTM 60–300s): also **≥ 95¢**. Same GUI / book / underlying gates. |
+| Ask band | **75–90¢** in the last **120s**. First **3 min** (TTM 120–300s): winning ask **≥ 90¢** up to 99¢. First **4 min** (TTM 60–300s): also **≥ 95¢**. Same GUI / book / underlying gates. |
 | Execution | FAK **limit** at the quoted ask, size `min(budget/ask, buy_max_shares)`. A clean **unmatched 400** re-quotes up to **3** FAKs in one trigger; then **0.15 s** cooldown. Unclear POSTs still quarantine (no second $2.50). |
 | GUI consensus | winner ≥ 70¢, loser ≤ 30¢ |
-| Windows | 5m **whole market**: early >90¢ for TTM (120, 300]; ≥95¢ for TTM [60, 300]; late 75–90¢ for TTM ≤ 120s (15m / hourly bots **not running**) |
+| Windows | 5m **whole market**: early ≥90¢ for TTM (120, 300]; ≥95¢ for TTM [60, 300]; late 75–90¢ for TTM ≤ 120s (15m / hourly bots **not running**) |
 | Hedge | **Trigger** bid ≤ **50¢** and ask ≤ **55¢**, spread ≤ 15¢, **plus** inverted buy GUI (held last trade ≤ 55¢, held GUI ≤ 30¢, other GUI ≥ 70¢). **Then sell at whatever the bid is** — no 32¢ floor. `toxic_fill` still dumps without GUI **only while held bid ≤ 50¢**; recovered books log `hedge_skip_toxic_recovered` and stay armed. |
 | Underlying edge | **$0** (5m: any non-zero TWAP vs PTB) / **$10** (15m, hourly); side must match |
 | `max_open_positions` | **0 = unlimited** |

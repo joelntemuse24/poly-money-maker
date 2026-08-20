@@ -34,7 +34,7 @@ def entry_band_for_seconds(
     early_95_min_s: float = 0.0,
     early_95_min: float = 0.95,
 ) -> Optional[EntryBand]:
-    """Primary band for this TTM (late, then >90 early, then ≥95).
+    """Primary band for this TTM (late, then ≥90 early, then ≥95).
 
     Prefer ``applicable_entry_bands`` when more than one window can fire
     (last 120s 75–90¢ and first-4-min ≥95¢ overlap).
@@ -71,7 +71,7 @@ def applicable_entry_bands(
 
     Late: ``seconds_left <= late_start_s`` → inclusive 75–90¢.
 
-    Early >90: ``late_start_s < seconds_left <= early_start_s`` → ask *above*
+    Early ≥90: ``late_start_s < seconds_left <= early_start_s`` → ask at least
     90¢ (first 3 minutes of a 5m market).
 
     Early ≥95: ``early_95_min_s <= seconds_left <= early_95_start_s`` → ask
@@ -92,7 +92,7 @@ def applicable_entry_bands(
     if ttm <= late_s + 1e-12:
         bands.append(EntryBand(float(late_min), float(late_max), False, "late"))
     if early_s > late_s + 1e-12 and late_s + 1e-12 < ttm <= early_s + 1e-12:
-        bands.append(EntryBand(float(early_min), float(early_max), True, "early"))
+        bands.append(EntryBand(float(early_min), float(early_max), False, "early"))
     if (
         early_95_s > early_95_floor + 1e-12
         and early_95_floor - 1e-12 <= ttm <= early_95_s + 1e-12
