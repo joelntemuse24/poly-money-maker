@@ -1,768 +1,1047 @@
-# Poly Money Maker — Technical Design Document
+# Poly Money Maker — Technical Design
 
-> **Audience:** A beginner-to-intermediate Python programmer who can read a
-> script, a JSON file, and a systemd unit, and who needs to **operate or
-> change a live trading bot without losing money**. Dense on purpose: the
-> constraints are the design.
->
-> **Three docs, three jobs:**
-> - `CURRENT.md` — what is live on the VM *today* (probe knobs, stop/start).
-> - `AGENTS.md` — agent quick-ref (never-do, file map, how to verify).
-> - This file — how the system is built and why.
+This document is the **guided tour of the live system**. It is written for
+someone who can follow Python with some help, not for a compiler.
 
-Live trading is **5-minute CLOB only** (`polybuybot5m`). 15m and hourly bots
-exist in the repo and on disk but are **stopped**. Pathlog is running (no
-orders). Mint is paused. Do not start the stopped units unless the operator
+If a word is jargon, it is defined the first time it appears. If a piece of
+code exists only to satisfy Python or the exchange, it is named and skipped.
+If a piece of code exists because **real money** or **Polymarket’s weirdness**
+forced a design, it is explained until the “why” is obvious.
+
+**Three docs, three jobs:**
+
+| File | Job |
+|---|---|
+| `CURRENT.md` | What is live **today** (knobs, start/stop). Short. Change it when ops change. |
+| `AGENTS.md` | Cheat sheet for coding agents (never-do, file map, how to verify). |
+| **This file** | How the program is built, what the important code does, and why. |
+
+Live trading is **only** the 5-minute buy bot (`buybot5m.py` / systemd
+`polybuybot5m`) plus a recorder that never places orders (`pathlog.py` /
+`polypathlog`). The 15-minute and hourly bots exist as near-copies and are
+**stopped**. Minting is **paused**. Do not start those unless the operator
 asks.
 
 ---
 
-## Table of Contents
+## Table of contents
 
-1. [What the System Does](#1-what-the-system-does)
-2. [Live vs Repo at a Glance](#2-live-vs-repo-at-a-glance)
-3. [Architecture](#3-architecture)
-4. [Market Discovery](#4-market-discovery)
-5. [Underlying Oracle Feeds & PTB](#5-underlying-oracle-feeds--ptb)
-6. [The Buy Decision](#6-the-buy-decision)
-7. [The Hedge (Sell-Only Exit)](#7-the-hedge-sell-only-exit)
-8. [Redemption](#8-redemption)
-9. [State, P&L, and Garbage Collection](#9-state-pl-and-garbage-collection)
-10. [Configuration & Hot Reload](#10-configuration--hot-reload)
-11. [Operations on the VM](#11-operations-on-the-vm)
-12. [Error Handling Philosophy](#12-error-handling-philosophy)
-13. [Latency, Disk, and Optional AI](#13-latency-disk-and-optional-ai)
-14. [Landmines](#14-landmines)
-15. [Testing & Research Tools](#15-testing--research-tools)
-16. [Removed / Historical](#16-removed--historical)
-17. [Glossary](#17-glossary)
+**Part I — Picture**
 
----
+1. [What the program is trying to do](#1-what-the-program-is-trying-to-do)
+2. [The computer, the wallet, and the files](#2-the-computer-the-wallet-and-the-files)
+3. [Map of the repository](#3-map-of-the-repository)
 
-## 1. What the System Does
+**Part II — Ideas the code assumes**
 
-Polymarket lists Bitcoin **"Up or Down"** binary markets. Each market asks:
-will BTC be up or down versus a **Price To Beat** at the end of a window
-(5 minutes, 15 minutes, or 1 hour)? A market has two **legs** (UP and DOWN
-tokens). Exactly one leg **wins** and can be redeemed on-chain for **$1.00**;
-the other is worth **$0**.
+4. [Binary markets, books, and Fill-And-Kill](#4-binary-markets-books-and-fill-and-kill)
+5. [Python shape of the bots](#5-python-shape-of-the-bots)
+6. [Polymarket’s five systems](#6-polymarkets-five-systems)
+7. [Crash-safe JSON (the “database”)](#7-crash-safe-json-the-database)
 
-The bot does **not** make markets and does **not** leave resting orders. It
-waits until the book already looks decided, **buys the winning leg** with a
-Fill-And-Kill (FAK) limit at the quoted ask, and holds to redemption. If the
-held book **actually collapses** (not a one-tick spoof), it **hedges** —
-market-sells the position to bound the loss. There is **no profit-take sell**.
-The only sells are hedge and `toxic_fill` dump. Everything else rides to $1.00
-or $0.
+**Part III — Walking `buybot5m.py`**
 
-**Why that shape:** a 5m BTC market that is already 80¢ / 20¢ with two minutes
-left is usually “already decided.” Buying that favorite at 75–90¢ and redeeming
-at $1.00 is ~10–25¢ per share on a $2.50 clip (~3.3 shares at 75¢). Early
-**≥90¢ / ≥95¢** fills exist to catch markets that never dip into 75–90¢; their
-edge to $1.00 is thin (a 95¢ fill makes ~5¢/share if it wins). Reversals still
-happen; the hedge is the safety exit, not a second trading style.
+8. [How to read the 5,000-line file](#8-how-to-read-the-5000-line-file)
+9. [Startup: lock, secrets, rounding, CLOB client](#9-startup-lock-secrets-rounding-clob-client)
+10. [Strategy JSON and hot reload](#10-strategy-json-and-hot-reload)
+11. [Logging, notifications, tiny helpers](#11-logging-notifications-tiny-helpers)
+12. [Positions: Data API vs local ledger](#12-positions-data-api-vs-local-ledger)
+13. [Quotes: websocket vs REST](#13-quotes-websocket-vs-rest)
+14. [What “the website shows 80¢” actually means](#14-what-the-website-shows-80-actually-means)
+15. [Buy gates and the 5m price bands](#15-buy-gates-and-the-5m-price-bands)
+16. [Sizing a buy (Decimal, 2 cents, 4 dp shares)](#16-sizing-a-buy-decimal-2-cents-4-dp-shares)
+17. [Posting a buy FAK and living with the result](#17-posting-a-buy-fak-and-living-with-the-result)
+18. [The hedge (the only sell)](#18-the-hedge-the-only-sell)
+19. [Redemption at $1.00](#19-redemption-at-100)
+20. [The main loop, one cycle](#20-the-main-loop-one-cycle)
 
-**Economics (no reversal):** buy, redeem $1.00 → profit is `(1 − entry) × shares`.
-**Economics (hedged reversal):** sell at the live collapsed bid → bounded loss
-instead of riding the wrong side to $0.
+**Part IV — The rest of the system**
 
-Take-profit (“sell once we are up $0.30”) is **not** in the product. It was
-evaluated and dropped: $0.30 is unreachable on ≥90¢ entries even at $1.00, and
-cutting a still-winning 80¢→$1 ride is a different strategy.
+21. [Shared `buy/` modules](#21-shared-buy-modules)
+22. [Pathlog (no orders)](#22-pathlog-no-orders)
+23. [Tests (the bots cannot be imported)](#23-tests-the-bots-cannot-be-imported)
+24. [Operations: systemd, CI, disk](#24-operations-systemd-ci-disk)
+25. [Error handling and the `known_cost` stall](#25-error-handling-and-the-known_cost-stall)
+26. [Landmines](#26-landmines)
+27. [Removed / historical](#27-removed--historical)
+28. [Glossary](#28-glossary)
 
 ---
 
-## 2. Live vs Repo at a Glance
+## 1. What the program is trying to do
 
-**Live on the GCP VM** (`instance-20260516-185922`, `~/poly-money-maker`,
-user `ntemusejoel`): **`polybuybot5m` + `polypathlog`**. Small ~10GB e2 boot
-disk. Python 3 venv at `.venv`. Secrets in gitignored `.env`.
+Polymarket lists short Bitcoin **“Up or Down”** markets. Each market is a
+yes/no bet with a clock:
 
-| | 15m | **5m (live)** | Hourly |
-|---|---|---|---|
-| Script | `buybot.py` | `buybot5m.py` | `buybothourly.py` |
-| systemd | `polybuybot` **stopped** | `polybuybot5m` **running** | `polybuybothourly` **stopped** |
-| Series slug | `btc-up-or-down-15m` | `btc-up-or-down-5m` | `btc-up-or-down-hourly` |
-| CLOB slug prefix / excludes | `btc-updown` excl. `btc-updown-5m`, `bitcoin-up-or-down` | `btc-updown-5m` excl. `bitcoin-up-or-down` | `bitcoin-up-or-down` excl. both `btc-updown*` |
-| Resolution oracle | Chainlink BTC TWAP 60s | Chainlink BTC TWAP 30s | Binance BTCUSDT |
-| Buy windows / ask | final 4.0 min, **75–90¢** | last **120s 75–90¢**; first **3 min ≥90–99¢**; first **4 min ≥95–99¢** | final 13.0 min, **75–90¢** |
-| Budget / market | $2.50 | $2.50 (hard cap $3, share rail 5) | $2.50 |
-| Hedge trigger | 35/40/15 + inverted GUI | **50/55/15** + inverted GUI | 35/40/15 + inverted GUI |
-| Tick size | 0.01 | **0.001** | 0.01 |
-| BTC gate vs PTB | $10 | **$0** (any non-zero tick; flat still refused) | $10 |
-| Strategy / state / P&L / log | `strategy_buy.json`, `positions_buy.json`, `pnl_buy.json`, `buybot.log` | `strategy_buy5m.json`, `positions_buy5m.json`, `pnl_buy5m.json`, `buybot5m.log` | `…hourly…` |
-| Heartbeat / research / PTB | `.heartbeat_buy`, `underlying_research_buy.jsonl`, `ptb_twap60_buy.json` | `.heartbeat_buy5m`, `…buy5m.jsonl`, `ptb_twap30_buy5m.json` | hourly twins |
+> From this start time to this end time (5 minutes, 15 minutes, or 1 hour),
+> will BTC finish **up** or **down** versus a starting price?
 
-Also on the VM: `polypathlog` writes `pathlog/ticks/*.jsonl` (no keys, no
-orders). `polymintbot` is **paused/disabled**.
+That starting price is the **Price To Beat (PTB)** — the oracle print nearest
+the market’s open. At the end, **exactly one side is worth $1.00** and the
+other is worth **$0**. You do not get a partial payout on the token itself.
+(You can sell early on the order book, which is a different price.)
 
-**In the repo but not live trading:** the 15m/hourly copies (kept in lockstep
-for when they come back), `mintbot.py` (complete-set mint helper), `check_*.py`
-diagnostics, `widget/polydesk.py` (laptop glance, public Data API only),
-`tests/`, `CLOUD_RESEARCH.md` (cloud agents, no `.env`).
+A market therefore has two **tokens** (also called **legs**): UP and DOWN.
+Buying UP at 80¢ means: “I pay 80¢ now; if UP wins I redeem $1.00; if DOWN
+wins I get nothing unless I sold first.”
 
-All strategy/state/log files live in the VM working directory. State, logs,
-heartbeats, research JSONL, PTB stores, live `strategy_*.json` (no `.example`),
-and `.env` are **gitignored**. Never commit or delete them. Pathlog ticks are
-the one auto-pruned exception (14 days / 400 MB) — **export before prune**.
+**This bot does not make a market.** It does not leave orders sitting on the
+book hoping someone hits them. It waits until the book already looks decided,
+**buys the favorite**, and holds. If the favorite later looks **actually
+dead**, it **sells** (the **hedge**) to bound the loss. If the favorite wins,
+it **redeems** on-chain for $1.00 per share. There is **no** “take profit at
++$0.30” sell. That idea was considered and dropped: on a 90¢ fill you cannot
+even make $0.30 before $1.00, and on an 80¢ fill selling at 90¢ throws away
+the rest of the ride to $1.00.
+
+**Live 5m entries (union of windows):**
+
+| Time left until close (TTM) | Winning ask the bot will consider |
+|---|---|
+| More than 300 seconds | none — too early |
+| 120s < TTM ≤ 300s (first ~3 minutes) | **90¢ through 99¢** |
+| 60s ≤ TTM ≤ 300s (first ~4 minutes) | **also 95¢ through 99¢** |
+| TTM ≤ 120s (last 2 minutes) | **75¢ through 90¢**, and **also ≥95¢** while TTM ≥ 60s |
+
+**Hole:** in the last 120 seconds, **91–94¢** is not in any band. The bot
+skips those prints on purpose (`ask_out_of_band`). At TTM = 60s exactly, ≥95¢
+is still allowed. Below 60s, only 75–90¢ remains.
+
+**Budget:** $2.50 per market, hard cap $3, share rail 5 shares. At 75¢ that is
+about 3.3 shares. If that ride wins, profit is roughly
+`(1.00 − 0.75) × 3.3 ≈ $0.83` before fees. A 95¢ fill that wins is only about
+5¢ per share.
+
+**Hedge (5m):** sell only when the **held** book looks collapsed — bid ≤ 50¢
+**and** ask ≤ 55¢, spread tight — **and** the website-style prices agree that
+side actually lost. Then sell at whatever the live bid is (even 20¢). The
+15m/hourly copies still use 35¢/40¢; they are not running.
+
+Everything else in this document exists to do **that** without:
+
+- buying a fake 97¢ ask that sits over a 1¢ bid,
+- double-spending after a crashed POST,
+- selling a still-winning position because one spoof bid printed 1¢,
+- filling the 10GB VM disk,
+- or running two copies of the bot at once.
 
 ---
 
-## 3. Architecture
+## 2. The computer, the wallet, and the files
+
+**Machine:** a Google Compute Engine VM named `instance-20260516-185922`.
+Linux user `ntemusejoel`. Working directory `~/poly-money-maker`. Python
+virtualenv `.venv`. Boot disk is small (~10GB). That last sentence is why
+logs and pathlog ticks are capped.
+
+**systemd** starts processes on boot and restarts them if they die:
+
+| Unit | Script | Live? |
+|---|---|---|
+| `polybuybot5m` | `buybot5m.py` | **yes — places orders** |
+| `polypathlog` | `pathlog.py` | **yes — GET books only** |
+| `polybuybot` | `buybot.py` | stopped |
+| `polybuybothourly` | `buybothourly.py` | stopped |
+| `polymintbot` | `mintbot.py` | paused |
+
+Unit files live in `deploy/` and are copied to `/etc/systemd/system/`. The 5m
+unit loads `.env` (secrets). Pathlog’s unit does **not** — it needs no keys.
+
+**Wallet:** Polymarket uses a **proxy** address (`FUNDER_ADDRESS`) that holds
+the USDC and the outcome tokens. `PRIVATE_KEY` is the signer. CLOB API keys
+(`API_KEY` / `API_SECRET` / `API_PASSPHRASE`) authenticate HTTP to the order
+book. Relayer/Builder keys authenticate **redemption** HTTP. None of these
+belong in git. Cloud research agents never get `.env`.
+
+**Live JSON on disk (gitignored, never delete):**
+
+| File | Role |
+|---|---|
+| `strategy_buy5m.json` | Knobs. Re-read every loop. This is what the running bot uses, not the `.example` file. |
+| `positions_buy5m.json` | Open markets, fills, quarantines, redeem pending |
+| `pnl_buy5m.json` | Settled P&L rows |
+| `buybot5m.log` | One JSON object per line (rotated) |
+| `.heartbeat_buy5m` | Unix time; if it stops moving, the loop is stuck |
+| `ptb_twap30_buy5m.json` | Cached Price To Beat per market |
+| `underlying_research_buy5m.jsonl` | Buy/skip audit for later analysis |
+| `pathlog/ticks/*.jsonl` | Recorded books (auto-deleted after 14 days or 400 MB) |
+
+Templates you **may** commit: `strategy_buy5m.example.json` (and 15m/hourly
+twins). The bot **never** loads `.example`.
+
+`dry_run: true` points state/log/PTB at `*.dryrun.*` names so a paper process
+cannot smash live files. `dry_run` is chosen at **startup** because those
+paths are picked once. Other knobs hot-reload.
+
+---
+
+## 3. Map of the repository
 
 ```
- GCP VM (~10GB e2)
- ┌─────────────────────────────────────────────────────────────────┐
- │  systemd                                                        │
- │   polybuybot5m  ──► buybot5m.py     (LIVE orders)               │
- │   polypathlog   ──► pathlog.py      (GET books only)            │
- │   polybuybot    ──► buybot.py       STOPPED                     │
- │   polybuybothourly ──► buybothourly.py STOPPED                  │
- │   polymintbot   ──► mintbot.py      PAUSED                      │
- └────────────┬───────────────────────────────┬────────────────────┘
-              │                               │
-    ┌─────────v─────────┐           ┌─────────v──────────┐
-    │ buy/market.py     │           │ buy/btc_price.py   │
-    │ Gamma discovery   │           │ RTDS oracles + PTB │
-    └─────────┬─────────┘           └────────────────────┘
-              │
-    ┌─────────v──────────┐   ┌───────────────────────────┐
-    │ buy/clob_book_ws.py│   │ buy/book.py  (TOB parse)  │
-    │ CLOB market WS TOB │   │ buy/entry_skip.py (5m     │
-    └─────────┬──────────┘   │   band union, skip labels)│
-              │              └───────────────────────────┘
-              v
-   Polymarket: Gamma | CLOB REST+WS | Data API | Relayer | RTDS
+buybot5m.py          LIVE 5m bot (~5177 lines). You are usually here.
+buybot.py            15m copy (~5063). Stopped.
+buybothourly.py      Hourly copy (~5061). Stopped.
+buy/                 Importable helpers (safe — they do not start trading)
+  market.py          Find markets on Gamma
+  btc_price.py       Chainlink / Binance websocket + PTB
+  clob_book_ws.py    Fast top-of-book websocket
+  book.py            Parse bid/ask levels (price + size)
+  entry_skip.py      5m band math + skip labels (5m + tests only)
+  chain.py           Mint helper: Polygon eth_call (paused path)
+  contracts.py       Mint helper: splitPosition calldata (paused path)
+pathlog.py           Recorder, no orders
+check_*.py           Offline / log diagnostics
+tests/               unittest (CI)
+deploy/              systemd units + disk notes
+widget/polydesk.py   Laptop glance (public API, no orders)
 ```
 
-Laptop-only (not the VM): `widget/polydesk.py` polls public `/value` +
-`/positions`. Cloud agents: same repo, **no `.env`**, paper-score pathlog
-(`CLOUD_RESEARCH.md`).
+**Rule of copies:** a buy/hedge/quarantine bug in `buybot5m.py` probably
+exists in the other two files. Diff them after a logic change. The 5m-only
+exceptions are the early price bands (`buy/entry_skip.py` + `BUY_HORIZON_S`)
+and 5m defaults (hedge 50/55, BTC gate $0, tick `0.001`, windows in
+**seconds**).
 
-### 3.1 Process model (read this before the 5,000-line bots)
-
-Each buy bot is **one Python process**, **one infinite `while True` poll
-loop**, started at **module import** (there is **no** `if __name__ ==
-"__main__"`). You cannot `import buybot5m` — it would start trading. Tests
-either import the small `buy/` modules and `check_*.py`, or **extract
-function source with `ast`** from the bot file (`tests/test_buy_fill_shapes.py`).
-
-There is **no asyncio, no database, no message queue**. The loop:
-
-1. `load_strategy()` — re-read JSON if mtime changed (hot reload).
-2. Write heartbeat.
-3. Refresh Gamma markets + Data API positions (thread pool).
-4. Point the CLOB book websocket at current token IDs.
-5. Redeem + garbage-collect settled inventory.
-6. **`for m in markets`** (held positions first): hedge if held; else buy
-   gates if in window. A fault **inside** this loop logs `condition_id` and
-   **continues**. A fault **outside** (refresh/GC/redeem/UI) still aborts the
-   rest of **that** poll.
-7. Rich UI every N cycles. Sleep `poll_held_s` (0.05s) while any position is
-   held, `poll_buy_window_s` (0.1s) while a market is in the buy horizon with
-   no inventory, else ~1s idle.
-
-**Hot mode** is on when any position is open **or** any market is inside
-`BUY_HORIZON_S`. On 5m that horizon is
-`max(buy_start_s, early_buy_start_s, early_95_start_s)` (300s), so the bot
-actually looks during the first 3–4 minutes, not only the last 120s.
-
-**Threads** exist only as small pools: book REST, notifications (ntfy.sh),
-redeem status. The CLOB book WS and BTC RTDS each run a **daemon thread**
-with an in-memory cache. The main loop is still synchronous.
-
-**Process lock:** `fcntl.flock` on `/tmp/poly-money-maker-buybot5m.lock` (and
-siblings). Two live instances of the same bot would double-spend. Pathlog and
-mint use repo-local lock files.
-
-**FAK only.** Fill-And-Kill: take what is there at your limit, cancel the
-rest. No maker quotes, no “leave 2 shares on the book.” Buys are **share-sized
-limit FAKs at the quoted ask** (`budget/ask`, clipped by `buy_max_shares`).
-Sells are share-denominated FAKs at the **live bid**. A CLOB **400 "no orders
-found to match"** is proven empty: re-quote and POST again (up to 3) in the
-same trigger, then `empty_fak_cooldown_s` (0.15s). Invalid-amount / auth 400s
-and unclear POSTs do **not** retry a second budget.
-
-### 3.2 Why three copies, not a library
-
-`buybot.py` (~5063 lines), `buybot5m.py` (~5177), `buybothourly.py` (~5061)
-are near-identical copies. They differ in slug prefix/excludes, oracle
-constant, window units (**seconds on 5m, minutes on 15m/hourly**), tick size,
-defaults (hedge 50/55 vs 35/40, BTC gate $0 vs $10), and — on 5m only — the
-early-band union in `buy/entry_skip.py`.
-
-A buy/hedge/quarantine bug in one copy **probably** exists in the other two.
-Diff the siblings after a logic change. Do **not** “fix it properly” by
-importing a bot module; there is no `main` guard. Shared code that is safe to
-import lives in `buy/`.
-
-### 3.3 Shared `buy/` package (importable)
-
-| Module | Who uses it | Job |
-|---|---|---|
-| `buy/market.py` | all bots, pathlog, mint | `MarketGateway` + `MintMarket`: Gamma discovery, token IDs, end time, tick |
-| `buy/btc_price.py` | buy bots only | RTDS websocket, PTB capture, `append_research` |
-| `buy/clob_book_ws.py` | buy bots only | CLOB **market-channel** WS top-of-book cache (speed path) |
-| `buy/book.py` | WS cache, pathlog, tests | Parse CLOB levels → best bid/ask **and displayed size** |
-| `buy/entry_skip.py` | **5m bot + tests** | Band union, `ask_in_any_band`, skip labels. 15m/hourly do **not** import this |
-| `buy/chain.py` / `buy/contracts.py` | **mintbot only** | Polygon `eth_call` + `splitPosition` calldata. Not on the CLOB buy path |
-
-`buy/__init__.py` is just a version string.
-
-### 3.4 Polymarket surfaces (the idiosyncrasies that matter)
-
-The bots talk to **five different Polymarket systems**. Mixing them up is how
-you sell on a spoofed 1¢ bid.
-
-| Surface | URL-ish | What we use it for |
-|---|---|---|
-| **Gamma** | `https://gamma-api.polymarket.com` | Market catalog: slug, condition ID, token IDs, end time, later `winner` |
-| **CLOB REST** | `https://clob.polymarket.com` | `/book` (force-fresh quote before buy/hedge), `/order` POST (FAK), balances |
-| **CLOB WS** | `wss://ws-subscriptions-clob.polymarket.com/ws/market` | Fast top-of-book **arm**. Never sufficient to POST a buy or a normal hedge |
-| **Data API** | positions / value / trades | Holdings across restart, GUI-ish last trade, redeemable flag, participation CSV |
-| **RTDS** | `wss://ws-live-data.polymarket.com` | The **same** BTC series the market resolves on (TWAP 30 / TWAP 60 / Binance) |
-| **Relayer** | Builder relayer | `redeemPositions` on Polygon via proxy; we do not broadcast our own txs |
-
-**CLOB v2 amounts:** a BUY’s `makingAmount` is USDC paid, `takingAmount` is
-shares received. Entry cost is USDC spent, **not** `shares × gate ask`.
-Protocol sizing is picky: USDC **2 decimal places**, taker shares **4 dp**
-(SDK also `round_down`s some sizes to 2 dp). Wrong rounding → HTTP 400
-`invalid amounts` (`check_buy_rejects.py` counts those). Binary token prices
-are in **(0, 1)** exclusive; 5m ticks **0.001**, 15m/hourly **0.01**.
-
-**Ask ≠ tradable price.** A 97¢ ask over a 1¢ bid is a wide book, not a
-97¢ favorite. Last-trade GUI can still look like a winner. Entry requires a
-**tight REST book** (bid ≥ 70¢, spread ≤ 5¢). Hedge requires the **whole
-book** to look lost, plus inverted GUI.
-
-**Unmatched FAK:** posting at an ask that just vanished returns 400 “no orders
-found to match.” That is empty, not “error, try a second $2.50.” Re-quote in
-the same trigger; if inventory appeared anyway, that is a **ghost fill**.
-
-**Proxy wallet:** `FUNDER_ADDRESS` is the Polymarket proxy; `PRIVATE_KEY` signs
-CLOB orders and the relayer’s EIP-712 request. Builder/Relayer API keys
-authenticate HTTP. The key does not pay gas itself.
-
-### 3.5 JSON files are the database
-
-`atomic_save()` writes `.tmp`, `flush` + `fsync`, keeps a validated `.bak`,
-`os.replace`s onto the live file, then `fsync`s the directory. Non-finite
-JSON is rejected. **Before every live POST** the bot writes a crash-durable
-`buy_uncertain` / hedge-uncertain quarantine (signed order ID, token, amounts,
-pre-submit balance). Ambiguous POSTs stay quarantined; GC never deletes
-unresolved quarantine; recovery continues after expiry.
-
-`dry_run: true` points state/P&L/heartbeat/research/PTB at `*.dryrun.*` paths
-so a dry process cannot clobber live files. `dry_run` is **startup-only**
-(it selects those paths). Other knobs hot-reload.
+15m/hourly windows are in **minutes** (`buy_window_min`). Mixing the two
+without converting units has caused production `NameError`s. The 5m loop
+**must** compute `seconds_left`. If someone ports a 15m snippet that only
+defines `minutes_left`, the 5m process dies every cycle.
 
 ---
 
-## 4. Market Discovery
+## 4. Binary markets, books, and Fill-And-Kill
 
-Each cycle, `MarketGateway` (`buy/market.py`) lists active markets for that
-bot’s series via Gamma, filtered by `SLUG_PREFIX` / `SLUG_EXCLUDES`.
+**Token price** is a probability on (0, 1). 0.80 means 80¢. 5m markets tick
+in tenths of a cent (`0.001`). 15m/hourly tick in whole cents (`0.01`).
 
-`btc-updown` is a **prefix of** `btc-updown-5m`. If the 15m bot omitted the
-5m exclude, both would buy the same market with separate $2.50 budgets.
-**Never change prefix/excludes on one bot without checking the other two.**
+**Order book:** people willing to **buy** the token (bids) and people willing
+to **sell** it (asks). The **best bid** is the highest price a buyer will
+pay. The **best ask** is the lowest price a seller will take. The bot **buys
+at the ask** (it is taking someone else’s sell) and **hedge-sells at the
+bid** (it is hitting someone else’s buy).
 
-Discovery yields: **condition ID** (on-chain market key, state dict key,
-redeem argument), **UP/DOWN CLOB token IDs**, tick size, end time. Slugs look
-like `btc-updown-5m-<unix_start_ts>`; start time is parsed from that suffix
-when present so PTB can be captured at the open.
+**Spread** is `ask − bid`. A 97¢ ask over a 1¢ bid is a **96¢ spread**. That
+is not “the market is 97¢.” It is an empty book with a decorative ask. Last
+trade on the website can still look like a winner. The bot therefore requires
+a **tight** book at entry (spread ≤ 5¢ and bid ≥ 70¢).
 
-The bot also polls Data API **positions** so a restarted process can hedge and
-redeem without re-buying. One entry per market is `meta["bought_token"]` in
-that state cache (and the `buy_uncertain` quarantine).
+**Fill-And-Kill (FAK):** “take whatever is available at my limit **right
+now**, cancel the rest.” Nothing rests. If the ask was 1 share and we wanted
+3, we get 1 (or nothing). We do **not** leave 2 shares sitting. That is
+deliberate: a resting order can fill later at a junk price after we walked
+away.
 
-Pathlog uses the same gateway for **all three** series, even when 15m/hourly
-are not posting.
+**Why a limit buy, not a “market buy in dollars”:** a dollar market FAK spends
+leftover USDC down the book. Quote 80¢, leftover cash lifts a 9¢ ask, you own
+junk. The bot sizes **shares** = `budget / ask` and posts a **limit at that
+ask**. Unfilled dollars die with the FAK.
 
----
-
-## 5. Underlying Oracle Feeds & PTB
-
-Each market **resolves** against a specific oracle. Each bot streams **that
-same feed** so it does not buy a CLOB “winner” the resolution oracle disagrees
-with.
-
-| Bot | Oracle | `buy/btc_price.py` constant | RTDS topic |
-|---|---|---|---|
-| 15m | Chainlink BTC/USD TWAP 60s | `SOURCE_TWAP_60` | `crypto_prices_twap_sixty` |
-| 5m | Chainlink BTC/USD TWAP 30s | `SOURCE_TWAP_30` | `crypto_prices_twap_thirty` |
-| Hourly | Binance BTCUSDT spot | `SOURCE_BINANCE` | `crypto_prices` (filter `btcusdt`) |
-
-A background websocket to `wss://ws-live-data.polymarket.com` keeps ~3 hours
-of ~1 Hz ticks (`RING_MAX_SAMPLES = 12_000`). `get_btc_feed(source)` is the
-read API.
-
-**Price To Beat (PTB):** resolution is close-oracle vs open-oracle. The bot
-caches the nearest tick to market `start_ts` (≤2s skew) in `ptb_*_buy*.json`.
-If the process missed the open, PTB is missing and **buys are refused**
-(fail closed). Live 5m gate is **$0**: any non-zero TWAP tick vs PTB, side
-must match, **flat still refused**. 15m/hourly default **$10**.
-
-**Research audit:** every PTB capture and every buy decision (taken or
-skipped) is appended to `underlying_research_buy*.jsonl` via
-`append_research()`. Those files rotate at 50 MiB × 2 backups so a skip storm
-cannot fill the disk. Gitignored.
-
-Pathlog does **not** record BTC/PTB. Counterfactuals for the edge gate are
-`check_edge_counterfactual.py`, not `--sweep`.
+**Displayed size is not a cap.** If the top ask shows 0.4 shares, the bot
+still posts ~3 shares at that price. The exchange fills what exists. Thin
+books log `[THIN ASK]`. Live unmatched remainder is gone; pathlog’s paper
+model instead pretends fillable size is `min(budget/ask, displayed size)` —
+that is a research approximation, not what live posts.
 
 ---
 
-## 6. The Buy Decision
+## 5. Python shape of the bots
 
-A buy fires only when **all** gates pass. 15m/hourly use one window (minutes)
-and one band (75–90¢). 5m uses a **union of time×price bands** (seconds).
+### One file, one process, one `while True`
 
-### 6.1 Gates that are the same on all three bots
+There is no web server, no database, no `asyncio`. The 5m bot is a script
+that:
 
-1. **Window + one-shot.** Inside the buy window, past `buy_grace_s`, not
-   already entered (`bought_token`), `buy_cooldown_s` elapsed,
-   `entry_enabled`, not `dry_run`-blocked, USDC/risk caps OK.
-2. **GUI consensus.** Polymarket display price (mid when spread ≤ 10¢, else
-   last trade): winner ≥ `min_winner_bid` (70¢), loser ≤ `max_loser_bid`
-   (30¢), gap ≥ `min_bid_edge` (5¢).
-3. **Tight REST book (critical).** Winning leg **REST** top-of-book: bid ≥
-   70¢ and `ask − bid` ≤ `max_entry_spread` (5¢). WS alone never arms entry.
-   A high ask over a 1¢ bid is a fake price.
-4. **Ask in an open band.** See §6.2. 15m/hourly: `buy_threshold`–
-   `buy_max_price` (75–90¢) in the last 4.0 / 13.0 minutes.
-5. **Underlying gate.** If enabled: live oracle far enough from PTB **and**
-   book side matches the move. Missing/stale/flat → skip.
-6. **Risk caps.** `buy_budget` $2.50, `buy_max_spend` $3, `buy_max_shares` 5,
-   `max_open_positions` (probe **0 = unlimited**), notional caps, wallet USDC.
+1. does a lot of setup at **import time** (the moment Python starts the file),
+2. then sits in `while not _shutdown_requested:` forever.
 
-### 6.2 5m band union (`buy/entry_skip.py`)
+**There is no `if __name__ == "__main__"`.** In many Python tutorials that
+guard means “only run when I type `python buybot5m.py`, not when I
+`import buybot5m`.” These bots skip it on purpose: the file **is** the
+program. Consequence: **`import buybot5m` would start trading.** Tests must
+not import the bot. They import `buy/` and `check_*.py`, or they **cut
+function source out of the file with the `ast` module**
+(`tests/test_buy_fill_shapes.py`).
 
-`buybot5m.current_entry_bands(seconds_left)` wraps
-`applicable_entry_bands` in `buy/entry_skip.py` and returns **every** band
-open at that TTM (a market can match more than one). `ask_in_any_band` is
-the gate. `select_entry_band` pins the FAK min/max to the **widest matching
-band** (lowest retry floor) so a 95¢ print in the last 120s is not rejected
-for being above the late 90¢ cap.
+### Why not a shared library for the three bots?
 
-| Band | When (TTM = seconds left) | Winning ask |
+Historically the three cadences drifted (seconds vs minutes, tick size,
+oracle). A shared 5,000-line module that you `import` is how you accidentally
+start a bot. Shared pieces that are **safe** to import were moved to `buy/`.
+The rest stays copied. That is ugly and it is the design: **diff the
+siblings**, do not invent a framework on a live money path.
+
+### Threads, but the brain is still the loop
+
+A **thread** is a second stack of work inside the same process. Used here
+for I/O that should not freeze the loop:
+
+- CLOB book **websocket** (`buy/clob_book_ws.py`) — daemon thread, cache in
+  memory.
+- BTC **RTDS** websocket (`buy/btc_price.py`) — same idea.
+- `ThreadPoolExecutor` pools in the main file: extra REST book fetches,
+  Gamma/positions/balance refresh, ntfy, redeem status.
+
+The **decision** (buy or not, sell or not) still happens on the main loop.
+Threads fill caches. A stale cache is treated as “no data” (fail closed), not
+as a price.
+
+`daemon=True` on the websocket threads means: when the main process exits,
+those threads die with it. They are not meant to outlive the bot.
+
+### Process lock (`fcntl.flock`)
+
+Near the top of `buybot5m.py`:
+
+```python
+def acquire_process_lock(path):
+    lock_fh = open(path, "a+")
+    try:
+        fcntl.flock(lock_fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        ...
+        raise SystemExit(1)
+```
+
+`fcntl.flock` is a **kernel lock** on a file. `LOCK_EX` = exclusive (only one
+holder). `LOCK_NB` = do not wait; if someone else has it, fail immediately.
+The path is `/tmp/poly-money-maker-buybot5m.lock`. If you `python buybot5m.py`
+while systemd already runs it, the second process **exits**. Two live
+instances would both think they may spend $2.50.
+
+The function **returns the open file handle** and the module stores it in
+`_PROCESS_LOCK_FH`. If that handle were closed, the lock would release. Do
+not “clean up” that global.
+
+Pathlog and mint use the same idea with repo-local lock files.
+
+### Ctrl-C does not yank the rug
+
+`signal.signal(SIGINT, _handle_shutdown)` (and `SIGTERM` for systemd)
+sets `_shutdown_requested = True`. The loop finishes the **current cycle**
+then exits. That avoids killing the process between “POST the order” and
+“save the order id.”
+
+---
+
+## 6. Polymarket’s five systems
+
+Mixing these up is how you sell on a fake 1¢ bid.
+
+| Name | What it is | What we use it for |
 |---|---|---|
-| Late | `0 < TTM ≤ 120` | **75–90¢** inclusive |
-| Early ≥90 | `120 < TTM ≤ 300` (first 3 min of the 5m) | **90–99¢** inclusive |
-| Early ≥95 | `60 ≤ TTM ≤ 300` (first 4 min) | **95–99¢** inclusive |
+| **Gamma** | Catalog HTTP API | List markets: slug, condition id, token ids, end time, later `winner` |
+| **CLOB REST** | Order book HTTP | `/book` (authoritative quote before an order), `/order` POST, balances, last trade |
+| **CLOB websocket** | Push top-of-book | Speed. **Arms** a check. Never enough to POST a normal buy/hedge by itself |
+| **Data API** | Account HTTP | Positions, redeemable flag, trades. Can **lag** after a fill |
+| **RTDS** | Live data websocket | The **same** BTC series the market resolves on (TWAP 30s for 5m) |
+| **Relayer** | Polymarket submits Polygon txs | `redeemPositions`. We sign a proxy request; we do not broadcast our own gas |
 
-**Overlap:** last 120s while TTM ≥ 60s → 75–90¢ **or** ≥95¢.
-**Hole:** **91–94¢ in the last 120s** is not in any open band
-(`ask_out_of_band`). For `TTM < 60` the ≥95 path is off (late 75–90¢ only).
-At **TTM = 60s** exactly, ≥95 is still open.
+**Condition ID:** 32-byte hex id of the market on-chain. Dictionary key in
+`positions_buy5m.json`. Argument to redeem.
 
-Hot poll / WS subscribe / redeem-delay horizon is `BUY_HORIZON_S` (300s), not
-`buy_start_s` alone. Otherwise the first three minutes would never be looked
-at.
+**Token ID:** CLOB asset id for UP or DOWN. What you actually buy/sell.
 
-Knobs (5m defaults): `buy_start_s` 120, `early_buy_start_s` 300,
-`early_buy_max_price` 0.99, `early_95_start_s` 300, `early_95_min_s` 60,
-`early_95_min_price` 0.95. Live JSON may omit the early keys; code defaults
-apply on hot reload. **Hedge keys must be in live JSON** (see §7 / §10).
+**CLOB v2 amounts:** on a BUY, `makingAmount` is USDC you paid,
+`takingAmount` is shares you received. Cost is USDC spent, **not**
+`shares × the gate ask`. Delayed stubs sometimes omit `makingAmount`; the
+code then estimates and still records inventory if shares appeared.
 
-### 6.3 Execution (all bots)
+**HTTP 400 `"no orders found to match"`:** the FAK crossed an empty book.
+That is “nothing there,” not “auth failed.” Safe to **re-quote** and try
+again in the same trigger (up to 3). Other 400s (`invalid amounts`, auth)
+must **not** retry a second $2.50.
 
-FAK **limit** buy sized in **shares** at the quoted ask:
-`min(budget/ask, buy_max_shares)` via `OrderArgs` + `create_order`. **Not** a
-USDC market order (those walk cheaper levels: gate 80¢, leftover cash lifts
-9¢). **Not** capped to displayed top size. Thin tops log `[THIN ASK]` and
-still post the dollar size; unmatched remainder dies on the FAK.
+**HTTP 400 `invalid amounts`:** USDC must be **2 decimal places** (cents).
+Taker shares **4 decimals**. The SDK also round-downs some sizes to 2 dp, so
+naive 4 dp share math signs as `$2.4999` and the CLOB rejects it.
+`quoted_buy_shares` exists for that. `check_buy_rejects.py` counts those
+in logs — they passed every strategy gate and still did not post.
 
-A 400 **"no orders found to match"** → re-quote (abort if the fresh ask left
-the band) and POST again, up to 3, then 0.15s cooldown. Invalid-amount / auth
-400s stop. Unclear POSTs quarantine — never a second full budget. A BUY limit
-is a **maximum**; the exchange can price-improve.
+**Chain:** Polygon, `CHAIN_ID = 137`. Collateral token (pUSD) and Conditional
+Token Framework (CTF) addresses are constants at the top of the bot. You
+almost never change them.
 
-Confirmed fills are **always persisted**. Average is **USDC / shares**. Below
-band → `buy_fill_below_band` + `toxic_fill` if avg `< toxic_force_exit_below`
-(65¢) **or** shares > 1.05× quoted size (`buy_fill_walk`). Delayed FAKs are
-polled; zero confirms fall back to balance reconciliation (`buy_ghost_fill`).
-Unmatched 400 + inventory appeared → `buy_ghost_fill` `via=unmatched_400_guard`
-(no second FAK). Unmatched 400 + unreadable balance →
-`buy_attempt_ambiguous` `via=unmatched_400_no_balance` (quarantine, no retry).
+---
 
-### 6.4 Skip / fill reasons (logs + research JSONL)
+## 7. Crash-safe JSON (the “database”)
 
-Throttled skip lines are **not** one event per market (often 8s).
+`atomic_save(path, data)` is the write path for state and P&L.
 
-| Event | Meaning |
+1. Write `path.tmp`.
+2. `flush()` then `os.fsync(file)` — force bytes onto disk, not just the OS
+   cache. A power cut after `write()` without `fsync` can leave a half file.
+3. `allow_nan=False` on `json.dump` — JSON has no `Infinity`. A NaN in state
+   would round-trip as garbage. `load_json` also rejects non-finite numbers
+   via `parse_float` / `parse_constant`.
+4. If the current `path` is valid JSON, copy it to `path.bak` (also fsynced)
+   **before** replacing. After a crash you still have one good file.
+5. `os.replace(tmp, path)` — atomic rename on the same filesystem.
+6. `fsync` the **directory**. On Linux, a rename is not durable until the
+   directory entry is flushed.
+
+`load_json` tries `path` then `path.bak`. Live mode (`dry_run` false) calls
+`load_json(STATE_FILE, required=True)`: missing state **refuses to arm**
+rather than inventing empty positions and maybe buying a market you already
+own.
+
+**Write-ahead quarantine:** before a live POST, the bot saves
+`buy_uncertain_*` (or hedge twins) including the **deterministic signed
+order id**, token, quoted shares, spend, and pre-submit token balance. If the
+process dies during the HTTP round-trip, the next cycle **inspects that exact
+order** instead of posting a second $2.50. This is the most important
+money-safety pattern in the file.
+
+---
+
+## 8. How to read the 5,000-line file
+
+`buybot5m.py` is one scroll with **comment banners** as chapters:
+
+| Banner | What lives there |
 |---|---|
-| `buy_window` | First time this market entered a 5m buy window (`window=` late / early / early_95) |
-| `buy_skip` `ask_below_band` / `ask_above_band` / `ask_out_of_band` / `no_ask` | In window, ask not in any **open** band |
-| `buy_skip_ambiguous` | GUI prices too close |
-| `buy_skip_no_consensus` | Ask in band; GUI or tight-book failed (`wide_spread`, `bid_too_low`, …) |
-| `buy_skip_incomplete_book` | Missing GUI on a leg |
-| `buy_skip_underlying_edge` | Missing/stale/flat vs PTB (5m $0 = any non-zero tick) |
-| `buy_skip_underlying_side` | Book wants the opposite leg from the oracle move |
-| `buy_skip_max_positions` | Only if `max_open_positions > 0` |
-| `buy_fill_below_band` / `buy_fill_walk` / `buy_ghost_fill` / `buy_uncertain` | Fill / quarantine outcomes |
+| (top) | Imports, `ImmediateResponseClobClient`, process lock, URLs, `.env` |
+| `STRATEGY CONFIG` | Defaults + `load_strategy()` |
+| `LOG ROTATION` | JSON-line log + ntfy |
+| `HELPERS` | `safe_api_call`, `finite_float`, `atomic_save` |
+| `P&L` | `record_pnl` |
+| `POSITIONS` | Data API fetch, merge with local ledger |
+| `PRICING` | Books, GUI, hedge/buy gates, share math, fees |
+| `TICK SIZE` | Cache of CLOB tick |
+| `ORDER HELPERS` | Decode fills, confirm size, quarantine inspect |
+| `BUY` | `buy_market_with_retry` |
+| `SELL (for hedge only)` | `sell_market_with_retry` |
+| `REDEEM` | Relayer submit + poll |
+| `CLIENT SETUP` | Construct `ClobClient` — **this runs at import** |
+| `SHUTDOWN` | SIGINT/SIGTERM |
+| `MAIN LOOP` | `while True`: reload, refresh, redeem, per-market hedge/buy, sleep |
 
-`check_buy_skips.py` tallies the live 5m JSON log. Counts ≠ unique markets.
+Read the banners, then the function **docstring**, then the fail-closed
+branches (`return` / `continue` / `break`). The happy path is usually the
+last branch.
 
----
-
-## 7. The Hedge (Sell-Only Exit)
-
-The bots **never take profit**. The only sell is the defensive hedge (or a
-`toxic_fill` dump). Thresholds are **per bot**:
-
-| | Bid ≤ | Ask ≤ | Spread ≤ | GUI |
-|---|---|---|---|---|
-| **5m live** | **50¢** | **55¢** | 15¢ | inverted buy GUI; held last trade ≤ 55¢ |
-| 15m / hourly (stopped) | 35¢ | 40¢ | 15¢ | same idea; last trade ≤ 40¢ |
-
-Write **`hedge_threshold` / `hedge_require_ask_max`**, not “35¢” as if it were
-universal. Live 5m JSON **must set** `0.50` / `0.55`. Hot reload uses the file;
-if live JSON still has `0.35` / `0.40`, the old hedge stays even after a
-code pull. Code defaults apply only when the keys are **omitted**.
-
-Pipeline (same on all bots; numbers from config):
-
-- **Arm (normal):** WS/cache bid ≤ `hedge_threshold` while held. Peek only —
-  never sufficient to sell.
-- **Arm (`toxic_fill`):** entry average `< toxic_force_exit_below` (65¢) sets
-  a flag on `meta`. Sell **only while held bid ≤ hedge_threshold**. A recovered
-  97¢ book logs `hedge_skip_toxic_recovered` and stays armed. Do not wait for
-  50/55/15 or GUI. Wide 1¢/99¢ still dumps **if bid is dead**. Milder
-  below-band fills (e.g. 70¢) use the normal hedge.
-- **Confirm:** `get_quote_fast(..., force_rest=True)`. Normal hedges skip if
-  either side is missing (`hedge_skip_incomplete_rest`) — **no WS fallback**.
-  Toxic dumps may sell on bid-only REST; no bid still skips. Fresh WS bid
-  **above** threshold skips REST for **both** paths (toxic logs recovered).
-  Normal path: bid bounced above threshold → `hedge_cancel_bounce`.
-- **Book integrity (normal):** lone penny bid under a still-high ask is not a
-  reversal (`hedge_skip_toxic_book`). Need bid ≤ threshold, ask ≤
-  `hedge_require_ask_max`, spread ≤ `hedge_max_spread`.
-- **GUI consensus (normal, `hedge_require_gui` default true):** invert the buy
-  display rule. Held last print ≤ ask-max, held GUI ≤ 30¢, other GUI ≥ 70¢.
-  A 48/52 (5m) or 32/38 (15m) book with last trade 85¢ →
-  `hedge_skip_no_consensus`. Toxic skips GUI.
-- **Execution:** FAK at the **live bid** (minus `hedge_undercut_ticks`). No
-  “won't sell below 32¢.” 20¢ or 1¢ on a still-tight collapsed book is a fill.
-  Retries force-REST; normal retries re-run two-sided integrity so a spoof
-  1¢/99¢ still aborts. Toxic retries use `abort_above=None` but still honor
-  the recovered-bid gate.
-- **Outcome:** crash-durable order ID. Only settlement-confirmed fills shrink
-  `bought_size` / add proceeds. Ambiguous → `hedge_uncertain` until exact-order
-  reconciliation. Full exit sets `hedge_closed`. Data API balances never
-  invent a sell fill.
-
-`sell_market_with_retry` is **hedge-only**. Do not reuse it as a profit-take
-without a new abort rule (you would need “abort if bid **dropped**,” the
-opposite of hedge bounce).
+15m/hourly files are the same shape with different constants.
 
 ---
 
-## 8. Redemption
+## 9. Startup: lock, secrets, rounding, CLOB client
 
-Winning shares are not sold. They redeem on-chain at $1.00 via Polymarket's
-relayer:
+**Order at import (this is the real “main”):**
 
-1. Data API marks a leg `redeemable` after resolution.
-2. Bot builds `redeemPositions(address,bytes32,bytes32,uint256[])` for the CTF
-   (`0x4D97…6045`), uses `py-builder-relayer-client` to build/sign the PROXY
-   request, checks the derived proxy equals `FUNDER_ADDRESS`, authenticates
-   `POST /submit` with Relayer API keys (`RELAYER_API_KEY` +
-   `RELAYER_API_KEY_ADDRESS`) **or** Builder HMAC (`POLY_BUILDER_*` via
-   `py-builder-signing-sdk`).
-3. Throttle per condition (`redeem_throttle_s` 30s); abandon after
-   `max_redeem_age_days` (7). Permanent failures go on an in-memory blocklist
-   so we do not burn gas on a reverting call.
-4. Submit only sets `redeem_pending`. Poll `GET /transaction`. Par is credited
-   only after `STATE_CONFIRMED` **and** a complete fresh Data API snapshot
-   shows inventory gone. **A relayer submit is not P&L.** GC never invents par.
+1. `load_dotenv()` — fill `os.environ` from `.env`.
+2. Process lock (above). If this exits, nothing else runs.
+3. Read env vars into module globals. Missing keys stay `None` until a later
+   check.
+4. Patch `ROUNDING_CONFIG`: CLOB rejects taker amounts with more than **four**
+   decimal places. The SDK’s rounding table is clamped to 4.
+5. `load_strategy()` **must succeed**. No valid `strategy_buy5m.json` →
+   process dies. Better a crash at start than a bot with invented knobs.
+6. If `dry_run`, rename state/log/PTB to `*.dryrun.*`.
+7. Build `ImmediateResponseClobClient`.
 
----
+### `ImmediateResponseClobClient`
 
-## 9. State, P&L, and Garbage Collection
+The official `ClobClient` can sit for up to ~30s after POST waiting for trade
+hashes. Matching already happened on the server. This subclass overrides
+`_resolve_transactions_hashes` to **return the POST body immediately**. The
+bot already saved the order id and does its **own** settlement checks. Waiting
+inside the SDK would delay **hedges on other markets** in the same process.
 
-**`positions_buy*.json`** — keyed by condition ID: question, end, tokens,
-tick, `bought_token` / size / cost, hedge proceeds, `pnl_redeem_value`,
-`redeem_submitted_at`, quarantine fields. This is how a restart resumes hedge
-and redeem without a second buy. **Never delete or truncate.**
+`retry_on_error=False` on the client: the SDK must not silently retry a POST.
+Retries are explicit in `buy_market_with_retry` / `sell_market_with_retry`.
 
-**`pnl_buy*.json`** — append-only settled rows: `entry_cost`, `redeem_value`,
-`hedge_proceeds`, `net`, `outcome` (`win` / `hedge` / `loss`). `atomic_save()`.
+`signature_type=1` and `funder=FUNDER_ADDRESS` mean: sign as the user, settle
+against the **proxy** wallet (the Polymarket account people see).
 
-**GC:** only terminal evidence (confirmed redeem value, or confirmed closed
-hedge with no remainder) folds a market into P&L and drops it from state.
-`record_pnl()` is idempotent by condition ID (crash between P&L and state
-saves must not double-count). Unresolved `buy_uncertain` / `hedge_uncertain`
-is never GC’d.
+API creds: if `API_KEY` trio is set, use them; else derive from the private
+key (prints `AUTH derived`). Then `update_balance_allowance` so USDC.e is
+approved for the exchange — a one-time-style sync; failure is a warning, not a
+hard exit (you will fail later on POST if allowance is actually missing).
 
-If `pnl_redeem_value` is missing, GC may fall back to `redeem_value =
-bought_size` (par). That is correct **only** for winner-leg inventory. See
-landmine 4.
+Then: `MarketGateway`, `get_btc_feed(...)`, `get_book_feed()`. Those start
+background threads. Then the ASCII banner (the 97¢ / 65¢ text in the banner
+is **cosmetic leftover** — live knobs are 75–90 / 50/55). Then
+`load_json(STATE_FILE)` and the `while` loop.
 
 ---
 
-## 10. Configuration & Hot Reload
+## 10. Strategy JSON and hot reload
 
-**`.env`** (gitignored, VM only — never on a cloud agent):
+`_STRATEGY_DEFAULTS` is a Python dict of every legal key and its type. That
+dict **is the schema**.
 
-| Variable | Purpose |
+`load_strategy()`:
+
+- If the file is **gone after a successful start**: do not crash the process
+  (that would strand a live position with no hedge). Disable **entries**
+  (`entry_enabled=False`) and **force `hedge_enabled=True`**. Held inventory
+  must still be able to exit.
+- If mtime unchanged: return cached dict (cheap).
+- Else: start from defaults, overlay JSON. Unknown keys → error. Booleans
+  must be real JSON `true`/`false`, not `"true"` strings. Numbers are cast
+  with `type(default)(value)` so `1` can become `1.0`.
+- Legacy: if JSON has `shares` but not `buy_budget`, treat `shares` as the
+  dollar budget.
+- Then a wall of validators: bands nest correctly, `hedge_require_ask_max >=
+  hedge_threshold`, tick is a CLOB tick and equals `EXPECTED_TICK_SIZE`
+  (`"0.001"` on 5m), `one_entry_per_market` stays true, live mode cannot
+  disable hedge, `buy_max_shares` is large enough for `budget/threshold`,
+  `max_open_positions == 0` means unlimited, no NaNs.
+
+**Hot reload vs restart:**
+
+| Change | Needs restart? |
 |---|---|
-| `PRIVATE_KEY`, `FUNDER_ADDRESS` | Signer + Polymarket proxy/funder |
-| `API_KEY`, `API_SECRET`, `API_PASSPHRASE` | CLOB L2 auth |
-| `RELAYER_URL` | Redeem relayer (production default) |
-| `RELAYER_API_KEY`, `RELAYER_API_KEY_ADDRESS` | Preferred redeem HTTP auth |
-| `POLY_BUILDER_API_KEY`, `POLY_BUILDER_SECRET`, `POLY_BUILDER_PASSPHRASE` | Alternate Builder HMAC |
+| Most knobs in live JSON | No — next loop iteration |
+| `dry_run` | **Yes** (state paths) |
+| Python code | **Yes** (`systemctl restart polybuybot5m`). `git pull` is not a restart. |
+| Hedge 50/55 if live JSON still says 0.35/0.40 | The **file** wins. Code defaults only apply when the key is **omitted**. Patch the JSON. |
 
-**Strategy JSON** is required at startup. Each cycle `load_strategy()` checks
-mtime. Ordinary knobs take effect on the **next tick** with **no restart**.
-Missing/malformed hot reload **disables new entries** and keeps last-known-good
-**hedge** settings (held inventory must still be able to exit). Unknown keys
-and invalid types/ranges are rejected.
-
-Templates (safe to commit): `strategy_buy.example.json`,
-`strategy_buy5m.example.json`, `strategy_buyhourly.example.json`. Live files
-**without** `.example` are gitignored and are what systemd actually reads.
-
-`entry_enabled` is the explicit arm for new buys. `dry_run: false` places
-**real orders with no confirmation prompt.** Confirm `dry_run` /
-`entry_enabled` before any manual `python buybot*.py`.
-
-| Key | 5m default | 15m / hourly | Meaning |
-|---|---|---|---|
-| `buy_threshold` / `buy_max_price` | 0.75 / 0.90 | same | Late band (5m last 120s; others whole window) |
-| `early_buy_start_s` / `early_buy_max_price` | 300 / 0.99 | — | 5m first 3 min: ask ≥ 90¢, cap 99¢ |
-| `early_95_start_s` / `early_95_min_s` / `early_95_min_price` | 300 / 60 / 0.95 | — | 5m first 4 min: ask ≥ 95¢ |
-| `min_winner_bid` / `max_loser_bid` / `min_bid_edge` | 0.70 / 0.30 / 0.05 | same | GUI consensus |
-| `max_entry_spread` | 0.05 | same | Winner ask−bid at entry |
-| `underlying_gate_enabled` / `min_underlying_edge_usd` | true / **0.0** | true / **10.0** | Oracle vs PTB |
-| `toxic_force_exit_below` | 0.65 | same | Arm dump if FAK avg &lt; this |
-| `hedge_threshold` / `hedge_require_ask_max` | **0.50 / 0.55** | **0.35 / 0.40** | Collapse trigger (ask max ≥ threshold) |
-| `hedge_max_spread` / `hedge_require_gui` | 0.15 / true | same | Two-sided book + inverted GUI |
-| `hedge_min_price` | 0.325 | 0.32 / 0.32 | Config leftover; **not** a FAK floor |
-| `buy_start_s` / `buy_window_min` | 120 s | 4.0 min / 13.0 min | Late window |
-| `buy_budget` / `buy_max_spend` / `buy_max_shares` | 2.5 / 3 / 5 | same | Size rails |
-| `max_open_positions` | 0 (=unlimited) | same | Probe uses 0 |
-| `empty_fak_cooldown_s` | 0.15 | same | After a fully empty trigger |
-| `poll_buy_window_s` / `poll_held_s` | 0.1 / 0.05 | same | Hot-loop cadence |
-| `tick_size` | `"0.001"` | `"0.01"` | Fallback if Gamma omits it |
-| `entry_enabled` / `dry_run` | false / true | same | Arm / paper |
-
-Code deploy ≠ live JSON. After merge: `git pull`, patch
-`strategy_buy5m.json` hedge keys if needed, **`systemctl restart polybuybot5m`**.
-CI does not restart. A merged bugfix is inert until that restart (13–19 Aug
-`known_cost` stall).
+`entry_enabled` is the operator arm. Defaults `false` in the example file.
+Live JSON on the VM is what actually arms buys.
 
 ---
 
-## 11. Operations on the VM
+## 11. Logging, notifications, tiny helpers
 
-**Host:** Google Compute Engine instance `instance-20260516-185922`,
-`User=ntemusejoel`, `WorkingDirectory=/home/ntemusejoel/poly-money-maker`,
-`ExecStart=.../.venv/bin/python buybot5m.py`, `EnvironmentFile=.../.env`,
-`Restart=always`. Unit files: `deploy/*.service` (copy to
-`/etc/systemd/system/`). Pathlog’s unit does **not** load `.env` (no keys).
+`log_event("buy_skip", reason="ask_below_band", ...)` writes one JSON object
+to `buybot5m.log` via `RotatingFileHandler` (5 MB × backups). Agents grep
+these names. `check_buy_skips.py` counts them. **Throttled** skips
+(`log_buy_skip_throttled`) fire at most about once per 8 seconds per
+market+reason — they are **not** “one line per missed market.”
+
+`notify(...)` pushes ntfy.sh (`polybot-joel-btc`) on a thread. Failures are
+swallowed. A phone notification must never kill the bot.
+
+`safe_api_call(func, ...)` runs `func` and turns 429 / 5xx / timeout-shaped
+errors into retries/skips instead of crashing the cycle.
+
+`finite_float(value, minimum=0, maximum=1)` is the standard “is this a real
+number in range?” helper. `None`, `""`, `NaN`, and out-of-range become
+`None`. Almost every price goes through this. Do not use raw `float()` on
+exchange JSON without it.
+
+---
+
+## 12. Positions: Data API vs local ledger
+
+`fetch_all_position_rows` pages the Data API. `build_held_positions` keeps
+rows whose slug starts with `SLUG_PREFIX` (`btc-updown-5m`) and **not**
+`SLUG_EXCLUDES`. Outcome `yes` maps to UP, `no` to DOWN (Polymarket naming
+drift).
+
+**The Data API lags.** You can buy, POST returns, local JSON has 3.3 shares,
+and Data API still shows 0 for a while. If the hedge loop trusted Data API
+alone, it would **skip hedging** a position that exists, or **re-buy** a
+market it already owns.
+
+`merge_tracked_positions(api_held, tracked_meta)` therefore **inserts local
+confirmed inventory** into the in-memory `held` map when Data API omitted it.
+Local `bought_size` after a confirmed **sell** is also a ceiling: Data API
+must not resurrect a larger bag.
+
+`add_tracked_market_stubs` keeps expired-but-unsettled markets in the loop
+so redeem/GC still run after Gamma drops them from “active.”
+
+Risk caps (`max_open_positions`) count **non-redeemable** size only.
+Redeemable leftovers are settlement backlog. If they counted as “open,” a
+slow redeem would freeze all new buys (silent `continue`). Probe uses
+`max_open_positions = 0` meaning unlimited.
+
+---
+
+## 13. Quotes: websocket vs REST
+
+**Websocket** (`book_ws.quote(token_id)`): fast, can be stale or
+price-only (size zeroed when price moved). Used to **notice** “bid just
+printed 48¢” so the loop bothers to check a hedge. `quote_age` older than
+`hedge_quote_max_age_s` (0.25s) is not “fresh.”
+
+**REST** (`get_book_quote` → CLOB `/book`): slower, full book, parsed by
+`buy/book.py` `best_from_levels`. Used when about to **spend**.
+
+`get_quote_fast(..., force_rest=True)` **bypasses WS and the 200ms REST
+cache**. Buy retries and hedge confirms always force REST. A stale snapshot
+at POST time is how you buy 80¢ that is already 99¢ or sell into a recovered
+book.
+
+WS cache details that matter:
+
+- A **price-only** event that moves the top price **zeros displayed size**.
+  Callers must REST before trusting size.
+- Out-of-order server timestamps are dropped.
+- Tokens not in the current `set_tokens(...)` watch list are forgotten
+  (markets roll every 5 minutes).
+
+`get_book_bid` / `_book_cache` are convenience wrappers around the same
+quote tuple: `(bid, bid_size, ask, ask_size, mid)`.
+
+---
+
+## 14. What “the website shows 80¢” actually means
+
+Polymarket’s UI does **not** always show last trade. Documented rule,
+implemented as `polymarket_display_price`:
+
+- If bid and ask exist and `ask − bid ≤ 10¢`, show the **midpoint**.
+- Otherwise show **last trade**.
+
+`get_last_trade_price` hits CLOB `/last-trade-price` with a 0.25s cache, then
+falls back to a timestamped field on the last `/book` snapshot if that
+snapshot is young enough.
+
+**Buy GUI consensus:** winner display ≥ 70¢, loser ≤ 30¢, gap ≥ 5¢. Both
+legs need a display price (mid or last trade) or the bot logs
+`buy_skip_incomplete_book`.
+
+**Hedge GUI** is the **inverse** on the held token: held last trade ≤ ask-max
+(55¢ on 5m), held GUI ≤ 30¢, other GUI ≥ 70¢. A 48¢/52¢ book with last trade
+**85¢** is a clip, not a reversal → `hedge_skip_no_consensus`.
+
+`entry_book_ok`: both sides present, not crossed, spread ≤ 5¢, bid ≥ 70¢.
+
+`hedge_book_ok`: bid ≤ threshold (50¢), ask ≤ 55¢, spread ≤ 15¢. A 1¢ bid
+under a 99¢ ask fails (`hedge_skip_toxic_book`).
+
+`toxic_dump_book_ok`: **only** `bid ≤ hedge_threshold`. Used when a fill was
+already classified junk (`toxic_fill`). Still will not dump a recovered 97¢
+bid.
+
+---
+
+## 15. Buy gates and the 5m price bands
+
+`buy/entry_skip.py` is pure functions (no network). Tests import it directly.
+
+`EntryBand` is a small named tuple: min price, max price, whether the min is
+exclusive, and a name (`late` / `early` / `early_95`).
+
+`applicable_entry_bands(seconds_left, ...)` appends every band whose TTM
+window contains `seconds_left`. **Union, not first-match-wins.** Last 90s
+can be late 75–90 **and** early_95 ≥95 at the same time.
+
+`ask_in_any_band` is the gate.
+
+`select_entry_band` picks the matching band with the **lowest retry floor**
+so FAK retries are pinned to the **widest** legal range. A 96¢ ask in the
+last 120s matches ≥95, not late 90¢-max — otherwise the retry would abort
+for “ask above 90.”
+
+`union_ask_band_reason` labels skips: below the lowest floor →
+`ask_below_band`; above the highest cap → `ask_above_band`; in a hole
+(91–94) → `ask_out_of_band`.
+
+`buybot5m.current_entry_bands` is a one-liner wrapper that plugs live knobs
+into `applicable_entry_bands`. `BUY_HORIZON_S = max(120, 300, 300) = 300`
+so hot polling and websocket subscribe actually run in the first 3–4
+minutes. If horizon were still 120, the early bands would exist in JSON and
+never be looked at.
+
+**Other gates (all must pass), in the loop after “we do not already hold”:**
+
+1. `ENTRY_ENABLED`
+2. Fresh Gamma discovery (stale catalog → hedge-only)
+3. Fresh positions snapshot and fresh USDC balance (never spend against
+   unknown collateral)
+4. Not `buy_uncertain` (quarantine)
+5. Not `bought_token` (one entry)
+6. Past `buy_grace_s` after first sighting
+7. Risk caps
+8. Cooldown after empty FAK
+9. GUI consensus + tight REST book
+10. Ask in an open band
+11. Underlying: live TWAP vs PTB, side matches, 5m `$0` means any **non-zero**
+    tick (flat still skip). Missing PTB → skip (`buy_skip_underlying_edge`).
+
+The underlying feed is **Chainlink BTC/USD TWAP 30s** for 5m, because that is
+what the market **resolves** on. Using Binance here would buy a CLOB winner
+the oracle might disagree with.
+
+---
+
+## 16. Sizing a buy (Decimal, 2 cents, 4 dp shares)
+
+`quoted_buy_shares(budget, ask, share_cap)`:
+
+1. Quantize budget down to **cents** (`Decimal("0.01")`, `ROUND_DOWN`).
+2. `shares = spend / ask`, quantized to **0.01 shares** (2 dp), round down.
+3. Clip to `buy_max_shares` (default 5).
+4. **Loop:** while `shares * ask` is not an exact cent, subtract 0.01 shares.
+   The CLOB + SDK will reject `$2.4999`.
+5. If it cannot find a legal pair, return `0.0` (no POST).
+
+`Decimal(str(x))` not `Decimal(x)`: `float(2.5)` is already binary-fuzzy;
+going through the string of the intended decimal is the usual money pattern.
+
+`buy_fill_walked`: confirmed shares > 1.05 × quoted. That means the bag
+walked cheaper levels. `classify_buy_fill` then sets `toxic_fill` if average
+`< toxic_force_exit_below` (65¢) **or** walked. Average is
+`USDC / shares` (`implied_buy_average`), never “extra shares × gate ask.”
+
+Fees: `_fill_fee_usdc` is the CLOB v2 taker curve
+`shares * rate * (p*(1-p))**exponent`. Small at 80–90¢. Net cost/proceeds
+subtract it when the schedule is known.
+
+---
+
+## 17. Posting a buy FAK and living with the result
+
+`buy_market_with_retry(...)` is the only buy POST path.
+
+**Dry run:** print `[DRY BUY]`, log `dry_buy`, return zeros, status `"dry"`.
+No client call.
+
+**Live:**
+
+1. Read token balance **baseline**. If unreadable → abort (cannot later tell
+   a ghost fill from nothing).
+2. Up to 3 attempts:
+   - Force REST quote. No ask / ask left the band / book went wide → stop.
+   - Size shares. Thin displayed size → log, still post full dollar size.
+   - Optional `pre_submit` hook (loop uses this for last-second gates).
+   - **`on_submit` write-ahead** (quarantine JSON) **before** POST. If this
+     save fails → **do not POST** (`persist_fail`).
+   - Sign order; `signed_order_id` hashes EIP-712 typed data so the id is
+     **determined before** the network — crash recovery can look it up.
+   - POST FAK limit at the ask.
+3. `confirm_fill_size` decides matched shares:
+   - Terminal `matched` + confirmed trades → trust making/taking.
+   - `delayed` POST can echo the **unsigned full size** before any match —
+     **do not** treat that as a fill. Poll `GET order` `size_matched`.
+   - Brief `GET order` 404 after a live match is normal; poll, do not call
+     it empty yet.
+4. Proven empty **400 no orders found to match**: if balance **rose** anyway
+   → `buy_ghost_fill` `via=unmatched_400_guard`, **stop** (no second FAK).
+   If balance unreadable → `buy_attempt_ambiguous`, quarantine, **stop**.
+   If truly empty → retry with a fresh quote.
+5. Other 400s → no retry.
+6. Exception / unclear POST → reconcile **once**, then **stop**. Retrying
+   the full budget after an accepted-but-timeout POST is how you double
+   spend.
+7. `on_fill` durable-saves after every confirmed increment. If save raises,
+   no further attempts.
+
+The main loop then writes `bought_token`, `bought_size`, `pnl_entry_cost`,
+maybe `toxic_fill`, and will not buy that condition again.
+
+**Unmatched empty cooldown:** after a fully empty trigger, wait
+`empty_fak_cooldown_s` (0.15s) before the outer loop tries that market
+again. Inner retries are immediate.
+
+---
+
+## 18. The hedge (the only sell)
+
+`sell_market_with_retry` docstring says hedge-only. There is no profit-take
+caller.
+
+**Normal hedge pipeline in the loop:**
+
+1. **Peek WS.** If a **fresh** WS bid is **above** 50¢, skip REST entirely
+   (`hedge_cancel` / toxic recovered). Do not hammer `/book` on a healthy
+   winner.
+2. Else **force REST**. Missing a side on a **normal** hedge →
+   `hedge_skip_incomplete_rest` (no WS sell). Toxic dump may proceed with
+   bid-only; no bid still skips.
+3. Bid bounced above 50¢ on REST → `hedge_cancel_bounce`.
+4. `hedge_book_ok` 50/55/15. Fail → `hedge_skip_toxic_book`.
+5. `hedge_consensus_ok` inverted GUI. Fail → `hedge_skip_no_consensus`.
+6. Write-ahead hedge quarantine, then FAK **sell at live bid minus
+   `hedge_undercut_ticks`** (default 2 ticks = 0.002 on 5m).
+   `hedge_sell_price` **ignores** `hedge_min_price` so a leftover 32¢ config
+   cannot refuse a 20¢ print. Floor is one tick (exchange minimum).
+7. Retries force REST again and re-run two-sided integrity so a spoof
+   1¢/99¢ still aborts. Toxic retries set `abort_above=None` but still
+   honor “bid recovered.”
+
+**`toxic_fill`:** armed from junk/walk average. Stays on `meta` forever until
+the dump actually sells (or you ride a recovered book). Dump **only while
+bid ≤ 50¢**. Recovered 97¢ → `hedge_skip_toxic_recovered`, flag stays armed.
+
+**Reconcile sells** with `reconcile_hedge_sold`: CLOB-confirmed sold size
+wins; a single low Data API read must not invent extra fills or erase
+confirms. `stable_zero_balances` requires **repeated** successful zeros
+before treating the bag as gone.
+
+Partial hedge: `bought_size` shrinks, `hedge_closed` only when remainder
+< 0.01. Ambiguous sell → `hedge_uncertain_*`, same inspect-exact-order
+pattern as buys.
+
+---
+
+## 19. Redemption at $1.00
+
+Winning shares are **not** sold at 99¢. After resolution, Data API sets
+`redeemable`. The bot:
+
+1. Skips redeem HTTP if a hedge is active or a buy window is open —
+   redeem latency must not delay a 50¢ dump.
+2. Skips if `buy_uncertain` / `hedge_uncertain` (settle execution first).
+3. Throttles per condition (`redeem_throttle_s` 30s).
+4. Builds `redeemPositions` calldata for the CTF.
+5. `submit_proxy_tx`: fetch relayer nonce, encode proxy call, EIP-712 sign
+   with `PRIVATE_KEY`, check derived proxy == `FUNDER_ADDRESS`, POST `/submit`
+   with Relayer API key headers **or** Builder HMAC.
+6. Store `redeem_pending` + `redeem_tx_id`. **This is not P&L.**
+7. Background `GET /transaction`. Credit par only when relayer says
+   confirmed **and** a complete Data API snapshot shows inventory gone.
+8. Permanent revert → in-memory blocklist (do not burn gas every cycle).
+9. Age out after `max_redeem_age_days` (7).
+
+GC (`gc_can_finalize`): only with terminal evidence (redeem value recorded,
+or hedge closed with dust remainder). `record_pnl` is idempotent by
+condition id. Fallback `redeem_value = bought_size` assumes winner-leg par —
+wrong if that invariant is ever broken (landmine).
+
+---
+
+## 20. The main loop, one cycle
+
+After import, `while not _shutdown_requested:`:
+
+1. Increment `CYCLE`, snapshot clocks.
+2. Filter cached Gamma markets: active, not closed, not `neg_risk`, end in
+   the future.
+3. `load_strategy()` and copy keys into the uppercase globals the rest of
+   the file uses (`HEDGE_THRESHOLD = _strat["hedge_threshold"]`, etc.).
+   Recompute `BUY_HORIZON_S`.
+4. Kick/collect thread-pool refresh of positions, USDC balance, Gamma
+   discovery (staggered by `positions_refresh_s` / `balance_refresh_s`).
+5. Heartbeat file.
+6. Rich table every `ui_every_n_cycles` in hot mode (cosmetic).
+7. Redeem phase (skipped if hedging or entries are live).
+8. GC / redeem-status poll.
+9. **Sort markets held-first** so a reversal is checked before a new buy
+   in the same cycle.
+10. `for m in markets:` **try/except per market**. Fault logs
+    `condition_id` and **continues**. This is what stopped a single
+    `NameError` from skipping every later hedge (see §25).
+11. Inside the try: seconds_left; merge held sizes; resolve `buy_uncertain`
+    / `hedge_uncertain` via exact order id; **hedge check** if held;
+    **buy check** if not held and bands open.
+12. Outer `except` → `cycle_error` (refresh/GC/UI/redeem failed). Process
+    stays up. Banner does not sleep 5s.
+13. Sleep: 0.05s if holding, 0.1s if something is inside `BUY_HORIZON_S`,
+    else 1s.
+14. Submit background REST quotes for tokens in horizon or held; 
+    `book_ws.set_tokens(watch_set)` (horizon + 30s slack).
+
+That is the whole runtime. There is no second scheduler.
+
+---
+
+## 21. Shared `buy/` modules
+
+**`buy/market.py` — `MintMarket` and `MarketGateway`**
+
+`MintMarket` is a frozen dataclass: condition id, slug, question, start/end,
+up/down token ids, flags (`active`, `closed`, `neg_risk`). The name
+“MintMarket” is historical (mint bot used it first). Buy bots use the same
+object.
+
+Start time: slugs look like `btc-updown-5m-1786528500`. The trailing unix
+time is the **real** open. Gamma’s `startDate` is sometimes event creation,
+hours off. Wrong start → wrong PTB window → wrong BTC gate. The parser
+rejects metadata whose duration is not ~5/15/60 minutes.
+
+`MarketGateway.discover([series_slug])` hits Gamma, caches a few seconds,
+returns a list of `MintMarket`. `discovery_fresh` is a bool the buy loop
+requires before new entries.
+
+**`buy/btc_price.py`**
+
+One `BtcUnderlyingFeed` per source. Daemon thread on
+`wss://ws-live-data.polymarket.com`. Ring buffer ~12,000 samples (~3 hours
+at 1 Hz). `live_price()` returns `None` if older than 5s (stale). PTB:
+nearest tick to `start_ts` within 2s skew, persisted to `ptb_*_buy*.json`.
+Missed the open → no PTB → no buy.
+
+`append_research` appends one JSON line and rotates at 50 MiB so a skip
+storm cannot fill the disk.
+
+**`buy/book.py`**
+
+`best_from_levels(levels, "bid"|"ask")`: ignore non-dicts, non-finite,
+price not in (0, 1), size ≤ 0. Bid = max price, ask = min price. Shared by
+WS cache and pathlog so REST and WS mean the same thing.
+
+**`buy/clob_book_ws.py`**
+
+`wss://ws-subscriptions-clob.polymarket.com/ws/market`. Subscribe with
+`assets_ids` + `custom_feature_enabled`. Ping every 8s. Reconnect with
+backoff. `get_book_feed()` is a process-wide singleton.
+
+**`buy/entry_skip.py`**
+
+§15. 15m/hourly bots do **not** import this.
+
+**`buy/chain.py` / `buy/contracts.py`**
+
+Mint-only. `splitPosition` into equal UP and DOWN. **Do not run mint live.**
+
+---
+
+## 22. Pathlog (no orders)
+
+`pathlog.py` is allowed to have `if __name__` style usage (it is a normal
+script with a lock and a loop; it does not import the buy bots).
+
+Every ~1s, for each series (5m whole window; last 8 minutes of 15m; last 15
+minutes of hourly), REST `/book` both legs, append a JSON line with bid/ask
+**and size**. After expiry, stamp `winner` from Gamma.
+
+Kill switch: `touch STOP_PATHLOG` in the repo.
+
+Prune: oldest JSONL first, skip files written in the last 2 minutes, stop at
+14 days **or** 400 MB. Look for `pathlog_prune` in `pathlog.log`. Export
+(`check_path_backtest.py --csv` or `scp` the directory) **before** prune.
+This is the one state-like tree that is allowed to delete itself. Do not
+`rm` it by hand.
+
+**`check_path_backtest.py`:** first tick that matches an ask band and TTM
+window is a “hit.” Paper hedge walks later ticks with the **example JSON**
+hedge (5m: 50/55/15) using mid as GUI when spread ≤ 10¢. Pathlog has **no**
+last-trade, **no** BTC/PTB, **no** POST latency.
+
+**`--sweep` / `--compare` do not replay the early ≥90 / ≥95 union.** They
+use `buy_threshold` / `buy_max_price` / `buy_start_s` (late 75–90 / 120s)
+plus paper hedge keys. `live_5m_paper` is that late rule, not the full live
+bot. Extra combos (`band_75_95`, `window_240s`) are one-knob variants, still
+not the union.
+
+`--series 5m` must not match filenames containing `15m` (the letters `5m`
+appear inside `15m`). The filter is exact-series, not a substring.
+
+---
+
+## 23. Tests (the bots cannot be imported)
+
+CI (`.github/workflows/test.yml`): Python 3.12, `pip install -r
+requirements.txt`, `py_compile` the scripts, `unittest discover -s tests`.
+
+| File | Approach |
+|---|---|
+| `test_buy_skips.py` | Imports `buy.entry_skip` directly |
+| `test_buy_fill_shapes.py` | `ast.parse(buybot.py)` and exec selected function sources into a fake namespace |
+| `test_path_backtest.py` | Imports `check_path_backtest` (has a `__main__` / functions) |
+| `test_book.py` | Imports `buy.book` |
+| others | Import the corresponding `check_*.py` or widget parsers |
+
+When you add a helper to the 5m bot that 15m also needs, either put it in
+`buy/` (importable) or copy it and teach `test_buy_fill_shapes` to extract
+it from **all three** files (several tests already loop the siblings).
+
+---
+
+## 24. Operations: systemd, CI, disk
+
+**Start/stop (operator):**
 
 ```bash
 systemctl is-active polybuybot polybuybot5m polybuybothourly polymintbot polypathlog
-# expect today: inactive  active  inactive  inactive  active
+# expect: inactive  active  inactive  inactive  active
 
-sudo systemctl restart polybuybot5m    # after validating a 5m code pull
-sudo journalctl -u polybuybot5m -f
+sudo systemctl restart polybuybot5m   # after a code pull you trust
 ```
 
-**Do not** `systemctl start polybuybot` / `polybuybothourly` / `polymintbot`
-unless the operator asks. Open 15m/hourly inventory is **not** hedged or
-redeemed while those processes are down.
+CI deploy (push to `main` touching bots / `buy/` / `pathlog.py` /
+`check_path_backtest.py` / `requirements.txt`): SSH `git pull` + `pip
+install`. **No `systemctl restart`.** A blind restart would start disabled
+15m/hourly/mint. A merged bugfix does nothing until you restart 5m.
 
-**CI deploy** (`.github/workflows/deploy.yml`): push to `main` touching
-`buybot*.py`, `pathlog.py`, `check_path_backtest.py`, `buy/**`, or
-`requirements.txt` → SSH `git pull` + `pip install`. **No systemd restart.**
-A blind restart would start disabled units.
+**Disk (July 2026):** `/var/log` filled a 10GB disk; app JSON was ~5MB. Cap
+the journal with `deploy/journald-size.conf` (`deploy/DISK_OPS.md`). Pathlog
+cap is separate and in-app.
 
-**Audit:**
+**After merging this 5m-band/hedge work:**
 
-- `tail -f buybot5m.log` — JSON lines, `RotatingFileHandler` (5 MB × backups).
-  `cycle_error`, `buy_skip_*`, `hedge_attempt` / `hedge_fill`, `redeem_submit`,
-  `pnl_recorded`.
-- `cat .heartbeat_buy5m` — unix timestamp; if it stops, the loop is wedged.
-- `positions_buy5m.json` / `pnl_buy5m.json` — open vs settled.
-- `check_buy_skips.py --since …` — what **this process** logged.
-- ntfy.sh fire-and-forget (`polybot-joel-btc`). Notification failures must
-  never crash the bot.
+```bash
+cd ~/poly-money-maker && git pull
+python3 -c 'import json; from pathlib import Path; p=Path("strategy_buy5m.json"); d=json.loads(p.read_text()); d["hedge_threshold"]=0.50; d["hedge_require_ask_max"]=0.55; p.write_text(json.dumps(d, indent=2)+"\n")'
+sudo systemctl restart polybuybot5m
+```
 
-**Disk:** July 2026 the ~10GB boot disk filled from **`/var/log` (~5GB)**, not
-bot JSON (~5MB). Cap journal with `deploy/journald-size.conf` (see
-`deploy/DISK_OPS.md`). Pathlog ticks are a **second** cap (14d / 400 MB) inside
-`pathlog.py`. Export CSVs / `scp` `pathlog/ticks` **before** prune. Do not
-`rm` ticks by hand. `STOP_PATHLOG` is the recorder kill switch.
+Watch `buy_attempt` `band=early` / `early_95` and `hedge_attempt` once held
+bid ≤ 50¢.
 
 ---
 
-## 12. Error Handling Philosophy
+## 25. Error handling and the `known_cost` stall
 
-- **Never crash the process.** Unexpected exceptions → `cycle_error` with
-  `{type}: {msg}` plus traceback. Per-market hedge+buy is wrapped; the poll
-  continues. Outer `except` still covers refresh/GC/redeem/UI. Banner does
-  **not** sleep 5s. `safe_api_call` turns 429/5xx/timeouts into retries/skips.
-- **Fail closed, not fast.** Incomplete book, no GUI consensus, missing PTB,
-  flat oracle, unclear POST → do nothing. Not trading is the default.
-- **Persist fills that already happened.** A posted FAK cannot be “rejected”
-  in software. Below-band buys are logged, written, `toxic_fill` armed, and
-  dumped **only while bid ≤ hedge_threshold**. Crashes between POST and save
-  recover via exact order ID, then trades, then stable balances.
-- **Complete audit trail.** Structured log events + research JSONL for buy
-  decisions.
+Philosophy: **the process stays up.** Missing data → skip. Ambiguous POST →
+quarantine. Unexpected exception → log and continue.
 
-**Worked incident (know this):** 13–19 Aug 2026 the live 5m process logged
-**3294/3294** `cycle_error` as `NameError: known_cost`. The 5m/hourly copies
-used `known_cost` before assignment inside `buy_uncertain` (`#80` /
-`be22662`). That exception was the **outer** poll `except`, so **every later
-market in that cycle skipped** (hedges included). Isolation (per-market
-`try`) is what stops the *next* NameError from stalling the morning. The
-assignment-order fix did nothing until **`systemctl restart polybuybot5m`**
-at 09:42Z on 19 Aug — CI had already pulled the code.
+**Per-market `try`:** a bug in market A’s buy path must not skip market B’s
+hedge in the same second. Outer `cycle_error` still means “something outside
+that loop failed” (refresh, GC, UI).
+
+**13–19 August 2026:** 3294/3294 live 5m `cycle_error`s were
+`NameError: name 'known_cost' is not defined`. Inside `buy_uncertain`
+handling, `known_cost` was used before assignment (`#80`). That exception
+was then the **outer** handler, so **every later market in the poll was
+skipped**, hedges included. Isolation (per-market try) is the guard for the
+*next* NameError. The assignment fix did nothing until
+`systemctl restart polybuybot5m` at 09:42Z on 19 Aug — CI had already
+pulled the code hours earlier.
+
+`known_cost` must still be assigned before `spend_cap` uses it. Tests in
+`test_buy_fill_shapes.py` grep the source for that order.
 
 ---
 
-## 13. Latency, Disk, and Optional AI
+## 26. Landmines
 
-**Will a bigger VM make buys/hedges faster?** Usually no. The hot path is
-network RTT to Polymarket, force-REST, `atomic_save` fsync, and SDK
-sign/POST — not local CPU. Prefer a **non-burstable** instance in a region
-with low measured latency to CLOB/Gamma, and keep hedge work off competing
-I/O (pathlog’s 8 REST workers, log rotation). Some crypto markets also impose
-an exchange taker delay no VM size can remove.
-
-**Disk is the VM’s real constraint.** Journal first (`DISK_OPS.md`), pathlog
-second (in-app prune), research JSONL third (50 MiB rotate). State/P&L are
-tiny. Do not “fix disk” by truncating `positions_buy5m.json`.
-
-**Can a small LLM validate each buy/hedge?** Not on the synchronous path.
-Unbounded tail latency + a new failure mode. Deterministic gates stay
-authoritative. If AI is wanted later: shadow scorer that **logs**
-agree/disagree without delaying POST; optional **buy-only** veto after that;
-**never** delay or veto hedges.
-
-Cloud agents paper-score **public books** (`CLOUD_RESEARCH.md`). They never
-receive `.env`, never load live `strategy_buy5m.json`, never `systemctl start`
-a buy bot.
+1. Three copies, not a library. `entry_skip` is 5m-only.
+2. 5m is seconds; 15m/hourly are minutes. Define `seconds_left` on 5m.
+3. `btc-updown` prefixes `btc-updown-5m`. Slug excludes are load-bearing.
+4. GC par fallback assumes winner-leg inventory.
+5. Never `import buybot5m`.
+6. Tick `0.001` vs `0.01`.
+7. Never delete live JSON / logs / `.env`. Export pathlog before prune.
+8. Ask ≠ price. Tight REST book required.
+9. Bid-alone is not a reversal. Toxic dump still requires bid ≤ threshold.
+10. `git pull` ≠ running new code.
+11. Live JSON hedge keys override code defaults.
+12. `--sweep` is not the live early-band union.
+13. Banner ASCII art still mentions old 97¢ / 65¢ — ignore it; JSON is truth.
+14. `hedge_min_price` is leftover config, not a FAK floor.
 
 ---
 
-## 14. Landmines
+## 27. Removed / historical
 
-1. **Three copies, not a library.** Fix `buybot5m.py` → diff `buybot.py` and
-   `buybothourly.py`. `buy/entry_skip.py` is 5m-only; do not assume 15m has
-   early bands.
-2. **5m is seconds; 15m/hourly are minutes.** 5m must define `seconds_left`
-   (not only `minutes_left`) or it NameErrors every cycle. `BUY_HORIZON_S`
-   must include the early windows or the first 3 minutes are invisible.
-3. **Slug excludes are load-bearing.** `btc-updown` prefixes `btc-updown-5m`.
-4. **GC par fallback.** `redeem_value = bought_size` is only valid for
-   winner-leg inventory.
-5. **No module guard.** Never `import buybot`. Tests use `ast` extraction or
-   import `buy/` / `check_*.py` / `pathlog.py`.
-6. **Tick sizes.** 5m `0.001`; others `0.01`. `hedge_min_price` must be a
-   valid tick multiple even though it is not a FAK floor.
-7. **State files are sacred.** Never delete/truncate/commit live JSON, logs,
-   `.env`. Export pathlog **before** prune.
-8. **Ask ≠ price.** 97¢ ask / 1¢ bid is not a 97¢ favorite. Tight REST book
-   required. Never trust last-trade GUI on a wide book.
-9. **Bid-alone is not a reversal.** Normal hedge needs ask collapsed + GUI.
-   `toxic_fill` may dump a wide 1¢/99¢ book **only if bid ≤ hedge_threshold**;
-   a recovered 97¢ bid must not dump.
-10. **`known_cost` before `spend_cap`.** See §12. `git pull` ≠ process restart.
-11. **Live JSON vs code defaults.** Hedge 50/55 on 5m is a default **and**
-    must be in `strategy_buy5m.json` or an old 35/40 file keeps the old
-    hedge. Early-band keys may be omitted (defaults apply).
-12. **`--series 5m` is not a substring.** `15m` contains the letters `5m`.
-    `check_path_backtest.py` matches only 5-minute markets. Pathlog
-    `--sweep` / `--compare` still score the **late** 75–90 / 120s keys from
-    the example JSON plus paper hedge 50/55; they do **not** replay the
-    early ≥90 / ≥95 union.
+Deleted in the 2026-08 cleanup (git history only): sell-side `bot*.py`,
+on-chain mint **buyer** `buy/runner.py`, paper `sim/`. `mintbot.py` remains
+as a **paused** helper, not that runner.
+
+Take-profit (“sell when up $0.30”) was evaluated in 2026-08 and **not**
+implemented. `sell_market_with_retry` stays hedge-only.
 
 ---
 
-## 15. Testing & Research Tools
-
-**CI** (`.github/workflows/test.yml`): Python 3.12, `pip install -r
-requirements.txt`, `py_compile` the bots + pathlog + `buy/entry_skip.py` +
-key `check_*.py`, then `python3 -m unittest discover -s tests -p 'test_*.py'`.
-
-| Test | What it covers |
-|---|---|
-| `tests/test_buy_skips.py` | 5m band union / skip reasons (`buy/entry_skip.py`) |
-| `tests/test_buy_fill_shapes.py` | Fill/GC/hedge helpers extracted from bot source |
-| `tests/test_buy_rejects.py` | Invalid-amount 400 classification |
-| `tests/test_path_backtest.py` | Grid/compare/paper helpers; example JSON hedge 0.50 |
-| `tests/test_pathlog_prune.py` | Tick retention / lock |
-| `tests/test_book.py` | `buy/book.py` level parse |
-| `tests/test_fetch_trades.py` | Data API trade CSV merge |
-| `tests/test_polydesk.py` | Widget parsing (no window) |
-
-**Pathlog** (`pathlog.py`, `polypathlog`): ~1s CLOB TOB samples, price **and**
-size, whole 5m / last 8m of 15m / last 15m of hourly. After expiry, stamps
-`winner` from Gamma. No last-trade GUI, no BTC/PTB, no POST latency. Kill:
-`touch STOP_PATHLOG`.
-
-**`check_path_backtest.py`** (importable): `--grid` ask × TTM; `--anatomy`
-“already decided at T-120 vs tight until the end”; `--compare` named presets;
-`--paper` walks later ticks for a **template** hedge (5m example = 50/55/15 +
-mid-as-GUI when spread ≤ 10¢); `--sweep` one-at-a-time variants from
-`strategy_buy5m.example.json`. Backtest **fills** `min(budget/ask, ask_size)`;
-live posts the full dollar size at that ask. Unresolved markets have no redeem
-P&L.
-
-**Other `check_*.py`:** `check_book.py` (ad-hoc book), `check_buy_skips.py`
-(live log), `check_buy_rejects.py` (invalid-amount 400s),
-`check_edge_counterfactual.py` (BTC-gate what-if), `check_fetch_trades.py`
-(full-wallet Data API → CSV), `check_participation.py` (bought vs missed).
-
-**Research loop before touching live JSON:** score `--compare --paper`,
-`--sweep`, `--anatomy` on **exported** ticks (prune is permanent), then
-`check_buy_skips.py` for what the process actually did. Pathlog cannot replay
-GUI last-trade, Chainlink, or FAK RTT.
-
-**Mint** (`mintbot.py`): approve + `splitPosition` for equal Up/Down
-inventory. **Paused.** `buy/chain.py` + `buy/contracts.py` exist for that
-path only. Do not restart `polymintbot` unless asked.
-
-**Widget** (`widget/polydesk.py`): always-on-top mark-to-market / HOLDING on
-a **laptop**. Public Data API. Not idle CLOB cash.
-
----
-
-## 16. Removed / Historical
-
-The repo previously had a sell-side bot family (`bot*.py`), an on-chain
-atomic-mint **buyer** (`buy/runner.py` + extra relayer/contracts), a shadow
-simulator (`sim/`), and their units. None ran in production; they were deleted
-in the 2026-08 cleanup. Retrieve from git history if needed.
-
-`mintbot.py` remains as a **paused** helper (not the deleted runner). The
-supported live product is the CLOB buy path in §1–§8, currently 5m-only.
-
----
-
-## 17. Glossary
+## 28. Glossary
 
 | Term | Meaning |
 |---|---|
-| **Leg** | One side of a binary market (UP or DOWN token) |
-| **Condition ID** | On-chain market id; key for state and redeem |
-| **Token ID** | CLOB asset id for one leg |
-| **CLOB** | Polymarket central limit order book (REST + WS) |
-| **Gamma** | Market catalog / metadata / winner after resolve |
-| **Data API** | Positions, value, trades, redeemable flag |
-| **RTDS** | Polymarket live-data socket (Chainlink TWAP / Binance) |
-| **FAK** | Fill-And-Kill: take now, cancel remainder; no resting order |
-| **PTB** | Price To Beat — oracle at window open |
-| **GUI consensus** | Winner/loser from display mid or last trade (70/30) |
-| **Hedge** | Sell-only exit when the held book **and** GUI say that side lost (5m 50/55, 15m/hr 35/40) |
-| **`toxic_fill`** | Flag: junk/walk fill; dump only while bid ≤ hedge threshold |
-| **Redeem** | Relayer `redeemPositions` of a winning leg at $1.00 |
-| **Hot mode** | 50–100 ms poll while held or inside `BUY_HORIZON_S` |
-| **GC** | Fold terminal markets into `pnl_buy*.json` and drop state |
-| **Quarantine** | `buy_uncertain` / `hedge_uncertain`: POST happened; outcome not settled |
-| **Pathlog** | No-order TOB recorder; paper research, not the live bot |
-| **Band union** | 5m: more than one ask window can be open at the same TTM |
+| **Ask** | Lowest price someone will sell the token for (we buy here) |
+| **Bid** | Highest price someone will pay (we hedge-sell here) |
+| **CLOB** | Central limit order book (the exchange) |
+| **Condition ID** | On-chain market id; state dict key |
+| **Daemon thread** | Background thread that dies with the process |
+| **FAK** | Fill-And-Kill: take now, cancel the rest |
+| **fsync** | Ask the OS to put file bytes on disk for real |
+| **Gamma** | Market catalog API |
+| **GUI consensus** | Website-style mid-or-last-trade 70/30 rule |
+| **Hedge** | Sell-only exit when the held side has truly lost |
+| **Hot reload** | Re-read JSON next loop without restarting Python |
+| **PTB** | Price To Beat — oracle at market open |
+| **Quarantine** | Saved “a POST happened; outcome unknown” |
+| **Relayer** | Polymarket submits the redeem transaction for us |
+| **REST** | HTTP request/response (here: `/book`, `/order`) |
+| **RTDS** | Polymarket live BTC websocket |
+| **Spread** | Ask minus bid |
+| **TTM** | Time to market end (seconds left on 5m) |
+| **Token ID** | CLOB id of UP or DOWN |
+| **toxic_fill** | Flag: junk fill; dump only while bid is dead |
+| **TWAP** | Time-weighted average price (Chainlink series the 5m market resolves on) |
+| **Websocket (WS)** | Push connection; fast cache, not an order |
+| **Write-ahead** | Save order id to disk **before** POST |

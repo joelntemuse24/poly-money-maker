@@ -1,7 +1,8 @@
 # AGENTS.md — Poly Money Maker
 
 Quick-reference for AI agents working on this codebase.
-Full architecture: `TECHNICAL_DESIGN.md`.
+Full architecture — a guided tour of the live 5m bot, the `buy/` helpers,
+and why the non-boilerplate code exists — is `TECHNICAL_DESIGN.md`.
 **Live probe / ops decisions:** read `CURRENT.md` first (update it when strategy changes).
 
 ## Project at a Glance
