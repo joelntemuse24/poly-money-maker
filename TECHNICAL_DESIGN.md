@@ -101,11 +101,13 @@ the rest of the ride to $1.00.
 | More than 300 seconds | none — too early |
 | 120s < TTM ≤ 300s (first ~3 minutes) | **90¢ through 99¢** |
 | 60s ≤ TTM ≤ 300s (first ~4 minutes) | **also 95¢ through 99¢** |
-| TTM ≤ 120s (last 2 minutes) | **75¢ through 90¢**, and **also ≥95¢** while TTM ≥ 60s |
+| TTM ≤ 120s (last 2 minutes) | **75¢ through 99¢** |
 
-**Hole:** in the last 120 seconds, **91–94¢** is not in any band. The bot
-skips those prints on purpose (`ask_out_of_band`). At TTM = 60s exactly, ≥95¢
-is still allowed. Below 60s, only 75–90¢ remains.
+Last 120s is the full 75–99¢ range. There is **no** 91–94¢ hole. The ≥95
+window still overlaps TTM 60–120s, but late already covers those asks.
+First 3 minutes stay **90–99¢** (not 75¢). Do not raise live `buy_max_price`
+to 0.99 — that knob is the early ≥90 floor; last-120s cap is
+`early_buy_max_price`.
 
 **Budget:** $2.50 per market, hard cap $3, share rail 5 shares. At 75¢ that is
 about 3.3 shares. If that ride wins, profit is roughly
@@ -459,7 +461,7 @@ hard exit (you will fail later on POST if allowance is actually missing).
 
 Then: `MarketGateway`, `get_btc_feed(...)`, `get_book_feed()`. Those start
 background threads. Then the ASCII banner (the 97¢ / 65¢ text in the banner
-is **cosmetic leftover** — live knobs are 75–90 / 50/55). Then
+is **cosmetic leftover** — live knobs are 75–99 / 50/55). Then
 `load_json(STATE_FILE)` and the `while` loop.
 
 ---
@@ -617,24 +619,25 @@ exclusive, and a name (`late` / `early` / `early_95`).
 
 `applicable_entry_bands(seconds_left, ...)` appends every band whose TTM
 window contains `seconds_left`. **Union, not first-match-wins.** Last 90s
-can be late 75–90 **and** early_95 ≥95 at the same time.
+can be late 75–99 **and** early_95 ≥95 at the same time.
 
 `ask_in_any_band` is the gate.
 
 `select_entry_band` picks the matching band with the **lowest retry floor**
 so FAK retries are pinned to the **widest** legal range. A 96¢ ask in the
-last 120s matches ≥95, not late 90¢-max — otherwise the retry would abort
-for “ask above 90.”
+last 120s matches **late** (floor 75¢), not ≥95 — a walk to 91¢ stays in-band.
 
 `union_ask_band_reason` labels skips: below the lowest floor →
-`ask_below_band`; above the highest cap → `ask_above_band`; in a hole
-(91–94) → `ask_out_of_band`.
+`ask_below_band`; above the highest cap → `ask_above_band`. Live last-120s
+75–99 has no hole; `ask_out_of_band` is for prices between disjoint bands
+if those return.
 
-`buybot5m.current_entry_bands` is a one-liner wrapper that plugs live knobs
-into `applicable_entry_bands`. `BUY_HORIZON_S = max(120, 300, 300) = 300`
-so hot polling and websocket subscribe actually run in the first 3–4
-minutes. If horizon were still 120, the early bands would exist in JSON and
-never be looked at.
+`buybot5m.current_entry_bands` is a one-liner wrapper. Last-120s
+`late_max` is `EARLY_BUY_MAX_PRICE` (0.99), **not** `BUY_MAX_PRICE` (0.90).
+`BUY_MAX_PRICE` remains the first-3-min ≥90 floor. `BUY_HORIZON_S =
+max(120, 300, 300) = 300` so hot polling and websocket subscribe actually
+run in the first 3–4 minutes. If horizon were still 120, the early bands
+would exist in JSON and never be looked at.
 
 **Other gates (all must pass), in the loop after “we do not already hold”:**
 
@@ -903,9 +906,10 @@ hedge (5m: 50/55/15) using mid as GUI when spread ≤ 10¢. Pathlog has **no**
 last-trade, **no** BTC/PTB, **no** POST latency.
 
 **`--sweep` / `--compare` do not replay the early ≥90 / ≥95 union.** They
-use `buy_threshold` / `buy_max_price` / `buy_start_s` (late 75–90 / 120s)
-plus paper hedge keys. `live_5m_paper` is that late rule, not the full live
-bot. Extra combos (`band_75_95`, `window_240s`) are one-knob variants, still
+use `buy_threshold` / `early_buy_max_price` / `buy_start_s` (late 75–99 /
+120s) plus paper hedge keys. `buy_max_price` 0.90 is the early ≥90 floor,
+not the paper late cap. `live_5m_paper` is that late rule, not the full live
+bot. Extra combos (`band_75_90`, `window_240s`) are one-knob variants, still
 not the union.
 
 `--series 5m` must not match filenames containing `15m` (the letters `5m`

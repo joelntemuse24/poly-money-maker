@@ -675,6 +675,8 @@ class AmbiguousCrossCyclePolicy(unittest.TestCase):
         self.assertIn("applicable_entry_bands", five)
         self.assertIn("EARLY_BUY_START_S", five)
         self.assertIn("EARLY_95_START_S", five)
+        self.assertIn("late_max=EARLY_BUY_MAX_PRICE", five)
+        self.assertNotIn("late_max=BUY_MAX_PRICE", five)
         self.assertIn('"hedge_threshold": 0.50', five)
         self.assertIn('"hedge_require_ask_max": 0.55', five)
         self.assertNotIn(

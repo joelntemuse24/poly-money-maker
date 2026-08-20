@@ -14,7 +14,7 @@ Examples (on the VM):
   python check_path_backtest.py --ask-min 0.80 --ask-max 0.85 --ttm-max 120
   python check_path_backtest.py --grid --budget 2.5 --series 5m
   python check_path_backtest.py --grid --budget 15 --series 5m
-  python check_path_backtest.py --ask-min 0.75 --ask-max 0.90 --ttm-max 120 --budget 15 --series 5m --csv /tmp/hits_15.csv
+  python check_path_backtest.py --ask-min 0.75 --ask-max 0.99 --ttm-max 120 --budget 15 --series 5m --csv /tmp/hits_15.csv
   python check_path_backtest.py --anatomy --series 5m --ttm-max 120
     python check_path_backtest.py --compare --series 5m --budget 2.5
     python check_path_backtest.py --compare --paper --series 5m --budget 2.5
@@ -199,11 +199,12 @@ PATHLOG_GUI_SPREAD = 0.10
 
 # Named alternatives vs the live 5m probe. Same ticks, no live orders.
 COMPARE_PRESETS: List[Tuple[str, float, float, float]] = [
-    ("live_5m", 0.75, 0.90, 120.0),
-    ("window_180s", 0.75, 0.90, 180.0),
-    ("window_240s", 0.75, 0.90, 240.0),
-    ("whole_5m", 0.75, 0.90, 300.0),
-    ("band_70_90", 0.70, 0.90, 120.0),
+    ("live_5m", 0.75, 0.99, 120.0),
+    ("window_180s", 0.75, 0.99, 180.0),
+    ("window_240s", 0.75, 0.99, 240.0),
+    ("whole_5m", 0.75, 0.99, 300.0),
+    ("band_70_99", 0.70, 0.99, 120.0),
+    ("band_75_90", 0.75, 0.90, 120.0),
     ("band_75_95", 0.75, 0.95, 120.0),
 ]
 
@@ -386,7 +387,9 @@ def template_from_strategy(path: Path) -> dict:
     spread = data.get("max_entry_spread")
     return {
         "ask_min": float(data["buy_threshold"]),
-        "ask_max": float(data["buy_max_price"]),
+        # 5m last-120s cap is early_buy_max_price (0.99). buy_max_price 0.90
+        # is the first-3-min ≥90 floor. 15m/hourly omit the early key.
+        "ask_max": float(data.get("early_buy_max_price", data["buy_max_price"])),
         "ttm_max": ttm_max,
         "budget": float(data["buy_budget"]),
         "max_spread": None if spread is None else float(spread),
@@ -417,9 +420,10 @@ def sweep_variants(tmpl: dict) -> List[dict]:
     add(f"live_{tag}_ride", paper=False)
     for ttm in (60, 90, 180, 240):
         add(f"window_{ttm}s", ttm_max=float(ttm), paper=True)
-    add("band_70_90", ask_min=0.70, paper=True)
-    add("band_80_90", ask_min=0.80, paper=True)
+    add("band_70_99", ask_min=0.70, paper=True)
+    add("band_80_99", ask_min=0.80, paper=True)
     add("band_75_85", ask_max=0.85, paper=True)
+    add("band_75_90", ask_max=0.90, paper=True)
     add("band_75_95", ask_max=0.95, paper=True)
     add("budget_15", budget=15.0, paper=True)
     add("no_spread_cap", max_spread=None, paper=True)
@@ -467,7 +471,7 @@ def classify_window(
     ttm_max: float = 120.0,
     min_edge: float = 0.05,
     ask_min: float = 0.75,
-    ask_max: float = 0.90,
+    ask_max: float = 0.99,
 ) -> dict:
     """Was the book already decided before the buy window, or tight until the end?
 
@@ -1007,7 +1011,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     if args.anatomy:
         ask_min, ask_max = args.ask_min, args.ask_max
         if ask_min == 0.80 and ask_max == 0.99:
-            ask_min, ask_max = 0.75, 0.90
+            ask_min, ask_max = 0.75, 0.99
         rows = anatomy_rows(
             markets,
             ttm_max=args.ttm_max,

@@ -3,7 +3,7 @@
 
 Past logs only contain skips that were actually written. Before the
 throttled ``buy_skip`` / ``buy_window`` events, most in-window "ask not
-in 75–90" ticks were silent — those cannot be recovered.
+in band" ticks were silent — those cannot be recovered.
 
 Usage (VM, repo root):
   python check_buy_skips.py

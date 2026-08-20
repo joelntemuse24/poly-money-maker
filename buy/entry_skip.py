@@ -37,7 +37,7 @@ def entry_band_for_seconds(
     """Primary band for this TTM (late, then ≥90 early, then ≥95).
 
     Prefer ``applicable_entry_bands`` when more than one window can fire
-    (last 120s 75–90¢ and first-4-min ≥95¢ overlap).
+    (last 120s 75–99¢ and first-4-min ≥95¢ overlap).
     """
     bands = applicable_entry_bands(
         seconds_left,
@@ -69,14 +69,15 @@ def applicable_entry_bands(
 ) -> List[EntryBand]:
     """Every 5m entry band that is open at this TTM (may be more than one).
 
-    Late: ``seconds_left <= late_start_s`` → inclusive 75–90¢.
+    Late: ``seconds_left <= late_start_s`` → inclusive 75–99¢
+    (``late_max`` is the early cap, typically 0.99).
 
     Early ≥90: ``late_start_s < seconds_left <= early_start_s`` → ask at least
     90¢ (first 3 minutes of a 5m market).
 
     Early ≥95: ``early_95_min_s <= seconds_left <= early_95_start_s`` → ask
     at least 95¢ (first 4 minutes of a 5m market). Overlaps the late window
-    for TTM 60–120s so 95¢+ can still buy there.
+    for TTM 60–120s; last 120s is already 75–99 so ≥95 is redundant there.
     """
     try:
         ttm = float(seconds_left)
