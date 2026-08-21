@@ -116,7 +116,8 @@ the combined bag.
 **Hedge (5m):** sell only when the **held** book looks collapsed — bid ≤ 50¢
 **and** ask ≤ 55¢, spread tight — **and** the website-style prices agree that
 side actually lost. Then sell at whatever the live bid is (even 20¢). The
-15m/hourly copies still use 35¢/40¢; they are not running.
+hourly copy’s template is 55¢/60¢ (still stopped). 15m still uses 35¢/40¢
+and is not running.
 
 Everything else in this document exists to do **that** without:
 
@@ -181,13 +182,13 @@ paths are picked once. Other knobs hot-reload.
 ```
 buybot5m.py          LIVE 5m bot (~5177 lines). You are usually here.
 buybot.py            15m copy (~5063). Stopped.
-buybothourly.py      Hourly copy (~5061). Stopped.
+buybothourly.py      Hourly copy. Stopped. Three slices, $10 cap, hedge 55/60.
 buy/                 Importable helpers (safe — they do not start trading)
   market.py          Find markets on Gamma
   btc_price.py       Chainlink / Binance websocket + PTB
   clob_book_ws.py    Fast top-of-book websocket
   book.py            Parse bid/ask levels (price + size)
-  entry_skip.py      5m band math + skip labels (5m + tests only)
+  entry_skip.py      5m two-slice + hourly three-slice band math (not 15m)
   chain.py           Mint helper: Polygon eth_call (paused path)
   contracts.py       Mint helper: splitPosition calldata (paused path)
 pathlog.py           Recorder, no orders
@@ -199,14 +200,16 @@ widget/polydesk.py   Laptop glance (public API, no orders)
 
 **Rule of copies:** a buy/hedge/quarantine bug in `buybot5m.py` probably
 exists in the other two files. Diff them after a logic change. The 5m-only
-exceptions are the early price bands (`buy/entry_skip.py` + `BUY_HORIZON_S`)
-and 5m defaults (hedge 50/55, BTC gate $0, tick `0.001`, windows in
-**seconds**).
+exceptions are the 5m early price bands (`buy/entry_skip.py` + `BUY_HORIZON_S`
+in **seconds**) and the hourly three-slice bands (`BUY_HORIZON_MIN` in
+**minutes**). 5m defaults: hedge 50/55, BTC gate $0, tick `0.001`. Hourly
+defaults: hedge 55/60, BTC gate $10, tick `0.01`, $10 market cap.
 
-15m/hourly windows are in **minutes** (`buy_window_min`). Mixing the two
-without converting units has caused production `NameError`s. The 5m loop
-**must** compute `seconds_left`. If someone ports a 15m snippet that only
-defines `minutes_left`, the 5m process dies every cycle.
+15m/hourly windows are in **minutes** (`buy_window_min` / `a22_window_min`).
+Mixing the two without converting units has caused production `NameError`s.
+The 5m loop **must** compute `seconds_left`. Hourly must **not** copy
+`seconds_left = (end_ts_ms - now_ms) / 1000`. If someone ports a 15m snippet
+that only defines `minutes_left` into 5m, the 5m process dies every cycle.
 
 ---
 
@@ -236,7 +239,8 @@ away.
 leftover USDC down the book. Quote 80¢, leftover cash lifts a 9¢ ask, you own
 junk. The 5m bot sizes **shares** = `budget / ask` and posts a **limit at the
 open band max (99¢)** so the FAK can take 84–99¢ if the 83¢ clip is gone.
-Unfilled dollars still die. 15m/hourly (stopped) still limit at the touch.
+Unfilled dollars still die. Hourly (stopped) uses the same limit-FAK sizer
+(A/C 99¢, B 90¢). 15m (stopped) still limits at the touch.
 
 **Displayed size is not a cap.** If the top ask shows 0.4 shares, the bot
 still posts ~3 shares at the **99¢ limit**. The exchange fills what exists
@@ -671,18 +675,19 @@ the oracle might disagree with.
 
 `quoted_buy_shares(budget, ask, share_cap)` sizes the share count.
 
-`quoted_buy_shares_up_to_limit` (5m only) starts from that count, floors
-at **3.00 shares** when `3 × band_max ≤ buy_max_spend`, then snaps to a
-size whose `size × band_max` is exact cents and ≤ `$3`. That is why early
-99¢ posts **3.00 sh / $2.97** instead of 2.00 / $1.98 (the only legal
-makers at 99¢ under $3 are $0.99 / $1.98 / $2.97).
+`quoted_buy_shares_up_to_limit` (5m and hourly) starts from that count, floors
+at **3.00 shares** when `3 × band_max ≤ spend_cap`, then snaps to a
+size whose `size × band_max` is exact cents and ≤ the slice spend cap. That is why early
+99¢ on 5m posts **3.00 sh / $2.97** instead of 2.00 / $1.98 (the only legal
+makers at 99¢ under $3 are $0.99 / $1.98 / $2.97). Hourly $5 @ 99¢ posts
+**5.00 sh / $4.95**; $10 @ 90¢ posts **11.10 sh / $9.99**.
 
-Do **not** pass `user_usdc_balance` on that 5m `OrderArgs`. The field is
+Do **not** pass `user_usdc_balance` on 5m or hourly BUY `OrderArgs`. The field is
 the wallet, not a spend cap. Passing `$2.97` (or `max(budget, 3*0.99)` as
 a float) makes `create_order` treat notional+fees as unaffordable, shrink
 size to `2.999…`, round_down to **2.99**, and sign maker **`$2.9601`**.
 Live 21 Aug 2026: **521** attempts, **471** `invalid_amount`, **0** fills.
-15m/hourly still pass `remaining_budget` (stopped; no 3-share floor).
+15m still passes `remaining_budget` (stopped; no 3-share floor).
 
 1. Quantize budget down to **cents** (`Decimal("0.01")`, `ROUND_DOWN`).
 2. `shares = spend / ask`, quantized to **0.01 shares** (2 dp), round down.
@@ -903,7 +908,8 @@ backoff. `get_book_feed()` is a process-wide singleton.
 
 **`buy/entry_skip.py`**
 
-§15. 15m/hourly bots do **not** import this.
+§15. 5m two-slice helpers plus hourly three-slice (`a22` / `b15` / `c5`)
+band and budget math. 15m does **not** import this.
 
 **`buy/chain.py` / `buy/contracts.py`**
 
@@ -1021,8 +1027,9 @@ pulled the code hours earlier.
 
 ## 26. Landmines
 
-1. Three copies, not a library. `entry_skip` is 5m-only.
+1. Three copies, not a library. `entry_skip` is 5m + hourly (not 15m).
 2. 5m is seconds; 15m/hourly are minutes. Define `seconds_left` on 5m.
+   Do not copy that assignment into hourly.
 3. `btc-updown` prefixes `btc-updown-5m`. Slug excludes are load-bearing.
 4. GC par fallback assumes winner-leg inventory.
 5. Never `import buybot5m`.
