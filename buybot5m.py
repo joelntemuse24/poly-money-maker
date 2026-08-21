@@ -611,7 +611,7 @@ _buy_window_logged = {}
 
 
 def log_buy_skip_throttled(reason, condition_id, event="buy_skip", **kwargs):
-    """In-window skip without flooding 0.1s polls (one line per reason / 8s)."""
+    """In-window skip without flooding 0.01s looks (one line per reason / 8s)."""
     key = (str(condition_id), str(reason))
     now_mono = time.monotonic()
     prev = _skip_log_mono.get(key, 0.0)
@@ -1343,6 +1343,34 @@ def get_quote_fast(
     if len(_rest_quote_cache) > _REST_QUOTE_CACHE_MAX:
         prune_rest_caches()
     return q
+
+
+def pick_look_quote(ws_q, cached_q):
+    """Prefer live WS top-of-book; else this cycle's prefetch. No HTTP."""
+    empty = (None, 0.0, None, 0.0, None)
+    if ws_q is not None and (ws_q[0] is not None or ws_q[2] is not None):
+        return ws_q
+    if cached_q is not None and (cached_q[0] is not None or cached_q[2] is not None):
+        return cached_q
+    return empty
+
+
+def look_book_quote(token_id, book_cache, max_age_s=2.0):
+    """0.01s look: WS / prefetch only. REST is for POST, not every tick."""
+    return pick_look_quote(
+        book_ws.quote(token_id, max_age_s=max_age_s),
+        (book_cache or {}).get(token_id),
+    )
+
+
+def look_last_trade(token_id):
+    """Last print already in memory. Do not HTTP on the 0.01s look."""
+    cached = _last_trade_cache.get(token_id)
+    if cached is None:
+        cached = _last_trade_cache.get(str(token_id))
+    if cached is not None:
+        return cached[0]
+    return get_book_snapshot_last_trade(token_id)
 
 
 def hedge_sell_price(bid, tick_size, undercut_ticks, min_price=None):
@@ -3463,6 +3491,8 @@ _cached_positions = drop_wallet_dust(
     _wallet_positions, positions_meta, time.time(),
 )
 _last_dust_dropped = None
+_HEARTBEAT_MIN_S = 1.0
+_last_heartbeat_mono = 0.0
 _cached_markets = []
 _cached_discovery_fresh = False
 _positions_received_mono = 0.0
@@ -3563,11 +3593,12 @@ while not _shutdown_requested:
         UI_EVERY_N_CYCLES = _strat["ui_every_n_cycles"]
         TICK_SIZE_FALLBACK = _strat["tick_size"]
 
-        write_heartbeat()
-
         # Consume background refreshes without putting unrelated network RTTs
         # ahead of the hedge path.
         _now_mono = time.monotonic()
+        if _now_mono - _last_heartbeat_mono >= _HEARTBEAT_MIN_S:
+            write_heartbeat()
+            _last_heartbeat_mono = _now_mono
         positions_raw = None
         if _positions_future is not None and _positions_future.done():
             try:
@@ -4914,25 +4945,19 @@ while not _shutdown_requested:
                     )
                     continue
 
-                # Fresh REST book + last trade in parallel.
-                # Entry decisions must not trust WS alone (stale/phantom sizes).
-                # GUI display = mid if spread ≤ 10¢ else last trade.
-                fut_up = _entry_executor.submit(
-                    get_quote_fast, m.up_token, 2.0, True, True,
-                )  # prefer_rest, force_rest — no 200ms cache at entry gate
-                fut_dn = _entry_executor.submit(
-                    get_quote_fast, m.dn_token, 2.0, True, True,
+                # 0.01s look: WS / prefetch only. REST every tick is why
+                # "sleeping 0.01s" used to wait hundreds of ms on CLOB.
+                # buy_market_with_retry still force-RESTs at POST.
+                up_bid, _, up_ask, _, up_mid = look_book_quote(
+                    m.up_token, _book_cache,
                 )
-                fut_ul = _entry_executor.submit(get_last_trade_price, m.up_token)
-                fut_dl = _entry_executor.submit(get_last_trade_price, m.dn_token)
-                up_bid, _, up_ask, _, up_mid = fut_up.result()
-                dn_bid, _, dn_ask, _, dn_mid = fut_dn.result()
-                up_last = fut_ul.result()
-                dn_last = fut_dl.result()
-                if up_last is None:
-                    up_last = get_book_snapshot_last_trade(m.up_token)
-                if dn_last is None:
-                    dn_last = get_book_snapshot_last_trade(m.dn_token)
+                dn_bid, _, dn_ask, _, dn_mid = look_book_quote(
+                    m.dn_token, _book_cache,
+                )
+                if up_ask is None and dn_ask is None:
+                    continue
+                up_last = look_last_trade(m.up_token)
+                dn_last = look_last_trade(m.dn_token)
                 up_gui = polymarket_display_price(up_bid, up_ask, up_last)
                 dn_gui = polymarket_display_price(dn_bid, dn_ask, dn_last)
 
@@ -4958,9 +4983,10 @@ while not _shutdown_requested:
                         save_json(STATE_FILE, positions_meta)
 
                 if up_gui is None or dn_gui is None:
-                    log_event(
-                        "buy_skip_incomplete_book",
-                        condition_id=cond,
+                    log_buy_skip_throttled(
+                        "incomplete_book",
+                        cond,
+                        event="buy_skip_incomplete_book",
                         up_bid=up_bid, dn_bid=dn_bid, up_ask=up_ask, dn_ask=dn_ask,
                         up_last=up_last, dn_last=dn_last, up_gui=up_gui, dn_gui=dn_gui,
                     )
@@ -4998,9 +5024,11 @@ while not _shutdown_requested:
                 )
 
                 if up_winning and up_ask_ok and not up_consensus:
-                    log_event(
-                        "buy_skip_no_consensus",
-                        condition_id=cond, leg="up",
+                    log_buy_skip_throttled(
+                        "no_consensus",
+                        cond,
+                        event="buy_skip_no_consensus",
+                        leg="up",
                         up_gui=up_gui, dn_gui=dn_gui, up_ask=up_ask,
                         up_bid=up_bid, dn_bid=dn_bid, up_last=up_last, dn_last=dn_last,
                         up_book_ok=up_book_ok, up_book_why=up_book_why,
@@ -5008,9 +5036,11 @@ while not _shutdown_requested:
                         min_winner_bid=MIN_WINNER_BID, max_loser_bid=MAX_LOSER_BID,
                     )
                 if dn_winning and dn_ask_ok and not dn_consensus:
-                    log_event(
-                        "buy_skip_no_consensus",
-                        condition_id=cond, leg="down",
+                    log_buy_skip_throttled(
+                        "no_consensus",
+                        cond,
+                        event="buy_skip_no_consensus",
+                        leg="down",
                         up_gui=up_gui, dn_gui=dn_gui, dn_ask=dn_ask,
                         up_bid=up_bid, dn_bid=dn_bid, up_last=up_last, dn_last=dn_last,
                         dn_book_ok=dn_book_ok, dn_book_why=dn_book_why,
@@ -5124,6 +5154,69 @@ while not _shutdown_requested:
                             entry_min=min(b.min_price for b in bands),
                             entry_max=max(b.max_price for b in bands),
                         )
+                    continue
+
+                # WS said buy. REST-confirm once (stale/phantom sizes), then
+                # POST. Skip ticks never wait on CLOB HTTP.
+                fut_up = _entry_executor.submit(
+                    get_quote_fast, m.up_token, 2.0, True, True,
+                )
+                fut_dn = _entry_executor.submit(
+                    get_quote_fast, m.dn_token, 2.0, True, True,
+                )
+                fut_ul = _entry_executor.submit(get_last_trade_price, m.up_token)
+                fut_dl = _entry_executor.submit(get_last_trade_price, m.dn_token)
+                up_bid, _, up_ask, _, up_mid = fut_up.result()
+                dn_bid, _, dn_ask, _, dn_mid = fut_dn.result()
+                up_last = fut_ul.result()
+                dn_last = fut_dl.result()
+                if up_last is None:
+                    up_last = get_book_snapshot_last_trade(m.up_token)
+                if dn_last is None:
+                    dn_last = get_book_snapshot_last_trade(m.dn_token)
+                up_gui = polymarket_display_price(up_bid, up_ask, up_last)
+                dn_gui = polymarket_display_price(dn_bid, dn_ask, dn_last)
+                if up_gui is None or dn_gui is None:
+                    log_buy_skip_throttled(
+                        "incomplete_book",
+                        cond,
+                        event="buy_skip_incomplete_book",
+                        via="rest_confirm",
+                        up_bid=up_bid, dn_bid=dn_bid, up_ask=up_ask, dn_ask=dn_ask,
+                        up_last=up_last, dn_last=dn_last, up_gui=up_gui, dn_gui=dn_gui,
+                    )
+                    continue
+                gui_edge = abs(up_gui - dn_gui)
+                if gui_edge < MIN_BID_EDGE:
+                    continue
+                up_winning = up_gui > dn_gui
+                dn_winning = dn_gui > up_gui
+                up_ask_ok = ask_in_any_band(up_ask, bands)
+                dn_ask_ok = ask_in_any_band(dn_ask, bands)
+                up_book_ok, _ = entry_book_ok(
+                    up_bid, up_ask, MAX_ENTRY_SPREAD, MIN_WINNER_BID,
+                )
+                dn_book_ok, _ = entry_book_ok(
+                    dn_bid, dn_ask, MAX_ENTRY_SPREAD, MIN_WINNER_BID,
+                )
+                up_consensus = (
+                    up_gui >= MIN_WINNER_BID and dn_gui <= MAX_LOSER_BID
+                    and up_book_ok
+                )
+                dn_consensus = (
+                    dn_gui >= MIN_WINNER_BID and up_gui <= MAX_LOSER_BID
+                    and dn_book_ok
+                )
+                up_buy = up_winning and up_ask_ok and up_consensus
+                dn_buy = dn_winning and dn_ask_ok and dn_consensus
+                if not (up_buy or dn_buy):
+                    log_buy_skip_throttled(
+                        "rest_confirm",
+                        cond,
+                        event="buy_skip_rest_confirm",
+                        up_ask=up_ask, dn_ask=dn_ask,
+                        up_gui=up_gui, dn_gui=dn_gui,
+                    )
                     continue
 
                 buy_token = m.up_token if up_buy else m.dn_token
@@ -5589,13 +5682,9 @@ while not _shutdown_requested:
     _pending_tokens = set(_pending_book_futs.values())
     _MAX_PENDING_BOOKS = 8
     _watch_tokens = set()
-    for m in markets:
+    for m in _loop_markets:
         pos = held.get(m.condition_id, {})
         meta = positions_meta.get(m.condition_id, {})
-        if not market_needs_fast_path(
-            m, pos, meta, now_s, BUY_HORIZON_S,
-        ):
-            continue
         has_pos = position_is_live_hedge(pos, meta, now_s)
         _ml_s = (m.end_ts * 1000 - _next_now) / 1000
         in_window = _ml_s > 0 and _ml_s <= BUY_HORIZON_S + 30
@@ -5612,6 +5701,9 @@ while not _shutdown_requested:
                 or (pos.get("dn", {}).get("size", 0) > 0.01 and token == m.dn_token)
             ):
                 _watch_tokens.add(token)
+            _wq = book_ws.quote(token, max_age_s=2.0)
+            if _wq is not None and (_wq[0] is not None or _wq[2] is not None):
+                continue
             if token not in _pending_tokens and len(_pending_book_futs) < _MAX_PENDING_BOOKS:
                 _pending_book_futs[_book_executor.submit(get_quote_fast, token)] = token
                 _pending_tokens.add(token)

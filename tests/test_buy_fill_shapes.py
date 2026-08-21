@@ -1468,6 +1468,7 @@ class FiveMFastPollHelpers(unittest.TestCase):
             "count_live_hedges",
             "inventory_is_hot",
             "drop_wallet_dust",
+            "pick_look_quote",
             "add_tracked_market_stubs",
             bot=BOT5M,
         )
@@ -1664,7 +1665,26 @@ class FiveMFastPollHelpers(unittest.TestCase):
         self.assertIn('"poll_held_s": 0.01', src)
         self.assertIn("for m in _loop_markets:", src)
         self.assertIn("drop_wallet_dust", src)
+        self.assertIn("look_book_quote", src)
+        self.assertIn("_HEARTBEAT_MIN_S", src)
+        self.assertIn("buy_skip_rest_confirm", src)
+        look_at = src.find("0.01s look: WS")
+        rest_at = src.find("WS said buy. REST-confirm once")
+        self.assertGreater(look_at, 0)
+        self.assertGreater(rest_at, look_at)
         self.assertIn("_REDEEM_ENQUEUE_MIN_S", src)
+
+    def test_pick_look_quote_prefers_ws_and_skips_empty(self):
+        pick = self.ns["pick_look_quote"]
+        ws = (0.80, 10.0, 0.81, 5.0, 0.805)
+        cached = (0.50, 1.0, 0.90, 1.0, 0.70)
+        self.assertEqual(pick(ws, cached), ws)
+        self.assertEqual(pick(None, cached), cached)
+        self.assertEqual(pick((None, 0.0, None, 0.0, None), cached), cached)
+        self.assertEqual(
+            pick(None, None),
+            (None, 0.0, None, 0.0, None),
+        )
 
 
 if __name__ == "__main__":

@@ -9,7 +9,7 @@ positions API still returns hundreds of old 5m rows (`WAIT 666` was that
 list, not 666 live markets). The bot **throws those rows away** after
 download. Do **not** delete `positions_buy5m.json` to “clear” them, and do
 **not** try to sell dead 5m tokens (no CLOB book). Real leftovers redeem;
-API ghosts get one `redeem_abandoned` skip. Look interval is **0.01s**.
+API ghosts get one `redeem_abandoned` skip. Look interval is **0.01s** on the live WS book (REST only when posting).
 Stop/disable 15m and hourly. Split the 5m stake into **two $2.50 slices** (**$5** if both
 fill): **early ≥90¢ (to 99¢) in the first 3 minutes** and **≥95¢ overlay**
 there, then **$2.50 only in the last 120s at the old 75–90¢ band**. Missed
@@ -55,7 +55,7 @@ overlay on that same window. Late: **75–90¢** in the last **120s** only
 | Underlying edge | **$0** (5m: any non-zero TWAP vs PTB) / **$10** (15m, hourly); side must match |
 | `max_open_positions` | **0 = unlimited** |
 | `toxic_force_exit_below` | **65¢** |
-| `poll_buy_window_s` / `poll_held_s` | **0.01** (live JSON + restart). Banner **POS** = live hedge only; **WAIT** should be **0** unless a *redeemable* leftover is still cashing out. Old wallet rows are dropped, not listed. |
+| `poll_buy_window_s` / `poll_held_s` | **0.01** on the **live 5m WS book**. REST only when a look says buy (then POST). Banner **POS** = live hedge only; **WAIT** should be **0** unless a *redeemable* leftover is still cashing out. |
 
 **Also running (no orders):** `pathlog.py` (`polypathlog`) writes one JSONL file
 per market under `pathlog/ticks/` so we can ask “if we had bought at 80¢ with
@@ -203,11 +203,12 @@ amount / HTTP 400), not this NameError.
       **`poll_held_s=0.01`**, then
       `sudo systemctl restart polybuybot5m` only. Watch banner **POS** (0–2
       live hedges), **WAIT 0** (or 1 if a real redeem is in flight — not
-      666), and `sleeping 0.01s`. `wallet_dust_dropped dropped=666 kept=0`
-      means the leftover list was thrown away. CLOB 404s on dead tokens
-      should be rare. Watch `buy_attempt` `slice=early|late` and `add=true`
-      on the second $2.50. Do **not** start 15m / hourly / mint. Do **not**
-      set `buy_budget` to 5.
+      666), and `sleeping 0.01s` with TICK lines ~0.5s apart (banner every
+      50 looks). Skip ticks must not wait on CLOB REST. `wallet_dust_dropped
+      dropped=666 kept=0` means the leftover list was thrown away. CLOB 404s
+      on dead tokens should be rare. Watch `buy_attempt` `slice=early|late`
+      and `add=true` on the second $2.50. Do **not** start 15m / hourly /
+      mint. Do **not** set `buy_budget` to 5.
 - [ ] Cloud paper P&L: paste `CLOUD_RESEARCH.md` section 2 (live `pathlog.py`
       + `--sweep --paper`, rank by `pnl_sum` vs `live_5m_paper`). No `.env`.
       Optional: attach `poly-research.zip` for the historical tape. Not live
