@@ -9,8 +9,8 @@ clicked.” Hits without `pnl` are incomplete.
 
 Pathlog **cannot** replay Polymarket last-trade GUI, Chainlink/PTB, or POST
 latency. Paper mode: fill at the recorded ask, walk later ticks for a
-50/55/15 hedge (live 5m template) using mid-as-GUI when spread ≤ 10¢. Wide books fail closed.
-Toxic dumps only while bid ≤ 50¢.
+53/55/15 hedge (live 5m template) using mid-as-GUI when spread ≤ 10¢. Wide books fail closed.
+Toxic dumps only while bid ≤ 53¢.
 
 Live books are **public** (Gamma + CLOB). `pathlog.py` records them with no
 keys. Do not put `PRIVATE_KEY` on a Cloud Agent.
@@ -34,7 +34,7 @@ Leave **Start** empty.
 You are a paper P&L research agent for joelntemuse24/poly-money-maker.
 
 Goal: rank strategy variants by money made, not by how often they would fire.
-Money = paper P&L after a 50/55/15 hedge (or toxic dump) or after redeem at
+Money = paper P&L after a 53/55/15 hedge (or toxic dump) or after redeem at
 $1.00 / $0.00. A skip with no fill is $0, not a win. Unresolved markets do
 not get a redeem P&L — wait or mark them unresolved.
 
@@ -123,7 +123,7 @@ Hard rules:
 - Do not edit strategy_buy.json / strategy_buy5m.json / strategy_buyhourly.json (non-example).
 - Do not read or write .env. Do not set dry_run false. Do not place orders.
 - Template file is strategy_buy5m.example.json. `--sweep` scores late
-  75–90¢ / 120s / $2.50 plus paper 50/55 — not the early ≥90 / ≥95 union.
+  75–90¢ / 120s / $2.50 plus paper 53/55 — not the early ≥90 / ≥95 union.
 - Rank by paper pnl_sum vs live_5m_paper, not by hit count. If pathlog/ticks
   is missing, run pathlog.py (no orders) instead of inventing books.
 
@@ -167,7 +167,7 @@ by pnl_sum (min 5 hits). Do not merge. Do not edit strategy_buy5m.json.
 | GUI + last trade for hedge | Mid if spread ≤ 10¢; wide book = no hedge |
 | BTC/PTB side gate | Not replayed (pathlog is books only) |
 | Unmatched FAK / POST RTT | Not replayed (optimistic fill at that tick) |
-| Toxic dump if bid ≤ 50¢ (5m) | Same from template; recovered bid > 50¢ rides |
+| Toxic dump if bid ≤ 53¢ (5m) | Same from template; recovered bid > 53¢ rides |
 | Redeem $1 / wipeout $0 | After no hedge: same — this is the P&L |
 
 `--sweep` is **one change at a time** from the template (window, band, $15,
