@@ -51,6 +51,21 @@ from py_builder_signing_sdk.sdk_types import BuilderApiKeyCreds
 from buy.market import MarketGateway, MintMarket
 from buy.btc_price import get_btc_feed, append_research, SOURCE_BINANCE
 from buy.clob_book_ws import get_book_feed
+from buy.entry_skip import (
+    accumulate_buy_inventory,
+    applicable_hourly_entry_bands,
+    ask_in_any_band,
+    can_arm_hourly_slice,
+    hourly_horizon_min,
+    hourly_remaining_to_cap,
+    hourly_slice_budget,
+    hourly_spent_so_far,
+    same_token,
+    select_hourly_entry_band,
+    stamp_hourly_slice_bought,
+    uncertain_buy_spend_cap,
+    window_no_buy_reason,
+)
 
 
 class ImmediateResponseClobClient(ClobClient):
@@ -127,29 +142,34 @@ POLY_BUILDER_PASSPHRASE = (
 )
 EXPECTED_TICK_SIZE = "0.01"
 
-# CLOB market orders reject taker amounts with more than four decimal places.
-# py-clob-client-v2 1.1.0 still exposes wider configs for sub-cent markets.
+# CLOB BUY: maker USDC max 2 decimals, taker shares max 4. Clamp every tick
+# to 4, then hourly's 0.01 maker to cents so a dirty float cannot sign 4dp.
 for _rounding in ROUNDING_CONFIG.values():
     if _rounding.amount > 4:
         _rounding.amount = 4
+_tick_01 = ROUNDING_CONFIG.get("0.01")
+if _tick_01 is not None and _tick_01.amount > 2:
+    _tick_01.amount = 2
 
 # ------------------------- STRATEGY CONFIG -------------------------
 _STRATEGY_DEFAULTS = {
     # Explicit hot-reloadable entry arm. A missing/invalid file disables new
     # entries while existing positions continue through the hedge path.
     "entry_enabled": False,
-    # Trigger at 75¢: buy as soon as the winning ask is ≥ 75¢, priced at the
-    # live ask (so early catches ≈ 75¢). buy_max_price is a hard ceiling only —
-    # never pay above 90¢; we do not wait for or target the top of the band.
+    # Three slices, $10 hard cap per market (sum of fills). Slice A never
+    # spends more than $5. B/C spend remaining to $10. buy_max_price is the
+    # 75–90¢ (B) cap and FAK limit; high_buy_max_price is the 99¢ A/C limit.
     "buy_threshold": 0.75,
     "buy_max_price": 0.90,
+    "high_buy_max_price": 0.99,
     # Consensus on Polymarket GUI display price (mid if spread≤10¢ else last trade).
     # Tuned for the 75¢ band (old 92¢/10¢ gates could never arm a 75¢ ask).
     "min_winner_bid": 0.70,
     "max_loser_bid": 0.30,
     "min_bid_edge": 0.05,
     # Skip buys unless live BTC is ≥ this many USD from the window Price To Beat,
-    # and only allow the side matching that underlying move.
+    # and only allow the side matching that underlying move. Hourly stays $10
+    # (5m is $0). Binance BTCUSDT is this bot's resolution feed.
     "underlying_gate_enabled": True,
     "min_underlying_edge_usd": 10.0,
     # Force-dump only when FAK avg is worse than this. Fills in
@@ -157,8 +177,8 @@ _STRATEGY_DEFAULTS = {
     # Must be <= buy_threshold (validator); 65¢ ≈ walk well below the 75¢ floor.
     "toxic_force_exit_below": 0.65,
     "hedge_enabled": True,
-    "hedge_threshold": 0.35,
-    # Kept in config (live JSON still sends it). Not a FAK floor: after 35/40
+    "hedge_threshold": 0.55,
+    # Kept in config (live JSON still sends it). Not a FAK floor: after 55/60
     # integrity, the sell follows the live bid so a 20¢ print is not $0.
     "hedge_min_price": 0.32,
     # Undercut top bid by N ticks so FAK crosses a falling book during order RTT.
@@ -172,17 +192,30 @@ _STRATEGY_DEFAULTS = {
     # Hedge: penny bids under a still-high ask are fake — require a tight book
     # and ask also collapsed (same lesson sell-side already learned on mids).
     "hedge_max_spread": 0.15,
-    "hedge_require_ask_max": 0.40,
+    "hedge_require_ask_max": 0.60,
     "hedge_require_gui": True,
-    "buy_window_min": 13.0,
-    "buy_grace_s": 2,
-    "buy_cooldown_s": 3,
+    # Outer look-ahead / poll horizon (minutes). Slice windows below.
+    "buy_window_min": 22.0,
+    "a22_window_min": 22.0,
+    "b15_window_min": 15.0,
+    "c5_window_min": 5.0,
+    "a22_min_price": 0.93,
+    "c5_min_price": 0.95,
+    "a22_buy_budget": 5.0,
+    "b15_buy_budget": 10.0,
+    "c5_buy_budget": 10.0,
+    "market_spend_cap": 10.0,
+    "buy_grace_s": 1,
+    "buy_cooldown_s": 1,
     "empty_fak_cooldown_s": 0.15,
-    "buy_budget": 2.5,
-    # Hard ceiling on USDC sent per market. Strategy is $2.50; never more than $3.
-    "buy_max_spend": 3.0,
-    # Sanity rail: ~3.3 sh at $2.50/75¢. Raise this when you raise the dollar size.
-    "buy_max_shares": 5.0,
+    # Legacy alias for slice A ($5). Named a22/b15/c5 budgets are the source of truth.
+    "buy_budget": 5.0,
+    # Per-FAK ceiling (5m analog: $3 on a $2.50 slice). Market cap is
+    # market_spend_cap $10; A is additionally capped at $5.
+    "buy_max_spend": 11.0,
+    # $10 / 75¢ ≈ 13.3 sh. Two slices may exceed 14 shares total; this is
+    # per FAK, not a lifetime share limit.
+    "buy_max_shares": 14.0,
     "max_open_positions": 0,  # 0 = unlimited
     "max_open_notional": 10000.0,
     "max_daily_notional": 999999.0,
@@ -191,13 +224,11 @@ _STRATEGY_DEFAULTS = {
     "max_redeem_age_days": 7,
     # Missing configuration must never arm real-money orders.
     "dry_run": True,
-    "poll_buy_window_s": 0.1,
-    # Sub-second while any position is held (hedge path), independent of buy window.
-    "poll_held_s": 0.05,
-    "positions_refresh_s": 2,
+    "poll_buy_window_s": 0.01,
+    "poll_held_s": 0.01,
+    "positions_refresh_s": 1,
     "balance_refresh_s": 15,
-    # Throttle Rich position table while in hot mode (every N cycles).
-    "ui_every_n_cycles": 5,
+    "ui_every_n_cycles": 50,
     "tick_size": "0.01",
 }
 STRATEGY_FILE = "strategy_buyhourly.json"
@@ -260,6 +291,23 @@ def load_strategy():
             cfg["buy_budget"] = float(overrides["shares"])
         if not (0 < cfg["buy_threshold"] <= cfg["buy_max_price"] <= 1):
             raise ValueError("buy price band must satisfy 0 < threshold <= max <= 1")
+        if not (0 < cfg["buy_max_price"] < cfg["high_buy_max_price"] <= 1):
+            raise ValueError(
+                "high_buy_max_price must satisfy buy_max_price < high_max <= 1"
+            )
+        if not (
+            0 < cfg["buy_max_price"] < cfg["a22_min_price"] < cfg["c5_min_price"]
+            < cfg["high_buy_max_price"] <= 1
+        ):
+            raise ValueError(
+                "hourly floors must satisfy buy_max < a22_min < c5_min < high_max <= 1"
+            )
+        if float(cfg["c5_window_min"]) <= 0:
+            raise ValueError("c5_window_min must be > 0")
+        if float(cfg["b15_window_min"]) + 1e-12 < float(cfg["c5_window_min"]):
+            raise ValueError("b15_window_min must be >= c5_window_min")
+        if float(cfg["a22_window_min"]) + 1e-12 < float(cfg["b15_window_min"]):
+            raise ValueError("a22_window_min must be >= b15_window_min")
         if not (0 < cfg["toxic_force_exit_below"] <= cfg["buy_threshold"]):
             raise ValueError("toxic_force_exit_below must satisfy 0 < below <= buy_threshold")
         if not (0 <= cfg["hedge_min_price"] <= cfg["hedge_threshold"] <= 1):
@@ -272,6 +320,7 @@ def load_strategy():
         for key in (
             "min_winner_bid", "max_loser_bid", "min_bid_edge",
             "max_entry_spread", "hedge_max_spread", "hedge_require_ask_max",
+            "high_buy_max_price", "a22_min_price", "c5_min_price",
         ):
             if not 0 <= float(cfg[key]) <= 1:
                 raise ValueError(f"{key} must be between 0 and 1")
@@ -292,22 +341,31 @@ def load_strategy():
         if not cfg["dry_run"] and not cfg["hedge_enabled"]:
             raise ValueError("live mode requires hedge_enabled=true")
         for key in (
-            "buy_budget", "buy_max_spend", "buy_max_shares", "max_open_notional",
-            "max_daily_notional", "poll_buy_window_s", "poll_held_s",
-            "positions_refresh_s", "balance_refresh_s", "buy_window_min",
-            "ui_every_n_cycles",
+            "buy_budget", "a22_buy_budget", "b15_buy_budget", "c5_buy_budget",
+            "market_spend_cap", "buy_max_spend", "buy_max_shares",
+            "max_open_notional", "max_daily_notional", "poll_buy_window_s",
+            "poll_held_s", "positions_refresh_s", "balance_refresh_s",
+            "buy_window_min", "a22_window_min", "b15_window_min",
+            "c5_window_min", "ui_every_n_cycles",
         ):
             if float(cfg[key]) <= 0:
                 raise ValueError(f"{key} must be positive")
-        if float(cfg["buy_max_spend"]) + 1e-9 < float(cfg["buy_budget"]):
-            raise ValueError("buy_max_spend must be >= buy_budget")
-        _need_shares = max(
-            float(cfg["buy_budget"]), float(cfg["buy_max_spend"]),
-        ) / float(cfg["buy_threshold"])
+        _market_cap = float(cfg["market_spend_cap"])
+        _max_slice = max(
+            float(cfg["a22_buy_budget"]),
+            float(cfg["b15_buy_budget"]),
+            float(cfg["c5_buy_budget"]),
+            _market_cap,
+        )
+        if float(cfg["buy_max_spend"]) + 1e-9 < _market_cap:
+            raise ValueError("buy_max_spend must be >= market_spend_cap")
+        if float(cfg["a22_buy_budget"]) + 1e-9 > _market_cap:
+            raise ValueError("a22_buy_budget must be <= market_spend_cap")
+        _need_shares = _market_cap / float(cfg["buy_threshold"])
         if float(cfg["buy_max_shares"]) + 1e-9 < _need_shares:
             raise ValueError(
-                "buy_max_shares must be >= max(buy_budget, buy_max_spend) "
-                "/ buy_threshold (raise it when you raise the dollar size)"
+                "buy_max_shares must be >= market_spend_cap / buy_threshold "
+                "(raise it when you raise the dollar size; $10/75¢ ≈ 14)"
             )
         # 0 = unlimited open markets (probe: redeem lag must not freeze entries).
         if float(cfg["max_open_positions"]) < 0:
@@ -357,6 +415,19 @@ HEDGE_MAX_SPREAD = _strat["hedge_max_spread"]
 HEDGE_REQUIRE_ASK_MAX = _strat["hedge_require_ask_max"]
 HEDGE_REQUIRE_GUI = _strat["hedge_require_gui"]
 BUY_WINDOW_MIN = _strat["buy_window_min"]
+A22_WINDOW_MIN = _strat["a22_window_min"]
+B15_WINDOW_MIN = _strat["b15_window_min"]
+C5_WINDOW_MIN = _strat["c5_window_min"]
+A22_MIN_PRICE = _strat["a22_min_price"]
+C5_MIN_PRICE = _strat["c5_min_price"]
+HIGH_BUY_MAX_PRICE = _strat["high_buy_max_price"]
+A22_BUY_BUDGET = _strat["a22_buy_budget"]
+B15_BUY_BUDGET = _strat["b15_buy_budget"]
+C5_BUY_BUDGET = _strat["c5_buy_budget"]
+MARKET_SPEND_CAP = _strat["market_spend_cap"]
+BUY_HORIZON_MIN = hourly_horizon_min(
+    A22_WINDOW_MIN, B15_WINDOW_MIN, C5_WINDOW_MIN, BUY_WINDOW_MIN,
+)
 BUY_GRACE_S = _strat["buy_grace_s"]
 BUY_COOLDOWN_S = _strat["buy_cooldown_s"]
 EMPTY_FAK_COOLDOWN_S = _strat["empty_fak_cooldown_s"]
@@ -550,6 +621,62 @@ def log_event(event, **kwargs):
     entry = {"ts": datetime.now().isoformat(), "event": event}
     entry.update(kwargs)
     _file_logger.info(json.dumps(entry))
+
+
+_SKIP_LOG_EVERY_S = 8.0
+_skip_log_mono = {}
+_buy_window_logged = {}
+
+
+def log_buy_skip_throttled(reason, condition_id, event="buy_skip", **kwargs):
+    """In-window skip without flooding 0.01s looks (one line per reason / 8s)."""
+    key = (str(condition_id), str(reason))
+    now_mono = time.monotonic()
+    prev = _skip_log_mono.get(key, 0.0)
+    if now_mono - prev < _SKIP_LOG_EVERY_S:
+        return
+    _skip_log_mono[key] = now_mono
+    if len(_skip_log_mono) > 256:
+        for stale, _ts in sorted(_skip_log_mono.items(), key=lambda kv: kv[1])[:64]:
+            _skip_log_mono.pop(stale, None)
+    log_event(event, reason=reason, condition_id=condition_id, **kwargs)
+
+
+def current_entry_bands(minutes_left):
+    """Open hourly buy bands at this TTM (A >93, B 75–90, C >95)."""
+    return applicable_hourly_entry_bands(
+        minutes_left,
+        a22_window_min=A22_WINDOW_MIN,
+        b15_window_min=B15_WINDOW_MIN,
+        c5_window_min=C5_WINDOW_MIN,
+        b15_min=BUY_THRESHOLD,
+        b15_max=BUY_MAX_PRICE,
+        a22_min=A22_MIN_PRICE,
+        c5_min=C5_MIN_PRICE,
+        high_max=HIGH_BUY_MAX_PRICE,
+    )
+
+
+def note_buy_window(condition_id, end_ts, minutes_left, slug=None, window=None):
+    """One buy_window line the first time a market enters an hourly buy window."""
+    cid = str(condition_id)
+    if cid in _buy_window_logged:
+        return
+    _buy_window_logged[cid] = float(end_ts or 0)
+    now_s = time.time()
+    for old_cid, market_end in list(_buy_window_logged.items()):
+        if old_cid == cid:
+            continue
+        if market_end and market_end < now_s - 60:
+            _buy_window_logged.pop(old_cid, None)
+    payload = {
+        "condition_id": cid,
+        "minutes_left": round(float(minutes_left), 2),
+        "slug": slug,
+    }
+    if window:
+        payload["window"] = window
+    log_event("buy_window", **payload)
 
 
 def write_heartbeat():
@@ -782,19 +909,182 @@ def merge_tracked_positions(api_held, tracked_meta):
     return held
 
 
-def add_tracked_market_stubs(markets, held, tracked_meta, now_s):
-    """Add hedge/recovery metadata when Gamma discovery is unavailable.
+def meta_end_ts(meta):
+    """Market end time from durable state (unix seconds)."""
+    meta = meta or {}
+    end_ts = finite_float(meta.get("end_ts", 0), minimum=0) or 0.0
+    if end_ts > 0:
+        return float(end_ts)
+    end_date = meta.get("end_date")
+    if not end_date:
+        return 0.0
+    try:
+        return datetime.fromisoformat(
+            str(end_date).replace("Z", "+00:00")
+        ).timestamp()
+    except (TypeError, ValueError):
+        return 0.0
 
-    Exact-order recovery must continue after market expiry and even when an
-    ambiguous BUY has not appeared in the positions API yet.
+
+def position_is_live_hedge(pos, meta, now_s, expiry_grace_s=30.0):
+    """True if this bag can still be quoted/hedged (not redeem dust).
+
+    Data API returns every unredeemed hourly share in the wallet. Those are
+    settlement inventory. The buy/hedge loop must only see a position that is
+    still in the market window (or just expired) and is not already marked
+    redeemable.
+    """
+    pos = pos or {}
+    meta = meta or {}
+    up = pos.get("up") or {}
+    dn = pos.get("dn") or {}
+    size = max(
+        finite_float(up.get("size", 0), minimum=0) or 0.0,
+        finite_float(dn.get("size", 0), minimum=0) or 0.0,
+    )
+    if size <= 0.01:
+        return False
+    if up.get("redeemable") or dn.get("redeemable"):
+        return False
+    if (
+        meta.get("hedge_closed")
+        or meta.get("redeem_pending")
+        or meta.get("redeem_confirmed")
+    ):
+        return False
+    end_ts = meta_end_ts(meta)
+    if end_ts <= 0:
+        return False
+    if float(now_s) - end_ts > float(expiry_grace_s):
+        return False
+    return True
+
+
+def uncertain_still_recoverable(meta, now_s, recovery_s=600.0):
+    meta = meta or {}
+    if not (meta.get("buy_uncertain") or meta.get("hedge_uncertain")):
+        return False
+    end_ts = meta_end_ts(meta)
+    if end_ts <= 0:
+        return True
+    return float(now_s) - end_ts <= float(recovery_s)
+
+
+def should_stub_tracked_market(pos, meta, now_s):
+    """Gamma stubs are for live hedges and recent quarantines, not wallet dust."""
+    if uncertain_still_recoverable(meta, now_s):
+        return True
+    return position_is_live_hedge(pos, meta, now_s)
+
+
+def market_needs_fast_path(market, pos, meta, now_s, horizon_s, extra_s=30.0):
+    """Quote/hedge/buy this hourly event; skip the rest of the Gamma slate."""
+    meta = meta or {}
+    if uncertain_still_recoverable(meta, now_s):
+        return True
+    if position_is_live_hedge(pos, meta, now_s):
+        return True
+    end_ts = getattr(market, "end_ts", None)
+    if end_ts is None and isinstance(market, dict):
+        end_ts = market.get("end_ts")
+    try:
+        ttm = float(end_ts) - float(now_s)
+    except (TypeError, ValueError):
+        return False
+    return 0 < ttm <= float(horizon_s) + float(extra_s)
+
+
+def bag_size(pos):
+    pos = pos or {}
+    up = pos.get("up") or {}
+    dn = pos.get("dn") or {}
+    return max(
+        finite_float(up.get("size", 0), minimum=0) or 0.0,
+        finite_float(dn.get("size", 0), minimum=0) or 0.0,
+    )
+
+
+def count_wallet_bags(held, tracked_meta=None):
+    """Bags still in the Data API that are not yet abandoned/confirmed."""
+    tracked_meta = tracked_meta or {}
+    n = 0
+    for cid, pos in (held or {}).items():
+        if bag_size(pos) <= 0.01:
+            continue
+        meta = tracked_meta.get(cid) or {}
+        if meta.get("redeem_abandoned") or meta.get("redeem_confirmed"):
+            continue
+        n += 1
+    return n
+
+
+def inventory_is_hot(pos, meta, now_s):
+    """Keep only live hourly work: a hedge still in play, a fresh quarantine, or a real redeem."""
+    meta = meta or {}
+    if position_is_live_hedge(pos, meta, now_s):
+        return True
+    if uncertain_still_recoverable(meta, now_s):
+        return True
+    if meta.get("redeem_abandoned") or meta.get("redeem_confirmed"):
+        return False
+    if bag_size(pos) <= 0.01:
+        return False
+    up = pos.get("up") or {}
+    dn = pos.get("dn") or {}
+    return bool(up.get("redeemable") or dn.get("redeemable"))
+
+
+def drop_wallet_dust(held, tracked_meta, now_s):
+    """Throw away expired non-live bags so the loop only sees the live market."""
+    tracked_meta = tracked_meta or {}
+    return {
+        cid: pos
+        for cid, pos in (held or {}).items()
+        if inventory_is_hot(pos, tracked_meta.get(cid), now_s)
+    }
+
+
+def positions_refresh_interval_s(refresh_s, need_fast):
+    refresh_s = float(refresh_s)
+    if need_fast:
+        return max(refresh_s, 0.01)
+    return max(refresh_s, 15.0)
+
+
+def positions_snapshot_is_fresh(received_mono, now_mono, interval_s):
+    if received_mono is None or float(received_mono) <= 0:
+        return False
+    max_age = max(5.0, float(interval_s) * 3.0)
+    return (float(now_mono) - float(received_mono)) <= max_age + 1e-9
+
+
+def count_live_hedges(held, tracked_meta, now_s):
+    tracked_meta = tracked_meta or {}
+    n = 0
+    for cid, pos in (held or {}).items():
+        if position_is_live_hedge(pos, tracked_meta.get(cid), now_s):
+            n += 1
+    return n
+
+
+def add_tracked_market_stubs(markets, held, tracked_meta, now_s):
+    """Keep live hedges and quarantines in the poll after Gamma drops them.
+
+    Call this on the *hot* inventory (`drop_wallet_dust`), not the raw Data
+    API list. Old hourly rows are thrown away; they must not become fake live
+    markets (that used to inflate POS and REST-quote dead tokens).
     """
     by_condition = {market.condition_id: market for market in markets}
-    recovery_conditions = set(held)
+    recovery_conditions = {
+        cond
+        for cond, pos in held.items()
+        if should_stub_tracked_market(pos, tracked_meta.get(cond, {}), now_s)
+    }
     recovery_conditions.update(
         str(cond)
         for cond, meta in tracked_meta.items()
         if isinstance(meta, dict)
-        and (meta.get("buy_uncertain") or meta.get("hedge_uncertain"))
+        and should_stub_tracked_market({}, meta, now_s)
     )
     for cond in recovery_conditions:
         if cond in by_condition:
@@ -820,16 +1110,17 @@ def add_tracked_market_stubs(markets, held, tracked_meta, now_s):
                 ).timestamp()
             except (TypeError, ValueError):
                 end_ts = 0.0
-        if end_ts > 0 and end_ts <= now_s and not uncertain:
+        if (
+            end_ts > 0
+            and end_ts <= now_s
+            and not uncertain
+            and not position_is_live_hedge(pos, meta, now_s)
+        ):
             continue
         if end_ts <= 0:
-            # Preserve an actually-held position's hedge path. A pure recovery
-            # stub stays expired so clearing its quarantine cannot arm entry.
-            end_ts = (
-                now_s + 86400
-                if max(up_size, dn_size) > 0.01
-                else now_s
-            )
+            if not uncertain:
+                continue
+            end_ts = now_s
         up_token = str(meta.get("up_token") or up.get("asset") or "")
         dn_token = str(meta.get("dn_token") or dn.get("asset") or "")
         uncertain_token = str(
@@ -865,11 +1156,20 @@ def add_tracked_market_stubs(markets, held, tracked_meta, now_s):
 
 # ------------------------- PRICING -------------------------
 
+def _clob_book_missing(err):
+    if getattr(err, "status_code", None) == 404:
+        return True
+    text = str(err or "").lower()
+    return "no orderbook exists" in text or "status_code=404" in text
+
+
 def get_book_bid(token_id):
     try:
         book = safe_api_call(client.get_order_book, token_id)
         path = "sdk"
     except Exception as sdk_err:
+        if _clob_book_missing(sdk_err):
+            return None, 0.0
         try:
             resp = requests.get(f"{HOST}/book", params={"token_id": token_id}, timeout=5)
             resp.raise_for_status()
@@ -942,6 +1242,8 @@ def get_book_quote(token_id, expected_condition_id=None):
         book = safe_api_call(client.get_order_book, token_id)
         path = "sdk"
     except Exception as sdk_err:
+        if _clob_book_missing(sdk_err):
+            return None, 0.0, None, 0.0, None
         try:
             resp = _http_get(
                 f"{HOST}/book", params={"token_id": token_id}, timeout=5,
@@ -1058,10 +1360,38 @@ def get_quote_fast(
     return q
 
 
+def pick_look_quote(ws_q, cached_q):
+    """Prefer live WS top-of-book; else this cycle's prefetch. No HTTP."""
+    empty = (None, 0.0, None, 0.0, None)
+    if ws_q is not None and (ws_q[0] is not None or ws_q[2] is not None):
+        return ws_q
+    if cached_q is not None and (cached_q[0] is not None or cached_q[2] is not None):
+        return cached_q
+    return empty
+
+
+def look_book_quote(token_id, book_cache, max_age_s=2.0):
+    """0.01s look: WS / prefetch only. REST is for POST, not every tick."""
+    return pick_look_quote(
+        book_ws.quote(token_id, max_age_s=max_age_s),
+        (book_cache or {}).get(token_id),
+    )
+
+
+def look_last_trade(token_id):
+    """Last print already in memory. Do not HTTP on the 0.01s look."""
+    cached = _last_trade_cache.get(token_id)
+    if cached is None:
+        cached = _last_trade_cache.get(str(token_id))
+    if cached is not None:
+        return cached[0]
+    return get_book_snapshot_last_trade(token_id)
+
+
 def hedge_sell_price(bid, tick_size, undercut_ticks, min_price=None):
     """FAK sell at the live bid (undercut, tick-aligned).
 
-    After 35/40 integrity, take whatever bid is there. min_price is ignored so
+    After 55/60 integrity, take whatever bid is there. min_price is ignored so
     a leftover 32¢ config cannot refuse a 20¢ or 1¢ print. One tick is only
     the exchange minimum, not a strategy floor.
     """
@@ -1279,6 +1609,67 @@ def quoted_buy_shares(budget, ask, share_cap=None):
             return float(shares)
         shares -= share_tick
         shares = shares.quantize(share_tick, rounding=ROUND_DOWN)
+    return 0.0
+
+
+def quoted_buy_shares_up_to_limit(budget, ask, limit, share_cap=None, spend_cap=None):
+    """Shares for a FAK at ``limit`` that can spend the slice budget.
+
+    Starts at ``budget/ask``. A 99¢ (or 90¢) maker must be exact cents, so
+    rounding **down** landed on 2.00 sh / $1.98 on 5m. Prefer at least 3.00 sh
+    when ``3 × limit ≤ spend_cap``, then snap to the nearest legal size that
+    is still ≤ the spend cap. ``ask`` still has to be in band; the FAK walks
+    from the touch up to the cap.
+    """
+    shares = quoted_buy_shares(budget, ask, share_cap)
+    limit_f = finite_float(limit, minimum=0, maximum=1)
+    if limit_f is None or limit_f <= 0:
+        return 0.0
+    ceiling = finite_float(spend_cap, minimum=0)
+    if ceiling is None or ceiling < 0.01:
+        ceiling = finite_float(budget, minimum=0)
+    if ceiling is None or ceiling < 0.01:
+        return 0.0
+    share_tick = Decimal("0.01")
+    min_shares = Decimal("0.01")
+    cent = Decimal("0.01")
+    lim = Decimal(str(limit_f))
+    cap_d = Decimal(str(ceiling)).quantize(cent, rounding=ROUND_DOWN)
+    max_sh = (cap_d / lim).quantize(share_tick, rounding=ROUND_DOWN)
+    cap = finite_float(share_cap, minimum=0)
+    if cap is not None:
+        max_sh = min(
+            max_sh,
+            Decimal(str(cap)).quantize(share_tick, rounding=ROUND_DOWN),
+        )
+    target = Decimal(str(shares if shares >= 0.01 else 0))
+    three = Decimal("3.00")
+    if three <= max_sh and three * lim <= cap_d:
+        target = max(target, three)
+    if target < min_shares:
+        return 0.0
+
+    def _valid(sh):
+        if sh < min_shares or sh > max_sh:
+            return False
+        maker = sh * lim
+        return maker.quantize(cent) == maker and maker <= cap_d
+
+    up = target.quantize(share_tick, rounding=ROUND_DOWN)
+    if up < target:
+        up += share_tick
+        up = up.quantize(share_tick, rounding=ROUND_DOWN)
+    while up <= max_sh:
+        if _valid(up):
+            return float(up)
+        up += share_tick
+        up = up.quantize(share_tick, rounding=ROUND_DOWN)
+    down = min(target, max_sh).quantize(share_tick, rounding=ROUND_DOWN)
+    while down >= min_shares:
+        if _valid(down):
+            return float(down)
+        down -= share_tick
+        down = down.quantize(share_tick, rounding=ROUND_DOWN)
     return 0.0
 
 
@@ -2116,6 +2507,11 @@ _BUY_UNCERTAIN_KEYS = (
     "buy_uncertain_observed_size",
     "buy_uncertain_observed_at",
     "buy_uncertain_observed_count",
+    "buy_uncertain_slice_prior_size",
+    "buy_uncertain_slice_prior_cost",
+    "buy_uncertain_slice_prior_quoted",
+    "buy_uncertain_slice_budget",
+    "buy_uncertain_slice",
 )
 
 _HEDGE_UNCERTAIN_KEYS = (
@@ -2159,16 +2555,18 @@ def buy_market_with_retry(
 ):
     """Buy token_id via FAK, sized in shares at the quoted ask.
 
-    Sends ``budget/ask`` shares as a **limit** FAK at the live ask (capped
-    by ``buy_max_spend`` and ``buy_max_shares``). Maker USDC is exact cents
-    (2 dp) and taker shares 4 dp — otherwise CLOB FAK BUY returns 400
+    Sends ``budget/ask`` shares as a **limit** FAK at the **open band max**
+    (hourly B 90¢, A/C 99¢). Maker USDC is exact cents (2 dp) at that
+    limit and taker shares 4 dp — otherwise CLOB FAK BUY returns 400
     ``invalid amounts``. This is not a USDC market order: leftover dollars
-    would walk cheaper asks (9¢ junk under an 80¢ quote). Displayed top size
-    does not shrink the order — a thin book fills what it can at that ask.
+    would walk cheaper asks (9¢ junk under an 80¢ quote). Share size is
+    still ``budget/ask``, clipped so ``size × limit`` cannot exceed the
+    slice spend cap. Displayed top size does not shrink the order.
 
-    Band is still min_price–max_price; this only pins execution to an
-    in-band ask. $2.50 / 75¢ is ~3.3 shares; ``buy_max_shares`` (default 5)
-    is the "wrong price" rail, not a displayed-size cap.
+    Band is still min_price–max_price for *whether* to fire. The limit is
+    max_price so the FAK can take depth behind the touch. ``buy_max_shares``
+    (default 14) is the per-FAK "wrong price" rail, not a displayed-size cap
+    or a lifetime share limit.
 
     Returns (shares_bought, usdc_spent, status). status is filled|ambiguous|empty|aborted|persist_fail|dry.
     spent may be estimated when the exchange
@@ -2192,7 +2590,7 @@ def buy_market_with_retry(
     if DRY_RUN:
         console.print(
             f"  [bold black on yellow][DRY BUY][/] would BUY ≤{budget:.2f} USDC of "
-            f"{str(token_id)[:12]}… at the quoted ask (band {min_price:.3f}–{max_price:.3f})"
+            f"{str(token_id)[:12]}… limit {max_price:.3f} (band {min_price:.3f}–{max_price:.3f})"
         )
         log_event("dry_buy", token_id=token_id, budget=budget, max_price=max_price, min_price=min_price)
         return 0.0, 0.0, "dry"
@@ -2296,10 +2694,17 @@ def buy_market_with_retry(
                 f"  [dim yellow][THIN ASK][/] displayed size {fresh_ask_size} · "
                 f"posting budget/ask anyway · attempt {attempt + 1}/{max_retries}"
             )
-        shares = quoted_buy_shares(remaining_budget, fresh_ask, BUY_MAX_SHARES)
+        shares = quoted_buy_shares_up_to_limit(
+            remaining_budget,
+            fresh_ask,
+            float(max_price),
+            BUY_MAX_SHARES,
+            spend_cap=max(0.0, min(float(BUY_MAX_SPEND), float(budget)) - spent),
+        )
         if shares < 0.01:
             break
-        price = fresh_ask
+        limit_price = float(max_price)
+        price = limit_price
         spend = shares * price
         max_shares = shares
         ambiguous = False
@@ -2325,10 +2730,9 @@ def buy_market_with_retry(
                 client.create_order,
                 OrderArgs(
                     token_id=token_id,
-                    price=price,
+                    price=limit_price,
                     size=shares,
                     side=BUY,
-                    user_usdc_balance=remaining_budget,
                 ),
                 options=PartialCreateOrderOptions(
                     tick_size=tick_size, neg_risk=False,
@@ -3109,17 +3513,34 @@ signal.signal(signal.SIGTERM, _handle_shutdown)
 # ------------------------- MAIN LOOP -------------------------
 
 positions_meta = load_json(STATE_FILE, required=not DRY_RUN)
+_redeem_permanent_failures.update(
+    str(cid)
+    for cid, meta in positions_meta.items()
+    if isinstance(meta, dict) and meta.get("redeem_abandoned")
+)
 CYCLE = 0
 _last_positions_refresh = 0.0
 _last_balance_refresh = 0.0
 _last_markets_refresh = 0.0
 pusd_bal = 0.0
-_cached_positions = merge_tracked_positions({}, positions_meta)
+_wallet_positions = merge_tracked_positions({}, positions_meta)
+_cached_positions = drop_wallet_dust(
+    _wallet_positions, positions_meta, time.time(),
+)
+_last_dust_dropped = None
+_HEARTBEAT_MIN_S = 1.0
+_last_heartbeat_mono = 0.0
 _cached_markets = []
 _cached_discovery_fresh = False
 _positions_received_mono = 0.0
 _balance_received_mono = 0.0
 _markets_received_mono = 0.0
+_need_fast_positions = True
+markets = []
+held = {}
+_loop_markets = []
+_show_ui = False
+now_s = time.time()
 _book_executor = ThreadPoolExecutor(max_workers=4)
 _entry_executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="entry")
 _pending_book_futs = {}
@@ -3177,6 +3598,19 @@ while not _shutdown_requested:
         HEDGE_REQUIRE_ASK_MAX = _strat["hedge_require_ask_max"]
         HEDGE_REQUIRE_GUI = _strat["hedge_require_gui"]
         BUY_WINDOW_MIN = _strat["buy_window_min"]
+        A22_WINDOW_MIN = _strat["a22_window_min"]
+        B15_WINDOW_MIN = _strat["b15_window_min"]
+        C5_WINDOW_MIN = _strat["c5_window_min"]
+        A22_MIN_PRICE = _strat["a22_min_price"]
+        C5_MIN_PRICE = _strat["c5_min_price"]
+        HIGH_BUY_MAX_PRICE = _strat["high_buy_max_price"]
+        A22_BUY_BUDGET = _strat["a22_buy_budget"]
+        B15_BUY_BUDGET = _strat["b15_buy_budget"]
+        C5_BUY_BUDGET = _strat["c5_buy_budget"]
+        MARKET_SPEND_CAP = _strat["market_spend_cap"]
+        BUY_HORIZON_MIN = hourly_horizon_min(
+            A22_WINDOW_MIN, B15_WINDOW_MIN, C5_WINDOW_MIN, BUY_WINDOW_MIN,
+        )
         BUY_GRACE_S = _strat["buy_grace_s"]
         BUY_COOLDOWN_S = _strat["buy_cooldown_s"]
         EMPTY_FAK_COOLDOWN_S = _strat["empty_fak_cooldown_s"]
@@ -3197,19 +3631,34 @@ while not _shutdown_requested:
         UI_EVERY_N_CYCLES = _strat["ui_every_n_cycles"]
         TICK_SIZE_FALLBACK = _strat["tick_size"]
 
-        write_heartbeat()
-
         # Consume background refreshes without putting unrelated network RTTs
         # ahead of the hedge path.
         _now_mono = time.monotonic()
+        if _now_mono - _last_heartbeat_mono >= _HEARTBEAT_MIN_S:
+            write_heartbeat()
+            _last_heartbeat_mono = _now_mono
         positions_raw = None
         if _positions_future is not None and _positions_future.done():
             try:
                 positions_raw = _positions_future.result()
                 if positions_raw is not None:
-                    _cached_positions = merge_tracked_positions(
+                    _wallet_positions = merge_tracked_positions(
                         build_held_positions(positions_raw), positions_meta,
                     )
+                    _cached_positions = drop_wallet_dust(
+                        _wallet_positions, positions_meta, now_s,
+                    )
+                    _dropped_n = max(
+                        0, len(_wallet_positions) - len(_cached_positions),
+                    )
+                    if _dropped_n != _last_dust_dropped:
+                        if _dropped_n:
+                            log_event(
+                                "wallet_dust_dropped",
+                                dropped=_dropped_n,
+                                kept=len(_cached_positions),
+                            )
+                        _last_dust_dropped = _dropped_n
                     _positions_received_mono = _now_mono
             except Exception as e:
                 log_event("positions_refresh_fail", error=str(e)[:200])
@@ -3245,7 +3694,9 @@ while not _shutdown_requested:
             _last_balance_refresh = _now_mono
         if (
             _positions_future is None
-            and _now_mono - _last_positions_refresh >= POSITIONS_REFRESH_S
+            and _now_mono - _last_positions_refresh >= positions_refresh_interval_s(
+                POSITIONS_REFRESH_S, _need_fast_positions,
+            )
         ):
             _positions_future = _io_executor.submit(get_user_positions)
             _last_positions_refresh = _now_mono
@@ -3267,17 +3718,25 @@ while not _shutdown_requested:
             m for m in _cached_markets
             if m.active and not m.closed and not m.neg_risk and m.end_ts > now_s
         ]
-        held = _cached_positions
+        held = drop_wallet_dust(_cached_positions, positions_meta, now_s)
+        _cached_positions = held
         markets = add_tracked_market_stubs(markets, held, positions_meta, now_s)
         held_conditions = {
             cond for cond, pos in held.items()
-            if max(
-                float(pos.get("up", {}).get("size", 0) or 0),
-                float(pos.get("dn", {}).get("size", 0) or 0),
-            ) > 0.01
+            if position_is_live_hedge(pos, positions_meta.get(cond), now_s)
         }
+        _loop_markets = [
+            m for m in markets
+            if market_needs_fast_path(
+                m,
+                held.get(m.condition_id),
+                positions_meta.get(m.condition_id),
+                now_s,
+                BUY_HORIZON_MIN * 60,
+            )
+        ]
         # Never let an unheld market's entry I/O run before an active hedge.
-        markets.sort(key=lambda market: (
+        _loop_markets.sort(key=lambda market: (
             market.condition_id not in held_conditions,
             not bool(
                 positions_meta.get(market.condition_id, {}).get("buy_uncertain")
@@ -3285,31 +3744,43 @@ while not _shutdown_requested:
             ),
             market.end_ts,
         ))
-        _open_pos_n = sum(
-            1 for p in held.values()
-            if max(p.get("up", {}).get("size", 0), p.get("dn", {}).get("size", 0)) > 0.01
-        )
+        _open_pos_n = count_live_hedges(held, positions_meta, now_s)
+        _wait_pos_n = max(0, count_wallet_bags(held, positions_meta) - _open_pos_n)
+        _need_fast_positions = _open_pos_n > 0 or _wait_pos_n > 0
         _min_ttm_now = min((m.end_ts * 1000 - now_ms) / 60000 for m in markets) if markets else 999
-        _hot_mode = _open_pos_n > 0 or _min_ttm_now <= BUY_WINDOW_MIN
+        _hot_mode = _open_pos_n > 0 or _min_ttm_now <= BUY_HORIZON_MIN
         _show_ui = (not _hot_mode) or (CYCLE % max(1, int(UI_EVERY_N_CYCLES)) == 0)
 
         if _show_ui:
+            _wait_bit = (
+                f"[dim]WAIT[/] [bold]{_wait_pos_n}[/] [dim]·[/] "
+                if _wait_pos_n else ""
+            )
             console.rule(
                 f"[bold bright_yellow]▲ TICK #{CYCLE:04d}[/] [dim]·[/] [bright_white]{now_str}[/] [dim]·[/] "
-                f"[bright_green]MKT[/] [bold]{len(markets):>2}[/] [dim]·[/] "
+                f"[bright_green]MKT[/] [bold]{len(_loop_markets)}[/][dim]/{len(markets)}[/] [dim]·[/] "
                 f"[bright_cyan]POS[/] [bold]{_open_pos_n:>2}[/] [dim]·[/] "
+                f"{_wait_bit}"
                 f"[bright_yellow]NAV[/] [bold]${pusd_bal:>7.2f}[/] [dim]▲[/]",
                 style="bright_yellow",
             )
 
         # ================= GC META CACHE =================
         if positions_raw is not None:
+            # GC still sees the raw wallet list so leftover Data API rows are
+            # not "missing" and finalized. The 0.01s loop uses `held` (dust
+            # already dropped).
             live_conds = {
-                cond for cond, p in held.items()
-                if max(p.get("up", {}).get("size", 0), p.get("dn", {}).get("size", 0)) > 0.01
-                or p.get("up", {}).get("redeemable") or p.get("dn", {}).get("redeemable")
+                cond for cond, p in _wallet_positions.items()
+                if bag_size(p) > 0.01
+                or (p.get("up") or {}).get("redeemable")
+                or (p.get("dn") or {}).get("redeemable")
             }
             live_conds |= {m.condition_id for m in markets}
+            live_conds |= {
+                c for c, meta in positions_meta.items()
+                if isinstance(meta, dict) and meta.get("redeem_abandoned")
+            }
             # An ambiguous BUY is durable recovery state, not ordinary stale
             # metadata. Keep it until its exact token/baseline is reconciled or
             # an operator clears it; discovery/Data API omissions must not erase
@@ -3396,9 +3867,9 @@ while not _shutdown_requested:
                     up_sz = up_p.get("size", 0)
                     dn_sz = dn_p.get("size", 0)
                     held_size = max(up_sz, dn_sz)
-                    if held_size < 0.01 and not up_p.get("redeemable") and not dn_p.get("redeemable"):
-                        continue
                     meta = positions_meta.get(cond, {})
+                    if not position_is_live_hedge(pos, meta, now_s):
+                        continue
                     leg = "up" if up_sz > 0.01 else "down" if dn_sz > 0.01 else "—"
                     entry = meta.get("fill_price", 0)
                     # Find end_ts from discovered markets or meta
@@ -3419,7 +3890,7 @@ while not _shutdown_requested:
                         state = "[bold bright_magenta]✓ REDEEM[/]"
                     elif mins <= 0:
                         state = "[dim]· closed[/]"
-                    elif mins <= BUY_WINDOW_MIN:
+                    elif mins <= BUY_HORIZON_MIN:
                         state = f"[bold yellow]● HELD · HEDGE ≤{int(HEDGE_THRESHOLD*100)}¢[/]"
                     else:
                         state = "[bold bright_green]● HELD[/]"
@@ -3445,21 +3916,14 @@ while not _shutdown_requested:
 
         # ================= REDEEM PHASE =================
         _has_active_hedge_inventory = any(
-            max(
-                float(pos.get("up", {}).get("size", 0) or 0),
-                float(pos.get("dn", {}).get("size", 0) or 0),
-            ) > 0.01
-            and not (
-                pos.get("up", {}).get("redeemable")
-                or pos.get("dn", {}).get("redeemable")
-            )
-            for pos in held.values()
+            position_is_live_hedge(pos, positions_meta.get(cond), now_s)
+            for cond, pos in held.items()
         )
         _entry_window_open = bool(
             ENTRY_ENABLED
             and _discovery_fresh
             and any(
-                0 < market.end_ts - now_s <= float(BUY_WINDOW_MIN) * 60
+                0 < market.end_ts - now_s <= float(BUY_HORIZON_MIN) * 60
                 for market in markets
             )
         )
@@ -3541,7 +4005,9 @@ while not _shutdown_requested:
         # Overlay WS top-of-book. Held tokens use hedge_quote_max_age_s so a
         # stale-high WS quote cannot overwrite REST and suppress hedge checks.
         _held_tokens = set()
-        for _p in held.values():
+        for _cid, _p in held.items():
+            if not position_is_live_hedge(_p, positions_meta.get(_cid), now_s):
+                continue
             for _leg in ("up", "dn"):
                 _info = _p.get(_leg) or {}
                 if float(_info.get("size", 0) or 0) > 0.01 and _info.get("asset"):
@@ -3553,7 +4019,7 @@ while not _shutdown_requested:
                 _book_cache[_t] = _wq
 
         # ================= HEDGE + BUY PHASE =================
-        for m in markets:
+        for m in _loop_markets:
             cond = getattr(m, "condition_id", None)
             try:
                 end_ts_ms = m.end_ts * 1000
@@ -3645,6 +4111,13 @@ while not _shutdown_requested:
                             / max(float(meta.get("buy_uncertain_price") or 0), 1e-9)
                         )
                     )
+                    slice_budget = float(
+                        meta.get("buy_uncertain_slice_budget")
+                        or MARKET_SPEND_CAP
+                    )
+                    slice_prior_cost = float(
+                        meta.get("buy_uncertain_slice_prior_cost") or 0
+                    )
                     inspected = inspect_uncertain_order(
                         uncertain_order_id,
                         side="BUY",
@@ -3652,9 +4125,11 @@ while not _shutdown_requested:
                         token_id=uncertain_token,
                         condition_id=cond,
                         limit_price=meta.get("buy_uncertain_price", 0),
-                        spend_cap=max(
-                            0.0,
-                            min(float(BUY_BUDGET), float(BUY_MAX_SPEND)) - known_cost,
+                        spend_cap=uncertain_buy_spend_cap(
+                            known_cost,
+                            slice_budget,
+                            BUY_MAX_SPEND,
+                            slice_prior_cost,
                         ),
                         trade_ids=meta.get("buy_uncertain_trade_ids"),
                     )
@@ -3671,7 +4146,10 @@ while not _shutdown_requested:
                         avg_fill = implied_buy_average(
                             resolved_cost, resolved_size, meta.get("buy_uncertain_price"),
                         )
-                        quoted = meta.get("quoted_buy_shares")
+                        quoted = meta.get("quoted_buy_shares_total") or (
+                            float(meta.get("buy_uncertain_slice_prior_quoted") or 0)
+                            + float(meta.get("quoted_buy_shares") or 0)
+                        ) or meta.get("quoted_buy_shares")
                         _, force_exit = classify_buy_fill(
                             avg_fill, resolved_size, quoted,
                             BUY_THRESHOLD, TOXIC_FORCE_EXIT_BELOW,
@@ -3686,6 +4164,9 @@ while not _shutdown_requested:
                         meta["fill_price"] = round(avg_fill, 4)
                         meta["pnl_entry_cost"] = round(resolved_cost, 4)
                         meta["toxic_fill"] = bool(force_exit or meta.get("toxic_fill"))
+                        stamp_hourly_slice_bought(
+                            meta, meta.get("buy_uncertain_slice"),
+                        )
                         leg_key = (
                             "up"
                             if str(meta["bought_leg"]).lower() == "up"
@@ -3774,11 +4255,14 @@ while not _shutdown_requested:
                         entry_cost = known_cost if known_cost > 0 else spend_est
                         if entry_cost <= 0:
                             entry_cost = min(
-                                float(BUY_BUDGET),
+                                float(MARKET_SPEND_CAP),
                                 float(BUY_MAX_SPEND),
                                 resolved_size * avg_est,
                             )
-                        quoted = meta.get("quoted_buy_shares")
+                        quoted = meta.get("quoted_buy_shares_total") or (
+                            float(meta.get("buy_uncertain_slice_prior_quoted") or 0)
+                            + float(meta.get("quoted_buy_shares") or 0)
+                        ) or meta.get("quoted_buy_shares")
                         avg_fill = implied_buy_average(entry_cost, resolved_size, avg_est)
                         _, force_exit = classify_buy_fill(
                             avg_fill, resolved_size, quoted, BUY_THRESHOLD, TOXIC_FORCE_EXIT_BELOW,
@@ -3789,6 +4273,9 @@ while not _shutdown_requested:
                         meta["fill_price"] = round(avg_fill, 4)
                         meta["pnl_entry_cost"] = round(entry_cost, 4)
                         meta["toxic_fill"] = bool(force_exit or meta.get("toxic_fill"))
+                        stamp_hourly_slice_bought(
+                            meta, meta.get("buy_uncertain_slice"),
+                        )
                         clear_uncertain_fields(meta, _BUY_UNCERTAIN_KEYS)
                         log_event(
                             "buy_uncertain_resolved", condition_id=cond, token_id=held_token,
@@ -4330,36 +4817,46 @@ while not _shutdown_requested:
                                             bid=hedge_bid, ask=hedge_ask, mid=fresh_mid,
                                         )
 
-                # --- BUY CHECK (for markets we don't hold) ---
-                if held_size > 0.01:
-                    continue  # already hold this market
-                if minutes_left > BUY_WINDOW_MIN:
-                    continue  # not in buy window yet
+                # --- BUY CHECK (unheld, or same-leg add up to the $10 cap) ---
+                bands = current_entry_bands(minutes_left)
+                if not bands:
+                    continue
+                note_buy_window(
+                    cond, m.end_ts, minutes_left, slug=getattr(m, "slug", None),
+                    window=",".join(b.name for b in bands),
+                )
                 if not ENTRY_ENABLED:
-                    continue  # explicit operator arm is required for every live entry
+                    continue
                 if not _discovery_fresh:
-                    continue  # stale Gamma metadata is hedge-only
-                if (
-                    _positions_received_mono <= 0
-                    or _now_mono - _positions_received_mono
-                    > max(5.0, float(POSITIONS_REFRESH_S) * 3)
-                ):
-                    continue  # open-position/notional checks require a recent snapshot
-                if (
-                    _balance_received_mono <= 0
-                    or _now_mono - _balance_received_mono
-                    > max(30.0, float(BALANCE_REFRESH_S) * 3)
-                ):
-                    continue  # never spend against an unknown/stale collateral balance
-
-                # Quarantine is unconditional, including when an earlier attempt in
-                # the same call already set bought_token. Stable held-state
-                # reconciliation above resolves it; this path never posts again.
+                    log_buy_skip_throttled(
+                        "stale_discovery", cond, event="buy_skip",
+                    )
+                    continue
+                # Quarantine is unconditional. This path never posts again.
                 if meta.get("buy_uncertain"):
                     continue
 
-                # One entry per market
-                if ONE_ENTRY_PER_MARKET and meta.get("bought_token"):
+                remaining_cap = hourly_remaining_to_cap(meta, MARKET_SPEND_CAP)
+                if remaining_cap < 0.01:
+                    continue
+
+                _arm_kwargs = dict(
+                    held_size=held_size,
+                    hedge_closed=bool(meta.get("hedge_closed")),
+                    market_cap=MARKET_SPEND_CAP,
+                    a22_budget=A22_BUY_BUDGET,
+                    b15_budget=B15_BUY_BUDGET,
+                    c5_budget=C5_BUY_BUDGET,
+                )
+                _any_slice_ok = False
+                for _band in bands:
+                    _ok, _why = can_arm_hourly_slice(
+                        meta, slice_name=_band.name, **_arm_kwargs,
+                    )
+                    if _ok:
+                        _any_slice_ok = True
+                        break
+                if not _any_slice_ok:
                     continue
 
                 # Initialize meta for first sighting
@@ -4379,14 +4876,10 @@ while not _shutdown_requested:
                 # Risk caps (in dollars / active markets). Redeemable Data-API
                 # leftovers are settlement backlog — they must NOT consume the
                 # max_open_positions budget or a redeem lag freezes all entries
-                # (silent continue). Only non-redeemable size counts as open risk.
+                # (silent continue). Only live hedges count as open risk.
                 open_conditions = set()
                 for c, p in held.items():
-                    up_sz = float(p.get("up", {}).get("size", 0) or 0)
-                    dn_sz = float(p.get("dn", {}).get("size", 0) or 0)
-                    up_live = up_sz > 0.01 and not p.get("up", {}).get("redeemable")
-                    dn_live = dn_sz > 0.01 and not p.get("dn", {}).get("redeemable")
-                    if up_live or dn_live:
+                    if position_is_live_hedge(p, positions_meta.get(c), now_s):
                         open_conditions.add(c)
                 open_conditions |= {
                     c for c, pm in positions_meta.items() if pm.get("buy_uncertain")
@@ -4411,8 +4904,13 @@ while not _shutdown_requested:
                     if (pm.get("bought_token") or pm.get("buy_uncertain"))
                     and pm.get("entered_at", 0) >= _today_start_ms()
                 )
-                est_cost = min(float(BUY_BUDGET), float(BUY_MAX_SPEND))
-                if MAX_OPEN_POSITIONS > 0 and open_count >= MAX_OPEN_POSITIONS:
+                est_cost = min(float(remaining_cap), float(BUY_MAX_SPEND))
+                already_open = (
+                    cond in open_conditions
+                    or held_size > 0.01
+                    or bool(meta.get("bought_token"))
+                )
+                if MAX_OPEN_POSITIONS > 0 and open_count >= MAX_OPEN_POSITIONS and not already_open:
                     log_event(
                         "buy_skip_max_positions",
                         condition_id=cond,
@@ -4452,29 +4950,30 @@ while not _shutdown_requested:
                     )
                     continue
 
-                # Fresh REST book + last trade in parallel.
-                # Entry decisions must not trust WS alone (stale/phantom sizes).
-                # GUI display = mid if spread ≤ 10¢ else last trade.
-                fut_up = _entry_executor.submit(
-                    get_quote_fast, m.up_token, 2.0, True, True,
-                )  # prefer_rest, force_rest — no 200ms cache at entry gate
-                fut_dn = _entry_executor.submit(
-                    get_quote_fast, m.dn_token, 2.0, True, True,
+                # 0.01s look: WS / prefetch only. REST every tick is why
+                # "sleeping 0.01s" used to wait hundreds of ms on CLOB.
+                # buy_market_with_retry still force-RESTs at POST.
+                up_bid, _, up_ask, _, up_mid = look_book_quote(
+                    m.up_token, _book_cache,
                 )
-                fut_ul = _entry_executor.submit(get_last_trade_price, m.up_token)
-                fut_dl = _entry_executor.submit(get_last_trade_price, m.dn_token)
-                up_bid, _, up_ask, _, up_mid = fut_up.result()
-                dn_bid, _, dn_ask, _, dn_mid = fut_dn.result()
-                up_last = fut_ul.result()
-                dn_last = fut_dl.result()
-                if up_last is None:
-                    up_last = get_book_snapshot_last_trade(m.up_token)
-                if dn_last is None:
-                    dn_last = get_book_snapshot_last_trade(m.dn_token)
+                dn_bid, _, dn_ask, _, dn_mid = look_book_quote(
+                    m.dn_token, _book_cache,
+                )
+                if up_ask is None:
+                    up_bid, _, up_ask, _, up_mid = get_quote_fast(m.up_token)
+                if dn_ask is None:
+                    dn_bid, _, dn_ask, _, dn_mid = get_quote_fast(m.dn_token)
+                if up_ask is None and dn_ask is None:
+                    log_buy_skip_throttled(
+                        "no_quote", cond, event="buy_skip",
+                    )
+                    continue
+                up_last = look_last_trade(m.up_token)
+                dn_last = look_last_trade(m.dn_token)
                 up_gui = polymarket_display_price(up_bid, up_ask, up_last)
                 dn_gui = polymarket_display_price(dn_bid, dn_ask, dn_last)
 
-                # Lock Chainlink PTB as soon as the window is open (memory/disk only).
+                # Lock Binance PTB as soon as the window is open (memory/disk only).
                 if m.start_ts and time.time() >= m.start_ts:
                     ptb_rec = btc_feed.capture_ptb(m.start_ts)
                     if ptb_rec and ptb_rec.get("ok") and not meta.get("ptb"):
@@ -4496,9 +4995,10 @@ while not _shutdown_requested:
                         save_json(STATE_FILE, positions_meta)
 
                 if up_gui is None or dn_gui is None:
-                    log_event(
-                        "buy_skip_incomplete_book",
-                        condition_id=cond,
+                    log_buy_skip_throttled(
+                        "incomplete_book",
+                        cond,
+                        event="buy_skip_incomplete_book",
                         up_bid=up_bid, dn_bid=dn_bid, up_ask=up_ask, dn_ask=dn_ask,
                         up_last=up_last, dn_last=dn_last, up_gui=up_gui, dn_gui=dn_gui,
                     )
@@ -4507,9 +5007,10 @@ while not _shutdown_requested:
                 # Winner by GUI display price (not raw mid — wide spreads poison mid).
                 gui_edge = abs(up_gui - dn_gui)
                 if gui_edge < MIN_BID_EDGE:
-                    log_event(
-                        "buy_skip_ambiguous",
-                        condition_id=cond,
+                    log_buy_skip_throttled(
+                        "ambiguous",
+                        cond,
+                        event="buy_skip_ambiguous",
                         up_gui=up_gui, dn_gui=dn_gui, gui_edge=round(gui_edge, 4),
                         up_bid=up_bid, dn_bid=dn_bid, up_ask=up_ask, dn_ask=dn_ask,
                     )
@@ -4519,8 +5020,8 @@ while not _shutdown_requested:
                 dn_winning = dn_gui > up_gui
 
                 # Ask in band + GUI consensus + tight real book (bid under the ask).
-                up_ask_ok = up_ask is not None and BUY_THRESHOLD <= up_ask <= BUY_MAX_PRICE
-                dn_ask_ok = dn_ask is not None and BUY_THRESHOLD <= dn_ask <= BUY_MAX_PRICE
+                up_ask_ok = ask_in_any_band(up_ask, bands)
+                dn_ask_ok = ask_in_any_band(dn_ask, bands)
                 up_book_ok, up_book_why = entry_book_ok(up_bid, up_ask, MAX_ENTRY_SPREAD, MIN_WINNER_BID)
                 dn_book_ok, dn_book_why = entry_book_ok(dn_bid, dn_ask, MAX_ENTRY_SPREAD, MIN_WINNER_BID)
                 up_consensus = (
@@ -4535,9 +5036,11 @@ while not _shutdown_requested:
                 )
 
                 if up_winning and up_ask_ok and not up_consensus:
-                    log_event(
-                        "buy_skip_no_consensus",
-                        condition_id=cond, leg="up",
+                    log_buy_skip_throttled(
+                        "no_consensus",
+                        cond,
+                        event="buy_skip_no_consensus",
+                        leg="up",
                         up_gui=up_gui, dn_gui=dn_gui, up_ask=up_ask,
                         up_bid=up_bid, dn_bid=dn_bid, up_last=up_last, dn_last=dn_last,
                         up_book_ok=up_book_ok, up_book_why=up_book_why,
@@ -4545,9 +5048,11 @@ while not _shutdown_requested:
                         min_winner_bid=MIN_WINNER_BID, max_loser_bid=MAX_LOSER_BID,
                     )
                 if dn_winning and dn_ask_ok and not dn_consensus:
-                    log_event(
-                        "buy_skip_no_consensus",
-                        condition_id=cond, leg="down",
+                    log_buy_skip_throttled(
+                        "no_consensus",
+                        cond,
+                        event="buy_skip_no_consensus",
+                        leg="down",
                         up_gui=up_gui, dn_gui=dn_gui, dn_ask=dn_ask,
                         up_bid=up_bid, dn_bid=dn_bid, up_last=up_last, dn_last=dn_last,
                         dn_book_ok=dn_book_ok, dn_book_why=dn_book_why,
@@ -4558,8 +5063,7 @@ while not _shutdown_requested:
                 up_buy = up_winning and up_ask_ok and up_consensus
                 dn_buy = dn_winning and dn_ask_ok and dn_consensus
 
-                # Underlying BTC vs Price To Beat. When enabled, always run the check —
-                # even if min_edge is 0 (still fail-closed on flat/missing/stale).
+                # Underlying BTC (Binance BTCUSDT) vs Price To Beat at window open.
                 uchk = None
                 if UNDERLYING_GATE_ENABLED and (up_buy or dn_buy):
                     uchk = btc_feed.underlying_check(m.start_ts, MIN_UNDERLYING_EDGE_USD)
@@ -4631,12 +5135,173 @@ while not _shutdown_requested:
                         continue
 
                 if not (up_buy or dn_buy):
+                    skip_why = window_no_buy_reason(
+                        up_ask=up_ask,
+                        dn_ask=dn_ask,
+                        up_winning=up_winning,
+                        dn_winning=dn_winning,
+                        up_ask_ok=up_ask_ok,
+                        dn_ask_ok=dn_ask_ok,
+                        up_consensus=up_consensus,
+                        dn_consensus=dn_consensus,
+                        up_buy=up_buy,
+                        dn_buy=dn_buy,
+                        threshold=min(b.min_price for b in bands),
+                        max_price=max(b.max_price for b in bands),
+                        min_exclusive=any(b.min_exclusive for b in bands),
+                        bands=bands,
+                    )
+                    if skip_why in {
+                        "ask_below_band", "ask_above_band", "ask_out_of_band", "no_ask",
+                    }:
+                        log_buy_skip_throttled(
+                            skip_why,
+                            cond,
+                            up_ask=up_ask,
+                            dn_ask=dn_ask,
+                            up_gui=up_gui,
+                            dn_gui=dn_gui,
+                            minutes_left=round(minutes_left, 2),
+                            band=",".join(b.name for b in bands),
+                            entry_min=min(b.min_price for b in bands),
+                            entry_max=max(b.max_price for b in bands),
+                        )
+                    continue
+
+                _pos_interval = positions_refresh_interval_s(
+                    POSITIONS_REFRESH_S, _need_fast_positions,
+                )
+                if not positions_snapshot_is_fresh(
+                    _positions_received_mono, _now_mono, _pos_interval,
+                ):
+                    log_buy_skip_throttled(
+                        "stale_positions", cond, event="buy_skip",
+                        age_s=round(_now_mono - _positions_received_mono, 2)
+                        if _positions_received_mono else None,
+                        interval_s=_pos_interval,
+                    )
+                    continue
+                if (
+                    _balance_received_mono <= 0
+                    or _now_mono - _balance_received_mono
+                    > max(30.0, float(BALANCE_REFRESH_S) * 3)
+                ):
+                    log_buy_skip_throttled(
+                        "stale_balance", cond, event="buy_skip",
+                    )
+                    continue
+
+                # WS said buy. REST-confirm once (stale/phantom sizes), then
+                # POST. Skip ticks never wait on CLOB HTTP.
+                fut_up = _entry_executor.submit(
+                    get_quote_fast, m.up_token, 2.0, True, True,
+                )
+                fut_dn = _entry_executor.submit(
+                    get_quote_fast, m.dn_token, 2.0, True, True,
+                )
+                fut_ul = _entry_executor.submit(get_last_trade_price, m.up_token)
+                fut_dl = _entry_executor.submit(get_last_trade_price, m.dn_token)
+                up_bid, _, up_ask, _, up_mid = fut_up.result()
+                dn_bid, _, dn_ask, _, dn_mid = fut_dn.result()
+                up_last = fut_ul.result()
+                dn_last = fut_dl.result()
+                if up_last is None:
+                    up_last = get_book_snapshot_last_trade(m.up_token)
+                if dn_last is None:
+                    dn_last = get_book_snapshot_last_trade(m.dn_token)
+                up_gui = polymarket_display_price(up_bid, up_ask, up_last)
+                dn_gui = polymarket_display_price(dn_bid, dn_ask, dn_last)
+                if up_gui is None or dn_gui is None:
+                    log_buy_skip_throttled(
+                        "incomplete_book",
+                        cond,
+                        event="buy_skip_incomplete_book",
+                        via="rest_confirm",
+                        up_bid=up_bid, dn_bid=dn_bid, up_ask=up_ask, dn_ask=dn_ask,
+                        up_last=up_last, dn_last=dn_last, up_gui=up_gui, dn_gui=dn_gui,
+                    )
+                    continue
+                gui_edge = abs(up_gui - dn_gui)
+                if gui_edge < MIN_BID_EDGE:
+                    continue
+                up_winning = up_gui > dn_gui
+                dn_winning = dn_gui > up_gui
+                up_ask_ok = ask_in_any_band(up_ask, bands)
+                dn_ask_ok = ask_in_any_band(dn_ask, bands)
+                up_book_ok, _ = entry_book_ok(
+                    up_bid, up_ask, MAX_ENTRY_SPREAD, MIN_WINNER_BID,
+                )
+                dn_book_ok, _ = entry_book_ok(
+                    dn_bid, dn_ask, MAX_ENTRY_SPREAD, MIN_WINNER_BID,
+                )
+                up_consensus = (
+                    up_gui >= MIN_WINNER_BID and dn_gui <= MAX_LOSER_BID
+                    and up_book_ok
+                )
+                dn_consensus = (
+                    dn_gui >= MIN_WINNER_BID and up_gui <= MAX_LOSER_BID
+                    and dn_book_ok
+                )
+                up_buy = up_winning and up_ask_ok and up_consensus
+                dn_buy = dn_winning and dn_ask_ok and dn_consensus
+                if not (up_buy or dn_buy):
+                    log_buy_skip_throttled(
+                        "rest_confirm",
+                        cond,
+                        event="buy_skip_rest_confirm",
+                        up_ask=up_ask, dn_ask=dn_ask,
+                        up_gui=up_gui, dn_gui=dn_gui,
+                    )
                     continue
 
                 buy_token = m.up_token if up_buy else m.dn_token
                 buy_ask = up_ask if up_buy else dn_ask
                 buy_leg = "up" if up_buy else "down"
                 buy_gui = up_gui if up_buy else dn_gui
+                band = select_hourly_entry_band(buy_ask, bands)
+                if band is None:
+                    continue
+
+                held_id = held_token or meta.get("bought_token")
+                if held_size > 0.01 and not same_token(held_id, buy_token):
+                    log_buy_skip_throttled(
+                        "other_leg",
+                        cond,
+                        event="buy_skip_other_leg",
+                        held_leg=held_leg or meta.get("bought_leg"),
+                        buy_leg=buy_leg,
+                        minutes_left=round(minutes_left, 2),
+                    )
+                    continue
+
+                arm_ok, arm_why = can_arm_hourly_slice(
+                    meta,
+                    slice_name=band.name,
+                    buy_token=buy_token,
+                    **_arm_kwargs,
+                )
+                if not arm_ok:
+                    if arm_why == "other_leg":
+                        log_buy_skip_throttled(
+                            "other_leg",
+                            cond,
+                            event="buy_skip_other_leg",
+                            held_leg=held_leg or meta.get("bought_leg"),
+                            buy_leg=buy_leg,
+                            minutes_left=round(minutes_left, 2),
+                        )
+                    continue
+
+                spend_usd = hourly_slice_budget(
+                    band.name, meta,
+                    a22_budget=A22_BUY_BUDGET,
+                    b15_budget=B15_BUY_BUDGET,
+                    c5_budget=C5_BUY_BUDGET,
+                    market_cap=MARKET_SPEND_CAP,
+                )
+                spend_usd = min(float(spend_usd), float(BUY_MAX_SPEND))
+                if spend_usd < 0.01:
+                    continue
 
                 # Cooldown (empty FAKs use the short empty_fak_cooldown_s).
                 last_buy_at = meta.get("last_buy_at") or 0
@@ -4654,19 +5319,28 @@ while not _shutdown_requested:
                     f"  [bright_green]UP[/]   gui [bold]{up_gui:.3f}[/]  ask [bold]{up_ask or 0:.3f}[/]   │   "
                     f"[bright_red]DN[/]  gui [bold]{dn_gui:.3f}[/]  ask [bold]{dn_ask or 0:.3f}[/]   │   "
                     f"[bold green]TTM {_ttm_disp}[/]",
-                    title=f"[bold bright_green]▲ BUY TRIGGER — {buy_leg.upper()} LEG[/]",
+                    title=f"[bold bright_green]▲ BUY TRIGGER — {buy_leg.upper()} · {band.name}[/]",
                     border_style="bright_green",
                     box=box.HEAVY,
                 ))
 
                 tick = get_tick_size_cached(buy_token)
-                spend_usd = min(float(BUY_BUDGET), float(BUY_MAX_SPEND))
+                slice_prior_size = float(meta.get("bought_size") or 0)
+                slice_prior_cost = float(meta.get("pnl_entry_cost") or 0)
+                slice_prior_quoted = float(meta.get("quoted_buy_shares_total") or 0)
+                if slice_prior_quoted < 0.01 and slice_prior_size > 0.01:
+                    slice_prior_quoted = float(meta.get("quoted_buy_shares") or 0)
+                spent_before = hourly_spent_so_far(meta)
                 if uchk is None and m.start_ts:
                     uchk = btc_feed.underlying_check(m.start_ts, 0)  # snapshot only
                 log_event(
                     "buy_attempt", condition_id=cond, leg=buy_leg, budget=spend_usd,
                     ask=buy_ask, gui=buy_gui, up_gui=up_gui, dn_gui=dn_gui,
-                    threshold=BUY_THRESHOLD, minutes_left=round(minutes_left, 2),
+                    threshold=band.retry_min_price, max_price=band.fak_limit,
+                    band=band.name, minutes_left=round(minutes_left, 2),
+                    slice=band.name,
+                    add=slice_prior_size > 0.01,
+                    spent_so_far=round(spent_before, 4),
                     ptb=(uchk or {}).get("ptb"),
                     live_btc=(uchk or {}).get("live_btc"),
                     edge_usd=(uchk or {}).get("edge_usd"),
@@ -4686,6 +5360,14 @@ while not _shutdown_requested:
                     "up_gui": up_gui,
                     "dn_gui": dn_gui,
                     "minutes_left": round(minutes_left, 2),
+                    "band": band.name,
+                    "entry_min": band.min_price,
+                    "entry_max": band.max_price,
+                    "fak_limit": band.fak_limit,
+                    "slice": band.name,
+                    "add": slice_prior_size > 0.01,
+                    "spent_so_far": round(spent_before, 4),
+                    "budget": spend_usd,
                     **{k: (uchk or {}).get(k) for k in (
                         "ptb", "live_btc", "edge_usd", "favored", "ptb_source",
                         "live_source", "live_age_s", "ptb_skew_ms",
@@ -4702,24 +5384,30 @@ while not _shutdown_requested:
                             filled_total * float(buy_ask or BUY_THRESHOLD),
                         )
                         avg = spent_total / filled_total if filled_total else avg
-                    quoted = meta.get("quoted_buy_shares")
+                    this_quoted = meta.get("quoted_buy_shares")
                     _, force_exit = classify_buy_fill(
-                        avg, filled_total, quoted, BUY_THRESHOLD, TOXIC_FORCE_EXIT_BELOW,
+                        avg, filled_total, this_quoted, BUY_THRESHOLD, TOXIC_FORCE_EXIT_BELOW,
+                    )
+                    total_size, total_cost, total_quoted, vwap = accumulate_buy_inventory(
+                        slice_prior_size, slice_prior_cost, filled_total, spent_total,
+                        slice_prior_quoted, this_quoted,
                     )
                     meta["last_buy_at"] = time.time() * 1000
                     meta["bought_token"] = buy_token
                     meta.pop("last_buy_empty", None)
                     meta["bought_leg"] = buy_leg
-                    meta["bought_size"] = filled_total
-                    meta["fill_price"] = round(avg, 4)
-                    meta["pnl_entry_cost"] = round(spent_total, 4)
-                    meta["toxic_fill"] = bool(force_exit)
+                    meta["bought_size"] = total_size
+                    meta["fill_price"] = round(vwap or avg, 4)
+                    meta["pnl_entry_cost"] = round(total_cost, 4)
+                    meta["quoted_buy_shares_total"] = float(total_quoted or 0)
+                    meta["toxic_fill"] = bool(force_exit or meta.get("toxic_fill"))
+                    stamp_hourly_slice_bought(meta, band.name)
                     leg_key = "up" if buy_leg == "up" else "dn"
                     _cached_positions.setdefault(cond, {})[leg_key] = {
                         "asset": buy_token,
-                        "size": float(filled_total),
+                        "size": float(total_size),
                         "redeemable": False,
-                        "avgPrice": float(avg),
+                        "avgPrice": float(vwap or avg),
                     }
                     save_json(STATE_FILE, positions_meta)
 
@@ -4756,6 +5444,12 @@ while not _shutdown_requested:
                     )
                     if trade_ids:
                         meta["buy_uncertain_trade_ids"] = trade_ids
+                    if not meta.get("buy_uncertain_slice_budget"):
+                        meta["buy_uncertain_slice_prior_size"] = float(slice_prior_size)
+                        meta["buy_uncertain_slice_prior_cost"] = float(slice_prior_cost)
+                        meta["buy_uncertain_slice_prior_quoted"] = float(slice_prior_quoted)
+                        meta["buy_uncertain_slice_budget"] = float(spend_usd)
+                        meta["buy_uncertain_slice"] = band.name
                     meta["buy_uncertain_known_size"] = float(
                         meta.get("bought_size") or 0
                     )
@@ -4766,7 +5460,8 @@ while not _shutdown_requested:
                     save_json(STATE_FILE, positions_meta)
 
                 bought, spent, buy_status = buy_market_with_retry(
-                    buy_token, spend_usd, BUY_MAX_PRICE, tick_size=tick, min_price=BUY_THRESHOLD,
+                    buy_token, spend_usd, band.fak_limit, tick_size=tick,
+                    min_price=band.retry_min_price,
                     on_fill=_persist_buy_fill, on_submit=_persist_buy_submit,
                     condition_id=cond,
                 )
@@ -4780,18 +5475,24 @@ while not _shutdown_requested:
                             bought * float(buy_ask or BUY_THRESHOLD),
                         )
                     avg_fill = implied_buy_average(spent, bought, buy_ask)
-                    quoted = meta.get("quoted_buy_shares")
+                    this_quoted = meta.get("quoted_buy_shares")
                     _, force_exit = classify_buy_fill(
-                        avg_fill, bought, quoted, BUY_THRESHOLD, TOXIC_FORCE_EXIT_BELOW,
+                        avg_fill, bought, this_quoted, BUY_THRESHOLD, TOXIC_FORCE_EXIT_BELOW,
+                    )
+                    total_size, total_cost, total_quoted, vwap = accumulate_buy_inventory(
+                        slice_prior_size, slice_prior_cost, bought, spent,
+                        slice_prior_quoted, this_quoted,
                     )
                     meta["last_buy_at"] = wall_ms
                     meta["bought_token"] = buy_token
                     meta.pop("last_buy_empty", None)
                     meta["bought_leg"] = buy_leg
-                    meta["bought_size"] = bought
-                    meta["fill_price"] = round(avg_fill, 4)
-                    meta["pnl_entry_cost"] = round(spent, 4)
-                    meta["toxic_fill"] = bool(force_exit)
+                    meta["bought_size"] = total_size
+                    meta["fill_price"] = round(vwap or avg_fill, 4)
+                    meta["pnl_entry_cost"] = round(total_cost, 4)
+                    meta["quoted_buy_shares_total"] = float(total_quoted or 0)
+                    meta["toxic_fill"] = bool(force_exit or meta.get("toxic_fill"))
+                    stamp_hourly_slice_bought(meta, band.name)
                     if uchk:
                         meta["ptb"] = uchk.get("ptb")
                         meta["ptb_source"] = uchk.get("ptb_source")
@@ -4799,7 +5500,12 @@ while not _shutdown_requested:
                         meta["entry_edge_usd"] = uchk.get("edge_usd")
                     log_event(
                         "buy_success", condition_id=cond, leg=buy_leg, bought=bought,
+                        size=total_size,
                         price=meta["fill_price"], ask_gate=buy_ask, entry_cost=meta["pnl_entry_cost"],
+                        slice=band.name,
+                        add=slice_prior_size > 0.01,
+                        spent_so_far=round(total_cost, 4),
+                        budget=spend_usd,
                         ptb=meta.get("ptb"), live_btc=meta.get("entry_live_btc"),
                         edge_usd=meta.get("entry_edge_usd"),
                         toxic_fill=bool(meta.get("toxic_fill")),
@@ -4813,9 +5519,14 @@ while not _shutdown_requested:
                         "end_ts": m.end_ts,
                         "leg": buy_leg,
                         "bought": bought,
+                        "size": total_size,
                         "price": meta["fill_price"],
                         "ask_gate": buy_ask,
                         "entry_cost": meta["pnl_entry_cost"],
+                        "slice": band.name,
+                        "add": slice_prior_size > 0.01,
+                        "spent_so_far": round(total_cost, 4),
+                        "budget": spend_usd,
                         "ptb": meta.get("ptb"),
                         "live_btc": meta.get("entry_live_btc"),
                         "edge_usd": meta.get("entry_edge_usd"),
@@ -4826,7 +5537,8 @@ while not _shutdown_requested:
                         notify(
                             "TOXIC BUY — FORCE EXIT",
                             f"{m.question}\nBelow-band fill {buy_leg.upper()} at "
-                            f"~{meta['fill_price']:.3f} ({bought:.2f} shares, ${spent:.2f})\n"
+                            f"~{meta['fill_price']:.3f} ({bought:.2f} this slice, "
+                            f"{total_size:.2f} total, ${spent:.2f})\n"
                             "Will not ride to $1 — dumping at next usable bid",
                             priority="urgent",
                         )
@@ -4834,7 +5546,7 @@ while not _shutdown_requested:
                         notify(
                             "BUY FILLED / UNCERTAIN" if buy_status == "ambiguous" else "BUY FILLED",
                             f"{m.question}\nBought {buy_leg.upper()} at ~{meta['fill_price']:.3f} "
-                            f"({bought:.2f} shares, ${spent:.2f})"
+                            f"({bought:.2f} this slice, {total_size:.2f} total, ${spent:.2f})"
                             + ("\nFinal POST unresolved; market remains quarantined" if buy_status == "ambiguous" else ""),
                             priority="urgent" if buy_status == "ambiguous" else "high",
                         )
@@ -4851,6 +5563,9 @@ while not _shutdown_requested:
                     log_event(
                         "buy_uncertain", condition_id=cond, leg=buy_leg, budget=spend_usd,
                         ask=buy_ask, token_id=buy_token,
+                        slice=band.name,
+                        add=slice_prior_size > 0.01,
+                        spent_so_far=round(spent_before, 4),
                     )
                     notify(
                         "BUY UNCERTAIN",
@@ -4867,7 +5582,10 @@ while not _shutdown_requested:
                         meta["last_buy_empty"] = True
                     else:
                         meta.pop("last_buy_empty", None)
-                    log_event("buy_fail", condition_id=cond, leg=buy_leg, budget=spend_usd, ask=buy_ask, status=buy_status)
+                    log_event(
+                        "buy_fail", condition_id=cond, leg=buy_leg, budget=spend_usd,
+                        ask=buy_ask, status=buy_status, slice=band.name,
+                    )
                     save_json(STATE_FILE, positions_meta)
             except Exception as exc:
                 log_event(
@@ -5013,16 +5731,17 @@ while not _shutdown_requested:
             box=box.HEAVY_EDGE,
         ))
 
-    # Variable polling: sub-second in buy window OR while holding (hedge path)
+    # Variable polling: 0.01s in/around buy window OR while holding a *live*
+    # hedge. Expired wallet rows are dropped; they are not WAIT.
     _now = time.time() * 1000
     _min_ttm = min((m.end_ts * 1000 - _now) / 60000 for m in markets) if markets else 999
     _has_held = any(
-        max(p.get("up", {}).get("size", 0), p.get("dn", {}).get("size", 0)) > 0.01
-        for p in held.values()
+        position_is_live_hedge(p, positions_meta.get(c), now_s)
+        for c, p in held.items()
     )
     if _has_held:
         _sleep_s = min(POLL_HELD_S, POLL_BUY_WINDOW_S)
-    elif _min_ttm <= BUY_WINDOW_MIN:
+    elif _min_ttm <= BUY_HORIZON_MIN:
         _sleep_s = POLL_BUY_WINDOW_S
     else:
         _sleep_s = 1
@@ -5030,14 +5749,17 @@ while not _shutdown_requested:
     # ================= KICK OFF NEXT CYCLE'S BOOK FETCH =================
     _next_now = time.time() * 1000 + _sleep_s * 1000
     _pending_tokens = set(_pending_book_futs.values())
-    _MAX_PENDING_BOOKS = 30
+    _MAX_PENDING_BOOKS = 8
     _watch_tokens = set()
-    for m in markets:
-        _ml = (m.end_ts * 1000 - _next_now) / 60000
+    for m in _loop_markets:
         pos = held.get(m.condition_id, {})
-        has_pos = max(pos.get("up", {}).get("size", 0), pos.get("dn", {}).get("size", 0)) > 0.01
-        in_window = _ml > 0 and _ml <= BUY_WINDOW_MIN + 0.5
-        if not (in_window or has_pos):
+        meta = positions_meta.get(m.condition_id, {})
+        has_pos = position_is_live_hedge(pos, meta, now_s)
+        _ml = (m.end_ts * 1000 - _next_now) / 60000
+        in_window = _ml > 0 and _ml <= BUY_HORIZON_MIN + 0.5
+        # Uncertain recovery inspects the signed order id; it must not REST
+        # a dead CLOB book (404) every 0.01s.
+        if not (in_window or (has_pos and _ml > -0.5)):
             continue
         for token in (m.up_token, m.dn_token):
             if not token:
@@ -5047,8 +5769,10 @@ while not _shutdown_requested:
                 (pos.get("up", {}).get("size", 0) > 0.01 and token == m.up_token)
                 or (pos.get("dn", {}).get("size", 0) > 0.01 and token == m.dn_token)
             ):
-                # Always watch the held leg tightly
                 _watch_tokens.add(token)
+            _wq = book_ws.quote(token, max_age_s=2.0)
+            if _wq is not None and (_wq[0] is not None or _wq[2] is not None):
+                continue
             if token not in _pending_tokens and len(_pending_book_futs) < _MAX_PENDING_BOOKS:
                 _pending_book_futs[_book_executor.submit(get_quote_fast, token)] = token
                 _pending_tokens.add(token)

@@ -40,6 +40,15 @@ mint complete sets. Operator still sells leftover mint inventory by hand.
 `polybuybothourly` unless the operator asks. Open 15m/hourly inventory (if any)
 will not be auto-hedged or redeemed by those processes.
 
+**Hourly template (code ready, service still stopped):** three slices, **$10
+hard cap** per market (sum of fills), same-leg only, hedge **55/60** + inverted
+GUI. Slice A (last 22 min, ask **> 93¢**) spends at most **$5** at a **99¢**
+FAK. Slice B (last 15 min, ask **75–90¢**) spends remaining to $10 at **90¢**.
+Slice C (last 5 min, ask **> 95¢**) spends remaining to $10 at **99¢**.
+`buy_max_spend` **$11**, `buy_max_shares` **14**. Underlying edge stays
+**$10**. Tick **0.01**. Windows are **minutes**. See
+`strategy_buyhourly.example.json`.
+
 **Active strategy:** **5m only** (`polybuybot5m`) with **two $2.50 slices**
 (up to **$5** per market). Early: **≥90¢** in the first 3 minutes, **≥95¢**
 overlay on that same window. Late: **75–90¢** in the last **120s** only
@@ -191,7 +200,8 @@ amount / HTTP 400), not this NameError.
 - [x] Path recorder + `check_path_backtest.py` (first-touch ask × time-left;
   ticks record TOB size; backtest is share-capped FAK, not infinite ask size).
 - [x] Hedge FAK follows live bid after book integrity (no 32¢ fill refusal).
-      5m trigger is now **50/55**; 15m/hourly stay 35/40 (stopped).
+      5m trigger is now **50/55**; hourly template is **55/60** (still stopped);
+      15m stays 35/40 (stopped).
 - [x] On VM: pathlog restarted onto size-aware ticks; 15m/hourly buy bots stopped.
 - [x] 5m underlying gate **$0** (any non-zero TWAP vs PTB; side must match).
 - [x] Pathlog `--anatomy` / `--compare` so window/band/size alts are scored offline.
@@ -215,6 +225,11 @@ amount / HTTP 400), not this NameError.
       `[BUY FILL]` / no more `max accuracy of 2 decimals`.
       `check_buy_skips.py --since 2026-08-21T08:08:00` — `invalid_amount`
       should stop climbing. Do **not** start 15m / hourly / mint.
+- [ ] Hourly three-slice bot is in the repo (`buybothourly.py` + example JSON).
+      **Do not start `polybuybothourly`.** Operator later: `git pull`, set live
+      `strategy_buyhourly.json` (`dry_run` / `entry_enabled` only when they mean
+      it), `sudo systemctl start polybuybothourly`. Leave 5m running. Do not
+      start 15m or mint.
 - [ ] Cloud paper P&L: paste `CLOUD_RESEARCH.md` section 2 (live `pathlog.py`
       + `--sweep --paper`, rank by `pnl_sum` vs `live_5m_paper`). No `.env`.
       Optional: attach `poly-research.zip` for the historical tape. Not live

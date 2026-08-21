@@ -621,18 +621,18 @@ class AmbiguousCrossCyclePolicy(unittest.TestCase):
     def test_known_cost_assigned_before_buy_uncertain_spend_cap(self):
         needle = "min(float(BUY_BUDGET), float(BUY_MAX_SPEND)) - known_cost"
         assign = 'known_cost = float(meta.get("buy_uncertain_known_cost")'
-        for bot in (BOT, BOT_HR):
+        src15 = BOT.read_text()
+        use = src15.find(needle)
+        self.assertGreater(use, -1, BOT.name)
+        defined = src15.rfind(assign, 0, use)
+        self.assertGreater(defined, -1, BOT.name)
+        for bot in (BOT5M, BOT_HR):
             src = bot.read_text()
-            use = src.find(needle)
-            self.assertGreater(use, -1, bot.name)
-            defined = src.rfind(assign, 0, use)
-            self.assertGreater(defined, -1, bot.name)
-        five = BOT5M.read_text()
-        self.assertIn("uncertain_buy_spend_cap(", five)
-        five_assign = five.find(assign)
-        five_use = five.find("spend_cap=uncertain_buy_spend_cap(", five_assign)
-        self.assertGreater(five_assign, -1)
-        self.assertGreater(five_use, five_assign)
+            self.assertIn("uncertain_buy_spend_cap(", src, bot.name)
+            bot_assign = src.find(assign)
+            bot_use = src.find("spend_cap=uncertain_buy_spend_cap(", bot_assign)
+            self.assertGreater(bot_assign, -1, bot.name)
+            self.assertGreater(bot_use, bot_assign, bot.name)
 
     def test_cycle_error_logs_error_field(self):
         for bot in (BOT, BOT5M, BOT_HR):
@@ -676,7 +676,7 @@ class AmbiguousCrossCyclePolicy(unittest.TestCase):
                 and (node.end_lineno - node.lineno) > 500
             ]
             self.assertEqual(len(market_fors), 1, bot.name)
-            if bot == BOT5M:
+            if bot in (BOT5M, BOT_HR):
                 self.assertEqual(market_fors[0].iter.id, "_loop_markets")
             try_nodes = [
                 stmt for stmt in market_fors[0].body if isinstance(stmt, ast.Try)
@@ -706,15 +706,29 @@ class AmbiguousCrossCyclePolicy(unittest.TestCase):
             "up_ask_ok = up_ask is not None and BUY_THRESHOLD <= up_ask <= BUY_MAX_PRICE",
             five,
         )
-        for bot in (BOT, BOT_HR):
-            src = bot.read_text()
-            self.assertNotIn("seconds_left = (end_ts_ms - now_ms) / 1000", src, bot.name)
-            self.assertIn("minutes_left = (end_ts_ms - now_ms) / 60000", src, bot.name)
-            self.assertIn(
-                "up_ask_ok = up_ask is not None and BUY_THRESHOLD <= up_ask <= BUY_MAX_PRICE",
-                src,
-                bot.name,
-            )
+        src15 = BOT.read_text()
+        self.assertNotIn("seconds_left = (end_ts_ms - now_ms) / 1000", src15)
+        self.assertIn("minutes_left = (end_ts_ms - now_ms) / 60000", src15)
+        self.assertIn(
+            "up_ask_ok = up_ask is not None and BUY_THRESHOLD <= up_ask <= BUY_MAX_PRICE",
+            src15,
+        )
+        hourly = BOT_HR.read_text()
+        self.assertNotIn("seconds_left = (end_ts_ms - now_ms) / 1000", hourly)
+        self.assertIn("minutes_left = (end_ts_ms - now_ms) / 60000", hourly)
+        self.assertNotIn(
+            "up_ask_ok = up_ask is not None and BUY_THRESHOLD <= up_ask <= BUY_MAX_PRICE",
+            hourly,
+        )
+        self.assertIn("ask_in_any_band", hourly)
+        self.assertIn("select_hourly_entry_band", hourly)
+        self.assertIn("stamp_hourly_slice_bought", hourly)
+        self.assertIn("applicable_hourly_entry_bands", hourly)
+        self.assertIn('"hedge_threshold": 0.55', hourly)
+        self.assertIn('"hedge_require_ask_max": 0.60', hourly)
+        self.assertIn("slice=band.name", hourly)
+        self.assertIn("spent_so_far", hourly)
+        self.assertIn("band.fak_limit", hourly)
 
     def test_hedge_liveness_and_reconcile_markers(self):
         src = BOT.read_text()
@@ -763,10 +777,10 @@ class AmbiguousCrossCyclePolicy(unittest.TestCase):
             self.assertIn("toxic_fill_armed_from_inventory", src, bot.name)
             self.assertIn('reason="no_bid"', src, bot.name)
             self.assertIn('quoted = meta.get("quoted_buy_shares")', src, bot.name)
-            self.assertIn('"buy_max_spend": 3.0', src, bot.name)
-            self.assertIn('"buy_max_shares": 5.0', src, bot.name)
             self.assertIn("BUY_MAX_SHARES", src, bot.name)
             if bot == BOT5M:
+                self.assertIn('"buy_max_spend": 3.0', src, bot.name)
+                self.assertIn('"buy_max_shares": 5.0', src, bot.name)
                 self.assertIn("quoted_buy_shares_up_to_limit(", src, bot.name)
                 self.assertIn("price=limit_price", src, bot.name)
                 self.assertNotIn(
@@ -778,7 +792,23 @@ class AmbiguousCrossCyclePolicy(unittest.TestCase):
                 self.assertNotIn("user_usdc_balance", order_chunk, bot.name)
                 self.assertIn('ROUNDING_CONFIG.get("0.001")', src, bot.name)
                 self.assertIn("_tick_001.amount = 2", src, bot.name)
+            elif bot == BOT_HR:
+                self.assertIn('"buy_max_spend": 11.0', src, bot.name)
+                self.assertIn('"buy_max_shares": 14.0', src, bot.name)
+                self.assertIn("quoted_buy_shares_up_to_limit(", src, bot.name)
+                self.assertIn("price=limit_price", src, bot.name)
+                self.assertNotIn(
+                    "quoted_buy_shares(remaining_budget, fresh_ask, BUY_MAX_SHARES)",
+                    src,
+                    bot.name,
+                )
+                order_chunk = src[src.index("OrderArgs(") : src.index("OrderArgs(") + 420]
+                self.assertNotIn("user_usdc_balance", order_chunk, bot.name)
+                self.assertIn('ROUNDING_CONFIG.get("0.01")', src, bot.name)
+                self.assertIn("_tick_01.amount = 2", src, bot.name)
             else:
+                self.assertIn('"buy_max_spend": 3.0', src, bot.name)
+                self.assertIn('"buy_max_shares": 5.0', src, bot.name)
                 self.assertIn(
                     "quoted_buy_shares(remaining_budget, fresh_ask, BUY_MAX_SHARES)",
                     src,
@@ -1311,6 +1341,132 @@ class FiveMinuteBandLimitFakTests(unittest.TestCase):
         self.assertFalse(toxic)
 
 
+class HourlyBandLimitFakTests(unittest.TestCase):
+    """Hourly FAK: A/C limit 99¢ ($5 or remaining to $10), B limit 90¢."""
+
+    def test_sizes_maker_valid_at_99_and_90(self):
+        ns = _load_funcs(
+            "finite_float",
+            "quoted_buy_shares",
+            "quoted_buy_shares_up_to_limit",
+            bot=BOT_HR,
+        )
+        fn = ns["quoted_buy_shares_up_to_limit"]
+        five = fn(5.0, 0.94, 0.99, 14.0, spend_cap=5.0)
+        self.assertGreaterEqual(five, 3.0)
+        self.assertLessEqual(five * 0.99, 5.0 + 1e-9)
+        maker_a = Decimal(str(five)) * Decimal("0.99")
+        self.assertEqual(maker_a.quantize(Decimal("0.01")), maker_a)
+        self.assertAlmostEqual(five, 5.0)
+        self.assertEqual(float(maker_a), 4.95)
+
+        ten = fn(10.0, 0.88, 0.90, 14.0, spend_cap=10.0)
+        self.assertGreaterEqual(ten, 3.0)
+        self.assertLessEqual(ten * 0.90, 10.0 + 1e-9)
+        maker_b = Decimal(str(ten)) * Decimal("0.90")
+        self.assertEqual(maker_b.quantize(Decimal("0.01")), maker_b)
+        self.assertAlmostEqual(ten, 11.10)
+        self.assertEqual(float(maker_b), 9.99)
+
+        ten_flat_c = fn(10.0, 0.96, 0.99, 14.0, spend_cap=10.0)
+        maker_c = Decimal(str(ten_flat_c)) * Decimal("0.99")
+        self.assertEqual(maker_c.quantize(Decimal("0.01")), maker_c)
+        self.assertLessEqual(float(maker_c), 10.0 + 1e-9)
+        self.assertGreaterEqual(float(maker_c), 9.0)
+
+    @staticmethod
+    def _namespace():
+        ns = _load_funcs(
+            "finite_float",
+            "_result_as_dict",
+            "quoted_buy_shares",
+            "quoted_buy_shares_up_to_limit",
+            "buy_fill_walked",
+            "classify_buy_fill",
+            "implied_buy_average",
+            "buy_market_with_retry",
+            "unmatched_fak_rejection",
+            "definitive_order_rejection",
+            bot=BOT_HR,
+        )
+        calls = {"post": 0, "submit": [], "orders": []}
+        signed_order = SimpleNamespace(
+            makerAmount="4950000",
+            takerAmount="5000000",
+            timestamp="1",
+        )
+
+        def post(*_args, **_kwargs):
+            calls["post"] += 1
+            return {"status": "unmatched", "orderID": "order-1"}
+
+        def create_order(args, **_kwargs):
+            calls["orders"].append(args)
+            return signed_order
+
+        ns.update(
+            {
+                "DRY_RUN": False,
+                "BUY": "BUY",
+                "BUY_MAX_SHARES": 14.0,
+                "BUY_MAX_SPEND": 11.0,
+                "HEDGE_GHOST_SLEEP_S": 0.0,
+                "MAX_ENTRY_SPREAD": 0.10,
+                "MIN_WINNER_BID": 0.70,
+                "TOXIC_FORCE_EXIT_BELOW": 0.65,
+                "console": SimpleNamespace(print=lambda *_a, **_k: None),
+                "log_event": lambda *_a, **_k: None,
+                "check_token_balance": lambda *_args: 0.0,
+                "check_clob_token_balance": lambda *_args, **_kwargs: 0.0,
+                "_fill_fee_usdc": lambda *_args, **_kwargs: None,
+                "entry_book_ok": lambda *_a, **_k: (True, "ok"),
+                "safe_api_call": lambda fn, *a, **k: fn(*a, **k),
+                "client": SimpleNamespace(
+                    create_order=create_order,
+                    post_order=post,
+                ),
+                "OrderArgs": lambda **kwargs: kwargs,
+                "PartialCreateOrderOptions": lambda **kwargs: kwargs,
+                "OrderType": SimpleNamespace(FAK="FAK"),
+                "signed_order_id": lambda *_a, **_k: "order-1",
+                "extract_order_id": lambda _result: "order-1",
+                "confirm_fill_size": lambda *_a, **_k: 0.0,
+                "fill_cost_usdc": lambda *_a, **_k: 0.0,
+                "time": SimpleNamespace(time=lambda: 1.0, sleep=lambda _s: None),
+            }
+        )
+        return ns, calls
+
+    def test_slice_a_posts_99_limit_no_usdc_balance(self):
+        ns, calls = self._namespace()
+        ns["get_quote_fast"] = lambda *_a, **_k: (0.93, 0.5, 0.94, 10.0, None)
+        result = ns["buy_market_with_retry"](
+            "token", 5.0, 0.99, min_price=0.93, max_retries=1,
+            on_submit=lambda *args: calls["submit"].append(args),
+        )
+        self.assertEqual(result, (0.0, 0.0, "empty"))
+        self.assertEqual(len(calls["orders"]), 1)
+        order = calls["orders"][0]
+        self.assertNotIn("user_usdc_balance", order)
+        self.assertAlmostEqual(order["price"], 0.99)
+        self.assertAlmostEqual(order["size"], 5.0)
+        self.assertLessEqual(order["size"] * 0.99, 5.0 + 1e-9)
+
+    def test_slice_b_posts_90_limit_ten_dollars(self):
+        ns, calls = self._namespace()
+        ns["get_quote_fast"] = lambda *_a, **_k: (0.87, 0.5, 0.88, 20.0, None)
+        ns["buy_market_with_retry"](
+            "token", 10.0, 0.90, min_price=0.75, max_retries=1,
+            on_submit=lambda *args: calls["submit"].append(args),
+        )
+        self.assertEqual(len(calls["orders"]), 1)
+        order = calls["orders"][0]
+        self.assertNotIn("user_usdc_balance", order)
+        self.assertAlmostEqual(order["price"], 0.90)
+        self.assertAlmostEqual(order["size"], 11.10)
+        self.assertLessEqual(order["size"] * 0.90, 10.0 + 1e-9)
+
+
 class FiveMinuteClobMakerRoundingTests(unittest.TestCase):
     """Live 21 Aug 2026: 3.00 @ 99¢ + fake $2.97 wallet → maker $2.9601 → 400."""
 
@@ -1507,7 +1663,24 @@ class BalanceAndGcSemantics(unittest.TestCase):
         self.assertNotIn("early_95_start_s", fifteen)
         self.assertNotIn("late_buy_budget", hourly)
         self.assertNotIn("late_buy_budget", fifteen)
-        self.assertEqual(hourly["hedge_threshold"], 0.35)
+        self.assertEqual(hourly["a22_window_min"], 22.0)
+        self.assertEqual(hourly["b15_window_min"], 15.0)
+        self.assertEqual(hourly["c5_window_min"], 5.0)
+        self.assertEqual(hourly["a22_min_price"], 0.93)
+        self.assertEqual(hourly["c5_min_price"], 0.95)
+        self.assertEqual(hourly["high_buy_max_price"], 0.99)
+        self.assertEqual(hourly["a22_buy_budget"], 5.0)
+        self.assertEqual(hourly["b15_buy_budget"], 10.0)
+        self.assertEqual(hourly["c5_buy_budget"], 10.0)
+        self.assertEqual(hourly["market_spend_cap"], 10.0)
+        self.assertEqual(hourly["buy_max_spend"], 11.0)
+        self.assertEqual(hourly["buy_max_shares"], 14.0)
+        self.assertEqual(hourly["hedge_threshold"], 0.55)
+        self.assertEqual(hourly["hedge_require_ask_max"], 0.60)
+        self.assertEqual(hourly["poll_buy_window_s"], 0.01)
+        self.assertEqual(hourly["poll_held_s"], 0.01)
+        self.assertEqual(hourly["min_underlying_edge_usd"], 10.0)
+        self.assertEqual(hourly["tick_size"], "0.01")
         self.assertEqual(fifteen["hedge_threshold"], 0.35)
 
 
@@ -1767,6 +1940,51 @@ class FiveMFastPollHelpers(unittest.TestCase):
             self.ns["positions_snapshot_is_fresh"](100.0, 106.0, fast)
         )
         self.assertFalse(self.ns["positions_snapshot_is_fresh"](0.0, 1.0, 15.0))
+
+
+class HourlyFastPollHelpers(FiveMFastPollHelpers):
+    """Hourly uses the same dust/live-hedge helpers; leftover bags are not POS."""
+
+    @classmethod
+    def setUpClass(cls):
+        from buy.market import MintMarket
+
+        cls.ns = _load_funcs(
+            "finite_float",
+            "meta_end_ts",
+            "position_is_live_hedge",
+            "uncertain_still_recoverable",
+            "should_stub_tracked_market",
+            "market_needs_fast_path",
+            "bag_size",
+            "count_wallet_bags",
+            "count_live_hedges",
+            "inventory_is_hot",
+            "drop_wallet_dust",
+            "pick_look_quote",
+            "positions_refresh_interval_s",
+            "positions_snapshot_is_fresh",
+            "add_tracked_market_stubs",
+            bot=BOT_HR,
+        )
+        cls.ns["MintMarket"] = MintMarket
+        cls.ns["SERIES_SLUG"] = "btc-up-or-down-hourly"
+
+    def test_5m_source_poll_defaults_are_one_centisecond(self):
+        src = BOT_HR.read_text()
+        self.assertIn('"poll_buy_window_s": 0.01', src)
+        self.assertIn('"poll_held_s": 0.01', src)
+        self.assertIn("for m in _loop_markets:", src)
+        self.assertIn("drop_wallet_dust", src)
+        self.assertIn("look_book_quote", src)
+        self.assertIn("_HEARTBEAT_MIN_S", src)
+        self.assertIn("buy_skip_rest_confirm", src)
+        self.assertIn("stale_positions", src)
+        self.assertIn("positions_snapshot_is_fresh", src)
+        look_at = src.find("0.01s look: WS")
+        rest_at = src.find("WS said buy. REST-confirm once")
+        self.assertGreater(look_at, 0)
+        self.assertGreater(rest_at, look_at)
 
 
 if __name__ == "__main__":
