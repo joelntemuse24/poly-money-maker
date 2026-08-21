@@ -1466,6 +1466,9 @@ class FiveMFastPollHelpers(unittest.TestCase):
             "bag_size",
             "count_wallet_bags",
             "count_live_hedges",
+            "inventory_is_hot",
+            "drop_wallet_dust",
+            "pick_look_quote",
             "add_tracked_market_stubs",
             bot=BOT5M,
         )
@@ -1616,6 +1619,35 @@ class FiveMFastPollHelpers(unittest.TestCase):
         self.assertEqual(self.ns["count_live_hedges"](held, meta, now), 1)
         self.assertEqual(self.ns["count_wallet_bags"](held), 2)
 
+    def test_drop_wallet_dust_keeps_only_live_and_real_redeem(self):
+        now = 1_700_000_000.0
+        held = {f"c{i:03d}": self._bag() for i in range(666)}
+        held["live"] = self._bag(token="live-up")
+        held["cash"] = self._bag(redeemable=True)
+        held["ghost"] = self._bag(redeemable=True)
+        meta = {
+            "live": {"bought_token": "live-up", "end_ts": now + 90},
+            "ghost": {"redeem_abandoned": True},
+        }
+        kept = self.ns["drop_wallet_dust"](held, meta, now)
+        self.assertEqual(set(kept), {"live", "cash"})
+        self.assertEqual(self.ns["count_wallet_bags"](kept, meta), 2)
+        self.assertEqual(self.ns["count_live_hedges"](kept, meta, now), 1)
+        self.assertEqual(
+            max(0, self.ns["count_wallet_bags"](kept, meta)
+                - self.ns["count_live_hedges"](kept, meta, now)),
+            1,
+        )
+        self.assertFalse(self.ns["inventory_is_hot"](held["c000"], {}, now))
+        self.assertTrue(self.ns["inventory_is_hot"](held["live"], meta["live"], now))
+        self.assertTrue(self.ns["inventory_is_hot"](held["cash"], {}, now))
+        self.assertFalse(self.ns["inventory_is_hot"](held["ghost"], meta["ghost"], now))
+        dust_only = self.ns["drop_wallet_dust"](
+            {f"c{i:03d}": held[f"c{i:03d}"] for i in range(666)}, {}, now,
+        )
+        self.assertEqual(dust_only, {})
+        self.assertEqual(self.ns["count_wallet_bags"](dust_only), 0)
+
     def test_fast_path_skips_far_gamma_slate(self):
         now = 1_700_000_000.0
         far = SimpleNamespace(end_ts=now + 3600, condition_id="far")
@@ -1632,7 +1664,27 @@ class FiveMFastPollHelpers(unittest.TestCase):
         self.assertIn('"poll_buy_window_s": 0.01', src)
         self.assertIn('"poll_held_s": 0.01', src)
         self.assertIn("for m in _loop_markets:", src)
+        self.assertIn("drop_wallet_dust", src)
+        self.assertIn("look_book_quote", src)
+        self.assertIn("_HEARTBEAT_MIN_S", src)
+        self.assertIn("buy_skip_rest_confirm", src)
+        look_at = src.find("0.01s look: WS")
+        rest_at = src.find("WS said buy. REST-confirm once")
+        self.assertGreater(look_at, 0)
+        self.assertGreater(rest_at, look_at)
         self.assertIn("_REDEEM_ENQUEUE_MIN_S", src)
+
+    def test_pick_look_quote_prefers_ws_and_skips_empty(self):
+        pick = self.ns["pick_look_quote"]
+        ws = (0.80, 10.0, 0.81, 5.0, 0.805)
+        cached = (0.50, 1.0, 0.90, 1.0, 0.70)
+        self.assertEqual(pick(ws, cached), ws)
+        self.assertEqual(pick(None, cached), cached)
+        self.assertEqual(pick((None, 0.0, None, 0.0, None), cached), cached)
+        self.assertEqual(
+            pick(None, None),
+            (None, 0.0, None, 0.0, None),
+        )
 
 
 if __name__ == "__main__":

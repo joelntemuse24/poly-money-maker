@@ -209,10 +209,13 @@ two-slice $2.50+$2.50 add.
 - `buy_skip` `ask_below_band` / `ask_above_band` / `ask_out_of_band` / `no_ask` — in window, winning ask not in any open band (throttled 8s)
 - `buy_skip_max_positions` — only if `max_open_positions > 0` (probe uses **0 = unlimited**)
 - `pathlog_prune` — oldest tick JSONL removed (14d / 400 MB cap); export first
-- Banner `POS` — live (unexpired) hedges only. `WAIT n` is unredeemed leftover
-  5m shares still in the wallet; they are **not** quoted every tick
-- `sleeping 0.01s` — look interval after a short cycle. If wall clock is still
-  seconds, the cycle body is still fat (do not “fix” that by sleeping less)
+- Banner `POS` — live hedges only. `WAIT` should be **0** unless a *redeemable*
+  leftover is still cashing out. `WAIT 666` meant old Data API rows, not
+  666 live markets. After `drop_wallet_dust`, those rows are thrown away.
+- `sleeping 0.01s` — look interval after a short cycle. Skip ticks read WS
+  only; REST is for a would-buy confirm + POST. If wall clock is still
+  seconds, leftover bags or HTTP are still on the look (do not “fix”
+  that by sleeping less)
 - `[SETTLE SKIP] redeem skipped: zero position balance` — WAIT drain of a
   leftover 5m bag with nothing on-chain; blacklisted (`redeem_abandoned` in
   state, kept across restarts). Do **not** delete `positions_buy5m.json`.
@@ -258,9 +261,10 @@ Cloud agents: `CLOUD_RESEARCH.md`.
 - **5m look-ahead:** `BUY_HORIZON_S = max(buy_start_s, early_buy_start_s,
   early_95_start_s)` (300s). Hot poll / WS subscribe use that, not 120s alone.
   Sleep is **0.01s** in that window or while a **live** hedge is open.
-  Data API leftover 5m shares (hundreds) are **WAIT** / background redeem —
-  they must not be stubbed, printed, or REST-quoted every tick. Live JSON
-  `poll_*` hot-reloads; the loop-body filter needs a 5m restart.
+  That look reads the live WS book. REST is only when the look says buy
+  (confirm + POST). Data API leftover 5m shares (hundreds) are **dropped**
+  after download — they must not be stubbed, printed, REST-quoted, or shown
+  as WAIT. Live JSON `poll_*` hot-reloads; the loop-body filter needs a 5m restart.
 - **Atomic durable save:** State and P&L files flush + `fsync` the `.tmp`, replace
   it, then `fsync` the parent directory before an order can proceed.
 - **Fail-closed startup:** A valid strategy file is required at startup. A
