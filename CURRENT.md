@@ -9,7 +9,9 @@ Unredeemed leftover 5m shares are **WAIT** (background redeem), not **POS**.
 `[SETTLE SKIP] redeem skipped: zero position balance` is that drain (blacklist
 after one try). CLOB **404** `No orderbook exists` means a dead token is still
 on the quote path — clockless `bought_token` bags must not be stubbed as live.
-Do not walk hundreds of closed bags on the buy path. Stop/disable
+Do not walk hundreds of closed bags on the buy path. Do **not** delete
+`positions_buy5m.json` or try to sell dead 5m tokens (no CLOB book). Real
+leftovers redeem; Data API ghosts get one `redeem_abandoned` skip. Stop/disable
 15m and hourly. Split the 5m stake into **two $2.50 slices** (**$5** if both
 fill): **early ≥90¢ (to 99¢) in the first 3 minutes** and **≥95¢ overlay**
 there, then **$2.50 only in the last 120s at the old 75–90¢ band**. Missed
