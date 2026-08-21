@@ -10,13 +10,20 @@ from pathlib import Path
 from buy.entry_skip import (
     accumulate_buy_inventory,
     applicable_entry_bands,
+    applicable_hourly_entry_bands,
     ask_in_any_band,
     ask_in_entry_band,
     can_arm_entry_slice,
+    can_arm_hourly_slice,
     entry_band_for_seconds,
     entry_slice_budget,
+    hourly_horizon_min,
+    hourly_slice_budget,
+    hourly_spent_so_far,
     is_late_entry_window,
     select_entry_band,
+    select_hourly_entry_band,
+    stamp_hourly_slice_bought,
     stamp_slice_bought,
     uncertain_buy_spend_cap,
     union_ask_band_reason,
@@ -346,6 +353,160 @@ class TwoSliceBudgetTests(unittest.TestCase):
         self.assertTrue(meta["early_bought"])
         stamp_slice_bought(meta, True)
         self.assertTrue(meta["late_bought"])
+
+
+class HourlyThreeSliceTests(unittest.TestCase):
+    """TTM 22/15/5 minutes, $5 vs $10 remaining, same-leg add, $10 cap."""
+
+    def _bands(self, minutes_left):
+        return applicable_hourly_entry_bands(minutes_left)
+
+    def _names(self, minutes_left):
+        return [b.name for b in self._bands(minutes_left)]
+
+    def _pick(self, minutes_left, ask):
+        return select_hourly_entry_band(ask, self._bands(minutes_left))
+
+    def test_ttm_22_opens_a_not_b(self):
+        names = self._names(22)
+        self.assertIn("a22", names)
+        self.assertNotIn("b15", names)
+        self.assertNotIn("c5", names)
+        a = self._pick(22, 0.94)
+        self.assertIsNotNone(a)
+        self.assertEqual(a.name, "a22")
+        self.assertTrue(a.min_exclusive)
+        self.assertAlmostEqual(a.fak_limit, 0.99)
+        self.assertIsNone(self._pick(22, 0.93))
+        self.assertIsNone(self._pick(22, 0.88))
+        self.assertIsNone(self._pick(22, 0.91))
+        self.assertEqual(self._pick(22, 0.96).name, "a22")
+
+    def test_ttm_above_22_is_closed(self):
+        self.assertEqual(self._names(22.001), [])
+        self.assertIsNone(self._pick(23, 0.96))
+        self.assertIsNone(self._pick(0, 0.96))
+        self.assertIsNone(self._pick(-1, 0.88))
+
+    def test_ttm_15_b_covers_75_90_inclusive(self):
+        names = self._names(15)
+        self.assertIn("b15", names)
+        self.assertIn("a22", names)
+        self.assertNotIn("c5", names)
+        b = self._pick(15, 0.88)
+        self.assertEqual(b.name, "b15")
+        self.assertFalse(b.min_exclusive)
+        self.assertAlmostEqual(b.fak_limit, 0.90)
+        self.assertEqual(self._pick(15, 0.75).name, "b15")
+        self.assertEqual(self._pick(15, 0.90).name, "b15")
+        self.assertIsNone(self._pick(15, 0.74))
+        self.assertIsNone(self._pick(15, 0.91))
+        # 0.96 is A (C is not open yet), never filled at 90¢.
+        a = self._pick(15, 0.96)
+        self.assertEqual(a.name, "a22")
+        self.assertAlmostEqual(a.fak_limit, 0.99)
+
+    def test_ttm_12_ask_088_is_only_b(self):
+        self.assertEqual(self._pick(12, 0.88).name, "b15")
+        self.assertAlmostEqual(self._pick(12, 0.88).fak_limit, 0.90)
+
+    def test_ttm_12_ask_096_is_a_not_c(self):
+        band = self._pick(12, 0.96)
+        self.assertEqual(band.name, "a22")
+        self.assertAlmostEqual(band.fak_limit, 0.99)
+        self.assertIsNone(self._pick(12, 0.91))
+
+    def test_last_5_gt95_uses_c_not_a(self):
+        names = self._names(5)
+        self.assertEqual(set(names), {"a22", "b15", "c5"})
+        c = self._pick(5, 0.96)
+        self.assertEqual(c.name, "c5")
+        self.assertTrue(c.min_exclusive)
+        self.assertAlmostEqual(c.fak_limit, 0.99)
+        self.assertEqual(self._pick(4, 0.951).name, "c5")
+        # Exactly 95¢ is A (not > 0.95), $5 / 99¢ limit.
+        a = self._pick(5, 0.94)
+        self.assertEqual(a.name, "a22")
+        self.assertAlmostEqual(a.max_price, 0.95)
+        self.assertAlmostEqual(a.fak_limit, 0.99)
+        self.assertEqual(self._pick(5, 0.95).name, "a22")
+        self.assertIsNone(self._pick(5, 0.93))
+
+    def test_last_5_75_90_still_uses_b_at_90_limit(self):
+        b = self._pick(5, 0.88)
+        self.assertEqual(b.name, "b15")
+        self.assertAlmostEqual(b.fak_limit, 0.90)
+        self.assertAlmostEqual(b.max_price, 0.90)
+
+    def test_ttm_18_88_is_out_of_band(self):
+        self.assertIn("a22", self._names(18))
+        self.assertNotIn("b15", self._names(18))
+        self.assertIsNone(self._pick(18, 0.88))
+        self.assertEqual(self._pick(18, 0.96).name, "a22")
+
+    def test_budgets_5_vs_10_remaining(self):
+        flat = {}
+        self.assertEqual(hourly_slice_budget("a22", flat), 5.0)
+        self.assertEqual(hourly_slice_budget("b15", flat), 10.0)
+        self.assertEqual(hourly_slice_budget("c5", flat), 10.0)
+        five = {"pnl_entry_cost": 5.0, "t22_bought": True, "bought_token": "up"}
+        self.assertEqual(hourly_spent_so_far(five), 5.0)
+        self.assertEqual(hourly_slice_budget("a22", five), 5.0)
+        self.assertEqual(hourly_slice_budget("b15", five), 5.0)
+        self.assertEqual(hourly_slice_budget("c5", five), 5.0)
+        ten = {"pnl_entry_cost": 10.0, "t15_bought": True}
+        self.assertEqual(hourly_slice_budget("a22", ten), 0.0)
+        self.assertEqual(hourly_slice_budget("b15", ten), 0.0)
+        self.assertEqual(hourly_slice_budget("c5", ten), 0.0)
+
+    def test_same_leg_add_and_other_leg_block(self):
+        meta = {
+            "t22_bought": True, "bought_token": "down", "pnl_entry_cost": 5.0,
+        }
+        ok, why = can_arm_hourly_slice(
+            meta, slice_name="b15", held_size=5.0, buy_token="down",
+        )
+        self.assertTrue(ok)
+        self.assertIsNone(why)
+        blocked, block_why = can_arm_hourly_slice(
+            meta, slice_name="b15", held_size=5.0, buy_token="up",
+        )
+        self.assertFalse(blocked)
+        self.assertEqual(block_why, "other_leg")
+        a_again, a_why = can_arm_hourly_slice(
+            meta, slice_name="a22", held_size=5.0, buy_token="down",
+        )
+        self.assertFalse(a_again)
+        self.assertEqual(a_why, "slice_filled")
+
+    def test_ten_cap_blocks_c(self):
+        meta = {
+            "t15_bought": True, "bought_token": "up", "pnl_entry_cost": 10.0,
+        }
+        ok, why = can_arm_hourly_slice(
+            meta, slice_name="c5", held_size=12.0, buy_token="up",
+        )
+        self.assertFalse(ok)
+        self.assertEqual(why, "spend_cap")
+
+    def test_stamp_hourly_flags(self):
+        meta = {}
+        stamp_hourly_slice_bought(meta, "a22")
+        stamp_hourly_slice_bought(meta, "b15")
+        stamp_hourly_slice_bought(meta, "c5")
+        self.assertTrue(meta["t22_bought"])
+        self.assertTrue(meta["t15_bought"])
+        self.assertTrue(meta["t5_bought"])
+
+    def test_horizon_is_22_minutes(self):
+        self.assertEqual(hourly_horizon_min(22, 15, 5, 13), 22.0)
+
+    def test_uncertain_blocks_hourly_slices(self):
+        ok, why = can_arm_hourly_slice(
+            {"buy_uncertain": True}, slice_name="a22",
+        )
+        self.assertFalse(ok)
+        self.assertEqual(why, "buy_uncertain")
 
 
 class SkipSummarizeTests(unittest.TestCase):

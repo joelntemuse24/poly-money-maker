@@ -1,4 +1,4 @@
-"""Classify why an in-window 5m market did not arm a BUY (no I/O)."""
+"""Classify why an in-window 5m or hourly market did not arm a BUY (no I/O)."""
 
 from __future__ import annotations
 
@@ -12,6 +12,9 @@ class EntryBand(NamedTuple):
     max_price: float
     min_exclusive: bool
     name: str
+    # 0 → FAK limit is ``max_price`` (5m late 90¢ / early 99¢). Hourly slice A
+    # matches (0.93, 0.95] when C is also open but still limits the FAK at 99¢.
+    limit_price: float = 0.0
 
     @property
     def retry_min_price(self) -> float:
@@ -19,6 +22,12 @@ class EntryBand(NamedTuple):
         if self.min_exclusive:
             return float(self.min_price) + 1e-12
         return float(self.min_price)
+
+    @property
+    def fak_limit(self) -> float:
+        """Limit posted on the BUY FAK (band max unless ``limit_price`` is set)."""
+        lim = float(self.limit_price or 0)
+        return lim if lim > 0 else float(self.max_price)
 
 
 def entry_band_for_seconds(
@@ -321,6 +330,199 @@ def union_ask_band_reason(
     if ask_f > max(caps) + 1e-12:
         return "ask_above_band"
     return "ask_out_of_band"
+
+
+# --- Hourly three slices (minutes TTM; do not feed 5m seconds into these) ---
+
+HOURLY_SLICE_A = "a22"
+HOURLY_SLICE_B = "b15"
+HOURLY_SLICE_C = "c5"
+HOURLY_SLICE_FLAGS = {
+    HOURLY_SLICE_A: "t22_bought",
+    HOURLY_SLICE_B: "t15_bought",
+    HOURLY_SLICE_C: "t5_bought",
+}
+_HOURLY_SLICE_PRIORITY = {
+    HOURLY_SLICE_B: 0,
+    HOURLY_SLICE_C: 1,
+    HOURLY_SLICE_A: 2,
+}
+
+
+def hourly_horizon_min(a22_window_min, b15_window_min, c5_window_min, buy_window_min=0.0) -> float:
+    """Widest hourly look-ahead in minutes (slice A is 22)."""
+    try:
+        return max(
+            float(a22_window_min),
+            float(b15_window_min),
+            float(c5_window_min),
+            float(buy_window_min or 0),
+        )
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def applicable_hourly_entry_bands(
+    minutes_left,
+    *,
+    a22_window_min=22.0,
+    b15_window_min=15.0,
+    c5_window_min=5.0,
+    b15_min=0.75,
+    b15_max=0.90,
+    a22_min=0.93,
+    c5_min=0.95,
+    high_max=0.99,
+) -> List[EntryBand]:
+    """Open hourly bands at this TTM (minutes). Inclusive ``0 < ttm <= window``.
+
+    Slice A (last 22 min): ask **> 0.93**. FAK limit **99¢**. Cap **$5**.
+    When slice C is also open, A only matches **> 0.93 and ≤ 0.95** so a
+    >95¢ print in the last 5 min uses C, not A.
+
+    Slice B (last 15 min): ask **75–90¢ inclusive**. FAK limit **90¢**.
+    Spend remaining to the $10 market cap ($10 if flat, $5 if $5 already in).
+
+    Slice C (last 5 min): ask **> 0.95**. FAK limit **99¢**. Same remaining-
+    to-$10 rule as B. Does not buy 75–90 (B still covers that in the last 5).
+    """
+    try:
+        ttm = float(minutes_left)
+        a22_w = float(a22_window_min)
+        b15_w = float(b15_window_min)
+        c5_w = float(c5_window_min)
+    except (TypeError, ValueError):
+        return []
+    if ttm <= 0:
+        return []
+    bands: List[EntryBand] = []
+    a22_open = ttm <= a22_w + 1e-12
+    b15_open = ttm <= b15_w + 1e-12
+    c5_open = ttm <= c5_w + 1e-12
+    if b15_open:
+        bands.append(EntryBand(
+            float(b15_min), float(b15_max), False, HOURLY_SLICE_B, float(b15_max),
+        ))
+    if a22_open:
+        # When C is open, keep 0.95 in A (≤95 uses A) and leave >95 to C.
+        a_max = float(c5_min) if c5_open else float(high_max)
+        bands.append(EntryBand(
+            float(a22_min), a_max, True, HOURLY_SLICE_A, float(high_max),
+        ))
+    if c5_open:
+        bands.append(EntryBand(
+            float(c5_min), float(high_max), True, HOURLY_SLICE_C, float(high_max),
+        ))
+    return bands
+
+
+def select_hourly_entry_band(
+    ask: Optional[float], bands: Sequence[EntryBand],
+) -> Optional[EntryBand]:
+    """Band that contains the ask. 75–90 is B; >95 in last 5 is C not A."""
+    matching = [
+        band for band in bands
+        if ask_in_entry_band(
+            ask, band.min_price, band.max_price,
+            min_exclusive=band.min_exclusive,
+        )
+    ]
+    if not matching:
+        return None
+    return min(
+        matching,
+        key=lambda band: (
+            _HOURLY_SLICE_PRIORITY.get(band.name, 9),
+            band.retry_min_price,
+            -band.max_price,
+        ),
+    )
+
+
+def hourly_spent_so_far(meta) -> float:
+    """USDC already credited on this market (sum of fills)."""
+    return float((meta or {}).get("pnl_entry_cost") or 0)
+
+
+def hourly_remaining_to_cap(meta, market_cap=10.0) -> float:
+    return max(0.0, float(market_cap) - hourly_spent_so_far(meta))
+
+
+def hourly_slice_budget(
+    slice_name,
+    meta,
+    *,
+    a22_budget=5.0,
+    b15_budget=10.0,
+    c5_budget=10.0,
+    market_cap=10.0,
+) -> float:
+    """USDC this slice may still POST.
+
+    A is never more than ``a22_budget`` ($5) even if the $10 cap is unused.
+    B and C spend remaining to ``market_cap`` ($10 if flat, $5 if $5 already in).
+    """
+    remaining = hourly_remaining_to_cap(meta, market_cap)
+    if remaining < 0.01:
+        return 0.0
+    name = str(slice_name or "")
+    if name == HOURLY_SLICE_A:
+        return min(float(a22_budget), remaining)
+    if name == HOURLY_SLICE_B:
+        return min(float(b15_budget), remaining)
+    if name == HOURLY_SLICE_C:
+        return min(float(c5_budget), remaining)
+    return 0.0
+
+
+def stamp_hourly_slice_bought(meta, slice_name):
+    """One fill per named hourly slice (``t22_bought`` / ``t15_bought`` / ``t5_bought``)."""
+    key = HOURLY_SLICE_FLAGS.get(str(slice_name or ""))
+    if key:
+        meta[key] = True
+
+
+def can_arm_hourly_slice(
+    meta,
+    *,
+    slice_name,
+    held_size=0.0,
+    buy_token=None,
+    hedge_closed=False,
+    market_cap=10.0,
+    a22_budget=5.0,
+    b15_budget=10.0,
+    c5_budget=10.0,
+):
+    """Whether this named hourly slice may still POST.
+
+    One fill per slice. Same-leg add only. After a full hedge, unused slices
+    may still fire if the $10 cap has room. ``buy_token=None`` skips the
+    other-leg check (caller does not know the winner yet).
+
+    Returns ``(ok, skip_reason)``.
+    """
+    meta = meta or {}
+    if meta.get("buy_uncertain"):
+        return False, "buy_uncertain"
+    name = str(slice_name or "")
+    flag = HOURLY_SLICE_FLAGS.get(name)
+    if flag and meta.get(flag):
+        return False, "slice_filled"
+    if hourly_slice_budget(
+        name, meta,
+        a22_budget=a22_budget,
+        b15_budget=b15_budget,
+        c5_budget=c5_budget,
+        market_cap=market_cap,
+    ) < 0.01:
+        return False, "spend_cap"
+    closed = bool(hedge_closed or meta.get("hedge_closed"))
+    held = float(held_size or 0) > 0.01 and not closed
+    tracked = meta.get("bought_token")
+    if held and buy_token is not None and tracked and not same_token(tracked, buy_token):
+        return False, "other_leg"
+    return True, None
 
 
 def window_no_buy_reason(
