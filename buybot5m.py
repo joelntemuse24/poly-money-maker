@@ -1011,6 +1011,36 @@ def count_wallet_bags(held, tracked_meta=None):
     return n
 
 
+def inventory_is_hot(pos, meta, now_s):
+    """Keep only live 5m work: a hedge still in play, a fresh quarantine, or a real redeem.
+
+    Everything else is leftover wallet list from old 5m markets. The Data API
+    still returns those rows. The bot does not need them on the 0.01s path.
+    """
+    meta = meta or {}
+    if position_is_live_hedge(pos, meta, now_s):
+        return True
+    if uncertain_still_recoverable(meta, now_s):
+        return True
+    if meta.get("redeem_abandoned") or meta.get("redeem_confirmed"):
+        return False
+    if bag_size(pos) <= 0.01:
+        return False
+    up = pos.get("up") or {}
+    dn = pos.get("dn") or {}
+    return bool(up.get("redeemable") or dn.get("redeemable"))
+
+
+def drop_wallet_dust(held, tracked_meta, now_s):
+    """Throw away expired non-live bags so the loop only sees the live market."""
+    tracked_meta = tracked_meta or {}
+    return {
+        cid: pos
+        for cid, pos in (held or {}).items()
+        if inventory_is_hot(pos, tracked_meta.get(cid), now_s)
+    }
+
+
 def count_live_hedges(held, tracked_meta, now_s):
     tracked_meta = tracked_meta or {}
     n = 0
@@ -1023,9 +1053,9 @@ def count_live_hedges(held, tracked_meta, now_s):
 def add_tracked_market_stubs(markets, held, tracked_meta, now_s):
     """Keep live hedges and quarantines in the poll after Gamma drops them.
 
-    Data API leftover 5m shares (hundreds of closed bags) stay in `held` for
-    background redeem. They must not become fake live markets — that used to
-    inflate POS, print a 700-row table, and make a 0.01s sleep take seconds.
+    Call this on the *hot* inventory (`drop_wallet_dust`), not the raw Data
+    API list. Old 5m rows are thrown away; they must not become fake live
+    markets (that used to inflate POS and make a 0.01s sleep take seconds).
     """
     by_condition = {market.condition_id: market for market in markets}
     recovery_conditions = {
@@ -3428,12 +3458,17 @@ _last_positions_refresh = 0.0
 _last_balance_refresh = 0.0
 _last_markets_refresh = 0.0
 pusd_bal = 0.0
-_cached_positions = merge_tracked_positions({}, positions_meta)
+_wallet_positions = merge_tracked_positions({}, positions_meta)
+_cached_positions = drop_wallet_dust(
+    _wallet_positions, positions_meta, time.time(),
+)
+_last_dust_dropped = None
 _cached_markets = []
 _cached_discovery_fresh = False
 _positions_received_mono = 0.0
 _balance_received_mono = 0.0
 _markets_received_mono = 0.0
+_need_fast_positions = True
 markets = []
 held = {}
 _loop_markets = []
@@ -3538,9 +3573,23 @@ while not _shutdown_requested:
             try:
                 positions_raw = _positions_future.result()
                 if positions_raw is not None:
-                    _cached_positions = merge_tracked_positions(
+                    _wallet_positions = merge_tracked_positions(
                         build_held_positions(positions_raw), positions_meta,
                     )
+                    _cached_positions = drop_wallet_dust(
+                        _wallet_positions, positions_meta, now_s,
+                    )
+                    _dropped_n = max(
+                        0, len(_wallet_positions) - len(_cached_positions),
+                    )
+                    if _dropped_n != _last_dust_dropped:
+                        if _dropped_n:
+                            log_event(
+                                "wallet_dust_dropped",
+                                dropped=_dropped_n,
+                                kept=len(_cached_positions),
+                            )
+                        _last_dust_dropped = _dropped_n
                     _positions_received_mono = _now_mono
             except Exception as e:
                 log_event("positions_refresh_fail", error=str(e)[:200])
@@ -3576,7 +3625,11 @@ while not _shutdown_requested:
             _last_balance_refresh = _now_mono
         if (
             _positions_future is None
-            and _now_mono - _last_positions_refresh >= POSITIONS_REFRESH_S
+            and _now_mono - _last_positions_refresh >= (
+                float(POSITIONS_REFRESH_S)
+                if _need_fast_positions
+                else max(float(POSITIONS_REFRESH_S), 15.0)
+            )
         ):
             _positions_future = _io_executor.submit(get_user_positions)
             _last_positions_refresh = _now_mono
@@ -3598,7 +3651,8 @@ while not _shutdown_requested:
             m for m in _cached_markets
             if m.active and not m.closed and not m.neg_risk and m.end_ts > now_s
         ]
-        held = _cached_positions
+        held = drop_wallet_dust(_cached_positions, positions_meta, now_s)
+        _cached_positions = held
         markets = add_tracked_market_stubs(markets, held, positions_meta, now_s)
         held_conditions = {
             cond for cond, pos in held.items()
@@ -3625,6 +3679,7 @@ while not _shutdown_requested:
         ))
         _open_pos_n = count_live_hedges(held, positions_meta, now_s)
         _wait_pos_n = max(0, count_wallet_bags(held, positions_meta) - _open_pos_n)
+        _need_fast_positions = _open_pos_n > 0 or _wait_pos_n > 0
         _min_ttm_now = min((m.end_ts * 1000 - now_ms) / 60000 for m in markets) if markets else 999
         _hot_mode = _open_pos_n > 0 or (_min_ttm_now * 60) <= BUY_HORIZON_S
         _show_ui = (not _hot_mode) or (CYCLE % max(1, int(UI_EVERY_N_CYCLES)) == 0)
@@ -3645,12 +3700,20 @@ while not _shutdown_requested:
 
         # ================= GC META CACHE =================
         if positions_raw is not None:
+            # GC still sees the raw wallet list so leftover Data API rows are
+            # not "missing" and finalized. The 0.01s loop uses `held` (dust
+            # already dropped).
             live_conds = {
-                cond for cond, p in held.items()
-                if max(p.get("up", {}).get("size", 0), p.get("dn", {}).get("size", 0)) > 0.01
-                or p.get("up", {}).get("redeemable") or p.get("dn", {}).get("redeemable")
+                cond for cond, p in _wallet_positions.items()
+                if bag_size(p) > 0.01
+                or (p.get("up") or {}).get("redeemable")
+                or (p.get("dn") or {}).get("redeemable")
             }
             live_conds |= {m.condition_id for m in markets}
+            live_conds |= {
+                c for c, meta in positions_meta.items()
+                if isinstance(meta, dict) and meta.get("redeem_abandoned")
+            }
             # An ambiguous BUY is durable recovery state, not ordinary stale
             # metadata. Keep it until its exact token/baseline is reconciled or
             # an operator clears it; discovery/Data API omissions must not erase
@@ -5507,7 +5570,7 @@ while not _shutdown_requested:
         ))
 
     # Variable polling: 0.01s in/around buy window OR while holding a *live*
-    # hedge. Leftover unredeemed bags are WAIT, not held.
+    # hedge. Expired wallet rows are dropped; they are not WAIT.
     _now = time.time() * 1000
     _min_ttm_s = min((m.end_ts * 1000 - _now) / 1000 for m in markets) if markets else 9999
     _has_held = any(

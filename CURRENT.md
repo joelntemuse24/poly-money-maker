@@ -3,16 +3,14 @@
 **Agents: read this after `AGENTS.md`.** Update this file when ops/strategy decisions change.
 Do not put secrets, API keys, or live wallet material here.
 
-Last updated: **2026-08-21** — **only the 5m CLOB bot is live.** Look interval
-is **0.01s** on live (unexpired) inventory and any 5m in the last 5 minutes.
-Unredeemed leftover 5m shares are **WAIT** (background redeem), not **POS**.
-`[SETTLE SKIP] redeem skipped: zero position balance` is that drain (blacklist
-after one try). CLOB **404** `No orderbook exists` means a dead token is still
-on the quote path — clockless `bought_token` bags must not be stubbed as live.
-Do not walk hundreds of closed bags on the buy path. Do **not** delete
-`positions_buy5m.json` or try to sell dead 5m tokens (no CLOB book). Real
-leftovers redeem; Data API ghosts get one `redeem_abandoned` skip. Stop/disable
-15m and hourly. Split the 5m stake into **two $2.50 slices** (**$5** if both
+Last updated: **2026-08-21** — **only the 5m CLOB bot is live.** It watches
+the **current** 5m market (and a live hedge if we just bought). Polymarket’s
+positions API still returns hundreds of old 5m rows (`WAIT 666` was that
+list, not 666 live markets). The bot **throws those rows away** after
+download. Do **not** delete `positions_buy5m.json` to “clear” them, and do
+**not** try to sell dead 5m tokens (no CLOB book). Real leftovers redeem;
+API ghosts get one `redeem_abandoned` skip. Look interval is **0.01s**.
+Stop/disable 15m and hourly. Split the 5m stake into **two $2.50 slices** (**$5** if both
 fill): **early ≥90¢ (to 99¢) in the first 3 minutes** and **≥95¢ overlay**
 there, then **$2.50 only in the last 120s at the old 75–90¢ band**. Missed
 early does **not** roll into late. Hedge is **50/55** on the combined bag.
@@ -57,7 +55,7 @@ overlay on that same window. Late: **75–90¢** in the last **120s** only
 | Underlying edge | **$0** (5m: any non-zero TWAP vs PTB) / **$10** (15m, hourly); side must match |
 | `max_open_positions` | **0 = unlimited** |
 | `toxic_force_exit_below` | **65¢** |
-| `poll_buy_window_s` / `poll_held_s` | **0.01** (live JSON + restart). Banner **POS** = live hedge only; **WAIT** = unredeemed leftover 5m shares (background redeem, not quoted). |
+| `poll_buy_window_s` / `poll_held_s` | **0.01** (live JSON + restart). Banner **POS** = live hedge only; **WAIT** should be **0** unless a *redeemable* leftover is still cashing out. Old wallet rows are dropped, not listed. |
 
 **Also running (no orders):** `pathlog.py` (`polypathlog`) writes one JSONL file
 per market under `pathlog/ticks/` so we can ask “if we had bought at 80¢ with
@@ -203,13 +201,13 @@ amount / HTTP 400), not this NameError.
 - [ ] After merge: `git pull`, set live `late_buy_budget=2.5` (keep
       `buy_budget=2.5`, `buy_max_price=0.90`), **`poll_buy_window_s=0.01`**,
       **`poll_held_s=0.01`**, then
-      `sudo systemctl restart polybuybot5m` only. Watch banner **POS** (live
-      hedges, not 700 leftover bags), **WAIT n**, and `sleeping 0.01s` with
-      wall-clock cycles near that. A burst of `[SETTLE SKIP] zero position
-      balance` is WAIT draining, not a buy-path failure. CLOB 404s on dead
-      tokens should be rare after the clockless-bag skip. Watch `buy_attempt`
-      `slice=early|late` and `add=true` on the second $2.50. Do **not**
-      start 15m / hourly / mint. Do **not** set `buy_budget` to 5.
+      `sudo systemctl restart polybuybot5m` only. Watch banner **POS** (0–2
+      live hedges), **WAIT 0** (or 1 if a real redeem is in flight — not
+      666), and `sleeping 0.01s`. `wallet_dust_dropped dropped=666 kept=0`
+      means the leftover list was thrown away. CLOB 404s on dead tokens
+      should be rare. Watch `buy_attempt` `slice=early|late` and `add=true`
+      on the second $2.50. Do **not** start 15m / hourly / mint. Do **not**
+      set `buy_budget` to 5.
 - [ ] Cloud paper P&L: paste `CLOUD_RESEARCH.md` section 2 (live `pathlog.py`
       + `--sweep --paper`, rank by `pnl_sum` vs `live_5m_paper`). No `.env`.
       Optional: attach `poly-research.zip` for the historical tape. Not live
