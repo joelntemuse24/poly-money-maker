@@ -431,8 +431,10 @@ last branch.
 2. Process lock (above). If this exits, nothing else runs.
 3. Read env vars into module globals. Missing keys stay `None` until a later
    check.
-4. Patch `ROUNDING_CONFIG`: CLOB rejects taker amounts with more than **four**
-   decimal places. The SDK’s rounding table is clamped to 4.
+4. Patch `ROUNDING_CONFIG`: CLOB taker (shares) max **four** dp; BUY maker
+   (USDC) max **two**. Every tick’s `amount` is clamped to 4; 5m also sets
+   tick `0.001` `amount` to **2**. Without that, a dirty float signs as
+   `$2.9601` and the CLOB 400s `invalid amounts`.
 5. `load_strategy()` **must succeed**. No valid `strategy_buy5m.json` →
    process dies. Better a crash at start than a bot with invented knobs.
 6. If `dry_run`, rename state/log/PTB to `*.dryrun.*`.
@@ -675,6 +677,13 @@ size whose `size × band_max` is exact cents and ≤ `$3`. That is why early
 99¢ posts **3.00 sh / $2.97** instead of 2.00 / $1.98 (the only legal
 makers at 99¢ under $3 are $0.99 / $1.98 / $2.97).
 
+Do **not** pass `user_usdc_balance` on that 5m `OrderArgs`. The field is
+the wallet, not a spend cap. Passing `$2.97` (or `max(budget, 3*0.99)` as
+a float) makes `create_order` treat notional+fees as unaffordable, shrink
+size to `2.999…`, round_down to **2.99**, and sign maker **`$2.9601`**.
+Live 21 Aug 2026: **521** attempts, **471** `invalid_amount`, **0** fills.
+15m/hourly still pass `remaining_budget` (stopped; no 3-share floor).
+
 1. Quantize budget down to **cents** (`Decimal("0.01")`, `ROUND_DOWN`).
 2. `shares = spend / ask`, quantized to **0.01 shares** (2 dp), round down.
 3. Clip to `buy_max_shares` (default 5).
@@ -719,7 +728,10 @@ No client call.
      save fails → **do not POST** (`persist_fail`).
    - Sign order; `signed_order_id` hashes EIP-712 typed data so the id is
      **determined before** the network — crash recovery can look it up.
-    - POST FAK limit at the **band max** (5m late 90¢, early 99¢). Size is still `budget/ask`.
+    - POST FAK limit at the **band max** (5m late 90¢, early 99¢). Size is
+      still `budget/ask` (floor 3 shares when `$3` allows). 5m `OrderArgs`
+      omits `user_usdc_balance` so the SDK cannot shrink a legal `$2.97`
+      maker into `$2.9601`.
 3. `confirm_fill_size` decides matched shares:
    - Terminal `matched` + confirmed trades → trust making/taking.
    - `delayed` POST can echo the **unsigned full size** before any match —

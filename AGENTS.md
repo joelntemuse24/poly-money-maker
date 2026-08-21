@@ -208,6 +208,10 @@ two-slice $2.50+$2.50 add.
 - `buy_window` — market first entered a 5m buy window (late 75–90, early ≥90, or ≥95; one line per market)
 - `buy_skip` `ask_below_band` / `ask_above_band` / `ask_out_of_band` / `no_ask` / `stale_positions` / `no_quote` / `stale_discovery` — in window, winning ask not in any open band, or the look had no book / stale wallet snapshot (throttled 8s)
 - `buy_skip_max_positions` — only if `max_open_positions > 0` (probe uses **0 = unlimited**)
+- `buy_attempt_rejected` / skip reason `invalid_amount` — CLOB 400 `invalid
+  amounts` (maker USDC must be **2** dp). 5m must **not** pass
+  `user_usdc_balance` on BUY `OrderArgs`: a fake `$2.97` wallet makes the
+  SDK shrink 3.00 @ 99¢ into `$2.9601`. `check_buy_rejects.py` counts these.
 - `pathlog_prune` — oldest tick JSONL removed (14d / 400 MB cap); export first
 - Banner `POS` — live hedges only. `WAIT` should be **0** unless a *redeemable*
   leftover is still cashing out. `WAIT 666` meant old Data API rows, not
