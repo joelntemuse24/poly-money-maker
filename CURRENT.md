@@ -3,10 +3,13 @@
 **Agents: read this after `AGENTS.md`.** Update this file when ops/strategy decisions change.
 Do not put secrets, API keys, or live wallet material here.
 
-Last updated: **2026-08-20** — **only the 5m CLOB bot is live.** Look interval
+Last updated: **2026-08-21** — **only the 5m CLOB bot is live.** Look interval
 is **0.01s** on live (unexpired) inventory and any 5m in the last 5 minutes.
-Unredeemed leftover 5m shares are **WAIT** (background redeem), not **POS** —
-do not walk hundreds of closed bags on the buy path. Stop/disable
+Unredeemed leftover 5m shares are **WAIT** (background redeem), not **POS**.
+`[SETTLE SKIP] redeem skipped: zero position balance` is that drain (blacklist
+after one try). CLOB **404** `No orderbook exists` means a dead token is still
+on the quote path — clockless `bought_token` bags must not be stubbed as live.
+Do not walk hundreds of closed bags on the buy path. Stop/disable
 15m and hourly. Split the 5m stake into **two $2.50 slices** (**$5** if both
 fill): **early ≥90¢ (to 99¢) in the first 3 minutes** and **≥95¢ overlay**
 there, then **$2.50 only in the last 120s at the old 75–90¢ band**. Missed
@@ -200,7 +203,9 @@ amount / HTTP 400), not this NameError.
       **`poll_held_s=0.01`**, then
       `sudo systemctl restart polybuybot5m` only. Watch banner **POS** (live
       hedges, not 700 leftover bags), **WAIT n**, and `sleeping 0.01s` with
-      wall-clock cycles near that. Watch `buy_attempt`
+      wall-clock cycles near that. A burst of `[SETTLE SKIP] zero position
+      balance` is WAIT draining, not a buy-path failure. CLOB 404s on dead
+      tokens should be rare after the clockless-bag skip. Watch `buy_attempt`
       `slice=early|late` and `add=true` on the second $2.50. Do **not**
       start 15m / hourly / mint. Do **not** set `buy_budget` to 5.
 - [ ] Cloud paper P&L: paste `CLOUD_RESEARCH.md` section 2 (live `pathlog.py`
