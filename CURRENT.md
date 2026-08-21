@@ -3,31 +3,37 @@
 **Agents: read this after `AGENTS.md`.** Update this file when ops/strategy decisions change.
 Do not put secrets, API keys, or live wallet material here.
 
-Last updated: **2026-08-21** — **only the 5m CLOB bot is live.** It watches
-the **current** 5m market (and a live hedge if we just bought). Polymarket’s
-positions API still returns hundreds of old 5m rows (`WAIT 666` was that
-list, not 666 live markets). The bot **throws those rows away** after
-download. Do **not** delete `positions_buy5m.json` to “clear” them, and do
-**not** try to sell dead 5m tokens (no CLOB book). Real leftovers redeem;
-API ghosts get one `redeem_abandoned` skip. Look interval is **0.01s** on the live WS book (REST only when posting).
+Last updated: **2026-08-21** — **5m and hourly CLOB bots are live.** 15m is
+stopped. Mint is paused. Pathlog records all three series (no orders).
+
+**5m (`polybuybot5m`):** watches the **current** 5m market (and a live hedge
+if we just bought). Polymarket’s positions API still returns hundreds of old
+5m rows (`WAIT 666` was that list, not 666 live markets). The bot **throws
+those rows away** after download. Do **not** delete `positions_buy5m.json`
+to “clear” them, and do **not** try to sell dead 5m tokens (no CLOB book).
+Real leftovers redeem; API ghosts get one `redeem_abandoned` skip. Look
+interval is **0.01s** on the live WS book (REST only when posting).
 Wallet list refresh is 15s when not holding; the buy gate must allow that
 age (a 5s “fresh” check would silently skip every spend between fetches).
-Stop/disable 15m and hourly. Split the 5m stake into **two $2.50 slices** (**$5** if both
-fill): **early ≥90¢ (to 99¢) in the first 3 minutes** and **≥95¢ overlay**
-there, then **$2.50 only in the last 120s at the old 75–90¢ band**. Missed
-early does **not** roll into late. Hedge is **50/55** on the combined bag.
-Chainlink TWAP gate is **$0** (any non-zero tick vs PTB; side must match;
-flat is still refused). Late FAKs **limit at 90¢**; early FAKs **limit at
-99¢**. Size starts at `budget/ask` and is **at least 3 shares** when
-`3 × limit` fits in `buy_max_spend` **$3 per FAK** (early 3.00 sh / $2.97
-at 99¢, late 3.00 sh / $2.70 at 90¢; 75¢ ask can still be ~3.3 sh). Do not
-round down to 2.00 sh / $1.98. Displayed top size is **not** a cap.
-**Do not pass `user_usdc_balance` on 5m BUY `OrderArgs`.** A fake `$2.97`
-wallet makes the SDK shrink 3.00 @ 99¢ into maker `$2.9601` and CLOB 400s
-`invalid amounts` (live 21 Aug: 521 attempts / 0 fills). `toxic_fill` arms
-from fill average < 65¢ (not extra shares vs the 99¢-sized quote) and dumps
-without GUI only while bid ≤ 50¢. Pause minting. Pathlog still records all
-three series (no orders; 14-day / 400 MB cap).
+Split the 5m stake into **two $2.50 slices** (**$5** if both fill): **early
+≥90¢ (to 99¢) in the first 3 minutes** and **≥95¢ overlay** there, then
+**$2.50 only in the last 120s at the old 75–90¢ band**. Missed early does
+**not** roll into late. Hedge is **50/55** on the combined bag. Chainlink
+TWAP gate is **$0**. Late FAKs **limit at 90¢**; early FAKs **limit at 99¢**.
+Size starts at `budget/ask` and is **at least 3 shares** when `3 × limit`
+fits in `buy_max_spend` **$3 per FAK**. **Do not pass `user_usdc_balance`
+on 5m BUY `OrderArgs`.** `toxic_fill` dumps without GUI only while bid ≤
+50¢.
+
+**Hourly (`polybuybothourly`):** started **21 Aug 2026 ~09:58 UTC** with
+`dry_run: false` and `entry_enabled: true`. Three slices, **$10 hard cap**
+per market (sum of fills), same-leg only, hedge **55/60**. Slice A (last
+22 min, ask **> 93¢**) spends at most **$5** at **99¢**. Slice B (last 15
+min, ask **75–90¢**) remaining to $10 at **90¢**. Slice C (last 5 min,
+ask **> 95¢**) remaining to $10 at **99¢**. Underlying **$10** (Binance).
+Tick **0.01**. Minutes windows. Quiet until TTM ≤ 22. First live look
+skipped a dying `…-5am-et` book (both GUIs 0.999). Do **not** restart 5m
+for hourly. Do **not** start 15m or mint.
 
 ---
 
@@ -36,20 +42,21 @@ three series (no orders; 14-day / 400 MB cap).
 **Mint-only helper is paused.** Stop `polymintbot` and leave it disabled. Do not
 mint complete sets. Operator still sells leftover mint inventory by hand.
 
-**15m and hourly CLOB bots are stopped.** Do not start `polybuybot` or
-`polybuybothourly` unless the operator asks. Open 15m/hourly inventory (if any)
-will not be auto-hedged or redeemed by those processes.
+**15m CLOB bot is stopped.** Do not start `polybuybot` unless the operator
+asks. Open 15m inventory (if any) will not be auto-hedged or redeemed.
 
-**Hourly template (code ready, service still stopped):** three slices, **$10
-hard cap** per market (sum of fills), same-leg only, hedge **55/60** + inverted
-GUI. Slice A (last 22 min, ask **> 93¢**) spends at most **$5** at a **99¢**
-FAK. Slice B (last 15 min, ask **75–90¢**) spends remaining to $10 at **90¢**.
-Slice C (last 5 min, ask **> 95¢**) spends remaining to $10 at **99¢**.
-`buy_max_spend` **$11**, `buy_max_shares` **14**. Underlying edge stays
-**$10**. Tick **0.01**. Windows are **minutes**. See
-`strategy_buyhourly.example.json`.
+**Hourly is live** (`polybuybothourly`, started 21 Aug 2026 ~09:58 UTC).
+Three slices, **$10 hard cap** per market (sum of fills), same-leg only,
+hedge **55/60** + inverted GUI. Slice A (last 22 min, ask **> 93¢**) spends
+at most **$5** at a **99¢** FAK. Slice B (last 15 min, ask **75–90¢**)
+spends remaining to $10 at **90¢**. Slice C (last 5 min, ask **> 95¢**)
+spends remaining to $10 at **99¢**. `buy_max_spend` **$11**,
+`buy_max_shares` **14**. Underlying edge **$10**. Tick **0.01**. Windows
+are **minutes**. Live JSON is `strategy_buyhourly.json` (`dry_run: false`,
+`entry_enabled: true`). Do **not** restart it unless an hourly bugfix
+requires it. Do **not** start a second copy with `python buybothourly.py`.
 
-**Active strategy:** **5m only** (`polybuybot5m`) with **two $2.50 slices**
+**Active 5m strategy:** `polybuybot5m` with **two $2.50 slices**
 (up to **$5** per market). Early: **≥90¢** in the first 3 minutes, **≥95¢**
 overlay on that same window. Late: **75–90¢** in the last **120s** only
 (do **not** buy 91–99¢ after T-120). Same-leg add only; hedge is unchanged
@@ -64,7 +71,7 @@ overlay on that same window. Late: **75–90¢** in the last **120s** only
 | Ask band | Last **120s**: **75–90¢**, FAK limit **90¢**. First **3 min** (`120 < TTM ≤ 300`): **≥ 90¢** to 99¢, FAK limit **99¢**. **≥95¢** overlay on that early window only. `buy_max_price` **0.90** is the late cap **and** the early ≥90 floor. |
 | Execution | Size `budget/ask`, **floor 3 shares** when `3 × limit ≤ $3`. Unmatched 400 re-quotes up to **3** FAKs; then **0.15 s** cooldown. Unclear POSTs still quarantine. |
 | GUI consensus | winner ≥ 70¢, loser ≤ 30¢ |
-| Windows | 5m **whole market**: early ≥90 / ≥95 for TTM (120, 300]; late 75–90 for TTM ≤ 120s (15m / hourly bots **not running**) |
+| Windows | 5m **whole market**: early ≥90 / ≥95 for TTM (120, 300]; late 75–90 for TTM ≤ 120s (15m bot **not running**; hourly is a **separate** process) |
 | Hedge | **Trigger** bid ≤ **50¢** and ask ≤ **55¢**, spread ≤ 15¢, **plus** inverted buy GUI. Combined early+late inventory. `toxic_fill` arms only when FAK **average** < 65¢ (not extra shares vs a 99¢-sized quote) and still dumps without GUI **only while held bid ≤ 50¢**. |
 | Underlying edge | **$0** (5m: any non-zero TWAP vs PTB) / **$10** (15m, hourly); side must match |
 | `max_open_positions` | **0 = unlimited** |
@@ -169,24 +176,27 @@ amount / HTTP 400), not this NameError.
 
 - **VM:** `~/poly-money-maker` on `instance-20260516-185922`.
 - **Mint:** `sudo systemctl stop polymintbot && sudo systemctl disable polymintbot`
-- **Buy bots:** **5m only.** Leave 15m/hourly stopped. `buy_max_spend` /
-  `buy_max_shares` may be omitted from live JSON — defaults **$3** / **5 shares**
-  apply. Live JSON **must** set `min_underlying_edge_usd` to **0.0** (hot
-  reload, no restart). Code default is 0.0 only when the key is omitted.
-  After pulling bot code, restart **5m only**:
+- **Buy bots:** **5m and hourly live.** 15m stopped. Hourly live JSON **must**
+  keep `hedge_threshold` 0.55 / `hedge_require_ask_max` 0.60 / three-slice
+  budgets / `buy_max_spend` $11 / `buy_max_shares` 14 or an old file keeps
+  35/40 and $2.50. 5m live JSON **must** set `min_underlying_edge_usd` to
+  **0.0** (hot reload, no restart). After pulling **5m** code, restart 5m
+  only — do **not** stop hourly:
   ```bash
-  sudo systemctl stop polybuybot polybuybothourly
-  sudo systemctl disable polybuybot polybuybothourly
+  sudo systemctl stop polybuybot
+  sudo systemctl disable polybuybot
   cd ~/poly-money-maker && git pull
   python3 -c 'import json; from pathlib import Path; p=Path("strategy_buy5m.json"); d=json.loads(p.read_text()); d["min_underlying_edge_usd"]=0.0; d["hedge_threshold"]=0.50; d["hedge_require_ask_max"]=0.55; d["buy_budget"]=2.5; d["late_buy_budget"]=2.5; d["buy_max_price"]=0.90; d["poll_buy_window_s"]=0.01; d["poll_held_s"]=0.01; d["ui_every_n_cycles"]=50; p.write_text(json.dumps(d, indent=2)+"\n"); print("budget", d["buy_budget"], "late", d["late_buy_budget"], "hedge", d["hedge_threshold"], d["hedge_require_ask_max"], "poll", d["poll_buy_window_s"], d["poll_held_s"])'
   sudo systemctl restart polybuybot5m
   sudo systemctl enable polybuybot5m
-  systemctl is-active polybuybot polybuybot5m polybuybothourly
-  # expect: inactive  active  inactive
+  systemctl is-active polybuybot polybuybot5m polybuybothourly polymintbot polypathlog
+  # expect: inactive  active  active  inactive  active
   .venv/bin/python check_buy_skips.py --since "$(date -u -d '2 hours ago' '+%Y-%m-%dT%H:%M:%S')"
   ```
   Confirm `strategy_buy5m.json` `dry_run` / `entry_enabled` before the 5m restart.
-  Do **not** start 15m or hourly unless the operator asks.
+  Do **not** start 15m. Restart hourly only after an hourly code pull you trust.
+  Hourly log is `buybothourly.log` (Aug 19 `invalid amounts` lines in that file
+  are old).
 - **Pathlog:** start `polypathlog` as above (no `.env` required).
 
 ---
@@ -194,15 +204,15 @@ amount / HTTP 400), not this NameError.
 ## Open / next
 
 - [x] Pause minting; keep CLOB triggers (now two $2.50 slices, late 75–90).
-- [x] **5m-only live trading** — 15m and hourly buy services stopped/disabled.
+- [x] **5m-only live trading** (until 21 Aug 2026) — 15m stayed stopped;
+      hourly started ~09:58 UTC that day.
 - [x] Pin BUY FAKs to **budget/ask limit** at the quoted ask (band unchanged;
   displayed top size is not a cap; `buy_max_spend` $3; `buy_max_shares` 5 buffer).
 - [x] Path recorder + `check_path_backtest.py` (first-touch ask × time-left;
   ticks record TOB size; backtest is share-capped FAK, not infinite ask size).
 - [x] Hedge FAK follows live bid after book integrity (no 32¢ fill refusal).
-      5m trigger is now **50/55**; hourly template is **55/60** (still stopped);
-      15m stays 35/40 (stopped).
-- [x] On VM: pathlog restarted onto size-aware ticks; 15m/hourly buy bots stopped.
+      5m trigger is **50/55**; hourly live is **55/60**; 15m stays 35/40 (stopped).
+- [x] On VM: pathlog restarted onto size-aware ticks; 15m stays stopped.
 - [x] 5m underlying gate **$0** (any non-zero TWAP vs PTB; side must match).
 - [x] Pathlog `--anatomy` / `--compare` so window/band/size alts are scored offline.
 - [x] 5m `known_cost` NameError (#80) — **code** fixed 13 Aug; live process
@@ -224,12 +234,12 @@ amount / HTTP 400), not this NameError.
       `sudo systemctl restart polybuybot5m` only. Watch journal for a
       `[BUY FILL]` / no more `max accuracy of 2 decimals`.
       `check_buy_skips.py --since 2026-08-21T08:08:00` — `invalid_amount`
-      should stop climbing. Do **not** start 15m / hourly / mint.
-- [ ] Hourly three-slice bot is in the repo (`buybothourly.py` + example JSON).
-      **Do not start `polybuybothourly`.** Operator later: `git pull`, set live
-      `strategy_buyhourly.json` (`dry_run` / `entry_enabled` only when they mean
-      it), `sudo systemctl start polybuybothourly`. Leave 5m running. Do not
-      start 15m or mint.
+      should stop climbing. Do **not** start 15m or mint. Hourly is a
+      separate process — do **not** restart 5m for hourly.
+- [x] Hourly three-slice bot started **21 Aug 2026 ~09:58 UTC**
+      (`polybuybothourly`, `dry_run: false`, `entry_enabled: true`).
+      Watch `buybothourly.log` (not journalctl) for `slice=a22|b15|c5`.
+      Leave 5m running. Do not start 15m or mint.
 - [ ] Cloud paper P&L: paste `CLOUD_RESEARCH.md` section 2 (live `pathlog.py`
       + `--sweep --paper`, rank by `pnl_sum` vs `live_5m_paper`). No `.env`.
       Optional: attach `poly-research.zip` for the historical tape. Not live
@@ -242,7 +252,9 @@ amount / HTTP 400), not this NameError.
 
 1. Read `AGENTS.md` + this file before changing mint/buy/hedge logic.
 2. Do **not** restart minting unless the operator asks. Do **not** start
-   `polybuybot` / `polybuybothourly` unless the operator asks.
+   `polybuybot` (15m). Hourly is **live** — do not restart
+   `polybuybothourly` unless an hourly bugfix requires it, and do not start
+   a second copy.
 3. Never truncate state/PnL/log files; never commit live strategy/state/`.env`.
    Pathlog ticks are **auto-pruned** (14d / 400 MB) — do not `rm` them by hand,
    but **do export** (`check_path_backtest.py --csv` or `scp` the ticks dir)
