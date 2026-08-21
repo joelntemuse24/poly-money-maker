@@ -10,6 +10,8 @@ list, not 666 live markets). The bot **throws those rows away** after
 download. Do **not** delete `positions_buy5m.json` to “clear” them, and do
 **not** try to sell dead 5m tokens (no CLOB book). Real leftovers redeem;
 API ghosts get one `redeem_abandoned` skip. Look interval is **0.01s** on the live WS book (REST only when posting).
+Wallet list refresh is 15s when not holding; the buy gate must allow that
+age (a 5s “fresh” check would silently skip every spend between fetches).
 Stop/disable 15m and hourly. Split the 5m stake into **two $2.50 slices** (**$5** if both
 fill): **early ≥90¢ (to 99¢) in the first 3 minutes** and **≥95¢ overlay**
 there, then **$2.50 only in the last 120s at the old 75–90¢ band**. Missed

@@ -1469,6 +1469,8 @@ class FiveMFastPollHelpers(unittest.TestCase):
             "inventory_is_hot",
             "drop_wallet_dust",
             "pick_look_quote",
+            "positions_refresh_interval_s",
+            "positions_snapshot_is_fresh",
             "add_tracked_market_stubs",
             bot=BOT5M,
         )
@@ -1668,6 +1670,8 @@ class FiveMFastPollHelpers(unittest.TestCase):
         self.assertIn("look_book_quote", src)
         self.assertIn("_HEARTBEAT_MIN_S", src)
         self.assertIn("buy_skip_rest_confirm", src)
+        self.assertIn("stale_positions", src)
+        self.assertIn("positions_snapshot_is_fresh", src)
         look_at = src.find("0.01s look: WS")
         rest_at = src.find("WS said buy. REST-confirm once")
         self.assertGreater(look_at, 0)
@@ -1685,6 +1689,22 @@ class FiveMFastPollHelpers(unittest.TestCase):
             pick(None, None),
             (None, 0.0, None, 0.0, None),
         )
+
+    def test_positions_freshness_allows_slow_wallet_refresh(self):
+        interval = self.ns["positions_refresh_interval_s"](1.0, False)
+        self.assertEqual(interval, 15.0)
+        self.assertTrue(
+            self.ns["positions_snapshot_is_fresh"](100.0, 110.0, interval)
+        )
+        self.assertFalse(
+            self.ns["positions_snapshot_is_fresh"](100.0, 160.0, interval)
+        )
+        fast = self.ns["positions_refresh_interval_s"](1.0, True)
+        self.assertEqual(fast, 1.0)
+        self.assertFalse(
+            self.ns["positions_snapshot_is_fresh"](100.0, 106.0, fast)
+        )
+        self.assertFalse(self.ns["positions_snapshot_is_fresh"](0.0, 1.0, 15.0))
 
 
 if __name__ == "__main__":

@@ -1041,6 +1041,25 @@ def drop_wallet_dust(held, tracked_meta, now_s):
     }
 
 
+# When there is no live hedge, do not re-download the fat Data API list every
+# second. The buy gate must use this same interval or it will refuse every
+# spend between fetches (15s refresh vs 5s "fresh" killed entries).
+
+
+def positions_refresh_interval_s(refresh_s, need_fast):
+    refresh_s = float(refresh_s)
+    if need_fast:
+        return max(refresh_s, 0.01)
+    return max(refresh_s, 15.0)
+
+
+def positions_snapshot_is_fresh(received_mono, now_mono, interval_s):
+    if received_mono is None or float(received_mono) <= 0:
+        return False
+    max_age = max(5.0, float(interval_s) * 3.0)
+    return (float(now_mono) - float(received_mono)) <= max_age + 1e-9
+
+
 def count_live_hedges(held, tracked_meta, now_s):
     tracked_meta = tracked_meta or {}
     n = 0
@@ -3656,10 +3675,8 @@ while not _shutdown_requested:
             _last_balance_refresh = _now_mono
         if (
             _positions_future is None
-            and _now_mono - _last_positions_refresh >= (
-                float(POSITIONS_REFRESH_S)
-                if _need_fast_positions
-                else max(float(POSITIONS_REFRESH_S), 15.0)
+            and _now_mono - _last_positions_refresh >= positions_refresh_interval_s(
+                POSITIONS_REFRESH_S, _need_fast_positions,
             )
         ):
             _positions_future = _io_executor.submit(get_user_positions)
@@ -4800,23 +4817,11 @@ while not _shutdown_requested:
                 if not ENTRY_ENABLED:
                     continue  # explicit operator arm is required for every live entry
                 if not _discovery_fresh:
+                    log_buy_skip_throttled(
+                        "stale_discovery", cond, event="buy_skip",
+                    )
                     continue  # stale Gamma metadata is hedge-only
-                if (
-                    _positions_received_mono <= 0
-                    or _now_mono - _positions_received_mono
-                    > max(5.0, float(POSITIONS_REFRESH_S) * 3)
-                ):
-                    continue  # risk caps require a recent complete positions snapshot
-                if (
-                    _balance_received_mono <= 0
-                    or _now_mono - _balance_received_mono
-                    > max(30.0, float(BALANCE_REFRESH_S) * 3)
-                ):
-                    continue  # never spend against unknown/stale collateral
-
-                # Quarantine is unconditional, including when an earlier attempt in
-                # the same call already set bought_token. Stable held-state
-                # reconciliation above resolves it; this path never posts again.
+                # Quarantine is unconditional. This path never posts again.
                 if meta.get("buy_uncertain"):
                     continue
 
@@ -4954,7 +4959,14 @@ while not _shutdown_requested:
                 dn_bid, _, dn_ask, _, dn_mid = look_book_quote(
                     m.dn_token, _book_cache,
                 )
+                if up_ask is None:
+                    up_bid, _, up_ask, _, up_mid = get_quote_fast(m.up_token)
+                if dn_ask is None:
+                    dn_bid, _, dn_ask, _, dn_mid = get_quote_fast(m.dn_token)
                 if up_ask is None and dn_ask is None:
+                    log_buy_skip_throttled(
+                        "no_quote", cond, event="buy_skip",
+                    )
                     continue
                 up_last = look_last_trade(m.up_token)
                 dn_last = look_last_trade(m.dn_token)
@@ -5154,6 +5166,29 @@ while not _shutdown_requested:
                             entry_min=min(b.min_price for b in bands),
                             entry_max=max(b.max_price for b in bands),
                         )
+                    continue
+
+                _pos_interval = positions_refresh_interval_s(
+                    POSITIONS_REFRESH_S, _need_fast_positions,
+                )
+                if not positions_snapshot_is_fresh(
+                    _positions_received_mono, _now_mono, _pos_interval,
+                ):
+                    log_buy_skip_throttled(
+                        "stale_positions", cond, event="buy_skip",
+                        age_s=round(_now_mono - _positions_received_mono, 2)
+                        if _positions_received_mono else None,
+                        interval_s=_pos_interval,
+                    )
+                    continue
+                if (
+                    _balance_received_mono <= 0
+                    or _now_mono - _balance_received_mono
+                    > max(30.0, float(BALANCE_REFRESH_S) * 3)
+                ):
+                    log_buy_skip_throttled(
+                        "stale_balance", cond, event="buy_skip",
+                    )
                     continue
 
                 # WS said buy. REST-confirm once (stale/phantom sizes), then
