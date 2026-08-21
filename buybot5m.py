@@ -176,8 +176,8 @@ _STRATEGY_DEFAULTS = {
     # Must be <= buy_threshold (validator); 65¢ ≈ walk well below the 75¢ floor.
     "toxic_force_exit_below": 0.65,
     "hedge_enabled": True,
-    "hedge_threshold": 0.50,
-    # Kept in config (live JSON still sends it). Not a FAK floor: after 50/55
+    "hedge_threshold": 0.53,
+    # Kept in config (live JSON still sends it). Not a FAK floor: after 53/55
     # integrity, the sell follows the live bid so a 20¢ print is not $0.
     "hedge_min_price": 0.325,
     "hedge_undercut_ticks": 2,
@@ -190,7 +190,7 @@ _STRATEGY_DEFAULTS = {
     # and ask also collapsed (same lesson sell-side already learned on mids).
     "hedge_max_spread": 0.15,
     "hedge_require_ask_max": 0.55,
-    # Invert the buy GUI 70/30 plus last-trade on the held token. TOB 50/55
+    # Invert the buy GUI 70/30 plus last-trade on the held token. TOB 53/55
     # alone is not consensus (same lesson as not buying a random ask).
     "hedge_require_gui": True,
     "buy_start_s": 120,
@@ -1400,7 +1400,7 @@ def look_last_trade(token_id):
 def hedge_sell_price(bid, tick_size, undercut_ticks, min_price=None):
     """FAK sell at the live bid (undercut, tick-aligned).
 
-    After 50/55 integrity, take whatever bid is there. min_price is ignored so
+    After 53/55 integrity, take whatever bid is there. min_price is ignored so
     a leftover 32¢ config cannot refuse a 20¢ or 1¢ print. One tick is only
     the exchange minimum, not a strategy floor.
     """
@@ -1528,7 +1528,7 @@ def toxic_dump_book_ok(bid, threshold):
 
     Recovered book (bid > hedge_threshold, e.g. 97¢ after a junk fill) must
     not dump. Missing bid is fail-closed. Wide 1¢/99¢ still dumps — this
-    gate is bid-only and does not require 50/55/15 or GUI.
+    gate is bid-only and does not require 53/55/15 or GUI.
     """
     bid = finite_float(bid, minimum=0, maximum=1)
     threshold = finite_float(threshold, minimum=0, maximum=1)
@@ -4431,8 +4431,8 @@ while not _shutdown_requested:
                 # --- HEDGE CHECK (for held positions) ---
                 if held_token and held_size > 0.01 and HEDGE_ENABLED and not meta.get("hedge_closed"):
                     # FAK avg < toxic_force_exit_below arms toxic_fill. Dump only while
-                    # held bid ≤ hedge_threshold (no GUI / 50/55/15). Recovered book
-                    # (bid > 50¢) logs hedge_skip_toxic_recovered and stays armed.
+                    # held bid ≤ hedge_threshold (no GUI / 53/55/15). Recovered book
+                    # (bid > 53¢) logs hedge_skip_toxic_recovered and stays armed.
                     # Mild below-band fills (≥ that floor) use the normal hedge path.
                     toxic_fill = bool(meta.get("toxic_fill"))
                     # Skip REST when a *fresh* WS bid is clearly above threshold
@@ -4596,7 +4596,7 @@ while not _shutdown_requested:
                                     (not toxic_fill) and hedge_bid <= HEDGE_THRESHOLD
                                 ):
                                     hedge_tick = get_tick_size_cached(held_token)
-                                    # 50/55 is only a tight book. GUI must agree
+                                    # 53/55 is only a tight book. GUI must agree
                                     # with that book (held ≤ ask-max, other ≥
                                     # complement), not wait for buy 30/70.
                                     # Last trade still has to have printed down.

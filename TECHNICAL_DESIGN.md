@@ -113,7 +113,7 @@ per FAK. Missed early does not roll into a $5 late buy. A late add is
 **same-leg only** (holding Down and seeing Up at 80¢ skips). Hedge sells
 the combined bag.
 
-**Hedge (5m):** sell only when the **held** book looks collapsed — bid ≤ 50¢
+**Hedge (5m):** sell only when the **held** book looks collapsed — bid ≤ 53¢
 **and** ask ≤ 55¢, spread tight — **and** the website-style prices agree that
 side actually lost. Then sell at whatever the live bid is (even 20¢). The
 hourly copy’s template is 55¢/60¢ (still stopped). 15m still uses 35¢/40¢
@@ -202,7 +202,7 @@ widget/polydesk.py   Laptop glance (public API, no orders)
 exists in the other two files. Diff them after a logic change. The 5m-only
 exceptions are the 5m early price bands (`buy/entry_skip.py` + `BUY_HORIZON_S`
 in **seconds**) and the hourly three-slice bands (`BUY_HORIZON_MIN` in
-**minutes**). 5m defaults: hedge 50/55, BTC gate $0, tick `0.001`. Hourly
+**minutes**). 5m defaults: hedge 53/55, BTC gate $0, tick `0.001`. Hourly
 defaults: hedge 55/60, BTC gate $10, tick `0.01`, $10 market cap.
 
 15m/hourly windows are in **minutes** (`buy_window_min` / `a22_window_min`).
@@ -465,7 +465,7 @@ hard exit (you will fail later on POST if allowance is actually missing).
 
 Then: `MarketGateway`, `get_btc_feed(...)`, `get_book_feed()`. Those start
 background threads. Then the ASCII banner (the 97¢ / 65¢ text in the banner
-is **cosmetic leftover** — live knobs are two $2.50 slices / 50/55). Then
+is **cosmetic leftover** — live knobs are two $2.50 slices / 53/55). Then
 `load_json(STATE_FILE)` and the `while` loop.
 
 ---
@@ -500,7 +500,7 @@ dict **is the schema**.
 | Most knobs in live JSON | No — next loop iteration |
 | `dry_run` | **Yes** (state paths) |
 | Python code | **Yes** (`systemctl restart polybuybot5m`). `git pull` is not a restart. |
-| Hedge 50/55 if live JSON still says 0.35/0.40 | The **file** wins. Code defaults only apply when the key is **omitted**. Patch the JSON. |
+| Hedge 53/55 if live JSON still says 0.35/0.40 | The **file** wins. Code defaults only apply when the key is **omitted**. Patch the JSON. |
 
 `entry_enabled` is the operator arm. Defaults `false` in the example file.
 Live JSON on the VM is what actually arms buys.
@@ -599,7 +599,7 @@ snapshot is young enough.
 legs need a display price (mid or last trade) or the bot logs
 `buy_skip_incomplete_book`.
 
-**5m hedge GUI** matches the 50/55 book, not buy 70/30: held last trade ≤
+**5m hedge GUI** matches the 53/55 book, not buy 70/30: held last trade ≤
 ask-max (55¢), held GUI ≤ 55¢, other GUI ≥ 45¢ (complement). A 53¢ vs 47¢
 display is the stop; the other side does not have to already be ahead.
 15m/hourly still invert 70/30. A 52/54 book with last trade **85¢** is a
@@ -607,7 +607,7 @@ clip, not a reversal → `hedge_skip_no_consensus`.
 
 `entry_book_ok`: both sides present, not crossed, spread ≤ 5¢, bid ≥ 70¢.
 
-`hedge_book_ok`: bid ≤ threshold (50¢), ask ≤ 55¢, spread ≤ 15¢. A 1¢ bid
+`hedge_book_ok`: bid ≤ threshold (53¢), ask ≤ 55¢, spread ≤ 15¢. A 1¢ bid
 under a 99¢ ask fails (`hedge_skip_toxic_book`).
 
 `toxic_dump_book_ok`: **only** `bid ≤ hedge_threshold`. Used when a fill was
@@ -772,14 +772,14 @@ caller.
 
 **Normal hedge pipeline in the loop:**
 
-1. **Peek WS.** If a **fresh** WS bid is **above** 50¢, skip REST entirely
+1. **Peek WS.** If a **fresh** WS bid is **above** 53¢, skip REST entirely
    (`hedge_cancel` / toxic recovered). Do not hammer `/book` on a healthy
    winner.
 2. Else **force REST**. Missing a side on a **normal** hedge →
    `hedge_skip_incomplete_rest` (no WS sell). Toxic dump may proceed with
    bid-only; no bid still skips.
-3. Bid bounced above 50¢ on REST → `hedge_cancel_bounce`.
-4. `hedge_book_ok` 50/55/15. Fail → `hedge_skip_toxic_book`.
+3. Bid bounced above 53¢ on REST → `hedge_cancel_bounce`.
+4. `hedge_book_ok` 53/55/15. Fail → `hedge_skip_toxic_book`.
 5. `hedge_consensus_ok` (5m: held ≤ ask-max / other ≥ complement; 15m/hourly:
    inverted 70/30). Fail → `hedge_skip_no_consensus`.
 6. Write-ahead hedge quarantine, then FAK **sell at live bid minus
@@ -792,7 +792,7 @@ caller.
 
 **`toxic_fill`:** armed from junk/walk average. Stays on `meta` forever until
 the dump actually sells (or you ride a recovered book). Dump **only while
-bid ≤ 50¢**. Recovered 97¢ → `hedge_skip_toxic_recovered`, flag stays armed.
+bid ≤ 53¢**. Recovered 97¢ → `hedge_skip_toxic_recovered`, flag stays armed.
 
 **Reconcile sells** with `reconcile_hedge_sold`: CLOB-confirmed sold size
 wins; a single low Data API read must not invent extra fills or erase
@@ -939,7 +939,7 @@ This is the one state-like tree that is allowed to delete itself. Do not
 
 **`check_path_backtest.py`:** first tick that matches an ask band and TTM
 window is a “hit.” Paper hedge walks later ticks with the **example JSON**
-hedge (5m: 50/55/15, held GUI ≤ 55¢ / other ≥ 45¢) using mid as GUI when spread ≤ 10¢. Pathlog has **no**
+hedge (5m: 53/55/15, held GUI ≤ 55¢ / other ≥ 45¢) using mid as GUI when spread ≤ 10¢. Pathlog has **no**
 last-trade, **no** BTC/PTB, **no** POST latency.
 
 **`--sweep` / `--compare` do not replay the early ≥90 / ≥95 union or two
@@ -996,12 +996,12 @@ cap is separate and in-app.
 
 ```bash
 cd ~/poly-money-maker && git pull
-python3 -c 'import json; from pathlib import Path; p=Path("strategy_buy5m.json"); d=json.loads(p.read_text()); d["hedge_threshold"]=0.50; d["hedge_require_ask_max"]=0.55; p.write_text(json.dumps(d, indent=2)+"\n")'
+python3 -c 'import json; from pathlib import Path; p=Path("strategy_buy5m.json"); d=json.loads(p.read_text()); d["hedge_threshold"]=0.53; d["hedge_require_ask_max"]=0.55; p.write_text(json.dumps(d, indent=2)+"\n")'
 sudo systemctl restart polybuybot5m
 ```
 
 Watch `buy_attempt` `band=early` / `early_95` and `hedge_attempt` once held
-bid ≤ 50¢.
+bid ≤ 53¢.
 
 ---
 

@@ -273,8 +273,8 @@ def paper_settle(
     as live ``hedge_skip_no_consensus`` / missing last trade.
 
     ``toxic_fill`` (avg < 65¢) dumps only while held bid ≤ ``hedge_threshold``
-    (5m example **50¢**) — recovered 97¢ books ride. Normal hedges still need
-    threshold / ask-max / max-spread (5m example **50/55/15**) plus the GUI
+    (5m example **53¢**) — recovered 97¢ books ride. Normal hedges still need
+    threshold / ask-max / max-spread (5m example **53/55/15**) plus the GUI
     proxy. 5m live GUI is held ≤ ask-max / other ≥ complement (55/45), and
     does **not** require the other mid to already be higher than held.
     """
@@ -951,7 +951,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     ap.add_argument(
         "--paper",
         action="store_true",
-        help="after a fill, walk later ticks for the template hedge (5m example: 50/55/15) + GUI-proxy / toxic dump",
+        help="after a fill, walk later ticks for the template hedge (5m example: 53/55/15) + GUI-proxy / toxic dump",
     )
     ap.add_argument(
         "--sweep",

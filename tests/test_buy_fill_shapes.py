@@ -700,7 +700,7 @@ class AmbiguousCrossCyclePolicy(unittest.TestCase):
         self.assertIn("stamp_slice_bought", five)
         self.assertIn("accumulate_buy_inventory", five)
         self.assertIn("buy_skip_other_leg", five)
-        self.assertIn('"hedge_threshold": 0.50', five)
+        self.assertIn('"hedge_threshold": 0.53', five)
         self.assertIn('"hedge_require_ask_max": 0.55', five)
         self.assertNotIn(
             "up_ask_ok = up_ask is not None and BUY_THRESHOLD <= up_ask <= BUY_MAX_PRICE",
@@ -1709,7 +1709,7 @@ class BalanceAndGcSemantics(unittest.TestCase):
         self.assertEqual(five["early_95_start_s"], 300)
         self.assertEqual(five["early_95_min_s"], 60)
         self.assertEqual(five["early_95_min_price"], 0.95)
-        self.assertEqual(five["hedge_threshold"], 0.50)
+        self.assertEqual(five["hedge_threshold"], 0.53)
         self.assertEqual(five["hedge_require_ask_max"], 0.55)
         self.assertEqual(five["buy_threshold"], 0.75)
         self.assertEqual(five["buy_max_price"], 0.90)
