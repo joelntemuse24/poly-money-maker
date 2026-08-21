@@ -271,7 +271,7 @@ def paper_settle(
 
     ``toxic_fill`` (avg < 65¢) dumps only while held bid ≤ ``hedge_threshold``
     (5m example **50¢**) — recovered 97¢ books ride. Normal hedges still need
-    threshold / ask-max / max-spread (5m example **50/55/15**) plus the GUI proxy.
+    threshold / ask-max / max-spread (5m example **53/55/15**) plus the GUI proxy.
     """
     shares = float(fill.get("shares") or 0.0)
     notional = float(fill.get("notional") or 0.0)
@@ -931,7 +931,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     ap.add_argument(
         "--paper",
         action="store_true",
-        help="after a fill, walk later ticks for the template hedge (5m example: 50/55/15) + GUI-proxy / toxic dump",
+        help="after a fill, walk later ticks for the template hedge (5m example: 53/55/15) + GUI-proxy / toxic dump",
     )
     ap.add_argument(
         "--sweep",

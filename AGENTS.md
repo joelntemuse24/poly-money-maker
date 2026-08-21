@@ -21,7 +21,7 @@ The 5m bot buys the winning leg of Polymarket BTC "Up or Down" markets in
 | Same early window | **≥95¢** overlay | uses the early $2.50, not a third slice |
 
 Missed early does **not** become a $5 late buy. Same-leg add only (no
-straddle). Hedge **50/55** on the combined bag (plus inverted GUI). Winners
+straddle). Hedge **53/55** on the combined bag (plus inverted GUI). Winners
 redeem at $1.00. **No profit-take sell.** See `CURRENT.md` for the active
 probe knobs.
 
@@ -50,7 +50,7 @@ Priority: the band that **contains** the ask. 75–90 never posts at 99¢.
 | File | Service | Markets | Oracle | Budget | Window |
 |---|---|---|---|---|---|
 | `buybot.py` | `polybuybot` **stopped** | 15m | Chainlink TWAP 60s | $2.50 | final 4.0 min, 75–90¢, hedge 35/40 |
-| `buybot5m.py` | `polybuybot5m` **live** | 5m | Chainlink TWAP 30s | $2.50+$2.50 | bands above; hedge **50/55** |
+| `buybot5m.py` | `polybuybot5m` **live** | 5m | Chainlink TWAP 30s | $2.50+$2.50 | bands above; hedge **53/55** |
 | `buybothourly.py` | `polybuybothourly` **stopped** | hourly | Binance BTCUSDT | $10 cap (A $5 / B–C remainder) | last 22/15/5 min; hedge **55/60** |
 | `pathlog.py` | `polypathlog` **live** | all three | — (CLOB books only) | — | whole 5m; last 8m of 15m; last 15m of hourly |
 
@@ -213,7 +213,7 @@ two-slice $2.50+$2.50 add.
   hot-reload; the loop-body fix needs `sudo systemctl restart polybuybot5m`.
 - `hedge_attempt` / `hedge_fill` — hedge fired after force-fresh REST + book integrity + GUI consensus (normal path)
 - `hedge_skip_toxic_book` — bid dipped but ask/spread still say "not reversed"
-- `hedge_skip_no_consensus` — 50/55 (5m) or 35/40 book passed but GUI/last-trade still say the held side has not actually fallen (same class of check as buy)
+- `hedge_skip_no_consensus` — 53/55 (5m) or 35/40 book passed but GUI/last-trade still say the held side has not actually fallen (same class of check as buy)
 - `hedge_skip_toxic_recovered` — `toxic_fill` is armed but held bid > hedge threshold (winner book); dump stays armed, no sell
 - `hedge_skip_incomplete_rest` — REST missing a side; fail closed (no WS sell)
 - `buy_skip_ambiguous` — GUI display prices too close (throttled 8s; **not** one event per market)
@@ -265,7 +265,7 @@ python check_buy_skips.py --since 2026-08-19T08:02:00
 
 `--sweep` scores the live 5m **example** late template (75–90 / 120s / $2.50)
 plus one-at-a-time window/band/size variants, with a **paper** hedge from that
-JSON (**50/55/15** + mid-as-GUI when spread ≤ 10¢). It does **not** union the
+JSON (**53/55/15** + mid-as-GUI when spread ≤ 10¢). It does **not** union the
 early ≥90 / ≥95 windows and does **not** model two $2.50 slices. `--anatomy` answers “already decided at T-120 vs
 50/50 until the end.” `--compare` is the named-preset table; add `--paper` to
 walk later ticks. `--grid` is ask × time. **`--series 5m` matches only 5m**
@@ -310,13 +310,13 @@ Cloud agents: `CLOUD_RESEARCH.md`.
   hedge: REST shows bid ≤ threshold **and** ask ≤ require_ask_max with tight
   spread, **and** Polymarket GUI + last trade agree the held side actually lost
   (held last print ≤ require_ask_max, held GUI ≤ 30¢, other GUI ≥ 70¢ — same
-  display rule as buy). Live 5m is **50/55**; hourly template is **55/60**
+  display rule as buy). Live 5m is **53/55**; hourly template is **55/60**
   (service still **stopped**); 15m remains 35/40.
   A random TOB clip is not enough; a last print of 85¢ on a 48/52 book will
   `hedge_skip_no_consensus`. `toxic_fill` stays armed and still skips GUI /
-  50/55/15 on 5m, but **sells only while held bid ≤ 50¢**. A recovered 97¢ book
+  53/55/15 on 5m, but **sells only while held bid ≤ 53¢**. A recovered 97¢ book
   logs `hedge_skip_toxic_recovered` and rides; a 6¢ junk bid (even under a
-  99¢ ask) still dumps on bid-only REST. Fresh WS bid > 50¢ skips REST for
+  99¢ ask) still dumps on bid-only REST. Fresh WS bid > 53¢ skips REST for
   both normal and toxic. After a dump is allowed, the FAK sells at the
   **live bid** even if it is 20¢. Everything else rides to redemption at
   $1.00. WS may *arm* a hedge check; normal sells need two-sided REST.
@@ -379,7 +379,7 @@ After this branch merges, on the VM (5m only):
 
 ```bash
 cd ~/poly-money-maker && git pull
-python3 -c 'import json; from pathlib import Path; p=Path("strategy_buy5m.json"); d=json.loads(p.read_text()); d["hedge_threshold"]=0.50; d["hedge_require_ask_max"]=0.55; d["buy_budget"]=2.5; d["late_buy_budget"]=2.5; d["buy_max_price"]=0.90; d["poll_buy_window_s"]=0.01; d["poll_held_s"]=0.01; d["ui_every_n_cycles"]=50; p.write_text(json.dumps(d, indent=2)+"\n")'
+python3 -c 'import json; from pathlib import Path; p=Path("strategy_buy5m.json"); d=json.loads(p.read_text()); d["hedge_threshold"]=0.53; d["hedge_require_ask_max"]=0.55; d["buy_budget"]=2.5; d["late_buy_budget"]=2.5; d["buy_max_price"]=0.90; d["poll_buy_window_s"]=0.01; d["poll_held_s"]=0.01; d["ui_every_n_cycles"]=50; p.write_text(json.dumps(d, indent=2)+"\n")'
 sudo systemctl restart polybuybot5m
 ```
 

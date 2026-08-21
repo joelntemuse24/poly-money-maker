@@ -15,7 +15,7 @@ age (a 5s “fresh” check would silently skip every spend between fetches).
 Stop/disable 15m and hourly. Split the 5m stake into **two $2.50 slices** (**$5** if both
 fill): **early ≥90¢ (to 99¢) in the first 3 minutes** and **≥95¢ overlay**
 there, then **$2.50 only in the last 120s at the old 75–90¢ band**. Missed
-early does **not** roll into late. Hedge is **50/55** on the combined bag.
+early does **not** roll into late. Hedge is **53/55** on the combined bag.
 Chainlink TWAP gate is **$0** (any non-zero tick vs PTB; side must match;
 flat is still refused). Late FAKs **limit at 90¢**; early FAKs **limit at
 99¢**. Size starts at `budget/ask` and is **at least 3 shares** when
@@ -26,7 +26,7 @@ round down to 2.00 sh / $1.98. Displayed top size is **not** a cap.
 wallet makes the SDK shrink 3.00 @ 99¢ into maker `$2.9601` and CLOB 400s
 `invalid amounts` (live 21 Aug: 521 attempts / 0 fills). `toxic_fill` arms
 from fill average < 65¢ (not extra shares vs the 99¢-sized quote) and dumps
-without GUI only while bid ≤ 50¢. Pause minting. Pathlog still records all
+without GUI only while bid ≤ 53¢. Pause minting. Pathlog still records all
 three series (no orders; 14-day / 400 MB cap).
 
 ---
@@ -52,8 +52,8 @@ Slice C (last 5 min, ask **> 95¢**) spends remaining to $10 at **99¢**.
 **Active strategy:** **5m only** (`polybuybot5m`) with **two $2.50 slices**
 (up to **$5** per market). Early: **≥90¢** in the first 3 minutes, **≥95¢**
 overlay on that same window. Late: **75–90¢** in the last **120s** only
-(do **not** buy 91–99¢ after T-120). Same-leg add only; hedge is unchanged
-50/55 on the combined bag:
+(do **not** buy 91–99¢ after T-120). Same-leg add only; hedge is **53/55**
+on the combined bag:
 
 | Knob | Value |
 |---|---|
@@ -65,7 +65,7 @@ overlay on that same window. Late: **75–90¢** in the last **120s** only
 | Execution | Size `budget/ask`, **floor 3 shares** when `3 × limit ≤ $3`. Unmatched 400 re-quotes up to **3** FAKs; then **0.15 s** cooldown. Unclear POSTs still quarantine. |
 | GUI consensus | winner ≥ 70¢, loser ≤ 30¢ |
 | Windows | 5m **whole market**: early ≥90 / ≥95 for TTM (120, 300]; late 75–90 for TTM ≤ 120s (15m / hourly bots **not running**) |
-| Hedge | **Trigger** bid ≤ **50¢** and ask ≤ **55¢**, spread ≤ 15¢, **plus** inverted buy GUI. Combined early+late inventory. `toxic_fill` arms only when FAK **average** < 65¢ (not extra shares vs a 99¢-sized quote) and still dumps without GUI **only while held bid ≤ 50¢**. |
+| Hedge | **Trigger** bid ≤ **53¢** and ask ≤ **55¢**, spread ≤ 15¢, **plus** inverted buy GUI. Combined early+late inventory. `toxic_fill` arms only when FAK **average** < 65¢ (not extra shares vs a 99¢-sized quote) and still dumps without GUI **only while held bid ≤ 53¢**. |
 | Underlying edge | **$0** (5m: any non-zero TWAP vs PTB) / **$10** (15m, hourly); side must match |
 | `max_open_positions` | **0 = unlimited** |
 | `toxic_force_exit_below` | **65¢** |
@@ -178,7 +178,7 @@ amount / HTTP 400), not this NameError.
   sudo systemctl stop polybuybot polybuybothourly
   sudo systemctl disable polybuybot polybuybothourly
   cd ~/poly-money-maker && git pull
-  python3 -c 'import json; from pathlib import Path; p=Path("strategy_buy5m.json"); d=json.loads(p.read_text()); d["min_underlying_edge_usd"]=0.0; d["hedge_threshold"]=0.50; d["hedge_require_ask_max"]=0.55; d["buy_budget"]=2.5; d["late_buy_budget"]=2.5; d["buy_max_price"]=0.90; d["poll_buy_window_s"]=0.01; d["poll_held_s"]=0.01; d["ui_every_n_cycles"]=50; p.write_text(json.dumps(d, indent=2)+"\n"); print("budget", d["buy_budget"], "late", d["late_buy_budget"], "hedge", d["hedge_threshold"], d["hedge_require_ask_max"], "poll", d["poll_buy_window_s"], d["poll_held_s"])'
+  python3 -c 'import json; from pathlib import Path; p=Path("strategy_buy5m.json"); d=json.loads(p.read_text()); d["min_underlying_edge_usd"]=0.0; d["hedge_threshold"]=0.53; d["hedge_require_ask_max"]=0.55; d["buy_budget"]=2.5; d["late_buy_budget"]=2.5; d["buy_max_price"]=0.90; d["poll_buy_window_s"]=0.01; d["poll_held_s"]=0.01; d["ui_every_n_cycles"]=50; p.write_text(json.dumps(d, indent=2)+"\n"); print("budget", d["buy_budget"], "late", d["late_buy_budget"], "hedge", d["hedge_threshold"], d["hedge_require_ask_max"], "poll", d["poll_buy_window_s"], d["poll_held_s"])'
   sudo systemctl restart polybuybot5m
   sudo systemctl enable polybuybot5m
   systemctl is-active polybuybot polybuybot5m polybuybothourly
@@ -200,7 +200,7 @@ amount / HTTP 400), not this NameError.
 - [x] Path recorder + `check_path_backtest.py` (first-touch ask × time-left;
   ticks record TOB size; backtest is share-capped FAK, not infinite ask size).
 - [x] Hedge FAK follows live bid after book integrity (no 32¢ fill refusal).
-      5m trigger is now **50/55**; hourly template is **55/60** (still stopped);
+      5m trigger is now **53/55**; hourly template is **55/60** (still stopped);
       15m stays 35/40 (stopped).
 - [x] On VM: pathlog restarted onto size-aware ticks; 15m/hourly buy bots stopped.
 - [x] 5m underlying gate **$0** (any non-zero TWAP vs PTB; side must match).
@@ -216,15 +216,14 @@ amount / HTTP 400), not this NameError.
 - [x] Faster look (0.01s) + drop leftover wallet dust — operator pulled
       `bd607db` / #108 and restarted **polybuybot5m** 21 Aug 2026 **08:08Z**.
       Banner `WAIT 8`, `sleeping 0.01s`, NAV ~$147. Dust drop worked.
-- [ ] **0 fills is `invalid amounts`, not “no markets.”** Since ~20 Aug 22:00Z
-      (3-share floor): `buy_window` 130, `buy_attempt` 521, fills **0**,
-      `invalid_amount` 471. CLOB 400 maker must be 2 dp. Cause: 5m passed
-      `user_usdc_balance=$2.97` into v2 `create_order`, which shrinks
-      3.00 @ 99¢ to `$2.9601`. After this merge: `git pull` then
-      `sudo systemctl restart polybuybot5m` only. Watch journal for a
-      `[BUY FILL]` / no more `max accuracy of 2 decimals`.
-      `check_buy_skips.py --since 2026-08-21T08:08:00` — `invalid_amount`
-      should stop climbing. Do **not** start 15m / hourly / mint.
+- [ ] **5m hedge bid 53¢** (`hedge_threshold=0.53`, ask max still **55¢**).
+      Live JSON **must** set the key (hot reload; an old `0.50` file keeps
+      50/55). After merge:
+      ```bash
+      python3 -c 'import json; from pathlib import Path; p=Path("strategy_buy5m.json"); d=json.loads(p.read_text()); d["hedge_threshold"]=0.53; d["hedge_require_ask_max"]=0.55; p.write_text(json.dumps(d, indent=2)+"\n"); print("hedge", d["hedge_threshold"], d["hedge_require_ask_max"])'
+      ```
+      Banner `HEDGE ≤53¢`. No 5m restart required for this knob. Do **not**
+      start 15m / hourly / mint.
 - [ ] Hourly three-slice bot is in the repo (`buybothourly.py` + example JSON).
       **Do not start `polybuybothourly`.** Operator later: `git pull`, set live
       `strategy_buyhourly.json` (`dry_run` / `entry_enabled` only when they mean
