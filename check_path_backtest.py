@@ -262,6 +262,9 @@ def paper_settle(
     min_bid_edge: float = 0.05,
     last_trade_max: float = 0.40,
     toxic_force_exit_below: float = 0.65,
+    hedge_held_gui_max: Optional[float] = None,
+    hedge_other_gui_min: Optional[float] = None,
+    require_gui_reversed: bool = True,
 ) -> dict:
     """Walk ticks after a fill. No orders. Not a live replay.
 
@@ -271,7 +274,9 @@ def paper_settle(
 
     ``toxic_fill`` (avg < 65¢) dumps only while held bid ≤ ``hedge_threshold``
     (5m example **50¢**) — recovered 97¢ books ride. Normal hedges still need
-    threshold / ask-max / max-spread (5m example **50/55/15**) plus the GUI proxy.
+    threshold / ask-max / max-spread (5m example **50/55/15**) plus the GUI
+    proxy. 5m live GUI is held ≤ ask-max / other ≥ complement (55/45), and
+    does **not** require the other mid to already be higher than held.
     """
     shares = float(fill.get("shares") or 0.0)
     notional = float(fill.get("notional") or 0.0)
@@ -333,11 +338,17 @@ def paper_settle(
                 other_gui = _tight_mid(other_bid, other_ask)
                 if held_gui is None or other_gui is None:
                     continue
-                if held_gui > max_loser_bid + 1e-12:
+                held_cap = max_loser_bid if hedge_held_gui_max is None else hedge_held_gui_max
+                other_floor = (
+                    min_winner_bid if hedge_other_gui_min is None else hedge_other_gui_min
+                )
+                if abs(held_gui - other_gui) + 1e-12 < min_bid_edge:
                     continue
-                if other_gui + 1e-12 < min_winner_bid:
+                if held_gui > held_cap + 1e-12:
                     continue
-                if (other_gui - held_gui) + 1e-12 < min_bid_edge:
+                if other_gui + 1e-12 < other_floor:
+                    continue
+                if require_gui_reversed and other_gui <= held_gui:
                     continue
                 if held_gui > last_trade_max + 1e-12:
                     continue
@@ -385,6 +396,8 @@ def template_from_strategy(path: Path) -> dict:
     else:
         ttm_max = float(data.get("buy_window_min") or 4.0) * 60.0
     spread = data.get("max_entry_spread")
+    ask_max = float(data.get("hedge_require_ask_max") or 0.40)
+    five_m = data.get("buy_start_s") is not None
     return {
         "ask_min": float(data["buy_threshold"]),
         # 5m last-120s cap is buy_max_price (0.90). early_buy_max_price 0.99
@@ -394,14 +407,21 @@ def template_from_strategy(path: Path) -> dict:
         "budget": float(data["buy_budget"]),
         "max_spread": None if spread is None else float(spread),
         "hedge_threshold": float(data.get("hedge_threshold") or 0.35),
-        "hedge_require_ask_max": float(data.get("hedge_require_ask_max") or 0.40),
+        "hedge_require_ask_max": ask_max,
         "hedge_max_spread": float(data.get("hedge_max_spread") or 0.15),
         "hedge_require_gui": bool(data.get("hedge_require_gui", True)),
         "min_winner_bid": float(data.get("min_winner_bid") or 0.70),
         "max_loser_bid": float(data.get("max_loser_bid") or 0.30),
         "min_bid_edge": float(data.get("min_bid_edge") or 0.05),
-        "last_trade_max": float(data.get("hedge_require_ask_max") or 0.40),
+        "last_trade_max": ask_max,
         "toxic_force_exit_below": float(data.get("toxic_force_exit_below") or 0.65),
+        # 5m live: held GUI ≤ ask-max, other ≥ complement, no other>held.
+        # 15m/hourly paper keeps inverted buy 70/30.
+        "hedge_held_gui_max": ask_max if five_m else float(data.get("max_loser_bid") or 0.30),
+        "hedge_other_gui_min": (
+            round(1.0 - ask_max, 4) if five_m else float(data.get("min_winner_bid") or 0.70)
+        ),
+        "require_gui_reversed": not five_m,
     }
 
 
@@ -972,6 +992,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             "min_bid_edge",
             "last_trade_max",
             "toxic_force_exit_below",
+            "hedge_held_gui_max",
+            "hedge_other_gui_min",
+            "require_gui_reversed",
         )
         if k in tmpl
     }

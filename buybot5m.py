@@ -1537,6 +1537,20 @@ def toxic_dump_book_ok(bid, threshold):
     return bid <= threshold + 1e-12
 
 
+def hedge_gui_limits(require_ask_max):
+    """Held display cap is ask-max; other-leg floor is the cash complement.
+
+    A 52/54 held book has mid ~53¢. Buy-style 30/70 would wait until the
+    website already shows a loser, which is after the 53¢ bid is gone.
+    5m live: ask-max 55¢ → held GUI ≤ 55¢, other GUI ≥ 45¢. Two-sided
+    53/55/15 and last-trade ≤ ask-max still have to pass.
+    """
+    ask_max = finite_float(require_ask_max, minimum=0, maximum=1)
+    if ask_max is None:
+        return None, None
+    return ask_max, round(1.0 - ask_max, 4)
+
+
 def hedge_consensus_ok(
     held_bid, held_ask, held_last,
     other_bid, other_ask, other_last,
@@ -1546,12 +1560,15 @@ def hedge_consensus_ok(
     min_edge,
     last_trade_max,
 ):
-    """True only when website-style prices say the held side actually lost.
+    """True when display prices agree with a 53/55 book — not buy 70/30.
 
-    A 32/38 clip can be a random TOB. Buy already uses Polymarket display
-    (mid if spread ≤ 10¢ else last trade) plus 70/30. Hedge inverts that,
-    and also requires a last print on the held token ≤ last_trade_max so a
-    spoofed tight book cannot manufacture a 50¢ mid while last trade is 85¢.
+    A 32/38 clip can be a random TOB. Buy still uses Polymarket display
+    (mid if spread ≤ 10¢ else last trade) plus 70/30. 5m hedge uses
+    ``hedge_gui_limits`` (held ≤ ask-max, other ≥ complement) and does
+    **not** require the other GUI to already be higher than held. A 53¢
+    vs 47¢ book is the stop. Last print on the held token still must be
+    ≤ last_trade_max so a spoofed tight book cannot manufacture a 53¢
+    mid while last trade is 85¢.
     """
     held_last = finite_float(held_last, minimum=0, maximum=1)
     last_trade_max = finite_float(last_trade_max, minimum=0, maximum=1)
@@ -1574,8 +1591,6 @@ def hedge_consensus_ok(
         return False, "held_gui_too_high"
     if other_gui + 1e-12 < other_gui_min:
         return False, "other_gui_too_low"
-    if other_gui <= held_gui:
-        return False, "gui_not_reversed"
     return True, "ok"
 
 
@@ -4529,6 +4544,7 @@ while not _shutdown_requested:
                                 gui_ok, gui_why = True, "skipped"
                                 held_gui = other_gui = held_last = other_last = None
                                 other_bid = other_ask = None
+                                held_gui_max, other_gui_min = hedge_gui_limits(HEDGE_REQUIRE_ASK_MAX)
                                 if not toxic_fill and HEDGE_REQUIRE_GUI:
                                     other_token = (
                                         m.dn_token if held_leg == "up" else m.up_token
@@ -4549,8 +4565,8 @@ while not _shutdown_requested:
                                     gui_ok, gui_why = hedge_consensus_ok(
                                         hedge_bid, hedge_ask, held_last,
                                         other_bid, other_ask, other_last,
-                                        held_gui_max=MAX_LOSER_BID,
-                                        other_gui_min=MIN_WINNER_BID,
+                                        held_gui_max=held_gui_max,
+                                        other_gui_min=other_gui_min,
                                         min_edge=MIN_BID_EDGE,
                                         last_trade_max=HEDGE_REQUIRE_ASK_MAX,
                                     )
@@ -4569,8 +4585,8 @@ while not _shutdown_requested:
                                         held_gui=held_gui, other_gui=other_gui,
                                         other_bid=other_bid, other_ask=other_ask,
                                         reason=gui_why,
-                                        held_gui_max=MAX_LOSER_BID,
-                                        other_gui_min=MIN_WINNER_BID,
+                                        held_gui_max=held_gui_max,
+                                        other_gui_min=other_gui_min,
                                         last_trade_max=HEDGE_REQUIRE_ASK_MAX,
                                     )
                                 elif (
@@ -4580,8 +4596,10 @@ while not _shutdown_requested:
                                     (not toxic_fill) and hedge_bid <= HEDGE_THRESHOLD
                                 ):
                                     hedge_tick = get_tick_size_cached(held_token)
-                                    # 50/55 is only a tight book. GUI + last trade
-                                    # must also say the held side actually lost.
+                                    # 50/55 is only a tight book. GUI must agree
+                                    # with that book (held ≤ ask-max, other ≥
+                                    # complement), not wait for buy 30/70.
+                                    # Last trade still has to have printed down.
                                     # Sell at the live bid — 20¢, 5¢, one tick, whatever
                                     # is there. No strategy "won't take less than X".
                                     hedge_floor = float(hedge_tick)

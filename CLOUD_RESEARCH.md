@@ -9,7 +9,8 @@ clicked.” Hits without `pnl` are incomplete.
 
 Pathlog **cannot** replay Polymarket last-trade GUI, Chainlink/PTB, or POST
 latency. Paper mode: fill at the recorded ask, walk later ticks for a
-50/55/15 hedge (live 5m template) using mid-as-GUI when spread ≤ 10¢. Wide books fail closed.
+50/55/15 hedge (live 5m template) using mid-as-GUI when spread ≤ 10¢
+(held ≤ 55¢ / other ≥ 45¢; other need not be ahead). Wide books fail closed.
 Toxic dumps only while bid ≤ 50¢.
 
 Live books are **public** (Gamma + CLOB). `pathlog.py` records them with no
@@ -164,7 +165,7 @@ by pnl_sum (min 5 hits). Do not merge. Do not edit strategy_buy5m.json.
 | Live | Paper (`--paper` / `--sweep`) |
 |---|---|
 | Limit FAK at quoted ask, `budget/ask` | Same size model; displayed top is fillable cap |
-| GUI + last trade for hedge | Mid if spread ≤ 10¢; wide book = no hedge |
+| GUI + last trade for hedge | Mid if spread ≤ 10¢; 5m held ≤ 55¢ / other ≥ 45¢; wide book = no hedge |
 | BTC/PTB side gate | Not replayed (pathlog is books only) |
 | Unmatched FAK / POST RTT | Not replayed (optimistic fill at that tick) |
 | Toxic dump if bid ≤ 50¢ (5m) | Same from template; recovered bid > 50¢ rides |

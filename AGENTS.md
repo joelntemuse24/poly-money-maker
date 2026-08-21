@@ -21,7 +21,8 @@ The 5m bot buys the winning leg of Polymarket BTC "Up or Down" markets in
 | Same early window | **≥95¢** overlay | uses the early $2.50, not a third slice |
 
 Missed early does **not** become a $5 late buy. Same-leg add only (no
-straddle). Hedge **50/55** on the combined bag (plus inverted GUI). Winners
+straddle). Hedge **50/55** on the combined bag (GUI: held ≤ **55¢**, other
+≥ **45¢**; not inverted 30/70). Winners
 redeem at $1.00. **No profit-take sell.** See `CURRENT.md` for the active
 probe knobs.
 
@@ -213,7 +214,7 @@ two-slice $2.50+$2.50 add.
   hot-reload; the loop-body fix needs `sudo systemctl restart polybuybot5m`.
 - `hedge_attempt` / `hedge_fill` — hedge fired after force-fresh REST + book integrity + GUI consensus (normal path)
 - `hedge_skip_toxic_book` — bid dipped but ask/spread still say "not reversed"
-- `hedge_skip_no_consensus` — 50/55 (5m) or 35/40 book passed but GUI/last-trade still say the held side has not actually fallen (same class of check as buy)
+- `hedge_skip_no_consensus` — 50/55 book passed but 5m GUI/last-trade still fail (held last print ≤ 55¢, held GUI ≤ 55¢, other GUI ≥ 45¢, 5¢ gap). 15m/hourly still invert buy 70/30.
 - `hedge_skip_toxic_recovered` — `toxic_fill` is armed but held bid > hedge threshold (winner book); dump stays armed, no sell
 - `hedge_skip_incomplete_rest` — REST missing a side; fail closed (no WS sell)
 - `buy_skip_ambiguous` — GUI display prices too close (throttled 8s; **not** one event per market)
@@ -265,7 +266,8 @@ python check_buy_skips.py --since 2026-08-19T08:02:00
 
 `--sweep` scores the live 5m **example** late template (75–90 / 120s / $2.50)
 plus one-at-a-time window/band/size variants, with a **paper** hedge from that
-JSON (**50/55/15** + mid-as-GUI when spread ≤ 10¢). It does **not** union the
+JSON (**50/55/15** + mid-as-GUI when spread ≤ 10¢, held ≤ 55¢ / other ≥ 45¢,
+no other-ahead requirement). It does **not** union the
 early ≥90 / ≥95 windows and does **not** model two $2.50 slices. `--anatomy` answers “already decided at T-120 vs
 50/50 until the end.” `--compare` is the named-preset table; add `--paper` to
 walk later ticks. `--grid` is ask × time. **`--series 5m` matches only 5m**
@@ -308,11 +310,13 @@ Cloud agents: `CLOUD_RESEARCH.md`.
   POSTs do not. After a fully empty trigger, wait `empty_fak_cooldown_s` (0.15 s).
 - **Hedge is sell-only exit:** The bots never profit-take. The only sell path is the
   hedge: REST shows bid ≤ threshold **and** ask ≤ require_ask_max with tight
-  spread, **and** Polymarket GUI + last trade agree the held side actually lost
-  (held last print ≤ require_ask_max, held GUI ≤ 30¢, other GUI ≥ 70¢ — same
-  display rule as buy). Live 5m is **50/55**; hourly template is **55/60**
-  (service still **stopped**); 15m remains 35/40.
-  A random TOB clip is not enough; a last print of 85¢ on a 48/52 book will
+  spread, **and** Polymarket GUI + last trade agree with that book. 5m: held
+  last print ≤ **55¢**, held GUI ≤ **55¢**, other GUI ≥ **45¢** (complement of
+  ask-max). A 53¢ vs 47¢ book is the stop; the other side does **not** have to
+  already be the winner. Buy 70/30 is unchanged. 15m/hourly (stopped) still
+  invert 70/30. Live 5m book trigger is **50/55**; hourly template **55/60**;
+  15m remains 35/40.
+  A random TOB clip is not enough; a last print of 85¢ on a 52/54 book will
   `hedge_skip_no_consensus`. `toxic_fill` stays armed and still skips GUI /
   50/55/15 on 5m, but **sells only while held bid ≤ 50¢**. A recovered 97¢ book
   logs `hedge_skip_toxic_recovered` and rides; a 6¢ junk bid (even under a

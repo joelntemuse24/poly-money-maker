@@ -599,9 +599,11 @@ snapshot is young enough.
 legs need a display price (mid or last trade) or the bot logs
 `buy_skip_incomplete_book`.
 
-**Hedge GUI** is the **inverse** on the held token: held last trade ≤ ask-max
-(55¢ on 5m), held GUI ≤ 30¢, other GUI ≥ 70¢. A 48¢/52¢ book with last trade
-**85¢** is a clip, not a reversal → `hedge_skip_no_consensus`.
+**5m hedge GUI** matches the 50/55 book, not buy 70/30: held last trade ≤
+ask-max (55¢), held GUI ≤ 55¢, other GUI ≥ 45¢ (complement). A 53¢ vs 47¢
+display is the stop; the other side does not have to already be ahead.
+15m/hourly still invert 70/30. A 52/54 book with last trade **85¢** is a
+clip, not a reversal → `hedge_skip_no_consensus`.
 
 `entry_book_ok`: both sides present, not crossed, spread ≤ 5¢, bid ≥ 70¢.
 
@@ -778,7 +780,8 @@ caller.
    bid-only; no bid still skips.
 3. Bid bounced above 50¢ on REST → `hedge_cancel_bounce`.
 4. `hedge_book_ok` 50/55/15. Fail → `hedge_skip_toxic_book`.
-5. `hedge_consensus_ok` inverted GUI. Fail → `hedge_skip_no_consensus`.
+5. `hedge_consensus_ok` (5m: held ≤ ask-max / other ≥ complement; 15m/hourly:
+   inverted 70/30). Fail → `hedge_skip_no_consensus`.
 6. Write-ahead hedge quarantine, then FAK **sell at live bid minus
    `hedge_undercut_ticks`** (default 2 ticks = 0.002 on 5m).
    `hedge_sell_price` **ignores** `hedge_min_price` so a leftover 32¢ config
@@ -936,7 +939,7 @@ This is the one state-like tree that is allowed to delete itself. Do not
 
 **`check_path_backtest.py`:** first tick that matches an ask band and TTM
 window is a “hit.” Paper hedge walks later ticks with the **example JSON**
-hedge (5m: 50/55/15) using mid as GUI when spread ≤ 10¢. Pathlog has **no**
+hedge (5m: 50/55/15, held GUI ≤ 55¢ / other ≥ 45¢) using mid as GUI when spread ≤ 10¢. Pathlog has **no**
 last-trade, **no** BTC/PTB, **no** POST latency.
 
 **`--sweep` / `--compare` do not replay the early ≥90 / ≥95 union or two

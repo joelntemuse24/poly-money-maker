@@ -65,7 +65,7 @@ overlay on that same window. Late: **75–90¢** in the last **120s** only
 | Execution | Size `budget/ask`, **floor 3 shares** when `3 × limit ≤ $3`. Unmatched 400 re-quotes up to **3** FAKs; then **0.15 s** cooldown. Unclear POSTs still quarantine. |
 | GUI consensus | winner ≥ 70¢, loser ≤ 30¢ |
 | Windows | 5m **whole market**: early ≥90 / ≥95 for TTM (120, 300]; late 75–90 for TTM ≤ 120s (15m / hourly bots **not running**) |
-| Hedge | **Trigger** bid ≤ **50¢** and ask ≤ **55¢**, spread ≤ 15¢, **plus** inverted buy GUI. Combined early+late inventory. `toxic_fill` arms only when FAK **average** < 65¢ (not extra shares vs a 99¢-sized quote) and still dumps without GUI **only while held bid ≤ 50¢**. |
+| Hedge | **Trigger** bid ≤ **50¢** and ask ≤ **55¢**, spread ≤ 15¢, **plus** GUI held ≤ **55¢** / other ≥ **45¢** (not inverted 30/70). Last print ≤ 55¢. Combined early+late inventory. `toxic_fill` arms only when FAK **average** < 65¢ (not extra shares vs a 99¢-sized quote) and still dumps without GUI **only while held bid ≤ 50¢**. |
 | Underlying edge | **$0** (5m: any non-zero TWAP vs PTB) / **$10** (15m, hourly); side must match |
 | `max_open_positions` | **0 = unlimited** |
 | `toxic_force_exit_below` | **65¢** |
@@ -225,6 +225,11 @@ amount / HTTP 400), not this NameError.
       `[BUY FILL]` / no more `max accuracy of 2 decimals`.
       `check_buy_skips.py --since 2026-08-21T08:08:00` — `invalid_amount`
       should stop climbing. Do **not** start 15m / hourly / mint.
+- [ ] **5m hedge GUI is 55/45, not inverted 30/70.** Held display ≤ ask-max
+      (55¢), other ≥ complement (45¢); other need not already be ahead.
+      Last print ≤ 55¢ and two-sided 50/55/15 stay. **Code change — restart
+      required:** `git pull` then `sudo systemctl restart polybuybot5m`.
+      Buy 70/30 unchanged. Do **not** start 15m / hourly / mint.
 - [ ] Hourly three-slice bot is in the repo (`buybothourly.py` + example JSON).
       **Do not start `polybuybothourly`.** Operator later: `git pull`, set live
       `strategy_buyhourly.json` (`dry_run` / `entry_enabled` only when they mean
