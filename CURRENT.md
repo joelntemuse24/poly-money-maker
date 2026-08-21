@@ -3,7 +3,10 @@
 **Agents: read this after `AGENTS.md`.** Update this file when ops/strategy decisions change.
 Do not put secrets, API keys, or live wallet material here.
 
-Last updated: **2026-08-20** — **only the 5m CLOB bot is live.** Stop/disable
+Last updated: **2026-08-20** — **only the 5m CLOB bot is live.** Look interval
+is **0.01s** on live (unexpired) inventory and any 5m in the last 5 minutes.
+Unredeemed leftover 5m shares are **WAIT** (background redeem), not **POS** —
+do not walk hundreds of closed bags on the buy path. Stop/disable
 15m and hourly. Split the 5m stake into **two $2.50 slices** (**$5** if both
 fill): **early ≥90¢ (to 99¢) in the first 3 minutes** and **≥95¢ overlay**
 there, then **$2.50 only in the last 120s at the old 75–90¢ band**. Missed
@@ -49,6 +52,7 @@ overlay on that same window. Late: **75–90¢** in the last **120s** only
 | Underlying edge | **$0** (5m: any non-zero TWAP vs PTB) / **$10** (15m, hourly); side must match |
 | `max_open_positions` | **0 = unlimited** |
 | `toxic_force_exit_below` | **65¢** |
+| `poll_buy_window_s` / `poll_held_s` | **0.01** (live JSON + restart). Banner **POS** = live hedge only; **WAIT** = unredeemed leftover 5m shares (background redeem, not quoted). |
 
 **Also running (no orders):** `pathlog.py` (`polypathlog`) writes one JSONL file
 per market under `pathlog/ticks/` so we can ask “if we had bought at 80¢ with
@@ -157,7 +161,7 @@ amount / HTTP 400), not this NameError.
   sudo systemctl stop polybuybot polybuybothourly
   sudo systemctl disable polybuybot polybuybothourly
   cd ~/poly-money-maker && git pull
-  python3 -c 'import json; from pathlib import Path; p=Path("strategy_buy5m.json"); d=json.loads(p.read_text()); d["min_underlying_edge_usd"]=0.0; d["hedge_threshold"]=0.50; d["hedge_require_ask_max"]=0.55; d["buy_budget"]=2.5; d["late_buy_budget"]=2.5; d["buy_max_price"]=0.90; p.write_text(json.dumps(d, indent=2)+"\n"); print("budget", d["buy_budget"], "late", d["late_buy_budget"], "hedge", d["hedge_threshold"], d["hedge_require_ask_max"])'
+  python3 -c 'import json; from pathlib import Path; p=Path("strategy_buy5m.json"); d=json.loads(p.read_text()); d["min_underlying_edge_usd"]=0.0; d["hedge_threshold"]=0.50; d["hedge_require_ask_max"]=0.55; d["buy_budget"]=2.5; d["late_buy_budget"]=2.5; d["buy_max_price"]=0.90; d["poll_buy_window_s"]=0.01; d["poll_held_s"]=0.01; d["ui_every_n_cycles"]=50; p.write_text(json.dumps(d, indent=2)+"\n"); print("budget", d["buy_budget"], "late", d["late_buy_budget"], "hedge", d["hedge_threshold"], d["hedge_require_ask_max"], "poll", d["poll_buy_window_s"], d["poll_held_s"])'
   sudo systemctl restart polybuybot5m
   sudo systemctl enable polybuybot5m
   systemctl is-active polybuybot polybuybot5m polybuybothourly
@@ -192,8 +196,11 @@ amount / HTTP 400), not this NameError.
 - [x] 5m BUY FAKs size `budget/ask` and limit at the **open band max**
       (99¢ early, then 90¢ late after the two-slice change).
 - [ ] After merge: `git pull`, set live `late_buy_budget=2.5` (keep
-      `buy_budget=2.5`, `buy_max_price=0.90`), then
-      `sudo systemctl restart polybuybot5m` only. Watch `buy_attempt`
+      `buy_budget=2.5`, `buy_max_price=0.90`), **`poll_buy_window_s=0.01`**,
+      **`poll_held_s=0.01`**, then
+      `sudo systemctl restart polybuybot5m` only. Watch banner **POS** (live
+      hedges, not 700 leftover bags), **WAIT n**, and `sleeping 0.01s` with
+      wall-clock cycles near that. Watch `buy_attempt`
       `slice=early|late` and `add=true` on the second $2.50. Do **not**
       start 15m / hourly / mint. Do **not** set `buy_budget` to 5.
 - [ ] Cloud paper P&L: paste `CLOUD_RESEARCH.md` section 2 (live `pathlog.py`
