@@ -65,7 +65,7 @@ on the combined bag:
 | Execution | Size `budget/ask`, **floor 3 shares** when `3 × limit ≤ $3`. Unmatched 400 re-quotes up to **3** FAKs; then **0.15 s** cooldown. Unclear POSTs still quarantine. |
 | GUI consensus | winner ≥ 70¢, loser ≤ 30¢ |
 | Windows | 5m **whole market**: early ≥90 / ≥95 for TTM (120, 300]; late 75–90 for TTM ≤ 120s (15m / hourly bots **not running**) |
-| Hedge | **Trigger** bid ≤ **53¢** and ask ≤ **55¢**, spread ≤ 15¢, **plus** inverted buy GUI. Combined early+late inventory. `toxic_fill` arms only when FAK **average** < 65¢ (not extra shares vs a 99¢-sized quote) and still dumps without GUI **only while held bid ≤ 53¢**. |
+| Hedge | **Trigger** bid ≤ **53¢** and ask ≤ **55¢**, spread ≤ 15¢, **plus** GUI held ≤ **55¢** / other ≥ **45¢** (not inverted 30/70). Last print ≤ 55¢. Combined early+late inventory. `toxic_fill` arms only when FAK **average** < 65¢ (not extra shares vs a 99¢-sized quote) and still dumps without GUI **only while held bid ≤ 53¢**. |
 | Underlying edge | **$0** (5m: any non-zero TWAP vs PTB) / **$10** (15m, hourly); side must match |
 | `max_open_positions` | **0 = unlimited** |
 | `toxic_force_exit_below` | **65¢** |
@@ -216,14 +216,14 @@ amount / HTTP 400), not this NameError.
 - [x] Faster look (0.01s) + drop leftover wallet dust — operator pulled
       `bd607db` / #108 and restarted **polybuybot5m** 21 Aug 2026 **08:08Z**.
       Banner `WAIT 8`, `sleeping 0.01s`, NAV ~$147. Dust drop worked.
-- [ ] **5m hedge bid 53¢** (`hedge_threshold=0.53`, ask max still **55¢**).
-      Live JSON **must** set the key (hot reload; an old `0.50` file keeps
-      50/55). After merge:
-      ```bash
-      python3 -c 'import json; from pathlib import Path; p=Path("strategy_buy5m.json"); d=json.loads(p.read_text()); d["hedge_threshold"]=0.53; d["hedge_require_ask_max"]=0.55; p.write_text(json.dumps(d, indent=2)+"\n"); print("hedge", d["hedge_threshold"], d["hedge_require_ask_max"])'
-      ```
-      Banner `HEDGE ≤53¢`. No 5m restart required for this knob. Do **not**
-      start 15m / hourly / mint.
+- [x] **5m hedge bid 53¢** (`hedge_threshold=0.53`, ask max still **55¢**) —
+      merged. Live JSON already has the keys (hot reload; no restart for that
+      knob). Banner `HEDGE ≤53¢`.
+- [ ] **5m hedge GUI is 55/45, not inverted 30/70.** Held display ≤ ask-max
+      (55¢), other ≥ complement (45¢); other need not already be ahead.
+      Last print ≤ 55¢ and two-sided **53/55/15** stay. **Code change — restart
+      required:** `git pull` then `sudo systemctl restart polybuybot5m`.
+      Buy 70/30 unchanged. Do **not** start 15m / hourly / mint.
 - [ ] Hourly three-slice bot is in the repo (`buybothourly.py` + example JSON).
       **Do not start `polybuybothourly`.** Operator later: `git pull`, set live
       `strategy_buyhourly.json` (`dry_run` / `entry_enabled` only when they mean

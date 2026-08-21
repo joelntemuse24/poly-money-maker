@@ -357,6 +357,25 @@ class PaperExitTests(unittest.TestCase):
         self.assertEqual(out["exit"], "toxic_dump")
         self.assertAlmostEqual(out["exit_bid"], 0.11)
 
+    def test_5m_paper_hedges_53c_stop_while_held_still_ahead(self):
+        fill = simulate_fak_buy(2.5, 0.90, None)
+        hit = {"ts": 1, "ttm": 90, "leg": "up", "ask": 0.90}
+        ticks = [
+            _tick(1, 90, 0.90, 0.10),
+            _tick(2, 40, 0.54, 0.48, ub=0.52, db=0.46),
+        ]
+        out = paper_settle(
+            ticks, hit, fill, winner="down",
+            hedge_threshold=0.53,
+            hedge_require_ask_max=0.55,
+            last_trade_max=0.55,
+            hedge_held_gui_max=0.55,
+            hedge_other_gui_min=0.45,
+            require_gui_reversed=False,
+        )
+        self.assertEqual(out["exit"], "hedge")
+        self.assertAlmostEqual(out["exit_bid"], 0.52)
+
 
 class SweepTemplateTests(unittest.TestCase):
     def test_template_reads_5m_example(self):
@@ -370,6 +389,9 @@ class SweepTemplateTests(unittest.TestCase):
         self.assertTrue(tmpl["hedge_require_gui"])
         self.assertEqual(tmpl["hedge_threshold"], 0.53)
         self.assertEqual(tmpl["hedge_require_ask_max"], 0.55)
+        self.assertEqual(tmpl["hedge_held_gui_max"], 0.55)
+        self.assertEqual(tmpl["hedge_other_gui_min"], 0.45)
+        self.assertFalse(tmpl["require_gui_reversed"])
 
     def test_template_15m_example_stays_buy_max_price(self):
         tmpl = template_from_strategy(

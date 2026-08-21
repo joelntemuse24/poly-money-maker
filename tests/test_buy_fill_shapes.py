@@ -1164,6 +1164,69 @@ class BuyExecutionAmbiguity(unittest.TestCase):
         self.assertIn('tick_size="0.001"', chunk)
 
 
+class FiveMinuteHedgeGuiTests(unittest.TestCase):
+    """5m hedge GUI follows 53/55, not buy 70/30. 15m/hourly stay inverted."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.ns = _load_funcs(
+            "finite_float",
+            "polymarket_display_price",
+            "hedge_gui_limits",
+            "hedge_consensus_ok",
+            bot=BOT5M,
+        )
+
+    def test_gui_limits_are_ask_max_and_complement(self):
+        self.assertEqual(self.ns["hedge_gui_limits"](0.55), (0.55, 0.45))
+        self.assertEqual(self.ns["hedge_gui_limits"](0.40), (0.40, 0.60))
+
+    def test_accepts_53c_stop_while_held_still_slightly_ahead(self):
+        # Tight 52/54 (mid 53) vs 46/48 (mid 47): the 53¢ stop, not a 30¢ loser.
+        held_max, other_min = self.ns["hedge_gui_limits"](0.55)
+        ok, why = self.ns["hedge_consensus_ok"](
+            0.52, 0.54, 0.52,
+            0.46, 0.48, 0.47,
+            held_gui_max=held_max, other_gui_min=other_min,
+            min_edge=0.05, last_trade_max=0.55,
+        )
+        self.assertTrue(ok)
+        self.assertEqual(why, "ok")
+
+    def test_still_rejects_85c_last_trade_on_tight_53c_book(self):
+        held_max, other_min = self.ns["hedge_gui_limits"](0.55)
+        ok, why = self.ns["hedge_consensus_ok"](
+            0.52, 0.54, 0.85,
+            0.46, 0.48, 0.47,
+            held_gui_max=held_max, other_gui_min=other_min,
+            min_edge=0.05, last_trade_max=0.55,
+        )
+        self.assertFalse(ok)
+        self.assertEqual(why, "last_trade_too_high")
+
+    def test_still_rejects_other_leg_that_has_not_repriced(self):
+        held_max, other_min = self.ns["hedge_gui_limits"](0.55)
+        ok, why = self.ns["hedge_consensus_ok"](
+            0.52, 0.54, 0.52,
+            0.20, 0.25, 0.22,
+            held_gui_max=held_max, other_gui_min=other_min,
+            min_edge=0.05, last_trade_max=0.55,
+        )
+        self.assertFalse(ok)
+        self.assertEqual(why, "other_gui_too_low")
+
+    def test_5m_call_site_uses_ask_max_complement_not_buy_70_30(self):
+        src = BOT5M.read_text()
+        self.assertIn("def hedge_gui_limits(", src)
+        self.assertIn("hedge_gui_limits(HEDGE_REQUIRE_ASK_MAX)", src)
+        self.assertNotIn("held_gui_max=MAX_LOSER_BID", src)
+        self.assertNotIn("other_gui_min=MIN_WINNER_BID", src)
+        start = src.find("def hedge_consensus_ok(")
+        end = src.find("\ndef quoted_buy_shares(", start)
+        self.assertNotIn('return False, "gui_not_reversed"', src[start:end])
+        self.assertIn('return False, "gui_not_reversed"', BOT.read_text())
+
+
 class FiveMinuteBandLimitFakTests(unittest.TestCase):
     """5m FAK limit is the open band max (90¢ late, 99¢ early); size stays budget/ask."""
 
