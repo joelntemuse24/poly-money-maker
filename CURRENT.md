@@ -26,7 +26,8 @@ on 5m BUY `OrderArgs`.** `toxic_fill` dumps without GUI only while bid ≤
 50¢.
 
 **Hourly (`polybuybothourly`):** started **21 Aug 2026 ~09:58 UTC** with
-`dry_run: false` and `entry_enabled: true`. Three slices, **$10 hard cap**
+`dry_run: false` and `entry_enabled: true`. **Enable on boot**
+(`sudo systemctl enable polybuybothourly` — does not restart). Three slices, **$10 hard cap**
 per market (sum of fills), same-leg only, hedge **55/60**. Slice A (last
 22 min, ask **> 93¢**) spends at most **$5** at **99¢**. Slice B (last 15
 min, ask **75–90¢**) remaining to $10 at **90¢**. Slice C (last 5 min,
@@ -189,6 +190,7 @@ amount / HTTP 400), not this NameError.
   python3 -c 'import json; from pathlib import Path; p=Path("strategy_buy5m.json"); d=json.loads(p.read_text()); d["min_underlying_edge_usd"]=0.0; d["hedge_threshold"]=0.50; d["hedge_require_ask_max"]=0.55; d["buy_budget"]=2.5; d["late_buy_budget"]=2.5; d["buy_max_price"]=0.90; d["poll_buy_window_s"]=0.01; d["poll_held_s"]=0.01; d["ui_every_n_cycles"]=50; p.write_text(json.dumps(d, indent=2)+"\n"); print("budget", d["buy_budget"], "late", d["late_buy_budget"], "hedge", d["hedge_threshold"], d["hedge_require_ask_max"], "poll", d["poll_buy_window_s"], d["poll_held_s"])'
   sudo systemctl restart polybuybot5m
   sudo systemctl enable polybuybot5m
+  sudo systemctl enable polybuybothourly
   systemctl is-active polybuybot polybuybot5m polybuybothourly polymintbot polypathlog
   # expect: inactive  active  active  inactive  active
   .venv/bin/python check_buy_skips.py --since "$(date -u -d '2 hours ago' '+%Y-%m-%dT%H:%M:%S')"
@@ -238,7 +240,9 @@ amount / HTTP 400), not this NameError.
       separate process — do **not** restart 5m for hourly.
 - [x] Hourly three-slice bot started **21 Aug 2026 ~09:58 UTC**
       (`polybuybothourly`, `dry_run: false`, `entry_enabled: true`).
-      Watch `buybothourly.log` (not journalctl) for `slice=a22|b15|c5`.
+      `is-enabled` was `disabled` after `start` only — run
+      `sudo systemctl enable polybuybothourly` (no restart) so it comes
+      back on reboot. Watch `buybothourly.log` for `slice=a22|b15|c5`.
       Leave 5m running. Do not start 15m or mint.
 - [ ] Cloud paper P&L: paste `CLOUD_RESEARCH.md` section 2 (live `pathlog.py`
       + `--sweep --paper`, rank by `pnl_sum` vs `live_5m_paper`). No `.env`.

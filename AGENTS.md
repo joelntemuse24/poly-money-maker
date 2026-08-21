@@ -30,7 +30,9 @@ Last 120s is **75–90¢ only** — do not buy 91–99¢ after T-120. `buy_max_p
 `early_buy_max_price` (0.99).
 
 **Hourly (`polybuybothourly`) is live** (started 21 Aug 2026 ~09:58 UTC,
-`dry_run: false`, `entry_enabled: true`). Three minutes-based slices and a
+`dry_run: false`, `entry_enabled: true`). **Enable on boot**
+(`sudo systemctl enable polybuybothourly`; `start` alone leaves it
+`disabled`). Three minutes-based slices and a
 **$10 per-market spend cap** (same-leg only, combined-bag hedge **55/60**).
 Do **not** restart it unless an hourly bugfix requires it. Do **not** start
 a second copy. Inclusive TTM: `0 < minutes_left ≤ window`. Ask **> 0.93** /
@@ -386,9 +388,10 @@ python3 -c 'import json; from pathlib import Path; p=Path("strategy_buy5m.json")
 sudo systemctl restart polybuybot5m
 ```
 
-Hourly is **live**. After an hourly code pull you trust (not this docs
-change): `sudo systemctl restart polybuybothourly`. Do **not** restart 5m
-for hourly-only work. Do **not** start 15m or mint.
+Hourly is **live**. Keep it enabled on boot:
+`sudo systemctl enable polybuybothourly` (does not restart). After an
+hourly code pull you trust: `sudo systemctl restart polybuybothourly`.
+Do **not** restart 5m for hourly-only work. Do **not** start 15m or mint.
 
 ## Dependencies
 

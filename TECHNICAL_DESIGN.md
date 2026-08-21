@@ -162,7 +162,7 @@ logs and pathlog ticks are capped.
 | Unit | Script | Live? |
 |---|---|---|
 | `polybuybot5m` | `buybot5m.py` | **yes — places orders** |
-| `polybuybothourly` | `buybothourly.py` | **yes — places orders** (started 21 Aug 2026 ~09:58 UTC) |
+| `polybuybothourly` | `buybothourly.py` | **yes — places orders** (started 21 Aug 2026 ~09:58 UTC; **enable on boot**) |
 | `polypathlog` | `pathlog.py` | **yes — GET books only** |
 | `polybuybot` | `buybot.py` | stopped |
 | `polymintbot` | `mintbot.py` | paused |
@@ -170,6 +170,8 @@ logs and pathlog ticks are capped.
 Unit files live in `deploy/` and are copied to `/etc/systemd/system/`. The 5m
 and hourly units load `.env` (secrets). Pathlog’s unit does **not** — it
 needs no keys. Hourly was `systemctl start`ed after the three-slice merge;
+`start` does **not** survive reboot. Enable it (no restart) with
+`sudo systemctl enable polybuybothourly` so `is-enabled` is `enabled`.
 CI still does **not** start or restart it. `git pull` is not a restart.
 
 **Wallet:** Polymarket uses a **proxy** address (`FUNDER_ADDRESS`) that holds
