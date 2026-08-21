@@ -7,9 +7,9 @@ and why the non-boilerplate code exists — is `TECHNICAL_DESIGN.md`.
 
 ## Project at a Glance
 
-**Live on the VM:** **5m buy bot only** (`polybuybot5m`) plus a no-order path
-recorder (`polypathlog`). 15m and hourly buy services are **stopped**. Mint
-(`polymintbot`) is **paused**.
+**Live on the VM:** **5m** (`polybuybot5m`) **and hourly**
+(`polybuybothourly`) buy bots, plus a no-order path recorder
+(`polypathlog`). 15m is **stopped**. Mint (`polymintbot`) is **paused**.
 
 The 5m bot buys the winning leg of Polymarket BTC "Up or Down" markets in
 **two $2.50 slices** (up to **$5** if both fill):
@@ -29,13 +29,15 @@ Last 120s is **75–90¢ only** — do not buy 91–99¢ after T-120. `buy_max_p
 0.90 is the late cap and the early ≥90 floor. Early FAK limit is
 `early_buy_max_price` (0.99).
 
-**Hourly (`polybuybothourly`) is still stopped.** Code now has three
-minutes-based slices and a **$10 per-market spend cap** (same-leg only,
-combined-bag hedge **55/60**). Do **not** start it until the operator
-copies `strategy_buyhourly.example.json` knobs into live JSON and
-explicitly enables `dry_run` / `entry_enabled`. Inclusive TTM:
-`0 < minutes_left ≤ window`. Ask **> 0.93** / **> 0.95** are exclusive;
-75–90 is inclusive. Do not copy 5m `seconds_left` into hourly.
+**Hourly (`polybuybothourly`) is live** (started 21 Aug 2026 ~09:58 UTC,
+`dry_run: false`, `entry_enabled: true`). **Enable on boot**
+(`sudo systemctl enable polybuybothourly`; `start` alone leaves it
+`disabled`). Three minutes-based slices and a
+**$10 per-market spend cap** (same-leg only, combined-bag hedge **55/60**).
+Do **not** restart it unless an hourly bugfix requires it. Do **not** start
+a second copy. Inclusive TTM: `0 < minutes_left ≤ window`. Ask **> 0.93** /
+**> 0.95** are exclusive; 75–90 is inclusive. Do not copy 5m `seconds_left`
+into hourly.
 
 | When (time to close) | Winning ask | Slice | Spend | FAK limit |
 |---|---|---|---|---|
@@ -51,7 +53,7 @@ Priority: the band that **contains** the ask. 75–90 never posts at 99¢.
 |---|---|---|---|---|---|
 | `buybot.py` | `polybuybot` **stopped** | 15m | Chainlink TWAP 60s | $2.50 | final 4.0 min, 75–90¢, hedge 35/40 |
 | `buybot5m.py` | `polybuybot5m` **live** | 5m | Chainlink TWAP 30s | $2.50+$2.50 | bands above; hedge **50/55** |
-| `buybothourly.py` | `polybuybothourly` **stopped** | hourly | Binance BTCUSDT | $10 cap (A $5 / B–C remainder) | last 22/15/5 min; hedge **55/60** |
+| `buybothourly.py` | `polybuybothourly` **live** | hourly | Binance BTCUSDT | $10 cap (A $5 / B–C remainder) | last 22/15/5 min; hedge **55/60** |
 | `pathlog.py` | `polypathlog` **live** | all three | — (CLOB books only) | — | whole 5m; last 8m of 15m; last 15m of hourly |
 
 Plus: `check_book.py`, `check_participation.py`, `check_path_backtest.py`,
@@ -65,8 +67,8 @@ Plus: `check_book.py`, `check_participation.py`, `check_path_backtest.py`,
 | File | What it does | Mirrors |
 |---|---|---|
 | `buybot.py` (~5063 lines) | 15m buy bot | `buybot5m.py`, `buybothourly.py` |
-| `buybot5m.py` (~5177 lines) | 5m buy bot (**live**) | `buybot.py`, `buybothourly.py` |
-| `buybothourly.py` (~5061 lines) | Hourly buy bot | `buybot.py`, `buybot5m.py` |
+| `buybot5m.py` (~5761 lines) | 5m buy bot (**live**) | `buybot.py`, `buybothourly.py` |
+| `buybothourly.py` (~5789 lines) | Hourly buy bot (**live**) | `buybot.py`, `buybot5m.py` |
 | `buy/market.py` | MarketGateway — Gamma discovery + metadata | — |
 | `buy/btc_price.py` | Resolution-aligned BTC feeds (TWAP 30/60, Binance) + PTB | — |
 | `buy/clob_book_ws.py` | CLOB market-channel WS top-of-book (buy/hedge speed path) | — |
@@ -134,8 +136,10 @@ functions with `ast` (`tests/test_buy_fill_shapes.py`).
 - **Never commit live `strategy_*.json`, `.env`, or state files** — they are
   gitignored but double-check before `git add .`.
 - **Do not restart `polymintbot` unless the operator asks.**
-- **Do not start `polybuybot` / `polybuybothourly` unless the operator asks** —
-  live trading is 5m-only (`polybuybot5m`).
+- **Do not start `polybuybot` unless the operator asks** — 15m stays stopped.
+  Hourly is **live**; do not restart `polybuybothourly` unless an hourly
+  bugfix requires it, and do not start a second copy (`python buybothourly.py`
+  while systemd is running).
 - **Do not add a profit-take sell** unless the operator asks. Hedge is the only
   sell path. Take-profit was evaluated and dropped (unreachable on ≥90¢ fills;
   cuts $1.00 rides on 75–85¢ fills).
@@ -299,9 +303,9 @@ Cloud agents: `CLOUD_RESEARCH.md`.
   making. 5m buys are **limit** FAKs at the **open band max** (late **90¢**,
   early **99¢**) sized `budget/ask` per slice, **at least 3 shares** when
   `3 × limit` fits in `buy_max_spend` $3 (early 3.00 sh / $2.97, not 2.00 /
-  $1.98; `buy_max_shares` 5; not displayed top size). Hourly (still
-  **stopped**) uses the same limit-FAK sizer: A/C at **99¢**, B at **90¢**,
-  `buy_max_spend` **$11**, `buy_max_shares` **14**. 15m (stopped) still pins
+  $1.98; `buy_max_shares` 5; not displayed top size). Hourly uses the same
+  limit-FAK sizer: A/C at **99¢**, B at **90¢**, `buy_max_spend` **$11**,
+  `buy_max_shares` **14**. 15m (stopped) still pins
   the limit to the quoted ask. Sells stay
   share-denominated market FAKs. A 400 **"no orders found to match"** re-quotes and
   POSTs again (up to 3) in the same trigger; invalid-amount / auth 400s and unclear
@@ -310,18 +314,19 @@ Cloud agents: `CLOUD_RESEARCH.md`.
   hedge: REST shows bid ≤ threshold **and** ask ≤ require_ask_max with tight
   spread, **and** Polymarket GUI + last trade agree the held side actually lost
   (held last print ≤ require_ask_max, held GUI ≤ 30¢, other GUI ≥ 70¢ — same
-  display rule as buy). Live 5m is **50/55**; hourly template is **55/60**
-  (service still **stopped**); 15m remains 35/40.
+  display rule as buy). Live 5m is **50/55**; live hourly is **55/60**;
+  15m remains 35/40.
   A random TOB clip is not enough; a last print of 85¢ on a 48/52 book will
   `hedge_skip_no_consensus`. `toxic_fill` stays armed and still skips GUI /
-  50/55/15 on 5m, but **sells only while held bid ≤ 50¢**. A recovered 97¢ book
+  50/55/15 on 5m (55/60/15 on hourly), but **sells only while held bid ≤
+  threshold** (50¢ on 5m, **55¢** on hourly). A recovered 97¢ book
   logs `hedge_skip_toxic_recovered` and rides; a 6¢ junk bid (even under a
-  99¢ ask) still dumps on bid-only REST. Fresh WS bid > 50¢ skips REST for
-  both normal and toxic. After a dump is allowed, the FAK sells at the
+  99¢ ask) still dumps on bid-only REST. Fresh WS bid above threshold skips
+  REST for both normal and toxic. After a dump is allowed, the FAK sells at the
   **live bid** even if it is 20¢. Everything else rides to redemption at
   $1.00. WS may *arm* a hedge check; normal sells need two-sided REST.
-  **Live `strategy_buy5m.json` must set the hedge keys** or an old 35/40 file
-  keeps the old hedge after hot reload.
+  **Live `strategy_buy5m.json` / `strategy_buyhourly.json` must set the hedge
+  keys** or an old 35/40 file keeps the old hedge after hot reload.
 - **Tick sizes:** 5m markets use `0.001`, 15m and hourly use `0.01`.
 - **One fill per slice:** 5m `early_bought` / `late_bought`. Hourly
   `t22_bought` / `t15_bought` / `t5_bought` (same-leg add up to a **$10**
@@ -364,7 +369,7 @@ Cloud agents: `CLOUD_RESEARCH.md`.
 |---|---|---|
 | `polybuybot.service` | `buybot.py` (15m) | **stopped** |
 | `polybuybot5m.service` | `buybot5m.py` (5m) | **yes** |
-| `polybuybothourly.service` | `buybothourly.py` (hourly) | **stopped** |
+| `polybuybothourly.service` | `buybothourly.py` (hourly) | **yes** |
 | `polypathlog.service` | `pathlog.py` (CLOB path recorder; no orders) | **yes** |
 | `polymintbot.service` | `mintbot.py` | **paused** |
 
@@ -383,10 +388,10 @@ python3 -c 'import json; from pathlib import Path; p=Path("strategy_buy5m.json")
 sudo systemctl restart polybuybot5m
 ```
 
-Hourly stays **stopped**. After the operator decides to run it (not this
-agent): `git pull`, copy the example knobs into live `strategy_buyhourly.json`
-(`dry_run` / `entry_enabled` only when they mean it), then
-`sudo systemctl start polybuybothourly`. Do **not** restart 5m for this.
+Hourly is **live**. Keep it enabled on boot:
+`sudo systemctl enable polybuybothourly` (does not restart). After an
+hourly code pull you trust: `sudo systemctl restart polybuybothourly`.
+Do **not** restart 5m for hourly-only work. Do **not** start 15m or mint.
 
 ## Dependencies
 
