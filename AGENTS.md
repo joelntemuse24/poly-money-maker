@@ -213,6 +213,13 @@ two-slice $2.50+$2.50 add.
   5m shares still in the wallet; they are **not** quoted every tick
 - `sleeping 0.01s` — look interval after a short cycle. If wall clock is still
   seconds, the cycle body is still fat (do not “fix” that by sleeping less)
+- `[SETTLE SKIP] redeem skipped: zero position balance` — WAIT drain of a
+  leftover 5m bag with nothing on-chain; blacklisted (`redeem_abandoned` in
+  state, kept across restarts). Do **not** delete `positions_buy5m.json`.
+  Do **not** try to sell them (no CLOB book). Real leftover CTF shares redeem
+  at $1; ghosts stay in the Data API until Polymarket drops them.
+- CLOB `404` `No orderbook exists` — a dead token is still on the REST/WS
+  quote path (clockless `bought_token` must not be treated as a live hedge)
 
 ## Research loop (before changing live knobs)
 

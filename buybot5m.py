@@ -937,17 +937,30 @@ def position_is_live_hedge(pos, meta, now_s, expiry_grace_s=30.0):
     ):
         return False
     end_ts = meta_end_ts(meta)
-    if end_ts > 0 and float(now_s) - end_ts > float(expiry_grace_s):
+    # A bag we cannot date is leftover inventory, not a live hedge. Inventing
+    # a 24h clock used to keep quoting dead tokens (CLOB 404) every 0.01s.
+    if end_ts <= 0:
         return False
-    if end_ts <= 0 and not meta.get("bought_token") and not meta.get("buy_uncertain"):
+    if float(now_s) - end_ts > float(expiry_grace_s):
         return False
     return True
 
 
-def should_stub_tracked_market(pos, meta, now_s):
-    """Gamma stubs are for live hedges and quarantines, not wallet dust."""
+# Inspect an unresolved BUY/SELL for this long after the 5m window ends.
+# August leftovers must not stay on the 0.01s quote path.
+def uncertain_still_recoverable(meta, now_s, recovery_s=600.0):
     meta = meta or {}
-    if meta.get("buy_uncertain") or meta.get("hedge_uncertain"):
+    if not (meta.get("buy_uncertain") or meta.get("hedge_uncertain")):
+        return False
+    end_ts = meta_end_ts(meta)
+    if end_ts <= 0:
+        return True
+    return float(now_s) - end_ts <= float(recovery_s)
+
+
+def should_stub_tracked_market(pos, meta, now_s):
+    """Gamma stubs are for live hedges and recent quarantines, not wallet dust."""
+    if uncertain_still_recoverable(meta, now_s):
         return True
     return position_is_live_hedge(pos, meta, now_s)
 
@@ -955,7 +968,7 @@ def should_stub_tracked_market(pos, meta, now_s):
 def market_needs_fast_path(market, pos, meta, now_s, horizon_s, extra_s=30.0):
     """Quote/hedge/buy this 5m event; skip the rest of the Gamma slate."""
     meta = meta or {}
-    if meta.get("buy_uncertain") or meta.get("hedge_uncertain"):
+    if uncertain_still_recoverable(meta, now_s):
         return True
     if position_is_live_hedge(pos, meta, now_s):
         return True
@@ -979,8 +992,23 @@ def bag_size(pos):
     )
 
 
-def count_wallet_bags(held):
-    return sum(1 for pos in (held or {}).values() if bag_size(pos) > 0.01)
+def count_wallet_bags(held, tracked_meta=None):
+    """Bags still in the Data API that are not yet abandoned/confirmed.
+
+    `redeem_abandoned` means the relayer already said there is nothing to
+    redeem (zero on-chain). Those ghosts stay in the wallet API until
+    Polymarket drops them; they are not WAIT and must not be retried.
+    """
+    tracked_meta = tracked_meta or {}
+    n = 0
+    for cid, pos in (held or {}).items():
+        if bag_size(pos) <= 0.01:
+            continue
+        meta = tracked_meta.get(cid) or {}
+        if meta.get("redeem_abandoned") or meta.get("redeem_confirmed"):
+            continue
+        n += 1
+    return n
 
 
 def count_live_hedges(held, tracked_meta, now_s):
@@ -1009,7 +1037,7 @@ def add_tracked_market_stubs(markets, held, tracked_meta, now_s):
         str(cond)
         for cond, meta in tracked_meta.items()
         if isinstance(meta, dict)
-        and (meta.get("buy_uncertain") or meta.get("hedge_uncertain"))
+        and should_stub_tracked_market({}, meta, now_s)
     )
     for cond in recovery_conditions:
         if cond in by_condition:
@@ -1045,14 +1073,11 @@ def add_tracked_market_stubs(markets, held, tracked_meta, now_s):
         ):
             continue
         if end_ts <= 0:
-            # Missing clock: keep hedge quoting without arming the buy window
-            # (TTM ~24h is outside BUY_HORIZON_S). Uncertain-only stubs expire
-            # immediately so clearing quarantine cannot buy.
-            end_ts = (
-                now_s + 86400
-                if position_is_live_hedge(pos, meta, now_s)
-                else now_s
-            )
+            if not uncertain:
+                continue
+            # Uncertain-only stub is already expired so clearing quarantine
+            # cannot arm a buy. Do not invent a 24h live market.
+            end_ts = now_s
         up_token = str(meta.get("up_token") or up.get("asset") or "")
         dn_token = str(meta.get("dn_token") or dn.get("asset") or "")
         uncertain_token = str(
@@ -1088,11 +1113,20 @@ def add_tracked_market_stubs(markets, held, tracked_meta, now_s):
 
 # ------------------------- PRICING -------------------------
 
+def _clob_book_missing(err):
+    if getattr(err, "status_code", None) == 404:
+        return True
+    text = str(err or "").lower()
+    return "no orderbook exists" in text or "status_code=404" in text
+
+
 def get_book_bid(token_id):
     try:
         book = safe_api_call(client.get_order_book, token_id)
         path = "sdk"
     except Exception as sdk_err:
+        if _clob_book_missing(sdk_err):
+            return None, 0.0
         try:
             resp = requests.get(f"{HOST}/book", params={"token_id": token_id}, timeout=5)
             resp.raise_for_status()
@@ -1164,6 +1198,8 @@ def get_book_quote(token_id, expected_condition_id=None):
         book = safe_api_call(client.get_order_book, token_id)
         path = "sdk"
     except Exception as sdk_err:
+        if _clob_book_missing(sdk_err):
+            return None, 0.0, None, 0.0, None
         try:
             resp = _http_get(
                 f"{HOST}/book", params={"token_id": token_id}, timeout=5,
@@ -3382,6 +3418,11 @@ signal.signal(signal.SIGTERM, _handle_shutdown)
 # ------------------------- MAIN LOOP -------------------------
 
 positions_meta = load_json(STATE_FILE, required=not DRY_RUN)
+_redeem_permanent_failures.update(
+    str(cid)
+    for cid, meta in positions_meta.items()
+    if isinstance(meta, dict) and meta.get("redeem_abandoned")
+)
 CYCLE = 0
 _last_positions_refresh = 0.0
 _last_balance_refresh = 0.0
@@ -3583,7 +3624,7 @@ while not _shutdown_requested:
             market.end_ts,
         ))
         _open_pos_n = count_live_hedges(held, positions_meta, now_s)
-        _wait_pos_n = max(0, count_wallet_bags(held) - _open_pos_n)
+        _wait_pos_n = max(0, count_wallet_bags(held, positions_meta) - _open_pos_n)
         _min_ttm_now = min((m.end_ts * 1000 - now_ms) / 60000 for m in markets) if markets else 999
         _hot_mode = _open_pos_n > 0 or (_min_ttm_now * 60) <= BUY_HORIZON_S
         _show_ui = (not _hot_mode) or (CYCLE % max(1, int(UI_EVERY_N_CYCLES)) == 0)
@@ -3793,6 +3834,9 @@ while not _shutdown_requested:
                 if cond in _redeem_permanent_failures:
                     continue
                 meta = positions_meta.setdefault(cond, {})
+                if meta.get("redeem_abandoned"):
+                    _redeem_permanent_failures.add(cond)
+                    continue
                 if meta.get("buy_uncertain") or meta.get("hedge_uncertain"):
                     continue
                 if meta.get("redeem_pending"):
@@ -5492,7 +5536,9 @@ while not _shutdown_requested:
         has_pos = position_is_live_hedge(pos, meta, now_s)
         _ml_s = (m.end_ts * 1000 - _next_now) / 1000
         in_window = _ml_s > 0 and _ml_s <= BUY_HORIZON_S + 30
-        if not (in_window or has_pos or meta.get("buy_uncertain") or meta.get("hedge_uncertain")):
+        # Uncertain recovery inspects the signed order id; it must not REST
+        # a dead CLOB book (404) every 0.01s.
+        if not (in_window or (has_pos and _ml_s > -30)):
             continue
         for token in (m.up_token, m.dn_token):
             if not token:

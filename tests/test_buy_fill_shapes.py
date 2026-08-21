@@ -1460,6 +1460,7 @@ class FiveMFastPollHelpers(unittest.TestCase):
             "finite_float",
             "meta_end_ts",
             "position_is_live_hedge",
+            "uncertain_still_recoverable",
             "should_stub_tracked_market",
             "market_needs_fast_path",
             "bag_size",
@@ -1520,7 +1521,37 @@ class FiveMFastPollHelpers(unittest.TestCase):
         meta = {"bought_token": "up-tok", "end_ts": now - 10}
         self.assertTrue(self.ns["position_is_live_hedge"](pos, meta, now))
 
-    def test_uncertain_is_stubbed_even_if_expired(self):
+    def test_bought_token_without_clock_is_not_live_hedge(self):
+        now = 1_700_000_000.0
+        pos = self._bag()
+        meta = {
+            "bought_token": "up-tok",
+            "up_token": "up-tok",
+            "dn_token": "dn-tok",
+        }
+        self.assertFalse(self.ns["position_is_live_hedge"](pos, meta, now))
+        self.assertFalse(self.ns["should_stub_tracked_market"](pos, meta, now))
+        self.assertEqual(
+            self.ns["add_tracked_market_stubs"]([], {"old": pos}, {"old": meta}, now),
+            [],
+        )
+
+    def test_stale_uncertain_is_not_stubbed(self):
+        now = 1_700_000_000.0
+        pos = self._bag(size=0.0)
+        meta = {
+            "buy_uncertain": True,
+            "buy_uncertain_token": "up-tok",
+            "end_ts": now - 86400,
+        }
+        self.assertFalse(self.ns["uncertain_still_recoverable"](meta, now))
+        self.assertFalse(self.ns["should_stub_tracked_market"](pos, meta, now))
+        self.assertEqual(
+            self.ns["add_tracked_market_stubs"]([], {}, {"old": meta}, now),
+            [],
+        )
+
+    def test_recent_uncertain_is_stubbed_without_quoting_as_live(self):
         now = 1_700_000_000.0
         pos = self._bag(size=0.0)
         meta = {
@@ -1531,6 +1562,17 @@ class FiveMFastPollHelpers(unittest.TestCase):
         self.assertFalse(self.ns["position_is_live_hedge"](pos, meta, now))
         self.assertTrue(self.ns["should_stub_tracked_market"](pos, meta, now))
 
+    def test_stubs_skip_hundreds_of_clockless_bought_tokens(self):
+        now = 1_700_000_000.0
+        held = {f"c{i:03d}": self._bag() for i in range(704)}
+        meta = {
+            f"c{i:03d}": {"bought_token": "up-tok", "up_token": "up-tok", "dn_token": "dn-tok"}
+            for i in range(704)
+        }
+        out = self.ns["add_tracked_market_stubs"]([], held, meta, now)
+        self.assertEqual(out, [])
+        self.assertEqual(self.ns["count_live_hedges"](held, meta, now), 0)
+
     def test_stubs_skip_hundreds_of_dust_bags(self):
         now = 1_700_000_000.0
         held = {f"c{i:03d}": self._bag() for i in range(704)}
@@ -1538,6 +1580,20 @@ class FiveMFastPollHelpers(unittest.TestCase):
         self.assertEqual(out, [])
         self.assertEqual(self.ns["count_wallet_bags"](held), 704)
         self.assertEqual(self.ns["count_live_hedges"](held, {}, now), 0)
+
+    def test_abandoned_ghosts_are_not_wait(self):
+        now = 1_700_000_000.0
+        held = {
+            "ghost": self._bag(redeemable=True),
+            "live": self._bag(token="live-up"),
+        }
+        meta = {
+            "ghost": {"redeem_abandoned": True},
+            "live": {"bought_token": "live-up", "end_ts": now + 45},
+        }
+        self.assertEqual(self.ns["count_wallet_bags"](held), 2)
+        self.assertEqual(self.ns["count_wallet_bags"](held, meta), 1)
+        self.assertEqual(self.ns["count_live_hedges"](held, meta, now), 1)
 
     def test_stubs_keep_live_hedge_and_not_dust(self):
         now = 1_700_000_000.0
