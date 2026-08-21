@@ -1581,6 +1581,20 @@ class FiveMFastPollHelpers(unittest.TestCase):
         self.assertEqual(self.ns["count_wallet_bags"](held), 704)
         self.assertEqual(self.ns["count_live_hedges"](held, {}, now), 0)
 
+    def test_abandoned_ghosts_are_not_wait(self):
+        now = 1_700_000_000.0
+        held = {
+            "ghost": self._bag(redeemable=True),
+            "live": self._bag(token="live-up"),
+        }
+        meta = {
+            "ghost": {"redeem_abandoned": True},
+            "live": {"bought_token": "live-up", "end_ts": now + 45},
+        }
+        self.assertEqual(self.ns["count_wallet_bags"](held), 2)
+        self.assertEqual(self.ns["count_wallet_bags"](held, meta), 1)
+        self.assertEqual(self.ns["count_live_hedges"](held, meta, now), 1)
+
     def test_stubs_keep_live_hedge_and_not_dust(self):
         now = 1_700_000_000.0
         held = {

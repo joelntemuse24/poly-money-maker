@@ -992,8 +992,23 @@ def bag_size(pos):
     )
 
 
-def count_wallet_bags(held):
-    return sum(1 for pos in (held or {}).values() if bag_size(pos) > 0.01)
+def count_wallet_bags(held, tracked_meta=None):
+    """Bags still in the Data API that are not yet abandoned/confirmed.
+
+    `redeem_abandoned` means the relayer already said there is nothing to
+    redeem (zero on-chain). Those ghosts stay in the wallet API until
+    Polymarket drops them; they are not WAIT and must not be retried.
+    """
+    tracked_meta = tracked_meta or {}
+    n = 0
+    for cid, pos in (held or {}).items():
+        if bag_size(pos) <= 0.01:
+            continue
+        meta = tracked_meta.get(cid) or {}
+        if meta.get("redeem_abandoned") or meta.get("redeem_confirmed"):
+            continue
+        n += 1
+    return n
 
 
 def count_live_hedges(held, tracked_meta, now_s):
@@ -3403,6 +3418,11 @@ signal.signal(signal.SIGTERM, _handle_shutdown)
 # ------------------------- MAIN LOOP -------------------------
 
 positions_meta = load_json(STATE_FILE, required=not DRY_RUN)
+_redeem_permanent_failures.update(
+    str(cid)
+    for cid, meta in positions_meta.items()
+    if isinstance(meta, dict) and meta.get("redeem_abandoned")
+)
 CYCLE = 0
 _last_positions_refresh = 0.0
 _last_balance_refresh = 0.0
@@ -3604,7 +3624,7 @@ while not _shutdown_requested:
             market.end_ts,
         ))
         _open_pos_n = count_live_hedges(held, positions_meta, now_s)
-        _wait_pos_n = max(0, count_wallet_bags(held) - _open_pos_n)
+        _wait_pos_n = max(0, count_wallet_bags(held, positions_meta) - _open_pos_n)
         _min_ttm_now = min((m.end_ts * 1000 - now_ms) / 60000 for m in markets) if markets else 999
         _hot_mode = _open_pos_n > 0 or (_min_ttm_now * 60) <= BUY_HORIZON_S
         _show_ui = (not _hot_mode) or (CYCLE % max(1, int(UI_EVERY_N_CYCLES)) == 0)
@@ -3814,6 +3834,9 @@ while not _shutdown_requested:
                 if cond in _redeem_permanent_failures:
                     continue
                 meta = positions_meta.setdefault(cond, {})
+                if meta.get("redeem_abandoned"):
+                    _redeem_permanent_failures.add(cond)
+                    continue
                 if meta.get("buy_uncertain") or meta.get("hedge_uncertain"):
                     continue
                 if meta.get("redeem_pending"):
