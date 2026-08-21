@@ -20,9 +20,12 @@ flat is still refused). Late FAKs **limit at 90¢**; early FAKs **limit at
 `3 × limit` fits in `buy_max_spend` **$3 per FAK** (early 3.00 sh / $2.97
 at 99¢, late 3.00 sh / $2.70 at 90¢; 75¢ ask can still be ~3.3 sh). Do not
 round down to 2.00 sh / $1.98. Displayed top size is **not** a cap.
-`toxic_fill` arms from fill average < 65¢ (not extra shares vs the
-99¢-sized quote) and dumps without GUI only while bid ≤ 50¢. Pause minting.
-Pathlog still records all three series (no orders; 14-day / 400 MB cap).
+**Do not pass `user_usdc_balance` on 5m BUY `OrderArgs`.** A fake `$2.97`
+wallet makes the SDK shrink 3.00 @ 99¢ into maker `$2.9601` and CLOB 400s
+`invalid amounts` (live 21 Aug: 521 attempts / 0 fills). `toxic_fill` arms
+from fill average < 65¢ (not extra shares vs the 99¢-sized quote) and dumps
+without GUI only while bid ≤ 50¢. Pause minting. Pathlog still records all
+three series (no orders; 14-day / 400 MB cap).
 
 ---
 
@@ -198,17 +201,18 @@ amount / HTTP 400), not this NameError.
       Live JSON does **not** need a new key — `empty_fak_cooldown_s` defaults to 0.15.
 - [x] 5m BUY FAKs size `budget/ask` and limit at the **open band max**
       (99¢ early, then 90¢ late after the two-slice change).
-- [ ] After merge: `git pull`, set live `late_buy_budget=2.5` (keep
-      `buy_budget=2.5`, `buy_max_price=0.90`), **`poll_buy_window_s=0.01`**,
-      **`poll_held_s=0.01`**, then
-      `sudo systemctl restart polybuybot5m` only. Watch banner **POS** (0–2
-      live hedges), **WAIT 0** (or 1 if a real redeem is in flight — not
-      666), and `sleeping 0.01s` with TICK lines ~0.5s apart (banner every
-      50 looks). Skip ticks must not wait on CLOB REST. `wallet_dust_dropped
-      dropped=666 kept=0` means the leftover list was thrown away. CLOB 404s
-      on dead tokens should be rare. Watch `buy_attempt` `slice=early|late`
-      and `add=true` on the second $2.50. Do **not** start 15m / hourly /
-      mint. Do **not** set `buy_budget` to 5.
+- [x] Faster look (0.01s) + drop leftover wallet dust — operator pulled
+      `bd607db` / #108 and restarted **polybuybot5m** 21 Aug 2026 **08:08Z**.
+      Banner `WAIT 8`, `sleeping 0.01s`, NAV ~$147. Dust drop worked.
+- [ ] **0 fills is `invalid amounts`, not “no markets.”** Since ~20 Aug 22:00Z
+      (3-share floor): `buy_window` 130, `buy_attempt` 521, fills **0**,
+      `invalid_amount` 471. CLOB 400 maker must be 2 dp. Cause: 5m passed
+      `user_usdc_balance=$2.97` into v2 `create_order`, which shrinks
+      3.00 @ 99¢ to `$2.9601`. After this merge: `git pull` then
+      `sudo systemctl restart polybuybot5m` only. Watch journal for a
+      `[BUY FILL]` / no more `max accuracy of 2 decimals`.
+      `check_buy_skips.py --since 2026-08-21T08:08:00` — `invalid_amount`
+      should stop climbing. Do **not** start 15m / hourly / mint.
 - [ ] Cloud paper P&L: paste `CLOUD_RESEARCH.md` section 2 (live `pathlog.py`
       + `--sweep --paper`, rank by `pnl_sum` vs `live_5m_paper`). No `.env`.
       Optional: attach `poly-research.zip` for the historical tape. Not live

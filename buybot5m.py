@@ -140,10 +140,15 @@ POLY_BUILDER_PASSPHRASE = (
 )
 EXPECTED_TICK_SIZE = "0.001"
 
-# CLOB market orders reject taker amounts with more than four decimal places.
+# CLOB BUY: maker USDC max 2 decimals, taker shares max 4. The SDK 0.001
+# row starts at amount=5 (USDC on a limit BUY). Clamp every tick to 4,
+# then 5m's 0.001 maker to cents so a dirty float cannot sign $2.9601.
 for _rounding in ROUNDING_CONFIG.values():
     if _rounding.amount > 4:
         _rounding.amount = 4
+_tick_001 = ROUNDING_CONFIG.get("0.001")
+if _tick_001 is not None and _tick_001.amount > 2:
+    _tick_001.amount = 2
 
 # ------------------------- STRATEGY CONFIG -------------------------
 _STRATEGY_DEFAULTS = {
@@ -2687,15 +2692,16 @@ def buy_market_with_retry(
         try:
             signed_order = safe_api_call(
                 client.create_order,
+                # Omit user_usdc_balance. A fake $2.97 "wallet" (3.00 @ 99¢,
+                # or 3*0.99 as a float) makes the v2 SDK shrink size to
+                # 2.999… → round_down 2.99 → maker $2.9601 → HTTP 400
+                # invalid amounts. Size is already exact cents; fees come
+                # out of NAV.
                 OrderArgs(
                     token_id=token_id,
                     price=limit_price,
                     size=shares,
                     side=BUY,
-                    user_usdc_balance=min(
-                        max(0.0, float(BUY_MAX_SPEND) - float(spent)),
-                        max(float(remaining_budget), float(spend)),
-                    ),
                 ),
                 options=PartialCreateOrderOptions(
                     tick_size=tick_size, neg_risk=False,

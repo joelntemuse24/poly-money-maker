@@ -774,6 +774,10 @@ class AmbiguousCrossCyclePolicy(unittest.TestCase):
                     src,
                     bot.name,
                 )
+                order_chunk = src[src.index("OrderArgs(") : src.index("OrderArgs(") + 420]
+                self.assertNotIn("user_usdc_balance", order_chunk, bot.name)
+                self.assertIn('ROUNDING_CONFIG.get("0.001")', src, bot.name)
+                self.assertIn("_tick_001.amount = 2", src, bot.name)
             else:
                 self.assertIn(
                     "quoted_buy_shares(remaining_budget, fresh_ask, BUY_MAX_SHARES)",
@@ -782,6 +786,7 @@ class AmbiguousCrossCyclePolicy(unittest.TestCase):
                 )
                 self.assertIn("price = fresh_ask", src, bot.name)
                 self.assertNotIn("quoted_buy_shares_up_to_limit(", src, bot.name)
+                self.assertIn("user_usdc_balance=remaining_budget", src, bot.name)
             self.assertIn("[THIN ASK]", src, bot.name)
             self.assertNotIn("min(budget / ask, ask_size)", src, bot.name)
             self.assertNotIn("[NO SIZE]", src, bot.name)
@@ -1264,6 +1269,19 @@ class FiveMinuteBandLimitFakTests(unittest.TestCase):
         self.assertAlmostEqual(calls["orders"][0]["price"], 0.99)
         self.assertAlmostEqual(calls["orders"][0]["size"], 3.0)
 
+    def test_early_99_limit_omits_fake_usdc_balance(self):
+        ns, calls = self._namespace()
+        ns["get_quote_fast"] = lambda *_a, **_k: (0.90, 0.5, 0.91, 10.0, None)
+        ns["buy_market_with_retry"](
+            "token", 2.50, 0.99, min_price=0.90, max_retries=1,
+            on_submit=lambda *args: calls["submit"].append(args),
+        )
+        self.assertEqual(len(calls["orders"]), 1)
+        order = calls["orders"][0]
+        self.assertNotIn("user_usdc_balance", order)
+        self.assertAlmostEqual(order["price"], 0.99)
+        self.assertAlmostEqual(order["size"], 3.0)
+
     def test_early_90_limit_fill_at_91_is_not_toxic(self):
         """Live 20 Aug 19:42 was 2.00 sh / $1.98; new sizer posts 3.00 / $2.97."""
         ns = _load_funcs(
@@ -1291,6 +1309,50 @@ class FiveMinuteBandLimitFakTests(unittest.TestCase):
         )
         self.assertFalse(below)
         self.assertFalse(toxic)
+
+
+class FiveMinuteClobMakerRoundingTests(unittest.TestCase):
+    """Live 21 Aug 2026: 3.00 @ 99¢ + fake $2.97 wallet → maker $2.9601 → 400."""
+
+    def tearDown(self):
+        from py_clob_client_v2.clob_types import RoundConfig
+        from py_clob_client_v2.order_builder.builder import ROUNDING_CONFIG
+
+        ROUNDING_CONFIG["0.001"] = RoundConfig(price=3, size=2, amount=5)
+
+    def _amounts(self, size, price, amount_dp):
+        from py_clob_client_v2.clob_types import RoundConfig
+        from py_clob_client_v2.order_builder.builder import OrderBuilder
+        from py_clob_client_v2.order_builder.constants import BUY
+
+        cfg = RoundConfig(price=3, size=2, amount=amount_dp)
+        builder = OrderBuilder.__new__(OrderBuilder)
+        _side, maker, taker = builder.get_order_amounts(BUY, size, price, cfg)
+        return maker / 1e6, taker / 1e6
+
+    def test_omitting_balance_keeps_three_shares_at_297_cents(self):
+        usdc, shares = self._amounts(3.0, 0.99, 4)
+        self.assertEqual(shares, 3.0)
+        self.assertEqual(usdc, 2.97)
+        self.assertEqual(Decimal(str(usdc)).as_tuple().exponent, -2)
+
+    def test_fake_balance_equal_to_notional_makes_4dp_maker(self):
+        from py_clob_client_v2.fees import adjust_buy_amount_for_fees
+
+        price = 0.99
+        spend = 3.0 * price
+        balance = min(3.0, max(2.50, spend))
+        adjusted = adjust_buy_amount_for_fees(spend, price, balance, 0.0, 0.0, 0.0)
+        usdc, shares = self._amounts(adjusted / price, price, 4)
+        self.assertEqual(shares, 2.99)
+        self.assertEqual(usdc, 2.9601)
+        self.assertGreater(Decimal(str(usdc)).as_tuple().exponent * -1, 2)
+
+    def test_5m_amount_2_patch_rounds_dirty_maker_to_cents(self):
+        usdc, shares = self._amounts(2.9999999999999996, 0.99, 2)
+        self.assertEqual(shares, 2.99)
+        self.assertEqual(usdc, 2.96)
+        self.assertEqual(Decimal(str(usdc)).as_tuple().exponent, -2)
 
 
 class SellExecutionAmbiguity(unittest.TestCase):
