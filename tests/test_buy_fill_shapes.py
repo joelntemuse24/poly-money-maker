@@ -484,16 +484,21 @@ class BuyFillProductionHelpers(unittest.TestCase):
         self.assertAlmostEqual(sell(0.20, 0.001, 0, 0.325), 0.20)
         self.assertAlmostEqual(sell(0.01, 0.001, 0, 0.325), 0.01)
 
-    def test_5m_hedge_exec_tick_never_coarsens_to_01(self):
+    def test_5m_hedge_exec_tick_honors_clob_01(self):
+        from buy.hedge_gate import hedge_market_tick
+
         ns = _load_funcs("hedge_exec_tick", "hedge_sell_price", bot=BOT5M)
         ns["EXPECTED_TICK_SIZE"] = "0.001"
         ns["TICK_SIZE_FALLBACK"] = "0.001"
-        self.assertEqual(ns["hedge_exec_tick"]("0.01"), 0.001)
-        self.assertEqual(ns["hedge_exec_tick"](0.01), 0.001)
+        ns["hedge_market_tick"] = hedge_market_tick
+        self.assertEqual(ns["hedge_exec_tick"]("0.01"), 0.01)
+        self.assertEqual(ns["hedge_exec_tick"](0.01), 0.01)
         self.assertEqual(ns["hedge_exec_tick"]("0.001"), 0.001)
-        # 0.53 bid + CLOB 0.01 tick + undercut 0 → 0.53, not 0.51.
-        self.assertAlmostEqual(ns["hedge_sell_price"](0.53, "0.01", 0, 0.001), 0.53)
-        self.assertAlmostEqual(ns["hedge_sell_price"](0.53, "0.01", 2, 0.001), 0.528)
+        # Live undercut is 0: 0.61 bid on a 0.01 book posts 0.61, not 0.001.
+        self.assertAlmostEqual(ns["hedge_sell_price"](0.61, "0.01", 0, 0.01), 0.61)
+        self.assertAlmostEqual(ns["hedge_sell_price"](0.612, "0.01", 0, 0.01), 0.61)
+        # Undercut 2 on a 0.01 tick is the 21 Aug 0.51-into-0.53 hole — keep 0.
+        self.assertAlmostEqual(ns["hedge_sell_price"](0.53, "0.01", 2, 0.01), 0.51)
 
 
 class HedgeReconcileProduction(unittest.TestCase):
@@ -1188,6 +1193,8 @@ class BuyExecutionAmbiguity(unittest.TestCase):
         self.assertIn("hedge_tick = hedge_exec_tick(", src)
         self.assertIn("undercut_ticks=0,", src)
         self.assertIn('"hedge_undercut_ticks": 0', src)
+        self.assertIn("hedge_tick_after_build_error", src)
+        self.assertIn("hedge_tick_retry", src)
 
 
 class FiveMinuteHedgeGuiTests(unittest.TestCase):

@@ -19,7 +19,8 @@ early does **not** roll into late. Late **first** entry stays 75–90¢; a
 same-leg add needs ask ≥ **90¢** (`add_min_price`). After a full hedge the
 market is done (no other-leg chase). Normal hedge is **persist 2s at 70/72**
 on the combined bag (GUI held ≤ **72¢** / other ≥ **28¢**). Then sell at
-the **live 0.001 bid** (no 2¢ undercut; unmatched 400 re-quotes). Instant
+the **live bid on the market tick** (0.001 or 0.01; no 2¢ undercut;
+unmatched 400 re-quotes; a minimum-tick 400 rebuilds at 0.01). Instant
 70 is out — a one-tick dip dumps winners. `toxic_fill` still dumps **only
 while bid ≤ 53¢**, no persist. Chainlink TWAP gate is **$0** (any non-zero tick vs
 PTB; side must match; flat is still refused). Late FAKs **limit at 90¢**;
@@ -74,7 +75,7 @@ Normal hedge is **persist 2s @ 70/72** on the combined bag:
 | Execution | Size `budget/ask`, **floor 3 shares** when `3 × limit ≤ $3`. Unmatched 400 re-quotes up to **3** FAKs; then **0.15 s** cooldown. Unclear POSTs still quarantine. |
 | GUI consensus | winner ≥ 70¢, loser ≤ 30¢ |
 | Windows | 5m **whole market**: early ≥90 / ≥95 for TTM (120, 300]; late 75–90 for TTM ≤ 120s (15m / hourly bots **not running**) |
-| Hedge | **Qualify** bid ≤ **70¢** and ask ≤ **72¢**, spread ≤ 15¢, **plus** GUI held ≤ **72¢** / other ≥ **28¢** (not inverted 30/70). Last print ≤ 72¢. Must **stay qualified 2s** (`hedge_persist_s`; a bounce resets). Then sell at the **live 0.001 bid** (no 2¢ undercut); unmatched 400 re-quotes up to 3. Combined early+late inventory. Instant 70 is out. After a full dump, `hedge_closed` blocks any later buy on that market. `toxic_fill` arms only when FAK **average** < 65¢ (not extra shares vs a 99¢-sized quote) and still dumps without GUI / persist **only while held bid ≤ 53¢** (`hedge_toxic_bid_max`). |
+| Hedge | **Qualify** bid ≤ **70¢** and ask ≤ **72¢**, spread ≤ 15¢, **plus** GUI held ≤ **72¢** / other ≥ **28¢** (not inverted 30/70). Last print ≤ 72¢. Must **stay qualified 2s** (`hedge_persist_s`; a bounce resets). Then sell at the **live bid on the market tick** (honor CLOB 0.01 when that is the minimum; no 2¢ undercut); unmatched / minimum-tick 400s re-quote up to 3. Combined early+late inventory. Instant 70 is out. After a full dump, `hedge_closed` blocks any later buy on that market. `toxic_fill` arms only when FAK **average** < 65¢ (not extra shares vs a 99¢-sized quote) and still dumps without GUI / persist **only while held bid ≤ 53¢** (`hedge_toxic_bid_max`). |
 | Underlying edge | **$0** (5m: any non-zero TWAP vs PTB) / **$10** (15m, hourly); side must match |
 | `max_open_positions` | **0 = unlimited** |
 | `toxic_force_exit_below` | **65¢** |
@@ -135,6 +136,12 @@ same ticks, then change live JSON:
 
 # Live skip reasons (not a backtest — what this process actually logged)
 .venv/bin/python check_buy_skips.py --since "$(date -u -d '6 hours ago' '+%Y-%m-%dT%H:%M:%S')"
+
+# The live tape 4–5 hours later (no stream). Dedicated journal after the
+# tick-fix restart; older sessions still read buybot5m.log.
+.venv/bin/python check_live_journal.py --hours 5
+# Exact Rich console, only while journald still has it (50 MB / 7d):
+#   journalctl -u polybuybot5m --since "5 hours ago" --no-pager
 ```
 
 `--anatomy` buckets: `decided_before_in_band` / `above_band` / `below_band`
@@ -234,15 +241,21 @@ amount / HTTP 400), not this NameError.
       merged and was live. Replaced by persist 70/72 below (toxic dump stays 53¢).
 - [x] **5m hedge GUI matches ask-max** (not inverted 30/70). Held display ≤
       ask-max, other ≥ complement. Buy 70/30 unchanged.
-- [ ] **5m persist hedge 2s @ 70/72 + late add-min 90¢.** Code defaults:
-      `hedge_threshold=0.70`, `hedge_require_ask_max=0.72`, `hedge_persist_s=2`,
-      `hedge_toxic_bid_max=0.53`, `add_min_price=0.90`. No re-entry after
-      `hedge_closed`. **Code change — restart required**, and live JSON
-      **must** overwrite the old 53/55 keys (file wins over defaults):
-      `git pull`, patch JSON with the snippet above, then
-      `sudo systemctl restart polybuybot5m`. Banner `HEDGE ≤70¢`.
+- [x] **5m persist hedge 2s @ 70/72 + late add-min 90¢.** Live process
+      restarted **2026-08-22 03:16Z**. Banner `HEDGE ≤70¢`.
       `hedge_skip_persist` / `buy_skip_add_below_min` / `buy_skip_hedge_closed`
-      are the new skip lines. Do **not** start 15m / hourly / mint.
+      are the skip lines. Do **not** start 15m / hourly / mint.
+- [ ] **5m hedge CLOB tick + live tape.** Some 5m books require **0.01**.
+      Forcing `tick_size=0.001` rejected the signed sell (`invalid tick
+      size (0.001), minimum is 0.01`) so persist 61/62 then `[EXIT FAIL]`
+      (22 Aug 11:40). Gate worked; the dump did not. Honor the market
+      tick and retry at the stated minimum (`hedge_tick_retry`). Same
+      restart writes `buybot5m.journal.jsonl` so
+      `check_live_journal.py --hours 5` can reprint the tape without a
+      live stream. **Code change — restart required** after merge
+      (`git pull` then `sudo systemctl restart polybuybot5m`). No live
+      JSON key. Confirm `dry_run` / `entry_enabled` first. Do **not**
+      start 15m / hourly / mint.
 - [ ] Hourly three-slice bot is in the repo (`buybothourly.py` + example JSON).
       **Do not start `polybuybothourly`.** Operator later: `git pull`, set live
       `strategy_buyhourly.json` (`dry_run` / `entry_enabled` only when they mean
