@@ -196,7 +196,7 @@ two-slice $2.50+$2.50 add.
 - `[DRY BUY]` / `[DRY SELL]` in dry-run — confirms trigger logic fires
 - `buy_attempt` `band=late` / `early` / `early_95` and `slice=early|late` — which 5m window armed
 - `buy_skip_other_leg` — late winner is the other side of an early fill (no straddle)
-- `[FAK EMPTY]` / `buy_attempt_rejected` with `unmatched_retry: true` — empty FAK re-quoted in the same trigger (up to 3 POSTs)
+- `[FAK EMPTY]` / `buy_attempt_rejected` or `sell_attempt_rejected` with `unmatched_retry: true` — empty FAK re-quoted in the same trigger (up to 3 POSTs). Live 21 Aug 16:00–00:34Z: **0 `hedge_fill`**, every sell was attempt-1 `400 no orders found to match` then `hedge_fail` (buys already retried; sells did not).
 - `buy_ghost_fill` `via=unmatched_400_guard` — unmatched 400 but inventory appeared; no second FAK
 - `buy_attempt_ambiguous` `via=unmatched_400_no_balance` — unmatched 400 and CLOB balance unreadable; quarantine, no retry
 - `cycle_error` in logs — unhandled exception. The bot process stays up.
@@ -321,8 +321,10 @@ Cloud agents: `CLOUD_RESEARCH.md`.
   53/55/15 on 5m, but **sells only while held bid ≤ 53¢**. A recovered 97¢ book
   logs `hedge_skip_toxic_recovered` and rides; a 6¢ junk bid (even under a
   99¢ ask) still dumps on bid-only REST. Fresh WS bid > 53¢ skips REST for
-  both normal and toxic. After a dump is allowed, the FAK sells at the
-  **live bid** even if it is 20¢. Everything else rides to redemption at
+  both normal and toxic. After a dump is allowed, the 5m FAK sells at the
+  **live 0.001 bid** (no 2¢ undercut). CLOB/WS sometimes reports tick 0.01;
+  using that with `hedge_undercut_ticks=2` posted 0.51 into a 0.53 book.
+  Unmatched sell 400s re-quote like buys. Everything else rides to redemption at
   $1.00. WS may *arm* a hedge check; normal sells need two-sided REST.
   **Live `strategy_buy5m.json` must set the hedge keys** or an old 35/40 file
   keeps the old hedge after hot reload.

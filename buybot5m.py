@@ -180,7 +180,7 @@ _STRATEGY_DEFAULTS = {
     # Kept in config (live JSON still sends it). Not a FAK floor: after 53/55
     # integrity, the sell follows the live bid so a 20¢ print is not $0.
     "hedge_min_price": 0.325,
-    "hedge_undercut_ticks": 2,
+    "hedge_undercut_ticks": 0,
     "hedge_quote_max_age_s": 0.25,
     "hedge_retry_sleep_s": 0.05,
     "hedge_ghost_sleep_s": 0.4,
@@ -1397,16 +1397,34 @@ def look_last_trade(token_id):
     return get_book_snapshot_last_trade(token_id)
 
 
+def hedge_exec_tick(tick_size):
+    """5m execution tick. Never coarsen 0.001 to a CLOB/WS 0.01.
+
+    Live 21 Aug: ``get_tick_size_cached`` returned 0.01, so
+    ``hedge_undercut_ticks=2`` posted 0.51 into a 0.53/0.54 book. Every
+    hedge FAK was ``400 no orders found to match`` (0 ``hedge_fill``).
+    """
+    expected = float(EXPECTED_TICK_SIZE or 0.001)
+    if expected <= 0:
+        expected = 0.001
+    try:
+        raw = float(tick_size) if tick_size not in (None, "") else expected
+    except (TypeError, ValueError):
+        raw = expected
+    if raw <= 0:
+        raw = expected
+    return min(raw, expected)
+
+
 def hedge_sell_price(bid, tick_size, undercut_ticks, min_price=None):
-    """FAK sell at the live bid (undercut, tick-aligned).
+    """FAK sell at the live bid (tick-aligned).
 
     After 53/55 integrity, take whatever bid is there. min_price is ignored so
     a leftover 32¢ config cannot refuse a 20¢ or 1¢ print. One tick is only
-    the exchange minimum, not a strategy floor.
+    the exchange minimum, not a strategy floor. 5m posts at the bid
+    (undercut 0): a 2¢ undercut on a 0.01 tick never sat on the 53¢ bid.
     """
-    tick = float(tick_size or TICK_SIZE_FALLBACK)
-    if tick <= 0:
-        tick = 0.01
+    tick = hedge_exec_tick(tick_size)
     undercut = max(0, int(undercut_ticks)) * tick
     raw = float(bid or 0) - undercut
     aligned = (int(raw / tick + 1e-12)) * tick
@@ -3015,8 +3033,10 @@ def sell_market_with_retry(
     total_sold = 0.0
     total_proceeds = 0.0
     remaining = float(size)
+    tick_size = str(hedge_exec_tick(tick_size))
     floor = float(min_price) if min_price is not None else float(tick_size)
     last_limit = float(price_limit) if price_limit is not None else floor
+    start_bal = check_clob_token_balance(token_id, refresh=False)
     if DRY_RUN:
         price = hedge_sell_price(price_limit, tick_size, undercut_ticks, floor)
         console.print(f"  [bold black on yellow][DRY SELL][/] would SELL {remaining:.4f} {str(token_id)[:12]}… @ ≥{price:.3f}")
@@ -3227,6 +3247,57 @@ def sell_market_with_retry(
                     "trade_ids": trade_ids,
                 }, total_proceeds
         except Exception as e:
+            if unmatched_fak_rejection(e):
+                can_retry = attempt + 1 < max_retries
+                log_event(
+                    "sell_attempt_rejected", token_id=token_id,
+                    order_id=expected_order_id, error=str(e)[:200],
+                    attempt=attempt + 1, remaining=remaining,
+                    unmatched_retry=can_retry,
+                )
+                # Fail closed if inventory disappeared despite the unmatched 400.
+                guard = check_clob_token_balance(token_id, refresh=True)
+                if (
+                    start_bal is not None
+                    and guard is not None
+                    and guard < float(start_bal) - float(total_sold) - 0.01
+                ):
+                    gone = float(start_bal) - float(guard) - float(total_sold)
+                    fill_px = float(last_limit)
+                    total_sold += gone
+                    total_proceeds += gone * fill_px
+                    remaining = max(0.0, remaining - gone)
+                    if on_fill:
+                        try:
+                            on_fill(float(total_sold), float(total_proceeds))
+                        except Exception:
+                            pass
+                    log_event(
+                        "hedge_ghost_fill", token_id=token_id, filled=gone,
+                        price=fill_px, attempt=attempt + 1, bal_after=guard,
+                        via="unmatched_400_guard",
+                    )
+                    out = {"bot_status": "filled", "last_limit": last_limit}
+                    return total_sold, out, total_proceeds
+                if guard is None or start_bal is None:
+                    log_event(
+                        "sell_attempt_ambiguous", token_id=token_id,
+                        error=str(e)[:200],
+                        attempt=attempt + 1, remaining=remaining,
+                        via="unmatched_400_no_balance",
+                    )
+                    return total_sold, {
+                        "bot_status": "ambiguous", "last_limit": last_limit,
+                        "order_id": expected_order_id,
+                    }, total_proceeds
+                if can_retry:
+                    console.print(
+                        f"  [dim yellow][FAK EMPTY][/] hedge no match · re-quote "
+                        f"{attempt + 2}/{max_retries}"
+                    )
+                    time.sleep(float(retry_sleep_s))
+                    continue
+                break
             if definitive_order_rejection(e):
                 log_event(
                     "sell_attempt_rejected", token_id=token_id,
@@ -4595,16 +4666,19 @@ while not _shutdown_requested:
                                 ) or (
                                     (not toxic_fill) and hedge_bid <= HEDGE_THRESHOLD
                                 ):
-                                    hedge_tick = get_tick_size_cached(held_token)
+                                    hedge_tick = hedge_exec_tick(
+                                        get_tick_size_cached(held_token),
+                                    )
                                     # 53/55 is only a tight book. GUI must agree
                                     # with that book (held ≤ ask-max, other ≥
                                     # complement), not wait for buy 30/70.
                                     # Last trade still has to have printed down.
-                                    # Sell at the live bid — 20¢, 5¢, one tick, whatever
-                                    # is there. No strategy "won't take less than X".
+                                    # Sell at the live 0.001 bid. Undercut on a
+                                    # CLOB 0.01 tick posted 0.51 into a 0.53
+                                    # book (live 21 Aug: unmatched 400, 0 fills).
                                     hedge_floor = float(hedge_tick)
                                     sell_floor = hedge_sell_price(
-                                        hedge_bid, hedge_tick, HEDGE_UNDERCUT_TICKS, hedge_floor,
+                                        hedge_bid, hedge_tick, 0, hedge_floor,
                                     )
                                     hedge_title = (
                                         "[bold bright_red]▼ TOXIC FILL — FORCE EXIT[/]"
@@ -4700,7 +4774,7 @@ while not _shutdown_requested:
                                         hedge_bid,
                                         tick_size=hedge_tick,
                                         min_price=hedge_floor,
-                                        undercut_ticks=HEDGE_UNDERCUT_TICKS,
+                                        undercut_ticks=0,
                                         retry_sleep_s=HEDGE_RETRY_SLEEP_S,
                                         # Toxic: never abort on bounce / integrity — dump inventory.
                                         abort_above=None if toxic_fill else HEDGE_THRESHOLD,
