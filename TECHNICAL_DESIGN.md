@@ -782,13 +782,16 @@ caller.
 4. `hedge_book_ok` 53/55/15. Fail → `hedge_skip_toxic_book`.
 5. `hedge_consensus_ok` (5m: held ≤ ask-max / other ≥ complement; 15m/hourly:
    inverted 70/30). Fail → `hedge_skip_no_consensus`.
-6. Write-ahead hedge quarantine, then FAK **sell at live bid minus
-   `hedge_undercut_ticks`** (default 2 ticks = 0.002 on 5m).
+6. Write-ahead hedge quarantine, then FAK **sell at the live 0.001 bid**
+   (5m undercut is 0). `hedge_exec_tick` never coarsens 0.001 to a CLOB/WS
+   0.01 — that plus `hedge_undercut_ticks=2` posted 0.51 into a 0.53 book
+   (21 Aug: every hedge `400 no orders found to match`, 0 fills).
    `hedge_sell_price` **ignores** `hedge_min_price` so a leftover 32¢ config
    cannot refuse a 20¢ print. Floor is one tick (exchange minimum).
 7. Retries force REST again and re-run two-sided integrity so a spoof
-   1¢/99¢ still aborts. Toxic retries set `abort_above=None` but still
-   honor “bid recovered.”
+   1¢/99¢ still aborts. An unmatched sell 400 re-quotes like a buy (up to
+   3) unless CLOB balance is unreadable or inventory already disappeared.
+   Toxic retries set `abort_above=None` but still honor “bid recovered.”
 
 **`toxic_fill`:** armed from junk/walk average. Stays on `meta` forever until
 the dump actually sells (or you ride a recovered book). Dump **only while

@@ -3013,6 +3013,7 @@ def sell_market_with_retry(
     remaining = float(size)
     floor = float(min_price) if min_price is not None else float(tick_size)
     last_limit = float(price_limit) if price_limit is not None else floor
+    start_bal = check_clob_token_balance(token_id, refresh=False)
     if DRY_RUN:
         price = hedge_sell_price(price_limit, tick_size, undercut_ticks, floor)
         console.print(f"  [bold black on yellow][DRY SELL][/] would SELL {remaining:.4f} {str(token_id)[:12]}… @ ≥{price:.3f}")
@@ -3223,6 +3224,56 @@ def sell_market_with_retry(
                     "trade_ids": trade_ids,
                 }, total_proceeds
         except Exception as e:
+            if unmatched_fak_rejection(e):
+                can_retry = attempt + 1 < max_retries
+                log_event(
+                    "sell_attempt_rejected", token_id=token_id,
+                    order_id=expected_order_id, error=str(e)[:200],
+                    attempt=attempt + 1, remaining=remaining,
+                    unmatched_retry=can_retry,
+                )
+                guard = check_clob_token_balance(token_id, refresh=True)
+                if (
+                    start_bal is not None
+                    and guard is not None
+                    and guard < float(start_bal) - float(total_sold) - 0.01
+                ):
+                    gone = float(start_bal) - float(guard) - float(total_sold)
+                    fill_px = float(last_limit)
+                    total_sold += gone
+                    total_proceeds += gone * fill_px
+                    remaining = max(0.0, remaining - gone)
+                    if on_fill:
+                        try:
+                            on_fill(float(total_sold), float(total_proceeds))
+                        except Exception:
+                            pass
+                    log_event(
+                        "hedge_ghost_fill", token_id=token_id, filled=gone,
+                        price=fill_px, attempt=attempt + 1, bal_after=guard,
+                        via="unmatched_400_guard",
+                    )
+                    out = {"bot_status": "filled", "last_limit": last_limit}
+                    return total_sold, out, total_proceeds
+                if guard is None or start_bal is None:
+                    log_event(
+                        "sell_attempt_ambiguous", token_id=token_id,
+                        error=str(e)[:200],
+                        attempt=attempt + 1, remaining=remaining,
+                        via="unmatched_400_no_balance",
+                    )
+                    return total_sold, {
+                        "bot_status": "ambiguous", "last_limit": last_limit,
+                        "order_id": expected_order_id,
+                    }, total_proceeds
+                if can_retry:
+                    console.print(
+                        f"  [dim yellow][FAK EMPTY][/] hedge no match · re-quote "
+                        f"{attempt + 2}/{max_retries}"
+                    )
+                    time.sleep(float(retry_sleep_s))
+                    continue
+                break
             if definitive_order_rejection(e):
                 log_event(
                     "sell_attempt_rejected", token_id=token_id,

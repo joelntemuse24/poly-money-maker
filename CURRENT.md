@@ -3,7 +3,7 @@
 **Agents: read this after `AGENTS.md`.** Update this file when ops/strategy decisions change.
 Do not put secrets, API keys, or live wallet material here.
 
-Last updated: **2026-08-21** — **only the 5m CLOB bot is live.** It watches
+Last updated: **2026-08-22** — **only the 5m CLOB bot is live.** It watches
 the **current** 5m market (and a live hedge if we just bought). Polymarket’s
 positions API still returns hundreds of old 5m rows (`WAIT 666` was that
 list, not 666 live markets). The bot **throws those rows away** after
@@ -65,7 +65,7 @@ on the combined bag:
 | Execution | Size `budget/ask`, **floor 3 shares** when `3 × limit ≤ $3`. Unmatched 400 re-quotes up to **3** FAKs; then **0.15 s** cooldown. Unclear POSTs still quarantine. |
 | GUI consensus | winner ≥ 70¢, loser ≤ 30¢ |
 | Windows | 5m **whole market**: early ≥90 / ≥95 for TTM (120, 300]; late 75–90 for TTM ≤ 120s (15m / hourly bots **not running**) |
-| Hedge | **Trigger** bid ≤ **53¢** and ask ≤ **55¢**, spread ≤ 15¢, **plus** GUI held ≤ **55¢** / other ≥ **45¢** (not inverted 30/70). Last print ≤ 55¢. Combined early+late inventory. `toxic_fill` arms only when FAK **average** < 65¢ (not extra shares vs a 99¢-sized quote) and still dumps without GUI **only while held bid ≤ 53¢**. |
+| Hedge | **Trigger** bid ≤ **53¢** and ask ≤ **55¢**, spread ≤ 15¢, **plus** GUI held ≤ **55¢** / other ≥ **45¢** (not inverted 30/70). Last print ≤ 55¢. Combined early+late inventory. 5m sell FAK is at the **live 0.001 bid** (no 2¢ undercut); unmatched 400 re-quotes up to 3. `toxic_fill` arms only when FAK **average** < 65¢ (not extra shares vs a 99¢-sized quote) and still dumps without GUI **only while held bid ≤ 53¢**. |
 | Underlying edge | **$0** (5m: any non-zero TWAP vs PTB) / **$10** (15m, hourly); side must match |
 | `max_open_positions` | **0 = unlimited** |
 | `toxic_force_exit_below` | **65¢** |
@@ -202,6 +202,12 @@ amount / HTTP 400), not this NameError.
 - [x] Hedge FAK follows live bid after book integrity (no 32¢ fill refusal).
       5m trigger is now **53/55**; hourly template is **55/60** (still stopped);
       15m stays 35/40 (stopped).
+- [ ] **5m hedge unmatched-400 retry + sell at the 0.001 bid.** Live 21 Aug
+      16:00–00:34Z: **0 `hedge_fill`**. Every sell was attempt-1
+      `400 no orders found to match` at `price_limit` = bid − 2¢ (CLOB tick
+      0.01 × undercut 2). Buys already retried that 400; sells did not.
+      **Code change — restart required:** `git pull` then
+      `sudo systemctl restart polybuybot5m`. Do not start 15m/hourly/mint.
 - [x] On VM: pathlog restarted onto size-aware ticks; 15m/hourly buy bots stopped.
 - [x] 5m underlying gate **$0** (any non-zero TWAP vs PTB; side must match).
 - [x] Pathlog `--anatomy` / `--compare` so window/band/size alts are scored offline.
