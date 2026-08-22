@@ -69,17 +69,64 @@ _SERIES_DURATION_S = {
     "btc-up-or-down-15m": 15 * 60,
     "btc-up-or-down-hourly": 60 * 60,
 }
+FIVE_M_DURATION_S = _SERIES_DURATION_S["btc-up-or-down-5m"]
 
 
-def _slug_start_ts(slug: str) -> Optional[float]:
+def slug_start_ts(slug: str) -> Optional[float]:
     """Extract the real market start timestamp from a slug like
-    'btc-updown-15m-1784638800'. Returns None if no timestamp found."""
+    'btc-updown-5m-1784638800'. Returns None if no timestamp found."""
     m = _SLUG_TS_RE.search(slug or "")
     if m:
         ts = int(m.group(1))
         if ts > 1_700_000_000:
             return float(ts)
     return None
+
+
+def _slug_start_ts(slug: str) -> Optional[float]:
+    return slug_start_ts(slug)
+
+
+def slug_window_end_ts(slug: str, duration_s: float = FIVE_M_DURATION_S) -> Optional[float]:
+    """True 5m/15m/hourly close: slug unix start + series duration."""
+    start = slug_start_ts(slug)
+    if start is None:
+        return None
+    try:
+        return float(start) + float(duration_s)
+    except (TypeError, ValueError):
+        return None
+
+
+def entry_seconds_left(
+    now_s,
+    gamma_end_ts,
+    slug=None,
+    duration_s: float = FIVE_M_DURATION_S,
+) -> float:
+    """TTM for entry/hedge clocks.
+
+    Gamma ``endDate`` can sit several seconds off ``slug+300``. Live 22 Aug
+    late 91–99 posts hugged TTM 113–120: Gamma still said early (99¢ FAK)
+    while the slug clock was already inside the last 120s. Use the
+    **earliest** close so a 93¢ ask at slug-TTM 116 cannot POST.
+    """
+    ends = []
+    try:
+        if gamma_end_ts not in (None, ""):
+            ends.append(float(gamma_end_ts))
+    except (TypeError, ValueError):
+        pass
+    slug_end = slug_window_end_ts(slug, duration_s) if slug else None
+    if slug_end is not None:
+        ends.append(float(slug_end))
+    if not ends:
+        return 0.0
+    try:
+        now = float(now_s)
+    except (TypeError, ValueError):
+        return 0.0
+    return min(ends) - now
 
 
 def _parse_event(event: dict, series_slug: str) -> Iterable[MintMarket]:
@@ -108,9 +155,13 @@ def _parse_event(event: dict, series_slug: str) -> Iterable[MintMarket]:
         duration_s = _SERIES_DURATION_S.get(series_slug)
         if duration_s is None:
             continue
-        slug_start = _slug_start_ts(slug)
+        slug_start = slug_start_ts(slug)
         if slug_start is not None:
+            # Slug unix is the real open. Pin the close to slug+duration so
+            # a late Gamma endDate cannot keep the early 99¢ FAK armed after
+            # T-120 (live 22 Aug late_gt_90 at TTM 113–120).
             start_ts = slug_start
+            end_ts = slug_start + duration_s
         else:
             try:
                 api_start_ts = _end_timestamp(str(start))

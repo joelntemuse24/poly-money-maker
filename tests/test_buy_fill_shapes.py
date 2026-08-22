@@ -672,7 +672,11 @@ class AmbiguousCrossCyclePolicy(unittest.TestCase):
             src = bot.read_text()
             self.assertIn("hedge_skip_toxic_recovered", src, bot.name)
             self.assertIn("def toxic_dump_book_ok", src, bot.name)
-            self.assertGreaterEqual(src.count("toxic_dump_book_ok("), 3, bot.name)
+            if bot == BOT5M:
+                self.assertIn("evaluate_held_bag(", src, bot.name)
+                self.assertIn("pick_held_quote(", src, bot.name)
+            else:
+                self.assertGreaterEqual(src.count("toxic_dump_book_ok("), 3, bot.name)
             self.assertIn("condition_id=cond", src, bot.name)
             self.assertNotIn(
                 "remaining markets skipped this poll",
@@ -706,7 +710,8 @@ class AmbiguousCrossCyclePolicy(unittest.TestCase):
             self.assertNotIn("remaining markets skipped this poll", handler_src, bot.name)
 
         five = BOT5M.read_text()
-        self.assertIn("seconds_left = (end_ts_ms - now_ms) / 1000", five)
+        self.assertIn("entry_seconds_left(", five)
+        self.assertNotIn("seconds_left = (end_ts_ms - now_ms) / 1000", five)
         self.assertIn("applicable_entry_bands", five)
         self.assertIn("EARLY_BUY_START_S", five)
         self.assertIn("EARLY_95_START_S", five)
@@ -1316,6 +1321,8 @@ class FiveMinuteBandLimitFakTests(unittest.TestCase):
             "definitive_order_rejection",
             bot=BOT5M,
         )
+        from buy.entry_skip import classify_fill_against_band
+        ns["classify_fill_against_band"] = classify_fill_against_band
         calls = {"post": 0, "submit": [], "orders": []}
         signed_order = SimpleNamespace(
             makerAmount="8000000",
@@ -1418,6 +1425,8 @@ class FiveMinuteBandLimitFakTests(unittest.TestCase):
             "classify_buy_fill",
             bot=BOT5M,
         )
+        from buy.entry_skip import classify_fill_against_band
+        ns["classify_fill_against_band"] = classify_fill_against_band
         posted = ns["quoted_buy_shares_up_to_limit"](
             2.50, 0.90, 0.99, 5.0, spend_cap=3.0,
         )
@@ -1630,6 +1639,9 @@ class SellExecutionAmbiguity(unittest.TestCase):
                 "SELL": "SELL",
                 "console": SimpleNamespace(print=lambda *_a, **_k: None),
                 "log_event": lambda *_a, **_k: None,
+                "hedge_exec_tick": lambda t: str(t or "0.001"),
+                "hedge_tick_after_build_error": lambda *_a, **_k: None,
+                "hedge_should_keep_retrying": lambda *_a, **_k: False,
                 "hedge_sell_price": lambda _bid, _tick, _under, _floor: 0.50,
                 "get_quote_fast": lambda *_a, **_k: (0.55, 10.0, 0.60, 10.0, 0.575),
                 "hedge_book_ok": lambda *_a, **_k: (True, "ok"),

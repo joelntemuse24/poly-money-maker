@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import re
-from typing import Optional, Tuple
+from typing import NamedTuple, Optional, Tuple
 
 _CLOB_TICKS = (0.1, 0.01, 0.005, 0.0025, 0.001, 0.0001)
 _MIN_TICK_RE = re.compile(r"minimum is\s+(0\.\d+)", re.IGNORECASE)
@@ -105,3 +105,242 @@ def hedge_tick_after_build_error(current_tick, error) -> Optional[float]:
     if minimum > current + 1e-12:
         return minimum
     return None
+
+
+class HedgeIntent(NamedTuple):
+    """What a live 5m bag should do this tick (no I/O)."""
+
+    action: str
+    reason: str
+    sell_at: Optional[float]
+    persist_ts: Optional[float]
+    persist_done: bool
+    skip_gui: bool
+    abort_above: Optional[float]
+    dump: bool
+
+
+def _finite_px(value) -> Optional[float]:
+    if value is None or value == "":
+        return None
+    try:
+        px = float(value)
+    except (TypeError, ValueError):
+        return None
+    if px < 0 or px > 1:
+        return None
+    return px
+
+
+def pick_held_quote(rest_bid, rest_ask, ws_bid, ws_ask, last_bid, last_ask):
+    """REST, then WS, then last-good. Bid-only is enough to dump.
+
+    Incomplete REST must not skip a live bag (22 Aug: 2176
+    ``hedge_skip_incomplete_rest`` while 09:35 / 11:25 rode to zero).
+    """
+    for bid, ask in (
+        (rest_bid, rest_ask),
+        (ws_bid, ws_ask),
+        (last_bid, last_ask),
+    ):
+        b = _finite_px(bid)
+        if b is None:
+            continue
+        return b, _finite_px(ask)
+    return None, None
+
+
+def hedge_qualify_ok(bid, ask, threshold, max_spread, require_ask_max):
+    """Tight 70/72 book. Missing ask cannot qualify persist (dump is bid-only)."""
+    bid_f = _finite_px(bid)
+    ask_f = _finite_px(ask)
+    try:
+        thr = float(threshold)
+        spread_max = float(max_spread)
+        ask_max = float(require_ask_max)
+    except (TypeError, ValueError):
+        return False, "missing_side"
+    if bid_f is None or ask_f is None:
+        return False, "missing_side"
+    if bid_f > thr + 1e-12:
+        return False, "bid_above"
+    if ask_f > ask_max + 1e-12:
+        return False, "ask_too_high"
+    if ask_f < bid_f:
+        return False, "crossed"
+    if (ask_f - bid_f) > spread_max + 1e-12:
+        return False, "wide_spread"
+    return True, "ok"
+
+
+def evaluate_held_bag(
+    bid,
+    ask=None,
+    *,
+    now_s,
+    persist_armed_ts,
+    persist_s=2.0,
+    dump_bid_max=0.53,
+    qualify_bid=0.70,
+    qualify_ask_max=0.72,
+    max_spread=0.15,
+    persist_done=False,
+    gui_ok=True,
+    gui_why="ok",
+):
+    """Dump / persist-sell / hold for one live bag.
+
+    * Bid ≤ 53¢ dumps every bag. Bid-only. No GUI / last-trade veto.
+      Wide 22/77 still dumps.
+    * Do not sell in (53, 70). Persist-not-done 61/70 is a hold.
+    * After persist, 74–80 live-bid sells are correct (do not clamp to 72).
+    * Persist qualify is still tight 70/72 for 2s (GUI applies only there).
+    """
+    bid_f = _finite_px(bid)
+    ask_f = _finite_px(ask)
+    try:
+        dump_max = float(dump_bid_max)
+        qualify = float(qualify_bid)
+        wait = float(persist_s or 0)
+    except (TypeError, ValueError):
+        return HedgeIntent("hold", "bad_thresholds", None, None, False, True, None, False)
+
+    done = bool(persist_done)
+    if persist_armed_ts is not None and wait > 1e-12:
+        try:
+            if float(now_s) - float(persist_armed_ts) >= wait - 1e-12:
+                done = True
+        except (TypeError, ValueError):
+            pass
+
+    if bid_f is None:
+        return HedgeIntent(
+            "hold", "no_bid", None, persist_armed_ts, done, True, None, False,
+        )
+
+    if bid_f <= dump_max + 1e-12:
+        return HedgeIntent(
+            "dump", "bid_le_dump", bid_f, persist_armed_ts, done, True, dump_max, True,
+        )
+
+    if done:
+        if bid_f + 1e-12 >= qualify:
+            return HedgeIntent(
+                "sell", "persist_live_bid", bid_f, persist_armed_ts, True, True, None, False,
+            )
+        return HedgeIntent(
+            "hold", "dead_band", None, persist_armed_ts, True, True, None, False,
+        )
+
+    ok, why = hedge_qualify_ok(
+        bid_f, ask_f, qualify, max_spread, qualify_ask_max,
+    )
+    if not ok:
+        return HedgeIntent("hold", why, None, None, False, False, None, False)
+
+    if not gui_ok:
+        return HedgeIntent(
+            "hold", str(gui_why or "no_consensus"), None, None, False, False, None, False,
+        )
+
+    fire, new_ts, pwhy = hedge_persist_ready(
+        True, now_s=float(now_s), armed_ts=persist_armed_ts, persist_s=wait,
+    )
+    if fire:
+        if dump_max < bid_f < qualify - 1e-12:
+            return HedgeIntent(
+                "hold", "dead_band", None, new_ts, True, False, None, False,
+            )
+        return HedgeIntent(
+            "sell", "persist_ready", bid_f, new_ts, True, False, None, False,
+        )
+    if pwhy == "armed":
+        return HedgeIntent("arm", "persist_armed", None, new_ts, False, False, None, False)
+    return HedgeIntent("wait", "persist_waiting", None, new_ts, False, False, None, False)
+
+
+def hedge_should_keep_retrying(
+    remaining,
+    bid,
+    *,
+    persist_done=False,
+    dump_bid_max=0.53,
+    qualify_bid=0.70,
+) -> bool:
+    """Unmatched / invalid-tick / could-not-run is not terminal while size remains."""
+    try:
+        rem = float(remaining or 0)
+    except (TypeError, ValueError):
+        rem = 0.0
+    if rem < 0.01:
+        return False
+    bid_f = _finite_px(bid)
+    if bid_f is None:
+        return True
+    try:
+        dump_max = float(dump_bid_max)
+        qualify = float(qualify_bid)
+    except (TypeError, ValueError):
+        return True
+    if bid_f <= dump_max + 1e-12:
+        return True
+    if persist_done and bid_f + 1e-12 >= qualify:
+        return True
+    return False
+
+
+def hedge_fail_is_terminal(
+    sell_status,
+    remaining,
+    bid,
+    *,
+    persist_done=False,
+    dump_bid_max=0.53,
+    qualify_bid=0.70,
+) -> bool:
+    """``hedge_fail`` after ``sell_attempt_rejected`` must not idle a live dump."""
+    status = str(sell_status or "")
+    if status == "ambiguous":
+        return True
+    return not hedge_should_keep_retrying(
+        remaining,
+        bid,
+        persist_done=persist_done,
+        dump_bid_max=dump_bid_max,
+        qualify_bid=qualify_bid,
+    )
+
+
+def should_mark_hedge_closed(sold, remaining) -> bool:
+    """Full hedge_closed only after confirmed inventory is gone."""
+    try:
+        sold_f = float(sold or 0)
+        rem = float(remaining or 0)
+    except (TypeError, ValueError):
+        return False
+    return sold_f > 0.01 and rem < 0.01
+
+
+def live_bag_log_fields(
+    *,
+    slug=None,
+    ttm=None,
+    bid=None,
+    ask=None,
+    tick=None,
+    reason=None,
+    order_error=None,
+):
+    """Every live-bag skip/fail must carry slug/ttm/bid/ask/tick/reason."""
+    payload = {
+        "slug": slug,
+        "ttm": None if ttm is None else round(float(ttm), 1),
+        "bid": bid,
+        "ask": ask,
+        "tick": tick,
+    }
+    if reason is not None:
+        payload["reason"] = reason
+    if order_error is not None:
+        payload["order_error"] = str(order_error)[:200]
+    return payload

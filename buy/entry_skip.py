@@ -152,6 +152,81 @@ def stamp_slice_bought(meta, late_slice):
         meta["early_bought"] = True
 
 
+def stamp_slice_on_inventory(meta, late_slice, filled):
+    """Stamp a slice only when confirmed inventory exists.
+
+    Ghosts / confirm timeouts must not consume early_bought / late_bought
+    without shares (live 22 Aug: 61 buy_ghost_fill, 136 order_confirm_timeout).
+    """
+    try:
+        size = float(filled or 0)
+    except (TypeError, ValueError):
+        return False
+    if size <= 0.01:
+        return False
+    stamp_slice_bought(meta, late_slice)
+    return True
+
+
+FIVE_M_BAND_DEFAULTS = {
+    "late_start_s": 120,
+    "late_min": 0.75,
+    "late_max": 0.90,
+    "early_start_s": 300,
+    "early_min": 0.90,
+    "early_max": 0.99,
+    "early_95_start_s": 300,
+    "early_95_min_s": 60,
+    "early_95_min": 0.95,
+}
+
+
+def decide_5m_entry(seconds_left, ask, **band_kwargs):
+    """Band that may POST at this TTM + ask, or None (no POST).
+
+    Late TTM (0, 120]: 75–90 only. 93¢ at TTM 116 is a no.
+    Early TTM (120, 300]: ≥90. 85¢ at TTM 180 is a no.
+    """
+    kwargs = dict(FIVE_M_BAND_DEFAULTS)
+    kwargs.update(band_kwargs)
+    bands = applicable_entry_bands(seconds_left, **kwargs)
+    return select_entry_band(ask, bands)
+
+
+def classify_fill_against_band(
+    avg,
+    band_min,
+    band_max=None,
+    toxic_below=0.65,
+):
+    """below/above the open band, and whether the fill is toxic.
+
+    Average **outside** the band (late 93, early 85) dumps. In-band 87¢
+    late is not toxic — that bag still dumps when held bid ≤ 53¢.
+    """
+    try:
+        avg_f = float(avg)
+    except (TypeError, ValueError):
+        avg_f = 0.0
+    try:
+        lo = float(band_min or 0)
+    except (TypeError, ValueError):
+        lo = 0.0
+    try:
+        hi = float(band_max) if band_max is not None else None
+    except (TypeError, ValueError):
+        hi = None
+    try:
+        floor = float(toxic_below or 0)
+    except (TypeError, ValueError):
+        floor = 0.0
+    below = lo > 0 and avg_f + 1e-9 < lo
+    above = hi is not None and hi > 0 and avg_f > hi + 1e-9
+    outside = below or above
+    toxic = outside or (floor > 0 and avg_f + 1e-9 < floor)
+    return below, above, toxic
+
+
 def slice_already_filled(meta, seconds_left, late_start_s) -> bool:
     return bool((meta or {}).get(slice_bought_key(seconds_left, late_start_s)))
 
