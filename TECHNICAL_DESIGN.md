@@ -802,14 +802,18 @@ caller.
    to zero).
 2. **Bid ≤ 53¢ dumps every live bag.** Bid-only. No GUI / last-trade
    veto. Wide 22/77 still dumps. Not only `toxic_fill` entries.
-3. Peek WS above 70¢ **only** skips REST when persist is **not** already
-   done. After persist, a 74–80 bounce must still sell at the live bid.
+3. Peek WS above 70¢ skips REST when persist is **not** already done.
+   After persist, a 74–80 bounce must still sell at the live bid. A
+   winner rally above 80¢ (0.93 / 0.99) cancels persist even if
+   persist-done — that was the 22 Aug 17:35Z false `REVERSAL DETECTED`.
 4. Persist qualify is still tight 70/72 + GUI + 2s. Fail →
    `hedge_skip_toxic_book` / `hedge_skip_no_consensus` / `hedge_skip_persist`.
+   Elapsed armed_ts alone is **not** persist-done.
 5. **Do not sell in (53¢, 70¢)** (`hedge_skip_dead_band`). Persist-not-done
    61/70 is a hold (9:55 dead-band sell).
 6. After persist, sell at the **live bid** (74–80 is correct; do not
-   clamp to 72). `abort_above` is not 70 after persist.
+   clamp to 72). Persist `abort_above` is **80¢**, not 70 and not
+   unbounded. Do not POST a persist sell at 0.93.
 7. Write-ahead hedge quarantine, then FAK **sell at the live bid** on the
    **market tick** (5m undercut is 0). Some 5m books are 0.01 even though
    the bot default is 0.001. Forcing 0.001 rejected the signed order
@@ -823,7 +827,8 @@ caller.
    `sell_attempt_rejected` is **not** terminal while size remains and bid
    ≤53 or persist completed — next look posts again. Dump retries abort
    only if bid recovers above 53¢. Persist-done retries abort in the
-   dead band. Incomplete REST on retry uses last-good, not idle cancel.
+   dead band **or** when the live bid rallies above 80¢. Incomplete REST
+   on retry uses last-good, not idle cancel.
 9. Every live-bag skip/fail logs slug, ttm, bid, ask, tick, reason,
    `order_error` (`live_bag_log_fields`). `hedge_closed` only after
    confirmed inventory is gone.
