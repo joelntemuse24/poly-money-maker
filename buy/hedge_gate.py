@@ -8,6 +8,10 @@ from typing import NamedTuple, Optional, Tuple
 _CLOB_TICKS = (0.1, 0.01, 0.005, 0.0025, 0.001, 0.0001)
 _MIN_TICK_RE = re.compile(r"minimum is\s+(0\.\d+)", re.IGNORECASE)
 
+# After persist, a 74–80¢ live bid is an execution bounce (CURRENT). A 0.93 /
+# 0.99 winner rally is not a hedge — that was the 22 Aug 17:35Z false sell.
+PERSIST_BOUNCE_MAX = 0.80
+
 
 def hedge_persist_ready(
     qualifies: bool,
@@ -150,6 +154,34 @@ def pick_held_quote(rest_bid, rest_ask, ws_bid, ws_ask, last_bid, last_ask):
     return None, None
 
 
+def persist_should_cancel_on_bid(
+    bid,
+    *,
+    persist_done=False,
+    qualify_bid=0.70,
+    bounce_max=PERSIST_BOUNCE_MAX,
+) -> bool:
+    """True when a live held bid must clear persist instead of selling.
+
+    * Persist not done: any bid above the 70¢ qualify is a bounce.
+    * Persist done: 74–80 still sells; above ``bounce_max`` is a winner rally
+      (live 22 Aug: Down 0.93 / 0.94 sold as ``REVERSAL DETECTED``).
+    """
+    bid_f = _finite_px(bid)
+    if bid_f is None:
+        return False
+    try:
+        qualify = float(qualify_bid)
+        cap = float(bounce_max)
+    except (TypeError, ValueError):
+        return False
+    if bid_f > cap + 1e-12:
+        return True
+    if (not persist_done) and bid_f > qualify + 1e-12:
+        return True
+    return False
+
+
 def hedge_qualify_ok(bid, ask, threshold, max_spread, require_ask_max):
     """Tight 70/72 book. Missing ask cannot qualify persist (dump is bid-only)."""
     bid_f = _finite_px(bid)
@@ -187,6 +219,7 @@ def evaluate_held_bag(
     persist_done=False,
     gui_ok=True,
     gui_why="ok",
+    persist_bounce_max=PERSIST_BOUNCE_MAX,
 ):
     """Dump / persist-sell / hold for one live bag.
 
@@ -194,7 +227,9 @@ def evaluate_held_bag(
       Wide 22/77 still dumps.
     * Do not sell in (53, 70). Persist-not-done 61/70 is a hold.
     * After persist, 74–80 live-bid sells are correct (do not clamp to 72).
+    * A held bid above 80¢ is a winner rally, not a reversal — clear persist.
     * Persist qualify is still tight 70/72 for 2s (GUI applies only there).
+    * Elapsed armed_ts alone is not persist-done; the book must stay in band.
     """
     bid_f = _finite_px(bid)
     ask_f = _finite_px(ask)
@@ -202,16 +237,11 @@ def evaluate_held_bag(
         dump_max = float(dump_bid_max)
         qualify = float(qualify_bid)
         wait = float(persist_s or 0)
+        bounce_max = float(persist_bounce_max)
     except (TypeError, ValueError):
         return HedgeIntent("hold", "bad_thresholds", None, None, False, True, None, False)
 
     done = bool(persist_done)
-    if persist_armed_ts is not None and wait > 1e-12:
-        try:
-            if float(now_s) - float(persist_armed_ts) >= wait - 1e-12:
-                done = True
-        except (TypeError, ValueError):
-            pass
 
     if bid_f is None:
         return HedgeIntent(
@@ -223,10 +253,16 @@ def evaluate_held_bag(
             "dump", "bid_le_dump", bid_f, persist_armed_ts, done, True, dump_max, True,
         )
 
+    if persist_should_cancel_on_bid(
+        bid_f, persist_done=done, qualify_bid=qualify, bounce_max=bounce_max,
+    ):
+        return HedgeIntent("hold", "bid_above", None, None, False, True, None, False)
+
     if done:
         if bid_f + 1e-12 >= qualify:
             return HedgeIntent(
-                "sell", "persist_live_bid", bid_f, persist_armed_ts, True, True, None, False,
+                "sell", "persist_live_bid", bid_f, persist_armed_ts, True, True,
+                bounce_max, False,
             )
         return HedgeIntent(
             "hold", "dead_band", None, persist_armed_ts, True, True, None, False,
@@ -252,7 +288,7 @@ def evaluate_held_bag(
                 "hold", "dead_band", None, new_ts, True, False, None, False,
             )
         return HedgeIntent(
-            "sell", "persist_ready", bid_f, new_ts, True, False, None, False,
+            "sell", "persist_ready", bid_f, new_ts, True, False, bounce_max, False,
         )
     if pwhy == "armed":
         return HedgeIntent("arm", "persist_armed", None, new_ts, False, False, None, False)
@@ -266,6 +302,7 @@ def hedge_should_keep_retrying(
     persist_done=False,
     dump_bid_max=0.53,
     qualify_bid=0.70,
+    bounce_max=PERSIST_BOUNCE_MAX,
 ) -> bool:
     """Unmatched / invalid-tick / could-not-run is not terminal while size remains."""
     try:
@@ -280,11 +317,14 @@ def hedge_should_keep_retrying(
     try:
         dump_max = float(dump_bid_max)
         qualify = float(qualify_bid)
+        cap = float(bounce_max)
     except (TypeError, ValueError):
         return True
     if bid_f <= dump_max + 1e-12:
         return True
     if persist_done and bid_f + 1e-12 >= qualify:
+        if bid_f > cap + 1e-12:
+            return False
         return True
     return False
 

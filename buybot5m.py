@@ -69,6 +69,7 @@ from buy.entry_skip import (
     window_no_buy_reason,
 )
 from buy.hedge_gate import (
+    PERSIST_BOUNCE_MAX,
     evaluate_held_bag,
     hedge_fail_is_terminal,
     hedge_market_tick,
@@ -77,6 +78,7 @@ from buy.hedge_gate import (
     hedge_should_keep_retrying,
     hedge_tick_after_build_error,
     live_bag_log_fields,
+    persist_should_cancel_on_bid,
     pick_held_quote,
     should_mark_hedge_closed,
 )
@@ -3117,6 +3119,7 @@ def sell_market_with_retry(
     Dump (bid ≤ 53) and persist-done sells are bid-only: incomplete REST
     reuses WS/last-good, unmatched / invalid-tick retries down the live bid.
     After persist, a 74–80¢ live bid is a correct fill (do not clamp to 72).
+    A winner rally above 80¢ aborts the persist sell (do not POST at 0.93).
     `hedge_min_price` is not a floor.
 
     Returns (total_sold, result, proceeds) where result["bot_status"] is
@@ -3141,11 +3144,17 @@ def sell_market_with_retry(
     )
     dump_bid_max = 0.53
     qualify_bid = 0.70
+    persist_bounce_max = 0.80
+    try:
+        persist_bounce_max = float(PERSIST_BOUNCE_MAX)
+    except (NameError, TypeError, ValueError):
+        persist_bounce_max = 0.80
     if dump and abort_above is None:
         abort_above = dump_bid_max
-    if persist_done:
-        abort_above = None
+    if persist_done and not dump:
         need_integrity = False
+        if abort_above is None:
+            abort_above = persist_bounce_max
     start_bal = check_clob_token_balance(token_id, refresh=False)
     if DRY_RUN:
         price = hedge_sell_price(price_limit, tick_size, undercut_ticks, floor)
@@ -4729,21 +4738,14 @@ while not _shutdown_requested:
                     last_bid, last_ask = last_good_held_quote(held_token)
                     persist_done = cond in _hedge_persist_done
                     armed_ts = _hedge_persist_armed.get(cond)
-                    if (
-                        armed_ts is not None
-                        and float(HEDGE_PERSIST_S) > 0
-                        and (time.monotonic() - float(armed_ts)) >= float(HEDGE_PERSIST_S) - 1e-12
-                    ):
-                        persist_done = True
-                        _hedge_persist_done.add(cond)
 
-                    # Healthy winner: skip REST only when persist is NOT already done.
-                    # After persist, a 74–80 bounce must still sell at the live bid.
-                    if (
-                        (not persist_done)
-                        and ws_fresh
-                        and peek_bid is not None
-                        and peek_bid > float(HEDGE_THRESHOLD) + 1e-12
+                    # Healthy winner / rally: clear persist. After persist, a
+                    # 74–80 bounce must still sell; 0.93 / 0.99 must not.
+                    if ws_fresh and persist_should_cancel_on_bid(
+                        peek_bid,
+                        persist_done=persist_done,
+                        qualify_bid=HEDGE_THRESHOLD,
+                        bounce_max=PERSIST_BOUNCE_MAX,
                     ):
                         _hedge_persist_armed.pop(cond, None)
                         _hedge_persist_done.discard(cond)
@@ -4755,7 +4757,12 @@ while not _shutdown_requested:
                                 ttm=seconds_left,
                                 bid=peek_bid, ask=peek_ask,
                                 tick=get_tick_size_cached(held_token),
-                                reason="ws_above_qualify",
+                                reason=(
+                                    "winner_rally"
+                                    if peek_bid is not None
+                                    and peek_bid > float(PERSIST_BOUNCE_MAX) + 1e-12
+                                    else "ws_above_qualify"
+                                ),
                             ),
                             mid=peek_mid, threshold=HEDGE_THRESHOLD,
                         )
@@ -5046,7 +5053,7 @@ while not _shutdown_requested:
                                 min_price=hedge_floor,
                                 undercut_ticks=0,
                                 retry_sleep_s=HEDGE_RETRY_SLEEP_S,
-                                abort_above=HEDGE_TOXIC_BID_MAX if dump else None,
+                                abort_above=intent.abort_above,
                                 require_ask_max=None,
                                 max_spread=None,
                                 on_submit=_persist_hedge_submit,

@@ -6,6 +6,10 @@ dumping. These cases are the spec. No 75/50 or 65/50 invention.
 22 Aug 16:08 UTC: polybuybot5m crashed twice in the 12:05 ET window —
 ``TypeError: log_buy_skip_throttled() got multiple values for argument 'reason'``
 at the hedge persist-skip log (buybot5m.py ~4886).
+
+22 Aug 17:35–17:40Z: late Down 3.14 @ 0.86, then ``REVERSAL DETECTED``
+at bid 0.93 / ask 0.94 (fill 0.99) while Down won. Persist-done must
+not sell a winner rally.
 """
 
 from __future__ import annotations
@@ -23,11 +27,13 @@ from buy.entry_skip import (
     stamp_slice_on_inventory,
 )
 from buy.hedge_gate import (
+    PERSIST_BOUNCE_MAX,
     evaluate_held_bag,
     hedge_fail_is_terminal,
     hedge_market_tick,
     hedge_should_keep_retrying,
     live_bag_log_fields,
+    persist_should_cancel_on_bid,
     pick_held_quote,
     should_mark_hedge_closed,
 )
@@ -150,7 +156,77 @@ class HeldBagDumpAndDeadBand(unittest.TestCase):
         self.assertEqual(intent.action, "sell")
         self.assertEqual(intent.reason, "persist_live_bid")
         self.assertAlmostEqual(intent.sell_at, 0.74)
-        self.assertIsNone(intent.abort_above)
+        self.assertAlmostEqual(intent.abort_above, PERSIST_BOUNCE_MAX)
+
+    def test_persist_done_bid_093_does_not_sell_winner_rally(self):
+        """22 Aug 17:35–17:40Z: late Down 0.86, then sold the 0.93/0.94 winner.
+
+        Persist-done must not treat a rally above the 70/72 band as a reversal.
+        After persist, 74–80 is an execution bounce; 0.93 / 0.99 is a winner.
+        """
+        for bid, ask in ((0.93, 0.94), (0.99, 0.995), (0.86, 0.87)):
+            with self.subTest(bid=bid, ask=ask):
+                intent = evaluate_held_bag(
+                    bid, ask, now_s=20.0, persist_armed_ts=10.0, persist_s=2.0,
+                    persist_done=True, gui_ok=True,
+                )
+                self.assertNotEqual(intent.action, "sell")
+                self.assertNotEqual(intent.action, "dump")
+                self.assertEqual(intent.action, "hold")
+                self.assertFalse(intent.persist_done)
+                self.assertIsNone(intent.persist_ts)
+                self.assertIsNone(intent.sell_at)
+
+    def test_elapsed_arm_alone_does_not_sell_093(self):
+        """A 2s-old arm is not persist-done if the book left 70/72."""
+        intent = evaluate_held_bag(
+            0.93, 0.94, now_s=13.0, persist_armed_ts=10.0, persist_s=2.0,
+            persist_done=False, gui_ok=True,
+        )
+        self.assertNotEqual(intent.action, "sell")
+        self.assertNotEqual(intent.action, "dump")
+        self.assertEqual(intent.reason, "bid_above")
+        self.assertFalse(intent.persist_done)
+        self.assertIsNone(intent.persist_ts)
+
+    def test_late_086_entry_093_094_book_is_not_a_reversal(self):
+        """Live incident book: bought ~0.86, later Down 0.93 / 0.94."""
+        for persist_done, armed in ((False, None), (False, 10.0), (True, 10.0)):
+            with self.subTest(persist_done=persist_done, armed=armed):
+                intent = evaluate_held_bag(
+                    0.93, 0.94, now_s=60.0, persist_armed_ts=armed,
+                    persist_s=2.0, persist_done=persist_done, gui_ok=True,
+                )
+                self.assertNotIn(intent.action, {"sell", "dump", "arm", "wait"})
+                self.assertEqual(intent.action, "hold")
+
+    def test_persist_ready_still_sells_at_70_72(self):
+        intent = evaluate_held_bag(
+            0.70, 0.72, now_s=12.0, persist_armed_ts=10.0, persist_s=2.0,
+            persist_done=False, gui_ok=True,
+        )
+        self.assertEqual(intent.action, "sell")
+        self.assertEqual(intent.reason, "persist_ready")
+        self.assertAlmostEqual(intent.sell_at, 0.70)
+        self.assertTrue(intent.persist_done)
+
+    def test_persist_done_bid_080_still_sells_execution_bounce(self):
+        intent = evaluate_held_bag(
+            0.80, 0.81, now_s=20.0, persist_armed_ts=10.0, persist_s=2.0,
+            persist_done=True,
+        )
+        self.assertEqual(intent.action, "sell")
+        self.assertEqual(intent.reason, "persist_live_bid")
+        self.assertAlmostEqual(intent.sell_at, 0.80)
+
+    def test_persist_done_bid_081_clears_as_winner_rally(self):
+        intent = evaluate_held_bag(
+            0.81, 0.82, now_s=20.0, persist_armed_ts=10.0, persist_s=2.0,
+            persist_done=True,
+        )
+        self.assertEqual(intent.action, "hold")
+        self.assertEqual(intent.reason, "bid_above")
+        self.assertFalse(intent.persist_done)
 
     def test_bid_061_persist_not_done_does_not_sell(self):
         intent = evaluate_held_bag(
@@ -196,6 +272,7 @@ class SellExecutionRails(unittest.TestCase):
     @staticmethod
     def _sell_ns(post_error=None, quotes=None, confirmed=0.0):
         from buy.hedge_gate import (
+            PERSIST_BOUNCE_MAX,
             hedge_market_tick,
             hedge_tick_after_build_error,
             hedge_should_keep_retrying,
@@ -244,6 +321,7 @@ class SellExecutionRails(unittest.TestCase):
                 "SELL": "SELL",
                 "EXPECTED_TICK_SIZE": "0.001",
                 "TICK_SIZE_FALLBACK": "0.001",
+                "PERSIST_BOUNCE_MAX": PERSIST_BOUNCE_MAX,
                 "hedge_market_tick": hedge_market_tick,
                 "hedge_tick_after_build_error": hedge_tick_after_build_error,
                 "hedge_should_keep_retrying": hedge_should_keep_retrying,
@@ -301,6 +379,12 @@ class SellExecutionRails(unittest.TestCase):
         self.assertTrue(
             hedge_should_keep_retrying(3.2, 0.47, persist_done=True)
         )
+        self.assertFalse(
+            hedge_should_keep_retrying(3.2, 0.93, persist_done=True)
+        )
+        self.assertTrue(
+            hedge_should_keep_retrying(3.2, 0.74, persist_done=True)
+        )
 
     def test_persist_done_074_posts_live_bid(self):
         ns, calls = self._sell_ns(quotes=[(0.74, 0.76)], confirmed=3.2)
@@ -317,6 +401,22 @@ class SellExecutionRails(unittest.TestCase):
         self.assertEqual(result.get("bot_status"), "filled")
         self.assertAlmostEqual(calls["orders"][0]["price"], 0.74)
         self.assertAlmostEqual(sold, 3.2)
+
+    def test_persist_done_093_does_not_post_winner_rally(self):
+        """HEDGE SELL / REVERSAL DETECTED at 0.93/0.94 must not POST."""
+        ns, calls = self._sell_ns(quotes=[(0.93, 0.94)], confirmed=3.13)
+        sold, result, _proceeds = ns["sell_market_with_retry"](
+            "token", 3.13, 0.93,
+            tick_size="0.001",
+            max_retries=3,
+            persist_done=True,
+            abort_above=None,
+            require_ask_max=None,
+            initial_quote=(0.93, 0.94),
+        )
+        self.assertEqual(calls["post"], 0)
+        self.assertEqual(sold, 0.0)
+        self.assertNotEqual(result.get("bot_status"), "filled")
 
     def test_incomplete_rest_uses_last_good_not_idle(self):
         class Unmatched(Exception):
@@ -534,6 +634,12 @@ class BotWiresCurrentRails(unittest.TestCase):
         self.assertIn("max_retries=12 if dump", src)
         self.assertNotIn(
             "seconds_left = (end_ts_ms - now_ms) / 1000",
+            src,
+        )
+        self.assertIn("persist_should_cancel_on_bid(", src)
+        self.assertIn("PERSIST_BOUNCE_MAX", src)
+        self.assertNotIn(
+            "(time.monotonic() - float(armed_ts)) >= float(HEDGE_PERSIST_S)",
             src,
         )
 

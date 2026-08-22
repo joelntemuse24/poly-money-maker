@@ -25,7 +25,8 @@ straddle), and only if the late ask is ≥ **90¢** (`add_min_price`). Flat
 late 75–90 is still a first entry. After a full hedge the market is done.
 Normal hedge is **persist 2s @ 70/72** on the combined bag (GUI: held ≤
 **72¢**, other ≥ **28¢**; not inverted 30/70). Then sell at the live bid
-(74–80 OK). **Any live bag** dumps bid-only at **≤53¢**. Do not sell in
+(74–80 OK). Do **not** sell a winner rally (0.93 / 0.99) as a hedge —
+persist-done is not unbounded. **Any live bag** dumps bid-only at **≤53¢**. Do not sell in
 (53¢, 70¢). Winners redeem at $1.00. **No profit-take sell.** See
 `CURRENT.md` for the active probe knobs.
 
@@ -223,7 +224,7 @@ two-slice $2.50+$2.50 add.
   (Data API), not 704 live markets. Banner **POS** is live hedges only;
   **WAIT** is dust. Look interval is **0.01s**. Live JSON poll keys
   hot-reload; the loop-body fix needs `sudo systemctl restart polybuybot5m`.
-- `hedge_attempt` / `hedge_fill` — persist 2s @ 70/72 then sell at the live bid (74–80 OK), or **any** bag dumps bid-only at ≤53¢
+- `hedge_attempt` / `hedge_fill` — persist 2s @ 70/72 then sell at the live bid (74–80 OK), or **any** bag dumps bid-only at ≤53¢. A 0.93 / 0.99 winner rally is **not** a hedge (`hedge_cancel_bounce` `winner_rally`).
 - `hedge_tick_retry` — CLOB rejected a too-fine tick (`invalid tick size (0.001), minimum is 0.01`); same trigger rebuilds at 0.01. Pre-fix this was `[EXIT FAIL]` / `sell_build_rejected` and the dump never sold (22 Aug 11:40).
 - `hedge_skip_persist` — 70/72 + GUI passed but the book has not stayed qualified for `hedge_persist_s` (2s). A bounce resets the arm.
 - `hedge_skip_toxic_book` — bid dipped but ask/spread still say "not reversed"
@@ -344,10 +345,13 @@ Cloud agents: `CLOUD_RESEARCH.md`.
   A random TOB clip is not enough; a last print of 85¢ on a 68/71 book will
   `hedge_skip_no_consensus`. **Any live bag** dumps bid-only while held bid
   ≤ **53¢** (no GUI veto; not only `toxic_fill`). Do **not** sell in
-  (53¢, 70¢). After persist, 74–80 live-bid fills are correct. A recovered
+  (53¢, 70¢). After persist, 74–80 live-bid fills are correct. A held
+  bid above 80¢ (0.93 / 0.99) is a winner rally — clear persist, do not
+  sell (`hedge_cancel_bounce`). A recovered
   97¢ book logs `hedge_skip_toxic_recovered` and rides; a 6¢ junk bid
-  (even under a 99¢ ask) still dumps. Fresh WS bid > 70¢ skips REST only
-  when persist is **not** already done. After a dump/persist sell is
+  (even under a 99¢ ask) still dumps. Fresh WS bid > 70¢ skips REST when
+  persist is not done; a WS bid above 80¢ cancels even after persist.
+  After a dump/persist sell is
   allowed, the 5m FAK sells at the **live bid** on the **market tick** (no
   2¢ undercut). Unmatched / invalid-tick is not a terminal `hedge_fail`
   while size remains. Some 5m books require **0.01**; posting `tick_size=0.001`

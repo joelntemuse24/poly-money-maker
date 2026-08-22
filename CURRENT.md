@@ -24,7 +24,8 @@ unmatched 400 re-quotes; a minimum-tick 400 rebuilds at 0.01). Instant
 70 is out — a one-tick dip dumps winners. **Any live bag** dumps **while
 bid ≤ 53¢** (bid-only; no GUI / last-trade veto; not only `toxic_fill`).
 Do **not** sell in (53¢, 70¢). After persist, a 74–80¢ live-bid fill is
-correct. Chainlink TWAP gate is **$0** (any non-zero tick vs
+correct. Do **not** sell a winner rally (held bid 0.93 / 0.99) as a
+reversal — persist-done is not a license to sell above 80¢. Chainlink TWAP gate is **$0** (any non-zero tick vs
 PTB; side must match; flat is still refused). Late FAKs **limit at 90¢**;
 early FAKs **limit at 99¢**. Size starts at `budget/ask` and is **at least 3
 shares** when `3 × limit` fits in `buy_max_spend` **$3 per FAK** (early
@@ -77,7 +78,7 @@ Normal hedge is **persist 2s @ 70/72** on the combined bag:
 | Execution | Size `budget/ask`, **floor 3 shares** when `3 × limit ≤ $3`. Unmatched 400 re-quotes up to **3** FAKs; then **0.15 s** cooldown. Unclear POSTs still quarantine. |
 | GUI consensus | winner ≥ 70¢, loser ≤ 30¢ |
 | Windows | 5m **whole market**: early ≥90 / ≥95 for TTM (120, 300]; late 75–90 for TTM ≤ 120s (15m / hourly bots **not running**) |
-| Hedge | **Qualify** bid ≤ **70¢** and ask ≤ **72¢**, spread ≤ 15¢, **plus** GUI held ≤ **72¢** / other ≥ **28¢** (not inverted 30/70). Last print ≤ 72¢. Must **stay qualified 2s** (`hedge_persist_s`; a bounce resets). Then sell at the **live bid on the market tick** (honor CLOB 0.01 when that is the minimum; no 2¢ undercut; 74–80¢ after persist is correct). Do **not** sell in **(53¢, 70¢)**. Unmatched / invalid-tick / could-not-run retry down the live bid; `hedge_fail` after `sell_attempt_rejected` is **not** terminal while size remains and bid ≤53 or persist completed. Incomplete REST uses WS / last-good bid (do not skip-dump). Combined early+late inventory. Instant 70 is out. After a full dump, `hedge_closed` blocks any later buy on that market. **Any live bag** dumps bid-only while held bid ≤ **53¢** (`hedge_toxic_bid_max`) — wide 22/77 still dumps; no GUI veto. `toxic_fill` also arms when FAK **average** is **outside the open band** or < 65¢. Entry TTM is `min(Gamma end, slug+300)` so 93¢ at slug-TTM 116 cannot POST as early 99¢. |
+| Hedge | **Qualify** bid ≤ **70¢** and ask ≤ **72¢**, spread ≤ 15¢, **plus** GUI held ≤ **72¢** / other ≥ **28¢** (not inverted 30/70). Last print ≤ 72¢. Must **stay qualified 2s** (`hedge_persist_s`; a bounce resets). Then sell at the **live bid on the market tick** (honor CLOB 0.01 when that is the minimum; no 2¢ undercut; 74–80¢ after persist is correct). Do **not** sell a winner rally above **80¢** (22 Aug 17:35Z: Down 0.86 entry, then `REVERSAL DETECTED` at 0.93/0.94 filled 0.99). Persist-done / elapsed arm must not sell 0.93. Do **not** sell in **(53¢, 70¢)**. Unmatched / invalid-tick / could-not-run retry down the live bid; `hedge_fail` after `sell_attempt_rejected` is **not** terminal while size remains and bid ≤53 or persist completed. Incomplete REST uses WS / last-good bid (do not skip-dump). Combined early+late inventory. Instant 70 is out. After a full dump, `hedge_closed` blocks any later buy on that market. **Any live bag** dumps bid-only while held bid ≤ **53¢** (`hedge_toxic_bid_max`) — wide 22/77 still dumps; no GUI veto. `toxic_fill` also arms when FAK **average** is **outside the open band** or < 65¢. Entry TTM is `min(Gamma end, slug+300)` so 93¢ at slug-TTM 116 cannot POST as early 99¢. |
 | Underlying edge | **$0** (5m: any non-zero TWAP vs PTB) / **$10** (15m, hourly); side must match |
 | `max_open_positions` | **0 = unlimited** |
 | `toxic_force_exit_below` | **65¢** |
@@ -262,6 +263,15 @@ amount / HTTP 400), not this NameError.
       after merge (`git pull` then `sudo systemctl restart polybuybot5m`).
       Confirm `dry_run` / `entry_enabled`. Do **not** start 15m /
       hourly / mint. Do **not** invent a 75/50 strategy.
+- [x] **22 Aug 2026 17:35Z false hedge.** Late Down 3.14 @ 0.86, then
+      `HEDGE SELL / REVERSAL DETECTED` at bid 0.93 / ask 0.94 (fill
+      0.99) while Down went to ~0.9995. Persist-done treated any bid
+      ≥70¢ as a sell, including a winner rally; elapsed arm also
+      promoted persist-done without the book staying at 70/72. Code:
+      hold/clear persist above 80¢; abort persist retries above 80¢;
+      WS bounce-cancel a 0.93 peek even after persist. Persist 2s @
+      70/72 and dump ≤53 unchanged. **Restart required** after merge
+      (code only; this agent does not restart).
 - [ ] Hourly three-slice bot is in the repo (`buybothourly.py` + example JSON).
       **Do not start `polybuybothourly`.** Operator later: `git pull`, set live
       `strategy_buyhourly.json` (`dry_run` / `entry_enabled` only when they mean
