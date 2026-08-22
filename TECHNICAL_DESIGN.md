@@ -189,6 +189,7 @@ buy/                 Importable helpers (safe — they do not start trading)
   clob_book_ws.py    Fast top-of-book websocket
   book.py            Parse bid/ask levels (price + size)
   entry_skip.py      5m two-slice + hourly three-slice band math (not 15m)
+  hedge_gate.py      5m persist hedge timer (toxic dumps stay instant)
   chain.py           Mint helper: Polygon eth_call (paused path)
   contracts.py       Mint helper: splitPosition calldata (paused path)
 pathlog.py           Recorder, no orders
@@ -202,8 +203,9 @@ widget/polydesk.py   Laptop glance (public API, no orders)
 exists in the other two files. Diff them after a logic change. The 5m-only
 exceptions are the 5m early price bands (`buy/entry_skip.py` + `BUY_HORIZON_S`
 in **seconds**) and the hourly three-slice bands (`BUY_HORIZON_MIN` in
-**minutes**). 5m defaults: hedge 53/55, BTC gate $0, tick `0.001`. Hourly
-defaults: hedge 55/60, BTC gate $10, tick `0.01`, $10 market cap.
+**minutes**). 5m defaults: persist hedge 2s @ 70/72 (toxic 53¢), BTC gate
+$0, tick `0.001`. Hourly defaults: hedge 55/60, BTC gate $10, tick `0.01`,
+$10 market cap.
 
 15m/hourly windows are in **minutes** (`buy_window_min` / `a22_window_min`).
 Mixing the two without converting units has caused production `NameError`s.
@@ -465,7 +467,8 @@ hard exit (you will fail later on POST if allowance is actually missing).
 
 Then: `MarketGateway`, `get_btc_feed(...)`, `get_book_feed()`. Those start
 background threads. Then the ASCII banner (the 97¢ / 65¢ text in the banner
-is **cosmetic leftover** — live knobs are two $2.50 slices / 53/55). Then
+is **cosmetic leftover** — live knobs are two $2.50 slices / persist 2s @
+70/72). Then
 `load_json(STATE_FILE)` and the `while` loop.
 
 ---
@@ -500,7 +503,7 @@ dict **is the schema**.
 | Most knobs in live JSON | No — next loop iteration |
 | `dry_run` | **Yes** (state paths) |
 | Python code | **Yes** (`systemctl restart polybuybot5m`). `git pull` is not a restart. |
-| Hedge 53/55 if live JSON still says 0.35/0.40 | The **file** wins. Code defaults only apply when the key is **omitted**. Patch the JSON. |
+| Hedge 70/72 if live JSON still says 0.53/0.55 | The **file** wins. Code defaults only apply when the key is **omitted**. Patch the JSON or persist waits 2s at the old 53/55. |
 
 `entry_enabled` is the operator arm. Defaults `false` in the example file.
 Live JSON on the VM is what actually arms buys.
@@ -599,20 +602,22 @@ snapshot is young enough.
 legs need a display price (mid or last trade) or the bot logs
 `buy_skip_incomplete_book`.
 
-**5m hedge GUI** matches the 53/55 book, not buy 70/30: held last trade ≤
-ask-max (55¢), held GUI ≤ 55¢, other GUI ≥ 45¢ (complement). A 53¢ vs 47¢
-display is the stop; the other side does not have to already be ahead.
-15m/hourly still invert 70/30. A 52/54 book with last trade **85¢** is a
-clip, not a reversal → `hedge_skip_no_consensus`.
+**5m hedge GUI** matches the 70/72 book, not buy 70/30: held last trade ≤
+ask-max (72¢), held GUI ≤ 72¢, other GUI ≥ 28¢ (complement). A 70¢ vs 28¢
+display is the qualify; the other side does not have to already be ahead.
+15m/hourly still invert 70/30. A 68/71 book with last trade **85¢** is a
+clip, not a reversal → `hedge_skip_no_consensus`. After GUI, 5m waits
+`hedge_persist_s` (2s) on a still-qualified book (`hedge_skip_persist` /
+`buy/hedge_gate.py`). A bounce clears the arm.
 
 `entry_book_ok`: both sides present, not crossed, spread ≤ 5¢, bid ≥ 70¢.
 
-`hedge_book_ok`: bid ≤ threshold (53¢), ask ≤ 55¢, spread ≤ 15¢. A 1¢ bid
+`hedge_book_ok`: bid ≤ threshold (70¢), ask ≤ 72¢, spread ≤ 15¢. A 1¢ bid
 under a 99¢ ask fails (`hedge_skip_toxic_book`).
 
-`toxic_dump_book_ok`: **only** `bid ≤ hedge_threshold`. Used when a fill was
-already classified junk (`toxic_fill`). Still will not dump a recovered 97¢
-bid.
+`toxic_dump_book_ok`: **only** `bid ≤ hedge_toxic_bid_max` (53¢). Used when
+a fill was already classified junk (`toxic_fill`). Skips GUI and persist.
+Still will not dump a recovered 97¢ bid.
 
 ---
 
@@ -646,9 +651,11 @@ last 120s matches **late** (floor 75¢), not ≥95 — a walk to 91¢ stays in-b
 subscribe actually run in the first 3 minutes.
 
 **Two slices:** `buy_budget` $2.50 early, `late_buy_budget` $2.50 late.
-`early_bought` / `late_bought` in state. Same-token add; `buy_skip_other_leg`
-if the late winner is the other side. Hedge is unchanged on the combined
-size.
+`early_bought` / `late_bought` in state. Same-token add only if ask ≥
+`add_min_price` (90¢) — `buy_skip_add_below_min` otherwise. Flat late 75–90
+is still a first entry. `buy_skip_other_leg` if the late winner is the
+other side. After a full hedge, `hedge_closed` blocks any later buy
+(`buy_skip_hedge_closed`). Hedge is persist 2s @ 70/72 on the combined size.
 
 **Other gates (all must pass):**
 
@@ -658,7 +665,8 @@ size.
    unknown collateral)
 4. Not `buy_uncertain` (quarantine)
 5. Not this slice already filled (`early_bought` / `late_bought`); same-leg
-   late add is allowed
+   late add is allowed only if ask ≥ `add_min_price` (90¢). `hedge_closed`
+   blocks every later slice.
 6. Past `buy_grace_s` after first sighting
 7. Risk caps
 8. Cooldown after empty FAK
@@ -772,21 +780,23 @@ caller.
 
 **Normal hedge pipeline in the loop:**
 
-1. **Peek WS.** If a **fresh** WS bid is **above** 53¢, skip REST entirely
-   (`hedge_cancel` / toxic recovered). Do not hammer `/book` on a healthy
-   winner.
+1. **Peek WS.** If a **fresh** WS bid is **above** 70¢ (normal) or **53¢**
+   (toxic), skip REST entirely (`hedge_cancel` / toxic recovered). Do not
+   hammer `/book` on a healthy winner.
 2. Else **force REST**. Missing a side on a **normal** hedge →
    `hedge_skip_incomplete_rest` (no WS sell). Toxic dump may proceed with
    bid-only; no bid still skips.
-3. Bid bounced above 53¢ on REST → `hedge_cancel_bounce`.
-4. `hedge_book_ok` 53/55/15. Fail → `hedge_skip_toxic_book`.
+3. Bid bounced above 70¢ on REST → `hedge_cancel_bounce`.
+4. `hedge_book_ok` 70/72/15. Fail → `hedge_skip_toxic_book`.
 5. `hedge_consensus_ok` (5m: held ≤ ask-max / other ≥ complement; 15m/hourly:
    inverted 70/30). Fail → `hedge_skip_no_consensus`.
-6. Write-ahead hedge quarantine, then FAK **sell at live bid minus
+6. `hedge_persist_ready` (5m 2s). Fail → `hedge_skip_persist` (arm or wait).
+   Toxic skips persist and sells on the first qualifying tick.
+7. Write-ahead hedge quarantine, then FAK **sell at live bid minus
    `hedge_undercut_ticks`** (default 2 ticks = 0.002 on 5m).
    `hedge_sell_price` **ignores** `hedge_min_price` so a leftover 32¢ config
    cannot refuse a 20¢ print. Floor is one tick (exchange minimum).
-7. Retries force REST again and re-run two-sided integrity so a spoof
+8. Retries force REST again and re-run two-sided integrity so a spoof
    1¢/99¢ still aborts. Toxic retries set `abort_above=None` but still
    honor “bid recovered.”
 
@@ -939,7 +949,7 @@ This is the one state-like tree that is allowed to delete itself. Do not
 
 **`check_path_backtest.py`:** first tick that matches an ask band and TTM
 window is a “hit.” Paper hedge walks later ticks with the **example JSON**
-hedge (5m: 53/55/15, held GUI ≤ 55¢ / other ≥ 45¢) using mid as GUI when spread ≤ 10¢. Pathlog has **no**
+hedge (5m example: 70/72/15, held GUI ≤ 72¢ / other ≥ 28¢) using mid as GUI when spread ≤ 10¢. Paper is still **instant**, not persist 2s. Pathlog has **no**
 last-trade, **no** BTC/PTB, **no** POST latency.
 
 **`--sweep` / `--compare` do not replay the early ≥90 / ≥95 union or two
@@ -996,12 +1006,12 @@ cap is separate and in-app.
 
 ```bash
 cd ~/poly-money-maker && git pull
-python3 -c 'import json; from pathlib import Path; p=Path("strategy_buy5m.json"); d=json.loads(p.read_text()); d["hedge_threshold"]=0.53; d["hedge_require_ask_max"]=0.55; p.write_text(json.dumps(d, indent=2)+"\n")'
+python3 -c 'import json; from pathlib import Path; p=Path("strategy_buy5m.json"); d=json.loads(p.read_text()); d["hedge_threshold"]=0.70; d["hedge_require_ask_max"]=0.72; d["hedge_persist_s"]=2.0; d["hedge_toxic_bid_max"]=0.53; d["add_min_price"]=0.90; p.write_text(json.dumps(d, indent=2)+"\n")'
 sudo systemctl restart polybuybot5m
 ```
 
-Watch `buy_attempt` `band=early` / `early_95` and `hedge_attempt` once held
-bid ≤ 53¢.
+Watch `buy_skip_add_below_min`, `hedge_skip_persist`, and `hedge_attempt`
+once a 70/72 book has stayed qualified for 2s.
 
 ---
 

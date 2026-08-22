@@ -700,8 +700,13 @@ class AmbiguousCrossCyclePolicy(unittest.TestCase):
         self.assertIn("stamp_slice_bought", five)
         self.assertIn("accumulate_buy_inventory", five)
         self.assertIn("buy_skip_other_leg", five)
-        self.assertIn('"hedge_threshold": 0.53', five)
-        self.assertIn('"hedge_require_ask_max": 0.55', five)
+        self.assertIn("buy_skip_add_below_min", five)
+        self.assertIn("hedge_skip_persist", five)
+        self.assertIn('"hedge_threshold": 0.70', five)
+        self.assertIn('"hedge_require_ask_max": 0.72', five)
+        self.assertIn('"hedge_persist_s": 2.0', five)
+        self.assertIn('"hedge_toxic_bid_max": 0.53', five)
+        self.assertIn('"add_min_price": 0.90', five)
         self.assertNotIn(
             "up_ask_ok = up_ask is not None and BUY_THRESHOLD <= up_ask <= BUY_MAX_PRICE",
             five,
@@ -1165,7 +1170,7 @@ class BuyExecutionAmbiguity(unittest.TestCase):
 
 
 class FiveMinuteHedgeGuiTests(unittest.TestCase):
-    """5m hedge GUI follows 53/55, not buy 70/30. 15m/hourly stay inverted."""
+    """5m hedge GUI follows ask-max / complement, not buy 70/30."""
 
     @classmethod
     def setUpClass(cls):
@@ -1709,8 +1714,11 @@ class BalanceAndGcSemantics(unittest.TestCase):
         self.assertEqual(five["early_95_start_s"], 300)
         self.assertEqual(five["early_95_min_s"], 60)
         self.assertEqual(five["early_95_min_price"], 0.95)
-        self.assertEqual(five["hedge_threshold"], 0.53)
-        self.assertEqual(five["hedge_require_ask_max"], 0.55)
+        self.assertEqual(five["hedge_threshold"], 0.70)
+        self.assertEqual(five["hedge_require_ask_max"], 0.72)
+        self.assertEqual(five["hedge_persist_s"], 2.0)
+        self.assertEqual(five["hedge_toxic_bid_max"], 0.53)
+        self.assertEqual(five["add_min_price"], 0.90)
         self.assertEqual(five["buy_threshold"], 0.75)
         self.assertEqual(five["buy_max_price"], 0.90)
         self.assertEqual(five["buy_budget"], 2.5)
