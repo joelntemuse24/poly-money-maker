@@ -28,7 +28,10 @@ from buy.market import (
     entry_seconds_left,
     slug_window_end_ts,
 )
-from tests.test_buy_fill_shapes import BOT5M, _load_funcs
+try:
+    from tests.test_buy_fill_shapes import BOT5M, _load_funcs
+except ImportError:
+    from test_buy_fill_shapes import BOT5M, _load_funcs
 
 
 def _band(ttm, ask):
