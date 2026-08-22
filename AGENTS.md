@@ -24,8 +24,9 @@ Missed early does **not** become a $5 late buy. Same-leg add only (no
 straddle), and only if the late ask is ≥ **90¢** (`add_min_price`). Flat
 late 75–90 is still a first entry. After a full hedge the market is done.
 Normal hedge is **persist 2s @ 70/72** on the combined bag (GUI: held ≤
-**72¢**, other ≥ **28¢**; not inverted 30/70). Toxic dump stays **53¢**,
-no persist. Winners redeem at $1.00. **No profit-take sell.** See
+**72¢**, other ≥ **28¢**; not inverted 30/70). Then sell at the live bid
+(74–80 OK). **Any live bag** dumps bid-only at **≤53¢**. Do not sell in
+(53¢, 70¢). Winners redeem at $1.00. **No profit-take sell.** See
 `CURRENT.md` for the active probe knobs.
 
 Last 120s is **75–90¢ only** — do not buy 91–99¢ after T-120. `buy_max_price`
@@ -222,16 +223,17 @@ two-slice $2.50+$2.50 add.
   (Data API), not 704 live markets. Banner **POS** is live hedges only;
   **WAIT** is dust. Look interval is **0.01s**. Live JSON poll keys
   hot-reload; the loop-body fix needs `sudo systemctl restart polybuybot5m`.
-- `hedge_attempt` / `hedge_fill` — hedge fired after force-fresh REST + book integrity + GUI consensus + persist 2s (normal path)
+- `hedge_attempt` / `hedge_fill` — persist 2s @ 70/72 then sell at the live bid (74–80 OK), or **any** bag dumps bid-only at ≤53¢
 - `hedge_tick_retry` — CLOB rejected a too-fine tick (`invalid tick size (0.001), minimum is 0.01`); same trigger rebuilds at 0.01. Pre-fix this was `[EXIT FAIL]` / `sell_build_rejected` and the dump never sold (22 Aug 11:40).
 - `hedge_skip_persist` — 70/72 + GUI passed but the book has not stayed qualified for `hedge_persist_s` (2s). A bounce resets the arm.
 - `hedge_skip_toxic_book` — bid dipped but ask/spread still say "not reversed"
-- `hedge_skip_no_consensus` — 70/72 book passed but 5m GUI/last-trade still fail (held last print ≤ 72¢, held GUI ≤ 72¢, other GUI ≥ 28¢, 5¢ gap). 15m/hourly still invert buy 70/30.
+- `hedge_skip_no_consensus` — 70/72 book passed but 5m GUI/last-trade still fail (held last print ≤ 72¢, held GUI ≤ 72¢, other GUI ≥ 28¢, 5¢ gap). Dump ≤53 skips this veto. 15m/hourly still invert buy 70/30.
 - `hedge_skip_toxic_recovered` — `toxic_fill` is armed but held bid > `hedge_toxic_bid_max` (53¢ winner book); dump stays armed, no sell
-- `hedge_skip_incomplete_rest` — REST missing a side; fail closed (no WS sell)
+- `hedge_skip_incomplete_rest` — no REST/WS/last-good bid. Incomplete REST must **not** skip a dump; use WS/last-good
+- `hedge_skip_dead_band` — persist done or qualify fired but bid is in (53¢, 70¢); do not sell
 - `buy_skip_ambiguous` — GUI display prices too close (throttled 8s; **not** one event per market)
 - `buy_skip_no_consensus` — ask in band but GUI/tight-book gate failed
-- `buy_fill_below_band` — fill avg below the open band min; inventory persisted. `toxic_fill` only if avg also < 65¢
+- `buy_fill_below_band` — fill avg outside the open band; inventory persisted and `toxic_fill` armed (also if avg < 65¢)
 - `buy_fill_walk` — confirmed shares > 1.05 × posted FAK size (normal when a 99¢/90¢ limit fills cheaper). Does **not** arm `toxic_fill` by itself
 - `buy_ghost_fill` — balance reconciliation after null/delayed BUY confirm
 - `buy_uncertain` — POST outcome unresolved; durable token/baseline quarantine blocks re-buy
@@ -340,13 +342,15 @@ Cloud agents: `CLOUD_RESEARCH.md`.
   book qualify is **70/72 persist 2s**; toxic dump **53¢**; hourly template
   **55/60**; 15m remains 35/40.
   A random TOB clip is not enough; a last print of 85¢ on a 68/71 book will
-  `hedge_skip_no_consensus`. `toxic_fill` stays armed and still skips GUI /
-  persist / 70/72/15 on 5m, but **sells only while held bid ≤ 53¢**. A
-  recovered 97¢ book logs `hedge_skip_toxic_recovered` and rides; a 6¢ junk
-  bid (even under a 99¢ ask) still dumps on bid-only REST. Fresh WS bid >
-  70¢ (normal) or > 53¢ (toxic) skips REST. After a dump is allowed, the
-  5m FAK sells at the **live bid** on the **market tick** (no 2¢
-  undercut). Some 5m books require **0.01**; posting `tick_size=0.001`
+  `hedge_skip_no_consensus`. **Any live bag** dumps bid-only while held bid
+  ≤ **53¢** (no GUI veto; not only `toxic_fill`). Do **not** sell in
+  (53¢, 70¢). After persist, 74–80 live-bid fills are correct. A recovered
+  97¢ book logs `hedge_skip_toxic_recovered` and rides; a 6¢ junk bid
+  (even under a 99¢ ask) still dumps. Fresh WS bid > 70¢ skips REST only
+  when persist is **not** already done. After a dump/persist sell is
+  allowed, the 5m FAK sells at the **live bid** on the **market tick** (no
+  2¢ undercut). Unmatched / invalid-tick is not a terminal `hedge_fail`
+  while size remains. Some 5m books require **0.01**; posting `tick_size=0.001`
   is `invalid tick size` and `[EXIT FAIL]` (22 Aug 11:40). Honor the
   CLOB tick; retry the FAK at the stated minimum (`hedge_tick_retry`).
   The 21 Aug unmatched 0.51-into-0.53 hole was undercut 2 on a 0.01

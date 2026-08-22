@@ -620,9 +620,10 @@ clip, not a reversal → `hedge_skip_no_consensus`. After GUI, 5m waits
 `hedge_book_ok`: bid ≤ threshold (70¢), ask ≤ 72¢, spread ≤ 15¢. A 1¢ bid
 under a 99¢ ask fails (`hedge_skip_toxic_book`).
 
-`toxic_dump_book_ok`: **only** `bid ≤ hedge_toxic_bid_max` (53¢). Used when
-a fill was already classified junk (`toxic_fill`). Skips GUI and persist.
-Still will not dump a recovered 97¢ bid.
+`toxic_dump_book_ok`: **only** `bid ≤ hedge_toxic_bid_max` (53¢). Live 5m
+dumps **any** bag at that bid (not only `toxic_fill`). Skips GUI and
+persist. Wide 22/77 still dumps. Recovered 97¢ rides; do not sell in
+(53¢, 70¢).
 
 ---
 
@@ -654,6 +655,13 @@ last 120s matches **late** (floor 75¢), not ≥95 — a walk to 91¢ stays in-b
 `BUY_MAX_PRICE` is both the late cap and the first-3-min ≥90 floor.
 `BUY_HORIZON_S = max(120, 300, 300) = 300` so hot polling and websocket
 subscribe actually run in the first 3 minutes.
+
+**TTM clock:** `entry_seconds_left` is `min(Gamma end, slug+300) − now`.
+Gamma `endDate` can sit several seconds late of the slug unix. Live 22 Aug
+late 91–99 posts hugged TTM 113–120 because Gamma still said early (99¢
+FAK). Discovery also pins `end_ts = slug_start + 300` when the slug has a
+unix start. After REST confirm (and again in `pre_submit`) the 5m loop
+recomputes TTM so a 93¢ ask at slug-TTM 116 cannot POST.
 
 **Two slices:** `buy_budget` $2.50 early, `late_buy_budget` $2.50 late.
 `early_bought` / `late_bought` in state. Same-token add only if ask ≥
@@ -719,9 +727,12 @@ going through the string of the intended decimal is the usual money pattern.
 USDC. It does **not** arm `toxic_fill`. A 5m limit FAK sized at the 99¢
 (or 90¢) cap yields more shares when it prints cheaper than the cap; that
 is the intended fill, not a junk walk. `classify_buy_fill` sets
-`toxic_fill` only when average `< toxic_force_exit_below` (65¢), and
-`below_band` only when average `<` the open band min. Average is
+`toxic_fill` when average is **outside the open band** (late 93, early 85)
+or `< toxic_force_exit_below` (65¢). In-band late 87¢ is **not** toxic —
+that bag still dumps when held bid ≤ 53¢. Average is
 `USDC / shares` (`implied_buy_average`), never “extra shares × gate ask.”
+Ghosts / confirm timeouts must not stamp `early_bought` / `late_bought`
+(`stamp_slice_on_inventory` requires filled > 0.01).
 
 Fees: `_fill_fee_usdc` is the CLOB v2 taker curve
 `shares * rate * (p*(1-p))**exponent`. Small at 80–90¢. Net cost/proceeds
@@ -783,38 +794,47 @@ again. Inner retries are immediate.
 `sell_market_with_retry` docstring says hedge-only. There is no profit-take
 caller.
 
-**Normal hedge pipeline in the loop:**
+**5m hedge pipeline** (`evaluate_held_bag` in `buy/hedge_gate.py`):
 
-1. **Peek WS.** If a **fresh** WS bid is **above** 70¢ (normal) or **53¢**
-   (toxic), skip REST entirely (`hedge_cancel` / toxic recovered). Do not
-   hammer `/book` on a healthy winner.
-2. Else **force REST**. Missing a side on a **normal** hedge →
-   `hedge_skip_incomplete_rest` (no WS sell). Toxic dump may proceed with
-   bid-only; no bid still skips.
-3. Bid bounced above 70¢ on REST → `hedge_cancel_bounce`.
-4. `hedge_book_ok` 70/72/15. Fail → `hedge_skip_toxic_book`.
-5. `hedge_consensus_ok` (5m: held ≤ ask-max / other ≥ complement; 15m/hourly:
-   inverted 70/30). Fail → `hedge_skip_no_consensus`.
-6. `hedge_persist_ready` (5m 2s). Fail → `hedge_skip_persist` (arm or wait).
-   Toxic skips persist and sells on the first qualifying tick.
+1. Coalesce the held quote: REST, then WS, then last-good
+   (`pick_held_quote`). Incomplete REST must not skip a live bag
+   (22 Aug: 2176 `hedge_skip_incomplete_rest` while 09:35 / 11:25 rode
+   to zero).
+2. **Bid ≤ 53¢ dumps every live bag.** Bid-only. No GUI / last-trade
+   veto. Wide 22/77 still dumps. Not only `toxic_fill` entries.
+3. Peek WS above 70¢ **only** skips REST when persist is **not** already
+   done. After persist, a 74–80 bounce must still sell at the live bid.
+4. Persist qualify is still tight 70/72 + GUI + 2s. Fail →
+   `hedge_skip_toxic_book` / `hedge_skip_no_consensus` / `hedge_skip_persist`.
+5. **Do not sell in (53¢, 70¢)** (`hedge_skip_dead_band`). Persist-not-done
+   61/70 is a hold (9:55 dead-band sell).
+6. After persist, sell at the **live bid** (74–80 is correct; do not
+   clamp to 72). `abort_above` is not 70 after persist.
 7. Write-ahead hedge quarantine, then FAK **sell at the live bid** on the
    **market tick** (5m undercut is 0). Some 5m books are 0.01 even though
    the bot default is 0.001. Forcing 0.001 rejected the signed order
    (`invalid tick size (0.001), minimum is 0.01`) and the dump never sold
-   (22 Aug 11:40: persist 61/62 then `[EXIT FAIL]`). `hedge_exec_tick`
-   honors a coarser CLOB tick; a minimum-tick 400 rebuilds at 0.01
-   (`hedge_tick_retry`). The 21 Aug unmatched 0.51-into-0.53 hole was
-   `hedge_undercut_ticks=2` on a 0.01 tick, not "must post 0.001".
+   (22 Aug 11:40). `hedge_exec_tick` honors a coarser CLOB tick; a
+   minimum-tick 400 rebuilds at 0.01 (`hedge_tick_retry`).
    `hedge_sell_price` **ignores** `hedge_min_price` so a leftover 32¢
-   config cannot refuse a 20¢ print. Floor is one market tick.
-8. Retries force REST again and re-run two-sided integrity so a spoof
-   1¢/99¢ still aborts. An unmatched sell 400 re-quotes like a buy (up to
-   3) unless CLOB balance is unreadable or inventory already disappeared.
-   Toxic retries set `abort_above=None` but still honor “bid recovered.”
+   config cannot refuse a 20¢ or 1¢ print. Floor is one market tick.
+8. Unmatched FAK / invalid tick / could-not-run retries down the live bid
+   (dump / persist-done: up to 12 in the trigger). `hedge_fail` after
+   `sell_attempt_rejected` is **not** terminal while size remains and bid
+   ≤53 or persist completed — next look posts again. Dump retries abort
+   only if bid recovers above 53¢. Persist-done retries abort in the
+   dead band. Incomplete REST on retry uses last-good, not idle cancel.
+9. Every live-bag skip/fail logs slug, ttm, bid, ask, tick, reason,
+   `order_error` (`live_bag_log_fields`). `hedge_closed` only after
+   confirmed inventory is gone.
 
-**`toxic_fill`:** armed from junk/walk average. Stays on `meta` forever until
-the dump actually sells (or you ride a recovered book). Dump **only while
-bid ≤ 53¢**. Recovered 97¢ → `hedge_skip_toxic_recovered`, flag stays armed.
+**`toxic_fill`:** armed from outside-band average or avg < 65¢. Stays on
+`meta` until the dump sells (or you ride a recovered book). Recovered 97¢
+→ `hedge_skip_toxic_recovered`, flag stays armed. Dump of **any** bag
+still follows bid ≤ 53¢.
+
+15m/hourly (stopped) still use the older toxic_fill-only REST-fail-closed
+pipeline.
 
 **Reconcile sells** with `reconcile_hedge_sold`: CLOB-confirmed sold size
 wins; a single low Data API read must not invent extra fills or erase
