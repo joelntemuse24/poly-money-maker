@@ -2,11 +2,19 @@
 
 22 Aug 2026 (Europe/Dublin): 09:35 / 11:20 / 11:25 bags expired instead of
 dumping. These cases are the spec. No 75/50 or 65/50 invention.
+
+22 Aug 16:08 UTC: polybuybot5m crashed twice in the 12:05 ET window —
+``TypeError: log_buy_skip_throttled() got multiple values for argument 'reason'``
+at the hedge persist-skip log (buybot5m.py ~4886).
 """
 
 from __future__ import annotations
 
+import ast
+import json
+import time
 import unittest
+from pathlib import Path
 from types import SimpleNamespace
 
 from buy.entry_skip import (
@@ -350,6 +358,166 @@ class SellExecutionRails(unittest.TestCase):
         )
         self.assertNotEqual(intent.action, "sell")
         self.assertNotEqual(intent.action, "dump")
+
+
+def _throttled_skip_calls(path: Path):
+    """Every ``log_buy_skip_throttled(...)`` Call in *path* (lineno, node)."""
+    tree = ast.parse(path.read_text())
+    out = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        func = node.func
+        name = func.id if isinstance(func, ast.Name) else ""
+        if name != "log_buy_skip_throttled":
+            continue
+        out.append(node)
+    return out
+
+
+def _dict_literal_has_key(node, key: str) -> bool:
+    """True if a dict literal (including ``{**a, **{"key": ...}}``) sets *key*."""
+    if isinstance(node, ast.Dict):
+        for k, v in zip(node.keys, node.values):
+            if isinstance(k, ast.Constant) and k.value == key:
+                return True
+            if k is None and _dict_literal_has_key(v, key):
+                return True
+        return False
+    if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
+        if node.func.id in {"dict"}:
+            for kw in node.keywords:
+                if kw.arg == key:
+                    return True
+                if kw.arg is None and _dict_literal_has_key(kw.value, key):
+                    return True
+    return False
+
+
+def _call_passes_reason_twice(node: ast.Call) -> bool:
+    """Positional *reason* plus ``reason=`` / ``**{..., "reason": ...}``."""
+    if len(node.args) < 1:
+        return False
+    for kw in node.keywords:
+        if kw.arg == "reason":
+            return True
+        if kw.arg is None and _dict_literal_has_key(kw.value, key="reason"):
+            return True
+    return False
+
+
+def _load_skip_logger():
+    """Extract 5m skip logger + log_event (bots are not importable)."""
+    recorded = []
+    ns = _load_funcs("log_event", "log_buy_skip_throttled", bot=BOT5M)
+    ns.update(
+        {
+            "time": time,
+            "_SKIP_LOG_EVERY_S": 0.0,
+            "_skip_log_mono": {},
+            "is_journal_event": lambda _e: False,
+            "_file_logger": SimpleNamespace(info=recorded.append),
+            "_journal_logger": SimpleNamespace(info=lambda _line: None),
+        }
+    )
+    return ns, recorded
+
+
+class PersistSkipReasonCollision(unittest.TestCase):
+    """Live 22 Aug 16:08 UTC: persist-skip logged reason twice and crashed."""
+
+    def test_persist_skip_kwargs_with_reason_do_not_typeerror(self):
+        """Construct the live persist-skip kwargs; calling the logger must not raise.
+
+        The VM call was::
+
+            log_buy_skip_throttled(
+                intent.reason, cond, event="hedge_skip_persist",
+                **{**bag_log, **{"reason": intent.reason}},
+                persist_s=..., persist_why=intent.reason, threshold=...,
+            )
+        """
+        intent = evaluate_held_bag(
+            0.70, 0.72, now_s=10.0, persist_armed_ts=None, persist_s=2.0,
+            persist_done=False, gui_ok=True,
+        )
+        self.assertEqual(intent.action, "arm")
+        self.assertEqual(intent.reason, "persist_armed")
+        bag_log = live_bag_log_fields(
+            slug="btc-updown-5m-1780000000", ttm=48.2, bid=0.70, ask=0.72,
+            tick=0.01,
+        )
+        self.assertNotIn("reason", bag_log)
+        kwargs = {**bag_log, **{"reason": intent.reason}}
+        ns, recorded = _load_skip_logger()
+        ns["log_buy_skip_throttled"](
+            intent.reason,
+            "cond-1205et",
+            event="hedge_skip_persist",
+            **kwargs,
+            persist_s=2.0,
+            persist_why=intent.reason,
+            threshold=0.70,
+        )
+        self.assertGreaterEqual(len(recorded), 1)
+        entry = json.loads(recorded[-1])
+        self.assertEqual(entry["event"], "hedge_skip_persist")
+        self.assertEqual(entry["reason"], "persist_armed")
+        self.assertEqual(entry["condition_id"], "cond-1205et")
+        self.assertAlmostEqual(entry["bid"], 0.70)
+        self.assertAlmostEqual(entry["persist_s"], 2.0)
+
+    def test_bag_log_with_reason_does_not_collide_log_event(self):
+        """``live_bag_log_fields(..., reason=)`` plus positional reason.
+
+        ``log_event(event, reason=reason, **kwargs)`` would TypeError if
+        kwargs still carried ``reason``.
+        """
+        bag_log = live_bag_log_fields(
+            slug="btc-updown-5m-1", ttm=48.2, bid=0.61, ask=0.70,
+            tick=0.01, reason="persist_waiting",
+        )
+        self.assertIn("reason", bag_log)
+        ns, recorded = _load_skip_logger()
+        ns["log_buy_skip_throttled"](
+            "persist_waiting",
+            "cond-wait",
+            event="hedge_skip_persist",
+            **bag_log,
+            persist_s=2.0,
+            persist_why="persist_waiting",
+            threshold=0.70,
+        )
+        entry = json.loads(recorded[-1])
+        self.assertEqual(entry["reason"], "persist_waiting")
+        self.assertEqual(entry["event"], "hedge_skip_persist")
+
+    def test_no_throttled_skip_caller_passes_reason_twice(self):
+        """Scan every ``log_buy_skip_throttled`` call in 5m + hourly."""
+        bots = (
+            Path(__file__).resolve().parents[1] / "buybot5m.py",
+            Path(__file__).resolve().parents[1] / "buybothourly.py",
+        )
+        collisions = []
+        persist_skip_calls = 0
+        for path in bots:
+            for node in _throttled_skip_calls(path):
+                ev = None
+                for kw in node.keywords:
+                    if kw.arg == "event" and isinstance(kw.value, ast.Constant):
+                        ev = kw.value.value
+                if ev == "hedge_skip_persist":
+                    persist_skip_calls += 1
+                if _call_passes_reason_twice(node):
+                    collisions.append(f"{path.name}:{node.lineno}")
+        self.assertGreaterEqual(
+            persist_skip_calls, 1,
+            "expected the 5m persist-skip log_buy_skip_throttled call",
+        )
+        self.assertEqual(
+            collisions, [],
+            "positional reason plus reason in kwargs: " + ", ".join(collisions),
+        )
 
 
 class BotWiresCurrentRails(unittest.TestCase):

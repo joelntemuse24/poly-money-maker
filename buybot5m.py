@@ -677,8 +677,17 @@ _hedge_persist_done = set()
 _last_good_held_quote = {}
 
 
-def log_buy_skip_throttled(reason, condition_id, event="buy_skip", **kwargs):
-    """In-window skip without flooding 0.01s looks (one line per reason / 8s)."""
+def log_buy_skip_throttled(skip_reason, condition_id, event="buy_skip", **kwargs):
+    """In-window skip without flooding 0.01s looks (one line per reason / 8s).
+
+    First arg is not named ``reason`` so a splat of ``bag_log`` / persist-skip
+    overlay that also carries ``reason`` cannot TypeError at bind time
+    (live 22 Aug 16:08, 12:05 ET). Pop ``reason`` before ``log_event`` so
+    ``log_event(event, reason=..., **kwargs)`` cannot collide the same way.
+    """
+    reason = kwargs.pop("reason", skip_reason)
+    if reason is None:
+        reason = skip_reason
     key = (str(condition_id), str(reason))
     now_mono = time.monotonic()
     prev = _skip_log_mono.get(key, 0.0)
@@ -4887,7 +4896,7 @@ while not _shutdown_requested:
                                 intent.reason,
                                 cond,
                                 event="hedge_skip_persist",
-                                **{**bag_log, **{"reason": intent.reason}},
+                                **bag_log,
                                 persist_s=HEDGE_PERSIST_S,
                                 persist_why=intent.reason,
                                 threshold=HEDGE_THRESHOLD,

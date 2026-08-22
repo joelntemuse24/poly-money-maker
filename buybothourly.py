@@ -628,8 +628,16 @@ _skip_log_mono = {}
 _buy_window_logged = {}
 
 
-def log_buy_skip_throttled(reason, condition_id, event="buy_skip", **kwargs):
-    """In-window skip without flooding 0.01s looks (one line per reason / 8s)."""
+def log_buy_skip_throttled(skip_reason, condition_id, event="buy_skip", **kwargs):
+    """In-window skip without flooding 0.01s looks (one line per reason / 8s).
+
+    First arg is not named ``reason`` so a splat that also carries ``reason``
+    cannot TypeError at bind time (5m live 22 Aug 16:08). Pop ``reason``
+    before ``log_event`` so the inner ``reason=reason, **kwargs`` cannot collide.
+    """
+    reason = kwargs.pop("reason", skip_reason)
+    if reason is None:
+        reason = skip_reason
     key = (str(condition_id), str(reason))
     now_mono = time.monotonic()
     prev = _skip_log_mono.get(key, 0.0)
