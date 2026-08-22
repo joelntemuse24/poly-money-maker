@@ -19,6 +19,7 @@ Examples (on the VM):
     python check_path_backtest.py --compare --series 5m --budget 2.5
     python check_path_backtest.py --compare --paper --series 5m --budget 2.5
     python check_path_backtest.py --sweep --series 5m
+    python check_path_backtest.py --hedge-sweep --series 5m --budget 2.5
     python check_path_backtest.py --export-market btc-updown-5m-1786528500 --csv /tmp/m.csv
   python check_path_backtest.py --ask-min 0.98 --ask-max 0.99 --ttm-max 90 --csv /tmp/hits.csv
 """
@@ -265,6 +266,8 @@ def paper_settle(
     hedge_held_gui_max: Optional[float] = None,
     hedge_other_gui_min: Optional[float] = None,
     require_gui_reversed: bool = True,
+    hedge_persist_s: float = 0.0,
+    hedge_drop_from_fill: Optional[float] = None,
 ) -> dict:
     """Walk ticks after a fill. No orders. Not a live replay.
 
@@ -277,6 +280,11 @@ def paper_settle(
     threshold / ask-max / max-spread (5m example **53/55/15**) plus the GUI
     proxy. 5m live GUI is held ≤ ask-max / other ≥ complement (55/45), and
     does **not** require the other mid to already be higher than held.
+
+    ``hedge_persist_s`` > 0 waits that many seconds of *continuous* qualifying
+    ticks before selling (a 1-tick 70¢ dip does not fire). ``hedge_drop_from_fill``
+    sells on a bid fade of that many cents from the entry ask, even above the
+    stop — backstop remains ``hedge_threshold``.
     """
     shares = float(fill.get("shares") or 0.0)
     notional = float(fill.get("notional") or 0.0)
@@ -293,6 +301,11 @@ def paper_settle(
 
     toxic = avg is not None and avg < toxic_force_exit_below - 1e-12
     other = "down" if held == "up" else "up"
+    fill_ask = _f(hit.get("ask"))
+    if fill_ask is None:
+        fill_ask = avg
+    persist_s = float(hedge_persist_s or 0.0)
+    armed_ts: Optional[float] = None
 
     def _redeem() -> dict:
         if winner is None:
@@ -318,40 +331,74 @@ def paper_settle(
         bid, ask, bid_sz = _leg_quote(row, held)
         if bid is None:
             continue
+        drop_hit = False
+        if (
+            not toxic
+            and hedge_drop_from_fill is not None
+            and fill_ask is not None
+            and bid <= float(fill_ask) - float(hedge_drop_from_fill) + 1e-12
+        ):
+            drop_hit = True
+        qualifies = False
         if toxic:
-            if bid > hedge_threshold + 1e-12:
-                continue
+            qualifies = bid <= hedge_threshold + 1e-12
+        elif drop_hit:
+            qualifies = True
         else:
             if ask is None:
+                armed_ts = None
                 continue
             if bid > hedge_threshold + 1e-12:
+                armed_ts = None
                 continue
             if ask > hedge_require_ask_max + 1e-12:
+                armed_ts = None
                 continue
             if ask < bid:
+                armed_ts = None
                 continue
             if (ask - bid) > hedge_max_spread + 1e-12:
+                armed_ts = None
                 continue
             if hedge_require_gui:
                 other_bid, other_ask, _ = _leg_quote(row, other)
                 held_gui = _tight_mid(bid, ask)
                 other_gui = _tight_mid(other_bid, other_ask)
                 if held_gui is None or other_gui is None:
+                    armed_ts = None
                     continue
                 held_cap = max_loser_bid if hedge_held_gui_max is None else hedge_held_gui_max
                 other_floor = (
                     min_winner_bid if hedge_other_gui_min is None else hedge_other_gui_min
                 )
                 if abs(held_gui - other_gui) + 1e-12 < min_bid_edge:
+                    armed_ts = None
                     continue
                 if held_gui > held_cap + 1e-12:
+                    armed_ts = None
                     continue
                 if other_gui + 1e-12 < other_floor:
+                    armed_ts = None
                     continue
                 if require_gui_reversed and other_gui <= held_gui:
+                    armed_ts = None
                     continue
                 if held_gui > last_trade_max + 1e-12:
+                    armed_ts = None
                     continue
+            qualifies = True
+        if not qualifies:
+            armed_ts = None
+            continue
+        if persist_s > 1e-12 and not toxic and not drop_hit:
+            row_ts = _f(row.get("ts"))
+            if row_ts is None:
+                continue
+            if armed_ts is None:
+                armed_ts = row_ts
+                continue
+            if (row_ts - armed_ts) < persist_s - 1e-12:
+                continue
         sell = shares
         if bid_sz is not None:
             sell = min(shares, bid_sz)
@@ -422,7 +469,90 @@ def template_from_strategy(path: Path) -> dict:
             round(1.0 - ask_max, 4) if five_m else float(data.get("min_winner_bid") or 0.70)
         ),
         "require_gui_reversed": not five_m,
+        "hedge_persist_s": float(data.get("hedge_persist_s") or 0.0),
+        "hedge_drop_from_fill": (
+            None
+            if data.get("hedge_drop_from_fill") in (None, "")
+            else float(data["hedge_drop_from_fill"])
+        ),
     }
+
+
+PAPER_KEYS = (
+    "hedge_threshold",
+    "hedge_require_ask_max",
+    "hedge_max_spread",
+    "hedge_require_gui",
+    "min_winner_bid",
+    "max_loser_bid",
+    "min_bid_edge",
+    "last_trade_max",
+    "toxic_force_exit_below",
+    "hedge_held_gui_max",
+    "hedge_other_gui_min",
+    "require_gui_reversed",
+    "hedge_persist_s",
+    "hedge_drop_from_fill",
+)
+
+
+def paper_kwargs_from(data: dict) -> dict:
+    return {k: data[k] for k in PAPER_KEYS if k in data}
+
+
+def hedge_level_kwargs(
+    threshold: float,
+    *,
+    persist_s: float = 0.0,
+    drop_from_fill: Optional[float] = None,
+    require_gui: bool = True,
+    max_spread: float = 0.15,
+) -> dict:
+    """5m-style paper stop: bid ≤ T, ask ≤ T+2¢, GUI T+2 / complement, no invert."""
+    ask_max = min(0.99, round(float(threshold) + 0.02, 4))
+    return {
+        "hedge_threshold": float(threshold),
+        "hedge_require_ask_max": ask_max,
+        "hedge_max_spread": float(max_spread),
+        "hedge_require_gui": bool(require_gui),
+        "last_trade_max": ask_max,
+        "hedge_held_gui_max": ask_max,
+        "hedge_other_gui_min": round(1.0 - ask_max, 4),
+        "require_gui_reversed": False,
+        "hedge_persist_s": float(persist_s or 0.0),
+        "hedge_drop_from_fill": drop_from_fill,
+    }
+
+
+def hedge_sweep_variants(tmpl: dict) -> List[dict]:
+    """Earlier vs later 5m stops on the same late-window first touch. Not live."""
+    rows: List[dict] = []
+
+    def add(name: str, *, paper: bool = True, **overrides: Any) -> None:
+        row = dict(tmpl)
+        row.update(overrides)
+        row["name"] = name
+        row["paper"] = paper
+        rows.append(row)
+
+    add("live_53_paper", **hedge_level_kwargs(0.53))
+    add("ride", paper=False)
+    for threshold in (0.53, 0.55, 0.60, 0.65, 0.70, 0.75):
+        cents = int(round(threshold * 100))
+        add(f"hedge_{cents}", **hedge_level_kwargs(threshold))
+        add(f"hedge_{cents}_nogui", **hedge_level_kwargs(threshold, require_gui=False))
+    add("hedge_70_persist2s", **hedge_level_kwargs(0.70, persist_s=2.0))
+    add("hedge_65_persist2s", **hedge_level_kwargs(0.65, persist_s=2.0))
+    add("hedge_70_persist5s", **hedge_level_kwargs(0.70, persist_s=5.0))
+    add(
+        "fade8c_or_53",
+        **hedge_level_kwargs(0.53, drop_from_fill=0.08),
+    )
+    add(
+        "fade10c_or_53",
+        **hedge_level_kwargs(0.53, drop_from_fill=0.10),
+    )
+    return rows
 
 
 def sweep_variants(tmpl: dict) -> List[dict]:
@@ -808,6 +938,17 @@ def summarize(rows: Sequence[dict]) -> dict:
         "toxic_dumps": sum(1 for r in hits if r.get("exit") == "toxic_dump"),
         "redeem_wins": sum(1 for r in hits if r.get("exit") == "redeem_win"),
         "redeem_losses": sum(1 for r in hits if r.get("exit") == "redeem_loss"),
+        # Full hedge sets won=False. A winner dump is exit=hedge on the winning leg.
+        "winner_dumps": sum(
+            1
+            for r in hits
+            if r.get("exit") == "hedge" and r.get("winner") and r.get("winner") == r.get("leg")
+        ),
+        "loser_hedges": sum(
+            1
+            for r in hits
+            if r.get("exit") == "hedge" and r.get("winner") and r.get("winner") != r.get("leg")
+        ),
     }
 
 
@@ -959,6 +1100,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         help="one-at-a-time variants of --template (default strategy_buy5m.example.json)",
     )
     ap.add_argument(
+        "--hedge-sweep",
+        action="store_true",
+        help="score 53/55/60/65/70/75¢ paper stops (+ persist / fade-from-fill) on pathlog ticks",
+    )
+    ap.add_argument(
         "--template",
         type=Path,
         default=REPO / "strategy_buy5m.example.json",
@@ -980,26 +1126,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         ]
 
     tmpl = template_from_strategy(args.template) if args.template.exists() else {}
-    paper_kwargs = {
-        k: tmpl[k]
-        for k in (
-            "hedge_threshold",
-            "hedge_require_ask_max",
-            "hedge_max_spread",
-            "hedge_require_gui",
-            "min_winner_bid",
-            "max_loser_bid",
-            "min_bid_edge",
-            "last_trade_max",
-            "toxic_force_exit_below",
-            "hedge_held_gui_max",
-            "hedge_other_gui_min",
-            "require_gui_reversed",
-        )
-        if k in tmpl
-    }
+    paper_kwargs = paper_kwargs_from(tmpl)
 
-    if not markets and (args.sweep or args.compare or args.grid or args.anatomy):
+    if not markets and (
+        args.sweep or args.compare or args.grid or args.anatomy or args.hedge_sweep
+    ):
         print(
             f"no pathlog ticks in {args.dir} (series={args.series or 'all'}). "
             "Export pathlog/ticks from the VM — see CLOUD_RESEARCH.md. No live orders.",
@@ -1071,6 +1202,52 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         if args.csv:
             export_anatomy_csv(rows, args.csv)
             print(f"wrote {len(rows)} rows → {args.csv}")
+        return 0
+
+    if args.hedge_sweep:
+        if not tmpl:
+            print(f"missing template {args.template}", file=sys.stderr)
+            return 1
+        print(
+            "name\tthreshold\task_max\tpersist_s\tdrop\tgui\t"
+            "hits\tdecided\twins\twin_rate\tpnl\thedges\twinner_dumps\tloser_hedges\t"
+            "redeem_wins\tredeem_losses"
+        )
+        for variant in hedge_sweep_variants(tmpl):
+            pk = paper_kwargs_from(variant)
+            rows = evaluate_rule(
+                markets,
+                ask_min=float(variant["ask_min"]),
+                ask_max=float(variant["ask_max"]),
+                ttm_min=0.0,
+                ttm_max=float(variant["ttm_max"]),
+                budget=float(variant.get("budget") or args.budget),
+                max_spread=variant.get("max_spread"),
+                paper=bool(variant.get("paper")),
+                paper_kwargs=pk,
+            )
+            stats = summarize(rows)
+            wr = stats["win_rate"]
+            wr_s = f"{wr:.3f}" if wr is not None else ""
+            drop = variant.get("hedge_drop_from_fill")
+            drop_s = "" if drop is None else f"{float(drop):.2f}"
+            print(
+                f"{variant['name']}\t"
+                f"{float(variant.get('hedge_threshold') or 0):.2f}\t"
+                f"{float(variant.get('hedge_require_ask_max') or 0):.2f}\t"
+                f"{float(variant.get('hedge_persist_s') or 0):g}\t"
+                f"{drop_s}\t"
+                f"{int(bool(variant.get('hedge_require_gui', True)))}\t"
+                f"{stats['hits']}\t{stats['decided']}\t{stats['wins']}\t"
+                f"{wr_s}\t{stats['pnl_sum']}\t{stats.get('hedges', 0)}\t"
+                f"{stats.get('winner_dumps', 0)}\t{stats.get('loser_hedges', 0)}\t"
+                f"{stats.get('redeem_wins', 0)}\t{stats.get('redeem_losses', 0)}"
+            )
+        print(
+            "Same late 75–90 / 120s first touch as --sweep. winner_dumps = paper "
+            "sold a market that still resolved to the held leg. Not live. "
+            "Pathlog has no last-trade / empty-FAK. Template: " + str(args.template)
+        )
         return 0
 
     if args.sweep:
