@@ -65,7 +65,11 @@ from buy.entry_skip import (
     uncertain_buy_spend_cap,
     window_no_buy_reason,
 )
-from buy.hedge_gate import hedge_persist_ready
+from buy.hedge_gate import (
+    hedge_persist_ready,
+    hedge_winner_rest_fresh,
+    hedge_winner_rest_rememberable,
+)
 
 
 class ImmediateResponseClobClient(ClobClient):
@@ -195,6 +199,10 @@ _STRATEGY_DEFAULTS = {
     "hedge_max_spread": 0.15,
     "hedge_require_ask_max": 0.72,
     "hedge_persist_s": 2.0,
+    # After WS drops, a recent 80¢+ REST/WS bid skips another /book for
+    # this long. Near-threshold (≤70+cushion) books keep RESTing.
+    "hedge_winner_rest_ttl_s": 2.0,
+    "hedge_winner_rest_cushion": 0.10,
     "hedge_toxic_bid_max": 0.53,
     # Invert the buy GUI 70/30 plus last-trade on the held token. TOB 70/72
     # alone is not consensus (same lesson as not buying a random ask).
@@ -328,7 +336,7 @@ def load_strategy():
             "min_winner_bid", "max_loser_bid", "min_bid_edge",
             "max_entry_spread", "hedge_max_spread", "hedge_require_ask_max",
             "early_buy_max_price", "early_95_min_price", "add_min_price",
-            "hedge_toxic_bid_max",
+            "hedge_toxic_bid_max", "hedge_winner_rest_cushion",
         ):
             if not 0 <= float(cfg[key]) <= 1:
                 raise ValueError(f"{key} must be between 0 and 1")
@@ -388,6 +396,7 @@ def load_strategy():
             "hedge_ghost_sleep_s", "buy_grace_s", "buy_cooldown_s",
             "empty_fak_cooldown_s", "early_95_min_s",
             "redeem_throttle_s", "max_redeem_age_days", "hedge_persist_s",
+            "hedge_winner_rest_ttl_s",
         ):
             if float(cfg[key]) < 0:
                 raise ValueError(f"{key} must be non-negative")
@@ -424,6 +433,8 @@ MAX_ENTRY_SPREAD = _strat["max_entry_spread"]
 HEDGE_MAX_SPREAD = _strat["hedge_max_spread"]
 HEDGE_REQUIRE_ASK_MAX = _strat["hedge_require_ask_max"]
 HEDGE_PERSIST_S = _strat["hedge_persist_s"]
+HEDGE_WINNER_REST_TTL_S = _strat["hedge_winner_rest_ttl_s"]
+HEDGE_WINNER_REST_CUSHION = _strat["hedge_winner_rest_cushion"]
 HEDGE_TOXIC_BID_MAX = _strat["hedge_toxic_bid_max"]
 HEDGE_REQUIRE_GUI = _strat["hedge_require_gui"]
 ADD_MIN_PRICE = _strat["add_min_price"]
@@ -635,6 +646,19 @@ _SKIP_LOG_EVERY_S = 8.0
 _skip_log_mono = {}
 _buy_window_logged = {}
 _hedge_persist_armed = {}
+_hedge_winner_rest = {}
+
+
+def _note_winner_rest(cond, bid):
+    """Cache a comfortable winner bid so a stale WS does not re-REST."""
+    if hedge_winner_rest_rememberable(
+        bid,
+        threshold=HEDGE_THRESHOLD,
+        cushion=HEDGE_WINNER_REST_CUSHION,
+    ):
+        _hedge_winner_rest[cond] = (float(bid), time.monotonic())
+    else:
+        _hedge_winner_rest.pop(cond, None)
 
 
 def log_buy_skip_throttled(reason, condition_id, event="buy_skip", **kwargs):
@@ -643,12 +667,13 @@ def log_buy_skip_throttled(reason, condition_id, event="buy_skip", **kwargs):
     now_mono = time.monotonic()
     prev = _skip_log_mono.get(key, 0.0)
     if now_mono - prev < _SKIP_LOG_EVERY_S:
-        return
+        return False
     _skip_log_mono[key] = now_mono
     if len(_skip_log_mono) > 256:
         for stale, _ts in sorted(_skip_log_mono.items(), key=lambda kv: kv[1])[:64]:
             _skip_log_mono.pop(stale, None)
     log_event(event, reason=reason, condition_id=condition_id, **kwargs)
+    return True
 
 
 def current_entry_bands(seconds_left):
@@ -3697,6 +3722,8 @@ while not _shutdown_requested:
         HEDGE_MAX_SPREAD = _strat["hedge_max_spread"]
         HEDGE_REQUIRE_ASK_MAX = _strat["hedge_require_ask_max"]
         HEDGE_PERSIST_S = _strat["hedge_persist_s"]
+        HEDGE_WINNER_REST_TTL_S = _strat["hedge_winner_rest_ttl_s"]
+        HEDGE_WINNER_REST_CUSHION = _strat["hedge_winner_rest_cushion"]
         HEDGE_TOXIC_BID_MAX = _strat["hedge_toxic_bid_max"]
         HEDGE_REQUIRE_GUI = _strat["hedge_require_gui"]
         ADD_MIN_PRICE = _strat["add_min_price"]
@@ -4440,6 +4467,7 @@ while not _shutdown_requested:
                             rem = 0.0
                             meta["hedge_closed"] = True
                             _hedge_persist_armed.pop(cond, None)
+                            _hedge_winner_rest.pop(cond, None)
                         meta["bought_size"] = rem
                         meta["pnl_hedge_proceeds"] = round(
                             max(
@@ -4527,6 +4555,8 @@ while not _shutdown_requested:
                         save_json(STATE_FILE, positions_meta)
 
                 # --- HEDGE CHECK (for held positions) ---
+                if held_size <= 0.01 or meta.get("hedge_closed"):
+                    _hedge_winner_rest.pop(cond, None)
                 if held_token and held_size > 0.01 and HEDGE_ENABLED and not meta.get("hedge_closed"):
                     # FAK avg < toxic_force_exit_below arms toxic_fill. Dump only while
                     # held bid ≤ hedge_toxic_bid_max (no GUI / persist). Recovered book
@@ -4551,12 +4581,15 @@ while not _shutdown_requested:
                         cached_bid = peek_bid
 
                     ws_floor = HEDGE_TOXIC_BID_MAX if toxic_fill else HEDGE_THRESHOLD
+                    _winner_rest = _hedge_winner_rest.get(cond)
                     if (
                         ws_fresh
                         and peek_bid is not None
                         and peek_bid > ws_floor + 1e-12
                     ):
                         _hedge_persist_armed.pop(cond, None)
+                        if not toxic_fill:
+                            _note_winner_rest(cond, peek_bid)
                         if toxic_fill:
                             log_event(
                                 "hedge_skip_toxic_recovered",
@@ -4568,6 +4601,27 @@ while not _shutdown_requested:
                                 f"bid {peek_bid:.3f} — dump stays armed, no sell"
                             )
                         # fresh WS still above threshold — do not REST / do not dump
+                    elif (
+                        (not toxic_fill)
+                        and hedge_winner_rest_fresh(
+                            None if _winner_rest is None else _winner_rest[0],
+                            None if _winner_rest is None else _winner_rest[1],
+                            now_s=time.monotonic(),
+                            threshold=HEDGE_THRESHOLD,
+                            ttl_s=HEDGE_WINNER_REST_TTL_S,
+                            cushion=HEDGE_WINNER_REST_CUSHION,
+                        )
+                    ):
+                        _hedge_persist_armed.pop(cond, None)
+                        log_buy_skip_throttled(
+                            "winner_rest",
+                            cond,
+                            event="hedge_skip_winner_rest",
+                            bid=None if _winner_rest is None else _winner_rest[0],
+                            ttl_s=HEDGE_WINNER_REST_TTL_S,
+                            cushion=HEDGE_WINNER_REST_CUSHION,
+                            threshold=HEDGE_THRESHOLD,
+                        )
                     else:
                         fresh_bid, _, fresh_ask, _, fresh_mid = get_quote_fast(
                             held_token,
@@ -4616,17 +4670,23 @@ while not _shutdown_requested:
                             )
                         elif not toxic_fill and fresh_bid > HEDGE_THRESHOLD:
                             _hedge_persist_armed.pop(cond, None)
-                            log_event(
-                                "hedge_cancel_bounce", condition_id=cond, leg=held_leg,
-                                trigger_bid=cached_bid, current_bid=fresh_bid,
-                                current_ask=fresh_ask, current_mid=fresh_mid,
+                            _note_winner_rest(cond, fresh_bid)
+                            if log_buy_skip_throttled(
+                                "bounce",
+                                cond,
+                                event="hedge_cancel_bounce",
+                                trigger_bid=cached_bid,
+                                current_bid=fresh_bid,
+                                current_ask=fresh_ask,
+                                current_mid=fresh_mid,
                                 threshold=HEDGE_THRESHOLD,
-                            )
-                            console.print(
-                                f"  [dim][CANCEL][/] {held_leg.upper()} hedge cancelled — bid bounced "
-                                f"{(cached_bid if cached_bid is not None else fresh_bid):.3f} → {fresh_bid:.3f}"
-                            )
+                            ):
+                                console.print(
+                                    f"  [dim][CANCEL][/] {held_leg.upper()} hedge cancelled — bid bounced "
+                                    f"{(cached_bid if cached_bid is not None else fresh_bid):.3f} → {fresh_bid:.3f}"
+                                )
                         else:
+                            _hedge_winner_rest.pop(cond, None)
                             hedge_bid = fresh_bid
                             hedge_ask = fresh_ask
                             if toxic_fill:

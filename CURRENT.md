@@ -9,7 +9,8 @@ positions API still returns hundreds of old 5m rows (`WAIT 666` was that
 list, not 666 live markets). The bot **throws those rows away** after
 download. Do **not** delete `positions_buy5m.json` to “clear” them, and do
 **not** try to sell dead 5m tokens (no CLOB book). Real leftovers redeem;
-API ghosts get one `redeem_abandoned` skip. Look interval is **0.01s** on the live WS book (REST only when posting).
+API ghosts get one `redeem_abandoned` skip. Look interval is **0.01s** on the live WS book (REST for would-buy confirm,
+near-threshold holds, and expired winner-book TTL — not every 80–99¢ hold).
 Wallet list refresh is 15s when not holding; the buy gate must allow that
 age (a 5s “fresh” check would silently skip every spend between fetches).
 Stop/disable 15m and hourly. Split the 5m stake into **two $2.50 slices** (**$5** if both
@@ -20,7 +21,9 @@ same-leg add needs ask ≥ **90¢** (`add_min_price`). After a full hedge the
 market is done (no other-leg chase). Normal hedge is **persist 2s at 70/72**
 on the combined bag (GUI held ≤ **72¢** / other ≥ **28¢**). Then sell at
 the **live 0.001 bid** (no 2¢ undercut; unmatched 400 re-quotes). Instant
-70 is out — a one-tick dip dumps winners. `toxic_fill` still dumps **only
+70 is out — a one-tick dip dumps winners. After a WS drop, a recent
+**>80¢** bid skips another REST for **2s** (`hedge_winner_rest_ttl_s`);
+71–80¢ books still REST. `[CANCEL]` is throttled 8s. `toxic_fill` still dumps **only
 while bid ≤ 53¢**, no persist. Chainlink TWAP gate is **$0** (any non-zero tick vs
 PTB; side must match; flat is still refused). Late FAKs **limit at 90¢**;
 early FAKs **limit at 99¢**. Size starts at `budget/ask` and is **at least 3
@@ -74,7 +77,7 @@ Normal hedge is **persist 2s @ 70/72** on the combined bag:
 | Execution | Size `budget/ask`, **floor 3 shares** when `3 × limit ≤ $3`. Unmatched 400 re-quotes up to **3** FAKs; then **0.15 s** cooldown. Unclear POSTs still quarantine. |
 | GUI consensus | winner ≥ 70¢, loser ≤ 30¢ |
 | Windows | 5m **whole market**: early ≥90 / ≥95 for TTM (120, 300]; late 75–90 for TTM ≤ 120s (15m / hourly bots **not running**) |
-| Hedge | **Qualify** bid ≤ **70¢** and ask ≤ **72¢**, spread ≤ 15¢, **plus** GUI held ≤ **72¢** / other ≥ **28¢** (not inverted 30/70). Last print ≤ 72¢. Must **stay qualified 2s** (`hedge_persist_s`; a bounce resets). Then sell at the **live 0.001 bid** (no 2¢ undercut); unmatched 400 re-quotes up to 3. Combined early+late inventory. Instant 70 is out. After a full dump, `hedge_closed` blocks any later buy on that market. `toxic_fill` arms only when FAK **average** < 65¢ (not extra shares vs a 99¢-sized quote) and still dumps without GUI / persist **only while held bid ≤ 53¢** (`hedge_toxic_bid_max`). |
+| Hedge | **Qualify** bid ≤ **70¢** and ask ≤ **72¢**, spread ≤ 15¢, **plus** GUI held ≤ **72¢** / other ≥ **28¢** (not inverted 30/70). Last print ≤ 72¢. Must **stay qualified 2s** (`hedge_persist_s`; a bounce resets). Then sell at the **live 0.001 bid** (no 2¢ undercut); unmatched 400 re-quotes up to 3. Combined early+late inventory. Instant 70 is out. After a WS drop, last **>80¢** bid skips REST for `hedge_winner_rest_ttl_s` **2s** (`hedge_skip_winner_rest`); 71–80¢ still REST. After a full dump, `hedge_closed` blocks any later buy on that market. `toxic_fill` arms only when FAK **average** < 65¢ (not extra shares vs a 99¢-sized quote) and still dumps without GUI / persist **only while held bid ≤ 53¢** (`hedge_toxic_bid_max`). |
 | Underlying edge | **$0** (5m: any non-zero TWAP vs PTB) / **$10** (15m, hourly); side must match |
 | `max_open_positions` | **0 = unlimited** |
 | `toxic_force_exit_below` | **65¢** |
@@ -243,6 +246,12 @@ amount / HTTP 400), not this NameError.
       `sudo systemctl restart polybuybot5m`. Banner `HEDGE ≤70¢`.
       `hedge_skip_persist` / `buy_skip_add_below_min` / `buy_skip_hedge_closed`
       are the new skip lines. Do **not** start 15m / hourly / mint.
+- [ ] **5m winner-book REST TTL** — after WS drops, do not `/book` every
+      look on an 80–99¢ winner. Defaults `hedge_winner_rest_ttl_s=2` /
+      `hedge_winner_rest_cushion=0.10` (omit from live JSON; file-not-present
+      is fine). `[CANCEL]` / `hedge_cancel_bounce` throttled 8s.
+      `hedge_skip_winner_rest` is the quiet skip. **Restart required.**
+      Do **not** sell on stale WS. Toxic still REST if WS is not fresh.
 - [ ] Hourly three-slice bot is in the repo (`buybothourly.py` + example JSON).
       **Do not start `polybuybothourly`.** Operator later: `git pull`, set live
       `strategy_buyhourly.json` (`dry_run` / `entry_enabled` only when they mean

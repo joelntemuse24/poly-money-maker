@@ -74,7 +74,7 @@ Plus: `check_book.py`, `check_participation.py`, `check_path_backtest.py`,
 | `buy/btc_price.py` | Resolution-aligned BTC feeds (TWAP 30/60, Binance) + PTB | — |
 | `buy/clob_book_ws.py` | CLOB market-channel WS top-of-book (buy/hedge speed path) | — |
 | `buy/entry_skip.py` | **5m + hourly:** band union, skip labels, add-min, three-slice hourly budgets | not imported by 15m |
-| `buy/hedge_gate.py` | 5m persist hedge timer (toxic dumps stay instant) | not imported by 15m/hourly |
+| `buy/hedge_gate.py` | 5m persist timer + winner-book REST skip (toxic dumps stay instant) | not imported by 15m/hourly |
 | `buy/book.py` | Shared TOB price+size parse (WS cache + pathlog) | — |
 
 **Pattern:** The three bots are near-identical copies (slug, oracle, window
@@ -218,6 +218,7 @@ two-slice $2.50+$2.50 add.
   hot-reload; the loop-body fix needs `sudo systemctl restart polybuybot5m`.
 - `hedge_attempt` / `hedge_fill` — hedge fired after force-fresh REST + book integrity + GUI consensus + persist 2s (normal path)
 - `hedge_skip_persist` — 70/72 + GUI passed but the book has not stayed qualified for `hedge_persist_s` (2s). A bounce resets the arm.
+- `hedge_skip_winner_rest` — last REST/WS bid was comfortably above 70¢ (default > 80¢) and younger than `hedge_winner_rest_ttl_s` (2s); skip another `/book` after WS drops. Near-threshold books still REST. `hedge_cancel_bounce` / `[CANCEL]` are throttled 8s.
 - `hedge_skip_toxic_book` — bid dipped but ask/spread still say "not reversed"
 - `hedge_skip_no_consensus` — 70/72 book passed but 5m GUI/last-trade still fail (held last print ≤ 72¢, held GUI ≤ 72¢, other GUI ≥ 28¢, 5¢ gap). 15m/hourly still invert buy 70/30.
 - `hedge_skip_toxic_recovered` — `toxic_fill` is armed but held bid > `hedge_toxic_bid_max` (53¢ winner book); dump stays armed, no sell
@@ -245,9 +246,10 @@ two-slice $2.50+$2.50 add.
   leftover is still cashing out. `WAIT 666` meant old Data API rows, not
   666 live markets. After `drop_wallet_dust`, those rows are thrown away.
 - `sleeping 0.01s` — look interval after a short cycle. Skip ticks read WS
-  only; REST is for a would-buy confirm + POST. If wall clock is still
-  seconds, leftover bags or HTTP are still on the look (do not “fix”
-  that by sleeping less)
+  only; REST is for a would-buy confirm + POST, or a hold whose last winner
+  bid expired / is near 70¢. After WS drops, 80–99¢ holds skip `/book` for
+  `hedge_winner_rest_ttl_s` (2s). If wall clock is still seconds, leftover
+  bags or HTTP are still on the look (do not “fix” that by sleeping less)
 - `[SETTLE SKIP] redeem skipped: zero position balance` — WAIT drain of a
   leftover 5m bag with nothing on-chain; blacklisted (`redeem_abandoned` in
   state, kept across restarts). Do **not** delete `positions_buy5m.json`.
