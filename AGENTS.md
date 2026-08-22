@@ -59,7 +59,8 @@ Priority: the band that **contains** the ask. 75–90 never posts at 99¢.
 
 Plus: `check_book.py`, `check_participation.py`, `check_path_backtest.py`,
 `check_fetch_trades.py`, `check_buy_skips.py`, `check_buy_rejects.py`,
-`check_edge_counterfactual.py`. Laptop glance (not a bot): `widget/polydesk.py`.
+`check_live_journal.py`, `check_edge_counterfactual.py`. Laptop glance
+(not a bot): `widget/polydesk.py`.
 
 ## File Map
 
@@ -74,7 +75,7 @@ Plus: `check_book.py`, `check_participation.py`, `check_path_backtest.py`,
 | `buy/btc_price.py` | Resolution-aligned BTC feeds (TWAP 30/60, Binance) + PTB | — |
 | `buy/clob_book_ws.py` | CLOB market-channel WS top-of-book (buy/hedge speed path) | — |
 | `buy/entry_skip.py` | **5m + hourly:** band union, skip labels, add-min, three-slice hourly budgets | not imported by 15m |
-| `buy/hedge_gate.py` | 5m persist hedge timer (toxic dumps stay instant) | not imported by 15m/hourly |
+| `buy/hedge_gate.py` | 5m persist timer + CLOB hedge tick (honor 0.01 min) | not imported by 15m/hourly |
 | `buy/book.py` | Shared TOB price+size parse (WS cache + pathlog) | — |
 
 **Pattern:** The three bots are near-identical copies (slug, oracle, window
@@ -104,6 +105,8 @@ functions with `ast` (`tests/test_buy_fill_shapes.py`).
 | `check_participation.py` | Diagnostic — post-facto bought vs missed + band exposure |
 | `check_fetch_trades.py` | Diagnostic — full-wallet Data API trade history → CSV |
 | `check_buy_skips.py` | Diagnostic — why 5m did not buy (JSON log skip/attempt/fill counts) |
+| `check_live_journal.py` | Replay the 5m live tape from JSONL hours later (no stream needed) |
+| `buy/live_journal.py` | Tape event filter + line format (imported by 5m + the checker) |
 | `check_buy_rejects.py` | Diagnostic — CLOB `invalid amounts` 400s that passed every gate |
 | `widget/polydesk.py` | Local always-on-top Polymarket value / HOLDING glance (no orders) |
 | `CURRENT.md` | Living ops/probe status — update when decisions change |
@@ -116,6 +119,7 @@ functions with `ast` (`tests/test_buy_fill_shapes.py`).
 
 - `positions_buy*.json`, `pnl_buy*.json` — bot state and P&L (auto-generated)
 - `*.log` — structured JSON-line logs with rotation
+- `*.journal.jsonl` — 5m money-path tape (`check_live_journal.py`); do not truncate
 - `.heartbeat*` — uptime tick counters
 - `underlying_research_buy*.jsonl`, `ptb_*_buy*.json` — oracle/PTB decision audit
 - `pathlog/ticks/*.jsonl` — recorded CLOB paths (**auto-pruned**: 14 days / 400 MB;
@@ -127,7 +131,7 @@ functions with `ast` (`tests/test_buy_fill_shapes.py`).
 ## Never Do
 
 - **Never delete or truncate state files** (`positions_buy*.json`, `pnl_buy*.json`,
-  `positions_mint.json`, logs, heartbeats, research/PTB files). Pathlog ticks are
+  `positions_mint.json`, logs, `*.journal.jsonl`, heartbeats, research/PTB files). Pathlog ticks are
   the exception: `pathlog.py` auto-prunes `pathlog/ticks/*.jsonl` (14 days / 400 MB)
   so they fit the small VM. Do **not** `rm` them by hand. **Do export** them
   (CSV or `scp` the ticks dir) before prune deletes old JSONL.
@@ -163,7 +167,9 @@ python check_book.py
 # CI-equivalent (no network to Polymarket required for unit tests)
 python3 -m py_compile buybot.py buybot5m.py buybothourly.py pathlog.py \
   check_path_backtest.py mintbot.py buy/book.py buy/clob_book_ws.py \
-  buy/entry_skip.py check_fetch_trades.py check_participation.py check_buy_skips.py
+  buy/entry_skip.py buy/hedge_gate.py buy/live_journal.py \
+  check_fetch_trades.py check_participation.py check_buy_skips.py \
+  check_live_journal.py
 python3 -m unittest discover -s tests -p 'test_*.py' -v
 
 # Full wallet fills (past the UI ~500-row export). Wallet: --user or FUNDER_ADDRESS.
@@ -217,6 +223,7 @@ two-slice $2.50+$2.50 add.
   **WAIT** is dust. Look interval is **0.01s**. Live JSON poll keys
   hot-reload; the loop-body fix needs `sudo systemctl restart polybuybot5m`.
 - `hedge_attempt` / `hedge_fill` — hedge fired after force-fresh REST + book integrity + GUI consensus + persist 2s (normal path)
+- `hedge_tick_retry` — CLOB rejected a too-fine tick (`invalid tick size (0.001), minimum is 0.01`); same trigger rebuilds at 0.01. Pre-fix this was `[EXIT FAIL]` / `sell_build_rejected` and the dump never sold (22 Aug 11:40).
 - `hedge_skip_persist` — 70/72 + GUI passed but the book has not stayed qualified for `hedge_persist_s` (2s). A bounce resets the arm.
 - `hedge_skip_toxic_book` — bid dipped but ask/spread still say "not reversed"
 - `hedge_skip_no_consensus` — 70/72 book passed but 5m GUI/last-trade still fail (held last print ≤ 72¢, held GUI ≤ 72¢, other GUI ≥ 28¢, 5¢ gap). 15m/hourly still invert buy 70/30.
@@ -271,6 +278,7 @@ python check_hedge_threshold.py --csv exports/trades.csv --hours 15
 python check_path_backtest.py --anatomy --series 5m --ttm-max 120 --csv /tmp/anatomy.csv
 python check_path_backtest.py --grid --budget 2.5 --series 5m
 python check_buy_skips.py --since 2026-08-19T08:02:00
+python check_live_journal.py --hours 5
 ```
 
 `--sweep` scores the live 5m **example** late template (75–90 / 120s / $2.50)
@@ -337,15 +345,19 @@ Cloud agents: `CLOUD_RESEARCH.md`.
   recovered 97¢ book logs `hedge_skip_toxic_recovered` and rides; a 6¢ junk
   bid (even under a 99¢ ask) still dumps on bid-only REST. Fresh WS bid >
   70¢ (normal) or > 53¢ (toxic) skips REST. After a dump is allowed, the
-  5m FAK sells at the **live 0.001 bid** (no 2¢ undercut). CLOB/WS
-  sometimes reports tick 0.01; using that with `hedge_undercut_ticks=2`
-  posted 0.51 into a 0.53 book. Unmatched sell 400s re-quote like buys.
+  5m FAK sells at the **live bid** on the **market tick** (no 2¢
+  undercut). Some 5m books require **0.01**; posting `tick_size=0.001`
+  is `invalid tick size` and `[EXIT FAIL]` (22 Aug 11:40). Honor the
+  CLOB tick; retry the FAK at the stated minimum (`hedge_tick_retry`).
+  The 21 Aug unmatched 0.51-into-0.53 hole was undercut 2 on a 0.01
+  tick, not "must post 0.001". Unmatched sell 400s re-quote like buys.
   Everything else rides to redemption at $1.00. WS may *arm* a hedge
   check; normal sells need two-sided REST. After `hedge_closed`, no later
   buy on that market. **Live `strategy_buy5m.json` must set the hedge
   keys** or an old 53/55 (or 35/40) file keeps the old qualify after hot
   reload.
-- **Tick sizes:** 5m markets use `0.001`, 15m and hourly use `0.01`.
+- **Tick sizes:** 5m *default* is `0.001`, but some 5m books are `0.01`.
+  Hedge FAKs must use the CLOB minimum. 15m and hourly stay `0.01`.
 - **One fill per slice:** 5m `early_bought` / `late_bought`. Hourly
   `t22_bought` / `t15_bought` / `t5_bought` (same-leg add up to a **$10**
   spend cap; slice A never more than **$5**). `bought_token` still means the
@@ -373,8 +385,8 @@ Cloud agents: `CLOUD_RESEARCH.md`.
    Redemption is credited only after relayer confirmation and a complete Data API
    snapshot shows the inventory gone; GC never invents par value.
 4. **No `if __name__ == "__main__"` guard** — buy-bot scripts execute at module
-   level. They cannot be imported. `pathlog.py`, `check_path_backtest.py`, and
-   `check_fetch_trades.py` can.
+   level. They cannot be imported. `pathlog.py`, `check_path_backtest.py`,
+   `check_fetch_trades.py`, and `check_live_journal.py` can.
 5. **Ask ≠ price.** 97¢ ask over 1¢ bid is not a tradable favorite. Entry needs
    a tight REST book; hedge needs the whole book + GUI to look lost.
 6. **POS ≠ wallet bags.** Data API returns every unredeemed 5m share. A 0.01s

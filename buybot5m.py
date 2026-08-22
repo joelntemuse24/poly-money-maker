@@ -65,7 +65,8 @@ from buy.entry_skip import (
     uncertain_buy_spend_cap,
     window_no_buy_reason,
 )
-from buy.hedge_gate import hedge_persist_ready
+from buy.hedge_gate import hedge_persist_ready, hedge_market_tick, hedge_tick_after_build_error
+from buy.live_journal import is_journal_event
 
 
 class ImmediateResponseClobClient(ClobClient):
@@ -469,12 +470,26 @@ if DRY_RUN:
 LOG_FILE = "buybot5m.dryrun.log" if DRY_RUN else "buybot5m.log"
 LOG_MAX_BYTES = 5 * 1024 * 1024
 LOG_BACKUP_COUNT = 3
+JOURNAL_FILE = (
+    "buybot5m.dryrun.journal.jsonl" if DRY_RUN else "buybot5m.journal.jsonl"
+)
+JOURNAL_MAX_BYTES = 2 * 1024 * 1024
+JOURNAL_BACKUP_COUNT = 16
 
 _file_logger = logging.getLogger("buybot5m")
 _file_logger.setLevel(logging.INFO)
 _log_handler = RotatingFileHandler(LOG_FILE, maxBytes=LOG_MAX_BYTES, backupCount=LOG_BACKUP_COUNT)
 _log_handler.setFormatter(logging.Formatter("%(message)s"))
 _file_logger.addHandler(_log_handler)
+
+_journal_logger = logging.getLogger("buybot5m.journal")
+_journal_logger.setLevel(logging.INFO)
+_journal_logger.propagate = False
+_journal_handler = RotatingFileHandler(
+    JOURNAL_FILE, maxBytes=JOURNAL_MAX_BYTES, backupCount=JOURNAL_BACKUP_COUNT,
+)
+_journal_handler.setFormatter(logging.Formatter("%(message)s"))
+_journal_logger.addHandler(_journal_handler)
 
 NTFY_TOPIC = os.getenv("NTFY_TOPIC", "polybot-joel-btc")
 _notify_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="ntfy")
@@ -628,7 +643,16 @@ def save_json(path, data):
 def log_event(event, **kwargs):
     entry = {"ts": datetime.now().isoformat(), "event": event}
     entry.update(kwargs)
-    _file_logger.info(json.dumps(entry))
+    try:
+        line = json.dumps(entry, default=str)
+    except (TypeError, ValueError):
+        line = json.dumps({"ts": entry["ts"], "event": str(event)})
+    _file_logger.info(line)
+    if is_journal_event(event):
+        try:
+            _journal_logger.info(line)
+        except Exception:
+            pass
 
 
 _SKIP_LOG_EVERY_S = 8.0
@@ -1420,22 +1444,17 @@ def look_last_trade(token_id):
 
 
 def hedge_exec_tick(tick_size):
-    """5m execution tick. Never coarsen 0.001 to a CLOB/WS 0.01.
+    """CLOB tick for this hedge FAK. Honor a coarser market minimum.
 
-    Live 21 Aug: ``get_tick_size_cached`` returned 0.01, so
-    ``hedge_undercut_ticks=2`` posted 0.51 into a 0.53/0.54 book. Every
-    hedge FAK was ``400 no orders found to match`` (0 ``hedge_fill``).
+    Forcing 0.001 on a 0.01 book rejects the signed order
+    (``invalid tick size (0.001), minimum is 0.01``) and the dump never
+    sells (live 22 Aug 11:40: persist 61/62 then ``[EXIT FAIL]``).
+
+    The 21 Aug unmatched 0.51-into-0.53 hole was ``hedge_undercut_ticks=2``
+    on a 0.01 tick, not "must post 0.001". Live undercut is 0: sell at
+    the live bid aligned to this tick.
     """
-    expected = float(EXPECTED_TICK_SIZE or 0.001)
-    if expected <= 0:
-        expected = 0.001
-    try:
-        raw = float(tick_size) if tick_size not in (None, "") else expected
-    except (TypeError, ValueError):
-        raw = expected
-    if raw <= 0:
-        raw = expected
-    return min(raw, expected)
+    return hedge_market_tick(tick_size, EXPECTED_TICK_SIZE)
 
 
 def hedge_sell_price(bid, tick_size, undercut_ticks, min_price=None):
@@ -3167,6 +3186,20 @@ def sell_market_with_retry(
                 "timestamp": str(signed_order.timestamp),
             }
         except Exception as e:
+            next_tick = hedge_tick_after_build_error(tick_size, e)
+            if next_tick is not None:
+                log_event(
+                    "hedge_tick_retry",
+                    token_id=token_id,
+                    from_tick=tick_size,
+                    to_tick=next_tick,
+                    error=str(e)[:200],
+                    attempt=attempt + 1,
+                    via="create_market_order",
+                )
+                tick_size = str(next_tick)
+                floor = max(float(floor), float(next_tick))
+                continue
             log_event(
                 "sell_build_rejected", token_id=token_id,
                 error=str(e)[:200], attempt=attempt + 1,
@@ -3270,6 +3303,20 @@ def sell_market_with_retry(
                     "trade_ids": trade_ids,
                 }, total_proceeds
         except Exception as e:
+            next_tick = hedge_tick_after_build_error(tick_size, e)
+            if next_tick is not None:
+                log_event(
+                    "hedge_tick_retry",
+                    token_id=token_id,
+                    from_tick=tick_size,
+                    to_tick=next_tick,
+                    error=str(e)[:200],
+                    attempt=attempt + 1,
+                    via="post_order",
+                )
+                tick_size = str(next_tick)
+                floor = max(float(floor), float(next_tick))
+                continue
             if unmatched_fak_rejection(e):
                 can_retry = attempt + 1 < max_retries
                 log_event(
@@ -4735,9 +4782,12 @@ while not _shutdown_requested:
                                     # GUI must agree with that book (held ≤
                                     # ask-max, other ≥ complement), not buy 30/70.
                                     # Last trade still has to have printed down.
-                                    # Sell at the live 0.001 bid. Undercut on a
-                                    # CLOB 0.01 tick posted 0.51 into a 0.53
-                                    # book (live 21 Aug: unmatched 400, 0 fills).
+                                    # Sell at the live bid on the market tick
+                                    # (0.01 when CLOB says so). Undercut 2 on
+                                    # a 0.01 tick posted 0.51 into a 0.53 book
+                                    # (live 21 Aug: unmatched 400, 0 fills).
+                                    # Forcing 0.001 on a 0.01 book rejected
+                                    # the order (live 22 Aug 11:40 EXIT FAIL).
                                     hedge_floor = float(hedge_tick)
                                     sell_floor = hedge_sell_price(
                                         hedge_bid, hedge_tick, 0, hedge_floor,

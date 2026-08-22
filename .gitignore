@@ -17,6 +17,8 @@ env/
 
 # Live buy-bot state
 *.log
+*.journal.jsonl
+*.journal.jsonl.*
 .heartbeat*
 positions_buy*.json
 pnl_buy*.json

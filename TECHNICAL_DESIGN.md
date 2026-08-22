@@ -163,6 +163,7 @@ belong in git. Cloud research agents never get `.env`.
 | `positions_buy5m.json` | Open markets, fills, quarantines, redeem pending |
 | `pnl_buy5m.json` | Settled P&L rows |
 | `buybot5m.log` | One JSON object per line (rotated) |
+| `buybot5m.journal.jsonl` | Money-path tape only; `check_live_journal.py --hours 5` |
 | `.heartbeat_buy5m` | Unix time; if it stops moving, the loop is stuck |
 | `ptb_twap30_buy5m.json` | Cached Price To Beat per market |
 | `underlying_research_buy5m.jsonl` | Buy/skip audit for later analysis |
@@ -513,8 +514,12 @@ Live JSON on the VM is what actually arms buys.
 ## 11. Logging, notifications, tiny helpers
 
 `log_event("buy_skip", reason="ask_below_band", ...)` writes one JSON object
-to `buybot5m.log` via `RotatingFileHandler` (5 MB × backups). Agents grep
-these names. `check_buy_skips.py` counts them. **Throttled** skips
+to `buybot5m.log` via `RotatingFileHandler` (5 MB × backups). Money-path
+events (buy / hedge / sell / redeem / `cycle_error`) are also copied to
+`buybot5m.journal.jsonl` (2 MB × 16). Hours later, without a live stream:
+`check_live_journal.py --hours 5`. The Rich console lives only in
+`journalctl -u polybuybot5m` (50 MB / 7 days). Agents grep these names.
+`check_buy_skips.py` counts skip reasons. **Throttled** skips
 (`log_buy_skip_throttled`) fire at most about once per 8 seconds per
 market+reason — they are **not** “one line per missed market.”
 
@@ -792,12 +797,16 @@ caller.
    inverted 70/30). Fail → `hedge_skip_no_consensus`.
 6. `hedge_persist_ready` (5m 2s). Fail → `hedge_skip_persist` (arm or wait).
    Toxic skips persist and sells on the first qualifying tick.
-7. Write-ahead hedge quarantine, then FAK **sell at the live 0.001 bid**
-   (5m undercut is 0). `hedge_exec_tick` never coarsens 0.001 to a CLOB/WS
-   0.01 — that plus `hedge_undercut_ticks=2` posted 0.51 into a 0.53 book
-   (21 Aug: every hedge `400 no orders found to match`, 0 fills).
-   `hedge_sell_price` **ignores** `hedge_min_price` so a leftover 32¢ config
-   cannot refuse a 20¢ print. Floor is one tick (exchange minimum).
+7. Write-ahead hedge quarantine, then FAK **sell at the live bid** on the
+   **market tick** (5m undercut is 0). Some 5m books are 0.01 even though
+   the bot default is 0.001. Forcing 0.001 rejected the signed order
+   (`invalid tick size (0.001), minimum is 0.01`) and the dump never sold
+   (22 Aug 11:40: persist 61/62 then `[EXIT FAIL]`). `hedge_exec_tick`
+   honors a coarser CLOB tick; a minimum-tick 400 rebuilds at 0.01
+   (`hedge_tick_retry`). The 21 Aug unmatched 0.51-into-0.53 hole was
+   `hedge_undercut_ticks=2` on a 0.01 tick, not "must post 0.001".
+   `hedge_sell_price` **ignores** `hedge_min_price` so a leftover 32¢
+   config cannot refuse a 20¢ print. Floor is one market tick.
 8. Retries force REST again and re-run two-sided integrity so a spoof
    1¢/99¢ still aborts. An unmatched sell 400 re-quotes like a buy (up to
    3) unless CLOB balance is unreadable or inventory already disappeared.
