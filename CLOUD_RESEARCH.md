@@ -73,6 +73,7 @@ LIVE recorder (markets that are happening):
 - Then score the session tape with paper hedge:
 
 .venv/bin/python check_path_backtest.py --sweep --series 5m
+.venv/bin/python check_path_backtest.py --hedge-sweep --series 5m --budget 2.5
 .venv/bin/python check_path_backtest.py --anatomy --series 5m --ttm-max 120
 .venv/bin/python check_path_backtest.py --compare --paper --series 5m --budget 2.5
 .venv/bin/python check_path_backtest.py --compare --paper --series 5m --budget 15

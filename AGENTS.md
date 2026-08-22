@@ -96,7 +96,8 @@ functions with `ast` (`tests/test_buy_fill_shapes.py`).
 | File | Purpose |
 |---|---|
 | `pathlog.py` | CLOB path recorder (no orders; TOB price **and** size) |
-| `check_path_backtest.py` | Pathlog: grid, anatomy, compare, **paper hedge**, `--sweep` (no orders) |
+| `check_path_backtest.py` | Pathlog: grid, anatomy, compare, **paper hedge**, `--sweep`, `--hedge-sweep` (no orders) |
+| `check_hedge_threshold.py` | Earlier-stop research: pathlog `--hedge-sweep` or public last-trade vs a history CSV |
 | `CLOUD_RESEARCH.md` | Cloud prompts: paper P&L on public books + `--sweep` (no `.env`) |
 | `check_book.py` | Diagnostic — inspect a live order book |
 | `check_edge_counterfactual.py` | Diagnostic — resolution win rate if edge skips had filled |
@@ -199,7 +200,7 @@ two-slice $2.50+$2.50 add.
 - `[DRY BUY]` / `[DRY SELL]` in dry-run — confirms trigger logic fires
 - `buy_attempt` `band=late` / `early` / `early_95` and `slice=early|late` — which 5m window armed
 - `buy_skip_other_leg` — late winner is the other side of an early fill (no straddle)
-- `[FAK EMPTY]` / `buy_attempt_rejected` with `unmatched_retry: true` — empty FAK re-quoted in the same trigger (up to 3 POSTs)
+- `[FAK EMPTY]` / `buy_attempt_rejected` or `sell_attempt_rejected` with `unmatched_retry: true` — empty FAK re-quoted in the same trigger (up to 3 POSTs). Live 21 Aug 16:00–00:34Z: **0 `hedge_fill`**, every sell was attempt-1 `400 no orders found to match` then `hedge_fail` (buys already retried; sells did not).
 - `buy_ghost_fill` `via=unmatched_400_guard` — unmatched 400 but inventory appeared; no second FAK
 - `buy_attempt_ambiguous` `via=unmatched_400_no_balance` — unmatched 400 and CLOB balance unreadable; quarantine, no retry
 - `cycle_error` in logs — unhandled exception. The bot process stays up.
@@ -265,6 +266,8 @@ editing `strategy_buy5m.json`:
 python check_path_backtest.py --compare --series 5m --budget 2.5
 python check_path_backtest.py --compare --paper --series 5m --budget 2.5
 python check_path_backtest.py --sweep --series 5m
+python check_path_backtest.py --hedge-sweep --series 5m --budget 2.5
+python check_hedge_threshold.py --csv exports/trades.csv --hours 15
 python check_path_backtest.py --anatomy --series 5m --ttm-max 120 --csv /tmp/anatomy.csv
 python check_path_backtest.py --grid --budget 2.5 --series 5m
 python check_buy_skips.py --since 2026-08-19T08:02:00
@@ -273,9 +276,12 @@ python check_buy_skips.py --since 2026-08-19T08:02:00
 `--sweep` scores the live 5m **example** late template (75–90 / 120s / $2.50)
 plus one-at-a-time window/band/size variants, with a **paper** hedge from that
 JSON (**70/72/15** + mid-as-GUI when spread ≤ 10¢, held ≤ 72¢ / other ≥ 28¢,
-no other-ahead requirement; pathlog paper is still **instant**, not persist
-2s). It does **not** union the
-early ≥90 / ≥95 windows and does **not** model two $2.50 slices. `--anatomy` answers “already decided at T-120 vs
+no other-ahead requirement; paper now honors `hedge_persist_s` from that
+JSON — 2s on the live example). It does **not** union the
+early ≥90 / ≥95 windows and does **not** model two $2.50 slices.
+`--hedge-sweep` keeps that late first touch and varies the **stop** (53/60/65/70/75,
+persist-2s, 8¢ fade-from-fill) and prints `winner_dumps` vs `loser_hedges`.
+`--anatomy` answers “already decided at T-120 vs
 50/50 until the end.” `--compare` is the named-preset table; add `--paper` to
 walk later ticks. `--grid` is ask × time. **`--series 5m` matches only 5m**
 (not 15m). Pathlog cannot replay last-trade, BTC/PTB, or POST latency.
@@ -331,11 +337,14 @@ Cloud agents: `CLOUD_RESEARCH.md`.
   recovered 97¢ book logs `hedge_skip_toxic_recovered` and rides; a 6¢ junk
   bid (even under a 99¢ ask) still dumps on bid-only REST. Fresh WS bid >
   70¢ (normal) or > 53¢ (toxic) skips REST. After a dump is allowed, the
-  FAK sells at the **live bid** even if it is 20¢. Everything else rides to
-  redemption at $1.00. WS may *arm* a hedge check; normal sells need
-  two-sided REST. After `hedge_closed`, no later buy on that market.
-  **Live `strategy_buy5m.json` must set the hedge keys** or an old 53/55
-  (or 35/40) file keeps the old qualify after hot reload.
+  5m FAK sells at the **live 0.001 bid** (no 2¢ undercut). CLOB/WS
+  sometimes reports tick 0.01; using that with `hedge_undercut_ticks=2`
+  posted 0.51 into a 0.53 book. Unmatched sell 400s re-quote like buys.
+  Everything else rides to redemption at $1.00. WS may *arm* a hedge
+  check; normal sells need two-sided REST. After `hedge_closed`, no later
+  buy on that market. **Live `strategy_buy5m.json` must set the hedge
+  keys** or an old 53/55 (or 35/40) file keeps the old qualify after hot
+  reload.
 - **Tick sizes:** 5m markets use `0.001`, 15m and hourly use `0.01`.
 - **One fill per slice:** 5m `early_bought` / `late_bought`. Hourly
   `t22_bought` / `t15_bought` / `t5_bought` (same-leg add up to a **$10**
@@ -393,7 +402,7 @@ After this branch merges, on the VM (5m only):
 
 ```bash
 cd ~/poly-money-maker && git pull
-python3 -c 'import json; from pathlib import Path; p=Path("strategy_buy5m.json"); d=json.loads(p.read_text()); d["hedge_threshold"]=0.70; d["hedge_require_ask_max"]=0.72; d["hedge_persist_s"]=2.0; d["hedge_toxic_bid_max"]=0.53; d["add_min_price"]=0.90; d["buy_budget"]=2.5; d["late_buy_budget"]=2.5; d["buy_max_price"]=0.90; d["poll_buy_window_s"]=0.01; d["poll_held_s"]=0.01; d["ui_every_n_cycles"]=50; p.write_text(json.dumps(d, indent=2)+"\n")'
+python3 -c 'import json; from pathlib import Path; p=Path("strategy_buy5m.json"); d=json.loads(p.read_text()); d["hedge_threshold"]=0.70; d["hedge_require_ask_max"]=0.72; d["hedge_persist_s"]=2.0; d["hedge_toxic_bid_max"]=0.53; d["add_min_price"]=0.90; d["hedge_undercut_ticks"]=0; d["buy_budget"]=2.5; d["late_buy_budget"]=2.5; d["buy_max_price"]=0.90; d["poll_buy_window_s"]=0.01; d["poll_held_s"]=0.01; d["ui_every_n_cycles"]=50; p.write_text(json.dumps(d, indent=2)+"\n")'
 sudo systemctl restart polybuybot5m
 ```
 

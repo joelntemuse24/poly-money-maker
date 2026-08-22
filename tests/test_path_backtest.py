@@ -10,6 +10,7 @@ from pathlib import Path
 from check_path_backtest import (
     evaluate_rule,
     first_entry,
+    hedge_sweep_variants,
     hypothetical_pnl,
     infer_winner,
     load_market_file,
@@ -357,6 +358,67 @@ class PaperExitTests(unittest.TestCase):
         self.assertEqual(out["exit"], "toxic_dump")
         self.assertAlmostEqual(out["exit_bid"], 0.11)
 
+    def test_persist_skips_one_tick_dip(self):
+        fill = simulate_fak_buy(2.5, 0.90, None)
+        hit = {"ts": 1, "ttm": 90, "leg": "up", "ask": 0.90}
+        ticks = [
+            _tick(1, 90, 0.90, 0.10),
+            _tick(2, 40, 0.70, 0.32, ub=0.68, db=0.28),
+            _tick(3, 39, 0.97, 0.03, ub=0.97, db=0.02),
+        ]
+        out = paper_settle(
+            ticks, hit, fill, winner="up",
+            hedge_threshold=0.70,
+            hedge_require_ask_max=0.72,
+            last_trade_max=0.72,
+            hedge_held_gui_max=0.72,
+            hedge_other_gui_min=0.28,
+            require_gui_reversed=False,
+            hedge_persist_s=2.0,
+        )
+        self.assertEqual(out["exit"], "redeem_win")
+
+    def test_persist_fires_after_held_below(self):
+        fill = simulate_fak_buy(2.5, 0.90, None)
+        hit = {"ts": 1, "ttm": 90, "leg": "up", "ask": 0.90}
+        ticks = [
+            _tick(1, 90, 0.90, 0.10),
+            _tick(2, 40, 0.70, 0.32, ub=0.68, db=0.28),
+            _tick(5, 37, 0.68, 0.34, ub=0.66, db=0.30),
+        ]
+        out = paper_settle(
+            ticks, hit, fill, winner="down",
+            hedge_threshold=0.70,
+            hedge_require_ask_max=0.72,
+            last_trade_max=0.72,
+            hedge_held_gui_max=0.72,
+            hedge_other_gui_min=0.28,
+            require_gui_reversed=False,
+            hedge_persist_s=2.0,
+        )
+        self.assertEqual(out["exit"], "hedge")
+        self.assertAlmostEqual(out["exit_bid"], 0.66)
+
+    def test_drop_from_fill_sells_above_stop(self):
+        fill = simulate_fak_buy(2.5, 0.92, None)
+        hit = {"ts": 1, "ttm": 180, "leg": "up", "ask": 0.92}
+        ticks = [
+            _tick(1, 180, 0.92, 0.08),
+            _tick(2, 100, 0.84, 0.16, ub=0.83, db=0.15),
+        ]
+        out = paper_settle(
+            ticks, hit, fill, winner="down",
+            hedge_threshold=0.53,
+            hedge_require_ask_max=0.55,
+            last_trade_max=0.55,
+            hedge_held_gui_max=0.55,
+            hedge_other_gui_min=0.45,
+            require_gui_reversed=False,
+            hedge_drop_from_fill=0.08,
+        )
+        self.assertEqual(out["exit"], "hedge")
+        self.assertAlmostEqual(out["exit_bid"], 0.83)
+
     def test_5m_paper_hedges_53c_stop_while_held_still_ahead(self):
         fill = simulate_fak_buy(2.5, 0.90, None)
         hit = {"ts": 1, "ttm": 90, "leg": "up", "ask": 0.90}
@@ -405,6 +467,7 @@ class SweepTemplateTests(unittest.TestCase):
         self.assertEqual(tmpl["hedge_threshold"], 0.70)
         self.assertEqual(tmpl["hedge_require_ask_max"], 0.72)
         self.assertEqual(tmpl["hedge_toxic_bid_max"], 0.53)
+        self.assertEqual(tmpl["hedge_persist_s"], 2.0)
         self.assertEqual(tmpl["hedge_held_gui_max"], 0.72)
         self.assertEqual(tmpl["hedge_other_gui_min"], 0.28)
         self.assertFalse(tmpl["require_gui_reversed"])
@@ -429,11 +492,63 @@ class SweepTemplateTests(unittest.TestCase):
         self.assertIn("budget_15", names)
         self.assertIn("no_spread_cap", names)
 
+    def test_hedge_sweep_includes_earlier_stops(self):
+        tmpl = template_from_strategy(
+            Path(__file__).resolve().parents[1] / "strategy_buy5m.example.json"
+        )
+        names = [row["name"] for row in hedge_sweep_variants(tmpl)]
+        self.assertIn("hedge_53", names)
+        self.assertIn("hedge_70", names)
+        self.assertIn("hedge_70_persist2s", names)
+        self.assertIn("fade8c_or_53", names)
+        hedge70 = next(r for r in hedge_sweep_variants(tmpl) if r["name"] == "hedge_70")
+        self.assertAlmostEqual(hedge70["hedge_threshold"], 0.70)
+        self.assertAlmostEqual(hedge70["hedge_require_ask_max"], 0.72)
+        self.assertAlmostEqual(hedge70["hedge_other_gui_min"], 0.28)
+        self.assertFalse(hedge70["require_gui_reversed"])
+
+    def test_summarize_counts_winner_dumps(self):
+        stats = summarize(
+            [
+                {
+                    "hit": True,
+                    "fill": "full",
+                    "won": False,
+                    "pnl": -0.5,
+                    "exit": "hedge",
+                    "winner": "up",
+                    "leg": "up",
+                    "notional": 2.5,
+                    "avg": 0.9,
+                },
+                {
+                    "hit": True,
+                    "fill": "full",
+                    "won": False,
+                    "pnl": -1.0,
+                    "exit": "hedge",
+                    "winner": "down",
+                    "leg": "up",
+                    "notional": 2.5,
+                    "avg": 0.9,
+                },
+            ]
+        )
+        self.assertEqual(stats["winner_dumps"], 1)
+        self.assertEqual(stats["loser_hedges"], 1)
+
     def test_sweep_without_ticks_exits_2(self):
         from check_path_backtest import main
 
         with tempfile.TemporaryDirectory() as tmp:
             rc = main(["--sweep", "--series", "5m", "--dir", tmp])
+        self.assertEqual(rc, 2)
+
+    def test_hedge_sweep_without_ticks_exits_2(self):
+        from check_path_backtest import main
+
+        with tempfile.TemporaryDirectory() as tmp:
+            rc = main(["--hedge-sweep", "--series", "5m", "--dir", tmp])
         self.assertEqual(rc, 2)
 
 

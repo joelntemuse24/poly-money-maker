@@ -484,6 +484,17 @@ class BuyFillProductionHelpers(unittest.TestCase):
         self.assertAlmostEqual(sell(0.20, 0.001, 0, 0.325), 0.20)
         self.assertAlmostEqual(sell(0.01, 0.001, 0, 0.325), 0.01)
 
+    def test_5m_hedge_exec_tick_never_coarsens_to_01(self):
+        ns = _load_funcs("hedge_exec_tick", "hedge_sell_price", bot=BOT5M)
+        ns["EXPECTED_TICK_SIZE"] = "0.001"
+        ns["TICK_SIZE_FALLBACK"] = "0.001"
+        self.assertEqual(ns["hedge_exec_tick"]("0.01"), 0.001)
+        self.assertEqual(ns["hedge_exec_tick"](0.01), 0.001)
+        self.assertEqual(ns["hedge_exec_tick"]("0.001"), 0.001)
+        # 0.53 bid + CLOB 0.01 tick + undercut 0 → 0.53, not 0.51.
+        self.assertAlmostEqual(ns["hedge_sell_price"](0.53, "0.01", 0, 0.001), 0.53)
+        self.assertAlmostEqual(ns["hedge_sell_price"](0.53, "0.01", 2, 0.001), 0.528)
+
 
 class HedgeReconcileProduction(unittest.TestCase):
     @classmethod
@@ -707,6 +718,7 @@ class AmbiguousCrossCyclePolicy(unittest.TestCase):
         self.assertIn('"hedge_persist_s": 2.0', five)
         self.assertIn('"hedge_toxic_bid_max": 0.53', five)
         self.assertIn('"add_min_price": 0.90', five)
+        self.assertIn('"hedge_undercut_ticks": 0', five)
         self.assertNotIn(
             "up_ask_ok = up_ask is not None and BUY_THRESHOLD <= up_ask <= BUY_MAX_PRICE",
             five,
@@ -1156,10 +1168,12 @@ class BuyExecutionAmbiguity(unittest.TestCase):
             src = bot.read_text()
             self.assertIn("def unmatched_fak_rejection(exc):", src, bot.name)
             self.assertIn("unmatched_retry=can_retry", src, bot.name)
+            self.assertGreaterEqual(src.count("unmatched_retry=can_retry"), 2, bot.name)
             self.assertIn('via="unmatched_400_no_balance"', src, bot.name)
             self.assertIn("empty_fak_cooldown_s", src, bot.name)
             self.assertIn("last_buy_empty", src, bot.name)
             self.assertIn("[FAK EMPTY]", src, bot.name)
+            self.assertIn("hedge no match · re-quote", src, bot.name)
 
     def test_5m_sell_default_tick(self):
         src = BOT5M.read_text()
@@ -1167,6 +1181,13 @@ class BuyExecutionAmbiguity(unittest.TestCase):
         start = src.index("def sell_market_with_retry(")
         chunk = src[start : start + 250]
         self.assertIn('tick_size="0.001"', chunk)
+
+    def test_5m_hedge_posts_at_bid_not_2c_undercut(self):
+        src = BOT5M.read_text()
+        self.assertIn("def hedge_exec_tick(", src)
+        self.assertIn("hedge_tick = hedge_exec_tick(", src)
+        self.assertIn("undercut_ticks=0,", src)
+        self.assertIn('"hedge_undercut_ticks": 0', src)
 
 
 class FiveMinuteHedgeGuiTests(unittest.TestCase):
@@ -1614,7 +1635,9 @@ class SellExecutionAmbiguity(unittest.TestCase):
                 "PartialCreateOrderOptions": lambda **kwargs: kwargs,
                 "OrderType": SimpleNamespace(FAK="FAK"),
                 "signed_order_id": lambda *_a, **_k: "order-sell",
+                "unmatched_fak_rejection": lambda _exc: False,
                 "definitive_order_rejection": lambda _exc: False,
+                "check_clob_token_balance": lambda *_a, **_k: 10.0,
                 "extract_order_id": lambda _result: "order-sell",
                 "confirm_fill_size": lambda *_a, **_k: confirmed,
                 "fill_proceeds": lambda *_a, **_k: confirmed * 0.50,
@@ -1661,6 +1684,86 @@ class SellExecutionAmbiguity(unittest.TestCase):
         self.assertEqual((sold, proceeds), (0.0, 0.0))
         self.assertEqual(result["bot_status"], "persist_fail")
         self.assertEqual(calls["post"], 0)
+
+    def test_sell_unmatched_fak_400_retries_up_to_max(self):
+        class Unmatched(Exception):
+            status_code = 400
+
+            def __str__(self):
+                return "no orders found to match with FAK order"
+
+        ns, calls = self._namespace(post_error=Unmatched())
+        ns["unmatched_fak_rejection"] = lambda exc: "no orders found to match" in str(exc).lower()
+        ns["check_clob_token_balance"] = lambda *_a, **_k: 3.2
+        sold, result, proceeds = ns["sell_market_with_retry"](
+            "token", 3.2, 0.53, max_retries=3,
+            on_submit=lambda *args: calls["submit"].append(args),
+        )
+        self.assertEqual((sold, proceeds), (0.0, 0.0))
+        self.assertEqual(result["bot_status"], "empty")
+        self.assertEqual(calls["post"], 3)
+        self.assertEqual(len(calls["submit"]), 3)
+
+    def test_sell_invalid_amount_400_does_not_retry(self):
+        class InvalidAmt(Exception):
+            status_code = 400
+
+            def __str__(self):
+                return "invalid amounts, max accuracy of 2 decimals"
+
+        ns, calls = self._namespace(post_error=InvalidAmt())
+        ns["unmatched_fak_rejection"] = lambda exc: "no orders found to match" in str(exc).lower()
+        ns["definitive_order_rejection"] = lambda exc: getattr(exc, "status_code", None) == 400
+        sold, result, proceeds = ns["sell_market_with_retry"](
+            "token", 3.2, 0.53, max_retries=3,
+            on_submit=lambda *args: calls["submit"].append(args),
+        )
+        self.assertEqual((sold, proceeds), (0.0, 0.0))
+        self.assertEqual(result["bot_status"], "empty")
+        self.assertEqual(calls["post"], 1)
+
+    def test_sell_unmatched_400_ghost_when_balance_drops(self):
+        class Unmatched(Exception):
+            status_code = 400
+
+            def __str__(self):
+                return "no orders found to match with FAK order"
+
+        ns, calls = self._namespace(post_error=Unmatched())
+        ns["unmatched_fak_rejection"] = lambda exc: "no orders found to match" in str(exc).lower()
+        bals = [3.2, 0.0]
+
+        def bal(*_a, **_k):
+            return bals.pop(0) if bals else 0.0
+
+        ns["check_clob_token_balance"] = bal
+        sold, result, proceeds = ns["sell_market_with_retry"](
+            "token", 3.2, 0.53, max_retries=3,
+            on_submit=lambda *args: calls["submit"].append(args),
+            on_fill=lambda *args: calls["fill"].append(args),
+        )
+        self.assertEqual(result["bot_status"], "filled")
+        self.assertAlmostEqual(sold, 3.2)
+        self.assertEqual(calls["post"], 1)
+        self.assertEqual(len(calls["fill"]), 1)
+
+    def test_sell_unmatched_400_no_balance_does_not_retry(self):
+        class Unmatched(Exception):
+            status_code = 400
+
+            def __str__(self):
+                return "no orders found to match with FAK order"
+
+        ns, calls = self._namespace(post_error=Unmatched())
+        ns["unmatched_fak_rejection"] = lambda exc: "no orders found to match" in str(exc).lower()
+        ns["check_clob_token_balance"] = lambda *_a, **_k: None
+        sold, result, proceeds = ns["sell_market_with_retry"](
+            "token", 3.2, 0.53, max_retries=3,
+            on_submit=lambda *args: calls["submit"].append(args),
+        )
+        self.assertEqual((sold, proceeds), (0.0, 0.0))
+        self.assertEqual(result["bot_status"], "ambiguous")
+        self.assertEqual(calls["post"], 1)
 
 
 class BalanceAndGcSemantics(unittest.TestCase):
@@ -1719,6 +1822,7 @@ class BalanceAndGcSemantics(unittest.TestCase):
         self.assertEqual(five["hedge_persist_s"], 2.0)
         self.assertEqual(five["hedge_toxic_bid_max"], 0.53)
         self.assertEqual(five["add_min_price"], 0.90)
+        self.assertEqual(five["hedge_undercut_ticks"], 0)
         self.assertEqual(five["buy_threshold"], 0.75)
         self.assertEqual(five["buy_max_price"], 0.90)
         self.assertEqual(five["buy_budget"], 2.5)

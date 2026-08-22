@@ -11,7 +11,7 @@
   "hedge_enabled": true,
   "hedge_threshold": 0.70,
   "hedge_min_price": 0.325,
-  "hedge_undercut_ticks": 2,
+  "hedge_undercut_ticks": 0,
   "hedge_quote_max_age_s": 0.25,
   "hedge_retry_sleep_s": 0.05,
   "hedge_ghost_sleep_s": 0.4,

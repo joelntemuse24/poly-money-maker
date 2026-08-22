@@ -18,9 +18,10 @@ there, then **$2.50 only in the last 120s at the old 75–90¢ band**. Missed
 early does **not** roll into late. Late **first** entry stays 75–90¢; a
 same-leg add needs ask ≥ **90¢** (`add_min_price`). After a full hedge the
 market is done (no other-leg chase). Normal hedge is **persist 2s at 70/72**
-on the combined bag (GUI held ≤ **72¢** / other ≥ **28¢**). Instant 70 is
-out — a one-tick dip dumps winners. `toxic_fill` still dumps **only while
-bid ≤ 53¢**, no persist. Chainlink TWAP gate is **$0** (any non-zero tick vs
+on the combined bag (GUI held ≤ **72¢** / other ≥ **28¢**). Then sell at
+the **live 0.001 bid** (no 2¢ undercut; unmatched 400 re-quotes). Instant
+70 is out — a one-tick dip dumps winners. `toxic_fill` still dumps **only
+while bid ≤ 53¢**, no persist. Chainlink TWAP gate is **$0** (any non-zero tick vs
 PTB; side must match; flat is still refused). Late FAKs **limit at 90¢**;
 early FAKs **limit at 99¢**. Size starts at `budget/ask` and is **at least 3
 shares** when `3 × limit` fits in `buy_max_spend` **$3 per FAK** (early
@@ -73,7 +74,7 @@ Normal hedge is **persist 2s @ 70/72** on the combined bag:
 | Execution | Size `budget/ask`, **floor 3 shares** when `3 × limit ≤ $3`. Unmatched 400 re-quotes up to **3** FAKs; then **0.15 s** cooldown. Unclear POSTs still quarantine. |
 | GUI consensus | winner ≥ 70¢, loser ≤ 30¢ |
 | Windows | 5m **whole market**: early ≥90 / ≥95 for TTM (120, 300]; late 75–90 for TTM ≤ 120s (15m / hourly bots **not running**) |
-| Hedge | **Qualify** bid ≤ **70¢** and ask ≤ **72¢**, spread ≤ 15¢, **plus** GUI held ≤ **72¢** / other ≥ **28¢** (not inverted 30/70). Last print ≤ 72¢. Must **stay qualified 2s** (`hedge_persist_s`; a bounce resets). Then sell at the live bid. Combined early+late inventory. Instant 70 is out. After a full dump, `hedge_closed` blocks any later buy on that market. `toxic_fill` arms only when FAK **average** < 65¢ (not extra shares vs a 99¢-sized quote) and still dumps without GUI / persist **only while held bid ≤ 53¢** (`hedge_toxic_bid_max`). |
+| Hedge | **Qualify** bid ≤ **70¢** and ask ≤ **72¢**, spread ≤ 15¢, **plus** GUI held ≤ **72¢** / other ≥ **28¢** (not inverted 30/70). Last print ≤ 72¢. Must **stay qualified 2s** (`hedge_persist_s`; a bounce resets). Then sell at the **live 0.001 bid** (no 2¢ undercut); unmatched 400 re-quotes up to 3. Combined early+late inventory. Instant 70 is out. After a full dump, `hedge_closed` blocks any later buy on that market. `toxic_fill` arms only when FAK **average** < 65¢ (not extra shares vs a 99¢-sized quote) and still dumps without GUI / persist **only while held bid ≤ 53¢** (`hedge_toxic_bid_max`). |
 | Underlying edge | **$0** (5m: any non-zero TWAP vs PTB) / **$10** (15m, hourly); side must match |
 | `max_open_positions` | **0 = unlimited** |
 | `toxic_force_exit_below` | **65¢** |
@@ -186,7 +187,7 @@ amount / HTTP 400), not this NameError.
   sudo systemctl stop polybuybot polybuybothourly
   sudo systemctl disable polybuybot polybuybothourly
   cd ~/poly-money-maker && git pull
-  python3 -c 'import json; from pathlib import Path; p=Path("strategy_buy5m.json"); d=json.loads(p.read_text()); d["min_underlying_edge_usd"]=0.0; d["hedge_threshold"]=0.70; d["hedge_require_ask_max"]=0.72; d["hedge_persist_s"]=2.0; d["hedge_toxic_bid_max"]=0.53; d["add_min_price"]=0.90; d["buy_budget"]=2.5; d["late_buy_budget"]=2.5; d["buy_max_price"]=0.90; d["poll_buy_window_s"]=0.01; d["poll_held_s"]=0.01; d["ui_every_n_cycles"]=50; p.write_text(json.dumps(d, indent=2)+"\n"); print("budget", d["buy_budget"], "late", d["late_buy_budget"], "hedge", d["hedge_threshold"], d["hedge_require_ask_max"], "persist", d["hedge_persist_s"], "add_min", d["add_min_price"], "poll", d["poll_buy_window_s"], d["poll_held_s"])'
+  python3 -c 'import json; from pathlib import Path; p=Path("strategy_buy5m.json"); d=json.loads(p.read_text()); d["min_underlying_edge_usd"]=0.0; d["hedge_threshold"]=0.70; d["hedge_require_ask_max"]=0.72; d["hedge_persist_s"]=2.0; d["hedge_toxic_bid_max"]=0.53; d["add_min_price"]=0.90; d["hedge_undercut_ticks"]=0; d["buy_budget"]=2.5; d["late_buy_budget"]=2.5; d["buy_max_price"]=0.90; d["poll_buy_window_s"]=0.01; d["poll_held_s"]=0.01; d["ui_every_n_cycles"]=50; p.write_text(json.dumps(d, indent=2)+"\n"); print("budget", d["buy_budget"], "late", d["late_buy_budget"], "hedge", d["hedge_threshold"], d["hedge_require_ask_max"], "persist", d["hedge_persist_s"], "add_min", d["add_min_price"], "poll", d["poll_buy_window_s"], d["poll_held_s"])'
   sudo systemctl restart polybuybot5m
   sudo systemctl enable polybuybot5m
   systemctl is-active polybuybot polybuybot5m polybuybothourly
@@ -210,6 +211,11 @@ amount / HTTP 400), not this NameError.
 - [x] Hedge FAK follows live bid after book integrity (no 32¢ fill refusal).
       5m **code default** is now persist **2s @ 70/72** (toxic still **53¢**);
       hourly template is **55/60** (still stopped); 15m stays 35/40 (stopped).
+- [x] **5m hedge unmatched-400 retry + sell at the 0.001 bid** (#115). Live
+      21 Aug 16:00–00:34Z: **0 `hedge_fill`**. Every sell was attempt-1
+      `400 no orders found to match` at `price_limit` = bid − 2¢ (CLOB tick
+      0.01 × undercut 2). Merged on main. Needs the same 5m restart as the
+      persist/add-min change below.
 - [x] On VM: pathlog restarted onto size-aware ticks; 15m/hourly buy bots stopped.
 - [x] 5m underlying gate **$0** (any non-zero TWAP vs PTB; side must match).
 - [x] Pathlog `--anatomy` / `--compare` so window/band/size alts are scored offline.
