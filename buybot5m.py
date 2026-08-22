@@ -58,12 +58,14 @@ from buy.entry_skip import (
     can_arm_entry_slice,
     entry_slice_budget,
     is_late_entry_window,
+    late_add_blocked_by_min,
     same_token,
     select_entry_band,
     stamp_slice_bought,
     uncertain_buy_spend_cap,
     window_no_buy_reason,
 )
+from buy.hedge_gate import hedge_persist_ready
 
 
 class ImmediateResponseClobClient(ClobClient):
@@ -176,9 +178,11 @@ _STRATEGY_DEFAULTS = {
     # Must be <= buy_threshold (validator); 65¢ ≈ walk well below the 75¢ floor.
     "toxic_force_exit_below": 0.65,
     "hedge_enabled": True,
-    "hedge_threshold": 0.53,
-    # Kept in config (live JSON still sends it). Not a FAK floor: after 53/55
-    # integrity, the sell follows the live bid so a 20¢ print is not $0.
+    # Pathlog persist-2s @ 70 beat instant 53 and instant 70. Toxic dumps
+    # still use hedge_toxic_bid_max (53¢), not this qualify level.
+    "hedge_threshold": 0.70,
+    # Kept in config (live JSON still sends it). Not a FAK floor: after 70/72
+    # persist, the sell follows the live bid so a 20¢ print is not $0.
     "hedge_min_price": 0.325,
     "hedge_undercut_ticks": 0,
     "hedge_quote_max_age_s": 0.25,
@@ -189,8 +193,10 @@ _STRATEGY_DEFAULTS = {
     # Hedge: penny bids under a still-high ask are fake — require a tight book
     # and ask also collapsed (same lesson sell-side already learned on mids).
     "hedge_max_spread": 0.15,
-    "hedge_require_ask_max": 0.55,
-    # Invert the buy GUI 70/30 plus last-trade on the held token. TOB 53/55
+    "hedge_require_ask_max": 0.72,
+    "hedge_persist_s": 2.0,
+    "hedge_toxic_bid_max": 0.53,
+    # Invert the buy GUI 70/30 plus last-trade on the held token. TOB 70/72
     # alone is not consensus (same lesson as not buying a random ask).
     "hedge_require_gui": True,
     "buy_start_s": 120,
@@ -210,6 +216,9 @@ _STRATEGY_DEFAULTS = {
     # Second $2.50 only in the last 120s (75–90). Missed early does not roll
     # into late — late is still $2.50, not $5.
     "late_buy_budget": 2.5,
+    # Same-leg late add only if ask ≥ this (0.90). Flat late 75–90 still
+    # allowed. 0 disables. Fade adds below 90¢ were the 64–77% hole.
+    "add_min_price": 0.90,
     # Hard ceiling on USDC sent per FAK. Each slice is $2.50; never more than $3
     # on one POST. Two slices can spend ~$5 total.
     "buy_max_spend": 3.0,
@@ -318,12 +327,21 @@ def load_strategy():
         for key in (
             "min_winner_bid", "max_loser_bid", "min_bid_edge",
             "max_entry_spread", "hedge_max_spread", "hedge_require_ask_max",
-            "early_buy_max_price", "early_95_min_price",
+            "early_buy_max_price", "early_95_min_price", "add_min_price",
+            "hedge_toxic_bid_max",
         ):
             if not 0 <= float(cfg[key]) <= 1:
                 raise ValueError(f"{key} must be between 0 and 1")
         if float(cfg["hedge_require_ask_max"]) < float(cfg["hedge_threshold"]):
             raise ValueError("hedge_require_ask_max must be >= hedge_threshold")
+        if not (0 <= float(cfg["add_min_price"]) <= 1):
+            raise ValueError("add_min_price must be between 0 and 1")
+        if float(cfg["add_min_price"]) > float(cfg["buy_max_price"]) + 1e-12:
+            raise ValueError("add_min_price must be <= buy_max_price")
+        if not (0 < float(cfg["hedge_toxic_bid_max"]) <= 1):
+            raise ValueError("hedge_toxic_bid_max must satisfy 0 < max <= 1")
+        if float(cfg["hedge_toxic_bid_max"]) > float(cfg["hedge_threshold"]) + 1e-12:
+            raise ValueError("hedge_toxic_bid_max must be <= hedge_threshold")
         if str(cfg["tick_size"]) not in {
             "0.1", "0.01", "0.005", "0.0025", "0.001", "0.0001",
         }:
@@ -369,7 +387,7 @@ def load_strategy():
             "hedge_quote_max_age_s", "hedge_retry_sleep_s",
             "hedge_ghost_sleep_s", "buy_grace_s", "buy_cooldown_s",
             "empty_fak_cooldown_s", "early_95_min_s",
-            "redeem_throttle_s", "max_redeem_age_days",
+            "redeem_throttle_s", "max_redeem_age_days", "hedge_persist_s",
         ):
             if float(cfg[key]) < 0:
                 raise ValueError(f"{key} must be non-negative")
@@ -405,7 +423,10 @@ HEDGE_GHOST_SLEEP_S = _strat["hedge_ghost_sleep_s"]
 MAX_ENTRY_SPREAD = _strat["max_entry_spread"]
 HEDGE_MAX_SPREAD = _strat["hedge_max_spread"]
 HEDGE_REQUIRE_ASK_MAX = _strat["hedge_require_ask_max"]
+HEDGE_PERSIST_S = _strat["hedge_persist_s"]
+HEDGE_TOXIC_BID_MAX = _strat["hedge_toxic_bid_max"]
 HEDGE_REQUIRE_GUI = _strat["hedge_require_gui"]
+ADD_MIN_PRICE = _strat["add_min_price"]
 BUY_START_S = _strat["buy_start_s"]
 EARLY_BUY_START_S = _strat["early_buy_start_s"]
 EARLY_BUY_MAX_PRICE = _strat["early_buy_max_price"]
@@ -613,6 +634,7 @@ def log_event(event, **kwargs):
 _SKIP_LOG_EVERY_S = 8.0
 _skip_log_mono = {}
 _buy_window_logged = {}
+_hedge_persist_armed = {}
 
 
 def log_buy_skip_throttled(reason, condition_id, event="buy_skip", **kwargs):
@@ -1419,7 +1441,7 @@ def hedge_exec_tick(tick_size):
 def hedge_sell_price(bid, tick_size, undercut_ticks, min_price=None):
     """FAK sell at the live bid (tick-aligned).
 
-    After 53/55 integrity, take whatever bid is there. min_price is ignored so
+    After 70/72 persist, take whatever bid is there. min_price is ignored so
     a leftover 32¢ config cannot refuse a 20¢ or 1¢ print. One tick is only
     the exchange minimum, not a strategy floor. 5m posts at the bid
     (undercut 0): a 2¢ undercut on a 0.01 tick never sat on the 53¢ bid.
@@ -1544,9 +1566,9 @@ def hedge_book_ok(bid, ask, threshold, max_spread, require_ask_max):
 def toxic_dump_book_ok(bid, threshold):
     """True iff a toxic_fill dump may sell: held bid exists and is still dead.
 
-    Recovered book (bid > hedge_threshold, e.g. 97¢ after a junk fill) must
-    not dump. Missing bid is fail-closed. Wide 1¢/99¢ still dumps — this
-    gate is bid-only and does not require 53/55/15 or GUI.
+    Recovered book (bid > hedge_toxic_bid_max, e.g. 97¢ after a junk fill)
+    must not dump. Missing bid is fail-closed. Wide 1¢/99¢ still dumps —
+    this gate is bid-only and does not require 70/72/15, persist, or GUI.
     """
     bid = finite_float(bid, minimum=0, maximum=1)
     threshold = finite_float(threshold, minimum=0, maximum=1)
@@ -1558,10 +1580,11 @@ def toxic_dump_book_ok(bid, threshold):
 def hedge_gui_limits(require_ask_max):
     """Held display cap is ask-max; other-leg floor is the cash complement.
 
-    A 52/54 held book has mid ~53¢. Buy-style 30/70 would wait until the
-    website already shows a loser, which is after the 53¢ bid is gone.
-    5m live: ask-max 55¢ → held GUI ≤ 55¢, other GUI ≥ 45¢. Two-sided
-    53/55/15 and last-trade ≤ ask-max still have to pass.
+    A 68/71 held book has mid ~70¢. Buy-style 30/70 would wait until the
+    website already shows a loser, which is after the 70¢ bid is gone.
+    5m live: ask-max 72¢ → held GUI ≤ 72¢, other GUI ≥ 28¢. Two-sided
+    70/72/15 and last-trade ≤ ask-max still have to pass. Toxic dumps
+    stay bid-only at hedge_toxic_bid_max (53¢).
     """
     ask_max = finite_float(require_ask_max, minimum=0, maximum=1)
     if ask_max is None:
@@ -1578,14 +1601,14 @@ def hedge_consensus_ok(
     min_edge,
     last_trade_max,
 ):
-    """True when display prices agree with a 53/55 book — not buy 70/30.
+    """True when display prices agree with the configured hedge book.
 
     A 32/38 clip can be a random TOB. Buy still uses Polymarket display
     (mid if spread ≤ 10¢ else last trade) plus 70/30. 5m hedge uses
     ``hedge_gui_limits`` (held ≤ ask-max, other ≥ complement) and does
-    **not** require the other GUI to already be higher than held. A 53¢
-    vs 47¢ book is the stop. Last print on the held token still must be
-    ≤ last_trade_max so a spoofed tight book cannot manufacture a 53¢
+    **not** require the other GUI to already be higher than held. A 70¢
+    vs 28¢ book is the stop. Last print on the held token still must be
+    ≤ last_trade_max so a spoofed tight book cannot manufacture a 70¢
     mid while last trade is 85¢.
     """
     held_last = finite_float(held_last, minimum=0, maximum=1)
@@ -3673,7 +3696,10 @@ while not _shutdown_requested:
         MAX_ENTRY_SPREAD = _strat["max_entry_spread"]
         HEDGE_MAX_SPREAD = _strat["hedge_max_spread"]
         HEDGE_REQUIRE_ASK_MAX = _strat["hedge_require_ask_max"]
+        HEDGE_PERSIST_S = _strat["hedge_persist_s"]
+        HEDGE_TOXIC_BID_MAX = _strat["hedge_toxic_bid_max"]
         HEDGE_REQUIRE_GUI = _strat["hedge_require_gui"]
+        ADD_MIN_PRICE = _strat["add_min_price"]
         BUY_START_S = _strat["buy_start_s"]
         EARLY_BUY_START_S = _strat["early_buy_start_s"]
         EARLY_BUY_MAX_PRICE = _strat["early_buy_max_price"]
@@ -4413,6 +4439,7 @@ while not _shutdown_requested:
                         if rem < 0.01:
                             rem = 0.0
                             meta["hedge_closed"] = True
+                            _hedge_persist_armed.pop(cond, None)
                         meta["bought_size"] = rem
                         meta["pnl_hedge_proceeds"] = round(
                             max(
@@ -4502,7 +4529,7 @@ while not _shutdown_requested:
                 # --- HEDGE CHECK (for held positions) ---
                 if held_token and held_size > 0.01 and HEDGE_ENABLED and not meta.get("hedge_closed"):
                     # FAK avg < toxic_force_exit_below arms toxic_fill. Dump only while
-                    # held bid ≤ hedge_threshold (no GUI / 53/55/15). Recovered book
+                    # held bid ≤ hedge_toxic_bid_max (no GUI / persist). Recovered book
                     # (bid > 53¢) logs hedge_skip_toxic_recovered and stays armed.
                     # Mild below-band fills (≥ that floor) use the normal hedge path.
                     toxic_fill = bool(meta.get("toxic_fill"))
@@ -4523,11 +4550,13 @@ while not _shutdown_requested:
                     if cached_bid is None:
                         cached_bid = peek_bid
 
+                    ws_floor = HEDGE_TOXIC_BID_MAX if toxic_fill else HEDGE_THRESHOLD
                     if (
                         ws_fresh
                         and peek_bid is not None
-                        and not toxic_dump_book_ok(peek_bid, HEDGE_THRESHOLD)
+                        and peek_bid > ws_floor + 1e-12
                     ):
+                        _hedge_persist_armed.pop(cond, None)
                         if toxic_fill:
                             log_event(
                                 "hedge_skip_toxic_recovered",
@@ -4548,6 +4577,7 @@ while not _shutdown_requested:
                             expected_condition_id=cond,
                         )
                         if fresh_bid is None and (not toxic_fill or fresh_ask is None):
+                            _hedge_persist_armed.pop(cond, None)
                             log_event(
                                 "hedge_skip_incomplete_rest", condition_id=cond, leg=held_leg,
                                 trigger_bid=cached_bid, current_bid=fresh_bid, current_ask=fresh_ask,
@@ -4556,6 +4586,7 @@ while not _shutdown_requested:
                                 toxic_fill=toxic_fill,
                             )
                         elif toxic_fill and fresh_bid is None:
+                            _hedge_persist_armed.pop(cond, None)
                             log_event(
                                 "hedge_skip_incomplete_rest", condition_id=cond, leg=held_leg,
                                 trigger_bid=cached_bid, current_bid=fresh_bid, current_ask=fresh_ask,
@@ -4564,6 +4595,7 @@ while not _shutdown_requested:
                                 toxic_fill=True, reason="no_bid",
                             )
                         elif (not toxic_fill) and (fresh_bid is None or fresh_ask is None):
+                            _hedge_persist_armed.pop(cond, None)
                             log_event(
                                 "hedge_skip_incomplete_rest", condition_id=cond, leg=held_leg,
                                 trigger_bid=cached_bid, current_bid=fresh_bid, current_ask=fresh_ask,
@@ -4571,7 +4603,8 @@ while not _shutdown_requested:
                                 quote_age_s=None if quote_age is None else round(quote_age, 3),
                                 toxic_fill=False,
                             )
-                        elif toxic_fill and not toxic_dump_book_ok(fresh_bid, HEDGE_THRESHOLD):
+                        elif toxic_fill and not toxic_dump_book_ok(fresh_bid, HEDGE_TOXIC_BID_MAX):
+                            _hedge_persist_armed.pop(cond, None)
                             log_event(
                                 "hedge_skip_toxic_recovered",
                                 condition_id=cond, leg=held_leg,
@@ -4582,6 +4615,7 @@ while not _shutdown_requested:
                                 f"bid {fresh_bid:.3f} — dump stays armed, no sell"
                             )
                         elif not toxic_fill and fresh_bid > HEDGE_THRESHOLD:
+                            _hedge_persist_armed.pop(cond, None)
                             log_event(
                                 "hedge_cancel_bounce", condition_id=cond, leg=held_leg,
                                 trigger_bid=cached_bid, current_bid=fresh_bid,
@@ -4602,6 +4636,7 @@ while not _shutdown_requested:
                                     hedge_bid, hedge_ask, HEDGE_THRESHOLD, HEDGE_MAX_SPREAD, HEDGE_REQUIRE_ASK_MAX,
                                 )
                             if not ok:
+                                _hedge_persist_armed.pop(cond, None)
                                 meta["hedge_blocked_toxic"] = True
                                 save_json(STATE_FILE, positions_meta)
                                 log_event(
@@ -4647,7 +4682,9 @@ while not _shutdown_requested:
                                     other_gui = polymarket_display_price(
                                         other_bid, other_ask, other_last,
                                     )
+                                persist_fire = False
                                 if not gui_ok:
+                                    _hedge_persist_armed.pop(cond, None)
                                     log_event(
                                         "hedge_skip_no_consensus",
                                         condition_id=cond, leg=held_leg,
@@ -4660,18 +4697,43 @@ while not _shutdown_requested:
                                         other_gui_min=other_gui_min,
                                         last_trade_max=HEDGE_REQUIRE_ASK_MAX,
                                     )
-                                elif (
-                                    toxic_fill
-                                    and toxic_dump_book_ok(hedge_bid, HEDGE_THRESHOLD)
-                                ) or (
-                                    (not toxic_fill) and hedge_bid <= HEDGE_THRESHOLD
+                                else:
+                                    persist_fire, persist_armed, persist_why = hedge_persist_ready(
+                                        True,
+                                        now_s=time.monotonic(),
+                                        armed_ts=_hedge_persist_armed.get(cond),
+                                        persist_s=HEDGE_PERSIST_S,
+                                        toxic=toxic_fill,
+                                    )
+                                    if persist_armed is None:
+                                        _hedge_persist_armed.pop(cond, None)
+                                    else:
+                                        _hedge_persist_armed[cond] = persist_armed
+                                    if not persist_fire:
+                                        log_buy_skip_throttled(
+                                            persist_why,
+                                            cond,
+                                            event="hedge_skip_persist",
+                                            bid=hedge_bid,
+                                            ask=hedge_ask,
+                                            persist_s=HEDGE_PERSIST_S,
+                                            persist_why=persist_why,
+                                            threshold=HEDGE_THRESHOLD,
+                                        )
+                                if persist_fire and (
+                                    (
+                                        toxic_fill
+                                        and toxic_dump_book_ok(hedge_bid, HEDGE_TOXIC_BID_MAX)
+                                    ) or (
+                                        (not toxic_fill) and hedge_bid <= HEDGE_THRESHOLD
+                                    )
                                 ):
                                     hedge_tick = hedge_exec_tick(
                                         get_tick_size_cached(held_token),
                                     )
-                                    # 53/55 is only a tight book. GUI must agree
-                                    # with that book (held ≤ ask-max, other ≥
-                                    # complement), not wait for buy 30/70.
+                                    # 70/72 is only a tight book. Persist 2s then
+                                    # GUI must agree with that book (held ≤
+                                    # ask-max, other ≥ complement), not buy 30/70.
                                     # Last trade still has to have printed down.
                                     # Sell at the live 0.001 bid. Undercut on a
                                     # CLOB 0.01 tick posted 0.51 into a 0.53
@@ -4756,6 +4818,7 @@ while not _shutdown_requested:
                                         if rem_now < 0.01:
                                             rem_now = 0.0
                                             meta["hedge_closed"] = True
+                                            _hedge_persist_armed.pop(cond, None)
                                         meta["bought_size"] = rem_now
                                         meta["pnl_hedge_proceeds"] = round(
                                             prior_hedge_proceeds + float(proceeds_total), 4
@@ -4867,6 +4930,7 @@ while not _shutdown_requested:
                                         )
                                         if rem < 0.01:
                                             meta["hedge_closed"] = True
+                                            _hedge_persist_armed.pop(cond, None)
                                             rem = 0.0
                                         meta["bought_size"] = rem
                                         leg_key = "up" if held_leg == "up" else "dn"
@@ -4931,10 +4995,12 @@ while not _shutdown_requested:
                     hedge_closed=bool(meta.get("hedge_closed")),
                 )
                 if not slice_ok:
-                    if slice_why == "slice_filled":
-                        continue
-                    if slice_why == "already_held":
-                        continue
+                    if slice_why in ("hedge_closed", "other_leg", "add_below_min"):
+                        log_buy_skip_throttled(
+                            slice_why,
+                            cond,
+                            event=f"buy_skip_{slice_why}",
+                        )
                     continue
 
                 # One fill per slice. bought_token still blocks a second early
@@ -5369,6 +5435,22 @@ while not _shutdown_requested:
                         held_leg=held_leg or meta.get("bought_leg"),
                         buy_leg=buy_leg,
                         seconds_left=round(seconds_left, 1),
+                    )
+                    continue
+                if late_add_blocked_by_min(
+                    buy_ask,
+                    held_size=held_size,
+                    hedge_closed=bool(meta.get("hedge_closed")),
+                    add_min_price=ADD_MIN_PRICE,
+                ):
+                    log_buy_skip_throttled(
+                        "add_below_min",
+                        cond,
+                        event="buy_skip_add_below_min",
+                        ask=buy_ask,
+                        add_min_price=ADD_MIN_PRICE,
+                        held_leg=held_leg or meta.get("bought_leg"),
+                        buy_leg=buy_leg,
                     )
                     continue
 

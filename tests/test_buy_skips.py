@@ -15,6 +15,7 @@ from buy.entry_skip import (
     ask_in_entry_band,
     can_arm_entry_slice,
     can_arm_hourly_slice,
+    late_add_blocked_by_min,
     entry_band_for_seconds,
     entry_slice_budget,
     hourly_horizon_min,
@@ -298,7 +299,7 @@ class TwoSliceBudgetTests(unittest.TestCase):
         self.assertFalse(ok)
         self.assertEqual(why, "other_leg")
 
-    def test_late_still_fires_after_full_hedge(self):
+    def test_late_blocked_after_full_hedge(self):
         meta = {
             "early_bought": True, "bought_token": "down", "hedge_closed": True,
         }
@@ -306,8 +307,49 @@ class TwoSliceBudgetTests(unittest.TestCase):
             meta, seconds_left=90, late_start_s=120, held_size=0.0,
             buy_token="up", hedge_closed=True,
         )
-        self.assertTrue(ok)
-        self.assertIsNone(why)
+        self.assertFalse(ok)
+        self.assertEqual(why, "hedge_closed")
+
+    def test_late_same_leg_add_below_90_is_blocked(self):
+        meta = {"early_bought": True, "bought_token": "down"}
+        self.assertTrue(
+            late_add_blocked_by_min(
+                0.84, held_size=2.6, add_min_price=0.90,
+            )
+        )
+        self.assertFalse(
+            late_add_blocked_by_min(
+                0.90, held_size=2.6, add_min_price=0.90,
+            )
+        )
+        self.assertFalse(
+            late_add_blocked_by_min(
+                0.84, held_size=0.0, add_min_price=0.90,
+            )
+        )
+        ok, why = can_arm_entry_slice(
+            meta, seconds_left=90, late_start_s=120, held_size=2.6,
+            buy_token="down", ask=0.84, add_min_price=0.90,
+        )
+        self.assertFalse(ok)
+        self.assertEqual(why, "add_below_min")
+        ok90, why90 = can_arm_entry_slice(
+            meta, seconds_left=90, late_start_s=120, held_size=2.6,
+            buy_token="down", ask=0.90, add_min_price=0.90,
+        )
+        self.assertTrue(ok90)
+        self.assertIsNone(why90)
+        ok_no_ask, why_no_ask = can_arm_entry_slice(
+            meta, seconds_left=90, late_start_s=120, held_size=2.6,
+            buy_token="down", add_min_price=0.90,
+        )
+        self.assertTrue(ok_no_ask)
+        self.assertIsNone(why_no_ask)
+        self.assertFalse(
+            late_add_blocked_by_min(
+                None, held_size=2.6, add_min_price=0.90,
+            )
+        )
 
     def test_late_bought_blocks_second_late(self):
         meta = {"late_bought": True, "bought_token": "up"}
@@ -514,6 +556,14 @@ class SkipSummarizeTests(unittest.TestCase):
         self.assertEqual(
             skip_reason({"event": "buy_skip_underlying_side"}),
             "underlying_side",
+        )
+        self.assertEqual(
+            skip_reason({"event": "buy_skip_add_below_min"}),
+            "add_below_min",
+        )
+        self.assertEqual(
+            skip_reason({"event": "buy_skip_hedge_closed"}),
+            "hedge_closed",
         )
         self.assertEqual(
             skip_reason({"event": "buy_skip", "reason": "ask_below_band"}),

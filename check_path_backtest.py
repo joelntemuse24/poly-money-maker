@@ -266,6 +266,7 @@ def paper_settle(
     hedge_held_gui_max: Optional[float] = None,
     hedge_other_gui_min: Optional[float] = None,
     require_gui_reversed: bool = True,
+    hedge_toxic_bid_max: Optional[float] = None,
     hedge_persist_s: float = 0.0,
     hedge_drop_from_fill: Optional[float] = None,
 ) -> dict:
@@ -275,11 +276,12 @@ def paper_settle(
     GUI *and* last-print proxy. Wide books fail closed (no hedge), same class
     as live ``hedge_skip_no_consensus`` / missing last trade.
 
-    ``toxic_fill`` (avg < 65¢) dumps only while held bid ≤ ``hedge_threshold``
-    (5m example **53¢**) — recovered 97¢ books ride. Normal hedges still need
-    threshold / ask-max / max-spread (5m example **53/55/15**) plus the GUI
-    proxy. 5m live GUI is held ≤ ask-max / other ≥ complement (55/45), and
-    does **not** require the other mid to already be higher than held.
+    ``toxic_fill`` (avg < 65¢) dumps only while held bid ≤
+    ``hedge_toxic_bid_max`` (5m example **53¢**, else ``hedge_threshold``) —
+    recovered 97¢ books ride. Normal hedges still need threshold / ask-max /
+    max-spread (5m example **70/72/15**) plus the GUI proxy. 5m live GUI is
+    held ≤ ask-max / other ≥ complement (72/28), and does **not** require
+    the other mid to already be higher than held.
 
     ``hedge_persist_s`` > 0 waits that many seconds of *continuous* qualifying
     ticks before selling (a 1-tick 70¢ dip does not fire). ``hedge_drop_from_fill``
@@ -300,6 +302,10 @@ def paper_settle(
         }
 
     toxic = avg is not None and avg < toxic_force_exit_below - 1e-12
+    toxic_floor = (
+        float(hedge_threshold) if hedge_toxic_bid_max is None
+        else float(hedge_toxic_bid_max)
+    )
     other = "down" if held == "up" else "up"
     fill_ask = _f(hit.get("ask"))
     if fill_ask is None:
@@ -341,7 +347,7 @@ def paper_settle(
             drop_hit = True
         qualifies = False
         if toxic:
-            qualifies = bid <= hedge_threshold + 1e-12
+            qualifies = bid <= toxic_floor + 1e-12
         elif drop_hit:
             qualifies = True
         else:
@@ -454,6 +460,11 @@ def template_from_strategy(path: Path) -> dict:
         "budget": float(data["buy_budget"]),
         "max_spread": None if spread is None else float(spread),
         "hedge_threshold": float(data.get("hedge_threshold") or 0.35),
+        "hedge_toxic_bid_max": float(
+            data["hedge_toxic_bid_max"]
+            if data.get("hedge_toxic_bid_max") is not None
+            else (data.get("hedge_threshold") or 0.35)
+        ),
         "hedge_require_ask_max": ask_max,
         "hedge_max_spread": float(data.get("hedge_max_spread") or 0.15),
         "hedge_require_gui": bool(data.get("hedge_require_gui", True)),
@@ -480,6 +491,7 @@ def template_from_strategy(path: Path) -> dict:
 
 PAPER_KEYS = (
     "hedge_threshold",
+    "hedge_toxic_bid_max",
     "hedge_require_ask_max",
     "hedge_max_spread",
     "hedge_require_gui",
@@ -1092,7 +1104,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     ap.add_argument(
         "--paper",
         action="store_true",
-        help="after a fill, walk later ticks for the template hedge (5m example: 53/55/15) + GUI-proxy / toxic dump",
+        help="after a fill, walk later ticks for the template hedge (5m example: 70/72/15) + GUI-proxy / toxic dump",
     )
     ap.add_argument(
         "--sweep",

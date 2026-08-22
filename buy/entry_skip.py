@@ -163,6 +163,36 @@ def same_token(held_token, buy_token) -> bool:
     return str(held_token) == str(buy_token)
 
 
+def late_add_blocked_by_min(
+    ask,
+    *,
+    held_size=0.0,
+    hedge_closed=False,
+    add_min_price=0.0,
+) -> bool:
+    """True when a same-leg add would buy a fade cheaper than ``add_min_price``.
+
+    Flat first entries (no inventory) are never blocked. ``add_min_price``
+    ≤ 0 disables the floor.
+    """
+    if bool(hedge_closed):
+        return False
+    if float(held_size or 0) <= 0.01:
+        return False
+    try:
+        floor = float(add_min_price or 0)
+    except (TypeError, ValueError):
+        return False
+    if floor <= 1e-12:
+        return False
+    if ask is None:
+        return False
+    try:
+        return float(ask) < floor - 1e-12
+    except (TypeError, ValueError):
+        return True
+
+
 def can_arm_entry_slice(
     meta,
     *,
@@ -171,11 +201,14 @@ def can_arm_entry_slice(
     held_size=0.0,
     buy_token=None,
     hedge_closed=False,
+    ask=None,
+    add_min_price=0.0,
 ):
     """Whether this TTM slice may still POST.
 
     One fill per slice. A live bag on the other leg blocks a late add
-    (no straddle). After a full hedge, the unused late slice may still fire.
+    (no straddle). After a full hedge, this market is done — no other-leg
+    chase. A same-leg late add cheaper than ``add_min_price`` is a fade.
 
     Returns ``(ok, skip_reason)``. ``skip_reason`` is None when ok.
     """
@@ -184,18 +217,27 @@ def can_arm_entry_slice(
         return False, "buy_uncertain"
     if slice_already_filled(meta, seconds_left, late_start_s):
         return False, "slice_filled"
-    late = is_late_entry_window(seconds_left, late_start_s)
     closed = bool(hedge_closed or meta.get("hedge_closed"))
-    held = float(held_size or 0) > 0.01 and not closed
+    if closed:
+        return False, "hedge_closed"
+    late = is_late_entry_window(seconds_left, late_start_s)
+    held = float(held_size or 0) > 0.01
     tracked = meta.get("bought_token")
     if not late:
-        if meta.get("early_bought") or (tracked and not closed):
+        if meta.get("early_bought") or tracked:
             return False, "slice_filled"
         if held:
             return False, "already_held"
         return True, None
     if held and buy_token is not None and tracked and not same_token(tracked, buy_token):
         return False, "other_leg"
+    if late_add_blocked_by_min(
+        ask,
+        held_size=held_size,
+        hedge_closed=closed,
+        add_min_price=add_min_price,
+    ):
+        return False, "add_below_min"
     return True, None
 
 

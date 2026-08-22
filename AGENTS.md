@@ -21,10 +21,12 @@ The 5m bot buys the winning leg of Polymarket BTC "Up or Down" markets in
 | Same early window | **≥95¢** overlay | uses the early $2.50, not a third slice |
 
 Missed early does **not** become a $5 late buy. Same-leg add only (no
-straddle). Hedge **53/55** on the combined bag (GUI: held ≤ **55¢**, other
-≥ **45¢**; not inverted 30/70). Winners
-redeem at $1.00. **No profit-take sell.** See `CURRENT.md` for the active
-probe knobs.
+straddle), and only if the late ask is ≥ **90¢** (`add_min_price`). Flat
+late 75–90 is still a first entry. After a full hedge the market is done.
+Normal hedge is **persist 2s @ 70/72** on the combined bag (GUI: held ≤
+**72¢**, other ≥ **28¢**; not inverted 30/70). Toxic dump stays **53¢**,
+no persist. Winners redeem at $1.00. **No profit-take sell.** See
+`CURRENT.md` for the active probe knobs.
 
 Last 120s is **75–90¢ only** — do not buy 91–99¢ after T-120. `buy_max_price`
 0.90 is the late cap and the early ≥90 floor. Early FAK limit is
@@ -51,7 +53,7 @@ Priority: the band that **contains** the ask. 75–90 never posts at 99¢.
 | File | Service | Markets | Oracle | Budget | Window |
 |---|---|---|---|---|---|
 | `buybot.py` | `polybuybot` **stopped** | 15m | Chainlink TWAP 60s | $2.50 | final 4.0 min, 75–90¢, hedge 35/40 |
-| `buybot5m.py` | `polybuybot5m` **live** | 5m | Chainlink TWAP 30s | $2.50+$2.50 | bands above; hedge **53/55** |
+| `buybot5m.py` | `polybuybot5m` **live** | 5m | Chainlink TWAP 30s | $2.50+$2.50 | bands above; persist **2s @ 70/72** (toxic 53¢) |
 | `buybothourly.py` | `polybuybothourly` **stopped** | hourly | Binance BTCUSDT | $10 cap (A $5 / B–C remainder) | last 22/15/5 min; hedge **55/60** |
 | `pathlog.py` | `polypathlog` **live** | all three | — (CLOB books only) | — | whole 5m; last 8m of 15m; last 15m of hourly |
 
@@ -71,7 +73,8 @@ Plus: `check_book.py`, `check_participation.py`, `check_path_backtest.py`,
 | `buy/market.py` | MarketGateway — Gamma discovery + metadata | — |
 | `buy/btc_price.py` | Resolution-aligned BTC feeds (TWAP 30/60, Binance) + PTB | — |
 | `buy/clob_book_ws.py` | CLOB market-channel WS top-of-book (buy/hedge speed path) | — |
-| `buy/entry_skip.py` | **5m + hourly:** band union, skip labels, three-slice hourly budgets | not imported by 15m |
+| `buy/entry_skip.py` | **5m + hourly:** band union, skip labels, add-min, three-slice hourly budgets | not imported by 15m |
+| `buy/hedge_gate.py` | 5m persist hedge timer (toxic dumps stay instant) | not imported by 15m/hourly |
 | `buy/book.py` | Shared TOB price+size parse (WS cache + pathlog) | — |
 
 **Pattern:** The three bots are near-identical copies (slug, oracle, window
@@ -213,10 +216,11 @@ two-slice $2.50+$2.50 add.
   (Data API), not 704 live markets. Banner **POS** is live hedges only;
   **WAIT** is dust. Look interval is **0.01s**. Live JSON poll keys
   hot-reload; the loop-body fix needs `sudo systemctl restart polybuybot5m`.
-- `hedge_attempt` / `hedge_fill` — hedge fired after force-fresh REST + book integrity + GUI consensus (normal path)
+- `hedge_attempt` / `hedge_fill` — hedge fired after force-fresh REST + book integrity + GUI consensus + persist 2s (normal path)
+- `hedge_skip_persist` — 70/72 + GUI passed but the book has not stayed qualified for `hedge_persist_s` (2s). A bounce resets the arm.
 - `hedge_skip_toxic_book` — bid dipped but ask/spread still say "not reversed"
-- `hedge_skip_no_consensus` — 53/55 book passed but 5m GUI/last-trade still fail (held last print ≤ 55¢, held GUI ≤ 55¢, other GUI ≥ 45¢, 5¢ gap). 15m/hourly still invert buy 70/30.
-- `hedge_skip_toxic_recovered` — `toxic_fill` is armed but held bid > hedge threshold (winner book); dump stays armed, no sell
+- `hedge_skip_no_consensus` — 70/72 book passed but 5m GUI/last-trade still fail (held last print ≤ 72¢, held GUI ≤ 72¢, other GUI ≥ 28¢, 5¢ gap). 15m/hourly still invert buy 70/30.
+- `hedge_skip_toxic_recovered` — `toxic_fill` is armed but held bid > `hedge_toxic_bid_max` (53¢ winner book); dump stays armed, no sell
 - `hedge_skip_incomplete_rest` — REST missing a side; fail closed (no WS sell)
 - `buy_skip_ambiguous` — GUI display prices too close (throttled 8s; **not** one event per market)
 - `buy_skip_no_consensus` — ask in band but GUI/tight-book gate failed
@@ -229,6 +233,8 @@ two-slice $2.50+$2.50 add.
 - `buy_skip_underlying_side` — book wants the opposite leg from the underlying move
 - `buy_window` — market first entered a 5m buy window (late 75–90, early ≥90, or ≥95; one line per market)
 - `buy_skip` `ask_below_band` / `ask_above_band` / `ask_out_of_band` / `no_ask` / `stale_positions` / `no_quote` / `stale_discovery` — in window, winning ask not in any open band, or the look had no book / stale wallet snapshot (throttled 8s)
+- `buy_skip_add_below_min` — same-leg late add but ask < `add_min_price` (90¢). Flat first late 75–90 still buys.
+- `buy_skip_hedge_closed` — this market already dumped; no other-leg chase and no re-entry
 - `buy_skip_max_positions` — only if `max_open_positions > 0` (probe uses **0 = unlimited**)
 - `buy_attempt_rejected` / skip reason `invalid_amount` — CLOB 400 `invalid
   amounts` (maker USDC must be **2** dp). 5m must **not** pass
@@ -269,8 +275,9 @@ python check_buy_skips.py --since 2026-08-19T08:02:00
 
 `--sweep` scores the live 5m **example** late template (75–90 / 120s / $2.50)
 plus one-at-a-time window/band/size variants, with a **paper** hedge from that
-JSON (**53/55/15** + mid-as-GUI when spread ≤ 10¢, held ≤ 55¢ / other ≥ 45¢,
-no other-ahead requirement). It does **not** union the
+JSON (**70/72/15** + mid-as-GUI when spread ≤ 10¢, held ≤ 72¢ / other ≥ 28¢,
+no other-ahead requirement; paper now honors `hedge_persist_s` from that
+JSON — 2s on the live example). It does **not** union the
 early ≥90 / ≥95 windows and does **not** model two $2.50 slices.
 `--hedge-sweep` keeps that late first touch and varies the **stop** (53/60/65/70/75,
 persist-2s, 8¢ fade-from-fill) and prints `winner_dumps` vs `loser_hedges`.
@@ -316,24 +323,28 @@ Cloud agents: `CLOUD_RESEARCH.md`.
   POSTs do not. After a fully empty trigger, wait `empty_fak_cooldown_s` (0.15 s).
 - **Hedge is sell-only exit:** The bots never profit-take. The only sell path is the
   hedge: REST shows bid ≤ threshold **and** ask ≤ require_ask_max with tight
-  spread, **and** Polymarket GUI + last trade agree with that book. 5m: held
-  last print ≤ **55¢**, held GUI ≤ **55¢**, other GUI ≥ **45¢** (complement of
-  ask-max). A 53¢ vs 47¢ book is the stop; the other side does **not** have to
-  already be the winner. Buy 70/30 is unchanged. 15m/hourly (stopped) still
-  invert 70/30. Live 5m book trigger is **53/55**; hourly template **55/60**;
-  15m remains 35/40.
-  A random TOB clip is not enough; a last print of 85¢ on a 52/54 book will
+  spread, **and** Polymarket GUI + last trade agree with that book, **and**
+  that qualify holds for `hedge_persist_s` (5m **2s**). 5m: held last print
+  ≤ **72¢**, held GUI ≤ **72¢**, other GUI ≥ **28¢** (complement of ask-max).
+  A 70¢ vs 28¢ book is the qualify; the other side does **not** have to
+  already be the winner. Instant 70 is out — a one-tick dip dumps winners.
+  Buy 70/30 is unchanged. 15m/hourly (stopped) still invert 70/30. Live 5m
+  book qualify is **70/72 persist 2s**; toxic dump **53¢**; hourly template
+  **55/60**; 15m remains 35/40.
+  A random TOB clip is not enough; a last print of 85¢ on a 68/71 book will
   `hedge_skip_no_consensus`. `toxic_fill` stays armed and still skips GUI /
-  53/55/15 on 5m, but **sells only while held bid ≤ 53¢**. A recovered 97¢ book
-  logs `hedge_skip_toxic_recovered` and rides; a 6¢ junk bid (even under a
-  99¢ ask) still dumps on bid-only REST. Fresh WS bid > 53¢ skips REST for
-  both normal and toxic. After a dump is allowed, the 5m FAK sells at the
-  **live 0.001 bid** (no 2¢ undercut). CLOB/WS sometimes reports tick 0.01;
-  using that with `hedge_undercut_ticks=2` posted 0.51 into a 0.53 book.
-  Unmatched sell 400s re-quote like buys. Everything else rides to redemption at
-  $1.00. WS may *arm* a hedge check; normal sells need two-sided REST.
-  **Live `strategy_buy5m.json` must set the hedge keys** or an old 35/40 file
-  keeps the old hedge after hot reload.
+  persist / 70/72/15 on 5m, but **sells only while held bid ≤ 53¢**. A
+  recovered 97¢ book logs `hedge_skip_toxic_recovered` and rides; a 6¢ junk
+  bid (even under a 99¢ ask) still dumps on bid-only REST. Fresh WS bid >
+  70¢ (normal) or > 53¢ (toxic) skips REST. After a dump is allowed, the
+  5m FAK sells at the **live 0.001 bid** (no 2¢ undercut). CLOB/WS
+  sometimes reports tick 0.01; using that with `hedge_undercut_ticks=2`
+  posted 0.51 into a 0.53 book. Unmatched sell 400s re-quote like buys.
+  Everything else rides to redemption at $1.00. WS may *arm* a hedge
+  check; normal sells need two-sided REST. After `hedge_closed`, no later
+  buy on that market. **Live `strategy_buy5m.json` must set the hedge
+  keys** or an old 53/55 (or 35/40) file keeps the old qualify after hot
+  reload.
 - **Tick sizes:** 5m markets use `0.001`, 15m and hourly use `0.01`.
 - **One fill per slice:** 5m `early_bought` / `late_bought`. Hourly
   `t22_bought` / `t15_bought` / `t5_bought` (same-leg add up to a **$10**
@@ -391,7 +402,7 @@ After this branch merges, on the VM (5m only):
 
 ```bash
 cd ~/poly-money-maker && git pull
-python3 -c 'import json; from pathlib import Path; p=Path("strategy_buy5m.json"); d=json.loads(p.read_text()); d["hedge_threshold"]=0.53; d["hedge_require_ask_max"]=0.55; d["buy_budget"]=2.5; d["late_buy_budget"]=2.5; d["buy_max_price"]=0.90; d["poll_buy_window_s"]=0.01; d["poll_held_s"]=0.01; d["ui_every_n_cycles"]=50; p.write_text(json.dumps(d, indent=2)+"\n")'
+python3 -c 'import json; from pathlib import Path; p=Path("strategy_buy5m.json"); d=json.loads(p.read_text()); d["hedge_threshold"]=0.70; d["hedge_require_ask_max"]=0.72; d["hedge_persist_s"]=2.0; d["hedge_toxic_bid_max"]=0.53; d["add_min_price"]=0.90; d["hedge_undercut_ticks"]=0; d["buy_budget"]=2.5; d["late_buy_budget"]=2.5; d["buy_max_price"]=0.90; d["poll_buy_window_s"]=0.01; d["poll_held_s"]=0.01; d["ui_every_n_cycles"]=50; p.write_text(json.dumps(d, indent=2)+"\n")'
 sudo systemctl restart polybuybot5m
 ```
 
