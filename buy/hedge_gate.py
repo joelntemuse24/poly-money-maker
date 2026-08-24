@@ -187,13 +187,16 @@ def evaluate_held_bag(
     persist_done=False,
     gui_ok=True,
     gui_why="ok",
+    recovery_cancel=0.85,
 ):
     """Dump / persist-sell / hold for one live bag.
 
     * Bid ≤ 53¢ dumps every bag. Bid-only. No GUI / last-trade veto.
       Wide 22/77 still dumps.
     * Do not sell in (53, 70). Persist-not-done 61/70 is a hold.
-    * After persist, 74–80 live-bid sells are correct (do not clamp to 72).
+    * After persist, 70–84 live-bid sells are correct (do not clamp to 72).
+      Bid ≥ recovery_cancel (default 85¢) is a recovered winner: HOLD and
+      clear persist. Do not sell 90–99¢ because persist_done stuck.
     * Persist qualify is still tight 70/72 for 2s (GUI applies only there).
     """
     bid_f = _finite_px(bid)
@@ -202,7 +205,10 @@ def evaluate_held_bag(
         dump_max = float(dump_bid_max)
         qualify = float(qualify_bid)
         wait = float(persist_s or 0)
+        recovery = float(recovery_cancel)
     except (TypeError, ValueError):
+        return HedgeIntent("hold", "bad_thresholds", None, None, False, True, None, False)
+    if not (dump_max < qualify <= recovery <= 1):
         return HedgeIntent("hold", "bad_thresholds", None, None, False, True, None, False)
 
     done = bool(persist_done)
@@ -223,10 +229,16 @@ def evaluate_held_bag(
             "dump", "bid_le_dump", bid_f, persist_armed_ts, done, True, dump_max, True,
         )
 
+    if bid_f + 1e-12 >= recovery:
+        return HedgeIntent(
+            "hold", "recovery_cancel", None, None, False, True, None, False,
+        )
+
     if done:
         if bid_f + 1e-12 >= qualify:
             return HedgeIntent(
-                "sell", "persist_live_bid", bid_f, persist_armed_ts, True, True, None, False,
+                "sell", "persist_live_bid", bid_f, persist_armed_ts, True, True,
+                recovery, False,
             )
         return HedgeIntent(
             "hold", "dead_band", None, persist_armed_ts, True, True, None, False,
@@ -252,7 +264,7 @@ def evaluate_held_bag(
                 "hold", "dead_band", None, new_ts, True, False, None, False,
             )
         return HedgeIntent(
-            "sell", "persist_ready", bid_f, new_ts, True, False, None, False,
+            "sell", "persist_ready", bid_f, new_ts, True, False, recovery, False,
         )
     if pwhy == "armed":
         return HedgeIntent("arm", "persist_armed", None, new_ts, False, False, None, False)
@@ -266,6 +278,7 @@ def hedge_should_keep_retrying(
     persist_done=False,
     dump_bid_max=0.53,
     qualify_bid=0.70,
+    recovery_cancel=0.85,
 ) -> bool:
     """Unmatched / invalid-tick / could-not-run is not terminal while size remains."""
     try:
@@ -280,11 +293,16 @@ def hedge_should_keep_retrying(
     try:
         dump_max = float(dump_bid_max)
         qualify = float(qualify_bid)
+        recovery = float(recovery_cancel)
     except (TypeError, ValueError):
         return True
     if bid_f <= dump_max + 1e-12:
         return True
-    if persist_done and bid_f + 1e-12 >= qualify:
+    if (
+        persist_done
+        and bid_f + 1e-12 >= qualify
+        and bid_f < recovery - 1e-12
+    ):
         return True
     return False
 
@@ -297,6 +315,7 @@ def hedge_fail_is_terminal(
     persist_done=False,
     dump_bid_max=0.53,
     qualify_bid=0.70,
+    recovery_cancel=0.85,
 ) -> bool:
     """``hedge_fail`` after ``sell_attempt_rejected`` must not idle a live dump."""
     status = str(sell_status or "")
@@ -308,6 +327,7 @@ def hedge_fail_is_terminal(
         persist_done=persist_done,
         dump_bid_max=dump_bid_max,
         qualify_bid=qualify_bid,
+        recovery_cancel=recovery_cancel,
     )
 
 

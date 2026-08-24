@@ -211,6 +211,9 @@ _STRATEGY_DEFAULTS = {
     "hedge_require_ask_max": 0.72,
     "hedge_persist_s": 2.0,
     "hedge_toxic_bid_max": 0.53,
+    # After persist_done, bid ≥ this is a recovered winner: HOLD and clear.
+    # 70–84 still sells at the live bid. Do not sell 90–99 because persist stuck.
+    "hedge_recovery_cancel": 0.85,
     # Invert the buy GUI 70/30 plus last-trade on the held token. TOB 70/72
     # alone is not consensus (same lesson as not buying a random ask).
     "hedge_require_gui": True,
@@ -343,7 +346,7 @@ def load_strategy():
             "min_winner_bid", "max_loser_bid", "min_bid_edge",
             "max_entry_spread", "hedge_max_spread", "hedge_require_ask_max",
             "early_buy_max_price", "early_95_min_price", "add_min_price",
-            "hedge_toxic_bid_max",
+            "hedge_toxic_bid_max", "hedge_recovery_cancel",
         ):
             if not 0 <= float(cfg[key]) <= 1:
                 raise ValueError(f"{key} must be between 0 and 1")
@@ -357,6 +360,15 @@ def load_strategy():
             raise ValueError("hedge_toxic_bid_max must satisfy 0 < max <= 1")
         if float(cfg["hedge_toxic_bid_max"]) > float(cfg["hedge_threshold"]) + 1e-12:
             raise ValueError("hedge_toxic_bid_max must be <= hedge_threshold")
+        if not (
+            float(cfg["hedge_toxic_bid_max"])
+            < float(cfg["hedge_threshold"])
+            <= float(cfg["hedge_recovery_cancel"])
+            <= 1
+        ):
+            raise ValueError(
+                "hedge_recovery_cancel must satisfy dump < qualify <= recovery_cancel <= 1"
+            )
         if str(cfg["tick_size"]) not in {
             "0.1", "0.01", "0.005", "0.0025", "0.001", "0.0001",
         }:
@@ -440,6 +452,7 @@ HEDGE_MAX_SPREAD = _strat["hedge_max_spread"]
 HEDGE_REQUIRE_ASK_MAX = _strat["hedge_require_ask_max"]
 HEDGE_PERSIST_S = _strat["hedge_persist_s"]
 HEDGE_TOXIC_BID_MAX = _strat["hedge_toxic_bid_max"]
+HEDGE_RECOVERY_CANCEL = _strat["hedge_recovery_cancel"]
 HEDGE_REQUIRE_GUI = _strat["hedge_require_gui"]
 ADD_MIN_PRICE = _strat["add_min_price"]
 BUY_START_S = _strat["buy_start_s"]
@@ -3116,7 +3129,8 @@ def sell_market_with_retry(
 
     Dump (bid ≤ 53) and persist-done sells are bid-only: incomplete REST
     reuses WS/last-good, unmatched / invalid-tick retries down the live bid.
-    After persist, a 74–80¢ live bid is a correct fill (do not clamp to 72).
+    After persist, a 70–84¢ live bid is a correct fill (do not clamp to 72).
+    Bid ≥ hedge_recovery_cancel (85¢) must abort — do not POST a 90–99 rally.
     `hedge_min_price` is not a floor.
 
     Returns (total_sold, result, proceeds) where result["bot_status"] is
@@ -3141,11 +3155,17 @@ def sell_market_with_retry(
     )
     dump_bid_max = 0.53
     qualify_bid = 0.70
+    recovery_cancel = 0.85
+    try:
+        recovery_cancel = float(HEDGE_RECOVERY_CANCEL)
+    except (NameError, TypeError, ValueError):
+        recovery_cancel = 0.85
     if dump and abort_above is None:
         abort_above = dump_bid_max
-    if persist_done:
-        abort_above = None
+    if persist_done and not dump:
         need_integrity = False
+        if abort_above is None:
+            abort_above = recovery_cancel
     start_bal = check_clob_token_balance(token_id, refresh=False)
     if DRY_RUN:
         price = hedge_sell_price(price_limit, tick_size, undercut_ticks, floor)
@@ -3235,20 +3255,28 @@ def sell_market_with_retry(
             live_bid = last_bid if last_bid is not None else price_limit
         last_bid = live_bid
         last_ask = live_ask
-        if abort_above is not None and live_bid is not None and live_bid > float(abort_above):
-            log_event(
-                "hedge_retry_abort_bounce",
-                token_id=token_id,
-                live_bid=live_bid,
-                live_ask=live_ask,
-                abort_above=abort_above,
-                attempt=attempt + 1,
-                sold_so_far=total_sold,
+        if abort_above is not None and live_bid is not None:
+            cap = float(abort_above)
+            bounced = (
+                live_bid + 1e-12 >= cap
+                if persist_done and not dump
+                else live_bid > cap
             )
-            console.print(
-                f"  [dim][CANCEL][/] hedge retry abort — bid recovered to {live_bid:.3f} > {float(abort_above):.3f}"
-            )
-            break
+            if bounced:
+                log_event(
+                    "hedge_retry_abort_bounce",
+                    token_id=token_id,
+                    live_bid=live_bid,
+                    live_ask=live_ask,
+                    abort_above=abort_above,
+                    attempt=attempt + 1,
+                    sold_so_far=total_sold,
+                )
+                console.print(
+                    f"  [dim][CANCEL][/] hedge retry abort — bid recovered to "
+                    f"{live_bid:.3f} vs {cap:.3f}"
+                )
+                break
         if (
             persist_done
             and (not dump)
@@ -3440,6 +3468,7 @@ def sell_market_with_retry(
                     persist_done=persist_done or dump,
                     dump_bid_max=dump_bid_max,
                     qualify_bid=qualify_bid,
+                    recovery_cancel=recovery_cancel,
                 )
                 log_event(
                     "sell_attempt_rejected", token_id=token_id,
@@ -3870,6 +3899,7 @@ while not _shutdown_requested:
         HEDGE_REQUIRE_ASK_MAX = _strat["hedge_require_ask_max"]
         HEDGE_PERSIST_S = _strat["hedge_persist_s"]
         HEDGE_TOXIC_BID_MAX = _strat["hedge_toxic_bid_max"]
+        HEDGE_RECOVERY_CANCEL = _strat["hedge_recovery_cancel"]
         HEDGE_REQUIRE_GUI = _strat["hedge_require_gui"]
         ADD_MIN_PRICE = _strat["add_min_price"]
         BUY_START_S = _strat["buy_start_s"]
@@ -4621,6 +4651,7 @@ while not _shutdown_requested:
                             rem = 0.0
                             meta["hedge_closed"] = True
                             _hedge_persist_armed.pop(cond, None)
+                            _hedge_persist_done.discard(cond)
                         meta["bought_size"] = rem
                         meta["pnl_hedge_proceeds"] = round(
                             max(
@@ -4710,9 +4741,13 @@ while not _shutdown_requested:
                         save_json(STATE_FILE, positions_meta)
 
                 # --- HEDGE CHECK (for held positions) ---
+                if held_size <= 0.01 or meta.get("hedge_closed"):
+                    _hedge_persist_armed.pop(cond, None)
+                    _hedge_persist_done.discard(cond)
                 if held_token and held_size > 0.01 and HEDGE_ENABLED and not meta.get("hedge_closed"):
                     # ANY live bag with held bid ≤ 53¢ dumps at the live bid.
-                    # Persist 2s @ 70/72, then sell at the live bid (74–80 OK).
+                    # Persist 2s @ 70/72, then sell at the live bid (70–84).
+                    # Bid ≥ recovery_cancel (85¢) holds and clears persist.
                     # Do not sell in (53, 70). Incomplete REST uses WS/last-good.
                     quote_age = book_ws.quote_age(held_token)
                     ws_fresh = quote_age is not None and quote_age <= float(HEDGE_QUOTE_MAX_AGE_S)
@@ -4737,27 +4772,37 @@ while not _shutdown_requested:
                         persist_done = True
                         _hedge_persist_done.add(cond)
 
-                    # Healthy winner: skip REST only when persist is NOT already done.
-                    # After persist, a 74–80 bounce must still sell at the live bid.
-                    if (
+                    # Healthy winner before persist: skip REST. After persist,
+                    # 70–84 still sells; ≥ recovery_cancel (85¢) is a rally — clear.
+                    recovered = (
+                        ws_fresh
+                        and peek_bid is not None
+                        and peek_bid + 1e-12 >= float(HEDGE_RECOVERY_CANCEL)
+                    )
+                    winner_before_persist = (
                         (not persist_done)
+                        and (not recovered)
                         and ws_fresh
                         and peek_bid is not None
                         and peek_bid > float(HEDGE_THRESHOLD) + 1e-12
-                    ):
+                    )
+                    if recovered or winner_before_persist:
                         _hedge_persist_armed.pop(cond, None)
                         _hedge_persist_done.discard(cond)
                         log_event(
-                            "hedge_cancel_bounce",
+                            "hedge_skip_recovery" if recovered else "hedge_cancel_bounce",
                             condition_id=cond, leg=held_leg,
                             **live_bag_log_fields(
                                 slug=getattr(m, "slug", None),
                                 ttm=seconds_left,
                                 bid=peek_bid, ask=peek_ask,
                                 tick=get_tick_size_cached(held_token),
-                                reason="ws_above_qualify",
+                                reason=(
+                                    "recovery_cancel" if recovered else "ws_above_qualify"
+                                ),
                             ),
                             mid=peek_mid, threshold=HEDGE_THRESHOLD,
+                            recovery_cancel=HEDGE_RECOVERY_CANCEL,
                         )
                     else:
                         rest_bid = rest_ask = rest_mid = None
@@ -4811,6 +4856,7 @@ while not _shutdown_requested:
                             persist_done=persist_done,
                             gui_ok=False,
                             gui_why="pending_gui",
+                            recovery_cancel=HEDGE_RECOVERY_CANCEL,
                         )
                         qualify_fail = preview.reason in {
                             "missing_side", "bid_above", "ask_too_high",
@@ -4866,6 +4912,7 @@ while not _shutdown_requested:
                                 persist_done=persist_done,
                                 gui_ok=gui_ok,
                                 gui_why=gui_why,
+                                recovery_cancel=HEDGE_RECOVERY_CANCEL,
                             )
                             if not gui_ok and intent.action == "hold":
                                 log_event(
@@ -4905,6 +4952,7 @@ while not _shutdown_requested:
                             event = {
                                 "dead_band": "hedge_skip_dead_band",
                                 "bid_above": "hedge_cancel_bounce",
+                                "recovery_cancel": "hedge_skip_recovery",
                                 "no_bid": "hedge_skip_incomplete_rest",
                                 "missing_side": "hedge_skip_incomplete_rest",
                                 "ask_too_high": "hedge_skip_toxic_book",
@@ -5046,7 +5094,7 @@ while not _shutdown_requested:
                                 min_price=hedge_floor,
                                 undercut_ticks=0,
                                 retry_sleep_s=HEDGE_RETRY_SLEEP_S,
-                                abort_above=HEDGE_TOXIC_BID_MAX if dump else None,
+                                abort_above=intent.abort_above,
                                 require_ask_max=None,
                                 max_spread=None,
                                 on_submit=_persist_hedge_submit,
@@ -5174,6 +5222,7 @@ while not _shutdown_requested:
                                     persist_done=bool(intent.persist_done or dump),
                                     dump_bid_max=HEDGE_TOXIC_BID_MAX,
                                     qualify_bid=HEDGE_THRESHOLD,
+                                    recovery_cancel=HEDGE_RECOVERY_CANCEL,
                                 )
                                 log_event(
                                     "hedge_fail", condition_id=cond, leg=held_leg, size=held_size,
