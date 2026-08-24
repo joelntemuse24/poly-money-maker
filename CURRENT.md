@@ -3,7 +3,7 @@
 **Agents: read this after `AGENTS.md`.** Update this file when ops/strategy decisions change.
 Do not put secrets, API keys, or live wallet material here.
 
-Last updated: **2026-08-22** — **only the 5m CLOB bot is live.** It watches
+Last updated: **2026-08-24** — **only the 5m CLOB bot is live.** It watches
 the **current** 5m market (and a live hedge if we just bought). Polymarket’s
 positions API still returns hundreds of old 5m rows (`WAIT 666` was that
 list, not 666 live markets). The bot **throws those rows away** after
@@ -23,8 +23,9 @@ the **live bid on the market tick** (0.001 or 0.01; no 2¢ undercut;
 unmatched 400 re-quotes; a minimum-tick 400 rebuilds at 0.01). Instant
 70 is out — a one-tick dip dumps winners. **Any live bag** dumps **while
 bid ≤ 53¢** (bid-only; no GUI / last-trade veto; not only `toxic_fill`).
-Do **not** sell in (53¢, 70¢). After persist, a 74–80¢ live-bid fill is
-correct. Chainlink TWAP gate is **$0** (any non-zero tick vs
+Do **not** sell in (53¢, 70¢). After persist, a 70–84¢ live-bid fill is
+correct. Bid ≥ **85¢** (`hedge_recovery_cancel`) is a recovered winner:
+HOLD and clear persist — do not sell 90–99¢ because persist_done stuck. Chainlink TWAP gate is **$0** (any non-zero tick vs
 PTB; side must match; flat is still refused). Late FAKs **limit at 90¢**;
 early FAKs **limit at 99¢**. Size starts at `budget/ask` and is **at least 3
 shares** when `3 × limit` fits in `buy_max_spend` **$3 per FAK** (early
@@ -77,7 +78,7 @@ Normal hedge is **persist 2s @ 70/72** on the combined bag:
 | Execution | Size `budget/ask`, **floor 3 shares** when `3 × limit ≤ $3`. Unmatched 400 re-quotes up to **3** FAKs; then **0.15 s** cooldown. Unclear POSTs still quarantine. |
 | GUI consensus | winner ≥ 70¢, loser ≤ 30¢ |
 | Windows | 5m **whole market**: early ≥90 / ≥95 for TTM (120, 300]; late 75–90 for TTM ≤ 120s (15m / hourly bots **not running**) |
-| Hedge | **Qualify** bid ≤ **70¢** and ask ≤ **72¢**, spread ≤ 15¢, **plus** GUI held ≤ **72¢** / other ≥ **28¢** (not inverted 30/70). Last print ≤ 72¢. Must **stay qualified 2s** (`hedge_persist_s`; a bounce resets). Then sell at the **live bid on the market tick** (honor CLOB 0.01 when that is the minimum; no 2¢ undercut; 74–80¢ after persist is correct). Do **not** sell in **(53¢, 70¢)**. Unmatched / invalid-tick / could-not-run retry down the live bid; `hedge_fail` after `sell_attempt_rejected` is **not** terminal while size remains and bid ≤53 or persist completed. Incomplete REST uses WS / last-good bid (do not skip-dump). Combined early+late inventory. Instant 70 is out. After a full dump, `hedge_closed` blocks any later buy on that market. **Any live bag** dumps bid-only while held bid ≤ **53¢** (`hedge_toxic_bid_max`) — wide 22/77 still dumps; no GUI veto. `toxic_fill` also arms when FAK **average** is **outside the open band** or < 65¢. Entry TTM is `min(Gamma end, slug+300)` so 93¢ at slug-TTM 116 cannot POST as early 99¢. |
+| Hedge | **Qualify** bid ≤ **70¢** and ask ≤ **72¢**, spread ≤ 15¢, **plus** GUI held ≤ **72¢** / other ≥ **28¢** (not inverted 30/70). Last print ≤ 72¢. Must **stay qualified 2s** (`hedge_persist_s`; a bounce resets). Then sell at the **live bid on the market tick** (honor CLOB 0.01 when that is the minimum; no 2¢ undercut; 70–84¢ after persist is correct). Bid ≥ **85¢** (`hedge_recovery_cancel`) holds and **clears persist** — do not sell a 90–99¢ recovery because persist_done stuck. Do **not** sell in **(53¢, 70¢)**. Unmatched / invalid-tick / could-not-run retry down the live bid; `hedge_fail` after `sell_attempt_rejected` is **not** terminal while size remains and bid ≤53 or persist completed. Incomplete REST uses WS / last-good bid (do not skip-dump). Combined early+late inventory. Instant 70 is out. After a full dump, `hedge_closed` blocks any later buy on that market. **Any live bag** dumps bid-only while held bid ≤ **53¢** (`hedge_toxic_bid_max`) — wide 22/77 still dumps; no GUI veto. `toxic_fill` also arms when FAK **average** is **outside the open band** or < 65¢. Entry TTM is `min(Gamma end, slug+300)` so 93¢ at slug-TTM 116 cannot POST as early 99¢. |
 | Underlying edge | **$0** (5m: any non-zero TWAP vs PTB) / **$10** (15m, hourly); side must match |
 | `max_open_positions` | **0 = unlimited** |
 | `toxic_force_exit_below` | **65¢** |
@@ -196,7 +197,7 @@ amount / HTTP 400), not this NameError.
   sudo systemctl stop polybuybot polybuybothourly
   sudo systemctl disable polybuybot polybuybothourly
   cd ~/poly-money-maker && git pull
-  python3 -c 'import json; from pathlib import Path; p=Path("strategy_buy5m.json"); d=json.loads(p.read_text()); d["min_underlying_edge_usd"]=0.0; d["hedge_threshold"]=0.70; d["hedge_require_ask_max"]=0.72; d["hedge_persist_s"]=2.0; d["hedge_toxic_bid_max"]=0.53; d["add_min_price"]=0.90; d["hedge_undercut_ticks"]=0; d["buy_budget"]=2.5; d["late_buy_budget"]=2.5; d["buy_max_price"]=0.90; d["poll_buy_window_s"]=0.01; d["poll_held_s"]=0.01; d["ui_every_n_cycles"]=50; p.write_text(json.dumps(d, indent=2)+"\n"); print("budget", d["buy_budget"], "late", d["late_buy_budget"], "hedge", d["hedge_threshold"], d["hedge_require_ask_max"], "persist", d["hedge_persist_s"], "add_min", d["add_min_price"], "poll", d["poll_buy_window_s"], d["poll_held_s"])'
+  python3 -c 'import json; from pathlib import Path; p=Path("strategy_buy5m.json"); d=json.loads(p.read_text()); d["min_underlying_edge_usd"]=0.0; d["hedge_threshold"]=0.70; d["hedge_require_ask_max"]=0.72; d["hedge_persist_s"]=2.0; d["hedge_toxic_bid_max"]=0.53; d["hedge_recovery_cancel"]=0.85; d["add_min_price"]=0.90; d["hedge_undercut_ticks"]=0; d["buy_budget"]=2.5; d["late_buy_budget"]=2.5; d["buy_max_price"]=0.90; d["poll_buy_window_s"]=0.01; d["poll_held_s"]=0.01; d["ui_every_n_cycles"]=50; p.write_text(json.dumps(d, indent=2)+"\n"); print("budget", d["buy_budget"], "late", d["late_buy_budget"], "hedge", d["hedge_threshold"], d["hedge_require_ask_max"], "persist", d["hedge_persist_s"], "recovery", d["hedge_recovery_cancel"], "add_min", d["add_min_price"], "poll", d["poll_buy_window_s"], d["poll_held_s"])'
   sudo systemctl restart polybuybot5m
   sudo systemctl enable polybuybot5m
   systemctl is-active polybuybot polybuybot5m polybuybothourly
@@ -262,6 +263,13 @@ amount / HTTP 400), not this NameError.
       after merge (`git pull` then `sudo systemctl restart polybuybot5m`).
       Confirm `dry_run` / `entry_enabled`. Do **not** start 15m /
       hourly / mint. Do **not** invent a 75/50 strategy.
+- [x] **5m persist recovery-cancel 85¢.** After `persist_done`, 70–84 still
+      sells at the live bid. Bid ≥ **85¢** (`hedge_recovery_cancel`) holds
+      and **clears persist** (`hedge_skip_recovery`) so a 90–99¢ rally is
+      not sold-then-won. Dump ≤53 and dead band (53, 70) unchanged.
+      After merge: `git pull`, patch live JSON (or omit the key; default
+      0.85), `sudo systemctl restart polybuybot5m`. Confirm `dry_run` /
+      `entry_enabled`. Do **not** start 15m / hourly / mint.
 - [ ] Hourly three-slice bot is in the repo (`buybothourly.py` + example JSON).
       **Do not start `polybuybothourly`.** Operator later: `git pull`, set live
       `strategy_buyhourly.json` (`dry_run` / `entry_enabled` only when they mean

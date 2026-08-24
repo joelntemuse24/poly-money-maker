@@ -803,13 +803,18 @@ caller.
 2. **Bid ≤ 53¢ dumps every live bag.** Bid-only. No GUI / last-trade
    veto. Wide 22/77 still dumps. Not only `toxic_fill` entries.
 3. Peek WS above 70¢ **only** skips REST when persist is **not** already
-   done. After persist, a 74–80 bounce must still sell at the live bid.
+   done. After persist, a 70–84 bounce must still sell at the live bid.
+   Bid ≥ `hedge_recovery_cancel` (85¢) holds, clears persist
+   (`hedge_skip_recovery`), and does **not** sell — `persist_done` must
+   not dump a 90–99¢ recovery.
 4. Persist qualify is still tight 70/72 + GUI + 2s. Fail →
    `hedge_skip_toxic_book` / `hedge_skip_no_consensus` / `hedge_skip_persist`.
 5. **Do not sell in (53¢, 70¢)** (`hedge_skip_dead_band`). Persist-not-done
    61/70 is a hold (9:55 dead-band sell).
-6. After persist, sell at the **live bid** (74–80 is correct; do not
-   clamp to 72). `abort_above` is not 70 after persist.
+6. After persist, sell at the **live bid** only while
+   `qualify ≤ bid < recovery_cancel` (70–84 is correct; do not clamp to
+   72). `abort_above` is `hedge_recovery_cancel` (85¢) after persist, not
+   70. Do **not** POST at live bid ≥ 85¢.
 7. Write-ahead hedge quarantine, then FAK **sell at the live bid** on the
    **market tick** (5m undercut is 0). Some 5m books are 0.01 even though
    the bot default is 0.001. Forcing 0.001 rejected the signed order
@@ -823,7 +828,8 @@ caller.
    `sell_attempt_rejected` is **not** terminal while size remains and bid
    ≤53 or persist completed — next look posts again. Dump retries abort
    only if bid recovers above 53¢. Persist-done retries abort in the
-   dead band. Incomplete REST on retry uses last-good, not idle cancel.
+   dead band **or** at bid ≥ `hedge_recovery_cancel` (85¢). Incomplete
+   REST on retry uses last-good, not idle cancel.
 9. Every live-bag skip/fail logs slug, ttm, bid, ask, tick, reason,
    `order_error` (`live_bag_log_fields`). `hedge_closed` only after
    confirmed inventory is gone.
@@ -1038,7 +1044,7 @@ cap is separate and in-app.
 
 ```bash
 cd ~/poly-money-maker && git pull
-python3 -c 'import json; from pathlib import Path; p=Path("strategy_buy5m.json"); d=json.loads(p.read_text()); d["hedge_threshold"]=0.70; d["hedge_require_ask_max"]=0.72; d["hedge_persist_s"]=2.0; d["hedge_toxic_bid_max"]=0.53; d["add_min_price"]=0.90; p.write_text(json.dumps(d, indent=2)+"\n")'
+python3 -c 'import json; from pathlib import Path; p=Path("strategy_buy5m.json"); d=json.loads(p.read_text()); d["hedge_threshold"]=0.70; d["hedge_require_ask_max"]=0.72; d["hedge_persist_s"]=2.0; d["hedge_toxic_bid_max"]=0.53; d["hedge_recovery_cancel"]=0.85; d["add_min_price"]=0.90; p.write_text(json.dumps(d, indent=2)+"\n")'
 sudo systemctl restart polybuybot5m
 ```
 

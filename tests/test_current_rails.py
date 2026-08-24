@@ -150,7 +150,7 @@ class HeldBagDumpAndDeadBand(unittest.TestCase):
         self.assertEqual(intent.action, "sell")
         self.assertEqual(intent.reason, "persist_live_bid")
         self.assertAlmostEqual(intent.sell_at, 0.74)
-        self.assertIsNone(intent.abort_above)
+        self.assertAlmostEqual(intent.abort_above, 0.85)
 
     def test_bid_061_persist_not_done_does_not_sell(self):
         intent = evaluate_held_bag(
@@ -317,6 +317,20 @@ class SellExecutionRails(unittest.TestCase):
         self.assertEqual(result.get("bot_status"), "filled")
         self.assertAlmostEqual(calls["orders"][0]["price"], 0.74)
         self.assertAlmostEqual(sold, 3.2)
+
+    def test_persist_done_090_aborts_without_post(self):
+        ns, calls = self._sell_ns(quotes=[(0.90, 0.92)], confirmed=3.2)
+        sold, result, _proceeds = ns["sell_market_with_retry"](
+            "token", 3.2, 0.90,
+            tick_size="0.001",
+            max_retries=3,
+            persist_done=True,
+            abort_above=0.85,
+            initial_quote=(0.90, 0.92),
+        )
+        self.assertEqual(calls["post"], 0)
+        self.assertEqual(sold, 0.0)
+        self.assertNotEqual(result.get("bot_status"), "filled")
 
     def test_incomplete_rest_uses_last_good_not_idle(self):
         class Unmatched(Exception):
@@ -525,6 +539,9 @@ class BotWiresCurrentRails(unittest.TestCase):
         src = BOT5M.read_text()
         self.assertIn("entry_seconds_left(", src)
         self.assertIn("evaluate_held_bag(", src)
+        self.assertIn("recovery_cancel=", src)
+        self.assertIn("hedge_skip_recovery", src)
+        self.assertIn("HEDGE_RECOVERY_CANCEL", src)
         self.assertIn("pick_held_quote(", src)
         self.assertIn("stamp_slice_on_inventory(", src)
         self.assertIn("hedge_fail_is_terminal(", src)
