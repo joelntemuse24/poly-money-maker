@@ -99,7 +99,7 @@ functions with `ast` (`tests/test_buy_fill_shapes.py`).
 
 | File | Purpose |
 |---|---|
-| `pathlog.py` | CLOB path recorder (no orders; TOB price **and** size) |
+| `pathlog.py` | CLOB path recorder (no orders; TOB price **and** size). Resolve is capped (4 Gamma/cycle, 2h give-up) so the 1s sampler is not stalled. |
 | `check_path_backtest.py` | Pathlog: grid, anatomy, compare, **paper hedge**, `--sweep`, `--hedge-sweep` (no orders) |
 | `check_hedge_threshold.py` | Earlier-stop research: pathlog `--hedge-sweep` or public last-trade vs a history CSV |
 | `CLOUD_RESEARCH.md` | Cloud prompts: paper P&L on public books + `--sweep` (no `.env`) |
@@ -253,6 +253,10 @@ two-slice $2.50+$2.50 add.
   `user_usdc_balance` on BUY `OrderArgs`: a fake `$2.97` wallet makes the
   SDK shrink 3.00 @ 99¢ into `$2.9601`. `check_buy_rejects.py` counts these.
 - `pathlog_prune` — oldest tick JSONL removed (14d / 400 MB cap); export first
+- Pathlog heartbeat `sampled` should move every ~1s while a 5m window is
+  open. `pending` / `resolve_capped` / `resolve_skipped_old` extra keys:
+  if `sampled` is stuck at 1–2 and files are 2-line stubs, resolve is
+  blocking again — cap/give-up/cache. Restart **only** `polypathlog`.
 - Banner `POS` — live hedges only. `WAIT` should be **0** unless a *redeemable*
   leftover is still cashing out. `WAIT 666` meant old Data API rows, not
   666 live markets. After `drop_wallet_dust`, those rows are thrown away.
