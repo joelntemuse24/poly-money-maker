@@ -569,6 +569,9 @@ class BotWiresCurrentRails(unittest.TestCase):
         self.assertIn("max_retries=12 if dump", src)
         self.assertIn('"hedge_threshold": 0.50', src)
         self.assertIn('"hedge_require_ask_max": 0.52', src)
+        self.assertIn('"hedge_persist_s": 5.0', src)
+        self.assertIn('"hedge_recovery_cancel": 0.53', src)
+        self.assertIn('"hedge_sell_fade": True', src)
         self.assertIn('"b15_window_min": 20.0', src)
         self.assertIn('"a22_window_min": 0.0', src)
         self.assertNotIn(

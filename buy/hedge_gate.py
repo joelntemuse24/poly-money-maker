@@ -188,16 +188,20 @@ def evaluate_held_bag(
     gui_ok=True,
     gui_why="ok",
     recovery_cancel=0.85,
+    sell_fade=False,
 ):
     """Dump / persist-sell / hold for one live bag.
 
-    * Bid ≤ 53¢ dumps every bag. Bid-only. No GUI / last-trade veto.
+    * Bid ≤ dump dumps every bag. Bid-only. No GUI / last-trade veto.
       Wide 22/77 still dumps.
-    * Do not sell in (53, 70). Persist-not-done 61/70 is a hold.
-    * After persist, 70–84 live-bid sells are correct (do not clamp to 72).
+    * 5m default: do not sell in (dump, qualify). Persist-not-done 61/70
+      is a hold. After persist, qualify–recovery live-bid sells (70–84).
       Bid ≥ recovery_cancel (default 85¢) is a recovered winner: HOLD and
       clear persist. Do not sell 90–99¢ because persist_done stuck.
-    * Persist qualify is still tight 70/72 for 2s (GUI applies only there).
+    * Hourly (``sell_fade``): after persist, sell any bid still below
+      recovery — including a fade through qualify — instead of waiting
+      for the dump print. Tight recovery (53¢) is what stops 50–69 fills.
+    * Persist qualify is still the tight book (GUI applies only there).
     """
     bid_f = _finite_px(bid)
     ask_f = _finite_px(ask)
@@ -236,6 +240,11 @@ def evaluate_held_bag(
 
     if done:
         if bid_f + 1e-12 >= qualify:
+            return HedgeIntent(
+                "sell", "persist_live_bid", bid_f, persist_armed_ts, True, True,
+                recovery, False,
+            )
+        if sell_fade:
             return HedgeIntent(
                 "sell", "persist_live_bid", bid_f, persist_armed_ts, True, True,
                 recovery, False,
@@ -279,6 +288,7 @@ def hedge_should_keep_retrying(
     dump_bid_max=0.53,
     qualify_bid=0.70,
     recovery_cancel=0.85,
+    sell_fade=False,
 ) -> bool:
     """Unmatched / invalid-tick / could-not-run is not terminal while size remains."""
     try:
@@ -298,12 +308,9 @@ def hedge_should_keep_retrying(
         return True
     if bid_f <= dump_max + 1e-12:
         return True
-    if (
-        persist_done
-        and bid_f + 1e-12 >= qualify
-        and bid_f < recovery - 1e-12
-    ):
-        return True
+    if persist_done and bid_f < recovery - 1e-12:
+        if bid_f + 1e-12 >= qualify or sell_fade:
+            return True
     return False
 
 
@@ -316,6 +323,7 @@ def hedge_fail_is_terminal(
     dump_bid_max=0.53,
     qualify_bid=0.70,
     recovery_cancel=0.85,
+    sell_fade=False,
 ) -> bool:
     """``hedge_fail`` after ``sell_attempt_rejected`` must not idle a live dump."""
     status = str(sell_status or "")
@@ -328,6 +336,7 @@ def hedge_fail_is_terminal(
         dump_bid_max=dump_bid_max,
         qualify_bid=qualify_bid,
         recovery_cancel=recovery_cancel,
+        sell_fade=sell_fade,
     )
 
 

@@ -14,11 +14,12 @@ and 15m buy services are **stopped**. Mint (`polymintbot`) is **paused**.
 The hourly bot buys the winning leg of Polymarket BTC "Up or Down" **hourly**
 markets: **75–90¢ in the last 20 minutes**, **$10** cap, FAK limit **90¢**.
 Same-leg only. After a full hedge the market is done. Normal hedge is
-**persist 2s @ 50/52** (GUI: held ≤ **52¢**, other ≥ **48¢**; not inverted
-30/70). Then sell at the live bid (50–69). Bid ≥ **70¢**
-(`hedge_recovery_cancel`) holds and **clears persist**. **Any live bag**
-dumps bid-only at **≤35¢**. Do not sell in (35¢, 50¢). Winners redeem at
-$1.00. **No profit-take sell.** See `CURRENT.md` for the active probe knobs.
+**persist 5s @ 50/52** (GUI: held ≤ **52¢**, other ≥ **48¢**; not inverted
+30/70). Then sell at the live bid while **< 53¢** (fade through 50 still
+sells). Bid ≥ **53¢** (`hedge_recovery_cancel`) holds and **clears persist**.
+**Any live bag** dumps bid-only at **≤35¢**. Do not sell 55–69 after persist
+(that was the 5m 70–84 complaint). Winners redeem at $1.00. **No profit-take
+sell.** See `CURRENT.md` for the active probe knobs.
 
 A/C slices (`>93` last 22 min / `>95` last 5) are **off**
 (`a22_window_min` = `c5_window_min` = 0). Do not copy 5m `seconds_left`
@@ -30,7 +31,7 @@ The 5m two-slice 70/72 bot is **stopped** (code still in `buybot5m.py`).
 |---|---|---|---|---|---|
 | `buybot.py` | `polybuybot` **stopped** | 15m | Chainlink TWAP 60s | $2.50 | final 4.0 min, 75–90¢, hedge 35/40 |
 | `buybot5m.py` | `polybuybot5m` **stopped** | 5m | Chainlink TWAP 30s | $2.50+$2.50 | early ≥90 / late 75–90; persist **2s @ 70/72** (toxic 53¢) |
-| `buybothourly.py` | `polybuybothourly` **live after operator start** | hourly | Binance BTCUSDT | $10 cap | last **20 min** 75–90¢; persist **2s @ 50/52** (toxic 35¢) |
+| `buybothourly.py` | `polybuybothourly` **live after operator start** | hourly | Binance BTCUSDT | $10 cap | last **20 min** 75–90¢; persist **5s @ 50/52** (recovery 53¢, toxic 35¢) |
 | `pathlog.py` | `polypathlog` **live** | all three | — (CLOB books only) | — | whole 5m; last 8m of 15m; last **20m** of hourly |
 
 Plus: `check_book.py`, `check_participation.py`, `check_path_backtest.py`,
@@ -314,9 +315,10 @@ Cloud agents: `CLOUD_RESEARCH.md`.
   ≤ **72¢**, held GUI ≤ **72¢**, other GUI ≥ **28¢** (complement of ask-max).
   A 70¢ vs 28¢ book is the qualify; the other side does **not** have to
   already be the winner. Instant 70 is out — a one-tick dip dumps winners.
-  Buy 70/30 is unchanged. 15m/hourly (stopped) still invert 70/30. Live 5m
-  book qualify is **70/72 persist 2s**; toxic dump **53¢**; hourly template
-  **55/60**; 15m remains 35/40.
+  Buy 70/30 is unchanged. 15m (stopped) still invert 70/30. Live 5m
+  book qualify is **70/72 persist 2s**; toxic dump **53¢**. Live hourly
+  (after operator start) is **persist 5s @ 50/52**, dump **35¢**, recovery
+  **53¢**, `hedge_sell_fade`. 15m remains 35/40.
   A random TOB clip is not enough; a last print of 85¢ on a 68/71 book will
   `hedge_skip_no_consensus`. **Any live bag** dumps bid-only while held bid
   ≤ **53¢** (no GUI veto; not only `toxic_fill`). Do **not** sell in
@@ -398,7 +400,7 @@ After this branch merges, on the VM (hourly; stop 5m):
 cd ~/poly-money-maker && git pull
 sudo systemctl stop polybuybot polybuybot5m
 sudo systemctl disable polybuybot polybuybot5m
-python3 -c 'import json; from pathlib import Path; p=Path("strategy_buyhourly.json"); d=json.loads(p.read_text()); d["buy_window_min"]=20.0; d["a22_window_min"]=0.0; d["b15_window_min"]=20.0; d["c5_window_min"]=0.0; d["hedge_threshold"]=0.50; d["hedge_require_ask_max"]=0.52; d["hedge_persist_s"]=2.0; d["hedge_toxic_bid_max"]=0.35; d["hedge_recovery_cancel"]=0.70; d["hedge_undercut_ticks"]=0; d["b15_buy_budget"]=10.0; d["market_spend_cap"]=10.0; d["buy_budget"]=10.0; p.write_text(json.dumps(d, indent=2)+"\n")'
+python3 -c 'import json; from pathlib import Path; p=Path("strategy_buyhourly.json"); d=json.loads(p.read_text()); d["buy_window_min"]=20.0; d["a22_window_min"]=0.0; d["b15_window_min"]=20.0; d["c5_window_min"]=0.0; d["hedge_threshold"]=0.50; d["hedge_require_ask_max"]=0.52; d["hedge_persist_s"]=5.0; d["hedge_toxic_bid_max"]=0.35; d["hedge_recovery_cancel"]=0.53; d["hedge_sell_fade"]=True; d["hedge_undercut_ticks"]=0; d["b15_buy_budget"]=10.0; d["market_spend_cap"]=10.0; d["buy_budget"]=10.0; p.write_text(json.dumps(d, indent=2)+"\n")'
 sudo systemctl restart polypathlog
 sudo systemctl start polybuybothourly
 sudo systemctl enable polybuybothourly

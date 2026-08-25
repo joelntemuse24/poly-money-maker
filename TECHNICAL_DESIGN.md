@@ -181,9 +181,9 @@ paths are picked once. Other knobs hot-reload.
 ## 3. Map of the repository
 
 ```
-buybot5m.py          LIVE 5m bot (~5177 lines). You are usually here.
+buybot5m.py          5m bot (~5177 lines). Stopped.
 buybot.py            15m copy (~5063). Stopped.
-buybothourly.py      Hourly copy. Live after operator start. Last 20 min 75–90, $10 cap, persist 50/52.
+buybothourly.py      Hourly copy. Live after operator start. Last 20 min 75–90, $10 cap, persist 5s @ 50/52.
 buy/                 Importable helpers (safe — they do not start trading)
   market.py          Find markets on Gamma
   btc_price.py       Chainlink / Binance websocket + PTB
@@ -205,8 +205,8 @@ exists in the other two files. Diff them after a logic change. The 5m-only
 exceptions are the 5m early price bands (`buy/entry_skip.py` + `BUY_HORIZON_S`
 in **seconds**) and the hourly three-slice bands (`BUY_HORIZON_MIN` in
 **minutes**). 5m defaults: persist hedge 2s @ 70/72 (toxic 53¢), BTC gate
-$0, tick `0.001`. Hourly defaults: persist hedge 50/52, dump 35, BTC gate $10, tick `0.01`,
-$10 market cap.
+$0, tick `0.001`. Hourly defaults: persist hedge **5s @ 50/52**, dump 35,
+recovery **53¢**, `hedge_sell_fade`, BTC gate $10, tick `0.01`, $10 market cap.
 
 15m/hourly windows are in **minutes** (`buy_window_min` / `a22_window_min`).
 Mixing the two without converting units has caused production `NameError`s.
@@ -839,8 +839,11 @@ caller.
 → `hedge_skip_toxic_recovered`, flag stays armed. Dump of **any** bag
 still follows bid ≤ 53¢.
 
-15m/hourly (stopped) still use the older toxic_fill-only REST-fail-closed
-pipeline.
+15m (stopped) still uses the older toxic_fill-only REST-fail-closed
+pipeline. Hourly now shares `evaluate_held_bag` with 5m, but knobs are
+**not** a 5m rescale: persist **5s @ 50/52**, recovery **53¢** (do not
+sell 55–69), `sell_fade` so a post-persist fade through 50 still sells,
+dump ≤35.
 
 **Reconcile sells** with `reconcile_hedge_sold`: CLOB-confirmed sold size
 wins; a single low Data API read must not invent extra fills or erase

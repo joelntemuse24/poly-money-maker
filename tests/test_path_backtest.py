@@ -483,7 +483,7 @@ class SweepTemplateTests(unittest.TestCase):
         self.assertEqual(tmpl["hedge_threshold"], 0.50)
         self.assertEqual(tmpl["hedge_require_ask_max"], 0.52)
         self.assertEqual(tmpl["hedge_toxic_bid_max"], 0.35)
-        self.assertEqual(tmpl["hedge_persist_s"], 2.0)
+        self.assertEqual(tmpl["hedge_persist_s"], 5.0)
         self.assertEqual(tmpl["hedge_held_gui_max"], 0.52)
         self.assertEqual(tmpl["hedge_other_gui_min"], 0.48)
         self.assertFalse(tmpl["require_gui_reversed"])

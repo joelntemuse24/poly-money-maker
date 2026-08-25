@@ -5,20 +5,37 @@ Do not put secrets, API keys, or live wallet material here.
 
 Last updated: **2026-08-25** — **stop the 5m bot. Switch live buying to hourly.**
 One slice: **75–90¢ in the last 20 minutes** of the BTC hourly Up/Down
-market, **$10** cap, FAK limit **90¢**. Hedge is **persist 2s @ 50/52**
+market, **$10** cap, FAK limit **90¢**. Hedge is **persist 5s @ 50/52**
 (GUI held ≤ **52¢** / other ≥ **48¢** — not inverted 30/70), then sell at
-the **live bid** (no 2¢ undercut). **Any live bag** dumps bid-only while
-bid ≤ **35¢**. Do **not** sell in (35¢, 50¢). After persist, a 50–69¢
-live-bid fill is correct. Bid ≥ **70¢** (`hedge_recovery_cancel`) holds and
-clears persist. Underlying edge stays **$10**. Tick **0.01**. Windows are
-**minutes**. Pause minting. Pathlog records all three series (hourly now
-samples the last **20 min**; 14-day / 400 MB cap).
+the **live bid** while it is still **< 53¢** (no 2¢ undercut). A fade
+through 50 after persist still sells (`hedge_sell_fade`). Bid ≥ **53¢**
+(`hedge_recovery_cancel`) holds and clears persist — do **not** sell 55–69
+the way 5m sold 70–84. **Any live bag** dumps bid-only while bid ≤ **35¢**.
+Underlying edge stays **$10**. Tick **0.01**. Windows are **minutes**.
+Pause minting. Pathlog records all three series (hourly now samples the
+last **20 min**; 14-day / 400 MB cap).
 
-**Why the old hourly hedge did not work:** it was still the pre-5m-fix
-path. Instant 55/60, inverted GUI (held ≤ 30 / other ≥ 70 — a 50/52 book
-can never pass), `hedge_undercut_ticks=2` on a 0.01 book (21 Aug: **0
-hedge fills**), and incomplete REST skipped the dump. Hourly now uses the
-same `evaluate_held_bag` path as 5m, keyed to 50/52 / dump 35 / recovery 70.
+**Why the 5m hedge disappointed:** the live 5m gate sometimes did what we
+wanted and often did not. Volatility made that worse, but the knobs also
+fought us:
+
+1. **Fired on markets that then won** — persist was only **2s** at 70/72.
+   A one-tick (or two-second) dip dumped a winner.
+2. **Failed to fire, then we lost** — dump needed a **≤53¢** bid. The
+   **(53, 70)** dead band held fading losers until they hit 53, and some
+   never printed a dumpable book.
+3. **Sold way above 53** — after persist, **70–84** live-bid fills were
+   treated as correct (`hedge_recovery_cancel` was **85¢**). That is the
+   opposite of “hedge at 53.”
+
+Hourly is slower on purpose so a 5s persist has time to distinguish a dip
+from a reversal. Recovery is **53¢** so persist-done does **not** sell
+50–69. `sell_fade` sells a post-persist fade through 50 instead of waiting
+for 35.
+
+**Hourly also keeps the later 5m execution fixes** (the old hourly path
+was still instant 55/60, inverted GUI 30/70, undercut 2, incomplete-REST
+skip). Those bugs are separate from the 5m *threshold* complaint.
 
 ---
 
@@ -43,11 +60,10 @@ Same-leg only. After `hedge_closed`, no re-buy. A/C slices are **off**
 | `b15_buy_budget` / `market_spend_cap` | **$10** per market |
 | `buy_max_spend` / `buy_max_shares` | **$11** / **14** per FAK |
 | `a22_window_min` / `c5_window_min` | **0** = disabled |
-| Hedge qualify | bid ≤ **50¢**, ask ≤ **52¢**, spread ≤ 15¢, persist **2s** |
+| Hedge qualify | bid ≤ **50¢**, ask ≤ **52¢**, spread ≤ 15¢, persist **5s** |
 | Hedge GUI | held ≤ **52¢**, other ≥ **48¢** (complement of ask-max). Buy 70/30 unchanged. Last print ≤ 52¢. |
 | Dump | **Any live bag** bid-only while held bid ≤ **35¢**. Wide 20/80 still dumps. |
-| Dead band | Do **not** sell in **(35¢, 50¢)** |
-| After persist | 50–69¢ live-bid fill is correct. Bid ≥ **70¢** holds and clears persist. |
+| After persist | Sell at the live bid while **< 53¢**, including a fade through 50 (`hedge_sell_fade`). Bid ≥ **53¢** holds and clears persist. Do **not** sell 55–69. |
 | Execution | Sell at the **live bid**, undercut **0**. Unmatched 400 re-quotes; invalid-tick rebuilds at 0.01. Incomplete REST uses WS / last-good. |
 | Underlying edge | **$10** (Binance BTCUSDT vs PTB); side must match |
 | `max_open_positions` | **0 = unlimited** |
@@ -159,7 +175,7 @@ amount / HTTP 400), not this NameError.
   sudo systemctl stop polybuybot polybuybot5m
   sudo systemctl disable polybuybot polybuybot5m
   cd ~/poly-money-maker && git pull
-  python3 -c 'import json; from pathlib import Path; p=Path("strategy_buyhourly.json"); d=json.loads(p.read_text()); d["buy_window_min"]=20.0; d["a22_window_min"]=0.0; d["b15_window_min"]=20.0; d["c5_window_min"]=0.0; d["buy_threshold"]=0.75; d["buy_max_price"]=0.90; d["b15_buy_budget"]=10.0; d["market_spend_cap"]=10.0; d["buy_budget"]=10.0; d["buy_max_spend"]=11.0; d["buy_max_shares"]=14.0; d["hedge_threshold"]=0.50; d["hedge_require_ask_max"]=0.52; d["hedge_persist_s"]=2.0; d["hedge_toxic_bid_max"]=0.35; d["hedge_recovery_cancel"]=0.70; d["hedge_undercut_ticks"]=0; d["poll_buy_window_s"]=0.01; d["poll_held_s"]=0.01; p.write_text(json.dumps(d, indent=2)+"\n"); print("window", d["b15_window_min"], "hedge", d["hedge_threshold"], d["hedge_require_ask_max"], "persist", d["hedge_persist_s"], "dump", d["hedge_toxic_bid_max"], "recovery", d["hedge_recovery_cancel"], "undercut", d["hedge_undercut_ticks"], "dry_run", d.get("dry_run"), "entry", d.get("entry_enabled"))'
+  python3 -c 'import json; from pathlib import Path; p=Path("strategy_buyhourly.json"); d=json.loads(p.read_text()); d["buy_window_min"]=20.0; d["a22_window_min"]=0.0; d["b15_window_min"]=20.0; d["c5_window_min"]=0.0; d["buy_threshold"]=0.75; d["buy_max_price"]=0.90; d["b15_buy_budget"]=10.0; d["market_spend_cap"]=10.0; d["buy_budget"]=10.0; d["buy_max_spend"]=11.0; d["buy_max_shares"]=14.0; d["hedge_threshold"]=0.50; d["hedge_require_ask_max"]=0.52; d["hedge_persist_s"]=5.0; d["hedge_toxic_bid_max"]=0.35; d["hedge_recovery_cancel"]=0.53; d["hedge_sell_fade"]=True; d["hedge_undercut_ticks"]=0; d["poll_buy_window_s"]=0.01; d["poll_held_s"]=0.01; p.write_text(json.dumps(d, indent=2)+"\n"); print("window", d["b15_window_min"], "hedge", d["hedge_threshold"], d["hedge_require_ask_max"], "persist", d["hedge_persist_s"], "dump", d["hedge_toxic_bid_max"], "recovery", d["hedge_recovery_cancel"], "fade", d["hedge_sell_fade"], "undercut", d["hedge_undercut_ticks"], "dry_run", d.get("dry_run"), "entry", d.get("entry_enabled"))'
   sudo systemctl restart polypathlog
   sudo systemctl start polybuybothourly
   sudo systemctl enable polybuybothourly
@@ -237,10 +253,11 @@ amount / HTTP 400), not this NameError.
       `entry_enabled`. Do **not** start 15m / hourly / mint.
 - [x] **Hourly last-20m 75–90 + persist hedge 50/52.** Operator asked to
       stop 5m and buy a 75 in the last 20 minutes of the hourly market,
-      hedge at 50. A/C slices off. Hedge review: inverted 70/30 GUI,
-      undercut 2, instant 55, incomplete-REST skip — replaced with the
-      5m `evaluate_held_bag` path (persist 2s @ 50/52, dump ≤35, recovery
-      ≥70, live bid, unmatched/tick retry). After merge: `git pull`,
+      hedge at 50. A/C slices off. 5m hedge complaint (fired on winners,
+      missed dumps, sold 70–84) is **not** copied: persist **5s**,
+      recovery **53¢**, `hedge_sell_fade` so a post-persist fade through
+      50 still sells. Execution still uses `evaluate_held_bag` (undercut 0,
+      dump any bag ≤35, unmatched/tick retry). After merge: `git pull`,
       patch live `strategy_buyhourly.json`, stop 5m, start hourly,
       restart pathlog. Confirm `dry_run` / `entry_enabled`.
 - [ ] Cloud paper P&L: paste `CLOUD_RESEARCH.md` section 2. Score
@@ -258,11 +275,6 @@ amount / HTTP 400), not this NameError.
 2. Do **not** restart minting unless the operator asks. Do **not** start
    `polybuybot` / `polybuybot5m` unless the operator asks. Hourly is the
    live buy bot after the operator copies knobs and starts the unit.
-3. Never truncate state/PnL/log files; never commit live strategy/state/`.env`.
-   Pathlog ticks are **auto-pruned** (14d / 400 MB) — do not `rm` them by hand,
-   but **do export** (`check_path_backtest.py --csv` or `scp` the ticks dir)
-   before prune. Cloud research: `CLOUD_RESEARCH.md`.
-4. When an ops decision changes, **update this file in the same PR/commit**.
 3. Never truncate state/PnL/log files; never commit live strategy/state/`.env`.
    Pathlog ticks are **auto-pruned** (14d / 400 MB) — do not `rm` them by hand,
    but **do export** (`check_path_backtest.py --csv` or `scp` the ticks dir)

@@ -165,74 +165,120 @@ class HeldBagRecoveryCancelTests(unittest.TestCase):
 
 
 class HourlyHeldBag50Tests(unittest.TestCase):
-    """Hourly persist 2s @ 50/52, dump ≤35, recovery ≥70."""
+    """Hourly persist 5s @ 50/52, dump ≤35, recovery ≥53, fade sells."""
+
+    KW = dict(
+        dump_bid_max=0.35,
+        qualify_bid=0.50,
+        qualify_ask_max=0.52,
+        recovery_cancel=0.53,
+        persist_s=5.0,
+        sell_fade=True,
+    )
 
     def test_persist_done_bid_050_sells_live_bid(self):
         intent = evaluate_held_bag(
-            0.50, 0.52, now_s=20.0, persist_armed_ts=10.0, persist_s=2.0,
-            persist_done=True,
-            dump_bid_max=0.35, qualify_bid=0.50, qualify_ask_max=0.52,
-            recovery_cancel=0.70,
+            0.50, 0.52, now_s=20.0, persist_armed_ts=10.0, persist_done=True,
+            **self.KW,
         )
         self.assertEqual(intent.action, "sell")
         self.assertEqual(intent.reason, "persist_live_bid")
         self.assertAlmostEqual(intent.sell_at, 0.50)
 
+    def test_persist_done_bid_051_sells_not_the_70_84_window(self):
+        intent = evaluate_held_bag(
+            0.51, 0.52, now_s=20.0, persist_armed_ts=10.0, persist_done=True,
+            **self.KW,
+        )
+        self.assertEqual(intent.action, "sell")
+        self.assertAlmostEqual(intent.sell_at, 0.51)
+
+    def test_bid_055_after_persist_is_recovery(self):
+        intent = evaluate_held_bag(
+            0.55, 0.56, now_s=20.0, persist_armed_ts=10.0, persist_done=True,
+            **self.KW,
+        )
+        self.assertEqual(intent.action, "hold")
+        self.assertEqual(intent.reason, "recovery_cancel")
+        self.assertFalse(intent.persist_done)
+
     def test_bid_035_dumps(self):
         intent = evaluate_held_bag(
-            0.35, 0.90, now_s=20.0, persist_armed_ts=None, persist_s=2.0,
-            persist_done=False, gui_ok=False,
-            dump_bid_max=0.35, qualify_bid=0.50, qualify_ask_max=0.52,
-            recovery_cancel=0.70,
+            0.35, 0.90, now_s=20.0, persist_armed_ts=None, persist_done=False,
+            gui_ok=False, **self.KW,
         )
         self.assertEqual(intent.action, "dump")
         self.assertTrue(intent.dump)
         self.assertTrue(intent.skip_gui)
 
-    def test_bid_040_dead_band(self):
+    def test_fade_through_50_after_persist_still_sells(self):
         intent = evaluate_held_bag(
-            0.40, 0.42, now_s=20.0, persist_armed_ts=10.0, persist_s=2.0,
-            persist_done=True,
-            dump_bid_max=0.35, qualify_bid=0.50, qualify_ask_max=0.52,
-            recovery_cancel=0.70,
+            0.40, 0.42, now_s=20.0, persist_armed_ts=10.0, persist_done=True,
+            **self.KW,
+        )
+        self.assertEqual(intent.action, "sell")
+        self.assertEqual(intent.reason, "persist_live_bid")
+        self.assertAlmostEqual(intent.sell_at, 0.40)
+
+    def test_without_fade_040_is_dead_band(self):
+        kw = dict(self.KW)
+        kw["sell_fade"] = False
+        intent = evaluate_held_bag(
+            0.40, 0.42, now_s=20.0, persist_armed_ts=10.0, persist_done=True,
+            **kw,
         )
         self.assertEqual(intent.action, "hold")
         self.assertEqual(intent.reason, "dead_band")
 
     def test_bid_075_after_persist_is_recovery(self):
         intent = evaluate_held_bag(
-            0.75, 0.76, now_s=20.0, persist_armed_ts=10.0, persist_s=2.0,
-            persist_done=True,
-            dump_bid_max=0.35, qualify_bid=0.50, qualify_ask_max=0.52,
-            recovery_cancel=0.70,
+            0.75, 0.76, now_s=20.0, persist_armed_ts=10.0, persist_done=True,
+            **self.KW,
         )
         self.assertEqual(intent.action, "hold")
         self.assertEqual(intent.reason, "recovery_cancel")
         self.assertFalse(intent.persist_done)
 
-    def test_arm_50_52_then_wait(self):
+    def test_arm_50_52_then_wait_5s(self):
         armed = evaluate_held_bag(
-            0.50, 0.52, now_s=10.0, persist_armed_ts=None, persist_s=2.0,
-            persist_done=False, gui_ok=True,
-            dump_bid_max=0.35, qualify_bid=0.50, qualify_ask_max=0.52,
-            recovery_cancel=0.70,
+            0.50, 0.52, now_s=10.0, persist_armed_ts=None, persist_done=False,
+            gui_ok=True, **self.KW,
         )
         self.assertEqual(armed.action, "arm")
         waiting = evaluate_held_bag(
-            0.50, 0.52, now_s=11.5, persist_armed_ts=10.0, persist_s=2.0,
-            persist_done=False, gui_ok=True,
-            dump_bid_max=0.35, qualify_bid=0.50, qualify_ask_max=0.52,
-            recovery_cancel=0.70,
+            0.50, 0.52, now_s=14.5, persist_armed_ts=10.0, persist_done=False,
+            gui_ok=True, **self.KW,
         )
         self.assertEqual(waiting.action, "wait")
         ready = evaluate_held_bag(
-            0.50, 0.52, now_s=12.0, persist_armed_ts=10.0, persist_s=2.0,
-            persist_done=False, gui_ok=True,
-            dump_bid_max=0.35, qualify_bid=0.50, qualify_ask_max=0.52,
-            recovery_cancel=0.70,
+            0.50, 0.52, now_s=15.0, persist_armed_ts=10.0, persist_done=False,
+            gui_ok=True, **self.KW,
         )
         self.assertEqual(ready.action, "sell")
         self.assertEqual(ready.reason, "persist_live_bid")
+
+    def test_keep_retrying_fade_but_not_recovered(self):
+        self.assertTrue(
+            hedge_should_keep_retrying(
+                3.2, 0.40, persist_done=True,
+                dump_bid_max=0.35, qualify_bid=0.50, recovery_cancel=0.53,
+                sell_fade=True,
+            )
+        )
+        self.assertFalse(
+            hedge_should_keep_retrying(
+                3.2, 0.55, persist_done=True,
+                dump_bid_max=0.35, qualify_bid=0.50, recovery_cancel=0.53,
+                sell_fade=True,
+            )
+        )
+        self.assertFalse(
+            hedge_should_keep_retrying(
+                3.2, 0.40, persist_done=True,
+                dump_bid_max=0.35, qualify_bid=0.50, recovery_cancel=0.53,
+                sell_fade=False,
+            )
+        )
 
 
 if __name__ == "__main__":

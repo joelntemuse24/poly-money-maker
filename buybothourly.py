@@ -188,8 +188,10 @@ _STRATEGY_DEFAULTS = {
     # Must be <= buy_threshold (validator); 65¢ ≈ walk well below the 75¢ floor.
     "toxic_force_exit_below": 0.65,
     "hedge_enabled": True,
-    # Persist 2s @ 50/52 then sell at the live bid. Instant 50 dumped
-    # winners the same way instant 70 did on 5m. Undercut 2 on a 0.01
+    # Persist 5s @ 50/52 then sell at the live bid while it is still
+    # below recovery (53¢). Instant 50 dumped winners the same way
+    # instant 70 did on 5m. 5m 2s + sell-up-to-84 was the "fired on
+    # winners / sold way above 53" complaint. Undercut 2 on a 0.01
     # tick was 0 hedge fills (21 Aug).
     "hedge_threshold": 0.50,
     # Kept in config (live JSON still sends it). Not a FAK floor: after 50/52
@@ -206,11 +208,13 @@ _STRATEGY_DEFAULTS = {
     # and ask also collapsed (same lesson sell-side already learned on mids).
     "hedge_max_spread": 0.15,
     "hedge_require_ask_max": 0.52,
-    "hedge_persist_s": 2.0,
+    "hedge_persist_s": 5.0,
     "hedge_toxic_bid_max": 0.35,
     # After persist_done, bid ≥ this is a recovered winner: HOLD and clear.
-    # 50–69 still sells at the live bid. Do not sell a 75–90 rally.
-    "hedge_recovery_cancel": 0.70,
+    # Tight 53¢ so we do not copy 5m's persist-then-sell 70–84 window.
+    "hedge_recovery_cancel": 0.53,
+    # After persist, a fade through 50 still sells (do not wait for 35¢).
+    "hedge_sell_fade": True,
     "hedge_require_gui": True,
     # Outer look-ahead / poll horizon (minutes). Window 0 disables A or C.
     "buy_window_min": 20.0,
@@ -453,6 +457,7 @@ HEDGE_REQUIRE_ASK_MAX = _strat["hedge_require_ask_max"]
 HEDGE_PERSIST_S = _strat["hedge_persist_s"]
 HEDGE_TOXIC_BID_MAX = _strat["hedge_toxic_bid_max"]
 HEDGE_RECOVERY_CANCEL = _strat["hedge_recovery_cancel"]
+HEDGE_SELL_FADE = _strat["hedge_sell_fade"]
 HEDGE_REQUIRE_GUI = _strat["hedge_require_gui"]
 BUY_WINDOW_MIN = _strat["buy_window_min"]
 A22_WINDOW_MIN = _strat["a22_window_min"]
@@ -3086,9 +3091,9 @@ def sell_market_with_retry(
 
     Dump (bid ≤ toxic) and persist-done sells are bid-only: incomplete REST
     reuses WS/last-good, unmatched / invalid-tick retries down the live bid.
-    After persist, a 50–69¢ live bid is a correct fill (do not clamp to 52).
-    Bid ≥ hedge_recovery_cancel (70¢) must abort — do not POST a 75–90 rally.
-    `hedge_min_price` is not a floor.
+    After persist, sell at the live bid while it is still below recovery
+    (53¢), including a fade through 50¢. Bid ≥ hedge_recovery_cancel must
+    abort — do not POST a 55–90 rally. `hedge_min_price` is not a floor.
 
     Returns (total_sold, result, proceeds) where result["bot_status"] is
     filled|empty|ambiguous|persist_fail|dry. Unknown POST outcomes stop retries.
@@ -3121,7 +3126,11 @@ def sell_market_with_retry(
     try:
         recovery_cancel = float(HEDGE_RECOVERY_CANCEL)
     except (NameError, TypeError, ValueError):
-        recovery_cancel = 0.70
+        recovery_cancel = 0.53
+    try:
+        sell_fade = bool(HEDGE_SELL_FADE)
+    except NameError:
+        sell_fade = True
     if dump and abort_above is None:
         abort_above = dump_bid_max
     if persist_done and not dump:
@@ -3431,6 +3440,7 @@ def sell_market_with_retry(
                     dump_bid_max=dump_bid_max,
                     qualify_bid=qualify_bid,
                     recovery_cancel=recovery_cancel,
+                    sell_fade=sell_fade,
                 )
                 log_event(
                     "sell_attempt_rejected", token_id=token_id,
@@ -3859,6 +3869,7 @@ while not _shutdown_requested:
         HEDGE_PERSIST_S = _strat["hedge_persist_s"]
         HEDGE_TOXIC_BID_MAX = _strat["hedge_toxic_bid_max"]
         HEDGE_RECOVERY_CANCEL = _strat["hedge_recovery_cancel"]
+        HEDGE_SELL_FADE = _strat["hedge_sell_fade"]
         HEDGE_REQUIRE_GUI = _strat["hedge_require_gui"]
         BUY_WINDOW_MIN = _strat["buy_window_min"]
         A22_WINDOW_MIN = _strat["a22_window_min"]
@@ -4692,9 +4703,9 @@ while not _shutdown_requested:
                     _hedge_persist_done.discard(cond)
                 if held_token and held_size > 0.01 and HEDGE_ENABLED and not meta.get("hedge_closed"):
                     # ANY live bag with held bid ≤ toxic (35¢) dumps at the live bid.
-                    # Persist 2s @ 50/52, then sell at the live bid (50–69).
-                    # Bid ≥ recovery_cancel (70¢) holds and clears persist.
-                    # Do not sell in (35, 50). Incomplete REST uses WS/last-good.
+                    # Persist 5s @ 50/52, then sell at the live bid while < 53¢
+                    # (including a fade through 50). Bid ≥ recovery_cancel (53¢)
+                    # holds and clears persist. Incomplete REST uses WS/last-good.
                     quote_age = book_ws.quote_age(held_token)
                     ws_fresh = quote_age is not None and quote_age <= float(HEDGE_QUOTE_MAX_AGE_S)
                     peek_bid = peek_ask = peek_mid = None
@@ -4719,7 +4730,8 @@ while not _shutdown_requested:
                         _hedge_persist_done.add(cond)
 
                     # Healthy winner before persist: skip REST. After persist,
-                    # 50–69 still sells; ≥ recovery_cancel (70¢) is a rally — clear.
+                    # fade through 50 still sells; ≥ recovery_cancel (53¢) is a
+                    # rally — clear. Do not copy 5m's persist-then-sell 70–84.
                     recovered = (
                         ws_fresh
                         and peek_bid is not None
@@ -4803,6 +4815,7 @@ while not _shutdown_requested:
                             gui_ok=False,
                             gui_why="pending_gui",
                             recovery_cancel=HEDGE_RECOVERY_CANCEL,
+                            sell_fade=HEDGE_SELL_FADE,
                         )
                         qualify_fail = preview.reason in {
                             "missing_side", "bid_above", "ask_too_high",
@@ -4859,6 +4872,7 @@ while not _shutdown_requested:
                                 gui_ok=gui_ok,
                                 gui_why=gui_why,
                                 recovery_cancel=HEDGE_RECOVERY_CANCEL,
+                                sell_fade=HEDGE_SELL_FADE,
                             )
                             if not gui_ok and intent.action == "hold":
                                 log_event(
@@ -5169,6 +5183,7 @@ while not _shutdown_requested:
                                     dump_bid_max=HEDGE_TOXIC_BID_MAX,
                                     qualify_bid=HEDGE_THRESHOLD,
                                     recovery_cancel=HEDGE_RECOVERY_CANCEL,
+                                    sell_fade=HEDGE_SELL_FADE,
                                 )
                                 log_event(
                                     "hedge_fail", condition_id=cond, leg=held_leg, size=held_size,
