@@ -136,6 +136,22 @@ class PlanResolvesTests(unittest.TestCase):
             pathlog.plan_resolves(NOW)
         scanner.assert_not_called()
 
+    def test_vm_scale_old_stubs_are_given_up_once(self):
+        """Live VM had ~2313 pending stubs; those must not be re-opened or Gamma'd."""
+        n = 2313
+        for i in range(n):
+            _write_stub(self.tick_dir, f"stub-{i:04d}", NOW - 20_000)
+        _write_stub(self.tick_dir, "just-closed", NOW - 40)
+        first = pathlog.plan_resolves(NOW)
+        self.assertEqual(first["resolve_skipped_old"], n)
+        self.assertEqual([item["slug"] for item in first["due"]], ["just-closed"])
+        self.assertEqual(first["opened"], n + 1)
+        self.assertEqual(first["resolve_capped"], 0)
+        second = pathlog.plan_resolves(NOW)
+        self.assertEqual(second["opened"], 1)
+        self.assertEqual(second["resolve_skipped_old"], 0)
+        self.assertEqual([item["slug"] for item in second["due"]], ["just-closed"])
+
 
 class ApplyResolvesAndCycleTests(unittest.TestCase):
     def setUp(self):
