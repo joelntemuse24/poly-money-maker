@@ -10,6 +10,11 @@ Ticks are auto-pruned (14 days / 400 MB, oldest first) so they fit the
 small VM disk. Export with check_path_backtest.py (or scp the ticks
 dir) before prune deletes them — pruned JSONL is gone.
 
+Resolve stamps ``winner`` from Gamma after expiry, but sampling always
+runs first. At most ``RESOLVE_MAX_PER_CYCLE`` Gamma calls per cycle
+(newest ``end_ts`` first); stubs older than ``RESOLVE_MAX_AGE_S`` are
+remembered and never HTTP-hammered. Do not parse every JSONL every tick.
+
 Usage:
     python pathlog.py
 Kill switch: touch STOP_PATHLOG
@@ -26,7 +31,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 
 import requests
 from rich.console import Console
@@ -62,6 +67,14 @@ RECORD_BEFORE_END_S = {
 POLL_S = 1.0
 BOOK_WORKERS = 8
 RESOLVE_GRACE_S = 20.0
+# Dead stubs never settle on Gamma; do not HTTP-hammer them every cycle.
+RESOLVE_MAX_AGE_S = 2 * 3600
+RESOLVE_MAX_PER_CYCLE = 4
+
+# Process-lifetime skip sets. Pathlog is long-lived; a restart re-classifies
+# from disk (first/last line only, no Gamma) and repopulates these.
+_resolved_slugs: Set[str] = set()
+_gave_up_slugs: Set[str] = set()
 
 # Disk cap sized for the ~10GB e2 boot disk (see deploy/DISK_OPS.md).
 # ~15 MB/day of ticks → ~210 MB in 14 days; 400 MB is the hard ceiling.
@@ -233,6 +246,163 @@ def file_has_event(path: Path, event: str) -> bool:
     return False
 
 
+def reset_resolve_memory() -> None:
+    """Clear in-memory resolve skip sets (tests / process start)."""
+    _resolved_slugs.clear()
+    _gave_up_slugs.clear()
+
+
+def _parse_json_object_line(raw: str) -> Optional[dict]:
+    raw = raw.strip()
+    if not raw:
+        return None
+    try:
+        row = json.loads(raw)
+    except json.JSONDecodeError:
+        return None
+    return row if isinstance(row, dict) else None
+
+
+def tick_file_bookends(path: Path) -> Tuple[Optional[dict], Optional[dict]]:
+    """First and last JSON objects in a JSONL file. Does not scan the body."""
+    try:
+        with open(path, "rb") as handle:
+            first_line = handle.readline()
+            handle.seek(0, os.SEEK_END)
+            size = handle.tell()
+            if size == 0:
+                return None, None
+            take = min(size, 8192)
+            handle.seek(size - take)
+            tail = handle.read()
+    except OSError:
+        return None, None
+    first = _parse_json_object_line(first_line.decode("utf-8", errors="replace"))
+    text = tail.decode("utf-8", errors="replace")
+    last_line = ""
+    for line in reversed(text.splitlines()):
+        if line.strip():
+            last_line = line
+            break
+    last = _parse_json_object_line(last_line)
+    return first, last
+
+
+def classify_resolve_status(
+    first: Optional[dict],
+    last: Optional[dict],
+    now: float,
+    grace_s: Optional[float] = None,
+    max_age_s: Optional[float] = None,
+) -> str:
+    """resolved | give_up | grace | due | skip."""
+    grace_s = RESOLVE_GRACE_S if grace_s is None else grace_s
+    max_age_s = RESOLVE_MAX_AGE_S if max_age_s is None else max_age_s
+    if (last and last.get("e") == "resolved") or (
+        first and first.get("e") == "resolved"
+    ):
+        return "resolved"
+    if not first or first.get("e") != "open":
+        # Incomplete write or unreadable header — try again next cycle.
+        return "skip"
+    try:
+        end_ts = float(first.get("end") or 0)
+    except (TypeError, ValueError):
+        return "give_up"
+    if end_ts <= 0:
+        return "give_up"
+    if now < end_ts:
+        return "skip"
+    if now < end_ts + grace_s:
+        return "grace"
+    if now - end_ts > max_age_s:
+        return "give_up"
+    return "due"
+
+
+def plan_resolves(
+    now: float,
+    tick_dir: Optional[Path] = None,
+    *,
+    resolved: Optional[Set[str]] = None,
+    gave_up: Optional[Set[str]] = None,
+    grace_s: Optional[float] = None,
+    max_age_s: Optional[float] = None,
+    max_per_cycle: Optional[int] = None,
+) -> Dict[str, Any]:
+    """Pick Gamma targets for this cycle without parsing every JSONL.
+
+    Skips slugs already in ``resolved`` / ``gave_up`` without opening the
+    file. Remaining files are classified from first+last line only.
+    Eligible (``due``) markets are newest ``end_ts`` first, then capped.
+    """
+    tick_dir = TICK_DIR if tick_dir is None else tick_dir
+    resolved = _resolved_slugs if resolved is None else resolved
+    gave_up = _gave_up_slugs if gave_up is None else gave_up
+    grace_s = RESOLVE_GRACE_S if grace_s is None else grace_s
+    max_age_s = RESOLVE_MAX_AGE_S if max_age_s is None else max_age_s
+    max_per_cycle = (
+        RESOLVE_MAX_PER_CYCLE if max_per_cycle is None else max_per_cycle
+    )
+
+    due: List[Dict[str, Any]] = []
+    pending = 0
+    skipped_old = 0
+    opened = 0
+    if not tick_dir.exists():
+        return {
+            "due": [],
+            "pending": 0,
+            "resolve_capped": 0,
+            "resolve_skipped_old": 0,
+            "opened": 0,
+        }
+
+    for path in tick_dir.glob("*.jsonl"):
+        slug = path.stem
+        if slug in resolved or slug in gave_up:
+            continue
+        opened += 1
+        first, last = tick_file_bookends(path)
+        status = classify_resolve_status(
+            first, last, now, grace_s=grace_s, max_age_s=max_age_s
+        )
+        if status == "resolved":
+            resolved.add(slug)
+            continue
+        if status == "give_up":
+            gave_up.add(slug)
+            skipped_old += 1
+            continue
+        if status == "skip":
+            continue
+        if status == "grace":
+            pending += 1
+            continue
+        # due
+        pending += 1
+        end_ts = float(first.get("end") or 0) if first else 0.0
+        gamma_slug = str((first or {}).get("slug") or slug)
+        due.append(
+            {
+                "slug": slug,
+                "path": path,
+                "end_ts": end_ts,
+                "gamma_slug": gamma_slug,
+            }
+        )
+
+    due.sort(key=lambda item: (-float(item["end_ts"]), str(item["slug"])))
+    capped = max(0, len(due) - int(max_per_cycle))
+    return {
+        "due": due[: int(max_per_cycle)],
+        "pending": pending,
+        "resolve_capped": capped,
+        "resolve_skipped_old": skipped_old,
+        "opened": opened,
+    }
+
+
 def fetch_book(token_id: str) -> Tuple[Optional[float], float, Optional[float], float]:
     """REST `/book` → (bid, bid_size, ask, ask_size). Same parser as the WS path."""
     try:
@@ -341,15 +511,28 @@ def gamma_winner(session: requests.Session, slug: str) -> Optional[str]:
     return None
 
 
-def pending_resolve_slugs() -> List[str]:
-    if not TICK_DIR.exists():
-        return []
-    out: List[str] = []
-    for path in TICK_DIR.glob("*.jsonl"):
-        if file_has_event(path, "resolved"):
+def apply_resolves(
+    session: requests.Session,
+    due: Sequence[Dict[str, Any]],
+    now: float,
+    resolved: Optional[Set[str]] = None,
+) -> int:
+    """Gamma-fetch the already-capped ``due`` list. Returns stamps written."""
+    resolved = _resolved_slugs if resolved is None else resolved
+    stamped = 0
+    for item in due:
+        winner = gamma_winner(session, str(item.get("gamma_slug") or item["slug"]))
+        if not winner:
             continue
-        out.append(path.stem)
-    return out
+        path = item["path"]
+        append_jsonl(
+            path,
+            {"e": "resolved", "ts": round(now, 3), "winner": winner, "src": "gamma"},
+        )
+        resolved.add(str(item["slug"]))
+        stamped += 1
+        log_event("resolved", slug=item.get("gamma_slug") or item["slug"], winner=winner)
+    return stamped
 
 
 def run_cycle(gateway: MarketGateway, session: requests.Session) -> str:
@@ -368,6 +551,7 @@ def run_cycle(gateway: MarketGateway, session: requests.Session) -> str:
         if 0 < ttm <= horizon:
             due.append(market)
 
+    # Sample first so a slow resolve cannot starve the 1s tick cadence.
     sampled = 0
     if due:
         with ThreadPoolExecutor(max_workers=BOOK_WORKERS) as pool:
@@ -388,32 +572,20 @@ def run_cycle(gateway: MarketGateway, session: requests.Session) -> str:
                 append_jsonl(path, tick)
                 sampled += 1
 
-    resolved = 0
-    for slug in pending_resolve_slugs():
-        path = tick_path(slug)
-        header = None
-        try:
-            with open(path, encoding="utf-8") as handle:
-                first = handle.readline()
-            header = json.loads(first) if first.strip() else None
-        except (OSError, json.JSONDecodeError):
-            continue
-        if not isinstance(header, dict):
-            continue
-        end_ts = float(header.get("end") or 0)
-        if end_ts <= 0 or now < end_ts + RESOLVE_GRACE_S:
-            continue
-        winner = gamma_winner(session, str(header.get("slug") or slug))
-        if not winner:
-            continue
-        append_jsonl(
-            path,
-            {"e": "resolved", "ts": round(now, 3), "winner": winner, "src": "gamma"},
-        )
-        resolved += 1
-        log_event("resolved", slug=header.get("slug") or slug, winner=winner)
+    plan = plan_resolves(now)
+    if plan["resolve_skipped_old"]:
+        log_event("resolve_give_up", count=plan["resolve_skipped_old"])
+    resolved = apply_resolves(session, plan["due"], now)
 
-    write_heartbeat("ok", markets=len(markets), sampled=sampled, resolved=resolved)
+    write_heartbeat(
+        "ok",
+        markets=len(markets),
+        sampled=sampled,
+        resolved=resolved,
+        pending=plan["pending"],
+        resolve_capped=plan["resolve_capped"],
+        resolve_skipped_old=plan["resolve_skipped_old"],
+    )
     return "ok"
 
 

@@ -975,7 +975,11 @@ script with a lock and a loop; it does not import the buy bots).
 
 Every ~1s, for each series (5m whole window; last 8 minutes of 15m; last 15
 minutes of hourly), REST `/book` both legs, append a JSON line with bid/ask
-**and size**. After expiry, stamp `winner` from Gamma.
+**and size**. Sampling **always runs before** resolve. After expiry, stamp
+`winner` from Gamma — at most 4 HTTP calls per cycle (newest `end_ts`
+first). Stubs older than 2 hours are remembered and skipped (Gamma never
+returns a winner for most dead files; hammering them used to stall the 1s
+loop for ~8–9 minutes). Do not JSON-parse every tick file every cycle.
 
 Kill switch: `touch STOP_PATHLOG` in the repo.
 

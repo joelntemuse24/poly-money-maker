@@ -3,7 +3,7 @@
 **Agents: read this after `AGENTS.md`.** Update this file when ops/strategy decisions change.
 Do not put secrets, API keys, or live wallet material here.
 
-Last updated: **2026-08-24** — **only the 5m CLOB bot is live.** It watches
+Last updated: **2026-08-25** — **only the 5m CLOB bot is live.** It watches
 the **current** 5m market (and a live hedge if we just bought). Polymarket’s
 positions API still returns hundreds of old 5m rows (`WAIT 666` was that
 list, not 666 live markets). The bot **throws those rows away** after
@@ -97,6 +97,25 @@ Legacy ticks without size still assume a full fill at the best ask.
 
 Recorder samples CLOB top-of-book ~1/s in the late window (whole 5m; last 8m of
 15m; last 15m of hourly). After expiry it stamps `winner` from Gamma.
+
+**2026-08-25 live bug:** `polypathlog` was **stubbing** 5m files (`open` + one
+tick, mtimes ~9–10 min apart, heartbeat `sampled: 2` / `resolved: 0`) even
+though `POLL_S = 1.0`. `run_cycle` JSON-parsed every `pathlog/ticks/*.jsonl`
+then called Gamma sequentially on ~2313 dead stubs (~8–9 min/cycle), so a
+5-minute market got at most one sample. Resolve is now **capped** at 4 Gamma
+calls/cycle (newest `end_ts` first), **gives up** after 2 hours without HTTP,
+and remembers resolved/give-up slugs in memory (first/last line only — do not
+full-parse 4k files every tick). Heartbeat adds `pending` /
+`resolve_capped` / `resolve_skipped_old`. **After merge, restart only
+`polypathlog` — not `polybuybot5m`:**
+
+```bash
+cd ~/poly-money-maker && git pull
+sudo systemctl restart polypathlog
+```
+
+A live 5m jsonl should then grow many ticks within one window (not 2 lines).
+Do **not** delete tick files.
 
 **Disk cap (small ~10GB VM):** keep ticks **14 days** and at most **400 MB**.
 Oldest JSONL is deleted first; files written in the last 2 minutes are skipped.
