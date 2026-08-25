@@ -373,3 +373,28 @@ def live_bag_log_fields(
     if order_error is not None:
         payload["order_error"] = str(order_error)[:200]
     return payload
+
+
+def hedge_oracle_allows_sell(held_leg, check, *, enabled=True):
+    """Once holding, do not sell while live BTC is still on the held side of PTB.
+
+    CLOB one-ticks and unreflective TOB are not a hedge if the resolution
+    oracle still says the held leg wins. Missing/stale oracle also blocks
+    the sell (fail closed against false hedges). A flipped or exactly-flat
+    oracle lets the book persist/dump path continue.
+    """
+    if not enabled:
+        return True, "oracle_off"
+    leg = str(held_leg or "").strip().lower()
+    if leg not in ("up", "down"):
+        return False, "oracle_bad_leg"
+    if not isinstance(check, dict):
+        return False, "oracle_unknown"
+    favored = check.get("favored")
+    if favored == leg:
+        return False, "oracle_still_winning"
+    if favored in ("up", "down") and favored != leg:
+        return True, "oracle_against"
+    if str(check.get("reason") or "") == "edge_zero":
+        return True, "oracle_flat"
+    return False, "oracle_unknown"

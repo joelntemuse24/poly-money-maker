@@ -70,6 +70,7 @@ from buy.hedge_gate import (
     evaluate_held_bag,
     hedge_fail_is_terminal,
     hedge_market_tick,
+    hedge_oracle_allows_sell,
     hedge_should_keep_retrying,
     hedge_tick_after_build_error,
     live_bag_log_fields,
@@ -216,6 +217,10 @@ _STRATEGY_DEFAULTS = {
     # After persist, a fade through 50 still sells (do not wait for 35¢).
     "hedge_sell_fade": True,
     "hedge_require_gui": True,
+    # Once holding: do not sell while Binance BTC is still on the held
+    # side of PTB. $0 = any non-zero tick. Missing/stale feed also holds.
+    "hedge_require_oracle": True,
+    "hedge_oracle_min_edge_usd": 0.0,
     # Outer look-ahead / poll horizon (minutes). Window 0 disables A or C.
     "buy_window_min": 20.0,
     "a22_window_min": 0.0,
@@ -416,7 +421,7 @@ def load_strategy():
             "hedge_ghost_sleep_s", "buy_grace_s", "buy_cooldown_s",
             "empty_fak_cooldown_s",
             "redeem_throttle_s", "max_redeem_age_days", "hedge_persist_s",
-            "a22_window_min", "c5_window_min",
+            "a22_window_min", "c5_window_min", "hedge_oracle_min_edge_usd",
         ):
             if float(cfg[key]) < 0:
                 raise ValueError(f"{key} must be non-negative")
@@ -459,6 +464,8 @@ HEDGE_TOXIC_BID_MAX = _strat["hedge_toxic_bid_max"]
 HEDGE_RECOVERY_CANCEL = _strat["hedge_recovery_cancel"]
 HEDGE_SELL_FADE = _strat["hedge_sell_fade"]
 HEDGE_REQUIRE_GUI = _strat["hedge_require_gui"]
+HEDGE_REQUIRE_ORACLE = _strat["hedge_require_oracle"]
+HEDGE_ORACLE_MIN_EDGE_USD = _strat["hedge_oracle_min_edge_usd"]
 BUY_WINDOW_MIN = _strat["buy_window_min"]
 A22_WINDOW_MIN = _strat["a22_window_min"]
 B15_WINDOW_MIN = _strat["b15_window_min"]
@@ -696,6 +703,40 @@ def log_buy_skip_throttled(skip_reason, condition_id, event="buy_skip", **kwargs
         for stale, _ts in sorted(_skip_log_mono.items(), key=lambda kv: kv[1])[:64]:
             _skip_log_mono.pop(stale, None)
     log_event(event, reason=reason, condition_id=condition_id, **kwargs)
+
+
+def hold_while_oracle_agrees(held_leg, start_ts, condition_id):
+    """True = do not sell; live BTC is still with the bag (or feed is unread)."""
+    if not HEDGE_REQUIRE_ORACLE:
+        return False
+    uchk = btc_feed.underlying_check(start_ts, float(HEDGE_ORACLE_MIN_EDGE_USD))
+    allow, why = hedge_oracle_allows_sell(held_leg, uchk, enabled=True)
+    if allow:
+        return False
+    _hedge_persist_armed.pop(condition_id, None)
+    _hedge_persist_done.discard(condition_id)
+    edge = uchk.get("edge_usd")
+    event = (
+        "hedge_skip_oracle_still_winning"
+        if why == "oracle_still_winning"
+        else "hedge_skip_oracle"
+    )
+    log_buy_skip_throttled(
+        why,
+        condition_id,
+        event=event,
+        leg=held_leg,
+        ptb=uchk.get("ptb"),
+        live_btc=uchk.get("live_btc"),
+        edge_usd=None if edge is None else round(float(edge), 2),
+        favored=uchk.get("favored"),
+        live_age_s=uchk.get("live_age_s"),
+        ptb_source=uchk.get("ptb_source"),
+        live_source=uchk.get("live_source"),
+        min_edge_usd=HEDGE_ORACLE_MIN_EDGE_USD,
+        feed=uchk.get("feed"),
+    )
+    return True
 
 
 def current_entry_bands(minutes_left):
@@ -3871,6 +3912,8 @@ while not _shutdown_requested:
         HEDGE_RECOVERY_CANCEL = _strat["hedge_recovery_cancel"]
         HEDGE_SELL_FADE = _strat["hedge_sell_fade"]
         HEDGE_REQUIRE_GUI = _strat["hedge_require_gui"]
+        HEDGE_REQUIRE_ORACLE = _strat["hedge_require_oracle"]
+        HEDGE_ORACLE_MIN_EDGE_USD = _strat["hedge_oracle_min_edge_usd"]
         BUY_WINDOW_MIN = _strat["buy_window_min"]
         A22_WINDOW_MIN = _strat["a22_window_min"]
         B15_WINDOW_MIN = _strat["b15_window_min"]
@@ -4701,7 +4744,18 @@ while not _shutdown_requested:
                 if held_size <= 0.01 or meta.get("hedge_closed"):
                     _hedge_persist_armed.pop(cond, None)
                     _hedge_persist_done.discard(cond)
-                if held_token and held_size > 0.01 and HEDGE_ENABLED and not meta.get("hedge_closed"):
+                hedge_open = (
+                    bool(held_token)
+                    and held_size > 0.01
+                    and HEDGE_ENABLED
+                    and not meta.get("hedge_closed")
+                )
+                # Oracle first: if live BTC is still on the held side of PTB,
+                # a one-tick CLOB dip is not a hedge. Missing/stale feed also
+                # holds (fail closed against false sells).
+                if hedge_open and hold_while_oracle_agrees(held_leg, m.start_ts, cond):
+                    hedge_open = False
+                if hedge_open:
                     # ANY live bag with held bid ≤ toxic (35¢) dumps at the live bid.
                     # Persist 5s @ 50/52, then sell at the live bid while < 53¢
                     # (including a fade through 50). Bid ≥ recovery_cancel (53¢)

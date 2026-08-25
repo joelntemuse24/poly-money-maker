@@ -8,6 +8,7 @@ from buy.hedge_gate import (
     clob_min_tick_from_error,
     evaluate_held_bag,
     hedge_market_tick,
+    hedge_oracle_allows_sell,
     hedge_persist_ready,
     hedge_should_keep_retrying,
     hedge_tick_after_build_error,
@@ -279,6 +280,53 @@ class HourlyHeldBag50Tests(unittest.TestCase):
                 sell_fade=False,
             )
         )
+
+
+class HedgeOracleAllowsSellTests(unittest.TestCase):
+    """Once holding, live BTC vs PTB vetoes CLOB-only false hedges."""
+
+    def test_still_winning_does_not_sell(self):
+        allow, why = hedge_oracle_allows_sell(
+            "up", {"ok": True, "favored": "up", "edge_usd": 12.0},
+        )
+        self.assertFalse(allow)
+        self.assertEqual(why, "oracle_still_winning")
+        allow, why = hedge_oracle_allows_sell(
+            "down", {"ok": True, "favored": "down", "edge_usd": -4.0},
+        )
+        self.assertFalse(allow)
+        self.assertEqual(why, "oracle_still_winning")
+
+    def test_flipped_oracle_allows_book_hedge(self):
+        allow, why = hedge_oracle_allows_sell(
+            "up", {"ok": True, "favored": "down", "edge_usd": -8.0},
+        )
+        self.assertTrue(allow)
+        self.assertEqual(why, "oracle_against")
+
+    def test_flat_allows_book_hedge(self):
+        allow, why = hedge_oracle_allows_sell(
+            "up", {"ok": False, "favored": None, "reason": "edge_zero"},
+        )
+        self.assertTrue(allow)
+        self.assertEqual(why, "oracle_flat")
+
+    def test_missing_or_stale_holds(self):
+        allow, why = hedge_oracle_allows_sell(
+            "up", {"ok": False, "favored": None, "reason": "live_stale"},
+        )
+        self.assertFalse(allow)
+        self.assertEqual(why, "oracle_unknown")
+        allow, why = hedge_oracle_allows_sell("up", None)
+        self.assertFalse(allow)
+        self.assertEqual(why, "oracle_unknown")
+
+    def test_disabled_passes_through(self):
+        allow, why = hedge_oracle_allows_sell(
+            "up", {"ok": True, "favored": "up"}, enabled=False,
+        )
+        self.assertTrue(allow)
+        self.assertEqual(why, "oracle_off")
 
 
 if __name__ == "__main__":

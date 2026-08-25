@@ -206,7 +206,7 @@ exceptions are the 5m early price bands (`buy/entry_skip.py` + `BUY_HORIZON_S`
 in **seconds**) and the hourly three-slice bands (`BUY_HORIZON_MIN` in
 **minutes**). 5m defaults: persist hedge 2s @ 70/72 (toxic 53¢), BTC gate
 $0, tick `0.001`. Hourly defaults: persist hedge **5s @ 50/52**, dump 35,
-recovery **53¢**, `hedge_sell_fade`, BTC gate $10, tick `0.01`, $10 market cap.
+recovery **53¢**, `hedge_sell_fade`, `hedge_require_oracle`, BTC gate $10, tick `0.01`, $10 market cap.
 
 15m/hourly windows are in **minutes** (`buy_window_min` / `a22_window_min`).
 Mixing the two without converting units has caused production `NameError`s.
@@ -843,7 +843,9 @@ still follows bid ≤ 53¢.
 pipeline. Hourly now shares `evaluate_held_bag` with 5m, but knobs are
 **not** a 5m rescale: persist **5s @ 50/52**, recovery **53¢** (do not
 sell 55–69), `sell_fade` so a post-persist fade through 50 still sells,
-dump ≤35.
+dump ≤35, and **`hedge_require_oracle`**: once holding, Binance vs PTB
+must have flipped (or gone flat) before any persist/dump sell. A one-tick
+CLOB dip while BTC is still on the held side is `hedge_skip_oracle_still_winning`.
 
 **Reconcile sells** with `reconcile_hedge_sold`: CLOB-confirmed sold size
 wins; a single low Data API read must not invent extra fills or erase

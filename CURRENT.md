@@ -10,10 +10,14 @@ market, **$10** cap, FAK limit **90¢**. Hedge is **persist 5s @ 50/52**
 the **live bid** while it is still **< 53¢** (no 2¢ undercut). A fade
 through 50 after persist still sells (`hedge_sell_fade`). Bid ≥ **53¢**
 (`hedge_recovery_cancel`) holds and clears persist — do **not** sell 55–69
-the way 5m sold 70–84. **Any live bag** dumps bid-only while bid ≤ **35¢**.
-Underlying edge stays **$10**. Tick **0.01**. Windows are **minutes**.
-Pause minting. Pathlog records all three series (hourly now samples the
-last **20 min**; 14-day / 400 MB cap).
+the way 5m sold 70–84. **Once holding, do not sell while live Binance BTC
+is still on the held side of PTB** (`hedge_require_oracle`) — a one-tick
+CLOB dip is not a hedge if the resolution oracle still agrees. Missing or
+stale BTC also holds. **Any live bag** dumps bid-only while bid ≤ **35¢**
+only after that oracle has flipped (or gone flat). Underlying *buy* edge
+stays **$10**. Tick **0.01**. Windows are **minutes**. Pause minting.
+Pathlog records all three series (hourly now samples the last **20 min**;
+14-day / 400 MB cap).
 
 **Why the 5m hedge disappointed:** the live 5m gate sometimes did what we
 wanted and often did not. Volatility made that worse, but the knobs also
@@ -62,8 +66,9 @@ Same-leg only. After `hedge_closed`, no re-buy. A/C slices are **off**
 | `a22_window_min` / `c5_window_min` | **0** = disabled |
 | Hedge qualify | bid ≤ **50¢**, ask ≤ **52¢**, spread ≤ 15¢, persist **5s** |
 | Hedge GUI | held ≤ **52¢**, other ≥ **48¢** (complement of ask-max). Buy 70/30 unchanged. Last print ≤ 52¢. |
-| Dump | **Any live bag** bid-only while held bid ≤ **35¢**. Wide 20/80 still dumps. |
+| Oracle while holding | Do **not** sell if live BTC is still on the held side of PTB (any non-zero tick). Missing/stale feed holds. `hedge_skip_oracle_still_winning` / `hedge_skip_oracle`. |
 | After persist | Sell at the live bid while **< 53¢**, including a fade through 50 (`hedge_sell_fade`). Bid ≥ **53¢** holds and clears persist. Do **not** sell 55–69. |
+| Dump | Bid-only ≤ **35¢** only after the oracle is against or flat. Wide 20/80 still dumps then. |
 | Execution | Sell at the **live bid**, undercut **0**. Unmatched 400 re-quotes; invalid-tick rebuilds at 0.01. Incomplete REST uses WS / last-good. |
 | Underlying edge | **$10** (Binance BTCUSDT vs PTB); side must match |
 | `max_open_positions` | **0 = unlimited** |
@@ -175,7 +180,7 @@ amount / HTTP 400), not this NameError.
   sudo systemctl stop polybuybot polybuybot5m
   sudo systemctl disable polybuybot polybuybot5m
   cd ~/poly-money-maker && git pull
-  python3 -c 'import json; from pathlib import Path; p=Path("strategy_buyhourly.json"); d=json.loads(p.read_text()); d["buy_window_min"]=20.0; d["a22_window_min"]=0.0; d["b15_window_min"]=20.0; d["c5_window_min"]=0.0; d["buy_threshold"]=0.75; d["buy_max_price"]=0.90; d["b15_buy_budget"]=10.0; d["market_spend_cap"]=10.0; d["buy_budget"]=10.0; d["buy_max_spend"]=11.0; d["buy_max_shares"]=14.0; d["hedge_threshold"]=0.50; d["hedge_require_ask_max"]=0.52; d["hedge_persist_s"]=5.0; d["hedge_toxic_bid_max"]=0.35; d["hedge_recovery_cancel"]=0.53; d["hedge_sell_fade"]=True; d["hedge_undercut_ticks"]=0; d["poll_buy_window_s"]=0.01; d["poll_held_s"]=0.01; p.write_text(json.dumps(d, indent=2)+"\n"); print("window", d["b15_window_min"], "hedge", d["hedge_threshold"], d["hedge_require_ask_max"], "persist", d["hedge_persist_s"], "dump", d["hedge_toxic_bid_max"], "recovery", d["hedge_recovery_cancel"], "fade", d["hedge_sell_fade"], "undercut", d["hedge_undercut_ticks"], "dry_run", d.get("dry_run"), "entry", d.get("entry_enabled"))'
+  python3 -c 'import json; from pathlib import Path; p=Path("strategy_buyhourly.json"); d=json.loads(p.read_text()); d["buy_window_min"]=20.0; d["a22_window_min"]=0.0; d["b15_window_min"]=20.0; d["c5_window_min"]=0.0; d["buy_threshold"]=0.75; d["buy_max_price"]=0.90; d["b15_buy_budget"]=10.0; d["market_spend_cap"]=10.0; d["buy_budget"]=10.0; d["buy_max_spend"]=11.0; d["buy_max_shares"]=14.0; d["hedge_threshold"]=0.50; d["hedge_require_ask_max"]=0.52; d["hedge_persist_s"]=5.0; d["hedge_toxic_bid_max"]=0.35; d["hedge_recovery_cancel"]=0.53; d["hedge_sell_fade"]=True; d["hedge_require_oracle"]=True; d["hedge_oracle_min_edge_usd"]=0.0; d["hedge_undercut_ticks"]=0; d["poll_buy_window_s"]=0.01; d["poll_held_s"]=0.01; p.write_text(json.dumps(d, indent=2)+"\n"); print("window", d["b15_window_min"], "hedge", d["hedge_threshold"], d["hedge_require_ask_max"], "persist", d["hedge_persist_s"], "dump", d["hedge_toxic_bid_max"], "recovery", d["hedge_recovery_cancel"], "fade", d["hedge_sell_fade"], "oracle", d["hedge_require_oracle"], "undercut", d["hedge_undercut_ticks"], "dry_run", d.get("dry_run"), "entry", d.get("entry_enabled"))'
   sudo systemctl restart polypathlog
   sudo systemctl start polybuybothourly
   sudo systemctl enable polybuybothourly
@@ -256,9 +261,11 @@ amount / HTTP 400), not this NameError.
       hedge at 50. A/C slices off. 5m hedge complaint (fired on winners,
       missed dumps, sold 70–84) is **not** copied: persist **5s**,
       recovery **53¢**, `hedge_sell_fade` so a post-persist fade through
-      50 still sells. Execution still uses `evaluate_held_bag` (undercut 0,
-      dump any bag ≤35, unmatched/tick retry). After merge: `git pull`,
-      patch live `strategy_buyhourly.json`, stop 5m, start hourly,
+      50 still sells, and **`hedge_require_oracle`**: once holding, do not
+      sell while live BTC is still on the held side of PTB (or the feed is
+      missing/stale). Execution still uses `evaluate_held_bag` (undercut 0,
+      dump ≤35 after oracle against/flat, unmatched/tick retry). After merge:
+      `git pull`, patch live `strategy_buyhourly.json`, stop 5m, start hourly,
       restart pathlog. Confirm `dry_run` / `entry_enabled`.
 - [ ] Cloud paper P&L: paste `CLOUD_RESEARCH.md` section 2. Score
       `--series hourly --template strategy_buyhourly.example.json --paper`.
