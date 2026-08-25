@@ -472,7 +472,21 @@ class SweepTemplateTests(unittest.TestCase):
         self.assertEqual(tmpl["hedge_other_gui_min"], 0.28)
         self.assertFalse(tmpl["require_gui_reversed"])
 
-    def test_template_15m_example_stays_buy_max_price(self):
+    def test_template_reads_hourly_example(self):
+        tmpl = template_from_strategy(
+            Path(__file__).resolve().parents[1] / "strategy_buyhourly.example.json"
+        )
+        self.assertEqual(tmpl["ask_min"], 0.75)
+        self.assertEqual(tmpl["ask_max"], 0.90)
+        self.assertEqual(tmpl["ttm_max"], 20.0 * 60.0)
+        self.assertEqual(tmpl["budget"], 10.0)
+        self.assertEqual(tmpl["hedge_threshold"], 0.50)
+        self.assertEqual(tmpl["hedge_require_ask_max"], 0.52)
+        self.assertEqual(tmpl["hedge_toxic_bid_max"], 0.35)
+        self.assertEqual(tmpl["hedge_persist_s"], 2.0)
+        self.assertEqual(tmpl["hedge_held_gui_max"], 0.52)
+        self.assertEqual(tmpl["hedge_other_gui_min"], 0.48)
+        self.assertFalse(tmpl["require_gui_reversed"])
         tmpl = template_from_strategy(
             Path(__file__).resolve().parents[1] / "strategy_buy.example.json"
         )

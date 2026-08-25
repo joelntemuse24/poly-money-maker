@@ -493,15 +493,18 @@ def applicable_hourly_entry_bands(
 ) -> List[EntryBand]:
     """Open hourly bands at this TTM (minutes). Inclusive ``0 < ttm <= window``.
 
-    Slice A (last 22 min): ask **> 0.93**. FAK limit **99¢**. Cap **$5**.
-    When slice C is also open, A only matches **> 0.93 and ≤ 0.95** so a
-    >95¢ print in the last 5 min uses C, not A.
+    A window ``<= 0`` disables that slice. Live hourly is **B only**: last
+    **20 min**, ask **75–90¢ inclusive**, FAK **90¢**. A (last 22, >93) and
+    C (last 5, >95) stay in the helper for tests / re-enable.
 
-    Slice B (last 15 min): ask **75–90¢ inclusive**. FAK limit **90¢**.
-    Spend remaining to the $10 market cap ($10 if flat, $5 if $5 already in).
+    Slice A (last 22 min when ``a22_window_min > 0``): ask **> 0.93**. FAK
+    limit **99¢**. Cap **$5**. When slice C is also open, A only matches
+    **> 0.93 and ≤ 0.95** so a >95¢ print in the last 5 min uses C, not A.
 
-    Slice C (last 5 min): ask **> 0.95**. FAK limit **99¢**. Same remaining-
-    to-$10 rule as B. Does not buy 75–90 (B still covers that in the last 5).
+    Slice B: ask **75–90¢ inclusive**. FAK limit **90¢**. Spend remaining to
+    the $10 market cap.
+
+    Slice C (when ``c5_window_min > 0``): ask **> 0.95**. FAK limit **99¢**.
     """
     try:
         ttm = float(minutes_left)
@@ -513,9 +516,10 @@ def applicable_hourly_entry_bands(
     if ttm <= 0:
         return []
     bands: List[EntryBand] = []
-    a22_open = ttm <= a22_w + 1e-12
-    b15_open = ttm <= b15_w + 1e-12
-    c5_open = ttm <= c5_w + 1e-12
+    # Window ≤ 0 disables that slice (live hourly: A/C off, B last 20 min 75–90).
+    a22_open = a22_w > 0 and ttm <= a22_w + 1e-12
+    b15_open = b15_w > 0 and ttm <= b15_w + 1e-12
+    c5_open = c5_w > 0 and ttm <= c5_w + 1e-12
     if b15_open:
         bands.append(EntryBand(
             float(b15_min), float(b15_max), False, HOURLY_SLICE_B, float(b15_max),

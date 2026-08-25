@@ -451,6 +451,8 @@ def template_from_strategy(path: Path) -> dict:
     spread = data.get("max_entry_spread")
     ask_max = float(data.get("hedge_require_ask_max") or 0.40)
     five_m = data.get("buy_start_s") is not None
+    hourly = data.get("b15_window_min") is not None
+    ask_max_gui = five_m or hourly
     return {
         "ask_min": float(data["buy_threshold"]),
         # 5m last-120s cap is buy_max_price (0.90). early_buy_max_price 0.99
@@ -473,13 +475,13 @@ def template_from_strategy(path: Path) -> dict:
         "min_bid_edge": float(data.get("min_bid_edge") or 0.05),
         "last_trade_max": ask_max,
         "toxic_force_exit_below": float(data.get("toxic_force_exit_below") or 0.65),
-        # 5m live: held GUI ≤ ask-max, other ≥ complement, no other>held.
-        # 15m/hourly paper keeps inverted buy 70/30.
-        "hedge_held_gui_max": ask_max if five_m else float(data.get("max_loser_bid") or 0.30),
+        # 5m and hourly: held GUI ≤ ask-max, other ≥ complement, no other>held.
+        # 15m paper keeps inverted buy 70/30.
+        "hedge_held_gui_max": ask_max if ask_max_gui else float(data.get("max_loser_bid") or 0.30),
         "hedge_other_gui_min": (
-            round(1.0 - ask_max, 4) if five_m else float(data.get("min_winner_bid") or 0.70)
+            round(1.0 - ask_max, 4) if ask_max_gui else float(data.get("min_winner_bid") or 0.70)
         ),
-        "require_gui_reversed": not five_m,
+        "require_gui_reversed": not ask_max_gui,
         "hedge_persist_s": float(data.get("hedge_persist_s") or 0.0),
         "hedge_drop_from_fill": (
             None

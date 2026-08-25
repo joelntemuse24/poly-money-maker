@@ -1,7 +1,9 @@
 """CURRENT 5m rails — today's live bugs must fail before the fix and pass after.
 
 22 Aug 2026 (Europe/Dublin): 09:35 / 11:20 / 11:25 bags expired instead of
-dumping. These cases are the spec. No 75/50 or 65/50 invention.
+dumping. These cases are the spec. 5m stays persist 70/72 + dump 53.
+Hourly (this change) is last-20m 75–90 with persist 50/52 + dump 35.
+
 
 22 Aug 16:08 UTC: polybuybot5m crashed twice in the 12:05 ET window —
 ``TypeError: log_buy_skip_throttled() got multiple values for argument 'reason'``
@@ -37,9 +39,9 @@ from buy.market import (
     slug_window_end_ts,
 )
 try:
-    from tests.test_buy_fill_shapes import BOT5M, _load_funcs
+    from tests.test_buy_fill_shapes import BOT5M, BOT_HR, _load_funcs
 except ImportError:
-    from test_buy_fill_shapes import BOT5M, _load_funcs
+    from test_buy_fill_shapes import BOT5M, BOT_HR, _load_funcs
 
 
 def _band(ttm, ask):
@@ -549,6 +551,26 @@ class BotWiresCurrentRails(unittest.TestCase):
         self.assertIn("persist_done=", src)
         self.assertIn("market_tick=", src)
         self.assertIn("max_retries=12 if dump", src)
+        self.assertNotIn(
+            "seconds_left = (end_ts_ms - now_ms) / 1000",
+            src,
+        )
+
+    def test_hourly_uses_persist_50_52_and_dump_helpers(self):
+        src = BOT_HR.read_text()
+        self.assertIn("evaluate_held_bag(", src)
+        self.assertIn("hedge_skip_recovery", src)
+        self.assertIn("HEDGE_RECOVERY_CANCEL", src)
+        self.assertIn("pick_held_quote(", src)
+        self.assertIn("hedge_fail_is_terminal(", src)
+        self.assertIn("dump=dump", src)
+        self.assertIn("persist_done=", src)
+        self.assertIn("market_tick=", src)
+        self.assertIn("max_retries=12 if dump", src)
+        self.assertIn('"hedge_threshold": 0.50', src)
+        self.assertIn('"hedge_require_ask_max": 0.52', src)
+        self.assertIn('"b15_window_min": 20.0', src)
+        self.assertIn('"a22_window_min": 0.0', src)
         self.assertNotIn(
             "seconds_left = (end_ts_ms - now_ms) / 1000",
             src,

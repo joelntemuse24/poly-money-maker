@@ -551,6 +551,46 @@ class HourlyThreeSliceTests(unittest.TestCase):
         self.assertEqual(why, "buy_uncertain")
 
 
+class HourlyLive20MinTests(unittest.TestCase):
+    """Live hourly: A/C off, B last 20 min 75–90 only."""
+
+    def _bands(self, minutes_left):
+        return applicable_hourly_entry_bands(
+            minutes_left,
+            a22_window_min=0.0,
+            b15_window_min=20.0,
+            c5_window_min=0.0,
+        )
+
+    def _pick(self, minutes_left, ask):
+        return select_hourly_entry_band(ask, self._bands(minutes_left))
+
+    def test_ttm_20_opens_b_only(self):
+        names = [b.name for b in self._bands(20)]
+        self.assertEqual(names, ["b15"])
+        b = self._pick(20, 0.75)
+        self.assertIsNotNone(b)
+        self.assertEqual(b.name, "b15")
+        self.assertAlmostEqual(b.fak_limit, 0.90)
+        self.assertEqual(self._pick(20, 0.90).name, "b15")
+        self.assertIsNone(self._pick(20, 0.74))
+        self.assertIsNone(self._pick(20, 0.91))
+        self.assertIsNone(self._pick(20, 0.96))
+
+    def test_ttm_above_20_is_closed(self):
+        self.assertEqual(self._bands(20.001), [])
+        self.assertIsNone(self._pick(21, 0.88))
+        self.assertIsNone(self._pick(22, 0.96))
+
+    def test_last_5_does_not_buy_high_asks(self):
+        self.assertEqual(self._pick(5, 0.88).name, "b15")
+        self.assertIsNone(self._pick(5, 0.96))
+        self.assertIsNone(self._pick(4, 0.94))
+
+    def test_horizon_is_20_when_a_and_c_off(self):
+        self.assertEqual(hourly_horizon_min(0, 20, 0, 20), 20.0)
+
+
 class SkipSummarizeTests(unittest.TestCase):
     def test_reason_from_legacy_event_name(self):
         self.assertEqual(

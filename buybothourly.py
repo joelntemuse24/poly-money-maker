@@ -66,6 +66,16 @@ from buy.entry_skip import (
     uncertain_buy_spend_cap,
     window_no_buy_reason,
 )
+from buy.hedge_gate import (
+    evaluate_held_bag,
+    hedge_fail_is_terminal,
+    hedge_market_tick,
+    hedge_should_keep_retrying,
+    hedge_tick_after_build_error,
+    live_bag_log_fields,
+    pick_held_quote,
+    should_mark_hedge_closed,
+)
 
 
 class ImmediateResponseClobClient(ClobClient):
@@ -156,9 +166,10 @@ _STRATEGY_DEFAULTS = {
     # Explicit hot-reloadable entry arm. A missing/invalid file disables new
     # entries while existing positions continue through the hedge path.
     "entry_enabled": False,
-    # Three slices, $10 hard cap per market (sum of fills). Slice A never
-    # spends more than $5. B/C spend remaining to $10. buy_max_price is the
-    # 75–90¢ (B) cap and FAK limit; high_buy_max_price is the 99¢ A/C limit.
+    # Live hourly is one slice: last 20 min, 75–90¢, $10 cap. A/C windows
+    # 0 = disabled (helper still supports 22/15/5 if re-enabled). buy_max_price
+    # is the 75–90¢ cap and FAK limit; high_buy_max_price is unused while A/C
+    # are off.
     "buy_threshold": 0.75,
     "buy_max_price": 0.90,
     "high_buy_max_price": 0.99,
@@ -177,12 +188,14 @@ _STRATEGY_DEFAULTS = {
     # Must be <= buy_threshold (validator); 65¢ ≈ walk well below the 75¢ floor.
     "toxic_force_exit_below": 0.65,
     "hedge_enabled": True,
-    "hedge_threshold": 0.55,
-    # Kept in config (live JSON still sends it). Not a FAK floor: after 55/60
-    # integrity, the sell follows the live bid so a 20¢ print is not $0.
+    # Persist 2s @ 50/52 then sell at the live bid. Instant 50 dumped
+    # winners the same way instant 70 did on 5m. Undercut 2 on a 0.01
+    # tick was 0 hedge fills (21 Aug).
+    "hedge_threshold": 0.50,
+    # Kept in config (live JSON still sends it). Not a FAK floor: after 50/52
+    # persist, the sell follows the live bid so a 20¢ print is not $0.
     "hedge_min_price": 0.32,
-    # Undercut top bid by N ticks so FAK crosses a falling book during order RTT.
-    "hedge_undercut_ticks": 2,
+    "hedge_undercut_ticks": 0,
     # Skip extra REST bounce confirm when WS/cache quote is this fresh (seconds).
     "hedge_quote_max_age_s": 0.25,
     "hedge_retry_sleep_s": 0.05,
@@ -192,13 +205,18 @@ _STRATEGY_DEFAULTS = {
     # Hedge: penny bids under a still-high ask are fake — require a tight book
     # and ask also collapsed (same lesson sell-side already learned on mids).
     "hedge_max_spread": 0.15,
-    "hedge_require_ask_max": 0.60,
+    "hedge_require_ask_max": 0.52,
+    "hedge_persist_s": 2.0,
+    "hedge_toxic_bid_max": 0.35,
+    # After persist_done, bid ≥ this is a recovered winner: HOLD and clear.
+    # 50–69 still sells at the live bid. Do not sell a 75–90 rally.
+    "hedge_recovery_cancel": 0.70,
     "hedge_require_gui": True,
-    # Outer look-ahead / poll horizon (minutes). Slice windows below.
-    "buy_window_min": 22.0,
-    "a22_window_min": 22.0,
-    "b15_window_min": 15.0,
-    "c5_window_min": 5.0,
+    # Outer look-ahead / poll horizon (minutes). Window 0 disables A or C.
+    "buy_window_min": 20.0,
+    "a22_window_min": 0.0,
+    "b15_window_min": 20.0,
+    "c5_window_min": 0.0,
     "a22_min_price": 0.93,
     "c5_min_price": 0.95,
     "a22_buy_budget": 5.0,
@@ -208,8 +226,8 @@ _STRATEGY_DEFAULTS = {
     "buy_grace_s": 1,
     "buy_cooldown_s": 1,
     "empty_fak_cooldown_s": 0.15,
-    # Legacy alias for slice A ($5). Named a22/b15/c5 budgets are the source of truth.
-    "buy_budget": 5.0,
+    # Legacy alias. Named b15 budget is the $10 75–90 slice.
+    "buy_budget": 10.0,
     # Per-FAK ceiling (5m analog: $3 on a $2.50 slice). Market cap is
     # market_spend_cap $10; A is additionally capped at $5.
     "buy_max_spend": 11.0,
@@ -302,12 +320,17 @@ def load_strategy():
             raise ValueError(
                 "hourly floors must satisfy buy_max < a22_min < c5_min < high_max <= 1"
             )
-        if float(cfg["c5_window_min"]) <= 0:
-            raise ValueError("c5_window_min must be > 0")
-        if float(cfg["b15_window_min"]) + 1e-12 < float(cfg["c5_window_min"]):
-            raise ValueError("b15_window_min must be >= c5_window_min")
-        if float(cfg["a22_window_min"]) + 1e-12 < float(cfg["b15_window_min"]):
-            raise ValueError("a22_window_min must be >= b15_window_min")
+        a22_w = float(cfg["a22_window_min"])
+        b15_w = float(cfg["b15_window_min"])
+        c5_w = float(cfg["c5_window_min"])
+        if min(a22_w, b15_w, c5_w) < 0:
+            raise ValueError("hourly slice windows must be >= 0 (0 = disabled)")
+        if max(a22_w, b15_w, c5_w, float(cfg["buy_window_min"])) <= 0:
+            raise ValueError("at least one hourly window must be > 0")
+        if c5_w > 0 and b15_w + 1e-12 < c5_w:
+            raise ValueError("b15_window_min must be >= c5_window_min when C is on")
+        if a22_w > 0 and b15_w > 0 and a22_w + 1e-12 < b15_w:
+            raise ValueError("a22_window_min must be >= b15_window_min when both are on")
         if not (0 < cfg["toxic_force_exit_below"] <= cfg["buy_threshold"]):
             raise ValueError("toxic_force_exit_below must satisfy 0 < below <= buy_threshold")
         if not (0 <= cfg["hedge_min_price"] <= cfg["hedge_threshold"] <= 1):
@@ -321,11 +344,25 @@ def load_strategy():
             "min_winner_bid", "max_loser_bid", "min_bid_edge",
             "max_entry_spread", "hedge_max_spread", "hedge_require_ask_max",
             "high_buy_max_price", "a22_min_price", "c5_min_price",
+            "hedge_toxic_bid_max", "hedge_recovery_cancel",
         ):
             if not 0 <= float(cfg[key]) <= 1:
                 raise ValueError(f"{key} must be between 0 and 1")
         if float(cfg["hedge_require_ask_max"]) < float(cfg["hedge_threshold"]):
             raise ValueError("hedge_require_ask_max must be >= hedge_threshold")
+        if not (0 < float(cfg["hedge_toxic_bid_max"]) <= 1):
+            raise ValueError("hedge_toxic_bid_max must satisfy 0 < max <= 1")
+        if float(cfg["hedge_toxic_bid_max"]) > float(cfg["hedge_threshold"]) + 1e-12:
+            raise ValueError("hedge_toxic_bid_max must be <= hedge_threshold")
+        if not (
+            float(cfg["hedge_toxic_bid_max"])
+            < float(cfg["hedge_threshold"])
+            <= float(cfg["hedge_recovery_cancel"])
+            <= 1
+        ):
+            raise ValueError(
+                "hedge_recovery_cancel must satisfy dump < qualify <= recovery_cancel <= 1"
+            )
         if str(cfg["tick_size"]) not in {
             "0.1", "0.01", "0.005", "0.0025", "0.001", "0.0001",
         }:
@@ -345,8 +382,7 @@ def load_strategy():
             "market_spend_cap", "buy_max_spend", "buy_max_shares",
             "max_open_notional", "max_daily_notional", "poll_buy_window_s",
             "poll_held_s", "positions_refresh_s", "balance_refresh_s",
-            "buy_window_min", "a22_window_min", "b15_window_min",
-            "c5_window_min", "ui_every_n_cycles",
+            "buy_window_min", "b15_window_min", "ui_every_n_cycles",
         ):
             if float(cfg[key]) <= 0:
                 raise ValueError(f"{key} must be positive")
@@ -375,7 +411,8 @@ def load_strategy():
             "hedge_quote_max_age_s", "hedge_retry_sleep_s",
             "hedge_ghost_sleep_s", "buy_grace_s", "buy_cooldown_s",
             "empty_fak_cooldown_s",
-            "redeem_throttle_s", "max_redeem_age_days",
+            "redeem_throttle_s", "max_redeem_age_days", "hedge_persist_s",
+            "a22_window_min", "c5_window_min",
         ):
             if float(cfg[key]) < 0:
                 raise ValueError(f"{key} must be non-negative")
@@ -413,6 +450,9 @@ HEDGE_GHOST_SLEEP_S = _strat["hedge_ghost_sleep_s"]
 MAX_ENTRY_SPREAD = _strat["max_entry_spread"]
 HEDGE_MAX_SPREAD = _strat["hedge_max_spread"]
 HEDGE_REQUIRE_ASK_MAX = _strat["hedge_require_ask_max"]
+HEDGE_PERSIST_S = _strat["hedge_persist_s"]
+HEDGE_TOXIC_BID_MAX = _strat["hedge_toxic_bid_max"]
+HEDGE_RECOVERY_CANCEL = _strat["hedge_recovery_cancel"]
 HEDGE_REQUIRE_GUI = _strat["hedge_require_gui"]
 BUY_WINDOW_MIN = _strat["buy_window_min"]
 A22_WINDOW_MIN = _strat["a22_window_min"]
@@ -626,6 +666,9 @@ def log_event(event, **kwargs):
 _SKIP_LOG_EVERY_S = 8.0
 _skip_log_mono = {}
 _buy_window_logged = {}
+_hedge_persist_armed = {}
+_hedge_persist_done = set()
+_last_good_held_quote = {}
 
 
 def log_buy_skip_throttled(skip_reason, condition_id, event="buy_skip", **kwargs):
@@ -651,7 +694,7 @@ def log_buy_skip_throttled(skip_reason, condition_id, event="buy_skip", **kwargs
 
 
 def current_entry_bands(minutes_left):
-    """Open hourly buy bands at this TTM (A >93, B 75–90, C >95)."""
+    """Open hourly buy bands at this TTM (live: B 75–90 last 20 min)."""
     return applicable_hourly_entry_bands(
         minutes_left,
         a22_window_min=A22_WINDOW_MIN,
@@ -1396,16 +1439,34 @@ def look_last_trade(token_id):
     return get_book_snapshot_last_trade(token_id)
 
 
-def hedge_sell_price(bid, tick_size, undercut_ticks, min_price=None):
-    """FAK sell at the live bid (undercut, tick-aligned).
+def remember_held_quote(token_id, bid, ask):
+    if token_id is None or bid is None:
+        return
+    _last_good_held_quote[str(token_id)] = (bid, ask)
 
-    After 55/60 integrity, take whatever bid is there. min_price is ignored so
+
+def last_good_held_quote(token_id):
+    rec = _last_good_held_quote.get(str(token_id or ""))
+    if not rec:
+        return None, None
+    return rec[0], rec[1]
+
+
+def hedge_exec_tick(tick_size):
+    """CLOB tick for this hedge FAK. Honor a coarser market minimum."""
+    return hedge_market_tick(tick_size, EXPECTED_TICK_SIZE)
+
+
+def hedge_sell_price(bid, tick_size, undercut_ticks, min_price=None):
+    """FAK sell at the live bid (tick-aligned).
+
+    After 50/52 persist, take whatever bid is there. min_price is ignored so
     a leftover 32¢ config cannot refuse a 20¢ or 1¢ print. One tick is only
-    the exchange minimum, not a strategy floor.
+    the exchange minimum, not a strategy floor. Hourly posts at the bid
+    (undercut 0): a 2¢ undercut on a 0.01 tick never sat on the bid
+    (live 5m 21 Aug: 0 hedge fills).
     """
-    tick = float(tick_size or TICK_SIZE_FALLBACK)
-    if tick <= 0:
-        tick = 0.01
+    tick = hedge_exec_tick(tick_size)
     undercut = max(0, int(undercut_ticks)) * tick
     raw = float(bid or 0) - undercut
     aligned = (int(raw / tick + 1e-12)) * tick
@@ -1536,6 +1597,19 @@ def toxic_dump_book_ok(bid, threshold):
     return bid <= threshold + 1e-12
 
 
+def hedge_gui_limits(require_ask_max):
+    """Held display cap is ask-max; other-leg floor is the cash complement.
+
+    A 48/51 held book has mid ~50¢. Buy-style 30/70 would wait until the
+    website already shows a loser, which is after the 50¢ bid is gone.
+    Hourly live: ask-max 52¢ → held GUI ≤ 52¢, other GUI ≥ 48¢.
+    """
+    ask_max = finite_float(require_ask_max, minimum=0, maximum=1)
+    if ask_max is None:
+        return None, None
+    return ask_max, round(1.0 - ask_max, 4)
+
+
 def hedge_consensus_ok(
     held_bid, held_ask, held_last,
     other_bid, other_ask, other_last,
@@ -1545,12 +1619,12 @@ def hedge_consensus_ok(
     min_edge,
     last_trade_max,
 ):
-    """True only when website-style prices say the held side actually lost.
+    """True when display prices agree with the configured hedge book.
 
-    A 32/38 clip can be a random TOB. Buy already uses Polymarket display
-    (mid if spread ≤ 10¢ else last trade) plus 70/30. Hedge inverts that,
-    and also requires a last print on the held token ≤ last_trade_max so a
-    spoofed tight book cannot manufacture a 35¢ mid while last trade is 85¢.
+    Buy still uses 70/30. Hourly hedge uses ``hedge_gui_limits`` (held ≤
+    ask-max, other ≥ complement) and does **not** require the other GUI
+    to already be higher than held. A 50¢ vs 48¢ book is the stop.
+    Last print on the held token still must be ≤ last_trade_max.
     """
     held_last = finite_float(held_last, minimum=0, maximum=1)
     last_trade_max = finite_float(last_trade_max, minimum=0, maximum=1)
@@ -1573,8 +1647,6 @@ def hedge_consensus_ok(
         return False, "held_gui_too_high"
     if other_gui + 1e-12 < other_gui_min:
         return False, "other_gui_too_low"
-    if other_gui <= held_gui:
-        return False, "gui_not_reversed"
     return True, "ok"
 
 
@@ -3006,21 +3078,56 @@ def sell_market_with_retry(
     on_fill=None,
     condition_id=None,
     initial_quote=None,
+    dump=False,
+    persist_done=False,
+    market_tick=None,
 ):
     """Sell `size` shares via FAK. Used for hedge exits only — no max_price cap.
 
-    Each retry force-REST refreshes the full book and re-runs two-sided integrity
-    when require_ask_max/max_spread are set. Incomplete REST fails closed (no WS
-    fallback). `price` is the worst (lowest) price we will accept.
+    Dump (bid ≤ toxic) and persist-done sells are bid-only: incomplete REST
+    reuses WS/last-good, unmatched / invalid-tick retries down the live bid.
+    After persist, a 50–69¢ live bid is a correct fill (do not clamp to 52).
+    Bid ≥ hedge_recovery_cancel (70¢) must abort — do not POST a 75–90 rally.
+    `hedge_min_price` is not a floor.
 
     Returns (total_sold, result, proceeds) where result["bot_status"] is
     filled|empty|ambiguous|persist_fail|dry. Unknown POST outcomes stop retries.
+    Empty after rejected FAKs is **not** terminal while size remains and the
+    dump/persist still qualifies — the loop must retry next tick.
     """
     total_sold = 0.0
     total_proceeds = 0.0
     remaining = float(size)
-    floor = float(min_price) if min_price is not None else float(tick_size)
+    tick_size = str(hedge_exec_tick(market_tick if market_tick not in (None, "") else tick_size))
+    floor = float(tick_size)
     last_limit = float(price_limit) if price_limit is not None else floor
+    dump = bool(dump)
+    persist_done = bool(persist_done)
+    need_integrity = (
+        (not dump)
+        and (not persist_done)
+        and require_ask_max is not None
+        and max_spread is not None
+        and abort_above is not None
+    )
+    try:
+        dump_bid_max = float(HEDGE_TOXIC_BID_MAX)
+    except (NameError, TypeError, ValueError):
+        dump_bid_max = 0.35
+    try:
+        qualify_bid = float(HEDGE_THRESHOLD)
+    except (NameError, TypeError, ValueError):
+        qualify_bid = 0.50
+    try:
+        recovery_cancel = float(HEDGE_RECOVERY_CANCEL)
+    except (NameError, TypeError, ValueError):
+        recovery_cancel = 0.70
+    if dump and abort_above is None:
+        abort_above = dump_bid_max
+    if persist_done and not dump:
+        need_integrity = False
+        if abort_above is None:
+            abort_above = recovery_cancel
     start_bal = check_clob_token_balance(token_id, refresh=False)
     if DRY_RUN:
         price = hedge_sell_price(price_limit, tick_size, undercut_ticks, floor)
@@ -3028,17 +3135,24 @@ def sell_market_with_retry(
         log_event("dry_sell", token_id=token_id, size=remaining, price_limit=price)
         return 0, {"bot_status": "dry", "last_limit": price}, 0.0
     fee_schedule = None
+    last_bid = price_limit
+    last_ask = None
+    if initial_quote is not None:
+        try:
+            last_bid, last_ask = initial_quote
+        except (TypeError, ValueError):
+            last_bid, last_ask = price_limit, None
     for attempt in range(max_retries):
         if remaining < 0.01:
             break
-        live_bid = price_limit
-        live_ask = None
+        live_bid = last_bid
+        live_ask = last_ask
         if attempt == 0 and initial_quote is not None:
             try:
                 live_bid, live_ask = initial_quote
             except (TypeError, ValueError):
                 live_bid, live_ask = None, None
-            if require_ask_max is not None and max_spread is not None and abort_above is not None:
+            if need_integrity:
                 ok, why = hedge_book_ok(
                     live_bid, live_ask, abort_above, max_spread, require_ask_max,
                 )
@@ -3059,19 +3173,28 @@ def sell_market_with_retry(
                 force_rest=True,
                 expected_condition_id=condition_id,
             )
+            if qb is None and live_bid is None:
+                live_bid = price_limit
+            if qb is not None:
+                live_bid = qb
+            if qa is not None:
+                live_ask = qa
             if qb is None or qa is None:
                 log_event(
                     "hedge_retry_incomplete_rest",
                     token_id=token_id,
-                    live_bid=qb,
-                    live_ask=qa,
+                    live_bid=live_bid,
+                    live_ask=live_ask,
                     attempt=attempt + 1,
                     sold_so_far=total_sold,
+                    used_last_good=True,
+                    dump=dump,
+                    persist_done=persist_done,
                 )
-                console.print("  [dim][CANCEL][/] hedge retry abort — incomplete REST book")
-                break
-            live_bid, live_ask = qb, qa
-            if require_ask_max is not None and max_spread is not None and abort_above is not None:
+                if live_bid is None and not (dump or persist_done):
+                    console.print("  [dim][CANCEL][/] hedge retry abort — incomplete REST book")
+                    break
+            if need_integrity:
                 ok, why = hedge_book_ok(
                     live_bid, live_ask, abort_above, max_spread, require_ask_max,
                 )
@@ -3090,18 +3213,48 @@ def sell_market_with_retry(
                         f"bid={live_bid:.3f} ask={live_ask:.3f}"
                     )
                     break
-        if abort_above is not None and live_bid is not None and live_bid > float(abort_above):
+        if live_bid is None:
+            live_bid = last_bid if last_bid is not None else price_limit
+        last_bid = live_bid
+        last_ask = live_ask
+        if abort_above is not None and live_bid is not None:
+            cap = float(abort_above)
+            bounced = (
+                live_bid + 1e-12 >= cap
+                if persist_done and not dump
+                else live_bid > cap
+            )
+            if bounced:
+                log_event(
+                    "hedge_retry_abort_bounce",
+                    token_id=token_id,
+                    live_bid=live_bid,
+                    live_ask=live_ask,
+                    abort_above=abort_above,
+                    attempt=attempt + 1,
+                    sold_so_far=total_sold,
+                )
+                console.print(
+                    f"  [dim][CANCEL][/] hedge retry abort — bid recovered to "
+                    f"{live_bid:.3f} vs {cap:.3f}"
+                )
+                break
+        if (
+            persist_done
+            and (not dump)
+            and live_bid is not None
+            and dump_bid_max < float(live_bid) < qualify_bid - 1e-12
+        ):
             log_event(
-                "hedge_retry_abort_bounce",
+                "hedge_retry_abort_dead_band",
                 token_id=token_id,
                 live_bid=live_bid,
                 live_ask=live_ask,
-                abort_above=abort_above,
                 attempt=attempt + 1,
                 sold_so_far=total_sold,
             )
             console.print(
-                f"  [dim][CANCEL][/] hedge retry abort — bid recovered to {live_bid:.3f} > {float(abort_above):.3f}"
+                f"  [dim][CANCEL][/] hedge retry abort — dead band {live_bid:.3f}"
             )
             break
         price = hedge_sell_price(live_bid, tick_size, undercut_ticks, floor)
@@ -3129,10 +3282,30 @@ def sell_market_with_retry(
                 "timestamp": str(signed_order.timestamp),
             }
         except Exception as e:
+            next_tick = hedge_tick_after_build_error(tick_size, e)
+            if next_tick is not None:
+                log_event(
+                    "hedge_tick_retry",
+                    token_id=token_id,
+                    from_tick=tick_size,
+                    to_tick=next_tick,
+                    error=str(e)[:200],
+                    attempt=attempt + 1,
+                    via="create_market_order",
+                )
+                tick_size = str(next_tick)
+                floor = float(next_tick)
+                cache = globals().get("_tick_size_cache")
+                if isinstance(cache, dict) and token_id:
+                    cache[token_id] = tick_size
+                continue
             log_event(
                 "sell_build_rejected", token_id=token_id,
                 error=str(e)[:200], attempt=attempt + 1,
             )
+            if dump or persist_done:
+                time.sleep(float(retry_sleep_s))
+                continue
             break
         if on_submit:
             try:
@@ -3232,14 +3405,43 @@ def sell_market_with_retry(
                     "trade_ids": trade_ids,
                 }, total_proceeds
         except Exception as e:
+            next_tick = hedge_tick_after_build_error(tick_size, e)
+            if next_tick is not None:
+                log_event(
+                    "hedge_tick_retry",
+                    token_id=token_id,
+                    from_tick=tick_size,
+                    to_tick=next_tick,
+                    error=str(e)[:200],
+                    attempt=attempt + 1,
+                    via="post_order",
+                )
+                tick_size = str(next_tick)
+                floor = float(next_tick)
+                cache = globals().get("_tick_size_cache")
+                if isinstance(cache, dict) and token_id:
+                    cache[token_id] = tick_size
+                continue
             if unmatched_fak_rejection(e):
                 can_retry = attempt + 1 < max_retries
+                keep_retrying = hedge_should_keep_retrying(
+                    remaining,
+                    live_bid,
+                    persist_done=persist_done or dump,
+                    dump_bid_max=dump_bid_max,
+                    qualify_bid=qualify_bid,
+                    recovery_cancel=recovery_cancel,
+                )
                 log_event(
                     "sell_attempt_rejected", token_id=token_id,
                     order_id=expected_order_id, error=str(e)[:200],
                     attempt=attempt + 1, remaining=remaining,
-                    unmatched_retry=can_retry,
+                    unmatched_retry=can_retry or keep_retrying,
+                    keep_retrying=keep_retrying,
+                    dump=dump,
+                    persist_done=persist_done,
                 )
+                # Fail closed if inventory disappeared despite the unmatched 400.
                 guard = check_clob_token_balance(token_id, refresh=True)
                 if (
                     start_bal is not None
@@ -3309,7 +3511,6 @@ def sell_market_with_retry(
     console.print(f"  [bold red][EXIT FAIL][/] market sell 0/{size:.4f} cleared")
     # Preserve last_limit so ghost reconciliation prices at the actual retry floor.
     return 0, {"sold": 0, "last_limit": last_limit, "bot_status": "empty"}, 0.0
-
 
 # ------------------------- REDEEM -------------------------
 
@@ -3655,6 +3856,9 @@ while not _shutdown_requested:
         MAX_ENTRY_SPREAD = _strat["max_entry_spread"]
         HEDGE_MAX_SPREAD = _strat["hedge_max_spread"]
         HEDGE_REQUIRE_ASK_MAX = _strat["hedge_require_ask_max"]
+        HEDGE_PERSIST_S = _strat["hedge_persist_s"]
+        HEDGE_TOXIC_BID_MAX = _strat["hedge_toxic_bid_max"]
+        HEDGE_RECOVERY_CANCEL = _strat["hedge_recovery_cancel"]
         HEDGE_REQUIRE_GUI = _strat["hedge_require_gui"]
         BUY_WINDOW_MIN = _strat["buy_window_min"]
         A22_WINDOW_MIN = _strat["a22_window_min"]
@@ -4483,15 +4687,14 @@ while not _shutdown_requested:
                         save_json(STATE_FILE, positions_meta)
 
                 # --- HEDGE CHECK (for held positions) ---
+                if held_size <= 0.01 or meta.get("hedge_closed"):
+                    _hedge_persist_armed.pop(cond, None)
+                    _hedge_persist_done.discard(cond)
                 if held_token and held_size > 0.01 and HEDGE_ENABLED and not meta.get("hedge_closed"):
-                    # FAK avg < toxic_force_exit_below arms toxic_fill. Dump only while
-                    # held bid ≤ hedge_threshold (no GUI / 35/40/15). Recovered book
-                    # (bid > 35¢) logs hedge_skip_toxic_recovered and stays armed.
-                    # Mild below-band fills (≥ that floor) use the normal hedge path.
-                    toxic_fill = bool(meta.get("toxic_fill"))
-                    # Skip REST when a *fresh* WS bid is clearly above threshold
-                    # (normal hedge and toxic recovered). Stale-high WS must not
-                    # suppress the check (hedge_quote_max_age_s).
+                    # ANY live bag with held bid ≤ toxic (35¢) dumps at the live bid.
+                    # Persist 2s @ 50/52, then sell at the live bid (50–69).
+                    # Bid ≥ recovery_cancel (70¢) holds and clears persist.
+                    # Do not sell in (35, 50). Incomplete REST uses WS/last-good.
                     quote_age = book_ws.quote_age(held_token)
                     ws_fresh = quote_age is not None and quote_age <= float(HEDGE_QUOTE_MAX_AGE_S)
                     peek_bid = peek_ask = peek_mid = None
@@ -4503,378 +4706,478 @@ while not _shutdown_requested:
                             peek_mid = _wq[4]
                     cached_quote = _book_cache.get(held_token)
                     cached_bid = (cached_quote[0] if cached_quote else None)
-                    if cached_bid is None:
-                        cached_bid = peek_bid
-
+                    cached_ask = (cached_quote[2] if cached_quote else None)
+                    last_bid, last_ask = last_good_held_quote(held_token)
+                    persist_done = cond in _hedge_persist_done
+                    armed_ts = _hedge_persist_armed.get(cond)
                     if (
+                        armed_ts is not None
+                        and float(HEDGE_PERSIST_S) > 0
+                        and (time.monotonic() - float(armed_ts)) >= float(HEDGE_PERSIST_S) - 1e-12
+                    ):
+                        persist_done = True
+                        _hedge_persist_done.add(cond)
+
+                    # Healthy winner before persist: skip REST. After persist,
+                    # 50–69 still sells; ≥ recovery_cancel (70¢) is a rally — clear.
+                    recovered = (
                         ws_fresh
                         and peek_bid is not None
-                        and not toxic_dump_book_ok(peek_bid, HEDGE_THRESHOLD)
-                    ):
-                        if toxic_fill:
-                            log_event(
-                                "hedge_skip_toxic_recovered",
-                                condition_id=cond, leg=held_leg,
-                                bid=peek_bid, ask=peek_ask, mid=peek_mid,
-                            )
-                            console.print(
-                                f"  [dim][TOXIC SKIP][/] {str(held_leg or '?').upper()} recovered "
-                                f"bid {peek_bid:.3f} — dump stays armed, no sell"
-                            )
-                        # fresh WS still above threshold — do not REST / do not dump
-                    else:
-                        fresh_bid, _, fresh_ask, _, fresh_mid = get_quote_fast(
-                            held_token,
-                            max_age_s=0.0,
-                            prefer_rest=True,
-                            force_rest=True,
-                            expected_condition_id=cond,
+                        and peek_bid + 1e-12 >= float(HEDGE_RECOVERY_CANCEL)
+                    )
+                    winner_before_persist = (
+                        (not persist_done)
+                        and (not recovered)
+                        and ws_fresh
+                        and peek_bid is not None
+                        and peek_bid > float(HEDGE_THRESHOLD) + 1e-12
+                    )
+                    if recovered or winner_before_persist:
+                        _hedge_persist_armed.pop(cond, None)
+                        _hedge_persist_done.discard(cond)
+                        log_event(
+                            "hedge_skip_recovery" if recovered else "hedge_cancel_bounce",
+                            condition_id=cond, leg=held_leg,
+                            **live_bag_log_fields(
+                                slug=getattr(m, "slug", None),
+                                ttm=minutes_left,
+                                bid=peek_bid, ask=peek_ask,
+                                tick=get_tick_size_cached(held_token),
+                                reason=(
+                                    "recovery_cancel" if recovered else "ws_above_qualify"
+                                ),
+                            ),
+                            mid=peek_mid, threshold=HEDGE_THRESHOLD,
+                            recovery_cancel=HEDGE_RECOVERY_CANCEL,
                         )
-                        if fresh_bid is None and (not toxic_fill or fresh_ask is None):
-                            log_event(
-                                "hedge_skip_incomplete_rest", condition_id=cond, leg=held_leg,
-                                trigger_bid=cached_bid, current_bid=fresh_bid, current_ask=fresh_ask,
-                                current_mid=fresh_mid,
-                                quote_age_s=None if quote_age is None else round(quote_age, 3),
-                                toxic_fill=toxic_fill,
+                    else:
+                        rest_bid = rest_ask = rest_mid = None
+                        need_rest = not persist_done
+                        peek_dump = (
+                            peek_bid is not None
+                            and peek_bid <= float(HEDGE_TOXIC_BID_MAX) + 1e-12
+                        )
+                        last_dump = (
+                            last_bid is not None
+                            and last_bid <= float(HEDGE_TOXIC_BID_MAX) + 1e-12
+                        )
+                        if peek_dump or last_dump or persist_done:
+                            need_rest = False
+                        if need_rest or (peek_bid is None and last_bid is None):
+                            rest_bid, _, rest_ask, _, rest_mid = get_quote_fast(
+                                held_token,
+                                max_age_s=0.0,
+                                prefer_rest=True,
+                                force_rest=True,
+                                expected_condition_id=cond,
                             )
-                        elif toxic_fill and fresh_bid is None:
-                            log_event(
-                                "hedge_skip_incomplete_rest", condition_id=cond, leg=held_leg,
-                                trigger_bid=cached_bid, current_bid=fresh_bid, current_ask=fresh_ask,
-                                current_mid=fresh_mid,
-                                quote_age_s=None if quote_age is None else round(quote_age, 3),
-                                toxic_fill=True, reason="no_bid",
+                        hedge_bid, hedge_ask = pick_held_quote(
+                            rest_bid, rest_ask, peek_bid, peek_ask, last_bid, last_ask,
+                        )
+                        if hedge_bid is None:
+                            hedge_bid, hedge_ask = pick_held_quote(
+                                cached_bid, cached_ask, peek_bid, peek_ask, last_bid, last_ask,
                             )
-                        elif (not toxic_fill) and (fresh_bid is None or fresh_ask is None):
-                            log_event(
-                                "hedge_skip_incomplete_rest", condition_id=cond, leg=held_leg,
-                                trigger_bid=cached_bid, current_bid=fresh_bid, current_ask=fresh_ask,
-                                current_mid=fresh_mid,
-                                quote_age_s=None if quote_age is None else round(quote_age, 3),
-                                toxic_fill=False,
+                        remember_held_quote(held_token, hedge_bid, hedge_ask)
+                        fresh_mid = rest_mid if rest_mid is not None else peek_mid
+                        hedge_tick = hedge_exec_tick(
+                            get_tick_size_cached(held_token),
+                        )
+                        bag_log = live_bag_log_fields(
+                            slug=getattr(m, "slug", None),
+                            ttm=minutes_left,
+                            bid=hedge_bid, ask=hedge_ask,
+                            tick=hedge_tick,
+                        )
+
+                        preview = evaluate_held_bag(
+                            hedge_bid, hedge_ask,
+                            now_s=time.monotonic(),
+                            persist_armed_ts=armed_ts,
+                            persist_s=HEDGE_PERSIST_S,
+                            dump_bid_max=HEDGE_TOXIC_BID_MAX,
+                            qualify_bid=HEDGE_THRESHOLD,
+                            qualify_ask_max=HEDGE_REQUIRE_ASK_MAX,
+                            max_spread=HEDGE_MAX_SPREAD,
+                            persist_done=persist_done,
+                            gui_ok=False,
+                            gui_why="pending_gui",
+                            recovery_cancel=HEDGE_RECOVERY_CANCEL,
+                        )
+                        qualify_fail = preview.reason in {
+                            "missing_side", "bid_above", "ask_too_high",
+                            "crossed", "wide_spread", "no_bid", "bad_thresholds",
+                        }
+                        if preview.dump or preview.skip_gui or qualify_fail:
+                            intent = preview
+                        else:
+                            gui_ok, gui_why = True, "skipped"
+                            held_gui = other_gui = held_last = other_last = None
+                            other_bid = other_ask = None
+                            held_gui_max, other_gui_min = hedge_gui_limits(HEDGE_REQUIRE_ASK_MAX)
+                            if HEDGE_REQUIRE_GUI:
+                                other_token = (
+                                    m.dn_token if held_leg == "up" else m.up_token
+                                )
+                                if other_token:
+                                    other_bid, _, other_ask, _, _ = get_quote_fast(
+                                        other_token,
+                                        max_age_s=0.0,
+                                        prefer_rest=True,
+                                        force_rest=True,
+                                        expected_condition_id=cond,
+                                    )
+                                held_last = get_last_trade_price(held_token)
+                                other_last = (
+                                    get_last_trade_price(other_token)
+                                    if other_token else None
+                                )
+                                gui_ok, gui_why = hedge_consensus_ok(
+                                    hedge_bid, hedge_ask, held_last,
+                                    other_bid, other_ask, other_last,
+                                    held_gui_max=held_gui_max,
+                                    other_gui_min=other_gui_min,
+                                    min_edge=MIN_BID_EDGE,
+                                    last_trade_max=HEDGE_REQUIRE_ASK_MAX,
+                                )
+                                held_gui = polymarket_display_price(
+                                    hedge_bid, hedge_ask, held_last,
+                                )
+                                other_gui = polymarket_display_price(
+                                    other_bid, other_ask, other_last,
+                                )
+                            intent = evaluate_held_bag(
+                                hedge_bid, hedge_ask,
+                                now_s=time.monotonic(),
+                                persist_armed_ts=armed_ts,
+                                persist_s=HEDGE_PERSIST_S,
+                                dump_bid_max=HEDGE_TOXIC_BID_MAX,
+                                qualify_bid=HEDGE_THRESHOLD,
+                                qualify_ask_max=HEDGE_REQUIRE_ASK_MAX,
+                                max_spread=HEDGE_MAX_SPREAD,
+                                persist_done=persist_done,
+                                gui_ok=gui_ok,
+                                gui_why=gui_why,
+                                recovery_cancel=HEDGE_RECOVERY_CANCEL,
                             )
-                        elif toxic_fill and not toxic_dump_book_ok(fresh_bid, HEDGE_THRESHOLD):
-                            log_event(
-                                "hedge_skip_toxic_recovered",
-                                condition_id=cond, leg=held_leg,
-                                bid=fresh_bid, ask=fresh_ask, mid=fresh_mid,
-                            )
-                            console.print(
-                                f"  [dim][TOXIC SKIP][/] {str(held_leg or '?').upper()} recovered "
-                                f"bid {fresh_bid:.3f} — dump stays armed, no sell"
-                            )
-                        elif not toxic_fill and fresh_bid > HEDGE_THRESHOLD:
-                            log_event(
-                                "hedge_cancel_bounce", condition_id=cond, leg=held_leg,
-                                trigger_bid=cached_bid, current_bid=fresh_bid,
-                                current_ask=fresh_ask, current_mid=fresh_mid,
+                            if not gui_ok and intent.action == "hold":
+                                log_event(
+                                    "hedge_skip_no_consensus",
+                                    condition_id=cond, leg=held_leg,
+                                    **{**bag_log, **{"reason": gui_why}},
+                                    held_last=held_last, other_last=other_last,
+                                    held_gui=held_gui, other_gui=other_gui,
+                                    other_bid=other_bid, other_ask=other_ask,
+                                    held_gui_max=held_gui_max,
+                                    other_gui_min=other_gui_min,
+                                    last_trade_max=HEDGE_REQUIRE_ASK_MAX,
+                                    order_error=None,
+                                )
+
+                        if intent.persist_ts is None and not intent.dump:
+                            _hedge_persist_armed.pop(cond, None)
+                            if not intent.persist_done:
+                                _hedge_persist_done.discard(cond)
+                        else:
+                            if intent.persist_ts is not None:
+                                _hedge_persist_armed[cond] = intent.persist_ts
+                            if intent.persist_done:
+                                _hedge_persist_done.add(cond)
+
+                        if intent.action in {"arm", "wait"}:
+                            log_buy_skip_throttled(
+                                intent.reason,
+                                cond,
+                                event="hedge_skip_persist",
+                                **bag_log,
+                                persist_s=HEDGE_PERSIST_S,
+                                persist_why=intent.reason,
                                 threshold=HEDGE_THRESHOLD,
                             )
-                            console.print(
-                                f"  [dim][CANCEL][/] {held_leg.upper()} hedge cancelled — bid bounced "
-                                f"{(cached_bid if cached_bid is not None else fresh_bid):.3f} → {fresh_bid:.3f}"
-                            )
-                        else:
-                            hedge_bid = fresh_bid
-                            hedge_ask = fresh_ask
-                            if toxic_fill:
-                                ok, why = True, "toxic_force_exit"
-                            else:
-                                ok, why = hedge_book_ok(
-                                    hedge_bid, hedge_ask, HEDGE_THRESHOLD, HEDGE_MAX_SPREAD, HEDGE_REQUIRE_ASK_MAX,
-                                )
-                            if not ok:
-                                meta["hedge_blocked_toxic"] = True
-                                save_json(STATE_FILE, positions_meta)
+                        elif intent.action == "hold":
+                            event = {
+                                "dead_band": "hedge_skip_dead_band",
+                                "bid_above": "hedge_cancel_bounce",
+                                "recovery_cancel": "hedge_skip_recovery",
+                                "no_bid": "hedge_skip_incomplete_rest",
+                                "missing_side": "hedge_skip_incomplete_rest",
+                                "ask_too_high": "hedge_skip_toxic_book",
+                                "wide_spread": "hedge_skip_toxic_book",
+                                "crossed": "hedge_skip_toxic_book",
+                            }.get(intent.reason, "hedge_skip")
+                            if intent.reason == "no_bid":
                                 log_event(
-                                    "hedge_skip_toxic_book", condition_id=cond, leg=held_leg,
-                                    bid=hedge_bid, ask=hedge_ask, mid=fresh_mid, reason=why,
-                                    threshold=HEDGE_THRESHOLD, max_spread=HEDGE_MAX_SPREAD,
-                                    require_ask_max=HEDGE_REQUIRE_ASK_MAX,
-                                    trigger_bid=cached_bid,
+                                    "hedge_skip_incomplete_rest",
+                                    condition_id=cond, leg=held_leg,
+                                    **bag_log,
+                                    reason="no_bid",
+                                    persist_done=intent.persist_done,
+                                    order_error=None,
+                                )
+                            elif intent.reason != "no_consensus":
+                                log_event(
+                                    event,
+                                    condition_id=cond, leg=held_leg,
+                                    **{**bag_log, **{"reason": intent.reason}},
+                                    persist_done=intent.persist_done,
+                                    order_error=None,
+                                )
+                            if (
+                                meta.get("toxic_fill")
+                                and hedge_bid is not None
+                                and hedge_bid > float(HEDGE_TOXIC_BID_MAX) + 1e-12
+                            ):
+                                log_event(
+                                    "hedge_skip_toxic_recovered",
+                                    condition_id=cond, leg=held_leg,
+                                    **{**bag_log, **{"reason": "toxic_recovered"}},
+                                    persist_done=intent.persist_done,
+                                    order_error=None,
+                                )
+                        elif intent.action in {"dump", "sell"}:
+                            hedge_bid = intent.sell_at if intent.sell_at is not None else hedge_bid
+                            hedge_floor = float(hedge_tick)
+                            sell_floor = hedge_sell_price(
+                                hedge_bid, hedge_tick, 0, hedge_floor,
+                            )
+                            dump = bool(intent.dump)
+                            hedge_title = (
+                                "[bold bright_red]▼ TOXIC FILL — FORCE EXIT[/]"
+                                if dump
+                                else "[bold bright_red]▼ HEDGE SELL — CUTTING LOSSES[/]"
+                            )
+                            hedge_label = (
+                                "DUMP ≤{:.0f}¢".format(float(HEDGE_TOXIC_BID_MAX) * 100) if dump else "REVERSAL DETECTED"
+                            )
+                            console.print(Panel(
+                                f"  [bright_white]{m.question}[/]\n"
+                                f"  [bright_red]{hedge_label}[/] — {held_leg.upper()} "
+                                f"bid [bold]{hedge_bid:.3f}[/] ask [bold]{(hedge_ask or 0):.3f}[/]  ·  "
+                                f"FAK ≥{sell_floor:.3f}  ·  [bold red]TTM {minutes_left:>4.1f}m[/]",
+                                title=hedge_title,
+                                border_style="bright_red",
+                                box=box.HEAVY,
+                            ))
+                            meta["hedge_attempted"] = True
+                            save_json(STATE_FILE, positions_meta)
+                            log_event(
+                                "hedge_attempt", condition_id=cond, leg=held_leg, size=held_size,
+                                **{**bag_log, **{"reason": intent.reason}},
+                                mid=fresh_mid, price_limit=sell_floor,
+                                quote_age_s=None if quote_age is None else round(quote_age, 3),
+                                dump=dump,
+                                persist_done=intent.persist_done,
+                                hedge_floor=hedge_floor,
+                            )
+                            prior_hedge_proceeds = float(
+                                meta.get("pnl_hedge_proceeds", 0) or 0
+                            )
+
+                            def _clear_hedge_uncertain():
+                                clear_uncertain_fields(
+                                    meta, _HEDGE_UNCERTAIN_KEYS,
+                                )
+
+                            def _persist_hedge_submit(
+                                sold_total, proceeds_total, remaining_size,
+                                attempt_no, submit_price, intent_order,
+                            ):
+                                meta["hedge_uncertain"] = True
+                                meta["hedge_uncertain_at"] = time.time() * 1000
+                                meta["hedge_uncertain_token"] = held_token
+                                meta["hedge_uncertain_attempt"] = int(attempt_no)
+                                meta["hedge_uncertain_remaining"] = float(remaining_size)
+                                meta["hedge_uncertain_price"] = float(submit_price)
+                                meta["hedge_uncertain_confirmed_sold"] = float(sold_total)
+                                meta["hedge_uncertain_confirmed_proceeds"] = float(proceeds_total)
+                                meta["hedge_uncertain_order_id"] = intent_order["order_id"]
+                                meta["hedge_uncertain_order_size"] = (
+                                    _decode_clob_fixed6(intent_order.get("maker_amount"))
+                                    or float(remaining_size)
+                                )
+                                trade_ids = _string_list(
+                                    intent_order.get("trade_ids")
+                                    or intent_order.get("tradeIDs")
+                                )
+                                if trade_ids:
+                                    meta["hedge_uncertain_trade_ids"] = trade_ids
+                                meta["hedge_uncertain_sold_before"] = float(sold_total)
+                                meta["hedge_uncertain_proceeds_before"] = float(
+                                    proceeds_total
+                                )
+                                meta["hedge_uncertain_position_size"] = float(
+                                    held_size
+                                )
+                                meta["hedge_uncertain_pnl_before"] = float(
+                                    prior_hedge_proceeds
+                                )
+                                save_json(STATE_FILE, positions_meta)
+
+                            def _persist_hedge_fill(sold_total, proceeds_total):
+                                rem_now = max(0.0, held_size - float(sold_total))
+                                if should_mark_hedge_closed(sold_total, rem_now):
+                                    rem_now = 0.0
+                                    meta["hedge_closed"] = True
+                                    _hedge_persist_armed.pop(cond, None)
+                                    _hedge_persist_done.discard(cond)
+                                meta["bought_size"] = rem_now
+                                meta["pnl_hedge_proceeds"] = round(
+                                    prior_hedge_proceeds + float(proceeds_total), 4
+                                )
+                                meta["hedge_uncertain_confirmed_sold"] = float(sold_total)
+                                meta["hedge_uncertain_confirmed_proceeds"] = float(proceeds_total)
+                                meta["hedge_uncertain_remaining"] = rem_now
+                                leg_key = "up" if held_leg == "up" else "dn"
+                                if cond in _cached_positions and leg_key in _cached_positions[cond]:
+                                    _cached_positions[cond][leg_key]["size"] = rem_now
+                                save_json(STATE_FILE, positions_meta)
+
+                            sold, sell_res, hedge_proceeds = sell_market_with_retry(
+                                held_token,
+                                held_size,
+                                hedge_bid,
+                                tick_size=hedge_tick,
+                                min_price=hedge_floor,
+                                undercut_ticks=0,
+                                retry_sleep_s=HEDGE_RETRY_SLEEP_S,
+                                abort_above=intent.abort_above,
+                                require_ask_max=None,
+                                max_spread=None,
+                                on_submit=_persist_hedge_submit,
+                                on_fill=_persist_hedge_fill,
+                                condition_id=cond,
+                                initial_quote=(hedge_bid, hedge_ask),
+                                dump=dump,
+                                persist_done=bool(intent.persist_done),
+                                market_tick=hedge_tick,
+                                max_retries=12 if dump or intent.persist_done else 3,
+                            )
+                            sell_status = (
+                                sell_res.get("bot_status")
+                                if isinstance(sell_res, dict) else None
+                            )
+                            order_error = None
+                            if isinstance(sell_res, dict):
+                                order_error = sell_res.get("status") or sell_status
+                            if sell_status == "ambiguous":
+                                if isinstance(sell_res, dict):
+                                    if sell_res.get("order_id"):
+                                        meta["hedge_uncertain_order_id"] = (
+                                            sell_res["order_id"]
+                                        )
+                                    trade_ids = _string_list(
+                                        sell_res.get("trade_ids")
+                                    )
+                                    if trade_ids:
+                                        meta["hedge_uncertain_trade_ids"] = (
+                                            trade_ids
+                                        )
+                                    meta["hedge_uncertain_status"] = (
+                                        sell_res.get("status") or "ambiguous"
+                                    )
+                                meta["hedge_uncertain_confirmed_sold"] = float(sold)
+                                meta["hedge_uncertain_confirmed_proceeds"] = float(hedge_proceeds)
+                                meta["hedge_uncertain_remaining"] = max(
+                                    0.0, held_size - float(sold),
+                                )
+                                save_json(STATE_FILE, positions_meta)
+                                notify(
+                                    "HEDGE UNCERTAIN",
+                                    f"{m.question}\nSELL outcome unresolved; quarantined "
+                                    "until the exact order is reconciled",
+                                    priority="urgent",
+                                )
+                            elif sell_status == "persist_fail":
+                                _clear_hedge_uncertain()
+                                log_event(
+                                    "hedge_submit_persist_fail",
+                                    condition_id=cond,
+                                    token_id=held_token,
+                                    **bag_log,
+                                )
+                                save_json(STATE_FILE, positions_meta)
+                            else:
+                                _clear_hedge_uncertain()
+                            last_limit = sell_floor
+                            if isinstance(sell_res, dict) and sell_res.get("last_limit") is not None:
+                                last_limit = float(sell_res["last_limit"])
+                            time.sleep(HEDGE_GHOST_SLEEP_S)
+                            actual_bal = check_token_balance(held_token, cond)
+                            rec = reconcile_hedge_sold(
+                                held_size, sold, hedge_proceeds, actual_bal, last_limit,
+                            )
+                            if rec["ghost_candidate"]:
+                                log_event(
+                                    "hedge_ghost_unconfirmed", condition_id=cond,
+                                    leg=held_leg, size=held_size,
+                                    confirmed_sold=float(sold),
+                                    api_bal=None if actual_bal is None else float(actual_bal),
+                                    **bag_log,
+                                )
+                            if rec["balance_unverified"]:
+                                log_event(
+                                    "hedge_balance_fail", condition_id=cond, leg=held_leg,
+                                    size=held_size, sold=sold, **bag_log,
+                                )
+                            if rec["lag"]:
+                                log_event(
+                                    "hedge_balance_lag", condition_id=cond, leg=held_leg,
+                                    confirmed_sold=float(sold), api_sold=rec["api_sold"],
+                                    api_bal=None if actual_bal is None else float(actual_bal),
+                                    **bag_log,
+                                )
+                            rem = rec["rem"]
+                            if should_mark_hedge_closed(rec["effective_sold"], rem):
+                                rem = 0.0
+                                meta["hedge_closed"] = True
+                                _hedge_persist_armed.pop(cond, None)
+                                _hedge_persist_done.discard(cond)
+                            if rec["effective_sold"] > 0.01:
+                                meta["pnl_hedge_proceeds"] = round(
+                                    prior_hedge_proceeds + rec["proceeds"], 4
+                                )
+                                meta["bought_size"] = rem
+                                leg_key = "up" if held_leg == "up" else "dn"
+                                if cond in _cached_positions and leg_key in _cached_positions[cond]:
+                                    _cached_positions[cond][leg_key]["size"] = rem
+                                fill_px = (
+                                    (rec["proceeds"] / rec["effective_sold"])
+                                    if rec["effective_sold"] > 0 else last_limit
+                                )
+                                log_event(
+                                    "hedge_fill", condition_id=cond, leg=held_leg,
+                                    sold=rec["effective_sold"], remaining=rem, price=fill_px,
+                                    proceeds=round(rec["proceeds"], 4),
+                                    mid=fresh_mid,
+                                    hedge_closed=bool(meta.get("hedge_closed")),
+                                    balance_unverified=bool(rec["balance_unverified"]),
+                                    **bag_log,
+                                )
+                                save_json(STATE_FILE, positions_meta)
+                                notify(
+                                    "HEDGE FIRED" if rem < 0.01 else "HEDGE PARTIAL",
+                                    f"Reversal on {m.question}\nSold {held_leg.upper()} at ~{fill_px:.3f} "
+                                    f"({rec['effective_sold']:.2f} shares, rem {rem:.2f})",
+                                    priority="urgent",
                                 )
                             else:
-                                gui_ok, gui_why = True, "skipped"
-                                held_gui = other_gui = held_last = other_last = None
-                                other_bid = other_ask = None
-                                if not toxic_fill and HEDGE_REQUIRE_GUI:
-                                    other_token = (
-                                        m.dn_token if held_leg == "up" else m.up_token
-                                    )
-                                    if other_token:
-                                        other_bid, _, other_ask, _, _ = get_quote_fast(
-                                            other_token,
-                                            max_age_s=0.0,
-                                            prefer_rest=True,
-                                            force_rest=True,
-                                            expected_condition_id=cond,
-                                        )
-                                    held_last = get_last_trade_price(held_token)
-                                    other_last = (
-                                        get_last_trade_price(other_token)
-                                        if other_token else None
-                                    )
-                                    gui_ok, gui_why = hedge_consensus_ok(
-                                        hedge_bid, hedge_ask, held_last,
-                                        other_bid, other_ask, other_last,
-                                        held_gui_max=MAX_LOSER_BID,
-                                        other_gui_min=MIN_WINNER_BID,
-                                        min_edge=MIN_BID_EDGE,
-                                        last_trade_max=HEDGE_REQUIRE_ASK_MAX,
-                                    )
-                                    held_gui = polymarket_display_price(
-                                        hedge_bid, hedge_ask, held_last,
-                                    )
-                                    other_gui = polymarket_display_price(
-                                        other_bid, other_ask, other_last,
-                                    )
-                                if not gui_ok:
-                                    log_event(
-                                        "hedge_skip_no_consensus",
-                                        condition_id=cond, leg=held_leg,
-                                        bid=hedge_bid, ask=hedge_ask, mid=fresh_mid,
-                                        held_last=held_last, other_last=other_last,
-                                        held_gui=held_gui, other_gui=other_gui,
-                                        other_bid=other_bid, other_ask=other_ask,
-                                        reason=gui_why,
-                                        held_gui_max=MAX_LOSER_BID,
-                                        other_gui_min=MIN_WINNER_BID,
-                                        last_trade_max=HEDGE_REQUIRE_ASK_MAX,
-                                    )
-                                elif (
-                                    toxic_fill
-                                    and toxic_dump_book_ok(hedge_bid, HEDGE_THRESHOLD)
-                                ) or (
-                                    (not toxic_fill) and hedge_bid <= HEDGE_THRESHOLD
-                                ):
-                                    hedge_tick = get_tick_size_cached(held_token)
-                                    # 35/40 is only a tight book. GUI + last trade
-                                    # must also say the held side actually lost.
-                                    # Sell at the live bid — 20¢, 5¢, one tick, whatever
-                                    # is there. No strategy "won't take less than X".
-                                    hedge_floor = float(hedge_tick)
-                                    sell_floor = hedge_sell_price(
-                                        hedge_bid, hedge_tick, HEDGE_UNDERCUT_TICKS, hedge_floor,
-                                    )
-                                    hedge_title = (
-                                        "[bold bright_red]▼ TOXIC FILL — FORCE EXIT[/]"
-                                        if toxic_fill
-                                        else "[bold bright_red]▼ HEDGE SELL — CUTTING LOSSES[/]"
-                                    )
-                                    hedge_label = (
-                                        "TOXIC FILL EXIT" if toxic_fill else "REVERSAL DETECTED"
-                                    )
-                                    console.print(Panel(
-                                        f"  [bright_white]{m.question}[/]\n"
-                                        f"  [bright_red]{hedge_label}[/] — {held_leg.upper()} "
-                                        f"bid [bold]{hedge_bid:.3f}[/] ask [bold]{(hedge_ask or 0):.3f}[/]  ·  "
-                                        f"FAK ≥{sell_floor:.3f}  ·  [bold red]TTM {minutes_left:>4.1f}m[/]",
-                                        title=hedge_title,
-                                        border_style="bright_red",
-                                        box=box.HEAVY,
-                                    ))
-                                    meta["hedge_attempted"] = True
+                                if sell_status not in ("ambiguous", "persist_fail"):
                                     save_json(STATE_FILE, positions_meta)
-                                    log_event(
-                                        "hedge_attempt", condition_id=cond, leg=held_leg, size=held_size,
-                                        bid=hedge_bid, ask=hedge_ask, mid=fresh_mid, price_limit=sell_floor,
-                                        quote_age_s=None if quote_age is None else round(quote_age, 3),
-                                        ws_fast_path=False,
-                                        toxic_fill=toxic_fill,
-                                        hedge_floor=hedge_floor,
-                                    )
-                                    prior_hedge_proceeds = float(
-                                        meta.get("pnl_hedge_proceeds", 0) or 0
-                                    )
-
-                                    def _clear_hedge_uncertain():
-                                        clear_uncertain_fields(
-                                            meta, _HEDGE_UNCERTAIN_KEYS,
-                                        )
-
-                                    def _persist_hedge_submit(
-                                        sold_total, proceeds_total, remaining_size,
-                                        attempt_no, submit_price, intent,
-                                    ):
-                                        meta["hedge_uncertain"] = True
-                                        meta["hedge_uncertain_at"] = time.time() * 1000
-                                        meta["hedge_uncertain_token"] = held_token
-                                        meta["hedge_uncertain_attempt"] = int(attempt_no)
-                                        meta["hedge_uncertain_remaining"] = float(remaining_size)
-                                        meta["hedge_uncertain_price"] = float(submit_price)
-                                        meta["hedge_uncertain_confirmed_sold"] = float(sold_total)
-                                        meta["hedge_uncertain_confirmed_proceeds"] = float(proceeds_total)
-                                        meta["hedge_uncertain_order_id"] = intent["order_id"]
-                                        meta["hedge_uncertain_order_size"] = (
-                                            _decode_clob_fixed6(intent.get("maker_amount"))
-                                            or float(remaining_size)
-                                        )
-                                        trade_ids = _string_list(
-                                            intent.get("trade_ids")
-                                            or intent.get("tradeIDs")
-                                        )
-                                        if trade_ids:
-                                            meta["hedge_uncertain_trade_ids"] = trade_ids
-                                        meta["hedge_uncertain_sold_before"] = float(sold_total)
-                                        meta["hedge_uncertain_proceeds_before"] = float(
-                                            proceeds_total
-                                        )
-                                        meta["hedge_uncertain_position_size"] = float(
-                                            held_size
-                                        )
-                                        meta["hedge_uncertain_pnl_before"] = float(
-                                            prior_hedge_proceeds
-                                        )
-                                        save_json(STATE_FILE, positions_meta)
-
-                                    def _persist_hedge_fill(sold_total, proceeds_total):
-                                        rem_now = max(0.0, held_size - float(sold_total))
-                                        if rem_now < 0.01:
-                                            rem_now = 0.0
-                                            meta["hedge_closed"] = True
-                                        meta["bought_size"] = rem_now
-                                        meta["pnl_hedge_proceeds"] = round(
-                                            prior_hedge_proceeds + float(proceeds_total), 4
-                                        )
-                                        meta["hedge_uncertain_confirmed_sold"] = float(sold_total)
-                                        meta["hedge_uncertain_confirmed_proceeds"] = float(proceeds_total)
-                                        meta["hedge_uncertain_remaining"] = rem_now
-                                        leg_key = "up" if held_leg == "up" else "dn"
-                                        if cond in _cached_positions and leg_key in _cached_positions[cond]:
-                                            _cached_positions[cond][leg_key]["size"] = rem_now
-                                        save_json(STATE_FILE, positions_meta)
-
-                                    sold, sell_res, hedge_proceeds = sell_market_with_retry(
-                                        held_token,
-                                        held_size,
-                                        hedge_bid,
-                                        tick_size=hedge_tick,
-                                        min_price=hedge_floor,
-                                        undercut_ticks=HEDGE_UNDERCUT_TICKS,
-                                        retry_sleep_s=HEDGE_RETRY_SLEEP_S,
-                                        # Toxic: never abort on bounce / integrity — dump inventory.
-                                        abort_above=None if toxic_fill else HEDGE_THRESHOLD,
-                                        require_ask_max=None if toxic_fill else HEDGE_REQUIRE_ASK_MAX,
-                                        max_spread=None if toxic_fill else HEDGE_MAX_SPREAD,
-                                        on_submit=_persist_hedge_submit,
-                                        on_fill=_persist_hedge_fill,
-                                        condition_id=cond,
-                                        initial_quote=(hedge_bid, hedge_ask),
-                                    )
-                                    sell_status = (
-                                        sell_res.get("bot_status")
-                                        if isinstance(sell_res, dict) else None
-                                    )
-                                    if sell_status == "ambiguous":
-                                        if isinstance(sell_res, dict):
-                                            if sell_res.get("order_id"):
-                                                meta["hedge_uncertain_order_id"] = (
-                                                    sell_res["order_id"]
-                                                )
-                                            trade_ids = _string_list(
-                                                sell_res.get("trade_ids")
-                                            )
-                                            if trade_ids:
-                                                meta["hedge_uncertain_trade_ids"] = (
-                                                    trade_ids
-                                                )
-                                            meta["hedge_uncertain_status"] = (
-                                                sell_res.get("status") or "ambiguous"
-                                            )
-                                        meta["hedge_uncertain_confirmed_sold"] = float(sold)
-                                        meta["hedge_uncertain_confirmed_proceeds"] = float(hedge_proceeds)
-                                        meta["hedge_uncertain_remaining"] = max(
-                                            0.0, held_size - float(sold),
-                                        )
-                                        save_json(STATE_FILE, positions_meta)
-                                        notify(
-                                            "HEDGE UNCERTAIN",
-                                            f"{m.question}\nSELL outcome unresolved; quarantined "
-                                            "until the exact order is reconciled",
-                                            priority="urgent",
-                                        )
-                                    elif sell_status == "persist_fail":
-                                        # on_submit failed before post_order. Its callback
-                                        # may have mutated in-memory metadata, but no
-                                        # exchange order exists, so quarantine is unsafe.
-                                        _clear_hedge_uncertain()
-                                        log_event(
-                                            "hedge_submit_persist_fail",
-                                            condition_id=cond,
-                                            token_id=held_token,
-                                        )
-                                        save_json(STATE_FILE, positions_meta)
-                                    else:
-                                        _clear_hedge_uncertain()
-                                    last_limit = sell_floor
-                                    if isinstance(sell_res, dict) and sell_res.get("last_limit") is not None:
-                                        last_limit = float(sell_res["last_limit"])
-                                    # Reconcile with Data API — one read never adds/erases confirms.
-                                    time.sleep(HEDGE_GHOST_SLEEP_S)
-                                    actual_bal = check_token_balance(held_token, cond)
-                                    rec = reconcile_hedge_sold(
-                                        held_size, sold, hedge_proceeds, actual_bal, last_limit,
-                                    )
-                                    if rec["ghost_candidate"]:
-                                        # Data API is eventually consistent. Even
-                                        # repeated omissions cannot prove a sale; only
-                                        # CLOB/order evidence may close the hedge.
-                                        log_event(
-                                            "hedge_ghost_unconfirmed", condition_id=cond,
-                                            leg=held_leg, size=held_size,
-                                            confirmed_sold=float(sold),
-                                            api_bal=None if actual_bal is None else float(actual_bal),
-                                        )
-                                    if rec["balance_unverified"]:
-                                        log_event(
-                                            "hedge_balance_fail", condition_id=cond, leg=held_leg,
-                                            size=held_size, bid=hedge_bid, ask=hedge_ask, sold=sold,
-                                        )
-                                    if rec["lag"]:
-                                        log_event(
-                                            "hedge_balance_lag", condition_id=cond, leg=held_leg,
-                                            confirmed_sold=float(sold), api_sold=rec["api_sold"],
-                                            api_bal=None if actual_bal is None else float(actual_bal),
-                                        )
-                                    if rec["effective_sold"] > 0.01:
-                                        rem = rec["rem"]
-                                        meta["pnl_hedge_proceeds"] = round(
-                                            prior_hedge_proceeds + rec["proceeds"], 4
-                                        )
-                                        if rem < 0.01:
-                                            meta["hedge_closed"] = True
-                                            rem = 0.0
-                                        meta["bought_size"] = rem
-                                        leg_key = "up" if held_leg == "up" else "dn"
-                                        if cond in _cached_positions and leg_key in _cached_positions[cond]:
-                                            _cached_positions[cond][leg_key]["size"] = rem
-                                        fill_px = (
-                                            (rec["proceeds"] / rec["effective_sold"])
-                                            if rec["effective_sold"] > 0 else last_limit
-                                        )
-                                        log_event(
-                                            "hedge_fill", condition_id=cond, leg=held_leg,
-                                            sold=rec["effective_sold"], remaining=rem, price=fill_px,
-                                            proceeds=round(rec["proceeds"], 4),
-                                            mid=fresh_mid, ask=hedge_ask,
-                                            hedge_closed=bool(meta.get("hedge_closed")),
-                                            balance_unverified=bool(rec["balance_unverified"]),
-                                        )
-                                        save_json(STATE_FILE, positions_meta)
-                                        notify(
-                                            "HEDGE FIRED" if rem < 0.01 else "HEDGE PARTIAL",
-                                            f"Reversal on {m.question}\nSold {held_leg.upper()} at ~{fill_px:.3f} "
-                                            f"({rec['effective_sold']:.2f} shares, rem {rem:.2f})",
-                                            priority="urgent",
-                                        )
-                                    else:
-                                        if sell_status not in ("ambiguous", "persist_fail"):
-                                            save_json(STATE_FILE, positions_meta)
-                                        log_event(
-                                            "hedge_fail", condition_id=cond, leg=held_leg, size=held_size,
-                                            bid=hedge_bid, ask=hedge_ask, mid=fresh_mid,
-                                        )
+                                terminal = hedge_fail_is_terminal(
+                                    sell_status, held_size, hedge_bid,
+                                    persist_done=bool(intent.persist_done or dump),
+                                    dump_bid_max=HEDGE_TOXIC_BID_MAX,
+                                    qualify_bid=HEDGE_THRESHOLD,
+                                    recovery_cancel=HEDGE_RECOVERY_CANCEL,
+                                )
+                                log_event(
+                                    "hedge_fail", condition_id=cond, leg=held_leg, size=held_size,
+                                    **{**bag_log, **{"reason": intent.reason}},
+                                    mid=fresh_mid,
+                                    sell_status=sell_status,
+                                    order_error=order_error,
+                                    terminal=terminal,
+                                )
 
                 # --- BUY CHECK (unheld, or same-leg add up to the $10 cap) ---
                 bands = current_entry_bands(minutes_left)

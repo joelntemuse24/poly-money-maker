@@ -16,9 +16,9 @@ forced a design, it is explained until the “why” is obvious.
 | `AGENTS.md` | Cheat sheet for coding agents (never-do, file map, how to verify). |
 | **This file** | How the program is built, what the important code does, and why. |
 
-Live trading is **only** the 5-minute buy bot (`buybot5m.py` / systemd
-`polybuybot5m`) plus a recorder that never places orders (`pathlog.py` /
-`polypathlog`). The 15-minute and hourly bots exist as near-copies and are
+Live trading is **the hourly buy bot** (`buybothourly.py` / systemd
+`polybuybothourly`) plus a recorder that never places orders (`pathlog.py` /
+`polypathlog`). The 5-minute and 15-minute bots exist as near-copies and are
 **stopped**. Minting is **paused**. Do not start those unless the operator
 asks.
 
@@ -116,7 +116,7 @@ the combined bag.
 **Hedge (5m):** sell only when the **held** book looks collapsed — bid ≤ 53¢
 **and** ask ≤ 55¢, spread tight — **and** the website-style prices agree that
 side actually lost. Then sell at whatever the live bid is (even 20¢). The
-hourly copy’s template is 55¢/60¢ (still stopped). 15m still uses 35¢/40¢
+hourly copy’s template is persist **2s @ 50¢/52¢** (dump 35¢). 15m still uses 35¢/40¢
 and is not running.
 
 Everything else in this document exists to do **that** without:
@@ -140,10 +140,10 @@ logs and pathlog ticks are capped.
 
 | Unit | Script | Live? |
 |---|---|---|
-| `polybuybot5m` | `buybot5m.py` | **yes — places orders** |
+| `polybuybothourly` | `buybothourly.py` | **yes — places orders (after operator start)** |
 | `polypathlog` | `pathlog.py` | **yes — GET books only** |
 | `polybuybot` | `buybot.py` | stopped |
-| `polybuybothourly` | `buybothourly.py` | stopped |
+| `polybuybot5m` | `buybot5m.py` | stopped |
 | `polymintbot` | `mintbot.py` | paused |
 
 Unit files live in `deploy/` and are copied to `/etc/systemd/system/`. The 5m
@@ -183,7 +183,7 @@ paths are picked once. Other knobs hot-reload.
 ```
 buybot5m.py          LIVE 5m bot (~5177 lines). You are usually here.
 buybot.py            15m copy (~5063). Stopped.
-buybothourly.py      Hourly copy. Stopped. Three slices, $10 cap, hedge 55/60.
+buybothourly.py      Hourly copy. Live after operator start. Last 20 min 75–90, $10 cap, persist 50/52.
 buy/                 Importable helpers (safe — they do not start trading)
   market.py          Find markets on Gamma
   btc_price.py       Chainlink / Binance websocket + PTB
@@ -205,7 +205,7 @@ exists in the other two files. Diff them after a logic change. The 5m-only
 exceptions are the 5m early price bands (`buy/entry_skip.py` + `BUY_HORIZON_S`
 in **seconds**) and the hourly three-slice bands (`BUY_HORIZON_MIN` in
 **minutes**). 5m defaults: persist hedge 2s @ 70/72 (toxic 53¢), BTC gate
-$0, tick `0.001`. Hourly defaults: hedge 55/60, BTC gate $10, tick `0.01`,
+$0, tick `0.001`. Hourly defaults: persist hedge 50/52, dump 35, BTC gate $10, tick `0.01`,
 $10 market cap.
 
 15m/hourly windows are in **minutes** (`buy_window_min` / `a22_window_min`).
