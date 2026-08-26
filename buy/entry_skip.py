@@ -617,13 +617,17 @@ def can_arm_hourly_slice(
 ):
     """Whether this named hourly slice may still POST.
 
-    One fill per slice. Same-leg add only. After a full hedge, unused slices
-    may still fire if the $10 cap has room. ``buy_token=None`` skips the
-    other-leg check (caller does not know the winner yet).
+    One fill per slice. Same-leg add only. After a full hedge the market is
+    permanently closed, including legacy records with no token/size/slice
+    fields. ``buy_token=None`` skips the other-leg check (caller does not know
+    the winner yet).
 
     Returns ``(ok, skip_reason)``.
     """
     meta = meta or {}
+    closed = bool(hedge_closed or meta.get("hedge_closed"))
+    if closed:
+        return False, "hedge_closed"
     if meta.get("buy_uncertain"):
         return False, "buy_uncertain"
     name = str(slice_name or "")
@@ -638,12 +642,82 @@ def can_arm_hourly_slice(
         market_cap=market_cap,
     ) < 0.01:
         return False, "spend_cap"
-    closed = bool(hedge_closed or meta.get("hedge_closed"))
-    held = float(held_size or 0) > 0.01 and not closed
+    held = float(held_size or 0) > 0.01
     tracked = meta.get("bought_token")
     if held and buy_token is not None and tracked and not same_token(tracked, buy_token):
         return False, "other_leg"
     return True, None
+
+
+def hourly_entry_final_gate(
+    minutes_left,
+    *,
+    selected_slice,
+    buy_ask,
+    bands,
+    buy_leg,
+    oracle_check,
+    oracle_gate_enabled=True,
+    hedge_closed=False,
+    buy_book_ok=False,
+    buy_clob_winner=False,
+    buy_gui=None,
+    other_gui=None,
+    min_winner_bid=0.70,
+    max_loser_bid=0.30,
+    min_gui_edge=0.0,
+):
+    """Final pure hourly BUY gate, evaluated immediately before every POST.
+
+    The selected slice must still contain the live ask, the market must remain
+    open and unhedged, the Binance/PTB gate must be enabled and fresh/favor
+    the selected leg, and the selected leg must still be the CLOB/GUI winner.
+    """
+    try:
+        ttm = float(minutes_left)
+    except (TypeError, ValueError):
+        return False, "invalid_ttm"
+    if ttm <= 0:
+        return False, "expired"
+    if bool(hedge_closed):
+        return False, "hedge_closed"
+
+    live_band = select_hourly_entry_band(buy_ask, bands)
+    if live_band is None or live_band.name != str(selected_slice or ""):
+        return False, "band_closed"
+    if not bool(buy_book_ok):
+        return False, "book_not_winner"
+    if not bool(buy_clob_winner):
+        return False, "clob_side_flip"
+
+    leg = str(buy_leg or "").strip().lower()
+    if leg not in ("up", "down"):
+        return False, "bad_leg"
+    if not bool(oracle_gate_enabled):
+        return False, "underlying_gate_disabled"
+    if not isinstance(oracle_check, dict) or not oracle_check.get("ok"):
+        return False, "oracle_unavailable"
+    favored = str(oracle_check.get("favored") or "").strip().lower()
+    if favored != leg:
+        return False, "oracle_side_flip"
+
+    try:
+        selected_gui = float(buy_gui)
+        opposing_gui = float(other_gui)
+        winner_floor = float(min_winner_bid)
+        loser_cap = float(max_loser_bid)
+        edge_floor = max(0.0, float(min_gui_edge or 0))
+    except (TypeError, ValueError):
+        return False, "incomplete_gui"
+    if not (0 <= selected_gui <= 1 and 0 <= opposing_gui <= 1):
+        return False, "incomplete_gui"
+    if selected_gui <= opposing_gui + 1e-12:
+        return False, "clob_gui_side_flip"
+    if selected_gui - opposing_gui + 1e-12 < edge_floor:
+        return False, "ambiguous"
+    if selected_gui + 1e-12 < winner_floor or opposing_gui > loser_cap + 1e-12:
+        return False, "no_consensus"
+    return True, "ok"
 
 
 def window_no_buy_reason(

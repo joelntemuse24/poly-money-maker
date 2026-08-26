@@ -3,7 +3,9 @@
 **Agents: read this after `AGENTS.md`.** Update this file when ops/strategy decisions change.
 Do not put secrets, API keys, or live wallet material here.
 
-Last updated: **2026-08-25** — **stop the 5m bot. Switch live buying to hourly.**
+Last updated: **2026-08-26** — hourly **execution gates** now match the
+intended rails (restart `polybuybothourly` after merge). Strategy knobs
+are unchanged from **2026-08-25**: **stop the 5m bot. Live buying is hourly.**
 One slice: **75–90¢ in the last 20 minutes** of the BTC hourly Up/Down
 market, **$10** cap, FAK limit **90¢**. Hedge is **persist 5s @ 50/52**
 (GUI held ≤ **52¢** / other ≥ **48¢** — not inverted 30/70), then sell at
@@ -35,7 +37,11 @@ fought us:
 Hourly is slower on purpose so a 5s persist has time to distinguish a dip
 from a reversal. Recovery is **53¢** so persist-done does **not** sell
 50–69. `sell_fade` sells a post-persist fade through 50 instead of waiting
-for 35.
+for 35. **2026-08-26:** the live executor now actually posts that fade,
+rechecks Binance/PTB and TTM immediately before every BUY/SELL POST or
+retry, completes the 5s persist only on a still-qualified 50/52+GUI tick,
+accepts the 50/48 hedge GUI boundary, and refuses re-entry after
+`hedge_closed`. Python changes are not hot-reloaded.
 
 **Hourly also keeps the later 5m execution fixes** (the old hourly path
 was still instant 55/60, inverted GUI 30/70, undercut 2, incomplete-REST
