@@ -573,8 +573,11 @@ class BotWiresCurrentRails(unittest.TestCase):
         self.assertIn('"hedge_recovery_cancel": 0.53', src)
         self.assertIn('"hedge_sell_fade": True', src)
         self.assertIn('"hedge_require_oracle": True', src)
+        self.assertIn('"hedge_dump_ignore_oracle": True', src)
+        self.assertIn("hedge_dump_overrides_oracle(", src)
         self.assertIn("hold_while_oracle_agrees(", src)
         self.assertIn("hedge_skip_oracle_still_winning", src)
+        self.assertIn("dump_only_override", src)
         self.assertIn('"b15_window_min": 20.0', src)
         self.assertIn('"a22_window_min": 0.0', src)
         self.assertNotIn(

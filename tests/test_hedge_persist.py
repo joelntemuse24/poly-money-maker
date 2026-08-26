@@ -9,6 +9,7 @@ from buy.hedge_gate import (
     evaluate_held_bag,
     hedge_market_tick,
     hedge_oracle_allows_sell,
+    hedge_dump_overrides_oracle,
     hedge_persist_ready,
     hedge_should_keep_retrying,
     hedge_tick_after_build_error,
@@ -327,6 +328,18 @@ class HedgeOracleAllowsSellTests(unittest.TestCase):
         )
         self.assertTrue(allow)
         self.assertEqual(why, "oracle_off")
+
+
+class HedgeDumpOverridesOracleTests(unittest.TestCase):
+    """Toxic dumps may ignore the oracle; persist-50 may not."""
+
+    def test_dump_print_overrides(self):
+        self.assertFalse(hedge_dump_overrides_oracle(0.17, 0.32, enabled=False))
+        self.assertTrue(hedge_dump_overrides_oracle(0.17, 0.32))
+        self.assertTrue(hedge_dump_overrides_oracle(0.32, 0.32))
+        self.assertFalse(hedge_dump_overrides_oracle(0.33, 0.32))
+        self.assertFalse(hedge_dump_overrides_oracle(None, 0.32))
+        self.assertFalse(hedge_dump_overrides_oracle(0.50, 0.32))
 
 
 if __name__ == "__main__":

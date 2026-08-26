@@ -72,6 +72,7 @@ from buy.hedge_gate import (
     hedge_fail_is_terminal,
     hedge_market_tick,
     hedge_oracle_allows_sell,
+    hedge_dump_overrides_oracle,
     hedge_should_keep_retrying,
     hedge_tick_after_build_error,
     live_bag_log_fields,
@@ -211,17 +212,19 @@ _STRATEGY_DEFAULTS = {
     "hedge_max_spread": 0.15,
     "hedge_require_ask_max": 0.52,
     "hedge_persist_s": 5.0,
-    "hedge_toxic_bid_max": 0.35,
+    "hedge_toxic_bid_max": 0.32,
     # After persist_done, bid ≥ this is a recovered winner: HOLD and clear.
     # Tight 53¢ so we do not copy 5m's persist-then-sell 70–84 window.
     "hedge_recovery_cancel": 0.53,
-    # After persist, a fade through 50 still sells (do not wait for 35¢).
+    # After persist, a fade through 50 still sells (do not wait for 32¢).
     "hedge_sell_fade": True,
     "hedge_require_gui": True,
-    # Once holding: do not sell while Binance BTC is still on the held
-    # side of PTB. $0 = any non-zero tick. Missing/stale feed also holds.
+    # Once holding: do not persist-sell while Binance BTC is still on the
+    # held side of PTB. $0 = any non-zero tick. Missing/stale feed also
+    # holds. Dump ≤ toxic is book-only (`hedge_dump_ignore_oracle`).
     "hedge_require_oracle": True,
     "hedge_oracle_min_edge_usd": 0.0,
+    "hedge_dump_ignore_oracle": True,
     # Outer look-ahead / poll horizon (minutes). Window 0 disables A or C.
     "buy_window_min": 20.0,
     "a22_window_min": 0.0,
@@ -467,6 +470,7 @@ HEDGE_SELL_FADE = _strat["hedge_sell_fade"]
 HEDGE_REQUIRE_GUI = _strat["hedge_require_gui"]
 HEDGE_REQUIRE_ORACLE = _strat["hedge_require_oracle"]
 HEDGE_ORACLE_MIN_EDGE_USD = _strat["hedge_oracle_min_edge_usd"]
+HEDGE_DUMP_IGNORE_ORACLE = _strat["hedge_dump_ignore_oracle"]
 BUY_WINDOW_MIN = _strat["buy_window_min"]
 A22_WINDOW_MIN = _strat["a22_window_min"]
 B15_WINDOW_MIN = _strat["b15_window_min"]
@@ -706,8 +710,11 @@ def log_buy_skip_throttled(skip_reason, condition_id, event="buy_skip", **kwargs
     log_event(event, reason=reason, condition_id=condition_id, **kwargs)
 
 
-def hold_while_oracle_agrees(held_leg, start_ts, condition_id):
-    """True = do not sell; live BTC is still with the bag (or feed is unread)."""
+def hold_while_oracle_agrees(held_leg, start_ts, condition_id, *, log=True):
+    """True = do not persist-sell; live BTC is still with the bag (or unread).
+
+    Dump ≤ toxic can ignore this when ``hedge_dump_ignore_oracle`` is on.
+    """
     if not HEDGE_REQUIRE_ORACLE:
         return False
     uchk = btc_feed.underlying_check(start_ts, float(HEDGE_ORACLE_MIN_EDGE_USD))
@@ -716,6 +723,8 @@ def hold_while_oracle_agrees(held_leg, start_ts, condition_id):
         return False
     _hedge_persist_armed.pop(condition_id, None)
     _hedge_persist_done.discard(condition_id)
+    if not log:
+        return True
     edge = uchk.get("edge_usd")
     event = (
         "hedge_skip_oracle_still_winning"
@@ -4033,6 +4042,7 @@ while not _shutdown_requested:
         HEDGE_REQUIRE_GUI = _strat["hedge_require_gui"]
         HEDGE_REQUIRE_ORACLE = _strat["hedge_require_oracle"]
         HEDGE_ORACLE_MIN_EDGE_USD = _strat["hedge_oracle_min_edge_usd"]
+        HEDGE_DUMP_IGNORE_ORACLE = _strat["hedge_dump_ignore_oracle"]
         BUY_WINDOW_MIN = _strat["buy_window_min"]
         A22_WINDOW_MIN = _strat["a22_window_min"]
         B15_WINDOW_MIN = _strat["b15_window_min"]
@@ -4869,14 +4879,47 @@ while not _shutdown_requested:
                     and HEDGE_ENABLED
                     and not meta.get("hedge_closed")
                 )
-                # Oracle first: if live BTC is still on the held side of PTB,
-                # a one-tick CLOB dip is not a hedge. Missing/stale feed also
-                # holds (fail closed against false sells).
-                if hedge_open and hold_while_oracle_agrees(held_leg, m.start_ts, cond):
-                    hedge_open = False
+                # Persist-50 stays behind the oracle (a one-tick CLOB dip is
+                # not a hedge). Dump ≤ toxic is book-only when
+                # hedge_dump_ignore_oracle: peek the book first so a 4–32¢
+                # print is not vetoed by BTC that has not crossed yet.
+                oracle_dump_only = False
                 if hedge_open:
-                    # ANY live bag with held bid ≤ toxic (35¢) dumps at the live bid.
-                    # Persist 5s @ 50/52, then sell at the live bid while < 53¢
+                    _dump_age = book_ws.quote_age(held_token)
+                    _dump_fresh = (
+                        _dump_age is not None
+                        and _dump_age <= float(HEDGE_QUOTE_MAX_AGE_S)
+                    )
+                    _dump_peek = None
+                    if _dump_fresh:
+                        _dump_q = book_ws.quote(
+                            held_token, max_age_s=float(HEDGE_QUOTE_MAX_AGE_S),
+                        )
+                        if _dump_q is not None:
+                            _dump_peek = _dump_q[0]
+                    _dump_last, _ = last_good_held_quote(held_token)
+                    _dump_cached = _book_cache.get(held_token)
+                    _dump_cached_bid = (
+                        _dump_cached[0] if _dump_cached else None
+                    )
+                    dump_hint = any(
+                        hedge_dump_overrides_oracle(
+                            bid,
+                            HEDGE_TOXIC_BID_MAX,
+                            enabled=HEDGE_DUMP_IGNORE_ORACLE,
+                        )
+                        for bid in (_dump_peek, _dump_last, _dump_cached_bid)
+                    )
+                    if dump_hint:
+                        oracle_dump_only = hold_while_oracle_agrees(
+                            held_leg, m.start_ts, cond, log=False,
+                        )
+                    elif hold_while_oracle_agrees(held_leg, m.start_ts, cond):
+                        hedge_open = False
+                if hedge_open:
+                    # ANY live bag with held bid ≤ toxic (32¢) dumps at the live bid
+                    # even if BTC has not crossed yet. Persist 5s @ 50/52 stays
+                    # behind the oracle. Then sell at the live bid while < 53¢
                     # (including a fade through 50). Bid ≥ recovery_cancel (53¢)
                     # holds and clears persist. Incomplete REST uses WS/last-good.
                     quote_age = book_ws.quote_age(held_token)
@@ -5064,7 +5107,17 @@ while not _shutdown_requested:
                             if intent.persist_done:
                                 _hedge_persist_done.add(cond)
 
-                        if intent.action in {"arm", "wait"}:
+                        if oracle_dump_only and not bool(intent.dump):
+                            log_buy_skip_throttled(
+                                "oracle_still_winning",
+                                cond,
+                                event="hedge_skip_oracle_still_winning",
+                                **bag_log,
+                                via="dump_only_override",
+                            )
+                            _hedge_persist_armed.pop(cond, None)
+                            _hedge_persist_done.discard(cond)
+                        elif intent.action in {"arm", "wait"}:
                             log_buy_skip_throttled(
                                 intent.reason,
                                 cond,
@@ -5148,6 +5201,7 @@ while not _shutdown_requested:
                                 dump=dump,
                                 persist_done=intent.persist_done,
                                 hedge_floor=hedge_floor,
+                                dump_oracle_override=bool(oracle_dump_only and dump),
                             )
                             prior_hedge_proceeds = float(
                                 meta.get("pnl_hedge_proceeds", 0) or 0
@@ -5222,6 +5276,12 @@ while not _shutdown_requested:
                                 live_minutes = (float(m.end_ts) - time.time()) / 60.0
                                 if live_minutes <= 0:
                                     return False, "expired"
+                                if hedge_dump_overrides_oracle(
+                                    _live_bid,
+                                    HEDGE_TOXIC_BID_MAX,
+                                    enabled=HEDGE_DUMP_IGNORE_ORACLE,
+                                ):
+                                    return True, "ok"
                                 if hold_while_oracle_agrees(
                                     held_leg, m.start_ts, cond,
                                 ):
