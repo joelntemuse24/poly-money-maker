@@ -215,17 +215,17 @@ def evaluate_held_bag(
     if not (dump_max < qualify <= recovery <= 1):
         return HedgeIntent("hold", "bad_thresholds", None, None, False, True, None, False)
 
+    # Elapsed wall time alone never completes persistence.  The endpoint tick
+    # must still pass the current book and GUI checks below.  A caller-provided
+    # ``persist_done`` is different: once a previously qualified tick completed
+    # persistence, the post-persist fade/recovery policy intentionally remains
+    # bid-only.
     done = bool(persist_done)
-    if persist_armed_ts is not None and wait > 1e-12:
-        try:
-            if float(now_s) - float(persist_armed_ts) >= wait - 1e-12:
-                done = True
-        except (TypeError, ValueError):
-            pass
 
     if bid_f is None:
         return HedgeIntent(
-            "hold", "no_bid", None, persist_armed_ts, done, True, None, False,
+            "hold", "no_bid", None, persist_armed_ts if done else None,
+            done, True, None, False,
         )
 
     if bid_f <= dump_max + 1e-12:
@@ -268,12 +268,12 @@ def evaluate_held_bag(
         True, now_s=float(now_s), armed_ts=persist_armed_ts, persist_s=wait,
     )
     if fire:
-        if dump_max < bid_f < qualify - 1e-12:
+        if dump_max < bid_f < qualify - 1e-12 and not sell_fade:
             return HedgeIntent(
                 "hold", "dead_band", None, new_ts, True, False, None, False,
             )
         return HedgeIntent(
-            "sell", "persist_ready", bid_f, new_ts, True, False, recovery, False,
+            "sell", "persist_live_bid", bid_f, new_ts, True, False, recovery, False,
         )
     if pwhy == "armed":
         return HedgeIntent("arm", "persist_armed", None, new_ts, False, False, None, False)
