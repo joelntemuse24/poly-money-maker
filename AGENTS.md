@@ -17,12 +17,13 @@ Same-leg only. After a full hedge the market is done. Normal hedge is
 **persist 5s @ 50/52** (GUI: held ≤ **52¢**, other ≥ **48¢**; not inverted
 30/70). Then sell at the live bid while **< 53¢** (fade through 50 still
 sells). Bid ≥ **53¢** (`hedge_recovery_cancel`) holds and **clears persist**.
-Once holding, do **not** sell while live Binance BTC is still on the held
-side of PTB (`hedge_require_oracle`). Missing/stale BTC also holds. **Any
-live bag** dumps bid-only at **≤35¢** only after that oracle has flipped
-or gone flat. Do not sell 55–69 after persist (that was the 5m 70–84
-complaint). Winners redeem at $1.00. **No profit-take sell.** See
-`CURRENT.md` for the active probe knobs.
+Once holding, do **not persist-sell** while live Binance BTC is still on
+the held side of PTB (`hedge_require_oracle`). Missing/stale BTC also
+holds. **Any live bag** dumps bid-only at **≤32¢** even if that oracle
+has not crossed yet (`hedge_dump_ignore_oracle`). Persist-50 stays
+behind the oracle so a one-tick 50¢ dip is not a hedge. Do not sell
+55–69 after persist (that was the 5m 70–84 complaint). Winners redeem at
+$1.00. **No profit-take sell.** See `CURRENT.md` for the active probe knobs.
 
 A/C slices (`>93` last 22 min / `>95` last 5) are **off**
 (`a22_window_min` = `c5_window_min` = 0). Do not copy 5m `seconds_left`
@@ -186,9 +187,9 @@ two-slice $2.50+$2.50 add.
 Live hourly (after this change is deployed and `polybuybothourly` restarted):
 
 - `buy_attempt` `slice=b15` — last-20m 75–90¢ FAK at 90¢. A/C windows are 0.
-- `hedge_attempt` / `hedge_fill` — persist **5s @ 50/52** then sell live bid **< 53¢**, including fade through 50. Dump ≤ **35¢** only after oracle against/flat. Bid ≥ **53¢** holds.
+- `hedge_attempt` / `hedge_fill` — persist **5s @ 50/52** then sell live bid **< 53¢**, including fade through 50. Dump ≤ **32¢** is book-only (`dump_oracle_override`). Bid ≥ **53¢** holds.
 - `hedge_skip_recovery` — persist_done but held bid ≥ 53¢; HOLD and clear persist. Do **not** sell 55–69.
-- `hedge_skip_oracle_still_winning` / `hedge_skip_oracle` — live BTC still on held side of PTB, or feed missing/stale; do not sell.
+- `hedge_skip_oracle_still_winning` / `hedge_skip_oracle` — live BTC still on held side of PTB, or feed missing/stale; do not persist-sell. A ≤32¢ dump still sells.
 - `hedge_skip_persist` — 50/52 + GUI passed but has not stayed qualified for 5s.
 - `buy_skip_hedge_closed` — market already dumped; no re-entry even if another slice window is open.
 - `buy_skip_underlying_edge` / `buy_skip_underlying_side` — Binance vs PTB **$10** buy edge, side must match.
@@ -222,7 +223,7 @@ Stopped 5m (do not start unless asked):
 - `hedge_skip_no_consensus` — book passed but GUI/last-trade still fail. Stopped 5m: held last print ≤ 72¢, held GUI ≤ 72¢, other GUI ≥ 28¢. Live hourly: held ≤ 52¢, other ≥ 48¢ (no buy 5¢ gap). Dump ≤35 (hourly) / ≤53 (5m) skips this veto. 15m still invert buy 70/30.
 - `hedge_skip_toxic_recovered` — `toxic_fill` is armed but held bid > `hedge_toxic_bid_max` (53¢ winner book); dump stays armed, no sell
 - `hedge_skip_incomplete_rest` — no REST/WS/last-good bid. Incomplete REST must **not** skip a dump; use WS/last-good
-- `hedge_skip_oracle_still_winning` — once holding, live BTC is still on the held side of PTB; do not sell a CLOB dip. Throttled 8s.
+- `hedge_skip_oracle_still_winning` — once holding, live BTC is still on the held side of PTB; do not persist-sell a CLOB dip. Dump ≤32¢ still sells. Throttled 8s.
 - `hedge_skip_oracle` — hedge oracle unread (missing PTB, stale/missing live BTC). Fail closed: do not sell.
 - `hedge_skip_dead_band` — persist done or qualify fired but bid is in (53¢, 70¢); do not sell
 - `buy_skip_ambiguous` — GUI display prices too close (throttled 8s; **not** one event per market)
@@ -424,7 +425,7 @@ After this branch merges, on the VM (hourly; stop 5m):
 cd ~/poly-money-maker && git pull
 sudo systemctl stop polybuybot polybuybot5m
 sudo systemctl disable polybuybot polybuybot5m
-python3 -c 'import json; from pathlib import Path; p=Path("strategy_buyhourly.json"); d=json.loads(p.read_text()); d["buy_window_min"]=20.0; d["a22_window_min"]=0.0; d["b15_window_min"]=20.0; d["c5_window_min"]=0.0; d["hedge_threshold"]=0.50; d["hedge_require_ask_max"]=0.52; d["hedge_persist_s"]=5.0; d["hedge_toxic_bid_max"]=0.35; d["hedge_recovery_cancel"]=0.53; d["hedge_sell_fade"]=True; d["hedge_require_oracle"]=True; d["hedge_oracle_min_edge_usd"]=0.0; d["hedge_undercut_ticks"]=0; d["b15_buy_budget"]=10.0; d["market_spend_cap"]=10.0; d["buy_budget"]=10.0; p.write_text(json.dumps(d, indent=2)+"\n")'
+python3 -c 'import json; from pathlib import Path; p=Path("strategy_buyhourly.json"); d=json.loads(p.read_text()); d["buy_window_min"]=20.0; d["a22_window_min"]=0.0; d["b15_window_min"]=20.0; d["c5_window_min"]=0.0; d["hedge_threshold"]=0.50; d["hedge_require_ask_max"]=0.52; d["hedge_persist_s"]=5.0; d["hedge_toxic_bid_max"]=0.32; d["hedge_recovery_cancel"]=0.53; d["hedge_sell_fade"]=True; d["hedge_require_oracle"]=True; d["hedge_dump_ignore_oracle"]=True; d["hedge_oracle_min_edge_usd"]=0.0; d["hedge_undercut_ticks"]=0; d["b15_buy_budget"]=10.0; d["market_spend_cap"]=10.0; d["buy_budget"]=10.0; p.write_text(json.dumps(d, indent=2)+"\n")'
 sudo systemctl restart polypathlog
 sudo systemctl start polybuybothourly
 sudo systemctl enable polybuybothourly

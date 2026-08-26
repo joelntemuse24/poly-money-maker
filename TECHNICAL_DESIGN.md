@@ -212,8 +212,9 @@ exist in the other two files. Diff the siblings after a logic change, but do
 not copy cadence-specific math blindly. The 5m bands use `BUY_HORIZON_S` in
 **seconds**. Hourly bands use `BUY_HORIZON_MIN` in **minutes**. Live hourly
 defaults are B-only for the last 20 minutes, persist **5s @ 50/52**, dump
-35¢, recovery **53¢**, `hedge_sell_fade`, `hedge_require_oracle`, Binance
-buy edge $10, tick `0.01`, and a $10 market cap.
+32¢ book-only (`hedge_dump_ignore_oracle`), recovery **53¢**, `hedge_sell_fade`,
+`hedge_require_oracle` on persist, Binance buy edge $10, tick `0.01`, and a
+$10 market cap.
 
 The stopped 5m defaults remain two slices, persist 2s @ 70/72, dump 53¢,
 recovery 85¢, Chainlink edge $0, and nominal tick `0.001`. Those values are
@@ -824,17 +825,17 @@ caller.
 **Live hourly hedge pipeline** (`evaluate_held_bag` in
 `buy/hedge_gate.py`, orchestrated by `buybothourly.py`):
 
-1. **Oracle veto first.** `hold_while_oracle_agrees` reads live Binance
+1. **Oracle veto on persist.** `hold_while_oracle_agrees` reads live Binance
    BTCUSDT versus the market PTB with a $0 minimum edge. If the feed is
    missing/stale or still favors the held leg, clear persistence and hold
    (`hedge_skip_oracle` / `hedge_skip_oracle_still_winning`). A flipped or
-   exactly-flat oracle lets the book checks continue. This applies to both
-   normal sells and the 35¢ dump.
+   exactly-flat oracle lets persist-50 continue. A bid ≤ **32¢** dump
+   bypasses this veto (`hedge_dump_ignore_oracle` / `hedge_dump_overrides_oracle`).
 2. Coalesce the held quote: REST, then WS, then last-good
    (`pick_held_quote`). Incomplete REST must not strand a live bag.
-3. After the oracle permits selling, **bid ≤ 35¢ dumps every live bag**.
-   It is bid-only, with no GUI, last-trade, spread, or persistence veto.
-   A wide 20/80 book still dumps.
+3. **Bid ≤ 32¢ dumps every live bag**, including while BTC still agrees.
+   It is bid-only, with no GUI, last-trade, spread, persistence, or oracle
+   veto. A wide 20/80 book still dumps. Persist-50 does not get this bypass.
 4. Before persistence completes, a fresh bid above 50¢ is a healthy
    bounce and clears the arm. Bid ≥ `hedge_recovery_cancel` (53¢) also
    clears a completed arm (`hedge_skip_recovery`).
@@ -855,12 +856,12 @@ caller.
    rebuilds at a coarser minimum if the CLOB reports one
    (`hedge_tick_retry`). `hedge_min_price` is retained config, not a FAK
    floor; a 20¢ live bid is not refused. Every SELL POST/retry also runs
-   `pre_submit` (`hold_while_oracle_agrees` + TTM > 0) and
-   `deadline_ts=m.end_ts`.
+   `pre_submit` (`hold_while_oracle_agrees` unless a ≤32¢ dump overrides,
+   plus TTM > 0) and `deadline_ts=m.end_ts`.
 8. Unmatched FAK / invalid tick / could-not-run retries re-quote the live
    bid (up to 12 attempts for a dump or persist-done sell) and recheck
    oracle/expiry before each POST. A dump retry stops if bid recovers
-   above 35¢. A persist-done retry continues while bid <53¢ because
+   above 32¢. A persist-done retry continues while bid <53¢ because
    `sell_fade` is on, and aborts at recovery. Incomplete REST uses
    WS/last-good rather than idling the bag.
 9. Every live-bag skip/fail logs slug, TTM, bid, ask, tick, reason, and
@@ -869,8 +870,8 @@ caller.
 
 **`toxic_fill`:** the hourly bot arms this when confirmed average is below
 65¢. The flag stays on metadata until exit/reconciliation, but it is not
-what makes the 35¢ dump universal: **every** live bag dumps at that bid
-after the oracle allows it. A recovered toxic flag may log
+what makes the 32¢ dump universal: **every** live bag dumps at that bid
+even if BTC still agrees. A recovered toxic flag may log
 `hedge_skip_toxic_recovered`.
 
 The stopped 5m bot also uses `evaluate_held_bag`, with different knobs:
@@ -1043,7 +1044,7 @@ last-trade proxy; displayed top size caps the paper fill.
 This is still **not a live hourly replay**. Pathlog has no Binance/PTB, no
 last trade, no POST latency, and no unmatched FAKs. Paper mode also does
 not model hourly `hedge_require_oracle`, `hedge_sell_fade`, recovery-cancel
-semantics, or the universal bid-only 35¢ dump exactly. Treat its P&L as a
+semantics, or the universal bid-only 32¢ dump exactly. Treat its P&L as a
 book-path comparison, not proof that the live bot would have traded.
 
 `--sweep --series hourly --template strategy_buyhourly.example.json` scores
@@ -1101,8 +1102,9 @@ cap is separate and in-app.
 
 `CURRENT.md` owns the exact transition/patch command so it cannot drift in
 two places. Before starting/restarting hourly, verify live JSON explicitly:
-B window 20, A/C windows 0, 75–90, $10 cap, hedge 50/52 for 5s, dump 35,
-recovery 53, sell-fade/oracle true, undercut 0, and the intended
+B window 20, A/C windows 0, 75–90, $10 cap, hedge 50/52 for 5s, dump 32
+book-only, recovery 53, sell-fade/oracle true, dump_ignore_oracle true,
+undercut 0, and the intended
 `dry_run` / `entry_enabled`. Restart `polypathlog` when recorder Python
 changes (including its hourly 20-minute window).
 
@@ -1151,8 +1153,8 @@ pulled the code hours earlier.
 6. Tick `0.001` vs `0.01`.
 7. Never delete live JSON / logs / `.env`. Export pathlog before prune.
 8. Ask ≠ price. Tight REST book required.
-9. Normal hourly reversal needs oracle + book + GUI + 5s. The 35¢ dump is
-   bid-only only **after** the oracle is against/flat.
+9. Normal hourly reversal needs oracle + book + GUI + 5s. The 32¢ dump is
+   bid-only and **ignores** the oracle.
 10. `git pull` ≠ running new code.
 11. Live JSON hedge keys override code defaults.
 12. Hourly paper sweep does not replay the live oracle, fade/recovery, or
@@ -1202,7 +1204,7 @@ implemented. `sell_market_with_retry` stays hedge-only.
 | **Spread** | Ask minus bid |
 | **TTM** | Time to market end (minutes in hourly/15m; seconds in 5m) |
 | **Token ID** | CLOB id of UP or DOWN |
-| **toxic_fill** | Hourly flag for average below 65¢; universal 35¢ dump is independent of the flag |
+| **toxic_fill** | Hourly flag for average below 65¢; universal 32¢ dump is independent of the flag |
 | **TWAP** | Time-weighted average price (used by the stopped Chainlink-based 5m/15m bots) |
 | **Websocket (WS)** | Push connection; fast cache, not an order |
 | **Write-ahead** | Save order id to disk **before** POST |

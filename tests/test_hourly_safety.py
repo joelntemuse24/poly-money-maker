@@ -650,6 +650,7 @@ class HourlySafetyWiringTests(unittest.TestCase):
         hedge = nested["_hedge_pre_submit"]
         self.assertIn("m.end_ts", hedge)
         self.assertIn("hold_while_oracle_agrees", hedge)
+        self.assertIn("hedge_dump_overrides_oracle", hedge)
         self.assertIn("_clear_buy_uncertain()", nested["_abort_buy_submit"])
         self.assertIn("save_json(", nested["_abort_buy_submit"])
         self.assertIn("_clear_hedge_uncertain()", nested["_abort_hedge_submit"])
