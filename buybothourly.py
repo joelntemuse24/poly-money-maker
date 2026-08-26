@@ -56,6 +56,7 @@ from buy.entry_skip import (
     applicable_hourly_entry_bands,
     ask_in_any_band,
     can_arm_hourly_slice,
+    hourly_entry_final_gate,
     hourly_horizon_min,
     hourly_remaining_to_cap,
     hourly_slice_budget,
@@ -1669,14 +1670,15 @@ def hedge_consensus_ok(
 
     Buy still uses 70/30. Hourly hedge uses ``hedge_gui_limits`` (held ≤
     ask-max, other ≥ complement) and does **not** require the other GUI
-    to already be higher than held. A 50¢ vs 48¢ book is the stop.
+    to already be higher than held. A 50¢ vs 48¢ book is the stop; the
+    unrelated buy-side ``min_edge`` ambiguity gap does not apply here.
     Last print on the held token still must be ≤ last_trade_max.
     """
+    _ = min_edge
     held_last = finite_float(held_last, minimum=0, maximum=1)
     last_trade_max = finite_float(last_trade_max, minimum=0, maximum=1)
     held_gui_max = finite_float(held_gui_max, minimum=0, maximum=1)
     other_gui_min = finite_float(other_gui_min, minimum=0, maximum=1)
-    min_edge = finite_float(min_edge, minimum=0, maximum=1)
     if held_last is None or last_trade_max is None:
         return False, "missing_last_trade"
     if held_last > last_trade_max + 1e-12:
@@ -1685,10 +1687,8 @@ def hedge_consensus_ok(
     other_gui = polymarket_display_price(other_bid, other_ask, other_last)
     if held_gui is None or other_gui is None:
         return False, "incomplete_gui"
-    if held_gui_max is None or other_gui_min is None or min_edge is None:
+    if held_gui_max is None or other_gui_min is None:
         return False, "missing_gui_limits"
-    if abs(held_gui - other_gui) + 1e-12 < min_edge:
-        return False, "ambiguous"
     if held_gui > held_gui_max + 1e-12:
         return False, "held_gui_too_high"
     if other_gui + 1e-12 < other_gui_min:
@@ -2676,8 +2676,10 @@ def buy_market_with_retry(
     min_price=0.0,
     on_fill=None,
     on_submit=None,
+    on_abort=None,
     condition_id=None,
     pre_submit=None,
+    deadline_ts=None,
 ):
     """Buy token_id via FAK, sized in shares at the quoted ask.
 
@@ -2706,6 +2708,11 @@ def buy_market_with_retry(
     state. It runs before every POST so a process crash cannot lose an in-flight
     attempt. ``intent`` includes the deterministic signed order id and amounts.
 
+    ``pre_submit`` and ``deadline_ts`` are fail-closed final gates. They are
+    checked for every attempt/retry after the durable write-ahead and
+    immediately before POST. If either rejects, ``on_abort()`` synchronously
+    clears that write-ahead because no POST occurred.
+
     Ambiguous POST outcomes (exception, falsy response, or non-terminal response
     with no confirmed fill) reconcile once and STOP — never retry with the full
     budget (accepted-then-timeout double spend).
@@ -2713,6 +2720,41 @@ def buy_market_with_retry(
     total_bought = 0.0
     spent = 0.0
     budget = float(budget)
+    submit_aborted = False
+    abort_cleanup_failed = False
+    write_ahead_written = False
+
+    def _deadline_open():
+        if deadline_ts is None:
+            return True
+        try:
+            return time.time() < float(deadline_ts)
+        except (TypeError, ValueError):
+            return False
+
+    def _reject_no_post(reason, attempt_no):
+        nonlocal submit_aborted, abort_cleanup_failed
+        submit_aborted = True
+        log_event(
+            "buy_pre_submit_rejected",
+            token_id=token_id,
+            condition_id=condition_id,
+            attempt=attempt_no,
+            reason=str(reason)[:160],
+        )
+        if write_ahead_written and on_abort:
+            try:
+                on_abort()
+            except Exception as exc:
+                abort_cleanup_failed = True
+                log_event(
+                    "buy_on_abort_fail",
+                    token_id=token_id,
+                    condition_id=condition_id,
+                    attempt=attempt_no,
+                    error=str(exc)[:200],
+                )
+
     if DRY_RUN:
         console.print(
             f"  [bold black on yellow][DRY BUY][/] would BUY ≤{budget:.2f} USDC of "
@@ -2784,6 +2826,9 @@ def buy_market_with_retry(
     for attempt in range(max_retries):
         if persist_failed:
             break
+        if not _deadline_open():
+            _reject_no_post("expired", attempt + 1)
+            break
         remaining_budget = budget - spent
         if remaining_budget < 0.01:
             break
@@ -2835,22 +2880,6 @@ def buy_market_with_retry(
         max_shares = shares
         ambiguous = False
         result = None
-        if pre_submit:
-            try:
-                allowed, reason = pre_submit(
-                    float(fresh_bid), float(fresh_ask), attempt + 1,
-                )
-            except Exception as exc:
-                allowed, reason = False, f"validator_error:{exc}"
-            if not allowed:
-                log_event(
-                    "buy_pre_submit_rejected",
-                    token_id=token_id,
-                    condition_id=condition_id,
-                    attempt=attempt + 1,
-                    reason=str(reason)[:160],
-                )
-                break
         try:
             signed_order = safe_api_call(
                 client.create_order,
@@ -2880,6 +2909,9 @@ def buy_market_with_retry(
                 attempt=attempt + 1, spend=round(spend, 4),
             )
             break
+        if not _deadline_open():
+            _reject_no_post("expired", attempt + 1)
+            break
         if on_submit:
             try:
                 on_submit(
@@ -2896,6 +2928,20 @@ def buy_market_with_retry(
                 )
                 console.print(f"  [bold red][PERSIST FAIL][/] BUY not submitted: {e}")
                 return total_bought, spent, "persist_fail"
+            write_ahead_written = True
+        if pre_submit:
+            try:
+                allowed, reason = pre_submit(
+                    float(fresh_bid), float(fresh_ask), attempt + 1,
+                )
+            except Exception as exc:
+                allowed, reason = False, f"validator_error:{exc}"
+            if not allowed:
+                _reject_no_post(reason, attempt + 1)
+                break
+        if not _deadline_open():
+            _reject_no_post("expired_after_write_ahead", attempt + 1)
+            break
         try:
             result = safe_api_call(
                 client.post_order,
@@ -3096,11 +3142,15 @@ def buy_market_with_retry(
             return total_bought, spent, "filled"
         time.sleep(0.05)
 
+    if abort_cleanup_failed:
+        return total_bought, spent, "persist_fail"
     if persist_failed and total_bought > 0:
         return total_bought, spent, "persist_fail"
     if total_bought > 0:
         console.print(f"  [bold yellow][BUY DONE][/]{total_bought:.4f} shares · ${spent:.2f}/${budget:.2f} spent")
         return total_bought, spent, "filled"
+    if submit_aborted:
+        return 0.0, 0.0, "aborted"
     console.print(f"  [bold red][BUY FAIL][/] spent $0.00/${budget:.2f}")
     return 0.0, 0.0, "empty"
 
@@ -3121,12 +3171,15 @@ def sell_market_with_retry(
     require_ask_max=None,
     max_spread=None,
     on_submit=None,
+    on_abort=None,
     on_fill=None,
     condition_id=None,
     initial_quote=None,
     dump=False,
     persist_done=False,
     market_tick=None,
+    pre_submit=None,
+    deadline_ts=None,
 ):
     """Sell `size` shares via FAK. Used for hedge exits only — no max_price cap.
 
@@ -3140,6 +3193,10 @@ def sell_market_with_retry(
     filled|empty|ambiguous|persist_fail|dry. Unknown POST outcomes stop retries.
     Empty after rejected FAKs is **not** terminal while size remains and the
     dump/persist still qualifies — the loop must retry next tick.
+
+    ``pre_submit`` and ``deadline_ts`` are checked after write-ahead and before
+    every POST/retry. A no-POST rejection invokes ``on_abort()`` to durably
+    clear that write-ahead without altering confirmed-fill reconciliation.
     """
     total_sold = 0.0
     total_proceeds = 0.0
@@ -3149,6 +3206,41 @@ def sell_market_with_retry(
     last_limit = float(price_limit) if price_limit is not None else floor
     dump = bool(dump)
     persist_done = bool(persist_done)
+    submit_aborted = False
+    abort_cleanup_failed = False
+    write_ahead_written = False
+
+    def _deadline_open():
+        if deadline_ts is None:
+            return True
+        try:
+            return time.time() < float(deadline_ts)
+        except (TypeError, ValueError):
+            return False
+
+    def _reject_no_post(reason, attempt_no):
+        nonlocal submit_aborted, abort_cleanup_failed
+        submit_aborted = True
+        log_event(
+            "sell_pre_submit_rejected",
+            token_id=token_id,
+            condition_id=condition_id,
+            attempt=attempt_no,
+            reason=str(reason)[:160],
+        )
+        if write_ahead_written and on_abort:
+            try:
+                on_abort()
+            except Exception as exc:
+                abort_cleanup_failed = True
+                log_event(
+                    "sell_on_abort_fail",
+                    token_id=token_id,
+                    condition_id=condition_id,
+                    attempt=attempt_no,
+                    error=str(exc)[:200],
+                )
+
     need_integrity = (
         (not dump)
         and (not persist_done)
@@ -3195,27 +3287,12 @@ def sell_market_with_retry(
     for attempt in range(max_retries):
         if remaining < 0.01:
             break
+        if not _deadline_open():
+            _reject_no_post("expired", attempt + 1)
+            break
         live_bid = last_bid
         live_ask = last_ask
-        if attempt == 0 and initial_quote is not None:
-            try:
-                live_bid, live_ask = initial_quote
-            except (TypeError, ValueError):
-                live_bid, live_ask = None, None
-            if need_integrity:
-                ok, why = hedge_book_ok(
-                    live_bid, live_ask, abort_above, max_spread, require_ask_max,
-                )
-                if not ok:
-                    log_event(
-                        "hedge_initial_quote_invalid",
-                        token_id=token_id,
-                        live_bid=live_bid,
-                        live_ask=live_ask,
-                        reason=why,
-                    )
-                    break
-        elif refresh_quote:
+        if refresh_quote:
             qb, _, qa, _, _ = get_quote_fast(
                 token_id,
                 max_age_s=0.0,
@@ -3263,6 +3340,19 @@ def sell_market_with_retry(
                         f"bid={live_bid:.3f} ask={live_ask:.3f}"
                     )
                     break
+        elif attempt == 0 and initial_quote is not None and need_integrity:
+            ok, why = hedge_book_ok(
+                live_bid, live_ask, abort_above, max_spread, require_ask_max,
+            )
+            if not ok:
+                log_event(
+                    "hedge_initial_quote_invalid",
+                    token_id=token_id,
+                    live_bid=live_bid,
+                    live_ask=live_ask,
+                    reason=why,
+                )
+                break
         if live_bid is None:
             live_bid = last_bid if last_bid is not None else price_limit
         last_bid = live_bid
@@ -3292,6 +3382,7 @@ def sell_market_with_retry(
         if (
             persist_done
             and (not dump)
+            and (not sell_fade)
             and live_bid is not None
             and dump_bid_max < float(live_bid) < qualify_bid - 1e-12
         ):
@@ -3357,6 +3448,9 @@ def sell_market_with_retry(
                 time.sleep(float(retry_sleep_s))
                 continue
             break
+        if not _deadline_open():
+            _reject_no_post("expired", attempt + 1)
+            break
         if on_submit:
             try:
                 on_submit(
@@ -3371,6 +3465,21 @@ def sell_market_with_retry(
                 return total_sold, {
                     "bot_status": "persist_fail", "last_limit": last_limit,
                 }, total_proceeds
+            write_ahead_written = True
+        if pre_submit:
+            try:
+                allowed, reason = pre_submit(
+                    float(live_bid), None if live_ask is None else float(live_ask),
+                    attempt + 1,
+                )
+            except Exception as exc:
+                allowed, reason = False, f"validator_error:{exc}"
+            if not allowed:
+                _reject_no_post(reason, attempt + 1)
+                break
+        if not _deadline_open():
+            _reject_no_post("expired_after_write_ahead", attempt + 1)
+            break
         try:
             result = safe_api_call(
                 client.post_order,
@@ -3554,11 +3663,21 @@ def sell_market_with_retry(
             }, total_proceeds
         time.sleep(float(retry_sleep_s))
 
+    if abort_cleanup_failed:
+        return total_sold, {
+            "sold": total_sold,
+            "last_limit": last_limit,
+            "bot_status": "persist_fail",
+        }, total_proceeds
     if total_sold > 0:
         return total_sold, {
             "partial": True, "sold": total_sold, "last_limit": last_limit,
             "bot_status": "filled",
         }, total_proceeds
+    if submit_aborted:
+        return 0, {
+            "sold": 0, "last_limit": last_limit, "bot_status": "aborted",
+        }, 0.0
     console.print(f"  [bold red][EXIT FAIL][/] market sell 0/{size:.4f} cleared")
     # Preserve last_limit so ghost reconciliation prices at the actual retry floor.
     return 0, {"sold": 0, "last_limit": last_limit, "bot_status": "empty"}, 0.0
@@ -4775,13 +4894,6 @@ while not _shutdown_requested:
                     last_bid, last_ask = last_good_held_quote(held_token)
                     persist_done = cond in _hedge_persist_done
                     armed_ts = _hedge_persist_armed.get(cond)
-                    if (
-                        armed_ts is not None
-                        and float(HEDGE_PERSIST_S) > 0
-                        and (time.monotonic() - float(armed_ts)) >= float(HEDGE_PERSIST_S) - 1e-12
-                    ):
-                        persist_done = True
-                        _hedge_persist_done.add(cond)
 
                     # Healthy winner before persist: skip REST. After persist,
                     # fade through 50 still sells; ≥ recovery_cancel (53¢) is a
@@ -5046,6 +5158,12 @@ while not _shutdown_requested:
                                     meta, _HEDGE_UNCERTAIN_KEYS,
                                 )
 
+                            def _abort_hedge_submit():
+                                # The final gate rejected after write-ahead, so
+                                # no exchange order can require quarantine.
+                                _clear_hedge_uncertain()
+                                save_json(STATE_FILE, positions_meta)
+
                             def _persist_hedge_submit(
                                 sold_total, proceeds_total, remaining_size,
                                 attempt_no, submit_price, intent_order,
@@ -5100,6 +5218,16 @@ while not _shutdown_requested:
                                     _cached_positions[cond][leg_key]["size"] = rem_now
                                 save_json(STATE_FILE, positions_meta)
 
+                            def _hedge_pre_submit(_live_bid, _live_ask, _attempt_no):
+                                live_minutes = (float(m.end_ts) - time.time()) / 60.0
+                                if live_minutes <= 0:
+                                    return False, "expired"
+                                if hold_while_oracle_agrees(
+                                    held_leg, m.start_ts, cond,
+                                ):
+                                    return False, "oracle_veto"
+                                return True, "ok"
+
                             sold, sell_res, hedge_proceeds = sell_market_with_retry(
                                 held_token,
                                 held_size,
@@ -5112,6 +5240,7 @@ while not _shutdown_requested:
                                 require_ask_max=None,
                                 max_spread=None,
                                 on_submit=_persist_hedge_submit,
+                                on_abort=_abort_hedge_submit,
                                 on_fill=_persist_hedge_fill,
                                 condition_id=cond,
                                 initial_quote=(hedge_bid, hedge_ask),
@@ -5119,6 +5248,8 @@ while not _shutdown_requested:
                                 persist_done=bool(intent.persist_done),
                                 market_tick=hedge_tick,
                                 max_retries=12 if dump or intent.persist_done else 3,
+                                pre_submit=_hedge_pre_submit,
+                                deadline_ts=m.end_ts,
                             )
                             sell_status = (
                                 sell_res.get("bot_status")
@@ -5280,14 +5411,24 @@ while not _shutdown_requested:
                     c5_budget=C5_BUY_BUDGET,
                 )
                 _any_slice_ok = False
+                _arm_reasons = []
                 for _band in bands:
                     _ok, _why = can_arm_hourly_slice(
                         meta, slice_name=_band.name, **_arm_kwargs,
                     )
+                    if _why:
+                        _arm_reasons.append(_why)
                     if _ok:
                         _any_slice_ok = True
                         break
                 if not _any_slice_ok:
+                    if "hedge_closed" in _arm_reasons:
+                        log_buy_skip_throttled(
+                            "hedge_closed",
+                            cond,
+                            event="buy_skip_hedge_closed",
+                            minutes_left=round(minutes_left, 2),
+                        )
                     continue
 
                 # Initialize meta for first sighting
@@ -5496,7 +5637,17 @@ while not _shutdown_requested:
 
                 # Underlying BTC (Binance BTCUSDT) vs Price To Beat at window open.
                 uchk = None
-                if UNDERLYING_GATE_ENABLED and (up_buy or dn_buy):
+                favored = None
+                if (up_buy or dn_buy) and not UNDERLYING_GATE_ENABLED:
+                    log_event(
+                        "buy_skip_underlying_edge",
+                        condition_id=cond,
+                        reason="underlying_gate_disabled",
+                        up_gui=up_gui,
+                        dn_gui=dn_gui,
+                    )
+                    continue
+                if up_buy or dn_buy:
                     uchk = btc_feed.underlying_check(m.start_ts, MIN_UNDERLYING_EDGE_USD)
                     favored = uchk.get("favored")
                     if not uchk.get("ok") or not favored:
@@ -5675,6 +5826,13 @@ while not _shutdown_requested:
                 )
                 up_buy = up_winning and up_ask_ok and up_consensus
                 dn_buy = dn_winning and dn_ask_ok and dn_consensus
+                # REST confirmation recomputes the book winner, so reapply the
+                # Binance/PTB side selected by the initial gate. A REST-side
+                # flip must not bypass that oracle decision.
+                if favored == "up":
+                    dn_buy = False
+                elif favored == "down":
+                    up_buy = False
                 if not (up_buy or dn_buy):
                     log_buy_skip_throttled(
                         "rest_confirm",
@@ -5682,6 +5840,7 @@ while not _shutdown_requested:
                         event="buy_skip_rest_confirm",
                         up_ask=up_ask, dn_ask=dn_ask,
                         up_gui=up_gui, dn_gui=dn_gui,
+                        favored=favored,
                     )
                     continue
 
@@ -5845,6 +6004,12 @@ while not _shutdown_requested:
                 def _clear_buy_uncertain():
                     clear_uncertain_fields(meta, _BUY_UNCERTAIN_KEYS)
 
+                def _abort_buy_submit():
+                    # The final gate rejected after write-ahead, so no exchange
+                    # order can require quarantine.
+                    _clear_buy_uncertain()
+                    save_json(STATE_FILE, positions_meta)
+
                 def _persist_buy_submit(
                     baseline, attempt, spend_cap, submit_price, intent,
                 ):
@@ -5890,11 +6055,75 @@ while not _shutdown_requested:
                     meta["last_buy_at"] = submit_ms
                     save_json(STATE_FILE, positions_meta)
 
+                def _buy_pre_submit(fresh_bid, fresh_ask, _attempt_no):
+                    # The selected token quote was force-RESTed by the executor.
+                    # Refresh the opposing leg and oracle too, then evaluate all
+                    # final gates together immediately before this attempt's POST.
+                    if time.time() >= float(m.end_ts):
+                        return False, "expired"
+                    if not UNDERLYING_GATE_ENABLED:
+                        return False, "underlying_gate_disabled"
+                    other_token = (
+                        m.dn_token if buy_leg == "up" else m.up_token
+                    )
+                    other_bid, _, other_ask, _, _ = get_quote_fast(
+                        other_token,
+                        max_age_s=0.0,
+                        prefer_rest=True,
+                        force_rest=True,
+                        expected_condition_id=cond,
+                    )
+                    selected_last = get_last_trade_price(buy_token)
+                    if selected_last is None:
+                        selected_last = get_book_snapshot_last_trade(buy_token)
+                    opposing_last = get_last_trade_price(other_token)
+                    if opposing_last is None:
+                        opposing_last = get_book_snapshot_last_trade(other_token)
+                    selected_gui = polymarket_display_price(
+                        fresh_bid, fresh_ask, selected_last,
+                    )
+                    opposing_gui = polymarket_display_price(
+                        other_bid, other_ask, opposing_last,
+                    )
+                    selected_book_ok, _ = entry_book_ok(
+                        fresh_bid, fresh_ask, MAX_ENTRY_SPREAD, MIN_WINNER_BID,
+                    )
+                    live_oracle = btc_feed.underlying_check(
+                        m.start_ts, MIN_UNDERLYING_EDGE_USD,
+                    )
+                    live_minutes = (float(m.end_ts) - time.time()) / 60.0
+                    live_bands = current_entry_bands(live_minutes)
+                    clob_winner = (
+                        fresh_bid is not None
+                        and other_bid is not None
+                        and float(fresh_bid) > float(other_bid) + 1e-12
+                    )
+                    return hourly_entry_final_gate(
+                        live_minutes,
+                        selected_slice=band.name,
+                        buy_ask=fresh_ask,
+                        bands=live_bands,
+                        buy_leg=buy_leg,
+                        oracle_check=live_oracle,
+                        oracle_gate_enabled=UNDERLYING_GATE_ENABLED,
+                        hedge_closed=bool(meta.get("hedge_closed")),
+                        buy_book_ok=selected_book_ok,
+                        buy_clob_winner=clob_winner,
+                        buy_gui=selected_gui,
+                        other_gui=opposing_gui,
+                        min_winner_bid=MIN_WINNER_BID,
+                        max_loser_bid=MAX_LOSER_BID,
+                        min_gui_edge=MIN_BID_EDGE,
+                    )
+
                 bought, spent, buy_status = buy_market_with_retry(
                     buy_token, spend_usd, band.fak_limit, tick_size=tick,
                     min_price=band.retry_min_price,
                     on_fill=_persist_buy_fill, on_submit=_persist_buy_submit,
+                    on_abort=_abort_buy_submit,
                     condition_id=cond,
+                    pre_submit=_buy_pre_submit,
+                    deadline_ts=m.end_ts,
                 )
                 wall_ms = time.time() * 1000
                 if bought > 0:
