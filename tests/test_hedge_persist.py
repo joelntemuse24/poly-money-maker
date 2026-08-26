@@ -7,6 +7,7 @@ import unittest
 from buy.hedge_gate import (
     clob_min_tick_from_error,
     evaluate_held_bag,
+    hedge_dump_overrides_oracle,
     hedge_market_tick,
     hedge_oracle_allows_sell,
     hedge_persist_ready,
@@ -327,6 +328,27 @@ class HedgeOracleAllowsSellTests(unittest.TestCase):
         )
         self.assertTrue(allow)
         self.assertEqual(why, "oracle_off")
+
+
+class HedgeDumpOverridesOracleTests(unittest.TestCase):
+    """Dump ≤32¢ is book-only; persist-50 stays behind the oracle."""
+
+    def test_dump_bid_overrides(self):
+        self.assertTrue(
+            hedge_dump_overrides_oracle(0.32, 0.32, enabled=True),
+        )
+        self.assertTrue(
+            hedge_dump_overrides_oracle(0.04, 0.32, enabled=True),
+        )
+        self.assertFalse(
+            hedge_dump_overrides_oracle(0.50, 0.32, enabled=True),
+        )
+
+    def test_disabled_never_overrides(self):
+        self.assertFalse(
+            hedge_dump_overrides_oracle(0.04, 0.32, enabled=False),
+        )
+        self.assertFalse(hedge_dump_overrides_oracle(None, 0.32))
 
 
 if __name__ == "__main__":

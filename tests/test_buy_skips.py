@@ -15,6 +15,7 @@ from buy.entry_skip import (
     ask_in_entry_band,
     can_arm_entry_slice,
     can_arm_hourly_slice,
+    decide_5m_entry,
     late_add_blocked_by_min,
     entry_band_for_seconds,
     entry_slice_budget,
@@ -205,6 +206,9 @@ class FirstFourMinutesAt95Tests(unittest.TestCase):
             early_95_start_s=300,
             early_95_min_s=60,
             early_95_min=0.95,
+            late_90_start_s=45,
+            late_90_min=0.90,
+            late_90_max=0.99,
         )
 
     def test_first_three_minutes_allow_90_or_above(self):
@@ -238,6 +242,39 @@ class FirstFourMinutesAt95Tests(unittest.TestCase):
         self.assertFalse(ask_in_any_band(0.91, bands))
         self.assertFalse(ask_in_any_band(0.95, bands))
         self.assertFalse(ask_in_any_band(0.99, bands))
+
+    def test_last_45s_allows_90_and_up(self):
+        bands = self._bands(40)
+        self.assertEqual([b.name for b in bands], ["late", "late_90"])
+        self.assertTrue(ask_in_any_band(0.80, bands))
+        self.assertTrue(ask_in_any_band(0.90, bands))
+        self.assertTrue(ask_in_any_band(0.91, bands))
+        self.assertTrue(ask_in_any_band(0.99, bands))
+        self.assertFalse(ask_in_any_band(0.74, bands))
+        at_45 = self._bands(45)
+        self.assertIn("late_90", [b.name for b in at_45])
+        just_after = self._bands(46)
+        self.assertEqual([b.name for b in just_after], ["late"])
+        self.assertFalse(ask_in_any_band(0.91, just_after))
+
+    def test_last_45s_90c_prefers_late_fak_90(self):
+        """Exactly 90¢ still posts the late 90¢ FAK, not the 99¢ overlay."""
+        band = select_entry_band(0.90, self._bands(40))
+        self.assertIsNotNone(band)
+        self.assertEqual(band.name, "late")
+        self.assertAlmostEqual(band.fak_limit, 0.90)
+        overlay = select_entry_band(0.91, self._bands(40))
+        self.assertIsNotNone(overlay)
+        self.assertEqual(overlay.name, "late_90")
+        self.assertAlmostEqual(overlay.fak_limit, 0.99)
+
+    def test_decide_5m_entry_last_45_93_posts_late_90(self):
+        band = decide_5m_entry(40, 0.93)
+        self.assertIsNotNone(band)
+        self.assertEqual(band.name, "late_90")
+        self.assertAlmostEqual(band.fak_limit, 0.99)
+        self.assertIsNone(decide_5m_entry(60, 0.93))
+        self.assertIsNone(decide_5m_entry(46, 0.91))
 
     def test_select_widest_matching_band_for_retry(self):
         early = select_entry_band(0.96, self._bands(180))

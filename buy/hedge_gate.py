@@ -398,3 +398,21 @@ def hedge_oracle_allows_sell(held_leg, check, *, enabled=True):
     if str(check.get("reason") or "") == "edge_zero":
         return True, "oracle_flat"
     return False, "oracle_unknown"
+
+
+def hedge_dump_overrides_oracle(bid, dump_bid_max, *, enabled=True) -> bool:
+    """True when a toxic CLOB dump should proceed even if BTC still agrees.
+
+    Persist-50 sells stay behind the oracle. A 4–32¢ book is not a one-tick
+    dip; blocking that dump is how the 20d tape missed losers.
+    """
+    if not enabled:
+        return False
+    bid_f = _finite_px(bid)
+    if bid_f is None:
+        return False
+    try:
+        dump_max = float(dump_bid_max)
+    except (TypeError, ValueError):
+        return False
+    return bid_f <= dump_max + 1e-12

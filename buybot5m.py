@@ -70,8 +70,10 @@ from buy.entry_skip import (
 )
 from buy.hedge_gate import (
     evaluate_held_bag,
+    hedge_dump_overrides_oracle,
     hedge_fail_is_terminal,
     hedge_market_tick,
+    hedge_oracle_allows_sell,
     hedge_persist_ready,
     hedge_qualify_ok,
     hedge_should_keep_retrying,
@@ -171,8 +173,10 @@ if _tick_001 is not None and _tick_001.amount > 2:
 _STRATEGY_DEFAULTS = {
     "entry_enabled": False,
     # Two $2.50 slices, $5 total if both fill. Last 120s is 75–90¢
-    # (buy_max_price). First 3 min (TTM 120–300s) is ≥90¢ to 99¢; ≥95¢ is an
-    # early overlay only (not last 120s). Late FAK limit is 90¢; early is 99¢.
+    # (buy_max_price). Last 45s also buys ≥90¢ (late_90, FAK 99¢, still
+    # the late $2.50). First 3 min (TTM 120–300s) is ≥90¢ to 99¢; ≥95¢ is
+    # an early overlay only (not last 120s). Late FAK limit is 90¢ except
+    # last-45 ≥90 which is 99¢; early is 99¢.
     # Size starts at budget/ask and is at least 3 shares when size × limit
     # fits in buy_max_spend ($3) — early 99¢ posts 3.00 / $2.97, not 2.00 /
     # $1.98. Per FAK, not $6 across both slices.
@@ -193,12 +197,13 @@ _STRATEGY_DEFAULTS = {
     # Must be <= buy_threshold (validator); 65¢ ≈ walk well below the 75¢ floor.
     "toxic_force_exit_below": 0.65,
     "hedge_enabled": True,
-    # Pathlog persist-2s @ 70 beat instant 53 and instant 70. Toxic dumps
-    # still use hedge_toxic_bid_max (53¢), not this qualify level.
-    "hedge_threshold": 0.70,
-    # Kept in config (live JSON still sends it). Not a FAK floor: after 70/72
+    # Persist 5s @ 50/52 then sell at the live bid while it is still
+    # below recovery (53¢). Instant 70 and persist-2s @ 70/72 dumped
+    # winners. After persist, do not sell 70–84 (recovery is 53¢).
+    "hedge_threshold": 0.50,
+    # Kept in config (live JSON still sends it). Not a FAK floor: after 50/52
     # persist, the sell follows the live bid so a 20¢ print is not $0.
-    "hedge_min_price": 0.325,
+    "hedge_min_price": 0.32,
     "hedge_undercut_ticks": 0,
     "hedge_quote_max_age_s": 0.25,
     "hedge_retry_sleep_s": 0.05,
@@ -208,23 +213,33 @@ _STRATEGY_DEFAULTS = {
     # Hedge: penny bids under a still-high ask are fake — require a tight book
     # and ask also collapsed (same lesson sell-side already learned on mids).
     "hedge_max_spread": 0.15,
-    "hedge_require_ask_max": 0.72,
-    "hedge_persist_s": 2.0,
-    "hedge_toxic_bid_max": 0.53,
+    "hedge_require_ask_max": 0.52,
+    "hedge_persist_s": 5.0,
+    "hedge_toxic_bid_max": 0.32,
     # After persist_done, bid ≥ this is a recovered winner: HOLD and clear.
-    # 70–84 still sells at the live bid. Do not sell 90–99 because persist stuck.
-    "hedge_recovery_cancel": 0.85,
-    # Invert the buy GUI 70/30 plus last-trade on the held token. TOB 70/72
+    # Tight 53¢ so we do not sell 50–69 the way 70–84 sold winners.
+    "hedge_recovery_cancel": 0.53,
+    # After persist, a fade through 50 still sells (do not wait for 32¢).
+    "hedge_sell_fade": True,
+    # Invert the buy GUI 70/30 plus last-trade on the held token. TOB 50/52
     # alone is not consensus (same lesson as not buying a random ask).
     "hedge_require_gui": True,
+    # Once holding: do not persist-sell while Chainlink TWAP is still on
+    # the held side of PTB. $0 = any non-zero tick. Missing/stale holds.
+    # Dump ≤ toxic is book-only (`hedge_dump_ignore_oracle`).
+    "hedge_require_oracle": True,
+    "hedge_oracle_min_edge_usd": 0.0,
+    "hedge_dump_ignore_oracle": True,
     "buy_start_s": 120,
     # Whole 5m market: last 120s is 75–90¢; TTM (120, 300] buys ask ≥ 90¢.
     "early_buy_start_s": 300,
     "early_buy_max_price": 0.99,
-    # ≥95 overlay for TTM (120, 300] only. Last 120s stays 75–90.
+    # ≥95 overlay for TTM (120, 300] only. Last 120s stays 75–90 except
+    # the last-45s ≥90 overlay (late_90).
     "early_95_start_s": 300,
     "early_95_min_s": 60,
     "early_95_min_price": 0.95,
+    "late_90_start_s": 45,
     "buy_grace_s": 1,
     "buy_cooldown_s": 1,
     # After a proven-empty FAK, wait this long before another outer attempt.
@@ -326,6 +341,10 @@ def load_strategy():
             raise ValueError("early_95_min_s must be >= 0")
         if float(cfg["early_95_start_s"]) < float(cfg["early_95_min_s"]):
             raise ValueError("early_95_start_s must be >= early_95_min_s")
+        if float(cfg["late_90_start_s"]) < 0:
+            raise ValueError("late_90_start_s must be >= 0")
+        if float(cfg["late_90_start_s"]) > float(cfg["buy_start_s"]) + 1e-12:
+            raise ValueError("late_90_start_s must be <= buy_start_s")
         if not (
             0 < cfg["buy_max_price"] < cfg["early_95_min_price"]
             <= cfg["early_buy_max_price"] <= 1
@@ -413,8 +432,9 @@ def load_strategy():
             "min_underlying_edge_usd", "hedge_undercut_ticks",
             "hedge_quote_max_age_s", "hedge_retry_sleep_s",
             "hedge_ghost_sleep_s", "buy_grace_s", "buy_cooldown_s",
-            "empty_fak_cooldown_s", "early_95_min_s",
+            "empty_fak_cooldown_s", "early_95_min_s", "late_90_start_s",
             "redeem_throttle_s", "max_redeem_age_days", "hedge_persist_s",
+            "hedge_oracle_min_edge_usd",
         ):
             if float(cfg[key]) < 0:
                 raise ValueError(f"{key} must be non-negative")
@@ -453,7 +473,11 @@ HEDGE_REQUIRE_ASK_MAX = _strat["hedge_require_ask_max"]
 HEDGE_PERSIST_S = _strat["hedge_persist_s"]
 HEDGE_TOXIC_BID_MAX = _strat["hedge_toxic_bid_max"]
 HEDGE_RECOVERY_CANCEL = _strat["hedge_recovery_cancel"]
+HEDGE_SELL_FADE = _strat["hedge_sell_fade"]
 HEDGE_REQUIRE_GUI = _strat["hedge_require_gui"]
+HEDGE_REQUIRE_ORACLE = _strat["hedge_require_oracle"]
+HEDGE_ORACLE_MIN_EDGE_USD = _strat["hedge_oracle_min_edge_usd"]
+HEDGE_DUMP_IGNORE_ORACLE = _strat["hedge_dump_ignore_oracle"]
 ADD_MIN_PRICE = _strat["add_min_price"]
 BUY_START_S = _strat["buy_start_s"]
 EARLY_BUY_START_S = _strat["early_buy_start_s"]
@@ -461,6 +485,7 @@ EARLY_BUY_MAX_PRICE = _strat["early_buy_max_price"]
 EARLY_95_START_S = _strat["early_95_start_s"]
 EARLY_95_MIN_S = _strat["early_95_min_s"]
 EARLY_95_MIN_PRICE = _strat["early_95_min_price"]
+LATE_90_START_S = _strat["late_90_start_s"]
 BUY_HORIZON_S = max(
     float(BUY_START_S), float(EARLY_BUY_START_S), float(EARLY_95_START_S),
 )
@@ -713,8 +738,47 @@ def log_buy_skip_throttled(skip_reason, condition_id, event="buy_skip", **kwargs
     log_event(event, reason=reason, condition_id=condition_id, **kwargs)
 
 
+def hold_while_oracle_agrees(held_leg, start_ts, condition_id, *, log=True):
+    """True = do not persist-sell; live BTC is still with the bag (or unread).
+
+    Dump ≤ toxic can ignore this when ``hedge_dump_ignore_oracle`` is on.
+    """
+    if not HEDGE_REQUIRE_ORACLE:
+        return False
+    uchk = btc_feed.underlying_check(start_ts, float(HEDGE_ORACLE_MIN_EDGE_USD))
+    allow, why = hedge_oracle_allows_sell(held_leg, uchk, enabled=True)
+    if allow:
+        return False
+    _hedge_persist_armed.pop(condition_id, None)
+    _hedge_persist_done.discard(condition_id)
+    if not log:
+        return True
+    edge = uchk.get("edge_usd")
+    event = (
+        "hedge_skip_oracle_still_winning"
+        if why == "oracle_still_winning"
+        else "hedge_skip_oracle"
+    )
+    log_buy_skip_throttled(
+        why,
+        condition_id,
+        event=event,
+        leg=held_leg,
+        ptb=uchk.get("ptb"),
+        live_btc=uchk.get("live_btc"),
+        edge_usd=None if edge is None else round(float(edge), 2),
+        favored=uchk.get("favored"),
+        live_age_s=uchk.get("live_age_s"),
+        ptb_source=uchk.get("ptb_source"),
+        live_source=uchk.get("live_source"),
+        min_edge_usd=HEDGE_ORACLE_MIN_EDGE_USD,
+        feed=uchk.get("feed"),
+    )
+    return True
+
+
 def current_entry_bands(seconds_left):
-    """Open 5m buy bands at this TTM (late 75–90, early ≥90, ≥95 overlay)."""
+    """Open 5m buy bands at this TTM (late 75–90, last-45 ≥90, early ≥90, ≥95)."""
     return applicable_entry_bands(
         seconds_left,
         late_start_s=BUY_START_S,
@@ -726,6 +790,9 @@ def current_entry_bands(seconds_left):
         early_95_start_s=EARLY_95_START_S,
         early_95_min_s=EARLY_95_MIN_S,
         early_95_min=EARLY_95_MIN_PRICE,
+        late_90_start_s=LATE_90_START_S,
+        late_90_min=BUY_MAX_PRICE,
+        late_90_max=EARLY_BUY_MAX_PRICE,
     )
 
 
@@ -768,6 +835,9 @@ def decide_entry_at(seconds_left, ask):
         early_95_start_s=EARLY_95_START_S,
         early_95_min_s=EARLY_95_MIN_S,
         early_95_min=EARLY_95_MIN_PRICE,
+        late_90_start_s=LATE_90_START_S,
+        late_90_min=BUY_MAX_PRICE,
+        late_90_max=EARLY_BUY_MAX_PRICE,
     )
 
 
@@ -3118,25 +3188,32 @@ def sell_market_with_retry(
     require_ask_max=None,
     max_spread=None,
     on_submit=None,
+    on_abort=None,
     on_fill=None,
     condition_id=None,
     initial_quote=None,
     dump=False,
     persist_done=False,
     market_tick=None,
+    pre_submit=None,
+    deadline_ts=None,
 ):
     """Sell `size` shares via FAK. Used for hedge exits only — no max_price cap.
 
-    Dump (bid ≤ 53) and persist-done sells are bid-only: incomplete REST
+    Dump (bid ≤ toxic) and persist-done sells are bid-only: incomplete REST
     reuses WS/last-good, unmatched / invalid-tick retries down the live bid.
-    After persist, a 70–84¢ live bid is a correct fill (do not clamp to 72).
-    Bid ≥ hedge_recovery_cancel (85¢) must abort — do not POST a 90–99 rally.
-    `hedge_min_price` is not a floor.
+    After persist, sell at the live bid while it is still below recovery
+    (53¢), including a fade through 50¢. Bid ≥ hedge_recovery_cancel must
+    abort — do not POST a 55–90 rally. `hedge_min_price` is not a floor.
 
     Returns (total_sold, result, proceeds) where result["bot_status"] is
     filled|empty|ambiguous|persist_fail|dry. Unknown POST outcomes stop retries.
     Empty after rejected FAKs is **not** terminal while size remains and the
     dump/persist still qualifies — the loop must retry next tick.
+
+    ``pre_submit`` and ``deadline_ts`` are checked after write-ahead and before
+    every POST/retry. A no-POST rejection invokes ``on_abort()`` to durably
+    clear that write-ahead without altering confirmed-fill reconciliation.
     """
     total_sold = 0.0
     total_proceeds = 0.0
@@ -3146,6 +3223,41 @@ def sell_market_with_retry(
     last_limit = float(price_limit) if price_limit is not None else floor
     dump = bool(dump)
     persist_done = bool(persist_done)
+    submit_aborted = False
+    abort_cleanup_failed = False
+    write_ahead_written = False
+
+    def _deadline_open():
+        if deadline_ts is None:
+            return True
+        try:
+            return time.time() < float(deadline_ts)
+        except (TypeError, ValueError):
+            return False
+
+    def _reject_no_post(reason, attempt_no):
+        nonlocal submit_aborted, abort_cleanup_failed
+        submit_aborted = True
+        log_event(
+            "sell_pre_submit_rejected",
+            token_id=token_id,
+            condition_id=condition_id,
+            attempt=attempt_no,
+            reason=str(reason)[:160],
+        )
+        if write_ahead_written and on_abort:
+            try:
+                on_abort()
+            except Exception as exc:
+                abort_cleanup_failed = True
+                log_event(
+                    "sell_on_abort_fail",
+                    token_id=token_id,
+                    condition_id=condition_id,
+                    attempt=attempt_no,
+                    error=str(exc)[:200],
+                )
+
     need_integrity = (
         (not dump)
         and (not persist_done)
@@ -3153,13 +3265,22 @@ def sell_market_with_retry(
         and max_spread is not None
         and abort_above is not None
     )
-    dump_bid_max = 0.53
-    qualify_bid = 0.70
-    recovery_cancel = 0.85
+    try:
+        dump_bid_max = float(HEDGE_TOXIC_BID_MAX)
+    except (NameError, TypeError, ValueError):
+        dump_bid_max = 0.32
+    try:
+        qualify_bid = float(HEDGE_THRESHOLD)
+    except (NameError, TypeError, ValueError):
+        qualify_bid = 0.50
     try:
         recovery_cancel = float(HEDGE_RECOVERY_CANCEL)
     except (NameError, TypeError, ValueError):
-        recovery_cancel = 0.85
+        recovery_cancel = 0.53
+    try:
+        sell_fade = bool(HEDGE_SELL_FADE)
+    except NameError:
+        sell_fade = True
     if dump and abort_above is None:
         abort_above = dump_bid_max
     if persist_done and not dump:
@@ -3182,6 +3303,9 @@ def sell_market_with_retry(
             last_bid, last_ask = price_limit, None
     for attempt in range(max_retries):
         if remaining < 0.01:
+            break
+        if not _deadline_open():
+            _reject_no_post("expired", attempt + 1)
             break
         live_bid = last_bid
         live_ask = last_ask
@@ -3280,6 +3404,7 @@ def sell_market_with_retry(
         if (
             persist_done
             and (not dump)
+            and (not sell_fade)
             and live_bid is not None
             and dump_bid_max < float(live_bid) < qualify_bid - 1e-12
         ):
@@ -3359,6 +3484,21 @@ def sell_market_with_retry(
                 return total_sold, {
                     "bot_status": "persist_fail", "last_limit": last_limit,
                 }, total_proceeds
+            write_ahead_written = True
+        if pre_submit:
+            try:
+                allowed, reason = pre_submit(
+                    float(live_bid), None if live_ask is None else float(live_ask),
+                    attempt + 1,
+                )
+            except Exception as exc:
+                allowed, reason = False, f"validator_error:{exc}"
+            if not allowed:
+                _reject_no_post(reason, attempt + 1)
+                break
+        if not _deadline_open():
+            _reject_no_post("expired_after_write_ahead", attempt + 1)
+            break
         try:
             result = safe_api_call(
                 client.post_order,
@@ -3469,6 +3609,7 @@ def sell_market_with_retry(
                     dump_bid_max=dump_bid_max,
                     qualify_bid=qualify_bid,
                     recovery_cancel=recovery_cancel,
+                    sell_fade=sell_fade,
                 )
                 log_event(
                     "sell_attempt_rejected", token_id=token_id,
@@ -3541,11 +3682,17 @@ def sell_market_with_retry(
             }, total_proceeds
         time.sleep(float(retry_sleep_s))
 
+    if abort_cleanup_failed:
+        return total_sold, {
+            "bot_status": "persist_fail", "last_limit": last_limit,
+        }, total_proceeds
     if total_sold > 0:
         return total_sold, {
             "partial": True, "sold": total_sold, "last_limit": last_limit,
             "bot_status": "filled",
         }, total_proceeds
+    if submit_aborted:
+        return 0, {"sold": 0, "last_limit": last_limit, "bot_status": "empty"}, 0.0
     console.print(f"  [bold red][EXIT FAIL][/] market sell 0/{size:.4f} cleared")
     # Preserve last_limit so ghost reconciliation prices at the actual retry floor.
     return 0, {"sold": 0, "last_limit": last_limit, "bot_status": "empty"}, 0.0
@@ -3900,7 +4047,11 @@ while not _shutdown_requested:
         HEDGE_PERSIST_S = _strat["hedge_persist_s"]
         HEDGE_TOXIC_BID_MAX = _strat["hedge_toxic_bid_max"]
         HEDGE_RECOVERY_CANCEL = _strat["hedge_recovery_cancel"]
+        HEDGE_SELL_FADE = _strat["hedge_sell_fade"]
         HEDGE_REQUIRE_GUI = _strat["hedge_require_gui"]
+        HEDGE_REQUIRE_ORACLE = _strat["hedge_require_oracle"]
+        HEDGE_ORACLE_MIN_EDGE_USD = _strat["hedge_oracle_min_edge_usd"]
+        HEDGE_DUMP_IGNORE_ORACLE = _strat["hedge_dump_ignore_oracle"]
         ADD_MIN_PRICE = _strat["add_min_price"]
         BUY_START_S = _strat["buy_start_s"]
         EARLY_BUY_START_S = _strat["early_buy_start_s"]
@@ -3908,6 +4059,7 @@ while not _shutdown_requested:
         EARLY_95_START_S = _strat["early_95_start_s"]
         EARLY_95_MIN_S = _strat["early_95_min_s"]
         EARLY_95_MIN_PRICE = _strat["early_95_min_price"]
+        LATE_90_START_S = _strat["late_90_start_s"]
         BUY_HORIZON_S = max(
             float(BUY_START_S), float(EARLY_BUY_START_S), float(EARLY_95_START_S),
         )
@@ -4744,11 +4896,55 @@ while not _shutdown_requested:
                 if held_size <= 0.01 or meta.get("hedge_closed"):
                     _hedge_persist_armed.pop(cond, None)
                     _hedge_persist_done.discard(cond)
-                if held_token and held_size > 0.01 and HEDGE_ENABLED and not meta.get("hedge_closed"):
-                    # ANY live bag with held bid ≤ 53¢ dumps at the live bid.
-                    # Persist 2s @ 70/72, then sell at the live bid (70–84).
-                    # Bid ≥ recovery_cancel (85¢) holds and clears persist.
-                    # Do not sell in (53, 70). Incomplete REST uses WS/last-good.
+                hedge_open = (
+                    bool(held_token)
+                    and held_size > 0.01
+                    and HEDGE_ENABLED
+                    and not meta.get("hedge_closed")
+                )
+                # Persist-50 stays behind the oracle (a one-tick CLOB dip is
+                # not a hedge). Dump ≤ toxic is book-only when
+                # hedge_dump_ignore_oracle: peek the book first so a 4–32¢
+                # print is not vetoed by BTC that has not crossed yet.
+                oracle_dump_only = False
+                if hedge_open:
+                    _dump_age = book_ws.quote_age(held_token)
+                    _dump_fresh = (
+                        _dump_age is not None
+                        and _dump_age <= float(HEDGE_QUOTE_MAX_AGE_S)
+                    )
+                    _dump_peek = None
+                    if _dump_fresh:
+                        _dump_q = book_ws.quote(
+                            held_token, max_age_s=float(HEDGE_QUOTE_MAX_AGE_S),
+                        )
+                        if _dump_q is not None:
+                            _dump_peek = _dump_q[0]
+                    _dump_last, _ = last_good_held_quote(held_token)
+                    _dump_cached = _book_cache.get(held_token)
+                    _dump_cached_bid = (
+                        _dump_cached[0] if _dump_cached else None
+                    )
+                    dump_hint = any(
+                        hedge_dump_overrides_oracle(
+                            bid,
+                            HEDGE_TOXIC_BID_MAX,
+                            enabled=HEDGE_DUMP_IGNORE_ORACLE,
+                        )
+                        for bid in (_dump_peek, _dump_last, _dump_cached_bid)
+                    )
+                    if dump_hint:
+                        oracle_dump_only = hold_while_oracle_agrees(
+                            held_leg, m.start_ts, cond, log=False,
+                        )
+                    elif hold_while_oracle_agrees(held_leg, m.start_ts, cond):
+                        hedge_open = False
+                if hedge_open:
+                    # ANY live bag with held bid ≤ toxic (32¢) dumps at the live bid
+                    # even if BTC has not crossed yet. Persist 5s @ 50/52 stays
+                    # behind the oracle. Then sell at the live bid while < 53¢
+                    # (including a fade through 50). Bid ≥ recovery_cancel (53¢)
+                    # holds and clears persist. Incomplete REST uses WS/last-good.
                     quote_age = book_ws.quote_age(held_token)
                     ws_fresh = quote_age is not None and quote_age <= float(HEDGE_QUOTE_MAX_AGE_S)
                     peek_bid = peek_ask = peek_mid = None
@@ -4764,16 +4960,10 @@ while not _shutdown_requested:
                     last_bid, last_ask = last_good_held_quote(held_token)
                     persist_done = cond in _hedge_persist_done
                     armed_ts = _hedge_persist_armed.get(cond)
-                    if (
-                        armed_ts is not None
-                        and float(HEDGE_PERSIST_S) > 0
-                        and (time.monotonic() - float(armed_ts)) >= float(HEDGE_PERSIST_S) - 1e-12
-                    ):
-                        persist_done = True
-                        _hedge_persist_done.add(cond)
 
                     # Healthy winner before persist: skip REST. After persist,
-                    # 70–84 still sells; ≥ recovery_cancel (85¢) is a rally — clear.
+                    # fade through 50 still sells; ≥ recovery_cancel (53¢) is a
+                    # rally — clear. Do not sell 70–84.
                     recovered = (
                         ws_fresh
                         and peek_bid is not None
@@ -4857,6 +5047,7 @@ while not _shutdown_requested:
                             gui_ok=False,
                             gui_why="pending_gui",
                             recovery_cancel=HEDGE_RECOVERY_CANCEL,
+                            sell_fade=HEDGE_SELL_FADE,
                         )
                         qualify_fail = preview.reason in {
                             "missing_side", "bid_above", "ask_too_high",
@@ -4913,6 +5104,7 @@ while not _shutdown_requested:
                                 gui_ok=gui_ok,
                                 gui_why=gui_why,
                                 recovery_cancel=HEDGE_RECOVERY_CANCEL,
+                                sell_fade=HEDGE_SELL_FADE,
                             )
                             if not gui_ok and intent.action == "hold":
                                 log_event(
@@ -4938,7 +5130,17 @@ while not _shutdown_requested:
                             if intent.persist_done:
                                 _hedge_persist_done.add(cond)
 
-                        if intent.action in {"arm", "wait"}:
+                        if oracle_dump_only and not bool(intent.dump):
+                            log_buy_skip_throttled(
+                                "oracle_still_winning",
+                                cond,
+                                event="hedge_skip_oracle_still_winning",
+                                **bag_log,
+                                via="dump_only_override",
+                            )
+                            _hedge_persist_armed.pop(cond, None)
+                            _hedge_persist_done.discard(cond)
+                        elif intent.action in {"arm", "wait"}:
                             log_buy_skip_throttled(
                                 intent.reason,
                                 cond,
@@ -5001,7 +5203,7 @@ while not _shutdown_requested:
                                 else "[bold bright_red]▼ HEDGE SELL — CUTTING LOSSES[/]"
                             )
                             hedge_label = (
-                                "DUMP ≤53¢" if dump else "REVERSAL DETECTED"
+                                "DUMP ≤{:.0f}¢".format(float(HEDGE_TOXIC_BID_MAX) * 100) if dump else "REVERSAL DETECTED"
                             )
                             console.print(Panel(
                                 f"  [bright_white]{m.question}[/]\n"
@@ -5031,6 +5233,12 @@ while not _shutdown_requested:
                                 clear_uncertain_fields(
                                     meta, _HEDGE_UNCERTAIN_KEYS,
                                 )
+
+                            def _abort_hedge_submit():
+                                # The final gate rejected after write-ahead, so
+                                # no exchange order can require quarantine.
+                                _clear_hedge_uncertain()
+                                save_json(STATE_FILE, positions_meta)
 
                             def _persist_hedge_submit(
                                 sold_total, proceeds_total, remaining_size,
@@ -5086,6 +5294,25 @@ while not _shutdown_requested:
                                     _cached_positions[cond][leg_key]["size"] = rem_now
                                 save_json(STATE_FILE, positions_meta)
 
+                            def _hedge_pre_submit(_live_bid, _live_ask, _attempt_no):
+                                ttm = entry_seconds_left(
+                                    time.time(), m.end_ts, getattr(m, "slug", None),
+                                    FIVE_M_DURATION_S,
+                                )
+                                if ttm <= 0:
+                                    return False, "expired"
+                                if hedge_dump_overrides_oracle(
+                                    _live_bid,
+                                    HEDGE_TOXIC_BID_MAX,
+                                    enabled=HEDGE_DUMP_IGNORE_ORACLE,
+                                ):
+                                    return True, "ok"
+                                if hold_while_oracle_agrees(
+                                    held_leg, m.start_ts, cond,
+                                ):
+                                    return False, "oracle_veto"
+                                return True, "ok"
+
                             sold, sell_res, hedge_proceeds = sell_market_with_retry(
                                 held_token,
                                 held_size,
@@ -5098,6 +5325,7 @@ while not _shutdown_requested:
                                 require_ask_max=None,
                                 max_spread=None,
                                 on_submit=_persist_hedge_submit,
+                                on_abort=_abort_hedge_submit,
                                 on_fill=_persist_hedge_fill,
                                 condition_id=cond,
                                 initial_quote=(hedge_bid, hedge_ask),
@@ -5105,6 +5333,8 @@ while not _shutdown_requested:
                                 persist_done=bool(intent.persist_done),
                                 market_tick=hedge_tick,
                                 max_retries=12 if dump or intent.persist_done else 3,
+                                pre_submit=_hedge_pre_submit,
+                                deadline_ts=m.end_ts,
                             )
                             sell_status = (
                                 sell_res.get("bot_status")
@@ -5223,6 +5453,7 @@ while not _shutdown_requested:
                                     dump_bid_max=HEDGE_TOXIC_BID_MAX,
                                     qualify_bid=HEDGE_THRESHOLD,
                                     recovery_cancel=HEDGE_RECOVERY_CANCEL,
+                                    sell_fade=HEDGE_SELL_FADE,
                                 )
                                 log_event(
                                     "hedge_fail", condition_id=cond, leg=held_leg, size=held_size,
@@ -5912,16 +6143,6 @@ while not _shutdown_requested:
                         return False, "ttm_or_ask_out_of_band"
                     if live_band.fak_limit + 1e-12 < float(band.max_price):
                         return False, "late_cap_now_90"
-                    if (
-                        is_late_entry_window(ttm, BUY_START_S)
-                        and fresh_ask > float(BUY_MAX_PRICE) + 1e-12
-                    ):
-                        return False, "late_ask_above_90"
-                    if (
-                        (not is_late_entry_window(ttm, BUY_START_S))
-                        and fresh_ask + 1e-12 < float(BUY_MAX_PRICE)
-                    ):
-                        return False, "early_ask_below_90"
                     return True, live_band.name
 
                 bought, spent, buy_status = buy_market_with_retry(

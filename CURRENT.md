@@ -3,49 +3,27 @@
 **Agents: read this after `AGENTS.md`.** Update this file when ops/strategy decisions change.
 Do not put secrets, API keys, or live wallet material here.
 
-Last updated: **2026-08-26** — hourly **execution gates** now match the
-intended rails (restart `polybuybothourly` after merge). Strategy knobs
-are unchanged from **2026-08-25**: **stop the 5m bot. Live buying is hourly.**
-One slice: **75–90¢ in the last 20 minutes** of the BTC hourly Up/Down
-market, **$10** cap, FAK limit **90¢**. Hedge is **persist 5s @ 50/52**
-(GUI held ≤ **52¢** / other ≥ **48¢** — not inverted 30/70), then sell at
-the **live bid** while it is still **< 53¢** (no 2¢ undercut). A fade
-through 50 after persist still sells (`hedge_sell_fade`). Bid ≥ **53¢**
-(`hedge_recovery_cancel`) holds and clears persist — do **not** sell 55–69
-the way 5m sold 70–84. **Once holding, do not sell while live Binance BTC
-is still on the held side of PTB** (`hedge_require_oracle`) — a one-tick
-CLOB dip is not a hedge if the resolution oracle still agrees. Missing or
-stale BTC also holds. **Any live bag** dumps bid-only while bid ≤ **35¢**
-only after that oracle has flipped (or gone flat). Underlying *buy* edge
-stays **$10**. Tick **0.01**. Windows are **minutes**. Pause minting.
-Pathlog records all three series (hourly now samples the last **20 min**;
-14-day / 400 MB cap).
+Last updated: **2026-08-26** — **back to the $2.50 5m bot.** Hourly is
+stopped. Last **45s** may buy **≥90¢** (FAK 99¢, late $2.50 slice). Hedge
+is the hourly false-hedge crackdown: **persist 5s @ 50/52**, recovery
+**53¢**, `hedge_sell_fade`, Chainlink TWAP oracle on persist, dump **≤32¢**
+book-only (`hedge_dump_ignore_oracle`). Early ≥90 first 3 min and late
+75–90 last 120s are unchanged (91–99 is still a no at TTM 46–120).
+Restart `polybuybot5m` after merge and patch live JSON. Confirm `dry_run`
+/ `entry_enabled`. Stop hourly. Pause minting. Pathlog records all three
+series (14-day / 400 MB cap).
 
-**Why the 5m hedge disappointed:** the live 5m gate sometimes did what we
-wanted and often did not. Volatility made that worse, but the knobs also
-fought us:
+**Why we left 70/72 persist-2s / recovery 85 / dump 53:**
 
 1. **Fired on markets that then won** — persist was only **2s** at 70/72.
-   A one-tick (or two-second) dip dumped a winner.
-2. **Failed to fire, then we lost** — dump needed a **≤53¢** bid. The
-   **(53, 70)** dead band held fading losers until they hit 53, and some
-   never printed a dumpable book.
-3. **Sold way above 53** — after persist, **70–84** live-bid fills were
-   treated as correct (`hedge_recovery_cancel` was **85¢**). That is the
-   opposite of “hedge at 53.”
+2. **Failed to fire, then we lost** — dump needed a **≤53¢** bid; the
+   **(53, 70)** dead band held fading losers.
+3. **Sold way above 53** — after persist, **70–84** fills were treated as
+   correct (`hedge_recovery_cancel` was **85¢**).
 
-Hourly is slower on purpose so a 5s persist has time to distinguish a dip
-from a reversal. Recovery is **53¢** so persist-done does **not** sell
-50–69. `sell_fade` sells a post-persist fade through 50 instead of waiting
-for 35. **2026-08-26:** the live executor now actually posts that fade,
-rechecks Binance/PTB and TTM immediately before every BUY/SELL POST or
-retry, completes the 5s persist only on a still-qualified 50/52+GUI tick,
-accepts the 50/48 hedge GUI boundary, and refuses re-entry after
-`hedge_closed`. Python changes are not hot-reloaded.
-
-**Hourly also keeps the later 5m execution fixes** (the old hourly path
-was still instant 55/60, inverted GUI 30/70, undercut 2, incomplete-REST
-skip). Those bugs are separate from the 5m *threshold* complaint.
+Those knobs are gone on 5m. Persist is **5s @ 50/52**, recovery **53¢**
+(do not sell 55–69), dump **32¢** even if BTC has not crossed yet, and
+persist-50 still needs the oracle against/flat.
 
 ---
 
@@ -54,34 +32,31 @@ skip). Those bugs are separate from the 5m *threshold* complaint.
 **Mint-only helper is paused.** Stop `polymintbot` and leave it disabled. Do not
 mint complete sets. Operator still sells leftover mint inventory by hand.
 
-**5m and 15m CLOB bots are stopped.** Do **not** start `polybuybot5m` or
-`polybuybot`. Open 5m inventory (if any) will not be auto-hedged by this
-process — redeem leftovers by hand or leave them for $1 settlement.
+**15m and hourly CLOB bots are stopped.** Do **not** start `polybuybot` or
+`polybuybothourly`.
 
-**Active strategy:** **hourly only** (`polybuybothourly`) after the operator
-copies knobs into live `strategy_buyhourly.json` and starts the unit.
-Same-leg only. After `hedge_closed`, no re-buy. A/C slices are **off**
-(`a22_window_min` / `c5_window_min` = 0). Do **not** re-enable >93 / >95.
+**Active strategy:** **5m only** (`polybuybot5m`) after the operator patches
+live `strategy_buy5m.json` and restarts the unit. Same-leg only. After
+`hedge_closed`, no re-buy. Two $2.50 slices.
 
 | Knob | Value |
 |---|---|
-| `b15_window_min` / `buy_window_min` | **20** minutes |
-| Ask band | **75–90¢** inclusive, FAK limit **90¢**. 91–99¢ is a no. |
-| `b15_buy_budget` / `market_spend_cap` | **$10** per market |
-| `buy_max_spend` / `buy_max_shares` | **$11** / **14** per FAK |
-| `a22_window_min` / `c5_window_min` | **0** = disabled |
+| Late window | last **120s**, **75–90¢**, FAK **90¢**, `$2.50` |
+| Last-45 overlay | last **45s**, **≥90¢**, FAK **99¢**, still the late `$2.50` |
+| Early window | TTM **120–300s**, **≥90¢**, FAK **99¢**, `$2.50` |
+| Early ≥95 | overlay on the early window only (not last 120s) |
+| `add_min_price` | **90¢** for a same-leg late add |
 | Hedge qualify | bid ≤ **50¢**, ask ≤ **52¢**, spread ≤ 15¢, persist **5s** |
-| Hedge GUI | held ≤ **52¢**, other ≥ **48¢** (complement of ask-max). Buy 70/30 unchanged. Last print ≤ 52¢. |
-| Oracle while holding | Do **not** sell if live BTC is still on the held side of PTB (any non-zero tick). Missing/stale feed holds. `hedge_skip_oracle_still_winning` / `hedge_skip_oracle`. |
-| After persist | Sell at the live bid while **< 53¢**, including a fade through 50 (`hedge_sell_fade`). Bid ≥ **53¢** holds and clears persist. Do **not** sell 55–69. |
-| Dump | Bid-only ≤ **35¢** only after the oracle is against or flat. Wide 20/80 still dumps then. |
-| Execution | Sell at the **live bid**, undercut **0**. Unmatched 400 re-quotes; invalid-tick rebuilds at 0.01. Incomplete REST uses WS / last-good. |
-| Underlying edge | **$10** (Binance BTCUSDT vs PTB); side must match |
+| Hedge GUI | held ≤ **52¢**, other ≥ **48¢**. Buy 70/30 unchanged. Last print ≤ 52¢. |
+| Oracle while holding | Do **not persist-sell** if live Chainlink TWAP is still on the held side of PTB. Missing/stale feed holds. |
+| After persist | Sell at the live bid while **< 53¢**, including a fade through 50 (`hedge_sell_fade`). Bid ≥ **53¢** holds and clears persist. |
+| Dump | Bid-only ≤ **32¢** even if BTC still agrees (`hedge_dump_ignore_oracle`). Persist-50 does **not** get this bypass. |
+| Underlying buy edge | **$0** (any non-zero TWAP vs PTB); side must match |
 | `max_open_positions` | **0 = unlimited** |
-| `poll_buy_window_s` / `poll_held_s` | **0.01** on the live hourly WS book |
+| `poll_buy_window_s` / `poll_held_s` | **0.01** on the live 5m WS book |
 
 **Also running (no orders):** `pathlog.py` (`polypathlog`) writes one JSONL file
-per market under `pathlog/ticks/`. Hourly ticks now cover the last **20 min**.
+per market under `pathlog/ticks/`.
 
 ---
 
@@ -180,24 +155,22 @@ amount / HTTP 400), not this NameError.
 
 - **VM:** `~/poly-money-maker` on `instance-20260516-185922`.
 - **Mint:** `sudo systemctl stop polymintbot && sudo systemctl disable polymintbot`
-- **Buy bots:** **hourly only.** Stop/disable 5m and 15m. After this branch
+- **Buy bots:** **5m only.** Stop/disable hourly and 15m. After this branch
   merges, on the VM:
   ```bash
-  sudo systemctl stop polybuybot polybuybot5m
-  sudo systemctl disable polybuybot polybuybot5m
+  sudo systemctl stop polybuybothourly polybuybot
+  sudo systemctl disable polybuybothourly polybuybot
   cd ~/poly-money-maker && git pull
-  python3 -c 'import json; from pathlib import Path; p=Path("strategy_buyhourly.json"); d=json.loads(p.read_text()); d["buy_window_min"]=20.0; d["a22_window_min"]=0.0; d["b15_window_min"]=20.0; d["c5_window_min"]=0.0; d["buy_threshold"]=0.75; d["buy_max_price"]=0.90; d["b15_buy_budget"]=10.0; d["market_spend_cap"]=10.0; d["buy_budget"]=10.0; d["buy_max_spend"]=11.0; d["buy_max_shares"]=14.0; d["hedge_threshold"]=0.50; d["hedge_require_ask_max"]=0.52; d["hedge_persist_s"]=5.0; d["hedge_toxic_bid_max"]=0.35; d["hedge_recovery_cancel"]=0.53; d["hedge_sell_fade"]=True; d["hedge_require_oracle"]=True; d["hedge_oracle_min_edge_usd"]=0.0; d["hedge_undercut_ticks"]=0; d["poll_buy_window_s"]=0.01; d["poll_held_s"]=0.01; p.write_text(json.dumps(d, indent=2)+"\n"); print("window", d["b15_window_min"], "hedge", d["hedge_threshold"], d["hedge_require_ask_max"], "persist", d["hedge_persist_s"], "dump", d["hedge_toxic_bid_max"], "recovery", d["hedge_recovery_cancel"], "fade", d["hedge_sell_fade"], "oracle", d["hedge_require_oracle"], "undercut", d["hedge_undercut_ticks"], "dry_run", d.get("dry_run"), "entry", d.get("entry_enabled"))'
-  sudo systemctl restart polypathlog
-  sudo systemctl start polybuybothourly
-  sudo systemctl enable polybuybothourly
+  python3 -c 'import json; from pathlib import Path; p=Path("strategy_buy5m.json"); d=json.loads(p.read_text()); d["hedge_threshold"]=0.50; d["hedge_require_ask_max"]=0.52; d["hedge_persist_s"]=5.0; d["hedge_toxic_bid_max"]=0.32; d["hedge_recovery_cancel"]=0.53; d["hedge_sell_fade"]=True; d["hedge_require_oracle"]=True; d["hedge_dump_ignore_oracle"]=True; d["hedge_oracle_min_edge_usd"]=0.0; d["hedge_undercut_ticks"]=0; d["hedge_min_price"]=0.32; d["late_90_start_s"]=45; d["add_min_price"]=0.90; d["buy_budget"]=2.5; d["late_buy_budget"]=2.5; d["buy_max_price"]=0.90; d["early_buy_max_price"]=0.99; d["poll_buy_window_s"]=0.01; d["poll_held_s"]=0.01; d["ui_every_n_cycles"]=50; p.write_text(json.dumps(d, indent=2)+"\n"); print("hedge", d["hedge_threshold"], d["hedge_require_ask_max"], "persist", d["hedge_persist_s"], "dump", d["hedge_toxic_bid_max"], "recovery", d["hedge_recovery_cancel"], "fade", d["hedge_sell_fade"], "oracle", d["hedge_require_oracle"], "dump_ignore", d["hedge_dump_ignore_oracle"], "late_90", d["late_90_start_s"], "dry_run", d.get("dry_run"), "entry", d.get("entry_enabled"))'
+  sudo systemctl restart polybuybot5m
+  sudo systemctl enable polybuybot5m
   systemctl is-active polybuybot polybuybot5m polybuybothourly
-  # expect: inactive  inactive  active
+  # expect: inactive  active  inactive
   ```
-  Confirm `strategy_buyhourly.json` `dry_run` / `entry_enabled` **before**
-  start. New Python needs an hourly restart. Live JSON **must** set the
-  hedge keys or an old 55/60 file keeps instant 55/60 after hot reload.
-  Pathlog last-20-min window needs `sudo systemctl restart polypathlog`.
-  Do **not** start 5m, 15m, or mint.
+  Confirm `strategy_buy5m.json` `dry_run` / `entry_enabled` **before**
+  restart. New Python needs a 5m restart. Live JSON **must** set the
+  hedge keys or an old 70/72/85 file keeps the old qualify after hot reload.
+  Do **not** start 15m, hourly, or mint.
 - **Pathlog:** start `polypathlog` as above (no `.env` required).
 
 ---
@@ -211,8 +184,8 @@ amount / HTTP 400), not this NameError.
 - [x] Path recorder + `check_path_backtest.py` (first-touch ask × time-left;
   ticks record TOB size; backtest is share-capped FAK, not infinite ask size).
 - [x] Hedge FAK follows live bid after book integrity (no 32¢ fill refusal).
-      5m **code default** is now persist **2s @ 70/72** (toxic still **53¢**);
-      hourly template is **55/60** (still stopped); 15m stays 35/40 (stopped).
+      Replaced later by persist 70/72, then by persist **5s @ 50/52** dump
+      **32¢** (this return-to-5m change). 15m stays 35/40 (stopped).
 - [x] **5m hedge unmatched-400 retry + sell at the 0.001 bid** (#115). Live
       21 Aug 16:00–00:34Z: **0 `hedge_fill`**. Every sell was attempt-1
       `400 no orders found to match` at `price_limit` = bid − 2¢ (CLOB tick
@@ -273,12 +246,17 @@ amount / HTTP 400), not this NameError.
       dump ≤35 after oracle against/flat, unmatched/tick retry). After merge:
       `git pull`, patch live `strategy_buyhourly.json`, stop 5m, start hourly,
       restart pathlog. Confirm `dry_run` / `entry_enabled`.
-- [ ] Cloud paper P&L: paste `CLOUD_RESEARCH.md` section 2. Score
-      `--series hourly --template strategy_buyhourly.example.json --paper`.
-      No `.env`.
-- [ ] Let pathlog collect resolved **hourly** markets (last 20 min ticks),
-      then `--anatomy` / `--compare` / `--sweep --series hourly` **off the VM**
-      before prune.
+- [x] **Back to $2.50 5m + last-45 ≥90 + false-hedge crackdown.** Operator
+      asked to leave hourly and restart 5m two-slice $2.50 with the hourly
+      hedge (persist 5s @ 50/52, recovery 53, fade, oracle on persist, dump
+      ≤32 ignore oracle) and allow ≥90¢ in the last 45 seconds. 91–99 still
+      a no at TTM 46–120. After merge: `git pull`, patch live
+      `strategy_buy5m.json`, stop hourly, restart 5m. Confirm `dry_run` /
+      `entry_enabled`. Do **not** start 15m / hourly / mint.
+- [ ] Cloud paper P&L on **pathlog ~1s ticks** (not 1-minute CLOB candles):
+      `--series 5m --template strategy_buy5m.example.json --paper`, plus
+      last-45s `--ask-min 0.90 --ask-max 0.99 --ttm-max 45`. Export ticks
+      off the VM before prune. No `.env`.
 
 ---
 
@@ -286,8 +264,8 @@ amount / HTTP 400), not this NameError.
 
 1. Read `AGENTS.md` + this file before changing mint/buy/hedge logic.
 2. Do **not** restart minting unless the operator asks. Do **not** start
-   `polybuybot` / `polybuybot5m` unless the operator asks. Hourly is the
-   live buy bot after the operator copies knobs and starts the unit.
+   `polybuybot` / `polybuybothourly` unless the operator asks. 5m is the
+   live buy bot after the operator patches knobs and restarts the unit.
 3. Never truncate state/PnL/log files; never commit live strategy/state/`.env`.
    Pathlog ticks are **auto-pruned** (14d / 400 MB) — do not `rm` them by hand,
    but **do export** (`check_path_backtest.py --csv` or `scp` the ticks dir)
