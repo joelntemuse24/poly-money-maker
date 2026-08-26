@@ -629,12 +629,14 @@ legs need a display price (mid or last trade) or the bot logs
 `buy_skip_incomplete_book`.
 
 **Hourly hedge GUI** matches the 50/52 book, not buy 70/30: held last trade
-≤ 52¢, held GUI ≤ 52¢, other GUI ≥ 48¢ (complement). The other side need
-not be strictly ahead beyond the configured 5¢ display gap. A 49/51 book
-with a held last trade at 85¢ is a clip, not a reversal →
-`hedge_skip_no_consensus`. After GUI, hourly waits `hedge_persist_s` (5s)
-on a continuously qualified book (`hedge_skip_persist` /
-`buy/hedge_gate.py`). A bounce clears the arm.
+≤ 52¢, held GUI ≤ 52¢, other GUI ≥ 48¢ (complement). The buy-side 5¢
+ambiguity gap does **not** apply here, so a documented 50¢-vs-48¢ book
+qualifies. A 49/51 book with a held last trade at 85¢ is a clip, not a
+reversal → `hedge_skip_no_consensus`. After GUI, hourly waits
+`hedge_persist_s` (5s) on a continuously qualified book
+(`hedge_skip_persist` / `buy/hedge_gate.py`). Elapsed wall time alone does
+not complete persistence; the endpoint tick must still pass the current
+50/52 book and GUI. A bounce or failed endpoint check clears the arm.
 
 `entry_book_ok`: both sides present, not crossed, spread ≤ 5¢, bid ≥ 70¢.
 
@@ -681,9 +683,11 @@ subscriptions begin in time for the entry window. TTM is
 
 `t15_bought` records a B-slice fill. `hourly_spent_so_far` uses durable
 `pnl_entry_cost`; `hourly_slice_budget` can spend only what remains under
-the $10 market cap. A filled live B slice cannot fire again. The generic
-multi-slice helper permits only same-token adds while inventory is live and
-logs `buy_skip_other_leg` for a side switch.
+the $10 market cap. A filled live B slice cannot fire again.
+`can_arm_hourly_slice` rejects **every** slice after `hedge_closed`,
+including legacy/incomplete state (`buy_skip_hedge_closed`). The generic
+multi-slice helper also permits only same-token adds while inventory is
+live and logs `buy_skip_other_leg` for a side switch.
 
 **Other gates (all must pass):**
 
@@ -701,7 +705,14 @@ logs `buy_skip_other_leg` for a side switch.
 11. Binance BTCUSDT versus the hourly PTB is at least **$10** from flat and
     favors the same leg. Missing/stale PTB/live data or side disagreement
     skips the buy (`buy_skip_underlying_edge` /
-    `buy_skip_underlying_side`).
+    `buy_skip_underlying_side`). REST confirmation recomputes the CLOB
+    winner, then reapplies that favored side so a book flip cannot buy
+    against Binance.
+12. Immediately before every BUY POST/retry, `hourly_entry_final_gate`
+    (wired as `pre_submit` plus `deadline_ts=m.end_ts`) rechecks TTM > 0,
+    the selected B band, fresh Binance/PTB still favoring the selected
+    leg, `hedge_closed` false, and the selected leg still the CLOB/GUI
+    winner. A failed gate aborts without posting.
 
 The entry feed is Binance because that is the hourly market’s resolution
 source. The holding-time oracle veto is separate and intentionally uses a
@@ -768,9 +779,10 @@ No client call.
 2. Up to 3 attempts:
    - Force REST quote. No ask / ask left the band / book went wide → stop.
    - Size shares. Thin displayed size → log, still post full dollar size.
-   - Optional `pre_submit` hook exists for cadence-specific last-second
-     gates; the hourly caller already REST-confirms before entry and every
-     retry force-refreshes inside this function.
+   - Hourly wires `pre_submit` + `deadline_ts` so every attempt/retry
+     re-runs `hourly_entry_final_gate` after the order is built and
+     immediately before write-ahead / POST. Expiry, oracle/side flip,
+     band close, or `hedge_closed` abort without posting.
    - **`on_submit` write-ahead** (quarantine JSON) **before** POST. If this
      save fails → **do not POST** (`persist_fail`).
    - Sign order; `signed_order_id` hashes EIP-712 typed data so the id is
@@ -828,21 +840,29 @@ caller.
    clears a completed arm (`hedge_skip_recovery`).
 5. Normal qualify is a tight bid ≤ **50¢**, ask ≤ **52¢**, spread ≤15¢,
    held GUI/last trade ≤52¢, and other GUI ≥48¢. It must remain qualified
-   for **5 seconds**; any failed book/GUI check resets the arm.
-6. Once persistence completes, `hedge_sell_fade=true` sells at the live
-   bid while it remains **below 53¢**, including a fade through 50¢.
-   Bid ≥53¢ holds and clears persistence. This deliberately does **not**
-   copy the stopped 5m bot’s 70–84¢ post-persist sell range.
+   for **5 seconds**; any failed book/GUI check resets the arm. The tick
+   that completes those 5 seconds must still pass the current book and
+   GUI. A 50/99 book or failed GUI at the endpoint holds and clears the
+   arm instead of selling.
+6. Once a previously qualified tick has completed persistence,
+   `hedge_sell_fade=true` sells at the live bid while it remains
+   **below 53¢**, including a fade through 50¢. The executor honors that
+   fade (it must not abort 36–49¢ as a dead band). Bid ≥53¢ holds and
+   clears persistence. This deliberately does **not** copy the stopped
+   5m bot’s 70–84¢ post-persist sell range.
 7. Write-ahead hedge quarantine, then a sell FAK at the **live bid** on
    the market tick. Hourly expects `0.01`, undercuts zero ticks, and
    rebuilds at a coarser minimum if the CLOB reports one
    (`hedge_tick_retry`). `hedge_min_price` is retained config, not a FAK
-   floor; a 20¢ live bid is not refused.
+   floor; a 20¢ live bid is not refused. Every SELL POST/retry also runs
+   `pre_submit` (`hold_while_oracle_agrees` + TTM > 0) and
+   `deadline_ts=m.end_ts`.
 8. Unmatched FAK / invalid tick / could-not-run retries re-quote the live
-   bid (up to 12 attempts for a dump or persist-done sell). A dump retry
-   stops if bid recovers above 35¢. A persist-done retry continues while
-   bid <53¢ because `sell_fade` is on, and aborts at recovery. Incomplete
-   REST uses WS/last-good rather than idling the bag.
+   bid (up to 12 attempts for a dump or persist-done sell) and recheck
+   oracle/expiry before each POST. A dump retry stops if bid recovers
+   above 35¢. A persist-done retry continues while bid <53¢ because
+   `sell_fade` is on, and aborts at recovery. Incomplete REST uses
+   WS/last-good rather than idling the bag.
 9. Every live-bag skip/fail logs slug, TTM, bid, ask, tick, reason, and
    order error (`live_bag_log_fields`). `hedge_closed` is set only after
    confirmed inventory is gone.
@@ -1141,6 +1161,10 @@ pulled the code hours earlier.
 14. `hedge_min_price` is leftover config, not a FAK floor.
 15. A/C hourly windows are disabled. Do not revive >93/>95 by copying an old
     template.
+16. After `hedge_closed`, hourly must not re-enter that market. Do not
+    treat unused slices as still available.
+17. Hourly fade sells in (35¢, 50¢) only when `hedge_sell_fade` is on.
+    The 5m executor still aborts that dead band.
 
 ---
 
