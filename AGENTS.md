@@ -7,58 +7,35 @@ and why the non-boilerplate code exists — is `TECHNICAL_DESIGN.md`.
 
 ## Project at a Glance
 
-**Live on the VM:** **5m buy bot only** (`polybuybot5m`) plus a no-order path
-recorder (`polypathlog`). 15m and hourly buy services are **stopped**. Mint
-(`polymintbot`) is **paused**.
+**Live on the VM (after this change is deployed):** **hourly buy bot**
+(`polybuybothourly`) plus a no-order path recorder (`polypathlog`). 5m
+and 15m buy services are **stopped**. Mint (`polymintbot`) is **paused**.
 
-The 5m bot buys the winning leg of Polymarket BTC "Up or Down" markets in
-**two $2.50 slices** (up to **$5** if both fill):
-
-| When (time to close) | Winning ask | Slice |
-|---|---|---|
-| Last **120s** (`TTM ≤ 120`) | **75–90¢** | **$2.50** late (`late_buy_budget`) |
-| First **3 min** (`120 < TTM ≤ 300`) | **90–99¢** | **$2.50** early (`buy_budget`) |
-| Same early window | **≥95¢** overlay | uses the early $2.50, not a third slice |
-
-Missed early does **not** become a $5 late buy. Same-leg add only (no
-straddle), and only if the late ask is ≥ **90¢** (`add_min_price`). Flat
-late 75–90 is still a first entry. After a full hedge the market is done.
-Normal hedge is **persist 2s @ 70/72** on the combined bag (GUI: held ≤
-**72¢**, other ≥ **28¢**; not inverted 30/70). Then sell at the live bid
-(70–84). Bid ≥ **85¢** (`hedge_recovery_cancel`) holds and **clears
-persist** — do not sell a 90–99¢ recovery because `persist_done` stuck.
-**Any live bag** dumps bid-only at **≤53¢**. Do not sell in
-(53¢, 70¢). Winners redeem at $1.00. **No profit-take sell.** See
+The hourly bot buys the winning leg of Polymarket BTC "Up or Down" **hourly**
+markets: **75–90¢ in the last 20 minutes**, **$10** cap, FAK limit **90¢**.
+Same-leg only. After a full hedge the market is done. Normal hedge is
+**persist 5s @ 50/52** (GUI: held ≤ **52¢**, other ≥ **48¢**; not inverted
+30/70). Then sell at the live bid while **< 53¢** (fade through 50 still
+sells). Bid ≥ **53¢** (`hedge_recovery_cancel`) holds and **clears persist**.
+Once holding, do **not** sell while live Binance BTC is still on the held
+side of PTB (`hedge_require_oracle`). Missing/stale BTC also holds. **Any
+live bag** dumps bid-only at **≤35¢** only after that oracle has flipped
+or gone flat. Do not sell 55–69 after persist (that was the 5m 70–84
+complaint). Winners redeem at $1.00. **No profit-take sell.** See
 `CURRENT.md` for the active probe knobs.
 
-Last 120s is **75–90¢ only** — do not buy 91–99¢ after T-120. `buy_max_price`
-0.90 is the late cap and the early ≥90 floor. Early FAK limit is
-`early_buy_max_price` (0.99).
+A/C slices (`>93` last 22 min / `>95` last 5) are **off**
+(`a22_window_min` = `c5_window_min` = 0). Do not copy 5m `seconds_left`
+into hourly.
 
-**Hourly (`polybuybothourly`) is still stopped.** Code now has three
-minutes-based slices and a **$10 per-market spend cap** (same-leg only,
-combined-bag hedge **55/60**). Do **not** start it until the operator
-copies `strategy_buyhourly.example.json` knobs into live JSON and
-explicitly enables `dry_run` / `entry_enabled`. Inclusive TTM:
-`0 < minutes_left ≤ window`. Ask **> 0.93** / **> 0.95** are exclusive;
-75–90 is inclusive. Do not copy 5m `seconds_left` into hourly.
-
-| When (time to close) | Winning ask | Slice | Spend | FAK limit |
-|---|---|---|---|---|
-| Last **22 min** | **> 93¢** (and **≤ 95¢** if C is also open) | `a22` | **$5** max | **99¢** |
-| Last **15 min** | **75–90¢** inclusive | `b15` | remaining to **$10** | **90¢** |
-| Last **5 min** | **> 95¢** | `c5` | remaining to **$10** | **99¢** |
-
-Priority: the band that **contains** the ask. 75–90 never posts at 99¢.
->95 in the last 5 min uses C, not A. Logs `slice=a22|b15|c5`, `add`,
-`spent_so_far`, `budget`; `buy_success` includes `slice`.
+The 5m two-slice 70/72 bot is **stopped** (code still in `buybot5m.py`).
 
 | File | Service | Markets | Oracle | Budget | Window |
 |---|---|---|---|---|---|
 | `buybot.py` | `polybuybot` **stopped** | 15m | Chainlink TWAP 60s | $2.50 | final 4.0 min, 75–90¢, hedge 35/40 |
-| `buybot5m.py` | `polybuybot5m` **live** | 5m | Chainlink TWAP 30s | $2.50+$2.50 | bands above; persist **2s @ 70/72** (toxic 53¢) |
-| `buybothourly.py` | `polybuybothourly` **stopped** | hourly | Binance BTCUSDT | $10 cap (A $5 / B–C remainder) | last 22/15/5 min; hedge **55/60** |
-| `pathlog.py` | `polypathlog` **live** | all three | — (CLOB books only) | — | whole 5m; last 8m of 15m; last 15m of hourly |
+| `buybot5m.py` | `polybuybot5m` **stopped** | 5m | Chainlink TWAP 30s | $2.50+$2.50 | early ≥90 / late 75–90; persist **2s @ 70/72** (toxic 53¢) |
+| `buybothourly.py` | `polybuybothourly` **live after operator start** | hourly | Binance BTCUSDT | $10 cap | last **20 min** 75–90¢; persist **5s @ 50/52** + oracle veto |
+| `pathlog.py` | `polypathlog` **live** | all three | — (CLOB books only) | — | whole 5m; last 8m of 15m; last **20m** of hourly |
 
 Plus: `check_book.py`, `check_participation.py`, `check_path_backtest.py`,
 `check_fetch_trades.py`, `check_buy_skips.py`, `check_buy_rejects.py`,
@@ -72,8 +49,8 @@ Plus: `check_book.py`, `check_participation.py`, `check_path_backtest.py`,
 | File | What it does | Mirrors |
 |---|---|---|
 | `buybot.py` (~5063 lines) | 15m buy bot | `buybot5m.py`, `buybothourly.py` |
-| `buybot5m.py` (~5177 lines) | 5m buy bot (**live**) | `buybot.py`, `buybothourly.py` |
-| `buybothourly.py` (~5061 lines) | Hourly buy bot | `buybot.py`, `buybot5m.py` |
+| `buybot5m.py` (~5177 lines) | 5m buy bot (**stopped**) | `buybot.py`, `buybothourly.py` |
+| `buybothourly.py` (~5061 lines) | Hourly buy bot (**live after operator start**) | `buybot.py`, `buybot5m.py` |
 | `buy/market.py` | MarketGateway — Gamma discovery + metadata | — |
 | `buy/btc_price.py` | Resolution-aligned BTC feeds (TWAP 30/60, Binance) + PTB | — |
 | `buy/clob_book_ws.py` | CLOB market-channel WS top-of-book (buy/hedge speed path) | — |
@@ -146,8 +123,8 @@ functions with `ast` (`tests/test_buy_fill_shapes.py`).
 - **Never commit live `strategy_*.json`, `.env`, or state files** — they are
   gitignored but double-check before `git add .`.
 - **Do not restart `polymintbot` unless the operator asks.**
-- **Do not start `polybuybot` / `polybuybothourly` unless the operator asks** —
-  live trading is 5m-only (`polybuybot5m`).
+- **Do not start `polybuybot` / `polybuybot5m` unless the operator asks** —
+  live trading is hourly (`polybuybothourly`) after they copy knobs and start it.
 - **Do not add a profit-take sell** unless the operator asks. Hedge is the only
   sell path. Take-profit was evaluated and dropped (unreachable on ≥90¢ fills;
   cuts $1.00 rides on 75–85¢ fills).
@@ -233,6 +210,8 @@ two-slice $2.50+$2.50 add.
 - `hedge_skip_no_consensus` — 70/72 book passed but 5m GUI/last-trade still fail (held last print ≤ 72¢, held GUI ≤ 72¢, other GUI ≥ 28¢, 5¢ gap). Dump ≤53 skips this veto. 15m/hourly still invert buy 70/30.
 - `hedge_skip_toxic_recovered` — `toxic_fill` is armed but held bid > `hedge_toxic_bid_max` (53¢ winner book); dump stays armed, no sell
 - `hedge_skip_incomplete_rest` — no REST/WS/last-good bid. Incomplete REST must **not** skip a dump; use WS/last-good
+- `hedge_skip_oracle_still_winning` — once holding, live BTC is still on the held side of PTB; do not sell a CLOB dip. Throttled 8s.
+- `hedge_skip_oracle` — hedge oracle unread (missing PTB, stale/missing live BTC). Fail closed: do not sell.
 - `hedge_skip_dead_band` — persist done or qualify fired but bid is in (53¢, 70¢); do not sell
 - `buy_skip_ambiguous` — GUI display prices too close (throttled 8s; **not** one event per market)
 - `buy_skip_no_consensus` — ask in band but GUI/tight-book gate failed
@@ -341,9 +320,11 @@ Cloud agents: `CLOUD_RESEARCH.md`.
   ≤ **72¢**, held GUI ≤ **72¢**, other GUI ≥ **28¢** (complement of ask-max).
   A 70¢ vs 28¢ book is the qualify; the other side does **not** have to
   already be the winner. Instant 70 is out — a one-tick dip dumps winners.
-  Buy 70/30 is unchanged. 15m/hourly (stopped) still invert 70/30. Live 5m
-  book qualify is **70/72 persist 2s**; toxic dump **53¢**; hourly template
-  **55/60**; 15m remains 35/40.
+  Buy 70/30 is unchanged. 15m (stopped) still invert 70/30. Live 5m
+  book qualify is **70/72 persist 2s**; toxic dump **53¢**. Live hourly
+  (after operator start) is **persist 5s @ 50/52**, dump **35¢**, recovery
+  **53¢**, `hedge_sell_fade`, plus **oracle veto**: no sell while live BTC
+  is still on the held side of PTB. 15m remains 35/40.
   A random TOB clip is not enough; a last print of 85¢ on a 68/71 book will
   `hedge_skip_no_consensus`. **Any live bag** dumps bid-only while held bid
   ≤ **53¢** (no GUI veto; not only `toxic_fill`). Do **not** sell in
@@ -409,8 +390,8 @@ Cloud agents: `CLOUD_RESEARCH.md`.
 | Service file | Bot | Live? |
 |---|---|---|
 | `polybuybot.service` | `buybot.py` (15m) | **stopped** |
-| `polybuybot5m.service` | `buybot5m.py` (5m) | **yes** |
-| `polybuybothourly.service` | `buybothourly.py` (hourly) | **stopped** |
+| `polybuybot5m.service` | `buybot5m.py` (5m) | **stopped** |
+| `polybuybothourly.service` | `buybothourly.py` (hourly) | **yes — after operator start** |
 | `polypathlog.service` | `pathlog.py` (CLOB path recorder; no orders) | **yes** |
 | `polymintbot.service` | `mintbot.py` | **paused** |
 
@@ -418,21 +399,21 @@ CI: pushes to `main` touching the buy bots, `pathlog.py`,
 `check_path_backtest.py`, `buy/`, or `requirements.txt` deploy to the VM via
 SSH (`git pull` + `pip install` only). Services are **not** auto-restarted —
 start/restart deliberately after validation (`systemctl start` / `restart`).
-A merged NameError fix does nothing until `polybuybot5m` is restarted
-(13–19 Aug `known_cost` stall).
 
-After this branch merges, on the VM (5m only):
+After this branch merges, on the VM (hourly; stop 5m):
 
 ```bash
 cd ~/poly-money-maker && git pull
-python3 -c 'import json; from pathlib import Path; p=Path("strategy_buy5m.json"); d=json.loads(p.read_text()); d["hedge_threshold"]=0.70; d["hedge_require_ask_max"]=0.72; d["hedge_persist_s"]=2.0; d["hedge_toxic_bid_max"]=0.53; d["hedge_recovery_cancel"]=0.85; d["add_min_price"]=0.90; d["hedge_undercut_ticks"]=0; d["buy_budget"]=2.5; d["late_buy_budget"]=2.5; d["buy_max_price"]=0.90; d["poll_buy_window_s"]=0.01; d["poll_held_s"]=0.01; d["ui_every_n_cycles"]=50; p.write_text(json.dumps(d, indent=2)+"\n")'
-sudo systemctl restart polybuybot5m
+sudo systemctl stop polybuybot polybuybot5m
+sudo systemctl disable polybuybot polybuybot5m
+python3 -c 'import json; from pathlib import Path; p=Path("strategy_buyhourly.json"); d=json.loads(p.read_text()); d["buy_window_min"]=20.0; d["a22_window_min"]=0.0; d["b15_window_min"]=20.0; d["c5_window_min"]=0.0; d["hedge_threshold"]=0.50; d["hedge_require_ask_max"]=0.52; d["hedge_persist_s"]=5.0; d["hedge_toxic_bid_max"]=0.35; d["hedge_recovery_cancel"]=0.53; d["hedge_sell_fade"]=True; d["hedge_require_oracle"]=True; d["hedge_oracle_min_edge_usd"]=0.0; d["hedge_undercut_ticks"]=0; d["b15_buy_budget"]=10.0; d["market_spend_cap"]=10.0; d["buy_budget"]=10.0; p.write_text(json.dumps(d, indent=2)+"\n")'
+sudo systemctl restart polypathlog
+sudo systemctl start polybuybothourly
+sudo systemctl enable polybuybothourly
 ```
 
-Hourly stays **stopped**. After the operator decides to run it (not this
-agent): `git pull`, copy the example knobs into live `strategy_buyhourly.json`
-(`dry_run` / `entry_enabled` only when they mean it), then
-`sudo systemctl start polybuybothourly`. Do **not** restart 5m for this.
+Confirm `strategy_buyhourly.json` `dry_run` / `entry_enabled` before start.
+Do **not** start 5m, 15m, or mint.
 
 ## Dependencies
 

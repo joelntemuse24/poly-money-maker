@@ -52,11 +52,11 @@ SERIES = [
     "btc-up-or-down-hourly",
 ]
 
-# Seconds before end to start sampling. Whole 5m window; last 8m of 15m; last 15m of hourly.
+# Seconds before end to start sampling. Whole 5m window; last 8m of 15m; last 20m of hourly.
 RECORD_BEFORE_END_S = {
     "btc-up-or-down-5m": 5 * 60,
     "btc-up-or-down-15m": 8 * 60,
-    "btc-up-or-down-hourly": 15 * 60,
+    "btc-up-or-down-hourly": 20 * 60,
 }
 
 POLL_S = 1.0
