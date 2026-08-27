@@ -570,7 +570,12 @@ def hedge_sweep_variants(tmpl: dict) -> List[dict]:
 
 
 def sweep_variants(tmpl: dict) -> List[dict]:
-    """One-at-a-time deviations from the live template. Not a full cartesian."""
+    """One-at-a-time deviations from the example JSON template.
+
+    ``live_5m_paper`` is whatever ``buy_start_s`` / ``buy_max_price`` the
+    template file currently has (probe last-45s / 75–90 today, not the live
+    120s bot). Window variants skip the template's own ``ttm_max``.
+    """
     ttm = float(tmpl["ttm_max"])
     tag = "5m" if abs(ttm - 120.0) < 1e-6 or abs(ttm - 45.0) < 1e-6 else "template"
     rows: List[dict] = []
@@ -583,8 +588,10 @@ def sweep_variants(tmpl: dict) -> List[dict]:
 
     add(f"live_{tag}_paper", paper=True)
     add(f"live_{tag}_ride", paper=False)
-    for ttm in (60, 90, 180, 240):
-        add(f"window_{ttm}s", ttm_max=float(ttm), paper=True)
+    for window_s in (45, 60, 90, 120, 180, 240):
+        if abs(float(window_s) - ttm) < 1e-6:
+            continue
+        add(f"window_{window_s}s", ttm_max=float(window_s), paper=True)
     add("band_70_99", ask_min=0.70, paper=True)
     add("band_80_99", ask_min=0.80, paper=True)
     add("band_75_85", ask_max=0.85, paper=True)
