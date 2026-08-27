@@ -93,7 +93,7 @@ functions with `ast` (`tests/test_buy_fill_shapes.py`).
 | File | Purpose |
 |---|---|
 | `pathlog.py` | CLOB path recorder (no orders; TOB price **and** size) |
-| `check_path_backtest.py` | Pathlog: grid, anatomy, compare, **paper hedge**, `--sweep`, `--hedge-sweep` (no orders) |
+| `check_path_backtest.py` | Pathlog: grid, anatomy, compare, **paper hedge**, `--sweep`, `--hedge-sweep`, **`--min-edge-usd` Binance join** (no orders) |
 | `check_hedge_threshold.py` | Earlier-stop research: pathlog `--hedge-sweep` or public last-trade vs a history CSV |
 | `check_reversal_features.py` | Research: Binance |dist|/vol/momentum vs 5m reversals (optional CLOB 75–90) |
 | `CLOUD_RESEARCH.md` | Cloud prompts: paper P&L on public books + `--sweep` (no `.env`) |
@@ -185,6 +185,8 @@ python check_participation.py --hours 72 --csv exports/trades.csv
 .venv/bin/python check_path_backtest.py --compare --paper --series 5m --budget 2.5
 .venv/bin/python check_path_backtest.py --sweep --series 5m
 .venv/bin/python check_path_backtest.py --anatomy --series 5m --ttm-max 120 --csv /tmp/anatomy.csv
+.venv/bin/python check_path_backtest.py --ask-min 0.75 --ask-max 0.90 --ttm-max 120 --budget 10 \
+    --series 5m --paper --max-spread 0.05 --min-edge-usd 25 --csv /tmp/hits_10_e25.csv
 .venv/bin/python check_path_backtest.py --export-market <slug> --csv /tmp/m.csv
 # then scp /tmp/hits.csv (or scp -r pathlog/ticks) off the box
 ```
@@ -192,9 +194,9 @@ python check_participation.py --hours 72 --csv exports/trades.csv
 Watch the console for `[DRY BUY]` / `[DRY SELL]` markers. Ctrl-C to stop.
 
 `--sweep` reads **late** keys from `strategy_buy5m.example.json`
-(**75–90 / last 45s / $2.50**; `live_5m_paper` is that file). Pathlog
-cannot replay the **$25** `|TWAP−PTB|` gate — score that in
-`check_reversal_features.py`. `window_120s` is an explicit variant.
+(**75–90 / last 45s / $2.50**; `live_5m_paper` is that file). Join the
+**$25** `|BTC−PTB|` gate with `--min-edge-usd 25` (Binance 1s, PTB =
+close at market start, live = close at fill ts — not Chainlink TWAP).
 `--compare` uses hardcoded late-band presets; `--paper` hedge knobs still
 come from the example JSON (**50/52 persist 5s**, dump **32¢**). Neither
 command replays the early ≥90 / ≥95 union **or** the two-slice $2.50+$2.50
@@ -287,6 +289,8 @@ python check_path_backtest.py --hedge-sweep --series 5m --budget 2.5
 python check_hedge_threshold.py --csv exports/trades.csv --hours 15
 python check_path_backtest.py --anatomy --series 5m --ttm-max 120 --csv /tmp/anatomy.csv
 python check_path_backtest.py --grid --budget 2.5 --series 5m
+python check_path_backtest.py --ask-min 0.75 --ask-max 0.90 --ttm-max 120 --budget 10 \
+    --series 5m --paper --max-spread 0.05 --min-edge-usd 25
 python check_buy_skips.py --since 2026-08-19T08:02:00
 python check_live_journal.py --hours 5
 python check_reversal_features.py --hours 72

@@ -15,6 +15,7 @@ from check_path_backtest import (
     infer_winner,
     load_market_file,
     matches_series,
+    oracle_entry_ok,
     paper_settle,
     simulate_fak_buy,
     summarize,
@@ -567,6 +568,129 @@ class SweepTemplateTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             rc = main(["--hedge-sweep", "--series", "5m", "--dir", tmp])
         self.assertEqual(rc, 2)
+
+
+class FakeBtc:
+    """Minimal at_or_before series for oracle tests (no Binance)."""
+
+    def __init__(self, samples):
+        self._samples = sorted((int(ts), float(px)) for ts, px in samples)
+
+    def at_or_before(self, unix):
+        last = None
+        for ts, px in self._samples:
+            if ts <= float(unix):
+                last = px
+            else:
+                break
+        return last
+
+
+class OracleEntryTests(unittest.TestCase):
+    def test_keep_when_edge_and_side_match(self):
+        ok, reason, dist = oracle_entry_ok("up", 100025.0, 100000.0, 25.0)
+        self.assertTrue(ok)
+        self.assertIsNone(reason)
+        self.assertEqual(dist, 25.0)
+
+    def test_skip_edge_too_small(self):
+        ok, reason, dist = oracle_entry_ok("up", 100010.0, 100000.0, 25.0)
+        self.assertFalse(ok)
+        self.assertEqual(reason, "edge_too_small")
+        self.assertEqual(dist, 10.0)
+
+    def test_skip_wrong_side(self):
+        ok, reason, dist = oracle_entry_ok("up", 99970.0, 100000.0, 25.0)
+        self.assertFalse(ok)
+        self.assertEqual(reason, "side_mismatch")
+        self.assertEqual(dist, -30.0)
+
+    def test_fail_closed_on_missing(self):
+        ok, reason, dist = oracle_entry_ok("down", None, 100000.0, 25.0)
+        self.assertFalse(ok)
+        self.assertEqual(reason, "missing_live")
+        self.assertIsNone(dist)
+
+    def test_zero_edge_never_picks(self):
+        ok, reason, dist = oracle_entry_ok("up", 100000.0, 100000.0, 0.0)
+        self.assertFalse(ok)
+        self.assertEqual(reason, "edge_zero")
+        self.assertEqual(dist, 0.0)
+
+
+class EvaluateOracleTests(unittest.TestCase):
+    def _market(self, start=1_000, end=1_300, ts=1_210, ttm=90.0, winner="up"):
+        rows = [
+            {
+                "e": "open",
+                "slug": "btc-updown-5m-oracle",
+                "series": "btc-up-or-down-5m",
+                "start": start,
+                "end": end,
+                "q": "test",
+            },
+            _tick(ts, ttm, 0.82, 0.18, uas=20.0, das=20.0),
+            {"e": "resolved", "winner": winner},
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "btc-updown-5m-oracle.jsonl"
+            path.write_text("".join(json.dumps(r) + "\n" for r in rows))
+            return load_market_file(path)
+
+    def test_book_hit_skipped_when_edge_under_25(self):
+        market = self._market()
+        btc = FakeBtc([(1_000, 100000.0), (1_210, 100010.0)])
+        rows = evaluate_rule(
+            [market],
+            ask_min=0.75,
+            ask_max=0.90,
+            ttm_min=0,
+            ttm_max=120,
+            budget=2.5,
+            btc=btc,
+            min_edge_usd=25.0,
+        )
+        stats = summarize(rows)
+        self.assertEqual(stats["book_hits"], 1)
+        self.assertEqual(stats["hits"], 0)
+        self.assertEqual(stats["oracle_skip_edge"], 1)
+        self.assertEqual(rows[0]["oracle_reason"], "edge_too_small")
+        self.assertAlmostEqual(rows[0]["dist"], 10.0)
+
+    def test_keep_when_binance_dist_is_25_and_side_matches(self):
+        market = self._market()
+        btc = FakeBtc([(1_000, 100000.0), (1_210, 100025.0)])
+        rows = evaluate_rule(
+            [market],
+            ask_min=0.75,
+            ask_max=0.90,
+            ttm_min=0,
+            ttm_max=120,
+            budget=2.5,
+            btc=btc,
+            min_edge_usd=25.0,
+        )
+        stats = summarize(rows)
+        self.assertEqual(stats["book_hits"], 1)
+        self.assertEqual(stats["hits"], 1)
+        self.assertEqual(stats["wins"], 1)
+        self.assertEqual(rows[0]["oracle_reason"], None)
+        self.assertAlmostEqual(rows[0]["dist"], 25.0)
+
+    def test_no_oracle_kwargs_unchanged(self):
+        market = self._market()
+        rows = evaluate_rule(
+            [market],
+            ask_min=0.75,
+            ask_max=0.90,
+            ttm_min=0,
+            ttm_max=120,
+            budget=2.5,
+        )
+        stats = summarize(rows)
+        self.assertEqual(stats["hits"], 1)
+        self.assertEqual(stats["book_hits"], 1)
+        self.assertEqual(stats.get("oracle_skip_edge"), 0)
 
 
 if __name__ == "__main__":

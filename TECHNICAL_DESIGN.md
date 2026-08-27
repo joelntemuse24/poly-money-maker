@@ -1066,12 +1066,14 @@ window is a “hit.” `--template strategy_buy5m.example.json` maps the live
 75–90¢ / last **45s** / $2.50 entry and basic 50/52/5s hedge into paper
 knobs. Paper persistence is real: qualifying ticks must stay continuous
 for the configured 5 seconds. Tight books use midpoint as the GUI and
-last-trade proxy; displayed top size caps the paper fill. Pathlog has
-**no** `|TWAP−PTB|` — the live **$25** edge is scored in
-`check_reversal_features.py`.
+last-trade proxy; displayed top size caps the paper fill. `--min-edge-usd 25`
+joins Binance 1s as a PTB (market start) / live (fill ts) proxy — fail-closed
+like the live gate, not Chainlink TWAP 30s. Analog-only `$25` scoring without
+a restable ask stays in `check_reversal_features.py`.
 
-This is still **not a live 5m replay**. Pathlog has no Chainlink/PTB, no
-last trade, no POST latency, and no unmatched FAKs. Paper mode also does
+This is still **not a live 5m replay**. Pathlog has no last trade, no POST
+latency, and no unmatched FAKs. Paper `--min-edge-usd` is Binance, not
+Chainlink TWAP. Paper mode also does
 not model `hedge_require_oracle`, `hedge_sell_fade`, recovery-cancel
 semantics, or the universal bid-only 32¢ dump exactly. Treat its P&L as a
 book-path comparison, not proof that the live bot would have traded.

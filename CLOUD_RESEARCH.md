@@ -7,10 +7,11 @@ load live `strategy_buy5m.json`, and never start systemd.
 The point is **paper P&L** (hedge proceeds or $1 / $0), not “would it have
 clicked.” Hits without `pnl` are incomplete.
 
-Pathlog **cannot** replay Polymarket last-trade GUI, Chainlink/PTB, or POST
-latency. Paper mode: fill at the recorded ask, walk later ticks for a
-50/52/15 hedge from the 5m example JSON (paper honors `hedge_persist_s`,
-5s on that file) using
+Pathlog **cannot** replay Polymarket last-trade GUI, Chainlink TWAP, or POST
+latency. `--min-edge-usd` joins **Binance** BTCUSDT as a PTB/live proxy
+(not the live 30s TWAP). Paper mode: fill at the recorded ask, walk later
+ticks for a 50/52/15 hedge from the 5m example JSON (paper honors
+`hedge_persist_s`, 5s on that file) using
 mid-as-GUI when spread ≤ 10¢ (held ≤ 52¢ / other ≥ 48¢; other need not be
 ahead). Wide books fail closed. Toxic dumps only while bid ≤ 32¢.
 

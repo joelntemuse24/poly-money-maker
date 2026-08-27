@@ -176,8 +176,9 @@ same ticks, then change live JSON:
 (clear winner before the window), `tight_through_window` (never 5¢ apart),
 `cleared_in_window` (first became obvious only after T-120). `--series 5m`
 is **only** 5-minute markets (`15m` contains the letters `5m` — do not use a
-raw substring). Pathlog has no last-trade GUI and no BTC/PTB — those still
-need `check_buy_skips.py` / `check_edge_counterfactual.py`.
+raw substring). Pathlog has no last-trade GUI. Join Binance `|BTC−PTB|` with
+`--min-edge-usd 25` on `check_path_backtest.py` (not Chainlink TWAP). Live skip
+reasons still need `check_buy_skips.py`.
 
 Kill switch: `touch STOP_PATHLOG`.
 
