@@ -77,6 +77,8 @@ class FeatureMathTests(unittest.TestCase):
         self.assertTrue(feat.against_30s)
         self.assertTrue(feat.cross_before_end)
         self.assertGreater(feat.abs_dist, 0)
+        self.assertIsNotNone(feat.flip_z)
+        self.assertGreater(feat.flip_z, 0)
 
     def test_features_with_momentum(self):
         ts = list(range(0, 120))

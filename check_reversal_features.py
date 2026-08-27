@@ -28,6 +28,7 @@ import math
 import statistics
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -38,7 +39,6 @@ from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
 from check_hedge_threshold import (
-    ET,
     fetch_event,
     fetch_trades,
     five_m_start_ts,
@@ -62,6 +62,8 @@ DEFAULT_FILL_PX = 0.85
 DIST_EDGES = (0.0, 5.0, 10.0, 20.0, 40.0, 80.0, math.inf)
 # 30s realized move (std of 1s diffs, USD).
 VOL_EDGES = (0.0, 2.0, 4.0, 8.0, 16.0, math.inf)
+# |dist| / (1s-vol * sqrt(TTM)) — Brownian "how many sigmas to PTB".
+Z_EDGES = (0.0, 1.0, 2.0, 4.0, 8.0, math.inf)
 # |30s momentum| in USD.
 MOM_EDGES = (0.0, 5.0, 10.0, 20.0, 40.0, math.inf)
 
@@ -283,6 +285,7 @@ class Features:
     ripping_to_ptb: Optional[bool] = None
     sec_to_cross: Optional[float] = None
     cross_before_end: Optional[bool] = None
+    flip_z: Optional[float] = None
     fill_px: Optional[float] = None
     leg: Optional[str] = None
 
@@ -304,6 +307,7 @@ class Features:
             "ripping_to_ptb": self.ripping_to_ptb,
             "sec_to_cross": self.sec_to_cross,
             "cross_before_end": self.cross_before_end,
+            "flip_z": self.flip_z,
             "fill_px": self.fill_px,
             "leg": self.leg,
         }
@@ -353,6 +357,9 @@ def features_at(
     stc = None if vel is None else seconds_to_cross(dist, vel)
     ttm = end_ts - ts
     cross = None if stc is None else (stc <= ttm)
+    flip_z = None
+    if vol30 is not None and ttm > 0:
+        flip_z = abs(dist) / (max(vol30, 1e-9) * math.sqrt(ttm))
     return Features(
         ts=ts,
         ttm=ttm,
@@ -370,6 +377,7 @@ def features_at(
         ripping_to_ptb=against,
         sec_to_cross=stc,
         cross_before_end=cross,
+        flip_z=flip_z,
         fill_px=fill_px,
         leg=leg,
     )
@@ -799,6 +807,16 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     report.append(skip_cost_table(btc_samples, lambda s: s.feat.abs_dist < 40, "skip |dist|<$40"))
     report.append(skip_cost_table(btc_samples, lambda s: bool(s.feat.against_30s), "skip against-mom 30s"))
     report.append(skip_cost_table(btc_samples, lambda s: bool(s.feat.cross_before_end), "skip projected cross"))
+    report.append("")
+    report.append("by flip_z = |dist| / (vol_1s * sqrt(TTM))  (sigmas to PTB)")
+    report.extend(
+        tabulate(
+            btc_samples,
+            lambda s: bucket(s.feat.flip_z, Z_EDGES),
+        )
+    )
+    report.append(skip_cost_table(btc_samples, lambda s: (s.feat.flip_z or 99) < 1, "skip z<1"))
+    report.append(skip_cost_table(btc_samples, lambda s: (s.feat.flip_z or 99) < 2, "skip z<2"))
     report.append(
         skip_cost_table(
             btc_samples,
@@ -845,30 +863,31 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         report.append(skip_cost_table(mid, lambda s: bool(s.feat.against_30s), "mid: skip against-mom"))
         report.append(skip_cost_table(mid, lambda s: bool(s.feat.cross_before_end), "mid: skip projected cross"))
         report.append(skip_cost_table(mid, lambda s: (s.feat.vol_30s or 0) >= 4, "mid: skip vol30>=$4"))
+        report.append(skip_cost_table(mid, lambda s: (s.feat.flip_z or 99) < 2, "mid: skip z<2"))
+        report.append("mid by flip_z")
+        report.extend(tabulate(mid, lambda s: bucket(s.feat.flip_z, Z_EDGES)))
 
     clob_samples: list[Sample] = []
     if args.with_clob:
-        gh = hedge_session()
-        n_ok = n_miss = n_noband = 0
-        for start, end, slug in windows:
+        n_ok = n_miss = n_noband = n_side = 0
+        cache_trades = args.cache / "trades"
+
+        def _one(window: tuple[int, int, str]) -> tuple[str, Optional[Sample]]:
+            start, end, slug = window
+            gh = hedge_session()
             try:
                 ev = fetch_event(gh, slug)
             except Exception:
-                n_miss += 1
-                continue
+                return "miss", None
             if not ev or not ev.get("condition"):
-                n_miss += 1
-                continue
+                return "miss", None
             try:
-                trades = fetch_trades(gh, ev["condition"], start, end, args.cache / "trades")
+                trades = fetch_trades(gh, ev["condition"], start, end, cache_trades)
             except Exception:
-                n_miss += 1
-                continue
+                return "miss", None
             touch = late_band_touch(trades, start, end)
             if not touch:
-                n_noband += 1
-                continue
-            n_ok += 1
+                return "noband", None
             sample = sample_from_window(
                 btc,
                 slug=slug,
@@ -880,18 +899,38 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 leg=str(touch.get("outcome") or ""),
                 winner_hint=ev.get("winner"),
             )
-            # Live 5m already skips book-vs-TWAP disagreement. Score only
-            # fills the bot would take (CLOB leg matches BTC side of PTB).
-            if sample and sample.feat.leg and sample.feat.leg.lower() != sample.feat.side:
-                n_noband += 1
-                continue
-            if sample:
-                clob_samples.append(sample)
+            if sample is None:
+                return "noband", None
+            if sample.feat.leg and sample.feat.leg.lower() != sample.feat.side:
+                return "side", None
+            return "ok", sample
+
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            futs = [pool.submit(_one, w) for w in windows]
+            for fut in as_completed(futs):
+                kind, sample = fut.result()
+                if kind == "ok" and sample is not None:
+                    n_ok += 1
+                    clob_samples.append(sample)
+                elif kind == "miss":
+                    n_miss += 1
+                elif kind == "side":
+                    n_side += 1
+                else:
+                    n_noband += 1
         report.append("")
         report.append(
             f"CLOB LATE-BAND 75–90 last {LATE_TTM_S:.0f}s  "
-            f"hits={len(clob_samples)} gamma_ok={n_ok} no_band={n_noband} miss={n_miss}"
+            f"hits={len(clob_samples)} gamma_ok={n_ok} no_band={n_noband} "
+            f"side_mismatch={n_side} miss={n_miss}"
         )
+        if windows and len(clob_samples) < 0.05 * len(windows):
+            report.append(
+                "WARN: public Data API /prices-history last-trades around 50¢ "
+                "and miss known 75–90 wallet fills. Do not use --with-clob as the "
+                "75–90 universe. Pathlog ticks on the VM are the book tape; "
+                "BTC-only + the session CSV are the numbers to trust here."
+            )
         if clob_samples:
             report.append("by |BTC−PTB| at first late-band print")
             report.extend(

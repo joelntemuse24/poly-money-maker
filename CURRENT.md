@@ -3,15 +3,10 @@
 **Agents: read this after `AGENTS.md`.** Update this file when ops/strategy decisions change.
 Do not put secrets, API keys, or live wallet material here.
 
-Last updated: **2026-08-26** — **back to the $2.50 5m bot.** Hourly is
+Last updated: **2026-08-27** — 5m live after #129. **Do not add a
+vol/momentum buy skip** from the post-restart tape (see below). Hourly is
 stopped. Last **45s** may buy **≥90¢** (FAK 99¢, late $2.50 slice). Hedge
-is the hourly false-hedge crackdown: **persist 5s @ 50/52**, recovery
-**53¢**, `hedge_sell_fade`, Chainlink TWAP oracle on persist, dump **≤32¢**
-book-only (`hedge_dump_ignore_oracle`). Early ≥90 first 3 min and late
-75–90 last 120s are unchanged (91–99 is still a no at TTM 46–120).
-Restart `polybuybot5m` after merge and patch live JSON. Confirm `dry_run`
-/ `entry_enabled`. Stop hourly. Pause minting. Pathlog records all three
-series (14-day / 400 MB cap).
+is **persist 5s @ 50/52**, recovery **53¢**, dump **≤32¢**.
 
 **Why we left 70/72 persist-2s / recovery 85 / dump 53:**
 
@@ -24,6 +19,15 @@ series (14-day / 400 MB cap).
 Those knobs are gone on 5m. Persist is **5s @ 50/52**, recovery **53¢**
 (do not sell 55–69), dump **32¢** even if BTC has not crossed yet, and
 persist-50 still needs the oracle against/flat.
+
+**Reversal features (27 Aug, no live-JSON change):** post-restart 5m tape
+was **28 fills / 24 redeem / 4 hedge / +$1.82**. Hedges had mean |BTC−PTB|
+**$33** vs **$79** on redeems. 48h of 1s Binance + 7d of 1m: **|dist| is
+monotone**; raw vol is **not** (high vol → fewer flips). Against-momentum
+is **flat inside the $10–40 band** that maps to a 75–90 favorite (48h:
+30.8% vs 30.6%). `check_reversal_features.py` is the backtest. Do **not**
+raise `min_edge` or add a vol skip until that checker plus pathlog
+`--anatomy` on the VM say otherwise.
 
 ---
 
@@ -257,6 +261,10 @@ amount / HTTP 400), not this NameError.
       `--series 5m --template strategy_buy5m.example.json --paper`, plus
       last-45s `--ask-min 0.90 --ask-max 0.99 --ttm-max 45`. Export ticks
       off the VM before prune. No `.env`.
+- [x] 27 Aug reversal-feature tape (`check_reversal_features.py`): **do not**
+      add a live vol/momentum skip. |BTC−PTB| is the only clean monotone;
+      inside the 75–90 analog it is already the band. Hedge is the reversal
+      tool. Re-score on VM pathlog `--anatomy` before any `min_edge` probe.
 
 ---
 
