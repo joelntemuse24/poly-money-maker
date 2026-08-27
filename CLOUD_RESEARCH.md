@@ -139,7 +139,8 @@ Setup:
 .venv/bin/python check_path_backtest.py --grid --series 5m --budget 2.5
 .venv/bin/python check_path_backtest.py --compare --paper --series 5m --budget 2.5
 .venv/bin/python check_path_backtest.py --compare --paper --series 5m --budget 15
-.venv/bin/python check_reversal_features.py --hours 48 --with-clob
+.venv/bin/python check_reversal_features.py --hours 72
+.venv/bin/python check_reversal_features.py --hours 168 --binance-interval 1m
 
 If buybot5m.log exists:
 .venv/bin/python check_buy_skips.py --since 2026-08-20T02:46:00

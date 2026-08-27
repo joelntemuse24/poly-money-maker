@@ -571,7 +571,8 @@ def hedge_sweep_variants(tmpl: dict) -> List[dict]:
 
 def sweep_variants(tmpl: dict) -> List[dict]:
     """One-at-a-time deviations from the live template. Not a full cartesian."""
-    tag = "5m" if abs(float(tmpl["ttm_max"]) - 120.0) < 1e-6 else "template"
+    ttm = float(tmpl["ttm_max"])
+    tag = "5m" if abs(ttm - 120.0) < 1e-6 or abs(ttm - 45.0) < 1e-6 else "template"
     rows: List[dict] = []
 
     def add(name: str, **overrides: Any) -> None:

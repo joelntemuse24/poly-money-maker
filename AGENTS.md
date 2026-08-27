@@ -12,7 +12,8 @@ and why the non-boilerplate code exists — is `TECHNICAL_DESIGN.md`.
 hourly buy services are **stopped**. Mint (`polymintbot`) is **paused**.
 
 The 5m bot buys the winning leg of Polymarket BTC "Up or Down" markets in
-**two $2.50 slices** (up to **$5** if both fill):
+**two $2.50 slices** (up to **$5** if both fill). **Live VM (until the
+operator pastes the last-45 + $25 probe in `CURRENT.md`):**
 
 | When (time to close) | Winning ask | Slice |
 |---|---|---|
@@ -20,6 +21,11 @@ The 5m bot buys the winning leg of Polymarket BTC "Up or Down" markets in
 | Last **45s** (`TTM ≤ 45`) | **≥90¢** overlay | uses the late $2.50, FAK **99¢** |
 | First **3 min** (`120 < TTM ≤ 300`) | **90–99¢** | **$2.50** early (`buy_budget`) |
 | Same early window | **≥95¢** overlay | uses the early $2.50, not a third slice |
+
+**Recommended next patch** (`strategy_buy5m.example.json`): last **45s**
+only, **75–99¢**, `min_underlying_edge_usd` **$25**, early/≥95 **off**,
+hedge unchanged, size still **$2.50**. Do not paste until the operator
+asks. See `CURRENT.md`.
 
 Missed early does **not** become a $5 late buy. Same-leg add only (no
 straddle), and only if the late ask is ≥ **90¢** (`add_min_price`). Flat
@@ -280,11 +286,14 @@ python check_path_backtest.py --anatomy --series 5m --ttm-max 120 --csv /tmp/ana
 python check_path_backtest.py --grid --budget 2.5 --series 5m
 python check_buy_skips.py --since 2026-08-19T08:02:00
 python check_live_journal.py --hours 5
-python check_reversal_features.py --hours 48 --with-clob
+python check_reversal_features.py --hours 72
+python check_reversal_features.py --hours 168 --binance-interval 1m
+python check_reversal_features.py --hours 336 --binance-interval 1m
 python check_reversal_features.py --csv exports/trades.csv --restart-utc 2026-08-27T08:57:16
 ```
 
-`--sweep` scores the live 5m **example** late template (75–90 / 120s / $2.50)
+`--sweep` scores the live 5m **example** late template (now **75–90 /
+last 45s / $2.50 / edge $25** in `strategy_buy5m.example.json`)
 plus one-at-a-time window/band/size variants, with a **paper** hedge from that
 JSON (**50/52 persist 5s**, dump **32¢**, mid-as-GUI when spread ≤ 10¢,
 held ≤ 52¢ / other ≥ 48¢; paper honors `hedge_persist_s`). It does **not**
@@ -418,7 +427,7 @@ After this branch merges, on the VM (5m only; stop hourly):
 cd ~/poly-money-maker && git pull
 sudo systemctl stop polybuybothourly polybuybot
 sudo systemctl disable polybuybothourly polybuybot
-python3 -c 'import json; from pathlib import Path; p=Path("strategy_buy5m.json"); d=json.loads(p.read_text()); d["hedge_threshold"]=0.50; d["hedge_require_ask_max"]=0.52; d["hedge_persist_s"]=5.0; d["hedge_toxic_bid_max"]=0.32; d["hedge_recovery_cancel"]=0.53; d["hedge_sell_fade"]=True; d["hedge_require_oracle"]=True; d["hedge_dump_ignore_oracle"]=True; d["hedge_oracle_min_edge_usd"]=0.0; d["hedge_undercut_ticks"]=0; d["hedge_min_price"]=0.32; d["late_90_start_s"]=45; d["add_min_price"]=0.90; d["buy_budget"]=2.5; d["late_buy_budget"]=2.5; d["buy_max_price"]=0.90; d["early_buy_max_price"]=0.99; d["poll_buy_window_s"]=0.01; d["poll_held_s"]=0.01; d["ui_every_n_cycles"]=50; p.write_text(json.dumps(d, indent=2)+"\n"); print("hedge", d["hedge_threshold"], d["hedge_require_ask_max"], "persist", d["hedge_persist_s"], "dump", d["hedge_toxic_bid_max"], "recovery", d["hedge_recovery_cancel"], "fade", d["hedge_sell_fade"], "oracle", d["hedge_require_oracle"], "dump_ignore", d["hedge_dump_ignore_oracle"], "late_90", d["late_90_start_s"], "dry_run", d.get("dry_run"), "entry", d.get("entry_enabled"))'
+python3 -c 'import json; from pathlib import Path; p=Path("strategy_buy5m.json"); d=json.loads(p.read_text()); d["hedge_threshold"]=0.50; d["hedge_require_ask_max"]=0.52; d["hedge_persist_s"]=5.0; d["hedge_toxic_bid_max"]=0.32; d["hedge_recovery_cancel"]=0.53; d["hedge_sell_fade"]=True; d["hedge_require_oracle"]=True; d["hedge_dump_ignore_oracle"]=True; d["hedge_oracle_min_edge_usd"]=0.0; d["hedge_undercut_ticks"]=0; d["hedge_min_price"]=0.32; d["buy_start_s"]=45; d["early_buy_start_s"]=45; d["early_95_start_s"]=0; d["early_95_min_s"]=0; d["late_90_start_s"]=45; d["min_underlying_edge_usd"]=25.0; d["add_min_price"]=0.90; d["buy_budget"]=2.5; d["late_buy_budget"]=2.5; d["buy_max_price"]=0.90; d["early_buy_max_price"]=0.99; d["poll_buy_window_s"]=0.01; d["poll_held_s"]=0.01; d["ui_every_n_cycles"]=50; p.write_text(json.dumps(d, indent=2)+"\n"); print("start", d["buy_start_s"], "early", d["early_buy_start_s"], "e95", d["early_95_start_s"], "edge", d["min_underlying_edge_usd"], "hedge", d["hedge_threshold"], d["hedge_require_ask_max"], "persist", d["hedge_persist_s"], "dump", d["hedge_toxic_bid_max"], "recovery", d["hedge_recovery_cancel"], "late_90", d["late_90_start_s"], "dry_run", d.get("dry_run"), "entry", d.get("entry_enabled"))'
 sudo systemctl restart polybuybot5m
 sudo systemctl enable polybuybot5m
 systemctl is-active polybuybot polybuybot5m polybuybothourly

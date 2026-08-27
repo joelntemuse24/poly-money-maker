@@ -461,7 +461,7 @@ class SweepTemplateTests(unittest.TestCase):
         )
         self.assertEqual(tmpl["ask_min"], 0.75)
         self.assertEqual(tmpl["ask_max"], 0.90)
-        self.assertEqual(tmpl["ttm_max"], 120.0)
+        self.assertEqual(tmpl["ttm_max"], 45.0)
         self.assertEqual(tmpl["budget"], 2.5)
         self.assertTrue(tmpl["hedge_require_gui"])
         self.assertEqual(tmpl["hedge_threshold"], 0.50)

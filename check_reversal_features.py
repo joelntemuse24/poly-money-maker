@@ -11,8 +11,9 @@ Session tape (operator UI export):
 
 Historical 5m windows (public Binance, optional CLOB last-trades):
 
-    python check_reversal_features.py --hours 48
+    python check_reversal_features.py --hours 72
     python check_reversal_features.py --hours 168 --binance-interval 1m
+    python check_reversal_features.py --hours 336 --binance-interval 1m
     python check_reversal_features.py --hours 48 --with-clob
 
 A reversal here is: the BTC side of PTB at sample time disagrees with the
@@ -32,7 +33,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Iterable, Optional, Sequence
+from typing import Any, Iterable, NamedTuple, Optional, Sequence
 
 import requests
 from requests.adapters import HTTPAdapter
@@ -233,10 +234,19 @@ def fetch_binance_klines(
     chunks: list[list[tuple[int, float]]] = []
     cursor = start_ms
     while cursor <= end_ms:
-        page = cache_dir / f"bn_{interval}_{cursor}_{end_ms}.json"
+        page = cache_dir / f"bn_{interval}_{cursor}.json"
+        raw = None
         if page.exists():
             raw = json.loads(page.read_text())
         else:
+            # Reuse complete pages cached under the old endTime-suffixed name.
+            for old in sorted(cache_dir.glob(f"bn_{interval}_{cursor}_*.json")):
+                prev = json.loads(old.read_text())
+                if len(prev) >= 1000:
+                    raw = prev
+                    page.write_text(json.dumps(prev))
+                    break
+        if raw is None:
             resp = http.get(
                 BINANCE_KLINES,
                 params={
@@ -250,7 +260,8 @@ def fetch_binance_klines(
             )
             resp.raise_for_status()
             raw = resp.json()
-            page.write_text(json.dumps(raw))
+            if len(raw) >= 1000:
+                page.write_text(json.dumps(raw))
             time.sleep(pause_s)
         if not raw:
             break
@@ -507,12 +518,16 @@ def first_touch_on_path(
     ttm_min: float,
     ttm_max: float,
     min_abs_dist: float,
+    max_abs_dist: float = math.inf,
 ) -> Optional[tuple[int, float, float, float]]:
-    """First tick with ttm_min < ttm ≤ ttm_max and |dist| ≥ min_abs_dist."""
+    """First tick with ttm_min < ttm ≤ ttm_max and min ≤ |dist| < max."""
     for ts, ttm, dist, px in path:
         if ttm <= ttm_min or ttm > ttm_max:
             continue
-        if abs(dist) + 1e-12 < min_abs_dist:
+        ad = abs(dist)
+        if ad + 1e-12 < min_abs_dist:
+            continue
+        if math.isfinite(max_abs_dist) and ad >= max_abs_dist - 1e-12:
             continue
         if dist == 0:
             continue
@@ -520,23 +535,121 @@ def first_touch_on_path(
     return None
 
 
-# (name, ttm_min, ttm_max, min_|dist|) — live-shaped windows, not a cartesian bomb.
-COMBO_SPECS: tuple[tuple[str, float, float, float], ...] = (
-    ("late120_e0", 0.0, 120.0, 0.0),
-    ("late120_e20", 0.0, 120.0, 20.0),
-    ("late120_e25", 0.0, 120.0, 25.0),
-    ("late120_e30", 0.0, 120.0, 30.0),
-    ("late120_e40", 0.0, 120.0, 40.0),
-    ("late60_e0", 0.0, 60.0, 0.0),
-    ("late60_e25", 0.0, 60.0, 25.0),
-    ("last45_e0", 0.0, 45.0, 0.0),
-    ("last45_e25", 0.0, 45.0, 25.0),
-    ("early300_e0", 120.0, 300.0, 0.0),
-    ("early300_e25", 120.0, 300.0, 25.0),
-    ("union300_e0", 0.0, 300.0, 0.0),
-    ("union300_e25", 0.0, 300.0, 25.0),
-    ("union300_e30", 0.0, 300.0, 30.0),
+def first_live_shaped_touch(
+    path: Sequence[tuple[int, float, float, float]],
+) -> Optional[tuple[int, float, float, float]]:
+    """Current live bands via implied fill: early ≥90, late 75–90, last-45 ≥90."""
+    for ts, ttm, dist, px in path:
+        if dist == 0:
+            continue
+        fill = implied_fill_px(abs(dist))
+        if ttm <= 45 and 0.75 - 1e-12 <= fill <= 0.99 + 1e-12:
+            return ts, ttm, dist, px
+        if ttm <= 120 and 0.75 - 1e-12 <= fill <= 0.90 + 1e-12:
+            return ts, ttm, dist, px
+        if 120.0 < ttm <= 300.0 and fill + 1e-12 >= 0.90:
+            return ts, ttm, dist, px
+    return None
+
+
+class ComboSpec(NamedTuple):
+    name: str
+    ttm_min: float
+    ttm_max: float
+    min_abs_dist: float
+    max_abs_dist: float = math.inf
+
+
+# Named windows, not a cartesian bomb. Grid below covers the rest.
+COMBO_SPECS: tuple[ComboSpec, ...] = (
+    ComboSpec("last30_e25", 0.0, 30.0, 25.0),
+    ComboSpec("last45_e0", 0.0, 45.0, 0.0),
+    ComboSpec("last45_e20", 0.0, 45.0, 20.0),
+    ComboSpec("last45_e25", 0.0, 45.0, 25.0),
+    ComboSpec("last45_e30", 0.0, 45.0, 30.0),
+    ComboSpec("last45_e40", 0.0, 45.0, 40.0),
+    ComboSpec("late60_e0", 0.0, 60.0, 0.0),
+    ComboSpec("late60_e20", 0.0, 60.0, 20.0),
+    ComboSpec("late60_e25", 0.0, 60.0, 25.0),
+    ComboSpec("late60_e30", 0.0, 60.0, 30.0),
+    ComboSpec("late90_e25", 0.0, 90.0, 25.0),
+    ComboSpec("late120_e0", 0.0, 120.0, 0.0),
+    ComboSpec("late120_e20", 0.0, 120.0, 20.0),
+    ComboSpec("late120_e25", 0.0, 120.0, 25.0),
+    ComboSpec("late120_e30", 0.0, 120.0, 30.0),
+    ComboSpec("late120_e40", 0.0, 120.0, 40.0),
+    ComboSpec("live_late_7590", 0.0, 120.0, 15.0, 40.0),
+    ComboSpec("early300_e0", 120.0, 300.0, 0.0),
+    ComboSpec("early300_e25", 120.0, 300.0, 25.0),
+    ComboSpec("union300_e0", 0.0, 300.0, 0.0),
+    ComboSpec("union300_e25", 0.0, 300.0, 25.0),
+    ComboSpec("union300_e30", 0.0, 300.0, 30.0),
 )
+
+GRID_TTM_MAX = (30.0, 45.0, 60.0, 90.0, 120.0)
+GRID_EDGE = (0.0, 20.0, 25.0, 30.0, 40.0)
+
+SESSION_REPLAY_GATES: tuple[tuple[str, float, float], ...] = (
+    ("last45_e25", 45.0, 25.0),
+    ("last45_e20", 45.0, 20.0),
+    ("late60_e25", 60.0, 25.0),
+    ("late120_e25", 120.0, 25.0),
+    ("last45_e0", 45.0, 0.0),
+    ("late120_e0", 120.0, 0.0),
+)
+
+
+def _combo_row(
+    *,
+    name: str,
+    hits: int,
+    flips: int,
+    pnl: float,
+    fills: list[float],
+    hours: float,
+) -> tuple[float, str]:
+    if not hits or hours <= 0:
+        return float("-inf"), f"{name}\t0\t\t\t\t\t\t\t\t"
+    fr = flips / hits
+    wr = 1.0 - fr
+    mean_f = mean(fills) or DEFAULT_FILL_PX
+    per_h = pnl / hours
+    eat = eatable(fr, mean_f, 0.0)
+    return (
+        per_h,
+        f"{name}\t{hits}\t{hits / hours:.1f}\t{pct(fr)}\t{pct(wr)}\t"
+        f"{mean_f:.2f}\t{money(pnl)}\t{money(per_h)}\t{money(per_h * 2)}\t{eat}",
+    )
+
+
+def score_packed_picks(
+    packed: Sequence[tuple[float, float, list[tuple[int, float, float, float]]]],
+    pick,
+    *,
+    name: str,
+    hours: float,
+    salvage: float,
+    budget: float,
+) -> tuple[float, str]:
+    hits = 0
+    flips = 0
+    pnl = 0.0
+    fills: list[float] = []
+    for ptb, close, path in packed:
+        hit = pick(path)
+        if hit is None:
+            continue
+        _ts, _ttm, dist, _px = hit
+        hits += 1
+        fill = implied_fill_px(abs(dist))
+        fills.append(fill)
+        side = "up" if dist > 0 else "down"
+        winner = side_of(close, ptb)
+        won = winner == side
+        if not won:
+            flips += 1
+        pnl += paper_fill_pnl(fill, bool(won), salvage=salvage, budget=budget)
+    return _combo_row(name=name, hits=hits, flips=flips, pnl=pnl, fills=fills, hours=hours)
 
 
 def score_combos(
@@ -555,44 +668,101 @@ def score_combos(
         "name\thits\thit/hour\tflip\twr\tmean_fill\tpnl\t$/h\t$/h_at_$5\teat_nohedge",
     ]
     rows_out: list[tuple[float, str]] = []
-    for name, ttm_min, ttm_max, edge in COMBO_SPECS:
-        hits = 0
-        flips = 0
-        pnl = 0.0
-        fills: list[float] = []
-        for ptb, close, path in packed:
-            hit = first_touch_on_path(
-                path, ttm_min=ttm_min, ttm_max=ttm_max, min_abs_dist=edge
-            )
-            if hit is None:
-                continue
-            _ts, _ttm, dist, _px = hit
-            hits += 1
-            fill = implied_fill_px(abs(dist))
-            fills.append(fill)
-            side = "up" if dist > 0 else "down"
-            winner = side_of(close, ptb)
-            won = winner == side
-            if not won:
-                flips += 1
-            pnl += paper_fill_pnl(fill, bool(won), salvage=salvage, budget=budget)
-        if not hits or hours <= 0:
-            rows_out.append((float("-inf"), f"{name}\t0\t\t\t\t\t\t\t\t"))
-            continue
-        fr = flips / hits
-        wr = 1.0 - fr
-        mean_f = mean(fills) or DEFAULT_FILL_PX
-        per_h = pnl / hours
-        eat = eatable(fr, mean_f, 0.0)
+    for spec in COMBO_SPECS:
         rows_out.append(
-            (
-                per_h,
-                f"{name}\t{hits}\t{hits / hours:.1f}\t{pct(fr)}\t{pct(wr)}\t"
-                f"{mean_f:.2f}\t{money(pnl)}\t{money(per_h)}\t{money(per_h * 2)}\t{eat}",
+            score_packed_picks(
+                packed,
+                lambda path, s=spec: first_touch_on_path(
+                    path,
+                    ttm_min=s.ttm_min,
+                    ttm_max=s.ttm_max,
+                    min_abs_dist=s.min_abs_dist,
+                    max_abs_dist=s.max_abs_dist,
+                ),
+                name=spec.name,
+                hours=hours,
+                salvage=salvage,
+                budget=budget,
             )
         )
+    rows_out.append(
+        score_packed_picks(
+            packed,
+            first_live_shaped_touch,
+            name="live_shaped_union",
+            hours=hours,
+            salvage=salvage,
+            budget=budget,
+        )
+    )
     rows_out.sort(key=lambda item: item[0], reverse=True)
     lines.extend(row for _score, row in rows_out)
+    return lines
+
+
+def score_grid(
+    packed: Sequence[tuple[float, float, list[tuple[int, float, float, float]]]],
+    *,
+    hours: float,
+    salvage: float = DEFAULT_SALVAGE,
+    budget: float = BUDGET,
+) -> list[str]:
+    """Compact TTM × |dist| $/h matrix (the combination picker)."""
+    lines = [
+        f"GRID $/h at ${budget:.2f}  salvage=${salvage:.2f}  "
+        f"cell = $/h (flip%)   first-touch in (0, ttm_max]",
+        "edge\\ttm_max\t" + "\t".join(f"{t:.0f}s" for t in GRID_TTM_MAX),
+    ]
+    for edge in GRID_EDGE:
+        cells = [f"e{edge:.0f}"]
+        for ttm_max in GRID_TTM_MAX:
+            _score, row = score_packed_picks(
+                packed,
+                lambda path, t=ttm_max, e=edge: first_touch_on_path(
+                    path, ttm_min=0.0, ttm_max=t, min_abs_dist=e
+                ),
+                name="tmp",
+                hours=hours,
+                salvage=salvage,
+                budget=budget,
+            )
+            parts = row.split("\t")
+            # name hits hit/h flip wr mean_fill pnl $/h $/h5 eat
+            if len(parts) < 8 or not parts[3]:
+                cells.append("—")
+                continue
+            cells.append(f"{parts[7]} ({parts[3]})")
+        lines.append("\t".join(cells))
+    return lines
+
+
+def session_replay_table(samples: Sequence[Sample], hours: float) -> list[str]:
+    """Keep session fills whose fill TTM and |dist| pass a combo gate."""
+    lines = [
+        "SESSION replay — keep actual wallet P&L if fill TTM ≤ window "
+        "and |BTC−PTB| ≥ edge (not implied fill)",
+        "name\tkeep\tskip\tkeep/h\tpnl_kept\t$/h_kept",
+    ]
+    base = sum(s.pnl_redeem for s in samples)
+    lines.append(
+        f"all_fills\t{len(samples)}\t0\t"
+        f"{(len(samples) / hours) if hours else 0:.1f}\t"
+        f"{money(base)}\t{money(base / hours) if hours else 0}"
+    )
+    for name, ttm_max, edge in SESSION_REPLAY_GATES:
+        kept = [
+            s
+            for s in samples
+            if s.feat.ttm <= ttm_max + 1e-12 and s.feat.abs_dist + 1e-12 >= edge
+        ]
+        skip_n = len(samples) - len(kept)
+        pnl = sum(s.pnl_redeem for s in kept)
+        per_h = (pnl / hours) if hours else 0.0
+        lines.append(
+            f"{name}\t{len(kept)}\t{skip_n}\t"
+            f"{(len(kept) / hours) if hours else 0:.1f}\t"
+            f"{money(pnl)}\t{money(per_h)}"
+        )
     return lines
 
 
@@ -1048,6 +1218,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                         f"fill={s.feat.fill_px:.3f} ttm={s.feat.ttm:.0f} "
                         f"pnl={money(s.pnl_redeem)}"
                     )
+            report.append("")
+            report.extend(session_replay_table(session_samples, hours))
 
     windows = five_m_windows(hist_start, hist_end - 1)
     btc_samples: list[Sample] = []
@@ -1058,19 +1230,6 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         pack = window_path(btc, start, end, step=path_step)
         if pack is not None:
             packed.append(pack)
-        sample_ts = end - sample_ttm
-        if sample_ts <= start:
-            continue
-        sample = sample_from_window(
-            btc,
-            slug=slug,
-            start_ts=start,
-            end_ts=end,
-            sample_ts=sample_ts,
-            source="btc_ttm",
-        )
-        if sample:
-            btc_samples.append(sample)
         sample_ts = end - sample_ttm
         if sample_ts <= start:
             continue
@@ -1237,8 +1396,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         )
         report.extend(score_combos(packed, hours=hist_hours, salvage=DEFAULT_SALVAGE))
         report.append("")
+        report.extend(score_grid(packed, hours=hist_hours, salvage=DEFAULT_SALVAGE))
+        report.append("")
         report.append("same combos, losers get $0 (no hedge):")
         report.extend(score_combos(packed, hours=hist_hours, salvage=0.0))
+        report.append("")
+        report.extend(score_grid(packed, hours=hist_hours, salvage=0.0))
 
     clob_samples: list[Sample] = []
     if args.with_clob:
@@ -1340,8 +1503,18 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     report.append("- Live 5m already requires TWAP vs PTB side match ($0 edge). This study asks whether |dist|, vol, or against-momentum add flip prediction on top of that.")
     report.append("- Binance 1s/1m is not Chainlink TWAP 30s. Directional level/vol should still rank; exact dollar thresholds will not match the live feed tick-for-tick.")
     report.append("- BTC-only rows include 50/50 windows the bot would never buy. CLOB late-band rows are the closer analog to a 75–90 fill.")
-    report.append("- Paper P&L is redeem $1/$0 with no hedge salvage. A live dump at 32¢ / persist-50 changes the skip-cost math in losers' favor (skipping a loser is worth less than $2.50).")
+    report.append("- Combo $/h uses implied fill from |dist| (session-calibrated). live_shaped_union is early ≥90 analog + late 75–90 + last-45 ≥90 on that map.")
+    report.append("- A live dump at 32¢ / persist-50 changes skip-cost in losers' favor (skipping a loser is worth less than $2.50).")
     report.append("- Do not copy these thresholds into live JSON from n<30 session tape.")
+    report.append("")
+    report.append("RECOMMENDATION (probe knobs; not live until the operator patches JSON)")
+    report.append("  entry time: last 45s only (buy_start_s=45, late_90_start_s=45)")
+    report.append("  disable early: early_buy_start_s=45, early_95_start_s=0, early_95_min_s=0")
+    report.append("  ask: 75–90 plus last-45 ≥90 overlay (75–99 in the last 45s)")
+    report.append("  oracle: min_underlying_edge_usd=25 (|TWAP−PTB|; this study used Binance)")
+    report.append("  size: stay $2.50; $5 is ~2× $/h if fills hold (buy_budget=late_buy_budget=5, buy_max_spend=6)")
+    report.append("  hedge: unchanged persist 5s @ 50/52, dump 32, recovery 53")
+    report.append("  do not add a vol or against-momentum skip")
 
     text = "\n".join(report) + "\n"
     print(text, end="")

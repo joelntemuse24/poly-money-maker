@@ -8,10 +8,12 @@ from pathlib import Path
 
 from check_reversal_features import (
     BtcSeries,
+    COMBO_SPECS,
     Features,
     Sample,
     breakeven_flip_rate,
     bucket,
+    first_live_shaped_touch,
     first_touch_on_path,
     features_at,
     five_m_windows,
@@ -22,6 +24,7 @@ from check_reversal_features import (
     paper_redeem_pnl,
     seconds_to_cross,
     session_markets,
+    session_replay_table,
     side_of,
     skip_cost_table,
     window_path,
@@ -179,6 +182,49 @@ class BandAndPnlTests(unittest.TestCase):
         self.assertLessEqual(late_only[1], 60)
         none = first_touch_on_path(path, ttm_min=0, ttm_max=120, min_abs_dist=500)
         self.assertIsNone(none)
+
+    def test_first_touch_max_abs_dist_skips_wide_names(self):
+        path = [
+            (1, 90.0, 50.0, 100_050.0),
+            (2, 40.0, 30.0, 100_030.0),
+        ]
+        hit = first_touch_on_path(
+            path, ttm_min=0, ttm_max=120, min_abs_dist=15, max_abs_dist=40
+        )
+        self.assertIsNotNone(hit)
+        self.assertEqual(hit[0], 2)
+        self.assertIsNone(
+            first_touch_on_path(
+                path, ttm_min=0, ttm_max=120, min_abs_dist=15, max_abs_dist=25
+            )
+        )
+
+    def test_live_shaped_waits_out_of_band_mid_late(self):
+        path = [
+            (1, 90.0, 50.0, 100_050.0),
+            (2, 40.0, 50.0, 100_050.0),
+        ]
+        hit = first_live_shaped_touch(path)
+        self.assertIsNotNone(hit)
+        self.assertEqual(hit[1], 40.0)
+
+    def test_combo_specs_include_last45_e25(self):
+        names = {s.name for s in COMBO_SPECS}
+        self.assertIn("last45_e25", names)
+        self.assertIn("last45_e20", names)
+        self.assertIn("last45_e40", names)
+        last45 = next(s for s in COMBO_SPECS if s.name == "last45_e25")
+        self.assertEqual(last45.ttm_max, 45.0)
+        self.assertEqual(last45.min_abs_dist, 25.0)
+
+    def test_session_replay_keeps_last45_edge(self):
+        keep = _sample(80, False, False, 0.50)
+        keep.feat.ttm = 40
+        skip = _sample(10, False, True, -1.70)
+        skip.feat.ttm = 110
+        body = "\n".join(session_replay_table([keep, skip], 1.0))
+        self.assertIn("all_fills\t2\t0", body)
+        self.assertIn("last45_e25\t1\t1", body)
 
     def test_implied_fill_and_window_path(self):
         self.assertEqual(implied_fill_px(10), 0.80)

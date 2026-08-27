@@ -3,10 +3,35 @@
 **Agents: read this after `AGENTS.md`.** Update this file when ops/strategy decisions change.
 Do not put secrets, API keys, or live wallet material here.
 
-Last updated: **2026-08-27** — 5m live after #129. **Do not add a
-vol/momentum buy skip** from the post-restart tape (see below). Hourly is
-stopped. Last **45s** may buy **≥90¢** (FAK 99¢, late $2.50 slice). Hedge
-is **persist 5s @ 50/52**, recovery **53¢**, dump **≤32¢**.
+Last updated: **2026-08-27** — 5m live after #129 (last **120s** 75–90,
+early ≥90, `min_edge` **$0**). Hourly is stopped. Hedge is **persist 5s
+@ 50/52**, recovery **53¢**, dump **≤32¢**. **Do not add a vol/momentum
+buy skip.**
+
+**Recommended next 5m combination** (example JSON; **not live** until
+the operator pastes into `strategy_buy5m.json` and restarts). Target
+~$1–2/hour. Evidence: 72h Binance 1s + 7d 1m first-touch, plus the
+post-restart wallet tape. Pathlog `--anatomy` on the VM is still the
+book check.
+
+| Knob | Live now | Next probe |
+|---|---|---|
+| Entry time | last **120s** + first **3 min** | last **45s** only |
+| Ask | 75–90; ≥90 last 45s; ≥90 early | **75–99** in last 45s (late 75–90 + `late_90` overlay) |
+| `min_underlying_edge_usd` | **$0** | **$25** (`|TWAP−PTB|`) |
+| Early / ≥95 | on | **off** (`early_buy_start_s=45`, `early_95_start_s=0`) |
+| Size | $2.50 + $2.50 | **$2.50** until this combo is live; then **$5** ≈ 2× $/h |
+| Hedge | 50/52 persist 5s, dump 32, recovery 53 | **unchanged** |
+
+Why this combo: last-45s + `$25` is the only first-touch window that stays
+eatable on both 72h 1s (~**+$1.56/h** at $2.50, **5%** flip, ~11 hits/h)
+and 7d 1m (~**+$0.69/h**, **7.8%** flip). Last **120s** + `$25` is
+**−$0.27/h** on 72h (15% flip — not eatable without a perfect hedge).
+Early first-touch is a coin flip (**33–48%**). Vol and against-momentum
+do not split the 75–90 analog. `$5` size is the scale lever for a **$1–3/h**
+band if fill rate holds; do not raise size on the current last-120 `$0`
+mix. Score on `check_reversal_features.py --hours 72` and `--hours 168
+--binance-interval 1m`.
 
 **Why we left 70/72 persist-2s / recovery 85 / dump 53:**
 
@@ -20,15 +45,21 @@ Those knobs are gone on 5m. Persist is **5s @ 50/52**, recovery **53¢**
 (do not sell 55–69), dump **32¢** even if BTC has not crossed yet, and
 persist-50 still needs the oracle against/flat.
 
-**Reversal features (27 Aug, no live-JSON change):** 25% flips in the
-**$20–40 bucket** is **not** eatable at an 85–88¢ fill (no-hedge cap is
-`1 − fill`: 15% at 85¢, 12% at 88¢; with ~$1 salvage, 23% / 18%). A
-**gate** is different from the bucket: keep `|TWAP−PTB| ≥ $25` (same as
-$30 on the post-restart tape) cuts session fills **10.8 → 8.1 / hour**
-(skip 7/28, not a drought) and drops 7d kept-flip to **11.7%**, which
-*is* eatable at 85¢ even without hedge. $40 starts to starve the 75–85¢
-fat winners. Do **not** patch live JSON until the operator asks; score
-on `check_reversal_features.py` + pathlog `--anatomy` first.
+**Reversal features (27 Aug):** 25% flips in the **$20–40 bucket** is
+**not** eatable at an 85–88¢ fill (no-hedge cap is `1 − fill`: 15% at
+85¢, 12% at 88¢; with ~$1 salvage, 23% / 18%). A **gate** is different
+from the bucket: keep `|TWAP−PTB| ≥ $25` and **wait until the last 45s**.
+Do **not** patch live JSON until the operator asks; the knobs live in
+`strategy_buy5m.example.json`. VM pathlog `--anatomy --ttm-max 45` is
+the book confirmation.
+
+Paste when applying the probe (5m only; do not start hourly/15m/mint):
+
+```bash
+cd ~/poly-money-maker && git pull
+python3 -c 'import json; from pathlib import Path; p=Path("strategy_buy5m.json"); d=json.loads(p.read_text()); d["buy_start_s"]=45; d["early_buy_start_s"]=45; d["early_95_start_s"]=0; d["early_95_min_s"]=0; d["late_90_start_s"]=45; d["min_underlying_edge_usd"]=25.0; d["buy_budget"]=2.5; d["late_buy_budget"]=2.5; d["buy_max_spend"]=3.0; p.write_text(json.dumps(d, indent=2)+"\n"); print("start", d["buy_start_s"], "early", d["early_buy_start_s"], "e95", d["early_95_start_s"], "edge", d["min_underlying_edge_usd"], "late_90", d["late_90_start_s"], "dry_run", d.get("dry_run"), "entry", d.get("entry_enabled"))'
+sudo systemctl restart polybuybot5m
+```
 
 ---
 
@@ -263,9 +294,10 @@ amount / HTTP 400), not this NameError.
       last-45s `--ask-min 0.90 --ask-max 0.99 --ttm-max 45`. Export ticks
       off the VM before prune. No `.env`.
 - [x] 27 Aug reversal-feature tape (`check_reversal_features.py`): no vol
-      skip. If we gate, the number is **`min_edge` $25** (session 75% of
-      fills kept, 8.1/hour; 7d kept-flip 12%). Not live until asked.
-      $20–40 *bucket* 25% flip is not eatable at 85¢.
+      skip. Combo is **last 45s + `min_edge` $25**, early off, hedge
+      unchanged, size $2.50 (then $5). Example JSON holds the knobs.
+      Not live until the operator pastes. $20–40 *bucket* 25% flip is
+      not eatable at 85¢; last-120 + $25 is still −EV on 72h 1s.
 
 ---
 
