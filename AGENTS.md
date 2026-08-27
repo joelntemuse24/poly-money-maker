@@ -7,14 +7,14 @@ and why the non-boilerplate code exists — is `TECHNICAL_DESIGN.md`.
 
 ## Project at a Glance
 
-**Live on the VM (after this change is deployed):** **5m buy bot**
-(`polybuybot5m`) plus a no-order path recorder (`polypathlog`). 15m and
-hourly buy services are **stopped**. Mint (`polymintbot`) is **paused**.
+**Live on the VM:** **5m buy bot** (`polybuybot5m`) plus a no-order path
+recorder (`polypathlog`). 15m and hourly buy services are **stopped**.
+Mint (`polymintbot`) is **paused**.
 
 The 5m bot buys the winning leg of Polymarket BTC "Up or Down" markets in
-**two $2.50 slices** (up to **$5** if both fill). **Live after the
-operator pastes and restarts** (knobs in `strategy_buy5m.example.json`
-and `CURRENT.md`):
+**two $2.50 slices** (up to **$5** if both fill). **Live now** (27 Aug
+paste on `e962a75`; knobs also in `strategy_buy5m.example.json` and
+`CURRENT.md`):
 
 | When (time to close) | Winning ask | Slice |
 |---|---|---|
@@ -431,9 +431,10 @@ CI: pushes to `main` touching the buy bots, `pathlog.py`,
 SSH (`git pull` + `pip install` only). Services are **not** auto-restarted —
 start/restart deliberately after validation (`systemctl start` / `restart`).
 
-After this branch merges, on the VM (5m only; stop hourly). This paste is
-**last 45s + $25** (same block as `CURRENT.md`). Confirm `dry_run` /
-`entry_enabled` **before** restart. Do **not** start 15m, hourly, or mint.
+Already applied on the VM (27 Aug, `e962a75` + JSON overlay). Re-run only
+if live `strategy_buy5m.json` drifted. 5m only; stop hourly. Confirm
+`dry_run` / `entry_enabled` **before** a restart. Do **not** start 15m,
+hourly, or mint.
 
 ```bash
 cd ~/poly-money-maker && git pull

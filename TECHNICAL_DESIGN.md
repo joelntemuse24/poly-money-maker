@@ -146,7 +146,7 @@ logs and pathlog ticks are capped.
 
 | Unit | Script | Live? |
 |---|---|---|
-| `polybuybot5m` | `buybot5m.py` | **yes — places orders (after operator restart)** |
+| `polybuybot5m` | `buybot5m.py` | **yes — places orders** |
 | `polypathlog` | `pathlog.py` | **yes — GET books only** |
 | `polybuybot` | `buybot.py` | stopped |
 | `polybuybothourly` | `buybothourly.py` | stopped |
@@ -218,7 +218,7 @@ defaults are B-only for the last 20 minutes, persist **5s @ 50/52**, dump
 35¢, recovery **53¢**, `hedge_sell_fade`, `hedge_require_oracle`, Binance
 buy edge $10, tick `0.01`, and a $10 market cap. Hourly is **stopped**.
 
-Live 5m JSON (after the operator paste) is last **45s** only, **75–99¢**
+Live 5m JSON is last **45s** only, **75–99¢**
 (late 75–90 + `late_90` overlay), `min_underlying_edge_usd` **$25**,
 early/≥95 **off** (`early_buy_start_s=45`, `early_95_start_s=0`), two
 $2.50 slices, persist 5s @ 50/52, dump 32¢ ignore-oracle, recovery 53¢,

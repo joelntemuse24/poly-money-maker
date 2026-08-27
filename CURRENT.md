@@ -3,11 +3,12 @@
 **Agents: read this after `AGENTS.md`.** Update this file when ops/strategy decisions change.
 Do not put secrets, API keys, or live wallet material here.
 
-Last updated: **2026-08-27** — 5m **last 45s + $25 edge** after the operator
-pastes and restarts (this file + `TECHNICAL_DESIGN.md`). Hourly is stopped.
-Hedge is **persist 5s @ 50/52**, recovery **53¢**, dump **≤32¢**. **Do
-not add a vol/momentum buy skip.** `early_95_start_s=0` is valid in
-`load_strategy` (disable ≥95); set `early_95_min_s=0` in the same paste.
+Last updated: **2026-08-27** — 5m **last 45s + $25 edge is live** on
+`instance-20260516-185922` (`e962a75` + JSON overlay, `dry_run False`,
+`entry True`). Hourly/15m **inactive**. Hedge is **persist 5s @ 50/52**,
+recovery **53¢**, dump **≤32¢**. **Do not add a vol/momentum buy skip.**
+`early_95_start_s=0` is valid in `load_strategy` (disable ≥95); keep
+`early_95_min_s=0` in live JSON.
 
 **Live 5m combination** (example JSON + the paste below). Target ~$1–2/hour.
 Evidence: Binance **1s** first-touch on **72h, 7d, and 14d**.
@@ -42,9 +43,9 @@ Last **30s** + `$25` is a bit better now that 1s can tell 30 from 45
 probe (already the live last-45 overlay; still in the $1–2/h band). Last
 **120s** is not eatable without salvage in the 72h/7d. Early first-touch
 is −EV. Vol / against-momentum do not split the analog. `$5` is the scale
-lever (`buy_max_spend=5`, `buy_max_shares=7`); stay **$2.50** until this
-paste is on the box. Score: `check_reversal_features.py --hours 72` /
-`--hours 168` / `--hours 336` (default **1s**).
+lever (`buy_max_spend=5`, `buy_max_shares=7`); stay **$2.50** until we
+scale. Score: `check_reversal_features.py --hours 72` / `--hours 168` /
+`--hours 336` (default **1s**).
 
 **Why we left 70/72 persist-2s / recovery 85 / dump 53:**
 
@@ -65,12 +66,13 @@ from the bucket: keep `|TWAP−PTB| ≥ $25` and **wait until the last 45s**.
 Knobs live in `strategy_buy5m.example.json`. VM pathlog
 `--anatomy --ttm-max 45` is the book confirmation.
 
-**Merge #130 first**, then paste (5m only; do not start hourly/15m/mint).
-`early_95_start_s=0` is allowed after this PR; without the merge that
-value takes 5m down. `BUY_HORIZON_S` becomes **45s** (WS from ~T-75).
-This paste includes the live hedge knobs so a file that never got them
-still qualifies. Confirm printed `dry_run` / `entry` **before** restart.
-Printed `horizon` must be **45**.
+**Applied 2026-08-27** on the VM (5m only; do not start hourly/15m/mint).
+`git pull` landed `e962a75` (#130). Printed knobs:
+`start 45 early 45 e95 0 e95min 0 edge 25.0 late_90 45 horizon 45`
+hedge 50/52 persist 5 dump 32 recovery 53, `dry_run False entry True`.
+`systemctl is-active`: **inactive / active / inactive**. Re-run the
+block below only if live JSON drifted. `BUY_HORIZON_S` is **45s**
+(WS from ~T-75).
 
 ```bash
 cd ~/poly-money-maker && git pull
@@ -93,8 +95,8 @@ mint complete sets. Operator still sells leftover mint inventory by hand.
 **15m and hourly CLOB bots are stopped.** Do **not** start `polybuybot` or
 `polybuybothourly`.
 
-**Active strategy:** **5m only** (`polybuybot5m`) after the operator patches
-live `strategy_buy5m.json` and restarts the unit. Same-leg only. After
+**Active strategy:** **5m only** (`polybuybot5m`). Live JSON is last **45s**
++ `$25` after the 27 Aug paste/restart. Same-leg only. After
 `hedge_closed`, no re-buy. Two $2.50 slices.
 
 | Knob | Value |
@@ -213,13 +215,10 @@ amount / HTTP 400), not this NameError.
 
 - **VM:** `~/poly-money-maker` on `instance-20260516-185922`.
 - **Mint:** `sudo systemctl stop polymintbot && sudo systemctl disable polymintbot`
-- **Buy bots:** **5m only.** Stop/disable hourly and 15m. After **#130**
-  merges, paste the **same block as the top of this file** (last **45s** +
-  edge **$25** + hedge 50/52). Confirm printed `horizon` **45**, `edge` **25**,
-  `e95` **0**, `e95min` **0**, and `dry_run` / `entry` **before** restart.
-  New Python needs a 5m restart. Live JSON **must** set the hedge and
-  entry keys or an old 120/300/$0 file keeps the old windows after hot
-  reload. Do **not** start 15m, hourly, or mint.
+- **Buy bots:** **5m only.** Hourly and 15m are stopped/disabled. Last-45
+  + `$25` is **on the box** (`e962a75`, 27 Aug paste). Re-run the top
+  paste only if live JSON drifted (printed `horizon` **45**, `edge` **25**,
+  `e95`/`e95min` **0**). Do **not** start 15m, hourly, or mint.
 - **Pathlog:** start `polypathlog` as above (no `.env` required).
 
 ---
@@ -311,7 +310,8 @@ amount / HTTP 400), not this NameError.
       unchanged, size $2.50 (then $5). Confirmed on **72h / 7d / 14d 1s**
       (closeTime stamps). Example JSON + the paste at the top of this file
       hold the knobs. $20–40 *bucket* 25% flip is not eatable at 85¢;
-      last-120 + $25 is still −EV on 72h/7d 1s. Merge **#130**, then paste.
+      last-120 + $25 is still −EV on 72h/7d 1s. **Live** on the VM
+      2026-08-27 (`e962a75` + JSON overlay, `dry_run False`, `entry True`).
 
 ---
 
@@ -320,7 +320,7 @@ amount / HTTP 400), not this NameError.
 1. Read `AGENTS.md` + this file before changing mint/buy/hedge logic.
 2. Do **not** restart minting unless the operator asks. Do **not** start
    `polybuybot` / `polybuybothourly` unless the operator asks. 5m is the
-   live buy bot after the operator patches knobs and restarts the unit.
+   live buy bot (last 45s + `$25`). New Python still needs a 5m restart.
 3. Never truncate state/PnL/log files; never commit live strategy/state/`.env`.
    Pathlog ticks are **auto-pruned** (14d / 400 MB) — do not `rm` them by hand,
    but **do export** (`check_path_backtest.py --csv` or `scp` the ticks dir)
