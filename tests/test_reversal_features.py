@@ -10,10 +10,13 @@ from check_reversal_features import (
     BtcSeries,
     Features,
     Sample,
+    breakeven_flip_rate,
     bucket,
     features_at,
     five_m_windows,
+    gate_table,
     late_band_touch,
+    paper_ev,
     paper_redeem_pnl,
     seconds_to_cross,
     session_markets,
@@ -136,6 +139,26 @@ class BandAndPnlTests(unittest.TestCase):
         self.assertIn("keep 2/4", line)
         # Skipping the two losers raises paper P&L.
         self.assertIn("delta +5.00", line)
+
+    def test_breakeven_flip_is_one_minus_fill_without_hedge(self):
+        self.assertAlmostEqual(breakeven_flip_rate(0.85), 0.15, places=6)
+        self.assertAlmostEqual(breakeven_flip_rate(0.75), 0.25, places=6)
+        # $1 salvage on $2.50 / 85¢: ~22.7% flips still EV=0.
+        self.assertAlmostEqual(breakeven_flip_rate(0.85, salvage=1.0), 0.2272727, places=4)
+        self.assertAlmostEqual(paper_ev(0.85, 0.15, salvage=0.0), 0.0, places=6)
+
+    def test_gate_table_keep_counts(self):
+        rows = [
+            _sample(12, False, True, -2.5),
+            _sample(28, False, True, -2.5),
+            _sample(45, False, False, 0.44),
+            _sample(90, False, False, 0.44),
+        ]
+        lines = gate_table(rows, mins=(0, 20, 40), fill_px=0.85, salvage=0.0)
+        body = "\n".join(lines)
+        self.assertIn("0\t4\t0", body)
+        self.assertIn("20\t3\t1", body)
+        self.assertIn("40\t2\t2", body)
 
     def test_five_m_windows_aligned(self):
         # ends 1000..1600 → first aligned end is 1200 if WINDOW_S=300

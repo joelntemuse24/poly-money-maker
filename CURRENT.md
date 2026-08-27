@@ -20,14 +20,15 @@ Those knobs are gone on 5m. Persist is **5s @ 50/52**, recovery **53¢**
 (do not sell 55–69), dump **32¢** even if BTC has not crossed yet, and
 persist-50 still needs the oracle against/flat.
 
-**Reversal features (27 Aug, no live-JSON change):** post-restart 5m tape
-was **28 fills / 24 redeem / 4 hedge / +$1.82**. Hedges had mean |BTC−PTB|
-**$33** vs **$79** on redeems. 48h of 1s Binance + 7d of 1m: **|dist| is
-monotone**; raw vol is **not** (high vol → fewer flips). Against-momentum
-is **flat inside the $10–40 band** that maps to a 75–90 favorite (48h:
-30.8% vs 30.6%). `check_reversal_features.py` is the backtest. Do **not**
-raise `min_edge` or add a vol skip until that checker plus pathlog
-`--anatomy` on the VM say otherwise.
+**Reversal features (27 Aug, no live-JSON change):** 25% flips in the
+**$20–40 bucket** is **not** eatable at an 85–88¢ fill (no-hedge cap is
+`1 − fill`: 15% at 85¢, 12% at 88¢; with ~$1 salvage, 23% / 18%). A
+**gate** is different from the bucket: keep `|TWAP−PTB| ≥ $25` (same as
+$30 on the post-restart tape) cuts session fills **10.8 → 8.1 / hour**
+(skip 7/28, not a drought) and drops 7d kept-flip to **11.7%**, which
+*is* eatable at 85¢ even without hedge. $40 starts to starve the 75–85¢
+fat winners. Do **not** patch live JSON until the operator asks; score
+on `check_reversal_features.py` + pathlog `--anatomy` first.
 
 ---
 
@@ -261,10 +262,10 @@ amount / HTTP 400), not this NameError.
       `--series 5m --template strategy_buy5m.example.json --paper`, plus
       last-45s `--ask-min 0.90 --ask-max 0.99 --ttm-max 45`. Export ticks
       off the VM before prune. No `.env`.
-- [x] 27 Aug reversal-feature tape (`check_reversal_features.py`): **do not**
-      add a live vol/momentum skip. |BTC−PTB| is the only clean monotone;
-      inside the 75–90 analog it is already the band. Hedge is the reversal
-      tool. Re-score on VM pathlog `--anatomy` before any `min_edge` probe.
+- [x] 27 Aug reversal-feature tape (`check_reversal_features.py`): no vol
+      skip. If we gate, the number is **`min_edge` $25** (session 75% of
+      fills kept, 8.1/hour; 7d kept-flip 12%). Not live until asked.
+      $20–40 *bucket* 25% flip is not eatable at 85¢.
 
 ---
 

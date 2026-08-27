@@ -60,6 +60,10 @@ DEFAULT_FILL_PX = 0.85
 
 # |BTC−PTB| buckets in USD (Binance proxy).
 DIST_EDGES = (0.0, 5.0, 10.0, 20.0, 40.0, 80.0, math.inf)
+FINE_DIST_EDGES = tuple(float(x) for x in range(0, 85, 5)) + (math.inf,)
+GATE_MINS = (0, 10, 15, 20, 25, 30, 35, 40, 50, 60, 80)
+# Typical salvage on a dumped loser from the 27 Aug session (~$1 on ~$2.50).
+DEFAULT_SALVAGE = 1.00
 # 30s realized move (std of 1s diffs, USD).
 VOL_EDGES = (0.0, 2.0, 4.0, 8.0, 16.0, math.inf)
 # |dist| / (1s-vol * sqrt(TTM)) — Brownian "how many sigmas to PTB".
@@ -405,6 +409,50 @@ def paper_redeem_pnl(fill_px: float, won: bool, budget: float = BUDGET) -> float
     return (shares - budget) if won else -budget
 
 
+def breakeven_flip_rate(
+    fill_px: float,
+    salvage: float = 0.0,
+    budget: float = BUDGET,
+) -> Optional[float]:
+    """Largest flip rate with EV ≥ 0. ``salvage`` is $ recovered on a loser.
+
+    With no hedge, this is ``1 - fill_px`` (an 85¢ fill needs ≤15% flips).
+    """
+    p = float(fill_px)
+    if p <= 0 or budget <= 0:
+        return None
+    win = budget / p
+    denom = win - salvage
+    if denom <= 1e-12:
+        return 1.0
+    wr = (budget - salvage) / denom
+    wr = min(1.0, max(0.0, wr))
+    return 1.0 - wr
+
+
+def paper_ev(
+    fill_px: float,
+    flip_rate: float,
+    salvage: float = 0.0,
+    budget: float = BUDGET,
+) -> Optional[float]:
+    """Expected $ at this fill / flip mix (one shot, ``budget`` notional)."""
+    p = float(fill_px)
+    if p <= 0:
+        return None
+    wr = 1.0 - float(flip_rate)
+    win = budget / p - budget
+    lose = salvage - budget
+    return wr * win + (1.0 - wr) * lose
+
+
+def eatable(flip_rate: Optional[float], fill_px: float, salvage: float) -> str:
+    cap = breakeven_flip_rate(fill_px, salvage=salvage)
+    if flip_rate is None or cap is None:
+        return ""
+    return "yes" if flip_rate <= cap + 1e-12 else "no"
+
+
 def session_markets(rows: list[dict], *, restart_ts: float, year: int) -> list[dict]:
     grouped: dict[str, dict] = {}
     for row in rows:
@@ -593,6 +641,82 @@ def skip_cost_table(samples: Sequence[Sample], predicate, label: str) -> str:
     )
 
 
+def fine_dist_order() -> list[str]:
+    edges = FINE_DIST_EDGES
+    return [
+        bucket((a + b) / 2 if math.isfinite(b) else a + 1.0, edges)
+        for a, b in zip(edges, edges[1:])
+    ]
+
+
+def gate_table(
+    samples: Sequence[Sample],
+    mins: Sequence[float] = GATE_MINS,
+    *,
+    fill_px: float = DEFAULT_FILL_PX,
+    salvage: float = DEFAULT_SALVAGE,
+    hours: Optional[float] = None,
+) -> list[str]:
+    """Keep if |dist| ≥ min. Flip rate of the *kept* set vs eatability at fill_px."""
+    n = len(samples)
+    cap0 = breakeven_flip_rate(fill_px, salvage=0.0)
+    cap1 = breakeven_flip_rate(fill_px, salvage=salvage)
+    header = (
+        f"GATE keep |dist|≥X   fill={fill_px:.2f}  "
+        f"eat_flips no-hedge≤{pct(cap0)}  "
+        f"with ${salvage:.2f} salvage≤{pct(cap1)}"
+    )
+    lines = [
+        header,
+        "min_|dist|\tkeep\tskip\tkeep_pct\tskip_pct\tflips_kept\tflip_kept\t"
+        "wr_kept\tpaper_pnl_kept\tev_nohedge\tev_salvage\teat_nohedge\teat_salvage"
+        + ("\tkeeps_per_hour" if hours else ""),
+    ]
+    for floor in mins:
+        kept = [s for s in samples if s.feat.abs_dist + 1e-12 >= float(floor)]
+        k = len(kept)
+        sk = n - k
+        flips = sum(s.reversed for s in kept)
+        fr = (flips / k) if k else None
+        wr = (1.0 - fr) if fr is not None else None
+        pnl = sum(s.pnl_redeem for s in kept)
+        ev0 = paper_ev(fill_px, fr, salvage=0.0) if fr is not None else None
+        ev1 = paper_ev(fill_px, fr, salvage=salvage) if fr is not None else None
+        row = (
+            f"{floor:g}\t{k}\t{sk}\t{pct(k / n if n else None)}\t{pct(sk / n if n else None)}\t"
+            f"{flips}\t{pct(fr)}\t{pct(wr)}\t{money(pnl)}\t"
+            f"{money(ev0)}\t{money(ev1)}\t"
+            f"{eatable(fr, fill_px, 0.0)}\t{eatable(fr, fill_px, salvage)}"
+        )
+        if hours and hours > 0:
+            row += f"\t{(k / hours):.1f}"
+        lines.append(row)
+    return lines
+
+
+def breakeven_ref_table(
+    fills: Sequence[float] = (0.75, 0.80, 0.85, 0.88, 0.90, 0.95),
+    salvages: Sequence[float] = (0.0, 1.00),
+    budget: float = BUDGET,
+) -> list[str]:
+    lines = [
+        "BREAK-EVEN flip rate (EV=0 at this fill). Winner pays (1/p − 1)*budget.",
+        "fill\twin_$\tno_hedge_max_flip\tsalvage=$1_max_flip\t"
+        "25pct_flip_EV_nohedge\t25pct_flip_EV_salv$1",
+    ]
+    for p in fills:
+        win = budget / p - budget
+        cap0 = breakeven_flip_rate(p, 0.0, budget)
+        cap1 = breakeven_flip_rate(p, 1.00, budget)
+        ev25_0 = paper_ev(p, 0.25, 0.0, budget)
+        ev25_1 = paper_ev(p, 0.25, 1.00, budget)
+        lines.append(
+            f"{p:.2f}\t{win:+.2f}\t{pct(cap0)}\t{pct(cap1)}\t"
+            f"{money(ev25_0)}\t{money(ev25_1)}"
+        )
+    return lines
+
+
 def late_band_touch(trades: Sequence[dict], start_ts: int, end_ts: int) -> Optional[dict]:
     """First last-print in the live late 75–90 band during the last 120s."""
     late0 = end_ts - LATE_TTM_S
@@ -734,6 +858,53 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 f"mean_vol30={(_avg(hedges, 'vol_30s') or 0):.2f} "
                 f"against_share={sum(1 for s in hedges if s.feat.against_30s)/len(hedges) if hedges else 0:.0%}"
             )
+            fills = [s.feat.fill_px for s in session_samples if s.feat.fill_px]
+            mean_fill = mean(fills) or DEFAULT_FILL_PX
+            t0 = min(m["start_ts"] for m in markets)
+            t1 = max(m["end_ts"] for m in markets)
+            hours = max((t1 - t0) / 3600.0, 1e-9)
+            report.append("")
+            report.append(
+                f"SESSION mean fill {mean_fill:.3f}  span {hours:.2f}h  "
+                f"fills/hour {len(session_samples) / hours:.1f}"
+            )
+            report.extend(breakeven_ref_table())
+            report.append("")
+            report.append("SESSION $5 |dist| buckets at fill")
+            report.extend(
+                tabulate(
+                    session_samples,
+                    lambda s: bucket(s.feat.abs_dist, FINE_DIST_EDGES),
+                    order=fine_dist_order(),
+                )
+            )
+            report.append("")
+            report.append(
+                "SESSION GATE — keep fills with |dist|≥X. "
+                "paper_pnl_kept is actual wallet P&L (hedge salvage included). "
+                "keeps_per_hour is this tape's fill rate after the gate."
+            )
+            report.extend(
+                gate_table(
+                    session_samples,
+                    fill_px=mean_fill,
+                    salvage=DEFAULT_SALVAGE,
+                    hours=hours,
+                )
+            )
+            for floor in (20, 25, 30, 40):
+                skipped = [
+                    s for s in session_samples if s.feat.abs_dist < float(floor)
+                ]
+                if not skipped:
+                    continue
+                report.append(f"session skipped |dist|<{floor:g}:")
+                for s in skipped:
+                    report.append(
+                        f"  {s.outcome:6} |dist|={s.feat.abs_dist:5.1f} "
+                        f"fill={s.feat.fill_px:.3f} ttm={s.feat.ttm:.0f} "
+                        f"pnl={money(s.pnl_redeem)}"
+                    )
 
     windows = five_m_windows(hist_start, hist_end - 1)
     btc_samples: list[Sample] = []
@@ -769,7 +940,35 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         tabulate(
             btc_samples,
             lambda s: bucket(s.feat.abs_dist, DIST_EDGES),
-            order=[bucket((a + b) / 2 if math.isfinite(b) else a + 1, DIST_EDGES) for a, b in zip(DIST_EDGES, DIST_EDGES[1:])],
+            order=[
+                bucket((a + b) / 2 if math.isfinite(b) else a + 1, DIST_EDGES)
+                for a, b in zip(DIST_EDGES, DIST_EDGES[1:])
+            ],
+        )
+    )
+    report.append("")
+    report.append("by |BTC−PTB| $5 buckets at sample (USD)")
+    report.extend(
+        tabulate(
+            btc_samples,
+            lambda s: bucket(s.feat.abs_dist, FINE_DIST_EDGES),
+            order=fine_dist_order(),
+        )
+    )
+    hist_hours = (len(windows) / 12.0) if windows else None
+    report.append("")
+    report.append(
+        "HISTORICAL GATE — keep windows with |dist|≥X at T-"
+        f"{sample_ttm:.0f}s. keep% of ALL 5m windows (including 50/50 the bot "
+        "would not buy) — treat skip% as an upper bound on fill loss. "
+        "keeps_per_hour = passing windows / hour (max 12)."
+    )
+    report.extend(
+        gate_table(
+            btc_samples,
+            fill_px=DEFAULT_FILL_PX,
+            salvage=DEFAULT_SALVAGE,
+            hours=hist_hours,
         )
     )
     report.append("")
