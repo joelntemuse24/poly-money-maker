@@ -297,6 +297,30 @@ class FirstFourMinutesAt95Tests(unittest.TestCase):
         self.assertEqual(at_44_90.name, "late")
         self.assertAlmostEqual(buy_retry_fak_limit(armed_99, at_44_90), 0.90)
 
+    def test_recommended_last45_probe_disables_early(self):
+        kwargs = dict(
+            late_start_s=45,
+            late_min=0.75,
+            late_max=0.90,
+            early_start_s=45,
+            early_min=0.90,
+            early_max=0.99,
+            early_95_start_s=0,
+            early_95_min_s=0,
+            early_95_min=0.95,
+            late_90_start_s=45,
+            late_90_min=0.90,
+            late_90_max=0.99,
+        )
+        self.assertEqual(applicable_entry_bands(180, **kwargs), [])
+        self.assertEqual(applicable_entry_bands(90, **kwargs), [])
+        self.assertEqual(applicable_entry_bands(60, **kwargs), [])
+        at40 = applicable_entry_bands(40, **kwargs)
+        self.assertEqual([b.name for b in at40], ["late", "late_90"])
+        self.assertTrue(ask_in_any_band(0.80, at40))
+        self.assertTrue(ask_in_any_band(0.93, at40))
+        self.assertEqual(validate_late_90_start_s(45, 45), 45.0)
+
     def test_invalid_late_90_start_s_rejected(self):
         with self.assertRaisesRegex(ValueError, "late_90_start_s must be >= 0"):
             validate_late_90_start_s(-1, 120)

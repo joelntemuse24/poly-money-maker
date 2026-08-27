@@ -50,6 +50,50 @@ def _load_funcs(*names: str, bot: Path = BOT):
     return ns
 
 
+def _load_strategy_sign_lists(src: str) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    """Positive (<=0 reject) and non-negative (<0 reject) key lists in load_strategy."""
+    tree = ast.parse(src)
+    func = next(
+        n for n in tree.body
+        if isinstance(n, ast.FunctionDef) and n.name == "load_strategy"
+    )
+    positive: tuple[str, ...] | None = None
+    nonnegative: tuple[str, ...] | None = None
+    for node in ast.walk(func):
+        if not isinstance(node, ast.For):
+            continue
+        if not isinstance(node.target, ast.Name) or node.target.id != "key":
+            continue
+        if not isinstance(node.iter, ast.Tuple):
+            continue
+        keys = tuple(
+            elt.value
+            for elt in node.iter.elts
+            if isinstance(elt, ast.Constant) and isinstance(elt.value, str)
+        )
+        if not keys:
+            continue
+        msg_bits: list[str] = []
+        for child in ast.walk(node):
+            if not isinstance(child, ast.Raise):
+                continue
+            if not isinstance(child.exc, ast.Call) or not child.exc.args:
+                continue
+            arg0 = child.exc.args[0]
+            if isinstance(arg0, ast.JoinedStr):
+                for part in arg0.values:
+                    if isinstance(part, ast.Constant) and isinstance(part.value, str):
+                        msg_bits.append(part.value)
+        msg = "".join(msg_bits)
+        if "must be positive" in msg:
+            positive = keys
+        elif "must be non-negative" in msg:
+            nonnegative = keys
+    if positive is None or nonnegative is None:
+        raise RuntimeError("could not extract load_strategy sign lists")
+    return positive, nonnegative
+
+
 HELPERS = (
     "finite_float",
     "_decode_clob_fixed6",
@@ -1854,13 +1898,14 @@ class BalanceAndGcSemantics(unittest.TestCase):
             self.assertIs(data["dry_run"], True)
             self.assertIs(data["entry_enabled"], False)
         five = json.loads((root / "strategy_buy5m.example.json").read_text())
-        self.assertEqual(five["buy_start_s"], 120)
-        self.assertEqual(five["early_buy_start_s"], 300)
+        self.assertEqual(five["buy_start_s"], 45)
+        self.assertEqual(five["early_buy_start_s"], 45)
         self.assertEqual(five["early_buy_max_price"], 0.99)
-        self.assertEqual(five["early_95_start_s"], 300)
-        self.assertEqual(five["early_95_min_s"], 60)
+        self.assertEqual(five["early_95_start_s"], 0)
+        self.assertEqual(five["early_95_min_s"], 0)
         self.assertEqual(five["early_95_min_price"], 0.95)
         self.assertEqual(five["late_90_start_s"], 45)
+        self.assertEqual(five["min_underlying_edge_usd"], 25.0)
         self.assertEqual(five["hedge_threshold"], 0.50)
         self.assertEqual(five["hedge_require_ask_max"], 0.52)
         self.assertEqual(five["hedge_persist_s"], 5.0)
@@ -1914,6 +1959,48 @@ class BalanceAndGcSemantics(unittest.TestCase):
         self.assertEqual(hourly["min_underlying_edge_usd"], 10.0)
         self.assertEqual(hourly["tick_size"], "0.01")
         self.assertEqual(fifteen["hedge_threshold"], 0.35)
+
+    def test_example_json_passes_5m_load_strategy_sign_rails(self):
+        src = BOT5M.read_text()
+        positive, nonnegative = _load_strategy_sign_lists(src)
+        self.assertIn("buy_start_s", positive)
+        self.assertIn("early_buy_start_s", positive)
+        self.assertNotIn("early_95_start_s", positive)
+        self.assertIn("early_95_start_s", nonnegative)
+        self.assertIn("early_95_min_s", nonnegative)
+        self.assertIn("late_90_start_s", nonnegative)
+        data = json.loads((BOT5M.parent / "strategy_buy5m.example.json").read_text())
+        for key in positive:
+            self.assertGreater(float(data[key]), 0, key)
+        for key in nonnegative:
+            self.assertGreaterEqual(float(data[key]), 0, key)
+        self.assertEqual(float(data["early_95_start_s"]), 0)
+        self.assertGreaterEqual(
+            float(data["early_95_start_s"]), float(data["early_95_min_s"]),
+        )
+        # 0 must disable ≥95 even if live JSON still has min_s=60.
+        self.assertIn(
+            'float(cfg["early_95_start_s"]) > 0',
+            src,
+        )
+
+    def test_docs_vm_paste_is_last45_edge25(self):
+        root = BOT5M.parent
+        for name in ("CURRENT.md", "AGENTS.md"):
+            text = (root / name).read_text()
+            self.assertIn('d["buy_start_s"]=45', text, name)
+            self.assertIn('d["early_buy_start_s"]=45', text, name)
+            self.assertIn('d["early_95_start_s"]=0', text, name)
+            self.assertIn('d["early_95_min_s"]=0', text, name)
+            self.assertIn('d["late_90_start_s"]=45', text, name)
+            self.assertIn('d["min_underlying_edge_usd"]=25.0', text, name)
+            self.assertNotIn('d["buy_start_s"]=120', text, name)
+            self.assertNotIn('d["min_underlying_edge_usd"]=0.0', text, name)
+        ttd = (root / "TECHNICAL_DESIGN.md").read_text()
+        self.assertIn("last **45s**", ttd)
+        self.assertIn("`min_underlying_edge_usd` is **$25**", ttd)
+        self.assertNotIn("Live hourly B uses 90¢", ttd)
+        self.assertIn("Walking `buybot5m.py`", ttd)
 
 
 class FiveMFastPollHelpers(unittest.TestCase):

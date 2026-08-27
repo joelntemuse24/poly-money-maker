@@ -9,9 +9,10 @@ clicked.” Hits without `pnl` are incomplete.
 
 Pathlog **cannot** replay Polymarket last-trade GUI, Chainlink/PTB, or POST
 latency. Paper mode: fill at the recorded ask, walk later ticks for a
-70/72/15 hedge (live 5m template; paper is instant, not persist 2s) using
-mid-as-GUI when spread ≤ 10¢ (held ≤ 72¢ / other ≥ 28¢; other need not be
-ahead). Wide books fail closed. Toxic dumps only while bid ≤ 53¢.
+50/52/15 hedge from the 5m example JSON (paper honors `hedge_persist_s`,
+5s on that file) using
+mid-as-GUI when spread ≤ 10¢ (held ≤ 52¢ / other ≥ 48¢; other need not be
+ahead). Wide books fail closed. Toxic dumps only while bid ≤ 32¢.
 
 Live books are **public** (Gamma + CLOB). `pathlog.py` records them with no
 keys. Do not put `PRIVATE_KEY` on a Cloud Agent.
@@ -35,7 +36,7 @@ Leave **Start** empty.
 You are a paper P&L research agent for joelntemuse24/poly-money-maker.
 
 Goal: rank strategy variants by money made, not by how often they would fire.
-Money = paper P&L after a 70/72/15 hedge (or toxic dump at 53¢) or after redeem at
+Money = paper P&L after a 50/52/15 hedge (or toxic dump at 32¢) or after redeem at
 $1.00 / $0.00. A skip with no fill is $0, not a win. Unresolved markets do
 not get a redeem P&L — wait or mark them unresolved.
 
@@ -45,7 +46,9 @@ Hard rules:
 - Do not read, write, or ask for .env. Do not set dry_run false.
 - Do not edit strategy_buy.json / strategy_buy5m.json / strategy_buyhourly.json
   (non-example). Template file is strategy_buy5m.example.json. `--sweep`
-  scores the **late** keys only (75–90¢ / last 120s / $2.50). It does
+  scores the **late** keys only (75–90¢ / last 45s probe / $2.50).
+  `live_5m_paper` is that file, not the live last-120 bot. `window_120s` is
+  an explicit variant. It does
   **not** replay the live early ≥90 / ≥95 union or two $2.50 slices.
 - pathlog.py is allowed (recorder only). check_book.py is allowed.
 - Gamma GET and CLOB GET only: gamma-api.polymarket.com, clob.polymarket.com.
@@ -61,6 +64,7 @@ NOW snapshot (30 seconds, public APIs):
 - Print slug, seconds left, up/down best bid/ask/size.
 - Print whether the live 5m template WOULD BUY on this tick (ask in 75–90,
   ttm ≤ 120, spread ≤ 5¢, one winning leg). This is a call, not P&L yet.
+  `--sweep` live_5m_paper is the example JSON (last 45s today).
 
 LIVE recorder (markets that are happening):
 - Start: .venv/bin/python pathlog.py
@@ -93,7 +97,8 @@ After the tables: at most 5 extra 5m combos that anatomy/grid suggest
 (not a cartesian bomb). --paper --series 5m --max-spread 0.05.
 
 How to pick a winner (this is the whole exercise):
-- Baseline = live_5m_paper (75–90, 120s, $2.50, paper hedge).
+- Baseline = live_5m_paper (example JSON late keys: 75–90, last 45s probe,
+  $2.50, paper 50/52). Compare `window_120s` if you want the live TTM.
 - Rank by pnl_sum first, then win_rate, then hits.
 - Ignore a variant with fewer than 5 hits on HISTORICAL or fewer than 3
   fills on SESSION. Lucky n=1 is not an edge.
@@ -125,7 +130,7 @@ Hard rules:
 - Do not edit strategy_buy.json / strategy_buy5m.json / strategy_buyhourly.json (non-example).
 - Do not read or write .env. Do not set dry_run false. Do not place orders.
 - Template file is strategy_buy5m.example.json. `--sweep` scores late
-  75–90¢ / 120s / $2.50 plus paper 70/72 (instant) — not the early ≥90 / ≥95 union.
+  75–90¢ / last 45s (probe template) / $2.50 plus paper 50/52 — not the early ≥90 / ≥95 union.
 - Rank by paper pnl_sum vs live_5m_paper, not by hit count. If pathlog/ticks
   is missing, run pathlog.py (no orders) instead of inventing books.
 
@@ -139,6 +144,8 @@ Setup:
 .venv/bin/python check_path_backtest.py --grid --series 5m --budget 2.5
 .venv/bin/python check_path_backtest.py --compare --paper --series 5m --budget 2.5
 .venv/bin/python check_path_backtest.py --compare --paper --series 5m --budget 15
+.venv/bin/python check_reversal_features.py --hours 72
+.venv/bin/python check_reversal_features.py --hours 168
 
 If buybot5m.log exists:
 .venv/bin/python check_buy_skips.py --since 2026-08-20T02:46:00
@@ -166,10 +173,10 @@ by pnl_sum (min 5 hits). Do not merge. Do not edit strategy_buy5m.json.
 | Live | Paper (`--paper` / `--sweep`) |
 |---|---|
 | Limit FAK at quoted ask, `budget/ask` | Same size model; displayed top is fillable cap |
-| GUI + last trade for hedge | Mid if spread ≤ 10¢; 5m held ≤ 55¢ / other ≥ 45¢; wide book = no hedge |
+| GUI + last trade for hedge | Mid if spread ≤ 10¢; 5m held ≤ 52¢ / other ≥ 48¢ from example JSON; wide book = no hedge |
 | BTC/PTB side gate | Not replayed (pathlog is books only) |
 | Unmatched FAK / POST RTT | Not replayed (optimistic fill at that tick) |
-| Toxic dump if bid ≤ 53¢ (5m) | Same from template; recovered bid > 53¢ rides |
+| Toxic dump if bid ≤ 32¢ (5m example) | Same from template; recovered bid > 32¢ rides |
 | Redeem $1 / wipeout $0 | After no hedge: same — this is the P&L |
 
 `--sweep` is **one change at a time** from the template (window, band, $15,

@@ -343,7 +343,12 @@ def load_strategy():
             raise ValueError("early_buy_start_s must be >= buy_start_s")
         if float(cfg["early_95_min_s"]) < 0:
             raise ValueError("early_95_min_s must be >= 0")
-        if float(cfg["early_95_start_s"]) < float(cfg["early_95_min_s"]):
+        # 0 disables the ≥95 overlay even if early_95_min_s is leftover 60.
+        # Overlay math is already early_95_s > early_95_floor.
+        if (
+            float(cfg["early_95_start_s"]) > 0
+            and float(cfg["early_95_start_s"]) < float(cfg["early_95_min_s"])
+        ):
             raise ValueError("early_95_start_s must be >= early_95_min_s")
         validate_late_90_start_s(cfg["late_90_start_s"], cfg["buy_start_s"])
         if not (
@@ -407,7 +412,7 @@ def load_strategy():
             "buy_budget", "late_buy_budget", "buy_max_spend", "buy_max_shares",
             "max_open_notional", "max_daily_notional", "poll_buy_window_s",
             "poll_held_s", "positions_refresh_s", "balance_refresh_s",
-            "buy_start_s", "early_buy_start_s", "early_95_start_s",
+            "buy_start_s", "early_buy_start_s",
             "ui_every_n_cycles",
         ):
             if float(cfg[key]) <= 0:
@@ -433,7 +438,8 @@ def load_strategy():
             "min_underlying_edge_usd", "hedge_undercut_ticks",
             "hedge_quote_max_age_s", "hedge_retry_sleep_s",
             "hedge_ghost_sleep_s", "buy_grace_s", "buy_cooldown_s",
-            "empty_fak_cooldown_s", "early_95_min_s", "late_90_start_s",
+            "empty_fak_cooldown_s", "early_95_start_s", "early_95_min_s",
+            "late_90_start_s",
             "redeem_throttle_s", "max_redeem_age_days", "hedge_persist_s",
             "hedge_oracle_min_edge_usd",
         ):

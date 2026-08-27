@@ -12,19 +12,25 @@ and why the non-boilerplate code exists — is `TECHNICAL_DESIGN.md`.
 hourly buy services are **stopped**. Mint (`polymintbot`) is **paused**.
 
 The 5m bot buys the winning leg of Polymarket BTC "Up or Down" markets in
-**two $2.50 slices** (up to **$5** if both fill):
+**two $2.50 slices** (up to **$5** if both fill). **Live after the
+operator pastes and restarts** (knobs in `strategy_buy5m.example.json`
+and `CURRENT.md`):
 
 | When (time to close) | Winning ask | Slice |
 |---|---|---|
-| Last **120s** (`TTM ≤ 120`) | **75–90¢** | **$2.50** late (`late_buy_budget`) |
-| Last **45s** (`TTM ≤ 45`) | **≥90¢** overlay | uses the late $2.50, FAK **99¢** |
-| First **3 min** (`120 < TTM ≤ 300`) | **90–99¢** | **$2.50** early (`buy_budget`) |
-| Same early window | **≥95¢** overlay | uses the early $2.50, not a third slice |
+| Last **45s** (`TTM ≤ 45`) | **75–90¢** | **$2.50** late (`late_buy_budget`), FAK **90¢** |
+| Same last **45s** | **≥90¢** overlay | uses the late $2.50, FAK **99¢** (`late_90`) |
+| TTM > 45s | none | early / ≥95 **off** |
 
-Missed early does **not** become a $5 late buy. Same-leg add only (no
-straddle), and only if the late ask is ≥ **90¢** (`add_min_price`). Flat
-late 75–90 is still a first entry. 91–99 is a no at TTM 46–120; last 45s
-is the exception. After a full hedge the market is done.
+`min_underlying_edge_usd` is **$25** (`|TWAP−PTB|`). Code defaults in
+`buybot5m.py` stay last-120 / early-300 / edge $0 until live JSON overlays
+them. `BUY_HORIZON_S` is **45** (WS from ~T-75). Later **$5** is
+`buy_budget=late_buy_budget=5`, `buy_max_spend=5`, `buy_max_shares=7`.
+
+Missed early does **not** become a $5 late buy — there is no early slice.
+Same-leg add only (no straddle), and only if the late ask is ≥ **90¢**
+(`add_min_price`). Flat late 75–90 is still a first entry. 91–99 is a no
+at TTM 46–120. After a full hedge the market is done.
 Normal hedge is **persist 5s @ 50/52** (GUI: held ≤ **52¢**, other ≥
 **48¢**; not inverted 30/70). Then sell at the live bid while **< 53¢**
 (fade through 50 still sells). Bid ≥ **53¢** (`hedge_recovery_cancel`)
@@ -42,13 +48,14 @@ unless the operator asks. 15m stays stopped.
 | File | Service | Markets | Oracle | Budget | Window |
 |---|---|---|---|---|---|
 | `buybot.py` | `polybuybot` **stopped** | 15m | Chainlink TWAP 60s | $2.50 | final 4.0 min, 75–90¢, hedge 35/40 |
-| `buybot5m.py` | `polybuybot5m` **live** | 5m | Chainlink TWAP 30s | $2.50+$2.50 | early ≥90 / late 75–90 / last-45 ≥90; persist **5s @ 50/52** (dump 32¢) |
+| `buybot5m.py` | `polybuybot5m` **live** | 5m | Chainlink TWAP 30s | $2.50+$2.50 | last **45s** 75–99, edge **$25**; persist **5s @ 50/52** (dump 32¢) |
 | `buybothourly.py` | `polybuybothourly` **stopped** | hourly | Binance BTCUSDT | $10 cap | last **20 min** 75–90¢; persist **5s @ 50/52** + oracle veto |
 | `pathlog.py` | `polypathlog` **live** | all three | — (CLOB books only) | — | whole 5m; last 8m of 15m; last **20m** of hourly |
 
 Plus: `check_book.py`, `check_participation.py`, `check_path_backtest.py`,
 `check_fetch_trades.py`, `check_buy_skips.py`, `check_buy_rejects.py`,
-`check_live_journal.py`, `check_edge_counterfactual.py`. Laptop glance
+`check_live_journal.py`, `check_edge_counterfactual.py`,
+`check_reversal_features.py`. Laptop glance
 (not a bot): `widget/polydesk.py`.
 
 ## File Map
@@ -88,6 +95,7 @@ functions with `ast` (`tests/test_buy_fill_shapes.py`).
 | `pathlog.py` | CLOB path recorder (no orders; TOB price **and** size) |
 | `check_path_backtest.py` | Pathlog: grid, anatomy, compare, **paper hedge**, `--sweep`, `--hedge-sweep` (no orders) |
 | `check_hedge_threshold.py` | Earlier-stop research: pathlog `--hedge-sweep` or public last-trade vs a history CSV |
+| `check_reversal_features.py` | Research: Binance |dist|/vol/momentum vs 5m reversals (optional CLOB 75–90) |
 | `CLOUD_RESEARCH.md` | Cloud prompts: paper P&L on public books + `--sweep` (no `.env`) |
 | `check_book.py` | Diagnostic — inspect a live order book |
 | `check_edge_counterfactual.py` | Diagnostic — resolution win rate if edge skips had filled |
@@ -157,8 +165,8 @@ python check_book.py
 python3 -m py_compile buybot.py buybot5m.py buybothourly.py pathlog.py \
   check_path_backtest.py mintbot.py buy/book.py buy/clob_book_ws.py \
   buy/entry_skip.py buy/hedge_gate.py buy/live_journal.py \
-  check_fetch_trades.py check_participation.py check_buy_skips.py \
-  check_live_journal.py
+ check_fetch_trades.py check_participation.py check_buy_skips.py \
+ check_live_journal.py check_reversal_features.py
 python3 -m unittest discover -s tests -p 'test_*.py' -v
 
 # Full wallet fills (past the UI ~500-row export). Wallet: --user or FUNDER_ADDRESS.
@@ -183,11 +191,14 @@ python check_participation.py --hours 72 --csv exports/trades.csv
 
 Watch the console for `[DRY BUY]` / `[DRY SELL]` markers. Ctrl-C to stop.
 
-`--sweep` reads **late** keys from `strategy_buy5m.example.json` (75–90 /
-120s / $2.50). `--compare` uses
-hardcoded late-band presets; `--paper` hedge knobs still come from the
-example JSON. Neither command replays the early ≥90 / ≥95 union **or** the
-two-slice $2.50+$2.50 add.
+`--sweep` reads **late** keys from `strategy_buy5m.example.json`
+(**75–90 / last 45s / $2.50**; `live_5m_paper` is that file). Pathlog
+cannot replay the **$25** `|TWAP−PTB|` gate — score that in
+`check_reversal_features.py`. `window_120s` is an explicit variant.
+`--compare` uses hardcoded late-band presets; `--paper` hedge knobs still
+come from the example JSON (**50/52 persist 5s**, dump **32¢**). Neither
+command replays the early ≥90 / ≥95 union **or** the two-slice $2.50+$2.50
+add.
 `--series 5m` matches **only** 5m (not 15m — the string `15m` contains `5m`).
 
 ### What to look for
@@ -234,9 +245,9 @@ Stopped hourly (do not start unless asked):
 - `buy_ghost_fill` — balance reconciliation after null/delayed BUY confirm
 - `buy_uncertain` — POST outcome unresolved; durable token/baseline quarantine blocks re-buy
 - `buy_skip_incomplete_book` — missing GUI price on a leg (no mid and no last trade)
-- `buy_skip_underlying_edge` — underlying gate failed (missing/stale/flat vs PTB; 5m is **$0** = any non-zero tick)
+- `buy_skip_underlying_edge` — underlying gate failed (missing/stale/flat vs PTB; live 5m is **$25**)
 - `buy_skip_underlying_side` — book wants the opposite leg from the underlying move
-- `buy_window` — market first entered a 5m buy window (late 75–90, last-45 ≥90, early ≥90, or ≥95; one line per market)
+- `buy_window` — market first entered a 5m buy window (late 75–90 or last-45 ≥90; early/≥95 are off; one line per market)
 - `buy_skip` `ask_below_band` / `ask_above_band` / `ask_out_of_band` / `no_ask` / `stale_positions` / `no_quote` / `stale_discovery` — in window, winning ask not in any open band, or the look had no book / stale wallet snapshot (throttled 8s)
 - `buy_skip_add_below_min` — same-leg late add but ask < `add_min_price` (90¢). Flat first late 75–90 still buys.
 - `buy_skip_hedge_closed` — this market already dumped; no other-leg chase and no re-entry
@@ -278,14 +289,21 @@ python check_path_backtest.py --anatomy --series 5m --ttm-max 120 --csv /tmp/ana
 python check_path_backtest.py --grid --budget 2.5 --series 5m
 python check_buy_skips.py --since 2026-08-19T08:02:00
 python check_live_journal.py --hours 5
+python check_reversal_features.py --hours 72
+python check_reversal_features.py --hours 168
+python check_reversal_features.py --hours 336
+python check_reversal_features.py --csv exports/trades.csv --restart-utc 2026-08-27T08:57:16
 ```
 
-`--sweep` scores the live 5m **example** late template (75–90 / 120s / $2.50)
-plus one-at-a-time window/band/size variants, with a **paper** hedge from that
-JSON (**50/52 persist 5s**, dump **32¢**, mid-as-GUI when spread ≤ 10¢,
-held ≤ 52¢ / other ≥ 48¢; paper honors `hedge_persist_s`). It does **not**
+`--sweep` scores the 5m **example** late template (**75–90 / last 45s /
+$2.50** in `strategy_buy5m.example.json`; the **$25** edge is not in
+pathlog) plus one-at-a-time window/band/size variants (`window_120s` is
+included; the template's own TTM is not duplicated).
+Paper hedge knobs come from that JSON (**50/52 persist 5s**, dump **32¢**,
+mid-as-GUI when spread ≤ 10¢, held ≤ 52¢ / other ≥ 48¢; paper honors
+`hedge_persist_s`). It does **not**
 union the early ≥90 / ≥95 windows, the last-45s ≥90 overlay, or two $2.50
-slices. Score last-45 separately with `--ask-min 0.90 --ask-max 0.99
+slices. Score last-45 90–99 separately with `--ask-min 0.90 --ask-max 0.99
 --ttm-max 45 --budget 2.5 --series 5m --paper`.
 `--hedge-sweep` keeps that late first touch and varies the **stop** (32/50/53
 plus persist) and prints `winner_dumps` vs `loser_hedges`.
@@ -306,7 +324,11 @@ Cloud agents: `CLOUD_RESEARCH.md`.
   Changes take effect on the next tick — no restart needed. `dry_run` is
   startup-only (selects `*.dryrun.*` state paths).
 - **5m look-ahead:** `BUY_HORIZON_S = max(buy_start_s, early_buy_start_s,
-  early_95_start_s)` (300s). Hot poll / WS subscribe use that, not 120s alone.
+  early_95_start_s)` (**45s** after the live paste: 45/45/0). Hot poll /
+  WS subscribe from ~T-75. Code defaults stay 120/300/300 until JSON
+  overlays them. `early_95_start_s=0` is allowed (disable ≥95); it used
+  to fail `must be positive` and take 5m down. Pair with `early_95_min_s=0`
+  so leftover `min_s=60` cannot disable entries.
   Sleep is **0.01s** in that window or while a **live** hedge is open.
   That look reads the live WS book. REST is only when the look says buy
   (confirm + POST). Data API leftover 5m shares (hundreds) are **dropped**
@@ -320,9 +342,9 @@ Cloud agents: `CLOUD_RESEARCH.md`.
   live instances.
 - **FAK orders only:** All orders are Fill-And-Kill — no resting orders, no market
   making. 5m buys are **limit** FAKs at the **open band max** (late **90¢**,
-  last-45 ≥90 and early **99¢**) sized `budget/ask` per slice, **at least 3 shares** when
-  `3 × limit` fits in   `buy_max_spend` $3 (early 3.00 sh / $2.97, not 2.00 /
-  $1.98; `buy_max_shares` 5; not displayed top size). Hourly (stopped) uses
+  last-45 ≥90 **99¢**) sized `budget/ask` per slice, **at least 3 shares** when
+  `3 × limit` fits in `buy_max_spend` $3 (3.00 sh / $2.97 at 99¢, not 2.00 /
+  $1.98; `buy_max_shares` 5; not displayed top size). Early ≥90 is **off**. Hourly (stopped) uses
   the same limit-FAK sizer: A/C at **99¢**, B at **90¢**,
   `buy_max_spend` **$11**, `buy_max_shares` **14**. Hourly template is B-only
   (A/C windows **0**). 15m (stopped) still pins
@@ -373,14 +395,15 @@ Cloud agents: `CLOUD_RESEARCH.md`.
    `buy/entry_skip.py` and `buy/hedge_gate.py` are imported by **5m and hourly**,
    not 15m. Persist completes only on a still-qualified 50/52+GUI tick — do not
    pre-complete `persist_done` from elapsed wall clock alone.
-2. **The 5m bot uses seconds-based window checks** (`buy_start_s = 120` late
-   75–90¢; `late_90_start_s = 45` for ask ≥ 90¢ in the last 45s;
-   `early_buy_start_s = 300` for ask ≥ 90¢; `early_95` overlay only
-   when TTM > 120) while 15m uses minutes (`buy_window_min = 4.0`) and hourly
-   uses minutes (template: `b15_window_min = 20`, A/C windows **0**;
-   code still documents 22/15/5). Don't mix them when propagating changes. The 5m loop
-   must define `seconds_left` (not only `minutes_left`) or it NameErrors every
-   cycle. Hourly must **not** define 5m's `seconds_left = (end_ts_ms - now_ms) / 1000`.
+2. **The 5m bot uses seconds-based window checks** (live paste:
+   `buy_start_s = 45` late 75–90¢; `late_90_start_s = 45` for ask ≥ 90¢;
+   `early_buy_start_s = 45` so early is off; `early_95_start_s = 0`).
+   Code defaults stay 120/300/300 until JSON overlays them. 15m uses
+   minutes (`buy_window_min = 4.0`) and hourly uses minutes (template:
+   `b15_window_min = 20`, A/C windows **0**; code still documents 22/15/5).
+   Don't mix them when propagating changes. The 5m loop must define
+   `seconds_left` (not only `minutes_left`) or it NameErrors every cycle.
+   Hourly must **not** define 5m's `seconds_left = (end_ts_ms - now_ms) / 1000`.
 3. **Settlement is confirmation-gated.** A relayer submission is not P&L.
    Redemption is credited only after relayer confirmation and a complete Data API
    snapshot shows the inventory gone; GC never invents par value.
@@ -408,13 +431,15 @@ CI: pushes to `main` touching the buy bots, `pathlog.py`,
 SSH (`git pull` + `pip install` only). Services are **not** auto-restarted —
 start/restart deliberately after validation (`systemctl start` / `restart`).
 
-After this branch merges, on the VM (5m only; stop hourly):
+After this branch merges, on the VM (5m only; stop hourly). This paste is
+**last 45s + $25** (same block as `CURRENT.md`). Confirm `dry_run` /
+`entry_enabled` **before** restart. Do **not** start 15m, hourly, or mint.
 
 ```bash
 cd ~/poly-money-maker && git pull
 sudo systemctl stop polybuybothourly polybuybot
 sudo systemctl disable polybuybothourly polybuybot
-python3 -c 'import json; from pathlib import Path; p=Path("strategy_buy5m.json"); d=json.loads(p.read_text()); d["hedge_threshold"]=0.50; d["hedge_require_ask_max"]=0.52; d["hedge_persist_s"]=5.0; d["hedge_toxic_bid_max"]=0.32; d["hedge_recovery_cancel"]=0.53; d["hedge_sell_fade"]=True; d["hedge_require_oracle"]=True; d["hedge_dump_ignore_oracle"]=True; d["hedge_oracle_min_edge_usd"]=0.0; d["hedge_undercut_ticks"]=0; d["hedge_min_price"]=0.32; d["late_90_start_s"]=45; d["add_min_price"]=0.90; d["buy_budget"]=2.5; d["late_buy_budget"]=2.5; d["buy_max_price"]=0.90; d["early_buy_max_price"]=0.99; d["poll_buy_window_s"]=0.01; d["poll_held_s"]=0.01; d["ui_every_n_cycles"]=50; p.write_text(json.dumps(d, indent=2)+"\n"); print("hedge", d["hedge_threshold"], d["hedge_require_ask_max"], "persist", d["hedge_persist_s"], "dump", d["hedge_toxic_bid_max"], "recovery", d["hedge_recovery_cancel"], "fade", d["hedge_sell_fade"], "oracle", d["hedge_require_oracle"], "dump_ignore", d["hedge_dump_ignore_oracle"], "late_90", d["late_90_start_s"], "dry_run", d.get("dry_run"), "entry", d.get("entry_enabled"))'
+python3 -c 'import json; from pathlib import Path; p=Path("strategy_buy5m.json"); d=json.loads(p.read_text()); d["hedge_threshold"]=0.50; d["hedge_require_ask_max"]=0.52; d["hedge_persist_s"]=5.0; d["hedge_toxic_bid_max"]=0.32; d["hedge_recovery_cancel"]=0.53; d["hedge_sell_fade"]=True; d["hedge_require_oracle"]=True; d["hedge_dump_ignore_oracle"]=True; d["hedge_oracle_min_edge_usd"]=0.0; d["hedge_undercut_ticks"]=0; d["hedge_min_price"]=0.32; d["buy_start_s"]=45; d["early_buy_start_s"]=45; d["early_95_start_s"]=0; d["early_95_min_s"]=0; d["late_90_start_s"]=45; d["min_underlying_edge_usd"]=25.0; d["add_min_price"]=0.90; d["buy_budget"]=2.5; d["late_buy_budget"]=2.5; d["buy_max_price"]=0.90; d["early_buy_max_price"]=0.99; d["buy_max_spend"]=3.0; d["buy_max_shares"]=5.0; d["poll_buy_window_s"]=0.01; d["poll_held_s"]=0.01; d["ui_every_n_cycles"]=50; p.write_text(json.dumps(d, indent=2)+"\n"); print("start", d["buy_start_s"], "early", d["early_buy_start_s"], "e95", d["early_95_start_s"], "e95min", d["early_95_min_s"], "edge", d["min_underlying_edge_usd"], "late_90", d["late_90_start_s"], "horizon", max(d["buy_start_s"], d["early_buy_start_s"], d["early_95_start_s"]), "hedge", d["hedge_threshold"], d["hedge_require_ask_max"], "persist", d["hedge_persist_s"], "dump", d["hedge_toxic_bid_max"], "recovery", d["hedge_recovery_cancel"], "dry_run", d.get("dry_run"), "entry", d.get("entry_enabled"))'
 sudo systemctl restart polybuybot5m
 sudo systemctl enable polybuybot5m
 systemctl is-active polybuybot polybuybot5m polybuybothourly
@@ -422,7 +447,7 @@ systemctl is-active polybuybot polybuybot5m polybuybothourly
 ```
 
 Confirm `strategy_buy5m.json` `dry_run` / `entry_enabled` before restart.
-Do **not** start 15m, hourly, or mint.
+Printed `horizon` must be **45**. Do **not** start 15m, hourly, or mint.
 
 ## Dependencies
 

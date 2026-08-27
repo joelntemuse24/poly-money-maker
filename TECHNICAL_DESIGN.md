@@ -39,7 +39,7 @@ asks.
 6. [Polymarket’s five systems](#6-polymarkets-five-systems)
 7. [Crash-safe JSON (the “database”)](#7-crash-safe-json-the-database)
 
-**Part III — Walking `buybothourly.py`**
+**Part III — Walking `buybot5m.py` (hourly/15m copies are stopped)**
 
 8. [How to read the live single-file bot](#8-how-to-read-the-live-single-file-bot)
 9. [Startup: lock, secrets, rounding, CLOB client](#9-startup-lock-secrets-rounding-clob-client)
@@ -48,7 +48,7 @@ asks.
 12. [Positions: Data API vs local ledger](#12-positions-data-api-vs-local-ledger)
 13. [Quotes: websocket vs REST](#13-quotes-websocket-vs-rest)
 14. [What “the website shows 80¢” actually means](#14-what-the-website-shows-80-actually-means)
-15. [Buy gates and the hourly price band](#15-buy-gates-and-the-hourly-price-band)
+15. [Buy gates and the 5m / hourly price bands](#15-buy-gates-and-the-5m--hourly-price-bands)
 16. [Sizing a buy (Decimal, 2 cents, 4 dp shares)](#16-sizing-a-buy-decimal-2-cents-4-dp-shares)
 17. [Posting a buy FAK and living with the result](#17-posting-a-buy-fak-and-living-with-the-result)
 18. [The hedge (the only sell)](#18-the-hedge-the-only-sell)
@@ -94,34 +94,36 @@ it **redeems** on-chain for $1.00 per share. There is **no** “take profit at
 even make $0.30 before $1.00, and on an 80¢ fill selling at 90¢ throws away
 the rest of the ride to $1.00.
 
-**Live hourly entry (one slice, up to $10):**
+**Live 5m entry (two $2.50 slices):**
 
 | Time left until close (TTM) | Winning ask | Slice / FAK limit |
 |---|---|---|
-| More than 20 minutes | none — too early | — |
-| 0 < TTM ≤ 20 minutes | **75¢ through 90¢ inclusive** | `b15`, up to **$10**, limit **90¢** |
+| More than 45 seconds | none — too early | early and ≥95 are **off** |
+| 0 < TTM ≤ 45 seconds | **75¢ through 90¢ inclusive** | late `$2.50`, limit **90¢** |
+| 0 < TTM ≤ 45 seconds | **≥90¢** | `late_90` overlay, same late `$2.50`, limit **99¢** |
 
-The old A/C hourly bands (**>93¢** in the last 22 minutes and **>95¢** in
-the last 5) remain in the helper but are **disabled**:
-`a22_window_min = c5_window_min = 0`. Do not re-enable them accidentally.
-`market_spend_cap` and the live B-slice budget are both $10.
-`buy_max_spend = 11` and `buy_max_shares = 14` are per-FAK safety rails,
-not permission to exceed the $10 market cap.
+`min_underlying_edge_usd` is **$25**: live Chainlink TWAP 30s must be at
+least $25 from the window-open PTB and on the same side as the book.
+`BUY_HORIZON_S = max(buy_start_s, early_buy_start_s, early_95_start_s)`
+is **45** with this paste, so websocket subscribe / 0.01s look start
+around T-75. `early_95_start_s=0` is a valid disable (do not leave it
+on the “must be positive” list). Pair it with `early_95_min_s=0` in the
+JSON; `0` also disables even if `min_s` is leftover 60.
 
-**Hedge (hourly):** the Binance BTC resolution feed must first be against
-the held leg (or exactly flat versus PTB). Missing/stale BTC and a feed still
-on the held side both **hold**. Once that oracle veto passes:
+Missed early does **not** become a $5 late buy — there is no early slice
+while those windows are off. Same-leg add only. After `hedge_closed`, no
+re-entry.
 
-- bid ≤ **35¢** dumps any live bag immediately, bid-only;
-- otherwise a tight held book at bid ≤ **50¢** / ask ≤ **52¢**, plus
-  website-style held ≤ 52¢ / other ≥ 48¢ and last trade ≤ 52¢, must persist
-  for **5 seconds**;
-- after persistence, sell at the live bid while it remains **below 53¢**,
-  including a fade through 50¢ (`hedge_sell_fade`);
-- bid ≥ **53¢** is recovery: hold and clear persistence.
+**Hedge (5m):** persist **5s @ 50/52** still needs the oracle against/flat
+(Chainlink TWAP vs PTB, $0 edge, missing/stale holds). Dump **≤32¢** is
+book-only even if BTC still agrees (`hedge_dump_ignore_oracle`). After
+persist, sell at the live bid while **< 53¢**, including a fade through 50.
+Bid ≥ **53¢** holds and clears persist. Do not sell 55–69 after persist.
+No profit-take sell. Winners redeem at $1.00.
 
-Sells use the live bid on the 1¢ market tick with no undercut. The 5m and
-15m bots are stopped and keep their own older thresholds.
+**Hourly is stopped.** Do not start it. Its last-20m 75–90 / $10 /
+persist 50/52 / dump 35 / Binance $10 buy-edge code remains in
+`buybothourly.py` for a later operator start. 15m is also stopped.
 
 Everything else in this document exists to do **that** without:
 
@@ -187,7 +189,7 @@ paths are picked once. Other knobs hot-reload.
 ## 3. Map of the repository
 
 ```
-buybot5m.py          Live bot. Two $2.50 slices, last-45 ≥90, persist 5s @ 50/52.
+buybot5m.py          Live bot. Last 45s 75–99, $25 edge, persist 5s @ 50/52.
 buybothourly.py      Hourly near-copy. Stopped.
 buybot.py            15m near-copy. Stopped.
 buy/                 Importable helpers (safe — they do not start trading)
@@ -201,7 +203,8 @@ buy/                 Importable helpers (safe — they do not start trading)
   chain.py           Mint helper: Polygon eth_call (paused path)
   contracts.py       Mint helper: splitPosition calldata (paused path)
 pathlog.py           Recorder, no orders
-check_*.py           Offline / log diagnostics
+check_*.py           Offline / log diagnostics (`check_reversal_features.py`
+                     is Binance |dist| / TTM paper, no orders)
 tests/               unittest (CI)
 deploy/              systemd units + disk notes
 widget/polydesk.py   Laptop glance (public API, no orders)
@@ -210,14 +213,17 @@ widget/polydesk.py   Laptop glance (public API, no orders)
 **Rule of copies:** a buy/hedge/quarantine bug in `buybothourly.py` may
 exist in the other two files. Diff the siblings after a logic change, but do
 not copy cadence-specific math blindly. The 5m bands use `BUY_HORIZON_S` in
-**seconds**. Hourly bands use `BUY_HORIZON_MIN` in **minutes**. Live hourly
+**seconds**. Hourly bands use `BUY_HORIZON_MIN` in **minutes**. Stopped hourly
 defaults are B-only for the last 20 minutes, persist **5s @ 50/52**, dump
 35¢, recovery **53¢**, `hedge_sell_fade`, `hedge_require_oracle`, Binance
 buy edge $10, tick `0.01`, and a $10 market cap. Hourly is **stopped**.
 
-Live 5m defaults are two $2.50 slices, last-45s ≥90 overlay, persist 5s @
-50/52, dump 32¢ ignore-oracle, recovery 53¢, Chainlink edge $0, and
-nominal tick `0.001`.
+Live 5m JSON (after the operator paste) is last **45s** only, **75–99¢**
+(late 75–90 + `late_90` overlay), `min_underlying_edge_usd` **$25**,
+early/≥95 **off** (`early_buy_start_s=45`, `early_95_start_s=0`), two
+$2.50 slices, persist 5s @ 50/52, dump 32¢ ignore-oracle, recovery 53¢,
+and nominal tick `0.001`. Code defaults in `buybot5m.py` stay last-120 /
+early-300 / edge $0 until the live JSON overlays them.
 
 15m/hourly windows are in **minutes** (`buy_window_min` / `a22_window_min`).
 Mixing the two without converting units has caused production `NameError`s.
@@ -255,7 +261,8 @@ leftover USDC down the book. Quote 80¢, leftover cash lifts a 9¢ ask, you own
 junk. The live 5m bot sizes **shares** from `budget / ask`, then clips
 to `buy_max_shares` and `buy_max_spend` so a 99¢ early FAK is at least
 3 shares when `$2.97` fits (`buy_max_spend` $3 / `buy_max_shares` 5).
-Late 75–90 posts at **90¢**; last-45 ≥90 and early ≥90 post at **99¢**.
+Late 75–90 posts at **90¢**; last-45 ≥90 posts at **99¢**. Early ≥90 is
+**off** on the live 5m paste.
 Unfilled dollars die. The stopped hourly bot uses the same limit-FAK
 sizer at a $10 cap; 15m still limits at the touch.
 
@@ -270,7 +277,7 @@ between the touch and that cap; the remainder dies. Thin books log
 
 ### One file, one process, one `while True`
 
-There is no web server, no database, no `asyncio`. The hourly bot is a script
+There is no web server, no database, no `asyncio`. The live 5m bot is a script
 that:
 
 1. does a lot of setup at **import time** (the moment Python starts the file),
@@ -312,7 +319,7 @@ those threads die with it. They are not meant to outlive the bot.
 
 ### Process lock (`fcntl.flock`)
 
-Near the top of `buybothourly.py`:
+Near the top of `buybot5m.py`:
 
 ```python
 def acquire_process_lock(path):
@@ -326,9 +333,9 @@ def acquire_process_lock(path):
 
 `fcntl.flock` is a **kernel lock** on a file. `LOCK_EX` = exclusive (only one
 holder). `LOCK_NB` = do not wait; if someone else has it, fail immediately.
-The path is `/tmp/poly-money-maker-buybothourly.lock`. If you run
-`python buybothourly.py` while systemd already runs it, the second process
-**exits**. Two live instances would both think they may spend $10.
+The path is `/tmp/poly-money-maker-buybot5m.lock`. If you run
+`python buybot5m.py` while systemd already runs it, the second process
+**exits**. Two live instances would both think they may spend $2.50.
 
 The function **returns the open file handle** and the module stores it in
 `_PROCESS_LOCK_FH`. If that handle were closed, the lock would release. Do
@@ -417,7 +424,11 @@ money-safety pattern in the file.
 
 ## 8. How to read the live single-file bot
 
-`buybothourly.py` is one long scroll with **comment banners** as chapters:
+Live file is `buybot5m.py`. The stopped hourly and 15m copies use the
+same comment banners; cadence-specific constants differ (seconds vs
+minutes, Chainlink TWAP 30s vs Binance, tick `0.001` vs `0.01`).
+
+`buybot5m.py` is one long scroll with **comment banners** as chapters:
 
 | Banner | What lives there |
 |---|---|
@@ -441,7 +452,8 @@ Read the banners, then the function **docstring**, then the fail-closed
 branches (`return` / `continue` / `break`). The happy path is usually the
 last branch.
 
-The stopped 5m/15m files have the same shape with cadence-specific constants.
+The stopped hourly and 15m files have the same shape with cadence-specific
+constants. Do not start them.
 
 ---
 
@@ -458,7 +470,7 @@ The stopped 5m/15m files have the same shape with cadence-specific constants.
    sets tick `0.01` `amount` to **2**. Without that, a dirty float can sign
    a maker amount with more than two decimals and the CLOB 400s
    `invalid amounts`.
-5. `load_strategy()` **must succeed**. No valid `strategy_buyhourly.json` →
+5. `load_strategy()` **must succeed**. No valid `strategy_buy5m.json` →
    process dies. Better a crash at start than a bot with invented knobs.
 6. If `dry_run`, rename state/log/PTB to `*.dryrun.*`.
 7. Build `ImmediateResponseClobClient`.
@@ -507,12 +519,16 @@ dict **is the schema**.
   with `type(default)(value)` so `1` can become `1.0`.
 - Legacy: if JSON has `shares` but not `buy_budget`, treat `shares` as the
   dollar budget.
-- Then a wall of validators: hourly floors and enabled windows are coherent,
+- Then a wall of validators: 5m windows and FAK caps are coherent,
+  `early_95_start_s=0` is a legal disable (non-negative, not “must be
+  positive”; `0` also skips the `start >= min` check so leftover
+  `early_95_min_s=60` cannot take entries down),
   `hedge_require_ask_max >= hedge_threshold`, dump < qualify ≤ recovery,
-  tick is a CLOB tick and equals hourly `EXPECTED_TICK_SIZE` (`"0.01"`),
+  tick is a CLOB tick and equals this bot’s `EXPECTED_TICK_SIZE`,
   `one_entry_per_market` stays true, live mode cannot disable hedge,
-  `buy_max_shares` is large enough for `market_spend_cap / buy_threshold`,
-  `max_open_positions == 0` means unlimited, no NaNs.
+  `buy_max_shares` is large enough for
+  `max(budget, buy_max_spend) / buy_threshold` ($2.50 / 75¢ needs 5;
+  $5 needs **7**), `max_open_positions == 0` means unlimited, no NaNs.
 
 **Hot reload vs restart:**
 
@@ -520,8 +536,8 @@ dict **is the schema**.
 |---|---|
 | Most knobs in live JSON | No — next loop iteration |
 | `dry_run` | **Yes** (state paths) |
-| Python code | **Yes** (`systemctl restart polybuybothourly`). `git pull` is not a restart. |
-| Current 50/52/5s/35/53/oracle values if live JSON has older keys | The **file** wins. Code defaults only apply when a key is omitted. Patch the live JSON before restart. |
+| Python code | **Yes** (`systemctl restart polybuybot5m`). `git pull` is not a restart. |
+| Current 50/52/5s/32/53/oracle values if live JSON has older keys | The **file** wins. Code defaults only apply when a key is omitted. Patch the live JSON before restart. |
 
 `entry_enabled` is the operator arm. Defaults `false` in the example file.
 Live JSON on the VM is what actually arms buys.
@@ -531,11 +547,10 @@ Live JSON on the VM is what actually arms buys.
 ## 11. Logging, notifications, tiny helpers
 
 `log_event("buy_skip", reason="ask_below_band", ...)` writes one JSON object
-to `buybothourly.log` via `RotatingFileHandler` (5 MiB × 3 backups). The
-Rich console lives in `journalctl -u polybuybothourly` (journald is capped
-separately). The hourly bot has no dedicated money-path journal; pass
-`--log buybothourly.log` to log diagnostics whose default is the stopped
-5m log. **Throttled** skips
+to `buybot5m.log` via `RotatingFileHandler` (5 MiB × 3 backups). The
+Rich console lives in `journalctl -u polybuybot5m` (journald is capped
+separately). The 5m bot also writes `buybot5m.journal.jsonl`
+(`check_live_journal.py`). **Throttled** skips
 (`log_buy_skip_throttled`) fire at most about once per 8 seconds per
 market+reason — they are **not** “one line per missed market.”
 
@@ -555,9 +570,10 @@ exchange JSON without it.
 ## 12. Positions: Data API vs local ledger
 
 `fetch_all_position_rows` pages the Data API. `build_held_positions` keeps
-rows whose slug/event slug matches the hourly `SLUG_PREFIX`
-(`bitcoin-up-or-down`) and **not** `SLUG_EXCLUDES`. The excludes prevent
-older 5m/15m naming from leaking into the hourly process. Outcome `yes`
+rows whose slug/event slug matches the 5m `SLUG_PREFIX`
+(`btc-updown-5m`) and **not** `SLUG_EXCLUDES`. The excludes prevent
+15m (`btc-updown`) and hourly (`bitcoin-up-or-down`) naming from leaking
+into the 5m process. Outcome `yes`
 maps to UP, `no` to DOWN (Polymarket naming drift).
 
 **The Data API lags.** You can buy, POST returns, local JSON has 11.1 shares,
@@ -607,7 +623,7 @@ WS cache details that matter:
   Callers must REST before trusting size.
 - Out-of-order server timestamps are dropped.
 - Tokens not in the current `set_tokens(...)` watch list are forgotten
-  (the live watch list follows the current hourly horizon and held bags).
+  (the live watch list follows the current 5m horizon and held bags).
 
 `get_book_bid` / `_book_cache` are convenience wrappers around the same
 quote tuple: `(bid, bid_size, ask, ask_size, mid)`.
@@ -630,11 +646,11 @@ snapshot is young enough.
 legs need a display price (mid or last trade) or the bot logs
 `buy_skip_incomplete_book`.
 
-**Hourly hedge GUI** matches the 50/52 book, not buy 70/30: held last trade
+**Live 5m hedge GUI** matches the 50/52 book, not buy 70/30: held last trade
 ≤ 52¢, held GUI ≤ 52¢, other GUI ≥ 48¢ (complement). The buy-side 5¢
 ambiguity gap does **not** apply here, so a documented 50¢-vs-48¢ book
 qualifies. A 49/51 book with a held last trade at 85¢ is a clip, not a
-reversal → `hedge_skip_no_consensus`. After GUI, hourly waits
+reversal → `hedge_skip_no_consensus`. After GUI, 5m waits
 `hedge_persist_s` (5s) on a continuously qualified book
 (`hedge_skip_persist` / `buy/hedge_gate.py`). Elapsed wall time alone does
 not complete persistence; the endpoint tick must still pass the current
@@ -655,16 +671,30 @@ its Binance oracle allows it.
 
 ---
 
-## 15. Buy gates and the hourly price band
+## 15. Buy gates and the 5m / hourly price bands
 
 `buy/entry_skip.py` contains pure entry functions (no network). Tests import
 it directly.
 
-`EntryBand` carries a minimum, maximum, whether the minimum is exclusive,
-a slice name, and the FAK limit. `applicable_hourly_entry_bands` uses
+**Live 5m** (`applicable_entry_bands` / `decide_5m_entry`) uses **seconds**.
+With the live JSON paste:
+
+- late: `0 < TTM ≤ buy_start_s` (**45**) → 75–90¢ inclusive, FAK **90¢**,
+  late `$2.50`;
+- `late_90`: `0 < TTM ≤ late_90_start_s` (**45**) → ask ≥90¢, FAK **99¢**,
+  same late slice;
+- early ≥90 is off when `early_buy_start_s == buy_start_s`;
+- ≥95 is off when `early_95_start_s=0` (`early_95_s > early_95_floor`
+  is false). `0` is legal in `load_strategy`.
+
+`BUY_HORIZON_S` is **45**, so hot poll / WS subscribe start around T-75.
+The `$25` Chainlink `|TWAP−PTB|` gate lives in the 5m loop, not this
+helper. 91–99 at TTM 46–120 is a no because those windows are closed.
+
+**Stopped hourly** (`applicable_hourly_entry_bands`) uses
 **minutes** and inclusive windows: `0 < minutes_left ≤ window`.
 
-The live configuration opens only slice B (`b15`):
+The last hourly configuration opened only slice B (`b15`):
 
 - `b15_window_min = buy_window_min = 20`;
 - ask **75–90¢ inclusive**;
@@ -680,10 +710,9 @@ rule.
 
 `buybothourly.current_entry_bands(minutes_left)` wraps the helper.
 `BUY_HORIZON_MIN` is the maximum of the configured hourly windows and
-`buy_window_min`; live it is **20**, so hot polling and websocket
-subscriptions begin in time for the entry window. TTM is
-`(market.end_ts - now) / 60`; do not paste the stopped 5m bot’s
-`seconds_left` math into this loop.
+`buy_window_min`; when hourly last ran it was **20**. TTM is
+`(market.end_ts - now) / 60`; do not paste the live 5m bot’s
+`seconds_left` math into this loop. Hourly stays **stopped**.
 
 `t15_bought` records a B-slice fill. `hourly_spent_so_far` uses durable
 `pnl_entry_cost`; `hourly_slice_budget` can spend only what remains under
@@ -732,9 +761,11 @@ or flipped permits the hedge pipeline.
 `quoted_buy_shares_up_to_limit` starts from that count, clips it to what the
 FAK limit and spend cap can legally fund, prefers at least **3.00 shares**
 when `3 × limit ≤ spend_cap`, then snaps to a size whose
-`size × limit` is exact cents. The active hourly B slice therefore posts
-**11.10 shares / $9.99** at its 90¢ limit, even when the triggering ask was
-75¢. It may fill cheaper; unfilled depth is killed.
+`size × limit` is exact cents. Live 5m late therefore posts about
+**2.77 shares / $2.50** at 90¢ when the ask is 90¢, or **3.00 shares /
+$2.97** at the 99¢ last-45 overlay when `$2.97` fits. It may fill cheaper;
+unfilled depth is killed. The stopped hourly B slice posts **11.10 shares
+/ $9.99** at 90¢.
 
 Do **not** pass `user_usdc_balance` on hourly (or 5m) BUY `OrderArgs`. That
 field means wallet balance, not a per-order cap. A fake cap can make the SDK
@@ -744,7 +775,7 @@ and still passes `remaining_budget`.
 
 1. Quantize budget down to **cents** (`Decimal("0.01")`, `ROUND_DOWN`).
 2. Start with `shares = budget / ask`, quantized to **0.01 shares**.
-3. Clip to `buy_max_shares` (hourly: 14) and to
+3. Clip to `buy_max_shares` (live 5m: 5; `$5` later needs **7**) and to
    `spend_cap / FAK_limit`.
 4. Search in 0.01-share steps for a size whose
    `shares × FAK_limit` is exact cents and within the cap.
@@ -791,8 +822,9 @@ No client call.
      save fails → **do not POST** (`persist_fail`).
    - Sign order; `signed_order_id` hashes EIP-712 typed data so the id is
      **determined before** the network — crash recovery can look it up.
-   - POST a limit FAK at the selected band’s cap. Live hourly B uses 90¢
-     and omits `user_usdc_balance`; dormant A/C would use 99¢.
+   - POST a limit FAK at the selected band’s cap. Live 5m late uses **90¢**,
+     last-45 ≥90 uses **99¢**, and omits `user_usdc_balance`. Stopped hourly
+     B uses 90¢; dormant A/C would use 99¢.
 3. `confirm_fill_size` decides matched shares:
    - Terminal `matched` + confirmed trades → trust making/taking.
    - `delayed` POST can echo the **unsigned full size** before any match —
@@ -811,8 +843,9 @@ No client call.
    no further attempts.
 
 The main loop then writes `bought_token`, `bought_size`, `pnl_entry_cost`,
-maybe `toxic_fill`, and stamps the filled slice. With only B enabled, that
-condition cannot post a second entry.
+maybe `toxic_fill`, and stamps the filled slice (`late_bought` or
+`early_bought`). With early off, that is one late slice unless a same-leg
+add still fits.
 
 **Unmatched empty cooldown:** after a fully empty trigger, wait
 `empty_fak_cooldown_s` (0.15s) before the outer loop tries that market
@@ -825,62 +858,52 @@ again. Inner retries are immediate.
 `sell_market_with_retry` docstring says hedge-only. There is no profit-take
 caller.
 
-**Live hourly hedge pipeline** (`evaluate_held_bag` in
-`buy/hedge_gate.py`, orchestrated by `buybothourly.py`):
+**Live 5m hedge pipeline** (`evaluate_held_bag` in `buy/hedge_gate.py`,
+orchestrated by `buybot5m.py`): persist **5s @ 50/52**, dump **≤32¢**
+book-only even if Chainlink still agrees (`hedge_dump_ignore_oracle`),
+recovery **53¢**, `hedge_sell_fade` (after persist, sell live bid **< 53¢**,
+including a fade through 50). Persist still needs the oracle against/flat.
+Do not sell 55–69 after persist. Sells use the live bid on the market tick
+(honor 0.01 when CLOB says so).
 
-1. **Oracle veto first.** `hold_while_oracle_agrees` reads live Binance
-   BTCUSDT versus the market PTB with a $0 minimum edge. If the feed is
-   missing/stale or still favors the held leg, clear persistence and hold
-   (`hedge_skip_oracle` / `hedge_skip_oracle_still_winning`). A flipped or
-   exactly-flat oracle lets the book checks continue. This applies to both
-   normal sells and the 35¢ dump.
-2. Coalesce the held quote: REST, then WS, then last-good
-   (`pick_held_quote`). Incomplete REST must not strand a live bag.
-3. After the oracle permits selling, **bid ≤ 35¢ dumps every live bag**.
-   It is bid-only, with no GUI, last-trade, spread, or persistence veto.
-   A wide 20/80 book still dumps.
-4. Before persistence completes, a fresh bid above 50¢ is a healthy
-   bounce and clears the arm. Bid ≥ `hedge_recovery_cancel` (53¢) also
-   clears a completed arm (`hedge_skip_recovery`).
-5. Normal qualify is a tight bid ≤ **50¢**, ask ≤ **52¢**, spread ≤15¢,
+**Stopped hourly** uses the same helper with dump **35¢** and a Binance
+oracle that also gates the dump (no `hedge_dump_ignore_oracle` on that
+template). Do not start it.
+
+Shared `evaluate_held_bag` steps (live **5m** numbers):
+
+1. **Dump can skip the oracle.** On 5m, bid ≤ **32¢** dumps any live bag
+   bid-only even if Chainlink still agrees (`hedge_dump_ignore_oracle`).
+   Persist-50 does **not** get that bypass. Missing/stale REST uses
+   WS/last-good (`pick_held_quote`).
+2. **Oracle veto on persist.** `hold_while_oracle_agrees` reads live
+   Chainlink TWAP versus PTB with a $0 minimum edge. Missing/stale or still
+   on the held side → clear persist and hold
+   (`hedge_skip_oracle` / `hedge_skip_oracle_still_winning`).
+3. Before persistence completes, a fresh bid above 50¢ is a healthy bounce
+   and clears the arm. Bid ≥ `hedge_recovery_cancel` (**53¢**) also clears
+   a completed arm (`hedge_skip_recovery`).
+4. Normal qualify is a tight bid ≤ **50¢**, ask ≤ **52¢**, spread ≤15¢,
    held GUI/last trade ≤52¢, and other GUI ≥48¢. It must remain qualified
-   for **5 seconds**; any failed book/GUI check resets the arm. The tick
-   that completes those 5 seconds must still pass the current book and
-   GUI. A 50/99 book or failed GUI at the endpoint holds and clears the
-   arm instead of selling.
-6. Once a previously qualified tick has completed persistence,
-   `hedge_sell_fade=true` sells at the live bid while it remains
-   **below 53¢**, including a fade through 50¢. The executor honors that
-   fade (it must not abort 36–49¢ as a dead band). Bid ≥53¢ holds and
-   clears persistence. This deliberately does **not** copy the stopped
-   5m bot’s 70–84¢ post-persist sell range.
-7. Write-ahead hedge quarantine, then a sell FAK at the **live bid** on
-   the market tick. Hourly expects `0.01`, undercuts zero ticks, and
-   rebuilds at a coarser minimum if the CLOB reports one
-   (`hedge_tick_retry`). `hedge_min_price` is retained config, not a FAK
-   floor; a 20¢ live bid is not refused. Every SELL POST/retry also runs
-   `pre_submit` (`hold_while_oracle_agrees` + TTM > 0) and
-   `deadline_ts=m.end_ts`.
-8. Unmatched FAK / invalid tick / could-not-run retries re-quote the live
-   bid (up to 12 attempts for a dump or persist-done sell) and recheck
-   oracle/expiry before each POST. A dump retry stops if bid recovers
-   above 35¢. A persist-done retry continues while bid <53¢ because
-   `sell_fade` is on, and aborts at recovery. Incomplete REST uses
-   WS/last-good rather than idling the bag.
-9. Every live-bag skip/fail logs slug, TTM, bid, ask, tick, reason, and
-   order error (`live_bag_log_fields`). `hedge_closed` is set only after
-   confirmed inventory is gone.
+   for **5 seconds**; any failed book/GUI check resets the arm.
+5. Once persist completes, `hedge_sell_fade=true` sells at the live bid
+   while it remains **below 53¢**, including a fade through 50¢. Bid ≥53¢
+   holds and clears persist. Do not sell 55–69. (32¢, 50¢) before persist
+   is a dead band except the 32¢ dump.
+6. Write-ahead hedge quarantine, then a sell FAK at the **live bid** on
+   the market tick (5m default `0.001`, honor CLOB 0.01 via
+   `hedge_tick_retry`). Undercut 0. `hedge_min_price` is leftover config,
+   not a FAK floor.
+7. Unmatched / invalid-tick retries re-quote. Dump retry stops if bid
+   recovers above 32¢. Persist-done retry continues while bid <53¢.
+8. `hedge_closed` only after confirmed inventory is gone.
 
-**`toxic_fill`:** the hourly bot arms this when confirmed average is below
-65¢. The flag stays on metadata until exit/reconciliation, but it is not
-what makes the 35¢ dump universal: **every** live bag dumps at that bid
-after the oracle allows it. A recovered toxic flag may log
-`hedge_skip_toxic_recovered`.
+Stopped hourly uses the same helper with dump **35¢** and **no** dump
+oracle bypass. Do not start it. Stopped 15m keeps an older separate path.
 
-Live 5m also uses `evaluate_held_bag`, with persist **5s @ 50/52**, dump
-**32¢** book-only even if Chainlink still agrees (`hedge_dump_ignore_oracle`),
-recovery **53¢**, `hedge_sell_fade`, and Chainlink TWAP oracle on persist
-only. The stopped 15m bot retains its older separate hedge path.
+**`toxic_fill`:** armed when confirmed average is below 65¢. Every live 5m
+bag still dumps at ≤32¢ whether or not the flag is set. A recovered toxic
+flag may log `hedge_skip_toxic_recovered`.
 
 **Reconcile sells** with `reconcile_hedge_sold`: CLOB-confirmed sold size
 wins; a single low Data API read must not invent extra fills or erase
@@ -927,7 +950,8 @@ from `bought_size`.
 After import, `while not _shutdown_requested:`:
 
 1. Increment `CYCLE`, snapshot clocks, and hot-reload strategy keys into
-   uppercase globals. Recompute `BUY_HORIZON_MIN`.
+   uppercase globals. Recompute `BUY_HORIZON_S` (live 5m) or
+   `BUY_HORIZON_MIN` (stopped hourly).
 2. Consume and re-kick staggered thread-pool refreshes for positions, USDC
    balance, and Gamma discovery. Write the heartbeat.
 3. Filter active, non-`neg_risk`, future markets; merge durable local
@@ -937,21 +961,21 @@ After import, `while not _shutdown_requested:`:
    hedge or exact-order recovery runs before new entry I/O.
 5. Render the throttled Rich status/positions table (cosmetic).
 6. GC stale metadata only when terminal evidence permits it.
-7. If there is no active hedge and no enabled hourly entry window, submit
+7. If there is no active hedge and no enabled 5m entry window, submit
    eligible redemptions with write-ahead intent.
 8. Collect prefetched books and overlay fresh WS top-of-book.
 9. `for m in _loop_markets:` uses a **per-market try/except**. Inside:
-   compute `minutes_left`, reconcile uncertain exact order ids, run the
+   compute `seconds_left`, reconcile uncertain exact order ids, run the
    oracle/hedge path for held inventory, then run entry gates for an
    eligible open slice. A fault logs `condition_id` and continues to the
-   next market.
+   next market. (Stopped hourly uses `minutes_left` instead.)
 10. Collect and schedule low-priority redeem-status polling; settle
     redemption value only after relayer confirmation plus a complete
     positions snapshot with inventory gone.
 11. An outer `cycle_error` covers failures outside the market loop
     (refresh/GC/UI/redeem). The process stays up.
 12. Choose sleep: **0.01s** for a live hedge or market inside
-    `BUY_HORIZON_MIN`, otherwise 1s. Expired/redeemable leftovers do not
+    `BUY_HORIZON_S` (45s after the paste), otherwise 1s. Expired/redeemable leftovers do not
     count as live hedges.
 13. Before sleeping, prefetch missing books, set the WS watch list to
     horizon/held tokens (with 30 seconds of slack), and prune REST caches.
@@ -1005,8 +1029,8 @@ backoff. `get_book_feed()` is a process-wide singleton.
 
 **`buy/entry_skip.py`**
 
-§15. Hourly (`a22` / `b15` / `c5`) band/budget math plus the stopped 5m
-two-slice helpers. 15m does **not** import this.
+§15. Live 5m two-slice band math (seconds) plus stopped hourly
+(`a22` / `b15` / `c5`) minutes/budget helpers. 15m does **not** import this.
 
 **`buy/hedge_gate.py`**
 
@@ -1038,23 +1062,25 @@ This is the one state-like tree that is allowed to delete itself. Do not
 `rm` it by hand.
 
 **`check_path_backtest.py`:** first tick that matches an ask band and TTM
-window is a “hit.” `--template strategy_buyhourly.example.json` maps the
-live 75–90¢ / 20-minute / $10 entry and basic 50/52/5s hedge into paper
+window is a “hit.” `--template strategy_buy5m.example.json` maps the live
+75–90¢ / last **45s** / $2.50 entry and basic 50/52/5s hedge into paper
 knobs. Paper persistence is real: qualifying ticks must stay continuous
 for the configured 5 seconds. Tight books use midpoint as the GUI and
-last-trade proxy; displayed top size caps the paper fill.
+last-trade proxy; displayed top size caps the paper fill. Pathlog has
+**no** `|TWAP−PTB|` — the live **$25** edge is scored in
+`check_reversal_features.py`.
 
-This is still **not a live hourly replay**. Pathlog has no Binance/PTB, no
+This is still **not a live 5m replay**. Pathlog has no Chainlink/PTB, no
 last trade, no POST latency, and no unmatched FAKs. Paper mode also does
-not model hourly `hedge_require_oracle`, `hedge_sell_fade`, recovery-cancel
-semantics, or the universal bid-only 35¢ dump exactly. Treat its P&L as a
+not model `hedge_require_oracle`, `hedge_sell_fade`, recovery-cancel
+semantics, or the universal bid-only 32¢ dump exactly. Treat its P&L as a
 book-path comparison, not proof that the live bot would have traded.
 
-`--sweep --series hourly --template strategy_buyhourly.example.json` scores
-one-at-a-time variants of that B-only template. It does not union dormant
-A/C slices. The default template and named `--compare` presets remain
-5m-oriented, so always pass the hourly template when researching the live
-cadence.
+`--sweep --series 5m` scores one-at-a-time variants of that late template
+(`live_5m_paper` is the example JSON last-45 75–90, not the $25 gate).
+`window_120s` is an explicit variant. It does not union last-45 ≥90 or
+early ≥90. Score last-45 90–99 with `--ask-min 0.90 --ask-max 0.99
+--ttm-max 45`. Always pass `--series 5m` when researching the live cadence.
 
 `--series 5m` must not match filenames containing `15m` (the letters `5m`
 appear inside `15m`). The filter is exact-series, not a substring.
@@ -1104,15 +1130,17 @@ the journal with `deploy/journald-size.conf` (`deploy/DISK_OPS.md`). Pathlog
 cap is separate and in-app.
 
 `CURRENT.md` owns the exact transition/patch command so it cannot drift in
-two places. Before restarting 5m, verify live JSON explicitly: two $2.50
-slices, `late_90_start_s` 45, hedge 50/52 for 5s, dump 32, recovery 53,
-sell-fade/oracle/dump-ignore true, undercut 0, and the intended
-`dry_run` / `entry_enabled`. Stop hourly. Restart `polypathlog` when
-recorder Python changes.
+two places. Before restarting 5m, verify live JSON explicitly: last **45s**
+(`buy_start_s=early_buy_start_s=late_90_start_s=45`), `early_95_start_s=0`
+and `early_95_min_s=0`, `min_underlying_edge_usd` **25**, two $2.50 slices,
+hedge 50/52 for 5s, dump 32, recovery 53, sell-fade/oracle/dump-ignore true,
+undercut 0, and the intended `dry_run` / `entry_enabled`. `BUY_HORIZON_S`
+becomes **45**. Stop hourly. Restart `polypathlog` when recorder Python
+changes.
 
-Watch `buy_attempt band=late_90`, `hedge_skip_oracle_still_winning`,
-`hedge_skip_persist`, `hedge_skip_recovery`, `hedge_attempt`, and
-`hedge_fill` in `buybot5m.log`.
+Watch `buy_attempt band=late` / `late_90`, `buy_skip_underlying_edge`,
+`hedge_skip_oracle_still_winning`, `hedge_skip_persist`,
+`hedge_skip_recovery`, `hedge_attempt`, and `hedge_fill` in `buybot5m.log`.
 
 ---
 
@@ -1155,20 +1183,19 @@ pulled the code hours earlier.
 6. Tick `0.001` vs `0.01`.
 7. Never delete live JSON / logs / `.env`. Export pathlog before prune.
 8. Ask ≠ price. Tight REST book required.
-9. Normal hourly reversal needs oracle + book + GUI + 5s. The 35¢ dump is
-   bid-only only **after** the oracle is against/flat.
+9. Normal 5m persist needs oracle + book + GUI + 5s. The 32¢ dump is
+   bid-only even if BTC still agrees.
 10. `git pull` ≠ running new code.
-11. Live JSON hedge keys override code defaults.
-12. Hourly paper sweep does not replay the live oracle, fade/recovery, or
-    universal dump exactly.
+11. Live JSON hedge and entry keys override code defaults.
+12. Pathlog `--sweep` `live_5m_paper` is the example JSON late 45s / 75–90
+    (no `$25` edge). Score `|dist|` in `check_reversal_features.py`.
 13. Banner ASCII art still mentions old 97¢ / 65¢ — ignore it; JSON is truth.
 14. `hedge_min_price` is leftover config, not a FAK floor.
 15. A/C hourly windows are disabled. Do not revive >93/>95 by copying an old
-    template.
-16. After `hedge_closed`, hourly must not re-enter that market. Do not
-    treat unused slices as still available.
-17. Hourly fade sells in (35¢, 50¢) only when `hedge_sell_fade` is on.
-    The 5m executor still aborts that dead band.
+    template. Do not start hourly.
+16. After `hedge_closed`, do not re-enter that market.
+17. 5m fade sells in (32¢, 50¢) only after persist when `hedge_sell_fade`
+    is on. Dump ≤32 does not wait.
 
 ---
 
@@ -1206,7 +1233,7 @@ implemented. `sell_market_with_retry` stays hedge-only.
 | **Spread** | Ask minus bid |
 | **TTM** | Time to market end (minutes in hourly/15m; seconds in 5m) |
 | **Token ID** | CLOB id of UP or DOWN |
-| **toxic_fill** | Hourly flag for average below 65¢; universal 35¢ dump is independent of the flag |
-| **TWAP** | Time-weighted average price (used by the stopped Chainlink-based 5m/15m bots) |
+| **toxic_fill** | Flag for average below 65¢; live 5m dump ≤32¢ is independent of the flag |
+| **TWAP** | Time-weighted average price (live 5m: Chainlink TWAP 30s vs PTB) |
 | **Websocket (WS)** | Push connection; fast cache, not an order |
 | **Write-ahead** | Save order id to disk **before** POST |
