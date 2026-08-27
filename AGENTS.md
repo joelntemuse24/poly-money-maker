@@ -197,6 +197,11 @@ Watch the console for `[DRY BUY]` / `[DRY SELL]` markers. Ctrl-C to stop.
 (**75–90 / last 45s / $2.50**; `live_5m_paper` is that file). Join the
 **$25** `|BTC−PTB|` gate with `--min-edge-usd 25` (Binance 1s, PTB =
 close at market start, live = close at fill ts — not Chainlink TWAP).
+VM 27 Aug (~3552 5m files, $10, spread ≤5¢, paper 50/52): last-45+$25
+kept **3/36** books (**−$7.39**); last-120+$25 kept **87/483**
+(**+$107 / +$0.36/h**); last-120 **no** `$25` was **+$1.58/h**. Analog
+last45+$25 is 99/1 implied fills, not a restable FAK. Next live probe
+is last-120 / 75–90 / edge **$0** (`CURRENT.md`) — not last-45+$25.
 `--compare` uses hardcoded late-band presets; `--paper` hedge knobs still
 come from the example JSON (**50/52 persist 5s**, dump **32¢**). Neither
 command replays the early ≥90 / ≥95 union **or** the two-slice $2.50+$2.50
@@ -435,23 +440,10 @@ CI: pushes to `main` touching the buy bots, `pathlog.py`,
 SSH (`git pull` + `pip install` only). Services are **not** auto-restarted —
 start/restart deliberately after validation (`systemctl start` / `restart`).
 
-After this branch merges, on the VM (5m only; stop hourly). This paste is
-**last 45s + $25** (same block as `CURRENT.md`). Confirm `dry_run` /
-`entry_enabled` **before** restart. Do **not** start 15m, hourly, or mint.
-
-```bash
-cd ~/poly-money-maker && git pull
-sudo systemctl stop polybuybothourly polybuybot
-sudo systemctl disable polybuybothourly polybuybot
-python3 -c 'import json; from pathlib import Path; p=Path("strategy_buy5m.json"); d=json.loads(p.read_text()); d["hedge_threshold"]=0.50; d["hedge_require_ask_max"]=0.52; d["hedge_persist_s"]=5.0; d["hedge_toxic_bid_max"]=0.32; d["hedge_recovery_cancel"]=0.53; d["hedge_sell_fade"]=True; d["hedge_require_oracle"]=True; d["hedge_dump_ignore_oracle"]=True; d["hedge_oracle_min_edge_usd"]=0.0; d["hedge_undercut_ticks"]=0; d["hedge_min_price"]=0.32; d["buy_start_s"]=45; d["early_buy_start_s"]=45; d["early_95_start_s"]=0; d["early_95_min_s"]=0; d["late_90_start_s"]=45; d["min_underlying_edge_usd"]=25.0; d["add_min_price"]=0.90; d["buy_budget"]=2.5; d["late_buy_budget"]=2.5; d["buy_max_price"]=0.90; d["early_buy_max_price"]=0.99; d["buy_max_spend"]=3.0; d["buy_max_shares"]=5.0; d["poll_buy_window_s"]=0.01; d["poll_held_s"]=0.01; d["ui_every_n_cycles"]=50; p.write_text(json.dumps(d, indent=2)+"\n"); print("start", d["buy_start_s"], "early", d["early_buy_start_s"], "e95", d["early_95_start_s"], "e95min", d["early_95_min_s"], "edge", d["min_underlying_edge_usd"], "late_90", d["late_90_start_s"], "horizon", max(d["buy_start_s"], d["early_buy_start_s"], d["early_95_start_s"]), "hedge", d["hedge_threshold"], d["hedge_require_ask_max"], "persist", d["hedge_persist_s"], "dump", d["hedge_toxic_bid_max"], "recovery", d["hedge_recovery_cancel"], "dry_run", d.get("dry_run"), "entry", d.get("entry_enabled"))'
-sudo systemctl restart polybuybot5m
-sudo systemctl enable polybuybot5m
-systemctl is-active polybuybot polybuybot5m polybuybothourly
-# expect: inactive  active  inactive
-```
-
-Confirm `strategy_buy5m.json` `dry_run` / `entry_enabled` before restart.
-Printed `horizon` must be **45**. Do **not** start 15m, hourly, or mint.
+Last-45 + `$25` is **already on the VM**. Do **not** re-paste it. Next
+probe paste (last **120s**, 75–90, edge **$0**, `late_90=0`) lives in
+`CURRENT.md`. Confirm `dry_run` / `entry_enabled` **before** restart.
+Printed `horizon` must be **120**. Do **not** start 15m, hourly, or mint.
 
 ## Dependencies
 

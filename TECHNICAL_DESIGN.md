@@ -102,13 +102,18 @@ the rest of the ride to $1.00.
 | 0 < TTM ≤ 45 seconds | **75¢ through 90¢ inclusive** | late `$2.50`, limit **90¢** |
 | 0 < TTM ≤ 45 seconds | **≥90¢** | `late_90` overlay, same late `$2.50`, limit **99¢** |
 
-`min_underlying_edge_usd` is **$25**: live Chainlink TWAP 30s must be at
-least $25 from the window-open PTB and on the same side as the book.
-`BUY_HORIZON_S = max(buy_start_s, early_buy_start_s, early_95_start_s)`
-is **45** with this paste, so websocket subscribe / 0.01s look start
-around T-75. `early_95_start_s=0` is a valid disable (do not leave it
-on the “must be positive” list). Pair it with `early_95_min_s=0` in the
-JSON; `0` also disables even if `min_s` is leftover 60.
+`min_underlying_edge_usd` is **$25** on the box: live Chainlink TWAP 30s
+must be at least $25 from the window-open PTB and on the same side as
+the book. Pathlog paper (27 Aug, ~3552 5m files, 75–90, 5¢, $10, Binance
+`$25`) kept **3** last-45 books (**−$7.39**) and **87** last-120 books
+(**+$0.36/h**). Analog last45+$25 was implied 99/1 fills, not a FAK.
+Recommended next probe is last **120s / 75–90 / edge $0** (`CURRENT.md`)
+— not live until the operator pastes. `BUY_HORIZON_S =
+max(buy_start_s, early_buy_start_s, early_95_start_s)` is **45** with
+the current paste, so websocket subscribe / 0.01s look start around
+T-75. `early_95_start_s=0` is a valid disable (do not leave it on the
+“must be positive” list). Pair it with `early_95_min_s=0` in the JSON;
+`0` also disables even if `min_s` is leftover 60.
 
 Missed early does **not** become a $5 late buy — there is no early slice
 while those windows are off. Same-leg add only. After `hedge_closed`, no
@@ -1132,13 +1137,9 @@ the journal with `deploy/journald-size.conf` (`deploy/DISK_OPS.md`). Pathlog
 cap is separate and in-app.
 
 `CURRENT.md` owns the exact transition/patch command so it cannot drift in
-two places. Before restarting 5m, verify live JSON explicitly: last **45s**
-(`buy_start_s=early_buy_start_s=late_90_start_s=45`), `early_95_start_s=0`
-and `early_95_min_s=0`, `min_underlying_edge_usd` **25**, two $2.50 slices,
-hedge 50/52 for 5s, dump 32, recovery 53, sell-fade/oracle/dump-ignore true,
-undercut 0, and the intended `dry_run` / `entry_enabled`. `BUY_HORIZON_S`
-becomes **45**. Stop hourly. Restart `polypathlog` when recorder Python
-changes.
+two places. On the box: last **45s** + `$25`. Next probe (not live until
+pasted): last **120s**, 75–90, edge **$0**, `late_90=0`, `horizon` **120**.
+Stop hourly. Restart `polypathlog` when recorder Python changes.
 
 Watch `buy_attempt band=late` / `late_90`, `buy_skip_underlying_edge`,
 `hedge_skip_oracle_still_winning`, `hedge_skip_persist`,
