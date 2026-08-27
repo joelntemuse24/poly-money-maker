@@ -1,8 +1,9 @@
 """CURRENT 5m rails — today's live bugs must fail before the fix and pass after.
 
 22 Aug 2026 (Europe/Dublin): 09:35 / 11:20 / 11:25 bags expired instead of
-dumping. These cases are the spec. 5m stays persist 70/72 + dump 53.
-Hourly (this change) is last-20m 75–90 with persist 50/52 + dump 35.
+dumping. These cases are the spec. 5m is back live: $2.50 two-slice, last-45s
+≥90 overlay, persist 5s @ 50/52 + dump 32 ignore-oracle (hourly false-hedge
+crackdown). Hourly stays last-20m 75–90 with persist 50/52 + dump 35.
 
 
 22 Aug 16:08 UTC: polybuybot5m crashed twice in the 12:05 ET window —
@@ -20,15 +21,20 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from buy.entry_skip import (
+    buy_retry_fak_limit,
     classify_fill_against_band,
     decide_5m_entry,
     stamp_slice_on_inventory,
+    validate_late_90_start_s,
 )
 from buy.hedge_gate import (
     evaluate_held_bag,
     hedge_fail_is_terminal,
     hedge_market_tick,
+    hedge_oracle_blocks_sell,
+    hedge_rest_required,
     hedge_should_keep_retrying,
+    held_hedge_decision,
     live_bag_log_fields,
     pick_held_quote,
     should_mark_hedge_closed,
@@ -49,10 +55,51 @@ def _band(ttm, ask):
 
 
 class LateEarlyPostGates(unittest.TestCase):
-    """Required: late 93 @ 116 no POST; early 85 @ 180 no POST; late 80 @ 41 POST."""
+    """Required: late 93 @ 116 no POST; last 45s 93 POST at 99; late 80 @ 41 POST."""
 
     def test_late_ttm_116_ask_93_no_post(self):
         self.assertIsNone(_band(116, 0.93))
+
+    def test_late_ttm_60_ask_93_no_post(self):
+        self.assertIsNone(_band(60, 0.93))
+
+    def test_late_ttm_40_ask_93_posts_99_limit(self):
+        band = _band(40, 0.93)
+        self.assertIsNotNone(band)
+        self.assertEqual(band.name, "late_90")
+        self.assertAlmostEqual(band.min_price, 0.90)
+        self.assertAlmostEqual(band.max_price, 0.99)
+        self.assertAlmostEqual(band.fak_limit, 0.99)
+        ns = _load_funcs(
+            "finite_float",
+            "quoted_buy_shares",
+            "quoted_buy_shares_up_to_limit",
+            bot=BOT5M,
+        )
+        shares = ns["quoted_buy_shares_up_to_limit"](
+            2.50, 0.93, 0.99, 5.0, spend_cap=3.0,
+        )
+        self.assertGreaterEqual(shares, 3.0)
+        self.assertLessEqual(shares * 0.99, 3.0 + 1e-9)
+
+    def test_late_ttm_40_ask_90_still_posts_late_90c_fak(self):
+        band = _band(40, 0.90)
+        self.assertIsNotNone(band)
+        self.assertEqual(band.name, "late")
+        self.assertAlmostEqual(band.fak_limit, 0.90)
+
+    def test_post_44s_93_allows_99_46s_93_rejects_44s_90_stays_fak_90(self):
+        armed = 0.99
+        live_44_93 = _band(44, 0.93)
+        self.assertIsNotNone(live_44_93)
+        self.assertEqual(live_44_93.name, "late_90")
+        self.assertAlmostEqual(buy_retry_fak_limit(armed, live_44_93), 0.99)
+        self.assertIsNone(_band(46, 0.93))
+        self.assertIsNone(buy_retry_fak_limit(armed, _band(46, 0.93)))
+        live_44_90 = _band(44, 0.90)
+        self.assertIsNotNone(live_44_90)
+        self.assertEqual(live_44_90.name, "late")
+        self.assertAlmostEqual(buy_retry_fak_limit(armed, live_44_90), 0.90)
 
     def test_early_ttm_180_ask_85_no_post(self):
         self.assertIsNone(_band(180, 0.85))
@@ -193,7 +240,7 @@ class HeldBagDumpAndDeadBand(unittest.TestCase):
 
 
 class SellExecutionRails(unittest.TestCase):
-    """Extracted 5m sell path: dump retries, 74¢ after persist, 0.01 tick."""
+    """Extracted 5m sell path: dump ≤32 retries, persist fade <53, 0.01 tick."""
 
     @staticmethod
     def _sell_ns(post_error=None, quotes=None, confirmed=0.0):
@@ -246,6 +293,10 @@ class SellExecutionRails(unittest.TestCase):
                 "SELL": "SELL",
                 "EXPECTED_TICK_SIZE": "0.001",
                 "TICK_SIZE_FALLBACK": "0.001",
+                "HEDGE_TOXIC_BID_MAX": 0.32,
+                "HEDGE_THRESHOLD": 0.50,
+                "HEDGE_RECOVERY_CANCEL": 0.53,
+                "HEDGE_SELL_FADE": True,
                 "hedge_market_tick": hedge_market_tick,
                 "hedge_tick_after_build_error": hedge_tick_after_build_error,
                 "hedge_should_keep_retrying": hedge_should_keep_retrying,
@@ -280,33 +331,54 @@ class SellExecutionRails(unittest.TestCase):
             def __str__(self):
                 return "no orders found to match with FAK order"
 
-        ns, calls = self._sell_ns(post_error=Unmatched(), quotes=[(0.47, 0.55)])
+        ns, calls = self._sell_ns(post_error=Unmatched(), quotes=[(0.31, 0.40)])
         sold, result, _proceeds = ns["sell_market_with_retry"](
-            "token", 3.2, 0.47,
+            "token", 3.2, 0.31,
             tick_size="0.001",
             max_retries=5,
             min_price=0.01,
             undercut_ticks=0,
             dump=True,
             persist_done=True,
-            initial_quote=(0.47, 0.55),
+            initial_quote=(0.31, 0.40),
             on_submit=lambda *args: calls["submit"].append(args),
         )
         self.assertEqual((sold, result.get("bot_status")), (0.0, "empty"))
         self.assertGreaterEqual(calls["post"], 2)
-        self.assertAlmostEqual(calls["orders"][0]["price"], 0.47)
+        self.assertAlmostEqual(calls["orders"][0]["price"], 0.31)
         self.assertFalse(
             hedge_fail_is_terminal(
-                result.get("bot_status"), 3.2, 0.47, persist_done=True,
+                result.get("bot_status"), 3.2, 0.31, persist_done=True,
+                dump_bid_max=0.32, qualify_bid=0.50, recovery_cancel=0.53,
+                sell_fade=True,
             )
         )
         self.assertTrue(
-            hedge_should_keep_retrying(3.2, 0.47, persist_done=True)
+            hedge_should_keep_retrying(
+                3.2, 0.31, persist_done=True,
+                dump_bid_max=0.32, qualify_bid=0.50, recovery_cancel=0.53,
+                sell_fade=True,
+            )
         )
 
-    def test_persist_done_074_posts_live_bid(self):
+    def test_persist_done_051_posts_live_bid(self):
+        ns, calls = self._sell_ns(quotes=[(0.51, 0.52)], confirmed=3.2)
+        ns["fill_proceeds"] = lambda *_a, **_k: 3.2 * 0.51
+        sold, result, _proceeds = ns["sell_market_with_retry"](
+            "token", 3.2, 0.51,
+            tick_size="0.001",
+            max_retries=1,
+            persist_done=True,
+            abort_above=None,
+            require_ask_max=None,
+            initial_quote=(0.51, 0.52),
+        )
+        self.assertEqual(result.get("bot_status"), "filled")
+        self.assertAlmostEqual(calls["orders"][0]["price"], 0.51)
+        self.assertAlmostEqual(sold, 3.2)
+
+    def test_persist_done_074_aborts_without_post(self):
         ns, calls = self._sell_ns(quotes=[(0.74, 0.76)], confirmed=3.2)
-        ns["fill_proceeds"] = lambda *_a, **_k: 3.2 * 0.74
         sold, result, _proceeds = ns["sell_market_with_retry"](
             "token", 3.2, 0.74,
             tick_size="0.001",
@@ -316,9 +388,9 @@ class SellExecutionRails(unittest.TestCase):
             require_ask_max=None,
             initial_quote=(0.74, 0.76),
         )
-        self.assertEqual(result.get("bot_status"), "filled")
-        self.assertAlmostEqual(calls["orders"][0]["price"], 0.74)
-        self.assertAlmostEqual(sold, 3.2)
+        self.assertEqual(calls["post"], 0)
+        self.assertEqual(sold, 0.0)
+        self.assertNotEqual(result.get("bot_status"), "filled")
 
     def test_persist_done_090_aborts_without_post(self):
         ns, calls = self._sell_ns(quotes=[(0.90, 0.92)], confirmed=3.2)
@@ -343,29 +415,33 @@ class SellExecutionRails(unittest.TestCase):
 
         ns, calls = self._sell_ns(post_error=Unmatched(), quotes=[(None, None)])
         sold, result, _proceeds = ns["sell_market_with_retry"](
-            "token", 3.2, 0.47,
+            "token", 3.2, 0.31,
             tick_size="0.01",
             max_retries=3,
             dump=True,
             refresh_quote=True,
-            initial_quote=(0.47, 0.55),
+            initial_quote=(0.31, 0.40),
         )
         self.assertGreaterEqual(calls["post"], 2)
         self.assertEqual(result.get("bot_status"), "empty")
-        self.assertFalse(hedge_fail_is_terminal("empty", 3.2, 0.47, persist_done=True))
+        self.assertFalse(hedge_fail_is_terminal(
+            "empty", 3.2, 0.31, persist_done=True,
+            dump_bid_max=0.32, qualify_bid=0.50, recovery_cancel=0.53,
+            sell_fade=True,
+        ))
 
     def test_signed_sell_uses_market_tick_01(self):
-        ns, calls = self._sell_ns(quotes=[(0.47, 0.55)], confirmed=3.2)
+        ns, calls = self._sell_ns(quotes=[(0.31, 0.40)], confirmed=3.2)
         ns["sell_market_with_retry"](
-            "token", 3.2, 0.47,
+            "token", 3.2, 0.31,
             tick_size="0.001",
             market_tick="0.01",
             max_retries=1,
             dump=True,
-            initial_quote=(0.47, 0.55),
+            initial_quote=(0.31, 0.40),
         )
         self.assertEqual(calls["options"][0]["tick_size"], "0.01")
-        self.assertAlmostEqual(calls["orders"][0]["price"], 0.47)
+        self.assertAlmostEqual(calls["orders"][0]["price"], 0.31)
 
     def test_061_not_sold_when_persist_not_done(self):
         intent = evaluate_held_bag(
@@ -536,6 +612,126 @@ class PersistSkipReasonCollision(unittest.TestCase):
         )
 
 
+class FiveMBuyRetryPinRails(unittest.TestCase):
+    """Armed late_90 FAK 99 must pin to the live band, not abort or walk 99."""
+
+    @staticmethod
+    def _buy_ns(ask, post_error=None):
+        ns = _load_funcs(
+            "finite_float",
+            "_result_as_dict",
+            "quoted_buy_shares",
+            "quoted_buy_shares_up_to_limit",
+            "buy_fill_walked",
+            "classify_buy_fill",
+            "implied_buy_average",
+            "buy_market_with_retry",
+            "unmatched_fak_rejection",
+            "definitive_order_rejection",
+            bot=BOT5M,
+        )
+        calls = {"post": 0, "orders": []}
+        signed = SimpleNamespace(
+            makerAmount="2500000",
+            takerAmount="2525253",
+            timestamp="1",
+        )
+
+        def post(*_a, **_k):
+            calls["post"] += 1
+            if post_error:
+                raise post_error
+            return {"status": "matched", "orderID": "order-buy"}
+
+        def create_order(args, **_kwargs):
+            calls["orders"].append(args)
+            return signed
+
+        ns.update(
+            {
+                "DRY_RUN": False,
+                "BUY": "BUY",
+                "BUY_MAX_SHARES": 5.0,
+                "BUY_MAX_SPEND": 3.0,
+                "HEDGE_GHOST_SLEEP_S": 0.0,
+                "MAX_ENTRY_SPREAD": 0.10,
+                "MIN_WINNER_BID": 0.70,
+                "TOXIC_FORCE_EXIT_BELOW": 0.65,
+                "console": SimpleNamespace(print=lambda *_a, **_k: None),
+                "log_event": lambda *_a, **_k: None,
+                "check_token_balance": lambda *_a, **_k: 0.0,
+                "check_clob_token_balance": lambda *_a, **_k: 0.0,
+                "_fill_fee_usdc": lambda *_a, **_k: None,
+                "get_quote_fast": lambda *_a, **_k: (
+                    round(float(ask) - 0.01, 4), 10.0, float(ask), 10.0, None,
+                ),
+                "entry_book_ok": lambda *_a, **_k: (True, "ok"),
+                "safe_api_call": lambda fn, *a, **k: fn(*a, **k),
+                "client": SimpleNamespace(
+                    create_order=create_order,
+                    post_order=post,
+                ),
+                "OrderArgs": lambda **kwargs: kwargs,
+                "PartialCreateOrderOptions": lambda **kwargs: kwargs,
+                "OrderType": SimpleNamespace(FAK="FAK"),
+                "signed_order_id": lambda *_a, **_k: "order-buy",
+                "extract_order_id": lambda _result: "order-buy",
+                "confirm_fill_size": lambda *_a, **_k: 3.0,
+                "fill_cost_usdc": lambda *_a, **_k: 2.50,
+                "classify_fill_against_band": classify_fill_against_band,
+                "time": SimpleNamespace(time=lambda: 1.0, sleep=lambda _s: None),
+            }
+        )
+        return ns, calls
+
+    def _run(self, ttm, ask, armed_max=0.99):
+        live = decide_5m_entry(ttm, ask)
+        retry_pins = [float(armed_max), 0.90]
+
+        def pre_submit(_bid, fresh_ask, _attempt):
+            band = decide_5m_entry(ttm, fresh_ask)
+            pinned = buy_retry_fak_limit(armed_max, band)
+            if pinned is None:
+                return False, "ttm_or_ask_out_of_band"
+            retry_pins[0] = float(pinned)
+            retry_pins[1] = float(band.retry_min_price)
+            return True, band.name
+
+        ns, calls = self._buy_ns(ask)
+        result = ns["buy_market_with_retry"](
+            "token", 2.50, armed_max,
+            min_price=0.90,
+            max_retries=1,
+            pre_submit=pre_submit,
+            retry_pins=retry_pins,
+        )
+        return result, calls, live
+
+    def test_44s_93_posts_99(self):
+        result, calls, live = self._run(44, 0.93)
+        self.assertIsNotNone(live)
+        self.assertEqual(live.name, "late_90")
+        self.assertEqual(calls["post"], 1)
+        self.assertAlmostEqual(calls["orders"][0]["price"], 0.99)
+        self.assertEqual(result[2], "filled")
+
+    def test_46s_93_rejects_without_post(self):
+        result, calls, live = self._run(46, 0.93)
+        self.assertIsNone(live)
+        self.assertEqual(calls["post"], 0)
+        self.assertEqual(calls["orders"], [])
+        self.assertEqual(result[2], "aborted")
+
+    def test_44s_90_stays_fak_90_not_99(self):
+        result, calls, live = self._run(44, 0.90)
+        self.assertIsNotNone(live)
+        self.assertEqual(live.name, "late")
+        self.assertEqual(calls["post"], 1)
+        self.assertAlmostEqual(calls["orders"][0]["price"], 0.90)
+        self.assertNotAlmostEqual(calls["orders"][0]["price"], 0.99)
+        self.assertEqual(result[2], "filled")
+
+
 class BotWiresCurrentRails(unittest.TestCase):
     def test_5m_uses_slug_clock_and_dump_helpers(self):
         src = BOT5M.read_text()
@@ -551,10 +747,58 @@ class BotWiresCurrentRails(unittest.TestCase):
         self.assertIn("persist_done=", src)
         self.assertIn("market_tick=", src)
         self.assertIn("max_retries=12 if dump", src)
+        self.assertIn('"hedge_threshold": 0.50', src)
+        self.assertIn('"hedge_require_ask_max": 0.52', src)
+        self.assertIn('"hedge_persist_s": 5.0', src)
+        self.assertIn('"hedge_toxic_bid_max": 0.32', src)
+        self.assertIn('"hedge_recovery_cancel": 0.53', src)
+        self.assertIn('"hedge_sell_fade": True', src)
+        self.assertIn('"hedge_require_oracle": True', src)
+        self.assertIn('"hedge_dump_ignore_oracle": True', src)
+        self.assertIn('"late_90_start_s": 45', src)
+        self.assertIn("hold_while_oracle_agrees(", src)
+        self.assertIn("hedge_dump_overrides_oracle(", src)
+        self.assertIn("hedge_rest_required(", src)
+        self.assertIn("hedge_oracle_blocks_sell(", src)
+        self.assertIn("buy_retry_fak_limit(", src)
+        self.assertIn("validate_late_90_start_s(", src)
+        self.assertIn("retry_pins=", src)
+        self.assertIn("hedge_skip_oracle_still_winning", src)
+        self.assertIn("sell_fade=HEDGE_SELL_FADE", src)
+        self.assertIn("pre_submit=_hedge_pre_submit", src)
+        self.assertIn("TTM {seconds_left", src)
+        self.assertNotIn("TTM {minutes_left", src)
+        self.assertNotIn("last_dump", src)
+        self.assertNotIn("oracle_dump_only", src)
+        self.assertNotIn("late_cap_now_90", src)
         self.assertNotIn(
             "seconds_left = (end_ts_ms - now_ms) / 1000",
             src,
         )
+        self.assertNotIn("late_ask_above_90", src)
+
+    def test_invalid_late_90_start_s_rejected(self):
+        with self.assertRaisesRegex(ValueError, "late_90_start_s must be >= 0"):
+            validate_late_90_start_s(-1, 120)
+        with self.assertRaisesRegex(ValueError, "late_90_start_s must be <= buy_start_s"):
+            validate_late_90_start_s(200, 120)
+
+    def test_dump_composition_helpers_match_review_cases(self):
+        self.assertTrue(hedge_rest_required(persist_done=False, peek_dump=False))
+        self.assertFalse(hedge_rest_required(persist_done=False, peek_dump=True))
+        self.assertFalse(
+            hedge_oracle_blocks_sell(
+                dump=True, oracle_agrees=True, dump_ignore_oracle=True,
+            )
+        )
+        intent = held_hedge_decision(
+            0.32, 0.90, None, None, None, None,
+            now_s=20.0, persist_armed_ts=None, persist_done=False,
+            oracle_agrees=True, dump_ignore_oracle=True,
+            dump_bid_max=0.32, qualify_bid=0.50, qualify_ask_max=0.52,
+            recovery_cancel=0.53, persist_s=5.0, sell_fade=True,
+        )
+        self.assertEqual(intent.action, "dump")
 
     def test_hourly_uses_persist_50_52_and_dump_helpers(self):
         src = BOT_HR.read_text()

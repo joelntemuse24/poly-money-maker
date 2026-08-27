@@ -42,11 +42,14 @@ def entry_band_for_seconds(
     early_95_start_s: float = 0.0,
     early_95_min_s: float = 0.0,
     early_95_min: float = 0.95,
+    late_90_start_s: float = 0.0,
+    late_90_min: float = 0.90,
+    late_90_max: float = 0.99,
 ) -> Optional[EntryBand]:
     """Primary band for this TTM (late, then ≥90 early, then ≥95).
 
     Prefer ``applicable_entry_bands`` when more than one window can fire
-    (first 3 min ≥90 and ≥95 overlap). Last 120s is late 75–90 only.
+    (first 3 min ≥90 and ≥95 overlap; last 45s 75–90 plus ≥90 overlay).
     """
     bands = applicable_entry_bands(
         seconds_left,
@@ -59,6 +62,9 @@ def entry_band_for_seconds(
         early_95_start_s=early_95_start_s,
         early_95_min_s=early_95_min_s,
         early_95_min=early_95_min,
+        late_90_start_s=late_90_start_s,
+        late_90_min=late_90_min,
+        late_90_max=late_90_max,
     )
     return bands[0] if bands else None
 
@@ -75,19 +81,26 @@ def applicable_entry_bands(
     early_95_start_s: float,
     early_95_min_s: float,
     early_95_min: float,
+    late_90_start_s: float = 0.0,
+    late_90_min: float = 0.90,
+    late_90_max: float = 0.99,
 ) -> List[EntryBand]:
     """Every 5m entry band that is open at this TTM (may be more than one).
 
     Late: ``seconds_left <= late_start_s`` → inclusive 75–90¢
-    (``late_max`` is ``buy_max_price``, typically 0.90). Last 120s does
+    (``late_max`` is ``buy_max_price``, typically 0.90). TTM 46–120 does
     **not** buy 91–99¢.
+
+    Last 45s ≥90 overlay: ``seconds_left <= late_90_start_s`` → ask at least
+    90¢ up to 99¢, FAK 99¢, still the late $2.50 slice. Exactly 90¢ stays
+    on the late 90¢ FAK (``select_entry_band`` picks the lower retry floor).
 
     Early ≥90: ``late_start_s < seconds_left <= early_start_s`` → ask at least
     90¢ (first 3 minutes of a 5m market).
 
     Early ≥95: ``early_95_min_s <= seconds_left <= early_95_start_s`` **and**
     ``seconds_left > late_start_s`` → ask at least 95¢. It does not overlay
-    the last 120s (that slice is 75–90 only).
+    the last 120s.
     """
     try:
         ttm = float(seconds_left)
@@ -95,6 +108,7 @@ def applicable_entry_bands(
         early_s = float(early_start_s)
         early_95_s = float(early_95_start_s)
         early_95_floor = float(early_95_min_s)
+        late_90_s = float(late_90_start_s)
     except (TypeError, ValueError):
         return []
     if ttm <= 0:
@@ -102,10 +116,15 @@ def applicable_entry_bands(
     bands: List[EntryBand] = []
     if ttm <= late_s + 1e-12:
         bands.append(EntryBand(float(late_min), float(late_max), False, "late"))
+    if late_90_s > 1e-12 and ttm <= late_90_s + 1e-12:
+        bands.append(EntryBand(
+            float(late_90_min), float(late_90_max), False, "late_90",
+            float(late_90_max),
+        ))
     if early_s > late_s + 1e-12 and late_s + 1e-12 < ttm <= early_s + 1e-12:
         bands.append(EntryBand(float(early_min), float(early_max), False, "early"))
     # ≥95 is an early-window overlay only. Last 120s stays late 75–90
-    # (do not buy 91–99 after T-120).
+    # except the last-45s ≥90 overlay above.
     if (
         early_95_s > early_95_floor + 1e-12
         and early_95_floor - 1e-12 <= ttm <= early_95_s + 1e-12
@@ -178,19 +197,66 @@ FIVE_M_BAND_DEFAULTS = {
     "early_95_start_s": 300,
     "early_95_min_s": 60,
     "early_95_min": 0.95,
+    "late_90_start_s": 45,
+    "late_90_min": 0.90,
+    "late_90_max": 0.99,
 }
 
 
 def decide_5m_entry(seconds_left, ask, **band_kwargs):
     """Band that may POST at this TTM + ask, or None (no POST).
 
-    Late TTM (0, 120]: 75–90 only. 93¢ at TTM 116 is a no.
+    Late TTM (45, 120]: 75–90 only. 93¢ at TTM 116 or 60 is a no.
+    Last 45s (0, 45]: 75–90 plus ≥90 overlay (93¢ POSTs as late_90 / FAK 99).
     Early TTM (120, 300]: ≥90. 85¢ at TTM 180 is a no.
     """
     kwargs = dict(FIVE_M_BAND_DEFAULTS)
     kwargs.update(band_kwargs)
     bands = applicable_entry_bands(seconds_left, **kwargs)
     return select_entry_band(ask, bands)
+
+
+def validate_late_90_start_s(late_90_start_s, buy_start_s) -> float:
+    """Reject a last-45 overlay that is negative or wider than the late window."""
+    try:
+        overlay = float(late_90_start_s)
+        late = float(buy_start_s)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("late_90_start_s must be a number") from exc
+    if overlay < 0:
+        raise ValueError("late_90_start_s must be >= 0")
+    if overlay > late + 1e-12:
+        raise ValueError("late_90_start_s must be <= buy_start_s")
+    return overlay
+
+
+def late_90_window_ok(seconds_left, late_90_start_s=45, late_start_s=120) -> bool:
+    """True when TTM is in (0, late_90_start_s] inside the late window."""
+    try:
+        overlay = validate_late_90_start_s(late_90_start_s, late_start_s)
+        ttm = float(seconds_left)
+    except (TypeError, ValueError):
+        return False
+    return overlay > 1e-12 and 0 < ttm <= overlay + 1e-12
+
+
+def buy_retry_fak_limit(armed_max, live_band):
+    """Pin FAK limit to the live open band (never walk 99 after late_90 closed).
+
+    ``None`` → abort POST (no live band). Else ``min(armed, live fak)``.
+    Armed late_90 @ 99 with a live 90¢ ask becomes a 90¢ FAK, not an abort
+    and not a 99¢ walk through 91–99.
+    """
+    if live_band is None:
+        return None
+    try:
+        armed = float(armed_max)
+        live = float(live_band.fak_limit)
+    except (TypeError, ValueError):
+        return None
+    if armed <= 0 or live <= 0:
+        return None
+    return min(armed, live)
 
 
 def classify_fill_against_band(

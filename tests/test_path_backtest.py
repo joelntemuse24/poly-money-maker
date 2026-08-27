@@ -464,12 +464,12 @@ class SweepTemplateTests(unittest.TestCase):
         self.assertEqual(tmpl["ttm_max"], 120.0)
         self.assertEqual(tmpl["budget"], 2.5)
         self.assertTrue(tmpl["hedge_require_gui"])
-        self.assertEqual(tmpl["hedge_threshold"], 0.70)
-        self.assertEqual(tmpl["hedge_require_ask_max"], 0.72)
-        self.assertEqual(tmpl["hedge_toxic_bid_max"], 0.53)
-        self.assertEqual(tmpl["hedge_persist_s"], 2.0)
-        self.assertEqual(tmpl["hedge_held_gui_max"], 0.72)
-        self.assertEqual(tmpl["hedge_other_gui_min"], 0.28)
+        self.assertEqual(tmpl["hedge_threshold"], 0.50)
+        self.assertEqual(tmpl["hedge_require_ask_max"], 0.52)
+        self.assertEqual(tmpl["hedge_toxic_bid_max"], 0.32)
+        self.assertEqual(tmpl["hedge_persist_s"], 5.0)
+        self.assertEqual(tmpl["hedge_held_gui_max"], 0.52)
+        self.assertEqual(tmpl["hedge_other_gui_min"], 0.48)
         self.assertFalse(tmpl["require_gui_reversed"])
 
     def test_template_reads_hourly_example(self):

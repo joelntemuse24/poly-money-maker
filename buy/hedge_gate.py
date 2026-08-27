@@ -151,7 +151,7 @@ def pick_held_quote(rest_bid, rest_ask, ws_bid, ws_ask, last_bid, last_ask):
 
 
 def hedge_qualify_ok(bid, ask, threshold, max_spread, require_ask_max):
-    """Tight 70/72 book. Missing ask cannot qualify persist (dump is bid-only)."""
+    """Tight persist book (live 5m 50/52). Missing ask cannot qualify persist."""
     bid_f = _finite_px(bid)
     ask_f = _finite_px(ask)
     try:
@@ -398,3 +398,101 @@ def hedge_oracle_allows_sell(held_leg, check, *, enabled=True):
     if str(check.get("reason") or "") == "edge_zero":
         return True, "oracle_flat"
     return False, "oracle_unknown"
+
+
+def hedge_dump_overrides_oracle(bid, dump_bid_max, *, enabled=True) -> bool:
+    """True when a toxic CLOB dump should proceed even if BTC still agrees.
+
+    Persist-50 sells stay behind the oracle. A 4–32¢ book is not a one-tick
+    dip; blocking that dump is how the 20d tape missed losers.
+    """
+    if not enabled:
+        return False
+    bid_f = _finite_px(bid)
+    if bid_f is None:
+        return False
+    try:
+        dump_max = float(dump_bid_max)
+    except (TypeError, ValueError):
+        return False
+    return bid_f <= dump_max + 1e-12
+
+
+def hedge_rest_required(*, persist_done, peek_dump) -> bool:
+    """REST unless persist is already done or a fresh WS dump peek is enough.
+
+    Stale last-good dump must not skip REST (false dump while BTC still agrees).
+    """
+    return not (bool(persist_done) or bool(peek_dump))
+
+
+def hedge_oracle_blocks_sell(*, dump, oracle_agrees, dump_ignore_oracle=True) -> bool:
+    """True → do not sell this tick.
+
+    Dump never blocked when ``dump_ignore_oracle``. Persist-50 stays gated.
+    """
+    if dump and dump_ignore_oracle:
+        return False
+    return bool(oracle_agrees)
+
+
+def held_hedge_decision(
+    rest_bid,
+    rest_ask,
+    ws_bid,
+    ws_ask,
+    last_bid,
+    last_ask,
+    *,
+    now_s,
+    persist_armed_ts,
+    persist_done=False,
+    oracle_agrees=False,
+    dump_ignore_oracle=True,
+    dump_bid_max=0.32,
+    qualify_bid=0.50,
+    qualify_ask_max=0.52,
+    recovery_cancel=0.53,
+    persist_s=5.0,
+    sell_fade=True,
+    max_spread=0.15,
+    gui_ok=True,
+    gui_why="ok",
+):
+    """REST + pick + evaluate + oracle block for one held tick (no I/O).
+
+    Fresh WS dump peek (or persist_done) may skip REST. Last-good is only a
+    pick fallback after REST is allowed to run. Dump skips the oracle; a
+    persist sell does not.
+    """
+    peek_dump = hedge_dump_overrides_oracle(ws_bid, dump_bid_max, enabled=True)
+    fetch_rest = hedge_rest_required(persist_done=persist_done, peek_dump=peek_dump)
+    use_rest_bid = rest_bid if fetch_rest else None
+    use_rest_ask = rest_ask if fetch_rest else None
+    bid, ask = pick_held_quote(
+        use_rest_bid, use_rest_ask, ws_bid, ws_ask, last_bid, last_ask,
+    )
+    intent = evaluate_held_bag(
+        bid, ask,
+        now_s=now_s,
+        persist_armed_ts=persist_armed_ts,
+        persist_s=persist_s,
+        dump_bid_max=dump_bid_max,
+        qualify_bid=qualify_bid,
+        qualify_ask_max=qualify_ask_max,
+        max_spread=max_spread,
+        persist_done=persist_done,
+        gui_ok=gui_ok,
+        gui_why=gui_why,
+        recovery_cancel=recovery_cancel,
+        sell_fade=sell_fade,
+    )
+    if hedge_oracle_blocks_sell(
+        dump=bool(intent.dump),
+        oracle_agrees=oracle_agrees,
+        dump_ignore_oracle=dump_ignore_oracle,
+    ):
+        return HedgeIntent(
+            "hold", "oracle_still_winning", None, None, False, True, None, False,
+        )
+    return intent

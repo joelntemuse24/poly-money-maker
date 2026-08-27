@@ -13,9 +13,12 @@ from buy.entry_skip import (
     applicable_hourly_entry_bands,
     ask_in_any_band,
     ask_in_entry_band,
+    buy_retry_fak_limit,
     can_arm_entry_slice,
     can_arm_hourly_slice,
+    decide_5m_entry,
     late_add_blocked_by_min,
+    late_90_window_ok,
     entry_band_for_seconds,
     entry_slice_budget,
     hourly_horizon_min,
@@ -28,6 +31,7 @@ from buy.entry_skip import (
     stamp_slice_bought,
     uncertain_buy_spend_cap,
     union_ask_band_reason,
+    validate_late_90_start_s,
     window_no_buy_reason,
 )
 from check_buy_skips import cycle_error_label, load_events, skip_reason, summarize
@@ -205,6 +209,9 @@ class FirstFourMinutesAt95Tests(unittest.TestCase):
             early_95_start_s=300,
             early_95_min_s=60,
             early_95_min=0.95,
+            late_90_start_s=45,
+            late_90_min=0.90,
+            late_90_max=0.99,
         )
 
     def test_first_three_minutes_allow_90_or_above(self):
@@ -238,6 +245,65 @@ class FirstFourMinutesAt95Tests(unittest.TestCase):
         self.assertFalse(ask_in_any_band(0.91, bands))
         self.assertFalse(ask_in_any_band(0.95, bands))
         self.assertFalse(ask_in_any_band(0.99, bands))
+
+    def test_last_45s_allows_90_and_up(self):
+        bands = self._bands(40)
+        self.assertEqual([b.name for b in bands], ["late", "late_90"])
+        self.assertTrue(ask_in_any_band(0.80, bands))
+        self.assertTrue(ask_in_any_band(0.90, bands))
+        self.assertTrue(ask_in_any_band(0.91, bands))
+        self.assertTrue(ask_in_any_band(0.99, bands))
+        self.assertFalse(ask_in_any_band(0.74, bands))
+        at_45 = self._bands(45)
+        self.assertIn("late_90", [b.name for b in at_45])
+        just_after = self._bands(46)
+        self.assertEqual([b.name for b in just_after], ["late"])
+        self.assertFalse(ask_in_any_band(0.91, just_after))
+
+    def test_last_45s_90c_prefers_late_fak_90(self):
+        """Exactly 90¢ still posts the late 90¢ FAK, not the 99¢ overlay."""
+        band = select_entry_band(0.90, self._bands(40))
+        self.assertIsNotNone(band)
+        self.assertEqual(band.name, "late")
+        self.assertAlmostEqual(band.fak_limit, 0.90)
+        overlay = select_entry_band(0.91, self._bands(40))
+        self.assertIsNotNone(overlay)
+        self.assertEqual(overlay.name, "late_90")
+        self.assertAlmostEqual(overlay.fak_limit, 0.99)
+
+    def test_decide_5m_entry_last_45_93_posts_late_90(self):
+        band = decide_5m_entry(40, 0.93)
+        self.assertIsNotNone(band)
+        self.assertEqual(band.name, "late_90")
+        self.assertAlmostEqual(band.fak_limit, 0.99)
+        self.assertIsNone(decide_5m_entry(60, 0.93))
+        self.assertIsNone(decide_5m_entry(46, 0.91))
+
+    def test_late_90_window_ok_is_45s_inclusive(self):
+        self.assertTrue(late_90_window_ok(44))
+        self.assertTrue(late_90_window_ok(45))
+        self.assertFalse(late_90_window_ok(46))
+        self.assertFalse(late_90_window_ok(0))
+        self.assertFalse(late_90_window_ok(120))
+
+    def test_buy_retry_fak_limit_pins_live_band_not_walk_99(self):
+        armed_99 = 0.99
+        at_44_93 = decide_5m_entry(44, 0.93)
+        self.assertIsNotNone(at_44_93)
+        self.assertAlmostEqual(buy_retry_fak_limit(armed_99, at_44_93), 0.99)
+        self.assertIsNone(buy_retry_fak_limit(armed_99, decide_5m_entry(46, 0.93)))
+        at_44_90 = decide_5m_entry(44, 0.90)
+        self.assertIsNotNone(at_44_90)
+        self.assertEqual(at_44_90.name, "late")
+        self.assertAlmostEqual(buy_retry_fak_limit(armed_99, at_44_90), 0.90)
+
+    def test_invalid_late_90_start_s_rejected(self):
+        with self.assertRaisesRegex(ValueError, "late_90_start_s must be >= 0"):
+            validate_late_90_start_s(-1, 120)
+        with self.assertRaisesRegex(ValueError, "late_90_start_s must be <= buy_start_s"):
+            validate_late_90_start_s(121, 120)
+        self.assertEqual(validate_late_90_start_s(45, 120), 45.0)
+        self.assertEqual(validate_late_90_start_s(0, 120), 0.0)
 
     def test_select_widest_matching_band_for_retry(self):
         early = select_entry_band(0.96, self._bands(180))
