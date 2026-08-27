@@ -23,15 +23,22 @@ book check.
 | Size | $2.50 + $2.50 | **$2.50** until this combo is live; then **$5** ≈ 2× $/h |
 | Hedge | 50/52 persist 5s, dump 32, recovery 53 | **unchanged** |
 
-Why this combo: last-45s + `$25` is the only first-touch window that stays
-eatable on both 72h 1s (~**+$1.56/h** at $2.50, **5%** flip, ~11 hits/h)
-and 7d 1m (~**+$0.69/h**, **7.8%** flip). Last **120s** + `$25` is
-**−$0.27/h** on 72h (15% flip — not eatable without a perfect hedge).
-Early first-touch is a coin flip (**33–48%**). Vol and against-momentum
-do not split the 75–90 analog. `$5` size is the scale lever for a **$1–3/h**
-band if fill rate holds; do not raise size on the current last-120 `$0`
-mix. Score on `check_reversal_features.py --hours 72` and `--hours 168
---binance-interval 1m`.
+Why this combo: last-45s + `$25` is the eatable cell on **72h 1s, 7d 1m,
+and 14d 1m**. First-touch paper (implied fill from `|dist|`, **$1** loser
+salvage, **$2.50** size):
+
+| Sample | last45+$25 | same at $5 | flip | last120+$25 | early+$25 |
+|---|---:|---:|---:|---:|---:|
+| 72h 1s | **+$1.55/h** | +$3.10/h | 5.0% | −$0.25/h | −$3.14/h |
+| 7d 1m | **+$0.69/h** | +$1.38/h | 7.7% | −$0.03/h | −$2.22/h |
+| 14d 1m | **+$0.78/h** | +$1.56/h | 6.3% | +$0.31/h | −$1.16/h |
+
+Last **30s** is a hair better on 72h 1s only (1m bars cannot tell 30 from
+45). Last **120s** is not eatable in the volatile 72h. Early first-touch
+is a coin flip. Vol / against-momentum do not split the 75–90 analog.
+`$5` is the scale lever for a **$1–2/h** band on the week; stay **$2.50**
+until this combo is live. Score: `check_reversal_features.py --hours 72`
+and `--hours 168 --binance-interval 1m` (14d: `--hours 336`).
 
 **Why we left 70/72 persist-2s / recovery 85 / dump 53:**
 
