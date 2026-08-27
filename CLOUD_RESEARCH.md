@@ -47,7 +47,7 @@ Hard rules:
 - Do not read, write, or ask for .env. Do not set dry_run false.
 - Do not edit strategy_buy.json / strategy_buy5m.json / strategy_buyhourly.json
   (non-example). Template file is strategy_buy5m.example.json. `--sweep`
-  scores the **late** keys only (75–90¢ / last 45s probe / $2.50).
+  scores the **late** keys only (75–90¢ / last 120s / $2.50).
   `live_5m_paper` is that file, not the live last-120 bot. `window_120s` is
   an explicit variant. It does
   **not** replay the live early ≥90 / ≥95 union or two $2.50 slices.
@@ -65,7 +65,7 @@ NOW snapshot (30 seconds, public APIs):
 - Print slug, seconds left, up/down best bid/ask/size.
 - Print whether the live 5m template WOULD BUY on this tick (ask in 75–90,
   ttm ≤ 120, spread ≤ 5¢, one winning leg). This is a call, not P&L yet.
-  `--sweep` live_5m_paper is the example JSON (last 45s today).
+  `--sweep` live_5m_paper is the example JSON (last 120s today).
 
 LIVE recorder (markets that are happening):
 - Start: .venv/bin/python pathlog.py
@@ -98,7 +98,7 @@ After the tables: at most 5 extra 5m combos that anatomy/grid suggest
 (not a cartesian bomb). --paper --series 5m --max-spread 0.05.
 
 How to pick a winner (this is the whole exercise):
-- Baseline = live_5m_paper (example JSON late keys: 75–90, last 45s probe,
+- Baseline = live_5m_paper (example JSON late keys: 75–90, last 120s,
   $2.50, paper 50/52). Compare `window_120s` if you want the live TTM.
 - Rank by pnl_sum first, then win_rate, then hits.
 - Ignore a variant with fewer than 5 hits on HISTORICAL or fewer than 3
@@ -131,7 +131,7 @@ Hard rules:
 - Do not edit strategy_buy.json / strategy_buy5m.json / strategy_buyhourly.json (non-example).
 - Do not read or write .env. Do not set dry_run false. Do not place orders.
 - Template file is strategy_buy5m.example.json. `--sweep` scores late
-  75–90¢ / last 45s (probe template) / $2.50 plus paper 50/52 — not the early ≥90 / ≥95 union.
+  75–90¢ / last 120s / $2.50 plus paper 50/52 — not the early ≥90 / ≥95 union.
 - Rank by paper pnl_sum vs live_5m_paper, not by hit count. If pathlog/ticks
   is missing, run pathlog.py (no orders) instead of inventing books.
 

@@ -631,8 +631,8 @@ def sweep_variants(tmpl: dict) -> List[dict]:
     """One-at-a-time deviations from the example JSON template.
 
     ``live_5m_paper`` is whatever ``buy_start_s`` / ``buy_max_price`` the
-    template file currently has (probe last-45s / 75–90 today, not the live
-    120s bot). Window variants skip the template's own ``ttm_max``.
+    template file currently has (live last-120s / 75–90). Window variants
+    skip the template's own ``ttm_max``.
     """
     ttm = float(tmpl["ttm_max"])
     tag = "5m" if abs(ttm - 120.0) < 1e-6 or abs(ttm - 45.0) < 1e-6 else "template"

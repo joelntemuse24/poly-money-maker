@@ -3,29 +3,25 @@
 **Agents: read this after `AGENTS.md`.** Update this file when ops/strategy decisions change.
 Do not put secrets, API keys, or live wallet material here.
 
-Last updated: **2026-08-27** — live 5m is still **last 45s + $25** (already
-on the VM). Pathlog paper + Binance `$25` shows that combo is **empty/−EV
-on restable CLOB books**. Analog +$1.53/h was implied 99/1 fills, not a
-FAK. **Do not re-paste last-45+$25.** Hourly is stopped. Hedge stays
-**persist 5s @ 50/52**, recovery **53¢**, dump **≤32¢**. **Do not add a
-vol/momentum buy skip.**
+Last updated: **2026-08-27** — operator pasted **last 120s / 75–90 / edge
+$0** (`start 120 … edge 0.0 late_90 0 horizon 120`, `dry_run False
+entry True`, 15m/hourly inactive). Last-45 + `$25` is off. Analog
++$1.53/h was implied 99/1 fills, not a FAK. Hourly is stopped. Hedge
+stays **persist 5s @ 50/52**, recovery **53¢**, dump **≤32¢**. **Do not
+add a vol/momentum buy skip.** Stay **$2.50**. Do not turn `late_90`
+back on until that overlay is papered.
 
-**On the box now** (do not treat analog as CLOB evidence):
+**On the box now:**
 
 | Knob | Value |
 |---|---|
-| Entry time | last **45s** (`buy_start_s=45`, `late_90_start_s=45`) |
-| Ask | **75–99¢** (late 75–90 + `late_90` overlay) |
-| `min_underlying_edge_usd` | **$25** |
+| Entry time | last **120s** (`buy_start_s=120`, `early_buy_start_s=120`) |
+| Ask | **75–90¢** only (`late_90_start_s=0`) |
+| `min_underlying_edge_usd` | **$0** (non-zero + same side; missing/flat/wrong side skip) |
 | Early / ≥95 | **off** |
-| Size | **$2.50** |
+| Size | **$2.50** (one late slice; early empty) |
 | Hedge | persist 5s @ 50/52, dump 32, recovery 53 |
-| Look / WS | `BUY_HORIZON_S` **45s** |
-
-**Recommended next probe** (operator must paste; not live until then):
-**last 120s, 75–90¢ only, `min_underlying_edge_usd=0`, `late_90` off,
-early off, $2.50**, same hedge. Printed `horizon` must be **120**, `edge`
-**0.0**, `late_90` **0**.
+| Look / WS | `BUY_HORIZON_S` **120s** (0.01s look from T-120; WS ~T-150) |
 
 ### Pathlog books (the FAK tape)
 
@@ -51,9 +47,8 @@ book this FAK cannot take.
 
 **$1/h lever is size + last-120, not `$25`.** At **$2.50** last-120 no
 edge is ~**+$0.41/h**. `$5` ~+$0.80/h. `$10` is the +$1.58 line (97–98%
-of 4× $2.50; few zeros). Stay **$2.50** until this next paste is on the
-box and filling. Do not enable `late_90` on the first switch (that ≥90
-overlay was **not** in this paper).
+of 4× $2.50; few zeros). Stay **$2.50** until last-120 is filling. Do
+not enable `late_90` yet (that ≥90 overlay was **not** in this paper).
 
 Analog Binance-only first-touch (implied fill from `|dist|`, not a
 restable ask) — keep for the 99/1 research, **do not pick live knobs
@@ -79,11 +74,12 @@ Those knobs stay gone. Persist is **5s @ 50/52**, recovery **53¢**
 (do not sell 55–69), dump **≤32¢** even if BTC has not crossed yet, and
 persist-50 still needs the oracle against/flat.
 
-**Next paste** (5m only; do not start hourly/15m/mint). `early_buy_start_s`
-must stay ≥ `buy_start_s` and positive — **120 / 120** makes the early
-window empty. `late_90_start_s=0` and `min_underlying_edge_usd=0`.
-Confirm printed `dry_run` / `entry` **before** restart. Printed `horizon`
-must be **120**, `edge` **0.0**, `late_90` **0**.
+**Already applied** (5m only; do not start hourly/15m/mint). Re-run only
+if live JSON drifted. `early_buy_start_s` must stay ≥ `buy_start_s` and
+positive — **120 / 120** makes the early window empty.
+`late_90_start_s=0` and `min_underlying_edge_usd=0`. Confirm printed
+`dry_run` / `entry` **before** restart. Printed `horizon` must be
+**120**, `edge` **0.0**, `late_90` **0**.
 
 ```bash
 cd ~/poly-money-maker && git pull
@@ -107,22 +103,21 @@ mint complete sets. Operator still sells leftover mint inventory by hand.
 `polybuybothourly`.
 
 **Active strategy:** **5m only** (`polybuybot5m`). Same-leg only. After
-`hedge_closed`, no re-buy. Two $2.50 slices. **On the box until the
-operator pastes last-120 / edge 0:**
+`hedge_closed`, no re-buy. One **$2.50** late slice (early window empty).
 
 | Knob | Value |
 |---|---|
-| Late window | last **45s**, **75–90¢**, FAK **90¢**, `$2.50` |
-| Last-45 overlay | last **45s**, **≥90¢**, FAK **99¢**, still the late `$2.50` |
-| Early / ≥95 | **off** |
-| `add_min_price` | **90¢** for a same-leg late add |
+| Late window | last **120s**, **75–90¢**, FAK **90¢**, `$2.50` |
+| `late_90` overlay | **off** (`late_90_start_s=0`) — do not FAK 99¢ |
+| Early / ≥95 | **off** (`early_buy_start_s=120`, `early_95_start_s=0`) |
+| `add_min_price` | **90¢** for a same-leg late add (no early fill → no add) |
 | Hedge qualify | bid ≤ **50¢**, ask ≤ **52¢**, spread ≤ 15¢, persist **5s** |
 | Hedge GUI | held ≤ **52¢**, other ≥ **48¢**. Buy 70/30 unchanged. Last print ≤ 52¢. |
 | Oracle while holding | Do **not persist-sell** if live Chainlink TWAP is still on the held side of PTB. Missing/stale feed holds. |
 | After persist | Sell at the live bid while **< 53¢**, including a fade through 50 (`hedge_sell_fade`). Bid ≥ **53¢** holds and clears persist. |
 | Dump | Bid-only ≤ **32¢** even if BTC still agrees (`hedge_dump_ignore_oracle`). Persist-50 does **not** get this bypass. |
-| Underlying buy edge | **$25** (`|TWAP−PTB|`); side must match. Pathlog: this ∩ restable last-45 is empty. |
-| `BUY_HORIZON_S` | **45s** (WS from ~T-75) |
+| Underlying buy edge | **$0** (`|TWAP−PTB|` non-zero + same side). Not `$25`. |
+| `BUY_HORIZON_S` | **120s** (WS from ~T-150) |
 | `max_open_positions` | **0 = unlimited** |
 | `poll_buy_window_s` / `poll_held_s` | **0.01** on the live 5m WS book |
 

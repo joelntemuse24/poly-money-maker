@@ -11,26 +11,26 @@ and why the non-boilerplate code exists — is `TECHNICAL_DESIGN.md`.
 (`polybuybot5m`) plus a no-order path recorder (`polypathlog`). 15m and
 hourly buy services are **stopped**. Mint (`polymintbot`) is **paused**.
 
-The 5m bot buys the winning leg of Polymarket BTC "Up or Down" markets in
-**two $2.50 slices** (up to **$5** if both fill). **Live after the
-operator pastes and restarts** (knobs in `strategy_buy5m.example.json`
-and `CURRENT.md`):
+The 5m bot buys the winning leg of Polymarket BTC "Up or Down" markets.
+**Live on the VM** (knobs in `strategy_buy5m.example.json` and `CURRENT.md`):
 
 | When (time to close) | Winning ask | Slice |
 |---|---|---|
-| Last **45s** (`TTM ≤ 45`) | **75–90¢** | **$2.50** late (`late_buy_budget`), FAK **90¢** |
-| Same last **45s** | **≥90¢** overlay | uses the late $2.50, FAK **99¢** (`late_90`) |
-| TTM > 45s | none | early / ≥95 **off** |
+| Last **120s** (`TTM ≤ 120`) | **75–90¢** | **$2.50** late (`late_buy_budget`), FAK **90¢** |
+| Same window | **≥90¢** | **no** (`late_90_start_s=0`) |
+| TTM > 120s | none | early / ≥95 **off** |
 
-`min_underlying_edge_usd` is **$25** (`|TWAP−PTB|`). Code defaults in
-`buybot5m.py` stay last-120 / early-300 / edge $0 until live JSON overlays
-them. `BUY_HORIZON_S` is **45** (WS from ~T-75). Later **$5** is
-`buy_budget=late_buy_budget=5`, `buy_max_spend=5`, `buy_max_shares=7`.
+`min_underlying_edge_usd` is **$0** (`|TWAP−PTB|` non-zero + same side).
+Code defaults in `buybot5m.py` still list last-120 / early-300 / edge $0
+until live JSON overlays them; the overlay now matches last-120 / early
+empty / edge $0 / `late_90` off. `BUY_HORIZON_S` is **120** (WS from
+~T-150). Later **$5** is `buy_budget=late_buy_budget=5`,
+`buy_max_spend=5`, `buy_max_shares=7`. Stay **$2.50** until this fills.
 
 Missed early does **not** become a $5 late buy — there is no early slice.
 Same-leg add only (no straddle), and only if the late ask is ≥ **90¢**
-(`add_min_price`). Flat late 75–90 is still a first entry. 91–99 is a no
-at TTM 46–120. After a full hedge the market is done.
+(`add_min_price`). Flat late 75–90 is the first entry. After a full hedge
+the market is done.
 Normal hedge is **persist 5s @ 50/52** (GUI: held ≤ **52¢**, other ≥
 **48¢**; not inverted 30/70). Then sell at the live bid while **< 53¢**
 (fade through 50 still sells). Bid ≥ **53¢** (`hedge_recovery_cancel`)
@@ -48,7 +48,7 @@ unless the operator asks. 15m stays stopped.
 | File | Service | Markets | Oracle | Budget | Window |
 |---|---|---|---|---|---|
 | `buybot.py` | `polybuybot` **stopped** | 15m | Chainlink TWAP 60s | $2.50 | final 4.0 min, 75–90¢, hedge 35/40 |
-| `buybot5m.py` | `polybuybot5m` **live** | 5m | Chainlink TWAP 30s | $2.50+$2.50 | last **45s** 75–99, edge **$25**; persist **5s @ 50/52** (dump 32¢) |
+| `buybot5m.py` | `polybuybot5m` **live** | 5m | Chainlink TWAP 30s | $2.50 | last **120s** 75–90, edge **$0**; persist **5s @ 50/52** (dump 32¢) |
 | `buybothourly.py` | `polybuybothourly` **stopped** | hourly | Binance BTCUSDT | $10 cap | last **20 min** 75–90¢; persist **5s @ 50/52** + oracle veto |
 | `pathlog.py` | `polypathlog` **live** | all three | — (CLOB books only) | — | whole 5m; last 8m of 15m; last **20m** of hourly |
 
@@ -194,14 +194,14 @@ python check_participation.py --hours 72 --csv exports/trades.csv
 Watch the console for `[DRY BUY]` / `[DRY SELL]` markers. Ctrl-C to stop.
 
 `--sweep` reads **late** keys from `strategy_buy5m.example.json`
-(**75–90 / last 45s / $2.50**; `live_5m_paper` is that file). Join the
-**$25** `|BTC−PTB|` gate with `--min-edge-usd 25` (Binance 1s, PTB =
-close at market start, live = close at fill ts — not Chainlink TWAP).
-VM 27 Aug (~3552 5m files, $10, spread ≤5¢, paper 50/52): last-45+$25
-kept **3/36** books (**−$7.39**); last-120+$25 kept **87/483**
-(**+$107 / +$0.36/h**); last-120 **no** `$25` was **+$1.58/h**. Analog
-last45+$25 is 99/1 implied fills, not a restable FAK. Next live probe
-is last-120 / 75–90 / edge **$0** (`CURRENT.md`) — not last-45+$25.
+(**75–90 / last 120s / $2.50**; `live_5m_paper` is that file). Join a
+Binance `|BTC−PTB|` floor with `--min-edge-usd` (1s, PTB = close at
+market start, live = close at fill ts — not Chainlink TWAP). VM 27 Aug
+(~3552 5m files, $10, spread ≤5¢, paper 50/52): last-45+$25 kept
+**3/36** books (**−$7.39**); last-120+$25 kept **87/483**
+(**+$107 / +$0.36/h**); last-120 **no** `$25` was **+$1.58/h** (~+$0.41/h
+at $2.50). Analog last45+$25 is 99/1 implied fills. Live probe is
+last-120 / 75–90 / edge **$0**.
 `--compare` uses hardcoded late-band presets; `--paper` hedge knobs still
 come from the example JSON (**50/52 persist 5s**, dump **32¢**). Neither
 command replays the early ≥90 / ≥95 union **or** the two-slice $2.50+$2.50
@@ -212,7 +212,7 @@ add.
 
 Live 5m (after this change is deployed and `polybuybot5m` restarted):
 
-- `buy_attempt` `band=late` / `late_90` / `early` / `early_95` and `slice=early|late` — which 5m window armed
+- `buy_attempt` `band=late` (75–90 last-120). `late_90` / `early` / `early_95` should not arm. `slice=late`
 - `hedge_attempt` / `hedge_fill` — persist **5s @ 50/52** then sell live bid **< 53¢**, including fade through 50. Dump ≤ **32¢** even if BTC still agrees. Bid ≥ **53¢** holds.
 - `hedge_skip_recovery` — persist_done but held bid ≥ 53¢; HOLD and clear persist. Do **not** sell 55–69.
 - `hedge_skip_oracle_still_winning` / `hedge_skip_oracle` — live TWAP still on held side of PTB, or feed missing/stale; do not persist-sell.
@@ -304,10 +304,10 @@ python check_reversal_features.py --hours 336
 python check_reversal_features.py --csv exports/trades.csv --restart-utc 2026-08-27T08:57:16
 ```
 
-`--sweep` scores the 5m **example** late template (**75–90 / last 45s /
-$2.50** in `strategy_buy5m.example.json`; the **$25** edge is not in
-pathlog) plus one-at-a-time window/band/size variants (`window_120s` is
-included; the template's own TTM is not duplicated).
+`--sweep` scores the 5m **example** late template (**75–90 / last 120s /
+$2.50** in `strategy_buy5m.example.json`) plus one-at-a-time
+window/band/size variants (`window_45s` is included; the template's own
+TTM is not duplicated). Join `$25` with `--min-edge-usd 25`.
 Paper hedge knobs come from that JSON (**50/52 persist 5s**, dump **32¢**,
 mid-as-GUI when spread ≤ 10¢, held ≤ 52¢ / other ≥ 48¢; paper honors
 `hedge_persist_s`). It does **not**
@@ -440,10 +440,10 @@ CI: pushes to `main` touching the buy bots, `pathlog.py`,
 SSH (`git pull` + `pip install` only). Services are **not** auto-restarted —
 start/restart deliberately after validation (`systemctl start` / `restart`).
 
-Last-45 + `$25` is **already on the VM**. Do **not** re-paste it. Next
-probe paste (last **120s**, 75–90, edge **$0**, `late_90=0`) lives in
-`CURRENT.md`. Confirm `dry_run` / `entry_enabled` **before** restart.
-Printed `horizon` must be **120**. Do **not** start 15m, hourly, or mint.
+Last **120s / 75–90 / edge $0** is **on the VM**. Re-paste only if JSON
+drifted (`CURRENT.md`). Confirm `dry_run` / `entry_enabled` **before**
+restart. Printed `horizon` must be **120**, `edge` **0.0**, `late_90`
+**0**. Do **not** start 15m, hourly, or mint. Stay **$2.50**.
 
 ## Dependencies
 
