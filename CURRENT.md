@@ -11,9 +11,9 @@ do not paste that into live JSON until you mean the probe.
 
 **Recommended next 5m combination** (example JSON; **not live** until
 the operator pastes into `strategy_buy5m.json` and restarts). Target
-~$1–2/hour. Evidence: Binance **1s** first-touch (72h + 7d; 14d if the
-API has it). 7d/14d **1m** numbers were biased: open-time stamps of the
-close look up to 60s ahead. Pathlog `--anatomy` on the VM is still the
+~$1–2/hour. Evidence: Binance **1s** first-touch on **72h, 7d, and 14d**
+(1,209,996 bars). 7d/14d **1m** numbers were biased: open-time stamps of
+the close look up to 60s ahead. Pathlog `--anatomy` on the VM is still the
 book check.
 
 | Knob | Live now | Next probe |
@@ -26,22 +26,29 @@ book check.
 | Hedge | 50/52 persist 5s, dump 32, recovery 53 | **unchanged** |
 | Look / WS | `BUY_HORIZON_S` 300 | **45s** (subscribe from ~T-75) |
 
-Why this combo: last-45s + `$25` was the eatable cell on 72h 1s. Confirm
-on 7d **1s** (not 1m) before pasting. First-touch paper (implied fill from
-`|dist|`, **$1** loser salvage, **$2.50** size):
+Why this combo: last-45s + `$25` is eatable on **72h, 7d, and 14d Binance
+1s** (closeTime stamps; the old 7d/14d 1m numbers were lookahead-biased).
+First-touch paper (implied fill from `|dist|`, **$1** loser salvage,
+**$2.50** size):
 
 | Sample | last45+$25 | same at $5 | flip | last120+$25 | early+$25 |
 |---|---:|---:|---:|---:|---:|
-| 72h 1s | **+$1.55/h** | +$3.10/h | 5.0% | −$0.25/h | −$3.14/h |
-| 7d 1s | *rerun this PR* | | | | |
-| 14d 1s | *rerun this PR if API has it* | | | | |
+| 72h 1s | **+$1.53/h** | +$3.06/h | 5.1% | −$0.27/h | −$3.17/h |
+| 7d 1s | **+$1.53/h** | +$3.05/h | 4.8% | −$0.21/h | −$3.20/h |
+| 14d 1s | **+$1.41/h** | +$2.83/h | 3.8% | +$0.41/h* | −$1.93/h |
 
-Last **30s** is a hair better on 72h 1s only. Last **120s** is not eatable
-in the volatile 72h. Early first-touch is a coin flip. Vol / against-momentum
-do not split the analog. `$5` is the scale lever for a **$1–2/h** band on
-the week; stay **$2.50** until this combo is live. Score:
-`check_reversal_features.py --hours 72` and `--hours 168` (14d: `--hours 336`).
-Default interval is **1s**.
+\*14d last-120 + `$25` is +EV only with `$1` salvage (`eat_nohedge=no`,
+12.1% flip). last-45 + `$25` is eatable with and without salvage on all
+three samples.
+
+Last **30s** + `$25` is a bit better now that 1s can tell 30 from 45
+(+$1.89 / +$1.82 / +$1.56 per hour, 2.2–2.8% flip). Keep **45s** as the
+probe (already the live last-45 overlay; still in the $1–2/h band). Last
+**120s** is not eatable without salvage in the 72h/7d. Early first-touch
+is −EV. Vol / against-momentum do not split the analog. `$5` is the scale
+lever (`buy_max_spend=5`, `buy_max_shares=7`); stay **$2.50** until this
+combo is live. Score: `check_reversal_features.py --hours 72` /
+`--hours 168` / `--hours 336` (default **1s**).
 
 **Why we left 70/72 persist-2s / recovery 85 / dump 53:**
 
@@ -308,9 +315,10 @@ amount / HTTP 400), not this NameError.
       off the VM before prune. No `.env`.
 - [x] 27 Aug reversal-feature tape (`check_reversal_features.py`): no vol
       skip. Combo is **last 45s + `min_edge` $25**, early off, hedge
-      unchanged, size $2.50 (then $5). Example JSON holds the knobs.
-      Not live until the operator pastes. $20–40 *bucket* 25% flip is
-      not eatable at 85¢; last-120 + $25 is still −EV on 72h 1s.
+      unchanged, size $2.50 (then $5). Confirmed on **72h / 7d / 14d 1s**
+      (closeTime stamps). Example JSON holds the knobs. Not live until the
+      operator pastes. $20–40 *bucket* 25% flip is not eatable at 85¢;
+      last-120 + $25 is still −EV on 72h/7d 1s.
 
 ---
 
