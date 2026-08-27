@@ -1978,6 +1978,29 @@ class BalanceAndGcSemantics(unittest.TestCase):
         self.assertGreaterEqual(
             float(data["early_95_start_s"]), float(data["early_95_min_s"]),
         )
+        # 0 must disable ≥95 even if live JSON still has min_s=60.
+        self.assertIn(
+            'float(cfg["early_95_start_s"]) > 0',
+            src,
+        )
+
+    def test_docs_vm_paste_is_last45_edge25(self):
+        root = BOT5M.parent
+        for name in ("CURRENT.md", "AGENTS.md"):
+            text = (root / name).read_text()
+            self.assertIn('d["buy_start_s"]=45', text, name)
+            self.assertIn('d["early_buy_start_s"]=45', text, name)
+            self.assertIn('d["early_95_start_s"]=0', text, name)
+            self.assertIn('d["early_95_min_s"]=0', text, name)
+            self.assertIn('d["late_90_start_s"]=45', text, name)
+            self.assertIn('d["min_underlying_edge_usd"]=25.0', text, name)
+            self.assertNotIn('d["buy_start_s"]=120', text, name)
+            self.assertNotIn('d["min_underlying_edge_usd"]=0.0', text, name)
+        ttd = (root / "TECHNICAL_DESIGN.md").read_text()
+        self.assertIn("last **45s**", ttd)
+        self.assertIn("`min_underlying_edge_usd` is **$25**", ttd)
+        self.assertNotIn("Live hourly B uses 90¢", ttd)
+        self.assertIn("Walking `buybot5m.py`", ttd)
 
 
 class FiveMFastPollHelpers(unittest.TestCase):

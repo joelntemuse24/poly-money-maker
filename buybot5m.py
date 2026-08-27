@@ -343,9 +343,12 @@ def load_strategy():
             raise ValueError("early_buy_start_s must be >= buy_start_s")
         if float(cfg["early_95_min_s"]) < 0:
             raise ValueError("early_95_min_s must be >= 0")
-        # 0/0 disables the ≥95 overlay (early_95_s > early_95_floor is false).
-        # Must stay off the "must be positive" list or example JSON cannot load.
-        if float(cfg["early_95_start_s"]) < float(cfg["early_95_min_s"]):
+        # 0 disables the ≥95 overlay even if early_95_min_s is leftover 60.
+        # Overlay math is already early_95_s > early_95_floor.
+        if (
+            float(cfg["early_95_start_s"]) > 0
+            and float(cfg["early_95_start_s"]) < float(cfg["early_95_min_s"])
+        ):
             raise ValueError("early_95_start_s must be >= early_95_min_s")
         validate_late_90_start_s(cfg["late_90_start_s"], cfg["buy_start_s"])
         if not (
