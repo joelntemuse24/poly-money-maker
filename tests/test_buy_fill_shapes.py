@@ -50,6 +50,50 @@ def _load_funcs(*names: str, bot: Path = BOT):
     return ns
 
 
+def _load_strategy_sign_lists(src: str) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    """Positive (<=0 reject) and non-negative (<0 reject) key lists in load_strategy."""
+    tree = ast.parse(src)
+    func = next(
+        n for n in tree.body
+        if isinstance(n, ast.FunctionDef) and n.name == "load_strategy"
+    )
+    positive: tuple[str, ...] | None = None
+    nonnegative: tuple[str, ...] | None = None
+    for node in ast.walk(func):
+        if not isinstance(node, ast.For):
+            continue
+        if not isinstance(node.target, ast.Name) or node.target.id != "key":
+            continue
+        if not isinstance(node.iter, ast.Tuple):
+            continue
+        keys = tuple(
+            elt.value
+            for elt in node.iter.elts
+            if isinstance(elt, ast.Constant) and isinstance(elt.value, str)
+        )
+        if not keys:
+            continue
+        msg_bits: list[str] = []
+        for child in ast.walk(node):
+            if not isinstance(child, ast.Raise):
+                continue
+            if not isinstance(child.exc, ast.Call) or not child.exc.args:
+                continue
+            arg0 = child.exc.args[0]
+            if isinstance(arg0, ast.JoinedStr):
+                for part in arg0.values:
+                    if isinstance(part, ast.Constant) and isinstance(part.value, str):
+                        msg_bits.append(part.value)
+        msg = "".join(msg_bits)
+        if "must be positive" in msg:
+            positive = keys
+        elif "must be non-negative" in msg:
+            nonnegative = keys
+    if positive is None or nonnegative is None:
+        raise RuntimeError("could not extract load_strategy sign lists")
+    return positive, nonnegative
+
+
 HELPERS = (
     "finite_float",
     "_decode_clob_fixed6",
@@ -1915,6 +1959,25 @@ class BalanceAndGcSemantics(unittest.TestCase):
         self.assertEqual(hourly["min_underlying_edge_usd"], 10.0)
         self.assertEqual(hourly["tick_size"], "0.01")
         self.assertEqual(fifteen["hedge_threshold"], 0.35)
+
+    def test_example_json_passes_5m_load_strategy_sign_rails(self):
+        src = BOT5M.read_text()
+        positive, nonnegative = _load_strategy_sign_lists(src)
+        self.assertIn("buy_start_s", positive)
+        self.assertIn("early_buy_start_s", positive)
+        self.assertNotIn("early_95_start_s", positive)
+        self.assertIn("early_95_start_s", nonnegative)
+        self.assertIn("early_95_min_s", nonnegative)
+        self.assertIn("late_90_start_s", nonnegative)
+        data = json.loads((BOT5M.parent / "strategy_buy5m.example.json").read_text())
+        for key in positive:
+            self.assertGreater(float(data[key]), 0, key)
+        for key in nonnegative:
+            self.assertGreaterEqual(float(data[key]), 0, key)
+        self.assertEqual(float(data["early_95_start_s"]), 0)
+        self.assertGreaterEqual(
+            float(data["early_95_start_s"]), float(data["early_95_min_s"]),
+        )
 
 
 class FiveMFastPollHelpers(unittest.TestCase):
