@@ -19,7 +19,9 @@ from check_reversal_features import (
     five_m_windows,
     gate_table,
     implied_fill_px,
+    kline_sample,
     late_band_touch,
+    merge_klines,
     paper_ev,
     paper_redeem_pnl,
     seconds_to_cross,
@@ -246,6 +248,23 @@ class BandAndPnlTests(unittest.TestCase):
         self.assertEqual(wins[0][1], 1200)
         self.assertEqual(wins[0][2], "btc-updown-5m-1200")
         self.assertEqual(wins[-1][1], 1500)
+
+    def test_1m_kline_stamps_close_time_not_open(self):
+        # Market end unix 300. TTM 45 is t=255. The last 1m bar opens at 240
+        # and closes at settlement (299.999) at 99000. Open-time stamp of that
+        # close would leak into TTM 45; closeTime must not.
+        bars = [
+            [180_000, "0", "0", "0", "100025", "0", 239_999],
+            [240_000, "0", "0", "0", "99000", "0", 299_999],
+        ]
+        series = merge_klines([[kline_sample(bar) for bar in bars]])
+        self.assertEqual(series.ts, [239, 299])
+        self.assertEqual(series.at_or_before(255), 100025.0)
+        self.assertEqual(series.at_or_before(299), 99000.0)
+        open_stamped = merge_klines(
+            [[(int(bar[0]) // 1000, float(bar[4])) for bar in bars]]
+        )
+        self.assertEqual(open_stamped.at_or_before(255), 99000.0)
 
 
 class CsvSessionTests(unittest.TestCase):

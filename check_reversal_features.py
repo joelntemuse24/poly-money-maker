@@ -12,8 +12,9 @@ Session tape (operator UI export):
 Historical 5m windows (public Binance, optional CLOB last-trades):
 
     python check_reversal_features.py --hours 72
+    python check_reversal_features.py --hours 168
+    python check_reversal_features.py --hours 336
     python check_reversal_features.py --hours 168 --binance-interval 1m
-    python check_reversal_features.py --hours 336 --binance-interval 1m
     python check_reversal_features.py --hours 48 --with-clob
 
 A reversal here is: the BTC side of PTB at sample time disagrees with the
@@ -218,6 +219,20 @@ def merge_klines(chunks: Iterable[list[tuple[int, float]]]) -> BtcSeries:
     return BtcSeries(ts=[t for t, _ in items], px=[p for _, p in items])
 
 
+def kline_sample(bar: Sequence[Any]) -> tuple[int, float]:
+    """Stamp the close at closeTime (ms index 6), not open time.
+
+    Open-time stamps of a 1m close look up to 60s ahead: ``at_or_before`` at
+    TTM 45 can see the settlement bar. 1s bars have closeTime in the same
+    unix second as open, so this is a no-op there. Pagination still walks
+    Binance ``openTime``. Cache files store raw API bars, so a stamp change
+    reparses existing pages.
+    """
+    close_ms = int(bar[6])
+    close = float(bar[4])
+    return close_ms // 1000, close
+
+
 def fetch_binance_klines(
     http: requests.Session,
     *,
@@ -269,8 +284,7 @@ def fetch_binance_klines(
         last_open = None
         for bar in raw:
             open_ms = int(bar[0])
-            close = float(bar[4])
-            rows.append((open_ms // 1000, close))
+            rows.append(kline_sample(bar))
             last_open = open_ms
         chunks.append(rows)
         if last_open is None or len(raw) < 1000:
@@ -607,18 +621,21 @@ def _combo_row(
     pnl: float,
     fills: list[float],
     hours: float,
+    salvage: float,
 ) -> tuple[float, str]:
     if not hits or hours <= 0:
-        return float("-inf"), f"{name}\t0\t\t\t\t\t\t\t\t"
+        return float("-inf"), f"{name}\t0\t\t\t\t\t\t\t\t\t"
     fr = flips / hits
     wr = 1.0 - fr
     mean_f = mean(fills) or DEFAULT_FILL_PX
     per_h = pnl / hours
-    eat = eatable(fr, mean_f, 0.0)
+    eat0 = eatable(fr, mean_f, 0.0)
+    eat1 = eatable(fr, mean_f, salvage)
     return (
         per_h,
         f"{name}\t{hits}\t{hits / hours:.1f}\t{pct(fr)}\t{pct(wr)}\t"
-        f"{mean_f:.2f}\t{money(pnl)}\t{money(per_h)}\t{money(per_h * 2)}\t{eat}",
+        f"{mean_f:.2f}\t{money(pnl)}\t{money(per_h)}\t{money(per_h * 2)}\t"
+        f"{eat0}\t{eat1}",
     )
 
 
@@ -649,7 +666,15 @@ def score_packed_picks(
         if not won:
             flips += 1
         pnl += paper_fill_pnl(fill, bool(won), salvage=salvage, budget=budget)
-    return _combo_row(name=name, hits=hits, flips=flips, pnl=pnl, fills=fills, hours=hours)
+    return _combo_row(
+        name=name,
+        hits=hits,
+        flips=flips,
+        pnl=pnl,
+        fills=fills,
+        hours=hours,
+        salvage=salvage,
+    )
 
 
 def score_combos(
@@ -665,7 +690,8 @@ def score_combos(
         f"COMBOS first-touch  n_windows={n}  hours={hours:.1f}  "
         f"budget=${budget:.2f}  salvage=${salvage:.2f} on losers  "
         f"$5 col = 2× size, same hits",
-        "name\thits\thit/hour\tflip\twr\tmean_fill\tpnl\t$/h\t$/h_at_$5\teat_nohedge",
+        "name\thits\thit/hour\tflip\twr\tmean_fill\tpnl\t$/h\t$/h_at_$5\t"
+        "eat_nohedge\teat_salvage",
     ]
     rows_out: list[tuple[float, str]] = []
     for spec in COMBO_SPECS:
@@ -737,10 +763,14 @@ def score_grid(
 
 
 def session_replay_table(samples: Sequence[Sample], hours: float) -> list[str]:
-    """Keep session fills whose fill TTM and |dist| pass a combo gate."""
+    """Keep session fills whose fill TTM and |dist| pass a combo gate.
+
+    This is not a last-45 first-touch simulator. A fill that already happened
+    at TTM 110 is skipped by last45_* even if a later tick would have passed.
+    """
     lines = [
-        "SESSION replay — keep actual wallet P&L if fill TTM ≤ window "
-        "and |BTC−PTB| ≥ edge (not implied fill)",
+        "SESSION replay — keep actual wallet P&L if that fill's TTM ≤ window "
+        "and |BTC−PTB| ≥ edge (not a last-45 simulator; early fills all skip)",
         "name\tkeep\tskip\tkeep/h\tpnl_kept\t$/h_kept",
     ]
     base = sum(s.pnl_redeem for s in samples)
@@ -1502,6 +1532,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     report.append("NOTES")
     report.append("- Live 5m already requires TWAP vs PTB side match ($0 edge). This study asks whether |dist|, vol, or against-momentum add flip prediction on top of that.")
     report.append("- Binance 1s/1m is not Chainlink TWAP 30s. Directional level/vol should still rank; exact dollar thresholds will not match the live feed tick-for-tick.")
+    report.append("- 1m klines are stamped at closeTime. Open-time stamps of the close look up to 60s ahead (TTM 45 can see settlement). Prefer --binance-interval 1s.")
     report.append("- BTC-only rows include 50/50 windows the bot would never buy. CLOB late-band rows are the closer analog to a 75–90 fill.")
     report.append("- Combo $/h uses implied fill from |dist| (session-calibrated). live_shaped_union is early ≥90 analog + late 75–90 + last-45 ≥90 on that map.")
     report.append("- A live dump at 32¢ / persist-50 changes skip-cost in losers' favor (skipping a loser is worth less than $2.50).")
@@ -1512,7 +1543,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     report.append("  disable early: early_buy_start_s=45, early_95_start_s=0, early_95_min_s=0")
     report.append("  ask: 75–90 plus last-45 ≥90 overlay (75–99 in the last 45s)")
     report.append("  oracle: min_underlying_edge_usd=25 (|TWAP−PTB|; this study used Binance)")
-    report.append("  size: stay $2.50; $5 is ~2× $/h if fills hold (buy_budget=late_buy_budget=5, buy_max_spend=6)")
+    report.append(
+        "  size: stay $2.50; $5 is ~2× $/h if fills hold "
+        "(buy_budget=late_buy_budget=5, buy_max_spend=5, buy_max_shares=7)"
+    )
     report.append("  hedge: unchanged persist 5s @ 50/52, dump 32, recovery 53")
     report.append("  do not add a vol or against-momentum skip")
 

@@ -6,12 +6,14 @@ Do not put secrets, API keys, or live wallet material here.
 Last updated: **2026-08-27** — 5m live after #129 (last **120s** 75–90,
 early ≥90, `min_edge` **$0**). Hourly is stopped. Hedge is **persist 5s
 @ 50/52**, recovery **53¢**, dump **≤32¢**. **Do not add a vol/momentum
-buy skip.**
+buy skip.** `early_95_start_s=0` is valid in `load_strategy` (disable ≥95);
+do not paste that into live JSON until you mean the probe.
 
 **Recommended next 5m combination** (example JSON; **not live** until
 the operator pastes into `strategy_buy5m.json` and restarts). Target
-~$1–2/hour. Evidence: 72h Binance 1s + 7d 1m first-touch, plus the
-post-restart wallet tape. Pathlog `--anatomy` on the VM is still the
+~$1–2/hour. Evidence: Binance **1s** first-touch (72h + 7d; 14d if the
+API has it). 7d/14d **1m** numbers were biased: open-time stamps of the
+close look up to 60s ahead. Pathlog `--anatomy` on the VM is still the
 book check.
 
 | Knob | Live now | Next probe |
@@ -20,25 +22,26 @@ book check.
 | Ask | 75–90; ≥90 last 45s; ≥90 early | **75–99** in last 45s (late 75–90 + `late_90` overlay) |
 | `min_underlying_edge_usd` | **$0** | **$25** (`|TWAP−PTB|`) |
 | Early / ≥95 | on | **off** (`early_buy_start_s=45`, `early_95_start_s=0`) |
-| Size | $2.50 + $2.50 | **$2.50** until this combo is live; then **$5** ≈ 2× $/h |
+| Size | $2.50 + $2.50 | **$2.50** until this combo is live; then **$5** (`buy_max_spend=5`, `buy_max_shares=7`) |
 | Hedge | 50/52 persist 5s, dump 32, recovery 53 | **unchanged** |
+| Look / WS | `BUY_HORIZON_S` 300 | **45s** (subscribe from ~T-75) |
 
-Why this combo: last-45s + `$25` is the eatable cell on **72h 1s, 7d 1m,
-and 14d 1m**. First-touch paper (implied fill from `|dist|`, **$1** loser
-salvage, **$2.50** size):
+Why this combo: last-45s + `$25` was the eatable cell on 72h 1s. Confirm
+on 7d **1s** (not 1m) before pasting. First-touch paper (implied fill from
+`|dist|`, **$1** loser salvage, **$2.50** size):
 
 | Sample | last45+$25 | same at $5 | flip | last120+$25 | early+$25 |
 |---|---:|---:|---:|---:|---:|
 | 72h 1s | **+$1.55/h** | +$3.10/h | 5.0% | −$0.25/h | −$3.14/h |
-| 7d 1m | **+$0.69/h** | +$1.38/h | 7.7% | −$0.03/h | −$2.22/h |
-| 14d 1m | **+$0.78/h** | +$1.56/h | 6.3% | +$0.31/h | −$1.16/h |
+| 7d 1s | *rerun this PR* | | | | |
+| 14d 1s | *rerun this PR if API has it* | | | | |
 
-Last **30s** is a hair better on 72h 1s only (1m bars cannot tell 30 from
-45). Last **120s** is not eatable in the volatile 72h. Early first-touch
-is a coin flip. Vol / against-momentum do not split the 75–90 analog.
-`$5` is the scale lever for a **$1–2/h** band on the week; stay **$2.50**
-until this combo is live. Score: `check_reversal_features.py --hours 72`
-and `--hours 168 --binance-interval 1m` (14d: `--hours 336`).
+Last **30s** is a hair better on 72h 1s only. Last **120s** is not eatable
+in the volatile 72h. Early first-touch is a coin flip. Vol / against-momentum
+do not split the analog. `$5` is the scale lever for a **$1–2/h** band on
+the week; stay **$2.50** until this combo is live. Score:
+`check_reversal_features.py --hours 72` and `--hours 168` (14d: `--hours 336`).
+Default interval is **1s**.
 
 **Why we left 70/72 persist-2s / recovery 85 / dump 53:**
 
@@ -60,11 +63,14 @@ Do **not** patch live JSON until the operator asks; the knobs live in
 `strategy_buy5m.example.json`. VM pathlog `--anatomy --ttm-max 45` is
 the book confirmation.
 
-Paste when applying the probe (5m only; do not start hourly/15m/mint):
+Paste when applying the probe (5m only; do not start hourly/15m/mint).
+`early_95_start_s=0` is allowed after this PR. `BUY_HORIZON_S` becomes
+**45s** (WS subscribe from ~T-75). This paste includes the live hedge knobs
+so a file that never got them still qualifies:
 
 ```bash
 cd ~/poly-money-maker && git pull
-python3 -c 'import json; from pathlib import Path; p=Path("strategy_buy5m.json"); d=json.loads(p.read_text()); d["buy_start_s"]=45; d["early_buy_start_s"]=45; d["early_95_start_s"]=0; d["early_95_min_s"]=0; d["late_90_start_s"]=45; d["min_underlying_edge_usd"]=25.0; d["buy_budget"]=2.5; d["late_buy_budget"]=2.5; d["buy_max_spend"]=3.0; p.write_text(json.dumps(d, indent=2)+"\n"); print("start", d["buy_start_s"], "early", d["early_buy_start_s"], "e95", d["early_95_start_s"], "edge", d["min_underlying_edge_usd"], "late_90", d["late_90_start_s"], "dry_run", d.get("dry_run"), "entry", d.get("entry_enabled"))'
+python3 -c 'import json; from pathlib import Path; p=Path("strategy_buy5m.json"); d=json.loads(p.read_text()); d["hedge_threshold"]=0.50; d["hedge_require_ask_max"]=0.52; d["hedge_persist_s"]=5.0; d["hedge_toxic_bid_max"]=0.32; d["hedge_recovery_cancel"]=0.53; d["hedge_sell_fade"]=True; d["hedge_require_oracle"]=True; d["hedge_dump_ignore_oracle"]=True; d["hedge_oracle_min_edge_usd"]=0.0; d["hedge_undercut_ticks"]=0; d["hedge_min_price"]=0.32; d["buy_start_s"]=45; d["early_buy_start_s"]=45; d["early_95_start_s"]=0; d["early_95_min_s"]=0; d["late_90_start_s"]=45; d["min_underlying_edge_usd"]=25.0; d["add_min_price"]=0.90; d["buy_budget"]=2.5; d["late_buy_budget"]=2.5; d["buy_max_price"]=0.90; d["early_buy_max_price"]=0.99; d["buy_max_spend"]=3.0; d["poll_buy_window_s"]=0.01; d["poll_held_s"]=0.01; d["ui_every_n_cycles"]=50; p.write_text(json.dumps(d, indent=2)+"\n"); print("start", d["buy_start_s"], "early", d["early_buy_start_s"], "e95", d["early_95_start_s"], "edge", d["min_underlying_edge_usd"], "late_90", d["late_90_start_s"], "horizon", max(d["buy_start_s"], d["early_buy_start_s"], d["early_95_start_s"]), "hedge", d["hedge_threshold"], d["hedge_require_ask_max"], "persist", d["hedge_persist_s"], "dump", d["hedge_toxic_bid_max"], "recovery", d["hedge_recovery_cancel"], "dry_run", d.get("dry_run"), "entry", d.get("entry_enabled"))'
 sudo systemctl restart polybuybot5m
 ```
 
