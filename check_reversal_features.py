@@ -329,7 +329,10 @@ def features_at(
 
     def _mom(lookback: float, min_age: float) -> Optional[float]:
         ago = btc.sample_at_or_before(ts - lookback)
-        if ago is None:
+        now_s = btc.sample_at_or_before(ts)
+        if ago is None or now_s is None:
+            return None
+        if ago[0] >= now_s[0]:
             return None
         age = ts - ago[0]
         if age < min_age:
@@ -817,6 +820,31 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             "skip |dist|<$10 OR projected cross",
         )
     )
+    mid = [s for s in btc_samples if 10.0 <= s.feat.abs_dist < 40.0]
+    report.append("")
+    report.append(
+        f"MID |dist| $10–40 at T-{sample_ttm:.0f}s (closer analog to a 75–90 favorite) n={len(mid)}"
+    )
+    if mid:
+        report.extend(
+            tabulate(
+                mid,
+                lambda s: "against" if s.feat.against_30s else ("with" if s.feat.against_30s is False else "na"),
+                order=("against", "with", "na"),
+            )
+        )
+        report.extend(
+            tabulate(
+                mid,
+                lambda s: "cross_before_end" if s.feat.cross_before_end else (
+                    "not_approaching" if s.feat.cross_before_end is False else "na"
+                ),
+                order=("cross_before_end", "not_approaching", "na"),
+            )
+        )
+        report.append(skip_cost_table(mid, lambda s: bool(s.feat.against_30s), "mid: skip against-mom"))
+        report.append(skip_cost_table(mid, lambda s: bool(s.feat.cross_before_end), "mid: skip projected cross"))
+        report.append(skip_cost_table(mid, lambda s: (s.feat.vol_30s or 0) >= 4, "mid: skip vol30>=$4"))
 
     clob_samples: list[Sample] = []
     if args.with_clob:

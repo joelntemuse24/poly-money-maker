@@ -96,6 +96,14 @@ class FeatureMathTests(unittest.TestCase):
         # Last two 1m bars: 100005 → 99990, still down and moving down = with.
         self.assertFalse(feat.against_30s)
 
+    def test_sparse_1m_detects_against(self):
+        ts = [0, 60, 120, 180, 240]
+        px = [100_000.0, 99_950.0, 99_940.0, 99_970.0, 99_990.0]
+        btc = BtcSeries(ts=ts, px=px)
+        feat = features_at(btc, ts=240, end_ts=300, ptb=100_000.0)
+        self.assertEqual(feat.side, "down")
+        self.assertTrue(feat.against_30s)
+
 
 class BandAndPnlTests(unittest.TestCase):
     def test_late_band_touch_first_in_window(self):
