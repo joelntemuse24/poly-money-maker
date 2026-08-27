@@ -1,0 +1,915 @@
+#!/usr/bin/env python3
+"""Correlate BTC level, short-horizon vol, and momentum with 5m reversals.
+
+No orders. No .env. Binance BTCUSDT is a proxy for Chainlink TWAP 30s (the
+live 5m oracle). Pathlog ~1s books are not required.
+
+Session tape (operator UI export):
+
+    python check_reversal_features.py --csv history.csv \\
+        --restart-utc 2026-08-27T08:57:16
+
+Historical 5m windows (public Binance, optional CLOB last-trades):
+
+    python check_reversal_features.py --hours 48
+    python check_reversal_features.py --hours 168 --binance-interval 1m
+    python check_reversal_features.py --hours 48 --with-clob
+
+A reversal here is: the BTC side of PTB at sample time disagrees with the
+side at the window close. CLOB mode additionally requires a 75–90¢ last
+print in the last 120s (the live late band) before scoring that market.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import math
+import statistics
+import sys
+import time
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Iterable, Optional, Sequence
+
+import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+
+from check_hedge_threshold import (
+    ET,
+    fetch_event,
+    fetch_trades,
+    five_m_start_ts,
+    load_csv,
+    series_of,
+    session as hedge_session,
+)
+
+# api.binance.com is geo-blocked on some cloud egress; the vision mirror is public.
+BINANCE_KLINES = "https://data-api.binance.vision/api/v3/klines"
+USER_AGENT = "Mozilla/5.0 (compatible; poly-money-maker-reversal-research/1.0)"
+SLUG_PREFIX = "btc-updown-5m"
+WINDOW_S = 300
+LATE_TTM_S = 120.0
+LATE_MIN = 0.75
+LATE_MAX = 0.90
+BUDGET = 2.50
+DEFAULT_FILL_PX = 0.85
+
+# |BTC−PTB| buckets in USD (Binance proxy).
+DIST_EDGES = (0.0, 5.0, 10.0, 20.0, 40.0, 80.0, math.inf)
+# 30s realized move (std of 1s diffs, USD).
+VOL_EDGES = (0.0, 2.0, 4.0, 8.0, 16.0, math.inf)
+# |30s momentum| in USD.
+MOM_EDGES = (0.0, 5.0, 10.0, 20.0, 40.0, math.inf)
+
+
+def http_session() -> requests.Session:
+    out = requests.Session()
+    retry = Retry(
+        total=4,
+        backoff_factor=0.4,
+        status_forcelist=(429, 500, 502, 503, 504),
+        allowed_methods=("GET",),
+    )
+    out.mount("https://", HTTPAdapter(max_retries=retry, pool_maxsize=16))
+    out.headers["User-Agent"] = USER_AGENT
+    return out
+
+
+def parse_utc(text: str) -> datetime:
+    raw = (text or "").strip().replace("Z", "+00:00")
+    dt = datetime.fromisoformat(raw)
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+
+def side_of(px: Optional[float], ptb: Optional[float]) -> Optional[str]:
+    if px is None or ptb is None:
+        return None
+    delta = float(px) - float(ptb)
+    if delta > 0:
+        return "up"
+    if delta < 0:
+        return "down"
+    return None
+
+
+def stdev(values: Sequence[float]) -> Optional[float]:
+    if len(values) < 2:
+        return None
+    return statistics.pstdev(values)
+
+
+def realized_move(prices: Sequence[float]) -> Optional[float]:
+    """USD std of successive diffs — typical 1-step move over the sample."""
+    if len(prices) < 3:
+        return None
+    diffs = [prices[i] - prices[i - 1] for i in range(1, len(prices))]
+    return stdev(diffs)
+
+
+def seconds_to_cross(dist: float, vel_per_s: float) -> Optional[float]:
+    """Linear time to PTB if velocity is toward the open. None = not approaching."""
+    if dist == 0:
+        return 0.0
+    if vel_per_s == 0 or dist * vel_per_s >= 0:
+        return None
+    return abs(dist) / abs(vel_per_s)
+
+
+def bucket(value: Optional[float], edges: Sequence[float]) -> str:
+    if value is None or not math.isfinite(value):
+        return "na"
+    for lo, hi in zip(edges, edges[1:]):
+        if lo <= value < hi:
+            if math.isinf(hi):
+                return f">={lo:g}"
+            return f"{lo:g}–{hi:g}"
+    return f">={edges[-2]:g}"
+
+
+def mean(values: Sequence[float]) -> Optional[float]:
+    if not values:
+        return None
+    return sum(values) / len(values)
+
+
+def money(value: Optional[float]) -> str:
+    if value is None:
+        return ""
+    return f"{value:+.2f}"
+
+
+def pct(value: Optional[float]) -> str:
+    if value is None:
+        return ""
+    return f"{value:.1%}"
+
+
+@dataclass
+class BtcSeries:
+    """Sorted (unix_s, close) samples."""
+
+    ts: list[int]
+    px: list[float]
+
+    def _idx_at_or_before(self, unix: float) -> int:
+        if not self.ts:
+            return -1
+        lo, hi = 0, len(self.ts)
+        while lo < hi:
+            mid = (lo + hi) // 2
+            if self.ts[mid] <= unix:
+                lo = mid + 1
+            else:
+                hi = mid
+        return lo - 1
+
+    def at_or_before(self, unix: float) -> Optional[float]:
+        idx = self._idx_at_or_before(unix)
+        if idx < 0:
+            return None
+        return self.px[idx]
+
+    def sample_at_or_before(self, unix: float) -> Optional[tuple[int, float]]:
+        idx = self._idx_at_or_before(unix)
+        if idx < 0:
+            return None
+        return self.ts[idx], self.px[idx]
+
+    def window(self, start: float, end: float) -> list[float]:
+        if not self.ts:
+            return []
+        lo, hi = 0, len(self.ts)
+        while lo < hi:
+            mid = (lo + hi) // 2
+            if self.ts[mid] < start:
+                lo = mid + 1
+            else:
+                hi = mid
+        left = lo
+        lo, hi = 0, len(self.ts)
+        while lo < hi:
+            mid = (lo + hi) // 2
+            if self.ts[mid] <= end:
+                lo = mid + 1
+            else:
+                hi = mid
+        return self.px[left:lo]
+
+
+def merge_klines(chunks: Iterable[list[tuple[int, float]]]) -> BtcSeries:
+    seen: dict[int, float] = {}
+    for chunk in chunks:
+        for ts, px in chunk:
+            seen[int(ts)] = float(px)
+    items = sorted(seen.items())
+    return BtcSeries(ts=[t for t, _ in items], px=[p for _, p in items])
+
+
+def fetch_binance_klines(
+    http: requests.Session,
+    *,
+    start_s: int,
+    end_s: int,
+    interval: str,
+    cache_dir: Path,
+    pause_s: float = 0.05,
+) -> BtcSeries:
+    """Inclusive [start_s, end_s] close samples. Caches per 1000-bar page."""
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    start_ms = int(start_s) * 1000
+    end_ms = int(end_s) * 1000
+    chunks: list[list[tuple[int, float]]] = []
+    cursor = start_ms
+    while cursor <= end_ms:
+        page = cache_dir / f"bn_{interval}_{cursor}_{end_ms}.json"
+        if page.exists():
+            raw = json.loads(page.read_text())
+        else:
+            resp = http.get(
+                BINANCE_KLINES,
+                params={
+                    "symbol": "BTCUSDT",
+                    "interval": interval,
+                    "startTime": cursor,
+                    "endTime": end_ms,
+                    "limit": 1000,
+                },
+                timeout=30,
+            )
+            resp.raise_for_status()
+            raw = resp.json()
+            page.write_text(json.dumps(raw))
+            time.sleep(pause_s)
+        if not raw:
+            break
+        rows = []
+        last_open = None
+        for bar in raw:
+            open_ms = int(bar[0])
+            close = float(bar[4])
+            rows.append((open_ms // 1000, close))
+            last_open = open_ms
+        chunks.append(rows)
+        if last_open is None or len(raw) < 1000:
+            break
+        nxt = last_open + 1
+        if nxt <= cursor:
+            break
+        cursor = nxt
+    return merge_klines(chunks)
+
+
+@dataclass
+class Features:
+    ts: float
+    ttm: float
+    px: float
+    ptb: float
+    dist: float
+    abs_dist: float
+    side: str
+    mom_15s: Optional[float] = None
+    mom_30s: Optional[float] = None
+    mom_60s: Optional[float] = None
+    vol_30s: Optional[float] = None
+    vol_60s: Optional[float] = None
+    against_30s: Optional[bool] = None
+    ripping_to_ptb: Optional[bool] = None
+    sec_to_cross: Optional[float] = None
+    cross_before_end: Optional[bool] = None
+    fill_px: Optional[float] = None
+    leg: Optional[str] = None
+
+    def row(self) -> dict[str, Any]:
+        return {
+            "ts": self.ts,
+            "ttm": self.ttm,
+            "px": self.px,
+            "ptb": self.ptb,
+            "dist": self.dist,
+            "abs_dist": self.abs_dist,
+            "side": self.side,
+            "mom_15s": self.mom_15s,
+            "mom_30s": self.mom_30s,
+            "mom_60s": self.mom_60s,
+            "vol_30s": self.vol_30s,
+            "vol_60s": self.vol_60s,
+            "against_30s": self.against_30s,
+            "ripping_to_ptb": self.ripping_to_ptb,
+            "sec_to_cross": self.sec_to_cross,
+            "cross_before_end": self.cross_before_end,
+            "fill_px": self.fill_px,
+            "leg": self.leg,
+        }
+
+
+def features_at(
+    btc: BtcSeries,
+    *,
+    ts: float,
+    end_ts: float,
+    ptb: float,
+    fill_px: Optional[float] = None,
+    leg: Optional[str] = None,
+) -> Optional[Features]:
+    now = btc.sample_at_or_before(ts)
+    if now is None:
+        return None
+    _, px = now
+    dist = px - ptb
+    if dist == 0:
+        return None
+    side = "up" if dist > 0 else "down"
+
+    def _mom(lookback: float, min_age: float) -> Optional[float]:
+        ago = btc.sample_at_or_before(ts - lookback)
+        if ago is None:
+            return None
+        age = ts - ago[0]
+        if age < min_age:
+            return None
+        return px - ago[1]
+
+    mom15 = _mom(15, 8)
+    mom30 = _mom(30, 20)
+    mom60 = _mom(60, 40)
+    w30 = btc.window(ts - 30, ts)
+    w60 = btc.window(ts - 300, ts) if len(w30) < 5 else btc.window(ts - 60, ts)
+    vol30 = realized_move(w30)
+    vol60 = realized_move(w60)
+    mom_dir = mom30 if mom30 is not None else mom60
+    mom_span = 30.0 if mom30 is not None else (60.0 if mom60 is not None else None)
+    against = None if mom_dir is None else (dist * mom_dir < 0)
+    vel = None if mom_dir is None or mom_span is None else mom_dir / mom_span
+    stc = None if vel is None else seconds_to_cross(dist, vel)
+    ttm = end_ts - ts
+    cross = None if stc is None else (stc <= ttm)
+    return Features(
+        ts=ts,
+        ttm=ttm,
+        px=px,
+        ptb=ptb,
+        dist=dist,
+        abs_dist=abs(dist),
+        side=side,
+        mom_15s=mom15,
+        mom_30s=mom30,
+        mom_60s=mom60,
+        vol_30s=vol30,
+        vol_60s=vol60,
+        against_30s=against,
+        ripping_to_ptb=against,
+        sec_to_cross=stc,
+        cross_before_end=cross,
+        fill_px=fill_px,
+        leg=leg,
+    )
+
+
+@dataclass
+class Sample:
+    slug: str
+    start_ts: int
+    end_ts: int
+    feat: Features
+    close_px: float
+    winner: str
+    reversed: bool
+    soft_close: bool
+    source: str
+    pnl_redeem: float = 0.0
+    outcome: str = ""  # redeem | hedge | unresolved | paper
+
+
+def paper_redeem_pnl(fill_px: float, won: bool, budget: float = BUDGET) -> float:
+    if fill_px <= 0:
+        return 0.0
+    shares = budget / fill_px
+    return (shares - budget) if won else -budget
+
+
+def session_markets(rows: list[dict], *, restart_ts: float, year: int) -> list[dict]:
+    grouped: dict[str, dict] = {}
+    for row in rows:
+        name = row["market"]
+        if series_of(name) != "5m":
+            continue
+        if row["ts"] < restart_ts - 1:
+            continue
+        start = five_m_start_ts(name, year)
+        if start is None:
+            continue
+        item = grouped.setdefault(
+            name,
+            {
+                "market": name,
+                "start_ts": start,
+                "end_ts": start + WINDOW_S,
+                "buys": [],
+                "sells": [],
+                "redeems": [],
+            },
+        )
+        if row["action"] == "Buy":
+            item["buys"].append(row)
+        elif row["action"] == "Sell":
+            item["sells"].append(row)
+        elif row["action"] == "Redeem":
+            item["redeems"].append(row)
+    return sorted(grouped.values(), key=lambda m: m["start_ts"])
+
+
+def session_pnl(market: dict) -> dict:
+    spent = sum(b["usdc"] for b in market["buys"])
+    sold = sum(s["usdc"] for s in market["sells"])
+    redeemed = sum(r["usdc"] for r in market["redeems"])
+    pnl = sold + redeemed - spent
+    if market["sells"] and not market["redeems"]:
+        outcome = "hedge"
+    elif market["redeems"] and not market["sells"]:
+        outcome = "redeem"
+    elif market["sells"] and market["redeems"]:
+        outcome = "mixed"
+    else:
+        outcome = "open"
+    first = market["buys"][0] if market["buys"] else None
+    return {
+        "spent": spent,
+        "sold": sold,
+        "redeemed": redeemed,
+        "pnl": pnl,
+        "outcome": outcome,
+        "fill_px": first["px"] if first else None,
+        "leg": first["leg"] if first else None,
+        "fill_ts": first["ts"] if first else None,
+        "shares": sum(b["tok"] for b in market["buys"]),
+    }
+
+
+def five_m_windows(end_after: int, end_before: int) -> list[tuple[int, int, str]]:
+    """Closed 5m windows with end_ts in (end_after, end_before]."""
+    first_end = ((end_after // WINDOW_S) + 1) * WINDOW_S
+    out = []
+    end = first_end
+    while end <= end_before:
+        start = end - WINDOW_S
+        out.append((start, end, f"{SLUG_PREFIX}-{end}"))
+        end += WINDOW_S
+    return out
+
+
+def sample_from_window(
+    btc: BtcSeries,
+    *,
+    slug: str,
+    start_ts: int,
+    end_ts: int,
+    sample_ts: float,
+    source: str,
+    fill_px: Optional[float] = None,
+    leg: Optional[str] = None,
+    winner_hint: Optional[str] = None,
+    outcome: str = "paper",
+) -> Optional[Sample]:
+    ptb = btc.at_or_before(start_ts)
+    close_px = btc.at_or_before(end_ts)
+    if ptb is None or close_px is None:
+        return None
+    feat = features_at(
+        btc,
+        ts=sample_ts,
+        end_ts=end_ts,
+        ptb=ptb,
+        fill_px=fill_px,
+        leg=leg,
+    )
+    if feat is None:
+        return None
+    winner = winner_hint or side_of(close_px, ptb)
+    if winner is None:
+        return None
+    bought = (leg.lower() if leg else feat.side)
+    reversed_ = winner != feat.side
+    won = winner == bought
+    px = fill_px if fill_px and fill_px > 0 else DEFAULT_FILL_PX
+    return Sample(
+        slug=slug,
+        start_ts=start_ts,
+        end_ts=end_ts,
+        feat=feat,
+        close_px=close_px,
+        winner=winner,
+        reversed=reversed_,
+        soft_close=abs(close_px - ptb) < 10.0,
+        source=source,
+        pnl_redeem=paper_redeem_pnl(px, won),
+        outcome=outcome,
+    )
+
+
+@dataclass
+class BucketStats:
+    n: int = 0
+    flips: int = 0
+    pnl: float = 0.0
+    abs_dist: list[float] = field(default_factory=list)
+    vol: list[float] = field(default_factory=list)
+
+    def add(self, sample: Sample) -> None:
+        self.n += 1
+        self.flips += int(sample.reversed)
+        self.pnl += sample.pnl_redeem
+        self.abs_dist.append(sample.feat.abs_dist)
+        if sample.feat.vol_30s is not None:
+            self.vol.append(sample.feat.vol_30s)
+
+    @property
+    def flip_rate(self) -> Optional[float]:
+        return (self.flips / self.n) if self.n else None
+
+    @property
+    def wr(self) -> Optional[float]:
+        if not self.n:
+            return None
+        return 1.0 - (self.flips / self.n)
+
+
+def tabulate(samples: Sequence[Sample], key_fn, order: Optional[Sequence[str]] = None) -> list[str]:
+    groups: dict[str, BucketStats] = {}
+    for sample in samples:
+        key = key_fn(sample)
+        groups.setdefault(key, BucketStats()).add(sample)
+    keys = list(order) if order else sorted(groups, key=lambda k: (-groups[k].n, k))
+    for key in groups:
+        if key not in keys:
+            keys.append(key)
+    lines = ["bucket\tn\tflips\tflip_rate\twr\tpaper_pnl\tmean_|dist|\tmean_vol30"]
+    for key in keys:
+        st = groups.get(key)
+        if st is None:
+            continue
+        lines.append(
+            f"{key}\t{st.n}\t{st.flips}\t{pct(st.flip_rate)}\t{pct(st.wr)}\t"
+            f"{money(st.pnl)}\t{(mean(st.abs_dist) or 0):.1f}\t"
+            f"{(mean(st.vol) or 0):.2f}"
+        )
+    return lines
+
+
+def skip_cost_table(samples: Sequence[Sample], predicate, label: str) -> str:
+    kept = [s for s in samples if not predicate(s)]
+    skipped = [s for s in samples if predicate(s)]
+    base_pnl = sum(s.pnl_redeem for s in samples)
+    kept_pnl = sum(s.pnl_redeem for s in kept)
+    skip_pnl = sum(s.pnl_redeem for s in skipped)
+    base_flips = sum(s.reversed for s in samples)
+    kept_flips = sum(s.reversed for s in kept)
+    n = len(samples)
+    k = len(kept)
+    sk = len(skipped)
+    return (
+        f"{label}\tkeep {k}/{n} ({(k / n if n else 0):.0%})\t"
+        f"skip {sk} pnl {money(skip_pnl)}\t"
+        f"base {money(base_pnl)} wr {pct(1 - base_flips / n if n else None)}\t"
+        f"kept {money(kept_pnl)} wr {pct(1 - kept_flips / k if k else None)}\t"
+        f"delta {money(kept_pnl - base_pnl)}"
+    )
+
+
+def late_band_touch(trades: Sequence[dict], start_ts: int, end_ts: int) -> Optional[dict]:
+    """First last-print in the live late 75–90 band during the last 120s."""
+    late0 = end_ts - LATE_TTM_S
+    best = None
+    for row in trades:
+        ts = float(row["ts"])
+        if ts < max(start_ts, late0) or ts > end_ts:
+            continue
+        px = float(row["px"])
+        if px + 1e-12 < LATE_MIN or px - 1e-12 > LATE_MAX:
+            continue
+        if best is None or ts < float(best["ts"]):
+            best = row
+    return best
+
+
+def render_session(markets: list[dict], samples: list[Sample]) -> str:
+    lines = [
+        "SESSION TAPE (5m only, post-restart)",
+        "market\toutcome\tleg\tfill\tttm_s\tspent\texit\tpnl\t|dist|\tmom30\tvol30\tagainst\tcross?",
+    ]
+    by_name = {s.slug: s for s in samples}
+    tot = 0.0
+    n_h = n_r = n_o = 0
+    for m in markets:
+        rec = session_pnl(m)
+        tot += rec["pnl"]
+        if rec["outcome"] == "hedge":
+            n_h += 1
+        elif rec["outcome"] == "redeem":
+            n_r += 1
+        else:
+            n_o += 1
+        sample = by_name.get(m["market"])
+        feat = sample.feat if sample else None
+        ttm = (m["end_ts"] - rec["fill_ts"]) if rec["fill_ts"] else ""
+        fill = f"{rec['fill_px']:.3f}" if rec["fill_px"] else ""
+        lines.append(
+            f"{m['market'].replace('Bitcoin Up or Down - ', '')}\t"
+            f"{rec['outcome']}\t{rec['leg'] or ''}\t{fill}\t{ttm:.0f}\t"
+            f"{rec['spent']:.2f}\t{(rec['sold'] + rec['redeemed']):.2f}\t"
+            f"{money(rec['pnl'])}\t"
+            f"{(feat.abs_dist if feat else 0):.1f}\t"
+            f"{(feat.mom_30s if feat and feat.mom_30s is not None else 0):.1f}\t"
+            f"{(feat.vol_30s if feat and feat.vol_30s is not None else 0):.2f}\t"
+            f"{feat.against_30s if feat else ''}\t"
+            f"{feat.cross_before_end if feat else ''}"
+        )
+    lines.append("")
+    lines.append(
+        f"n={len(markets)} redeem={n_r} hedge={n_h} other={n_o} "
+        f"session_pnl={money(tot)} mean={money(tot / len(markets) if markets else None)}"
+    )
+    return "\n".join(lines)
+
+
+def main(argv: Optional[Sequence[str]] = None) -> int:
+    p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("--csv", type=Path, help="Polymarket UI history CSV")
+    p.add_argument("--restart-utc", default="2026-08-27T08:57:16+00:00")
+    p.add_argument("--year", type=int, default=2026)
+    p.add_argument("--hours", type=float, default=48.0, help="Historical lookback ending now (UTC)")
+    p.add_argument("--end-utc", default="", help="Override historical end (default: now)")
+    p.add_argument("--binance-interval", default="1s", choices=("1s", "1m"))
+    p.add_argument("--with-clob", action="store_true", help="Join public last-trades (late 75–90)")
+    p.add_argument("--cache", type=Path, default=Path("/tmp/poly_reversal_cache"))
+    p.add_argument("--out", type=Path, help="Write full report to this path")
+    p.add_argument("--sample-ttm", type=float, default=90.0, help="BTC-only sample seconds before close")
+    args = p.parse_args(list(argv) if argv is not None else None)
+
+    http = http_session()
+    report: list[str] = []
+
+    now = parse_utc(args.end_utc) if args.end_utc else datetime.now(timezone.utc)
+    hist_end = int(now.timestamp())
+    hist_start = hist_end - int(args.hours * 3600)
+    # Pad for PTB / momentum lookback.
+    fetch_from = hist_start - WINDOW_S - 90
+    btc = fetch_binance_klines(
+        http,
+        start_s=fetch_from,
+        end_s=hist_end + 5,
+        interval=args.binance_interval,
+        cache_dir=args.cache / "binance",
+    )
+    report.append(
+        f"binance {args.binance_interval} bars={len(btc.ts)} "
+        f"[{fetch_from}..{hist_end}]"
+    )
+    if len(btc.ts) < 10:
+        report.append("ERROR: not enough Binance bars")
+        text = "\n".join(report) + "\n"
+        print(text, end="")
+        return 2
+
+    session_samples: list[Sample] = []
+    if args.csv:
+        restart = parse_utc(args.restart_utc)
+        rows = load_csv(args.csv)
+        markets = session_markets(rows, restart_ts=restart.timestamp(), year=args.year)
+        for m in markets:
+            rec = session_pnl(m)
+            if not rec["fill_ts"]:
+                continue
+            sample = sample_from_window(
+                btc,
+                slug=m["market"],
+                start_ts=m["start_ts"],
+                end_ts=m["end_ts"],
+                sample_ts=rec["fill_ts"],
+                source="session",
+                fill_px=rec["fill_px"],
+                leg=rec["leg"],
+                outcome=rec["outcome"],
+            )
+            if sample is None:
+                continue
+            sample.pnl_redeem = rec["pnl"]
+            session_samples.append(sample)
+        report.append("")
+        report.append(render_session(markets, session_samples))
+        if session_samples:
+            report.append("")
+            report.append("SESSION vs BTC features at fill")
+            hedges = [s for s in session_samples if s.outcome == "hedge"]
+            redeems = [s for s in session_samples if s.outcome == "redeem"]
+            def _avg(xs, attr):
+                vals = [getattr(s.feat, attr) for s in xs if getattr(s.feat, attr) is not None]
+                return mean(vals)
+            report.append(
+                f"redeem n={len(redeems)} mean_|dist|={(_avg(redeems, 'abs_dist') or 0):.1f} "
+                f"mean_mom30={(_avg(redeems, 'mom_30s') or 0):.1f} "
+                f"mean_vol30={(_avg(redeems, 'vol_30s') or 0):.2f} "
+                f"against_share={sum(1 for s in redeems if s.feat.against_30s)/len(redeems) if redeems else 0:.0%}"
+            )
+            report.append(
+                f"hedge  n={len(hedges)} mean_|dist|={(_avg(hedges, 'abs_dist') or 0):.1f} "
+                f"mean_mom30={(_avg(hedges, 'mom_30s') or 0):.1f} "
+                f"mean_vol30={(_avg(hedges, 'vol_30s') or 0):.2f} "
+                f"against_share={sum(1 for s in hedges if s.feat.against_30s)/len(hedges) if hedges else 0:.0%}"
+            )
+
+    windows = five_m_windows(hist_start, hist_end - 1)
+    btc_samples: list[Sample] = []
+    sample_ttm = float(args.sample_ttm)
+    for start, end, slug in windows:
+        sample_ts = end - sample_ttm
+        if sample_ts <= start:
+            continue
+        sample = sample_from_window(
+            btc,
+            slug=slug,
+            start_ts=start,
+            end_ts=end,
+            sample_ts=sample_ts,
+            source="btc_ttm",
+        )
+        if sample:
+            btc_samples.append(sample)
+    report.append("")
+    report.append(
+        f"HISTORICAL BTC-ONLY sampled at T-{sample_ttm:.0f}s  "
+        f"windows={len(windows)} scored={len(btc_samples)} "
+        f"interval={args.binance_interval}"
+    )
+    report.append(
+        "This is every 5m window, not only 75–90 books. Flip = BTC side of PTB "
+        "at sample disagrees with close."
+    )
+    report.extend(tabulate(btc_samples, lambda s: "all", order=("all",)))
+    report.append("")
+    report.append("by |BTC−PTB| at sample (USD)")
+    report.extend(
+        tabulate(
+            btc_samples,
+            lambda s: bucket(s.feat.abs_dist, DIST_EDGES),
+            order=[bucket((a + b) / 2 if math.isfinite(b) else a + 1, DIST_EDGES) for a, b in zip(DIST_EDGES, DIST_EDGES[1:])],
+        )
+    )
+    report.append("")
+    report.append("by 30s realized 1s-move std (USD)")
+    report.extend(
+        tabulate(
+            btc_samples,
+            lambda s: bucket(s.feat.vol_30s, VOL_EDGES),
+        )
+    )
+    report.append("")
+    report.append("by against-momentum (30s BTC move opposite the current side)")
+    report.extend(
+        tabulate(
+            btc_samples,
+            lambda s: "against" if s.feat.against_30s else ("with" if s.feat.against_30s is False else "na"),
+            order=("against", "with", "na"),
+        )
+    )
+    report.append("")
+    report.append("by linear cross-before-close (vel from 30s mom toward PTB)")
+    report.extend(
+        tabulate(
+            btc_samples,
+            lambda s: "cross_before_end" if s.feat.cross_before_end else (
+                "not_approaching" if s.feat.cross_before_end is False else "na"
+            ),
+            order=("cross_before_end", "not_approaching", "na"),
+        )
+    )
+    report.append("")
+    report.append("SKIP COST (paper $2.50 @ 85¢, redeem $1/$0, no hedge)")
+    report.append(skip_cost_table(btc_samples, lambda s: s.feat.abs_dist < 10, "skip |dist|<$10"))
+    report.append(skip_cost_table(btc_samples, lambda s: s.feat.abs_dist < 20, "skip |dist|<$20"))
+    report.append(skip_cost_table(btc_samples, lambda s: s.feat.abs_dist < 40, "skip |dist|<$40"))
+    report.append(skip_cost_table(btc_samples, lambda s: bool(s.feat.against_30s), "skip against-mom 30s"))
+    report.append(skip_cost_table(btc_samples, lambda s: bool(s.feat.cross_before_end), "skip projected cross"))
+    report.append(
+        skip_cost_table(
+            btc_samples,
+            lambda s: bool(s.feat.against_30s) and s.feat.abs_dist < 20,
+            "skip against AND |dist|<$20",
+        )
+    )
+    report.append(
+        skip_cost_table(
+            btc_samples,
+            lambda s: (s.feat.vol_30s or 0) >= 8,
+            "skip vol30>=$8",
+        )
+    )
+    report.append(
+        skip_cost_table(
+            btc_samples,
+            lambda s: s.feat.abs_dist < 10 or bool(s.feat.cross_before_end),
+            "skip |dist|<$10 OR projected cross",
+        )
+    )
+
+    clob_samples: list[Sample] = []
+    if args.with_clob:
+        gh = hedge_session()
+        n_ok = n_miss = n_noband = 0
+        for start, end, slug in windows:
+            try:
+                ev = fetch_event(gh, slug)
+            except Exception:
+                n_miss += 1
+                continue
+            if not ev or not ev.get("condition"):
+                n_miss += 1
+                continue
+            try:
+                trades = fetch_trades(gh, ev["condition"], start, end, args.cache / "trades")
+            except Exception:
+                n_miss += 1
+                continue
+            touch = late_band_touch(trades, start, end)
+            if not touch:
+                n_noband += 1
+                continue
+            n_ok += 1
+            sample = sample_from_window(
+                btc,
+                slug=slug,
+                start_ts=start,
+                end_ts=end,
+                sample_ts=float(touch["ts"]),
+                source="clob_late",
+                fill_px=float(touch["px"]),
+                leg=str(touch.get("outcome") or ""),
+                winner_hint=ev.get("winner"),
+            )
+            # Live 5m already skips book-vs-TWAP disagreement. Score only
+            # fills the bot would take (CLOB leg matches BTC side of PTB).
+            if sample and sample.feat.leg and sample.feat.leg.lower() != sample.feat.side:
+                n_noband += 1
+                continue
+            if sample:
+                clob_samples.append(sample)
+        report.append("")
+        report.append(
+            f"CLOB LATE-BAND 75–90 last {LATE_TTM_S:.0f}s  "
+            f"hits={len(clob_samples)} gamma_ok={n_ok} no_band={n_noband} miss={n_miss}"
+        )
+        if clob_samples:
+            report.append("by |BTC−PTB| at first late-band print")
+            report.extend(
+                tabulate(
+                    clob_samples,
+                    lambda s: bucket(s.feat.abs_dist, DIST_EDGES),
+                )
+            )
+            report.append("")
+            report.append("by against-momentum at first late-band print")
+            report.extend(
+                tabulate(
+                    clob_samples,
+                    lambda s: "against" if s.feat.against_30s else ("with" if s.feat.against_30s is False else "na"),
+                    order=("against", "with", "na"),
+                )
+            )
+            report.append("")
+            report.append("CLOB SKIP COST (fill at last-print, $2.50, redeem $1/$0)")
+            report.append(skip_cost_table(clob_samples, lambda s: s.feat.abs_dist < 10, "skip |dist|<$10"))
+            report.append(skip_cost_table(clob_samples, lambda s: s.feat.abs_dist < 20, "skip |dist|<$20"))
+            report.append(skip_cost_table(clob_samples, lambda s: bool(s.feat.against_30s), "skip against-mom 30s"))
+            report.append(skip_cost_table(clob_samples, lambda s: bool(s.feat.cross_before_end), "skip projected cross"))
+            report.append(
+                skip_cost_table(
+                    clob_samples,
+                    lambda s: bool(s.feat.against_30s) and s.feat.abs_dist < 20,
+                    "skip against AND |dist|<$20",
+                )
+            )
+
+    report.append("")
+    report.append("NOTES")
+    report.append("- Live 5m already requires TWAP vs PTB side match ($0 edge). This study asks whether |dist|, vol, or against-momentum add flip prediction on top of that.")
+    report.append("- Binance 1s/1m is not Chainlink TWAP 30s. Directional level/vol should still rank; exact dollar thresholds will not match the live feed tick-for-tick.")
+    report.append("- BTC-only rows include 50/50 windows the bot would never buy. CLOB late-band rows are the closer analog to a 75–90 fill.")
+    report.append("- Paper P&L is redeem $1/$0 with no hedge salvage. A live dump at 32¢ / persist-50 changes the skip-cost math in losers' favor (skipping a loser is worth less than $2.50).")
+    report.append("- Do not copy these thresholds into live JSON from n<30 session tape.")
+
+    text = "\n".join(report) + "\n"
+    print(text, end="")
+    if args.out:
+        args.out.parent.mkdir(parents=True, exist_ok=True)
+        args.out.write_text(text)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

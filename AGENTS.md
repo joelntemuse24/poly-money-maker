@@ -48,7 +48,8 @@ unless the operator asks. 15m stays stopped.
 
 Plus: `check_book.py`, `check_participation.py`, `check_path_backtest.py`,
 `check_fetch_trades.py`, `check_buy_skips.py`, `check_buy_rejects.py`,
-`check_live_journal.py`, `check_edge_counterfactual.py`. Laptop glance
+`check_live_journal.py`, `check_edge_counterfactual.py`,
+`check_reversal_features.py`. Laptop glance
 (not a bot): `widget/polydesk.py`.
 
 ## File Map
@@ -88,6 +89,7 @@ functions with `ast` (`tests/test_buy_fill_shapes.py`).
 | `pathlog.py` | CLOB path recorder (no orders; TOB price **and** size) |
 | `check_path_backtest.py` | Pathlog: grid, anatomy, compare, **paper hedge**, `--sweep`, `--hedge-sweep` (no orders) |
 | `check_hedge_threshold.py` | Earlier-stop research: pathlog `--hedge-sweep` or public last-trade vs a history CSV |
+| `check_reversal_features.py` | Research: Binance |dist|/vol/momentum vs 5m reversals (optional CLOB 75–90) |
 | `CLOUD_RESEARCH.md` | Cloud prompts: paper P&L on public books + `--sweep` (no `.env`) |
 | `check_book.py` | Diagnostic — inspect a live order book |
 | `check_edge_counterfactual.py` | Diagnostic — resolution win rate if edge skips had filled |
@@ -157,8 +159,8 @@ python check_book.py
 python3 -m py_compile buybot.py buybot5m.py buybothourly.py pathlog.py \
   check_path_backtest.py mintbot.py buy/book.py buy/clob_book_ws.py \
   buy/entry_skip.py buy/hedge_gate.py buy/live_journal.py \
-  check_fetch_trades.py check_participation.py check_buy_skips.py \
-  check_live_journal.py
+ check_fetch_trades.py check_participation.py check_buy_skips.py \
+ check_live_journal.py check_reversal_features.py
 python3 -m unittest discover -s tests -p 'test_*.py' -v
 
 # Full wallet fills (past the UI ~500-row export). Wallet: --user or FUNDER_ADDRESS.
@@ -278,6 +280,8 @@ python check_path_backtest.py --anatomy --series 5m --ttm-max 120 --csv /tmp/ana
 python check_path_backtest.py --grid --budget 2.5 --series 5m
 python check_buy_skips.py --since 2026-08-19T08:02:00
 python check_live_journal.py --hours 5
+python check_reversal_features.py --hours 48 --with-clob
+python check_reversal_features.py --csv exports/trades.csv --restart-utc 2026-08-27T08:57:16
 ```
 
 `--sweep` scores the live 5m **example** late template (75–90 / 120s / $2.50)
