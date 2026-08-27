@@ -12,9 +12,11 @@ from check_reversal_features import (
     Sample,
     breakeven_flip_rate,
     bucket,
+    first_touch_on_path,
     features_at,
     five_m_windows,
     gate_table,
+    implied_fill_px,
     late_band_touch,
     paper_ev,
     paper_redeem_pnl,
@@ -22,6 +24,7 @@ from check_reversal_features import (
     session_markets,
     side_of,
     skip_cost_table,
+    window_path,
 )
 from check_hedge_threshold import load_csv, series_of
 
@@ -159,6 +162,37 @@ class BandAndPnlTests(unittest.TestCase):
         self.assertIn("0\t4\t0", body)
         self.assertIn("20\t3\t1", body)
         self.assertIn("40\t2\t2", body)
+
+    def test_first_touch_respects_ttm_and_edge(self):
+        # ttm 150 → 50 over 100s, dist from +10 to +40.
+        path = []
+        for ttm in range(150, 49, -1):
+            ts = 1000 - ttm
+            dist = 10.0 + (150 - ttm) * 0.3
+            path.append((ts, float(ttm), dist, 100_000 + dist))
+        miss = first_touch_on_path(path, ttm_min=0, ttm_max=120, min_abs_dist=25)
+        self.assertIsNotNone(miss)
+        self.assertLessEqual(miss[1], 120)
+        self.assertGreaterEqual(abs(miss[2]), 25)
+        late_only = first_touch_on_path(path, ttm_min=0, ttm_max=60, min_abs_dist=25)
+        self.assertIsNotNone(late_only)
+        self.assertLessEqual(late_only[1], 60)
+        none = first_touch_on_path(path, ttm_min=0, ttm_max=120, min_abs_dist=500)
+        self.assertIsNone(none)
+
+    def test_implied_fill_and_window_path(self):
+        self.assertEqual(implied_fill_px(10), 0.80)
+        self.assertEqual(implied_fill_px(22), 0.85)
+        self.assertEqual(implied_fill_px(90), 0.94)
+        ts = list(range(0, 20))
+        px = [100_000.0 + i for i in ts]
+        btc = BtcSeries(ts=ts, px=px)
+        pack = window_path(btc, 0, 10, step=1)
+        self.assertIsNotNone(pack)
+        ptb, close, path = pack
+        self.assertEqual(ptb, 100_000.0)
+        self.assertTrue(path)
+        self.assertEqual(path[0][1], 9)  # ttm at ts=1
 
     def test_five_m_windows_aligned(self):
         # ends 1000..1600 → first aligned end is 1200 if WINDOW_S=300

@@ -453,6 +453,149 @@ def eatable(flip_rate: Optional[float], fill_px: float, salvage: float) -> str:
     return "yes" if flip_rate <= cap + 1e-12 else "no"
 
 
+def implied_fill_px(abs_dist: float) -> float:
+    """Map |BTC−PTB| to a 5m ask. Calibrated on the 27 Aug session mix."""
+    d = abs(float(abs_dist))
+    if d < 15:
+        return 0.80
+    if d < 25:
+        return 0.85
+    if d < 40:
+        return 0.88
+    if d < 80:
+        return 0.92
+    return 0.94
+
+
+def paper_fill_pnl(
+    fill_px: float,
+    won: bool,
+    salvage: float = DEFAULT_SALVAGE,
+    budget: float = BUDGET,
+) -> float:
+    if won:
+        return paper_redeem_pnl(fill_px, True, budget)
+    return float(salvage) - float(budget)
+
+
+def window_path(
+    btc: BtcSeries,
+    start_ts: int,
+    end_ts: int,
+    step: int = 1,
+) -> Optional[tuple[float, float, list[tuple[int, float, float, float]]]]:
+    """(ptb, close, [(ts, ttm, dist, px), ...]) inside (start, end)."""
+    ptb = btc.at_or_before(start_ts)
+    close = btc.at_or_before(end_ts)
+    if ptb is None or close is None:
+        return None
+    path: list[tuple[int, float, float, float]] = []
+    ts = int(start_ts) + int(step)
+    end_i = int(end_ts)
+    step = max(1, int(step))
+    while ts < end_i:
+        px = btc.at_or_before(ts)
+        if px is not None:
+            path.append((ts, float(end_i - ts), px - ptb, px))
+        ts += step
+    return ptb, close, path
+
+
+def first_touch_on_path(
+    path: Sequence[tuple[int, float, float, float]],
+    *,
+    ttm_min: float,
+    ttm_max: float,
+    min_abs_dist: float,
+) -> Optional[tuple[int, float, float, float]]:
+    """First tick with ttm_min < ttm ≤ ttm_max and |dist| ≥ min_abs_dist."""
+    for ts, ttm, dist, px in path:
+        if ttm <= ttm_min or ttm > ttm_max:
+            continue
+        if abs(dist) + 1e-12 < min_abs_dist:
+            continue
+        if dist == 0:
+            continue
+        return ts, ttm, dist, px
+    return None
+
+
+# (name, ttm_min, ttm_max, min_|dist|) — live-shaped windows, not a cartesian bomb.
+COMBO_SPECS: tuple[tuple[str, float, float, float], ...] = (
+    ("late120_e0", 0.0, 120.0, 0.0),
+    ("late120_e20", 0.0, 120.0, 20.0),
+    ("late120_e25", 0.0, 120.0, 25.0),
+    ("late120_e30", 0.0, 120.0, 30.0),
+    ("late120_e40", 0.0, 120.0, 40.0),
+    ("late60_e0", 0.0, 60.0, 0.0),
+    ("late60_e25", 0.0, 60.0, 25.0),
+    ("last45_e0", 0.0, 45.0, 0.0),
+    ("last45_e25", 0.0, 45.0, 25.0),
+    ("early300_e0", 120.0, 300.0, 0.0),
+    ("early300_e25", 120.0, 300.0, 25.0),
+    ("union300_e0", 0.0, 300.0, 0.0),
+    ("union300_e25", 0.0, 300.0, 25.0),
+    ("union300_e30", 0.0, 300.0, 30.0),
+)
+
+
+def score_combos(
+    packed: Sequence[tuple[float, float, list[tuple[int, float, float, float]]]],
+    *,
+    hours: float,
+    salvage: float = DEFAULT_SALVAGE,
+    budget: float = BUDGET,
+) -> list[str]:
+    """First-touch entries. $/hour at ``budget`` and 2× (the $5-size column)."""
+    n = len(packed)
+    lines = [
+        f"COMBOS first-touch  n_windows={n}  hours={hours:.1f}  "
+        f"budget=${budget:.2f}  salvage=${salvage:.2f} on losers  "
+        f"$5 col = 2× size, same hits",
+        "name\thits\thit/hour\tflip\twr\tmean_fill\tpnl\t$/h\t$/h_at_$5\teat_nohedge",
+    ]
+    rows_out: list[tuple[float, str]] = []
+    for name, ttm_min, ttm_max, edge in COMBO_SPECS:
+        hits = 0
+        flips = 0
+        pnl = 0.0
+        fills: list[float] = []
+        for ptb, close, path in packed:
+            hit = first_touch_on_path(
+                path, ttm_min=ttm_min, ttm_max=ttm_max, min_abs_dist=edge
+            )
+            if hit is None:
+                continue
+            _ts, _ttm, dist, _px = hit
+            hits += 1
+            fill = implied_fill_px(abs(dist))
+            fills.append(fill)
+            side = "up" if dist > 0 else "down"
+            winner = side_of(close, ptb)
+            won = winner == side
+            if not won:
+                flips += 1
+            pnl += paper_fill_pnl(fill, bool(won), salvage=salvage, budget=budget)
+        if not hits or hours <= 0:
+            rows_out.append((float("-inf"), f"{name}\t0\t\t\t\t\t\t\t\t"))
+            continue
+        fr = flips / hits
+        wr = 1.0 - fr
+        mean_f = mean(fills) or DEFAULT_FILL_PX
+        per_h = pnl / hours
+        eat = eatable(fr, mean_f, 0.0)
+        rows_out.append(
+            (
+                per_h,
+                f"{name}\t{hits}\t{hits / hours:.1f}\t{pct(fr)}\t{pct(wr)}\t"
+                f"{mean_f:.2f}\t{money(pnl)}\t{money(per_h)}\t{money(per_h * 2)}\t{eat}",
+            )
+        )
+    rows_out.sort(key=lambda item: item[0], reverse=True)
+    lines.extend(row for _score, row in rows_out)
+    return lines
+
+
 def session_markets(rows: list[dict], *, restart_ts: float, year: int) -> list[dict]:
     grouped: dict[str, dict] = {}
     for row in rows:
@@ -908,8 +1051,26 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     windows = five_m_windows(hist_start, hist_end - 1)
     btc_samples: list[Sample] = []
+    packed: list[tuple[float, float, list[tuple[int, float, float, float]]]] = []
     sample_ttm = float(args.sample_ttm)
+    path_step = 1 if args.binance_interval == "1s" else 5
     for start, end, slug in windows:
+        pack = window_path(btc, start, end, step=path_step)
+        if pack is not None:
+            packed.append(pack)
+        sample_ts = end - sample_ttm
+        if sample_ts <= start:
+            continue
+        sample = sample_from_window(
+            btc,
+            slug=slug,
+            start_ts=start,
+            end_ts=end,
+            sample_ts=sample_ts,
+            source="btc_ttm",
+        )
+        if sample:
+            btc_samples.append(sample)
         sample_ts = end - sample_ttm
         if sample_ts <= start:
             continue
@@ -1065,6 +1226,19 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         report.append(skip_cost_table(mid, lambda s: (s.feat.flip_z or 99) < 2, "mid: skip z<2"))
         report.append("mid by flip_z")
         report.extend(tabulate(mid, lambda s: bucket(s.feat.flip_z, Z_EDGES)))
+
+    hist_hours = (len(windows) / 12.0) if windows else 0.0
+    if packed and hist_hours > 0:
+        report.append("")
+        report.append(
+            "STRATEGY COMBOS — first tick in the TTM window with |BTC−PTB| ≥ edge. "
+            "This is the live-shaped question (when + how decided), not a fixed T-90 cut. "
+            "Fill price is implied from |dist| (session calibration). Losers return $1 salvage."
+        )
+        report.extend(score_combos(packed, hours=hist_hours, salvage=DEFAULT_SALVAGE))
+        report.append("")
+        report.append("same combos, losers get $0 (no hedge):")
+        report.extend(score_combos(packed, hours=hist_hours, salvage=0.0))
 
     clob_samples: list[Sample] = []
     if args.with_clob:
