@@ -170,7 +170,7 @@ belong in git. Cloud research agents never get `.env`.
 | `buybot5m.log` | One JSON object per line (5 MiB × 3 backups) |
 | `buybot5m.journal.jsonl` | 5m money-path tape (`check_live_journal.py`) |
 | `.heartbeat_buy5m` | Unix time; if it stops moving, the loop is stuck |
-| `ptb_rtds_buy5m.json` | Cached Chainlink Price To Beat per market |
+| `ptb_twap30_buy5m.json` | Cached Chainlink Price To Beat per market |
 | `underlying_research_buy5m.jsonl` | Buy/skip/oracle audit for later analysis |
 | `pathlog/ticks/*.jsonl` | Recorded books (auto-deleted after 14 days or 400 MB) |
 
@@ -985,7 +985,7 @@ One `BtcUnderlyingFeed` per source. Daemon thread on
 at 1 Hz). `live_price()` returns `None` if older than 5s (stale). PTB:
 nearest tick to `start_ts` within 2s skew, persisted to `ptb_*_buy*.json`.
 Missed the open → no PTB → no buy. The live 5m feed uses Chainlink TWAP
-30s and persists `ptb_rtds_buy5m.json`; the stopped hourly bot
+30s and persists `ptb_twap30_buy5m.json`; the stopped hourly bot
 subscribes to `crypto_prices` / `btcusdt` instead.
 
 `append_research` appends one JSON line and rotates at 50 MiB so a skip

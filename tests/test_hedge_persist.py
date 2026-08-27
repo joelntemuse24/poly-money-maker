@@ -10,9 +10,12 @@ from buy.hedge_gate import (
     hedge_dump_overrides_oracle,
     hedge_market_tick,
     hedge_oracle_allows_sell,
+    hedge_oracle_blocks_sell,
     hedge_persist_ready,
+    hedge_rest_required,
     hedge_should_keep_retrying,
     hedge_tick_after_build_error,
+    held_hedge_decision,
 )
 
 
@@ -349,6 +352,104 @@ class HedgeDumpOverridesOracleTests(unittest.TestCase):
             hedge_dump_overrides_oracle(0.04, 0.32, enabled=False),
         )
         self.assertFalse(hedge_dump_overrides_oracle(None, 0.32))
+
+
+class HedgeRestRequiredTests(unittest.TestCase):
+    """REST unless persist is already done or a fresh WS dump peek is enough."""
+
+    def test_fetches_rest_on_a_normal_held_tick(self):
+        self.assertTrue(
+            hedge_rest_required(persist_done=False, peek_dump=False),
+        )
+
+    def test_skips_rest_after_persist_or_fresh_ws_dump(self):
+        self.assertFalse(
+            hedge_rest_required(persist_done=True, peek_dump=False),
+        )
+        self.assertFalse(
+            hedge_rest_required(persist_done=False, peek_dump=True),
+        )
+
+
+class HedgeOracleBlocksSellTests(unittest.TestCase):
+    """Dump never blocked when ignore-oracle is on; persist stays gated."""
+
+    def test_dump_skips_oracle_when_ignore_on(self):
+        self.assertFalse(
+            hedge_oracle_blocks_sell(
+                dump=True, oracle_agrees=True, dump_ignore_oracle=True,
+            )
+        )
+
+    def test_persist_sell_blocked_while_oracle_agrees(self):
+        self.assertTrue(
+            hedge_oracle_blocks_sell(
+                dump=False, oracle_agrees=True, dump_ignore_oracle=True,
+            )
+        )
+        self.assertFalse(
+            hedge_oracle_blocks_sell(
+                dump=False, oracle_agrees=False, dump_ignore_oracle=True,
+            )
+        )
+
+    def test_dump_stays_gated_when_ignore_off(self):
+        self.assertTrue(
+            hedge_oracle_blocks_sell(
+                dump=True, oracle_agrees=True, dump_ignore_oracle=False,
+            )
+        )
+
+
+class HeldHedgeCompositionTests(unittest.TestCase):
+    """REST + evaluate before oracle. Last-good dump must not skip REST."""
+
+    KW = dict(
+        now_s=20.0,
+        persist_armed_ts=10.0,
+        persist_s=5.0,
+        dump_bid_max=0.32,
+        qualify_bid=0.50,
+        qualify_ask_max=0.52,
+        recovery_cancel=0.53,
+        sell_fade=True,
+        dump_ignore_oracle=True,
+    )
+
+    def test_oracle_agrees_no_cache_rest_32_dumps(self):
+        intent = held_hedge_decision(
+            0.32, 0.90, None, None, None, None,
+            persist_done=False, oracle_agrees=True, **self.KW,
+        )
+        self.assertEqual(intent.action, "dump")
+        self.assertTrue(intent.dump)
+
+    def test_oracle_agrees_at_50_52_does_not_persist_sell(self):
+        intent = held_hedge_decision(
+            0.50, 0.52, None, None, None, None,
+            persist_done=True, oracle_agrees=True, **self.KW,
+        )
+        self.assertEqual(intent.action, "hold")
+        self.assertEqual(intent.reason, "oracle_still_winning")
+        self.assertNotEqual(intent.action, "sell")
+        self.assertFalse(intent.dump)
+
+    def test_ws_80_last_good_32_does_not_dump(self):
+        intent = held_hedge_decision(
+            None, None, 0.80, 0.82, 0.32, 0.90,
+            persist_done=False, oracle_agrees=True, **self.KW,
+        )
+        self.assertNotEqual(intent.action, "dump")
+        self.assertFalse(intent.dump)
+
+    def test_stale_last_good_32_still_fetches_rest_80(self):
+        """last-good 32 must not skip REST; a live 80¢ book is not a dump."""
+        intent = held_hedge_decision(
+            0.80, 0.82, None, None, 0.32, 0.90,
+            persist_done=False, oracle_agrees=True, **self.KW,
+        )
+        self.assertNotEqual(intent.action, "dump")
+        self.assertFalse(intent.dump)
 
 
 if __name__ == "__main__":

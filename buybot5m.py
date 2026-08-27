@@ -55,6 +55,7 @@ from buy.entry_skip import (
     accumulate_buy_inventory,
     applicable_entry_bands,
     ask_in_any_band,
+    buy_retry_fak_limit,
     can_arm_entry_slice,
     classify_fill_against_band,
     decide_5m_entry,
@@ -66,6 +67,7 @@ from buy.entry_skip import (
     stamp_slice_bought,
     stamp_slice_on_inventory,
     uncertain_buy_spend_cap,
+    validate_late_90_start_s,
     window_no_buy_reason,
 )
 from buy.hedge_gate import (
@@ -74,8 +76,10 @@ from buy.hedge_gate import (
     hedge_fail_is_terminal,
     hedge_market_tick,
     hedge_oracle_allows_sell,
+    hedge_oracle_blocks_sell,
     hedge_persist_ready,
     hedge_qualify_ok,
+    hedge_rest_required,
     hedge_should_keep_retrying,
     hedge_tick_after_build_error,
     live_bag_log_fields,
@@ -341,10 +345,7 @@ def load_strategy():
             raise ValueError("early_95_min_s must be >= 0")
         if float(cfg["early_95_start_s"]) < float(cfg["early_95_min_s"]):
             raise ValueError("early_95_start_s must be >= early_95_min_s")
-        if float(cfg["late_90_start_s"]) < 0:
-            raise ValueError("late_90_start_s must be >= 0")
-        if float(cfg["late_90_start_s"]) > float(cfg["buy_start_s"]) + 1e-12:
-            raise ValueError("late_90_start_s must be <= buy_start_s")
+        validate_late_90_start_s(cfg["late_90_start_s"], cfg["buy_start_s"])
         if not (
             0 < cfg["buy_max_price"] < cfg["early_95_min_price"]
             <= cfg["early_buy_max_price"] <= 1
@@ -1707,7 +1708,7 @@ def hedge_book_ok(bid, ask, threshold, max_spread, require_ask_max):
 
     A 1¢ bid under a 99¢ ask is illiquidity/spoof, not a reversal. Require:
       bid ≤ threshold, ask ≤ require_ask_max, and spread ≤ max_spread.
-    Dump (bid ≤ 53) does not use this gate.
+    Dump (bid ≤ 32) does not use this gate.
     """
     return hedge_qualify_ok(bid, ask, threshold, max_spread, require_ask_max)
 
@@ -1717,7 +1718,7 @@ def toxic_dump_book_ok(bid, threshold):
 
     Recovered book (bid > hedge_toxic_bid_max, e.g. 97¢ after a junk fill)
     must not dump. Missing bid is fail-closed. Wide 1¢/99¢ still dumps —
-    this gate is bid-only and does not require 70/72/15, persist, or GUI.
+    this gate is bid-only and does not require 50/52/15, persist, or GUI.
     """
     bid = finite_float(bid, minimum=0, maximum=1)
     threshold = finite_float(threshold, minimum=0, maximum=1)
@@ -1729,11 +1730,11 @@ def toxic_dump_book_ok(bid, threshold):
 def hedge_gui_limits(require_ask_max):
     """Held display cap is ask-max; other-leg floor is the cash complement.
 
-    A 68/71 held book has mid ~70¢. Buy-style 30/70 would wait until the
-    website already shows a loser, which is after the 70¢ bid is gone.
-    5m live: ask-max 72¢ → held GUI ≤ 72¢, other GUI ≥ 28¢. Two-sided
-    70/72/15 and last-trade ≤ ask-max still have to pass. Toxic dumps
-    stay bid-only at hedge_toxic_bid_max (53¢).
+    A 48/51 held book has mid ~50¢. Buy-style 30/70 would wait until the
+    website already shows a loser, which is after the 50¢ bid is gone.
+    5m live: ask-max 52¢ → held GUI ≤ 52¢, other GUI ≥ 48¢. Two-sided
+    50/52/15 and last-trade ≤ ask-max still have to pass. Toxic dumps
+    stay bid-only at hedge_toxic_bid_max (32¢).
     """
     ask_max = finite_float(require_ask_max, minimum=0, maximum=1)
     if ask_max is None:
@@ -1755,8 +1756,8 @@ def hedge_consensus_ok(
     A 32/38 clip can be a random TOB. Buy still uses Polymarket display
     (mid if spread ≤ 10¢ else last trade) plus 70/30. 5m hedge uses
     ``hedge_gui_limits`` (held ≤ ask-max, other ≥ complement) and does
-    **not** require the other GUI to already be higher than held. A 70¢
-    vs 28¢ book is the stop. Last print on the held token still must be
+    **not** require the other GUI to already be higher than held. A 50¢
+    vs 48¢ book is the stop. Last print on the held token still must be
     ≤ last_trade_max so a spoofed tight book cannot manufacture a 70¢
     mid while last trade is 85¢.
     """
@@ -2739,6 +2740,7 @@ def buy_market_with_retry(
     on_submit=None,
     condition_id=None,
     pre_submit=None,
+    retry_pins=None,
 ):
     """Buy token_id via FAK, sized in shares at the quoted ask.
 
@@ -2752,7 +2754,10 @@ def buy_market_with_retry(
 
     Band is still min_price–max_price for *whether* to fire. The limit is
     max_price so the FAK can take depth behind the touch (83¢ clip gone,
-    84–90¢ still fills in the late window). $2.50 / 75¢ is ~3.3 shares;
+    84–90¢ still fills in the late window). ``retry_pins`` is a 2-item
+    ``[max, min]`` the caller may mutate from ``pre_submit`` so a live
+    late 90¢ band pins a late_90 FAK to 90¢ instead of aborting or walking
+    99. $2.50 / 75¢ is ~3.3 shares;
     ``buy_max_shares`` (default 5) is the per-FAK "wrong price" rail, not a
     displayed-size cap or a lifetime share limit.
 
@@ -2799,6 +2804,7 @@ def buy_market_with_retry(
         return 0.0, 0.0, "aborted"
 
     persist_failed = False
+    pre_submit_aborted = False
     max_shares = 0.0
 
     def _persist():
@@ -2857,6 +2863,32 @@ def buy_market_with_retry(
         if fresh_ask is None:
             console.print(f"  [dim yellow][NO ASK][/] no asks available · attempt {attempt + 1}/{max_retries}")
             break
+        if pre_submit:
+            try:
+                allowed, reason = pre_submit(
+                    float(fresh_bid) if fresh_bid is not None else 0.0,
+                    float(fresh_ask), attempt + 1,
+                )
+            except Exception as exc:
+                allowed, reason = False, f"validator_error:{exc}"
+            if not allowed:
+                pre_submit_aborted = True
+                log_event(
+                    "buy_pre_submit_rejected",
+                    token_id=token_id,
+                    condition_id=condition_id,
+                    attempt=attempt + 1,
+                    reason=str(reason)[:160],
+                )
+                break
+        if retry_pins:
+            try:
+                if retry_pins[0] is not None:
+                    max_price = float(retry_pins[0])
+                if len(retry_pins) > 1 and retry_pins[1] is not None:
+                    min_price = float(retry_pins[1])
+            except (TypeError, ValueError, IndexError):
+                pass
         if fresh_ask > max_price:
             console.print(f"  [dim yellow][SKIP][/] ask {fresh_ask:.3f} > cap {max_price:.3f} · attempt {attempt + 1}/{max_retries}")
             time.sleep(0.05)
@@ -2896,22 +2928,6 @@ def buy_market_with_retry(
         max_shares = shares
         ambiguous = False
         result = None
-        if pre_submit:
-            try:
-                allowed, reason = pre_submit(
-                    float(fresh_bid), float(fresh_ask), attempt + 1,
-                )
-            except Exception as exc:
-                allowed, reason = False, f"validator_error:{exc}"
-            if not allowed:
-                log_event(
-                    "buy_pre_submit_rejected",
-                    token_id=token_id,
-                    condition_id=condition_id,
-                    attempt=attempt + 1,
-                    reason=str(reason)[:160],
-                )
-                break
         try:
             signed_order = safe_api_call(
                 client.create_order,
@@ -3168,6 +3184,8 @@ def buy_market_with_retry(
     if total_bought > 0:
         console.print(f"  [bold yellow][BUY DONE][/]{total_bought:.4f} shares · ${spent:.2f}/${budget:.2f} spent")
         return total_bought, spent, "filled"
+    if pre_submit_aborted:
+        return 0.0, 0.0, "aborted"
     console.print(f"  [bold red][BUY FAIL][/] spent $0.00/${budget:.2f}")
     return 0.0, 0.0, "empty"
 
@@ -4902,43 +4920,9 @@ while not _shutdown_requested:
                     and HEDGE_ENABLED
                     and not meta.get("hedge_closed")
                 )
-                # Persist-50 stays behind the oracle (a one-tick CLOB dip is
-                # not a hedge). Dump ≤ toxic is book-only when
-                # hedge_dump_ignore_oracle: peek the book first so a 4–32¢
-                # print is not vetoed by BTC that has not crossed yet.
-                oracle_dump_only = False
-                if hedge_open:
-                    _dump_age = book_ws.quote_age(held_token)
-                    _dump_fresh = (
-                        _dump_age is not None
-                        and _dump_age <= float(HEDGE_QUOTE_MAX_AGE_S)
-                    )
-                    _dump_peek = None
-                    if _dump_fresh:
-                        _dump_q = book_ws.quote(
-                            held_token, max_age_s=float(HEDGE_QUOTE_MAX_AGE_S),
-                        )
-                        if _dump_q is not None:
-                            _dump_peek = _dump_q[0]
-                    _dump_last, _ = last_good_held_quote(held_token)
-                    _dump_cached = _book_cache.get(held_token)
-                    _dump_cached_bid = (
-                        _dump_cached[0] if _dump_cached else None
-                    )
-                    dump_hint = any(
-                        hedge_dump_overrides_oracle(
-                            bid,
-                            HEDGE_TOXIC_BID_MAX,
-                            enabled=HEDGE_DUMP_IGNORE_ORACLE,
-                        )
-                        for bid in (_dump_peek, _dump_last, _dump_cached_bid)
-                    )
-                    if dump_hint:
-                        oracle_dump_only = hold_while_oracle_agrees(
-                            held_leg, m.start_ts, cond, log=False,
-                        )
-                    elif hold_while_oracle_agrees(held_leg, m.start_ts, cond):
-                        hedge_open = False
+                # REST + evaluate before oracle so a 4–32¢ book dumps even if
+                # WS is down. Persist 5s @ 50/52 stays behind the oracle.
+                # Fresh WS dump peek may skip REST; stale last-good must not.
                 if hedge_open:
                     # ANY live bag with held bid ≤ toxic (32¢) dumps at the live bid
                     # even if BTC has not crossed yet. Persist 5s @ 50/52 stays
@@ -4996,17 +4980,15 @@ while not _shutdown_requested:
                         )
                     else:
                         rest_bid = rest_ask = rest_mid = None
-                        need_rest = not persist_done
-                        peek_dump = (
-                            peek_bid is not None
-                            and peek_bid <= float(HEDGE_TOXIC_BID_MAX) + 1e-12
+                        peek_dump = hedge_dump_overrides_oracle(
+                            peek_bid,
+                            HEDGE_TOXIC_BID_MAX,
+                            enabled=True,
                         )
-                        last_dump = (
-                            last_bid is not None
-                            and last_bid <= float(HEDGE_TOXIC_BID_MAX) + 1e-12
+                        need_rest = hedge_rest_required(
+                            persist_done=persist_done,
+                            peek_dump=peek_dump,
                         )
-                        if peek_dump or last_dump or persist_done:
-                            need_rest = False
                         if need_rest or (peek_bid is None and last_bid is None):
                             rest_bid, _, rest_ask, _, rest_mid = get_quote_fast(
                                 held_token,
@@ -5130,16 +5112,18 @@ while not _shutdown_requested:
                             if intent.persist_done:
                                 _hedge_persist_done.add(cond)
 
-                        if oracle_dump_only and not bool(intent.dump):
-                            log_buy_skip_throttled(
-                                "oracle_still_winning",
-                                cond,
-                                event="hedge_skip_oracle_still_winning",
-                                **bag_log,
-                                via="dump_only_override",
+                        oracle_agrees = False
+                        skip_oracle = bool(intent.dump) and HEDGE_DUMP_IGNORE_ORACLE
+                        if not skip_oracle:
+                            oracle_agrees = hold_while_oracle_agrees(
+                                held_leg, m.start_ts, cond,
                             )
-                            _hedge_persist_armed.pop(cond, None)
-                            _hedge_persist_done.discard(cond)
+                        if hedge_oracle_blocks_sell(
+                            dump=bool(intent.dump),
+                            oracle_agrees=oracle_agrees,
+                            dump_ignore_oracle=HEDGE_DUMP_IGNORE_ORACLE,
+                        ):
+                            pass
                         elif intent.action in {"arm", "wait"}:
                             log_buy_skip_throttled(
                                 intent.reason,
@@ -5209,7 +5193,7 @@ while not _shutdown_requested:
                                 f"  [bright_white]{m.question}[/]\n"
                                 f"  [bright_red]{hedge_label}[/] — {held_leg.upper()} "
                                 f"bid [bold]{hedge_bid:.3f}[/] ask [bold]{(hedge_ask or 0):.3f}[/]  ·  "
-                                f"FAK ≥{sell_floor:.3f}  ·  [bold red]TTM {minutes_left:>4.1f}m[/]",
+                                f"FAK ≥{sell_floor:.3f}  ·  [bold red]TTM {seconds_left:>5.1f}s[/]",
                                 title=hedge_title,
                                 border_style="bright_red",
                                 box=box.HEAVY,
@@ -6133,16 +6117,19 @@ while not _shutdown_requested:
                     meta["last_buy_at"] = submit_ms
                     save_json(STATE_FILE, positions_meta)
 
+                retry_pins = [float(band.max_price), float(band.retry_min_price)]
+
                 def _pre_submit_ttm(fresh_bid, fresh_ask, attempt):
                     ttm = entry_seconds_left(
                         time.time(), m.end_ts, getattr(m, "slug", None),
                         FIVE_M_DURATION_S,
                     )
                     live_band = decide_entry_at(ttm, fresh_ask)
-                    if live_band is None:
+                    pinned = buy_retry_fak_limit(band.max_price, live_band)
+                    if pinned is None:
                         return False, "ttm_or_ask_out_of_band"
-                    if live_band.fak_limit + 1e-12 < float(band.max_price):
-                        return False, "late_cap_now_90"
+                    retry_pins[0] = float(pinned)
+                    retry_pins[1] = float(live_band.retry_min_price)
                     return True, live_band.name
 
                 bought, spent, buy_status = buy_market_with_retry(
@@ -6151,6 +6138,7 @@ while not _shutdown_requested:
                     on_fill=_persist_buy_fill, on_submit=_persist_buy_submit,
                     condition_id=cond,
                     pre_submit=_pre_submit_ttm,
+                    retry_pins=retry_pins,
                 )
                 wall_ms = time.time() * 1000
                 if bought > 0:

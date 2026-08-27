@@ -216,6 +216,49 @@ def decide_5m_entry(seconds_left, ask, **band_kwargs):
     return select_entry_band(ask, bands)
 
 
+def validate_late_90_start_s(late_90_start_s, buy_start_s) -> float:
+    """Reject a last-45 overlay that is negative or wider than the late window."""
+    try:
+        overlay = float(late_90_start_s)
+        late = float(buy_start_s)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("late_90_start_s must be a number") from exc
+    if overlay < 0:
+        raise ValueError("late_90_start_s must be >= 0")
+    if overlay > late + 1e-12:
+        raise ValueError("late_90_start_s must be <= buy_start_s")
+    return overlay
+
+
+def late_90_window_ok(seconds_left, late_90_start_s=45, late_start_s=120) -> bool:
+    """True when TTM is in (0, late_90_start_s] inside the late window."""
+    try:
+        overlay = validate_late_90_start_s(late_90_start_s, late_start_s)
+        ttm = float(seconds_left)
+    except (TypeError, ValueError):
+        return False
+    return overlay > 1e-12 and 0 < ttm <= overlay + 1e-12
+
+
+def buy_retry_fak_limit(armed_max, live_band):
+    """Pin FAK limit to the live open band (never walk 99 after late_90 closed).
+
+    ``None`` → abort POST (no live band). Else ``min(armed, live fak)``.
+    Armed late_90 @ 99 with a live 90¢ ask becomes a 90¢ FAK, not an abort
+    and not a 99¢ walk through 91–99.
+    """
+    if live_band is None:
+        return None
+    try:
+        armed = float(armed_max)
+        live = float(live_band.fak_limit)
+    except (TypeError, ValueError):
+        return None
+    if armed <= 0 or live <= 0:
+        return None
+    return min(armed, live)
+
+
 def classify_fill_against_band(
     avg,
     band_min,
