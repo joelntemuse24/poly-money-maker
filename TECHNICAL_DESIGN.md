@@ -94,21 +94,26 @@ it **redeems** on-chain for $1.00 per share. There is **no** “take profit at
 even make $0.30 before $1.00, and on an 80¢ fill selling at 90¢ throws away
 the rest of the ride to $1.00.
 
-**Live 5m entry (two $2.50 slices):**
+**Live 5m entry (one $2.50 late slice):**
 
 | Time left until close (TTM) | Winning ask | Slice / FAK limit |
 |---|---|---|
-| More than 45 seconds | none — too early | early and ≥95 are **off** |
-| 0 < TTM ≤ 45 seconds | **75¢ through 90¢ inclusive** | late `$2.50`, limit **90¢** |
-| 0 < TTM ≤ 45 seconds | **≥90¢** | `late_90` overlay, same late `$2.50`, limit **99¢** |
+| More than 120 seconds | none — too early | early and ≥95 are **off** |
+| 0 < TTM ≤ 120 seconds | **75¢ through 90¢ inclusive** | late `$2.50`, limit **90¢** |
+| 0 < TTM ≤ 120 seconds | **≥90¢** | **no** (`late_90_start_s=0`) |
 
-`min_underlying_edge_usd` is **$25**: live Chainlink TWAP 30s must be at
-least $25 from the window-open PTB and on the same side as the book.
-`BUY_HORIZON_S = max(buy_start_s, early_buy_start_s, early_95_start_s)`
-is **45** with this paste, so websocket subscribe / 0.01s look start
-around T-75. `early_95_start_s=0` is a valid disable (do not leave it
-on the “must be positive” list). Pair it with `early_95_min_s=0` in the
-JSON; `0` also disables even if `min_s` is leftover 60.
+`min_underlying_edge_usd` is **$0** on the box: live Chainlink TWAP 30s
+must be non-zero vs the window-open PTB and on the same side as the
+book (missing/flat/wrong side skip). Pathlog paper (27 Aug, ~3552 5m
+files, 75–90, 5¢, $10, Binance `$25`) kept **3** last-45 books
+(**−$7.39**) and **87** last-120 books (**+$0.36/h**). Last-120
+**without** `$25` was **+$1.58/h** at $10 (~+$0.41/h at $2.50). Analog
+last45+$25 was implied 99/1 fills, not a FAK. `BUY_HORIZON_S =
+max(buy_start_s, early_buy_start_s, early_95_start_s)` is **120** with
+this paste, so websocket subscribe / 0.01s look start around T-150.
+`early_95_start_s=0` is a valid disable (do not leave it on the “must
+be positive” list). Pair it with `early_95_min_s=0` in the JSON; `0`
+also disables even if `min_s` is leftover 60.
 
 Missed early does **not** become a $5 late buy — there is no early slice
 while those windows are off. Same-leg add only. After `hedge_closed`, no
@@ -189,7 +194,7 @@ paths are picked once. Other knobs hot-reload.
 ## 3. Map of the repository
 
 ```
-buybot5m.py          Live bot. Last 45s 75–99, $25 edge, persist 5s @ 50/52.
+buybot5m.py          Live bot. Last 120s 75–90, edge $0, persist 5s @ 50/52.
 buybothourly.py      Hourly near-copy. Stopped.
 buybot.py            15m near-copy. Stopped.
 buy/                 Importable helpers (safe — they do not start trading)
@@ -218,12 +223,12 @@ defaults are B-only for the last 20 minutes, persist **5s @ 50/52**, dump
 35¢, recovery **53¢**, `hedge_sell_fade`, `hedge_require_oracle`, Binance
 buy edge $10, tick `0.01`, and a $10 market cap. Hourly is **stopped**.
 
-Live 5m JSON (after the operator paste) is last **45s** only, **75–99¢**
-(late 75–90 + `late_90` overlay), `min_underlying_edge_usd` **$25**,
-early/≥95 **off** (`early_buy_start_s=45`, `early_95_start_s=0`), two
-$2.50 slices, persist 5s @ 50/52, dump 32¢ ignore-oracle, recovery 53¢,
-and nominal tick `0.001`. Code defaults in `buybot5m.py` stay last-120 /
-early-300 / edge $0 until the live JSON overlays them.
+Live 5m JSON (after the operator paste) is last **120s**, **75–90¢**
+(`late_90` off), `min_underlying_edge_usd` **$0**, early/≥95 **off**
+(`early_buy_start_s=120`, `early_95_start_s=0`), one $2.50 late slice,
+persist 5s @ 50/52, dump 32¢ ignore-oracle, recovery 53¢, and nominal
+tick `0.001`. Code defaults in `buybot5m.py` still list last-120 /
+early-300 / edge $0 / `late_90` 45 until live JSON overlays them.
 
 15m/hourly windows are in **minutes** (`buy_window_min` / `a22_window_min`).
 Mixing the two without converting units has caused production `NameError`s.
@@ -1063,15 +1068,17 @@ This is the one state-like tree that is allowed to delete itself. Do not
 
 **`check_path_backtest.py`:** first tick that matches an ask band and TTM
 window is a “hit.” `--template strategy_buy5m.example.json` maps the live
-75–90¢ / last **45s** / $2.50 entry and basic 50/52/5s hedge into paper
+75–90¢ / last **120s** / $2.50 entry and basic 50/52/5s hedge into paper
 knobs. Paper persistence is real: qualifying ticks must stay continuous
 for the configured 5 seconds. Tight books use midpoint as the GUI and
-last-trade proxy; displayed top size caps the paper fill. Pathlog has
-**no** `|TWAP−PTB|` — the live **$25** edge is scored in
-`check_reversal_features.py`.
+last-trade proxy; displayed top size caps the paper fill. `--min-edge-usd 25`
+joins Binance 1s as a PTB (market start) / live (fill ts) proxy — fail-closed
+like the live gate, not Chainlink TWAP 30s. Analog-only `$25` scoring without
+a restable ask stays in `check_reversal_features.py`.
 
-This is still **not a live 5m replay**. Pathlog has no Chainlink/PTB, no
-last trade, no POST latency, and no unmatched FAKs. Paper mode also does
+This is still **not a live 5m replay**. Pathlog has no last trade, no POST
+latency, and no unmatched FAKs. Paper `--min-edge-usd` is Binance, not
+Chainlink TWAP. Paper mode also does
 not model `hedge_require_oracle`, `hedge_sell_fade`, recovery-cancel
 semantics, or the universal bid-only 32¢ dump exactly. Treat its P&L as a
 book-path comparison, not proof that the live bot would have traded.
@@ -1130,12 +1137,8 @@ the journal with `deploy/journald-size.conf` (`deploy/DISK_OPS.md`). Pathlog
 cap is separate and in-app.
 
 `CURRENT.md` owns the exact transition/patch command so it cannot drift in
-two places. Before restarting 5m, verify live JSON explicitly: last **45s**
-(`buy_start_s=early_buy_start_s=late_90_start_s=45`), `early_95_start_s=0`
-and `early_95_min_s=0`, `min_underlying_edge_usd` **25**, two $2.50 slices,
-hedge 50/52 for 5s, dump 32, recovery 53, sell-fade/oracle/dump-ignore true,
-undercut 0, and the intended `dry_run` / `entry_enabled`. `BUY_HORIZON_S`
-becomes **45**. Stop hourly. Restart `polypathlog` when recorder Python
+two places. On the box: last **120s**, 75–90, edge **$0**, `late_90=0`,
+`horizon` **120**. Stop hourly. Restart `polypathlog` when recorder Python
 changes.
 
 Watch `buy_attempt band=late` / `late_90`, `buy_skip_underlying_edge`,

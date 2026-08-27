@@ -21,7 +21,8 @@ Examples (on the VM):
     python check_path_backtest.py --sweep --series 5m
     python check_path_backtest.py --hedge-sweep --series 5m --budget 2.5
     python check_path_backtest.py --export-market btc-updown-5m-1786528500 --csv /tmp/m.csv
-  python check_path_backtest.py --ask-min 0.98 --ask-max 0.99 --ttm-max 90 --csv /tmp/hits.csv
+  python check_path_backtest.py --ask-min 0.75 --ask-max 0.90 --ttm-max 120 --budget 10 \\
+      --series 5m --paper --max-spread 0.05 --min-edge-usd 25
 """
 
 from __future__ import annotations
@@ -115,6 +116,63 @@ def _f(value: Any) -> Optional[float]:
         return float(value)
     except (TypeError, ValueError):
         return None
+
+
+def oracle_entry_ok(leg, live_btc, ptb, min_edge_usd):
+    """Fail-closed like live ``underlying_check``: missing, flat, too small, wrong side.
+
+    ``dist`` is live − PTB (Up when dist > 0). Returns ``(ok, reason, dist)``.
+    Pathlog paper uses Binance as a PTB/live proxy, not Chainlink TWAP 30s.
+    """
+    if ptb is None and live_btc is None:
+        return False, "missing_ptb", None
+    if ptb is None:
+        return False, "missing_ptb", None
+    if live_btc is None:
+        return False, "missing_live", None
+    try:
+        live_f = float(live_btc)
+        ptb_f = float(ptb)
+    except (TypeError, ValueError):
+        return False, "non_finite_price", None
+    if not math.isfinite(live_f) or not math.isfinite(ptb_f):
+        return False, "non_finite_price", None
+    dist = live_f - ptb_f
+    if dist == 0:
+        return False, "edge_zero", dist
+    try:
+        floor = float(min_edge_usd or 0)
+    except (TypeError, ValueError):
+        floor = 0.0
+    if abs(dist) < floor:
+        return False, "edge_too_small", dist
+    favored = "up" if dist > 0 else "down"
+    if str(leg or "") != favored:
+        return False, "side_mismatch", dist
+    return True, None, dist
+
+
+def lookup_btc_at(btc, unix) -> Optional[float]:
+    if btc is None or unix is None:
+        return None
+    getter = getattr(btc, "at_or_before", None)
+    if getter is None:
+        return None
+    try:
+        return getter(float(unix))
+    except (TypeError, ValueError):
+        return None
+
+
+def hit_unix_ts(hit: dict, market: MarketPath) -> Optional[float]:
+    ts = _f(hit.get("ts"))
+    if ts is not None:
+        return ts
+    ttm = _f(hit.get("ttm"))
+    end = _f(market.end_ts)
+    if ttm is None or end is None:
+        return None
+    return end - ttm
 
 
 def matches_series(series: str, slug: str, needle: str) -> bool:
@@ -573,8 +631,8 @@ def sweep_variants(tmpl: dict) -> List[dict]:
     """One-at-a-time deviations from the example JSON template.
 
     ``live_5m_paper`` is whatever ``buy_start_s`` / ``buy_max_price`` the
-    template file currently has (probe last-45s / 75–90 today, not the live
-    120s bot). Window variants skip the template's own ``ttm_max``.
+    template file currently has (live last-120s / 75–90). Window variants
+    skip the template's own ``ttm_max``.
     """
     ttm = float(tmpl["ttm_max"])
     tag = "5m" if abs(ttm - 120.0) < 1e-6 or abs(ttm - 45.0) < 1e-6 else "template"
@@ -840,6 +898,35 @@ def iter_markets(tick_dir: Path = TICK_DIR) -> Iterable[MarketPath]:
             yield market
 
 
+def _oracle_fields(market: MarketPath, hit: Optional[dict], btc, min_edge_usd):
+    """Look up Binance PTB/live and apply ``min_edge_usd`` if that floor is set."""
+    empty = {
+        "book_hit": hit is not None,
+        "dist": None,
+        "ptb": None,
+        "live_btc": None,
+        "oracle_reason": None,
+        "hit_ts": None,
+        "start_ts": market.start_ts or None,
+    }
+    if hit is None or min_edge_usd is None:
+        return empty
+    hit_ts = hit_unix_ts(hit, market)
+    ptb = lookup_btc_at(btc, market.start_ts)
+    live = lookup_btc_at(btc, hit_ts)
+    ok, reason, dist = oracle_entry_ok(hit.get("leg"), live, ptb, min_edge_usd)
+    empty.update(
+        {
+            "dist": None if dist is None else round(float(dist), 4),
+            "ptb": ptb,
+            "live_btc": live,
+            "oracle_reason": None if ok else reason,
+            "hit_ts": hit_ts,
+        }
+    )
+    return empty
+
+
 def evaluate_rule(
     markets: Sequence[MarketPath],
     *,
@@ -851,6 +938,8 @@ def evaluate_rule(
     max_spread: Optional[float] = None,
     paper: bool = False,
     paper_kwargs: Optional[dict] = None,
+    btc=None,
+    min_edge_usd: Optional[float] = None,
 ) -> List[dict]:
     rows: List[dict] = []
     pk = paper_kwargs or {}
@@ -864,6 +953,7 @@ def evaluate_rule(
             ttm_max=ttm_max,
             max_spread=max_spread,
         )
+        oracle = _oracle_fields(market, hit, btc, min_edge_usd)
         if hit is None:
             rows.append(
                 {
@@ -883,6 +973,30 @@ def evaluate_rule(
                     "pnl": None,
                     "exit": None,
                     "exit_bid": None,
+                    **oracle,
+                }
+            )
+            continue
+        if oracle.get("oracle_reason"):
+            rows.append(
+                {
+                    "slug": market.slug,
+                    "series": market.series,
+                    "hit": False,
+                    "winner": winner,
+                    "leg": hit["leg"],
+                    "ask": hit["ask"],
+                    "ask_size": hit.get("ask_size"),
+                    "ttm": hit["ttm"],
+                    "fill": None,
+                    "shares": None,
+                    "notional": None,
+                    "avg": None,
+                    "won": None,
+                    "pnl": None,
+                    "exit": f"oracle_{oracle['oracle_reason']}",
+                    "exit_bid": None,
+                    **oracle,
                 }
             )
             continue
@@ -926,6 +1040,7 @@ def evaluate_rule(
                 "pnl": None if pnl is None else round(pnl, 4),
                 "exit": exit_kind,
                 "exit_bid": None if exit_bid is None else round(float(exit_bid), 4),
+                **oracle,
             }
         )
     return rows
@@ -971,6 +1086,22 @@ def summarize(rows: Sequence[dict]) -> dict:
             for r in hits
             if r.get("exit") == "hedge" and r.get("winner") and r.get("winner") != r.get("leg")
         ),
+        "book_hits": sum(1 for r in rows if r.get("book_hit")),
+        "oracle_skip_edge": sum(
+            1 for r in rows if r.get("oracle_reason") == "edge_too_small"
+        ),
+        "oracle_skip_side": sum(
+            1 for r in rows if r.get("oracle_reason") == "side_mismatch"
+        ),
+        "oracle_skip_missing": sum(
+            1
+            for r in rows
+            if str(r.get("oracle_reason") or "").startswith("missing")
+            or r.get("oracle_reason") in {"non_finite_price", "edge_zero"}
+        ),
+        "oracle_applied": any(
+            r.get("dist") is not None or r.get("oracle_reason") for r in rows
+        ),
     }
 
 
@@ -979,6 +1110,8 @@ def grid_scan(
     *,
     budget: float,
     max_spread: Optional[float],
+    btc=None,
+    min_edge_usd: Optional[float] = None,
 ) -> List[dict]:
     asks = [0.70, 0.75, 0.80, 0.85, 0.90, 0.95, 0.98]
     ttms = [30, 60, 90, 120, 180, 240]
@@ -993,6 +1126,8 @@ def grid_scan(
                 ttm_max=float(ttm_max),
                 budget=budget,
                 max_spread=max_spread,
+                btc=btc,
+                min_edge_usd=min_edge_usd,
             )
             stats = summarize(rows)
             out.append({"ask": ask, "ttm_max": ttm_max, **stats})
@@ -1067,6 +1202,13 @@ def export_hits_csv(rows: Sequence[dict], dest: Path) -> None:
         "pnl",
         "exit",
         "exit_bid",
+        "book_hit",
+        "dist",
+        "ptb",
+        "live_btc",
+        "oracle_reason",
+        "hit_ts",
+        "start_ts",
     ]
     with open(dest, "w", newline="", encoding="utf-8") as handle:
         writer = csv.DictWriter(handle, fieldnames=fields, extrasaction="ignore")
@@ -1085,6 +1227,45 @@ def _print_summary(stats: dict) -> None:
         f"wins={stats['wins']}  win_rate={wr_s}  pnl={stats['pnl_sum']}  "
         f"hedges={stats.get('hedges', 0)}  toxic_dumps={stats.get('toxic_dumps', 0)}  "
         f"misses={stats['misses']}  unresolved={stats['unresolved']}"
+    )
+    book_hits = stats.get("book_hits")
+    skip_e = stats.get("oracle_skip_edge") or 0
+    skip_s = stats.get("oracle_skip_side") or 0
+    skip_m = stats.get("oracle_skip_missing") or 0
+    if stats.get("oracle_applied"):
+        print(
+            f"book_hits={book_hits}  oracle_keep={stats['hits']}  "
+            f"oracle_skip_edge={skip_e}  oracle_skip_side={skip_s}  "
+            f"oracle_skip_missing={skip_m}"
+        )
+
+
+def load_binance_for_markets(markets: Sequence[MarketPath], *, interval: str, cache_dir: Path):
+    """Binance BTCUSDT closes for PTB (market start) and live (fill ts).
+
+    Same helper as ``check_reversal_features`` (vision mirror, closeTime stamps).
+    Not Chainlink TWAP 30s. Missing bars fail the gate closed.
+    """
+    from check_reversal_features import fetch_binance_klines, http_session
+
+    starts = [float(m.start_ts) for m in markets if m.start_ts]
+    ends = [float(m.end_ts) for m in markets if m.end_ts]
+    if not starts or not ends:
+        print("binance: no market start/end timestamps", file=sys.stderr)
+        return None
+    start_s = int(min(starts)) - 2
+    end_s = int(max(ends)) + 2
+    print(
+        f"binance {interval} [{start_s}..{end_s}] cache={cache_dir} "
+        "(PTB=close at market start, live=close at fill ts; not Chainlink TWAP)",
+        file=sys.stderr,
+    )
+    return fetch_binance_klines(
+        http_session(),
+        start_s=start_s,
+        end_s=end_s,
+        interval=interval,
+        cache_dir=cache_dir,
     )
 
 
@@ -1138,6 +1319,24 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         default=0.05,
         help="GUI/ask gap that counts as unambiguous (anatomy; default 5¢)",
     )
+    ap.add_argument(
+        "--min-edge-usd",
+        type=float,
+        default=None,
+        help="Binance |BTC−PTB| floor in USD at fill (live min_underlying_edge_usd). "
+        "PTB = close at market start. Omit to skip the oracle gate.",
+    )
+    ap.add_argument(
+        "--binance-interval",
+        default="1s",
+        help="klines interval for --min-edge-usd (default 1s; 1m is faster/worse)",
+    )
+    ap.add_argument(
+        "--binance-cache",
+        type=Path,
+        default=Path("/tmp/poly_reversal_cache/binance"),
+        help="page cache shared with check_reversal_features.py",
+    )
     args = ap.parse_args(argv)
 
     markets = list(iter_markets(args.dir))
@@ -1149,6 +1348,15 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     tmpl = template_from_strategy(args.template) if args.template.exists() else {}
     paper_kwargs = paper_kwargs_from(tmpl)
+    btc = None
+    min_edge_usd = args.min_edge_usd
+    if min_edge_usd is not None and markets:
+        btc = load_binance_for_markets(
+            markets,
+            interval=str(args.binance_interval),
+            cache_dir=args.binance_cache,
+        )
+    oracle_kw = {"btc": btc, "min_edge_usd": min_edge_usd}
 
     if not markets and (
         args.sweep or args.compare or args.grid or args.anatomy or args.hedge_sweep
@@ -1172,7 +1380,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         return 0
 
     if args.grid:
-        table = grid_scan(markets, budget=args.budget, max_spread=args.max_spread)
+        table = grid_scan(
+            markets,
+            budget=args.budget,
+            max_spread=args.max_spread,
+            **oracle_kw,
+        )
         print("ask\tttm_max\thits\tfull\tpartial\tzero\tdecided\twins\twin_rate\tpnl")
         for row in table:
             wr = row["win_rate"]
@@ -1247,6 +1460,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 max_spread=variant.get("max_spread"),
                 paper=bool(variant.get("paper")),
                 paper_kwargs=pk,
+                **oracle_kw,
             )
             stats = summarize(rows)
             wr = stats["win_rate"]
@@ -1291,6 +1505,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 max_spread=variant.get("max_spread"),
                 paper=bool(variant.get("paper")),
                 paper_kwargs=paper_kwargs,
+                **oracle_kw,
             )
             stats = summarize(rows)
             wr = stats["win_rate"]
@@ -1329,6 +1544,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 max_spread=args.max_spread,
                 paper=args.paper,
                 paper_kwargs=paper_kwargs,
+                **oracle_kw,
             )
             stats = summarize(rows)
             wr = stats["win_rate"]
@@ -1357,6 +1573,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         max_spread=args.max_spread,
         paper=args.paper,
         paper_kwargs=paper_kwargs,
+        **oracle_kw,
     )
     _print_summary(summarize(rows))
     if args.csv:
