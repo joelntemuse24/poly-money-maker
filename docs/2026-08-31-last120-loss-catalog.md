@@ -1,8 +1,9 @@
 # Last-120 5m — first full overlay tape (27–31 Aug 2026)
 
-Research note. Operator asked 31 Aug to ship **B+C** (persist 1s, dump
-40¢, flatten walks avg <75¢). Do **not** paste last-45 + $25. Do not
-size up from **$2.50**. Live paste is in `CURRENT.md`.
+Research note. Operator shipped **B+C** (persist 1s, dump 40¢, flatten
+walks avg <75¢) on the VM **31 Aug ~22:25Z**. Do **not** paste last-45
++ $25. Do not size up from **$2.50**. The already-applied live paste
+is in `CURRENT.md`.
 
 Live (VM 31 Aug ~15:49Z): last **120s**, winning ask **75–90¢**, one
 **$2.50** FAK @ **90¢**, `late_90` / early / ≥95 **off**,
@@ -202,9 +203,12 @@ exit quality on 5m losers is.
 
 ---
 
-## 4. Measure on the next 48h (after B+C paste + 5m restart)
+## 4. Measure on the next 48h (clock started 31 Aug ~22:25Z)
 
-After the operator pastes B+C and restarts `polybuybot5m`:
+B+C is live. Operator pasted and restarted `polybuybot5m` **31 Aug
+~22:25Z**. Printed: persist 1.0 dump 0.4 min 0.4 toxic 0.75 flatten
+True start 120 edge 0.0 dry_run False entry True. Services: inactive /
+active / inactive. On the next 48h tape:
 
 - `hedge_fill` should rise toward wallet sells; `hedge_fail` then
   `uncertain_resolved` should no longer be the only sell story.
