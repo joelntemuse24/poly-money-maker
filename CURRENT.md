@@ -3,26 +3,27 @@
 **Agents: read this after `AGENTS.md`.** Update this file when ops/strategy decisions change.
 Do not put secrets, API keys, or live wallet material here.
 
-Last updated: **2026-08-31** — 5m **last 120s / 75–90 / $2.50 / edge $0**
-has been live since **27 Aug 2026 ~17:26Z**. First full tape: barely +EV
-(**+$9 / ~94h ≈ +$0.10–$0.12/h**). Paper-credit VM tape (same CSV):
-`paper_win=288` / `paper_loss=71` / `hedge=54` / `session_pnl=−163` is
-**still not live P&L** (24 no-BTC opens + Binance≠resolution). **Do not
-size up. Do not paste last-45 + $25** (replay keep **6 / −$3.46**).
-Operator asked for the money-moving **B+C** exits: persist **1s**, dump
-**40¢**, flatten walks **avg <75¢** at live bid **<75¢**. Loss catalog:
-`docs/2026-08-31-last120-loss-catalog.md` §9. Hourly and 15m are stopped.
-**Do not add a |dist| or vol/momentum buy skip.**
+Last updated: **2026-08-31 ~22:36Z** — 0–10 `|dist|` at fill is about
+**half the session flips** and −EV at an 80¢ fill. **Paste last-120 +
+`$10`** (window and B+C stay). **Do not paste last-45 + $25** (replay
+keep **6 / −$3.46**). B+C exits are already live (31 Aug ~22:25Z).
+First last-120 tape at edge $0: barely +EV (**+$9 / ~94h ≈
++$0.10–$0.12/h**). Paper-credit VM tape: `paper_win=288` /
+`paper_loss=71` / `hedge=54` / `session_pnl=−163` is **still not live
+P&L** (24 no-BTC opens + Binance≠resolution). **Do not size up.**
+Catalog: `docs/2026-08-31-last120-loss-catalog.md` §9. Hourly and 15m
+are stopped. **Do not add a vol/momentum buy skip.** last-120+`$10`
+is the 0–10 cut; GATE `|dist|≥25` is still no.
 
-**Live 5m combination** after the operator pastes B+C and restarts 5m.
-Entry stays last-120 / edge $0 (already on the box). Example JSON
-`--sweep` entry is still last-45+$25; its **hedge** knobs now match B+C.
+**Live 5m combination** after the `$10` paste (B+C already on the box).
+Example JSON `--sweep` entry is still last-45+$25; its **hedge** knobs
+match B+C.
 
 | Knob | Value |
 |---|---|
 | Entry time | last **120s** (`buy_start_s=120`, `late_90_start_s=0`) |
 | Ask | **75–90¢** only (no ≥90 overlay) |
-| `min_underlying_edge_usd` | **$0** |
+| `min_underlying_edge_usd` | **$10** (skip 0–10 `|TWAP−PTB|`; not $25) |
 | Early / ≥95 | **off** (`early_buy_start_s=120`, `early_95_start_s=0`) |
 | Size | **one $2.50** (`buy_budget=late_buy_budget=2.5`). **Do not size up.** |
 | Hedge | persist **1s** @ 50/52, dump **40¢**, flatten walks **<75¢**, recovery 53, fade, oracle on persist |
@@ -53,23 +54,26 @@ tape already had **8 sold-then-won**; faster persist and flatten add more.
 **Reversal features (27 Aug):** 25% flips in the **$20–40 bucket** is
 **not** eatable at an 85–88¢ fill (no-hedge cap is `1 − fill`: 15% at
 85¢, 12% at 88¢; with ~$1 salvage, 23% / 18%). A **gate** is different
-from the bucket. Live buy edge is **$0** (last-120). Example JSON still
-holds last-45+$25 for `--sweep` only. **Do not add a vol skip.**
+from the bucket. Intended live buy edge is **$10** (last-120; paste
+above). Example JSON still holds last-45+$25 for `--sweep` only.
+**Do not add a vol skip.**
 
-**B+C live paste (operator asked 31 Aug).** Entry stays last-120 / edge $0.
-Confirm `dry_run` / `entry_enabled` before restart. Flatten is **code**
-(needs `polybuybot5m` restart). Persist/dump/toxic hot-reload but restart
-anyway so flatten is on. Do **not** start 15m, hourly, or mint.
+**B+C live paste — done 31 Aug ~22:25Z.** Persist/dump/flatten are on.
+**`$10` edge paste — do this now.** Entry stays last-120. Only
+`min_underlying_edge_usd` changes. Edge hot-reloads; restart is
+optional. Confirm `dry_run` / `entry_enabled`. Printed `start` must
+stay **120**, `edge` **10**. Do **not** paste last-45 + $25. Do **not**
+start 15m, hourly, or mint.
 
 ```bash
 cd ~/poly-money-maker && git pull
-python3 -c 'import json; from pathlib import Path; p=Path("strategy_buy5m.json"); d=json.loads(p.read_text()); d["hedge_persist_s"]=1.0; d["hedge_toxic_bid_max"]=0.40; d["hedge_min_price"]=0.40; d["toxic_force_exit_below"]=0.75; d["hedge_flatten_walks"]=True; p.write_text(json.dumps(d, indent=2)+"\n"); print("persist", d["hedge_persist_s"], "dump", d["hedge_toxic_bid_max"], "min", d["hedge_min_price"], "toxic", d["toxic_force_exit_below"], "flatten", d.get("hedge_flatten_walks"), "start", d["buy_start_s"], "edge", d["min_underlying_edge_usd"], "dry_run", d.get("dry_run"), "entry", d.get("entry_enabled"))'
+python3 -c 'import json; from pathlib import Path; p=Path("strategy_buy5m.json"); d=json.loads(p.read_text()); d["min_underlying_edge_usd"]=10.0; p.write_text(json.dumps(d, indent=2)+"\n"); print("persist", d.get("hedge_persist_s"), "dump", d.get("hedge_toxic_bid_max"), "flatten", d.get("hedge_flatten_walks"), "start", d["buy_start_s"], "edge", d["min_underlying_edge_usd"], "dry_run", d.get("dry_run"), "entry", d.get("entry_enabled"))'
 sudo systemctl restart polybuybot5m
 systemctl is-active polybuybot polybuybot5m polybuybothourly
 # expect: inactive active inactive
 ```
 
-Printed `start` must stay **120**, `edge` **0**. Do **not** paste last-45 + $25.
+Printed `start` must stay **120**, `edge` **10**. Do **not** paste last-45 + $25.
 
 First last-120 tape (27 Aug 17:26Z → 31 Aug 15:12 Dublin): **+$9**, WR ~**82%**,
 take rate **411/1129 = 36%**, **73 walks**, **52 sells / 0 `hedge_fill`**
@@ -101,8 +105,8 @@ featured 403: `paper_pnl_kept=−85.12` / **−$0.86/h**. Live overlay recap
 is still ~**+$9** / **+$0.10–$0.12/h**. Fill×TTM: walks **<70¢** WR
 **34%**; 75–90 WR **60–76%**; TTM 60–90 best (**70.9%**). SESSION replay
 `last45_e25` keep **6 / −$3.46**. GATE `|dist|≥25` keep 132 / −$5 at
-1.3/h — **do not add a |dist| gate**. Do **not** paste last-45+$25.
-Do **not** size up. See catalog §9. VM stash
+1.3/h — **do not paste last-45+$25 or GATE ≥25**. last-120+`$10` is
+the 0–10 cut. Do **not** size up. See catalog §9. VM stash
 `vm local check_path_backtest` is still on the box.
 
 ---
@@ -130,7 +134,7 @@ mint complete sets. Operator still sells leftover mint inventory by hand.
 | After persist | Sell at the live bid while **< 53¢**, including a fade through 50 (`hedge_sell_fade`). Bid ≥ **53¢** holds and clears persist. |
 | Dump | Bid-only ≤ **40¢** even if BTC still agrees (`hedge_dump_ignore_oracle`). Persist-50 does **not** get this bypass. |
 | Flatten walks | `toxic_force_exit_below=0.75` arms `toxic_fill` on avg **<75¢**. Sell at the live bid while bid **<75¢** (`hedge_flatten_walks`). Bid ≥75 rides. |
-| Underlying buy edge | **$0** |
+| Underlying buy edge | **$10** |
 | `BUY_HORIZON_S` | **120s** |
 | `max_open_positions` | **0 = unlimited** |
 | `poll_buy_window_s` / `poll_held_s` | **0.01** on the live 5m WS book |
@@ -236,9 +240,9 @@ amount / HTTP 400), not this NameError.
 - **VM:** `~/poly-money-maker` on `instance-20260516-185922`.
 - **Mint:** `sudo systemctl stop polymintbot && sudo systemctl disable polymintbot`
 - **Buy bots:** **5m only.** Stop/disable hourly and 15m. Live JSON is
-  already last-120 / edge $0 / hedge 50/52 (pasted 27 Aug 17:26Z).
-  **Do not paste last-45 + $25. Do not paste a new overlay or restart
-  unless the operator asks.** Do **not** start 15m, hourly, or mint.
+  last-120 plus B+C (persist **1s**, dump **40¢**, flatten) pasted
+  **31 Aug ~22:25Z**. **Paste `$10` edge** (block above). **Do not
+  paste last-45 + $25.** Do **not** start 15m, hourly, or mint.
 - **Pathlog:** start `polypathlog` as above (no `.env` required).
 
 ---
@@ -329,6 +333,14 @@ amount / HTTP 400), not this NameError.
       leverage is loser exits (held-to-zero + dump-at-1¢), not more
       entries. Sell unmatched retry already exists; `hedge_fill` was
       missing on the ghost-resolve path.
+- [x] **B+C live paste + 5m restart** — 31 Aug ~22:25Z. Printed persist
+      1.0 / dump 0.4 / toxic 0.75 / flatten True / start 120 / edge 0 /
+      dry_run False / entry True. Services inactive / active / inactive.
+- [ ] **Paste last-120 + `$10`** (block above). Not last-45. Not $25.
+      Then measure: `buy_skip_underlying_edge` `reason=edge_too_small`
+      on 0–10; fill rate vs 4.1/h; 0–10 share of new fills; B+C sell
+      px / held-to-zero; sold-then-won vs tape’s 8; Dublin $/h;
+      `cycle_error` 0; `invalid amounts` 0.
 
 ---
 
@@ -337,7 +349,7 @@ amount / HTTP 400), not this NameError.
 1. Read `AGENTS.md` + this file before changing mint/buy/hedge logic.
 2. Do **not** restart minting unless the operator asks. Do **not** start
    `polybuybot` / `polybuybothourly` unless the operator asks. 5m is the
-   live buy bot after the operator patches knobs and restarts the unit.
+   live buy bot. B+C is on the box. Next paste is last-120 + `$10`.
 3. Never truncate state/PnL/log files; never commit live strategy/state/`.env`.
    Pathlog ticks are **auto-pruned** (14d / 400 MB) — do not `rm` them by hand,
    but **do export** (`check_path_backtest.py --csv` or `scp` the ticks dir)

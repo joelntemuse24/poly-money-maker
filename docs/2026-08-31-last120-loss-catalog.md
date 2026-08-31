@@ -1,8 +1,9 @@
 # Last-120 5m — first full overlay tape (27–31 Aug 2026)
 
-Research note. Operator asked 31 Aug to ship **B+C** (persist 1s, dump
-40¢, flatten walks avg <75¢). Do **not** paste last-45 + $25. Do not
-size up from **$2.50**. Live paste is in `CURRENT.md`.
+Research note. Operator shipped **B+C** (persist 1s, dump 40¢, flatten
+walks avg <75¢) on the VM **31 Aug ~22:25Z**. Next paste is last-120 +
+**`$10`** so 0–10 `|dist|` fills stay out. Do **not** paste last-45 +
+$25. Do not size up from **$2.50**. Pastes are in `CURRENT.md`.
 
 Live (VM 31 Aug ~15:49Z): last **120s**, winning ask **75–90¢**, one
 **$2.50** FAK @ **90¢**, `late_90` / early / ≥95 **off**,
@@ -202,9 +203,12 @@ exit quality on 5m losers is.
 
 ---
 
-## 4. Measure on the next 48h (after B+C paste + 5m restart)
+## 4. Measure on the next 48h (clock started 31 Aug ~22:25Z)
 
-After the operator pastes B+C and restarts `polybuybot5m`:
+B+C is live. Operator pasted and restarted `polybuybot5m` **31 Aug
+~22:25Z**. Printed: persist 1.0 dump 0.4 min 0.4 toxic 0.75 flatten
+True start 120 edge 0.0 dry_run False entry True. Services: inactive /
+active / inactive. On the next 48h tape:
 
 - `hedge_fill` should rise toward wallet sells; `hedge_fail` then
   `uncertain_resolved` should no longer be the only sell story.
@@ -445,6 +449,13 @@ no-hedge max flip is **20%**. 0–10 is not eatable; 10–20 is knife-edge;
 20+ mostly is. GATE `ev_nohedge` (flip × fill, not the fake wallet
 column): all **−0.09**; ≥10 **+0.13**; ≥20 **+0.18**; ≥30 **+0.25**.
 
+**0–10 is the entry leak.** 118 fills, **47 flips** (~40% flip). That
+is about **half** the scored session flips (47/83 in the printed
+buckets). Redeem-only at mean fill 80¢ is about **−$0.85**/fill in
+0–5 and **−$0.43** in 5–10 ≈ **−$73** on the pile. last-45+$25 kept
+**6/405** and is still no. last-120+`$10` keeps the window and drops
+only this pile. B+C still handles 10+ losers that fade.
+
 SESSION replay (keep if TTM ≤ window and |dist| ≥ edge — poisoned by
 −$2.70 opens until paper-credit):
 
@@ -559,9 +570,11 @@ negative until ≥$30** and fill rate collapses.
 | 30 | 92 | 0.9 | 12.0% | 88.0% | +2.75 |
 | 40 | 55 | 0.6 | 12.7% | 87.3% | +9.23 |
 
-**Do not add a |dist| gate from this table.** ≥$25 cuts the tape to
-1.3 fills/h and is still −$5 paper. Historical COMBOS `last45_e20`
-+$1.85/h is implied-|dist| paper on **all 5m clocks**, not these fills.
+**Do not add GATE `|dist|≥25` / last-45+$25 from this table.** ≥$25
+cuts the tape to 1.3 fills/h and is still −$5 paper. last-120+`$10`
+is the 0–10 cut (separate from this ≥25 row). Historical COMBOS
+`last45_e20` +$1.85/h is implied-|dist| paper on **all 5m clocks**,
+not these fills.
 
 ### SESSION replay (un-poisoned for paper_win / paper_loss)
 
@@ -584,15 +597,15 @@ Keep actual wallet/paper P&amp;L if that fill’s TTM ≤ window and
 Tape **54** sells / **47** with BTC: mean_|dist| **20.6**, against
 **45%**, mean_mom30 **−5.6**. Recovery still poor (many −$1.5 to
 −$2.8; a few +3.11 / +2.86). This tape is dump **32** / persist **5s**.
-B+C (persist 1s / dump 40 / flatten &lt;75) is not in these rows until
-the operator pastes and restarts 5m.
+B+C (persist 1s / dump 40 / flatten &lt;75) is not in these rows
+(tape is pre-paste). Operator pasted B+C **31 Aug ~22:25Z**.
 
 ### What this does / does not change
 
-Stay **last-120 / 75–90 / edge $0 / $2.50**. Early / ≥95 / late_90
-**off**. **Do not size up.** **Do not add a vol or against-momentum
-skip.** Measure B+C on the next 48h of live recap, not this paper
-banner. Optional later: exclude `open` from banner `session_pnl` so
+Stay **last-120 / 75–90 / $2.50**. Next paste is last-120 + `$10`
+(0–10 skip). Early / ≥95 / late_90 **off**. **Do not size up.** **Do
+not add a vol or against-momentum skip.** Measure B+C + `$10` on the
+next live recap, not this paper banner. Optional later: exclude `open` from banner `session_pnl` so
 the 24 coverage-gap bags do not drag −$65; `/activity?type=REDEEM` if
 we want real Redeem rows. VM stash `vm local check_path_backtest` is
 still on the box.

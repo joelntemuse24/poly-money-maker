@@ -102,11 +102,12 @@ the rest of the ride to $1.00.
 | 0 < TTM ≤ 120 seconds | **75¢ through 90¢ inclusive** | late `$2.50`, limit **90¢** |
 | Any TTM | ≥90¢ | **off** (`late_90_start_s=0`) |
 
-Live `min_underlying_edge_usd` is **$0**. The example JSON / `--sweep`
-template still documents last **45s** + `$25` as a *research* combo:
-`min_underlying_edge_usd` is **$25** in that file only. `CURRENT.md`
-wins for what is actually running. `BUY_HORIZON_S` is **120** on the
-live overlay. `early_95_start_s=0` is a valid disable.
+Live `min_underlying_edge_usd` is **$10** (skip 0–10 `|TWAP−PTB|`).
+The example JSON / `--sweep` template still documents last **45s** +
+`$25` as a *research* combo: `min_underlying_edge_usd` is **$25** in
+that file only. `CURRENT.md` wins for what is actually running.
+`BUY_HORIZON_S` is **120** on the live overlay. `early_95_start_s=0`
+is a valid disable.
 
 Missed early does **not** become a $5 late buy — there is no early slice
 while those windows are off. Same-leg add only. After `hedge_closed`, no
@@ -188,7 +189,7 @@ paths are picked once. Other knobs hot-reload.
 ## 3. Map of the repository
 
 ```
-buybot5m.py          Live bot. Last 120s 75–90, edge $0, persist 1s @ 50/52, dump 40, flatten walks <75.
+buybot5m.py          Live bot. Last 120s 75–90, edge $10, persist 1s @ 50/52, dump 40, flatten walks <75.
 buybothourly.py      Hourly near-copy. Stopped.
 buybot.py            15m near-copy. Stopped.
 buy/                 Importable helpers (safe — they do not start trading)
@@ -218,14 +219,14 @@ defaults are B-only for the last 20 minutes, persist **5s @ 50/52**, dump
 buy edge $10, tick `0.01`, and a $10 market cap. Hourly is **stopped**.
 
 Live 5m JSON (on the VM since 27 Aug 2026 ~17:26Z; **`CURRENT.md` wins**)
-is last **120s**, **75–90¢**, `min_underlying_edge_usd` **$0**,
+is last **120s**, **75–90¢**, `min_underlying_edge_usd` **$10**,
 `late_90` / early / ≥95 **off**, one $2.50 FAK, persist **1s @ 50/52**,
 dump **40¢** ignore-oracle, flatten walks **avg <75¢** at live bid **<75¢**,
 recovery 53¢, tick `0.001`. The example JSON
 and `--sweep` template are still last **45s** + `$25` — that is
 research **entry**, not live. Example hedge knobs now match B+C
-(persist 1s / dump 40 / flatten). Code defaults in `buybot5m.py` stay last-120 /
-early-300 / edge $0 until JSON overlays them. First last-120 tape:
+(persist 1s / dump 40 / flatten). Code defaults in `buybot5m.py` are
+last-120 / edge $10; live JSON still overlays them. First last-120 tape:
 `docs/2026-08-31-last120-loss-catalog.md`.
 
 15m/hourly windows are in **minutes** (`buy_window_min` / `a22_window_min`).
@@ -1142,7 +1143,7 @@ the journal with `deploy/journald-size.conf` (`deploy/DISK_OPS.md`). Pathlog
 cap is separate and in-app.
 
 `CURRENT.md` owns the live knobs so they cannot drift in two places.
-Live is last-120 / edge $0 / one $2.50. **Do not paste last-45 + $25.
+Live is last-120 / edge $10 / one $2.50. **Do not paste last-45 + $25.
 Do not restart 5m unless the operator asks.** Hedge 50/52 for 5s, dump
 32, recovery 53, sell-fade/oracle/dump-ignore true, undercut 0. Stop
 hourly. Restart `polypathlog` when recorder Python changes.

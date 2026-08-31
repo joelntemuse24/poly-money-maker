@@ -9,6 +9,7 @@ from pathlib import Path
 from check_reversal_features import (
     BtcSeries,
     COMBO_SPECS,
+    SESSION_REPLAY_GATES,
     Features,
     Sample,
     attach_btc_winners,
@@ -233,6 +234,16 @@ class BandAndPnlTests(unittest.TestCase):
         body = "\n".join(session_replay_table([keep, skip], 1.0))
         self.assertIn("all_fills\t2\t0", body)
         self.assertIn("last45_e25\t1\t1", body)
+
+    def test_session_replay_late120_e10_drops_sub_ten(self):
+        names = [n for n, _, _ in SESSION_REPLAY_GATES]
+        self.assertIn("late120_e10", names)
+        keep = _sample(15, False, False, 0.50)
+        keep.feat.ttm = 80
+        skip = _sample(5, False, True, -2.50)
+        skip.feat.ttm = 80
+        body = "\n".join(session_replay_table([keep, skip], 1.0))
+        self.assertIn("late120_e10\t1\t1", body)
 
     def test_implied_fill_and_window_path(self):
         self.assertEqual(implied_fill_px(10), 0.80)
