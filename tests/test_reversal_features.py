@@ -11,6 +11,8 @@ from check_reversal_features import (
     COMBO_SPECS,
     Features,
     Sample,
+    attach_btc_winners,
+    bought_side,
     breakeven_flip_rate,
     bucket,
     csv_join_report,
@@ -26,8 +28,10 @@ from check_reversal_features import (
     paper_ev,
     paper_redeem_pnl,
     seconds_to_cross,
+    render_session,
     session_fill_split,
     session_markets,
+    session_pnl,
     session_replay_table,
     side_of,
     skip_cost_table,
@@ -337,6 +341,123 @@ class CsvSessionTests(unittest.TestCase):
         self.assertAlmostEqual(rows[0]["ts"], 1787821393.0)
         mk = session_markets(rows, restart_ts=1787821036, year=2026)
         self.assertEqual(len(mk), 1)
+
+
+def _clob_buy(*, start_ts: int, leg: str, spent: float = 2.70, shares: float = 3.21, px: float = 0.841):
+    return {
+        "market": f"August 27, 1:30PM-1:35PM ET {start_ts}",
+        "start_ts": start_ts,
+        "end_ts": start_ts + 300,
+        "buys": [
+            {
+                "usdc": spent,
+                "tok": shares,
+                "px": px,
+                "leg": leg,
+                "ts": float(start_ts + 199),
+                "action": "Buy",
+            }
+        ],
+        "sells": [],
+        "redeems": [],
+    }
+
+
+class SessionPaperCreditTests(unittest.TestCase):
+    """Data API /trades has no Redeem. Resolved opens need Binance paper credit."""
+
+    def test_clob_only_winner_is_paper_win(self):
+        # Window 1000–1300. PTB 100000, close 100050 → Up wins.
+        market = _clob_buy(start_ts=1000, leg="Up")
+        btc = BtcSeries(ts=[1000, 1300], px=[100_000.0, 100_050.0])
+        attach_btc_winners([market], btc, now_ts=1391.0)
+        rec = session_pnl(market)
+        self.assertEqual(bought_side("Up"), "up")
+        self.assertEqual(rec["outcome"], "paper_win")
+        self.assertAlmostEqual(rec["pnl"], 3.21 - 2.70, places=4)
+        self.assertAlmostEqual(rec["redeemed"], 3.21, places=4)
+
+    def test_clob_only_loser_is_paper_loss(self):
+        # Same window, close below PTB → Up loses. Credit $0, keep −spend.
+        market = _clob_buy(start_ts=1000, leg="Up")
+        btc = BtcSeries(ts=[1000, 1300], px=[100_000.0, 99_950.0])
+        attach_btc_winners([market], btc, now_ts=1391.0)
+        rec = session_pnl(market)
+        self.assertEqual(rec["outcome"], "paper_loss")
+        self.assertAlmostEqual(rec["pnl"], -2.70, places=4)
+        self.assertAlmostEqual(rec["redeemed"], 0.0, places=4)
+
+    def test_hedge_sell_keeps_wallet_cash(self):
+        market = _clob_buy(start_ts=1000, leg="Up")
+        market["sells"] = [
+            {
+                "usdc": 0.50,
+                "tok": 3.21,
+                "px": 0.16,
+                "leg": "Up",
+                "ts": 1280.0,
+                "action": "Sell",
+            }
+        ]
+        btc = BtcSeries(ts=[1000, 1300], px=[100_000.0, 100_050.0])
+        attach_btc_winners([market], btc, now_ts=1391.0)
+        rec = session_pnl(market)
+        self.assertEqual(rec["outcome"], "hedge")
+        self.assertAlmostEqual(rec["pnl"], 0.50 - 2.70, places=4)
+        self.assertAlmostEqual(rec["sold"], 0.50, places=4)
+
+    def test_real_redeem_is_not_overwritten(self):
+        market = _clob_buy(start_ts=1000, leg="Up")
+        market["redeems"] = [
+            {
+                "usdc": 3.00,
+                "tok": 3.21,
+                "px": 1.0,
+                "leg": "Up",
+                "ts": 1310.0,
+                "action": "Redeem",
+            }
+        ]
+        btc = BtcSeries(ts=[1000, 1300], px=[100_000.0, 99_950.0])
+        attach_btc_winners([market], btc, now_ts=1391.0)
+        rec = session_pnl(market)
+        self.assertEqual(rec["outcome"], "redeem")
+        self.assertAlmostEqual(rec["redeemed"], 3.00, places=4)
+        self.assertAlmostEqual(rec["pnl"], 3.00 - 2.70, places=4)
+
+    def test_unsettled_open_stays_open(self):
+        market = _clob_buy(start_ts=1000, leg="Up")
+        btc = BtcSeries(ts=[1000, 1300], px=[100_000.0, 100_050.0])
+        attach_btc_winners([market], btc, now_ts=1350.0)
+        rec = session_pnl(market)
+        self.assertEqual(rec["outcome"], "open")
+        self.assertAlmostEqual(rec["pnl"], -2.70, places=4)
+        self.assertAlmostEqual(rec["redeemed"], 0.0, places=4)
+
+    def test_render_counts_paper_win_and_paper_loss(self):
+        win = _clob_buy(start_ts=1000, leg="Up")
+        lose = _clob_buy(start_ts=2000, leg="Up")
+        btc = BtcSeries(
+            ts=[1000, 1300, 2000, 2300],
+            px=[100_000.0, 100_050.0, 100_000.0, 99_950.0],
+        )
+        attach_btc_winners([win, lose], btc, now_ts=2391.0)
+        text = render_session([win, lose], [])
+        self.assertIn("paper_win=1", text)
+        self.assertIn("paper_loss=1", text)
+        self.assertIn("/trades is CLOB-only", text)
+
+    def test_fill_split_counts_paper_win_not_paper_loss(self):
+        win = _clob_buy(start_ts=1000, leg="Up")
+        lose = _clob_buy(start_ts=2000, leg="Up")
+        btc = BtcSeries(
+            ts=[1000, 1300, 2000, 2300],
+            px=[100_000.0, 100_050.0, 100_000.0, 99_950.0],
+        )
+        attach_btc_winners([win, lose], btc, now_ts=2391.0)
+        text = session_fill_split([win, lose])
+        self.assertIn("win = redeem or paper_win", text)
+        self.assertRegex(text, r"0\.8–0\.85\t2\t1\t50\.0%")
 
 
 if __name__ == "__main__":

@@ -75,13 +75,19 @@ take rate **411/1129 = 36%**, **73 walks**, **52 sells / 0 `hedge_fill`**
 `docs/2026-08-31-last120-loss-catalog.md`.
 
 **31 Aug ~20:53Z reversal + participation paste:** SESSION TAPE **n=0**
-and participation **0 `csv` sources** are the same join miss (generic
-title / unused `slug`), not zero fills. 5m autopsy: **585/1151 “bought”**
-is bot log (`buy_attempt` included), not the **411** wallet fills.
-**409** misses were above-ceiling (99/1). The only live-shaped combo
-cell is `live_late_7590` (**17.1% flip / 82.9% WR**). Script used to
-print last-45+$25 as RECOMMENDATION — that line is now “do not paste”.
-See catalog §7.
+and participation **0 `csv` sources** were a join miss (generic title /
+unused `slug`), not zero fills. See catalog §7.
+
+**31 Aug ~21:30Z SESSION TAPE n=437** (re-fetched CSV through 20:39Z;
+titles were range-shaped so join worked). `session_pnl=−1139` /
+`redeem=0` / 383 `open` at −$2.70 is **CLOB-only accounting** — Data
+API `/trades` has no Redeem. Live overlay is still ~**+$9** /
+**+$0.10–$0.12/h**. Flip-by-`|dist|` at fill is real (0–5 **47%**,
+5–10 **34%**, 20–25 **14%**). SESSION replay `last45_e25` keep **6/405**.
+Do **not** paste last-45+$25. Do **not** size up. Paper-credit lands
+with this branch so the next tape scores winners as +$0.48-class.
+See catalog §8. VM `git pull` still needs a stash of local
+`check_path_backtest.py`.
 
 ---
 
