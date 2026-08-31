@@ -76,7 +76,12 @@ take rate **411/1129 = 36%**, **73 walks**, **52 sells / 0 `hedge_fill`**
 
 **31 Aug ~20:53Z reversal + participation paste:** SESSION TAPE **n=0**
 and participation **0 `csv` sources** were a join miss (generic title /
-unused `slug`), not zero fills. See catalog §7.
+unused `slug`), not zero fills. 5m autopsy: **585/1151 “bought”**
+is bot log (`buy_attempt` included), not the **411** wallet fills.
+**409** misses were above-ceiling (99/1). The only live-shaped combo
+cell is `live_late_7590` (**17.1% flip / 82.9% WR**). Script used to
+print last-45+$25 as RECOMMENDATION — that line is now “do not paste”.
+See catalog §7.
 
 **31 Aug ~21:30Z SESSION TAPE n=437** (re-fetched CSV through 20:39Z;
 titles were range-shaped so join worked). `session_pnl=−1139` /
