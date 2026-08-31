@@ -31,14 +31,15 @@ Missed early does **not** become a $5 late buy — there is no early slice.
 Same-leg add only (no straddle), and only if the late ask is ≥ **90¢**
 (`add_min_price`). Flat late 75–90 is still a first entry. 91–99 is a
 no on this overlay (`late_90` off). After a full hedge the market is done.
-Normal hedge is **persist 5s @ 50/52** (GUI: held ≤ **52¢**, other ≥
+Normal hedge is **persist 1s @ 50/52** (GUI: held ≤ **52¢**, other ≥
 **48¢**; not inverted 30/70). Then sell at the live bid while **< 53¢**
 (fade through 50 still sells). Bid ≥ **53¢** (`hedge_recovery_cancel`)
 holds and **clears persist**. Once holding, do **not persist-sell** while
 live Chainlink TWAP is still on the held side of PTB
 (`hedge_require_oracle`). Missing/stale BTC also holds. **Any live bag**
-dumps bid-only at **≤32¢** even if BTC has not crossed yet
-(`hedge_dump_ignore_oracle`). Do not sell 55–69 after persist. Winners
+dumps bid-only at **≤40¢** even if BTC has not crossed yet
+(`hedge_dump_ignore_oracle`). Walks **avg <75¢** flatten at the live bid
+while bid **<75¢**. Do not sell 55–69 after persist. Winners
 redeem at $1.00. **No profit-take sell.** See `CURRENT.md` for the active
 probe knobs.
 
@@ -48,7 +49,7 @@ unless the operator asks. 15m stays stopped.
 | File | Service | Markets | Oracle | Budget | Window |
 |---|---|---|---|---|---|
 | `buybot.py` | `polybuybot` **stopped** | 15m | Chainlink TWAP 60s | $2.50 | final 4.0 min, 75–90¢, hedge 35/40 |
-| `buybot5m.py` | `polybuybot5m` **live** | 5m | Chainlink TWAP 30s | $2.50 | last **120s** 75–90, edge **$0**; persist **5s @ 50/52** (dump 32¢) |
+| `buybot5m.py` | `polybuybot5m` **live** | 5m | Chainlink TWAP 30s | $2.50 | last **120s** 75–90, edge **$0**; persist **1s @ 50/52** (dump 40¢; flatten walks <75¢) |
 | `buybothourly.py` | `polybuybothourly` **stopped** | hourly | Binance BTCUSDT | $10 cap | last **20 min** 75–90¢; persist **5s @ 50/52** + oracle veto |
 | `pathlog.py` | `polypathlog` **live** | all three | — (CLOB books only) | — | whole 5m; last 8m of 15m; last **20m** of hourly |
 
@@ -197,7 +198,8 @@ Watch the console for `[DRY BUY]` / `[DRY SELL]` markers. Ctrl-C to stop.
 cannot replay the **$25** `|TWAP−PTB|` gate — score that in
 `check_reversal_features.py`. `window_120s` is an explicit variant.
 `--compare` uses hardcoded late-band presets; `--paper` hedge knobs still
-come from the example JSON (**50/52 persist 5s**, dump **32¢**). Neither
+come from the example JSON (**50/52 persist 1s**, dump **40¢**, flatten
+walks **<75¢**). Neither
 command replays the early ≥90 / ≥95 union **or** the two-slice $2.50+$2.50
 add.
 `--series 5m` matches **only** 5m (not 15m — the string `15m` contains `5m`).
@@ -207,10 +209,10 @@ add.
 Live 5m (after this change is deployed and `polybuybot5m` restarted):
 
 - `buy_attempt` `band=late` / `late_90` / `early` / `early_95` and `slice=early|late` — which 5m window armed
-- `hedge_attempt` / `hedge_fill` — persist **5s @ 50/52** then sell live bid **< 53¢**, including fade through 50. Dump ≤ **32¢** even if BTC still agrees. Bid ≥ **53¢** holds.
-- `hedge_skip_recovery` — persist_done but held bid ≥ 53¢; HOLD and clear persist. Do **not** sell 55–69.
+- `hedge_attempt` / `hedge_fill` — persist **1s @ 50/52** then sell live bid **< 53¢**, including fade through 50. Dump ≤ **40¢** even if BTC still agrees. Walk flatten (`reason=flatten_walk`) sells toxic bags while bid **<75¢**. Bid ≥ **53¢** holds (unless flattening).
+- `hedge_skip_recovery` — persist_done but held bid ≥ 53¢; HOLD and clear persist. Do **not** sell 55–69. Flatten walks skip this early-out while bid <75¢.
 - `hedge_skip_oracle_still_winning` / `hedge_skip_oracle` — live TWAP still on held side of PTB, or feed missing/stale; do not persist-sell.
-- `hedge_skip_persist` — 50/52 + GUI passed but has not stayed qualified for 5s.
+- `hedge_skip_persist` — 50/52 + GUI passed but has not stayed qualified for 1s.
 - `buy_skip_other_leg` — late winner is the other side of an early fill (no straddle)
 - `buy_skip_hedge_closed` — market already dumped; no re-entry.
 
@@ -235,10 +237,10 @@ Stopped hourly (do not start unless asked):
   hot-reload; the loop-body fix needs `sudo systemctl restart polybuybot5m`.
 - `hedge_tick_retry` — CLOB rejected a too-fine tick (`invalid tick size (0.001), minimum is 0.01`); same trigger rebuilds at 0.01. Pre-fix this was `[EXIT FAIL]` / `sell_build_rejected` and the dump never sold (22 Aug 11:40).
 - `hedge_skip_toxic_book` — bid dipped but ask/spread still say "not reversed"
-- `hedge_skip_no_consensus` — 50/52 book passed but GUI/last-trade still fail (held last print ≤ 52¢, held GUI ≤ 52¢, other GUI ≥ 48¢). Dump ≤32 skips this veto.
-- `hedge_skip_toxic_recovered` — `toxic_fill` is armed but held bid > `hedge_toxic_bid_max` (32¢ winner book); dump stays armed, no sell
+- `hedge_skip_no_consensus` — 50/52 book passed but GUI/last-trade still fail (held last print ≤ 52¢, held GUI ≤ 52¢, other GUI ≥ 48¢). Dump ≤40 and flatten walks skip this veto.
+- `hedge_skip_toxic_recovered` — `toxic_fill` is armed but held bid ≥ **75¢** (band floor); flatten stays armed, no sell
 - `hedge_skip_incomplete_rest` — no REST/WS/last-good bid. Incomplete REST must **not** skip a dump; use WS/last-good
-- `hedge_skip_dead_band` — persist done or qualify fired but bid is in (32¢, 50¢) **and** `hedge_sell_fade` is off; live 5m fade sells that band after persist
+- `hedge_skip_dead_band` — persist done or qualify fired but bid is in (40¢, 50¢) **and** `hedge_sell_fade` is off; live 5m fade sells that band after persist
 - `buy_skip_ambiguous` — GUI display prices too close (throttled 8s; **not** one event per market)
 - `buy_skip_no_consensus` — ask in band but GUI/tight-book gate failed
 - `buy_fill_below_band` — fill avg outside the open band; inventory persisted and `toxic_fill` armed (also if avg < 65¢)
@@ -301,8 +303,8 @@ python check_reversal_features.py --csv exports/trades.csv --restart-utc 2026-08
 $2.50** in `strategy_buy5m.example.json`; the **$25** edge is not in
 pathlog) plus one-at-a-time window/band/size variants (`window_120s` is
 included; the template's own TTM is not duplicated).
-Paper hedge knobs come from that JSON (**50/52 persist 5s**, dump **32¢**,
-mid-as-GUI when spread ≤ 10¢, held ≤ 52¢ / other ≥ 48¢; paper honors
+Paper hedge knobs come from that JSON (**50/52 persist 1s**, dump **40¢**,
+flatten walks **<75¢**, mid-as-GUI when spread ≤ 10¢, held ≤ 52¢ / other ≥ 48¢; paper honors
 `hedge_persist_s`). It does **not**
 union the early ≥90 / ≥95 windows, the last-45s ≥90 overlay, or two $2.50
 slices. Score last-45 90–99 separately with `--ask-min 0.90 --ask-max 0.99
@@ -357,26 +359,27 @@ Cloud agents: `CLOUD_RESEARCH.md`.
 - **Hedge is sell-only exit:** The bots never profit-take. The only sell path is the
   hedge: REST shows bid ≤ threshold **and** ask ≤ require_ask_max with tight
   spread, **and** Polymarket GUI + last trade agree with that book, **and**
-  that qualify holds for `hedge_persist_s` (5m **5s**). Live 5m: held last print
+  that qualify holds for `hedge_persist_s` (5m **1s**). Live 5m: held last print
   ≤ **52¢**, held GUI ≤ **52¢**, other GUI ≥ **48¢** (complement of ask-max).
   Instant 70/2s-at-70 is out — those dumped winners. Buy 70/30 is unchanged.
-  15m (stopped) still invert 70/30. Live 5m book qualify is **persist 5s @
-  50/52**; toxic dump **32¢** book-only (`hedge_dump_ignore_oracle`);
+  15m (stopped) still invert 70/30. Live 5m book qualify is **persist 1s @
+  50/52**; toxic dump **40¢** book-only (`hedge_dump_ignore_oracle`);
+  walks **avg <75¢** flatten at live bid **<75¢** (`hedge_flatten_walks`);
   recovery **53¢**; `hedge_sell_fade`; persist still needs Chainlink TWAP
   against/flat (`hedge_require_oracle`). Stopped hourly template is the same
   50/52 persist with dump **35¢** still oracle-gated. 15m remains 35/40.
   A random TOB clip is not enough; a last print of 85¢ on a 48/51 book will
   `hedge_skip_no_consensus`. **Any live bag** dumps bid-only while held bid
-  ≤ **32¢** (no GUI veto; not only `toxic_fill`). After persist, sell at the
+  ≤ **40¢** (no GUI veto; not only `toxic_fill`). After persist, sell at the
   live bid while **< 53¢** (including a fade through 50). Bid ≥ **53¢**
   (`hedge_recovery_cancel`) holds and **clears persist**
   (`hedge_skip_recovery`) — do not sell 55–69 because persist stuck.
   Everything else rides to redemption at $1.00. WS may *arm* a hedge
   check; normal sells need two-sided REST. After `hedge_closed`, no later
   buy on that market. **Live `strategy_buy5m.json` must set the hedge
-  keys** (50/52 persist 5s, dump 32, recovery 53, `hedge_sell_fade`,
-  `hedge_require_oracle`, `hedge_dump_ignore_oracle`, `late_90_start_s` 45)
-  or an old 70/72/85 file keeps the old qualify after hot reload.
+  keys** (50/52 persist 1s, dump 40, flatten walks, recovery 53, `hedge_sell_fade`,
+  `hedge_require_oracle`, `hedge_dump_ignore_oracle`)
+  or an old 70/72/85 or persist-5s/dump-32 file keeps the old qualify after hot reload.
 - **Tick sizes:** 5m *default* is `0.001`, but some 5m books are `0.01`.
   Hedge FAKs must use the CLOB minimum. 15m and hourly stay `0.01`.
 - **One fill per slice:** 5m `early_bought` / `late_bought`. Hourly
@@ -438,12 +441,10 @@ CI: pushes to `main` touching the buy bots, `pathlog.py`,
 SSH (`git pull` + `pip install` only). Services are **not** auto-restarted —
 start/restart deliberately after validation (`systemctl start` / `restart`).
 
-Live overlay is already last-120 / edge $0 (27 Aug 17:26Z). **Do not
-paste last-45 + $25.** **Do not paste a new `strategy_buy5m.json`
-overlay or restart** unless the operator asks after they buy a
-recommendation. See `CURRENT.md` and
-`docs/2026-08-31-last120-loss-catalog.md`. Do **not** start 15m,
-hourly, or mint.
+Live overlay is last-120 / edge $0 (27 Aug 17:26Z). Operator asked for
+B+C exits (persist 1s / dump 40 / flatten walks). **Do not paste
+last-45 + $25.** Confirm `dry_run` / `entry_enabled` before restart.
+See `CURRENT.md` for the paste. Do **not** start 15m, hourly, or mint.
 
 ## Dependencies
 

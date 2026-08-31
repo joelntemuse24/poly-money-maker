@@ -150,6 +150,15 @@ class FillOutsideBandIsToxic(unittest.TestCase):
         self.assertTrue(below)
         self.assertTrue(toxic)
 
+    def test_walk_70_is_toxic_when_floor_is_75(self):
+        below, above, toxic = classify_fill_against_band(0.70, 0.75, 0.90, 0.75)
+        self.assertTrue(below)
+        self.assertFalse(above)
+        self.assertTrue(toxic)
+        below, above, toxic = classify_fill_against_band(0.80, 0.75, 0.90, 0.75)
+        self.assertFalse(below)
+        self.assertFalse(toxic)
+
     def test_ghost_timeout_does_not_consume_slice(self):
         meta = {}
         self.assertFalse(stamp_slice_on_inventory(meta, True, 0.0))
@@ -749,8 +758,12 @@ class BotWiresCurrentRails(unittest.TestCase):
         self.assertIn("max_retries=12 if dump", src)
         self.assertIn('"hedge_threshold": 0.50', src)
         self.assertIn('"hedge_require_ask_max": 0.52', src)
-        self.assertIn('"hedge_persist_s": 5.0', src)
-        self.assertIn('"hedge_toxic_bid_max": 0.32', src)
+        self.assertIn('"hedge_persist_s": 1.0', src)
+        self.assertIn('"hedge_toxic_bid_max": 0.40', src)
+        self.assertIn('"hedge_flatten_walks": True', src)
+        self.assertIn('"toxic_force_exit_below": 0.75', src)
+        self.assertIn("hedge_flatten_overrides_oracle(", src)
+        self.assertIn("flatten=flatten_armed", src)
         self.assertIn('"hedge_recovery_cancel": 0.53', src)
         self.assertIn('"hedge_sell_fade": True', src)
         self.assertIn('"hedge_require_oracle": True', src)
@@ -825,6 +838,8 @@ class BotWiresCurrentRails(unittest.TestCase):
             "seconds_left = (end_ts_ms - now_ms) / 1000",
             src,
         )
+        self.assertNotIn("hedge_flatten_walks", src)
+        self.assertNotIn("hedge_flatten_overrides_oracle", src)
 
 
 if __name__ == "__main__":

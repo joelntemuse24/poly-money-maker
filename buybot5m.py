@@ -74,6 +74,7 @@ from buy.hedge_gate import (
     evaluate_held_bag,
     hedge_dump_overrides_oracle,
     hedge_fail_is_terminal,
+    hedge_flatten_overrides_oracle,
     hedge_market_tick,
     hedge_oracle_allows_sell,
     hedge_oracle_blocks_sell,
@@ -197,18 +198,18 @@ _STRATEGY_DEFAULTS = {
     # non-zero TWAP tick (flat still fail-closed). 15m/hourly stay $10.
     "underlying_gate_enabled": True,
     "min_underlying_edge_usd": 0.0,
-    # Force-dump only when FAK avg is worse than this. Fills in
-    # [toxic_force_exit_below, buy_threshold) stay on the normal hedge path.
-    # Must be <= buy_threshold (validator); 65¢ ≈ walk well below the 75¢ floor.
-    "toxic_force_exit_below": 0.65,
+    # Walks (avg < buy_threshold) arm toxic_fill. Flatten sells those bags
+    # at the live bid while bid < 75¢ — do not wait for dump 40. Must be
+    # <= buy_threshold (validator).
+    "toxic_force_exit_below": 0.75,
     "hedge_enabled": True,
-    # Persist 5s @ 50/52 then sell at the live bid while it is still
+    # Persist 1s @ 50/52 then sell at the live bid while it is still
     # below recovery (53¢). Instant 70 and persist-2s @ 70/72 dumped
     # winners. After persist, do not sell 70–84 (recovery is 53¢).
     "hedge_threshold": 0.50,
     # Kept in config (live JSON still sends it). Not a FAK floor: after 50/52
     # persist, the sell follows the live bid so a 20¢ print is not $0.
-    "hedge_min_price": 0.32,
+    "hedge_min_price": 0.40,
     "hedge_undercut_ticks": 0,
     "hedge_quote_max_age_s": 0.25,
     "hedge_retry_sleep_s": 0.05,
@@ -219,19 +220,23 @@ _STRATEGY_DEFAULTS = {
     # and ask also collapsed (same lesson sell-side already learned on mids).
     "hedge_max_spread": 0.15,
     "hedge_require_ask_max": 0.52,
-    "hedge_persist_s": 5.0,
-    "hedge_toxic_bid_max": 0.32,
+    "hedge_persist_s": 1.0,
+    "hedge_toxic_bid_max": 0.40,
+    # Walk flatten: toxic bags sell at the live bid while bid < buy_threshold.
+    # Separate from dump_bid_max so 40 < 50 <= 53 still holds.
+    "hedge_flatten_walks": True,
     # After persist_done, bid ≥ this is a recovered winner: HOLD and clear.
     # Tight 53¢ so we do not sell 50–69 the way 70–84 sold winners.
     "hedge_recovery_cancel": 0.53,
-    # After persist, a fade through 50 still sells (do not wait for 32¢).
+    # After persist, a fade through 50 still sells (do not wait for 40¢).
     "hedge_sell_fade": True,
     # Invert the buy GUI 70/30 plus last-trade on the held token. TOB 50/52
     # alone is not consensus (same lesson as not buying a random ask).
     "hedge_require_gui": True,
     # Once holding: do not persist-sell while Chainlink TWAP is still on
     # the held side of PTB. $0 = any non-zero tick. Missing/stale holds.
-    # Dump ≤ toxic is book-only (`hedge_dump_ignore_oracle`).
+    # Dump ≤ toxic (40¢) is book-only (`hedge_dump_ignore_oracle`).
+    # Flatten walks also skip the oracle (`dump=True`).
     "hedge_require_oracle": True,
     "hedge_oracle_min_edge_usd": 0.0,
     "hedge_dump_ignore_oracle": True,
@@ -480,6 +485,7 @@ HEDGE_MAX_SPREAD = _strat["hedge_max_spread"]
 HEDGE_REQUIRE_ASK_MAX = _strat["hedge_require_ask_max"]
 HEDGE_PERSIST_S = _strat["hedge_persist_s"]
 HEDGE_TOXIC_BID_MAX = _strat["hedge_toxic_bid_max"]
+HEDGE_FLATTEN_WALKS = _strat["hedge_flatten_walks"]
 HEDGE_RECOVERY_CANCEL = _strat["hedge_recovery_cancel"]
 HEDGE_SELL_FADE = _strat["hedge_sell_fade"]
 HEDGE_REQUIRE_GUI = _strat["hedge_require_gui"]
@@ -1715,7 +1721,7 @@ def hedge_book_ok(bid, ask, threshold, max_spread, require_ask_max):
 
     A 1¢ bid under a 99¢ ask is illiquidity/spoof, not a reversal. Require:
       bid ≤ threshold, ask ≤ require_ask_max, and spread ≤ max_spread.
-    Dump (bid ≤ 32) does not use this gate.
+    Dump (bid ≤ 40) does not use this gate.
     """
     return hedge_qualify_ok(bid, ask, threshold, max_spread, require_ask_max)
 
@@ -1741,7 +1747,8 @@ def hedge_gui_limits(require_ask_max):
     website already shows a loser, which is after the 50¢ bid is gone.
     5m live: ask-max 52¢ → held GUI ≤ 52¢, other GUI ≥ 48¢. Two-sided
     50/52/15 and last-trade ≤ ask-max still have to pass. Toxic dumps
-    stay bid-only at hedge_toxic_bid_max (32¢).
+    stay bid-only at hedge_toxic_bid_max (40¢). Walk flatten is a
+    separate bid < buy_threshold path.
     """
     ask_max = finite_float(require_ask_max, minimum=0, maximum=1)
     if ask_max is None:
@@ -3293,7 +3300,11 @@ def sell_market_with_retry(
     try:
         dump_bid_max = float(HEDGE_TOXIC_BID_MAX)
     except (NameError, TypeError, ValueError):
-        dump_bid_max = 0.32
+        dump_bid_max = 0.40
+    try:
+        flatten_ceil = float(BUY_THRESHOLD)
+    except (NameError, TypeError, ValueError):
+        flatten_ceil = 0.75
     try:
         qualify_bid = float(HEDGE_THRESHOLD)
     except (NameError, TypeError, ValueError):
@@ -3635,6 +3646,8 @@ def sell_market_with_retry(
                     qualify_bid=qualify_bid,
                     recovery_cancel=recovery_cancel,
                     sell_fade=sell_fade,
+                    flatten=dump,
+                    flatten_max=flatten_ceil,
                 )
                 log_event(
                     "sell_attempt_rejected", token_id=token_id,
@@ -4071,6 +4084,7 @@ while not _shutdown_requested:
         HEDGE_REQUIRE_ASK_MAX = _strat["hedge_require_ask_max"]
         HEDGE_PERSIST_S = _strat["hedge_persist_s"]
         HEDGE_TOXIC_BID_MAX = _strat["hedge_toxic_bid_max"]
+        HEDGE_FLATTEN_WALKS = _strat["hedge_flatten_walks"]
         HEDGE_RECOVERY_CANCEL = _strat["hedge_recovery_cancel"]
         HEDGE_SELL_FADE = _strat["hedge_sell_fade"]
         HEDGE_REQUIRE_GUI = _strat["hedge_require_gui"]
@@ -4969,16 +4983,27 @@ while not _shutdown_requested:
                     persist_done = cond in _hedge_persist_done
                     armed_ts = _hedge_persist_armed.get(cond)
 
+                    flatten_armed = bool(HEDGE_FLATTEN_WALKS) and bool(
+                        meta.get("toxic_fill")
+                    )
+                    flatten_max = float(BUY_THRESHOLD)
+                    peek_flatten = hedge_flatten_overrides_oracle(
+                        peek_bid, flatten_max, armed=flatten_armed, enabled=True,
+                    )
+
                     # Healthy winner before persist: skip REST. After persist,
                     # fade through 50 still sells; ≥ recovery_cancel (53¢) is a
-                    # rally — clear. Do not sell 70–84.
+                    # rally — clear. Do not sell 70–84. A flatten walk at 70¢
+                    # is not a recovered winner — skip this early-out.
                     recovered = (
-                        ws_fresh
+                        (not peek_flatten)
+                        and ws_fresh
                         and peek_bid is not None
                         and peek_bid + 1e-12 >= float(HEDGE_RECOVERY_CANCEL)
                     )
                     winner_before_persist = (
-                        (not persist_done)
+                        (not peek_flatten)
+                        and (not persist_done)
                         and (not recovered)
                         and ws_fresh
                         and peek_bid is not None
@@ -5008,7 +5033,7 @@ while not _shutdown_requested:
                             peek_bid,
                             HEDGE_TOXIC_BID_MAX,
                             enabled=True,
-                        )
+                        ) or peek_flatten
                         need_rest = hedge_rest_required(
                             persist_done=persist_done,
                             peek_dump=peek_dump,
@@ -5054,6 +5079,8 @@ while not _shutdown_requested:
                             gui_why="pending_gui",
                             recovery_cancel=HEDGE_RECOVERY_CANCEL,
                             sell_fade=HEDGE_SELL_FADE,
+                            flatten=flatten_armed,
+                            flatten_max=flatten_max,
                         )
                         qualify_fail = preview.reason in {
                             "missing_side", "bid_above", "ask_too_high",
@@ -5111,6 +5138,8 @@ while not _shutdown_requested:
                                 gui_why=gui_why,
                                 recovery_cancel=HEDGE_RECOVERY_CANCEL,
                                 sell_fade=HEDGE_SELL_FADE,
+                                flatten=flatten_armed,
+                                flatten_max=flatten_max,
                             )
                             if not gui_ok and intent.action == "hold":
                                 log_event(
@@ -5189,7 +5218,7 @@ while not _shutdown_requested:
                             if (
                                 meta.get("toxic_fill")
                                 and hedge_bid is not None
-                                and hedge_bid > float(HEDGE_TOXIC_BID_MAX) + 1e-12
+                                and hedge_bid + 1e-12 >= flatten_max
                             ):
                                 log_event(
                                     "hedge_skip_toxic_recovered",
@@ -5210,9 +5239,16 @@ while not _shutdown_requested:
                                 if dump
                                 else "[bold bright_red]▼ HEDGE SELL — CUTTING LOSSES[/]"
                             )
-                            hedge_label = (
-                                "DUMP ≤{:.0f}¢".format(float(HEDGE_TOXIC_BID_MAX) * 100) if dump else "REVERSAL DETECTED"
-                            )
+                            if dump and intent.reason == "flatten_walk":
+                                hedge_label = "FLATTEN WALK <{:.0f}¢".format(
+                                    flatten_max * 100
+                                )
+                            elif dump:
+                                hedge_label = "DUMP ≤{:.0f}¢".format(
+                                    float(HEDGE_TOXIC_BID_MAX) * 100
+                                )
+                            else:
+                                hedge_label = "REVERSAL DETECTED"
                             console.print(Panel(
                                 f"  [bright_white]{m.question}[/]\n"
                                 f"  [bright_red]{hedge_label}[/] — {held_leg.upper()} "
@@ -5309,6 +5345,8 @@ while not _shutdown_requested:
                                 )
                                 if ttm <= 0:
                                     return False, "expired"
+                                if dump and HEDGE_DUMP_IGNORE_ORACLE:
+                                    return True, "ok"
                                 if hedge_dump_overrides_oracle(
                                     _live_bid,
                                     HEDGE_TOXIC_BID_MAX,
@@ -5462,6 +5500,8 @@ while not _shutdown_requested:
                                     qualify_bid=HEDGE_THRESHOLD,
                                     recovery_cancel=HEDGE_RECOVERY_CANCEL,
                                     sell_fade=HEDGE_SELL_FADE,
+                                    flatten=dump,
+                                    flatten_max=flatten_max,
                                 )
                                 log_event(
                                     "hedge_fail", condition_id=cond, leg=held_leg, size=held_size,

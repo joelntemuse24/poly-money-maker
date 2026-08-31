@@ -1,8 +1,8 @@
 # Last-120 5m — first full overlay tape (27–31 Aug 2026)
 
-Research note. **Not a live deploy.** Do not paste a new
-`strategy_buy5m.json` overlay and do not restart unless the operator
-asks after they buy a recommendation. Do not size up from **$2.50**.
+Research note. Operator asked 31 Aug to ship **B+C** (persist 1s, dump
+40¢, flatten walks avg <75¢). Do **not** paste last-45 + $25. Do not
+size up from **$2.50**. Live paste is in `CURRENT.md`.
 
 Live (VM 31 Aug ~15:49Z): last **120s**, winning ask **75–90¢**, one
 **$2.50** FAK @ **90¢**, `late_90` / early / ≥95 **off**,
@@ -171,20 +171,22 @@ not size) is the path from +$0.10/h toward +$0.20–$0.40/h at $2.50.
 
 ---
 
-## 3. Ranked changes (do not ship a live paste)
+## 3. Ranked changes (B+C now shipping; D is still no)
 
 | Rank | Change | Tape $ | Winner-dump risk | Ship? |
 |---|---|---|---|---|
-| **B** | **Loser exits:** persist 1–2s and/or dump while bid is still 40–50 (hit the 32¢ bid, don’t wait for 1¢). | Illustrative: if true losers recovered **$1.00–$1.25** instead of **$0–$0.40**, loser drag shrinks ~$50–$110 on this tape → **+$0.20–$0.40/h at $2.50**. | 8 STW already. Faster persist adds more. Score on VM `--hedge-sweep` + the 411-fill journal before any JSON. | **Recommend research on the VM, then one knob if the sweep agrees.** Not a paste in this PR. |
-| **C** | **Refuse or flatten walks** (`avg &lt; 75¢`). `toxic_fill` already arms; dump still waits for bid ≤32. | UI walk subset **−$6.61 / 32**; ~**+$0.16/h** if the 73 overlay walks match. | Low (walk WR ~56% vs 82%). | Second. Flatten (sell immediately) is closer to B than “skip the fill.” |
-| **A** | **Tape: `hedge_fill` on `uncertain_resolved`.** Sell unmatched retry is already in 5m. | **$0.** Makes the next 48h measurable. | None. | **This PR, 5m-only.** |
-| **D** | Tighter entry so take-rate falls toward paper (36% of clocks vs paper ~6–14%). | Extra clocks are walks + loose in-band. Live WR **82%** vs paper **96%**. Tightening toward restable 75–90 cuts losers *and* a lot of +$0.48 winners. | Low dump risk, high opportunity cost. | Not first. Do not re-open last-45+$25. |
+| **B** | **Loser exits:** persist **1s** @ 50/52 and dump while bid is still **40¢** (hit the 40¢ bid, don’t wait for 1¢). | Illustrative: if true losers recovered **$1.00–$1.25** instead of **$0–$0.40**, loser drag shrinks ~$50–$110 on this tape → **+$0.20–$0.40/h at $2.50**. | 8 STW already. Faster persist adds more. | **Shipped this PR (5m-only).** Code defaults + example JSON hedge knobs + live paste in `CURRENT.md`. |
+| **C** | **Flatten walks** (`avg &lt; 75¢`) at live bid while bid **&lt;75¢**. Must run *before* recovery 53 or a 70¢ walk HOLDs. | UI walk subset **−$6.61 / 32**; ~**+$0.16/h** if the 73 overlay walks match. | Low (walk WR ~56% vs 82%). | **Shipped this PR** with B. `hedge_flatten_walks` + `toxic_force_exit_below=0.75`. |
+| **A** | **Tape: `hedge_fill` on `uncertain_resolved`.** Sell unmatched retry is already in 5m. | **$0.** Makes the next 48h measurable. | None. | **Already in this PR, 5m-only.** |
+| **D** | Tighter entry so take-rate falls toward paper (36% of clocks vs paper ~6–14%). | Extra clocks are walks + loose in-band. Live WR **82%** vs paper **96%**. Tightening toward restable 75–90 cuts losers *and* a lot of +$0.48 winners. | Low dump risk, high opportunity cost. | **Not this PR.** Do not re-open last-45+$25. |
 
 `two_slice_missing` is **not a leak** (early slice is off).
 
-**Walks vs toxic:** 73 `buy_fill_below_band`. Junk walks (`avg &lt; 65¢`)
-arm `toxic_fill`; dump is still **bid ≤32**. That is why walk bags
-show up as held-to-zero or 1–20¢ dumps, not as an immediate flatten.
+**Walks vs toxic:** 73 `buy_fill_below_band`. This PR raises
+`toxic_force_exit_below` to **75¢** and flattens those bags at the live
+bid while bid **<75¢**. Pre-change, junk walks (`avg &lt; 65¢`) armed
+`toxic_fill` but dump waited for **bid ≤32**, which is why walk bags
+showed up as held-to-zero or 1–20¢ dumps.
 
 **Time of day:** Dublin day **+$0.61/h** vs evening **−$0.52** vs night
 **−$0.10**. Session filter is illustrative only. Clusters sit inside
@@ -200,15 +202,17 @@ exit quality on 5m losers is.
 
 ---
 
-## 4. Measure on the next 48h (if a knob is pasted later)
+## 4. Measure on the next 48h (after B+C paste + 5m restart)
 
-After a 5m restart that includes the tape fix (no strategy change
-required for A):
+After the operator pastes B+C and restarts `polybuybot5m`:
 
 - `hedge_fill` should rise toward wallet sells; `hedge_fail` then
   `uncertain_resolved` should no longer be the only sell story.
-- Sell px median (want **≫ 19¢**; 40–50¢ is the +EV lever).
-- Walk rate (73/411 = **17.8%**). Held-to-zero count.
+- Sell px median (want **≫ 19¢**; **40–50¢** is the B lever; flatten
+  walks should print **closer to fill** than 1–20¢).
+- Walk rate (73/411 = **17.8%**). Held-to-zero count should fall.
+- `hedge_attempt` `reason=flatten_walk` vs `bid_le_dump` vs `persist_live_bid`.
+- Sold-then-won count vs the tape’s **8** (winner-dump risk).
 - Dublin $/h and drawdown (trough was **−$14** from ~$121).
 - `cycle_error` stays **0**. `invalid amounts` stays **0**.
 
@@ -225,7 +229,8 @@ lines to this overlay — not to pathlog’s 96% WR.
 - **Do not** add a profit-take sell.
 - **Do not** start `polybuybot` / `polybuybothourly` / `polymintbot`.
 - Example JSON `strategy_buy5m.example.json` still describes last-45 +
-  $25 for `--sweep`. Live JSON is the overlay in `CURRENT.md`.
+  $25 for `--sweep` **entry**. Hedge knobs in that file now match B+C
+  (persist 1s / dump 40 / flatten). Live JSON paste is in `CURRENT.md`.
 
 ---
 

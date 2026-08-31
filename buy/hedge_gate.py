@@ -189,11 +189,18 @@ def evaluate_held_bag(
     gui_why="ok",
     recovery_cancel=0.85,
     sell_fade=False,
+    flatten=False,
+    flatten_max=None,
 ):
     """Dump / persist-sell / hold for one live bag.
 
     * Bid ≤ dump dumps every bag. Bid-only. No GUI / last-trade veto.
       Wide 22/77 still dumps.
+    * Flatten (5m walks): when ``flatten`` and bid < ``flatten_max``
+      (live 75¢ = ``buy_threshold``), dump immediately at the live bid.
+      This runs *before* recovery_cancel so a 70¢ walk does not HOLD at
+      53¢. ``dump=True`` so the oracle is ignored. Do not raise
+      ``dump_bid_max`` to 75¢ — that breaks dump < qualify.
     * 5m default: do not sell in (dump, qualify). Persist-not-done 61/70
       is a hold. After persist, qualify–recovery live-bid sells (70–84).
       Bid ≥ recovery_cancel (default 85¢) is a recovered winner: HOLD and
@@ -231,6 +238,16 @@ def evaluate_held_bag(
     if bid_f <= dump_max + 1e-12:
         return HedgeIntent(
             "dump", "bid_le_dump", bid_f, persist_armed_ts, done, True, dump_max, True,
+        )
+
+    flatten_on = bool(flatten)
+    fmax = None
+    if flatten_on:
+        fmax = _finite_px(flatten_max)
+        flatten_on = fmax is not None
+    if flatten_on and bid_f + 1e-12 < fmax:
+        return HedgeIntent(
+            "dump", "flatten_walk", bid_f, persist_armed_ts, done, True, fmax, True,
         )
 
     if bid_f + 1e-12 >= recovery:
@@ -289,6 +306,8 @@ def hedge_should_keep_retrying(
     qualify_bid=0.70,
     recovery_cancel=0.85,
     sell_fade=False,
+    flatten=False,
+    flatten_max=None,
 ) -> bool:
     """Unmatched / invalid-tick / could-not-run is not terminal while size remains."""
     try:
@@ -308,6 +327,10 @@ def hedge_should_keep_retrying(
         return True
     if bid_f <= dump_max + 1e-12:
         return True
+    if flatten:
+        fmax = _finite_px(flatten_max)
+        if fmax is not None and bid_f + 1e-12 < fmax:
+            return True
     if persist_done and bid_f < recovery - 1e-12:
         if bid_f + 1e-12 >= qualify or sell_fade:
             return True
@@ -324,6 +347,8 @@ def hedge_fail_is_terminal(
     qualify_bid=0.70,
     recovery_cancel=0.85,
     sell_fade=False,
+    flatten=False,
+    flatten_max=None,
 ) -> bool:
     """``hedge_fail`` after ``sell_attempt_rejected`` must not idle a live dump."""
     status = str(sell_status or "")
@@ -337,6 +362,8 @@ def hedge_fail_is_terminal(
         qualify_bid=qualify_bid,
         recovery_cancel=recovery_cancel,
         sell_fade=sell_fade,
+        flatten=flatten,
+        flatten_max=flatten_max,
     )
 
 
@@ -429,6 +456,21 @@ def hedge_dump_overrides_oracle(bid, dump_bid_max, *, enabled=True) -> bool:
     return bid_f <= dump_max + 1e-12
 
 
+def hedge_flatten_overrides_oracle(bid, flatten_max, *, armed=False, enabled=True) -> bool:
+    """True when a walk flatten should skip REST / ignore the oracle.
+
+    Bid < flatten_max (live 75¢). Bid ≥ that is a recovered walk: ride.
+    ``armed`` is ``toxic_fill``. Off unless both flags are set.
+    """
+    if not enabled or not armed:
+        return False
+    bid_f = _finite_px(bid)
+    fmax = _finite_px(flatten_max)
+    if bid_f is None or fmax is None:
+        return False
+    return bid_f + 1e-12 < fmax
+
+
 def hedge_rest_required(*, persist_done, peek_dump) -> bool:
     """REST unless persist is already done or a fresh WS dump peek is enough.
 
@@ -469,15 +511,22 @@ def held_hedge_decision(
     max_spread=0.15,
     gui_ok=True,
     gui_why="ok",
+    flatten=False,
+    flatten_max=None,
 ):
     """REST + pick + evaluate + oracle block for one held tick (no I/O).
 
-    Fresh WS dump peek (or persist_done) may skip REST. Last-good is only a
-    pick fallback after REST is allowed to run. Dump skips the oracle; a
-    persist sell does not.
+    Fresh WS dump/flatten peek (or persist_done) may skip REST. Last-good
+    is only a pick fallback after REST is allowed to run. Dump and flatten
+    skip the oracle; a persist sell does not.
     """
     peek_dump = hedge_dump_overrides_oracle(ws_bid, dump_bid_max, enabled=True)
-    fetch_rest = hedge_rest_required(persist_done=persist_done, peek_dump=peek_dump)
+    peek_flatten = hedge_flatten_overrides_oracle(
+        ws_bid, flatten_max, armed=flatten, enabled=True,
+    )
+    fetch_rest = hedge_rest_required(
+        persist_done=persist_done, peek_dump=peek_dump or peek_flatten,
+    )
     use_rest_bid = rest_bid if fetch_rest else None
     use_rest_ask = rest_ask if fetch_rest else None
     bid, ask = pick_held_quote(
@@ -497,6 +546,8 @@ def held_hedge_decision(
         gui_why=gui_why,
         recovery_cancel=recovery_cancel,
         sell_fade=sell_fade,
+        flatten=flatten,
+        flatten_max=flatten_max,
     )
     if hedge_oracle_blocks_sell(
         dump=bool(intent.dump),

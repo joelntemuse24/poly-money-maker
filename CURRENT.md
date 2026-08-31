@@ -6,18 +6,15 @@ Do not put secrets, API keys, or live wallet material here.
 Last updated: **2026-08-31** — 5m **last 120s / 75–90 / $2.50 / edge $0**
 has been live since **27 Aug 2026 ~17:26Z**. First full tape: barely +EV
 (**+$9 / ~94h ≈ +$0.10–$0.12/h**). **Do not size up. Do not paste
-last-45 + $25** (that probe was empty / −EV). **Do not paste a new
-live overlay or restart** unless the operator asks after they buy a
-recommendation. Loss catalog: `docs/2026-08-31-last120-loss-catalog.md`
-(VM 31 Aug: pathlog overlay **770** clocks at **mean 1.0 tick/file** — not
-a 1s book; persist 0 vs 5s is not identified. `journal_fills` join works
-via `token_id`. Run `check_last120_tick_autopsy.py`).
-Hourly and 15m are stopped. Hedge is **persist 5s @ 50/52**, recovery
-**53¢**, dump **≤32¢**. **Do not add a vol/momentum buy skip.**
+last-45 + $25** (that probe was empty / −EV). Operator asked for the
+money-moving **B+C** exits: persist **1s**, dump **40¢**, flatten walks
+**avg <75¢** at live bid **<75¢**. Loss catalog:
+`docs/2026-08-31-last120-loss-catalog.md`. Hourly and 15m are stopped.
+**Do not add a vol/momentum buy skip.**
 
-**Live 5m combination** (confirmed on the VM 31 Aug ~15:49Z). Example
-JSON is still the old last-45+$25 *research* template — **live JSON is
-the overlay below, already on the box.**
+**Live 5m combination** after the operator pastes B+C and restarts 5m.
+Entry stays last-120 / edge $0 (already on the box). Example JSON
+`--sweep` entry is still last-45+$25; its **hedge** knobs now match B+C.
 
 | Knob | Value |
 |---|---|
@@ -26,7 +23,7 @@ the overlay below, already on the box.**
 | `min_underlying_edge_usd` | **$0** |
 | Early / ≥95 | **off** (`early_buy_start_s=120`, `early_95_start_s=0`) |
 | Size | **one $2.50** (`buy_budget=late_buy_budget=2.5`). **Do not size up.** |
-| Hedge | persist 5s @ 50/52, dump 32, recovery 53, fade, oracle on persist |
+| Hedge | persist **1s** @ 50/52, dump **40¢**, flatten walks **<75¢**, recovery 53, fade, oracle on persist |
 | Look / WS | `BUY_HORIZON_S` **120s** |
 
 **How we got here (do not relitigate):** last-45 + `$25` looked eatable
@@ -45,9 +42,11 @@ WR ~82%. Stay **$2.50**. Score exits, not size.
 3. **Sold way above 53** — after persist, **70–84** fills were treated as
    correct (`hedge_recovery_cancel` was **85¢**).
 
-Those knobs are gone on 5m. Persist is **5s @ 50/52**, recovery **53¢**
-(do not sell 55–69), dump **32¢** even if BTC has not crossed yet, and
-persist-50 still needs the oracle against/flat.
+Those knobs are gone on 5m. Persist is now **1s @ 50/52**, recovery **53¢**
+(do not sell 55–69), dump **40¢** even if BTC has not crossed yet,
+walks **avg <75¢** flatten at the live bid while bid **<75¢**, and
+persist-50 still needs the oracle against/flat. Winner-dump risk: the
+tape already had **8 sold-then-won**; faster persist and flatten add more.
 
 **Reversal features (27 Aug):** 25% flips in the **$20–40 bucket** is
 **not** eatable at an 85–88¢ fill (no-hedge cap is `1 − fill`: 15% at
@@ -55,14 +54,25 @@ persist-50 still needs the oracle against/flat.
 from the bucket. Live buy edge is **$0** (last-120). Example JSON still
 holds last-45+$25 for `--sweep` only. **Do not add a vol skip.**
 
-**No live paste in this file.** Last-45 + $25 was tried, then replaced
-on **27 Aug ~17:26Z** by last-120 / edge $0 (already on the VM). First
-full tape (27 Aug 17:26Z → 31 Aug 15:12 Dublin): **+$9**, WR ~**82%**,
+**B+C live paste (operator asked 31 Aug).** Entry stays last-120 / edge $0.
+Confirm `dry_run` / `entry_enabled` before restart. Flatten is **code**
+(needs `polybuybot5m` restart). Persist/dump/toxic hot-reload but restart
+anyway so flatten is on. Do **not** start 15m, hourly, or mint.
+
+```bash
+cd ~/poly-money-maker && git pull
+python3 -c 'import json; from pathlib import Path; p=Path("strategy_buy5m.json"); d=json.loads(p.read_text()); d["hedge_persist_s"]=1.0; d["hedge_toxic_bid_max"]=0.40; d["hedge_min_price"]=0.40; d["toxic_force_exit_below"]=0.75; d["hedge_flatten_walks"]=True; p.write_text(json.dumps(d, indent=2)+"\n"); print("persist", d["hedge_persist_s"], "dump", d["hedge_toxic_bid_max"], "min", d["hedge_min_price"], "toxic", d["toxic_force_exit_below"], "flatten", d.get("hedge_flatten_walks"), "start", d["buy_start_s"], "edge", d["min_underlying_edge_usd"], "dry_run", d.get("dry_run"), "entry", d.get("entry_enabled"))'
+sudo systemctl restart polybuybot5m
+systemctl is-active polybuybot polybuybot5m polybuybothourly
+# expect: inactive active inactive
+```
+
+Printed `start` must stay **120**, `edge` **0**. Do **not** paste last-45 + $25.
+
+First last-120 tape (27 Aug 17:26Z → 31 Aug 15:12 Dublin): **+$9**, WR ~**82%**,
 take rate **411/1129 = 36%**, **73 walks**, **52 sells / 0 `hedge_fill`**
 (sells ghost via `hedge_uncertain_resolved`). Catalog:
-`docs/2026-08-31-last120-loss-catalog.md`. Do **not** restart 5m and
-do **not** edit live JSON unless the operator asks after they buy a
-recommendation.
+`docs/2026-08-31-last120-loss-catalog.md`.
 
 ---
 
@@ -83,11 +93,12 @@ mint complete sets. Operator still sells leftover mint inventory by hand.
 | Last-45 ≥90 overlay | **off** (`late_90_start_s=0`) |
 | Early / ≥95 | **off** |
 | `add_min_price` | **90¢** (no late add while early is off) |
-| Hedge qualify | bid ≤ **50¢**, ask ≤ **52¢**, spread ≤ 15¢, persist **5s** |
+| Hedge qualify | bid ≤ **50¢**, ask ≤ **52¢**, spread ≤ 15¢, persist **1s** |
 | Hedge GUI | held ≤ **52¢**, other ≥ **48¢**. Buy 70/30 unchanged. Last print ≤ 52¢. |
 | Oracle while holding | Do **not persist-sell** if live Chainlink TWAP is still on the held side of PTB. Missing/stale feed holds. |
 | After persist | Sell at the live bid while **< 53¢**, including a fade through 50 (`hedge_sell_fade`). Bid ≥ **53¢** holds and clears persist. |
-| Dump | Bid-only ≤ **32¢** even if BTC still agrees (`hedge_dump_ignore_oracle`). Persist-50 does **not** get this bypass. |
+| Dump | Bid-only ≤ **40¢** even if BTC still agrees (`hedge_dump_ignore_oracle`). Persist-50 does **not** get this bypass. |
+| Flatten walks | `toxic_force_exit_below=0.75` arms `toxic_fill` on avg **<75¢**. Sell at the live bid while bid **<75¢** (`hedge_flatten_walks`). Bid ≥75 rides. |
 | Underlying buy edge | **$0** |
 | `BUY_HORIZON_S` | **120s** |
 | `max_open_positions` | **0 = unlimited** |

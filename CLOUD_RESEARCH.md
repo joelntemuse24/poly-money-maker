@@ -10,9 +10,10 @@ clicked.” Hits without `pnl` are incomplete.
 Pathlog **cannot** replay Polymarket last-trade GUI, Chainlink/PTB, or POST
 latency. Paper mode: fill at the recorded ask, walk later ticks for a
 50/52/15 hedge from the 5m example JSON (paper honors `hedge_persist_s`,
-5s on that file) using
+1s on that file; dump **40¢**; flatten walks **<75¢**) using
 mid-as-GUI when spread ≤ 10¢ (held ≤ 52¢ / other ≥ 48¢; other need not be
-ahead). Wide books fail closed. Toxic dumps only while bid ≤ 32¢.
+ahead). Wide books fail closed. Toxic dumps while bid ≤ 40¢, or flatten
+while bid < 75¢.
 
 Live books are **public** (Gamma + CLOB). `pathlog.py` records them with no
 keys. Do not put `PRIVATE_KEY` on a Cloud Agent.
@@ -176,7 +177,7 @@ by pnl_sum (min 5 hits). Do not merge. Do not edit strategy_buy5m.json.
 | GUI + last trade for hedge | Mid if spread ≤ 10¢; 5m held ≤ 52¢ / other ≥ 48¢ from example JSON; wide book = no hedge |
 | BTC/PTB side gate | Not replayed (pathlog is books only) |
 | Unmatched FAK / POST RTT | Not replayed (optimistic fill at that tick) |
-| Toxic dump if bid ≤ 32¢ (5m example) | Same from template; recovered bid > 32¢ rides |
+| Toxic dump if bid ≤ 40¢ (5m example); flatten walks while bid < 75¢ | Same from template; recovered bid ≥ 75¢ rides |
 | Redeem $1 / wipeout $0 | After no hedge: same — this is the P&L |
 
 `--sweep` is **one change at a time** from the template (window, band, $15,

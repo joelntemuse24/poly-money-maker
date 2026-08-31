@@ -358,6 +358,38 @@ class PaperExitTests(unittest.TestCase):
         self.assertEqual(out["exit"], "toxic_dump")
         self.assertAlmostEqual(out["exit_bid"], 0.11)
 
+    def test_flatten_walk_sells_at_70(self):
+        fill = simulate_fak_buy(2.5, 0.70, None)
+        hit = {"ts": 1, "ttm": 90, "leg": "up", "ask": 0.70}
+        ticks = [
+            _tick(1, 90, 0.70, 0.30),
+            _tick(2, 80, 0.30, 0.70, ub=0.70, db=0.28),
+        ]
+        out = paper_settle(
+            ticks, hit, fill, winner="up",
+            toxic_force_exit_below=0.75,
+            flatten_max=0.75,
+            hedge_toxic_bid_max=0.40,
+        )
+        self.assertEqual(out["exit"], "toxic_dump")
+        self.assertAlmostEqual(out["exit_bid"], 0.70)
+
+    def test_flatten_recovered_walk_rides(self):
+        fill = simulate_fak_buy(2.5, 0.70, None)
+        hit = {"ts": 1, "ttm": 90, "leg": "up", "ask": 0.70}
+        ticks = [
+            _tick(1, 90, 0.70, 0.30),
+            _tick(2, 50, 0.20, 0.80, ub=0.80, db=0.18),
+        ]
+        out = paper_settle(
+            ticks, hit, fill, winner="up",
+            toxic_force_exit_below=0.75,
+            flatten_max=0.75,
+            hedge_toxic_bid_max=0.40,
+        )
+        self.assertEqual(out["exit"], "redeem_win")
+        self.assertGreater(out["pnl"], 0)
+
     def test_persist_skips_one_tick_dip(self):
         fill = simulate_fak_buy(2.5, 0.90, None)
         hit = {"ts": 1, "ttm": 90, "leg": "up", "ask": 0.90}
@@ -466,8 +498,10 @@ class SweepTemplateTests(unittest.TestCase):
         self.assertTrue(tmpl["hedge_require_gui"])
         self.assertEqual(tmpl["hedge_threshold"], 0.50)
         self.assertEqual(tmpl["hedge_require_ask_max"], 0.52)
-        self.assertEqual(tmpl["hedge_toxic_bid_max"], 0.32)
-        self.assertEqual(tmpl["hedge_persist_s"], 5.0)
+        self.assertEqual(tmpl["hedge_toxic_bid_max"], 0.40)
+        self.assertEqual(tmpl["hedge_persist_s"], 1.0)
+        self.assertEqual(tmpl["flatten_max"], 0.75)
+        self.assertEqual(tmpl["toxic_force_exit_below"], 0.75)
         self.assertEqual(tmpl["hedge_held_gui_max"], 0.52)
         self.assertEqual(tmpl["hedge_other_gui_min"], 0.48)
         self.assertFalse(tmpl["require_gui_reversed"])
@@ -484,6 +518,7 @@ class SweepTemplateTests(unittest.TestCase):
         self.assertEqual(tmpl["hedge_require_ask_max"], 0.52)
         self.assertEqual(tmpl["hedge_toxic_bid_max"], 0.35)
         self.assertEqual(tmpl["hedge_persist_s"], 5.0)
+        self.assertIsNone(tmpl["flatten_max"])
         self.assertEqual(tmpl["hedge_held_gui_max"], 0.52)
         self.assertEqual(tmpl["hedge_other_gui_min"], 0.48)
         self.assertFalse(tmpl["require_gui_reversed"])
