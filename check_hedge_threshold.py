@@ -67,11 +67,23 @@ RANGE_RE = re.compile(
     r"(\d{1,2}):(\d{2})\s*([AP]M)\s*-\s*(\d{1,2}):(\d{2})\s*([AP]M)",
     re.I,
 )
+# Data API / UI sometimes drop the first AM/PM or use an en-dash:
+# "August 27, 5:00-5:05PM ET" / "August 27, 5:00AM–5:05AM ET".
+RANGE_RE_LOOSE = re.compile(
+    r"(January|February|March|April|May|June|July|August|September|"
+    r"October|November|December)\s+(\d{1,2}),\s+"
+    r"(\d{1,2}):(\d{2})\s*([AP]M)?\s*[-–—]\s*(\d{1,2}):(\d{2})\s*([AP]M)",
+    re.I,
+)
 HOUR_RE = re.compile(
     r"(January|February|March|April|May|June|July|August|September|"
     r"October|November|December)\s+(\d{1,2}),\s+(\d{1,2})\s*([AP]M)\s*ET",
     re.I,
 )
+# check_fetch_trades writes slug=btc-updown-5m-{start}. Title is often just
+# "BTC Up or Down 5m" (no clock) — RANGE_RE then misses every 5m row.
+SLUG_5M_RE = re.compile(r"btc-updown-5m-(\d{10,})", re.I)
+SLUG_15M_RE = re.compile(r"btc-updown-15m-(\d{10,})", re.I)
 THRESHOLDS = (0.75, 0.70, 0.65, 0.60, 0.55, 0.53)
 PERSIST_S = (2.0, 5.0)
 DROPS = (0.05, 0.08, 0.10)
@@ -106,10 +118,33 @@ def _et_hm(hour: int, minute: int, ap: str) -> tuple[int, int]:
     return hour, int(minute)
 
 
+def five_m_slug_start(text: str) -> Optional[int]:
+    """Start unix from ``btc-updown-5m-{start}`` (Gamma / Data API slug)."""
+    m = SLUG_5M_RE.search(text or "")
+    if not m:
+        return None
+    ts = int(m.group(1))
+    if ts > 1_700_000_000:
+        return ts
+    return None
+
+
+def _range_match(name: str):
+    return RANGE_RE.search(name or "") or RANGE_RE_LOOSE.search(name or "")
+
+
 def series_of(name: str) -> str:
-    m = RANGE_RE.search(name or "")
+    if five_m_slug_start(name):
+        return "5m"
+    if SLUG_15M_RE.search(name or ""):
+        return "15m"
+    m = _range_match(name)
     if m:
         h1, mi1, ap1, h2, mi2, ap2 = m.group(3, 4, 5, 6, 7, 8)
+        if not ap2:
+            return "unknown"
+        if not ap1:
+            ap1 = ap2
 
         def mins(h: str, mi: str, ap: str) -> int:
             hh, mm = _et_hm(int(h), int(mi), ap)
@@ -127,12 +162,18 @@ def series_of(name: str) -> str:
 
 
 def five_m_start_ts(name: str, year: int) -> Optional[int]:
-    m = RANGE_RE.search(name or "")
+    slug_ts = five_m_slug_start(name)
+    if slug_ts is not None:
+        return slug_ts
+    m = _range_match(name)
     if not m:
+        return None
+    ap1 = m.group(5) or m.group(8)
+    if not ap1:
         return None
     month = MONTHS[m.group(1).lower()]
     day = int(m.group(2))
-    hour, minute = _et_hm(int(m.group(3)), int(m.group(4)), m.group(5))
+    hour, minute = _et_hm(int(m.group(3)), int(m.group(4)), ap1)
     dt = datetime(year, month, day, hour, minute, tzinfo=ET)
     return int(dt.timestamp())
 
@@ -145,13 +186,18 @@ def load_csv(path: Path) -> list[dict]:
         for raw in rdr:
             row = {(k or "").strip().strip('"'): v for k, v in raw.items()}
             ts = _f(row.get("timestamp"))
+            if ts is not None and ts > 1e12:
+                ts = ts / 1000.0
             usdc = _f(row.get("usdcAmount")) or 0.0
             tok = _f(row.get("tokenAmount")) or 0.0
             if ts is None:
                 continue
+            slug = (row.get("slug") or row.get("eventSlug") or "").strip()
+            title = (row.get("marketName") or row.get("title") or "").strip()
             rows.append(
                 {
-                    "market": row.get("marketName") or row.get("title") or "",
+                    "market": title or slug,
+                    "slug": slug,
                     "action": (row.get("action") or row.get("side") or "").title(),
                     "usdc": usdc,
                     "tok": tok,
@@ -426,7 +472,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     cut = raw[-1]["ts"] - float(args.hours) * 3600.0
     win = [r for r in raw if r["ts"] >= cut]
     for row in win:
-        row["series"] = series_of(row["market"])
+        row["series"] = series_of(row.get("slug") or row["market"])
     p(
         "CSV",
         args.csv.name,

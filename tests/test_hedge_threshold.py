@@ -26,6 +26,16 @@ class ParseTests(unittest.TestCase):
             series_of("Bitcoin Up or Down - August 21, 7:05PM-7:10PM ET"), "5m"
         )
         self.assertEqual(series_of("Bitcoin Up or Down - August 21, 6PM ET"), "hourly")
+        self.assertEqual(series_of("btc-updown-5m-1787353500"), "5m")
+        self.assertEqual(five_m_start_ts("btc-updown-5m-1787353500", 2026), 1787353500)
+        self.assertEqual(series_of("BTC Up or Down 5m"), "unknown")
+        self.assertEqual(
+            series_of("Bitcoin Up or Down - August 27, 5:00-5:05PM ET"), "5m"
+        )
+        self.assertEqual(
+            five_m_start_ts("Bitcoin Up or Down - August 27, 5:00-5:05PM ET", 2026),
+            five_m_start_ts("Bitcoin Up or Down - August 27, 5:00PM-5:05PM ET", 2026),
+        )
 
 
 class TouchTests(unittest.TestCase):
