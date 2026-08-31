@@ -400,3 +400,78 @@ Do **not** reopen last-45 + $25 from this table.
 Join + fill×TTM split + slug match + a join diagnostic are in this PR.
 Re-run after `git pull`. Historical `--hours 96` if the overlay span is
 wanted. Participation: `--bot 5m` (15m/hourly are stopped).
+
+---
+
+## 8. VM SESSION TAPE n=437 (31 Aug ~21:30Z) — −$1139 is not live P&L
+
+Operator re-fetched `exports/trades.csv` (stale file ended 1787357611,
+before the 27 Aug 17:26Z restart) then:
+
+```bash
+.venv/bin/python check_fetch_trades.py --out exports/trades.csv
+.venv/bin/python check_reversal_features.py --csv exports/trades.csv \
+  --restart-utc 2026-08-27T17:26:00 --hours 96 --out /tmp/reversal_join.txt
+```
+
+Fetch: **4922** rows, newest **2026-08-31 20:39:00Z**, **491**
+post-restart. Titles in this pull were range-shaped
+(`August 27, 1:30PM-1:35PM ET`), so join worked without the slug
+fallback. `git pull` still aborted on local `check_path_backtest.py`.
+`--skip-miss-history` is on origin, not the VM checkout.
+
+**Do not treat `session_pnl=−1139.58` / mean −$2.61 as live P&L.**
+`GET /trades` is CLOB Buy/Sell only. `session_pnl` only credited
+`action == "Redeem"`. 437 markets: **redeem=0**, **hedge=54**,
+**other=383**. Every unresolved winner looked like `open` / exit $0 /
+pnl = −spent (~−$2.70). Smoking gun: SESSION $5 buckets **50–55** and
+**60–65** show WR **100%** and negative `paper_pnl`. Live overlay from
+the first tape is still ~**+$9** / **+$0.10–$0.12/h**.
+
+What is usable from this paste (Binance at fill, not wallet cash):
+
+| |dist| at fill | n | flip | WR |
+|---|---|---|---|
+| 0–5 | 53 | 47.2% | 52.8% |
+| 5–10 | 65 | 33.8% | 66.2% |
+| 10–15 | 57 | 19.3% | 80.7% |
+| 15–20 | 60 | 16.7% | 83.3% |
+| 20–25 | 37 | 13.5% | 86.5% |
+| 25–30 | 41 | 19.5% | 80.5% |
+| 30–35 | 24 | 8.3% | 91.7% |
+
+Mean fill **0.801**, span **99.17h**, **4.1** fills/h. At 80¢ the
+no-hedge max flip is **20%**. 0–10 is not eatable; 10–20 is knife-edge;
+20+ mostly is. GATE `ev_nohedge` (flip × fill, not the fake wallet
+column): all **−0.09**; ≥10 **+0.13**; ≥20 **+0.18**; ≥30 **+0.25**.
+
+SESSION replay (keep if TTM ≤ window and |dist| ≥ edge — poisoned by
+−$2.70 opens until paper-credit):
+
+| name | keep | keep/h | note |
+|---|---|---|---|
+| all_fills | 405 | 4.1 | almost all last-120 |
+| last45_e0 | 27 | 0.3 | ~6.7% of fills in last 45s |
+| last45_e25 | 6 | 0.1 | empty |
+
+Historical COMBOS `last45_e20` +$1.86/h is implied-|dist| paper on
+**all 5m clocks**, not this tape. VM script on `e962a75` still printed
+last-45+$25 as RECOMMENDATION. **Do not paste it. Do not size up.**
+
+Hedges with BTC features: **n=48**, mean_|dist| **20.7**, against
+**44%**. Some recovered (+3.11, +2.86); most still lost. Participation
+**585/1151 “bought”** remains bot-log (attempt-inflated); wallet take
+on the overlay was **411/1129 = 36%**. 15m/hourly 0 is correct.
+
+Paper-credit (this PR): resolved CLOB-only opens become `paper_win`
+($1 × shares) or `paper_loss` (−spend) from Binance close vs PTB after
+a 90s settle grace. Real Redeem rows and hedge sells keep wallet cash.
+Re-run after `git pull` (stash local `check_path_backtest.py` first):
+
+```bash
+cd ~/poly-money-maker
+git stash push -m "vm local check_path_backtest" -- check_path_backtest.py
+git pull
+.venv/bin/python check_reversal_features.py --csv exports/trades.csv \
+  --restart-utc 2026-08-27T17:26:00 --hours 96 --out /tmp/reversal_join.txt
+```

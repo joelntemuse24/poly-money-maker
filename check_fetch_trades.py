@@ -24,6 +24,12 @@ Output CSV uses the same column names as the UI history export so
 Re-runs merge/dedupe into the output file (key: tx hash + asset + unix
 ts + size + side). Wallet comes from ``--user`` or ``FUNDER_ADDRESS`` in
 ``.env`` — never committed. Data API only; no subgraph fallback.
+
+``GET /trades`` is CLOB Buy/Sell only. On-chain Redeem does not appear
+here (winners cash via the relayer, not a CLOB fill). The real redeem
+feed is ``GET /activity?type=REDEEM`` — this script does not fetch it.
+``check_reversal_features.py --csv`` paper-credits resolved opens from
+Binance close vs PTB so a CLOB-only tape is not scored as −spend.
 """
 from __future__ import annotations
 

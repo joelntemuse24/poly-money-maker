@@ -61,6 +61,9 @@ LATE_MIN = 0.75
 LATE_MAX = 0.90
 BUDGET = 2.50
 DEFAULT_FILL_PX = 0.85
+# Data API /trades is CLOB Buy/Sell only. After the window is this far
+# past close, an open bag is paper-credited from Binance vs PTB.
+SETTLE_GRACE_S = 90.0
 
 # |BTC−PTB| buckets in USD (Binance proxy).
 DIST_EDGES = (0.0, 5.0, 10.0, 20.0, 40.0, 80.0, math.inf)
@@ -818,6 +821,34 @@ def _row_5m_key(row: dict, year: int) -> Optional[tuple[str, int]]:
     return None
 
 
+def bought_side(leg: Optional[str]) -> Optional[str]:
+    """Map a wallet token name to the BTC side of PTB (up / down)."""
+    raw = (leg or "").strip().lower()
+    if raw in ("up", "yes"):
+        return "up"
+    if raw in ("down", "no"):
+        return "down"
+    return None
+
+
+def attach_btc_winners(
+    markets: list[dict],
+    btc: BtcSeries,
+    *,
+    now_ts: float,
+) -> None:
+    """Stamp each 5m bag with Binance close vs PTB. Mutates ``markets``."""
+    for market in markets:
+        start = market.get("start_ts")
+        end = market.get("end_ts")
+        ptb = btc.at_or_before(start) if start is not None else None
+        close = btc.at_or_before(end) if end is not None else None
+        market["btc_ptb"] = ptb
+        market["btc_close"] = close
+        market["btc_now"] = float(now_ts)
+        market["btc_winner"] = side_of(close, ptb)
+
+
 def session_markets(rows: list[dict], *, restart_ts: float, year: int) -> list[dict]:
     grouped: dict[str, dict] = {}
     for row in rows:
@@ -861,6 +892,28 @@ def session_pnl(market: dict) -> dict:
     else:
         outcome = "open"
     first = market["buys"][0] if market["buys"] else None
+    shares = sum(b["tok"] for b in market["buys"])
+    if (
+        outcome == "open"
+        and not market["sells"]
+        and not market["redeems"]
+        and shares > 0
+    ):
+        now_ts = market.get("btc_now")
+        end_ts = market.get("end_ts")
+        winner = market.get("btc_winner")
+        bought = bought_side(first["leg"] if first else None)
+        settled = (
+            now_ts is not None
+            and end_ts is not None
+            and float(now_ts) >= float(end_ts) + SETTLE_GRACE_S
+        )
+        if settled and winner and bought and winner == bought:
+            outcome = "paper_win"
+            redeemed = shares
+            pnl = sold + redeemed - spent
+        elif settled and winner and bought and winner != bought:
+            outcome = "paper_loss"
     return {
         "spent": spent,
         "sold": sold,
@@ -870,7 +923,7 @@ def session_pnl(market: dict) -> dict:
         "fill_px": first["px"] if first else None,
         "leg": first["leg"] if first else None,
         "fill_ts": first["ts"] if first else None,
-        "shares": sum(b["tok"] for b in market["buys"]),
+        "shares": shares,
     }
 
 
@@ -1150,9 +1203,7 @@ def session_fill_split(markets: list[dict]) -> str:
         if not rec["fill_px"] or not rec["fill_ts"] or not rec["spent"]:
             continue
         ttm = m["end_ts"] - rec["fill_ts"]
-        won = rec["outcome"] == "redeem" or (
-            rec["outcome"] != "hedge" and rec["pnl"] > 0
-        )
+        won = rec["outcome"] in ("redeem", "paper_win")
         rows.append((rec["fill_px"], ttm, rec["pnl"], won, rec["outcome"]))
 
     def _tab(label: str, key_fn) -> list[str]:
@@ -1182,7 +1233,7 @@ def session_fill_split(markets: list[dict]) -> str:
         return "SESSION fill×TTM split n=0 (no joined buys)"
     lines = [
         f"SESSION fill×TTM split  n={len(rows)}  "
-        "(wallet fills only; win = redeem or pnl>0 and not a hedge)",
+        "(wallet fills only; win = redeem or paper_win)",
     ]
     lines.extend(
         _tab(
@@ -1207,7 +1258,7 @@ def render_session(markets: list[dict], samples: list[Sample]) -> str:
     ]
     by_name = {s.slug: s for s in samples}
     tot = 0.0
-    n_h = n_r = n_o = 0
+    n_h = n_r = n_o = n_pw = n_pl = 0
     for m in markets:
         rec = session_pnl(m)
         tot += rec["pnl"]
@@ -1215,6 +1266,10 @@ def render_session(markets: list[dict], samples: list[Sample]) -> str:
             n_h += 1
         elif rec["outcome"] == "redeem":
             n_r += 1
+        elif rec["outcome"] == "paper_win":
+            n_pw += 1
+        elif rec["outcome"] == "paper_loss":
+            n_pl += 1
         else:
             n_o += 1
         sample = by_name.get(m["market"])
@@ -1235,8 +1290,13 @@ def render_session(markets: list[dict], samples: list[Sample]) -> str:
         )
     lines.append("")
     lines.append(
-        f"n={len(markets)} redeem={n_r} hedge={n_h} other={n_o} "
+        f"n={len(markets)} redeem={n_r} paper_win={n_pw} paper_loss={n_pl} "
+        f"hedge={n_h} other={n_o} "
         f"session_pnl={money(tot)} mean={money(tot / len(markets) if markets else None)}"
+    )
+    lines.append(
+        "Data API /trades is CLOB-only (Buy/Sell). paper_win / paper_loss "
+        "are Binance close vs PTB after settle grace; real Redeem rows take precedence."
     )
     return "\n".join(lines)
 
@@ -1285,6 +1345,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         restart = parse_utc(args.restart_utc)
         rows = load_csv(args.csv)
         markets = session_markets(rows, restart_ts=restart.timestamp(), year=args.year)
+        attach_btc_winners(markets, btc, now_ts=float(hist_end))
         for m in markets:
             rec = session_pnl(m)
             if not rec["fill_ts"]:
@@ -1315,7 +1376,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             report.append("")
             report.append("SESSION vs BTC features at fill")
             hedges = [s for s in session_samples if s.outcome == "hedge"]
-            redeems = [s for s in session_samples if s.outcome == "redeem"]
+            redeems = [
+                s
+                for s in session_samples
+                if s.outcome in ("redeem", "paper_win")
+            ]
             def _avg(xs, attr):
                 vals = [getattr(s.feat, attr) for s in xs if getattr(s.feat, attr) is not None]
                 return mean(vals)
@@ -1354,7 +1419,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             report.append("")
             report.append(
                 "SESSION GATE — keep fills with |dist|≥X. "
-                "paper_pnl_kept is actual wallet P&L (hedge salvage included). "
+                "paper_pnl_kept is wallet P&L after paper-credit "
+                "(paper_win = $1×shares; hedges keep sell cash). "
                 "keeps_per_hour is this tape's fill rate after the gate."
             )
             report.extend(
@@ -1667,6 +1733,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     report.append("- Combo $/h uses implied fill from |dist| (session-calibrated). live_shaped_union is early ≥90 analog + late 75–90 + last-45 ≥90 on that map.")
     report.append("- A live dump at 32¢ / persist-50 changes skip-cost in losers' favor (skipping a loser is worth less than $2.50).")
     report.append("- Do not copy these thresholds into live JSON from n<30 session tape.")
+    report.append("- Data API /trades has no Redeem. session_pnl is not wallet cash until paper_win / paper_loss (Binance vs PTB) or a real Redeem row. Do not treat a CLOB-only tape of −$2.70 opens as live P&L.")
     report.append("")
     report.append("RECOMMENDATION (do not paste last-45 + $25 — that probe already lived empty/−EV)")
     report.append("  entry: last 120s / 75–90 / edge $0 (live since 27 Aug 17:26Z)")
