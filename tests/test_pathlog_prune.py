@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import tempfile
 import unittest
@@ -153,6 +154,48 @@ class SampleMarketSizeTests(unittest.TestCase):
         self.assertEqual(tick["das"], 40.0)
         self.assertEqual(tick["ubs"], 10.0)
         self.assertEqual(tick["dbs"], 8.0)
+
+
+class ResolveQueueTests(unittest.TestCase):
+    def test_15m_stem_is_not_5m_duration(self):
+        start = 1_787_855_000
+        five = pathlog.stem_end_ts(f"btc-updown-5m-{start}")
+        fifteen = pathlog.stem_end_ts(f"btc-updown-15m-{start}")
+        hourly = pathlog.stem_end_ts(f"btc-updown-hourly-{start}")
+        self.assertEqual(five, start + 300)
+        self.assertEqual(fifteen, start + 900)
+        self.assertEqual(hourly, start + 3600)
+
+    def test_pending_skips_old_and_live_and_caps(self):
+        now = 1_787_900_000.0
+        with tempfile.TemporaryDirectory() as tmp:
+            tick_dir = Path(tmp)
+            # 5m that closed 1h ago — eligible
+            recent = int(now - 3600 - 300)
+            # 5m that closed 2d ago — too old
+            ancient = int(now - 2 * 86400 - 300)
+            # 5m still live
+            live = int(now - 60)
+            for start in (recent, ancient, live):
+                (tick_dir / f"btc-updown-5m-{start}.jsonl").write_text(
+                    json.dumps({"e": "open", "slug": f"btc-updown-5m-{start}"}) + "\n"
+                    + json.dumps({"e": "tick", "ts": start + 1}) + "\n"
+                )
+            extras = []
+            for i in range(12):
+                start = int(now - 1800 - 300 - i)
+                extras.append(start)
+                (tick_dir / f"btc-updown-5m-{start}.jsonl").write_text("{}\n")
+            with patch.object(pathlog, "TICK_DIR", tick_dir):
+                pathlog._resolve_fail_until.clear()
+                slugs = pathlog.pending_resolve_slugs(
+                    now, lookback_s=6 * 3600, grace_s=20, limit=8,
+                )
+            stems = set(slugs)
+            self.assertIn(f"btc-updown-5m-{recent}", stems)
+            self.assertNotIn(f"btc-updown-5m-{ancient}", stems)
+            self.assertNotIn(f"btc-updown-5m-{live}", stems)
+            self.assertEqual(len(slugs), 8)
 
 
 if __name__ == "__main__":

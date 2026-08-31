@@ -269,6 +269,7 @@ def paper_settle(
     hedge_toxic_bid_max: Optional[float] = None,
     hedge_persist_s: float = 0.0,
     hedge_drop_from_fill: Optional[float] = None,
+    flatten_max: Optional[float] = None,
 ) -> dict:
     """Walk ticks after a fill. No orders. Not a live replay.
 
@@ -276,12 +277,12 @@ def paper_settle(
     GUI *and* last-print proxy. Wide books fail closed (no hedge), same class
     as live ``hedge_skip_no_consensus`` / missing last trade.
 
-    ``toxic_fill`` (avg < 65¢) dumps only while held bid ≤
-    ``hedge_toxic_bid_max`` (5m example **53¢**, else ``hedge_threshold``) —
-    recovered 97¢ books ride. Normal hedges still need threshold / ask-max /
-    max-spread (5m example **70/72/15**) plus the GUI proxy. 5m live GUI is
-    held ≤ ask-max / other ≥ complement (72/28), and does **not** require
-    the other mid to already be higher than held.
+    ``toxic_fill`` (avg < ``toxic_force_exit_below``) dumps while held bid
+    ≤ ``hedge_toxic_bid_max``, or flattens immediately when ``flatten_max``
+    is set and bid < that (5m walks: avg < 75¢, sell while bid < 75¢).
+    Recovered books (bid ≥ flatten_max, else 97¢ after a junk fill) ride.
+    Normal hedges still need threshold / ask-max / max-spread plus the GUI
+    proxy.
 
     ``hedge_persist_s`` > 0 waits that many seconds of *continuous* qualifying
     ticks before selling (a 1-tick 70¢ dip does not fire). ``hedge_drop_from_fill``
@@ -311,6 +312,7 @@ def paper_settle(
     if fill_ask is None:
         fill_ask = avg
     persist_s = float(hedge_persist_s or 0.0)
+    flatten_ceil = _f(flatten_max)
     armed_ts: Optional[float] = None
 
     def _redeem() -> dict:
@@ -347,7 +349,10 @@ def paper_settle(
             drop_hit = True
         qualifies = False
         if toxic:
-            qualifies = bid <= toxic_floor + 1e-12
+            if flatten_ceil is not None and bid + 1e-12 < flatten_ceil:
+                qualifies = True
+            else:
+                qualifies = bid <= toxic_floor + 1e-12
         elif drop_hit:
             qualifies = True
         else:
@@ -483,6 +488,11 @@ def template_from_strategy(path: Path) -> dict:
         ),
         "require_gui_reversed": not ask_max_gui,
         "hedge_persist_s": float(data.get("hedge_persist_s") or 0.0),
+        "flatten_max": (
+            float(data["buy_threshold"])
+            if five_m and data.get("hedge_flatten_walks", True)
+            else None
+        ),
         "hedge_drop_from_fill": (
             None
             if data.get("hedge_drop_from_fill") in (None, "")
@@ -507,6 +517,7 @@ PAPER_KEYS = (
     "require_gui_reversed",
     "hedge_persist_s",
     "hedge_drop_from_fill",
+    "flatten_max",
 )
 
 

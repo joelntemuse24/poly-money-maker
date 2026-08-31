@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import unittest
+from pathlib import Path
 
 from buy.hedge_gate import (
     clob_min_tick_from_error,
     evaluate_held_bag,
     hedge_dump_overrides_oracle,
+    hedge_flatten_overrides_oracle,
     hedge_market_tick,
     hedge_oracle_allows_sell,
     hedge_oracle_blocks_sell,
@@ -16,6 +18,8 @@ from buy.hedge_gate import (
     hedge_should_keep_retrying,
     hedge_tick_after_build_error,
     held_hedge_decision,
+    should_log_hedge_fill_on_uncertain,
+    should_mark_hedge_closed,
 )
 
 
@@ -452,5 +456,175 @@ class HeldHedgeCompositionTests(unittest.TestCase):
         self.assertFalse(intent.dump)
 
 
+class HedgeFillOnUncertainResolvedTests(unittest.TestCase):
+    """27–31 Aug last-120: 0 hedge_fill, 52 uncertain_resolved, 52 CSV sells."""
+
+    def test_gate_matches_hedge_closed(self):
+        self.assertTrue(should_log_hedge_fill_on_uncertain(3.2, 0.0))
+        self.assertTrue(should_mark_hedge_closed(3.2, 0.0))
+        self.assertFalse(should_log_hedge_fill_on_uncertain(0.0, 3.2))
+        self.assertFalse(should_log_hedge_fill_on_uncertain(1.0, 2.0))
+        self.assertFalse(should_log_hedge_fill_on_uncertain(None, 0.0))
+
+    def test_5m_logs_hedge_fill_after_uncertain_resolved(self):
+        src = (
+            Path(__file__).resolve().parents[1] / "buybot5m.py"
+        ).read_text()
+        resolved = src.find('"hedge_uncertain_resolved"')
+        fill = src.find('"hedge_fill"', resolved)
+        via = src.find('via="uncertain_resolved"', fill)
+        self.assertGreater(resolved, 0)
+        self.assertGreater(fill, resolved)
+        self.assertGreater(via, fill)
+        self.assertIn("should_log_hedge_fill_on_uncertain(", src)
+        hourly = (
+            Path(__file__).resolve().parents[1] / "buybothourly.py"
+        ).read_text()
+        self.assertNotIn("should_log_hedge_fill_on_uncertain", hourly)
+
+
+class FiveMFlattenWalkTests(unittest.TestCase):
+    """B+C: persist 1s, dump 40¢, flatten avg<75 while bid < 75 (before recovery 53)."""
+
+    KW = dict(
+        dump_bid_max=0.40,
+        qualify_bid=0.50,
+        qualify_ask_max=0.52,
+        recovery_cancel=0.53,
+        persist_s=1.0,
+        sell_fade=True,
+        flatten=True,
+        flatten_max=0.75,
+    )
+
+    def test_walk_70_flattens_before_recovery_cancel(self):
+        intent = evaluate_held_bag(
+            0.70, 0.72, now_s=20.0, persist_armed_ts=None, persist_done=False,
+            gui_ok=False, **self.KW,
+        )
+        self.assertEqual(intent.action, "dump")
+        self.assertEqual(intent.reason, "flatten_walk")
+        self.assertTrue(intent.dump)
+        self.assertTrue(intent.skip_gui)
+        self.assertAlmostEqual(intent.sell_at, 0.70)
+        self.assertAlmostEqual(intent.abort_above, 0.75)
+
+    def test_flatten_off_70_is_recovery_hold(self):
+        kw = dict(self.KW)
+        kw["flatten"] = False
+        intent = evaluate_held_bag(
+            0.70, 0.72, now_s=20.0, persist_armed_ts=None, persist_done=False,
+            gui_ok=False, **kw,
+        )
+        self.assertEqual(intent.action, "hold")
+        self.assertEqual(intent.reason, "recovery_cancel")
+        self.assertFalse(intent.dump)
+
+    def test_bid_at_band_floor_rides(self):
+        intent = evaluate_held_bag(
+            0.75, 0.76, now_s=20.0, persist_armed_ts=None, persist_done=False,
+            gui_ok=False, **self.KW,
+        )
+        self.assertEqual(intent.action, "hold")
+        self.assertEqual(intent.reason, "recovery_cancel")
+        self.assertFalse(intent.dump)
+
+    def test_dump_40_still_wins_over_flatten(self):
+        intent = evaluate_held_bag(
+            0.40, 0.90, now_s=20.0, persist_armed_ts=None, persist_done=False,
+            gui_ok=False, **self.KW,
+        )
+        self.assertEqual(intent.action, "dump")
+        self.assertEqual(intent.reason, "bid_le_dump")
+        self.assertAlmostEqual(intent.sell_at, 0.40)
+
+    def test_in_band_persist_sell_is_not_flatten(self):
+        kw = dict(self.KW)
+        kw["flatten"] = False
+        intent = evaluate_held_bag(
+            0.51, 0.52, now_s=20.0, persist_armed_ts=10.0, persist_done=True,
+            **kw,
+        )
+        self.assertEqual(intent.action, "sell")
+        self.assertEqual(intent.reason, "persist_live_bid")
+        self.assertFalse(intent.dump)
+
+    def test_persist_1s_then_sell(self):
+        live = dict(self.KW)
+        live["flatten"] = False
+        armed = evaluate_held_bag(
+            0.50, 0.52, now_s=10.0, persist_armed_ts=None, persist_done=False,
+            gui_ok=True, **live,
+        )
+        self.assertEqual(armed.action, "arm")
+        waiting = evaluate_held_bag(
+            0.50, 0.52, now_s=10.5, persist_armed_ts=10.0, persist_done=False,
+            gui_ok=True, **live,
+        )
+        self.assertEqual(waiting.action, "wait")
+        ready = evaluate_held_bag(
+            0.50, 0.52, now_s=11.0, persist_armed_ts=10.0, persist_done=False,
+            gui_ok=True, **live,
+        )
+        self.assertEqual(ready.action, "sell")
+        self.assertEqual(ready.reason, "persist_live_bid")
+
+    def test_keep_retrying_flatten_at_70(self):
+        self.assertTrue(
+            hedge_should_keep_retrying(
+                3.2, 0.70, persist_done=True,
+                dump_bid_max=0.40, qualify_bid=0.50, recovery_cancel=0.53,
+                sell_fade=True, flatten=True, flatten_max=0.75,
+            )
+        )
+        self.assertFalse(
+            hedge_should_keep_retrying(
+                3.2, 0.70, persist_done=True,
+                dump_bid_max=0.40, qualify_bid=0.50, recovery_cancel=0.53,
+                sell_fade=True, flatten=False, flatten_max=0.75,
+            )
+        )
+        self.assertFalse(
+            hedge_should_keep_retrying(
+                3.2, 0.75, persist_done=True,
+                dump_bid_max=0.40, qualify_bid=0.50, recovery_cancel=0.53,
+                sell_fade=True, flatten=True, flatten_max=0.75,
+            )
+        )
+
+    def test_45_without_flatten_is_not_dump(self):
+        kw = dict(self.KW)
+        kw["flatten"] = False
+        intent = evaluate_held_bag(
+            0.45, 0.47, now_s=20.0, persist_armed_ts=None, persist_done=False,
+            gui_ok=False, gui_why="no_consensus", **kw,
+        )
+        self.assertNotEqual(intent.action, "dump")
+        self.assertEqual(intent.reason, "no_consensus")
+
+    def test_flatten_peek_skips_oracle(self):
+        self.assertTrue(
+            hedge_flatten_overrides_oracle(0.70, 0.75, armed=True),
+        )
+        self.assertFalse(
+            hedge_flatten_overrides_oracle(0.75, 0.75, armed=True),
+        )
+        self.assertFalse(
+            hedge_flatten_overrides_oracle(0.70, 0.75, armed=False),
+        )
+        intent = held_hedge_decision(
+            None, None, 0.70, 0.72, 0.80, 0.82,
+            now_s=20.0, persist_armed_ts=None, persist_done=False,
+            oracle_agrees=True, dump_ignore_oracle=True,
+            dump_bid_max=0.40, qualify_bid=0.50, qualify_ask_max=0.52,
+            recovery_cancel=0.53, persist_s=1.0, sell_fade=True,
+            flatten=True, flatten_max=0.75,
+        )
+        self.assertEqual(intent.action, "dump")
+        self.assertEqual(intent.reason, "flatten_walk")
+        self.assertTrue(intent.dump)
+
+
 if __name__ == "__main__":
     unittest.main()
+
