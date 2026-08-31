@@ -113,6 +113,7 @@ class Market:
 @dataclass
 class BuyHit:
     sources: Set[str] = field(default_factory=set)
+    events: Set[str] = field(default_factory=set)
     avg_price: Optional[float] = None
     usdc: Optional[float] = None
     leg: Optional[str] = None
@@ -253,6 +254,7 @@ def load_bot_buys(
             hit = buys.setdefault(cid, BuyHit())
             hit.sources.add("log" if "log" in str(cfg["log"]) else "bot")
             hit.sources.add("bot")
+            hit.events.add(name)
             if ev.get("avg_price") is not None:
                 try:
                     hit.avg_price = float(ev["avg_price"])
@@ -282,6 +284,7 @@ def load_bot_buys(
             dest = buys.setdefault(cid, BuyHit())
             dest.sources.add("pnl")
             dest.sources.update(hit.sources)
+            dest.events.update(hit.events)
             if hit.avg_price is not None:
                 dest.avg_price = hit.avg_price
             if hit.leg:
@@ -362,15 +365,20 @@ def load_csv_buys(path: Optional[str]) -> List[dict]:
             tokens = float(r["tokenAmount"])
         except (KeyError, TypeError, ValueError):
             continue
+        if ts > 1e12:
+            ts /= 1000.0
+        slug = (r.get("slug") or r.get("eventSlug") or "").strip()
+        title = r.get("marketName") or r.get("title") or ""
         out.append(
             {
                 "ts": ts,
-                "market": r.get("marketName") or "",
-                "leg": (r.get("tokenName") or "").strip().lower() or None,
+                "market": title or slug,
+                "slug": slug,
+                "leg": (r.get("tokenName") or r.get("outcome") or "").strip().lower() or None,
                 "usdc": usdc,
                 "tokens": tokens,
                 "avg": (usdc / tokens) if tokens else None,
-                "norm": _norm_q(r.get("marketName") or ""),
+                "norm": _norm_q(title or slug),
             }
         )
     return out
@@ -381,12 +389,20 @@ def match_csv_to_markets(
     markets: List[Market],
 ) -> Dict[str, BuyHit]:
     by_norm: Dict[str, List[Market]] = defaultdict(list)
+    by_slug: Dict[str, Market] = {}
     for m in markets:
         by_norm[_norm_q(m.question)].append(m)
+        if m.slug:
+            by_slug[m.slug.lower()] = m
 
     hits: Dict[str, BuyHit] = {}
     for b in csv_buys:
-        cands = by_norm.get(b["norm"]) or []
+        slug = (b.get("slug") or "").strip().lower()
+        cands: List[Market] = []
+        if slug and slug in by_slug:
+            cands = [by_slug[slug]]
+        if not cands:
+            cands = by_norm.get(b["norm"]) or []
         if not cands:
             # fuzzy: strip "bitcoin up or down -"
             alt = re.sub(r"^bitcoin up or down\s*-?\s*", "", b["norm"]).strip()
@@ -516,6 +532,7 @@ def merge_buys(*maps: Dict[str, BuyHit]) -> Dict[str, BuyHit]:
         for cid, hit in m.items():
             dest = out.setdefault(cid, BuyHit())
             dest.sources.update(hit.sources)
+            dest.events.update(hit.events)
             if hit.avg_price is not None:
                 dest.avg_price = hit.avg_price
             if hit.usdc is not None:
@@ -545,6 +562,7 @@ def run_bot(
     fidelity: int,
     sleep_s: float,
     show_rows: int,
+    skip_miss_history: bool = False,
 ) -> None:
     print(f"\n===== {bot}  window={cfg['window_s']:.0f}s  band={lo:.2f}-{hi:.2f} =====")
     markets = enumerate_markets(session, bot, cfg, start_ts, end_ts, sleep_s)
@@ -559,6 +577,25 @@ def run_bot(
         hit.sources.add("bot")
     csv_hits = match_csv_to_markets(csv_buys, markets)
     buys = merge_buys(bot_buys, csv_hits)
+    n_bought_preview = sum(
+        1 for m in markets if buys.get(m.condition_id) and buys[m.condition_id].sources
+    )
+    n_fill = sum(
+        1
+        for m in markets
+        if (h := buys.get(m.condition_id))
+        and h.sources
+        and (h.events & {"buy_fill", "buy_ghost_fill"} or "csv" in h.sources)
+    )
+    print(
+        f"csv file buys={len(csv_buys)}  matched_this_series={len(csv_hits)}  "
+        f"bot_buys={len(bot_buys)}  bought={n_bought_preview}/{len(markets)} "
+        f"({(100.0 * n_bought_preview / len(markets)) if markets else 0:.1f}%)  "
+        f"fill_or_csv={n_fill}  "
+        f"(bought includes buy_attempt; fill_or_csv is wallet-shaped)"
+    )
+    if skip_miss_history:
+        print("skip-miss-history: not fetching CLOB prices-history on misses")
 
     bought_rows = []
     miss_rows = []
@@ -573,6 +610,11 @@ def run_bot(
             source_counts[src] += 1
             bought_rows.append((m, hit, src))
             labels["bought"] += 1
+            continue
+
+        if skip_miss_history:
+            labels["miss_no_history"] += 1
+            miss_rows.append((m, {"primary": "miss_no_history", "up_max": None, "dn_max": None}, skips.get(m.condition_id) or []))
             continue
 
         info = analyze_miss(session, m, float(cfg["window_s"]), lo, hi, fidelity, sleep_s)
@@ -649,6 +691,12 @@ def main() -> None:
     ap.add_argument("--fidelity", type=int, default=1, help="prices-history fidelity minutes")
     ap.add_argument("--sleep", type=float, default=0.05, help="pause between HTTP calls")
     ap.add_argument("--show", type=int, default=15, help="sample rows to print")
+    ap.add_argument(
+        "--skip-miss-history",
+        action="store_true",
+        help="Print bought vs calendar only; skip CLOB prices-history on misses "
+        "(96h 5m is ~1000 markets × 2 HTTP).",
+    )
     ap.add_argument("--window-5m", type=float, default=None)
     ap.add_argument("--window-15m", type=float, default=None)
     ap.add_argument("--window-hr", type=float, default=None)
@@ -689,6 +737,7 @@ def main() -> None:
             args.fidelity,
             args.sleep,
             args.show,
+            skip_miss_history=args.skip_miss_history,
         )
 
 

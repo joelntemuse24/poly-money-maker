@@ -30,6 +30,7 @@ import math
 import statistics
 import sys
 import time
+from collections import Counter, defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -43,6 +44,7 @@ from urllib3.util.retry import Retry
 from check_hedge_threshold import (
     fetch_event,
     fetch_trades,
+    five_m_slug_start,
     five_m_start_ts,
     load_csv,
     series_of,
@@ -796,17 +798,35 @@ def session_replay_table(samples: Sequence[Sample], hours: float) -> list[str]:
     return lines
 
 
+def _row_5m_key(row: dict, year: int) -> Optional[tuple[str, int]]:
+    """Stable 5m identity: prefer Data API slug, then range title.
+
+    ``check_fetch_trades`` writes ``slug=btc-updown-5m-{start}`` and often a
+    generic title (``BTC Up or Down 5m``) that RANGE_RE cannot parse. Grouping
+    by that title would collapse every clock into one market.
+    """
+    slug = (row.get("slug") or "").strip()
+    name = (row.get("market") or "").strip()
+    for text in (slug, name):
+        if series_of(text) != "5m":
+            continue
+        start = five_m_start_ts(text, year)
+        if start is None:
+            continue
+        key = f"btc-updown-5m-{start}" if five_m_slug_start(text) else name
+        return key, start
+    return None
+
+
 def session_markets(rows: list[dict], *, restart_ts: float, year: int) -> list[dict]:
     grouped: dict[str, dict] = {}
     for row in rows:
-        name = row["market"]
-        if series_of(name) != "5m":
+        ident = _row_5m_key(row, year)
+        if ident is None:
             continue
         if row["ts"] < restart_ts - 1:
             continue
-        start = five_m_start_ts(name, year)
-        if start is None:
-            continue
+        name, start = ident
         item = grouped.setdefault(
             name,
             {
@@ -1076,6 +1096,105 @@ def late_band_touch(trades: Sequence[dict], start_ts: int, end_ts: int) -> Optio
     return best
 
 
+FILL_SPLIT_EDGES = (0.0, 0.70, 0.75, 0.80, 0.85, 0.90, 1.01)
+TTM_SPLIT_EDGES = (0.0, 30.0, 60.0, 90.0, 120.0, 301.0)
+
+
+def csv_join_report(rows: list[dict], markets: list[dict], *, restart_ts: float, year: int) -> str:
+    """Why SESSION TAPE is empty: title-only vs slug/title join."""
+    title_series = Counter(series_of(r.get("market") or "") for r in rows)
+    slug_series = Counter(
+        series_of((r.get("slug") or r.get("market") or "")) for r in rows
+    )
+    n_5m_keys = sum(1 for r in rows if _row_5m_key(r, year) is not None)
+    n_post = sum(
+        1
+        for r in rows
+        if _row_5m_key(r, year) is not None and r["ts"] >= restart_ts - 1
+    )
+    sample = []
+    for row in rows[:6]:
+        sample.append(
+            f"  title={row.get('market', '')!r} slug={row.get('slug', '')!r} "
+            f"action={row.get('action')} ts={row.get('ts')} "
+            f"title_series={series_of(row.get('market') or '')} "
+            f"join={_row_5m_key(row, year)}"
+        )
+    lines = [
+        f"csv rows={len(rows)} title_series={dict(title_series)} "
+        f"slug_or_title_series={dict(slug_series)} "
+        f"5m_joinable={n_5m_keys} post_restart_5m_rows={n_post} "
+        f"session_markets={len(markets)}",
+    ]
+    if sample:
+        lines.append("csv sample (first 6):")
+        lines.extend(sample)
+    if not markets:
+        lines.append(
+            "SESSION TAPE n=0 is a join miss, not zero fills. "
+            "Need slug=btc-updown-5m-{{start}} or a Month D, H:MM AM-H:MM AM title."
+        )
+    return "\n".join(lines)
+
+
+def session_fill_split(markets: list[dict]) -> str:
+    """Winner-split the actual wallet fills by fill ¢ and TTM (not BTC clocks)."""
+    rows = []
+    for m in markets:
+        rec = session_pnl(m)
+        if not rec["fill_px"] or not rec["fill_ts"] or not rec["spent"]:
+            continue
+        ttm = m["end_ts"] - rec["fill_ts"]
+        won = rec["outcome"] == "redeem" or (
+            rec["outcome"] != "hedge" and rec["pnl"] > 0
+        )
+        rows.append((rec["fill_px"], ttm, rec["pnl"], won, rec["outcome"]))
+
+    def _tab(label: str, key_fn) -> list[str]:
+        buckets: dict[str, list] = defaultdict(list)
+        for item in rows:
+            buckets[key_fn(item)].append(item)
+        lines = [
+            f"{label}",
+            "bucket\tn\twins\twr\tmean_fill\tmean_ttm\tmean_pnl\thedg\tredeem",
+        ]
+        for name in sorted(buckets, key=lambda n: (n == "other", n)):
+            xs = buckets[name]
+            n = len(xs)
+            wins = sum(1 for _px, _t, _p, won, _o in xs if won)
+            hedges = sum(1 for item in xs if item[4] == "hedge")
+            redeems = sum(1 for item in xs if item[4] == "redeem")
+            mean_f = mean([px for px, *_ in xs]) or 0.0
+            mean_t = mean([t for _px, t, *_ in xs]) or 0.0
+            mean_p = mean([p for _px, _t, p, *_ in xs]) or 0.0
+            lines.append(
+                f"{name}\t{n}\t{wins}\t{pct(wins / n if n else None)}\t"
+                f"{mean_f:.3f}\t{mean_t:.0f}\t{money(mean_p)}\t{hedges}\t{redeems}"
+            )
+        return lines
+
+    if not rows:
+        return "SESSION fill×TTM split n=0 (no joined buys)"
+    lines = [
+        f"SESSION fill×TTM split  n={len(rows)}  "
+        "(wallet fills only; win = redeem or pnl>0 and not a hedge)",
+    ]
+    lines.extend(
+        _tab(
+            "by fill ¢",
+            lambda item: bucket(item[0], FILL_SPLIT_EDGES) or "other",
+        )
+    )
+    lines.append("")
+    lines.extend(
+        _tab(
+            "by fill TTM",
+            lambda item: bucket(item[1], TTM_SPLIT_EDGES) or "other",
+        )
+    )
+    return "\n".join(lines)
+
+
 def render_session(markets: list[dict], samples: list[Sample]) -> str:
     lines = [
         "SESSION TAPE (5m only, post-restart)",
@@ -1095,11 +1214,12 @@ def render_session(markets: list[dict], samples: list[Sample]) -> str:
             n_o += 1
         sample = by_name.get(m["market"])
         feat = sample.feat if sample else None
-        ttm = (m["end_ts"] - rec["fill_ts"]) if rec["fill_ts"] else ""
+        ttm = (m["end_ts"] - rec["fill_ts"]) if rec["fill_ts"] else None
         fill = f"{rec['fill_px']:.3f}" if rec["fill_px"] else ""
+        ttm_s = f"{ttm:.0f}" if ttm is not None else ""
         lines.append(
             f"{m['market'].replace('Bitcoin Up or Down - ', '')}\t"
-            f"{rec['outcome']}\t{rec['leg'] or ''}\t{fill}\t{ttm:.0f}\t"
+            f"{rec['outcome']}\t{rec['leg'] or ''}\t{fill}\t{ttm_s}\t"
             f"{rec['spent']:.2f}\t{(rec['sold'] + rec['redeemed']):.2f}\t"
             f"{money(rec['pnl'])}\t"
             f"{(feat.abs_dist if feat else 0):.1f}\t"
@@ -1180,7 +1300,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             sample.pnl_redeem = rec["pnl"]
             session_samples.append(sample)
         report.append("")
+        report.append(csv_join_report(rows, markets, restart_ts=restart.timestamp(), year=args.year))
+        report.append("")
         report.append(render_session(markets, session_samples))
+        if markets:
+            report.append("")
+            report.append(session_fill_split(markets))
         if session_samples:
             report.append("")
             report.append("SESSION vs BTC features at fill")
@@ -1538,17 +1663,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     report.append("- A live dump at 32¢ / persist-50 changes skip-cost in losers' favor (skipping a loser is worth less than $2.50).")
     report.append("- Do not copy these thresholds into live JSON from n<30 session tape.")
     report.append("")
-    report.append("RECOMMENDATION (probe knobs; not live until the operator patches JSON)")
-    report.append("  entry time: last 45s only (buy_start_s=45, late_90_start_s=45)")
-    report.append("  disable early: early_buy_start_s=45, early_95_start_s=0, early_95_min_s=0")
-    report.append("  ask: 75–90 plus last-45 ≥90 overlay (75–99 in the last 45s)")
-    report.append("  oracle: min_underlying_edge_usd=25 (|TWAP−PTB|; this study used Binance)")
-    report.append(
-        "  size: stay $2.50; $5 is ~2× $/h if fills hold "
-        "(buy_budget=late_buy_budget=5, buy_max_spend=5, buy_max_shares=7)"
-    )
-    report.append("  hedge: unchanged persist 5s @ 50/52, dump 32, recovery 53")
+    report.append("RECOMMENDATION (do not paste last-45 + $25 — that probe already lived empty/−EV)")
+    report.append("  entry: last 120s / 75–90 / edge $0 (live since 27 Aug 17:26Z)")
+    report.append("  early / ≥95 / late_90 overlay: stay off")
+    report.append("  oracle: min_underlying_edge_usd=0 (Binance |dist| gates here are research-only)")
+    report.append("  size: stay $2.50; do not size up from this table")
+    report.append("  hedge: persist 1s @ 50/52, dump 40, flatten walks <75 (B+C); recovery 53")
     report.append("  do not add a vol or against-momentum skip")
+    report.append("  last45_e20 / GATE |dist|≥25 are implied-|dist| paper on ALL clocks, not fills")
 
     text = "\n".join(report) + "\n"
     print(text, end="")

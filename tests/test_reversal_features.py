@@ -13,6 +13,7 @@ from check_reversal_features import (
     Sample,
     breakeven_flip_rate,
     bucket,
+    csv_join_report,
     first_live_shaped_touch,
     first_touch_on_path,
     features_at,
@@ -25,6 +26,7 @@ from check_reversal_features import (
     paper_ev,
     paper_redeem_pnl,
     seconds_to_cross,
+    session_fill_split,
     session_markets,
     session_replay_table,
     side_of,
@@ -294,6 +296,45 @@ class CsvSessionTests(unittest.TestCase):
         self.assertEqual(len(mk), 1)
         self.assertEqual(len(mk[0]["buys"]), 1)
         self.assertEqual(len(mk[0]["redeems"]), 1)
+
+    def test_generic_title_joins_via_slug(self):
+        raw = (
+            "marketName,action,usdcAmount,tokenAmount,tokenName,timestamp,slug\n"
+            "BTC Up or Down 5m,Buy,2.50,3.00,Up,1787852000,btc-updown-5m-1787851800\n"
+            "BTC Up or Down 5m,Redeem,3.00,3.00,Up,1787852200,btc-updown-5m-1787851800\n"
+            "BTC Up or Down 5m,Buy,2.50,2.94,Down,1787852300,btc-updown-5m-1787852100\n"
+            "BTC Up or Down 5m,Sell,0.40,2.94,Down,1787852500,btc-updown-5m-1787852100\n"
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "h.csv"
+            path.write_text(raw, encoding="utf-8")
+            rows = load_csv(path)
+        self.assertEqual(series_of(rows[0]["market"]), "unknown")
+        self.assertEqual(series_of(rows[0]["slug"]), "5m")
+        mk = session_markets(rows, restart_ts=1787851560, year=2026)
+        self.assertEqual(len(mk), 2)
+        by_start = {m["start_ts"]: m for m in mk}
+        self.assertEqual(len(by_start[1787851800]["buys"]), 1)
+        self.assertEqual(len(by_start[1787851800]["redeems"]), 1)
+        self.assertEqual(len(by_start[1787852100]["sells"]), 1)
+        report = csv_join_report(rows, mk, restart_ts=1787851560, year=2026)
+        self.assertIn("session_markets=2", report)
+        split = session_fill_split(mk)
+        self.assertIn("SESSION fill×TTM split  n=2", split)
+        self.assertIn("by fill ¢", split)
+
+    def test_ms_timestamp_and_title_only_still_works(self):
+        raw = (
+            "marketName,action,usdcAmount,tokenAmount,tokenName,timestamp\n"
+            "\"Bitcoin Up or Down - August 27, 5:00AM-5:05AM ET\",Buy,2.50,3.00,Up,1787821393000\n"
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "h.csv"
+            path.write_text(raw, encoding="utf-8")
+            rows = load_csv(path)
+        self.assertAlmostEqual(rows[0]["ts"], 1787821393.0)
+        mk = session_markets(rows, restart_ts=1787821036, year=2026)
+        self.assertEqual(len(mk), 1)
 
 
 if __name__ == "__main__":
