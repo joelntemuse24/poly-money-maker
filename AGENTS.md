@@ -7,14 +7,15 @@ and why the non-boilerplate code exists — is `TECHNICAL_DESIGN.md`.
 
 ## Project at a Glance
 
-**Live on the VM (after this change is deployed):** **5m buy bot**
+**Live on the VM:** **5m buy bot**
 (`polybuybot5m`) plus a no-order path recorder (`polypathlog`). 15m and
 hourly buy services are **stopped**. Mint (`polymintbot`) is **paused**.
 
 The 5m bot buys the winning leg of Polymarket BTC "Up or Down" markets
-with **one $2.50** FAK. **Live since 27 Aug 2026 ~17:26Z** (confirmed
-on the VM 31 Aug; knobs in live `strategy_buy5m.json`, **not** the
-example file). Catalog: `docs/2026-08-31-last120-loss-catalog.md`.
+with **one $2.50** FAK. Entry **live since 27 Aug 2026 ~17:26Z**.
+**B+C exits live since 31 Aug ~22:25Z** (persist 1s / dump 40¢ /
+flatten walks). Knobs are in live `strategy_buy5m.json`, **not** the
+example file. Catalog: `docs/2026-08-31-last120-loss-catalog.md`.
 
 | When (time to close) | Winning ask | Slice |
 |---|---|---|
@@ -441,10 +442,10 @@ CI: pushes to `main` touching the buy bots, `pathlog.py`,
 SSH (`git pull` + `pip install` only). Services are **not** auto-restarted —
 start/restart deliberately after validation (`systemctl start` / `restart`).
 
-Live overlay is last-120 / edge $0 (27 Aug 17:26Z). Operator asked for
-B+C exits (persist 1s / dump 40 / flatten walks). **Do not paste
-last-45 + $25.** Confirm `dry_run` / `entry_enabled` before restart.
-See `CURRENT.md` for the paste. Do **not** start 15m, hourly, or mint.
+Live overlay is last-120 / edge $0 (27 Aug 17:26Z) plus B+C exits
+(persist 1s / dump 40 / flatten walks) pasted **31 Aug ~22:25Z**.
+**Do not re-paste** unless live JSON was overwritten. **Do not paste
+last-45 + $25.** See `CURRENT.md`. Do **not** start 15m, hourly, or mint.
 
 ## Dependencies
 
