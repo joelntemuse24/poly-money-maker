@@ -8,7 +8,9 @@ has been live since **27 Aug 2026 ~17:26Z**. First full tape: barely +EV
 (**+$9 / ~94h ≈ +$0.10–$0.12/h**). **Do not size up. Do not paste
 last-45 + $25** (that probe was empty / −EV). **Do not paste a new
 live overlay or restart** unless the operator asks after they buy a
-recommendation. Loss catalog: `docs/2026-08-31-last120-loss-catalog.md`.
+recommendation. Loss catalog: `docs/2026-08-31-last120-loss-catalog.md`
+(VM 31 Aug: pathlog overlay **726/1106** clocks, named-loss ticks **31/56**;
+`journal_fills=0` was a slug join bug — run `check_last120_tick_autopsy.py`).
 Hourly and 15m are stopped. Hedge is **persist 5s @ 50/52**, recovery
 **53¢**, dump **≤32¢**. **Do not add a vol/momentum buy skip.**
 

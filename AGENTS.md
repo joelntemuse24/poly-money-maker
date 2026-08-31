@@ -55,7 +55,7 @@ unless the operator asks. 15m stays stopped.
 Plus: `check_book.py`, `check_participation.py`, `check_path_backtest.py`,
 `check_fetch_trades.py`, `check_buy_skips.py`, `check_buy_rejects.py`,
 `check_live_journal.py`, `check_edge_counterfactual.py`,
-`check_reversal_features.py`. Laptop glance
+`check_reversal_features.py`, `check_last120_tick_autopsy.py`. Laptop glance
 (not a bot): `widget/polydesk.py`.
 
 ## File Map
@@ -103,6 +103,7 @@ functions with `ast` (`tests/test_buy_fill_shapes.py`).
 | `check_fetch_trades.py` | Diagnostic — full-wallet Data API trade history → CSV |
 | `check_buy_skips.py` | Diagnostic — why 5m did not buy (JSON log skip/attempt/fill counts) |
 | `check_live_journal.py` | Replay the 5m live tape from JSONL hours later (no stream needed) |
+| `check_last120_tick_autopsy.py` | Join live fills to ~1s pathlog (token_id / research slug) and score persist 0/1/2/5s @ 50/52 dump 32 |
 | `buy/live_journal.py` | Tape event filter + line format (imported by 5m + the checker) |
 | `check_buy_rejects.py` | Diagnostic — CLOB `invalid amounts` 400s that passed every gate |
 | `widget/polydesk.py` | Local always-on-top Polymarket value / HOLDING glance (no orders) |
@@ -166,7 +167,7 @@ python3 -m py_compile buybot.py buybot5m.py buybothourly.py pathlog.py \
   check_path_backtest.py mintbot.py buy/book.py buy/clob_book_ws.py \
   buy/entry_skip.py buy/hedge_gate.py buy/live_journal.py \
  check_fetch_trades.py check_participation.py check_buy_skips.py \
- check_live_journal.py check_reversal_features.py
+ check_live_journal.py check_reversal_features.py check_last120_tick_autopsy.py
 python3 -m unittest discover -s tests -p 'test_*.py' -v
 
 # Full wallet fills (past the UI ~500-row export). Wallet: --user or FUNDER_ADDRESS.
@@ -289,6 +290,7 @@ python check_path_backtest.py --anatomy --series 5m --ttm-max 120 --csv /tmp/ana
 python check_path_backtest.py --grid --budget 2.5 --series 5m
 python check_buy_skips.py --since 2026-08-19T08:02:00
 python check_live_journal.py --hours 5
+python check_last120_tick_autopsy.py --since 2026-08-27T17:26:00
 python check_reversal_features.py --hours 72
 python check_reversal_features.py --hours 168
 python check_reversal_features.py --hours 336

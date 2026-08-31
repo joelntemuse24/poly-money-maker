@@ -226,3 +226,60 @@ lines to this overlay — not to pathlog’s 96% WR.
 - **Do not** start `polybuybot` / `polybuybothourly` / `polymintbot`.
 - Example JSON `strategy_buy5m.example.json` still describes last-45 +
   $25 for `--sweep`. Live JSON is the overlay in `CURRENT.md`.
+
+---
+
+## 6. VM ~1s tape (31 Aug ~19:53Z) — join was empty for the wrong reason
+
+Operator coverage:
+
+| | |
+|---|---|
+| 5m JSONL on disk | **3137** files, **1.92 MB** |
+| Oldest / newest | 17 Aug 19:40Z → 31 Aug 19:45Z |
+| Overlay clocks (27 Aug 17:26Z → 31 Aug ~14Z) | **726** vs ~**1106** expected |
+| Named-loss JSONL copied | **31** present / **25** missing |
+| `loss_ticks.tgz` | **7.4K** — too small for 31 full 5m 1Hz books |
+| `journal_fills` / autopsies | **0** (parser bug, not an empty tape) |
+
+**Prune already ate the left third of the overlay** (~380 clocks, including
+25 of 56 named-loss slugs). Export remaining overlay ticks before the
+next 400 MB / 14d cut. Mean bytes/file across all 3137 is ~**600 B**.
+That is header + a handful of ticks, not 300 × 1s lines. The autopsy
+prints `mean_ticks` / `p50` / `median_dt` before anyone trusts a 5s
+persist run on this tape.
+
+**Why the persist CF printed zeros:** `buy_fill` journal lines have
+`token_id`, `avg_price`, `filled` — **no `slug`**. `buy_success` has
+`condition_id`. Research JSONL (`underlying_research_buy5m.jsonl`) has
+`slug` / `start_ts` and **`logged_at`** (unix), not `ts`. A snippet that
+required `event==buy_fill` **and** `slug` joined nothing. Tick coverage
+and the 31-file copy were fine.
+
+`check_last120_tick_autopsy.py` joins through pathlog `open` headers
+(`up`/`dn` token → slug, `cid` → slug, `start_ts` → `btc-updown-5m-{start}`)
+and walks live dump/persist/fade (`evaluate_held_bag`, dump **32¢** any
+bag, persist **50/52**, recovery **53¢**, fade on). Pathlog has no
+last-trade and no Chainlink — oracle is **not** replayed. GUI proxy is
+tight mid; **`min_bid_edge` 5¢ makes a 51¢ vs 49¢ book `ambiguous`**, so
+the report scores persist with GUI on and book-only. That is a live
+gate, not a paper invention: persist 50/52 coin-flips fail consensus
+until the other mid is ~**56¢+**, which is why named persist 32–53 was
+only **5** and dump-at-32 / held-to-zero dominate.
+
+On the VM (does **not** checkout the live tree):
+
+```bash
+cd ~/poly-money-maker
+git fetch origin cursor/last120-loss-catalog-f488
+git show origin/cursor/last120-loss-catalog-f488:check_last120_tick_autopsy.py \
+    > /tmp/check_last120_tick_autopsy.py
+python3 /tmp/check_last120_tick_autopsy.py --repo "$PWD" \
+    --out /tmp/last120-research --since 2026-08-27T17:26:00 \
+    | tee /tmp/last120-research/autopsy.txt
+```
+
+Paste `autopsy.txt` (and `reversal_1s.txt` if not already). Do **not**
+restart. Do **not** paste live JSON. The 31 surviving named-loss books
+are autopsied even when the journal join is still empty (synthetic
+last-120 75–90 first touch).

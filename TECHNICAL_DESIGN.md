@@ -1098,6 +1098,7 @@ requirements.txt`, `py_compile` the scripts, `unittest discover -s tests`.
 | `test_buy_fill_shapes.py` | `ast.parse` buy-bot files and exec selected function sources into a fake namespace |
 | `test_hedge_persist.py` | Exercises persist, recovery, fade, oracle, and hourly wiring without importing a bot |
 | `test_path_backtest.py` | Imports `check_path_backtest` (has a `__main__` / functions) |
+| `test_last120_tick_autopsy.py` | Joins `buy_fill` via `token_id` (no slug) and walks live 50/52 dump-32 persist 0/1/2/5s |
 | `test_book.py` | Imports `buy.book` |
 | others | Import the corresponding `check_*.py` or widget parsers |
 
