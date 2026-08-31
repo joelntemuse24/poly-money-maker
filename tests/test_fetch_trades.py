@@ -23,7 +23,7 @@ from check_fetch_trades import (
     summarize_csv,
     trade_dedup_key,
 )
-from check_participation import load_csv_buys
+from check_participation import Market, load_csv_buys, match_csv_to_markets
 
 
 def _raw(
@@ -299,6 +299,37 @@ class CliAndParticipationTests(unittest.TestCase):
             self.assertAlmostEqual(buys[0]["tokens"], 39.29)
             self.assertAlmostEqual(buys[0]["usdc"], 39.29 * 0.0624, places=5)
             self.assertEqual(buys[0]["ts"], 1_787_000_000.0)
+            self.assertEqual(buys[0]["slug"], "btc-updown-5m-1")
+
+    def test_csv_matches_5m_by_slug_when_title_is_generic(self):
+        slug = "btc-updown-5m-1787851800"
+        buys = [
+            {
+                "ts": 1787852000.0,
+                "market": "BTC Up or Down 5m",
+                "slug": slug,
+                "leg": "up",
+                "usdc": 2.50,
+                "tokens": 3.0,
+                "avg": 0.833,
+                "norm": "btc up or down 5m",
+            }
+        ]
+        markets = [
+            Market(
+                condition_id="cid-1",
+                slug=slug,
+                question="Bitcoin Up or Down - August 27, 5:30PM-5:35PM ET",
+                start_ts=1787851800.0,
+                end_ts=1787852100.0,
+                up_token="u",
+                dn_token="d",
+                bot="5m",
+            )
+        ]
+        hits = match_csv_to_markets(buys, markets)
+        self.assertEqual(set(hits), {"cid-1"})
+        self.assertIn("csv", hits["cid-1"].sources)
 
 
 if __name__ == "__main__":

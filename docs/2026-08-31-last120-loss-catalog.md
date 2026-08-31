@@ -336,3 +336,67 @@ each 5m market ~once. Fix: resolve only books that closed in the last
 that lands, `sudo systemctl restart polypathlog` (recorder only, no
 orders). Do **not** restart `polybuybot5m`. Confirm with
 `mean_ticks` on a new 5m file (`wc -l` should be hundreds, not 2).
+
+---
+
+## 7. VM reversal paste (31 Aug ~20:53Z) — not a fill winner-split
+
+Operator ran:
+
+```bash
+.venv/bin/python check_reversal_features.py --csv exports/trades.csv --restart-utc 2026-08-27T17:26:00
+.venv/bin/python check_participation.py --hours 96 --csv exports/trades.csv
+```
+
+**SESSION TAPE n=0** is a join miss, not zero fills. The checker required
+`series_of(marketName)=="5m"` via a `Month D, H:MM AM-H:MM AM` title.
+`check_fetch_trades` writes `slug=btc-updown-5m-{start}` and often a
+generic title (`BTC Up or Down 5m`). Participation still loaded **1905**
+buys (no title regex). Historical tables still ran because they do not
+use the CSV.
+
+**Those tables are every 5m clock, not the 411 last-120 buys.**
+`--hours` defaulted to **48** (576 windows / 566 scored), not the ~94h
+overlay. Flip = Binance side of PTB at **T-90s** disagrees with close.
+Paper fill is implied from `|dist|` (session-calibrated ~85¢), not live
+VWAP. Hedge is not replayed except as a $0 / $1 salvage column.
+
+| Read this | Not this |
+|---|---|
+| `live_late_7590` 380 hits, **17.1% flip / 82.9% WR**, mean_fill 0.87, **+$0.50/h** with $1 salvage / **−$0.85/h** with $0 | `last45_e20` +$1.98/h — same last-45+$20 paper that already went empty/−EV live |
+| GATE `|dist|≥25` keep **60% of ALL clocks** (incl. 50/50). skip% is an **upper bound**; live take is **36% of 75–90** | “skip 40% of fills and keep +$85” |
+| MID $10–40 against-mom **17.6%** vs with **14.5%** | a momentum skip |
+| vol30 flip **~14–16%** flat | a vol skip |
+| Script `RECOMMENDATION` last-45+$25 / persist 5 / dump 32 | a live paste |
+
+`live_late_7590` matches the knife-edge tape (WR ~82–83%, flip ~17%).
+That is last-120 75–90 on implied `|dist|` fills, not proof that $25
+or last-45 helps. **Do not paste last-45 + $25. Do not size up.**
+
+Participation **96h** (27 Aug 20:53Z → 31 Aug 20:53Z; overlay started
+17:26Z so the first ~3.5h are outside this cut):
+
+| | |
+|---|---|
+| 5m clocks | **1151** (96h × 12) |
+| “bought” | **585 / 1151 = 50.8%** — sources **`bot` 536 + `bot+pnl` 49**. **No `csv`.** |
+| CSV | 1905 rows loaded, **0 matched** to 5m questions (same title/slug miss as SESSION TAPE) |
+| above_ceiling_only | **409** — ask stayed ≥90¢ (the 99/1 pile) |
+| never_reached_trigger | **77** — never printed 75¢ |
+| saw_in_band | **50** — 1m CLOB wick; samples are mostly 99/1 (`up_max=0.135 dn_max=0.995`) |
+| gapped_through_band | **30** |
+| named skips on misses | ambiguous 21, incomplete_book 19, side 3, rest_confirm 2, consensus 1, edge 1 |
+
+**585 is not 411 wallet fills.** `load_bot_buys` counts `buy_attempt` +
+`buy_fill` + `buy_ghost_fill`. Empty FAKs inflate “bought.” Wallet take
+on the overlay was **411/1129 = 36%**. The 409 above-ceiling misses are
+the restable-subset story: paper 96% WR only sees books that actually
+printed 75–90.
+
+A few `saw_in_band` look restable (dn 0.820 / 0.765, up 0.865). Treat as
+1m wick unless the journal shows `buy_skip_rest_confirm` on that slug.
+Do **not** reopen last-45 + $25 from this table.
+
+Join + fill×TTM split + slug match + a join diagnostic are in this PR.
+Re-run after `git pull`. Historical `--hours 96` if the overlay span is
+wanted. Participation: `--bot 5m` (15m/hourly are stopped).
