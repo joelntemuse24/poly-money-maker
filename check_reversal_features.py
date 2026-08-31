@@ -1106,33 +1106,38 @@ def csv_join_report(rows: list[dict], markets: list[dict], *, restart_ts: float,
     slug_series = Counter(
         series_of((r.get("slug") or r.get("market") or "")) for r in rows
     )
+    post = [r for r in rows if r["ts"] >= restart_ts - 1]
+    post_series = Counter(series_of(r.get("market") or "") for r in post)
+    post_action = Counter(r.get("action") or "" for r in post)
     n_5m_keys = sum(1 for r in rows if _row_5m_key(r, year) is not None)
-    n_post = sum(
-        1
-        for r in rows
-        if _row_5m_key(r, year) is not None and r["ts"] >= restart_ts - 1
-    )
-    sample = []
-    for row in rows[:6]:
-        sample.append(
+    n_post = sum(1 for r in post if _row_5m_key(r, year) is not None)
+    lines = [
+        f"csv rows={len(rows)} title_series={dict(title_series)} "
+        f"slug_or_title_series={dict(slug_series)} "
+        f"5m_joinable={n_5m_keys} post_restart_rows={len(post)} "
+        f"post_restart_series={dict(post_series)} post_restart_action={dict(post_action)} "
+        f"post_restart_5m_joinable={n_post} session_markets={len(markets)}",
+    ]
+    lines.append("csv oldest (full-wallet dumps start with non-BTC):")
+    for row in rows[:3]:
+        lines.append(
+            f"  title={row.get('market', '')!r} slug={row.get('slug', '')!r} "
+            f"action={row.get('action')} ts={row.get('ts')} "
+            f"title_series={series_of(row.get('market') or '')}"
+        )
+    lines.append("csv post-restart sample:")
+    for row in post[:8]:
+        lines.append(
             f"  title={row.get('market', '')!r} slug={row.get('slug', '')!r} "
             f"action={row.get('action')} ts={row.get('ts')} "
             f"title_series={series_of(row.get('market') or '')} "
             f"join={_row_5m_key(row, year)}"
         )
-    lines = [
-        f"csv rows={len(rows)} title_series={dict(title_series)} "
-        f"slug_or_title_series={dict(slug_series)} "
-        f"5m_joinable={n_5m_keys} post_restart_5m_rows={n_post} "
-        f"session_markets={len(markets)}",
-    ]
-    if sample:
-        lines.append("csv sample (first 6):")
-        lines.extend(sample)
     if not markets:
         lines.append(
-            "SESSION TAPE n=0 is a join miss, not zero fills. "
-            "Need slug=btc-updown-5m-{{start}} or a Month D, H:MM AM-H:MM AM title."
+            "SESSION TAPE n=0: no post-restart row joined as 5m. "
+            "Usual causes: titles lack Month D, H:MM AM-H:MM AM and slug is empty; "
+            "or 5m rows exist only before --restart-utc."
         )
     return "\n".join(lines)
 

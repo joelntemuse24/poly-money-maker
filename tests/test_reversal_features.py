@@ -319,6 +319,8 @@ class CsvSessionTests(unittest.TestCase):
         self.assertEqual(len(by_start[1787852100]["sells"]), 1)
         report = csv_join_report(rows, mk, restart_ts=1787851560, year=2026)
         self.assertIn("session_markets=2", report)
+        self.assertIn("post_restart_5m_joinable=4", report)
+        self.assertIn("post_restart_series=", report)
         split = session_fill_split(mk)
         self.assertIn("SESSION fill×TTM split  n=2", split)
         self.assertIn("by fill ¢", split)
