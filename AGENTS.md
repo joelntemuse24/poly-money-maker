@@ -37,15 +37,16 @@ no on this overlay (`late_90` off). After a full hedge the market is done.
 Normal hedge is **persist 1s @ 50/52** while TTM **>30s** (GUI: held ≤
 **52¢**, other ≥ **48¢**; not inverted 30/70). Then sell at the live
 bid while **< 53¢** (fade through 50 still sells). Bid ≥ **53¢**
-holds and **clears persist**. Last **30s** (`hedge_late_ttm_s`) moves
-the whole rung: dump **55¢**, persist **58/60**, recovery **62¢**.
-A last-30s 50 dumps instantly (STW risk). Once holding, do **not
-persist-sell** while live Chainlink TWAP is still on the held side of
-PTB (`hedge_require_oracle`). Missing/stale BTC also holds. **Any live
-bag** dumps bid-only at **≤40¢** (TTM>30) or **≤55¢** (TTM≤30) even if
-BTC has not crossed yet (`hedge_dump_ignore_oracle`). Walks **avg <75¢**
-flatten at the live bid while bid **<75¢**. Early: do not sell 55–69
-after persist. Late: sell 55–61 after persist. Winners redeem at $1.00.
+holds and **clears persist**. Last **30s** (`hedge_late_ttm_s`) raises
+persist to **58/60** and recovery to **62¢**. Dump stays **40¢**. A
+last-30s 50/52 must pass GUI + last-trade + 1s — a random 50 bid under
+a high ask does not sell. Once holding, do **not persist-sell** while
+live Chainlink TWAP is still on the held side of PTB
+(`hedge_require_oracle`). Missing/stale BTC also holds. **Any live bag**
+dumps bid-only at **≤40¢** even if BTC has not crossed yet
+(`hedge_dump_ignore_oracle`). Walks **avg <75¢** flatten at the live bid
+while bid **<75¢**. Early: do not sell 55–69 after persist. Late: sell
+55–61 after persist (consensus persist, not dump). Winners redeem at $1.00.
 **No profit-take sell.** See `CURRENT.md` for the active probe knobs.
 
 **Hourly (`polybuybothourly`) is still stopped.** Do **not** start it
@@ -54,7 +55,7 @@ unless the operator asks. 15m stays stopped.
 | File | Service | Markets | Oracle | Budget | Window |
 |---|---|---|---|---|---|
 | `buybot.py` | `polybuybot` **stopped** | 15m | Chainlink TWAP 60s | $2.50 | final 4.0 min, 75–90¢, hedge 35/40 |
-| `buybot5m.py` | `polybuybot5m` **live** | 5m | Chainlink TWAP 30s | $2.50 | last **120s** 75–90, edge **$10**; persist **1s @ 50/52** (dump 40¢; last-30s 55/58/60/62; flatten <75¢) |
+| `buybot5m.py` | `polybuybot5m` **live** | 5m | Chainlink TWAP 30s | $2.50 | last **120s** 75–90, edge **$10**; persist **1s @ 50/52** (dump 40¢; last-30s persist 58/60 recovery 62; flatten <75¢) |
 | `buybothourly.py` | `polybuybothourly` **stopped** | hourly | Binance BTCUSDT | $10 cap | last **20 min** 75–90¢; persist **5s @ 50/52** + oracle veto |
 | `pathlog.py` | `polypathlog` **live** | all three | — (CLOB books only) | — | whole 5m; last 8m of 15m; last **20m** of hourly |
 
@@ -214,7 +215,7 @@ add.
 Live 5m (after this change is deployed and `polybuybot5m` restarted):
 
 - `buy_attempt` `band=late` / `late_90` / `early` / `early_95` and `slice=early|late` — which 5m window armed
-- `hedge_attempt` / `hedge_fill` — TTM>30: persist **1s @ 50/52** then sell live bid **< 53¢**. TTM≤30 (`hedge_late=true`): dump ≤ **55¢** instant / persist **58/60** / sell **<62¢**. Dump even if BTC still agrees. Walk flatten (`reason=flatten_walk`) sells toxic bags while bid **<75¢**. Early bid ≥ **53¢** holds (unless flattening); last-30s recovery is **62¢**.
+- `hedge_attempt` / `hedge_fill` — TTM>30: persist **1s @ 50/52** then sell live bid **< 53¢**. TTM≤30 (`hedge_late=true`): persist **58/60** + GUI/last-trade + 1s, then sell **<62¢**. Dump stays ≤ **40¢** (bid-only). Walk flatten (`reason=flatten_walk`) sells toxic bags while bid **<75¢**. Early bid ≥ **53¢** holds (unless flattening); last-30s recovery is **62¢**.
 - `hedge_skip_recovery` — persist_done but held bid ≥ 53¢; HOLD and clear persist. Do **not** sell 55–69. Flatten walks skip this early-out while bid <75¢.
 - `hedge_skip_oracle_still_winning` / `hedge_skip_oracle` — live TWAP still on held side of PTB, or feed missing/stale; do not persist-sell.
 - `hedge_skip_persist` — 50/52 + GUI passed but has not stayed qualified for 1s.
@@ -382,17 +383,18 @@ Cloud agents: `CLOUD_RESEARCH.md`.
   50/52 persist with dump **35¢** still oracle-gated. 15m remains 35/40.
   A random TOB clip is not enough; a last print of 85¢ on a 48/51 book will
   `hedge_skip_no_consensus`. **Any live bag** dumps bid-only while held bid
-  ≤ **40¢** while TTM>30, or **≤55¢** in the last 30s (no GUI veto; not
-  only `toxic_fill`). After persist, sell at the live bid while **< 53¢**
-  (early) or **< 62¢** (last 30s). Bid ≥ recovery holds and **clears
-  persist** (`hedge_skip_recovery`) — early do not sell 55–69 because
-  persist stuck; last 30s 55–61 still sells.
+  ≤ **40¢** (no GUI veto; not only `toxic_fill`). Last-30s 50/52 must
+  still pass GUI + last-trade + 1s persist. After persist, sell at the
+  live bid while **< 53¢** (early) or **< 62¢** (last 30s). Bid ≥ recovery
+  holds and **clears persist** (`hedge_skip_recovery`) — early do not sell
+  55–69 because persist stuck; last 30s 55–61 still sells after consensus.
   Everything else rides to redemption at $1.00. WS may *arm* a hedge
   check; normal sells need two-sided REST. After `hedge_closed`, no later
   buy on that market. **Live `strategy_buy5m.json` must set the hedge
   keys** (50/52 persist 1s, dump 40, flatten walks, recovery 53, `hedge_sell_fade`,
   `hedge_require_oracle`, `hedge_dump_ignore_oracle`). Last-30s ladder
-  keys default in code (`hedge_late_ttm_s` 30 / 55/58/60/62) if omitted.
+  keys default in code (`hedge_late_ttm_s` 30 / dump 40 / persist 58/60 /
+  recovery 62) if omitted.
   An old 70/72/85 or persist-5s/dump-32 file keeps the old early qualify
   after hot reload.
 - **Tick sizes:** 5m *default* is `0.001`, but some 5m books are `0.01`.
