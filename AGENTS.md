@@ -11,26 +11,26 @@ and why the non-boilerplate code exists — is `TECHNICAL_DESIGN.md`.
 (`polybuybot5m`) plus a no-order path recorder (`polypathlog`). 15m and
 hourly buy services are **stopped**. Mint (`polymintbot`) is **paused**.
 
-The 5m bot buys the winning leg of Polymarket BTC "Up or Down" markets in
-**two $2.50 slices** (up to **$5** if both fill). **Live after the
-operator pastes and restarts** (knobs in `strategy_buy5m.example.json`
-and `CURRENT.md`):
+The 5m bot buys the winning leg of Polymarket BTC "Up or Down" markets
+with **one $2.50** FAK. **Live since 27 Aug 2026 ~17:26Z** (confirmed
+on the VM 31 Aug; knobs in live `strategy_buy5m.json`, **not** the
+example file). Catalog: `docs/2026-08-31-last120-loss-catalog.md`.
 
 | When (time to close) | Winning ask | Slice |
 |---|---|---|
-| Last **45s** (`TTM ≤ 45`) | **75–90¢** | **$2.50** late (`late_buy_budget`), FAK **90¢** |
-| Same last **45s** | **≥90¢** overlay | uses the late $2.50, FAK **99¢** (`late_90`) |
-| TTM > 45s | none | early / ≥95 **off** |
+| Last **120s** (`TTM ≤ 120`) | **75–90¢** | **$2.50** late, FAK **90¢** |
+| Same window | ≥90¢ | **off** (`late_90_start_s=0`) |
+| TTM > 120s | none | early / ≥95 **off** |
 
-`min_underlying_edge_usd` is **$25** (`|TWAP−PTB|`). Code defaults in
-`buybot5m.py` stay last-120 / early-300 / edge $0 until live JSON overlays
-them. `BUY_HORIZON_S` is **45** (WS from ~T-75). Later **$5** is
-`buy_budget=late_buy_budget=5`, `buy_max_spend=5`, `buy_max_shares=7`.
+`min_underlying_edge_usd` is **$0**. Code defaults in `buybot5m.py`
+already look like last-120 / early-300 / edge $0; live JSON is the
+overlay above. `BUY_HORIZON_S` is **120**. **Do not paste last-45 +
+$25. Do not size up from $2.50.** See `CURRENT.md`.
 
 Missed early does **not** become a $5 late buy — there is no early slice.
 Same-leg add only (no straddle), and only if the late ask is ≥ **90¢**
-(`add_min_price`). Flat late 75–90 is still a first entry. 91–99 is a no
-at TTM 46–120. After a full hedge the market is done.
+(`add_min_price`). Flat late 75–90 is still a first entry. 91–99 is a
+no on this overlay (`late_90` off). After a full hedge the market is done.
 Normal hedge is **persist 5s @ 50/52** (GUI: held ≤ **52¢**, other ≥
 **48¢**; not inverted 30/70). Then sell at the live bid while **< 53¢**
 (fade through 50 still sells). Bid ≥ **53¢** (`hedge_recovery_cancel`)
@@ -48,7 +48,7 @@ unless the operator asks. 15m stays stopped.
 | File | Service | Markets | Oracle | Budget | Window |
 |---|---|---|---|---|---|
 | `buybot.py` | `polybuybot` **stopped** | 15m | Chainlink TWAP 60s | $2.50 | final 4.0 min, 75–90¢, hedge 35/40 |
-| `buybot5m.py` | `polybuybot5m` **live** | 5m | Chainlink TWAP 30s | $2.50+$2.50 | last **45s** 75–99, edge **$25**; persist **5s @ 50/52** (dump 32¢) |
+| `buybot5m.py` | `polybuybot5m` **live** | 5m | Chainlink TWAP 30s | $2.50 | last **120s** 75–90, edge **$0**; persist **5s @ 50/52** (dump 32¢) |
 | `buybothourly.py` | `polybuybothourly` **stopped** | hourly | Binance BTCUSDT | $10 cap | last **20 min** 75–90¢; persist **5s @ 50/52** + oracle veto |
 | `pathlog.py` | `polypathlog` **live** | all three | — (CLOB books only) | — | whole 5m; last 8m of 15m; last **20m** of hourly |
 
@@ -431,23 +431,12 @@ CI: pushes to `main` touching the buy bots, `pathlog.py`,
 SSH (`git pull` + `pip install` only). Services are **not** auto-restarted —
 start/restart deliberately after validation (`systemctl start` / `restart`).
 
-After this branch merges, on the VM (5m only; stop hourly). This paste is
-**last 45s + $25** (same block as `CURRENT.md`). Confirm `dry_run` /
-`entry_enabled` **before** restart. Do **not** start 15m, hourly, or mint.
-
-```bash
-cd ~/poly-money-maker && git pull
-sudo systemctl stop polybuybothourly polybuybot
-sudo systemctl disable polybuybothourly polybuybot
-python3 -c 'import json; from pathlib import Path; p=Path("strategy_buy5m.json"); d=json.loads(p.read_text()); d["hedge_threshold"]=0.50; d["hedge_require_ask_max"]=0.52; d["hedge_persist_s"]=5.0; d["hedge_toxic_bid_max"]=0.32; d["hedge_recovery_cancel"]=0.53; d["hedge_sell_fade"]=True; d["hedge_require_oracle"]=True; d["hedge_dump_ignore_oracle"]=True; d["hedge_oracle_min_edge_usd"]=0.0; d["hedge_undercut_ticks"]=0; d["hedge_min_price"]=0.32; d["buy_start_s"]=45; d["early_buy_start_s"]=45; d["early_95_start_s"]=0; d["early_95_min_s"]=0; d["late_90_start_s"]=45; d["min_underlying_edge_usd"]=25.0; d["add_min_price"]=0.90; d["buy_budget"]=2.5; d["late_buy_budget"]=2.5; d["buy_max_price"]=0.90; d["early_buy_max_price"]=0.99; d["buy_max_spend"]=3.0; d["buy_max_shares"]=5.0; d["poll_buy_window_s"]=0.01; d["poll_held_s"]=0.01; d["ui_every_n_cycles"]=50; p.write_text(json.dumps(d, indent=2)+"\n"); print("start", d["buy_start_s"], "early", d["early_buy_start_s"], "e95", d["early_95_start_s"], "e95min", d["early_95_min_s"], "edge", d["min_underlying_edge_usd"], "late_90", d["late_90_start_s"], "horizon", max(d["buy_start_s"], d["early_buy_start_s"], d["early_95_start_s"]), "hedge", d["hedge_threshold"], d["hedge_require_ask_max"], "persist", d["hedge_persist_s"], "dump", d["hedge_toxic_bid_max"], "recovery", d["hedge_recovery_cancel"], "dry_run", d.get("dry_run"), "entry", d.get("entry_enabled"))'
-sudo systemctl restart polybuybot5m
-sudo systemctl enable polybuybot5m
-systemctl is-active polybuybot polybuybot5m polybuybothourly
-# expect: inactive  active  inactive
-```
-
-Confirm `strategy_buy5m.json` `dry_run` / `entry_enabled` before restart.
-Printed `horizon` must be **45**. Do **not** start 15m, hourly, or mint.
+Live overlay is already last-120 / edge $0 (27 Aug 17:26Z). **Do not
+paste last-45 + $25.** **Do not paste a new `strategy_buy5m.json`
+overlay or restart** unless the operator asks after they buy a
+recommendation. See `CURRENT.md` and
+`docs/2026-08-31-last120-loss-catalog.md`. Do **not** start 15m,
+hourly, or mint.
 
 ## Dependencies
 

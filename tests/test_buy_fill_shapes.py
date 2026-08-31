@@ -1984,18 +1984,18 @@ class BalanceAndGcSemantics(unittest.TestCase):
             src,
         )
 
-    def test_docs_vm_paste_is_last45_edge25(self):
+    def test_docs_live_overlay_is_last120_edge0(self):
         root = BOT5M.parent
-        for name in ("CURRENT.md", "AGENTS.md"):
-            text = (root / name).read_text()
-            self.assertIn('d["buy_start_s"]=45', text, name)
-            self.assertIn('d["early_buy_start_s"]=45', text, name)
-            self.assertIn('d["early_95_start_s"]=0', text, name)
-            self.assertIn('d["early_95_min_s"]=0', text, name)
-            self.assertIn('d["late_90_start_s"]=45', text, name)
-            self.assertIn('d["min_underlying_edge_usd"]=25.0', text, name)
-            self.assertNotIn('d["buy_start_s"]=120', text, name)
-            self.assertNotIn('d["min_underlying_edge_usd"]=0.0', text, name)
+        current = (root / "CURRENT.md").read_text()
+        agents = (root / "AGENTS.md").read_text()
+        for name, text in (("CURRENT.md", current), ("AGENTS.md", agents)):
+            self.assertIn("last **120s**", text, name)
+            self.assertNotIn('d["buy_start_s"]=45', text, name)
+            self.assertNotIn('d["min_underlying_edge_usd"]=25.0', text, name)
+        self.assertIn("`min_underlying_edge_usd`", current)
+        self.assertIn("**$0**", current)
+        self.assertIn("docs/2026-08-31-last120-loss-catalog.md", current)
+        self.assertIn("docs/2026-08-31-last120-loss-catalog.md", agents)
         ttd = (root / "TECHNICAL_DESIGN.md").read_text()
         self.assertIn("last **45s**", ttd)
         self.assertIn("`min_underlying_edge_usd` is **$25**", ttd)

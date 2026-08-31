@@ -3,48 +3,36 @@
 **Agents: read this after `AGENTS.md`.** Update this file when ops/strategy decisions change.
 Do not put secrets, API keys, or live wallet material here.
 
-Last updated: **2026-08-27** — 5m **last 45s + $25 edge** after the operator
-pastes and restarts (this file + `TECHNICAL_DESIGN.md`). Hourly is stopped.
-Hedge is **persist 5s @ 50/52**, recovery **53¢**, dump **≤32¢**. **Do
-not add a vol/momentum buy skip.** `early_95_start_s=0` is valid in
-`load_strategy` (disable ≥95); set `early_95_min_s=0` in the same paste.
+Last updated: **2026-08-31** — 5m **last 120s / 75–90 / $2.50 / edge $0**
+has been live since **27 Aug 2026 ~17:26Z**. First full tape: barely +EV
+(**+$9 / ~94h ≈ +$0.10–$0.12/h**). **Do not size up. Do not paste
+last-45 + $25** (that probe was empty / −EV). **Do not paste a new
+live overlay or restart** unless the operator asks after they buy a
+recommendation. Loss catalog: `docs/2026-08-31-last120-loss-catalog.md`.
+Hourly and 15m are stopped. Hedge is **persist 5s @ 50/52**, recovery
+**53¢**, dump **≤32¢**. **Do not add a vol/momentum buy skip.**
 
-**Live 5m combination** (example JSON + the paste below). Target ~$1–2/hour.
-Evidence: Binance **1s** first-touch on **72h, 7d, and 14d**.
+**Live 5m combination** (confirmed on the VM 31 Aug ~15:49Z). Example
+JSON is still the old last-45+$25 *research* template — **live JSON is
+the overlay below, already on the box.**
 
 | Knob | Value |
 |---|---|
-| Entry time | last **45s** only (`buy_start_s=45`, `late_90_start_s=45`) |
-| Ask | **75–99¢** (late 75–90 + `late_90` overlay) |
-| `min_underlying_edge_usd` | **$25** (`|TWAP−PTB|`) |
-| Early / ≥95 | **off** (`early_buy_start_s=45`, `early_95_start_s=0`, `early_95_min_s=0`) |
-| Size | **$2.50** + $2.50; later **$5** is `buy_budget=late_buy_budget=5`, `buy_max_spend=5`, `buy_max_shares=7` |
-| Hedge | persist 5s @ 50/52, dump 32, recovery 53 |
-| Look / WS | `BUY_HORIZON_S` **45s** (subscribe from ~T-75) |
+| Entry time | last **120s** (`buy_start_s=120`, `late_90_start_s=0`) |
+| Ask | **75–90¢** only (no ≥90 overlay) |
+| `min_underlying_edge_usd` | **$0** |
+| Early / ≥95 | **off** (`early_buy_start_s=120`, `early_95_start_s=0`) |
+| Size | **one $2.50** (`buy_budget=late_buy_budget=2.5`). **Do not size up.** |
+| Hedge | persist 5s @ 50/52, dump 32, recovery 53, fade, oracle on persist |
+| Look / WS | `BUY_HORIZON_S` **120s** |
 
-Why this combo: last-45s + `$25` is eatable on **72h, 7d, and 14d Binance
-1s** (closeTime stamps; the old 7d/14d 1m numbers were lookahead-biased).
-First-touch paper (implied fill from `|dist|`, **$1** loser salvage,
-**$2.50** size):
-
-| Sample | last45+$25 | same at $5 | flip | last120+$25 | early+$25 |
-|---|---:|---:|---:|---:|---:|
-| 72h 1s | **+$1.53/h** | +$3.06/h | 5.1% | −$0.27/h | −$3.17/h |
-| 7d 1s | **+$1.53/h** | +$3.05/h | 4.8% | −$0.21/h | −$3.20/h |
-| 14d 1s | **+$1.41/h** | +$2.83/h | 3.8% | +$0.41/h* | −$1.93/h |
-
-\*14d last-120 + `$25` is +EV only with `$1` salvage (`eat_nohedge=no`,
-12.1% flip). last-45 + `$25` is eatable with and without salvage on all
-three samples.
-
-Last **30s** + `$25` is a bit better now that 1s can tell 30 from 45
-(+$1.89 / +$1.82 / +$1.56 per hour, 2.2–2.8% flip). Keep **45s** as the
-probe (already the live last-45 overlay; still in the $1–2/h band). Last
-**120s** is not eatable without salvage in the 72h/7d. Early first-touch
-is −EV. Vol / against-momentum do not split the analog. `$5` is the scale
-lever (`buy_max_spend=5`, `buy_max_shares=7`); stay **$2.50** until this
-paste is on the box. Score: `check_reversal_features.py --hours 72` /
-`--hours 168` / `--hours 336` (default **1s**).
+**How we got here (do not relitigate):** last-45 + `$25` looked eatable
+on Binance 1s paper, then went empty / −EV live (99/1 books; `$25`
+cancelled restable 75–90). Pathlog + Binance join (PR #132) said
+**last-120 75–90, no $25** was the paper winner. Operator pasted that
+on **27 Aug ~17:26Z**. Live tape is **barely +EV** — paper 96% WR /
++$0.40/h was the restable subset; live took 36% of clocks, walked 18%,
+WR ~82%. Stay **$2.50**. Score exits, not size.
 
 **Why we left 70/72 persist-2s / recovery 85 / dump 53:**
 
@@ -61,27 +49,17 @@ persist-50 still needs the oracle against/flat.
 **Reversal features (27 Aug):** 25% flips in the **$20–40 bucket** is
 **not** eatable at an 85–88¢ fill (no-hedge cap is `1 − fill`: 15% at
 85¢, 12% at 88¢; with ~$1 salvage, 23% / 18%). A **gate** is different
-from the bucket: keep `|TWAP−PTB| ≥ $25` and **wait until the last 45s**.
-Knobs live in `strategy_buy5m.example.json`. VM pathlog
-`--anatomy --ttm-max 45` is the book confirmation.
+from the bucket. Live buy edge is **$0** (last-120). Example JSON still
+holds last-45+$25 for `--sweep` only. **Do not add a vol skip.**
 
-**Merge #130 first**, then paste (5m only; do not start hourly/15m/mint).
-`early_95_start_s=0` is allowed after this PR; without the merge that
-value takes 5m down. `BUY_HORIZON_S` becomes **45s** (WS from ~T-75).
-This paste includes the live hedge knobs so a file that never got them
-still qualifies. Confirm printed `dry_run` / `entry` **before** restart.
-Printed `horizon` must be **45**.
-
-```bash
-cd ~/poly-money-maker && git pull
-sudo systemctl stop polybuybothourly polybuybot
-sudo systemctl disable polybuybothourly polybuybot
-python3 -c 'import json; from pathlib import Path; p=Path("strategy_buy5m.json"); d=json.loads(p.read_text()); d["hedge_threshold"]=0.50; d["hedge_require_ask_max"]=0.52; d["hedge_persist_s"]=5.0; d["hedge_toxic_bid_max"]=0.32; d["hedge_recovery_cancel"]=0.53; d["hedge_sell_fade"]=True; d["hedge_require_oracle"]=True; d["hedge_dump_ignore_oracle"]=True; d["hedge_oracle_min_edge_usd"]=0.0; d["hedge_undercut_ticks"]=0; d["hedge_min_price"]=0.32; d["buy_start_s"]=45; d["early_buy_start_s"]=45; d["early_95_start_s"]=0; d["early_95_min_s"]=0; d["late_90_start_s"]=45; d["min_underlying_edge_usd"]=25.0; d["add_min_price"]=0.90; d["buy_budget"]=2.5; d["late_buy_budget"]=2.5; d["buy_max_price"]=0.90; d["early_buy_max_price"]=0.99; d["buy_max_spend"]=3.0; d["buy_max_shares"]=5.0; d["poll_buy_window_s"]=0.01; d["poll_held_s"]=0.01; d["ui_every_n_cycles"]=50; p.write_text(json.dumps(d, indent=2)+"\n"); print("start", d["buy_start_s"], "early", d["early_buy_start_s"], "e95", d["early_95_start_s"], "e95min", d["early_95_min_s"], "edge", d["min_underlying_edge_usd"], "late_90", d["late_90_start_s"], "horizon", max(d["buy_start_s"], d["early_buy_start_s"], d["early_95_start_s"]), "hedge", d["hedge_threshold"], d["hedge_require_ask_max"], "persist", d["hedge_persist_s"], "dump", d["hedge_toxic_bid_max"], "recovery", d["hedge_recovery_cancel"], "dry_run", d.get("dry_run"), "entry", d.get("entry_enabled"))'
-sudo systemctl restart polybuybot5m
-sudo systemctl enable polybuybot5m
-systemctl is-active polybuybot polybuybot5m polybuybothourly
-# expect: inactive  active  inactive
-```
+**No live paste in this file.** Last-45 + $25 was tried, then replaced
+on **27 Aug ~17:26Z** by last-120 / edge $0 (already on the VM). First
+full tape (27 Aug 17:26Z → 31 Aug 15:12 Dublin): **+$9**, WR ~**82%**,
+take rate **411/1129 = 36%**, **73 walks**, **52 sells / 0 `hedge_fill`**
+(sells ghost via `hedge_uncertain_resolved`). Catalog:
+`docs/2026-08-31-last120-loss-catalog.md`. Do **not** restart 5m and
+do **not** edit live JSON unless the operator asks after they buy a
+recommendation.
 
 ---
 
@@ -93,23 +71,22 @@ mint complete sets. Operator still sells leftover mint inventory by hand.
 **15m and hourly CLOB bots are stopped.** Do **not** start `polybuybot` or
 `polybuybothourly`.
 
-**Active strategy:** **5m only** (`polybuybot5m`) after the operator patches
-live `strategy_buy5m.json` and restarts the unit. Same-leg only. After
-`hedge_closed`, no re-buy. Two $2.50 slices.
+**Active strategy:** **5m only** (`polybuybot5m`). Same-leg only. After
+`hedge_closed`, no re-buy. Early slice **off** (one $2.50, not two).
 
 | Knob | Value |
 |---|---|
-| Late window | last **45s**, **75–90¢**, FAK **90¢**, `$2.50` |
-| Last-45 overlay | last **45s**, **≥90¢**, FAK **99¢**, still the late `$2.50` |
+| Late window | last **120s**, **75–90¢**, FAK **90¢**, `$2.50` |
+| Last-45 ≥90 overlay | **off** (`late_90_start_s=0`) |
 | Early / ≥95 | **off** |
-| `add_min_price` | **90¢** for a same-leg late add |
+| `add_min_price` | **90¢** (no late add while early is off) |
 | Hedge qualify | bid ≤ **50¢**, ask ≤ **52¢**, spread ≤ 15¢, persist **5s** |
 | Hedge GUI | held ≤ **52¢**, other ≥ **48¢**. Buy 70/30 unchanged. Last print ≤ 52¢. |
 | Oracle while holding | Do **not persist-sell** if live Chainlink TWAP is still on the held side of PTB. Missing/stale feed holds. |
 | After persist | Sell at the live bid while **< 53¢**, including a fade through 50 (`hedge_sell_fade`). Bid ≥ **53¢** holds and clears persist. |
 | Dump | Bid-only ≤ **32¢** even if BTC still agrees (`hedge_dump_ignore_oracle`). Persist-50 does **not** get this bypass. |
-| Underlying buy edge | **$25** (`|TWAP−PTB|`); side must match |
-| `BUY_HORIZON_S` | **45s** (WS from ~T-75) |
+| Underlying buy edge | **$0** |
+| `BUY_HORIZON_S` | **120s** |
 | `max_open_positions` | **0 = unlimited** |
 | `poll_buy_window_s` / `poll_held_s` | **0.01** on the live 5m WS book |
 
@@ -213,13 +190,10 @@ amount / HTTP 400), not this NameError.
 
 - **VM:** `~/poly-money-maker` on `instance-20260516-185922`.
 - **Mint:** `sudo systemctl stop polymintbot && sudo systemctl disable polymintbot`
-- **Buy bots:** **5m only.** Stop/disable hourly and 15m. After **#130**
-  merges, paste the **same block as the top of this file** (last **45s** +
-  edge **$25** + hedge 50/52). Confirm printed `horizon` **45**, `edge` **25**,
-  `e95` **0**, `e95min` **0**, and `dry_run` / `entry` **before** restart.
-  New Python needs a 5m restart. Live JSON **must** set the hedge and
-  entry keys or an old 120/300/$0 file keeps the old windows after hot
-  reload. Do **not** start 15m, hourly, or mint.
+- **Buy bots:** **5m only.** Stop/disable hourly and 15m. Live JSON is
+  already last-120 / edge $0 / hedge 50/52 (pasted 27 Aug 17:26Z).
+  **Do not paste last-45 + $25. Do not paste a new overlay or restart
+  unless the operator asks.** Do **not** start 15m, hourly, or mint.
 - **Pathlog:** start `polypathlog` as above (no `.env` required).
 
 ---
@@ -302,16 +276,14 @@ amount / HTTP 400), not this NameError.
       a no at TTM 46–120. After merge: `git pull`, patch live
       `strategy_buy5m.json`, stop hourly, restart 5m. Confirm `dry_run` /
       `entry_enabled`. Do **not** start 15m / hourly / mint.
-- [ ] Cloud paper P&L on **pathlog ~1s ticks** (not 1-minute CLOB candles):
-      `--series 5m --template strategy_buy5m.example.json --paper`, plus
-      last-45s `--ask-min 0.90 --ask-max 0.99 --ttm-max 45`. Export ticks
-      off the VM before prune. No `.env`.
-- [x] 27 Aug reversal-feature tape (`check_reversal_features.py`): no vol
-      skip. Combo is **last 45s + `min_edge` $25**, early off, hedge
-      unchanged, size $2.50 (then $5). Confirmed on **72h / 7d / 14d 1s**
-      (closeTime stamps). Example JSON + the paste at the top of this file
-      hold the knobs. $20–40 *bucket* 25% flip is not eatable at 85¢;
-      last-120 + $25 is still −EV on 72h/7d 1s. Merge **#130**, then paste.
+- [x] Cloud paper P&L / last-45+$25 probe: last-45+$25 was empty / −EV
+      live. Operator pasted last-120 / edge $0 on **27 Aug ~17:26Z**.
+- [x] 27 Aug reversal-feature tape: no vol skip (still).
+- [x] **31 Aug last-120 tape** — barely +EV (+$9 / ~94h). Do not size
+      up. Catalog `docs/2026-08-31-last120-loss-catalog.md`. Highest
+      leverage is loser exits (held-to-zero + dump-at-1¢), not more
+      entries. Sell unmatched retry already exists; `hedge_fill` was
+      missing on the ghost-resolve path.
 
 ---
 

@@ -94,21 +94,19 @@ it **redeems** on-chain for $1.00 per share. There is **no** “take profit at
 even make $0.30 before $1.00, and on an 80¢ fill selling at 90¢ throws away
 the rest of the ride to $1.00.
 
-**Live 5m entry (two $2.50 slices):**
+**Live 5m entry (one $2.50 FAK, since 27 Aug 2026 ~17:26Z):**
 
 | Time left until close (TTM) | Winning ask | Slice / FAK limit |
 |---|---|---|
-| More than 45 seconds | none — too early | early and ≥95 are **off** |
-| 0 < TTM ≤ 45 seconds | **75¢ through 90¢ inclusive** | late `$2.50`, limit **90¢** |
-| 0 < TTM ≤ 45 seconds | **≥90¢** | `late_90` overlay, same late `$2.50`, limit **99¢** |
+| More than 120 seconds | none — too early | early and ≥95 are **off** |
+| 0 < TTM ≤ 120 seconds | **75¢ through 90¢ inclusive** | late `$2.50`, limit **90¢** |
+| Any TTM | ≥90¢ | **off** (`late_90_start_s=0`) |
 
-`min_underlying_edge_usd` is **$25**: live Chainlink TWAP 30s must be at
-least $25 from the window-open PTB and on the same side as the book.
-`BUY_HORIZON_S = max(buy_start_s, early_buy_start_s, early_95_start_s)`
-is **45** with this paste, so websocket subscribe / 0.01s look start
-around T-75. `early_95_start_s=0` is a valid disable (do not leave it
-on the “must be positive” list). Pair it with `early_95_min_s=0` in the
-JSON; `0` also disables even if `min_s` is leftover 60.
+Live `min_underlying_edge_usd` is **$0**. The example JSON / `--sweep`
+template still documents last **45s** + `$25` as a *research* combo:
+`min_underlying_edge_usd` is **$25** in that file only. `CURRENT.md`
+wins for what is actually running. `BUY_HORIZON_S` is **120** on the
+live overlay. `early_95_start_s=0` is a valid disable.
 
 Missed early does **not** become a $5 late buy — there is no early slice
 while those windows are off. Same-leg add only. After `hedge_closed`, no
@@ -218,12 +216,14 @@ defaults are B-only for the last 20 minutes, persist **5s @ 50/52**, dump
 35¢, recovery **53¢**, `hedge_sell_fade`, `hedge_require_oracle`, Binance
 buy edge $10, tick `0.01`, and a $10 market cap. Hourly is **stopped**.
 
-Live 5m JSON (after the operator paste) is last **45s** only, **75–99¢**
-(late 75–90 + `late_90` overlay), `min_underlying_edge_usd` **$25**,
-early/≥95 **off** (`early_buy_start_s=45`, `early_95_start_s=0`), two
-$2.50 slices, persist 5s @ 50/52, dump 32¢ ignore-oracle, recovery 53¢,
-and nominal tick `0.001`. Code defaults in `buybot5m.py` stay last-120 /
-early-300 / edge $0 until the live JSON overlays them.
+Live 5m JSON (on the VM since 27 Aug 2026 ~17:26Z; **`CURRENT.md` wins**)
+is last **120s**, **75–90¢**, `min_underlying_edge_usd` **$0**,
+`late_90` / early / ≥95 **off**, one $2.50 FAK, persist 5s @ 50/52,
+dump 32¢ ignore-oracle, recovery 53¢, tick `0.001`. The example JSON
+and `--sweep` template are still last **45s** + `$25` — that is
+research, not live. Code defaults in `buybot5m.py` stay last-120 /
+early-300 / edge $0 until JSON overlays them. First last-120 tape:
+`docs/2026-08-31-last120-loss-catalog.md`.
 
 15m/hourly windows are in **minutes** (`buy_window_min` / `a22_window_min`).
 Mixing the two without converting units has caused production `NameError`s.
@@ -1129,14 +1129,11 @@ hourly, 15m, or mint as part of a 5m deploy.
 the journal with `deploy/journald-size.conf` (`deploy/DISK_OPS.md`). Pathlog
 cap is separate and in-app.
 
-`CURRENT.md` owns the exact transition/patch command so it cannot drift in
-two places. Before restarting 5m, verify live JSON explicitly: last **45s**
-(`buy_start_s=early_buy_start_s=late_90_start_s=45`), `early_95_start_s=0`
-and `early_95_min_s=0`, `min_underlying_edge_usd` **25**, two $2.50 slices,
-hedge 50/52 for 5s, dump 32, recovery 53, sell-fade/oracle/dump-ignore true,
-undercut 0, and the intended `dry_run` / `entry_enabled`. `BUY_HORIZON_S`
-becomes **45**. Stop hourly. Restart `polypathlog` when recorder Python
-changes.
+`CURRENT.md` owns the live knobs so they cannot drift in two places.
+Live is last-120 / edge $0 / one $2.50. **Do not paste last-45 + $25.
+Do not restart 5m unless the operator asks.** Hedge 50/52 for 5s, dump
+32, recovery 53, sell-fade/oracle/dump-ignore true, undercut 0. Stop
+hourly. Restart `polypathlog` when recorder Python changes.
 
 Watch `buy_attempt band=late` / `late_90`, `buy_skip_underlying_edge`,
 `hedge_skip_oracle_still_winning`, `hedge_skip_persist`,
