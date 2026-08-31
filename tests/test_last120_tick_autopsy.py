@@ -20,6 +20,7 @@ from check_last120_tick_autopsy import (
     pathlog_gui_ok,
     repo_from_argv,
     resolve_slug,
+    should_replace_fill,
     slug_from_start_ts,
     tick_density,
     walk_live_exit,
@@ -141,8 +142,23 @@ class JoinWithoutSlugTests(unittest.TestCase):
         }
         self.assertEqual(collect_fills([row], index, since_unix=1787851560), [])
 
-    def test_fill_avg_prefers_avg_price(self):
-        self.assertAlmostEqual(fill_avg({"avg_price": 0.77, "price": 0.90}), 0.77)
+    def test_research_buy_fill_beats_earlier_ghost(self):
+        ghost = {
+            "slug": "btc-updown-5m-1",
+            "event": "buy_ghost_fill",
+            "source": "log",
+            "ts": 100.0,
+            "avg": 0.90,
+        }
+        research = {
+            "slug": "btc-updown-5m-1",
+            "event": "buy_fill",
+            "source": "research",
+            "ts": 110.0,
+            "avg": 0.81,
+        }
+        self.assertTrue(should_replace_fill(ghost, research))
+        self.assertFalse(should_replace_fill(research, ghost))
 
 
 class LiveExitWalkerTests(unittest.TestCase):

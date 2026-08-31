@@ -32,7 +32,7 @@ import requests
 from rich.console import Console
 
 from buy.book import best_from_levels
-from buy.market import MarketGateway, MintMarket
+from buy.market import MarketGateway, MintMarket, slug_window_end_ts
 
 console = Console()
 REPO = Path(__file__).resolve().parent
@@ -62,6 +62,12 @@ RECORD_BEFORE_END_S = {
 POLL_S = 1.0
 BOOK_WORKERS = 8
 RESOLVE_GRACE_S = 20.0
+# Do not Gamma-poll the whole 14d retain set every cycle. VM 31 Aug autopsy:
+# overlay mean_ticks=1.0 — resolve HTTP on thousands of unresolved JSONL
+# starved the 1s sampler. Only recently closed books, few lookups per poll.
+RESOLVE_LOOKBACK_S = 6 * 3600
+RESOLVE_MAX_PER_CYCLE = 8
+RESOLVE_FAIL_COOLDOWN_S = 60.0
 
 # Disk cap sized for the ~10GB e2 boot disk (see deploy/DISK_OPS.md).
 # ~15 MB/day of ticks → ~210 MB in 14 days; 400 MB is the hard ceiling.
@@ -71,6 +77,7 @@ PRUNE_EVERY_S = 60.0
 PROTECT_RECENT_S = 120.0  # skip files still being written
 
 _shutdown = False
+_resolve_fail_until: Dict[str, float] = {}
 
 
 def _signal_handler(signum, frame):
@@ -341,15 +348,53 @@ def gamma_winner(session: requests.Session, slug: str) -> Optional[str]:
     return None
 
 
-def pending_resolve_slugs() -> List[str]:
+def stem_duration_s(stem: str) -> float:
+    """Series length from a tick filename. Check 15m before 5m."""
+    name = (stem or "").lower()
+    if "15m" in name:
+        return 15 * 60
+    if "hourly" in name:
+        return 60 * 60
+    return 5 * 60
+
+
+def stem_end_ts(stem: str) -> Optional[float]:
+    return slug_window_end_ts(stem, stem_duration_s(stem))
+
+
+def pending_resolve_slugs(
+    now: Optional[float] = None,
+    *,
+    lookback_s: float = RESOLVE_LOOKBACK_S,
+    grace_s: float = RESOLVE_GRACE_S,
+    limit: int = RESOLVE_MAX_PER_CYCLE,
+) -> List[str]:
+    """Unresolved books that closed recently. Not the whole retain dir.
+
+    Scanning every JSONL + Gamma GET for files Gamma will never mark 0.99/0.01
+    makes one poll last minutes; each 5m market then gets ~one tick.
+    """
     if not TICK_DIR.exists():
         return []
-    out: List[str] = []
+    clock = time.time() if now is None else float(now)
+    ranked: List[Tuple[float, str]] = []
     for path in TICK_DIR.glob("*.jsonl"):
+        end = stem_end_ts(path.stem)
+        if end is None:
+            continue
+        if clock < end + float(grace_s):
+            continue
+        if clock > end + float(lookback_s):
+            continue
+        fail_until = _resolve_fail_until.get(path.stem, 0.0)
+        if fail_until > clock:
+            continue
         if file_has_event(path, "resolved"):
             continue
-        out.append(path.stem)
-    return out
+        ranked.append((end, path.stem))
+    ranked.sort(key=lambda item: item[0])
+    cap = max(0, int(limit))
+    return [stem for _end, stem in ranked[:cap]]
 
 
 def run_cycle(gateway: MarketGateway, session: requests.Session) -> str:
@@ -389,7 +434,8 @@ def run_cycle(gateway: MarketGateway, session: requests.Session) -> str:
                 sampled += 1
 
     resolved = 0
-    for slug in pending_resolve_slugs():
+    resolve_slugs = pending_resolve_slugs(now)
+    for slug in resolve_slugs:
         path = tick_path(slug)
         header = None
         try:
@@ -405,6 +451,7 @@ def run_cycle(gateway: MarketGateway, session: requests.Session) -> str:
             continue
         winner = gamma_winner(session, str(header.get("slug") or slug))
         if not winner:
+            _resolve_fail_until[slug] = now + RESOLVE_FAIL_COOLDOWN_S
             continue
         append_jsonl(
             path,
@@ -413,7 +460,13 @@ def run_cycle(gateway: MarketGateway, session: requests.Session) -> str:
         resolved += 1
         log_event("resolved", slug=header.get("slug") or slug, winner=winner)
 
-    write_heartbeat("ok", markets=len(markets), sampled=sampled, resolved=resolved)
+    write_heartbeat(
+        "ok",
+        markets=len(markets),
+        sampled=sampled,
+        resolved=resolved,
+        resolve_attempted=len(resolve_slugs),
+    )
     return "ok"
 
 

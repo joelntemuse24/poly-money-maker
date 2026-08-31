@@ -376,6 +376,29 @@ def collect_fills(
     return sorted(by_slug.values(), key=lambda item: (item["ts"] or 0, item["slug"]))
 
 
+def fill_quality(fill: dict) -> Tuple[int, float]:
+    """Lower is better. Prefer research / buy_fill price over ghost ask=90¢."""
+    event = str(fill.get("event") or "")
+    source = str(fill.get("source") or "")
+    if source == "research" or event in {
+        "buy_fill",
+        "buy_fill_below_band",
+        "buy_success",
+    }:
+        rank = 0
+    elif event == "buy_ghost_fill":
+        rank = 2
+    else:
+        rank = 1
+    return rank, float(fill.get("ts") or 0)
+
+
+def should_replace_fill(current: Optional[dict], incoming: dict) -> bool:
+    if current is None:
+        return True
+    return fill_quality(incoming) < fill_quality(current)
+
+
 def pathlog_gui_ok(
     held_bid,
     held_ask,
@@ -890,7 +913,7 @@ def build_report(repo: Path, out_dir: Path, since_iso: str) -> str:
             fill = dict(fill)
             fill["source"] = label
             prev = merged.get(fill["slug"])
-            if prev is None or (fill["ts"] or 0) < (prev["ts"] or 0):
+            if should_replace_fill(prev, fill):
                 merged[fill["slug"]] = fill
     fills = sorted(merged.values(), key=lambda item: (item["ts"] or 0, item["slug"]))
     no_slug_journal = 0

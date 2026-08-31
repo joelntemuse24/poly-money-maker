@@ -417,6 +417,11 @@ Cloud agents: `CLOUD_RESEARCH.md`.
 6. **POS ≠ wallet bags.** Data API returns every unredeemed 5m share. A 0.01s
    sleep with a 5s wall clock means the cycle walked dust (Rich table, REST
    404s, fake stubs). Do not "fix" that by sleeping less.
+7. **Pathlog resolve must not Gamma-poll the whole 14d retain dir every 1s
+   cycle.** Unresolved JSONL that Gamma never marks 0.99/0.01 stay pending
+   forever. VM 31 Aug overlay `mean_ticks=1.0` — sampling starved. Cap
+   (`RESOLVE_MAX_PER_CYCLE=8`, `RESOLVE_LOOKBACK_S=6h`). Restart
+   `polypathlog` only (no orders) after that fix; do not restart 5m.
 
 ## Systemd Services (in `deploy/`)
 

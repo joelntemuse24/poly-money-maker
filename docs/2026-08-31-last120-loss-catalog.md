@@ -299,6 +299,35 @@ skip is only +$36 paper on this all-window set. **Do not paste `$25` or
 a vol skip from this table.** Score edge on joined 75–90 fills after the
 autopsy.
 
-Paste `autopsy.txt`. Do **not** restart. Do **not** paste live JSON. The
-31 surviving named-loss books are autopsied even when the journal join
-is still empty (synthetic last-120 75–90 first touch).
+Paste `autopsy.txt`. Do **not** restart 5m. Do **not** paste live JSON.
+
+### Autopsy paste (31 Aug ~20:23Z) — first full report
+
+This is the first `autopsy.txt`. Earlier VM pastes were tick coverage,
+empty join, `reversal_1s.txt`, and `No module named 'buy'`.
+
+| | |
+|---|---|
+| Join | **436** unique fills (research). **283** have a tick file. **153** pruned. |
+| Journal | `buy_fill` **353**, `buy_success`/`buy_ghost_fill` **436**, `buy_attempt` **721**. Keys match the join fix (`token_id`, no `slug`). |
+| Tick density | all_5m **mean 1.39** ticks (`p50=1`, `p90=2`). Overlay **mean 1.0**. Named-loss **1.0**. **Not a 1s book.** |
+| Named-loss | 31 present / 25 missing. `printed_<=50=2` and those were already `<=32`. `book_run>=1s=0`. |
+| Persist 0/1/2/5 | **Identical** on losers: 4 dumps @ ~4.5¢, 21 redeem_loss, 0 persist. One extra persist at persist_s=0 is an unresolved fill, not a loser save. |
+| Overlay first-touch | 15 / 770 clocks still had a 75–90 print on that **single** tick; 14 redeem_win, 0 losers. Restable subset, not a path. |
+
+**Persist 0s vs 5s is not identified on this tape.** The 4 dumps are
+markets where the only recorded tick already was a 4–20¢ bid. 21/25
+resolved losers never printed 50 on that tick (`min_bid=None` — the
+line is the entry/ghost 90¢ book, or the walk is `ts > fill` so the
+lone tick does not count). Recap catalog still stands: held-to-zero
+and dump-at-1–20¢. Ghost rows used ask **90¢** as avg (FAK cap, not
+fill VWAP); the checker now prefers research `buy_fill` price.
+
+**Why one tick:** `pathlog.py` Gamma-resolved *every* unresolved JSONL
+every poll (~3000 files). Gamma never marks most old 5m books 0.99, so
+the queue never drains and one cycle lasts minutes. Sampling then hits
+each 5m market ~once. Fix: resolve only books that closed in the last
+**6h**, **8** Gamma lookups per poll, 60s cooldown on a miss. After
+that lands, `sudo systemctl restart polypathlog` (recorder only, no
+orders). Do **not** restart `polybuybot5m`. Confirm with
+`mean_ticks` on a new 5m file (`wc -l` should be hundreds, not 2).
