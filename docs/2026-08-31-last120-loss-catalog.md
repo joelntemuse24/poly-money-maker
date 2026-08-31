@@ -463,10 +463,8 @@ Hedges with BTC features: **n=48**, mean_|dist| **20.7**, against
 **585/1151 “bought”** remains bot-log (attempt-inflated); wallet take
 on the overlay was **411/1129 = 36%**. 15m/hourly 0 is correct.
 
-Paper-credit (this PR): resolved CLOB-only opens become `paper_win`
-($1 × shares) or `paper_loss` (−spend) from Binance close vs PTB after
-a 90s settle grace. Real Redeem rows and hedge sells keep wallet cash.
-Re-run after `git pull` (stash local `check_path_backtest.py` first):
+Paper-credit landed on `main` as #135. Operator ran the re-run below
+~22:08Z after stash + pull to `7cb783c`. Results in §9.
 
 ```bash
 cd ~/poly-money-maker
@@ -475,3 +473,126 @@ git pull
 .venv/bin/python check_reversal_features.py --csv exports/trades.csv \
   --restart-utc 2026-08-27T17:26:00 --hours 96 --out /tmp/reversal_join.txt
 ```
+
+---
+
+## 9. Paper-credit tape (31 Aug ~22:08Z) — −$163 is still not live P&L
+
+Same CSV as §8 (through 20:39Z). VM pulled `7cb783c` after stashing
+local `check_path_backtest.py`. Binance 1s: **345996** bars
+`[1787867518..1788213508]`. awk printed SESSION TAPE twice because
+the script writes stdout **and** `--out`.
+
+```
+n=437 redeem=0 paper_win=288 paper_loss=71 hedge=54 other=24
+session_pnl=-163.16 mean=-0.37
+span 99.17h  mean fill 0.801  4.1 fills/h
+```
+
+Paper-credit **worked**. Winners print **+$0.30 to +$1.21** (walks up
+to **+$5.74**), not −$2.70. `redeem` is still 0 (`/trades` has no
+Redeem). Real Redeem rows still take precedence when present.
+
+**Do not treat −$163 / −$0.37/bag as live P&L.** Mix:
+
+- 24 `open` before Binance 1s (1787851800–1787867400 plus a few later
+  holes) still −spend ≈ **−$65**
+- GATE featured 403 (`|dist|` present): `paper_pnl_kept=−85.12` /
+  **−$0.86/h**
+- Binance close vs PTB can disagree with Polymarket resolution
+
+Live overlay recap from the first tape is still ~**+$9** /
+**+$0.10–$0.12/h**. Do not replace that with this banner.
+
+### Fill × TTM (win = paper_win)
+
+This is the winner-split asked for. 288 / (288+71) = **80.2%** paper WR
+excluding hedges (matches live ~80–82%). Including hedges:
+288 / 413 = **69.7%**.
+
+| fill ¢ | n | WR | mean_pnl | hedges |
+|---|---:|---:|---:|---:|
+| 0–0.7 | 47 | 34.0% | −0.68 | 15 |
+| 0.7–0.75 | 36 | 61.1% | −0.32 | 5 |
+| 0.75–0.8 | 58 | 60.3% | −0.36 | 9 |
+| 0.8–0.85 | 148 | 70.3% | −0.37 | 9 |
+| 0.85–0.9 | 119 | 74.8% | −0.29 | 13 |
+| 0.9–1.01 | 29 | 75.9% | −0.36 | 3 |
+
+| TTM s | n | WR | mean_pnl | hedges |
+|---|---:|---:|---:|---:|
+| 0–30 | 4 | 25.0% | −2.03 | 0 |
+| 30–60 | 56 | 53.6% | −0.83 | 4 |
+| 60–90 | 148 | 70.9% | −0.18 | 14 |
+| 90–120 | 229 | 66.4% | −0.36 | 36 |
+
+**&lt;70¢ walks are the bad pile (34% WR).** 75–90 is 60–76% WR and
+slightly negative mean_pnl (hedges + paper_loss in-band). Last-45-ish
+(TTM 30–60) is worse than 60–120. n=4 in 0–30: ignore.
+
+### |dist| at fill (paper_pnl now paper-credit)
+
+Flip rates match §8. Dollars are no longer −$2.70-poisoned.
+
+| |dist| | n | flip | WR | paper_pnl |
+|---|---:|---:|---:|---:|
+| 0–5 | 53 | 47.2% | 52.8% | −38.13 |
+| 5–10 | 65 | 33.8% | 66.2% | −16.70 |
+| 10–15 | 57 | 19.3% | 80.7% | −7.63 |
+| 15–20 | 59 | 16.9% | 83.1% | −19.64 |
+| 20–25 | 37 | 13.5% | 86.5% | +2.01 |
+| 25–30 | 40 | 17.5% | 82.5% | −7.78 |
+| 30–35 | 24 | 8.3% | 91.7% | −0.48 |
+
+0–10 is not eatable at an 80¢ fill (no-hedge cap **20%**). 10–20 is
+knife-edge. 20+ mostly is on flip, but **paper P&amp;L stays flat /
+negative until ≥$30** and fill rate collapses.
+
+### GATE keep |dist|≥X (featured 403)
+
+| min | keep | keep/h | flip_kept | wr_kept | paper_pnl_kept |
+|---|---:|---:|---:|---:|---:|
+| 0 | 403 | 4.1 | 22.6% | 77.4% | −85.12 |
+| 10 | 285 | 2.9 | 15.4% | 84.6% | −30.29 |
+| 20 | 169 | 1.7 | 13.6% | 86.4% | −3.03 |
+| 25 | 132 | 1.3 | 13.6% | 86.4% | −5.03 |
+| 30 | 92 | 0.9 | 12.0% | 88.0% | +2.75 |
+| 40 | 55 | 0.6 | 12.7% | 87.3% | +9.23 |
+
+**Do not add a |dist| gate from this table.** ≥$25 cuts the tape to
+1.3 fills/h and is still −$5 paper. Historical COMBOS `last45_e20`
++$1.85/h is implied-|dist| paper on **all 5m clocks**, not these fills.
+
+### SESSION replay (un-poisoned for paper_win / paper_loss)
+
+Keep actual wallet/paper P&amp;L if that fill’s TTM ≤ window and
+|BTC−PTB| ≥ edge. Not a last-45 simulator — early fills skip.
+
+| name | keep | skip | keep/h | pnl_kept |
+|---|---:|---:|---:|---:|
+| all_fills | 403 | 0 | 4.1 | −85.12 |
+| last45_e25 | 6 | 397 | 0.1 | −3.46 |
+| last45_e20 | 7 | 396 | 0.1 | −6.16 |
+| last45_e0 | 27 | 376 | 0.3 | −23.73 |
+| late120_e25 | 132 | 271 | 1.3 | −5.03 |
+| late120_e0 | 403 | 0 | 4.1 | −85.12 |
+
+**Confirms last-45+$25 empty / −EV on this tape. Do not paste.**
+
+### Hedges (pre-B+C)
+
+Tape **54** sells / **47** with BTC: mean_|dist| **20.6**, against
+**45%**, mean_mom30 **−5.6**. Recovery still poor (many −$1.5 to
+−$2.8; a few +3.11 / +2.86). This tape is dump **32** / persist **5s**.
+B+C (persist 1s / dump 40 / flatten &lt;75) is not in these rows until
+the operator pastes and restarts 5m.
+
+### What this does / does not change
+
+Stay **last-120 / 75–90 / edge $0 / $2.50**. Early / ≥95 / late_90
+**off**. **Do not size up.** **Do not add a vol or against-momentum
+skip.** Measure B+C on the next 48h of live recap, not this paper
+banner. Optional later: exclude `open` from banner `session_pnl` so
+the 24 coverage-gap bags do not drag −$65; `/activity?type=REDEEM` if
+we want real Redeem rows. VM stash `vm local check_path_backtest` is
+still on the box.

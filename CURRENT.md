@@ -5,12 +5,14 @@ Do not put secrets, API keys, or live wallet material here.
 
 Last updated: **2026-08-31** — 5m **last 120s / 75–90 / $2.50 / edge $0**
 has been live since **27 Aug 2026 ~17:26Z**. First full tape: barely +EV
-(**+$9 / ~94h ≈ +$0.10–$0.12/h**). **Do not size up. Do not paste
-last-45 + $25** (that probe was empty / −EV). Operator asked for the
-money-moving **B+C** exits: persist **1s**, dump **40¢**, flatten walks
-**avg <75¢** at live bid **<75¢**. Loss catalog:
-`docs/2026-08-31-last120-loss-catalog.md`. Hourly and 15m are stopped.
-**Do not add a vol/momentum buy skip.**
+(**+$9 / ~94h ≈ +$0.10–$0.12/h**). Paper-credit VM tape (same CSV):
+`paper_win=288` / `paper_loss=71` / `hedge=54` / `session_pnl=−163` is
+**still not live P&L** (24 no-BTC opens + Binance≠resolution). **Do not
+size up. Do not paste last-45 + $25** (replay keep **6 / −$3.46**).
+Operator asked for the money-moving **B+C** exits: persist **1s**, dump
+**40¢**, flatten walks **avg <75¢** at live bid **<75¢**. Loss catalog:
+`docs/2026-08-31-last120-loss-catalog.md` §9. Hourly and 15m are stopped.
+**Do not add a |dist| or vol/momentum buy skip.**
 
 **Live 5m combination** after the operator pastes B+C and restarts 5m.
 Entry stays last-120 / edge $0 (already on the box). Example JSON
@@ -85,14 +87,23 @@ See catalog §7.
 
 **31 Aug ~21:30Z SESSION TAPE n=437** (re-fetched CSV through 20:39Z;
 titles were range-shaped so join worked). `session_pnl=−1139` /
-`redeem=0` / 383 `open` at −$2.70 is **CLOB-only accounting** — Data
-API `/trades` has no Redeem. Live overlay is still ~**+$9** /
-**+$0.10–$0.12/h**. Flip-by-`|dist|` at fill is real (0–5 **47%**,
-5–10 **34%**, 20–25 **14%**). SESSION replay `last45_e25` keep **6/405**.
-Do **not** paste last-45+$25. Do **not** size up. Paper-credit lands
-with this branch so the next tape scores winners as +$0.48-class.
-See catalog §8. VM `git pull` still needs a stash of local
-`check_path_backtest.py`.
+`redeem=0` / 383 `open` at −$2.70 was **CLOB-only accounting** — Data
+API `/trades` has no Redeem. Flip-by-`|dist|` at fill is real (0–5
+**47%**, 5–10 **34%**, 20–25 **14%**). See catalog §8.
+
+**31 Aug ~22:08Z paper-credit re-run** (VM stash + `git pull` to
+`7cb783c`, same CSV). Banner:
+`paper_win=288 paper_loss=71 hedge=54 other=24 redeem=0
+session_pnl=-163.16`. Winners are **+$0.30 to +$1.21**, not −$2.70.
+**Do not treat −$163 as live P&L.** 24 `open` bags sit before Binance
+1s (`1787867518`) and still count −spend (~**−$65** of the −$163). GATE
+featured 403: `paper_pnl_kept=−85.12` / **−$0.86/h**. Live overlay recap
+is still ~**+$9** / **+$0.10–$0.12/h**. Fill×TTM: walks **<70¢** WR
+**34%**; 75–90 WR **60–76%**; TTM 60–90 best (**70.9%**). SESSION replay
+`last45_e25` keep **6 / −$3.46**. GATE `|dist|≥25` keep 132 / −$5 at
+1.3/h — **do not add a |dist| gate**. Do **not** paste last-45+$25.
+Do **not** size up. See catalog §9. VM stash
+`vm local check_path_backtest` is still on the box.
 
 ---
 
