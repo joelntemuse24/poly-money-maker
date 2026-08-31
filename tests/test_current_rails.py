@@ -762,6 +762,8 @@ class BotWiresCurrentRails(unittest.TestCase):
         self.assertIn('"hedge_toxic_bid_max": 0.40', src)
         self.assertIn('"hedge_flatten_walks": True', src)
         self.assertIn('"toxic_force_exit_below": 0.75', src)
+        self.assertIn("hedge_ladder_for_ttm(", src)
+        self.assertIn('"hedge_late_ttm_s": 30.0', src)
         self.assertIn("hedge_flatten_overrides_oracle(", src)
         self.assertIn("flatten=flatten_armed", src)
         self.assertIn('"hedge_recovery_cancel": 0.53', src)
@@ -840,6 +842,8 @@ class BotWiresCurrentRails(unittest.TestCase):
         )
         self.assertNotIn("hedge_flatten_walks", src)
         self.assertNotIn("hedge_flatten_overrides_oracle", src)
+        self.assertNotIn("hedge_ladder_for_ttm", src)
+        self.assertNotIn("hedge_late_ttm_s", src)
 
 
 if __name__ == "__main__":

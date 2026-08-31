@@ -10,6 +10,7 @@ from buy.hedge_gate import (
     evaluate_held_bag,
     hedge_dump_overrides_oracle,
     hedge_flatten_overrides_oracle,
+    hedge_ladder_for_ttm,
     hedge_market_tick,
     hedge_oracle_allows_sell,
     hedge_oracle_blocks_sell,
@@ -623,6 +624,162 @@ class FiveMFlattenWalkTests(unittest.TestCase):
         self.assertEqual(intent.action, "dump")
         self.assertEqual(intent.reason, "flatten_walk")
         self.assertTrue(intent.dump)
+
+
+class FiveMTtmHedgeLadderTests(unittest.TestCase):
+    """Last-30s moves the whole 5m ladder: 40/50/52/53 → 55/58/60/62.
+
+    Early (TTM > 30) keeps B+C so a one-tick 50 at T−90 does not dump
+    a 75¢ bag. Last 30s dump ≤55 is instant / bid-only (a one-tick 50
+    *will* dump — STW risk). Persist 1s stays. Flatten <75 is unchanged.
+    Late dump 55 > early qualify 50 is legal; do not require late dump
+    ≤ early threshold.
+    """
+
+    EARLY = dict(dump=0.40, qualify=0.50, ask_max=0.52, recovery=0.53)
+    LATE = dict(
+        late_ttm=30.0,
+        late_dump=0.55,
+        late_qualify=0.58,
+        late_ask_max=0.60,
+        late_recovery=0.62,
+    )
+    DECISION = dict(
+        persist_armed_ts=10.0,
+        persist_s=1.0,
+        dump_bid_max=0.40,
+        qualify_bid=0.50,
+        qualify_ask_max=0.52,
+        recovery_cancel=0.53,
+        sell_fade=True,
+        dump_ignore_oracle=True,
+        late_ttm=30.0,
+        late_dump=0.55,
+        late_qualify=0.58,
+        late_ask_max=0.60,
+        late_recovery=0.62,
+    )
+
+    def _ladder(self, seconds_left, **kw):
+        args = {**self.EARLY, **self.LATE, **kw}
+        return hedge_ladder_for_ttm(seconds_left, **args)
+
+    def test_ttm_90_keeps_early_40_50_52_53(self):
+        ladder = self._ladder(90.0)
+        self.assertFalse(ladder.late)
+        self.assertAlmostEqual(ladder.dump, 0.40)
+        self.assertAlmostEqual(ladder.qualify, 0.50)
+        self.assertAlmostEqual(ladder.ask_max, 0.52)
+        self.assertAlmostEqual(ladder.recovery, 0.53)
+
+    def test_ttm_just_above_30_stays_early(self):
+        ladder = self._ladder(30.0001)
+        self.assertFalse(ladder.late)
+        self.assertAlmostEqual(ladder.dump, 0.40)
+
+    def test_ttm_30_and_20_use_late_55_58_60_62(self):
+        for ttm in (30.0, 20.0, 0.0, -1.0):
+            ladder = self._ladder(ttm)
+            self.assertTrue(ladder.late, ttm)
+            self.assertAlmostEqual(ladder.dump, 0.55)
+            self.assertAlmostEqual(ladder.qualify, 0.58)
+            self.assertAlmostEqual(ladder.ask_max, 0.60)
+            self.assertAlmostEqual(ladder.recovery, 0.62)
+
+    def test_missing_or_invalid_ttm_falls_back_to_early(self):
+        for ttm in (None, "", "nope", float("nan")):
+            ladder = self._ladder(ttm)
+            self.assertFalse(ladder.late)
+            self.assertAlmostEqual(ladder.dump, 0.40)
+
+    def test_late_ttm_zero_disables_late_rung(self):
+        ladder = self._ladder(20.0, late_ttm=0.0)
+        self.assertFalse(ladder.late)
+        self.assertAlmostEqual(ladder.dump, 0.40)
+
+    def test_invalid_late_rung_falls_back_to_early(self):
+        ladder = self._ladder(
+            20.0, late_dump=0.60, late_qualify=0.55, late_recovery=0.62,
+        )
+        self.assertFalse(ladder.late)
+        self.assertAlmostEqual(ladder.dump, 0.40)
+
+    def test_late_dump_may_exceed_early_qualify(self):
+        ladder = self._ladder(20.0)
+        self.assertGreater(ladder.dump, 0.50)
+        self.assertLess(ladder.dump, ladder.qualify)
+        self.assertLessEqual(ladder.qualify, ladder.recovery)
+
+    def test_held_ttm_20_bid_50_dumps_late(self):
+        """Last-30s dump ≤55 is instant. A 50/52 book does not wait for persist."""
+        intent = held_hedge_decision(
+            0.50, 0.52, None, None, None, None,
+            now_s=20.0, persist_done=False, oracle_agrees=True,
+            seconds_left=20.0, **self.DECISION,
+        )
+        self.assertEqual(intent.action, "dump")
+        self.assertEqual(intent.reason, "bid_le_dump")
+        self.assertTrue(intent.dump)
+        self.assertAlmostEqual(intent.sell_at, 0.50)
+
+    def test_held_ttm_90_bid_50_does_not_dump(self):
+        # persist_done skips REST; put the book on WS so pick_held_quote sees it.
+        intent = held_hedge_decision(
+            None, None, 0.50, 0.52, None, None,
+            now_s=20.0, persist_done=True, oracle_agrees=False,
+            seconds_left=90.0, **self.DECISION,
+        )
+        self.assertEqual(intent.action, "sell")
+        self.assertEqual(intent.reason, "persist_live_bid")
+        self.assertFalse(intent.dump)
+
+    def test_held_ttm_20_bid_57_persists_late_not_recovery(self):
+        kw = dict(self.DECISION)
+        kw["persist_armed_ts"] = None
+        intent = held_hedge_decision(
+            0.57, 0.59, None, None, None, None,
+            now_s=20.0, persist_done=False,
+            oracle_agrees=False, seconds_left=20.0, **kw,
+        )
+        self.assertEqual(intent.action, "arm")
+        self.assertEqual(intent.reason, "persist_armed")
+
+    def test_held_ttm_90_bid_57_is_early_recovery_hold(self):
+        intent = held_hedge_decision(
+            0.57, 0.59, None, None, None, None,
+            now_s=20.0, persist_done=False, oracle_agrees=False,
+            seconds_left=90.0, **self.DECISION,
+        )
+        self.assertEqual(intent.action, "hold")
+        self.assertEqual(intent.reason, "recovery_cancel")
+
+    def test_held_without_seconds_left_stays_static(self):
+        intent = held_hedge_decision(
+            None, None, 0.50, 0.52, None, None,
+            now_s=20.0, persist_done=True, oracle_agrees=False,
+            **self.DECISION,
+        )
+        self.assertEqual(intent.action, "sell")
+        self.assertFalse(intent.dump)
+
+    def test_5m_wires_ladder_hourly_does_not(self):
+        root = Path(__file__).resolve().parents[1]
+        five = (root / "buybot5m.py").read_text()
+        hourly = (root / "buybothourly.py").read_text()
+        fifteen = (root / "buybot.py").read_text()
+        self.assertIn("hedge_ladder_for_ttm(", five)
+        self.assertIn('"hedge_late_ttm_s": 30.0', five)
+        self.assertIn('"hedge_late_dump": 0.55', five)
+        self.assertIn('"hedge_late_qualify": 0.58', five)
+        self.assertIn('"hedge_late_ask_max": 0.60', five)
+        self.assertIn('"hedge_late_recovery": 0.62', five)
+        self.assertNotIn("hedge_ladder_for_ttm", hourly)
+        self.assertNotIn("hedge_late_ttm_s", hourly)
+        self.assertNotIn("hedge_ladder_for_ttm", fifteen)
+        self.assertNotIn("hedge_late_ttm_s", fifteen)
+        self.assertNotIn(
+            "hedge_late_dump must be <= hedge_threshold", five,
+        )
 
 
 if __name__ == "__main__":

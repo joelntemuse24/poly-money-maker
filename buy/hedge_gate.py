@@ -120,6 +120,87 @@ class HedgeIntent(NamedTuple):
     dump: bool
 
 
+class HedgeLadder(NamedTuple):
+    """Dump / qualify / ask-max / recovery for one TTM. ``late`` is TTM ≤ cutoff."""
+
+    dump: float
+    qualify: float
+    ask_max: float
+    recovery: float
+    late: bool
+
+
+def hedge_ladder_ok(dump, qualify, ask_max, recovery) -> bool:
+    """``dump < qualify <= recovery <= 1`` and ``qualify <= ask_max <= 1``."""
+    try:
+        dump_f = float(dump)
+        qualify_f = float(qualify)
+        ask_f = float(ask_max)
+        recovery_f = float(recovery)
+    except (TypeError, ValueError):
+        return False
+    if any(x != x for x in (dump_f, qualify_f, ask_f, recovery_f)):
+        return False
+    return (
+        0 < dump_f < qualify_f <= recovery_f <= 1
+        and qualify_f <= ask_f <= 1
+    )
+
+
+def hedge_ladder_for_ttm(
+    seconds_left,
+    dump,
+    qualify,
+    ask_max,
+    recovery,
+    late_ttm=30.0,
+    late_dump=0.55,
+    late_qualify=0.58,
+    late_ask_max=0.60,
+    late_recovery=0.62,
+) -> HedgeLadder:
+    """Raise the whole 5m hedge ladder in the last ``late_ttm`` seconds.
+
+    TTM > 30 keeps 40 / 50/52 / 53 so a one-tick 50 at T−90 does not dump
+    a 75¢ bag. TTM ≤ 30 (including 0 / already-closed) uses 55 / 58/60 / 62
+    so a last-30s 50 dumps now instead of waiting for 40 and riding to 0.
+
+    Missing / invalid TTM stays on the early rung. ``late_ttm`` ≤ 0 disables
+    the late rung. An illegal late rung (not dump < qualify ≤ recovery)
+    falls back to early. Late dump may exceed early qualify — do not require
+    late dump ≤ early threshold.
+    """
+    try:
+        early = HedgeLadder(
+            float(dump), float(qualify), float(ask_max), float(recovery), False,
+        )
+    except (TypeError, ValueError):
+        early = HedgeLadder(0.40, 0.50, 0.52, 0.53, False)
+    try:
+        cutoff = float(late_ttm)
+    except (TypeError, ValueError):
+        return early
+    if cutoff != cutoff or cutoff <= 0:
+        return early
+    if seconds_left is None or seconds_left == "":
+        return early
+    try:
+        ttm = float(seconds_left)
+    except (TypeError, ValueError):
+        return early
+    if ttm != ttm or ttm > cutoff:
+        return early
+    if not hedge_ladder_ok(late_dump, late_qualify, late_ask_max, late_recovery):
+        return early
+    return HedgeLadder(
+        float(late_dump),
+        float(late_qualify),
+        float(late_ask_max),
+        float(late_recovery),
+        True,
+    )
+
+
 def _finite_px(value) -> Optional[float]:
     if value is None or value == "":
         return None
@@ -513,13 +594,40 @@ def held_hedge_decision(
     gui_why="ok",
     flatten=False,
     flatten_max=None,
+    seconds_left=None,
+    late_ttm=0.0,
+    late_dump=0.55,
+    late_qualify=0.58,
+    late_ask_max=0.60,
+    late_recovery=0.62,
 ):
     """REST + pick + evaluate + oracle block for one held tick (no I/O).
 
     Fresh WS dump/flatten peek (or persist_done) may skip REST. Last-good
     is only a pick fallback after REST is allowed to run. Dump and flatten
     skip the oracle; a persist sell does not.
+
+    Pass ``seconds_left`` to raise the dump/qualify/recovery rung in the
+    last ``late_ttm`` seconds (5m). ``late_ttm`` ≤ 0 or omitted TTM keeps
+    the static early knobs. Hourly must not pass 5m seconds.
     """
+    if seconds_left is not None:
+        ladder = hedge_ladder_for_ttm(
+            seconds_left,
+            dump_bid_max,
+            qualify_bid,
+            qualify_ask_max,
+            recovery_cancel,
+            late_ttm=late_ttm,
+            late_dump=late_dump,
+            late_qualify=late_qualify,
+            late_ask_max=late_ask_max,
+            late_recovery=late_recovery,
+        )
+        dump_bid_max = ladder.dump
+        qualify_bid = ladder.qualify
+        qualify_ask_max = ladder.ask_max
+        recovery_cancel = ladder.recovery
     peek_dump = hedge_dump_overrides_oracle(ws_bid, dump_bid_max, enabled=True)
     peek_flatten = hedge_flatten_overrides_oracle(
         ws_bid, flatten_max, armed=flatten, enabled=True,

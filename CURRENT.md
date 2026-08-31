@@ -3,10 +3,15 @@
 **Agents: read this after `AGENTS.md`.** Update this file when ops/strategy decisions change.
 Do not put secrets, API keys, or live wallet material here.
 
-Last updated: **2026-08-31 ~22:36Z** — 0–10 `|dist|` at fill is about
-**half the session flips** and −EV at an 80¢ fill. **Paste last-120 +
-`$10`** (window and B+C stay). **Do not paste last-45 + $25** (replay
-keep **6 / −$3.46**). B+C exits are already live (31 Aug ~22:25Z).
+Last updated: **2026-08-31 ~22:58Z** — **`$10` is live** (printed
+persist 1.0 / dump 0.4 / flatten True / start 120 / edge 10.0 /
+`dry_run` False / `entry` True; services inactive / active /
+inactive). Do **not** re-paste `$10`. **Do not paste last-45 + $25**
+(replay keep **6 / −$3.46**). Next money move is the **last-30s hedge
+ladder** (this PR): TTM **>30** stays 40 / 50/52 / 53; TTM **≤30**
+is dump **55** / persist **58** / ask **60** / recovery **62**.
+Persist **1s** both rungs. Flatten **<75¢** unchanged. Restart
+required after merge — code defaults apply; no extra JSON paste.
 First last-120 tape at edge $0: barely +EV (**+$9 / ~94h ≈
 +$0.10–$0.12/h**). Paper-credit VM tape: `paper_win=288` /
 `paper_loss=71` / `hedge=54` / `session_pnl=−163` is **still not live
@@ -17,7 +22,7 @@ is the 0–10 cut; GATE `|dist|≥25` is still no.
 
 **Live 5m combination** after the `$10` paste (B+C already on the box).
 Example JSON `--sweep` entry is still last-45+$25; its **hedge** knobs
-match B+C.
+match B+C plus the last-30s ladder defaults.
 
 | Knob | Value |
 |---|---|
@@ -26,7 +31,8 @@ match B+C.
 | `min_underlying_edge_usd` | **$10** (skip 0–10 `|TWAP−PTB|`; not $25) |
 | Early / ≥95 | **off** (`early_buy_start_s=120`, `early_95_start_s=0`) |
 | Size | **one $2.50** (`buy_budget=late_buy_budget=2.5`). **Do not size up.** |
-| Hedge | persist **1s** @ 50/52, dump **40¢**, flatten walks **<75¢**, recovery 53, fade, oracle on persist |
+| Hedge TTM >30 | persist **1s** @ 50/52, dump **40¢**, flatten **<75¢**, recovery 53 |
+| Hedge TTM ≤30 | persist **1s** @ 58/60, dump **55¢**, recovery 62 (same flatten) |
 | Look / WS | `BUY_HORIZON_S` **120s** |
 
 **How we got here (do not relitigate):** last-45 + `$25` looked eatable
@@ -59,11 +65,10 @@ above). Example JSON still holds last-45+$25 for `--sweep` only.
 **Do not add a vol skip.**
 
 **B+C live paste — done 31 Aug ~22:25Z.** Persist/dump/flatten are on.
-**`$10` edge paste — do this now.** Entry stays last-120. Only
-`min_underlying_edge_usd` changes. Edge hot-reloads; restart is
-optional. Confirm `dry_run` / `entry_enabled`. Printed `start` must
-stay **120**, `edge` **10**. Do **not** paste last-45 + $25. Do **not**
-start 15m, hourly, or mint.
+**`$10` edge paste — done 31 Aug ~22:58Z.** Printed persist 1.0 /
+dump 0.4 / flatten True / start 120 / edge 10.0 / `dry_run` False /
+`entry` True. Do **not** re-paste. Historical command (already
+applied):
 
 ```bash
 cd ~/poly-money-maker && git pull
@@ -73,7 +78,20 @@ systemctl is-active polybuybot polybuybot5m polybuybothourly
 # expect: inactive active inactive
 ```
 
-Printed `start` must stay **120**, `edge` **10**. Do **not** paste last-45 + $25.
+**Last-30s hedge ladder — after this merge.** Code defaults
+(`hedge_late_ttm_s=30`, dump 55 / qualify 58 / ask 60 / recovery 62)
+apply on restart. Live JSON does not need a new paste unless you want
+the keys written into the file. Confirm `dry_run` / `entry_enabled`.
+Printed `start` must stay **120**, `edge` **10**. Do **not** paste
+last-45 + $25. Do **not** start 15m, hourly, or mint.
+
+```bash
+cd ~/poly-money-maker && git pull
+# $10 and B+C already on the box — do not re-paste
+sudo systemctl restart polybuybot5m
+systemctl is-active polybuybot polybuybot5m polybuybothourly
+# expect: inactive active inactive
+```
 
 First last-120 tape (27 Aug 17:26Z → 31 Aug 15:12 Dublin): **+$9**, WR ~**82%**,
 take rate **411/1129 = 36%**, **73 walks**, **52 sells / 0 `hedge_fill`**
@@ -241,8 +259,9 @@ amount / HTTP 400), not this NameError.
 - **Mint:** `sudo systemctl stop polymintbot && sudo systemctl disable polymintbot`
 - **Buy bots:** **5m only.** Stop/disable hourly and 15m. Live JSON is
   last-120 plus B+C (persist **1s**, dump **40¢**, flatten) pasted
-  **31 Aug ~22:25Z**. **Paste `$10` edge** (block above). **Do not
-  paste last-45 + $25.** Do **not** start 15m, hourly, or mint.
+  **31 Aug ~22:25Z** and **`$10`** pasted **31 Aug ~22:58Z**. After
+  this merge: `git pull` + restart 5m for the last-30s ladder. **Do
+  not paste last-45 + $25.** Do **not** start 15m, hourly, or mint.
 - **Pathlog:** start `polypathlog` as above (no `.env` required).
 
 ---
@@ -336,11 +355,16 @@ amount / HTTP 400), not this NameError.
 - [x] **B+C live paste + 5m restart** — 31 Aug ~22:25Z. Printed persist
       1.0 / dump 0.4 / toxic 0.75 / flatten True / start 120 / edge 0 /
       dry_run False / entry True. Services inactive / active / inactive.
-- [ ] **Paste last-120 + `$10`** (block above). Not last-45. Not $25.
-      Then measure: `buy_skip_underlying_edge` `reason=edge_too_small`
-      on 0–10; fill rate vs 4.1/h; 0–10 share of new fills; B+C sell
-      px / held-to-zero; sold-then-won vs tape’s 8; Dublin $/h;
-      `cycle_error` 0; `invalid amounts` 0.
+- [x] **Paste last-120 + `$10`** — 31 Aug ~22:58Z. Printed persist
+      1.0 / dump 0.4 / flatten True / start 120 / edge 10.0 /
+      dry_run False / entry True. Services inactive / active /
+      inactive.
+- [ ] **Last-30s hedge ladder** (this PR). After merge: `git pull` +
+      `sudo systemctl restart polybuybot5m`. No JSON paste. Measure
+      48h: `hedge_late=true` dump/persist; sell px last 30s (want
+      50–55 not 1–20); held-to-zero with TTM<20; sold-then-won vs
+      tape’s 8; `$10` `edge_too_small` on 0–10; fill rate vs 4.1/h;
+      B+C sell px / h2z; Dublin $/h; `cycle_error` 0.
 
 ---
 
@@ -349,7 +373,8 @@ amount / HTTP 400), not this NameError.
 1. Read `AGENTS.md` + this file before changing mint/buy/hedge logic.
 2. Do **not** restart minting unless the operator asks. Do **not** start
    `polybuybot` / `polybuybothourly` unless the operator asks. 5m is the
-   live buy bot. B+C is on the box. Next paste is last-120 + `$10`.
+   live buy bot. B+C and `$10` are on the box. Next is the last-30s
+   ladder restart after this merge. Do **not** re-paste `$10`.
 3. Never truncate state/PnL/log files; never commit live strategy/state/`.env`.
    Pathlog ticks are **auto-pruned** (14d / 400 MB) — do not `rm` them by hand,
    but **do export** (`check_path_backtest.py --csv` or `scp` the ticks dir)
