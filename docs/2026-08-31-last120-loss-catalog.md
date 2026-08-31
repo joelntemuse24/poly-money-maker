@@ -3,7 +3,7 @@
 Research note. Operator shipped **B+C** (persist 1s, dump 40¢, flatten
 walks avg <75¢) on the VM **31 Aug ~22:25Z** and **`$10`**
 **31 Aug ~22:58Z**. Next is the last-30s hedge ladder (TTM>30 stays
-40/50/52/53; TTM≤30 is 55/58/60/62). Do **not** re-paste `$10`. Do
+40/50/52/53; TTM≤30 is dump 40 / persist 58/60 / recovery 62). Do **not** re-paste `$10`. Do
 **not** paste last-45 + $25. Do not size up from **$2.50**. Pastes
 are in `CURRENT.md`.
 

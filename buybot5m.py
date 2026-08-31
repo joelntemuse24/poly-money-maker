@@ -230,14 +230,13 @@ _STRATEGY_DEFAULTS = {
     # After persist_done, bid ≥ this is a recovered winner: HOLD and clear.
     # Tight 53¢ so we do not sell 50–69 the way 70–84 sold winners.
     "hedge_recovery_cancel": 0.53,
-    # Last-30s ladder: move the whole dump/qualify/ask/recovery rung up
-    # so a 50¢ book at TTM ≤30 dumps now instead of waiting for 40 and
-    # riding to 0. TTM >30 keeps 40/50/52/53 (a one-tick 50 at T−90
-    # must not dump a 75¢ bag). Persist stays 1s. Late dump 55 > early
-    # qualify 50 is legal — do not require late dump ≤ early threshold.
-    # 0 disables the late rung.
+    # Last-30s ladder: raise persist/recovery only. Dump stays 40 so a
+    # random 50 bid is not a bid-only dump. TTM ≤30 persist is 58/60
+    # (GUI + last-trade + 1s). TTM >30 keeps 40/50/52/53. 0 disables
+    # the late rung. Late dump may exceed early qualify if set — do
+    # not require late dump ≤ early threshold.
     "hedge_late_ttm_s": 30.0,
-    "hedge_late_dump": 0.55,
+    "hedge_late_dump": 0.40,
     "hedge_late_qualify": 0.58,
     "hedge_late_ask_max": 0.60,
     "hedge_late_recovery": 0.62,

@@ -1926,7 +1926,7 @@ class BalanceAndGcSemantics(unittest.TestCase):
         self.assertIs(five["hedge_flatten_walks"], True)
         self.assertEqual(five["hedge_recovery_cancel"], 0.53)
         self.assertEqual(five["hedge_late_ttm_s"], 30.0)
-        self.assertEqual(five["hedge_late_dump"], 0.55)
+        self.assertEqual(five["hedge_late_dump"], 0.40)
         self.assertEqual(five["hedge_late_qualify"], 0.58)
         self.assertEqual(five["hedge_late_ask_max"], 0.60)
         self.assertEqual(five["hedge_late_recovery"], 0.62)
