@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import unittest
+from pathlib import Path
 
 from buy.hedge_gate import (
     clob_min_tick_from_error,
@@ -16,6 +17,8 @@ from buy.hedge_gate import (
     hedge_should_keep_retrying,
     hedge_tick_after_build_error,
     held_hedge_decision,
+    should_log_hedge_fill_on_uncertain,
+    should_mark_hedge_closed,
 )
 
 
@@ -450,6 +453,33 @@ class HeldHedgeCompositionTests(unittest.TestCase):
         )
         self.assertNotEqual(intent.action, "dump")
         self.assertFalse(intent.dump)
+
+
+class HedgeFillOnUncertainResolvedTests(unittest.TestCase):
+    """27–31 Aug last-120: 0 hedge_fill, 52 uncertain_resolved, 52 CSV sells."""
+
+    def test_gate_matches_hedge_closed(self):
+        self.assertTrue(should_log_hedge_fill_on_uncertain(3.2, 0.0))
+        self.assertTrue(should_mark_hedge_closed(3.2, 0.0))
+        self.assertFalse(should_log_hedge_fill_on_uncertain(0.0, 3.2))
+        self.assertFalse(should_log_hedge_fill_on_uncertain(1.0, 2.0))
+        self.assertFalse(should_log_hedge_fill_on_uncertain(None, 0.0))
+
+    def test_5m_logs_hedge_fill_after_uncertain_resolved(self):
+        src = (
+            Path(__file__).resolve().parents[1] / "buybot5m.py"
+        ).read_text()
+        resolved = src.find('"hedge_uncertain_resolved"')
+        fill = src.find('"hedge_fill"', resolved)
+        via = src.find('via="uncertain_resolved"', fill)
+        self.assertGreater(resolved, 0)
+        self.assertGreater(fill, resolved)
+        self.assertGreater(via, fill)
+        self.assertIn("should_log_hedge_fill_on_uncertain(", src)
+        hourly = (
+            Path(__file__).resolve().parents[1] / "buybothourly.py"
+        ).read_text()
+        self.assertNotIn("should_log_hedge_fill_on_uncertain", hourly)
 
 
 if __name__ == "__main__":

@@ -84,6 +84,7 @@ from buy.hedge_gate import (
     hedge_tick_after_build_error,
     live_bag_log_fields,
     pick_held_quote,
+    should_log_hedge_fill_on_uncertain,
     should_mark_hedge_closed,
 )
 from buy.live_journal import is_journal_event
@@ -4852,6 +4853,23 @@ while not _shutdown_requested:
                             remaining=rem,
                             via="exact_order",
                         )
+                        if should_log_hedge_fill_on_uncertain(total_sold, rem):
+                            fill_px = (
+                                (float(total_proceeds) / float(total_sold))
+                                if float(total_sold) > 0
+                                else None
+                            )
+                            log_event(
+                                "hedge_fill",
+                                condition_id=cond,
+                                token_id=held_token,
+                                sold=total_sold,
+                                remaining=rem,
+                                price=fill_px,
+                                proceeds=round(float(total_proceeds), 4),
+                                hedge_closed=True,
+                                via="uncertain_resolved",
+                            )
                         save_json(STATE_FILE, positions_meta)
                         continue
                     if hedge_state in {"empty", "failed"}:

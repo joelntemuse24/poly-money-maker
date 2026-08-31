@@ -350,6 +350,17 @@ def should_mark_hedge_closed(sold, remaining) -> bool:
     return sold_f > 0.01 and rem < 0.01
 
 
+def should_log_hedge_fill_on_uncertain(sold, remaining) -> bool:
+    """Wallet already lost the bag; confirm path never logged hedge_fill.
+
+    Last-120 tape 27–31 Aug: 91 ``hedge_attempt``, 91 ``hedge_fail``,
+    0 ``hedge_fill``, 52 ``hedge_uncertain_resolved`` matching 52 CSV
+    sells. The inspect path must still emit ``hedge_fill`` so the tape
+    matches the wallet. Same numeric gate as ``should_mark_hedge_closed``.
+    """
+    return should_mark_hedge_closed(sold, remaining)
+
+
 def live_bag_log_fields(
     *,
     slug=None,
