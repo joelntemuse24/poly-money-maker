@@ -267,7 +267,9 @@ gate, not a paper invention: persist 50/52 coin-flips fail consensus
 until the other mid is ~**56¢+**, which is why named persist 32–53 was
 only **5** and dump-at-32 / held-to-zero dominate.
 
-On the VM (does **not** checkout the live tree):
+On the VM (does **not** checkout the live tree). ``cd`` into the repo
+so ``buy/`` imports; ``--repo`` is also inserted on ``sys.path`` when
+the file lives in ``/tmp``:
 
 ```bash
 cd ~/poly-money-maker
@@ -279,7 +281,24 @@ python3 /tmp/check_last120_tick_autopsy.py --repo "$PWD" \
     | tee /tmp/last120-research/autopsy.txt
 ```
 
-Paste `autopsy.txt` (and `reversal_1s.txt` if not already). Do **not**
-restart. Do **not** paste live JSON. The 31 surviving named-loss books
-are autopsied even when the journal join is still empty (synthetic
-last-120 75–90 first touch).
+If an older `/tmp` copy raises `No module named 'buy'`:
+
+```bash
+cd ~/poly-money-maker
+PYTHONPATH="$PWD" python3 /tmp/check_last120_tick_autopsy.py --repo "$PWD" \
+    --out /tmp/last120-research --since 2026-08-27T17:26:00 \
+    | tee /tmp/last120-research/autopsy.txt
+```
+
+**Binance 1s (VM `reversal_1s.txt`, T-90, overlay):** 1139 scored clocks —
+every 5m window, **not** only 75–90 books. Flip **15.4%**. |$20–40| is
+**12.4%** flips (the 27 Aug 25% figure is stale). Gate |dist|≥$25 keeps
+60% of *all* clocks at 6.5% flip / paper +$171. That keep% is an upper
+bound on fill loss: live already takes 36% of clocks (75–90). Against-mom
+skip is only +$36 paper on this all-window set. **Do not paste `$25` or
+a vol skip from this table.** Score edge on joined 75–90 fills after the
+autopsy.
+
+Paste `autopsy.txt`. Do **not** restart. Do **not** paste live JSON. The
+31 surviving named-loss books are autopsied even when the journal join
+is still empty (synthetic last-120 75–90 first touch).

@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -16,6 +18,7 @@ from check_last120_tick_autopsy import (
     fill_avg,
     index_tick_headers,
     pathlog_gui_ok,
+    repo_from_argv,
     resolve_slug,
     slug_from_start_ts,
     tick_density,
@@ -37,6 +40,30 @@ def _tick(ts: float, ttm: float, ua: float, da: float, ub=None, db=None):
         "ub": ua - 0.01 if ub is None else ub,
         "db": da - 0.01 if db is None else db,
     }
+
+
+class BootstrapPathTests(unittest.TestCase):
+    def test_repo_flag_not_file_parent(self):
+        repo = repo_from_argv(["/tmp/check_last120_tick_autopsy.py", "--repo", "/opt/poly"])
+        self.assertEqual(repo, Path("/opt/poly").resolve())
+
+    def test_cwd_when_flag_missing(self):
+        self.assertEqual(repo_from_argv(["/tmp/check_last120_tick_autopsy.py"]), Path.cwd().resolve())
+
+    def test_copied_to_tmp_imports_with_repo_flag(self):
+        src = Path(__file__).resolve().parents[1] / "check_last120_tick_autopsy.py"
+        with tempfile.TemporaryDirectory() as tmp:
+            dest = Path(tmp) / "check_last120_tick_autopsy.py"
+            dest.write_text(src.read_text(encoding="utf-8"), encoding="utf-8")
+            proc = subprocess.run(
+                [sys.executable, str(dest), "--repo", str(src.parent), "--help"],
+                cwd=tmp,
+                capture_output=True,
+                text=True,
+            )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("--since", proc.stdout)
+        self.assertNotIn("No module named 'buy'", proc.stderr)
 
 
 class ExtractAndSlugTests(unittest.TestCase):

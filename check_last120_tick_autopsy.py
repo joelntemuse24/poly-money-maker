@@ -6,12 +6,16 @@ Read-only. No orders. The 27–31 Aug join failed when a VM snippet required
 ``buy_success`` carries ``condition_id``). Research JSONL has ``slug`` /
 ``start_ts`` and ``logged_at`` (unix), not ``ts``.
 
-Usage (VM, copy the file off this branch — do not checkout over live):
+Usage (VM, copy the file off this branch — do not checkout over live).
+``cd`` into the repo first so ``buy/`` is importable, or pass ``--repo``
+(the script puts that path on ``sys.path`` even when the file lives in
+``/tmp``):
 
+  cd ~/poly-money-maker
   git fetch origin cursor/last120-loss-catalog-f488
   git show origin/cursor/last120-loss-catalog-f488:check_last120_tick_autopsy.py \\
       > /tmp/check_last120_tick_autopsy.py
-  python3 /tmp/check_last120_tick_autopsy.py --repo ~/poly-money-maker \\
+  python3 /tmp/check_last120_tick_autopsy.py --repo "$PWD" \\
       --out /tmp/last120-research --since 2026-08-27T17:26:00
 
 Paste the printed report (also written to ``$OUT/autopsy.txt``).
@@ -22,10 +26,31 @@ from __future__ import annotations
 import argparse
 import json
 import statistics
+import sys
 from collections import Counter, defaultdict
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+
+
+def repo_from_argv(argv: Optional[Sequence[str]] = None) -> Path:
+    """``--repo`` if passed, else cwd. Not ``__file__`` (copies live in /tmp)."""
+    args = list(sys.argv if argv is None else argv)
+    for i, arg in enumerate(args):
+        if arg == "--repo" and i + 1 < len(args):
+            return Path(args[i + 1]).expanduser().resolve()
+    return Path.cwd().resolve()
+
+
+def bootstrap_sys_path(argv: Optional[Sequence[str]] = None) -> Path:
+    repo = repo_from_argv(argv)
+    path = str(repo)
+    if path not in sys.path:
+        sys.path.insert(0, path)
+    return repo
+
+
+REPO = bootstrap_sys_path()
 
 from buy.hedge_gate import evaluate_held_bag, hedge_qualify_ok
 from buy.live_journal import default_journal_path, iter_rotated_paths
@@ -38,8 +63,6 @@ from check_path_backtest import (
     matches_series,
     simulate_fak_buy,
 )
-
-REPO = Path(__file__).resolve().parent
 OVERLAY_SINCE_ISO = "2026-08-27T17:26:00"
 OVERLAY_START_UNIX = 1787851560
 PATHLOG_GUI_SPREAD = 0.10
@@ -1018,7 +1041,12 @@ def build_report(repo: Path, out_dir: Path, since_iso: str) -> str:
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
     ap = argparse.ArgumentParser(description="Join 5m fills to pathlog ticks (no orders)")
-    ap.add_argument("--repo", type=Path, default=REPO)
+    ap.add_argument(
+        "--repo",
+        type=lambda value: Path(value).expanduser().resolve(),
+        default=REPO,
+        help="Repo root with buy/ and pathlog/ticks (cwd if omitted; not this file's directory)",
+    )
     ap.add_argument("--out", type=Path, default=Path("/tmp/last120-research"))
     ap.add_argument("--since", default=OVERLAY_SINCE_ISO)
     args = ap.parse_args(argv)
