@@ -2,7 +2,7 @@
 
 Research note. Operator shipped **B+C** (persist 1s, dump 40¢, flatten
 walks avg <75¢) on the VM **31 Aug ~22:25Z** and **`$10`**
-**31 Aug ~22:58Z**. Next is the last-30s hedge ladder (TTM>30 stays
+**31 Aug ~22:58Z**. Last-30s ladder live **31 Aug ~23:32Z** (TTM>30 stays
 40/50/52/53; TTM≤30 is dump 40 / persist 58/60 / recovery 62). Do **not** re-paste `$10`. Do
 **not** paste last-45 + $25. Do not size up from **$2.50**. Pastes
 are in `CURRENT.md`.
@@ -605,7 +605,7 @@ B+C (persist 1s / dump 40 / flatten &lt;75) is not in these rows
 ### What this does / does not change
 
 Stay **last-120 / 75–90 / $2.50**. **`$10` is live** (31 Aug ~22:58Z).
-Next is the last-30s hedge ladder after merge + 5m restart. Early /
+Last-30s ladder is live (`7d36a16`, 31 Aug ~23:32Z). Early /
 ≥95 / late_90 **off**. **Do not size up.** **Do not add a vol or
 against-momentum skip.** Measure B+C + `$10` + ladder on the next
 live recap, not this paper banner. Optional later: exclude `open` from banner `session_pnl` so

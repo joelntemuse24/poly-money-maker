@@ -15,7 +15,7 @@ The 5m bot buys the winning leg of Polymarket BTC "Up or Down" markets
 with **one $2.50** FAK. Entry **live since 27 Aug 2026 ~17:26Z**.
 **B+C exits live since 31 Aug ~22:25Z** (persist 1s / dump 40¢ /
 flatten walks). **`$10` live since 31 Aug ~22:58Z.** Last-30s hedge
-ladder is **code** (restart after this merge). Knobs are in live
+ladder **live since 31 Aug ~23:32Z** (`7d36a16`). Knobs are in live
 `strategy_buy5m.json`, **not** the example file. Catalog:
 `docs/2026-08-31-last120-loss-catalog.md`.
 
@@ -459,10 +459,10 @@ SSH (`git pull` + `pip install` only). Services are **not** auto-restarted —
 start/restart deliberately after validation (`systemctl start` / `restart`).
 
 Live overlay is last-120 plus B+C exits (persist 1s / dump 40 /
-flatten walks) pasted **31 Aug ~22:25Z** and **`$10`** pasted
-**31 Aug ~22:58Z**. After this merge: `git pull` + restart 5m for
-the last-30s ladder. **Do not re-paste `$10`. Do not paste last-45
-+ $25.** Do **not** start 15m, hourly, or mint.
+flatten walks) pasted **31 Aug ~22:25Z**, **`$10`** pasted
+**31 Aug ~22:58Z**, last-30s ladder live **31 Aug ~23:32Z**
+(`7d36a16`). **Do not re-paste `$10`. Do not paste last-45 + $25.**
+Do **not** start 15m, hourly, or mint.
 
 ## Dependencies
 
