@@ -297,8 +297,15 @@ python check_last120_tick_autopsy.py --since 2026-08-27T17:26:00
 python check_reversal_features.py --hours 72
 python check_reversal_features.py --hours 168
 python check_reversal_features.py --hours 336
-python check_reversal_features.py --csv exports/trades.csv --restart-utc 2026-08-27T08:57:16
+python check_reversal_features.py --csv exports/trades.csv --restart-utc 2026-08-27T17:26:00 --hours 96
 ```
+
+`--csv --restart-utc` scores the last-120 overlay wallet tape. Data API
+`/trades` has no Redeem; resolved opens become `paper_win` / `paper_loss`
+from Binance close vs PTB. **Do not treat `session_pnl` as live wallet
+cash** (31 Aug paper-credit banner −$163 still includes no-BTC opens;
+live recap is ~+$9). `last45_e25` keep **6 / −$3.46** — do not paste
+last-45+$25. Catalog §9.
 
 `--sweep` scores the 5m **example** late template (**75–90 / last 45s /
 $2.50** in `strategy_buy5m.example.json`; the **$25** edge is not in
