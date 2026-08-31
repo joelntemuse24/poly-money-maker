@@ -23,10 +23,10 @@ example file. Catalog: `docs/2026-08-31-last120-loss-catalog.md`.
 | Same window | ≥90¢ | **off** (`late_90_start_s=0`) |
 | TTM > 120s | none | early / ≥95 **off** |
 
-`min_underlying_edge_usd` is **$0**. Code defaults in `buybot5m.py`
-already look like last-120 / early-300 / edge $0; live JSON is the
-overlay above. `BUY_HORIZON_S` is **120**. **Do not paste last-45 +
-$25. Do not size up from $2.50.** See `CURRENT.md`.
+`min_underlying_edge_usd` is **$10** (skip 0–10 `|TWAP−PTB|`). Code
+defaults in `buybot5m.py` match last-120 / edge $10 after the paste;
+live JSON is the overlay. `BUY_HORIZON_S` is **120**. **Do not paste
+last-45 + $25. Do not size up from $2.50.** See `CURRENT.md`.
 
 Missed early does **not** become a $5 late buy — there is no early slice.
 Same-leg add only (no straddle), and only if the late ask is ≥ **90¢**
@@ -50,7 +50,7 @@ unless the operator asks. 15m stays stopped.
 | File | Service | Markets | Oracle | Budget | Window |
 |---|---|---|---|---|---|
 | `buybot.py` | `polybuybot` **stopped** | 15m | Chainlink TWAP 60s | $2.50 | final 4.0 min, 75–90¢, hedge 35/40 |
-| `buybot5m.py` | `polybuybot5m` **live** | 5m | Chainlink TWAP 30s | $2.50 | last **120s** 75–90, edge **$0**; persist **1s @ 50/52** (dump 40¢; flatten walks <75¢) |
+| `buybot5m.py` | `polybuybot5m` **live** | 5m | Chainlink TWAP 30s | $2.50 | last **120s** 75–90, edge **$10**; persist **1s @ 50/52** (dump 40¢; flatten walks <75¢) |
 | `buybothourly.py` | `polybuybothourly` **stopped** | hourly | Binance BTCUSDT | $10 cap | last **20 min** 75–90¢; persist **5s @ 50/52** + oracle veto |
 | `pathlog.py` | `polypathlog` **live** | all three | — (CLOB books only) | — | whole 5m; last 8m of 15m; last **20m** of hourly |
 
@@ -442,10 +442,10 @@ CI: pushes to `main` touching the buy bots, `pathlog.py`,
 SSH (`git pull` + `pip install` only). Services are **not** auto-restarted —
 start/restart deliberately after validation (`systemctl start` / `restart`).
 
-Live overlay is last-120 / edge $0 (27 Aug 17:26Z) plus B+C exits
-(persist 1s / dump 40 / flatten walks) pasted **31 Aug ~22:25Z**.
-**Do not re-paste** unless live JSON was overwritten. **Do not paste
-last-45 + $25.** See `CURRENT.md`. Do **not** start 15m, hourly, or mint.
+Live overlay is last-120 plus B+C exits (persist 1s / dump 40 /
+flatten walks) pasted **31 Aug ~22:25Z**. **Paste `$10` edge** (see
+`CURRENT.md`). **Do not paste last-45 + $25.** Do **not** start 15m,
+hourly, or mint.
 
 ## Dependencies
 

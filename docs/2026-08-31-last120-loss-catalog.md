@@ -1,9 +1,9 @@
 # Last-120 5m — first full overlay tape (27–31 Aug 2026)
 
 Research note. Operator shipped **B+C** (persist 1s, dump 40¢, flatten
-walks avg <75¢) on the VM **31 Aug ~22:25Z**. Do **not** paste last-45
-+ $25. Do not size up from **$2.50**. The already-applied live paste
-is in `CURRENT.md`.
+walks avg <75¢) on the VM **31 Aug ~22:25Z**. Next paste is last-120 +
+**`$10`** so 0–10 `|dist|` fills stay out. Do **not** paste last-45 +
+$25. Do not size up from **$2.50**. Pastes are in `CURRENT.md`.
 
 Live (VM 31 Aug ~15:49Z): last **120s**, winning ask **75–90¢**, one
 **$2.50** FAK @ **90¢**, `late_90` / early / ≥95 **off**,
@@ -448,6 +448,13 @@ Mean fill **0.801**, span **99.17h**, **4.1** fills/h. At 80¢ the
 no-hedge max flip is **20%**. 0–10 is not eatable; 10–20 is knife-edge;
 20+ mostly is. GATE `ev_nohedge` (flip × fill, not the fake wallet
 column): all **−0.09**; ≥10 **+0.13**; ≥20 **+0.18**; ≥30 **+0.25**.
+
+**0–10 is the entry leak.** 118 fills, **47 flips** (~40% flip). That
+is about **half** the scored session flips (47/83 in the printed
+buckets). Redeem-only at mean fill 80¢ is about **−$0.85**/fill in
+0–5 and **−$0.43** in 5–10 ≈ **−$73** on the pile. last-45+$25 kept
+**6/405** and is still no. last-120+`$10` keeps the window and drops
+only this pile. B+C still handles 10+ losers that fade.
 
 SESSION replay (keep if TTM ≤ window and |dist| ≥ edge — poisoned by
 −$2.70 opens until paper-credit):

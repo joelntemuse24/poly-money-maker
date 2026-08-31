@@ -1994,7 +1994,7 @@ class BalanceAndGcSemantics(unittest.TestCase):
             src,
         )
 
-    def test_docs_live_overlay_is_last120_edge0(self):
+    def test_docs_live_overlay_is_last120_edge10(self):
         root = BOT5M.parent
         current = (root / "CURRENT.md").read_text()
         agents = (root / "AGENTS.md").read_text()
@@ -2003,7 +2003,8 @@ class BalanceAndGcSemantics(unittest.TestCase):
             self.assertNotIn('d["buy_start_s"]=45', text, name)
             self.assertNotIn('d["min_underlying_edge_usd"]=25.0', text, name)
         self.assertIn("`min_underlying_edge_usd`", current)
-        self.assertIn("**$0**", current)
+        self.assertIn("**$10**", current)
+        self.assertIn('d["min_underlying_edge_usd"]=10.0', current)
         self.assertIn("docs/2026-08-31-last120-loss-catalog.md", current)
         self.assertIn("docs/2026-08-31-last120-loss-catalog.md", agents)
         ttd = (root / "TECHNICAL_DESIGN.md").read_text()

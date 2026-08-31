@@ -194,10 +194,11 @@ _STRATEGY_DEFAULTS = {
     "max_loser_bid": 0.30,
     "min_bid_edge": 0.05,
     # Skip buys unless live BTC is ≥ this many USD from the window Price To Beat,
-    # and only allow the side matching that underlying move. $0 on 5m = any
-    # non-zero TWAP tick (flat still fail-closed). 15m/hourly stay $10.
+    # and only allow the side matching that underlying move. Live 5m is $10
+    # so 0–10 |TWAP−PTB| fills (47%/34% flip on the last-120 tape) stay out.
+    # Flat still fail-closed. 15m/hourly stay $10. Do not paste $25.
     "underlying_gate_enabled": True,
-    "min_underlying_edge_usd": 0.0,
+    "min_underlying_edge_usd": 10.0,
     # Walks (avg < buy_threshold) arm toxic_fill. Flatten sells those bags
     # at the live bid while bid < 75¢ — do not wait for dump 40. Must be
     # <= buy_threshold (validator).

@@ -613,6 +613,7 @@ SESSION_REPLAY_GATES: tuple[tuple[str, float, float], ...] = (
     ("last45_e20", 45.0, 20.0),
     ("late60_e25", 60.0, 25.0),
     ("late120_e25", 120.0, 25.0),
+    ("late120_e10", 120.0, 10.0),
     ("last45_e0", 45.0, 0.0),
     ("late120_e0", 120.0, 0.0),
 )
@@ -1726,7 +1727,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     report.append("")
     report.append("NOTES")
-    report.append("- Live 5m already requires TWAP vs PTB side match ($0 edge). This study asks whether |dist|, vol, or against-momentum add flip prediction on top of that.")
+    report.append("- Live 5m requires TWAP vs PTB side match and |edge| ≥ $10 (after the $10 paste). This study still ranks |dist| / vol / against-momentum on top of that.")
     report.append("- Binance 1s/1m is not Chainlink TWAP 30s. Directional level/vol should still rank; exact dollar thresholds will not match the live feed tick-for-tick.")
     report.append("- 1m klines are stamped at closeTime. Open-time stamps of the close look up to 60s ahead (TTM 45 can see settlement). Prefer --binance-interval 1s.")
     report.append("- BTC-only rows include 50/50 windows the bot would never buy. CLOB late-band rows are the closer analog to a 75–90 fill.")
@@ -1736,9 +1737,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     report.append("- Data API /trades has no Redeem. session_pnl is not wallet cash until paper_win / paper_loss (Binance vs PTB) or a real Redeem row. Do not treat a CLOB-only tape of −$2.70 opens as live P&L.")
     report.append("")
     report.append("RECOMMENDATION (do not paste last-45 + $25 — that probe already lived empty/−EV)")
-    report.append("  entry: last 120s / 75–90 / edge $0 (live since 27 Aug 17:26Z)")
+    report.append("  entry: last 120s / 75–90 / edge $10 (skip 0–10 |dist|; not $25)")
     report.append("  early / ≥95 / late_90 overlay: stay off")
-    report.append("  oracle: min_underlying_edge_usd=0 (Binance |dist| gates here are research-only)")
+    report.append("  oracle: min_underlying_edge_usd=10 (Binance |dist| here is research; live is Chainlink TWAP)")
     report.append("  size: stay $2.50; do not size up from this table")
     report.append("  hedge: persist 1s @ 50/52, dump 40, flatten walks <75 (B+C); recovery 53")
     report.append("  do not add a vol or against-momentum skip")
