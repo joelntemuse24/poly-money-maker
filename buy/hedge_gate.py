@@ -154,21 +154,23 @@ def hedge_ladder_for_ttm(
     ask_max,
     recovery,
     late_ttm=30.0,
-    late_dump=0.55,
+    late_dump=0.40,
     late_qualify=0.58,
     late_ask_max=0.60,
     late_recovery=0.62,
 ) -> HedgeLadder:
-    """Raise the whole 5m hedge ladder in the last ``late_ttm`` seconds.
+    """Raise persist/recovery in the last ``late_ttm`` seconds. Dump stays 40.
 
     TTM > 30 keeps 40 / 50/52 / 53 so a one-tick 50 at T−90 does not dump
-    a 75¢ bag. TTM ≤ 30 (including 0 / already-closed) uses 55 / 58/60 / 62
-    so a last-30s 50 dumps now instead of waiting for 40 and riding to 0.
+    a 75¢ bag. TTM ≤ 30 (including 0 / already-closed) keeps dump **40**
+    and uses persist **58/60** / recovery **62**. A last-30s 50/52 must
+    still pass GUI + last-trade + 1s persist. A random 50 bid under a
+    high ask does not sell.
 
     Missing / invalid TTM stays on the early rung. ``late_ttm`` ≤ 0 disables
     the late rung. An illegal late rung (not dump < qualify ≤ recovery)
-    falls back to early. Late dump may exceed early qualify — do not require
-    late dump ≤ early threshold.
+    falls back to early. Late dump may exceed early qualify if an operator
+    sets it — do not require late dump ≤ early threshold.
     """
     try:
         early = HedgeLadder(
@@ -596,7 +598,7 @@ def held_hedge_decision(
     flatten_max=None,
     seconds_left=None,
     late_ttm=0.0,
-    late_dump=0.55,
+    late_dump=0.40,
     late_qualify=0.58,
     late_ask_max=0.60,
     late_recovery=0.62,
@@ -607,8 +609,9 @@ def held_hedge_decision(
     is only a pick fallback after REST is allowed to run. Dump and flatten
     skip the oracle; a persist sell does not.
 
-    Pass ``seconds_left`` to raise the dump/qualify/recovery rung in the
-    last ``late_ttm`` seconds (5m). ``late_ttm`` ≤ 0 or omitted TTM keeps
+    Pass ``seconds_left`` to raise persist/recovery in the last
+    ``late_ttm`` seconds (5m). Dump stays on the early floor unless
+    ``late_dump`` is set higher. ``late_ttm`` ≤ 0 or omitted TTM keeps
     the static early knobs. Hourly must not pass 5m seconds.
     """
     if seconds_left is not None:

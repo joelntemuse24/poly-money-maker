@@ -9,7 +9,9 @@ persist 1.0 / dump 0.4 / flatten True / start 120 / edge 10.0 /
 inactive). Do **not** re-paste `$10`. **Do not paste last-45 + $25**
 (replay keep **6 / −$3.46**). Next money move is the **last-30s hedge
 ladder** (this PR): TTM **>30** stays 40 / 50/52 / 53; TTM **≤30**
-is dump **55** / persist **58** / ask **60** / recovery **62**.
+is dump **40** / persist **58** / ask **60** / recovery **62**.
+A last-30s 50/52 waits **1s** + GUI/last-trade; a random 50 bid does
+not dump.
 Persist **1s** both rungs. Flatten **<75¢** unchanged. Restart
 required after merge — code defaults apply; no extra JSON paste.
 First last-120 tape at edge $0: barely +EV (**+$9 / ~94h ≈
@@ -32,7 +34,7 @@ match B+C plus the last-30s ladder defaults.
 | Early / ≥95 | **off** (`early_buy_start_s=120`, `early_95_start_s=0`) |
 | Size | **one $2.50** (`buy_budget=late_buy_budget=2.5`). **Do not size up.** |
 | Hedge TTM >30 | persist **1s** @ 50/52, dump **40¢**, flatten **<75¢**, recovery 53 |
-| Hedge TTM ≤30 | persist **1s** @ 58/60, dump **55¢**, recovery 62 (same flatten) |
+| Hedge TTM ≤30 | persist **1s** @ 58/60 + GUI/last-trade, dump **40¢**, recovery 62 (same flatten) |
 | Look / WS | `BUY_HORIZON_S` **120s** |
 
 **How we got here (do not relitigate):** last-45 + `$25` looked eatable
@@ -79,7 +81,7 @@ systemctl is-active polybuybot polybuybot5m polybuybothourly
 ```
 
 **Last-30s hedge ladder — after this merge.** Code defaults
-(`hedge_late_ttm_s=30`, dump 55 / qualify 58 / ask 60 / recovery 62)
+(`hedge_late_ttm_s=30`, dump 40 / qualify 58 / ask 60 / recovery 62)
 apply on restart. Live JSON does not need a new paste unless you want
 the keys written into the file. Confirm `dry_run` / `entry_enabled`.
 Printed `start` must stay **120**, `edge` **10**. Do **not** paste
@@ -361,8 +363,9 @@ amount / HTTP 400), not this NameError.
       inactive.
 - [ ] **Last-30s hedge ladder** (this PR). After merge: `git pull` +
       `sudo systemctl restart polybuybot5m`. No JSON paste. Measure
-      48h: `hedge_late=true` dump/persist; sell px last 30s (want
-      50–55 not 1–20); held-to-zero with TTM<20; sold-then-won vs
+      48h: `hedge_late=true` persist (not dump-55); last-30s 50/90
+      should hold; sell px after 1s consensus (want 50–58 not 1–20);
+      held-to-zero with TTM<20; sold-then-won vs
       tape’s 8; `$10` `edge_too_small` on 0–10; fill rate vs 4.1/h;
       B+C sell px / h2z; Dublin $/h; `cycle_error` 0.
 

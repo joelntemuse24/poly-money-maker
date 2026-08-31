@@ -222,7 +222,8 @@ Live 5m JSON (on the VM since 27 Aug 2026 ~17:26Z; **`CURRENT.md` wins**)
 is last **120s**, **75–90¢**, `min_underlying_edge_usd` **$10**,
 `late_90` / early / ≥95 **off**, one $2.50 FAK, persist **1s @ 50/52**,
 dump **40¢** ignore-oracle, flatten walks **avg <75¢** at live bid **<75¢**,
-recovery 53¢, last-30s ladder **55/58/60/62**, tick `0.001`. The example JSON
+recovery 53¢, last-30s ladder dump **40** / persist **58/60** / recovery
+**62**, tick `0.001`. The example JSON
 and `--sweep` template are still last **45s** + `$25` — that is
 research **entry**, not live. Example hedge knobs now match B+C
 (persist 1s / dump 40 / flatten) plus the last-30s ladder defaults.
