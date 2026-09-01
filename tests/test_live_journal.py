@@ -32,6 +32,8 @@ class JournalEventFilterTests(unittest.TestCase):
             "cycle_error",
             "pnl_recorded",
             "dry_sell",
+            "complement_fill",
+            "complement_skip",
         ):
             self.assertTrue(is_journal_event(name), name)
 
