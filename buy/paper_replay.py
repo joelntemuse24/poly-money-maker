@@ -21,7 +21,7 @@ from buy.hedge_gate import (
 
 GUI_SPREAD = 0.10
 ASK_92_MIN = 0.92
-ASK_92_MAX = 0.929999999999  # 92.0–92.9¢ on a 0.001 book; 0.92 on 0.01
+ASK_92_MAX = 0.924999999999  # nearest cent 92¢ (0.915–0.925); 0.93 floats stay out
 BUDGET = 2.5
 BUY_MAX_SPEND = 3.0
 BUY_MAX_SHARES = 5.0
@@ -208,15 +208,20 @@ def quoted_buy_shares_up_to_limit(
 
 
 def fak_fill(series: str, ask: float, ask_size: Optional[float] = None) -> dict:
-    """Size the FAK. 5m posts at 92¢; 15m pins the limit to the quoted ask."""
+    """Size the FAK. 5m posts at 92¢; 15m pins the limit to the 0.01 ask."""
+    ask_f = float(ask)
+    if series == "15m":
+        ask_f = round(ask_f + 1e-12, 2)
     if series == "5m":
         shares = quoted_buy_shares_up_to_limit(
-            BUDGET, ask, ASK_92_MIN, BUY_MAX_SHARES, BUY_MAX_SPEND,
+            BUDGET, ask_f, ASK_92_MIN, BUY_MAX_SHARES, BUY_MAX_SPEND,
         )
         limit = ASK_92_MIN
+        avg = limit
     else:
-        shares = quoted_buy_shares(BUDGET, ask, BUY_MAX_SHARES)
-        limit = ask
+        shares = quoted_buy_shares(BUDGET, ask_f, BUY_MAX_SHARES)
+        limit = ask_f
+        avg = ask_f
     out = {
         "status": "zero",
         "shares": 0.0,
@@ -232,8 +237,6 @@ def fak_fill(series: str, ask: float, ask_size: Optional[float] = None) -> dict:
         fill_sh = min(shares, math.floor(float(ask_size) * 10000 + 1e-12) / 10000)
     if fill_sh < 0.01:
         return out
-    avg = limit if series == "5m" else ask
-    # Optimistic: fill at the posted limit (5m) / quoted ask (15m). No walk.
     notional = fill_sh * avg
     status = "full"
     if ask_size is not None and ask_size + 1e-12 < shares:
@@ -269,21 +272,19 @@ def ticks_from_trades(
         if sec < int(start_ts) or sec > int(end_ts):
             continue
         outcome = str(row.get("outcome") or "").lower()
-        size = _f(row.get("size"))
         by_sec.setdefault(sec, []).append(
-            {"outcome": outcome, "px": px, "size": size}
+            {"outcome": outcome, "px": px}
         )
     up_px = dn_px = None
-    up_sz = dn_sz = None
     ticks: List[dict] = []
     t0 = int(start_ts)
     t1 = int(end_ts)
     for sec in range(t0, t1 + 1):
         for tr in by_sec.get(sec, []):
             if tr["outcome"] == "up":
-                up_px, up_sz = tr["px"], tr["size"]
+                up_px = tr["px"]
             elif tr["outcome"] == "down":
-                dn_px, dn_sz = tr["px"], tr["size"]
+                dn_px = tr["px"]
         if up_px is None or dn_px is None:
             continue
         ua, da = float(up_px), float(dn_px)
@@ -300,10 +301,6 @@ def ticks_from_trades(
                 "db": db,
                 "ult": ua,
                 "dlt": da,
-                "uas": up_sz,
-                "das": dn_sz,
-                "ubs": up_sz,
-                "dbs": dn_sz,
             }
         )
     return ticks
@@ -312,7 +309,8 @@ def ticks_from_trades(
 def ask_is_92(ask: Optional[float]) -> bool:
     if ask is None:
         return False
-    return ASK_92_MIN - 1e-12 <= float(ask) <= ASK_92_MAX + 1e-12
+    # Nearest cent. 0.929999… is 93¢ (float 0.93), not 92.
+    return abs(float(ask) - 0.92) < 0.005 + 1e-12
 
 
 def first_92_entry(
@@ -648,43 +646,50 @@ def evaluate_market(
 
 def summarize(rows: Sequence[dict]) -> dict:
     hits = [r for r in rows if r.get("hit")]
-    decided = [r for r in hits if r.get("won") is not None or (
-        r.get("pnl") is not None and r.get("exit") not in (None, "unresolved", "zero", "no_fill")
-    )]
-    # A hedge/dump sets won=False even on a winner dump. Count decided via pnl.
-    with_pnl = [r for r in hits if r.get("pnl") is not None]
-    wins = [r for r in with_pnl if r.get("exit") == "redeem_win"]
+    filled = [r for r in hits if r.get("fill") in ("full", "partial")]
+    with_pnl = [r for r in filled if r.get("pnl") is not None]
+    redeem_wins = [r for r in filled if r.get("exit") == "redeem_win"]
+    resolution_wins = [
+        r for r in filled
+        if r.get("winner") in ("up", "down") and r.get("winner") == r.get("leg")
+    ]
+    resolved = [
+        r for r in filled
+        if r.get("winner") in ("up", "down")
+    ]
     pnl = [float(r["pnl"]) for r in with_pnl]
     return {
         "markets": len(rows),
         "hits": len(hits),
-        "fills": sum(1 for r in hits if r.get("fill") in ("full", "partial")),
+        "fills": len(filled),
         "full": sum(1 for r in hits if r.get("fill") == "full"),
         "partial": sum(1 for r in hits if r.get("fill") == "partial"),
         "zero": sum(1 for r in hits if r.get("fill") == "zero"),
         "decided": len(with_pnl),
-        "redeem_wins": sum(1 for r in hits if r.get("exit") == "redeem_win"),
-        "redeem_losses": sum(1 for r in hits if r.get("exit") == "redeem_loss"),
-        "hedges": sum(1 for r in hits if r.get("exit") == "hedge"),
-        "dumps": sum(1 for r in hits if r.get("exit") == "dump"),
-        "flattens": sum(1 for r in hits if r.get("exit") == "flatten"),
-        "winner_dumps": sum(1 for r in hits if r.get("winner_dump")),
-        "hedge_late": sum(1 for r in hits if r.get("hedge_late")),
-        "unresolved": sum(1 for r in hits if r.get("exit") == "unresolved"),
-        "win_rate": (len(wins) / len(with_pnl)) if with_pnl else None,
+        "redeem_wins": len(redeem_wins),
+        "redeem_losses": sum(1 for r in filled if r.get("exit") == "redeem_loss"),
+        "hedges": sum(1 for r in filled if r.get("exit") == "hedge"),
+        "dumps": sum(1 for r in filled if r.get("exit") == "dump"),
+        "flattens": sum(1 for r in filled if r.get("exit") == "flatten"),
+        "winner_dumps": sum(1 for r in filled if r.get("winner_dump")),
+        "hedge_late": sum(1 for r in filled if r.get("hedge_late")),
+        "unresolved": sum(1 for r in filled if r.get("exit") == "unresolved"),
+        "win_rate": (len(redeem_wins) / len(with_pnl)) if with_pnl else None,
         "redeem_win_rate": (
-            (sum(1 for r in with_pnl if r.get("exit") == "redeem_win") / len(with_pnl))
-            if with_pnl else None
+            (len(redeem_wins) / len(with_pnl)) if with_pnl else None
+        ),
+        "resolution_win_rate": (
+            (len(resolution_wins) / len(resolved)) if resolved else None
         ),
         "pnl_sum": round(sum(pnl), 4) if pnl else 0.0,
         "pnl_per_hit": round(sum(pnl) / len(with_pnl), 4) if with_pnl else None,
-        "spend": round(sum(float(r["notional"]) for r in hits if r.get("notional")), 4),
+        "spend": round(sum(float(r["notional"]) for r in filled if r.get("notional")), 4),
         "misses": len(rows) - len(hits),
         "mean_ticks": (
             round(sum(int(r.get("tick_n") or 0) for r in rows) / len(rows), 1)
             if rows else 0.0
         ),
-        "decided_n": len(decided),
+        "decided_n": len(with_pnl),
     }
 
 

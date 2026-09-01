@@ -299,6 +299,8 @@ def score_public(
 def print_stats(title: str, stats: dict, tape: str) -> None:
     wr = stats.get("redeem_win_rate")
     wr_s = f"{wr:.1%}" if wr is not None else "n/a"
+    res = stats.get("resolution_win_rate")
+    res_s = f"{res:.1%}" if res is not None else "n/a"
     print()
     print(f"=== {title} ===")
     print(f"tape={tape}")
@@ -309,7 +311,8 @@ def print_stats(title: str, stats: dict, tape: str) -> None:
     )
     print(
         f"pnl={stats['pnl_sum']}  spend={stats['spend']}  "
-        f"pnl/hit={stats['pnl_per_hit']}  redeem_win_rate={wr_s}"
+        f"pnl/fill={stats['pnl_per_hit']}  redeem_win_rate={wr_s}  "
+        f"resolution_win_rate={res_s}"
     )
     print(
         f"redeem_wins={stats['redeem_wins']}  redeem_losses={stats['redeem_losses']}  "

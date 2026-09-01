@@ -45,6 +45,11 @@ class SizerTests(unittest.TestCase):
         self.assertGreaterEqual(fill["shares"], 2.5)
         self.assertAlmostEqual(fill["avg"], 0.92)
 
+    def test_15m_snaps_float_92_to_tick(self):
+        fill = fak_fill("15m", 0.9199999995)
+        self.assertEqual(fill["status"], "full")
+        self.assertAlmostEqual(fill["avg"], 0.92)
+
 
 class TickRebuildTests(unittest.TestCase):
     def test_forward_fills_every_second(self):
@@ -90,8 +95,8 @@ class EntryTests(unittest.TestCase):
         ticks = [_tick(1, 50, 0.92, 0.08, ub=0.10, db=0.01)]
         self.assertIsNone(first_92_entry(ticks, ttm_max=60))
 
-    def test_skips_91c(self):
-        ticks = [_tick(1, 50, 0.91, 0.09)]
+    def test_skips_93c_float(self):
+        ticks = [_tick(1, 50, 0.9299999888, 0.07)]
         self.assertIsNone(first_92_entry(ticks, ttm_max=60))
 
 
