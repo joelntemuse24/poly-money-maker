@@ -86,6 +86,7 @@ class HedgeSpec(NamedTuple):
     # ``crash`` = saw bid ≤ 40 after entry (live-legal). ``lost`` uses resolution.
     require_crash: bool = False
     require_lost: bool = False
+    dump_min_s: float = 0.0  # bid must stay ≤ dump this many seconds
 
 
 LIVE_FIVE = HedgeSpec(name="live_50_late30_58", style="5m")
@@ -870,6 +871,15 @@ def _informed_blocks_sell(
     if spec.require_lost and winner == held:
         return True
     dump = bool(intent.dump)
+    if spec.dump_min_s > 0 and dump:
+        ts = _f(row.get("ts")) or 0.0
+        so_far = [
+            t for t in ticks
+            if _f(t.get("ts")) is None or _f(t.get("ts")) <= ts + 1e-12
+        ]
+        feats = path_after_entry(so_far, hit, held)
+        if float(feats.get("sec_le40") or 0) + 1e-12 < float(spec.dump_min_s):
+            return True
     if dump:
         return False
     if spec.require_crash:
@@ -919,6 +929,12 @@ def informed_five_specs() -> List[HedgeSpec]:
             min_drop_from_entry=0.40,
         ),
         HedgeSpec(name="crash_then_persist_50", late_ttm=0.0, require_crash=True),
+        HedgeSpec(name="dump40_hold_1s", late_ttm=0.0, persist_s=5.0, dump_min_s=1.0),
+        HedgeSpec(name="dump40_hold_2s", late_ttm=0.0, persist_s=5.0, dump_min_s=2.0),
+        HedgeSpec(
+            name="persist3s_dump2s",
+            persist_s=3.0, late_ttm=0.0, dump_min_s=2.0,
+        ),
         HedgeSpec(name="hindsight_lost_only", require_lost=True),
         HedgeSpec(name="hindsight_lost_at_50", late_ttm=0.0, require_lost=True),
     ]

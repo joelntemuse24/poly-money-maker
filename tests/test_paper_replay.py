@@ -265,6 +265,19 @@ class HedgeSpecTests(unittest.TestCase):
         out = walk_5m_held(ticks, hit, fill, winner="down", spec=dump_only_spec(0.40))
         self.assertEqual(out["exit"], "redeem_loss")
 
+    def test_dump_hold_2s_skips_one_tick_40(self):
+        spec = HedgeSpec(name="dump40_hold_2s", late_ttm=0.0, persist_s=5.0, dump_min_s=2.0)
+        hit = {"ts": 1, "ttm": 80, "leg": "up", "ask": 0.92}
+        fill = fak_fill("5m", 0.92, budget=10.0)
+        ticks = [
+            _tick(1, 80, 0.92, 0.08),
+            _tick(2, 79, 0.90, 0.10, ub=0.39, db=0.01, ult=0.92, dlt=0.08),
+            _tick(3, 78, 0.95, 0.05),
+            _tick(4, 77, 0.99, 0.01),
+        ]
+        out = walk_5m_held(ticks, hit, fill, winner="up", spec=spec)
+        self.assertEqual(out["exit"], "redeem_win")
+
     def test_dump_only_sells_at_39(self):
         hit = {"ts": 1, "ttm": 80, "leg": "up", "ask": 0.92}
         fill = fak_fill("5m", 0.92, budget=10.0)
