@@ -1,7 +1,7 @@
 {
   "entry_enabled": false,
   "buy_threshold": 0.90,
-  "buy_max_price": 0.92,
+  "buy_max_price": 0.96,
   "min_winner_bid": 0.70,
   "max_loser_bid": 0.30,
   "min_bid_edge": 0.05,

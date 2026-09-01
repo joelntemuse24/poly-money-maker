@@ -3,15 +3,16 @@
 **Agents: read this after `AGENTS.md`.** Update this file when ops/strategy decisions change.
 Do not put secrets, API keys, or live wallet material here.
 
-Last updated: **2026-09-01** — **92¢ $10 production** (5m last **60s**
-90–92 + 15m last **3 min** 90–92). Paper week 25 Aug–1 Sep (last-trade
-1s, $10/fill): 5m dump-hold **2s** **+$109.43** (275 fills, WR 95.6%);
-15m inverted 35/40 **+$29.08** (234 fills, WR 93.2%); combined
-**~$138/wk**. Live JSON overlay still wins until the paste below.
+Last updated: **2026-09-01** — **90–96¢ $10 production** (5m last **60s**
+90–96 + 15m last **3 min** 90–96). Paper week 25 Aug–1 Sep was scored
+at 92¢ (last-trade 1s, $10/fill): 5m dump-hold **2s** **+$109.43**
+(275 fills, WR 95.6%); 15m inverted 35/40 **+$29.08** (234 fills,
+WR 93.2%); combined **~$138/wk**. Wider 90–96 takes more prints than
+that 92-only tape. Live JSON overlay still wins until the paste below.
 **Do not paste last-45 + $25.** Do **not** start hourly or mint.
 Do **not** start `polycomplement` until a **second** funded Polymarket
 account is in `.env.complement`. Do **not** re-enable last-30s persist
-58/60 on 92¢ fills.
+58/60 on these fills.
 Clip size is **$10** per fill on both bots.
 
 **Live combination after this paste + restart 5m + start 15m.**
@@ -21,7 +22,7 @@ Clip size is **$10** per fill on both bots.
 | Knob | Value |
 |---|---|
 | Entry time | last **60s** (`buy_start_s=60`, `late_90_start_s=0`) |
-| Ask | **90–92¢** (FAK **92¢**) |
+| Ask | **90–96¢** (FAK **96¢**) |
 | `min_underlying_edge_usd` | **$0** (any non-zero TWAP vs PTB; missing/flat skip) |
 | Early / ≥95 | **off** (`early_buy_start_s=60`, `early_95_start_s=0`) |
 | Size | **one $10** (`buy_budget=late_buy_budget=10`, spend **$11**, shares **17**) |
@@ -34,7 +35,7 @@ Clip size is **$10** per fill on both bots.
 | Knob | Value |
 |---|---|
 | Entry time | last **3 min** (`buy_window_min=3.0`) |
-| Ask | **90–92¢** (FAK pins to the live ask) |
+| Ask | **90–96¢** (FAK pins to the live ask) |
 | `min_underlying_edge_usd` | **$0** |
 | Size | **one $10** (spend **$11**, shares **17**) |
 | Hedge | keep inverted **35/40** + 70/30 GUI (not last-minute 58/60) |
@@ -51,6 +52,8 @@ almost all of that. Last-30s 58 cut 5m to +$65 — leave it off.
 **Paste + start (after `git pull`).** Live JSON overlays code defaults.
 Print `dry_run` / `entry` before restart. Confirm both files. Then
 restart 5m and **start 15m**. Hourly stays stopped.
+`early_95_min_price` must be **0.97** (current VM validator is
+`buy_max < early_95_min`). Leftover **0.95** rejects a 96¢ cap.
 
 ```bash
 cd ~/poly-money-maker && git pull
@@ -71,7 +74,8 @@ def patch(path, updates):
 patch("strategy_buy5m.json", {
     "buy_start_s": 60, "early_buy_start_s": 60, "early_95_start_s": 0,
     "early_95_min_s": 0, "late_90_start_s": 0,
-    "buy_threshold": 0.90, "buy_max_price": 0.92,
+    "buy_threshold": 0.90, "buy_max_price": 0.96,
+    "early_buy_max_price": 0.99, "early_95_min_price": 0.97,
     "buy_budget": 10.0, "late_buy_budget": 10.0,
     "buy_max_spend": 11.0, "buy_max_shares": 17.0,
     "min_underlying_edge_usd": 0.0,
@@ -84,7 +88,7 @@ patch("strategy_buy5m.json", {
 })
 patch("strategy_buy.json", {
     "buy_window_min": 3.0,
-    "buy_threshold": 0.90, "buy_max_price": 0.92,
+    "buy_threshold": 0.90, "buy_max_price": 0.96,
     "buy_budget": 10.0, "buy_max_spend": 11.0, "buy_max_shares": 17.0,
     "min_underlying_edge_usd": 0.0,
     "poll_buy_window_s": 0.01, "poll_held_s": 0.01,
@@ -105,7 +109,7 @@ First last-120 tape (27 Aug 17:26Z → 31 Aug 15:12 Dublin): **+$9**, WR ~**82%*
 take rate **411/1129 = 36%**, **73 walks**, **52 sells / 0 `hedge_fill`**
 (sells ghost via `hedge_uncertain_resolved`). Catalog:
 `docs/2026-08-31-last120-loss-catalog.md`. That overlay is **retired** by
-this 92¢ paste.
+this 90–96 paste.
 
 **31 Aug ~20:53Z reversal + participation paste:** SESSION TAPE **n=0**
 and participation **0 `csv` sources** were a join miss (generic title /
@@ -148,7 +152,7 @@ only. After `hedge_closed`, no re-buy. Early slice **off** (one $10, not two).
 
 | Knob | 5m | 15m |
 |---|---|---|
-| Window | last **60s**, **90–92¢**, FAK **92¢**, `$10` | last **3 min**, **90–92¢**, FAK at ask, `$10` |
+| Window | last **60s**, **90–96¢**, FAK **96¢**, `$10` | last **3 min**, **90–96¢**, FAK at ask, `$10` |
 | Last-45 ≥90 overlay | **off** (`late_90_start_s=0`) | n/a |
 | Early / ≥95 | **off** | n/a |
 | Hedge qualify | persist **1s @ 50/52** | instant **35/40** inverted 70/30 |
@@ -279,7 +283,7 @@ amount / HTTP 400), not this NameError.
 - **VM:** `~/poly-money-maker` on `instance-20260516-185922`.
 - **Mint:** `sudo systemctl stop polymintbot && sudo systemctl disable polymintbot`
 - **Buy bots:** **5m + 15m.** Stop/disable hourly and mint. Live JSON is
-  92¢ $10 last-60 / last-3min after the paste above. **Do not paste
+  90–96 $10 last-60 / last-3min after the paste above. **Do not paste
   last-45 + $25.** Do **not** start hourly or mint.
 - **Pathlog:** start `polypathlog` as above (no `.env` required).
 
@@ -378,17 +382,20 @@ amount / HTTP 400), not this NameError.
       1.0 / dump 0.4 / flatten True / start 120 / edge 10.0 /
       dry_run False / entry True. Services inactive / active /
       inactive.
-- [ ] **92¢ $10 production (this PR).** After merge: paste 5m last-60
-      90–92 $10 dump-hold 2s + 15m last-3min 90–92 $10 inverted 35/40,
-      `sudo systemctl restart polybuybot5m`, `sudo systemctl start
-      polybuybot`. Expect **active active inactive**. Do not start
-      hourly or mint. Measure 48h: 5m `buy_attempt` band=late 90–92
-      TTM≤60; dump `hedge_skip_persist` reason dump_waiting/dump_armed
-      then `hedge_fill`; 15m fills last 3 min; combined $/h vs paper
-      +$0.82/h; false dump rate vs paper 5/275; `cycle_error` 0.
-- [ ] **Complement second account (this PR).** Do **not** start until
-      `.env.complement` is a different funder. Copy example JSON, keep
-      dry_run until funded. Primary 5m/15m hedge unchanged.
+- [x] **92¢ $10 production** — paste + start 5m last-60 90–92 + 15m
+      last-3min 90–92 (#144, 1 Sep).
+- [x] **Complement second account** — code on main (#146). Do **not**
+      start until `.env.complement` is a different funder. Copy example
+      JSON, keep dry_run until funded. Primary 5m/15m hedge unchanged.
+- [ ] **90–96 $10 band raise (this PR).** After merge: paste 5m last-60
+      90–96 $10 dump-hold 2s + 15m last-3min 90–96 $10 inverted 35/40
+      (set `early_95_min_price` **0.97** so current validators accept
+      `buy_max` 0.96), `sudo systemctl restart polybuybot5m`,
+      `sudo systemctl start polybuybot`. Expect **active active
+      inactive**. Do not start hourly or mint. Measure 48h: 5m
+      `buy_attempt` band=late 90–96 TTM≤60; dump `hedge_skip_persist`
+      reason dump_waiting/dump_armed then `hedge_fill`; 15m fills last
+      3 min; 97–99 stay skipped; `cycle_error` 0.
 
 ---
 
@@ -398,7 +405,7 @@ amount / HTTP 400), not this NameError.
 2. Do **not** restart minting unless the operator asks. Do **not** start
    `polybuybothourly` unless the operator asks. Do **not** start
    `polycomplement` without a second-account `.env.complement`. Live buy
-   bots are **5m + 15m** after the 92¢ paste. Do **not** paste last-45 + $25.
+   bots are **5m + 15m** after the 90–96 paste. Do **not** paste last-45 + $25.
 3. Never truncate state/PnL/log files; never commit live strategy/state/`.env`.
    Pathlog ticks are **auto-pruned** (14d / 400 MB) — do not `rm` them by hand,
    but **do export** (`check_path_backtest.py --csv` or `scp` the ticks dir)

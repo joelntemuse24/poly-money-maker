@@ -12,20 +12,21 @@ and why the non-boilerplate code exists — is `TECHNICAL_DESIGN.md`.
 (`polypathlog`). Hourly is **stopped**. Mint (`polymintbot`) is **paused**.
 
 The 5m bot buys the winning leg of Polymarket BTC "Up or Down" markets
-with **one $10** FAK in the last **60s** at **90–92¢**. The 15m bot
+with **one $10** FAK in the last **60s** at **90–96¢**. The 15m bot
 does the same in the last **3 min** (FAK at the live ask). Paper week
-25 Aug–1 Sep 2026 ($10/fill, last-trade 1s): 5m dump-hold 2s **+$109**;
-15m inverted 35/40 **+$29**; combined **~$138/wk**. Knobs are in live
-`strategy_buy5m.json` / `strategy_buy.json`, **not** the example files
-until the operator paste. Catalog of the retired last-120 overlay:
+25 Aug–1 Sep 2026 ($10/fill, last-trade 1s) was scored at 92¢: 5m
+dump-hold 2s **+$109**; 15m inverted 35/40 **+$29**; combined
+**~$138/wk**. Knobs are in live `strategy_buy5m.json` /
+`strategy_buy.json`, **not** the example files until the operator
+paste. Catalog of the retired last-120 overlay:
 `docs/2026-08-31-last120-loss-catalog.md`.
 
 | When (time to close) | Winning ask | Slice |
 |---|---|---|
-| 5m last **60s** (`TTM ≤ 60`) | **90–92¢** | **$10** late, FAK **92¢** |
-| Same window | ≥93¢ | **off** (`late_90_start_s=0`) |
+| 5m last **60s** (`TTM ≤ 60`) | **90–96¢** | **$10** late, FAK **96¢** |
+| Same window | ≥97¢ | **off** (`late_90_start_s=0`) |
 | 5m TTM > 60s | none | early / ≥95 **off** |
-| 15m last **3 min** | **90–92¢** | **$10**, FAK at ask |
+| 15m last **3 min** | **90–96¢** | **$10**, FAK at ask |
 
 `min_underlying_edge_usd` is **$0** so paper-scored prints take (flat /
 missing still skip). Code defaults in `buybot5m.py` / `buybot.py` match
@@ -38,7 +39,7 @@ is ≥ **90¢** (`add_min_price`). After a full hedge the market is done.
 5m hedge is **persist 1s @ 50/52** (GUI: held ≤ **52¢**, other ≥
 **48¢**; not inverted 30/70). Then sell at the live bid while **< 53¢**.
 Bid ≥ **53¢** holds and **clears persist**. Last-30s ladder is **off**
-(`hedge_late_ttm_s=0`) — persist 58 on 92¢ fills dumped winners. Dump
+(`hedge_late_ttm_s=0`) — persist 58 on 92¢-style fills dumped winners. Dump
 stays **40¢** but must hold **2s** (`hedge_dump_persist_s`) so a
 one-tick V-reversal rides. Once holding, do **not persist-sell** while
 live Chainlink TWAP is still on the held side of PTB
@@ -53,8 +54,8 @@ unless the operator asks. **Start 15m** after the paste (`polybuybot`).
 
 | File | Service | Markets | Oracle | Budget | Window |
 |---|---|---|---|---|---|
-| `buybot.py` | `polybuybot` **start** | 15m | Chainlink TWAP 60s | $10 | last **3 min**, 90–92¢, hedge 35/40 inverted |
-| `buybot5m.py` | `polybuybot5m` **live** | 5m | Chainlink TWAP 30s | $10 | last **60s** 90–92, edge **$0**; persist **1s @ 50/52** (dump 40¢ hold **2s**; last-30s **off**; flatten <90¢) |
+| `buybot.py` | `polybuybot` **start** | 15m | Chainlink TWAP 60s | $10 | last **3 min**, 90–96¢, hedge 35/40 inverted |
+| `buybot5m.py` | `polybuybot5m` **live** | 5m | Chainlink TWAP 30s | $10 | last **60s** 90–96, edge **$0**; persist **1s @ 50/52** (dump 40¢ hold **2s**; last-30s **off**; flatten <90¢) |
 | `buybothourly.py` | `polybuybothourly` **stopped** | hourly | Binance BTCUSDT | $10 cap | last **20 min** 75–90¢; persist **5s @ 50/52** + oracle veto |
 | `pathlog.py` | `polypathlog` **live** | all three | — (CLOB books only) | — | whole 5m; last 8m of 15m; last **20m** of hourly |
 | `complementbot.py` | `polycomplement` **stopped** | other leg of 5m/15m fills | same TWAP as the source bot | share-match, cap $16 | other ask **80–99¢** after a primary fill |
@@ -221,7 +222,7 @@ add.
 
 Live 5m (after this change is deployed, JSON pasted, and `polybuybot5m` restarted):
 
-- `buy_attempt` `band=late` / `late_90` / `early` / `early_95` and `slice=early|late` — which 5m window armed. Live overlay is **late 90–92 last 60s** only.
+- `buy_attempt` `band=late` / `late_90` / `early` / `early_95` and `slice=early|late` — which 5m window armed. Live overlay is **late 90–96 last 60s** only.
 - `hedge_attempt` / `hedge_fill` — persist **1s @ 50/52** then sell live bid **< 53¢**. Dump ≤ **40¢** after **2s** (`dump_waiting` / `dump_armed`). Walk flatten (`reason=flatten_walk`) sells toxic bags while bid **<90¢**. Bid ≥ **53¢** holds (unless flattening). Last-30s ladder is **off**.
 - `hedge_skip_recovery` — persist_done but held bid ≥ 53¢; HOLD and clear persist. Do **not** sell 55–69. Flatten walks skip this early-out while bid <90¢.
 - `hedge_skip_oracle_still_winning` / `hedge_skip_oracle` — live TWAP still on held side of PTB, or feed missing/stale; do not persist-sell.
@@ -231,7 +232,7 @@ Live 5m (after this change is deployed, JSON pasted, and `polybuybot5m` restarte
 
 Live 15m (after `systemctl start polybuybot`):
 
-- `buy_attempt` last **3 min** 90–92¢, FAK at the live ask, `$10`.
+- `buy_attempt` last **3 min** 90–96¢, FAK at the live ask, `$10`.
 - Hedge stays inverted **35/40** + GUI 70/30. No last-minute 58/60.
 
 Complement (`polycomplement`, second account, **stopped** until `.env.complement`):
@@ -377,14 +378,14 @@ Cloud agents: `CLOUD_RESEARCH.md`.
   last-known-good hedge parameters. A per-bot process lock prevents duplicate
   live instances.
 - **FAK orders only:** All orders are Fill-And-Kill — no resting orders, no market
-  making. 5m buys are **limit** FAKs at the **open band max** (late **92¢**)
+  making. 5m buys are **limit** FAKs at the **open band max** (late **96¢**)
   sized `budget/ask` per slice, **at least 3 shares** when
   `3 × limit` fits in `buy_max_spend` $11 (`buy_max_shares` 17; not displayed
   top size). Early ≥90 is **off**. Hourly (stopped) uses
   the same limit-FAK sizer: A/C at **99¢**, B at **90¢**,
   `buy_max_spend` **$11**, `buy_max_shares` **14**. Hourly template is B-only
   (A/C windows **0**). 15m pins
-  the limit to the quoted ask (90–92 band). Sells stay
+  the limit to the quoted ask (90–96 band). Sells stay
   share-denominated market FAKs. A 400 **"no orders found to match"** re-quotes and
   POSTs again (up to 3) in the same trigger; invalid-amount / auth 400s and unclear
   POSTs do not. After a fully empty trigger, wait `empty_fak_cooldown_s` (0.15 s).
@@ -436,7 +437,7 @@ Cloud agents: `CLOUD_RESEARCH.md`.
    not 15m. Persist completes only on a still-qualified 50/52+GUI tick — do not
    pre-complete `persist_done` from elapsed wall clock alone.
 2. **The 5m bot uses seconds-based window checks** (live overlay:
-   `buy_start_s = 60` late 90–92¢; `late_90_start_s = 0`;
+   `buy_start_s = 60` late 90–96¢; `late_90_start_s = 0`;
    `early_buy_start_s` ≥ 60 so early is off; `early_95_start_s = 0`).
    Code defaults match last-60 / edge $0 / dump persist 2s. 15m uses
    minutes (`buy_window_min = 3.0`) and hourly uses minutes (template:
@@ -477,7 +478,7 @@ CI: pushes to `main` touching the buy bots, `pathlog.py`,
 SSH (`git pull` + `pip install` only). Services are **not** auto-restarted —
 start/restart deliberately after validation (`systemctl start` / `restart`).
 
-Live overlay is 92¢ $10 last-60 (5m) + last-3min (15m). After this
+Live overlay is 90–96 $10 last-60 (5m) + last-3min (15m). After this
 merge: paste live JSON (see `CURRENT.md`), restart 5m, **start 15m**.
 **Do not paste last-45 + $25.** Do **not** start hourly or mint.
 
