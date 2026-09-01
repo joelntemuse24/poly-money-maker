@@ -1,0 +1,17 @@
+[Unit]
+Description=Polymarket complement buyer (second account, other-leg ≥80¢)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ntemusejoel
+WorkingDirectory=/home/ntemusejoel/poly-money-maker
+Environment=PYTHONUNBUFFERED=1
+EnvironmentFile=/home/ntemusejoel/poly-money-maker/.env.complement
+ExecStart=/home/ntemusejoel/poly-money-maker/.venv/bin/python complementbot.py
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

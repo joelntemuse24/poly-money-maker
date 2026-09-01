@@ -1,0 +1,449 @@
+"""Unit tests for the second-account complement buyer (no network)."""
+
+from __future__ import annotations
+
+import json
+import unittest
+from pathlib import Path
+
+from buy.complement_gate import (
+    apply_balance_evidence,
+    apply_complement_outcome,
+    arm_from_primary_meta,
+    complement_fill_from_post,
+    complement_target_shares,
+    evaluate_complement,
+    mark_submit_quarantine,
+    other_leg_token,
+    primary_and_complement_same_wallet,
+    resolve_inflight,
+    should_block_post,
+)
+
+
+def _meta(**kwargs):
+    row = {
+        "bought_token": "DOWN1",
+        "bought_leg": "down",
+        "bought_size": 10.87,
+        "up_token": "UP1",
+        "dn_token": "DOWN1",
+        "end_ts": 1_800_000_000,
+        "slug": "btc-updown-5m-1800000000",
+        "hedge_closed": False,
+    }
+    row.update(kwargs)
+    return row
+
+
+class OtherLegTests(unittest.TestCase):
+    def test_down_hold_buys_up(self):
+        token, leg = other_leg_token("down", "UP1", "DOWN1")
+        self.assertEqual((token, leg), ("UP1", "up"))
+
+    def test_up_hold_buys_down(self):
+        token, leg = other_leg_token("up", "UP1", "DOWN1")
+        self.assertEqual((token, leg), ("DOWN1", "down"))
+
+    def test_unknown_leg_uses_token_id(self):
+        token, leg = other_leg_token("", "UP1", "DOWN1", bought_token="UP1")
+        self.assertEqual((token, leg), ("DOWN1", "down"))
+
+
+class ArmFromPrimaryTests(unittest.TestCase):
+    def test_arms_confirmed_fill(self):
+        armed = arm_from_primary_meta(
+            {"c1": _meta()},
+            source="5m",
+            now_s=1_799_999_900,
+        )
+        self.assertEqual(len(armed), 1)
+        self.assertEqual(armed[0].condition_id, "c1")
+        self.assertEqual(armed[0].other_token, "UP1")
+        self.assertEqual(armed[0].other_leg, "up")
+        self.assertAlmostEqual(armed[0].held_shares, 10.87)
+        self.assertEqual(armed[0].source, "5m")
+
+    def test_skips_hedge_closed(self):
+        armed = arm_from_primary_meta(
+            {"c1": _meta(hedge_closed=True)},
+            source="5m",
+            now_s=1_799_999_900,
+        )
+        self.assertEqual(armed, [])
+
+    def test_skips_flat_size(self):
+        armed = arm_from_primary_meta(
+            {"c1": _meta(bought_size=0.0)},
+            source="5m",
+            now_s=1_799_999_900,
+        )
+        self.assertEqual(armed, [])
+
+    def test_skips_uncertain_without_fill(self):
+        armed = arm_from_primary_meta(
+            {"c1": _meta(bought_token="", bought_size=0, buy_uncertain=True)},
+            source="5m",
+            now_s=1_799_999_900,
+        )
+        self.assertEqual(armed, [])
+
+    def test_skips_expired_past_grace(self):
+        armed = arm_from_primary_meta(
+            {"c1": _meta(end_ts=1000.0)},
+            source="5m",
+            now_s=2000.0,
+            grace_s=30.0,
+        )
+        self.assertEqual(armed, [])
+
+    def test_keeps_just_expired_inside_grace(self):
+        armed = arm_from_primary_meta(
+            {"c1": _meta(end_ts=1980.0)},
+            source="5m",
+            now_s=2000.0,
+            grace_s=30.0,
+        )
+        self.assertEqual(len(armed), 1)
+
+    def test_merges_5m_and_15m(self):
+        rows = []
+        rows.extend(arm_from_primary_meta({"a": _meta()}, source="5m", now_s=1))
+        rows.extend(
+            arm_from_primary_meta(
+                {"b": _meta(bought_token="UP2", bought_leg="up", up_token="UP2", dn_token="DN2")},
+                source="15m",
+                now_s=1,
+            )
+        )
+        self.assertEqual({r.source for r in rows}, {"5m", "15m"})
+        self.assertEqual(rows[1].other_token, "DN2")
+
+
+class TargetSharesTests(unittest.TestCase):
+    def test_share_match_at_80(self):
+        shares = complement_target_shares(
+            10.87, ask=0.80, limit=0.99, spend_cap=16.0, share_cap=20.0,
+        )
+        # 10.87 × 99¢ is not exact maker cents; snap down to a legal 2dp size.
+        self.assertAlmostEqual(shares, 10.00, places=2)
+        self.assertLessEqual(shares * 0.99, 16.0 + 1e-9)
+
+    def test_spend_cap_clips(self):
+        shares = complement_target_shares(
+            20.0, ask=0.80, limit=0.99, spend_cap=10.0, share_cap=40.0,
+        )
+        self.assertLessEqual(shares * 0.99, 10.0 + 1e-9)
+        self.assertGreaterEqual(shares, 10.0)
+
+    def test_zero_without_held(self):
+        self.assertEqual(
+            complement_target_shares(0.0, ask=0.80, limit=0.99, spend_cap=16.0),
+            0.0,
+        )
+
+
+class EvaluateComplementTests(unittest.TestCase):
+    def test_fires_at_80_tight_book(self):
+        fire, why, shares = evaluate_complement(
+            other_ask=0.80,
+            other_bid=0.78,
+            held_shares=10.87,
+            already_bought=False,
+            primary_still_holding=True,
+            oracle_favors_other=True,
+        )
+        self.assertTrue(fire)
+        self.assertEqual(why, "fire")
+        self.assertGreaterEqual(shares, 10.0)
+
+    def test_fires_at_95_no_ceiling(self):
+        fire, why, shares = evaluate_complement(
+            other_ask=0.95,
+            other_bid=0.93,
+            held_shares=10.87,
+            already_bought=False,
+            primary_still_holding=True,
+            oracle_favors_other=True,
+        )
+        self.assertTrue(fire)
+        self.assertEqual(why, "fire")
+
+    def test_skips_below_80(self):
+        fire, why, _ = evaluate_complement(
+            other_ask=0.79,
+            other_bid=0.77,
+            held_shares=10.87,
+            already_bought=False,
+            primary_still_holding=True,
+            oracle_favors_other=True,
+        )
+        self.assertFalse(fire)
+        self.assertEqual(why, "ask_below_min")
+
+    def test_skips_wide_book(self):
+        fire, why, _ = evaluate_complement(
+            other_ask=0.80,
+            other_bid=0.10,
+            held_shares=10.87,
+            already_bought=False,
+            primary_still_holding=True,
+            oracle_favors_other=True,
+        )
+        self.assertFalse(fire)
+        self.assertEqual(why, "wide_book")
+
+    def test_skips_when_primary_already_sold(self):
+        fire, why, _ = evaluate_complement(
+            other_ask=0.80,
+            other_bid=0.78,
+            held_shares=10.87,
+            already_bought=False,
+            primary_still_holding=False,
+            oracle_favors_other=True,
+        )
+        self.assertFalse(fire)
+        self.assertEqual(why, "primary_flat")
+
+    def test_skips_second_fill(self):
+        fire, why, _ = evaluate_complement(
+            other_ask=0.80,
+            other_bid=0.78,
+            held_shares=10.87,
+            already_bought=True,
+            primary_still_holding=True,
+            oracle_favors_other=True,
+        )
+        self.assertFalse(fire)
+        self.assertEqual(why, "already_bought")
+
+    def test_skips_oracle_still_on_held_side(self):
+        fire, why, _ = evaluate_complement(
+            other_ask=0.80,
+            other_bid=0.78,
+            held_shares=10.87,
+            already_bought=False,
+            primary_still_holding=True,
+            oracle_favors_other=False,
+        )
+        self.assertFalse(fire)
+        self.assertEqual(why, "oracle_still_held")
+
+    def test_skips_missing_ask(self):
+        fire, why, _ = evaluate_complement(
+            other_ask=None,
+            other_bid=0.78,
+            held_shares=10.87,
+            already_bought=False,
+            primary_still_holding=True,
+            oracle_favors_other=True,
+        )
+        self.assertFalse(fire)
+        self.assertEqual(why, "no_ask")
+
+
+class WalletIsolationTests(unittest.TestCase):
+    def test_same_funder_is_rejected(self):
+        self.assertTrue(
+            primary_and_complement_same_wallet(
+                "0xAbc", "0xabc",
+            )
+        )
+        self.assertFalse(
+            primary_and_complement_same_wallet(
+                "0xaaa", "0xbbb",
+            )
+        )
+        self.assertTrue(primary_and_complement_same_wallet("", ""))
+
+
+class ExampleJsonTests(unittest.TestCase):
+    def test_example_is_disarmed_80_99(self):
+        data = json.loads(
+            (Path(__file__).resolve().parents[1] / "strategy_complement.example.json").read_text()
+        )
+        self.assertIs(data["dry_run"], True)
+        self.assertIs(data["entry_enabled"], False)
+        self.assertEqual(data["buy_min_price"], 0.80)
+        self.assertEqual(data["buy_max_price"], 0.99)
+        self.assertIs(data["require_oracle"], True)
+        self.assertIn("positions_buy5m.json", data["primary_state_files"])
+        self.assertIn("positions_buy.json", data["primary_state_files"])
+        self.assertGreaterEqual(float(data["reject_cooldown_s"]), 1.0)
+        self.assertGreaterEqual(float(data["empty_cycle_cooldown_s"]), 0.5)
+        self.assertGreaterEqual(float(data["uncertain_timeout_s"]), 2.0)
+
+
+class PostOutcomeTests(unittest.TestCase):
+    def test_matched_size_is_fill_not_requested(self):
+        status, shares = complement_fill_from_post(
+            {"status": "matched", "size_matched": "4.20"},
+            requested=10.0,
+        )
+        self.assertEqual(status, "filled")
+        self.assertAlmostEqual(shares, 4.20)
+
+    def test_zero_matched_is_empty(self):
+        status, shares = complement_fill_from_post(
+            {"status": "matched", "size_matched": "0", "takingAmount": "0"},
+            requested=10.0,
+        )
+        self.assertEqual((status, shares), ("empty", 0.0))
+
+    def test_unmatched_error_is_empty(self):
+        status, shares = complement_fill_from_post(
+            {"success": False, "errorMsg": "no orders found to match with FAK order"},
+            requested=10.0,
+        )
+        self.assertEqual((status, shares), ("empty", 0.0))
+
+    def test_delayed_zero_is_ambiguous(self):
+        status, shares = complement_fill_from_post(
+            {"status": "delayed", "orderID": "abc", "takingAmount": "0"},
+            requested=10.0,
+        )
+        self.assertEqual((status, shares), ("ambiguous", 0.0))
+
+    def test_none_result_is_ambiguous(self):
+        status, shares = complement_fill_from_post(None, requested=10.0)
+        self.assertEqual((status, shares), ("ambiguous", 0.0))
+
+    def test_fixed_point_taking_amount(self):
+        status, shares = complement_fill_from_post(
+            {"status": "matched", "takingAmount": "4200000"},
+            requested=4.2,
+        )
+        self.assertEqual(status, "filled")
+        self.assertAlmostEqual(shares, 4.2)
+
+    def test_taking_amount_without_matched_status_is_ambiguous(self):
+        status, shares = complement_fill_from_post(
+            {"takingAmount": "10.00"},
+            requested=10.0,
+        )
+        self.assertEqual((status, shares), ("ambiguous", 0.0))
+
+    def test_unmatched_plus_balance_bump_is_ghost_fill(self):
+        status, shares = apply_balance_evidence(
+            "empty", 0.0, baseline=1.0, after=5.2,
+        )
+        self.assertEqual(status, "filled")
+        self.assertAlmostEqual(shares, 4.2)
+
+    def test_unmatched_unread_balance_stays_ambiguous(self):
+        status, shares = apply_balance_evidence(
+            "empty", 0.0, baseline=1.0, after=None,
+        )
+        self.assertEqual((status, shares), ("ambiguous", 0.0))
+
+    def test_unmatched_flat_balance_stays_empty(self):
+        status, shares = apply_balance_evidence(
+            "empty", 0.0, baseline=1.0, after=1.0,
+        )
+        self.assertEqual((status, shares), ("empty", 0.0))
+
+
+class QuarantineAndCooldownTests(unittest.TestCase):
+    def test_write_ahead_blocks_second_post(self):
+        meta = mark_submit_quarantine(
+            {}, token="UP1", shares=10.0, limit=0.99, baseline=0.0, now_s=100.0,
+        )
+        blocked, why = should_block_post(meta, 100.1)
+        self.assertTrue(blocked)
+        self.assertEqual(why, "in_flight")
+
+    def test_fill_clears_uncertain(self):
+        meta = mark_submit_quarantine(
+            {}, token="UP1", shares=10.0, limit=0.99, baseline=0.0, now_s=100.0,
+        )
+        apply_complement_outcome(
+            meta, status="filled", shares=4.2, token="UP1", leg="up",
+            source="5m", slug="s", held_token="DOWN1", now_s=101.0,
+            empty_cooldown_s=1.0, reject_cooldown_s=2.0,
+        )
+        self.assertFalse(meta.get("buy_uncertain"))
+        self.assertAlmostEqual(meta["bought_size"], 4.2)
+        blocked, why = should_block_post(meta, 101.0)
+        self.assertTrue(blocked)
+        self.assertEqual(why, "already_bought")
+
+    def test_empty_sets_cooldown(self):
+        meta = mark_submit_quarantine(
+            {}, token="UP1", shares=10.0, limit=0.99, baseline=0.0, now_s=100.0,
+        )
+        apply_complement_outcome(
+            meta, status="empty", shares=0.0, token="UP1", leg="up",
+            source="5m", slug="s", held_token="DOWN1", now_s=101.0,
+            empty_cooldown_s=1.0, reject_cooldown_s=2.0,
+        )
+        self.assertFalse(meta.get("buy_uncertain"))
+        blocked, why = should_block_post(meta, 101.5)
+        self.assertTrue(blocked)
+        self.assertEqual(why, "cooldown")
+        blocked, why = should_block_post(meta, 102.1)
+        self.assertFalse(blocked)
+
+    def test_rejected_uses_longer_cooldown(self):
+        meta = mark_submit_quarantine(
+            {}, token="UP1", shares=10.0, limit=0.99, baseline=0.0, now_s=100.0,
+        )
+        apply_complement_outcome(
+            meta, status="rejected", shares=0.0, token="UP1", leg="up",
+            source="5m", slug="s", held_token="DOWN1", now_s=101.0,
+            empty_cooldown_s=1.0, reject_cooldown_s=2.0,
+        )
+        blocked, why = should_block_post(meta, 102.5)
+        self.assertTrue(blocked)
+        self.assertEqual(why, "cooldown")
+        blocked, _ = should_block_post(meta, 103.1)
+        self.assertFalse(blocked)
+
+    def test_ambiguous_stays_in_flight(self):
+        meta = mark_submit_quarantine(
+            {}, token="UP1", shares=10.0, limit=0.99, baseline=0.0, now_s=100.0,
+        )
+        apply_complement_outcome(
+            meta, status="ambiguous", shares=0.0, token="UP1", leg="up",
+            source="5m", slug="s", held_token="DOWN1", now_s=101.0,
+            empty_cooldown_s=1.0, reject_cooldown_s=2.0,
+        )
+        self.assertTrue(meta.get("buy_uncertain"))
+        blocked, why = should_block_post(meta, 200.0)
+        self.assertTrue(blocked)
+        self.assertEqual(why, "in_flight")
+
+    def test_inflight_balance_bump_is_fill(self):
+        meta = mark_submit_quarantine(
+            {}, token="UP1", shares=10.0, limit=0.99, baseline=1.0, now_s=100.0,
+        )
+        status, shares = resolve_inflight(
+            meta, now_s=100.5, after=5.2, timeout_s=5.0,
+        )
+        self.assertEqual(status, "filled")
+        self.assertAlmostEqual(shares, 4.2)
+
+    def test_inflight_flat_balance_waits_then_empties(self):
+        meta = mark_submit_quarantine(
+            {}, token="UP1", shares=10.0, limit=0.99, baseline=1.0, now_s=100.0,
+        )
+        status, shares = resolve_inflight(
+            meta, now_s=102.0, after=1.0, timeout_s=5.0,
+        )
+        self.assertEqual((status, shares), ("wait", 0.0))
+        status, shares = resolve_inflight(
+            meta, now_s=105.0, after=1.0, timeout_s=5.0,
+        )
+        self.assertEqual((status, shares), ("empty", 0.0))
+
+    def test_inflight_unread_balance_stays_wait(self):
+        meta = mark_submit_quarantine(
+            {}, token="UP1", shares=10.0, limit=0.99, baseline=1.0, now_s=100.0,
+        )
+        status, shares = resolve_inflight(
+            meta, now_s=200.0, after=None, timeout_s=5.0,
+        )
+        self.assertEqual((status, shares), ("wait", 0.0))
+
+
+if __name__ == "__main__":
+    unittest.main()

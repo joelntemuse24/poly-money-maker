@@ -9,7 +9,9 @@ Last updated: **2026-09-01** — **92¢ $10 production** (5m last **60s**
 15m inverted 35/40 **+$29.08** (234 fills, WR 93.2%); combined
 **~$138/wk**. Live JSON overlay still wins until the paste below.
 **Do not paste last-45 + $25.** Do **not** start hourly or mint.
-Do **not** re-enable last-30s persist 58/60 on 92¢ fills.
+Do **not** start `polycomplement` until a **second** funded Polymarket
+account is in `.env.complement`. Do **not** re-enable last-30s persist
+58/60 on 92¢ fills.
 Clip size is **$10** per fill on both bots.
 
 **Live combination after this paste + restart 5m + start 15m.**
@@ -158,6 +160,26 @@ only. After `hedge_closed`, no re-buy. Early slice **off** (one $10, not two).
 
 **Also running (no orders):** `pathlog.py` (`polypathlog`) writes one JSONL file
 per market under `pathlog/ticks/`.
+
+### Complement (`polycomplement`) — **do not start yet**
+
+Second Polymarket account. First-account 5m/15m hedge is **unchanged**.
+After a confirmed primary fill, this process watches the **other** token
+and lifts it at **80–99¢** (FAK 99¢, share-match, oracle must favor that
+side). If the primary already sold (`hedge_closed`), it does not buy.
+
+Needs `.env.complement` with a **different** `FUNDER_ADDRESS` than `.env`.
+Same wallet is a hard refuse (the live 5m loop would see those shares and
+sell them). Copy `strategy_complement.example.json` →
+`strategy_complement.json`, keep `dry_run: true` until the second
+account is funded. Then `entry_enabled: true`, `dry_run: false`,
+`sudo systemctl start polycomplement`. Hourly/mint stay off.
+
+POST never invents a full fill (`size_matched` / GET-order only). A
+write-ahead `buy_uncertain` hits disk **before** the FAK. Empty / reject
+cools 1s / 2s so a miss does not retry every 0.01s look. Leftover
+quarantine resolves from wallet delta or empties after 5s if balances
+are flat; unread balance stays in-flight (no second POST).
 
 ---
 
@@ -364,6 +386,9 @@ amount / HTTP 400), not this NameError.
       TTM≤60; dump `hedge_skip_persist` reason dump_waiting/dump_armed
       then `hedge_fill`; 15m fills last 3 min; combined $/h vs paper
       +$0.82/h; false dump rate vs paper 5/275; `cycle_error` 0.
+- [ ] **Complement second account (this PR).** Do **not** start until
+      `.env.complement` is a different funder. Copy example JSON, keep
+      dry_run until funded. Primary 5m/15m hedge unchanged.
 
 ---
 
@@ -371,8 +396,9 @@ amount / HTTP 400), not this NameError.
 
 1. Read `AGENTS.md` + this file before changing mint/buy/hedge logic.
 2. Do **not** restart minting unless the operator asks. Do **not** start
-   `polybuybothourly` unless the operator asks. Live buy bots are **5m +
-   15m** after the 92¢ paste. Do **not** paste last-45 + $25.
+   `polybuybothourly` unless the operator asks. Do **not** start
+   `polycomplement` without a second-account `.env.complement`. Live buy
+   bots are **5m + 15m** after the 92¢ paste. Do **not** paste last-45 + $25.
 3. Never truncate state/PnL/log files; never commit live strategy/state/`.env`.
    Pathlog ticks are **auto-pruned** (14d / 400 MB) — do not `rm` them by hand,
    but **do export** (`check_path_backtest.py --csv` or `scp` the ticks dir)

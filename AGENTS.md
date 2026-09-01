@@ -57,6 +57,7 @@ unless the operator asks. **Start 15m** after the paste (`polybuybot`).
 | `buybot5m.py` | `polybuybot5m` **live** | 5m | Chainlink TWAP 30s | $10 | last **60s** 90–92, edge **$0**; persist **1s @ 50/52** (dump 40¢ hold **2s**; last-30s **off**; flatten <90¢) |
 | `buybothourly.py` | `polybuybothourly` **stopped** | hourly | Binance BTCUSDT | $10 cap | last **20 min** 75–90¢; persist **5s @ 50/52** + oracle veto |
 | `pathlog.py` | `polypathlog` **live** | all three | — (CLOB books only) | — | whole 5m; last 8m of 15m; last **20m** of hourly |
+| `complementbot.py` | `polycomplement` **stopped** | other leg of 5m/15m fills | same TWAP as the source bot | share-match, cap $16 | other ask **80–99¢** after a primary fill |
 
 Plus: `check_book.py`, `check_participation.py`, `check_path_backtest.py`,
 `check_fetch_trades.py`, `check_buy_skips.py`, `check_buy_rejects.py`,
@@ -79,6 +80,8 @@ Plus: `check_book.py`, `check_participation.py`, `check_path_backtest.py`,
 | `buy/entry_skip.py` | **5m + hourly:** band union, skip labels, add-min, three-slice hourly budgets | not imported by 15m |
 | `buy/hedge_gate.py` | 5m + hourly persist, recovery, fade, CLOB tick; 5m TTM ladder | not imported by 15m |
 | `buy/book.py` | Shared TOB price+size parse (WS cache + pathlog) | — |
+| `buy/complement_gate.py` | Second-account other-leg ≥80 arm/fire (no I/O) | `complementbot.py` |
+| `complementbot.py` | Complement buyer (**stopped**) | first-account hedge **unchanged** |
 
 **Pattern:** The three bots are near-identical copies (slug, oracle, window
 units, tick, defaults). A logic change to one usually needs the siblings.
@@ -150,6 +153,10 @@ functions with `ast` (`tests/test_buy_fill_shapes.py`).
 - **Do not start `polybuybothourly` unless the operator asks** —
   live trading is 5m + 15m (`polybuybot5m` + `polybuybot`). Do **not**
   start mint.
+- **Do not start `polycomplement` unless the operator has a second
+  Polymarket account in `.env.complement`.** Same funder is a hard
+  refuse. Do **not** change 5m/15m hedge logic to make same-account
+  complement work.
 - **Do not add a profit-take sell** unless the operator asks. Hedge is the only
   sell path. Take-profit was evaluated and dropped (unreachable on ≥90¢ fills;
   cuts $1.00 rides on 75–85¢ fills).
@@ -171,10 +178,10 @@ python check_book.py
 
 # CI-equivalent (no network to Polymarket required for unit tests)
 python3 -m py_compile buybot.py buybot5m.py buybothourly.py pathlog.py \
-  check_path_backtest.py mintbot.py buy/book.py buy/clob_book_ws.py \
-  buy/entry_skip.py buy/hedge_gate.py buy/live_journal.py \
- check_fetch_trades.py check_participation.py check_buy_skips.py \
- check_live_journal.py check_reversal_features.py check_last120_tick_autopsy.py
+  check_path_backtest.py mintbot.py complementbot.py buy/book.py buy/clob_book_ws.py \
+  buy/entry_skip.py buy/hedge_gate.py buy/complement_gate.py buy/live_journal.py \
+  check_fetch_trades.py check_participation.py check_buy_skips.py \
+  check_live_journal.py check_reversal_features.py check_last120_tick_autopsy.py
 python3 -m unittest discover -s tests -p 'test_*.py' -v
 
 # Full wallet fills (past the UI ~500-row export). Wallet: --user or FUNDER_ADDRESS.
@@ -226,6 +233,13 @@ Live 15m (after `systemctl start polybuybot`):
 
 - `buy_attempt` last **3 min** 90–92¢, FAK at the live ask, `$10`.
 - Hedge stays inverted **35/40** + GUI 70/30. No last-minute 58/60.
+
+Complement (`polycomplement`, second account, **stopped** until `.env.complement`):
+
+- Arms only after a primary `bought_token` in `positions_buy5m.json` / `positions_buy.json`.
+- `complement_fill` = other-leg FAK **80–99¢** (`size_matched` / GET-order, never the requested size). `complement_skip` `primary_flat` / `in_flight` / `cooldown` /
+  `ask_below_min` / `oracle_still_held` / `already_bought`.
+- First-account hedge is unchanged. If the primary already sold, complement does not buy.
 
 Stopped hourly (do not start unless asked):
 
@@ -456,6 +470,7 @@ Cloud agents: `CLOUD_RESEARCH.md`.
 | `polybuybothourly.service` | `buybothourly.py` (hourly) | **stopped** |
 | `polypathlog.service` | `pathlog.py` (CLOB path recorder; no orders) | **yes** |
 | `polymintbot.service` | `mintbot.py` | **paused** |
+| `polycomplement.service` | `complementbot.py` (other-leg ≥80) | **stopped** — second account |
 
 CI: pushes to `main` touching the buy bots, `pathlog.py`,
 `check_path_backtest.py`, `buy/`, or `requirements.txt` deploy to the VM via

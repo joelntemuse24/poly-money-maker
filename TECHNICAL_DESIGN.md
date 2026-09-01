@@ -130,6 +130,15 @@ persist 50/52 / dump 35 / Binance $10 buy-edge code remains in
 `buybothourly.py` for a later operator start. **15m is live** after
 the paste (last 3 min 90–92 / $10 / inverted 35/40).
 
+**Complement (`complementbot.py`) is a second Polymarket account.** It
+does not change 5m/15m sell-hedge. After a confirmed primary fill it
+lifts the other token at ≥80¢ (FAK 99¢, share-match). Same-wallet
+start is refused. Do not start `polycomplement` without
+`.env.complement`. A complement POST is never treated as a full fill
+from the request size: confirm `size_matched` / GET-order, persist
+`buy_uncertain` **before** the FAK, and cool empty/reject so a miss
+does not retry every look.
+
 Everything else in this document exists to do **that** without:
 
 - buying a fake 97¢ ask that sits over a 1¢ bid,
