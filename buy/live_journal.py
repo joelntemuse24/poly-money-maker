@@ -13,7 +13,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
 
-JOURNAL_PREFIXES = ("buy_", "hedge_", "sell_", "redeem_", "dry_")
+JOURNAL_PREFIXES = ("buy_", "hedge_", "sell_", "redeem_", "dry_", "complement_")
 JOURNAL_EXACT = frozenset(
     {
         "cycle_error",
