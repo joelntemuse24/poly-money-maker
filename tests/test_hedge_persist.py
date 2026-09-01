@@ -539,6 +539,51 @@ class FiveMFlattenWalkTests(unittest.TestCase):
         self.assertEqual(intent.reason, "bid_le_dump")
         self.assertAlmostEqual(intent.sell_at, 0.40)
 
+    def test_dump_persist_2s_holds_one_tick_v(self):
+        kw = dict(self.KW)
+        kw["flatten"] = False
+        armed = evaluate_held_bag(
+            0.39, 0.90, now_s=10.0, persist_armed_ts=None, persist_done=False,
+            gui_ok=False, dump_persist_s=2.0, dump_armed_ts=None, **kw,
+        )
+        self.assertEqual(armed.action, "arm")
+        self.assertEqual(armed.reason, "dump_armed")
+        self.assertTrue(armed.dump)
+        self.assertAlmostEqual(armed.dump_armed_ts, 10.0)
+        waiting = evaluate_held_bag(
+            0.39, 0.90, now_s=11.5, persist_armed_ts=None, persist_done=False,
+            gui_ok=False, dump_persist_s=2.0, dump_armed_ts=10.0, **kw,
+        )
+        self.assertEqual(waiting.action, "wait")
+        self.assertEqual(waiting.reason, "dump_waiting")
+        self.assertTrue(waiting.dump)
+        ready = evaluate_held_bag(
+            0.39, 0.90, now_s=12.0, persist_armed_ts=None, persist_done=False,
+            gui_ok=False, dump_persist_s=2.0, dump_armed_ts=10.0, **kw,
+        )
+        self.assertEqual(ready.action, "dump")
+        self.assertEqual(ready.reason, "bid_le_dump")
+        self.assertAlmostEqual(ready.sell_at, 0.39)
+
+    def test_dump_persist_resets_when_bid_recovers(self):
+        kw = dict(self.KW)
+        kw["flatten"] = False
+        intent = evaluate_held_bag(
+            0.99, 0.99, now_s=11.0, persist_armed_ts=None, persist_done=False,
+            gui_ok=False, dump_persist_s=2.0, dump_armed_ts=10.0, **kw,
+        )
+        self.assertEqual(intent.action, "hold")
+        self.assertEqual(intent.reason, "recovery_cancel")
+        self.assertIsNone(intent.dump_armed_ts)
+
+    def test_flatten_stays_instant_with_dump_persist(self):
+        intent = evaluate_held_bag(
+            0.70, 0.72, now_s=20.0, persist_armed_ts=None, persist_done=False,
+            gui_ok=False, dump_persist_s=2.0, dump_armed_ts=None, **self.KW,
+        )
+        self.assertEqual(intent.action, "dump")
+        self.assertEqual(intent.reason, "flatten_walk")
+
     def test_in_band_persist_sell_is_not_flatten(self):
         kw = dict(self.KW)
         kw["flatten"] = False
@@ -819,7 +864,7 @@ class FiveMTtmHedgeLadderTests(unittest.TestCase):
         hourly = (root / "buybothourly.py").read_text()
         fifteen = (root / "buybot.py").read_text()
         self.assertIn("hedge_ladder_for_ttm(", five)
-        self.assertIn('"hedge_late_ttm_s": 30.0', five)
+        self.assertIn('"hedge_late_ttm_s": 0.0', five)
         self.assertIn('"hedge_late_dump": 0.40', five)
         self.assertIn('"hedge_late_qualify": 0.58', five)
         self.assertIn('"hedge_late_ask_max": 0.60', five)

@@ -138,20 +138,21 @@ _STRATEGY_DEFAULTS = {
     # Explicit hot-reloadable entry arm. A missing/invalid file disables new
     # entries while existing positions continue through the hedge path.
     "entry_enabled": False,
-    # Trigger at 75¢: buy as soon as the winning ask is ≥ 75¢, priced at the
-    # live ask (so early catches ≈ 75¢). buy_max_price is a hard ceiling only —
-    # never pay above 90¢; we do not wait for or target the top of the band.
-    "buy_threshold": 0.75,
-    "buy_max_price": 0.90,
+    # Trigger at 90¢: last 3 minutes, winning ask 90–92¢. FAK pins to the
+    # live ask (15m does not use 5m band-max sizer). Paper week 25 Aug–1 Sep
+    # 2026: 234 fills WR 93.2%; inverted 35/40 ≈ +$29 / week at $10.
+    "buy_threshold": 0.90,
+    "buy_max_price": 0.92,
     # Consensus on Polymarket GUI display price (mid if spread≤10¢ else last trade).
     # Tuned for the 75¢ band (old 92¢/10¢ gates could never arm a 75¢ ask).
     "min_winner_bid": 0.70,
     "max_loser_bid": 0.30,
     "min_bid_edge": 0.05,
     # Skip buys unless live BTC is ≥ this many USD from the window Price To Beat,
-    # and only allow the side matching that underlying move.
+    # and only allow the side matching that underlying move. Live 15m 90–92
+    # last-3min is $0 so paper-scored prints take (flat / missing fail-closed).
     "underlying_gate_enabled": True,
-    "min_underlying_edge_usd": 10.0,
+    "min_underlying_edge_usd": 0.0,
     # Force-dump only when FAK avg is worse than this. Fills in
     # [toxic_force_exit_below, buy_threshold) stay on the normal hedge path.
     # Must be <= buy_threshold (validator); 65¢ ≈ walk well below the 75¢ floor.
@@ -174,15 +175,15 @@ _STRATEGY_DEFAULTS = {
     "hedge_max_spread": 0.15,
     "hedge_require_ask_max": 0.40,
     "hedge_require_gui": True,
-    "buy_window_min": 4.0,
+    "buy_window_min": 3.0,
     "buy_grace_s": 2,
     "buy_cooldown_s": 3,
     "empty_fak_cooldown_s": 0.15,
-    "buy_budget": 2.5,
-    # Hard ceiling on USDC sent per market. Strategy is $2.50; never more than $3.
-    "buy_max_spend": 3.0,
-    # Sanity rail: ~3.3 sh at $2.50/75¢. Raise this when you raise the dollar size.
-    "buy_max_shares": 5.0,
+    "buy_budget": 10.0,
+    # Hard ceiling on USDC sent per market. Strategy is $10; never more than $11.
+    "buy_max_spend": 11.0,
+    # Sanity rail: $11 / 90¢ ≈ 12.3 sh. 17 covers a cheap walk.
+    "buy_max_shares": 17.0,
     "max_open_positions": 0,  # 0 = unlimited
     "max_open_notional": 10000.0,
     "max_daily_notional": 999999.0,
@@ -191,9 +192,9 @@ _STRATEGY_DEFAULTS = {
     "max_redeem_age_days": 7,
     # Missing configuration must never arm real-money orders.
     "dry_run": True,
-    "poll_buy_window_s": 0.1,
+    "poll_buy_window_s": 0.01,
     # Sub-second while any position is held (hedge path), independent of buy window.
-    "poll_held_s": 0.05,
+    "poll_held_s": 0.01,
     "positions_refresh_s": 2,
     "balance_refresh_s": 15,
     # Throttle Rich position table while in hot mode (every N cycles).
