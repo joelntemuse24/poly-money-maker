@@ -27,7 +27,19 @@ import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
-from buy.paper_replay import evaluate_market, summarize, ticks_from_trades
+from buy.paper_replay import (
+    evaluate_market,
+    fak_fill,
+    fifteen_hedge_specs,
+    first_92_entry,
+    five_hedge_specs,
+    print_size_near,
+    salvage_breakeven,
+    summarize,
+    ticks_from_trades,
+    walk_15m_held,
+    walk_5m_held,
+)
 from check_path_backtest import iter_markets, matches_series
 
 GAMMA = "https://gamma-api.polymarket.com"
@@ -339,6 +351,327 @@ def export_csv(rows: Sequence[dict], dest: Path) -> None:
             writer.writerow(row)
 
 
+def market_tape(
+    http: requests.Session,
+    market: dict,
+    series_key: str,
+    cache_dir: Path,
+) -> Tuple[List[dict], List[dict]]:
+    start = int(market["start_ts"])
+    end = int(market["end_ts"])
+    fetch_start = start if series_key == "5m" else max(start, end - 8 * 60)
+    trades = fetch_trades(
+        http, market["condition_id"], fetch_start, end + 5, cache_dir,
+    )
+    ticks = ticks_from_trades(trades, fetch_start, end)
+    return trades, ticks
+
+
+def collect_entries(
+    http: requests.Session,
+    markets: Sequence[dict],
+    series_key: str,
+    cache_dir: Path,
+    workers: int,
+    budget: float,
+) -> List[dict]:
+    """One 92¢ hit (or miss) per market, with ticks kept for hedge variants."""
+    ttm_max = SERIES[series_key]["ttm_max"]
+    rows: List[Optional[dict]] = [None] * len(markets)
+
+    def one(idx_m: Tuple[int, dict]) -> Tuple[int, dict]:
+        idx, market = idx_m
+        trades, ticks = market_tape(http, market, series_key, cache_dir)
+        hit = first_92_entry(ticks, ttm_max=ttm_max)
+        winner = market.get("winner")
+        packed: Dict[str, Any] = {
+            "slug": market["slug"],
+            "series": series_key,
+            "winner": winner,
+            "ticks": ticks,
+            "trades": trades,
+            "hit": hit,
+            "print_1s": 0.0,
+            "print_3s": 0.0,
+        }
+        if hit is None:
+            packed["fill"] = None
+            return idx, packed
+        packed["print_1s"] = print_size_near(
+            trades, float(hit["ts"]), hit["leg"], window_s=0.0,
+        )
+        packed["print_3s"] = print_size_near(
+            trades, float(hit["ts"]), hit["leg"], window_s=1.0,
+        )
+        packed["fill"] = fak_fill(
+            series_key, float(hit["ask"]), None, budget=budget,
+        )
+        return idx, packed
+
+    done = 0
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futs = [pool.submit(one, (i, m)) for i, m in enumerate(markets)]
+        for fut in as_completed(futs):
+            idx, packed = fut.result()
+            rows[idx] = packed
+            done += 1
+            if done % 50 == 0 or done == len(markets):
+                print(f"  {series_key} entries {done}/{len(markets)}", flush=True)
+    return [r for r in rows if r is not None]
+
+
+def replay_entries(entries: Sequence[dict], spec, series_key: str) -> List[dict]:
+    walker = walk_5m_held if spec.style == "5m" else walk_15m_held
+    out = []
+    for item in entries:
+        hit = item.get("hit")
+        fill = item.get("fill")
+        winner = item.get("winner")
+        if hit is None or fill is None or fill.get("status") == "zero":
+            continue
+        settled = walker(item["ticks"], hit, fill, winner, spec=spec)
+        out.append(
+            {
+                "slug": item["slug"],
+                "series": series_key,
+                "hit": True,
+                "winner": winner,
+                "leg": hit.get("leg"),
+                "ask": hit.get("ask"),
+                "ttm": hit.get("ttm"),
+                "fill": fill.get("status"),
+                "shares": fill.get("shares"),
+                "notional": fill.get("notional"),
+                "avg": fill.get("avg"),
+                "won": settled.get("won"),
+                "pnl": settled.get("pnl"),
+                "exit": settled.get("exit"),
+                "exit_reason": settled.get("exit_reason"),
+                "exit_bid": settled.get("exit_bid"),
+                "exit_ttm": settled.get("exit_ttm"),
+                "hedge_late": settled.get("hedge_late"),
+                "winner_dump": settled.get("winner_dump"),
+                "tick_n": len(item.get("ticks") or []),
+                "hedge": spec.name,
+            }
+        )
+    return out
+
+
+def print_hedge_table(title: str, entries: Sequence[dict], specs, series_key: str) -> List[dict]:
+    filled = [
+        e for e in entries
+        if e.get("hit") is not None and (e.get("fill") or {}).get("status") in ("full", "partial")
+    ]
+    if not filled:
+        print(f"\n=== {title} ===\nno fills")
+        return []
+    sample = filled[0]["fill"]
+    shares = float(sample["shares"])
+    notional = float(sample["notional"])
+    win = shares - notional
+    print()
+    print(f"=== {title} ===")
+    print(
+        f"fills={len(filled)}  clip={shares:.2f} sh / ${notional:.2f}  "
+        f"win=+{win:.2f}  wipe=-{notional:.2f}  ride BE={salvage_breakeven(shares, notional, 0.0):.1%}"
+    )
+    print(
+        "perfect-hedge BE (losers only, no false sells):  "
+        + "  ".join(
+            f"@{c}¢={salvage_breakeven(shares, notional, c / 100.0):.1%}"
+            for c in (40, 50, 58, 60, 65, 70)
+        )
+    )
+    header = (
+        f"{'spec':<24} {'pnl':>8} {'$/fill':>7} {'WR':>6} {'false':>5} "
+        f"{'hedge':>5} {'dump':>5} {'redeem':>6} {'med_exit':>8}"
+    )
+    print(header)
+    print("-" * len(header))
+    table = []
+    for spec in specs:
+        rows = replay_entries(entries, spec, series_key)
+        stats = summarize(rows)
+        with_pnl = [r for r in rows if r.get("pnl") is not None]
+        pnl = sum(float(r["pnl"]) for r in with_pnl)
+        wr = stats.get("resolution_win_rate")
+        wr_s = f"{100 * wr:.1f}" if wr is not None else "n/a"
+        exits = [float(r["exit_bid"]) for r in rows if r.get("exit_bid") is not None]
+        exits.sort()
+        med = exits[len(exits) // 2] if exits else None
+        med_s = f"{med:.2f}" if med is not None else "—"
+        line = (
+            f"{spec.name:<24} {pnl:8.2f} {stats['pnl_per_hit'] or 0:7.3f} {wr_s:>6} "
+            f"{stats['winner_dumps']:5d} {stats['hedges']:5d} {stats['dumps']:5d} "
+            f"{stats['redeem_wins']:6d} {med_s:>8}"
+        )
+        print(line)
+        table.append(
+            {
+                "series": series_key,
+                "spec": spec.name,
+                "pnl": round(pnl, 4),
+                "fills": stats["fills"],
+                "winner_dumps": stats["winner_dumps"],
+                "hedges": stats["hedges"],
+                "dumps": stats["dumps"],
+                "redeem_wins": stats["redeem_wins"],
+                "redeem_losses": stats["redeem_losses"],
+                "median_exit": med,
+                "resolution_wr": wr,
+            }
+        )
+    return table
+
+
+def print_liquidity(title: str, entries: Sequence[dict], budget: float, series_key: str) -> None:
+    hits = [e for e in entries if e.get("hit") is not None]
+    if not hits:
+        return
+    fill = fak_fill(series_key, 0.92, None, budget=budget)
+    need = float(fill["shares"])
+    s1 = sorted(float(e["print_1s"]) for e in hits)
+    s3 = sorted(float(e["print_3s"]) for e in hits)
+
+    def pct(arr, p):
+        if not arr:
+            return 0.0
+        return arr[int(p / 100 * (len(arr) - 1))]
+
+    def cover(arr, sh):
+        return sum(1 for x in arr if x + 1e-12 >= sh) / len(arr) if arr else 0.0
+
+    print()
+    print(f"=== {title} liquidity (last-trade size at the 92¢ fire, NOT restable TOB) ===")
+    print(f"need {need:.2f} sh for ${budget:g} @ 92¢ (${fill['notional']:.2f})")
+    print(
+        f"same-second print p10/p50/p90={pct(s1,10):.2f}/{pct(s1,50):.2f}/{pct(s1,90):.2f}  "
+        f"cover {cover(s1, need):.1%}"
+    )
+    print(
+        f"±1s print        p10/p50/p90={pct(s3,10):.2f}/{pct(s3,50):.2f}/{pct(s3,90):.2f}  "
+        f"cover {cover(s3, need):.1%}"
+    )
+    for other in (10.0, 20.0, 25.0):
+        o = fak_fill(series_key, 0.92, None, budget=other)
+        print(
+            f"  ${other:g} needs {o['shares']:.2f} sh (${o['notional']:.2f})  "
+            f"same-sec cover {cover(s1, o['shares']):.1%}  ±1s {cover(s3, o['shares']):.1%}"
+        )
+
+
+def size_from_print_pnl(entries: Sequence[dict], spec, series_key: str, budget: float) -> dict:
+    """Pessimistic: cap FAK shares at same-second 92¢ print size."""
+    walker = walk_5m_held if spec.style == "5m" else walk_15m_held
+    rows = []
+    for item in entries:
+        hit = item.get("hit")
+        if hit is None:
+            continue
+        cap = float(item.get("print_1s") or 0.0)
+        fill = fak_fill(series_key, float(hit["ask"]), cap if cap > 0 else 0.0, budget=budget)
+        if fill.get("status") == "zero":
+            continue
+        settled = walker(item["ticks"], hit, fill, item.get("winner"), spec=spec)
+        rows.append(
+            {
+                "hit": True,
+                "fill": fill["status"],
+                "shares": fill["shares"],
+                "notional": fill["notional"],
+                "winner": item.get("winner"),
+                "leg": hit.get("leg"),
+                "pnl": settled.get("pnl"),
+                "exit": settled.get("exit"),
+                "winner_dump": settled.get("winner_dump"),
+                "hedge_late": settled.get("hedge_late"),
+            }
+        )
+    return summarize(rows)
+
+
+def live_book_snapshot(http: requests.Session) -> None:
+    """Public CLOB TOB for the current 5m/15m clocks — size at 92¢ now, not history."""
+    print("\n=== live CLOB snapshot (now, not the week tape) ===")
+    for series_key, slug in (
+        ("5m", "btc-up-or-down-5m"),
+        ("15m", "btc-up-or-down-15m"),
+    ):
+        try:
+            resp = http.get(
+                f"{GAMMA}/events",
+                params={"slug": slug, "closed": "false", "limit": 1},
+                timeout=15,
+            )
+            resp.raise_for_status()
+            events = resp.json() or []
+        except (requests.RequestException, ValueError, TypeError) as exc:
+            print(f"  {series_key}: gamma fail {exc}")
+            continue
+        if not events:
+            print(f"  {series_key}: no open event")
+            continue
+        markets = events[0].get("markets") or []
+        if not markets:
+            print(f"  {series_key}: no markets on event")
+            continue
+        m = markets[0]
+        tokens = m.get("clobTokenIds") or m.get("clob_token_ids")
+        if isinstance(tokens, str):
+            try:
+                tokens = json.loads(tokens)
+            except (TypeError, ValueError):
+                tokens = []
+        outcomes = m.get("outcomes")
+        if isinstance(outcomes, str):
+            try:
+                outcomes = json.loads(outcomes)
+            except (TypeError, ValueError):
+                outcomes = []
+        print(f"  {series_key} {events[0].get('slug')}")
+        for outcome, token in zip(outcomes or [], tokens or []):
+            try:
+                book = http.get(
+                    "https://clob.polymarket.com/book",
+                    params={"token_id": token},
+                    timeout=15,
+                )
+                book.raise_for_status()
+                raw = book.json() or {}
+            except (requests.RequestException, ValueError, TypeError) as exc:
+                print(f"    {outcome}: book fail {exc}")
+                continue
+            asks = raw.get("asks") or []
+            bids = raw.get("bids") or []
+
+            def _lvl(row):
+                if isinstance(row, dict):
+                    try:
+                        return float(row.get("price")), float(row.get("size") or 0)
+                    except (TypeError, ValueError):
+                        return None, 0.0
+                try:
+                    return float(row[0]), float(row[1])
+                except (TypeError, ValueError, IndexError):
+                    return None, 0.0
+
+            parsed_asks = [(_lvl(r)) for r in asks]
+            parsed_bids = [(_lvl(r)) for r in bids]
+            parsed_asks = [(p, s) for p, s in parsed_asks if p is not None]
+            parsed_bids = [(p, s) for p, s in parsed_bids if p is not None]
+            ask_px = ask_sz = bid_px = bid_sz = None
+            if parsed_asks:
+                ask_px, ask_sz = min(parsed_asks, key=lambda x: x[0])
+            if parsed_bids:
+                bid_px, bid_sz = max(parsed_bids, key=lambda x: x[0])
+            near92 = sum(sz for px, sz in parsed_asks if px <= 0.92 + 1e-12)
+            print(
+                f"    {outcome}: bid {bid_px} x {bid_sz}  ask {ask_px} x {ask_sz}  "
+                f"ask≤92 size={near92:.2f}"
+            )
+
+
 def main(argv: Optional[Sequence[str]] = None) -> int:
     ap = argparse.ArgumentParser(description="92¢ last-week paper P&L (1s ticks, live hedge gates)")
     ap.add_argument("--hours", type=float, default=168.0, help="lookback hours (default 168 = 7d)")
@@ -353,6 +686,16 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         type=float,
         default=10.0,
         help="USDC per fill (default 10). Live $2.50 rails are not used.",
+    )
+    ap.add_argument(
+        "--hedge-sweep",
+        action="store_true",
+        help="Replay the same 92¢ fills through ride / persist / dump / last-minute 15m 60¢.",
+    )
+    ap.add_argument(
+        "--size-from-print",
+        action="store_true",
+        help="Also score a pessimistic fill cap at same-second 92¢ last-trade size.",
     )
     args = ap.parse_args(argv)
 
@@ -395,30 +738,76 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     http = session()
     all_rows: List[dict] = []
+    sweep_tables: List[dict] = []
     for series_key in want:
         ttm = SERIES[series_key]["ttm_max"]
         tape = "last-trade-1s"
         pathlog = []
         if tick_dir is not None:
             pathlog = load_pathlog_markets(tick_dir, series_key, start_ts, end_ts)
-        if pathlog:
+        if pathlog and not args.hedge_sweep:
             print(f"\n{series_key}: {len(pathlog)} pathlog markets (TOB 1s)")
             rows = score_pathlog(pathlog, series_key, args.budget)
             tape = "pathlog-tob-1s"
-        else:
-            print(f"\n{series_key}: fetching Gamma calendar + last-trades (public, no keys)")
-            markets = enumerate_gamma(http, series_key, start_ts, end_ts)
-            print(f"  gamma markets ending in window: {len(markets)}")
-            if not markets:
-                print_stats(f"{series_key} 92¢ last {ttm:g}s", summarize([]), tape)
-                continue
-            rows = score_public(
+            stats = summarize(rows)
+            print_stats(f"{series_key} buy@92¢ last {ttm:g}s", stats, tape)
+            all_rows.extend(rows)
+            continue
+        print(f"\n{series_key}: fetching Gamma calendar + last-trades (public, no keys)")
+        markets = enumerate_gamma(http, series_key, start_ts, end_ts)
+        print(f"  gamma markets ending in window: {len(markets)}")
+        if not markets:
+            print_stats(f"{series_key} 92¢ last {ttm:g}s", summarize([]), tape)
+            continue
+        if args.hedge_sweep:
+            entries = collect_entries(
                 http, markets, series_key, args.cache, args.workers, args.budget,
             )
+            print_liquidity(
+                f"{series_key} 92¢ last {ttm:g}s", entries, args.budget, series_key,
+            )
+            specs = five_hedge_specs() if series_key == "5m" else fifteen_hedge_specs()
+            sweep_tables.extend(
+                print_hedge_table(
+                    f"{series_key} hedge sweep @ ${args.budget:g}",
+                    entries, specs, series_key,
+                )
+            )
+            if args.size_from_print:
+                live = specs[1] if len(specs) > 1 else specs[0]
+                ride = specs[0]
+                print(f"\n=== {series_key} pessimistic same-second print cap ===")
+                for spec in (ride, live):
+                    st = size_from_print_pnl(entries, spec, series_key, args.budget)
+                    print(
+                        f"  {spec.name}: fills={st['fills']} partial={st['partial']} "
+                        f"zero skipped  pnl={st['pnl_sum']} spend={st['spend']} "
+                        f"false={st['winner_dumps']}"
+                    )
+            continue
+        rows = score_public(
+            http, markets, series_key, args.cache, args.workers, args.budget,
+        )
         stats = summarize(rows)
         print_stats(f"{series_key} buy@92¢ last {ttm:g}s", stats, tape)
         all_rows.extend(rows)
 
+    if args.hedge_sweep:
+        live_book_snapshot(http)
+        if args.csv:
+            args.csv.parent.mkdir(parents=True, exist_ok=True)
+            fields = [
+                "series", "spec", "pnl", "fills", "winner_dumps", "hedges",
+                "dumps", "redeem_wins", "redeem_losses", "median_exit",
+                "resolution_wr",
+            ]
+            with args.csv.open("w", newline="", encoding="utf-8") as handle:
+                writer = csv.DictWriter(handle, fieldnames=fields, extrasaction="ignore")
+                writer.writeheader()
+                for row in sweep_tables:
+                    writer.writerow(row)
+            print(f"\nwrote {len(sweep_tables)} rows → {args.csv}")
+        return 0
     if args.csv:
         export_csv(all_rows, args.csv)
         print(f"\nwrote {len(all_rows)} rows → {args.csv}")

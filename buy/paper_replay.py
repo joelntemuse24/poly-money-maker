@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import math
 from decimal import Decimal, ROUND_DOWN
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, NamedTuple, Optional, Sequence, Tuple
 
 from buy.hedge_gate import (
     hedge_ladder_for_ttm,
@@ -50,6 +50,168 @@ FIFTEEN_THRESHOLD = 0.35
 FIFTEEN_ASK_MAX = 0.40
 FIFTEEN_SPREAD = 0.15
 FIFTEEN_TOXIC_BELOW = 0.65
+
+
+class HedgeSpec(NamedTuple):
+    """Paper exit knobs. Live 5m / 15m defaults; sweep variants override.
+
+    ``style``:
+    - ``5m`` — persist / dump / fade / recovery / optional TTM ladder
+    - ``15m`` — instant 35/40 + inverted 70/30 GUI
+    - ``15m_then_5m_late`` — 15m inverted until ``late_ttm``, then 5m persist
+    """
+
+    name: str = "live"
+    enabled: bool = True
+    style: str = "5m"
+    dump: float = FIVE_DUMP
+    qualify: float = FIVE_QUALIFY
+    ask_max: float = FIVE_ASK_MAX
+    recovery: float = FIVE_RECOVERY
+    persist_s: float = FIVE_PERSIST_S
+    sell_fade: bool = True
+    flatten: bool = True
+    late_ttm: float = FIVE_LATE_TTM
+    late_dump: float = FIVE_LATE_DUMP
+    late_qualify: float = FIVE_LATE_QUALIFY
+    late_ask_max: float = FIVE_LATE_ASK_MAX
+    late_recovery: float = FIVE_LATE_RECOVERY
+    fifteen_dump: float = FIFTEEN_THRESHOLD
+    fifteen_ask_max: float = FIFTEEN_ASK_MAX
+
+
+LIVE_FIVE = HedgeSpec(name="live_50_late30_58", style="5m")
+LIVE_FIFTEEN = HedgeSpec(
+    name="live_35_inverted",
+    style="15m",
+    dump=FIFTEEN_THRESHOLD,
+    qualify=FIFTEEN_THRESHOLD,
+    ask_max=FIFTEEN_ASK_MAX,
+    recovery=FIFTEEN_ASK_MAX,
+    persist_s=0.0,
+    late_ttm=0.0,
+)
+RIDE = HedgeSpec(name="ride", enabled=False, style="5m")
+
+
+def dump_only_spec(dump: float = 0.40, *, style: str = "5m") -> HedgeSpec:
+    """Bid-only dump; persist book is a 0.1¢ band so 50/52 never sells."""
+    dump_f = float(dump)
+    qualify = min(dump_f + 0.001, 0.99)
+    ask_max = min(qualify + 0.01, 1.0)
+    recovery = min(ask_max + 0.01, 1.0)
+    cents = int(round(dump_f * 100))
+    return HedgeSpec(
+        name=f"dump_{cents}",
+        style=style,
+        dump=dump_f,
+        qualify=qualify,
+        ask_max=ask_max,
+        recovery=recovery,
+        persist_s=1.0,
+        sell_fade=True,
+        flatten=False,
+        late_ttm=0.0,
+        late_dump=dump_f,
+        late_qualify=qualify,
+        late_ask_max=ask_max,
+        late_recovery=recovery,
+    )
+
+
+def five_hedge_specs() -> List[HedgeSpec]:
+    """92¢ 5m last-60s: same fills, different stops. Not live JSON."""
+    return [
+        RIDE,
+        LIVE_FIVE,
+        HedgeSpec(name="persist_50_no_late", late_ttm=0.0),
+        HedgeSpec(
+            name="persist_55_no_late",
+            qualify=0.55, ask_max=0.58, recovery=0.60, late_ttm=0.0,
+        ),
+        HedgeSpec(
+            name="persist_58_no_late",
+            qualify=0.58, ask_max=0.60, recovery=0.62, late_ttm=0.0,
+        ),
+        HedgeSpec(
+            name="persist_60_no_late",
+            qualify=0.60, ask_max=0.62, recovery=0.65, late_ttm=0.0,
+        ),
+        HedgeSpec(
+            name="persist_65_no_late",
+            qualify=0.65, ask_max=0.68, recovery=0.70, late_ttm=0.0,
+        ),
+        HedgeSpec(
+            name="persist_70_no_late",
+            qualify=0.70, ask_max=0.72, recovery=0.75, late_ttm=0.0,
+        ),
+        HedgeSpec(name="late15_58", late_ttm=15.0),
+        HedgeSpec(name="late45_58", late_ttm=45.0),
+        HedgeSpec(name="late60_58", late_ttm=60.0),
+        dump_only_spec(0.40),
+        dump_only_spec(0.50),
+        HedgeSpec(
+            name="persist_50_late30_60",
+            late_qualify=0.60, late_ask_max=0.62, late_recovery=0.65,
+        ),
+    ]
+
+
+def fifteen_hedge_specs() -> List[HedgeSpec]:
+    """92¢ 15m last-180s: live inverted vs last-minute 58/60 raise."""
+    late58 = dict(
+        late_dump=0.40, late_qualify=0.58, late_ask_max=0.60, late_recovery=0.62,
+    )
+    late60 = dict(
+        late_dump=0.40, late_qualify=0.60, late_ask_max=0.62, late_recovery=0.65,
+    )
+    return [
+        HedgeSpec(name="ride", enabled=False, style="15m"),
+        LIVE_FIFTEEN,
+        HedgeSpec(name="persist_50_like_5m", style="5m", late_ttm=0.0),
+        HedgeSpec(name="persist_50_late60_58", style="5m", late_ttm=60.0, **late58),
+        HedgeSpec(
+            name="persist_60_like_5m",
+            style="5m",
+            qualify=0.60, ask_max=0.62, recovery=0.65, late_ttm=0.0,
+        ),
+        HedgeSpec(
+            name="live_then_last60_58",
+            style="15m_then_5m_late",
+            late_ttm=60.0,
+            **late58,
+        ),
+        HedgeSpec(
+            name="live_then_last60_60",
+            style="15m_then_5m_late",
+            late_ttm=60.0,
+            **late60,
+        ),
+        HedgeSpec(
+            name="live_then_last90_58",
+            style="15m_then_5m_late",
+            late_ttm=90.0,
+            **late58,
+        ),
+        dump_only_spec(0.40, style="5m"),
+    ]
+
+
+def breakeven_wr(win_pnl: float, lose_pnl: float) -> Optional[float]:
+    """``p`` such that ``p*win + (1-p)*lose = 0``. ``lose`` is ≤ 0."""
+    span = float(win_pnl) - float(lose_pnl)
+    if abs(span) < 1e-12:
+        return None
+    return float(-lose_pnl) / span
+
+
+def salvage_breakeven(shares: float, notional: float, salvage: float) -> Optional[float]:
+    """BE win rate if every loser exits at ``salvage`` and no winner is sold."""
+    if shares <= 0 or notional <= 0:
+        return None
+    win = shares - notional
+    lose = shares * float(salvage) - notional
+    return breakeven_wr(win, lose)
 
 
 def _f(value: Any) -> Optional[float]:
@@ -326,6 +488,40 @@ def ticks_from_trades(
     return ticks
 
 
+def print_size_near(
+    trades: Sequence[dict],
+    ts: float,
+    outcome: str,
+    *,
+    px: float = 0.92,
+    window_s: float = 0.0,
+) -> float:
+    """Sum of last-trade size at ~``px`` for ``outcome`` within ``window_s`` of ``ts``.
+
+    This is flow at 92¢, not restable CLOB ask size. Used as a pessimistic
+    fill cap, not as the default paper fill.
+    """
+    total = 0.0
+    want = str(outcome or "").lower()
+    for row in trades:
+        row_ts = _f(row.get("ts") if "ts" in row else row.get("timestamp"))
+        row_px = _f(row.get("px") if "px" in row else row.get("price"))
+        if row_ts is None or row_px is None:
+            continue
+        if abs(row_ts - float(ts)) > float(window_s) + 1e-9:
+            continue
+        if str(row.get("outcome") or "").lower() != want:
+            continue
+        if abs(row_px - float(px)) >= 0.005 + 1e-12:
+            continue
+        total += float(row.get("size") or 0.0)
+    return total
+    if ask is None:
+        return False
+    # Nearest cent. 0.929999… is 93¢ (float 0.93), not 92.
+    return abs(float(ask) - 0.92) < 0.005 + 1e-12
+
+
 def ask_is_92(ask: Optional[float]) -> bool:
     if ask is None:
         return False
@@ -417,13 +613,123 @@ def _redeem(held: str, fill: dict, winner: Optional[str]) -> dict:
     }
 
 
+def _sell_result(
+    *,
+    shares: float,
+    notional: float,
+    px: float,
+    bid_sz: Optional[float],
+    ttm: Optional[float],
+    winner: Optional[str],
+    held: str,
+    intent,
+    late: bool,
+) -> Optional[dict]:
+    sell = shares
+    if bid_sz is not None:
+        sell = min(shares, bid_sz)
+    sell = math.floor(sell * 10000 + 1e-12) / 10000
+    if sell <= 0:
+        return None
+    proceeds = sell * float(px)
+    remain = max(0.0, shares - sell)
+    label = "dump" if intent.dump else "hedge"
+    if intent.reason == "flatten_walk":
+        label = "flatten"
+    if remain >= 0.01:
+        remain_val = remain if winner == held else 0.0
+        pnl = round(proceeds + remain_val - notional, 4)
+    else:
+        pnl = round(proceeds - notional, 4)
+    return {
+        "exit": label,
+        "exit_reason": intent.reason,
+        "exit_bid": float(px),
+        "exit_ttm": ttm,
+        "won": False,
+        "pnl": pnl,
+        "hedge_late": bool(late),
+        "winner_dump": bool(winner == held),
+    }
+
+
+def _five_intent_for_tick(
+    row: dict,
+    held: str,
+    other: str,
+    *,
+    spec: HedgeSpec,
+    ts: float,
+    ttm: Optional[float],
+    armed,
+    persist_done: bool,
+    toxic: bool,
+    static_late: bool = False,
+):
+    bid, ask, last = _leg_quote(row, held)
+    other_bid, other_ask, other_last = _leg_quote(row, other)
+    dump = spec.late_dump if static_late else spec.dump
+    qualify = spec.late_qualify if static_late else spec.qualify
+    ask_max = spec.late_ask_max if static_late else spec.ask_max
+    recovery = spec.late_recovery if static_late else spec.recovery
+    late_ttm = 0.0 if static_late else spec.late_ttm
+    ladder = hedge_ladder_for_ttm(
+        ttm,
+        dump,
+        qualify,
+        ask_max,
+        recovery,
+        late_ttm=late_ttm,
+        late_dump=spec.late_dump,
+        late_qualify=spec.late_qualify,
+        late_ask_max=spec.late_ask_max,
+        late_recovery=spec.late_recovery,
+    )
+    gui_ok, gui_why = hedge_consensus_ok(
+        bid, ask, last,
+        other_bid, other_ask, other_last,
+        held_gui_max=ladder.ask_max,
+        other_gui_min=round(1.0 - ladder.ask_max, 4),
+        min_edge=MIN_BID_EDGE,
+        last_trade_max=ladder.ask_max,
+    )
+    intent = held_hedge_decision(
+        bid, ask, bid, ask, bid, ask,
+        now_s=ts,
+        persist_armed_ts=armed,
+        persist_s=spec.persist_s,
+        persist_done=persist_done,
+        oracle_agrees=False,
+        dump_ignore_oracle=True,
+        dump_bid_max=dump,
+        qualify_bid=qualify,
+        qualify_ask_max=ask_max,
+        recovery_cancel=recovery,
+        sell_fade=spec.sell_fade,
+        max_spread=FIVE_SPREAD,
+        gui_ok=gui_ok,
+        gui_why=gui_why,
+        flatten=bool(spec.flatten and toxic),
+        flatten_max=FIVE_FLATTEN_MAX,
+        seconds_left=ttm,
+        late_ttm=late_ttm,
+        late_dump=spec.late_dump,
+        late_qualify=spec.late_qualify,
+        late_ask_max=spec.late_ask_max,
+        late_recovery=spec.late_recovery,
+    )
+    return intent, ladder, bid
+
+
 def walk_5m_held(
     ticks: Sequence[dict],
     hit: dict,
     fill: dict,
     winner: Optional[str],
+    spec: Optional[HedgeSpec] = None,
 ) -> dict:
     """Live 5m dump / persist-1s / fade / recovery / last-30s ladder / flatten."""
+    spec = spec or LIVE_FIVE
     shares = float(fill.get("shares") or 0.0)
     notional = float(fill.get("notional") or 0.0)
     avg = _f(fill.get("avg"))
@@ -438,8 +744,78 @@ def walk_5m_held(
             "pnl": 0.0 if winner else None,
             "hedge_late": False,
         }
+    if not spec.enabled:
+        return _redeem(held, fill, winner)
     toxic = avg is not None and avg < FIVE_TOXIC_BELOW - 1e-12
     other = "down" if held == "up" else "up"
+    armed = None
+    persist_done = False
+    for row in ticks:
+        if not _after_entry(row, hit):
+            continue
+        ttm = _f(row.get("ttm"))
+        ts = _f(row.get("ts"))
+        if ts is None:
+            continue
+        intent, ladder, bid = _five_intent_for_tick(
+            row, held, other,
+            spec=spec, ts=ts, ttm=ttm, armed=armed,
+            persist_done=persist_done, toxic=toxic,
+        )
+        persist_done = bool(intent.persist_done)
+        armed = intent.persist_ts
+        if intent.action not in {"sell", "dump"}:
+            continue
+        px = float(intent.sell_at) if intent.sell_at is not None else bid
+        if px is None:
+            continue
+        sold = _sell_result(
+            shares=shares, notional=notional, px=px,
+            bid_sz=_f(row.get("ubs" if held == "up" else "dbs")),
+            ttm=ttm, winner=winner, held=held, intent=intent,
+            late=bool(ladder.late),
+        )
+        if sold is not None:
+            return sold
+    return _redeem(held, fill, winner)
+
+
+def walk_15m_held(
+    ticks: Sequence[dict],
+    hit: dict,
+    fill: dict,
+    winner: Optional[str],
+    spec: Optional[HedgeSpec] = None,
+) -> dict:
+    """Stopped 15m: toxic dump at ≤35¢; else 35/40 book + inverted 70/30 GUI.
+
+    ``15m_then_5m_late`` keeps that inverted book until ``late_ttm``, then
+    switches to 5m persist (58/60 or 60/62). Raising 15m's 35/40 threshold
+    to 60 without dropping 70/30 GUI never sells at 60 — held GUI max is 30¢.
+    """
+    spec = spec or LIVE_FIFTEEN
+    if spec.style == "5m":
+        return walk_5m_held(ticks, hit, fill, winner, spec=spec)
+    shares = float(fill.get("shares") or 0.0)
+    notional = float(fill.get("notional") or 0.0)
+    avg = _f(fill.get("avg"))
+    held = hit.get("leg")
+    if shares <= 0 or notional <= 0 or held not in ("up", "down"):
+        return {
+            "exit": "no_fill",
+            "exit_reason": "no_fill",
+            "exit_bid": None,
+            "exit_ttm": None,
+            "won": None,
+            "pnl": 0.0 if winner else None,
+            "hedge_late": False,
+        }
+    if not spec.enabled:
+        return _redeem(held, fill, winner)
+    toxic = avg is not None and avg < FIFTEEN_TOXIC_BELOW - 1e-12
+    other = "down" if held == "up" else "up"
+    dump_px = float(spec.fifteen_dump)
+    ask_max = float(spec.fifteen_ask_max)
     armed = None
     persist_done = False
     for row in ticks:
@@ -449,120 +825,37 @@ def walk_5m_held(
         other_bid, other_ask, other_last = _leg_quote(row, other)
         ttm = _f(row.get("ttm"))
         ts = _f(row.get("ts"))
-        if ts is None:
+        if (
+            spec.style == "15m_then_5m_late"
+            and spec.late_ttm > 0
+            and ttm is not None
+            and ttm <= spec.late_ttm + 1e-12
+            and ts is not None
+        ):
+            intent, ladder, px_bid = _five_intent_for_tick(
+                row, held, other,
+                spec=spec, ts=ts, ttm=ttm, armed=armed,
+                persist_done=persist_done, toxic=toxic, static_late=True,
+            )
+            persist_done = bool(intent.persist_done)
+            armed = intent.persist_ts
+            if intent.action not in {"sell", "dump"}:
+                continue
+            px = float(intent.sell_at) if intent.sell_at is not None else px_bid
+            if px is None:
+                continue
+            sold = _sell_result(
+                shares=shares, notional=notional, px=px,
+                bid_sz=_f(row.get("ubs" if held == "up" else "dbs")),
+                ttm=ttm, winner=winner, held=held, intent=intent,
+                late=True,
+            )
+            if sold is not None:
+                return sold
             continue
-        ladder = hedge_ladder_for_ttm(
-            ttm,
-            FIVE_DUMP,
-            FIVE_QUALIFY,
-            FIVE_ASK_MAX,
-            FIVE_RECOVERY,
-            late_ttm=FIVE_LATE_TTM,
-            late_dump=FIVE_LATE_DUMP,
-            late_qualify=FIVE_LATE_QUALIFY,
-            late_ask_max=FIVE_LATE_ASK_MAX,
-            late_recovery=FIVE_LATE_RECOVERY,
-        )
-        gui_ok, gui_why = hedge_consensus_ok(
-            bid, ask, last,
-            other_bid, other_ask, other_last,
-            held_gui_max=ladder.ask_max,
-            other_gui_min=round(1.0 - ladder.ask_max, 4),
-            min_edge=MIN_BID_EDGE,
-            last_trade_max=ladder.ask_max,
-        )
-        intent = held_hedge_decision(
-            bid, ask, bid, ask, bid, ask,
-            now_s=ts,
-            persist_armed_ts=armed,
-            persist_s=FIVE_PERSIST_S,
-            persist_done=persist_done,
-            oracle_agrees=False,
-            dump_ignore_oracle=True,
-            dump_bid_max=FIVE_DUMP,
-            qualify_bid=FIVE_QUALIFY,
-            qualify_ask_max=FIVE_ASK_MAX,
-            recovery_cancel=FIVE_RECOVERY,
-            sell_fade=True,
-            max_spread=FIVE_SPREAD,
-            gui_ok=gui_ok,
-            gui_why=gui_why,
-            flatten=toxic,
-            flatten_max=FIVE_FLATTEN_MAX,
-            seconds_left=ttm,
-            late_ttm=FIVE_LATE_TTM,
-            late_dump=FIVE_LATE_DUMP,
-            late_qualify=FIVE_LATE_QUALIFY,
-            late_ask_max=FIVE_LATE_ASK_MAX,
-            late_recovery=FIVE_LATE_RECOVERY,
-        )
-        persist_done = bool(intent.persist_done)
-        armed = intent.persist_ts
-        if intent.action not in {"sell", "dump"}:
-            continue
-        px = float(intent.sell_at)
-        bid_sz = _f(row.get("ubs" if held == "up" else "dbs"))
-        sell = shares
-        if bid_sz is not None:
-            sell = min(shares, bid_sz)
-        sell = math.floor(sell * 10000 + 1e-12) / 10000
-        if sell <= 0:
-            continue
-        proceeds = sell * px
-        remain = max(0.0, shares - sell)
-        label = "dump" if intent.dump else "hedge"
-        if intent.reason == "flatten_walk":
-            label = "flatten"
-        if remain >= 0.01:
-            remain_val = remain if winner == held else 0.0
-            pnl = round(proceeds + remain_val - notional, 4)
-        else:
-            pnl = round(proceeds - notional, 4)
-        return {
-            "exit": label,
-            "exit_reason": intent.reason,
-            "exit_bid": px,
-            "exit_ttm": ttm,
-            "won": False,
-            "pnl": pnl,
-            "hedge_late": bool(ladder.late),
-            "winner_dump": bool(winner == held),
-        }
-    return _redeem(held, fill, winner)
-
-
-def walk_15m_held(
-    ticks: Sequence[dict],
-    hit: dict,
-    fill: dict,
-    winner: Optional[str],
-) -> dict:
-    """Stopped 15m: toxic dump at ≤35¢; else 35/40 book + inverted 70/30 GUI."""
-    shares = float(fill.get("shares") or 0.0)
-    notional = float(fill.get("notional") or 0.0)
-    avg = _f(fill.get("avg"))
-    held = hit.get("leg")
-    if shares <= 0 or notional <= 0 or held not in ("up", "down"):
-        return {
-            "exit": "no_fill",
-            "exit_reason": "no_fill",
-            "exit_bid": None,
-            "exit_ttm": None,
-            "won": None,
-            "pnl": 0.0 if winner else None,
-            "hedge_late": False,
-        }
-    toxic = avg is not None and avg < FIFTEEN_TOXIC_BELOW - 1e-12
-    other = "down" if held == "up" else "up"
-    for row in ticks:
-        if not _after_entry(row, hit):
-            continue
-        bid, ask, last = _leg_quote(row, held)
-        other_bid, other_ask, other_last = _leg_quote(row, other)
-        ttm = _f(row.get("ttm"))
         if bid is None:
             continue
-        if toxic and bid <= FIFTEEN_THRESHOLD + 1e-12:
+        if toxic and bid <= dump_px + 1e-12:
             return {
                 "exit": "dump",
                 "exit_reason": "toxic_bid",
@@ -574,7 +867,7 @@ def walk_15m_held(
                 "winner_dump": bool(winner == held),
             }
         ok, why = hedge_qualify_ok(
-            bid, ask, FIFTEEN_THRESHOLD, FIFTEEN_SPREAD, FIFTEEN_ASK_MAX,
+            bid, ask, dump_px, FIFTEEN_SPREAD, ask_max,
         )
         if not ok:
             continue
@@ -584,7 +877,7 @@ def walk_15m_held(
             held_gui_max=MAX_LOSER_BID,
             other_gui_min=MIN_WINNER_BID,
             min_edge=MIN_BID_EDGE,
-            last_trade_max=FIFTEEN_ASK_MAX,
+            last_trade_max=ask_max,
         )
         if not gui_ok:
             continue
@@ -609,6 +902,8 @@ def evaluate_market(
     winner: Optional[str],
     slug: str = "",
     budget: float = BUDGET,
+    hedge: Optional[HedgeSpec] = None,
+    ask_size: Optional[float] = None,
 ) -> dict:
     hit = first_92_entry(ticks, ttm_max=ttm_max)
     base = {
@@ -635,7 +930,9 @@ def evaluate_market(
     }
     if hit is None:
         return base
-    fill = fak_fill(series, float(hit["ask"]), hit.get("ask_size"), budget=budget)
+    spec = hedge or (LIVE_FIVE if series == "5m" else LIVE_FIFTEEN)
+    size = ask_size if ask_size is not None else hit.get("ask_size")
+    fill = fak_fill(series, float(hit["ask"]), size, budget=budget)
     base.update(
         hit=True,
         leg=hit["leg"],
@@ -650,8 +947,8 @@ def evaluate_market(
         base["exit"] = "zero"
         base["pnl"] = 0.0 if winner else None
         return base
-    walker = walk_5m_held if series == "5m" else walk_15m_held
-    settled = walker(ticks, hit, fill, winner)
+    walker = walk_5m_held if spec.style == "5m" else walk_15m_held
+    settled = walker(ticks, hit, fill, winner, spec=spec)
     base.update(
         won=settled.get("won"),
         pnl=settled.get("pnl"),

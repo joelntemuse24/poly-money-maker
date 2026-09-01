@@ -5,10 +5,14 @@ from __future__ import annotations
 import unittest
 
 from buy.paper_replay import (
+    HedgeSpec,
+    RIDE,
+    dump_only_spec,
     evaluate_market,
     fak_fill,
     first_92_entry,
     quoted_buy_shares_up_to_limit,
+    salvage_breakeven,
     summarize,
     ticks_from_trades,
     walk_15m_held,
@@ -234,6 +238,90 @@ class EvaluateMarketTests(unittest.TestCase):
         row = evaluate_market(ticks, series="5m", ttm_max=60, winner="up")
         self.assertFalse(row["hit"])
         self.assertIsNone(row["pnl"])
+
+
+class HedgeSpecTests(unittest.TestCase):
+    def test_ride_does_not_sell_50_52(self):
+        hit = {"ts": 1000, "ttm": 90, "leg": "up", "ask": 0.92}
+        fill = fak_fill("5m", 0.92, budget=10.0)
+        ticks = [_tick(1000, 90, 0.92, 0.08)]
+        for i in range(3):
+            ticks.append(
+                _tick(1001 + i, 89 - i, 0.52, 0.58, ub=0.50, db=0.56, ult=0.50, dlt=0.56)
+            )
+        out = walk_5m_held(ticks, hit, fill, winner="down", spec=RIDE)
+        self.assertEqual(out["exit"], "redeem_loss")
+
+    def test_dump_only_skips_50_52(self):
+        hit = {"ts": 1000, "ttm": 90, "leg": "up", "ask": 0.92}
+        fill = fak_fill("5m", 0.92, budget=10.0)
+        ticks = [_tick(1000, 90, 0.92, 0.08)]
+        for i in range(3):
+            ticks.append(
+                _tick(1001 + i, 89 - i, 0.52, 0.58, ub=0.50, db=0.56, ult=0.50, dlt=0.56)
+            )
+        out = walk_5m_held(ticks, hit, fill, winner="down", spec=dump_only_spec(0.40))
+        self.assertEqual(out["exit"], "redeem_loss")
+
+    def test_dump_only_sells_at_39(self):
+        hit = {"ts": 1, "ttm": 80, "leg": "up", "ask": 0.92}
+        fill = fak_fill("5m", 0.92, budget=10.0)
+        ticks = [
+            _tick(1, 80, 0.92, 0.08),
+            _tick(2, 79, 0.90, 0.10, ub=0.39, db=0.01, ult=0.92, dlt=0.08),
+        ]
+        out = walk_5m_held(ticks, hit, fill, winner="down", spec=dump_only_spec(0.40))
+        self.assertEqual(out["exit"], "dump")
+        self.assertAlmostEqual(out["exit_bid"], 0.39)
+
+    def test_15m_last_minute_60_does_not_fire_early(self):
+        spec = HedgeSpec(
+            name="live_then_last60_58",
+            style="15m_then_5m_late",
+            late_ttm=60.0,
+            late_qualify=0.58,
+            late_ask_max=0.60,
+            late_recovery=0.62,
+        )
+        hit = {"ts": 1, "ttm": 90, "leg": "up", "ask": 0.92}
+        fill = fak_fill("15m", 0.92, budget=10.0)
+        ticks = [_tick(1, 90, 0.92, 0.08)]
+        for i in range(4):
+            ticks.append(
+                _tick(2 + i, 89 - i, 0.60, 0.42, ub=0.58, db=0.40, ult=0.58, dlt=0.42)
+            )
+        out = walk_15m_held(ticks, hit, fill, winner="down", spec=spec)
+        self.assertEqual(out["exit"], "redeem_loss")
+
+    def test_15m_last_minute_60_persist_sells(self):
+        spec = HedgeSpec(
+            name="live_then_last60_58",
+            style="15m_then_5m_late",
+            late_ttm=60.0,
+            late_qualify=0.58,
+            late_ask_max=0.60,
+            late_recovery=0.62,
+        )
+        hit = {"ts": 1, "ttm": 55, "leg": "up", "ask": 0.92}
+        fill = fak_fill("15m", 0.92, budget=10.0)
+        ticks = [_tick(1, 55, 0.92, 0.08)]
+        for i in range(4):
+            ticks.append(
+                _tick(2 + i, 54 - i, 0.60, 0.42, ub=0.58, db=0.40, ult=0.58, dlt=0.42)
+            )
+        out = walk_15m_held(ticks, hit, fill, winner="down", spec=spec)
+        self.assertEqual(out["exit"], "hedge")
+        self.assertAlmostEqual(out["exit_bid"], 0.58)
+        self.assertTrue(out["hedge_late"])
+
+    def test_perfect_50_hedge_lowers_be(self):
+        fill = fak_fill("5m", 0.92, budget=10.0)
+        ride = salvage_breakeven(fill["shares"], fill["notional"], 0.0)
+        at50 = salvage_breakeven(fill["shares"], fill["notional"], 0.50)
+        self.assertAlmostEqual(ride, 0.92, places=4)
+        self.assertIsNotNone(at50)
+        self.assertLess(at50, 0.86)
+        self.assertGreater(at50, 0.80)
 
 
 if __name__ == "__main__":
