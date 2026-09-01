@@ -1340,7 +1340,7 @@ class FiveMinuteHedgeGuiTests(unittest.TestCase):
     def test_5m_call_site_uses_ask_max_complement_not_buy_70_30(self):
         src = BOT5M.read_text()
         self.assertIn("def hedge_gui_limits(", src)
-        self.assertIn("hedge_gui_limits(ladder.ask_max)", src)
+        self.assertIn("hedge_gui_limits(ask_max)", src)
         self.assertNotIn("held_gui_max=MAX_LOSER_BID", src)
         self.assertNotIn("other_gui_min=MIN_WINNER_BID", src)
         start = src.find("def hedge_consensus_ok(")
