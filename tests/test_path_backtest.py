@@ -492,7 +492,7 @@ class SweepTemplateTests(unittest.TestCase):
             Path(__file__).resolve().parents[1] / "strategy_buy5m.example.json"
         )
         self.assertEqual(tmpl["ask_min"], 0.90)
-        self.assertEqual(tmpl["ask_max"], 0.92)
+        self.assertEqual(tmpl["ask_max"], 0.96)
         self.assertEqual(tmpl["ttm_max"], 60.0)
         self.assertEqual(tmpl["budget"], 10.0)
         self.assertTrue(tmpl["hedge_require_gui"])
@@ -525,7 +525,7 @@ class SweepTemplateTests(unittest.TestCase):
         tmpl = template_from_strategy(
             Path(__file__).resolve().parents[1] / "strategy_buy.example.json"
         )
-        self.assertEqual(tmpl["ask_max"], 0.92)
+        self.assertEqual(tmpl["ask_max"], 0.96)
         self.assertEqual(tmpl["ask_min"], 0.90)
         self.assertEqual(tmpl["ttm_max"], 3.0 * 60.0)
         self.assertEqual(tmpl["budget"], 10.0)
@@ -536,7 +536,7 @@ class SweepTemplateTests(unittest.TestCase):
         )
         names = [row["name"] for row in sweep_variants(tmpl)]
         self.assertEqual(names[0], "live_5m_paper")
-        self.assertEqual(sweep_variants(tmpl)[0]["ask_max"], 0.92)
+        self.assertEqual(sweep_variants(tmpl)[0]["ask_max"], 0.96)
         self.assertIn("live_5m_ride", names)
         self.assertIn("window_120s", names)
         self.assertIn("window_180s", names)

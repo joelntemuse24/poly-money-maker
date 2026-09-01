@@ -138,18 +138,18 @@ _STRATEGY_DEFAULTS = {
     # Explicit hot-reloadable entry arm. A missing/invalid file disables new
     # entries while existing positions continue through the hedge path.
     "entry_enabled": False,
-    # Trigger at 90¢: last 3 minutes, winning ask 90–92¢. FAK pins to the
+    # Trigger at 90¢: last 3 minutes, winning ask 90–96¢. FAK pins to the
     # live ask (15m does not use 5m band-max sizer). Paper week 25 Aug–1 Sep
-    # 2026: 234 fills WR 93.2%; inverted 35/40 ≈ +$29 / week at $10.
+    # 2026 scored 92¢; this overlay widens the cap to 96.
     "buy_threshold": 0.90,
-    "buy_max_price": 0.92,
+    "buy_max_price": 0.96,
     # Consensus on Polymarket GUI display price (mid if spread≤10¢ else last trade).
     # Tuned for the 75¢ band (old 92¢/10¢ gates could never arm a 75¢ ask).
     "min_winner_bid": 0.70,
     "max_loser_bid": 0.30,
     "min_bid_edge": 0.05,
     # Skip buys unless live BTC is ≥ this many USD from the window Price To Beat,
-    # and only allow the side matching that underlying move. Live 15m 90–92
+    # and only allow the side matching that underlying move. Live 15m 90–96
     # last-3min is $0 so paper-scored prints take (flat / missing fail-closed).
     "underlying_gate_enabled": True,
     "min_underlying_edge_usd": 0.0,

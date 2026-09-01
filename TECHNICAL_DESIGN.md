@@ -94,20 +94,20 @@ it **redeems** on-chain for $1.00 per share. There is **no** “take profit at
 even make $0.30 before $1.00, and on an 80¢ fill selling at 90¢ throws away
 the rest of the ride to $1.00.
 
-**Live 5m entry (one $10 FAK, 92¢ last-60s overlay):**
+**Live 5m entry (one $10 FAK, 90–96 last-60s overlay):**
 
 | Time left until close (TTM) | Winning ask | Slice / FAK limit |
 |---|---|---|
 | More than 60 seconds | none — too early | early and ≥95 are **off** |
-| 0 < TTM ≤ 60 seconds | **90¢ through 92¢ inclusive** | late `$10`, limit **92¢** |
-| Any TTM | ≥93¢ | **off** (`late_90_start_s=0`) |
+| 0 < TTM ≤ 60 seconds | **90¢ through 96¢ inclusive** | late `$10`, limit **96¢** |
+| Any TTM | ≥97¢ | **off** (`late_90_start_s=0`) |
 
-**Live 15m entry (one $10 FAK, last 3 min):** winning ask **90–92¢**,
+**Live 15m entry (one $10 FAK, last 3 min):** winning ask **90–96¢**,
 FAK at the live ask. Hedge stays inverted **35/40**.
 
 Live `min_underlying_edge_usd` is **$0** (any non-zero TWAP vs PTB).
 The example JSON / `--sweep` template matches this overlay (last **60s**
-90–92 $10, dump persist 2s). `CURRENT.md` wins for what is actually
+90–96 $10, dump persist 2s). `CURRENT.md` wins for what is actually
 running. `BUY_HORIZON_S` is **60** on the live overlay.
 `early_95_start_s=0` is a valid disable.
 
@@ -128,7 +128,7 @@ No profit-take sell. Winners redeem at $1.00.
 **Hourly is stopped.** Do not start it. Its last-20m 75–90 / $10 /
 persist 50/52 / dump 35 / Binance $10 buy-edge code remains in
 `buybothourly.py` for a later operator start. **15m is live** after
-the paste (last 3 min 90–92 / $10 / inverted 35/40).
+the paste (last 3 min 90–96 / $10 / inverted 35/40).
 
 **Complement (`complementbot.py`) is a second Polymarket account.** It
 does not change 5m/15m sell-hedge. After a confirmed primary fill it
@@ -232,8 +232,8 @@ defaults are B-only for the last 20 minutes, persist **5s @ 50/52**, dump
 35¢, recovery **53¢**, `hedge_sell_fade`, `hedge_require_oracle`, Binance
 buy edge $10, tick `0.01`, and a $10 market cap. Hourly is **stopped**.
 
-Live 5m JSON (on the VM after the 92¢ paste; **`CURRENT.md` wins**)
-is last **60s**, **90–92¢**, `min_underlying_edge_usd` **$0**,
+Live 5m JSON (on the VM after the 90–96 paste; **`CURRENT.md` wins**)
+is last **60s**, **90–96¢**, `min_underlying_edge_usd` **$0**,
 `late_90` / early / ≥95 **off**, one $10 FAK, persist **1s @ 50/52**,
 dump **40¢** hold **2s**, flatten walks **avg <75¢** at live bid **<90¢**,
 recovery 53¢, last-30s ladder **off**, tick `0.001`. The example JSON
@@ -1086,7 +1086,7 @@ This is the one state-like tree that is allowed to delete itself. Do not
 
 **`check_path_backtest.py`:** first tick that matches an ask band and TTM
 window is a “hit.” `--template strategy_buy5m.example.json` maps the live
-90–92¢ / last **60s** / $10 entry and B+C hedge (persist 1s, dump 40
+90–96¢ / last **60s** / $10 entry and B+C hedge (persist 1s, dump 40
 hold 2s, flatten walks) into paper
 knobs. Paper persistence is real: qualifying ticks must stay continuous
 for the configured 1 second. Tight books use midpoint as the GUI and
@@ -1100,7 +1100,7 @@ semantics, or the universal bid-only 40¢ dump / walk flatten exactly. Treat its
 book-path comparison, not proof that the live bot would have traded.
 
 `--sweep --series 5m` scores one-at-a-time variants of that late template
-(`live_5m_paper` is the example JSON last-60 90–92).
+(`live_5m_paper` is the example JSON last-60 90–96).
 `window_120s` is an explicit variant. It does not union last-45 ≥90 or
 early ≥90. Always pass `--series 5m` when researching the live cadence.
 
@@ -1154,7 +1154,7 @@ the journal with `deploy/journald-size.conf` (`deploy/DISK_OPS.md`). Pathlog
 cap is separate and in-app.
 
 `CURRENT.md` owns the live knobs so they cannot drift in two places.
-Live is last-60 90–92 / $10 / dump-hold 2s (5m) plus last-3min 90–92 /
+Live is last-60 90–96 / $10 / dump-hold 2s (5m) plus last-3min 90–96 /
 $10 inverted 35/40 (15m). **Do not paste last-45 + $25.
 Do not restart 5m unless the operator asks.** Hedge 50/52 for 5s, dump
 32, recovery 53, sell-fade/oracle/dump-ignore true, undercut 0. Stop

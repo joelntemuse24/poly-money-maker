@@ -1,7 +1,7 @@
 {
   "entry_enabled": false,
   "buy_threshold": 0.90,
-  "buy_max_price": 0.92,
+  "buy_max_price": 0.96,
   "min_winner_bid": 0.70,
   "max_loser_bid": 0.30,
   "min_bid_edge": 0.05,
@@ -38,7 +38,7 @@
   "early_buy_max_price": 0.99,
   "early_95_start_s": 0,
   "early_95_min_s": 0,
-  "early_95_min_price": 0.95,
+  "early_95_min_price": 0.97,
   "late_90_start_s": 0,
   "buy_grace_s": 1,
   "buy_cooldown_s": 1,
