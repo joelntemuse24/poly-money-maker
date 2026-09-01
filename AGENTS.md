@@ -237,7 +237,7 @@ Live 15m (after `systemctl start polybuybot`):
 Complement (`polycomplement`, second account, **stopped** until `.env.complement`):
 
 - Arms only after a primary `bought_token` in `positions_buy5m.json` / `positions_buy.json`.
-- `complement_fill` = other-leg FAK **80–99¢**. `complement_skip` `primary_flat` /
+- `complement_fill` = other-leg FAK **80–99¢** (`size_matched` / GET-order, never the requested size). `complement_skip` `primary_flat` / `in_flight` / `cooldown` /
   `ask_below_min` / `oracle_still_held` / `already_bought`.
 - First-account hedge is unchanged. If the primary already sold, complement does not buy.
 

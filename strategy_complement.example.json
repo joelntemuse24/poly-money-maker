@@ -13,6 +13,9 @@
   "poll_s": 0.01,
   "primary_grace_s": 45.0,
   "empty_fak_cooldown_s": 0.15,
+  "empty_cycle_cooldown_s": 1.0,
+  "reject_cooldown_s": 2.0,
+  "uncertain_timeout_s": 5.0,
   "max_retries": 3,
   "tick_size": "0.001"
 }

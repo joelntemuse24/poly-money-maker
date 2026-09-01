@@ -7,11 +7,17 @@ import unittest
 from pathlib import Path
 
 from buy.complement_gate import (
+    apply_balance_evidence,
+    apply_complement_outcome,
     arm_from_primary_meta,
+    complement_fill_from_post,
     complement_target_shares,
     evaluate_complement,
+    mark_submit_quarantine,
     other_leg_token,
     primary_and_complement_same_wallet,
+    resolve_inflight,
+    should_block_post,
 )
 
 
@@ -263,6 +269,180 @@ class ExampleJsonTests(unittest.TestCase):
         self.assertIs(data["require_oracle"], True)
         self.assertIn("positions_buy5m.json", data["primary_state_files"])
         self.assertIn("positions_buy.json", data["primary_state_files"])
+        self.assertGreaterEqual(float(data["reject_cooldown_s"]), 1.0)
+        self.assertGreaterEqual(float(data["empty_cycle_cooldown_s"]), 0.5)
+        self.assertGreaterEqual(float(data["uncertain_timeout_s"]), 2.0)
+
+
+class PostOutcomeTests(unittest.TestCase):
+    def test_matched_size_is_fill_not_requested(self):
+        status, shares = complement_fill_from_post(
+            {"status": "matched", "size_matched": "4.20"},
+            requested=10.0,
+        )
+        self.assertEqual(status, "filled")
+        self.assertAlmostEqual(shares, 4.20)
+
+    def test_zero_matched_is_empty(self):
+        status, shares = complement_fill_from_post(
+            {"status": "matched", "size_matched": "0", "takingAmount": "0"},
+            requested=10.0,
+        )
+        self.assertEqual((status, shares), ("empty", 0.0))
+
+    def test_unmatched_error_is_empty(self):
+        status, shares = complement_fill_from_post(
+            {"success": False, "errorMsg": "no orders found to match with FAK order"},
+            requested=10.0,
+        )
+        self.assertEqual((status, shares), ("empty", 0.0))
+
+    def test_delayed_zero_is_ambiguous(self):
+        status, shares = complement_fill_from_post(
+            {"status": "delayed", "orderID": "abc", "takingAmount": "0"},
+            requested=10.0,
+        )
+        self.assertEqual((status, shares), ("ambiguous", 0.0))
+
+    def test_none_result_is_ambiguous(self):
+        status, shares = complement_fill_from_post(None, requested=10.0)
+        self.assertEqual((status, shares), ("ambiguous", 0.0))
+
+    def test_fixed_point_taking_amount(self):
+        status, shares = complement_fill_from_post(
+            {"status": "matched", "takingAmount": "4200000"},
+            requested=4.2,
+        )
+        self.assertEqual(status, "filled")
+        self.assertAlmostEqual(shares, 4.2)
+
+    def test_taking_amount_without_matched_status_is_ambiguous(self):
+        status, shares = complement_fill_from_post(
+            {"takingAmount": "10.00"},
+            requested=10.0,
+        )
+        self.assertEqual((status, shares), ("ambiguous", 0.0))
+
+    def test_unmatched_plus_balance_bump_is_ghost_fill(self):
+        status, shares = apply_balance_evidence(
+            "empty", 0.0, baseline=1.0, after=5.2,
+        )
+        self.assertEqual(status, "filled")
+        self.assertAlmostEqual(shares, 4.2)
+
+    def test_unmatched_unread_balance_stays_ambiguous(self):
+        status, shares = apply_balance_evidence(
+            "empty", 0.0, baseline=1.0, after=None,
+        )
+        self.assertEqual((status, shares), ("ambiguous", 0.0))
+
+    def test_unmatched_flat_balance_stays_empty(self):
+        status, shares = apply_balance_evidence(
+            "empty", 0.0, baseline=1.0, after=1.0,
+        )
+        self.assertEqual((status, shares), ("empty", 0.0))
+
+
+class QuarantineAndCooldownTests(unittest.TestCase):
+    def test_write_ahead_blocks_second_post(self):
+        meta = mark_submit_quarantine(
+            {}, token="UP1", shares=10.0, limit=0.99, baseline=0.0, now_s=100.0,
+        )
+        blocked, why = should_block_post(meta, 100.1)
+        self.assertTrue(blocked)
+        self.assertEqual(why, "in_flight")
+
+    def test_fill_clears_uncertain(self):
+        meta = mark_submit_quarantine(
+            {}, token="UP1", shares=10.0, limit=0.99, baseline=0.0, now_s=100.0,
+        )
+        apply_complement_outcome(
+            meta, status="filled", shares=4.2, token="UP1", leg="up",
+            source="5m", slug="s", held_token="DOWN1", now_s=101.0,
+            empty_cooldown_s=1.0, reject_cooldown_s=2.0,
+        )
+        self.assertFalse(meta.get("buy_uncertain"))
+        self.assertAlmostEqual(meta["bought_size"], 4.2)
+        blocked, why = should_block_post(meta, 101.0)
+        self.assertTrue(blocked)
+        self.assertEqual(why, "already_bought")
+
+    def test_empty_sets_cooldown(self):
+        meta = mark_submit_quarantine(
+            {}, token="UP1", shares=10.0, limit=0.99, baseline=0.0, now_s=100.0,
+        )
+        apply_complement_outcome(
+            meta, status="empty", shares=0.0, token="UP1", leg="up",
+            source="5m", slug="s", held_token="DOWN1", now_s=101.0,
+            empty_cooldown_s=1.0, reject_cooldown_s=2.0,
+        )
+        self.assertFalse(meta.get("buy_uncertain"))
+        blocked, why = should_block_post(meta, 101.5)
+        self.assertTrue(blocked)
+        self.assertEqual(why, "cooldown")
+        blocked, why = should_block_post(meta, 102.1)
+        self.assertFalse(blocked)
+
+    def test_rejected_uses_longer_cooldown(self):
+        meta = mark_submit_quarantine(
+            {}, token="UP1", shares=10.0, limit=0.99, baseline=0.0, now_s=100.0,
+        )
+        apply_complement_outcome(
+            meta, status="rejected", shares=0.0, token="UP1", leg="up",
+            source="5m", slug="s", held_token="DOWN1", now_s=101.0,
+            empty_cooldown_s=1.0, reject_cooldown_s=2.0,
+        )
+        blocked, why = should_block_post(meta, 102.5)
+        self.assertTrue(blocked)
+        self.assertEqual(why, "cooldown")
+        blocked, _ = should_block_post(meta, 103.1)
+        self.assertFalse(blocked)
+
+    def test_ambiguous_stays_in_flight(self):
+        meta = mark_submit_quarantine(
+            {}, token="UP1", shares=10.0, limit=0.99, baseline=0.0, now_s=100.0,
+        )
+        apply_complement_outcome(
+            meta, status="ambiguous", shares=0.0, token="UP1", leg="up",
+            source="5m", slug="s", held_token="DOWN1", now_s=101.0,
+            empty_cooldown_s=1.0, reject_cooldown_s=2.0,
+        )
+        self.assertTrue(meta.get("buy_uncertain"))
+        blocked, why = should_block_post(meta, 200.0)
+        self.assertTrue(blocked)
+        self.assertEqual(why, "in_flight")
+
+    def test_inflight_balance_bump_is_fill(self):
+        meta = mark_submit_quarantine(
+            {}, token="UP1", shares=10.0, limit=0.99, baseline=1.0, now_s=100.0,
+        )
+        status, shares = resolve_inflight(
+            meta, now_s=100.5, after=5.2, timeout_s=5.0,
+        )
+        self.assertEqual(status, "filled")
+        self.assertAlmostEqual(shares, 4.2)
+
+    def test_inflight_flat_balance_waits_then_empties(self):
+        meta = mark_submit_quarantine(
+            {}, token="UP1", shares=10.0, limit=0.99, baseline=1.0, now_s=100.0,
+        )
+        status, shares = resolve_inflight(
+            meta, now_s=102.0, after=1.0, timeout_s=5.0,
+        )
+        self.assertEqual((status, shares), ("wait", 0.0))
+        status, shares = resolve_inflight(
+            meta, now_s=105.0, after=1.0, timeout_s=5.0,
+        )
+        self.assertEqual((status, shares), ("empty", 0.0))
+
+    def test_inflight_unread_balance_stays_wait(self):
+        meta = mark_submit_quarantine(
+            {}, token="UP1", shares=10.0, limit=0.99, baseline=1.0, now_s=100.0,
+        )
+        status, shares = resolve_inflight(
+            meta, now_s=200.0, after=None, timeout_s=5.0,
+        )
+        self.assertEqual((status, shares), ("wait", 0.0))
 
 
 if __name__ == "__main__":

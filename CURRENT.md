@@ -175,6 +175,12 @@ sell them). Copy `strategy_complement.example.json` →
 account is funded. Then `entry_enabled: true`, `dry_run: false`,
 `sudo systemctl start polycomplement`. Hourly/mint stay off.
 
+POST never invents a full fill (`size_matched` / GET-order only). A
+write-ahead `buy_uncertain` hits disk **before** the FAK. Empty / reject
+cools 1s / 2s so a miss does not retry every 0.01s look. Leftover
+quarantine resolves from wallet delta or empties after 5s if balances
+are flat; unread balance stays in-flight (no second POST).
+
 ---
 
 ## Pathlog / backtest

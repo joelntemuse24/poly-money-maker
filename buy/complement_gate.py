@@ -225,3 +225,227 @@ def merge_armed(batches: Iterable[Iterable[ArmedMarket]]) -> List[ArmedMarket]:
         for row in batch:
             seen.setdefault(row.condition_id, row)
     return list(seen.values())
+
+
+def _amount_to_shares(raw: object, expected: float) -> Optional[float]:
+    """Human shares or 1e6 fixed-point. None if unusable."""
+    if raw is None or raw == "":
+        return None
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return None
+    if value != value or value <= 0 or value in (float("inf"), float("-inf")):
+        return None
+    expected_f = _finite(expected, minimum=0) or 0.0
+    text = str(raw).strip().lower()
+    if value >= 10_000 and "." not in text and "e" not in text:
+        fixed = value / 1_000_000.0
+        if expected_f > 0 and abs(fixed - expected_f) <= abs(value - expected_f):
+            return fixed
+        if expected_f <= 0:
+            return fixed
+    return value
+
+
+def complement_fill_from_post(result: Any, requested: float) -> Tuple[str, float]:
+    """Classify a CLOB POST body. Never treat a missing body as a full fill.
+
+    Returns ``(status, shares)``: filled / empty / ambiguous.
+    """
+    if result is None:
+        return "ambiguous", 0.0
+    data: Dict[str, Any]
+    if isinstance(result, dict):
+        data = result
+    else:
+        data = {}
+        for key in (
+            "status", "success", "errorMsg", "error", "size_matched",
+            "takingAmount", "taking_amount", "orderID", "order_id",
+        ):
+            if hasattr(result, key):
+                data[key] = getattr(result, key)
+    err = str(data.get("errorMsg") or data.get("error") or "").lower()
+    if "no orders found to match" in err:
+        return "empty", 0.0
+    status = str(data.get("status") or "").strip().lower()
+    want = _finite(requested, minimum=0) or 0.0
+    matched = _amount_to_shares(data.get("size_matched"), want)
+    taking = _amount_to_shares(
+        data.get("takingAmount", data.get("taking_amount")), want,
+    )
+    shares = 0.0
+    if matched is not None and matched > 0:
+        shares = float(matched)
+    elif taking is not None and taking > 0:
+        shares = float(taking)
+    if status in {"delayed"}:
+        return "ambiguous", 0.0
+    # size_matched is fill evidence. takingAmount without a terminal
+    # matched status can be the signed order size on a delayed POST.
+    if matched is not None and matched > 0 and status in {"", "matched", "order_status_matched"}:
+        return "filled", float(matched)
+    if taking is not None and taking > 0 and status in {"matched", "order_status_matched"}:
+        return "filled", float(taking)
+    if status in {"matched", "order_status_matched"} and shares <= 0:
+        return "empty", 0.0
+    if data.get("success") is False:
+        return "rejected", 0.0
+    return "ambiguous", 0.0
+
+
+def apply_balance_evidence(
+    status: str,
+    shares: float,
+    *,
+    baseline: Optional[float],
+    after: Optional[float],
+) -> Tuple[str, float]:
+    """Unmatched 400 + inventory bump is a ghost fill; unread balance stays ambiguous."""
+    base = _finite(baseline, minimum=0)
+    later = _finite(after, minimum=0)
+    if later is not None and base is not None:
+        delta = later - base
+        if delta > 0.01:
+            return "filled", float(delta)
+        if status == "empty":
+            return "empty", 0.0
+        if status == "filled" and shares > 0:
+            return "filled", float(shares)
+        return status, shares
+    if status == "empty" and (base is None or later is None):
+        return "ambiguous", 0.0
+    return status, shares
+
+
+def mark_submit_quarantine(
+    meta: Dict[str, Any],
+    *,
+    token: str,
+    shares: float,
+    limit: float,
+    baseline: Optional[float],
+    now_s: float,
+    leg: str = "",
+    source: str = "",
+    slug: str = "",
+    held_token: str = "",
+) -> Dict[str, Any]:
+    """Write-ahead marker. Must hit disk before the CLOB POST."""
+    row = dict(meta or {})
+    row["buy_uncertain"] = True
+    row["buy_uncertain_at"] = float(now_s)
+    row["buy_uncertain_token"] = str(token)
+    row["buy_uncertain_shares"] = float(shares)
+    row["buy_uncertain_price"] = float(limit)
+    if leg:
+        row["buy_uncertain_leg"] = str(leg)
+    if source:
+        row["source"] = str(source)
+    if slug:
+        row["slug"] = str(slug)
+    if held_token:
+        row["primary_held"] = str(held_token)
+    if baseline is None:
+        row.pop("buy_uncertain_baseline", None)
+    else:
+        row["buy_uncertain_baseline"] = float(baseline)
+    return row
+
+
+def _clear_uncertain(meta: Dict[str, Any]) -> None:
+    for key in (
+        "buy_uncertain",
+        "buy_uncertain_at",
+        "buy_uncertain_token",
+        "buy_uncertain_shares",
+        "buy_uncertain_price",
+        "buy_uncertain_baseline",
+        "buy_uncertain_order_id",
+        "buy_uncertain_leg",
+    ):
+        meta.pop(key, None)
+
+
+def apply_complement_outcome(
+    meta: Dict[str, Any],
+    *,
+    status: str,
+    shares: float,
+    token: str,
+    leg: str,
+    source: str,
+    slug: str,
+    held_token: str,
+    now_s: float,
+    empty_cooldown_s: float,
+    reject_cooldown_s: float,
+) -> Dict[str, Any]:
+    """Persist fill, empty/reject cooldown, or keep in-flight quarantine."""
+    if status == "filled" and shares > 0.01:
+        _clear_uncertain(meta)
+        meta.pop("cooldown_until", None)
+        meta["bought_token"] = str(token)
+        meta["bought_leg"] = str(leg)
+        meta["bought_size"] = float(shares)
+        meta["source"] = str(source)
+        meta["primary_held"] = str(held_token)
+        meta["slug"] = str(slug)
+        meta["filled_at"] = float(now_s)
+        return meta
+    if status == "ambiguous":
+        meta["buy_uncertain"] = True
+        return meta
+    _clear_uncertain(meta)
+    cool = float(reject_cooldown_s if status == "rejected" else empty_cooldown_s)
+    meta["cooldown_until"] = float(now_s) + max(0.0, cool)
+    return meta
+
+
+def resolve_inflight(
+    meta: Any,
+    *,
+    now_s: float,
+    after: Optional[float],
+    timeout_s: float,
+) -> Tuple[str, float]:
+    """Classify leftover write-ahead quarantine. Never invent a fill.
+
+    Returns ``(status, shares)``: filled / empty / wait.
+    Flat readable balances become empty only after ``timeout_s`` so a
+    delayed match can still show up. Unreadable balances stay ``wait``
+    (fail closed — do not POST again).
+    """
+    if not isinstance(meta, dict) or not meta.get("buy_uncertain"):
+        return "wait", 0.0
+    baseline = meta.get("buy_uncertain_baseline")
+    status, shares = apply_balance_evidence(
+        "ambiguous", 0.0, baseline=baseline, after=after,
+    )
+    if status == "filled" and shares > 0.01:
+        return "filled", shares
+    base = _finite(baseline, minimum=0)
+    later = _finite(after, minimum=0)
+    started = _finite(meta.get("buy_uncertain_at"), minimum=0) or 0.0
+    aged = float(now_s) - float(started)
+    if later is not None and base is not None and (later - base) <= 0.01:
+        if aged + 1e-12 >= float(timeout_s):
+            return "empty", 0.0
+        return "wait", 0.0
+    return "wait", 0.0
+
+
+def should_block_post(meta: Any, now_s: float) -> Tuple[bool, str]:
+    """Block a new FAK while filled, in-flight, or cooling down."""
+    if not isinstance(meta, dict) or not meta:
+        return False, ""
+    size = _finite(meta.get("bought_size"), minimum=0) or 0.0
+    if meta.get("bought_token") and size > 0.01:
+        return True, "already_bought"
+    if meta.get("buy_uncertain"):
+        return True, "in_flight"
+    until = _finite(meta.get("cooldown_until"), minimum=0) or 0.0
+    if until > float(now_s):
+        return True, "cooldown"
+    return False, ""

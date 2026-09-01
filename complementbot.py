@@ -28,10 +28,16 @@ from buy.book import best_from_levels
 from buy.btc_price import SOURCE_TWAP_30, SOURCE_TWAP_60, get_btc_feed
 from buy.clob_book_ws import get_book_feed
 from buy.complement_gate import (
+    apply_balance_evidence,
+    apply_complement_outcome,
     arm_from_primary_meta,
+    complement_fill_from_post,
     evaluate_complement,
+    mark_submit_quarantine,
     merge_armed,
     primary_and_complement_same_wallet,
+    resolve_inflight,
+    should_block_post,
 )
 from buy.live_journal import is_journal_event
 
@@ -58,6 +64,9 @@ _STRATEGY_DEFAULTS = {
     "poll_s": 0.01,
     "primary_grace_s": 45.0,
     "empty_fak_cooldown_s": 0.15,
+    "empty_cycle_cooldown_s": 1.0,
+    "reject_cooldown_s": 2.0,
+    "uncertain_timeout_s": 5.0,
     "max_retries": 3,
     "tick_size": "0.001",
 }
@@ -228,6 +237,8 @@ if not PRIVATE_KEY or not FUNDER_ADDRESS:
 
 from py_clob_client_v2 import (  # noqa: E402
     ApiCreds,
+    AssetType,
+    BalanceAllowanceParams,
     ClobClient,
     OrderArgs,
     OrderType,
@@ -312,7 +323,56 @@ def unmatched_fak(exc):
     return "no orders found to match" in str(exc or "").lower()
 
 
+def token_balance(token_id):
+    try:
+        params = BalanceAllowanceParams(
+            asset_type=AssetType.CONDITIONAL,
+            token_id=str(token_id),
+        )
+        client.update_balance_allowance(params)
+        result = client.get_balance_allowance(params)
+        raw = (
+            result.get("balance")
+            if isinstance(result, dict)
+            else getattr(result, "balance", None)
+        )
+        if raw is None or raw == "":
+            return None
+        return float(raw) / 1_000_000.0
+    except Exception as exc:
+        log_event("complement_balance_fail", token_id=token_id, error=str(exc)[:200])
+        return None
+
+
+def _order_id(result):
+    if isinstance(result, dict):
+        return str(result.get("orderID") or result.get("order_id") or "")
+    return str(getattr(result, "orderID", None) or getattr(result, "order_id", None) or "")
+
+
+def confirm_posted_shares(result, requested):
+    """POST body first; GET-order size_matched if the body is delayed/empty."""
+    status, shares = complement_fill_from_post(result, requested)
+    if status == "filled" and shares > 0:
+        return status, shares
+    oid = _order_id(result)
+    if not oid:
+        return status, shares
+    try:
+        details = client.get_order(oid)
+    except Exception as exc:
+        log_event("complement_get_order_fail", order_id=oid[:24], error=str(exc)[:200])
+        return status, shares
+    extra, extra_sh = complement_fill_from_post(details, requested)
+    if extra == "filled" and extra_sh > 0:
+        return extra, extra_sh
+    if status == "ambiguous" and extra in {"empty", "filled", "rejected"}:
+        return extra, extra_sh
+    return status, shares
+
+
 def post_complement(token_id, shares, limit, tick_size):
+    """Return (status, filled_shares, detail). Never invent a full fill."""
     if DRY_RUN or not _strat["entry_enabled"]:
         log_event(
             "dry_buy",
@@ -325,9 +385,11 @@ def post_complement(token_id, shares, limit, tick_size):
         console.print(
             f"  [yellow][DRY COMPLEMENT][/] {shares:.2f} sh @ {limit:.2f} {token_id[:10]}…"
         )
-        return True, shares, "dry"
+        return "filled", float(shares), "dry"
     last_err = ""
     tick = str(tick_size)
+    last_result = None
+    last_status = "rejected"
     for attempt in range(int(_strat["max_retries"])):
         try:
             signed = client.create_order(
@@ -339,32 +401,50 @@ def post_complement(token_id, shares, limit, tick_size):
                 ),
                 options=PartialCreateOrderOptions(tick_size=tick, neg_risk=False),
             )
-            client.post_order(signed, order_type=OrderType.FAK)
+            result = client.post_order(signed, order_type=OrderType.FAK)
+            last_result = result
+            status, filled = confirm_posted_shares(result, shares)
             log_event(
                 "complement_attempt",
                 token_id=token_id,
                 shares=shares,
+                filled=filled,
+                status=status,
                 limit=limit,
                 attempt=attempt + 1,
             )
-            return True, shares, "posted"
+            if status == "filled" and filled > 0.01:
+                return "filled", float(filled), "posted"
+            if status == "ambiguous":
+                return "ambiguous", 0.0, "ambiguous_post"
+            last_status = status
+            if status == "empty" and attempt + 1 < int(_strat["max_retries"]):
+                time.sleep(float(_strat["empty_fak_cooldown_s"]))
+                continue
+            return status, 0.0, status
         except Exception as exc:
             last_err = str(exc)[:200]
             text = last_err.lower()
             if "invalid tick size" in text and tick == "0.001":
                 tick = "0.01"
                 continue
-            if unmatched_fak(exc) and attempt + 1 < int(_strat["max_retries"]):
-                time.sleep(float(_strat["empty_fak_cooldown_s"]))
-                continue
+            if unmatched_fak(exc):
+                last_status = "empty"
+                if attempt + 1 < int(_strat["max_retries"]):
+                    time.sleep(float(_strat["empty_fak_cooldown_s"]))
+                    continue
+                return "empty", 0.0, last_err
             log_event(
                 "complement_attempt_rejected",
                 token_id=token_id,
                 error=last_err,
                 attempt=attempt + 1,
             )
-            return False, 0.0, last_err
-    return False, 0.0, last_err
+            return "rejected", 0.0, last_err
+    if last_result is not None:
+        status, filled = confirm_posted_shares(last_result, shares)
+        return status, filled, last_status
+    return last_status, 0.0, last_err
 
 
 _shutdown = False
@@ -423,10 +503,49 @@ while not _shutdown:
         )
     armed = merge_armed(batches)
     book_ws.set_tokens(row.other_token for row in armed)
+    for cid, own in list(state.items()):
+        if not isinstance(own, dict) or not own.get("buy_uncertain"):
+            continue
+        token = own.get("buy_uncertain_token")
+        if not token:
+            continue
+        after = None if DRY_RUN else token_balance(token)
+        status, filled = resolve_inflight(
+            own,
+            now_s=now_s,
+            after=after,
+            timeout_s=float(_strat["uncertain_timeout_s"]),
+        )
+        if status == "wait":
+            skip_throttled(cid, "in_flight", source=own.get("source"))
+            continue
+        apply_complement_outcome(
+            own, status=status, shares=filled, token=token,
+            leg=own.get("buy_uncertain_leg") or "",
+            source=own.get("source") or "",
+            slug=own.get("slug") or cid,
+            held_token=own.get("primary_held") or "",
+            now_s=now_s,
+            empty_cooldown_s=float(_strat["empty_cycle_cooldown_s"]),
+            reject_cooldown_s=float(_strat["reject_cooldown_s"]),
+        )
+        state[cid] = own
+        atomic_save(STATE_FILE, state)
+        if status == "filled" and filled > 0.01:
+            log_event(
+                "complement_fill", condition_id=cid, token_id=token,
+                shares=filled, via="uncertain_balance",
+                source=own.get("source"),
+            )
+        else:
+            skip_throttled(cid, status, via="inflight_resolve")
     for row in armed:
         cid = row.condition_id
         own = state.get(cid) if isinstance(state.get(cid), dict) else {}
-        already = bool(own.get("bought_token")) and float(own.get("bought_size") or 0) > 0.01
+        blocked, block_why = should_block_post(own, now_s)
+        if blocked:
+            skip_throttled(cid, block_why, source=row.source)
+            continue
         bid, ask = quote_other(row.other_token)
         oracle_ok = True
         if _strat["require_oracle"]:
@@ -435,7 +554,7 @@ while not _shutdown:
             other_ask=ask,
             other_bid=bid,
             held_shares=row.held_shares,
-            already_bought=already,
+            already_bought=False,
             primary_still_holding=True,
             oracle_favors_other=oracle_ok,
             min_price=float(_strat["buy_min_price"]),
@@ -454,23 +573,36 @@ while not _shutdown:
         if not _strat["entry_enabled"] and not DRY_RUN:
             skip_throttled(cid, "entry_disabled")
             continue
-        ok, filled, detail = post_complement(
+        baseline = None if DRY_RUN else token_balance(row.other_token)
+        own = mark_submit_quarantine(
+            own, token=row.other_token, shares=shares,
+            limit=float(_strat["buy_max_price"]), baseline=baseline, now_s=now_s,
+            leg=row.other_leg, source=row.source, slug=row.slug,
+            held_token=row.held_token,
+        )
+        state[cid] = own
+        atomic_save(STATE_FILE, state)
+        status, filled, detail = post_complement(
             row.other_token,
             shares,
             float(_strat["buy_max_price"]),
             _strat["tick_size"],
         )
-        if ok:
-            state[cid] = {
-                "bought_token": row.other_token,
-                "bought_leg": row.other_leg,
-                "bought_size": float(filled),
-                "source": row.source,
-                "primary_held": row.held_token,
-                "slug": row.slug,
-                "filled_at": now_s,
-            }
-            atomic_save(STATE_FILE, state)
+        if status != "filled" and not DRY_RUN:
+            after = token_balance(row.other_token)
+            status, filled = apply_balance_evidence(
+                status, filled, baseline=baseline, after=after,
+            )
+        apply_complement_outcome(
+            own, status=status, shares=filled, token=row.other_token,
+            leg=row.other_leg, source=row.source, slug=row.slug,
+            held_token=row.held_token, now_s=now_s,
+            empty_cooldown_s=float(_strat["empty_cycle_cooldown_s"]),
+            reject_cooldown_s=float(_strat["reject_cooldown_s"]),
+        )
+        state[cid] = own
+        atomic_save(STATE_FILE, state)
+        if status == "filled" and filled > 0.01:
             log_event(
                 "complement_fill",
                 condition_id=cid,
@@ -482,6 +614,10 @@ while not _shutdown:
             console.print(
                 f"  [bold green][COMPLEMENT][/] {row.other_leg} {filled:.2f} sh "
                 f"{row.slug} ({row.source})"
+            )
+        else:
+            skip_throttled(
+                cid, status, source=row.source, detail=str(detail)[:160],
             )
     try:
         with open(HEARTBEAT_FILE, "w") as hb:
