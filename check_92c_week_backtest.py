@@ -28,11 +28,14 @@ from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
 from buy.paper_replay import (
+    LIVE_FIVE,
     evaluate_market,
     fak_fill,
     fifteen_hedge_specs,
     first_92_entry,
     five_hedge_specs,
+    informed_five_specs,
+    path_after_entry,
     print_size_near,
     salvage_breakeven,
     summarize,
@@ -591,6 +594,85 @@ def size_from_print_pnl(entries: Sequence[dict], spec, series_key: str, budget: 
     return summarize(rows)
 
 
+def print_autopsy(title: str, entries: Sequence[dict], spec, series_key: str) -> List[dict]:
+    """Bucket live exits and print watcher features on false vs true sells."""
+    walker = walk_5m_held if spec.style == "5m" else walk_15m_held
+    rows = []
+    for item in entries:
+        hit = item.get("hit")
+        fill = item.get("fill")
+        if hit is None or fill is None or fill.get("status") == "zero":
+            continue
+        held = hit.get("leg")
+        winner = item.get("winner")
+        settled = walker(item["ticks"], hit, fill, winner, spec=spec)
+        feats = path_after_entry(item["ticks"], hit, held)
+        won = winner == held
+        sold = settled.get("exit") in ("hedge", "dump", "flatten")
+        if sold and won:
+            bucket = "false_sell"
+        elif sold and not won:
+            bucket = "true_sell"
+        elif (not sold) and won:
+            bucket = "winner_ride"
+        else:
+            bucket = "loser_ride"
+        rows.append(
+            {
+                "slug": item.get("slug"),
+                "bucket": bucket,
+                "exit": settled.get("exit"),
+                "exit_bid": settled.get("exit_bid"),
+                "exit_ttm": settled.get("exit_ttm"),
+                "hedge_late": settled.get("hedge_late"),
+                "ttm": hit.get("ttm"),
+                "won": won,
+                **feats,
+            }
+        )
+    print()
+    print(f"=== {title} autopsy ({spec.name}) ===")
+    counts = {}
+    for row in rows:
+        counts[row["bucket"]] = counts.get(row["bucket"], 0) + 1
+    print("  ".join(f"{k}={v}" for k, v in sorted(counts.items())))
+
+    def _med(vals):
+        vals = [v for v in vals if v is not None]
+        if not vals:
+            return None
+        vals = sorted(vals)
+        return vals[len(vals) // 2]
+
+    for bucket in ("false_sell", "true_sell", "loser_ride", "winner_ride"):
+        chunk = [r for r in rows if r["bucket"] == bucket]
+        if not chunk:
+            continue
+        rec = sum(1 for r in chunk if r.get("recovered_70_after_52"))
+        print(
+            f"  {bucket:<12} n={len(chunk):3d}  "
+            f"min_bid med={_med([r.get('min_bid') for r in chunk])}  "
+            f"end_bid med={_med([r.get('end_bid') for r in chunk])}  "
+            f"sec≤52 med={_med([r.get('sec_le52') for r in chunk])}  "
+            f"sec≤40 med={_med([r.get('sec_le40') for r in chunk])}  "
+            f"recovered_70={rec}/{len(chunk)}  "
+            f"exit_bid med={_med([r.get('exit_bid') for r in chunk])}"
+        )
+    interesting = [r for r in rows if r["bucket"] in ("false_sell", "true_sell", "loser_ride")]
+    print("  slug                              bucket       exit  bid   ttm  min   end  recov")
+    for row in interesting:
+        print(
+            f"  {str(row.get('slug') or '')[:32]:<32} {row['bucket']:<12} "
+            f"{str(row.get('exit') or ''):<6} "
+            f"{'' if row.get('exit_bid') is None else f'{row['exit_bid']:.2f}':>5} "
+            f"{'' if row.get('exit_ttm') is None else f'{row['exit_ttm']:.0f}':>4} "
+            f"{'' if row.get('min_bid') is None else f'{row['min_bid']:.2f}':>5} "
+            f"{'' if row.get('end_bid') is None else f'{row['end_bid']:.2f}':>5} "
+            f"{'Y' if row.get('recovered_70_after_52') else 'n'}"
+        )
+    return rows
+
+
 def live_book_snapshot(http: requests.Session) -> None:
     """Public CLOB TOB for the current 5m/15m clocks — size at 92¢ now, not history."""
     print("\n=== live CLOB snapshot (now, not the week tape) ===")
@@ -697,6 +779,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         action="store_true",
         help="Also score a pessimistic fill cap at same-second 92¢ last-trade size.",
     )
+    ap.add_argument(
+        "--hedge-autopsy",
+        action="store_true",
+        help="Bucket false vs true sells and score informed (watcher) hedge rules.",
+    )
     args = ap.parse_args(argv)
 
     end_ts = float(args.end_ts) if args.end_ts else time.time()
@@ -745,7 +832,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         pathlog = []
         if tick_dir is not None:
             pathlog = load_pathlog_markets(tick_dir, series_key, start_ts, end_ts)
-        if pathlog and not args.hedge_sweep:
+        if pathlog and not args.hedge_sweep and not args.hedge_autopsy:
             print(f"\n{series_key}: {len(pathlog)} pathlog markets (TOB 1s)")
             rows = score_pathlog(pathlog, series_key, args.budget)
             tape = "pathlog-tob-1s"
@@ -759,31 +846,44 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         if not markets:
             print_stats(f"{series_key} 92¢ last {ttm:g}s", summarize([]), tape)
             continue
-        if args.hedge_sweep:
+        if args.hedge_sweep or args.hedge_autopsy:
             entries = collect_entries(
                 http, markets, series_key, args.cache, args.workers, args.budget,
             )
-            print_liquidity(
-                f"{series_key} 92¢ last {ttm:g}s", entries, args.budget, series_key,
-            )
-            specs = five_hedge_specs() if series_key == "5m" else fifteen_hedge_specs()
-            sweep_tables.extend(
-                print_hedge_table(
-                    f"{series_key} hedge sweep @ ${args.budget:g}",
-                    entries, specs, series_key,
+            if args.hedge_autopsy:
+                live = LIVE_FIVE if series_key == "5m" else fifteen_hedge_specs()[1]
+                print_autopsy(
+                    f"{series_key} 92¢ last {ttm:g}s", entries, live, series_key,
                 )
-            )
-            if args.size_from_print:
-                live = specs[1] if len(specs) > 1 else specs[0]
-                ride = specs[0]
-                print(f"\n=== {series_key} pessimistic same-second print cap ===")
-                for spec in (ride, live):
-                    st = size_from_print_pnl(entries, spec, series_key, args.budget)
-                    print(
-                        f"  {spec.name}: fills={st['fills']} partial={st['partial']} "
-                        f"zero skipped  pnl={st['pnl_sum']} spend={st['spend']} "
-                        f"false={st['winner_dumps']}"
+                specs = informed_five_specs() if series_key == "5m" else fifteen_hedge_specs()
+                sweep_tables.extend(
+                    print_hedge_table(
+                        f"{series_key} informed hedge @ ${args.budget:g}",
+                        entries, specs, series_key,
                     )
+                )
+            if args.hedge_sweep:
+                print_liquidity(
+                    f"{series_key} 92¢ last {ttm:g}s", entries, args.budget, series_key,
+                )
+                specs = five_hedge_specs() if series_key == "5m" else fifteen_hedge_specs()
+                sweep_tables.extend(
+                    print_hedge_table(
+                        f"{series_key} hedge sweep @ ${args.budget:g}",
+                        entries, specs, series_key,
+                    )
+                )
+                if args.size_from_print:
+                    live = specs[1] if len(specs) > 1 else specs[0]
+                    ride = specs[0]
+                    print(f"\n=== {series_key} pessimistic same-second print cap ===")
+                    for spec in (ride, live):
+                        st = size_from_print_pnl(entries, spec, series_key, args.budget)
+                        print(
+                            f"  {spec.name}: fills={st['fills']} partial={st['partial']} "
+                            f"zero skipped  pnl={st['pnl_sum']} spend={st['spend']} "
+                            f"false={st['winner_dumps']}"
+                        )
             continue
         rows = score_public(
             http, markets, series_key, args.cache, args.workers, args.budget,
@@ -792,8 +892,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         print_stats(f"{series_key} buy@92¢ last {ttm:g}s", stats, tape)
         all_rows.extend(rows)
 
-    if args.hedge_sweep:
-        live_book_snapshot(http)
+    if args.hedge_sweep or args.hedge_autopsy:
+        if args.hedge_sweep:
+            live_book_snapshot(http)
         if args.csv:
             args.csv.parent.mkdir(parents=True, exist_ok=True)
             fields = [

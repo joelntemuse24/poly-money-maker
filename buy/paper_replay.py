@@ -78,6 +78,14 @@ class HedgeSpec(NamedTuple):
     late_recovery: float = FIVE_LATE_RECOVERY
     fifteen_dump: float = FIFTEEN_THRESHOLD
     fifteen_ask_max: float = FIFTEEN_ASK_MAX
+    # Informed persist vetoes (dumps still fire). 0 = off.
+    min_drop_from_entry: float = 0.0
+    lookback_s: float = 0.0
+    min_drop_in_lookback: float = 0.0
+    # Hindsight research only: persist-sell iff the path later proves lost.
+    # ``crash`` = saw bid ≤ 40 after entry (live-legal). ``lost`` uses resolution.
+    require_crash: bool = False
+    require_lost: bool = False
 
 
 LIVE_FIVE = HedgeSpec(name="live_50_late30_58", style="5m")
@@ -776,8 +784,144 @@ def walk_5m_held(
             late=bool(ladder.late),
         )
         if sold is not None:
+            if _informed_blocks_sell(spec, hit, ticks, row, px, intent, winner, held):
+                continue
             return sold
     return _redeem(held, fill, winner)
+
+
+def _bid_at_or_before(ticks: Sequence[dict], held: str, ts: float) -> Optional[float]:
+    best = None
+    best_ts = None
+    for row in ticks:
+        row_ts = _f(row.get("ts"))
+        if row_ts is None or row_ts > ts + 1e-12:
+            continue
+        bid, _, _ = _leg_quote(row, held)
+        if bid is None:
+            continue
+        if best_ts is None or row_ts >= best_ts:
+            best_ts = row_ts
+            best = bid
+    return best
+
+
+def path_after_entry(ticks: Sequence[dict], hit: dict, held: str) -> dict:
+    """Watcher features after the 92¢ fill. No resolution leak except end_bid."""
+    bids: List[Tuple[float, float, Optional[float], Optional[float]]] = []
+    for row in ticks:
+        if not _after_entry(row, hit):
+            continue
+        bid, ask, last = _leg_quote(row, held)
+        ttm = _f(row.get("ttm"))
+        if bid is None:
+            continue
+        bids.append((bid, float(ttm) if ttm is not None else float("nan"), ask, last))
+    if not bids:
+        return {
+            "n": 0,
+            "min_bid": None,
+            "max_bid": None,
+            "end_bid": None,
+            "sec_le52": 0,
+            "sec_le40": 0,
+            "first_le52_ttm": None,
+            "recovered_70_after_52": False,
+            "drop_from_entry": None,
+        }
+    min_bid = min(b[0] for b in bids)
+    max_bid = max(b[0] for b in bids)
+    end_bid = bids[-1][0]
+    sec_le52 = sum(1 for b in bids if b[0] <= 0.52 + 1e-12)
+    sec_le40 = sum(1 for b in bids if b[0] <= 0.40 + 1e-12)
+    first_le52 = next((b[1] for b in bids if b[0] <= 0.52 + 1e-12), None)
+    saw_52 = False
+    recovered = False
+    for bid, _ttm, _ask, _last in bids:
+        if bid <= 0.52 + 1e-12:
+            saw_52 = True
+        elif saw_52 and bid >= 0.70 - 1e-12:
+            recovered = True
+    entry = _f(hit.get("ask")) or ASK_92_MIN
+    return {
+        "n": len(bids),
+        "min_bid": round(min_bid, 4),
+        "max_bid": round(max_bid, 4),
+        "end_bid": round(end_bid, 4),
+        "sec_le52": sec_le52,
+        "sec_le40": sec_le40,
+        "first_le52_ttm": None if first_le52 is None or first_le52 != first_le52 else round(float(first_le52), 1),
+        "recovered_70_after_52": recovered,
+        "drop_from_entry": round(entry - min_bid, 4),
+    }
+
+
+def _informed_blocks_sell(
+    spec: HedgeSpec,
+    hit: dict,
+    ticks: Sequence[dict],
+    row: dict,
+    px: float,
+    intent,
+    winner: Optional[str],
+    held: str,
+) -> bool:
+    """True = hold instead of this persist/dump. Dumps ignore drop/crash vetoes."""
+    if spec.require_lost and winner == held:
+        return True
+    dump = bool(intent.dump)
+    if dump:
+        return False
+    if spec.require_crash:
+        feats = path_after_entry(ticks, hit, held)
+        # Only the path *so far* (ticks at/before this row).
+        so_far = [t for t in ticks if _f(t.get("ts")) is None or _f(t.get("ts")) <= (_f(row.get("ts")) or 0) + 1e-12]
+        feats = path_after_entry(so_far, hit, held)
+        if feats.get("min_bid") is None or float(feats["min_bid"]) > 0.40 + 1e-12:
+            return True
+    entry = _f(hit.get("ask")) or ASK_92_MIN
+    if spec.min_drop_from_entry > 0 and (entry - float(px)) < spec.min_drop_from_entry - 1e-12:
+        return True
+    if spec.lookback_s > 0 and spec.min_drop_in_lookback > 0:
+        ts = _f(row.get("ts"))
+        if ts is None:
+            return True
+        past = _bid_at_or_before(ticks, held, ts - float(spec.lookback_s))
+        if past is None or (past - float(px)) < spec.min_drop_in_lookback - 1e-12:
+            return True
+    return False
+
+
+def informed_five_specs() -> List[HedgeSpec]:
+    """Watcher-style 5m stops. Dumps stay 40. Not live JSON."""
+    return [
+        RIDE,
+        LIVE_FIVE,
+        HedgeSpec(name="persist_50_no_late", late_ttm=0.0),
+        HedgeSpec(name="persist_50_3s_no_late", persist_s=3.0, late_ttm=0.0),
+        HedgeSpec(name="persist_50_5s_no_late", persist_s=5.0, late_ttm=0.0),
+        dump_only_spec(0.40),
+        HedgeSpec(
+            name="collapse_15c_3s",
+            late_ttm=0.0,
+            lookback_s=3.0,
+            min_drop_in_lookback=0.15,
+        ),
+        HedgeSpec(
+            name="collapse_20c_5s",
+            late_ttm=0.0,
+            lookback_s=5.0,
+            min_drop_in_lookback=0.20,
+        ),
+        HedgeSpec(
+            name="drop_40_from_entry",
+            late_ttm=0.0,
+            min_drop_from_entry=0.40,
+        ),
+        HedgeSpec(name="crash_then_persist_50", late_ttm=0.0, require_crash=True),
+        HedgeSpec(name="hindsight_lost_only", require_lost=True),
+        HedgeSpec(name="hindsight_lost_at_50", late_ttm=0.0, require_lost=True),
+    ]
 
 
 def walk_15m_held(

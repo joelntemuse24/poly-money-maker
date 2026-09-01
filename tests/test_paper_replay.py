@@ -12,6 +12,8 @@ from buy.paper_replay import (
     fak_fill,
     first_92_entry,
     quoted_buy_shares_up_to_limit,
+    informed_five_specs,
+    path_after_entry,
     salvage_breakeven,
     summarize,
     ticks_from_trades,
@@ -322,6 +324,52 @@ class HedgeSpecTests(unittest.TestCase):
         self.assertIsNotNone(at50)
         self.assertLess(at50, 0.86)
         self.assertGreater(at50, 0.80)
+
+    def test_hindsight_lost_rides_winner_dip(self):
+        spec = HedgeSpec(name="hindsight_lost_only", require_lost=True, late_ttm=0.0)
+        hit = {"ts": 1000, "ttm": 90, "leg": "up", "ask": 0.92}
+        fill = fak_fill("5m", 0.92, budget=10.0)
+        ticks = [_tick(1000, 90, 0.92, 0.08)]
+        for i in range(3):
+            ticks.append(
+                _tick(1001 + i, 89 - i, 0.52, 0.58, ub=0.50, db=0.56, ult=0.50, dlt=0.56)
+            )
+        for i in range(5):
+            ticks.append(_tick(1004 + i, 86 - i, 0.95, 0.05))
+        out = walk_5m_held(ticks, hit, fill, winner="up", spec=spec)
+        self.assertEqual(out["exit"], "redeem_win")
+
+    def test_collapse_blocks_stale_50(self):
+        """After 5s at 50 the 3s lookback is also 50 — no fresh crash, hold."""
+        spec = HedgeSpec(
+            name="collapse_15c_3s",
+            persist_s=5.0,
+            late_ttm=0.0,
+            lookback_s=3.0,
+            min_drop_in_lookback=0.15,
+        )
+        hit = {"ts": 1000, "ttm": 90, "leg": "up", "ask": 0.92}
+        fill = fak_fill("5m", 0.92, budget=10.0)
+        ticks = [_tick(1000, 90, 0.92, 0.08)]
+        for i in range(8):
+            ticks.append(
+                _tick(1001 + i, 89 - i, 0.52, 0.58, ub=0.50, db=0.56, ult=0.50, dlt=0.56)
+            )
+        out = walk_5m_held(ticks, hit, fill, winner="down", spec=spec)
+        self.assertEqual(out["exit"], "redeem_loss")
+
+    def test_path_marks_recovery_after_52(self):
+        hit = {"ts": 1, "ttm": 50, "leg": "up", "ask": 0.92}
+        ticks = [
+            _tick(1, 50, 0.92, 0.08),
+            _tick(2, 49, 0.50, 0.50, ub=0.50, db=0.48),
+            _tick(3, 48, 0.80, 0.20, ub=0.79, db=0.19),
+        ]
+        feats = path_after_entry(ticks, hit, "up")
+        self.assertTrue(feats["recovered_70_after_52"])
+        self.assertAlmostEqual(feats["min_bid"], 0.50)
+        names = [s.name for s in informed_five_specs()]
+        self.assertIn("hindsight_lost_only", names)
 
 
 if __name__ == "__main__":
