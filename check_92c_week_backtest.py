@@ -227,7 +227,7 @@ def load_pathlog_markets(tick_dir: Path, series_key: str, start_ts: float, end_t
     return out
 
 
-def score_pathlog(markets, series_key: str) -> List[dict]:
+def score_pathlog(markets, series_key: str, budget: float) -> List[dict]:
     ttm_max = SERIES[series_key]["ttm_max"]
     rows = []
     for market in markets:
@@ -246,6 +246,7 @@ def score_pathlog(markets, series_key: str) -> List[dict]:
                 ttm_max=ttm_max,
                 winner=market.winner,
                 slug=market.slug,
+                budget=budget,
             )
         )
     return rows
@@ -257,6 +258,7 @@ def score_public(
     series_key: str,
     cache_dir: Path,
     workers: int,
+    budget: float,
 ) -> List[dict]:
     ttm_max = SERIES[series_key]["ttm_max"]
     duration = SERIES[series_key]["duration_s"]
@@ -277,6 +279,7 @@ def score_public(
             ticks,
             series=series_key,
             ttm_max=ttm_max,
+            budget=budget,
             winner=market.get("winner"),
             slug=market["slug"],
         )
@@ -345,6 +348,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     ap.add_argument("--csv", type=Path, default=None)
     ap.add_argument("--workers", type=int, default=8)
     ap.add_argument("--end-ts", type=float, default=None)
+    ap.add_argument(
+        "--budget",
+        type=float,
+        default=10.0,
+        help="USDC per fill (default 10). Live $2.50 rails are not used.",
+    )
     args = ap.parse_args(argv)
 
     end_ts = float(args.end_ts) if args.end_ts else time.time()
@@ -364,6 +373,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         + " → "
         + datetime.fromtimestamp(end_ts, tz=timezone.utc).strftime("%Y-%m-%d %H:%M")
         + " UTC"
+        + f"  budget=${args.budget:g}"
     )
     print(
         "5m: last 60s @ 92¢, FAK 92¢, live hedge "
@@ -393,7 +403,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             pathlog = load_pathlog_markets(tick_dir, series_key, start_ts, end_ts)
         if pathlog:
             print(f"\n{series_key}: {len(pathlog)} pathlog markets (TOB 1s)")
-            rows = score_pathlog(pathlog, series_key)
+            rows = score_pathlog(pathlog, series_key, args.budget)
             tape = "pathlog-tob-1s"
         else:
             print(f"\n{series_key}: fetching Gamma calendar + last-trades (public, no keys)")
@@ -402,7 +412,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             if not markets:
                 print_stats(f"{series_key} 92¢ last {ttm:g}s", summarize([]), tape)
                 continue
-            rows = score_public(http, markets, series_key, args.cache, args.workers)
+            rows = score_public(
+                http, markets, series_key, args.cache, args.workers, args.budget,
+            )
         stats = summarize(rows)
         print_stats(f"{series_key} buy@92¢ last {ttm:g}s", stats, tape)
         all_rows.extend(rows)

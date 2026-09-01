@@ -207,19 +207,39 @@ def quoted_buy_shares_up_to_limit(
     return 0.0
 
 
-def fak_fill(series: str, ask: float, ask_size: Optional[float] = None) -> dict:
+def size_caps(budget: float) -> Tuple[float, float]:
+    """Spend / share rails for a paper clip. Live $2.50 keeps $3 / 5.
+
+    A $10 probe uses the hourly-shaped $11 / 14 so the $3 live cap cannot
+    shrink the FAK. Not a live JSON change.
+    """
+    b = float(budget)
+    if abs(b - 2.5) < 1e-9:
+        return BUY_MAX_SPEND, BUY_MAX_SHARES
+    spend = round(b + 1.0, 2)
+    shares = max(14.0, math.ceil(spend / 0.70) + 1.0)
+    return spend, float(shares)
+
+
+def fak_fill(
+    series: str,
+    ask: float,
+    ask_size: Optional[float] = None,
+    budget: float = BUDGET,
+) -> dict:
     """Size the FAK. 5m posts at 92¢; 15m pins the limit to the 0.01 ask."""
     ask_f = float(ask)
+    spend_cap, share_cap = size_caps(budget)
     if series == "15m":
         ask_f = round(ask_f + 1e-12, 2)
     if series == "5m":
         shares = quoted_buy_shares_up_to_limit(
-            BUDGET, ask_f, ASK_92_MIN, BUY_MAX_SHARES, BUY_MAX_SPEND,
+            float(budget), ask_f, ASK_92_MIN, share_cap, spend_cap,
         )
         limit = ASK_92_MIN
         avg = limit
     else:
-        shares = quoted_buy_shares(BUDGET, ask_f, BUY_MAX_SHARES)
+        shares = quoted_buy_shares(float(budget), ask_f, share_cap)
         limit = ask_f
         avg = ask_f
     out = {
@@ -588,6 +608,7 @@ def evaluate_market(
     ttm_max: float,
     winner: Optional[str],
     slug: str = "",
+    budget: float = BUDGET,
 ) -> dict:
     hit = first_92_entry(ticks, ttm_max=ttm_max)
     base = {
@@ -614,7 +635,7 @@ def evaluate_market(
     }
     if hit is None:
         return base
-    fill = fak_fill(series, float(hit["ask"]), hit.get("ask_size"))
+    fill = fak_fill(series, float(hit["ask"]), hit.get("ask_size"), budget=budget)
     base.update(
         hit=True,
         leg=hit["leg"],

@@ -39,6 +39,13 @@ class SizerTests(unittest.TestCase):
         self.assertEqual(fill["shares"], 3.0)
         self.assertAlmostEqual(fill["notional"], 2.76)
 
+    def test_5m_10_dollars_is_not_clipped_by_live_3_cap(self):
+        fill = fak_fill("5m", 0.92, budget=10.0)
+        self.assertEqual(fill["status"], "full")
+        self.assertGreaterEqual(fill["shares"], 10.0)
+        self.assertGreaterEqual(fill["notional"], 9.0)
+        self.assertLessEqual(fill["notional"], 11.0)
+
     def test_15m_pins_ask(self):
         fill = fak_fill("15m", 0.92)
         self.assertEqual(fill["status"], "full")
