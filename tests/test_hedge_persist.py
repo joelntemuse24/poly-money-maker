@@ -8,6 +8,7 @@ from pathlib import Path
 from buy.hedge_gate import (
     clob_min_tick_from_error,
     evaluate_held_bag,
+    hedge_apply_oracle_against_dump,
     hedge_dump_overrides_oracle,
     hedge_flatten_overrides_oracle,
     hedge_ladder_for_ttm,
@@ -15,6 +16,7 @@ from buy.hedge_gate import (
     hedge_oracle_allows_sell,
     hedge_oracle_blocks_sell,
     hedge_persist_ready,
+    hedge_persist_skips_oracle,
     hedge_rest_required,
     hedge_should_keep_retrying,
     hedge_tick_after_build_error,
@@ -425,6 +427,67 @@ class HedgeOracleBlocksSellTests(unittest.TestCase):
                 late=True, late_ignore_oracle=False,
             )
         )
+
+    def test_persist_skips_oracle_inside_ignore_ttm(self):
+        """8:15AM: T-54 is still persist-50, not the last-30s rung."""
+        self.assertTrue(
+            hedge_persist_skips_oracle(54.0, 60.0, late=False, late_ignore=True),
+        )
+        self.assertTrue(
+            hedge_persist_skips_oracle(60.0, 60.0, late=False, late_ignore=False),
+        )
+        self.assertFalse(
+            hedge_persist_skips_oracle(60.1, 60.0, late=False, late_ignore=True),
+        )
+        self.assertFalse(
+            hedge_persist_skips_oracle(90.0, 60.0, late=False, late_ignore=True),
+        )
+        self.assertFalse(
+            hedge_persist_skips_oracle(54.0, 0.0, late=False, late_ignore=False),
+        )
+        self.assertFalse(
+            hedge_oracle_blocks_sell(
+                dump=False, oracle_agrees=True, dump_ignore_oracle=True,
+                persist_ignore_oracle=True,
+            )
+        )
+
+
+class HedgeOracleAgainstDumpTests(unittest.TestCase):
+    """4:20AM: TWAP already against — dump at 50, do not wait for 40."""
+
+    def test_against_raises_dump_and_bumps_qualify(self):
+        dump, qualify, ask, recovery = hedge_apply_oracle_against_dump(
+            0.40, 0.50, 0.52, 0.53, against=True, against_dump=0.50,
+        )
+        self.assertAlmostEqual(dump, 0.50)
+        self.assertAlmostEqual(qualify, 0.52)
+        self.assertAlmostEqual(ask, 0.52)
+        self.assertAlmostEqual(recovery, 0.53)
+        self.assertLess(dump, qualify)
+        self.assertLessEqual(qualify, recovery)
+
+    def test_still_winning_keeps_dump_40(self):
+        dump, qualify, ask, recovery = hedge_apply_oracle_against_dump(
+            0.40, 0.50, 0.52, 0.53, against=False, against_dump=0.50,
+        )
+        self.assertAlmostEqual(dump, 0.40)
+        self.assertAlmostEqual(qualify, 0.50)
+
+    def test_late_58_already_above_50_only_raises_dump(self):
+        dump, qualify, ask, recovery = hedge_apply_oracle_against_dump(
+            0.40, 0.58, 0.60, 0.62, against=True, against_dump=0.50,
+        )
+        self.assertAlmostEqual(dump, 0.50)
+        self.assertAlmostEqual(qualify, 0.58)
+        self.assertAlmostEqual(recovery, 0.62)
+
+    def test_unknown_or_stale_does_not_raise_dump(self):
+        dump, qualify, _, _ = hedge_apply_oracle_against_dump(
+            0.40, 0.50, 0.52, 0.53, against=False, against_dump=0.50,
+        )
+        self.assertAlmostEqual(dump, 0.40)
+        self.assertAlmostEqual(qualify, 0.50)
 
 
 class HeldHedgeCompositionTests(unittest.TestCase):
@@ -843,6 +906,74 @@ class FiveMTtmHedgeLadderTests(unittest.TestCase):
         self.assertEqual(intent.action, "hold")
         self.assertFalse(intent.dump)
 
+    def test_held_ttm_54_persist_50_skips_oracle(self):
+        """8:15AM Up 83¢: spot flipped T-54 while persist is still 50/52."""
+        kw = dict(self.DECISION)
+        kw["late_ignore_oracle"] = True
+        kw["oracle_ignore_ttm"] = 60.0
+        intent = held_hedge_decision(
+            None, None, 0.50, 0.52, None, None,
+            now_s=20.0, persist_done=True, oracle_agrees=True,
+            seconds_left=54.0, **kw,
+        )
+        self.assertEqual(intent.action, "sell")
+        self.assertEqual(intent.reason, "persist_live_bid")
+        self.assertFalse(intent.dump)
+
+    def test_held_ttm_61_persist_still_oracle_gated(self):
+        """Last-60s skip does not leak into TTM 61 persist-50."""
+        kw = dict(self.DECISION)
+        kw["late_ignore_oracle"] = True
+        kw["oracle_ignore_ttm"] = 60.0
+        intent = held_hedge_decision(
+            None, None, 0.50, 0.52, None, None,
+            now_s=20.0, persist_done=True, oracle_agrees=True,
+            seconds_left=61.0, **kw,
+        )
+        self.assertEqual(intent.action, "hold")
+        self.assertEqual(intent.reason, "oracle_still_winning")
+        self.assertFalse(intent.dump)
+
+    def test_held_ttm_90_oracle_against_dumps_50(self):
+        """4:20AM Up 83¢: TWAP already against — bid 50 dumps, no wait for 40."""
+        kw = dict(self.DECISION)
+        kw["oracle_against"] = True
+        kw["oracle_against_dump"] = 0.50
+        intent = held_hedge_decision(
+            0.50, 0.90, None, None, None, None,
+            now_s=20.0, persist_done=False, oracle_agrees=False,
+            seconds_left=90.0, **kw,
+        )
+        self.assertEqual(intent.action, "dump")
+        self.assertEqual(intent.reason, "bid_le_dump")
+        self.assertTrue(intent.dump)
+
+    def test_held_ttm_90_oracle_winning_50_does_not_dump(self):
+        kw = dict(self.DECISION)
+        kw["oracle_against"] = False
+        kw["oracle_against_dump"] = 0.50
+        intent = held_hedge_decision(
+            0.50, 0.52, None, None, None, None,
+            now_s=20.0, persist_done=True, oracle_agrees=True,
+            seconds_left=90.0, **kw,
+        )
+        self.assertEqual(intent.action, "hold")
+        self.assertEqual(intent.reason, "oracle_still_winning")
+        self.assertFalse(intent.dump)
+
+    def test_held_knife_edge_winner_does_not_against_dump(self):
+        """5:30AM Up 82¢: Binance still with the bag — do not dump at 50."""
+        kw = dict(self.DECISION)
+        kw["oracle_against"] = False
+        kw["oracle_against_dump"] = 0.50
+        intent = held_hedge_decision(
+            0.82, 0.84, None, None, None, None,
+            now_s=20.0, persist_done=False, oracle_agrees=True,
+            seconds_left=90.0, **kw,
+        )
+        self.assertEqual(intent.action, "hold")
+        self.assertFalse(intent.dump)
+
     def test_held_ttm_20_bid_57_persists_late_not_recovery(self):
         kw = dict(self.DECISION)
         kw["persist_armed_ts"] = None
@@ -885,11 +1016,21 @@ class FiveMTtmHedgeLadderTests(unittest.TestCase):
         self.assertIn('"hedge_late_recovery": 0.62', five)
         self.assertIn('"hedge_late_ignore_oracle": True', five)
         self.assertIn("late_ignore_oracle=HEDGE_LATE_IGNORE_ORACLE", five)
+        self.assertIn("persist_ignore_oracle=persist_ignore", five)
+        self.assertIn("hedge_persist_skips_oracle(", five)
+        self.assertIn("hedge_apply_oracle_against_dump(", five)
+        self.assertIn("peek_oracle_against(", five)
+        self.assertIn('"hedge_oracle_ignore_ttm_s": 60.0', five)
+        self.assertIn('"hedge_oracle_against_dump": 0.50', five)
         self.assertNotIn("hedge_late_ignore_oracle", hourly)
+        self.assertNotIn("hedge_oracle_ignore_ttm_s", hourly)
+        self.assertNotIn("hedge_oracle_against_dump", hourly)
         self.assertNotIn("hedge_ladder_for_ttm", hourly)
         self.assertNotIn("hedge_late_ttm_s", hourly)
         self.assertNotIn("hedge_ladder_for_ttm", fifteen)
         self.assertNotIn("hedge_late_ttm_s", fifteen)
+        self.assertNotIn("hedge_oracle_ignore_ttm_s", fifteen)
+        self.assertNotIn("hedge_oracle_against_dump", fifteen)
         self.assertNotIn(
             "hedge_late_dump must be <= hedge_threshold", five,
         )

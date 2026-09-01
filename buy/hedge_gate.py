@@ -562,6 +562,71 @@ def hedge_rest_required(*, persist_done, peek_dump) -> bool:
     return not (bool(persist_done) or bool(peek_dump))
 
 
+def hedge_persist_skips_oracle(
+    seconds_left,
+    ignore_ttm,
+    *,
+    late=False,
+    late_ignore=False,
+) -> bool:
+    """True when persist may skip TWAP (last-30s ladder or last-60s window).
+
+    8:15AM 1 Sep: spot flipped at T-54. Last-30s ignore-oracle does not
+    cover that — persist is still 50/52. ``ignore_ttm`` 60 does.
+    """
+    if late and late_ignore:
+        return True
+    if seconds_left is None or seconds_left == "":
+        return False
+    try:
+        ttm = float(seconds_left)
+        cutoff = float(ignore_ttm or 0)
+    except (TypeError, ValueError):
+        return False
+    if ttm != ttm or cutoff != cutoff or cutoff <= 0:
+        return False
+    return ttm <= cutoff + 1e-12
+
+
+def hedge_apply_oracle_against_dump(
+    dump,
+    qualify,
+    ask_max,
+    recovery,
+    *,
+    against=False,
+    against_dump=0.0,
+):
+    """Raise dump when TWAP is already against the bag (4:20AM 1 Sep).
+
+    Persist-50 dump is 40 while BTC still agrees. Once the oracle has
+    flipped, bid ≤50 is a loser book — dump it, do not wait for 40.
+    Bump qualify/ask/recovery so dump < qualify ≤ recovery still holds.
+    ``against_dump`` ≤ 0 disables. Unknown/stale oracle must not raise dump.
+    """
+    try:
+        dump_f = float(dump)
+        qualify_f = float(qualify)
+        ask_f = float(ask_max)
+        recovery_f = float(recovery)
+    except (TypeError, ValueError):
+        return dump, qualify, ask_max, recovery
+    if not against:
+        return dump_f, qualify_f, ask_f, recovery_f
+    try:
+        raised = float(against_dump or 0)
+    except (TypeError, ValueError):
+        return dump_f, qualify_f, ask_f, recovery_f
+    if raised != raised or raised <= dump_f + 1e-12:
+        return dump_f, qualify_f, ask_f, recovery_f
+    dump_f = raised
+    if dump_f + 1e-12 >= qualify_f:
+        qualify_f = min(1.0, dump_f + 0.02)
+        ask_f = max(ask_f, qualify_f)
+        recovery_f = max(recovery_f, qualify_f)
+    return dump_f, qualify_f, ask_f, recovery_f
+
+
 def hedge_oracle_blocks_sell(
     *,
     dump,
@@ -569,17 +634,18 @@ def hedge_oracle_blocks_sell(
     dump_ignore_oracle=True,
     late=False,
     late_ignore_oracle=False,
+    persist_ignore_oracle=False,
 ) -> bool:
     """True → do not sell this tick.
 
-    Dump never blocked when ``dump_ignore_oracle``. Last-30s persist skips
-    TWAP when ``late_ignore_oracle`` — GUI + last-trade + 1s @ 58/60 is
-    the false-hedge brake; waiting for Chainlink 30s TWAP to cross PTB
-    misses the CLOB reverse. TTM >30 persist-50 stays gated.
+    Dump never blocked when ``dump_ignore_oracle``. Persist skips TWAP
+    when ``late_ignore_oracle`` (last-30s 58/60) or ``persist_ignore_oracle``
+    (last-60s persist-50). Waiting for Chainlink 30s TWAP to cross PTB
+    misses the CLOB reverse. TTM > ignore window persist-50 stays gated.
     """
     if dump and dump_ignore_oracle:
         return False
-    if late and late_ignore_oracle:
+    if persist_ignore_oracle or (late and late_ignore_oracle):
         return False
     return bool(oracle_agrees)
 
@@ -615,13 +681,18 @@ def held_hedge_decision(
     late_ask_max=0.60,
     late_recovery=0.62,
     late_ignore_oracle=False,
+    oracle_ignore_ttm=0.0,
+    oracle_against=False,
+    oracle_against_dump=0.0,
 ):
     """REST + pick + evaluate + oracle block for one held tick (no I/O).
 
     Fresh WS dump/flatten peek (or persist_done) may skip REST. Last-good
     is only a pick fallback after REST is allowed to run. Dump and flatten
-    skip the oracle. Last-30s persist skips it when ``late_ignore_oracle``.
-    TTM >30 persist-50 does not.
+    skip the oracle. Persist skips it in the last ``oracle_ignore_ttm``
+    seconds (5m: 60) and on the last-30s ladder when ``late_ignore_oracle``.
+    When TWAP is already against the bag, dump raises to
+    ``oracle_against_dump`` (5m: 50¢).
 
     Pass ``seconds_left`` to raise persist/recovery in the last
     ``late_ttm`` seconds (5m). Dump stays on the early floor unless
@@ -647,6 +718,15 @@ def held_hedge_decision(
         qualify_ask_max = ladder.ask_max
         recovery_cancel = ladder.recovery
         late = bool(ladder.late)
+    dump_bid_max, qualify_bid, qualify_ask_max, recovery_cancel = (
+        hedge_apply_oracle_against_dump(
+            dump_bid_max, qualify_bid, qualify_ask_max, recovery_cancel,
+            against=oracle_against, against_dump=oracle_against_dump,
+        )
+    )
+    persist_ignore = hedge_persist_skips_oracle(
+        seconds_left, oracle_ignore_ttm, late=late, late_ignore=late_ignore_oracle,
+    )
     peek_dump = hedge_dump_overrides_oracle(ws_bid, dump_bid_max, enabled=True)
     peek_flatten = hedge_flatten_overrides_oracle(
         ws_bid, flatten_max, armed=flatten, enabled=True,
@@ -682,6 +762,7 @@ def held_hedge_decision(
         dump_ignore_oracle=dump_ignore_oracle,
         late=late,
         late_ignore_oracle=late_ignore_oracle,
+        persist_ignore_oracle=persist_ignore,
     ):
         return HedgeIntent(
             "hold", "oracle_still_winning", None, None, False, True, None, False,

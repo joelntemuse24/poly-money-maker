@@ -890,11 +890,15 @@ Shared `evaluate_held_bag` steps (live **5m** numbers):
 2. **Oracle veto on persist-50.** `hold_while_oracle_agrees` reads live
    Chainlink TWAP versus PTB with a $0 minimum edge. Missing/stale or still
    on the held side → clear persist and hold
-   (`hedge_skip_oracle` / `hedge_skip_oracle_still_winning`). Last-30s
-   persist skips this (`hedge_late_ignore_oracle`): GUI + last-trade +
+   (`hedge_skip_oracle` / `hedge_skip_oracle_still_winning`). Last **60s**
+   persist-50 skips this (`hedge_oracle_ignore_ttm_s`); last-30s persist
+   58/60 also skips (`hedge_late_ignore_oracle`): GUI + last-trade +
    1s @ 58/60 is the false-hedge brake. Spot leads the 30s TWAP ~10–20s;
-   waiting for TWAP to cross PTB misses the CLOB reverse. Dump/flatten
-   already ignore the oracle.
+   waiting for TWAP to cross PTB misses the CLOB reverse (8:15AM 1 Sep
+   flipped at T-54). Dump/flatten already ignore the oracle. When TWAP
+   is already against the bag, dump raises to **50¢**
+   (`hedge_oracle_against_dump`) so a 50/90 book does not wait for 40
+   (4:20AM). Unknown/stale/still-winning must not raise dump.
 3. Before persistence completes, a fresh bid above 50¢ is a healthy bounce
    and clears the arm. Bid ≥ `hedge_recovery_cancel` (**53¢**) also clears
    a completed arm (`hedge_skip_recovery`).

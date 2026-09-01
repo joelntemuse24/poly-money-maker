@@ -33,6 +33,8 @@
   "hedge_oracle_min_edge_usd": 0.0,
   "hedge_dump_ignore_oracle": true,
   "hedge_late_ignore_oracle": true,
+  "hedge_oracle_ignore_ttm_s": 60.0,
+  "hedge_oracle_against_dump": 0.50,
   "buy_start_s": 45,
   "early_buy_start_s": 45,
   "early_buy_max_price": 0.99,
