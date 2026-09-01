@@ -248,10 +248,15 @@ _STRATEGY_DEFAULTS = {
     # Once holding: do not persist-sell while Chainlink TWAP is still on
     # the held side of PTB. $0 = any non-zero tick. Missing/stale holds.
     # Dump ≤ toxic (40¢) is book-only (`hedge_dump_ignore_oracle`).
-    # Flatten walks also skip the oracle (`dump=True`).
+    # Flatten walks also skip the oracle (`dump=True`). Last-30s persist
+    # skips TWAP too (`hedge_late_ignore_oracle`): CLOB 58/60 + GUI + 1s
+    # is the false-hedge brake. Spot leads 30s TWAP ~10–20s; waiting for
+    # the oracle to flip misses the reverse. TTM >30 persist-50 stays
+    # behind TWAP.
     "hedge_require_oracle": True,
     "hedge_oracle_min_edge_usd": 0.0,
     "hedge_dump_ignore_oracle": True,
+    "hedge_late_ignore_oracle": True,
     "buy_start_s": 120,
     # Whole 5m market: last 120s is 75–90¢; TTM (120, 300] buys ask ≥ 90¢.
     "early_buy_start_s": 300,
@@ -529,6 +534,7 @@ HEDGE_REQUIRE_GUI = _strat["hedge_require_gui"]
 HEDGE_REQUIRE_ORACLE = _strat["hedge_require_oracle"]
 HEDGE_ORACLE_MIN_EDGE_USD = _strat["hedge_oracle_min_edge_usd"]
 HEDGE_DUMP_IGNORE_ORACLE = _strat["hedge_dump_ignore_oracle"]
+HEDGE_LATE_IGNORE_ORACLE = _strat["hedge_late_ignore_oracle"]
 ADD_MIN_PRICE = _strat["add_min_price"]
 BUY_START_S = _strat["buy_start_s"]
 EARLY_BUY_START_S = _strat["early_buy_start_s"]
@@ -793,6 +799,7 @@ def hold_while_oracle_agrees(held_leg, start_ts, condition_id, *, log=True):
     """True = do not persist-sell; live BTC is still with the bag (or unread).
 
     Dump ≤ toxic can ignore this when ``hedge_dump_ignore_oracle`` is on.
+    Last-30s persist can ignore it when ``hedge_late_ignore_oracle`` is on.
     """
     if not HEDGE_REQUIRE_ORACLE:
         return False
@@ -4142,6 +4149,7 @@ while not _shutdown_requested:
         HEDGE_REQUIRE_ORACLE = _strat["hedge_require_oracle"]
         HEDGE_ORACLE_MIN_EDGE_USD = _strat["hedge_oracle_min_edge_usd"]
         HEDGE_DUMP_IGNORE_ORACLE = _strat["hedge_dump_ignore_oracle"]
+        HEDGE_LATE_IGNORE_ORACLE = _strat["hedge_late_ignore_oracle"]
         ADD_MIN_PRICE = _strat["add_min_price"]
         BUY_START_S = _strat["buy_start_s"]
         EARLY_BUY_START_S = _strat["early_buy_start_s"]
@@ -5022,14 +5030,15 @@ while not _shutdown_requested:
                     and not meta.get("hedge_closed")
                 )
                 # REST + evaluate before oracle so a 4–32¢ book dumps even if
-                # WS is down. Persist 5s @ 50/52 stays behind the oracle.
-                # Fresh WS dump peek may skip REST; stale last-good must not.
+                # WS is down. Persist-50 stays behind the oracle except last
+                # 30s (`hedge_late_ignore_oracle`). Fresh WS dump peek may
+                # skip REST; stale last-good must not.
                 if hedge_open:
-                    # ANY live bag with held bid ≤ toxic (32¢) dumps at the live bid
-                    # even if BTC has not crossed yet. Persist 5s @ 50/52 stays
-                    # behind the oracle. Then sell at the live bid while < 53¢
-                    # (including a fade through 50). Bid ≥ recovery_cancel (53¢)
-                    # holds and clears persist. Incomplete REST uses WS/last-good.
+                    # ANY live bag with held bid ≤ toxic (40¢) dumps at the live bid
+                    # even if BTC has not crossed yet. Persist-50 stays behind
+                    # the oracle; last-30s persist 58/60 + GUI does not.
+                    # Then sell at the live bid while < recovery. Incomplete
+                    # REST uses WS/last-good.
                     quote_age = book_ws.quote_age(held_token)
                     ws_fresh = quote_age is not None and quote_age <= float(HEDGE_QUOTE_MAX_AGE_S)
                     peek_bid = peek_ask = peek_mid = None
@@ -5246,7 +5255,10 @@ while not _shutdown_requested:
                                 _hedge_persist_done.add(cond)
 
                         oracle_agrees = False
-                        skip_oracle = bool(intent.dump) and HEDGE_DUMP_IGNORE_ORACLE
+                        skip_oracle = (
+                            (bool(intent.dump) and HEDGE_DUMP_IGNORE_ORACLE)
+                            or (bool(ladder.late) and HEDGE_LATE_IGNORE_ORACLE)
+                        )
                         if not skip_oracle:
                             oracle_agrees = hold_while_oracle_agrees(
                                 held_leg, m.start_ts, cond,
@@ -5255,6 +5267,8 @@ while not _shutdown_requested:
                             dump=bool(intent.dump),
                             oracle_agrees=oracle_agrees,
                             dump_ignore_oracle=HEDGE_DUMP_IGNORE_ORACLE,
+                            late=bool(ladder.late),
+                            late_ignore_oracle=HEDGE_LATE_IGNORE_ORACLE,
                         ):
                             pass
                         elif intent.action in {"arm", "wait"}:
@@ -5431,6 +5445,12 @@ while not _shutdown_requested:
                                     _live_bid,
                                     ladder.dump,
                                     enabled=HEDGE_DUMP_IGNORE_ORACLE,
+                                ):
+                                    return True, "ok"
+                                if (
+                                    HEDGE_LATE_IGNORE_ORACLE
+                                    and HEDGE_LATE_TTM_S > 0
+                                    and ttm <= HEDGE_LATE_TTM_S
                                 ):
                                     return True, "ok"
                                 if hold_while_oracle_agrees(

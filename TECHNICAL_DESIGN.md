@@ -223,7 +223,7 @@ is last **120s**, **75–90¢**, `min_underlying_edge_usd` **$10**,
 `late_90` / early / ≥95 **off**, one $2.50 FAK, persist **1s @ 50/52**,
 dump **40¢** ignore-oracle, flatten walks **avg <75¢** at live bid **<75¢**,
 recovery 53¢, last-30s ladder dump **40** / persist **58/60** / recovery
-**62**, tick `0.001`. The example JSON
+**62** with persist **ignore-oracle**, tick `0.001`. The example JSON
 and `--sweep` template are still last **45s** + `$25` — that is
 research **entry**, not live. Example hedge knobs now match B+C
 (persist 1s / dump 40 / flatten) plus the last-30s ladder defaults.
@@ -887,10 +887,14 @@ Shared `evaluate_held_bag` steps (live **5m** numbers):
    also dumps at the live bid while bid **<75¢** so a 70¢ walk does not
    HOLD at recovery 53. Missing/stale REST uses
    WS/last-good (`pick_held_quote`).
-2. **Oracle veto on persist.** `hold_while_oracle_agrees` reads live
+2. **Oracle veto on persist-50.** `hold_while_oracle_agrees` reads live
    Chainlink TWAP versus PTB with a $0 minimum edge. Missing/stale or still
    on the held side → clear persist and hold
-   (`hedge_skip_oracle` / `hedge_skip_oracle_still_winning`).
+   (`hedge_skip_oracle` / `hedge_skip_oracle_still_winning`). Last-30s
+   persist skips this (`hedge_late_ignore_oracle`): GUI + last-trade +
+   1s @ 58/60 is the false-hedge brake. Spot leads the 30s TWAP ~10–20s;
+   waiting for TWAP to cross PTB misses the CLOB reverse. Dump/flatten
+   already ignore the oracle.
 3. Before persistence completes, a fresh bid above 50¢ is a healthy bounce
    and clears the arm. Bid ≥ `hedge_recovery_cancel` (**53¢**) also clears
    a completed arm (`hedge_skip_recovery`).

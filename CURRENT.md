@@ -3,24 +3,17 @@
 **Agents: read this after `AGENTS.md`.** Update this file when ops/strategy decisions change.
 Do not put secrets, API keys, or live wallet material here.
 
-Last updated: **2026-08-31 ~22:58Z** — **`$10` is live** (printed
-persist 1.0 / dump 0.4 / flatten True / start 120 / edge 10.0 /
-`dry_run` False / `entry` True; services inactive / active /
-inactive). Do **not** re-paste `$10`. **Do not paste last-45 + $25**
-(replay keep **6 / −$3.46**). Next money move is the **last-30s hedge
-ladder** (this PR): TTM **>30** stays 40 / 50/52 / 53; TTM **≤30**
-is dump **40** / persist **58** / ask **60** / recovery **62**.
-A last-30s 50/52 waits **1s** + GUI/last-trade; a random 50 bid does
-not dump.
-Persist **1s** both rungs. Flatten **<75¢** unchanged. Restart
-required after merge — code defaults apply; no extra JSON paste.
-First last-120 tape at edge $0: barely +EV (**+$9 / ~94h ≈
-+$0.10–$0.12/h**). Paper-credit VM tape: `paper_win=288` /
-`paper_loss=71` / `hedge=54` / `session_pnl=−163` is **still not live
-P&L** (24 no-BTC opens + Binance≠resolution). **Do not size up.**
-Catalog: `docs/2026-08-31-last120-loss-catalog.md` §9. Hourly and 15m
-are stopped. **Do not add a vol/momentum buy skip.** last-120+`$10`
-is the 0–10 cut; GATE `|dist|≥25` is still no.
+Last updated: **2026-09-01** — last-30s persist **ignores the oracle**
+(`hedge_late_ignore_oracle`, this PR). TTM **≤30** persist 58/60 + GUI
++ 1s sells even while Chainlink TWAP is still on the held side of PTB.
+Dump **40** and flatten already skipped TWAP; persist-50 at TTM **>30**
+still needs the oracle against/flat. **Restart required** after merge
+(code default `True`; no JSON paste). Do **not** re-paste `$10`. **Do
+not paste last-45 + $25**. Last-30s ladder + `$10` + B+C already live
+(~23:32Z / ~22:58Z / ~22:25Z 31 Aug). First last-120 tape at edge $0:
+barely +EV (**+$9 / ~94h**). **Do not size up.** Catalog:
+`docs/2026-08-31-last120-loss-catalog.md`. Hourly and 15m are stopped.
+**Do not add a vol/momentum buy skip.**
 
 **Live 5m combination** after the `$10` paste (B+C already on the box).
 Example JSON `--sweep` entry is still last-45+$25; its **hedge** knobs
@@ -33,8 +26,8 @@ match B+C plus the last-30s ladder defaults.
 | `min_underlying_edge_usd` | **$10** (skip 0–10 `|TWAP−PTB|`; not $25) |
 | Early / ≥95 | **off** (`early_buy_start_s=120`, `early_95_start_s=0`) |
 | Size | **one $2.50** (`buy_budget=late_buy_budget=2.5`). **Do not size up.** |
-| Hedge TTM >30 | persist **1s** @ 50/52, dump **40¢**, flatten **<75¢**, recovery 53 |
-| Hedge TTM ≤30 | persist **1s** @ 58/60 + GUI/last-trade, dump **40¢**, recovery 62 (same flatten) |
+| Hedge TTM >30 | persist **1s** @ 50/52, dump **40¢**, flatten **<75¢**, recovery 53, **oracle on persist** |
+| Hedge TTM ≤30 | persist **1s** @ 58/60 + GUI/last-trade, dump **40¢**, recovery 62, **oracle off persist** (`hedge_late_ignore_oracle`) |
 | Look / WS | `BUY_HORIZON_S` **120s** |
 
 **How we got here (do not relitigate):** last-45 + `$25` looked eatable
@@ -56,8 +49,10 @@ WR ~82%. Stay **$2.50**. Score exits, not size.
 Those knobs are gone on 5m. Persist is now **1s @ 50/52**, recovery **53¢**
 (do not sell 55–69), dump **40¢** even if BTC has not crossed yet,
 walks **avg <75¢** flatten at the live bid while bid **<75¢**, and
-persist-50 still needs the oracle against/flat. Winner-dump risk: the
-tape already had **8 sold-then-won**; faster persist and flatten add more.
+persist-50 still needs the oracle against/flat. Last-30s persist 58/60
+skips that oracle (CLOB consensus is the brake; 30s TWAP lags spot
+~10–20s). Winner-dump risk: the tape already had **8 sold-then-won**;
+faster persist and flatten add more.
 
 **Reversal features (27 Aug):** 25% flips in the **$20–40 bucket** is
 **not** eatable at an 85–88¢ fill (no-hedge cap is `1 − fill`: 15% at
@@ -80,20 +75,29 @@ systemctl is-active polybuybot polybuybot5m polybuybothourly
 # expect: inactive active inactive
 ```
 
-**Last-30s hedge ladder — after this merge.** Code defaults
-(`hedge_late_ttm_s=30`, dump 40 / qualify 58 / ask 60 / recovery 62)
-apply on restart. Live JSON does not need a new paste unless you want
-the keys written into the file. Confirm `dry_run` / `entry_enabled`.
-Printed `start` must stay **120**, `edge` **10**. Do **not** paste
-last-45 + $25. Do **not** start 15m, hourly, or mint.
+**Last-30s hedge ladder — live 31 Aug ~23:32Z** (`7d36a16`). **Last-30s
+persist ignores oracle — this PR.** Code default
+`hedge_late_ignore_oracle=true`. Live JSON does not need a paste.
+Confirm `dry_run` / `entry_enabled`. Printed `start` must stay **120**,
+`edge` **10**. Do **not** paste last-45 + $25. Do **not** start 15m,
+hourly, or mint.
 
 ```bash
 cd ~/poly-money-maker && git pull
-# $10 and B+C already on the box — do not re-paste
+git rev-parse --short HEAD
 sudo systemctl restart polybuybot5m
 systemctl is-active polybuybot polybuybot5m polybuybothourly
 # expect: inactive active inactive
 ```
+
+**1 Sep UI CSV (500 rows, 29 Aug 19:18Z–1 Sep 12:26Z):** 259 buys / 205
+redeems / 36 sells / 18 held-to-zero. Pre-B+C sell median **19¢**;
+post-ladder sell median **43¢**. Binance 1s join: on late reversals
+spot leads 30s TWAP **~10–20s**. Persist-50 was waiting for TWAP.
+Post-ladder zeros are mixed (one last-60s reverse with 41s of
+oracle-allowed persist then h2z; one bought already-against; one
+Binance-won knife-edge). Last-30s persist ignore-oracle is the
+CLOB-consensus path; it does not turn dump-misses into fills.
 
 First last-120 tape (27 Aug 17:26Z → 31 Aug 15:12 Dublin): **+$9**, WR ~**82%**,
 take rate **411/1129 = 36%**, **73 walks**, **52 sells / 0 `hedge_fill`**
@@ -361,13 +365,12 @@ amount / HTTP 400), not this NameError.
       1.0 / dump 0.4 / flatten True / start 120 / edge 10.0 /
       dry_run False / entry True. Services inactive / active /
       inactive.
-- [ ] **Last-30s hedge ladder** (this PR). After merge: `git pull` +
-      `sudo systemctl restart polybuybot5m`. No JSON paste. Measure
-      48h: `hedge_late=true` persist (not dump-55); last-30s 50/90
-      should hold; sell px after 1s consensus (want 50–58 not 1–20);
-      held-to-zero with TTM<20; sold-then-won vs
-      tape’s 8; `$10` `edge_too_small` on 0–10; fill rate vs 4.1/h;
-      B+C sell px / h2z; Dublin $/h; `cycle_error` 0.
+- [x] **Last-30s hedge ladder** — live 31 Aug ~23:32Z (`7d36a16`).
+- [ ] **Last-30s persist ignore-oracle** (this PR). After merge:
+      `git pull` + `sudo systemctl restart polybuybot5m`. No JSON paste.
+      Measure: last-30s `hedge_skip_oracle_still_winning` should drop;
+      persist sells at 50–58 while TWAP still agrees; last-30s 50/90
+      still holds; sold-then-won vs tape’s 8; h2z with TTM<20.
 
 ---
 
@@ -376,8 +379,9 @@ amount / HTTP 400), not this NameError.
 1. Read `AGENTS.md` + this file before changing mint/buy/hedge logic.
 2. Do **not** restart minting unless the operator asks. Do **not** start
    `polybuybot` / `polybuybothourly` unless the operator asks. 5m is the
-   live buy bot. B+C and `$10` are on the box. Next is the last-30s
-   ladder restart after this merge. Do **not** re-paste `$10`.
+   live buy bot. B+C, `$10`, and the last-30s ladder are on the box.
+   Next is last-30s persist ignore-oracle after this merge. Do **not**
+   re-paste `$10`.
 3. Never truncate state/PnL/log files; never commit live strategy/state/`.env`.
    Pathlog ticks are **auto-pruned** (14d / 400 MB) — do not `rm` them by hand,
    but **do export** (`check_path_backtest.py --csv` or `scp` the ticks dir)

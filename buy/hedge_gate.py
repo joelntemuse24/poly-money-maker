@@ -562,12 +562,24 @@ def hedge_rest_required(*, persist_done, peek_dump) -> bool:
     return not (bool(persist_done) or bool(peek_dump))
 
 
-def hedge_oracle_blocks_sell(*, dump, oracle_agrees, dump_ignore_oracle=True) -> bool:
+def hedge_oracle_blocks_sell(
+    *,
+    dump,
+    oracle_agrees,
+    dump_ignore_oracle=True,
+    late=False,
+    late_ignore_oracle=False,
+) -> bool:
     """True → do not sell this tick.
 
-    Dump never blocked when ``dump_ignore_oracle``. Persist-50 stays gated.
+    Dump never blocked when ``dump_ignore_oracle``. Last-30s persist skips
+    TWAP when ``late_ignore_oracle`` — GUI + last-trade + 1s @ 58/60 is
+    the false-hedge brake; waiting for Chainlink 30s TWAP to cross PTB
+    misses the CLOB reverse. TTM >30 persist-50 stays gated.
     """
     if dump and dump_ignore_oracle:
+        return False
+    if late and late_ignore_oracle:
         return False
     return bool(oracle_agrees)
 
@@ -602,18 +614,21 @@ def held_hedge_decision(
     late_qualify=0.58,
     late_ask_max=0.60,
     late_recovery=0.62,
+    late_ignore_oracle=False,
 ):
     """REST + pick + evaluate + oracle block for one held tick (no I/O).
 
     Fresh WS dump/flatten peek (or persist_done) may skip REST. Last-good
     is only a pick fallback after REST is allowed to run. Dump and flatten
-    skip the oracle; a persist sell does not.
+    skip the oracle. Last-30s persist skips it when ``late_ignore_oracle``.
+    TTM >30 persist-50 does not.
 
     Pass ``seconds_left`` to raise persist/recovery in the last
     ``late_ttm`` seconds (5m). Dump stays on the early floor unless
     ``late_dump`` is set higher. ``late_ttm`` ≤ 0 or omitted TTM keeps
     the static early knobs. Hourly must not pass 5m seconds.
     """
+    late = False
     if seconds_left is not None:
         ladder = hedge_ladder_for_ttm(
             seconds_left,
@@ -631,6 +646,7 @@ def held_hedge_decision(
         qualify_bid = ladder.qualify
         qualify_ask_max = ladder.ask_max
         recovery_cancel = ladder.recovery
+        late = bool(ladder.late)
     peek_dump = hedge_dump_overrides_oracle(ws_bid, dump_bid_max, enabled=True)
     peek_flatten = hedge_flatten_overrides_oracle(
         ws_bid, flatten_max, armed=flatten, enabled=True,
@@ -664,6 +680,8 @@ def held_hedge_decision(
         dump=bool(intent.dump),
         oracle_agrees=oracle_agrees,
         dump_ignore_oracle=dump_ignore_oracle,
+        late=late,
+        late_ignore_oracle=late_ignore_oracle,
     ):
         return HedgeIntent(
             "hold", "oracle_still_winning", None, None, False, True, None, False,
