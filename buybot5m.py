@@ -72,6 +72,7 @@ from buy.entry_skip import (
 )
 from buy.hedge_gate import (
     evaluate_held_bag,
+    hedge_apply_oracle_against_dump,
     hedge_dump_overrides_oracle,
     hedge_fail_is_terminal,
     hedge_flatten_overrides_oracle,
@@ -80,6 +81,7 @@ from buy.hedge_gate import (
     hedge_oracle_allows_sell,
     hedge_oracle_blocks_sell,
     hedge_persist_ready,
+    hedge_persist_skips_oracle,
     hedge_qualify_ok,
     hedge_rest_required,
     hedge_should_keep_retrying,
@@ -248,10 +250,22 @@ _STRATEGY_DEFAULTS = {
     # Once holding: do not persist-sell while Chainlink TWAP is still on
     # the held side of PTB. $0 = any non-zero tick. Missing/stale holds.
     # Dump ≤ toxic (40¢) is book-only (`hedge_dump_ignore_oracle`).
-    # Flatten walks also skip the oracle (`dump=True`).
+    # Flatten walks also skip the oracle (`dump=True`). Persist skips
+    # TWAP in the last 60s (`hedge_oracle_ignore_ttm_s`) and on the
+    # last-30s 58/60 ladder (`hedge_late_ignore_oracle`). When TWAP is
+    # already against the bag, dump raises to 50¢
+    # (`hedge_oracle_against_dump`). TTM >60 persist-50 stays behind
+    # TWAP unless dump ≤40.
     "hedge_require_oracle": True,
     "hedge_oracle_min_edge_usd": 0.0,
     "hedge_dump_ignore_oracle": True,
+    "hedge_late_ignore_oracle": True,
+    # 8:15AM 1 Sep: spot flipped T-54, persist still 50/52. Last-30s
+    # ignore-oracle does not cover that. 0 disables.
+    "hedge_oracle_ignore_ttm_s": 60.0,
+    # 4:20AM 1 Sep: TWAP already against from the fill. Dump at 50¢,
+    # do not wait for 40. 0 disables. Unknown/stale must not raise dump.
+    "hedge_oracle_against_dump": 0.50,
     "buy_start_s": 120,
     # Whole 5m market: last 120s is 75–90¢; TTM (120, 300] buys ask ≥ 90¢.
     "early_buy_start_s": 300,
@@ -392,6 +406,7 @@ def load_strategy():
             "hedge_toxic_bid_max", "hedge_recovery_cancel",
             "hedge_late_dump", "hedge_late_qualify",
             "hedge_late_ask_max", "hedge_late_recovery",
+            "hedge_oracle_against_dump",
         ):
             if not 0 <= float(cfg[key]) <= 1:
                 raise ValueError(f"{key} must be between 0 and 1")
@@ -478,6 +493,7 @@ def load_strategy():
             "hedge_ghost_sleep_s", "buy_grace_s", "buy_cooldown_s",
             "empty_fak_cooldown_s", "early_95_start_s", "early_95_min_s",
             "late_90_start_s", "hedge_late_ttm_s",
+            "hedge_oracle_ignore_ttm_s",
             "redeem_throttle_s", "max_redeem_age_days", "hedge_persist_s",
             "hedge_oracle_min_edge_usd",
         ):
@@ -529,6 +545,9 @@ HEDGE_REQUIRE_GUI = _strat["hedge_require_gui"]
 HEDGE_REQUIRE_ORACLE = _strat["hedge_require_oracle"]
 HEDGE_ORACLE_MIN_EDGE_USD = _strat["hedge_oracle_min_edge_usd"]
 HEDGE_DUMP_IGNORE_ORACLE = _strat["hedge_dump_ignore_oracle"]
+HEDGE_LATE_IGNORE_ORACLE = _strat["hedge_late_ignore_oracle"]
+HEDGE_ORACLE_IGNORE_TTM_S = _strat["hedge_oracle_ignore_ttm_s"]
+HEDGE_ORACLE_AGAINST_DUMP = _strat["hedge_oracle_against_dump"]
 ADD_MIN_PRICE = _strat["add_min_price"]
 BUY_START_S = _strat["buy_start_s"]
 EARLY_BUY_START_S = _strat["early_buy_start_s"]
@@ -789,10 +808,26 @@ def log_buy_skip_throttled(skip_reason, condition_id, event="buy_skip", **kwargs
     log_event(event, reason=reason, condition_id=condition_id, **kwargs)
 
 
+def peek_oracle_against(held_leg, start_ts):
+    """True when live TWAP favors the other leg. Does not clear persist.
+
+    Used to raise dump to ``hedge_oracle_against_dump`` (4:20AM). Unknown
+    or still-winning must not raise dump. Flat (edge_zero) also does not.
+    """
+    if not HEDGE_REQUIRE_ORACLE:
+        return False
+    uchk = btc_feed.underlying_check(start_ts, float(HEDGE_ORACLE_MIN_EDGE_USD))
+    _, why = hedge_oracle_allows_sell(held_leg, uchk, enabled=True)
+    return why == "oracle_against"
+
+
 def hold_while_oracle_agrees(held_leg, start_ts, condition_id, *, log=True):
     """True = do not persist-sell; live BTC is still with the bag (or unread).
 
     Dump ≤ toxic can ignore this when ``hedge_dump_ignore_oracle`` is on.
+    Last-60s persist can ignore it when ``hedge_oracle_ignore_ttm_s`` is
+    on; last-30s 58/60 also ignores via ``hedge_late_ignore_oracle``.
+    Do not call this on those ticks — it clears persist.
     """
     if not HEDGE_REQUIRE_ORACLE:
         return False
@@ -4142,6 +4177,9 @@ while not _shutdown_requested:
         HEDGE_REQUIRE_ORACLE = _strat["hedge_require_oracle"]
         HEDGE_ORACLE_MIN_EDGE_USD = _strat["hedge_oracle_min_edge_usd"]
         HEDGE_DUMP_IGNORE_ORACLE = _strat["hedge_dump_ignore_oracle"]
+        HEDGE_LATE_IGNORE_ORACLE = _strat["hedge_late_ignore_oracle"]
+        HEDGE_ORACLE_IGNORE_TTM_S = _strat["hedge_oracle_ignore_ttm_s"]
+        HEDGE_ORACLE_AGAINST_DUMP = _strat["hedge_oracle_against_dump"]
         ADD_MIN_PRICE = _strat["add_min_price"]
         BUY_START_S = _strat["buy_start_s"]
         EARLY_BUY_START_S = _strat["early_buy_start_s"]
@@ -5022,14 +5060,17 @@ while not _shutdown_requested:
                     and not meta.get("hedge_closed")
                 )
                 # REST + evaluate before oracle so a 4–32¢ book dumps even if
-                # WS is down. Persist 5s @ 50/52 stays behind the oracle.
-                # Fresh WS dump peek may skip REST; stale last-good must not.
+                # WS is down. Persist-50 stays behind the oracle except last
+                # 60s (`hedge_oracle_ignore_ttm_s`) and last-30s 58/60
+                # (`hedge_late_ignore_oracle`). When TWAP is already against,
+                # dump raises to 50¢ (`hedge_oracle_against_dump`). Fresh WS
+                # dump peek may skip REST; stale last-good must not.
                 if hedge_open:
-                    # ANY live bag with held bid ≤ toxic (32¢) dumps at the live bid
-                    # even if BTC has not crossed yet. Persist 5s @ 50/52 stays
-                    # behind the oracle. Then sell at the live bid while < 53¢
-                    # (including a fade through 50). Bid ≥ recovery_cancel (53¢)
-                    # holds and clears persist. Incomplete REST uses WS/last-good.
+                    # ANY live bag with held bid ≤ toxic (40¢) dumps at the live bid
+                    # even if BTC has not crossed yet. Persist-50 stays behind
+                    # the oracle except last 60s; last-30s persist 58/60 + GUI
+                    # does not. Then sell at the live bid while < recovery.
+                    # Incomplete REST uses WS/last-good.
                     quote_age = book_ws.quote_age(held_token)
                     ws_fresh = quote_age is not None and quote_age <= float(HEDGE_QUOTE_MAX_AGE_S)
                     peek_bid = peek_ask = peek_mid = None
@@ -5062,6 +5103,22 @@ while not _shutdown_requested:
                         late_ask_max=HEDGE_LATE_ASK_MAX,
                         late_recovery=HEDGE_LATE_RECOVERY,
                     )
+                    # Peek without clearing persist. Against raises dump to
+                    # 50¢ (4:20AM). Still-winning / unknown / flat do not.
+                    oracle_against = peek_oracle_against(held_leg, m.start_ts)
+                    dump_max, qualify, ask_max, recovery = (
+                        hedge_apply_oracle_against_dump(
+                            ladder.dump, ladder.qualify, ladder.ask_max,
+                            ladder.recovery,
+                            against=oracle_against,
+                            against_dump=HEDGE_ORACLE_AGAINST_DUMP,
+                        )
+                    )
+                    persist_ignore = hedge_persist_skips_oracle(
+                        seconds_left, HEDGE_ORACLE_IGNORE_TTM_S,
+                        late=bool(ladder.late),
+                        late_ignore=HEDGE_LATE_IGNORE_ORACLE,
+                    )
                     peek_flatten = hedge_flatten_overrides_oracle(
                         peek_bid, flatten_max, armed=flatten_armed, enabled=True,
                     )
@@ -5074,7 +5131,7 @@ while not _shutdown_requested:
                         (not peek_flatten)
                         and ws_fresh
                         and peek_bid is not None
-                        and peek_bid + 1e-12 >= float(ladder.recovery)
+                        and peek_bid + 1e-12 >= float(recovery)
                     )
                     winner_before_persist = (
                         (not peek_flatten)
@@ -5082,7 +5139,7 @@ while not _shutdown_requested:
                         and (not recovered)
                         and ws_fresh
                         and peek_bid is not None
-                        and peek_bid > float(ladder.qualify) + 1e-12
+                        and peek_bid > float(qualify) + 1e-12
                     )
                     if recovered or winner_before_persist:
                         _hedge_persist_armed.pop(cond, None)
@@ -5099,15 +5156,15 @@ while not _shutdown_requested:
                                     "recovery_cancel" if recovered else "ws_above_qualify"
                                 ),
                             ),
-                            mid=peek_mid, threshold=ladder.qualify,
-                            recovery_cancel=ladder.recovery,
+                            mid=peek_mid, threshold=qualify,
+                            recovery_cancel=recovery,
                             hedge_late=ladder.late,
                         )
                     else:
                         rest_bid = rest_ask = rest_mid = None
                         peek_dump = hedge_dump_overrides_oracle(
                             peek_bid,
-                            ladder.dump,
+                            dump_max,
                             enabled=True,
                         ) or peek_flatten
                         need_rest = hedge_rest_required(
@@ -5141,23 +5198,25 @@ while not _shutdown_requested:
                             tick=hedge_tick,
                         )
                         bag_log["hedge_late"] = ladder.late
-                        bag_log["dump_max"] = ladder.dump
-                        bag_log["qualify"] = ladder.qualify
-                        bag_log["recovery"] = ladder.recovery
+                        bag_log["dump_max"] = dump_max
+                        bag_log["qualify"] = qualify
+                        bag_log["recovery"] = recovery
+                        bag_log["oracle_against"] = oracle_against
+                        bag_log["persist_ignore_oracle"] = persist_ignore
 
                         preview = evaluate_held_bag(
                             hedge_bid, hedge_ask,
                             now_s=time.monotonic(),
                             persist_armed_ts=armed_ts,
                             persist_s=HEDGE_PERSIST_S,
-                            dump_bid_max=ladder.dump,
-                            qualify_bid=ladder.qualify,
-                            qualify_ask_max=ladder.ask_max,
+                            dump_bid_max=dump_max,
+                            qualify_bid=qualify,
+                            qualify_ask_max=ask_max,
                             max_spread=HEDGE_MAX_SPREAD,
                             persist_done=persist_done,
                             gui_ok=False,
                             gui_why="pending_gui",
-                            recovery_cancel=ladder.recovery,
+                            recovery_cancel=recovery,
                             sell_fade=HEDGE_SELL_FADE,
                             flatten=flatten_armed,
                             flatten_max=flatten_max,
@@ -5172,7 +5231,7 @@ while not _shutdown_requested:
                             gui_ok, gui_why = True, "skipped"
                             held_gui = other_gui = held_last = other_last = None
                             other_bid = other_ask = None
-                            held_gui_max, other_gui_min = hedge_gui_limits(ladder.ask_max)
+                            held_gui_max, other_gui_min = hedge_gui_limits(ask_max)
                             if HEDGE_REQUIRE_GUI:
                                 other_token = (
                                     m.dn_token if held_leg == "up" else m.up_token
@@ -5196,7 +5255,7 @@ while not _shutdown_requested:
                                     held_gui_max=held_gui_max,
                                     other_gui_min=other_gui_min,
                                     min_edge=MIN_BID_EDGE,
-                                    last_trade_max=ladder.ask_max,
+                                    last_trade_max=ask_max,
                                 )
                                 held_gui = polymarket_display_price(
                                     hedge_bid, hedge_ask, held_last,
@@ -5209,14 +5268,14 @@ while not _shutdown_requested:
                                 now_s=time.monotonic(),
                                 persist_armed_ts=armed_ts,
                                 persist_s=HEDGE_PERSIST_S,
-                                dump_bid_max=ladder.dump,
-                                qualify_bid=ladder.qualify,
-                                qualify_ask_max=ladder.ask_max,
+                                dump_bid_max=dump_max,
+                                qualify_bid=qualify,
+                                qualify_ask_max=ask_max,
                                 max_spread=HEDGE_MAX_SPREAD,
                                 persist_done=persist_done,
                                 gui_ok=gui_ok,
                                 gui_why=gui_why,
-                                recovery_cancel=ladder.recovery,
+                                recovery_cancel=recovery,
                                 sell_fade=HEDGE_SELL_FADE,
                                 flatten=flatten_armed,
                                 flatten_max=flatten_max,
@@ -5231,7 +5290,7 @@ while not _shutdown_requested:
                                     other_bid=other_bid, other_ask=other_ask,
                                     held_gui_max=held_gui_max,
                                     other_gui_min=other_gui_min,
-                                    last_trade_max=ladder.ask_max,
+                                    last_trade_max=ask_max,
                                     order_error=None,
                                 )
 
@@ -5246,7 +5305,10 @@ while not _shutdown_requested:
                                 _hedge_persist_done.add(cond)
 
                         oracle_agrees = False
-                        skip_oracle = bool(intent.dump) and HEDGE_DUMP_IGNORE_ORACLE
+                        skip_oracle = (
+                            (bool(intent.dump) and HEDGE_DUMP_IGNORE_ORACLE)
+                            or persist_ignore
+                        )
                         if not skip_oracle:
                             oracle_agrees = hold_while_oracle_agrees(
                                 held_leg, m.start_ts, cond,
@@ -5255,6 +5317,9 @@ while not _shutdown_requested:
                             dump=bool(intent.dump),
                             oracle_agrees=oracle_agrees,
                             dump_ignore_oracle=HEDGE_DUMP_IGNORE_ORACLE,
+                            late=bool(ladder.late),
+                            late_ignore_oracle=HEDGE_LATE_IGNORE_ORACLE,
+                            persist_ignore_oracle=persist_ignore,
                         ):
                             pass
                         elif intent.action in {"arm", "wait"}:
@@ -5265,7 +5330,7 @@ while not _shutdown_requested:
                                 **bag_log,
                                 persist_s=HEDGE_PERSIST_S,
                                 persist_why=intent.reason,
-                                threshold=ladder.qualify,
+                                threshold=qualify,
                             )
                         elif intent.action == "hold":
                             event = {
@@ -5325,7 +5390,7 @@ while not _shutdown_requested:
                                 )
                             elif dump:
                                 hedge_label = "DUMP ≤{:.0f}¢".format(
-                                    float(ladder.dump) * 100
+                                    float(dump_max) * 100
                                 )
                             else:
                                 hedge_label = "REVERSAL DETECTED"
@@ -5429,8 +5494,18 @@ while not _shutdown_requested:
                                     return True, "ok"
                                 if hedge_dump_overrides_oracle(
                                     _live_bid,
-                                    ladder.dump,
+                                    dump_max,
                                     enabled=HEDGE_DUMP_IGNORE_ORACLE,
+                                ):
+                                    return True, "ok"
+                                late_now = (
+                                    HEDGE_LATE_TTM_S > 0
+                                    and ttm <= HEDGE_LATE_TTM_S
+                                )
+                                if hedge_persist_skips_oracle(
+                                    ttm, HEDGE_ORACLE_IGNORE_TTM_S,
+                                    late=late_now,
+                                    late_ignore=HEDGE_LATE_IGNORE_ORACLE,
                                 ):
                                     return True, "ok"
                                 if hold_while_oracle_agrees(
@@ -5461,9 +5536,9 @@ while not _shutdown_requested:
                                 max_retries=12 if dump or intent.persist_done else 3,
                                 pre_submit=_hedge_pre_submit,
                                 deadline_ts=m.end_ts,
-                                dump_bid_max=ladder.dump,
-                                qualify_bid=ladder.qualify,
-                                recovery_cancel=ladder.recovery,
+                                dump_bid_max=dump_max,
+                                qualify_bid=qualify,
+                                recovery_cancel=recovery,
                             )
                             sell_status = (
                                 sell_res.get("bot_status")
@@ -5579,9 +5654,9 @@ while not _shutdown_requested:
                                 terminal = hedge_fail_is_terminal(
                                     sell_status, held_size, hedge_bid,
                                     persist_done=bool(intent.persist_done or dump),
-                                    dump_bid_max=ladder.dump,
-                                    qualify_bid=ladder.qualify,
-                                    recovery_cancel=ladder.recovery,
+                                    dump_bid_max=dump_max,
+                                    qualify_bid=qualify,
+                                    recovery_cancel=recovery,
                                     sell_fade=HEDGE_SELL_FADE,
                                     flatten=dump,
                                     flatten_max=flatten_max,

@@ -770,6 +770,14 @@ class BotWiresCurrentRails(unittest.TestCase):
         self.assertIn('"hedge_sell_fade": True', src)
         self.assertIn('"hedge_require_oracle": True', src)
         self.assertIn('"hedge_dump_ignore_oracle": True', src)
+        self.assertIn('"hedge_late_ignore_oracle": True', src)
+        self.assertIn("late_ignore_oracle=HEDGE_LATE_IGNORE_ORACLE", src)
+        self.assertIn("persist_ignore_oracle=persist_ignore", src)
+        self.assertIn("hedge_persist_skips_oracle(", src)
+        self.assertIn("hedge_apply_oracle_against_dump(", src)
+        self.assertIn("peek_oracle_against(", src)
+        self.assertIn('"hedge_oracle_ignore_ttm_s": 60.0', src)
+        self.assertIn('"hedge_oracle_against_dump": 0.50', src)
         self.assertIn('"late_90_start_s": 45', src)
         self.assertIn("hold_while_oracle_agrees(", src)
         self.assertIn("hedge_dump_overrides_oracle(", src)
@@ -844,6 +852,9 @@ class BotWiresCurrentRails(unittest.TestCase):
         self.assertNotIn("hedge_flatten_overrides_oracle", src)
         self.assertNotIn("hedge_ladder_for_ttm", src)
         self.assertNotIn("hedge_late_ttm_s", src)
+        self.assertNotIn("hedge_late_ignore_oracle", src)
+        self.assertNotIn("hedge_oracle_ignore_ttm_s", src)
+        self.assertNotIn("hedge_oracle_against_dump", src)
 
 
 if __name__ == "__main__":
