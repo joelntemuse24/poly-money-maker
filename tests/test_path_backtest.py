@@ -491,16 +491,16 @@ class SweepTemplateTests(unittest.TestCase):
         tmpl = template_from_strategy(
             Path(__file__).resolve().parents[1] / "strategy_buy5m.example.json"
         )
-        self.assertEqual(tmpl["ask_min"], 0.75)
-        self.assertEqual(tmpl["ask_max"], 0.90)
-        self.assertEqual(tmpl["ttm_max"], 45.0)
-        self.assertEqual(tmpl["budget"], 2.5)
+        self.assertEqual(tmpl["ask_min"], 0.90)
+        self.assertEqual(tmpl["ask_max"], 0.92)
+        self.assertEqual(tmpl["ttm_max"], 60.0)
+        self.assertEqual(tmpl["budget"], 10.0)
         self.assertTrue(tmpl["hedge_require_gui"])
         self.assertEqual(tmpl["hedge_threshold"], 0.50)
         self.assertEqual(tmpl["hedge_require_ask_max"], 0.52)
         self.assertEqual(tmpl["hedge_toxic_bid_max"], 0.40)
         self.assertEqual(tmpl["hedge_persist_s"], 1.0)
-        self.assertEqual(tmpl["flatten_max"], 0.75)
+        self.assertEqual(tmpl["flatten_max"], 0.90)
         self.assertEqual(tmpl["toxic_force_exit_below"], 0.75)
         self.assertEqual(tmpl["hedge_held_gui_max"], 0.52)
         self.assertEqual(tmpl["hedge_other_gui_min"], 0.48)
@@ -525,7 +525,10 @@ class SweepTemplateTests(unittest.TestCase):
         tmpl = template_from_strategy(
             Path(__file__).resolve().parents[1] / "strategy_buy.example.json"
         )
-        self.assertEqual(tmpl["ask_max"], 0.90)
+        self.assertEqual(tmpl["ask_max"], 0.92)
+        self.assertEqual(tmpl["ask_min"], 0.90)
+        self.assertEqual(tmpl["ttm_max"], 3.0 * 60.0)
+        self.assertEqual(tmpl["budget"], 10.0)
 
     def test_sweep_starts_from_live_template(self):
         tmpl = template_from_strategy(
@@ -533,12 +536,13 @@ class SweepTemplateTests(unittest.TestCase):
         )
         names = [row["name"] for row in sweep_variants(tmpl)]
         self.assertEqual(names[0], "live_5m_paper")
-        self.assertEqual(sweep_variants(tmpl)[0]["ask_max"], 0.90)
+        self.assertEqual(sweep_variants(tmpl)[0]["ask_max"], 0.92)
         self.assertIn("live_5m_ride", names)
         self.assertIn("window_120s", names)
         self.assertIn("window_180s", names)
-        self.assertNotIn("window_45s", names)
-        self.assertEqual(sweep_variants(tmpl)[0]["ttm_max"], 45.0)
+        self.assertIn("window_45s", names)
+        self.assertNotIn("window_60s", names)
+        self.assertEqual(sweep_variants(tmpl)[0]["ttm_max"], 60.0)
         self.assertIn("band_70_99", names)
         self.assertIn("band_75_90", names)
         self.assertIn("budget_15", names)

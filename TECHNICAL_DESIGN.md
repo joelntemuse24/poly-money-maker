@@ -16,11 +16,11 @@ forced a design, it is explained until the “why” is obvious.
 | `AGENTS.md` | Cheat sheet for coding agents (never-do, file map, how to verify). |
 | **This file** | How the program is built, what the important code does, and why. |
 
-Live trading is **the 5-minute buy bot** (`buybot5m.py` / systemd
-`polybuybot5m`) plus a recorder that never places orders (`pathlog.py` /
-`polypathlog`). The hourly and 15-minute bots exist as near-copies and are
-**stopped**. Minting is **paused**. Do not start those unless the operator
-asks.
+Live trading is **the 5-minute and 15-minute buy bots** (`buybot5m.py` /
+systemd `polybuybot5m`, `buybot.py` / `polybuybot`) plus a recorder that
+never places orders (`pathlog.py` / `polypathlog`). The hourly bot exists
+as a near-copy and is **stopped**. Minting is **paused**. Do not start
+hourly or mint unless the operator asks.
 
 ---
 
@@ -94,20 +94,22 @@ it **redeems** on-chain for $1.00 per share. There is **no** “take profit at
 even make $0.30 before $1.00, and on an 80¢ fill selling at 90¢ throws away
 the rest of the ride to $1.00.
 
-**Live 5m entry (one $2.50 FAK, since 27 Aug 2026 ~17:26Z):**
+**Live 5m entry (one $10 FAK, 92¢ last-60s overlay):**
 
 | Time left until close (TTM) | Winning ask | Slice / FAK limit |
 |---|---|---|
-| More than 120 seconds | none — too early | early and ≥95 are **off** |
-| 0 < TTM ≤ 120 seconds | **75¢ through 90¢ inclusive** | late `$2.50`, limit **90¢** |
-| Any TTM | ≥90¢ | **off** (`late_90_start_s=0`) |
+| More than 60 seconds | none — too early | early and ≥95 are **off** |
+| 0 < TTM ≤ 60 seconds | **90¢ through 92¢ inclusive** | late `$10`, limit **92¢** |
+| Any TTM | ≥93¢ | **off** (`late_90_start_s=0`) |
 
-Live `min_underlying_edge_usd` is **$10** (skip 0–10 `|TWAP−PTB|`).
-The example JSON / `--sweep` template still documents last **45s** +
-`$25` as a *research* combo: `min_underlying_edge_usd` is **$25** in
-that file only. `CURRENT.md` wins for what is actually running.
-`BUY_HORIZON_S` is **120** on the live overlay. `early_95_start_s=0`
-is a valid disable.
+**Live 15m entry (one $10 FAK, last 3 min):** winning ask **90–92¢**,
+FAK at the live ask. Hedge stays inverted **35/40**.
+
+Live `min_underlying_edge_usd` is **$0** (any non-zero TWAP vs PTB).
+The example JSON / `--sweep` template matches this overlay (last **60s**
+90–92 $10, dump persist 2s). `CURRENT.md` wins for what is actually
+running. `BUY_HORIZON_S` is **60** on the live overlay.
+`early_95_start_s=0` is a valid disable.
 
 Missed early does **not** become a $5 late buy — there is no early slice
 while those windows are off. Same-leg add only. After `hedge_closed`, no
@@ -115,15 +117,18 @@ re-entry.
 
 **Hedge (5m):** persist **1s @ 50/52** still needs the oracle against/flat
 (Chainlink TWAP vs PTB, $0 edge, missing/stale holds). Dump **≤40¢** is
-book-only even if BTC still agrees (`hedge_dump_ignore_oracle`). Walks
-avg <75¢ flatten at the live bid while bid <75¢. After
+book-only even if BTC still agrees, but must stay ≤40 for **2s**
+(`hedge_dump_persist_s`) so a one-tick V-reversal rides. Walks
+avg <75¢ flatten at the live bid while bid <90¢. After
 persist, sell at the live bid while **< 53¢**, including a fade through 50.
-Bid ≥ **53¢** holds and clears persist. Do not sell 55–69 after persist.
+Bid ≥ **53¢** holds and clears persist. Last-30s persist 58 is **off**.
+Do not sell 55–69 after persist.
 No profit-take sell. Winners redeem at $1.00.
 
 **Hourly is stopped.** Do not start it. Its last-20m 75–90 / $10 /
 persist 50/52 / dump 35 / Binance $10 buy-edge code remains in
-`buybothourly.py` for a later operator start. 15m is also stopped.
+`buybothourly.py` for a later operator start. **15m is live** after
+the paste (last 3 min 90–92 / $10 / inverted 35/40).
 
 Everything else in this document exists to do **that** without:
 
@@ -148,7 +153,7 @@ logs and pathlog ticks are capped.
 |---|---|---|
 | `polybuybot5m` | `buybot5m.py` | **yes — places orders (after operator restart)** |
 | `polypathlog` | `pathlog.py` | **yes — GET books only** |
-| `polybuybot` | `buybot.py` | stopped |
+| `polybuybot` | `buybot.py` | **yes — start after paste** |
 | `polybuybothourly` | `buybothourly.py` | stopped |
 | `polymintbot` | `mintbot.py` | paused |
 
@@ -218,18 +223,14 @@ defaults are B-only for the last 20 minutes, persist **5s @ 50/52**, dump
 35¢, recovery **53¢**, `hedge_sell_fade`, `hedge_require_oracle`, Binance
 buy edge $10, tick `0.01`, and a $10 market cap. Hourly is **stopped**.
 
-Live 5m JSON (on the VM since 27 Aug 2026 ~17:26Z; **`CURRENT.md` wins**)
-is last **120s**, **75–90¢**, `min_underlying_edge_usd` **$10**,
-`late_90` / early / ≥95 **off**, one $2.50 FAK, persist **1s @ 50/52**,
-dump **40¢** ignore-oracle, flatten walks **avg <75¢** at live bid **<75¢**,
-recovery 53¢, last-30s ladder dump **40** / persist **58/60** / recovery
-**62**, tick `0.001`. The example JSON
-and `--sweep` template are still last **45s** + `$25` — that is
-research **entry**, not live. Example hedge knobs now match B+C
-(persist 1s / dump 40 / flatten) plus the last-30s ladder defaults.
-Code defaults in `buybot5m.py` are last-120 / edge $10 / late ladder;
-live JSON still overlays them. `$10` pasted **31 Aug ~22:58Z**. First
-last-120 tape: `docs/2026-08-31-last120-loss-catalog.md`.
+Live 5m JSON (on the VM after the 92¢ paste; **`CURRENT.md` wins**)
+is last **60s**, **90–92¢**, `min_underlying_edge_usd` **$0**,
+`late_90` / early / ≥95 **off**, one $10 FAK, persist **1s @ 50/52**,
+dump **40¢** hold **2s**, flatten walks **avg <75¢** at live bid **<90¢**,
+recovery 53¢, last-30s ladder **off**, tick `0.001`. The example JSON
+and `--sweep` template match that overlay. Code defaults in
+`buybot5m.py` are last-60 / edge $0 / dump persist 2s; live JSON still
+overlays them until the operator paste.
 
 15m/hourly windows are in **minutes** (`buy_window_min` / `a22_window_min`).
 Mixing the two without converting units has caused production `NameError`s.
@@ -1076,13 +1077,12 @@ This is the one state-like tree that is allowed to delete itself. Do not
 
 **`check_path_backtest.py`:** first tick that matches an ask band and TTM
 window is a “hit.” `--template strategy_buy5m.example.json` maps the live
-75–90¢ / last **45s** / $2.50 entry and B+C hedge (persist 1s, dump 40,
-flatten walks <75) into paper
+90–92¢ / last **60s** / $10 entry and B+C hedge (persist 1s, dump 40
+hold 2s, flatten walks) into paper
 knobs. Paper persistence is real: qualifying ticks must stay continuous
 for the configured 1 second. Tight books use midpoint as the GUI and
 last-trade proxy; displayed top size caps the paper fill. Pathlog has
-**no** `|TWAP−PTB|` — the live **$25** edge is scored in
-`check_reversal_features.py`.
+**no** `|TWAP−PTB|` — the live **$0** edge is not in pathlog.
 
 This is still **not a live 5m replay**. Pathlog has no Chainlink/PTB, no
 last trade, no POST latency, and no unmatched FAKs. Paper mode also does
@@ -1091,10 +1091,9 @@ semantics, or the universal bid-only 40¢ dump / walk flatten exactly. Treat its
 book-path comparison, not proof that the live bot would have traded.
 
 `--sweep --series 5m` scores one-at-a-time variants of that late template
-(`live_5m_paper` is the example JSON last-45 75–90, not the $25 gate).
+(`live_5m_paper` is the example JSON last-60 90–92).
 `window_120s` is an explicit variant. It does not union last-45 ≥90 or
-early ≥90. Score last-45 90–99 with `--ask-min 0.90 --ask-max 0.99
---ttm-max 45`. Always pass `--series 5m` when researching the live cadence.
+early ≥90. Always pass `--series 5m` when researching the live cadence.
 
 `--series 5m` must not match filenames containing `15m` (the letters `5m`
 appear inside `15m`). The filter is exact-series, not a substring.
@@ -1128,24 +1127,26 @@ affected siblings. Never import a buy-bot module in a test.
 
 ```bash
 systemctl is-active polybuybot polybuybot5m polybuybothourly polymintbot polypathlog
-# expect: inactive  active  inactive  inactive  active
+# expect: active  active  inactive  inactive  active
 
-# Only after checking strategy_buy5m.json dry_run / entry_enabled:
+# After checking strategy_buy5m.json / strategy_buy.json dry_run / entry_enabled:
 sudo systemctl restart polybuybot5m
+sudo systemctl start polybuybot
 ```
 
 CI deploy (push to `main` touching bots / `buy/` / `pathlog.py` /
 `check_path_backtest.py` / `requirements.txt`): SSH `git pull` + `pip
 install`. **No `systemctl restart`.** A merged bot change does nothing until
 the operator deliberately restarts the affected active unit. Do not start
-hourly, 15m, or mint as part of a 5m deploy.
+hourly or mint as part of a 5m/15m deploy.
 
 **Disk (July 2026):** `/var/log` filled a 10GB disk; app JSON was ~5MB. Cap
 the journal with `deploy/journald-size.conf` (`deploy/DISK_OPS.md`). Pathlog
 cap is separate and in-app.
 
 `CURRENT.md` owns the live knobs so they cannot drift in two places.
-Live is last-120 / edge $10 / one $2.50. **Do not paste last-45 + $25.
+Live is last-60 90–92 / $10 / dump-hold 2s (5m) plus last-3min 90–92 /
+$10 inverted 35/40 (15m). **Do not paste last-45 + $25.
 Do not restart 5m unless the operator asks.** Hedge 50/52 for 5s, dump
 32, recovery 53, sell-fade/oracle/dump-ignore true, undercut 0. Stop
 hourly. Restart `polypathlog` when recorder Python changes.

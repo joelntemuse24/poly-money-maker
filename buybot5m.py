@@ -179,27 +179,23 @@ if _tick_001 is not None and _tick_001.amount > 2:
 # ------------------------- STRATEGY CONFIG -------------------------
 _STRATEGY_DEFAULTS = {
     "entry_enabled": False,
-    # Two $2.50 slices, $5 total if both fill. Last 120s is 75–90¢
-    # (buy_max_price). Last 45s also buys ≥90¢ (late_90, FAK 99¢, still
-    # the late $2.50). First 3 min (TTM 120–300s) is ≥90¢ to 99¢; ≥95¢ is
-    # an early overlay only (not last 120s). Late FAK limit is 90¢ except
-    # last-45 ≥90 which is 99¢; early is 99¢.
-    # Size starts at budget/ask and is at least 3 shares when size × limit
-    # fits in buy_max_spend ($3) — early 99¢ posts 3.00 / $2.97, not 2.00 /
-    # $1.98. Per FAK, not $6 across both slices.
-    "buy_threshold": 0.75,
-    "buy_max_price": 0.90,
+    # One $10 FAK in the last 60s at 90–92¢ (FAK limit 92¢). Early / ≥95 /
+    # last-45 ≥90 overlays are off. Paper week 25 Aug–1 Sep 2026: 275 fills
+    # WR 95.6%; dump-hold 2s ≈ +$109. Size starts at budget/ask; 3-share
+    # floor still applies when 3 × limit fits in buy_max_spend ($11).
+    "buy_threshold": 0.90,
+    "buy_max_price": 0.92,
     # Consensus on Polymarket GUI display price (mid if spread≤10¢ else last trade).
     # Tuned for the 75¢ band (old 92¢/10¢ gates could never arm a 75¢ ask).
     "min_winner_bid": 0.70,
     "max_loser_bid": 0.30,
     "min_bid_edge": 0.05,
     # Skip buys unless live BTC is ≥ this many USD from the window Price To Beat,
-    # and only allow the side matching that underlying move. Live 5m is $10
-    # so 0–10 |TWAP−PTB| fills (47%/34% flip on the last-120 tape) stay out.
-    # Flat still fail-closed. 15m/hourly stay $10. Do not paste $25.
+    # and only allow the side matching that underlying move. Live 5m 90–92
+    # last-60s is $0 so paper-scored prints actually take (flat / missing
+    # still fail-closed). Do not paste last-45 + $25.
     "underlying_gate_enabled": True,
-    "min_underlying_edge_usd": 10.0,
+    "min_underlying_edge_usd": 0.0,
     # Walks (avg < buy_threshold) arm toxic_fill. Flatten sells those bags
     # at the live bid while bid < 75¢ — do not wait for dump 40. Must be
     # <= buy_threshold (validator).
@@ -230,12 +226,11 @@ _STRATEGY_DEFAULTS = {
     # After persist_done, bid ≥ this is a recovered winner: HOLD and clear.
     # Tight 53¢ so we do not sell 50–69 the way 70–84 sold winners.
     "hedge_recovery_cancel": 0.53,
-    # Last-30s ladder: raise persist/recovery only. Dump stays 40 so a
-    # random 50 bid is not a bid-only dump. TTM ≤30 persist is 58/60
-    # (GUI + last-trade + 1s). TTM >30 keeps 40/50/52/53. 0 disables
-    # the late rung. Late dump may exceed early qualify if set — do
-    # not require late dump ≤ early threshold.
-    "hedge_late_ttm_s": 30.0,
+    # Last-30s ladder keys stay in config but the 92¢ overlay disables
+    # the raise (`hedge_late_ttm_s=0`). Persist-58 on a 92 fill dumped
+    # winners (paper +$65 vs dump-hold-2s +$109). Re-enable only after
+    # a new tape. Late dump may exceed early qualify if set.
+    "hedge_late_ttm_s": 0.0,
     "hedge_late_dump": 0.40,
     "hedge_late_qualify": 0.58,
     "hedge_late_ask_max": 0.60,
@@ -252,34 +247,35 @@ _STRATEGY_DEFAULTS = {
     "hedge_require_oracle": True,
     "hedge_oracle_min_edge_usd": 0.0,
     "hedge_dump_ignore_oracle": True,
-    "buy_start_s": 120,
-    # Whole 5m market: last 120s is 75–90¢; TTM (120, 300] buys ask ≥ 90¢.
-    "early_buy_start_s": 300,
+    # Bid ≤ dump must stay there this many seconds (paper: 1s is a no-op
+    # on 1s ticks; 2s cuts 13/14 V-reversal winner dumps). 0 = instant.
+    "hedge_dump_persist_s": 2.0,
+    "buy_start_s": 60,
+    # Early ≥90 is off: same TTM as late so (buy_start, early_start] is empty.
+    "early_buy_start_s": 60,
     "early_buy_max_price": 0.99,
-    # ≥95 overlay for TTM (120, 300] only. Last 120s stays 75–90 except
-    # the last-45s ≥90 overlay (late_90).
-    "early_95_start_s": 300,
-    "early_95_min_s": 60,
+    # ≥95 overlay off. Pair start_s=0 with min_s=0 so leftover min_s=60
+    # cannot disable the late 90–92 window.
+    "early_95_start_s": 0,
+    "early_95_min_s": 0,
     "early_95_min_price": 0.95,
-    "late_90_start_s": 45,
+    "late_90_start_s": 0,
     "buy_grace_s": 1,
     "buy_cooldown_s": 1,
     # After a proven-empty FAK, wait this long before another outer attempt.
     # Inner unmatched 400s re-quote immediately (up to max_retries).
     "empty_fak_cooldown_s": 0.15,
-    "buy_budget": 2.5,
-    # Second $2.50 only in the last 120s (75–90). Missed early does not roll
-    # into late — late is still $2.50, not $5.
-    "late_buy_budget": 2.5,
-    # Same-leg late add only if ask ≥ this (0.90). Flat late 75–90 still
-    # allowed. 0 disables. Fade adds below 90¢ were the 64–77% hole.
+    "buy_budget": 10.0,
+    # Second slice only if early filled (it does not on this overlay).
+    "late_buy_budget": 10.0,
+    # Same-leg late add only if ask ≥ this (0.90). Flat first 90–92 still
+    # allowed. 0 disables.
     "add_min_price": 0.90,
-    # Hard ceiling on USDC sent per FAK. Each slice is $2.50; never more than $3
-    # on one POST. Two slices can spend ~$5 total.
-    "buy_max_spend": 3.0,
-    # Sanity rail per FAK: ~3.3 sh at $2.50/75¢. Two slices may exceed 5 shares
-    # combined; this cap is not a lifetime share limit.
-    "buy_max_shares": 5.0,
+    # Hard ceiling on USDC sent per FAK. $10 clip; never more than $11
+    # on one POST (10.87 sh / $10.00 at 92¢; 3.00 × 0.92 fits).
+    "buy_max_spend": 11.0,
+    # Sanity rail per FAK: $11 / 90¢ ≈ 12.3 sh. 17 covers a cheap walk.
+    "buy_max_shares": 17.0,
     "max_open_positions": 0,  # 0 = unlimited
     "max_open_notional": 10000.0,
     "max_daily_notional": 999999.0,
@@ -479,7 +475,7 @@ def load_strategy():
             "empty_fak_cooldown_s", "early_95_start_s", "early_95_min_s",
             "late_90_start_s", "hedge_late_ttm_s",
             "redeem_throttle_s", "max_redeem_age_days", "hedge_persist_s",
-            "hedge_oracle_min_edge_usd",
+            "hedge_oracle_min_edge_usd", "hedge_dump_persist_s",
         ):
             if float(cfg[key]) < 0:
                 raise ValueError(f"{key} must be non-negative")
@@ -529,6 +525,7 @@ HEDGE_REQUIRE_GUI = _strat["hedge_require_gui"]
 HEDGE_REQUIRE_ORACLE = _strat["hedge_require_oracle"]
 HEDGE_ORACLE_MIN_EDGE_USD = _strat["hedge_oracle_min_edge_usd"]
 HEDGE_DUMP_IGNORE_ORACLE = _strat["hedge_dump_ignore_oracle"]
+HEDGE_DUMP_PERSIST_S = _strat["hedge_dump_persist_s"]
 ADD_MIN_PRICE = _strat["add_min_price"]
 BUY_START_S = _strat["buy_start_s"]
 EARLY_BUY_START_S = _strat["early_buy_start_s"]
@@ -763,6 +760,7 @@ _skip_log_mono = {}
 _buy_window_logged = {}
 _hedge_persist_armed = {}
 _hedge_persist_done = set()
+_hedge_dump_armed = {}
 _last_good_held_quote = {}
 
 
@@ -829,7 +827,7 @@ def hold_while_oracle_agrees(held_leg, start_ts, condition_id, *, log=True):
 
 
 def current_entry_bands(seconds_left):
-    """Open 5m buy bands at this TTM (late 75–90, last-45 ≥90, early ≥90, ≥95)."""
+    """Open 5m buy bands at this TTM (late 90–92, last-45 ≥90 off, early off)."""
     return applicable_entry_bands(
         seconds_left,
         late_start_s=BUY_START_S,
@@ -4142,6 +4140,7 @@ while not _shutdown_requested:
         HEDGE_REQUIRE_ORACLE = _strat["hedge_require_oracle"]
         HEDGE_ORACLE_MIN_EDGE_USD = _strat["hedge_oracle_min_edge_usd"]
         HEDGE_DUMP_IGNORE_ORACLE = _strat["hedge_dump_ignore_oracle"]
+        HEDGE_DUMP_PERSIST_S = _strat["hedge_dump_persist_s"]
         ADD_MIN_PRICE = _strat["add_min_price"]
         BUY_START_S = _strat["buy_start_s"]
         EARLY_BUY_START_S = _strat["early_buy_start_s"]
@@ -4906,6 +4905,7 @@ while not _shutdown_requested:
                             meta["hedge_closed"] = True
                             _hedge_persist_armed.pop(cond, None)
                             _hedge_persist_done.discard(cond)
+                            _hedge_dump_armed.pop(cond, None)
                         meta["bought_size"] = rem
                         meta["pnl_hedge_proceeds"] = round(
                             max(
@@ -5015,6 +5015,7 @@ while not _shutdown_requested:
                 if held_size <= 0.01 or meta.get("hedge_closed"):
                     _hedge_persist_armed.pop(cond, None)
                     _hedge_persist_done.discard(cond)
+                    _hedge_dump_armed.pop(cond, None)
                 hedge_open = (
                     bool(held_token)
                     and held_size > 0.01
@@ -5045,6 +5046,7 @@ while not _shutdown_requested:
                     last_bid, last_ask = last_good_held_quote(held_token)
                     persist_done = cond in _hedge_persist_done
                     armed_ts = _hedge_persist_armed.get(cond)
+                    dump_armed_ts = _hedge_dump_armed.get(cond)
 
                     flatten_armed = bool(HEDGE_FLATTEN_WALKS) and bool(
                         meta.get("toxic_fill")
@@ -5087,6 +5089,7 @@ while not _shutdown_requested:
                     if recovered or winner_before_persist:
                         _hedge_persist_armed.pop(cond, None)
                         _hedge_persist_done.discard(cond)
+                        _hedge_dump_armed.pop(cond, None)
                         log_event(
                             "hedge_skip_recovery" if recovered else "hedge_cancel_bounce",
                             condition_id=cond, leg=held_leg,
@@ -5161,6 +5164,8 @@ while not _shutdown_requested:
                             sell_fade=HEDGE_SELL_FADE,
                             flatten=flatten_armed,
                             flatten_max=flatten_max,
+                            dump_persist_s=HEDGE_DUMP_PERSIST_S,
+                            dump_armed_ts=dump_armed_ts,
                         )
                         qualify_fail = preview.reason in {
                             "missing_side", "bid_above", "ask_too_high",
@@ -5220,6 +5225,8 @@ while not _shutdown_requested:
                                 sell_fade=HEDGE_SELL_FADE,
                                 flatten=flatten_armed,
                                 flatten_max=flatten_max,
+                                dump_persist_s=HEDGE_DUMP_PERSIST_S,
+                                dump_armed_ts=dump_armed_ts,
                             )
                             if not gui_ok and intent.action == "hold":
                                 log_event(
@@ -5244,6 +5251,10 @@ while not _shutdown_requested:
                                 _hedge_persist_armed[cond] = intent.persist_ts
                             if intent.persist_done:
                                 _hedge_persist_done.add(cond)
+                        if intent.dump_armed_ts is None:
+                            _hedge_dump_armed.pop(cond, None)
+                        else:
+                            _hedge_dump_armed[cond] = intent.dump_armed_ts
 
                         oracle_agrees = False
                         skip_oracle = bool(intent.dump) and HEDGE_DUMP_IGNORE_ORACLE
@@ -5264,6 +5275,7 @@ while not _shutdown_requested:
                                 event="hedge_skip_persist",
                                 **bag_log,
                                 persist_s=HEDGE_PERSIST_S,
+                                dump_persist_s=HEDGE_DUMP_PERSIST_S,
                                 persist_why=intent.reason,
                                 threshold=ladder.qualify,
                             )
@@ -5406,6 +5418,7 @@ while not _shutdown_requested:
                                     meta["hedge_closed"] = True
                                     _hedge_persist_armed.pop(cond, None)
                                     _hedge_persist_done.discard(cond)
+                                    _hedge_dump_armed.pop(cond, None)
                                 meta["bought_size"] = rem_now
                                 meta["pnl_hedge_proceeds"] = round(
                                     prior_hedge_proceeds + float(proceeds_total), 4
@@ -5545,6 +5558,7 @@ while not _shutdown_requested:
                                 meta["hedge_closed"] = True
                                 _hedge_persist_armed.pop(cond, None)
                                 _hedge_persist_done.discard(cond)
+                                _hedge_dump_armed.pop(cond, None)
                             if rec["effective_sold"] > 0.01:
                                 meta["pnl_hedge_proceeds"] = round(
                                     prior_hedge_proceeds + rec["proceeds"], 4

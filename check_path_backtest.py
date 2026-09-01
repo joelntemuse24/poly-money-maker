@@ -460,7 +460,7 @@ def template_from_strategy(path: Path) -> dict:
     ask_max_gui = five_m or hourly
     return {
         "ask_min": float(data["buy_threshold"]),
-        # 5m last-120s cap is buy_max_price (0.90). early_buy_max_price 0.99
+        # 5m last-60s cap is buy_max_price (0.92). early_buy_max_price 0.99
         # is the early-window ceiling. Sweep still scores one late touch.
         "ask_max": float(data["buy_max_price"]),
         "ttm_max": ttm_max,
@@ -584,11 +584,17 @@ def sweep_variants(tmpl: dict) -> List[dict]:
     """One-at-a-time deviations from the example JSON template.
 
     ``live_5m_paper`` is whatever ``buy_start_s`` / ``buy_max_price`` the
-    template file currently has (probe last-45s / 75–90 today, not the live
-    120s bot). Window variants skip the template's own ``ttm_max``.
+    template file currently has (probe last-60s / 90–92 today). Window
+    variants skip the template's own ``ttm_max``.
     """
     ttm = float(tmpl["ttm_max"])
-    tag = "5m" if abs(ttm - 120.0) < 1e-6 or abs(ttm - 45.0) < 1e-6 else "template"
+    tag = (
+        "5m"
+        if abs(ttm - 120.0) < 1e-6
+        or abs(ttm - 60.0) < 1e-6
+        or abs(ttm - 45.0) < 1e-6
+        else "template"
+    )
     rows: List[dict] = []
 
     def add(name: str, **overrides: Any) -> None:
