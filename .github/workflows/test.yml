@@ -16,6 +16,6 @@ jobs:
       - name: Install runtime dependencies
         run: python3 -m pip install -r requirements.txt
       - name: Compile buy bots
-        run: python3 -m py_compile buybot.py buybot5m.py buybothourly.py pathlog.py check_path_backtest.py mintbot.py buy/book.py buy/clob_book_ws.py buy/entry_skip.py buy/hedge_gate.py buy/live_journal.py buy/market.py check_fetch_trades.py check_participation.py check_buy_skips.py check_live_journal.py check_last120_tick_autopsy.py
+        run: python3 -m py_compile buybot.py buybot5m.py buybothourly.py pathlog.py check_path_backtest.py mintbot.py complementbot.py buy/book.py buy/clob_book_ws.py buy/entry_skip.py buy/hedge_gate.py buy/complement_gate.py buy/live_journal.py buy/market.py check_fetch_trades.py check_participation.py check_buy_skips.py check_live_journal.py check_last120_tick_autopsy.py
       - name: Run unit tests
         run: python3 -m unittest discover -s tests -p 'test_*.py' -v

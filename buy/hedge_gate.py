@@ -1,4 +1,7 @@
-"""Hedge persist gate and CLOB tick helpers (no I/O). Toxic dumps stay instant."""
+"""Hedge persist gate and CLOB tick helpers (no I/O).
+
+Toxic dumps stay instant unless ``dump_persist_s`` > 0 (5m V-reversal hold).
+"""
 
 from __future__ import annotations
 
@@ -118,6 +121,7 @@ class HedgeIntent(NamedTuple):
     skip_gui: bool
     abort_above: Optional[float]
     dump: bool
+    dump_armed_ts: Optional[float] = None
 
 
 class HedgeLadder(NamedTuple):
@@ -274,11 +278,15 @@ def evaluate_held_bag(
     sell_fade=False,
     flatten=False,
     flatten_max=None,
+    dump_persist_s=0.0,
+    dump_armed_ts=None,
 ):
     """Dump / persist-sell / hold for one live bag.
 
     * Bid ≤ dump dumps every bag. Bid-only. No GUI / last-trade veto.
-      Wide 22/77 still dumps.
+      Wide 22/77 still dumps. ``dump_persist_s`` ≤ 0 is instant (hourly).
+      5m live is **2s**: a one-tick 40¢ V-reversal must stay ≤ dump
+      before the sell. Flatten walks stay instant.
     * Flatten (5m walks): when ``flatten`` and bid < ``flatten_max``
       (live 75¢ = ``buy_threshold``), dump immediately at the live bid.
       This runs *before* recovery_cancel so a 70¢ walk does not HOLD at
@@ -319,8 +327,25 @@ def evaluate_held_bag(
         )
 
     if bid_f <= dump_max + 1e-12:
+        try:
+            dump_wait = float(dump_persist_s or 0)
+        except (TypeError, ValueError):
+            dump_wait = 0.0
+        fire, new_dump_ts, dwhy = hedge_persist_ready(
+            True,
+            now_s=float(now_s),
+            armed_ts=dump_armed_ts,
+            persist_s=dump_wait,
+        )
+        if fire:
+            return HedgeIntent(
+                "dump", "bid_le_dump", bid_f, persist_armed_ts, done, True,
+                dump_max, True, new_dump_ts,
+            )
         return HedgeIntent(
-            "dump", "bid_le_dump", bid_f, persist_armed_ts, done, True, dump_max, True,
+            "arm" if dwhy == "armed" else "wait",
+            "dump_armed" if dwhy == "armed" else "dump_waiting",
+            None, persist_armed_ts, done, True, dump_max, True, new_dump_ts,
         )
 
     flatten_on = bool(flatten)
@@ -596,6 +621,8 @@ def held_hedge_decision(
     gui_why="ok",
     flatten=False,
     flatten_max=None,
+    dump_persist_s=0.0,
+    dump_armed_ts=None,
     seconds_left=None,
     late_ttm=0.0,
     late_dump=0.40,
@@ -659,6 +686,8 @@ def held_hedge_decision(
         sell_fade=sell_fade,
         flatten=flatten,
         flatten_max=flatten_max,
+        dump_persist_s=dump_persist_s,
+        dump_armed_ts=dump_armed_ts,
     )
     if hedge_oracle_blocks_sell(
         dump=bool(intent.dump),

@@ -1,0 +1,21 @@
+{
+  "entry_enabled": false,
+  "dry_run": true,
+  "primary_state_files": ["positions_buy5m.json", "positions_buy.json"],
+  "primary_sources": ["5m", "15m"],
+  "buy_min_price": 0.80,
+  "buy_max_price": 0.99,
+  "max_entry_spread": 0.05,
+  "buy_max_spend": 16.0,
+  "buy_max_shares": 20.0,
+  "require_oracle": true,
+  "min_underlying_edge_usd": 0.0,
+  "poll_s": 0.01,
+  "primary_grace_s": 45.0,
+  "empty_fak_cooldown_s": 0.15,
+  "empty_cycle_cooldown_s": 1.0,
+  "reject_cooldown_s": 2.0,
+  "uncertain_timeout_s": 5.0,
+  "max_retries": 3,
+  "tick_size": "0.001"
+}
