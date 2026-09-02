@@ -13,6 +13,7 @@ from buy.complement_gate import (
     complement_fill_from_post,
     complement_target_shares,
     evaluate_complement,
+    funder_from_env_file,
     mark_submit_quarantine,
     other_leg_token,
     primary_and_complement_same_wallet,
@@ -255,6 +256,25 @@ class WalletIsolationTests(unittest.TestCase):
             )
         )
         self.assertTrue(primary_and_complement_same_wallet("", ""))
+
+    def test_funder_from_file_ignores_process_env(self):
+        import os
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            primary = Path(tmp) / ".env"
+            complement = Path(tmp) / ".env.complement"
+            primary.write_text("FUNDER_ADDRESS=0x8222PRIMARY\n", encoding="utf-8")
+            complement.write_text("FUNDER_ADDRESS=0xCFF5COMPLEMENT\n", encoding="utf-8")
+            os.environ["FUNDER_ADDRESS"] = "0xCFF5COMPLEMENT"
+            try:
+                a = funder_from_env_file(primary)
+                b = funder_from_env_file(complement)
+            finally:
+                os.environ.pop("FUNDER_ADDRESS", None)
+        self.assertEqual(a.lower(), "0x8222primary")
+        self.assertEqual(b.lower(), "0xcff5complement")
+        self.assertFalse(primary_and_complement_same_wallet(a, b))
 
 
 class ExampleJsonTests(unittest.TestCase):

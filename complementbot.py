@@ -33,6 +33,7 @@ from buy.complement_gate import (
     arm_from_primary_meta,
     complement_fill_from_post,
     evaluate_complement,
+    funder_from_env_file,
     mark_submit_quarantine,
     merge_armed,
     primary_and_complement_same_wallet,
@@ -210,17 +211,18 @@ def log_event(event, **kwargs):
             pass
 
 
-# Primary .env only to compare funders. Complement keys must come from
-# .env.complement so this process cannot silently trade the live desk.
-load_dotenv(".env")
-PRIMARY_FUNDER = os.getenv("FUNDER_ADDRESS")
+# Primary funder is read from the .env *file*, not os.environ. systemd
+# EnvironmentFile=.env.complement already set FUNDER_ADDRESS, and
+# load_dotenv(".env") will not override it — that compared the complement
+# wallet to itself and refused to start (crash loop).
+PRIMARY_FUNDER = funder_from_env_file(".env")
 if not os.path.exists(".env.complement"):
     console.print("[bold red]complementbot requires .env.complement (second account).[/]")
     raise SystemExit(1)
 load_dotenv(".env.complement", override=True)
 
 PRIVATE_KEY = os.getenv("PRIVATE_KEY")
-FUNDER_ADDRESS = os.getenv("FUNDER_ADDRESS")
+FUNDER_ADDRESS = os.getenv("FUNDER_ADDRESS") or funder_from_env_file(".env.complement")
 API_KEY = os.getenv("API_KEY")
 API_SECRET = os.getenv("API_SECRET")
 API_PASSPHRASE = os.getenv("API_PASSPHRASE")

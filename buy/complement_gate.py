@@ -30,6 +30,36 @@ def _norm_addr(value: object) -> str:
     return str(value or "").strip().lower()
 
 
+def funder_from_env_file(path: object) -> str:
+    """Read FUNDER_ADDRESS from a dotenv file. Ignores process env.
+
+    systemd EnvironmentFile= injects complement vars before Python starts.
+    load_dotenv('.env') will not override those, so os.getenv would compare
+    the complement funder to itself and refuse to start.
+    """
+    raw = str(path or "")
+    if not raw:
+        return ""
+    try:
+        with open(raw, "r", encoding="utf-8") as handle:
+            lines = handle.readlines()
+    except OSError:
+        return ""
+    for line in lines:
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        if stripped.startswith("export "):
+            stripped = stripped[7:].strip()
+        if not stripped.startswith("FUNDER_ADDRESS="):
+            continue
+        value = stripped.split("=", 1)[1].strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in {"'", '"'}:
+            value = value[1:-1]
+        return value.strip()
+    return ""
+
+
 def primary_and_complement_same_wallet(primary: object, complement: object) -> bool:
     """Fail closed: empty or matching funders are the same wallet."""
     a = _norm_addr(primary)

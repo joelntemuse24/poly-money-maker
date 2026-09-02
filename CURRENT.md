@@ -174,7 +174,10 @@ side). If the primary already sold (`hedge_closed`), it does not buy.
 
 Needs `.env.complement` with a **different** `FUNDER_ADDRESS` than `.env`.
 Same wallet is a hard refuse (the live 5m loop would see those shares and
-sell them). Copy `strategy_complement.example.json` →
+sell them). Compare funders from the **files**, not `os.environ` —
+systemd `EnvironmentFile=.env.complement` pre-sets `FUNDER_ADDRESS` so
+`load_dotenv(".env")` would compare the complement wallet to itself.
+Copy `strategy_complement.example.json` →
 `strategy_complement.json`, keep `dry_run: true` until the second
 account is funded. Then `entry_enabled: true`, `dry_run: false`,
 `sudo systemctl start polycomplement`. Hourly/mint stay off.
