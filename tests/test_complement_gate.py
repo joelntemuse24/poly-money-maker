@@ -264,8 +264,8 @@ class WalletIsolationTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             primary = Path(tmp) / ".env"
             complement = Path(tmp) / ".env.complement"
-            primary.write_text("FUNDER_ADDRESS=0x8222PRIMARY\n", encoding="utf-8")
-            complement.write_text("FUNDER_ADDRESS=0xCFF5COMPLEMENT\n", encoding="utf-8")
+            primary.write_text("FUNDER_ADDRESS = 0x8222PRIMARY\n", encoding="utf-8")
+            complement.write_text("export FUNDER_ADDRESS=0xCFF5COMPLEMENT\n", encoding="utf-8")
             os.environ["FUNDER_ADDRESS"] = "0xCFF5COMPLEMENT"
             try:
                 a = funder_from_env_file(primary)

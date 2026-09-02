@@ -211,26 +211,39 @@ def log_event(event, **kwargs):
             pass
 
 
+# Paths are next to this file. systemd WorkingDirectory should match,
+# but a relative ".env" is empty if cwd is not the repo — empty primary
+# also fail-closes as "same wallet".
+_ROOT = os.path.dirname(os.path.abspath(__file__))
+_PRIMARY_ENV = os.path.join(_ROOT, ".env")
+_COMPLEMENT_ENV = os.path.join(_ROOT, ".env.complement")
+
 # Primary funder is read from the .env *file*, not os.environ. systemd
 # EnvironmentFile=.env.complement already set FUNDER_ADDRESS, and
 # load_dotenv(".env") will not override it — that compared the complement
 # wallet to itself and refused to start (crash loop).
-PRIMARY_FUNDER = funder_from_env_file(".env")
-if not os.path.exists(".env.complement"):
+PRIMARY_FUNDER = funder_from_env_file(_PRIMARY_ENV)
+if not os.path.exists(_COMPLEMENT_ENV):
     console.print("[bold red]complementbot requires .env.complement (second account).[/]")
     raise SystemExit(1)
-load_dotenv(".env.complement", override=True)
+load_dotenv(_COMPLEMENT_ENV, override=True)
 
 PRIVATE_KEY = os.getenv("PRIVATE_KEY")
-FUNDER_ADDRESS = os.getenv("FUNDER_ADDRESS") or funder_from_env_file(".env.complement")
+FUNDER_ADDRESS = os.getenv("FUNDER_ADDRESS") or funder_from_env_file(_COMPLEMENT_ENV)
 API_KEY = os.getenv("API_KEY")
 API_SECRET = os.getenv("API_SECRET")
 API_PASSPHRASE = os.getenv("API_PASSPHRASE")
 
+if not PRIMARY_FUNDER:
+    console.print(
+        f"[bold red]Could not read FUNDER_ADDRESS from {_PRIMARY_ENV}.[/]"
+    )
+    raise SystemExit(1)
 if primary_and_complement_same_wallet(PRIMARY_FUNDER, FUNDER_ADDRESS):
     console.print(
         "[bold red]Complement funder matches the primary wallet. "
-        "Refusing to start — use a second Polymarket account in .env.complement.[/]"
+        "Refusing to start — use a second Polymarket account in .env.complement.[/] "
+        f"primary={PRIMARY_FUNDER[:10]}… complement={(FUNDER_ADDRESS or '')[:10]}…"
     )
     raise SystemExit(1)
 if not PRIVATE_KEY or not FUNDER_ADDRESS:
