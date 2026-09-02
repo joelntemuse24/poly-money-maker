@@ -5,7 +5,13 @@ Do not put secrets, API keys, or live wallet material here.
 
 Last updated: **2026-09-02** — trading oracle is **last live BTC vs
 window-open PTB** (never a 30s/60s TWAP). Overlay remains **90–96¢ $10
-production** (5m last **60s** 90–96 + 15m last **3 min** 90–96). Paper week
+production** (5m last **60s** 90–96 + 15m last **3 min** 90–96).
+Gamma is a background directory only: a known last-60s / last-3min
+market with tokens + `end_ts` already in `_cached_markets` no longer
+skips as `stale_discovery` when the Gamma snapshot is older than
+max(10s, 2×`discover_cache_s`). Overnight 2026-09-02 07:54 IST ate
+real 90–96 seconds on that veto. Unknown markets still cannot buy.
+Hedge never waited on Gamma freshness. Paper week
 25 Aug–1 Sep 2026 was scored at 92¢ (last-trade 1s, $10/fill): 5m dump-hold
 **2s** **+$109.43**
 (275 fills, WR 95.6%); 15m inverted 35/40 **+$29.08** (234 fills,

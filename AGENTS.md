@@ -277,7 +277,8 @@ Stopped hourly (do not start unless asked):
 - `buy_skip_underlying_edge` — underlying gate failed (missing/stale/flat vs PTB; live 5m is **$10**)
 - `buy_skip_underlying_side` — book wants the opposite leg from the underlying move
 - `buy_window` — market first entered a 5m buy window (late 75–90 or last-45 ≥90; early/≥95 are off; one line per market)
-- `buy_skip` `ask_below_band` / `ask_above_band` / `ask_out_of_band` / `no_ask` / `stale_positions` / `no_quote` / `stale_discovery` — in window, winning ask not in any open band, or the look had no book / stale wallet snapshot (throttled 8s)
+- `buy_skip` `ask_below_band` / `ask_above_band` / `ask_out_of_band` / `no_ask` / `stale_positions` / `no_quote` — in window, winning ask not in any open band, or the look had no book / stale wallet snapshot (throttled 8s)
+- `buy_skip` `stale_discovery` — in window but Gamma is stale **and** this market is not already in `_cached_markets` with tokens + `end_ts`. Known last-60s (5m) / last-window (15m) markets still look at the CLOB; hedge never waits on Gamma age.
 - `buy_skip_add_below_min` — same-leg late add but ask < `add_min_price` (90¢). Flat first late 75–90 still buys.
 - `buy_skip_hedge_closed` — this market already dumped; no other-leg chase and no re-entry
 - `buy_skip_max_positions` — only if `max_open_positions > 0` (probe uses **0 = unlimited**)

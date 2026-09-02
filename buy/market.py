@@ -202,6 +202,37 @@ def _parse_event(event: dict, series_slug: str) -> Iterable[MintMarket]:
         )
 
 
+def market_is_known_for_buy(market) -> bool:
+    """True when we already have CLOB tokens and a close time for this market."""
+    if market is None:
+        return False
+    try:
+        end_ts = float(getattr(market, "end_ts", 0) or 0)
+    except (TypeError, ValueError):
+        return False
+    if not math.isfinite(end_ts) or end_ts <= 0:
+        return False
+    up = str(getattr(market, "up_token", "") or "").strip()
+    dn = str(getattr(market, "dn_token", "") or "").strip()
+    return bool(up) and bool(dn) and up != dn
+
+
+def discovery_allows_buy_look(
+    discovery_fresh: bool,
+    *,
+    in_live_window: bool,
+    market,
+) -> bool:
+    """Gamma age must not veto a known market already in its live buy window.
+
+    Fresh discovery still allows the CLOB look (other gates apply). A stale
+    Gamma snapshot only blocks markets we never stored tokens/end_ts for.
+    """
+    if discovery_fresh:
+        return True
+    return bool(in_live_window) and market_is_known_for_buy(market)
+
+
 class MarketGateway:
     def __init__(
         self,

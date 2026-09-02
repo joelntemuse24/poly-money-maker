@@ -935,7 +935,7 @@ class AmbiguousCrossCyclePolicy(unittest.TestCase):
             self.assertIn("def _discover_markets_snapshot():", src, bot.name)
             self.assertIn("_entry_executor = ThreadPoolExecutor", src, bot.name)
             self.assertIn("fut_up = _entry_executor.submit(", src, bot.name)
-            self.assertIn("if not _discovery_fresh:", src, bot.name)
+            self.assertIn("discovery_allows_buy_look(", src, bot.name)
             self.assertIn(
                 "not bool(\n"
                 "                positions_meta.get(market.condition_id, {}).get(\"buy_uncertain\")",

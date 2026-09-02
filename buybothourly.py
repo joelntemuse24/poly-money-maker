@@ -48,7 +48,7 @@ from py_builder_relayer_client.signer import Signer as RelayerSigner
 from py_builder_signing_sdk.config import BuilderConfig
 from py_builder_signing_sdk.sdk_types import BuilderApiKeyCreds
 
-from buy.market import MarketGateway, MintMarket
+from buy.market import MarketGateway, MintMarket, discovery_allows_buy_look
 from buy.btc_price import (
     get_btc_feed,
     append_research,
@@ -4362,9 +4362,13 @@ while not _shutdown_requested:
         )
         _entry_window_open = bool(
             ENTRY_ENABLED
-            and _discovery_fresh
             and any(
                 0 < market.end_ts - now_s <= float(BUY_HORIZON_MIN) * 60
+                and discovery_allows_buy_look(
+                    _discovery_fresh,
+                    in_live_window=True,
+                    market=market,
+                )
                 for market in markets
             )
         )
@@ -5394,11 +5398,15 @@ while not _shutdown_requested:
                 )
                 if not ENTRY_ENABLED:
                     continue
-                if not _discovery_fresh:
+                if not discovery_allows_buy_look(
+                    _discovery_fresh,
+                    in_live_window=True,
+                    market=m,
+                ):
                     log_buy_skip_throttled(
                         "stale_discovery", cond, event="buy_skip",
                     )
-                    continue
+                    continue  # unknown market still needs a fresh Gamma directory
                 # Quarantine is unconditional. This path never posts again.
                 if meta.get("buy_uncertain"):
                     continue
