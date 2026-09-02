@@ -187,11 +187,15 @@ Same wallet is a hard refuse (the live 5m loop would see those shares and
 sell them). Compare funders from the **files**, not `os.environ` —
 systemd `EnvironmentFile=.env.complement` pre-sets `FUNDER_ADDRESS` so
 `load_dotenv(".env")` would compare the complement wallet to itself.
-CLOB derive **and** trading clients must both get `signature_type=1` +
-that funder (same deposit/proxy flow as 15m `buybot.py`). Overnight
-2026-09-02 10:44:30 UTC the derive client omitted those kwargs and
+CLOB derive **and** trading clients both get `signature_type=1` + that
+funder (deposit/proxy maker flow). 15m `buybot.py` still stamps those
+kwargs only on the trading client. Overnight 2026-09-02 10:44:30 UTC
 CLOB returned 400 `maker address not allowed, please use the deposit
-wallet flow`.
+wallet flow`. Aligning derive is construction hygiene; if the 400
+persists after restart and the API-key trio is set in
+`.env.complement`, unset the trio so startup re-derives (do not print
+the values). Confirm `FUNDER_ADDRESS` is the Polymarket proxy, not the
+EOA. Do **not** start `polycomplement` from this change.
 Copy `strategy_complement.example.json` →
 `strategy_complement.json`, keep `dry_run: true` until the second
 account is funded. Then `entry_enabled: true`, `dry_run: false`,

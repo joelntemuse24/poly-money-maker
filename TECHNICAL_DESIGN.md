@@ -134,9 +134,10 @@ the paste (last 3 min 90–96 / $10 / inverted 35/40).
 does not change 5m/15m sell-hedge. After a confirmed primary fill it
 lifts the other token at ≥80¢ (FAK 99¢, share-match). Same-wallet
 start is refused. Do not start `polycomplement` without
-`.env.complement`. CLOB clients (API-key derive **and** trading) pass
-the same `signature_type=1` + `funder` as 15m `buybot.py` so orders
-use the deposit/proxy maker flow. A complement POST is never treated
+`.env.complement`. Complement stamps `signature_type=1` + `funder` on
+**both** the API-key derive client and the trading client (15m
+`buybot.py` still stamps those kwargs only on the trading client).
+A complement POST is never treated
 as a full fill from the request size: confirm `size_matched` /
 GET-order, persist `buy_uncertain` **before** the FAK, and cool
 empty/reject so a miss does not retry every look.

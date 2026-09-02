@@ -1,8 +1,9 @@
-"""Second-account complement buyer — arm + fire rules (no I/O).
+"""Second-account complement buyer — arm + fire rules, plus CLOB client build.
 
-Primary 5m/15m hedge logic is untouched. This module only reads a snapshot
-of the first account's positions JSON and decides whether the isolated
-complement wallet should lift the *other* token at ≥80¢.
+Primary 5m/15m hedge logic is untouched. Gate helpers read a snapshot of
+the first account's positions JSON and decide whether the isolated
+complement wallet should lift the *other* token at ≥80¢. CLOB I/O lives
+only inside the injected client passed to ``build_complement_clob_clients``.
 """
 
 from __future__ import annotations

@@ -331,9 +331,13 @@ class ComplementClobClientBuilderTests(unittest.TestCase):
             and node.func.id == "build_complement_clob_clients"
         ]
         self.assertEqual(len(calls), 1, "complementbot must use the shared CLOB builder")
-        keywords = {kw.arg for kw in calls[0].keywords}
-        self.assertIn("signature_type", keywords)
-        self.assertIn("funder", keywords)
+        by_name = {kw.arg: kw.value for kw in calls[0].keywords}
+        self.assertIn("signature_type", by_name)
+        self.assertIn("funder", by_name)
+        sig = by_name["signature_type"]
+        funder = by_name["funder"]
+        self.assertTrue(isinstance(sig, ast.Constant) and sig.value == 1)
+        self.assertTrue(isinstance(funder, ast.Name) and funder.id == "FUNDER_ADDRESS")
         leftover = [
             node
             for node in ast.walk(tree)
