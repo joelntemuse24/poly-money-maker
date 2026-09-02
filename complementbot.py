@@ -27,6 +27,10 @@ from rich.console import Console
 from buy.book import best_from_levels
 from buy.btc_price import SOURCE_CHAINLINK, get_btc_feed, require_last_print_source
 from buy.clob_book_ws import get_book_feed
+from buy.complement_clob import (
+    COMPLEMENT_SIGNATURE_TYPE,
+    ComplementDepositClobClient,
+)
 from buy.complement_gate import (
     apply_balance_evidence,
     apply_complement_outcome,
@@ -225,9 +229,6 @@ load_dotenv(".env.complement", override=True)
 
 PRIVATE_KEY = os.getenv("PRIVATE_KEY")
 FUNDER_ADDRESS = os.getenv("FUNDER_ADDRESS") or funder_from_env_file(".env.complement")
-API_KEY = os.getenv("API_KEY")
-API_SECRET = os.getenv("API_SECRET")
-API_PASSPHRASE = os.getenv("API_PASSPHRASE")
 
 if primary_and_complement_same_wallet(PRIMARY_FUNDER, FUNDER_ADDRESS):
     console.print(
@@ -240,30 +241,24 @@ if not PRIVATE_KEY or not FUNDER_ADDRESS:
     raise SystemExit(1)
 
 from py_clob_client_v2 import (  # noqa: E402
-    ApiCreds,
     AssetType,
     BalanceAllowanceParams,
-    ClobClient,
     OrderArgs,
     OrderType,
     PartialCreateOrderOptions,
 )
 from py_clob_client_v2.order_builder.constants import BUY  # noqa: E402
 
-if API_KEY and API_SECRET and API_PASSPHRASE:
-    api_creds = ApiCreds(
-        api_key=API_KEY, api_secret=API_SECRET, api_passphrase=API_PASSPHRASE,
-    )
-else:
-    api_creds = None
-
+# Do not reuse an EOA-bound API_KEY trio. py-clob-client-v2 L1 auth
+# registers that key under the signer EOA; type-3 posts then 400 with
+# signer != API KEY. SecureClient.create(wallet=funder) derives instead.
 api_creds, client = build_complement_clob_clients(
-    ClobClient,
+    ComplementDepositClobClient,
     host=HOST,
     key=PRIVATE_KEY,
     chain_id=CHAIN_ID,
-    creds=api_creds,
-    signature_type=1,
+    creds=None,
+    signature_type=COMPLEMENT_SIGNATURE_TYPE,
     funder=FUNDER_ADDRESS,
     retry_on_error=False,
 )

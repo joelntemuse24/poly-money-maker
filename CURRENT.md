@@ -18,8 +18,9 @@ Hedge never waited on Gamma freshness. Paper week
 WR 93.2%); combined **~$138/wk**. Wider 90–96 takes more prints than
 that 92-only tape. Live JSON overlay still wins until the paste below.
 **Do not paste last-45 + $25.** Do **not** start hourly or mint.
-Do **not** start `polycomplement` until a **second** funded Polymarket
-account is in `.env.complement`. Do **not** re-enable last-30s persist
+Do **not** start `polybuybot` / `polybuybot5m` from the complement CLOB
+fix. After that merge, the operator restarts `polycomplement` on the VM
+(not from a cloud agent). Do **not** re-enable last-30s persist
 58/60 on these fills.
 Clip size is **$10** per fill on both bots.
 
@@ -175,7 +176,7 @@ only. After `hedge_closed`, no re-buy. Early slice **off** (one $10, not two).
 **Also running (no orders):** `pathlog.py` (`polypathlog`) writes one JSONL file
 per market under `pathlog/ticks/`.
 
-### Complement (`polycomplement`) — **do not start yet**
+### Complement (`polycomplement`) — **restart after this merge** (not from the cloud VM)
 
 Second Polymarket account. First-account 5m/15m hedge is **unchanged**.
 After a confirmed primary fill, this process watches the **other** token
@@ -187,19 +188,34 @@ Same wallet is a hard refuse (the live 5m loop would see those shares and
 sell them). Compare funders from the **files**, not `os.environ` —
 systemd `EnvironmentFile=.env.complement` pre-sets `FUNDER_ADDRESS` so
 `load_dotenv(".env")` would compare the complement wallet to itself.
-CLOB derive **and** trading clients both get `signature_type=1` + that
-funder (deposit/proxy maker flow). 15m `buybot.py` still stamps those
-kwargs only on the trading client. Overnight 2026-09-02 10:44:30 UTC
-CLOB returned 400 `maker address not allowed, please use the deposit
-wallet flow`. Aligning derive is construction hygiene; if the 400
-persists after restart and the API-key trio is set in
-`.env.complement`, unset the trio so startup re-derives (do not print
-the values). Confirm `FUNDER_ADDRESS` is the Polymarket proxy, not the
-EOA. Do **not** start `polycomplement` from this change.
+
+**CLOB client (2026-09-02):** this account is a **deposit wallet**
+(`signature_type=3` / POLY_1271), not Magic/proxy type 1. py-clob-client-v2
+L1 auth always sets `POLY_ADDRESS` to the EOA, so derive returns a key
+bound to the signer; type 1/2 then 400 `maker address not allowed` and
+type 3 400 `the order signer address has to be the address of the API
+KEY` (issues 70/58/75). Complement **only** now builds
+`ComplementDepositClobClient` → `polymarket.SecureClient.create(
+private_key=…, wallet=FUNDER_ADDRESS)`. Maker and signer are the deposit
+wallet; the API key is derived by that client. 5m/15m/hourly stay
+py-clob type 1. **Unset** any `API_KEY` / `API_SECRET` /
+`API_PASSPHRASE` trio in `.env.complement` (those were EOA-bound; do not
+print the values). `FUNDER_ADDRESS` must be the profile deposit /
+`proxyWallet`, not the EOA.
+
+A 1¢ FAK that does not fill is enough to prove maker is allowed: CLOB
+must not 400 `maker address not allowed` or `signer address has to be
+the address of the API KEY`. Empty FAK (`no orders found to match`) is
+success for that probe.
+
+Do **not** start `polybuybot` / `polybuybot5m` from this change. After
+merge on the VM: `git pull`, `.venv/bin/pip install -r requirements.txt`,
+then `sudo systemctl restart polycomplement`. Cloud agents must not
+start it. Hourly/mint stay off.
 Copy `strategy_complement.example.json` →
-`strategy_complement.json`, keep `dry_run: true` until the second
-account is funded. Then `entry_enabled: true`, `dry_run: false`,
-`sudo systemctl start polycomplement`. Hourly/mint stay off.
+`strategy_complement.json` if missing. Keep `dry_run: true` until you
+want live other-leg lifts; `entry_enabled: true` / `dry_run: false` for
+real 80¢ FAKs. A 1¢ probe can be a one-off outside the bot.
 
 POST never invents a full fill (`size_matched` / GET-order only). A
 write-ahead `buy_uncertain` hits disk **before** the FAK. Empty / reject

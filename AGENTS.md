@@ -58,7 +58,7 @@ unless the operator asks. **Start 15m** after the paste (`polybuybot`).
 | `buybot5m.py` | `polybuybot5m` **live** | 5m | Chainlink last vs PTB | $10 | last **60s** 90–96, edge **$0**; persist **1s @ 50/52** (dump 40¢ hold **2s**; last-30s **off**; flatten <90¢) |
 | `buybothourly.py` | `polybuybothourly` **stopped** | hourly | Binance last vs PTB | $10 cap | last **20 min** 75–90¢; persist **5s @ 50/52** + oracle veto |
 | `pathlog.py` | `polypathlog` **live** | all three | — (CLOB books only) | — | whole 5m; last 8m of 15m; last **20m** of hourly |
-| `complementbot.py` | `polycomplement` **stopped** | other leg of 5m/15m fills | same last-print as the source bot | share-match, cap $16 | other ask **80–99¢** after a primary fill |
+| `complementbot.py` | `polycomplement` **restart after merge** | other leg of 5m/15m fills | same last-print as the source bot | share-match, cap $16 | other ask **80–99¢**, deposit wallet type **3** |
 
 Plus: `check_book.py`, `check_participation.py`, `check_path_backtest.py`,
 `check_fetch_trades.py`, `check_buy_skips.py`, `check_buy_rejects.py`,
@@ -82,7 +82,8 @@ Plus: `check_book.py`, `check_participation.py`, `check_path_backtest.py`,
 | `buy/hedge_gate.py` | 5m + hourly persist, recovery, fade, CLOB tick; 5m TTM ladder | not imported by 15m |
 | `buy/book.py` | Shared TOB price+size parse (WS cache + pathlog) | — |
 | `buy/complement_gate.py` | Second-account other-leg ≥80 arm/fire; CLOB client builder (I/O only in the injected client) | `complementbot.py` |
-| `complementbot.py` | Complement buyer (**stopped**) | first-account hedge **unchanged** |
+| `buy/complement_clob.py` | Complement-only deposit-wallet CLOB (`polymarket-client`, type **3**) | `complementbot.py` |
+| `complementbot.py` | Complement buyer (**restart after merge**; not from the cloud VM) | first-account hedge **unchanged** |
 
 **Pattern:** The three bots are near-identical copies (slug, oracle, window
 units, tick, defaults). A logic change to one usually needs the siblings.
@@ -180,7 +181,7 @@ python check_book.py
 # CI-equivalent (no network to Polymarket required for unit tests)
 python3 -m py_compile buybot.py buybot5m.py buybothourly.py pathlog.py \
   check_path_backtest.py mintbot.py complementbot.py buy/book.py buy/clob_book_ws.py \
-  buy/entry_skip.py buy/hedge_gate.py buy/complement_gate.py buy/live_journal.py \
+  buy/entry_skip.py buy/hedge_gate.py buy/complement_gate.py buy/complement_clob.py buy/live_journal.py \
   check_fetch_trades.py check_participation.py check_buy_skips.py \
   check_live_journal.py check_reversal_features.py check_last120_tick_autopsy.py
 python3 -m unittest discover -s tests -p 'test_*.py' -v
@@ -235,11 +236,12 @@ Live 15m (after `systemctl start polybuybot`):
 - `buy_attempt` last **3 min** 90–96¢, FAK at the live ask, `$10`.
 - Hedge stays inverted **35/40** + GUI 70/30. No last-minute 58/60.
 
-Complement (`polycomplement`, second account, **stopped** until `.env.complement`):
+Complement (`polycomplement`, second account, **restart after merge** — not from the cloud VM):
 
 - Arms only after a primary `bought_token` in `positions_buy5m.json` / `positions_buy.json`.
 - `complement_fill` = other-leg FAK **80–99¢** (`size_matched` / GET-order, never the requested size). `complement_skip` `primary_flat` / `in_flight` / `cooldown` /
   `ask_below_min` / `oracle_still_held` / `already_bought`.
+- CLOB construction is `ComplementDepositClobClient` / `signature_type=3` / `wallet=FUNDER_ADDRESS`. A 1¢ FAK must not 400 `maker address not allowed` or `signer address has to be the address of the API KEY`.
 - First-account hedge is unchanged. If the primary already sold, complement does not buy.
 
 Stopped hourly (do not start unless asked):
@@ -472,7 +474,7 @@ Cloud agents: `CLOUD_RESEARCH.md`.
 | `polybuybothourly.service` | `buybothourly.py` (hourly) | **stopped** |
 | `polypathlog.service` | `pathlog.py` (CLOB path recorder; no orders) | **yes** |
 | `polymintbot.service` | `mintbot.py` | **paused** |
-| `polycomplement.service` | `complementbot.py` (other-leg ≥80) | **stopped** — second account |
+| `polycomplement.service` | `complementbot.py` (other-leg ≥80, deposit wallet type 3) | **restart after merge** — second account; not from the cloud VM |
 
 CI: pushes to `main` touching the buy bots, `pathlog.py`,
 `check_path_backtest.py`, `buy/`, or `requirements.txt` deploy to the VM via
@@ -486,7 +488,8 @@ merge: paste live JSON (see `CURRENT.md`), restart 5m, **start 15m**.
 ## Dependencies
 
 ```
-py_clob_client_v2            # Polymarket CLOB SDK
+py_clob_client_v2            # Polymarket CLOB SDK (5m/15m/hourly)
+polymarket-client            # Complement-only deposit-wallet CLOB (type 3)
 py-builder-relayer-client    # Relayer proxy transaction builder/signing
 py-builder-signing-sdk       # POLY_BUILDER_* HMAC authentication headers
 requests                     # HTTP for Data API, Gamma API, ntfy, relayer

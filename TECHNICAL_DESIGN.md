@@ -134,9 +134,16 @@ the paste (last 3 min 90–96 / $10 / inverted 35/40).
 does not change 5m/15m sell-hedge. After a confirmed primary fill it
 lifts the other token at ≥80¢ (FAK 99¢, share-match). Same-wallet
 start is refused. Do not start `polycomplement` without
-`.env.complement`. Complement stamps `signature_type=1` + `funder` on
-**both** the API-key derive client and the trading client (15m
-`buybot.py` still stamps those kwargs only on the trading client).
+`.env.complement`. This account is a **deposit wallet**: complement
+stamps `signature_type=3` + `funder` on **both** the API-key derive
+client and the trading client, via `buy/complement_clob.py`
+(`polymarket.SecureClient.create(wallet=funder)`). py-clob-client-v2
+cannot bind L1 `POLY_ADDRESS` to the funder (it stays the EOA), which
+is why type 1/2 400'd `maker address not allowed` and type 3 400'd
+`signer address has to be the address of the API KEY`. 5m/15m/hourly
+stay Magic/proxy type 1 on py-clob. Unset an EOA-bound API-key trio in
+`.env.complement` so startup re-derives. After merge, restart
+`polycomplement` on the VM; do not start 5m/15m from that change.
 A complement POST is never treated
 as a full fill from the request size: confirm `size_matched` /
 GET-order, persist `buy_uncertain` **before** the FAK, and cool
@@ -1135,7 +1142,8 @@ requirements.txt`, `py_compile` the scripts, `unittest discover -s tests`.
 | `test_hedge_persist.py` | Exercises persist, recovery, fade, oracle, and hourly wiring without importing a bot |
 | `test_path_backtest.py` | Imports `check_path_backtest` (has a `__main__` / functions) |
 | `test_last120_tick_autopsy.py` | Joins `buy_fill` via `token_id` (no slug) and walks live 50/52 dump-32 persist 0/1/2/5s |
-| `test_book.py` | Imports `buy.book` |
+| `test_complement_gate.py` | Complement arm/fire + builder kwargs (funder + type 3) without importing the bot |
+| `test_complement_clob.py` | Deposit-wallet adapter: factory gets `wallet=funder` on derive and trading |
 | others | Import the corresponding `check_*.py` or widget parsers |
 
 When you add a helper that another bot needs, either put it in `buy/`
