@@ -1,15 +1,16 @@
-"""Second-account complement buyer — arm + fire rules (no I/O).
+"""Second-account complement buyer — arm + fire rules, plus CLOB client build.
 
-Primary 5m/15m hedge logic is untouched. This module only reads a snapshot
-of the first account's positions JSON and decides whether the isolated
-complement wallet should lift the *other* token at ≥80¢.
+Primary 5m/15m hedge logic is untouched. Gate helpers read a snapshot of
+the first account's positions JSON and decide whether the isolated
+complement wallet should lift the *other* token at ≥80¢. CLOB I/O lives
+only inside the injected client passed to ``build_complement_clob_clients``.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 from decimal import Decimal, ROUND_DOWN
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
 
 
 @dataclass(frozen=True)
@@ -479,6 +480,45 @@ def resolve_inflight(
             return "empty", 0.0
         return "wait", 0.0
     return "wait", 0.0
+
+
+def build_complement_clob_clients(
+    clob_client_cls: Callable[..., Any],
+    *,
+    host: str,
+    key: str,
+    chain_id: int,
+    creds: Any = None,
+    signature_type: int,
+    funder: str,
+    retry_on_error: bool = False,
+) -> Tuple[Any, Any]:
+    """Build derive + trading CLOB clients with the same proxy/deposit kwargs.
+
+    Polymarket rejects orders with ``maker address not allowed, please use
+    the deposit wallet flow`` when API keys are derived on an EOA-only
+    client and then used with ``signature_type`` + ``funder`` on the
+    trading client. Both constructions must pass the same pair.
+    ``funder`` is the caller-supplied deposit/proxy address (from env).
+    """
+    if creds is None:
+        creds = clob_client_cls(
+            host=host,
+            key=key,
+            chain_id=chain_id,
+            signature_type=signature_type,
+            funder=funder,
+        ).create_or_derive_api_key()
+    client = clob_client_cls(
+        host=host,
+        key=key,
+        chain_id=chain_id,
+        creds=creds,
+        signature_type=signature_type,
+        funder=funder,
+        retry_on_error=retry_on_error,
+    )
+    return creds, client
 
 
 def should_block_post(meta: Any, now_s: float) -> Tuple[bool, str]:

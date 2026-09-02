@@ -81,7 +81,7 @@ Plus: `check_book.py`, `check_participation.py`, `check_path_backtest.py`,
 | `buy/entry_skip.py` | **5m + hourly:** band union, skip labels, add-min, three-slice hourly budgets | not imported by 15m |
 | `buy/hedge_gate.py` | 5m + hourly persist, recovery, fade, CLOB tick; 5m TTM ladder | not imported by 15m |
 | `buy/book.py` | Shared TOB price+size parse (WS cache + pathlog) | — |
-| `buy/complement_gate.py` | Second-account other-leg ≥80 arm/fire (no I/O) | `complementbot.py` |
+| `buy/complement_gate.py` | Second-account other-leg ≥80 arm/fire; CLOB client builder (I/O only in the injected client) | `complementbot.py` |
 | `complementbot.py` | Complement buyer (**stopped**) | first-account hedge **unchanged** |
 
 **Pattern:** The three bots are near-identical copies (slug, oracle, window

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ast
 import json
 import unittest
 from pathlib import Path
@@ -10,6 +11,7 @@ from buy.complement_gate import (
     apply_balance_evidence,
     apply_complement_outcome,
     arm_from_primary_meta,
+    build_complement_clob_clients,
     complement_fill_from_post,
     complement_target_shares,
     evaluate_complement,
@@ -259,6 +261,95 @@ class EvaluateComplementTests(unittest.TestCase):
         )
         self.assertFalse(fire)
         self.assertEqual(why, "no_ask")
+
+
+class _RecordingClobClient:
+    """Stand-in for py_clob_client_v2.ClobClient — records constructor kwargs."""
+
+    def __init__(self, **kwargs):
+        self.kwargs = dict(kwargs)
+        type(self)._calls.append(self.kwargs)
+
+    def create_or_derive_api_key(self):
+        return {"api_key": "derived", "api_secret": "s", "api_passphrase": "p"}
+
+
+class ComplementClobClientBuilderTests(unittest.TestCase):
+    def setUp(self):
+        _RecordingClobClient._calls = []
+
+    def test_derive_and_trading_clients_both_get_funder_and_signature_type(self):
+        creds, client = build_complement_clob_clients(
+            _RecordingClobClient,
+            host="https://clob.polymarket.com",
+            key="0xpriv",
+            chain_id=137,
+            creds=None,
+            signature_type=1,
+            funder="0xFUNDER",
+        )
+        self.assertEqual(creds["api_key"], "derived")
+        self.assertEqual(client.kwargs["funder"], "0xFUNDER")
+        self.assertEqual(client.kwargs["signature_type"], 1)
+        self.assertEqual(len(_RecordingClobClient._calls), 2)
+        derive_kwargs, trading_kwargs = _RecordingClobClient._calls
+        for kwargs in (derive_kwargs, trading_kwargs):
+            self.assertEqual(kwargs["funder"], "0xFUNDER")
+            self.assertEqual(kwargs["signature_type"], 1)
+            self.assertEqual(kwargs["host"], "https://clob.polymarket.com")
+            self.assertEqual(kwargs["key"], "0xpriv")
+            self.assertEqual(kwargs["chain_id"], 137)
+        self.assertNotIn("creds", derive_kwargs)
+        self.assertEqual(trading_kwargs["creds"], creds)
+        self.assertIs(trading_kwargs["retry_on_error"], False)
+
+    def test_pregenerated_creds_still_pass_proxy_kwargs_on_trading_client(self):
+        preset = {"api_key": "preset"}
+        creds, client = build_complement_clob_clients(
+            _RecordingClobClient,
+            host="https://clob.polymarket.com",
+            key="0xpriv",
+            chain_id=137,
+            creds=preset,
+            signature_type=1,
+            funder="0xFUNDER",
+        )
+        self.assertIs(creds, preset)
+        self.assertEqual(len(_RecordingClobClient._calls), 1)
+        self.assertEqual(client.kwargs["funder"], "0xFUNDER")
+        self.assertEqual(client.kwargs["signature_type"], 1)
+        self.assertEqual(client.kwargs["creds"], preset)
+
+    def test_complementbot_wires_builder_with_proxy_kwargs(self):
+        src = (Path(__file__).resolve().parents[1] / "complementbot.py").read_text()
+        tree = ast.parse(src)
+        calls = [
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "build_complement_clob_clients"
+        ]
+        self.assertEqual(len(calls), 1, "complementbot must use the shared CLOB builder")
+        by_name = {kw.arg: kw.value for kw in calls[0].keywords}
+        self.assertIn("signature_type", by_name)
+        self.assertIn("funder", by_name)
+        sig = by_name["signature_type"]
+        funder = by_name["funder"]
+        self.assertTrue(isinstance(sig, ast.Constant) and sig.value == 1)
+        self.assertTrue(isinstance(funder, ast.Name) and funder.id == "FUNDER_ADDRESS")
+        leftover = [
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "ClobClient"
+        ]
+        self.assertEqual(
+            leftover,
+            [],
+            "complementbot must not construct ClobClient without the proxy builder",
+        )
 
 
 class WalletIsolationTests(unittest.TestCase):
