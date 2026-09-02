@@ -48,7 +48,13 @@ from py_builder_relayer_client.signer import Signer as RelayerSigner
 from py_builder_signing_sdk.config import BuilderConfig
 from py_builder_signing_sdk.sdk_types import BuilderApiKeyCreds
 
-from buy.market import FIVE_M_DURATION_S, MarketGateway, MintMarket, entry_seconds_left
+from buy.market import (
+    FIVE_M_DURATION_S,
+    MarketGateway,
+    MintMarket,
+    discovery_allows_buy_look,
+    entry_seconds_left,
+)
 from buy.btc_price import (
     get_btc_feed,
     append_research,
@@ -5630,11 +5636,15 @@ while not _shutdown_requested:
                 )
                 if not ENTRY_ENABLED:
                     continue  # explicit operator arm is required for every live entry
-                if not _discovery_fresh:
+                if not discovery_allows_buy_look(
+                    _discovery_fresh,
+                    in_live_window=late_slice,
+                    market=m,
+                ):
                     log_buy_skip_throttled(
                         "stale_discovery", cond, event="buy_skip",
                     )
-                    continue  # stale Gamma metadata is hedge-only
+                    continue  # unknown market still needs a fresh Gamma directory
                 # Quarantine is unconditional. This path never posts again.
                 if meta.get("buy_uncertain"):
                     continue

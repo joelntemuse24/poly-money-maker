@@ -743,7 +743,11 @@ live and logs `buy_skip_other_leg` for a side switch.
 **Other gates (all must pass):**
 
 1. `ENTRY_ENABLED`
-2. Fresh Gamma discovery (stale catalog → hedge-only)
+2. Gamma discovery is a background directory. A stale catalog still
+   allows a buy look on a market already in `_cached_markets` with
+   tokens + `end_ts` that is inside the live window (5m last-60s /
+   15m last-3min / hourly open slice). `stale_discovery` only skips
+   markets we never stored. Hedge never waits on Gamma freshness.
 3. Fresh positions snapshot and USDC balance
 4. No `buy_uncertain` quarantine
 5. Slice still unused and market spend still below $10
@@ -1023,7 +1027,10 @@ rejects metadata whose duration is not ~5/15/60 minutes.
 
 `MarketGateway.discover([series_slug])` hits Gamma, caches a few seconds,
 returns a list of `MintMarket`. `discovery_fresh` is a bool the buy loop
-requires before new entries.
+uses for **new** directory rows. A known live-window market
+(`discovery_allows_buy_look`) still reaches the CLOB look when Gamma is
+stale. `market_is_known_for_buy` is tokens + `end_ts` already on the
+cached object.
 
 **`buy/btc_price.py`**
 
@@ -1120,6 +1127,7 @@ requirements.txt`, `py_compile` the scripts, `unittest discover -s tests`.
 | File | Approach |
 |---|---|
 | `test_buy_skips.py` | Imports `buy.entry_skip` directly |
+| `test_discovery_buy.py` | Known last-window + stale Gamma still looks at the CLOB; unknown markets cannot; `MarketGateway.discover` still refreshes |
 | `test_buy_fill_shapes.py` | `ast.parse` buy-bot files and exec selected function sources into a fake namespace |
 | `test_hedge_persist.py` | Exercises persist, recovery, fade, oracle, and hourly wiring without importing a bot |
 | `test_path_backtest.py` | Imports `check_path_backtest` (has a `__main__` / functions) |
