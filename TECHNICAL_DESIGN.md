@@ -137,7 +137,11 @@ start is refused. Do not start `polycomplement` without
 `.env.complement`. This account is a **deposit wallet**: complement
 stamps `signature_type=3` + `funder` on **both** the API-key derive
 client and the trading client, via `buy/complement_clob.py`
-(`polymarket.SecureClient.create(wallet=funder)`). py-clob-client-v2
+(`polymarket.SecureClient.create(wallet=funder)`). Gamma's
+`proxyWallet` field is that same address; the official client may
+report `wallet_type=POLY_PROXY` rather than `DEPOSIT_WALLET`. Complement
+allows either when `inner.wallet` equals `FUNDER_ADDRESS` and still
+refuses a mismatch (live #152 crash-looped on POLY_PROXY). py-clob-client-v2
 cannot bind L1 `POLY_ADDRESS` to the funder (it stays the EOA), which
 is why type 1/2 400'd `maker address not allowed` and type 3 400'd
 `signer address has to be the address of the API KEY`. 5m/15m/hourly

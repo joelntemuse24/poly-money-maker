@@ -8,17 +8,23 @@ address has to be the address of the API KEY``.
 
 5m/15m/hourly stay on py-clob-client-v2 + Magic/proxy type 1. This
 module is imported only by ``complementbot.py``. Trading goes through
-``polymarket.SecureClient.create(private_key=..., wallet=funder)`` so
-the deposit wallet is both maker and signer (POLY_1271 / type 3).
+``polymarket.SecureClient.create(private_key=..., wallet=funder)``.
+Gamma names that address ``proxyWallet``, so the official client may
+classify it ``POLY_PROXY`` rather than ``DEPOSIT_WALLET``; both are
+allowed when ``inner.wallet`` equals the funder.
 """
 
 from __future__ import annotations
 
+import inspect
 from dataclasses import is_dataclass, replace
 from typing import Any, Callable, Dict, Optional
 
 COMPLEMENT_SIGNATURE_TYPE = 3
-_DEPOSIT_WALLET = "DEPOSIT_WALLET"
+# Gamma labels this account's deposit address ``proxyWallet``. Official
+# SecureClient.create(wallet=funder) therefore classifies it POLY_PROXY,
+# not DEPOSIT_WALLET. Either is allowed when inner.wallet == funder.
+_ALLOWED_WALLET_TYPES = frozenset({"DEPOSIT_WALLET", "POLY_PROXY"})
 
 SecureFactory = Callable[..., Any]
 
@@ -158,6 +164,20 @@ def order_response_to_post_dict(result: Any) -> Dict[str, Any]:
     return data
 
 
+def _optional_secure_create_kwargs(create_fn: Any) -> Dict[str, Any]:
+    """Pass wallet_type / signature_type only if SecureClient.create accepts them."""
+    extra: Dict[str, Any] = {}
+    try:
+        params = inspect.signature(create_fn).parameters
+    except (TypeError, ValueError):
+        return extra
+    if "wallet_type" in params:
+        extra["wallet_type"] = "DEPOSIT_WALLET"
+    if "signature_type" in params:
+        extra["signature_type"] = COMPLEMENT_SIGNATURE_TYPE
+    return extra
+
+
 def default_secure_factory(
     *,
     private_key: str,
@@ -170,20 +190,21 @@ def default_secure_factory(
     kwargs: Dict[str, Any] = {"private_key": private_key, "wallet": wallet}
     if credentials is not None:
         kwargs["credentials"] = creds_to_secure(credentials)
+    kwargs.update(_optional_secure_create_kwargs(SecureClient.create))
     return SecureClient.create(**kwargs)
 
 
 def _require_deposit_wallet(inner: Any, funder: str) -> None:
-    wallet_type = getattr(inner, "wallet_type", None)
-    if wallet_type != _DEPOSIT_WALLET:
-        raise RuntimeError(
-            "complement CLOB client wallet_type must be DEPOSIT_WALLET "
-            f"(signature_type={COMPLEMENT_SIGNATURE_TYPE}), got {wallet_type!r}"
-        )
     wallet = str(getattr(inner, "wallet", "") or "")
     if not wallet or _norm_addr(wallet) != _norm_addr(funder):
         raise RuntimeError(
             "complement CLOB wallet must equal FUNDER_ADDRESS (deposit wallet)"
+        )
+    wallet_type = getattr(inner, "wallet_type", None)
+    if wallet_type not in _ALLOWED_WALLET_TYPES:
+        raise RuntimeError(
+            "complement CLOB client wallet_type must be DEPOSIT_WALLET or "
+            f"POLY_PROXY (Gamma proxyWallet), got {wallet_type!r}"
         )
 
 

@@ -196,8 +196,11 @@ bound to the signer; type 1/2 then 400 `maker address not allowed` and
 type 3 400 `the order signer address has to be the address of the API
 KEY` (issues 70/58/75). Complement **only** now builds
 `ComplementDepositClobClient` → `polymarket.SecureClient.create(
-private_key=…, wallet=FUNDER_ADDRESS)`. Maker and signer are the deposit
-wallet; the API key is derived by that client. 5m/15m/hourly stay
+private_key=…, wallet=FUNDER_ADDRESS)`. Gamma calls that address
+`proxyWallet`; the official client therefore classifies it **POLY_PROXY**,
+not `DEPOSIT_WALLET`. Complement accepts either when
+`inner.wallet == FUNDER_ADDRESS` (startup crash-looped on POLY_PROXY
+after #152). Still refuses a wallet/funder mismatch. 5m/15m/hourly stay
 py-clob type 1. **Unset** any `API_KEY` / `API_SECRET` /
 `API_PASSPHRASE` trio in `.env.complement` (those were EOA-bound; do not
 print the values). `FUNDER_ADDRESS` must be the profile deposit /
