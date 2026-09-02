@@ -105,7 +105,7 @@ the rest of the ride to $1.00.
 **Live 15m entry (one $10 FAK, last 3 min):** winning ask **90–96¢**,
 FAK at the live ask. Hedge stays inverted **35/40**.
 
-Live `min_underlying_edge_usd` is **$0** (any non-zero TWAP vs PTB).
+Live `min_underlying_edge_usd` is **$0** (any non-zero last print vs PTB).
 The example JSON / `--sweep` template matches this overlay (last **60s**
 90–96 $10, dump persist 2s). `CURRENT.md` wins for what is actually
 running. `BUY_HORIZON_S` is **60** on the live overlay.
@@ -116,7 +116,7 @@ while those windows are off. Same-leg add only. After `hedge_closed`, no
 re-entry.
 
 **Hedge (5m):** persist **1s @ 50/52** still needs the oracle against/flat
-(Chainlink TWAP vs PTB, $0 edge, missing/stale holds). Dump **≤40¢** is
+(Chainlink last vs PTB, $0 edge, missing/stale holds). Dump **≤40¢** is
 book-only even if BTC still agrees, but must stay ≤40 for **2s**
 (`hedge_dump_persist_s`) so a one-tick V-reversal rides. Walks
 avg <75¢ flatten at the live bid while bid <90¢. After
@@ -186,7 +186,7 @@ belong in git. Cloud research agents never get `.env`.
 | `buybot5m.log` | One JSON object per line (5 MiB × 3 backups) |
 | `buybot5m.journal.jsonl` | 5m money-path tape (`check_live_journal.py`) |
 | `.heartbeat_buy5m` | Unix time; if it stops moving, the loop is stuck |
-| `ptb_twap30_buy5m.json` | Cached Chainlink Price To Beat per market |
+| `ptb_chainlink_buy5m.json` | Cached last-print Price To Beat per 5m market |
 | `underlying_research_buy5m.jsonl` | Buy/skip/oracle audit for later analysis |
 | `pathlog/ticks/*.jsonl` | Recorded books (auto-deleted after 14 days or 400 MB) |
 
@@ -378,7 +378,7 @@ Mixing these up is how you sell on a fake 1¢ bid.
 | **CLOB REST** | Order book HTTP | `/book` (authoritative quote before an order), `/order` POST, balances, last trade |
 | **CLOB websocket** | Push top-of-book | Speed. **Arms** a check. Never enough to POST a normal buy/hedge by itself |
 | **Data API** | Account HTTP | Positions, redeemable flag, trades. Can **lag** after a fill |
-| **RTDS** | Live data websocket | The BTC series that cadence resolves on (live 5m: Chainlink TWAP 30s) |
+| **RTDS** | Live data websocket | Last-print BTC for trading gates (5m/15m: Chainlink BTC/USD last). TWAP topics exist for resolution logging only |
 | **Relayer** | Polymarket submits Polygon txs | `redeemPositions`. We sign a proxy request; we do not broadcast our own gas |
 
 **Condition ID:** 32-byte hex id of the market on-chain. Dictionary key in
@@ -442,7 +442,7 @@ money-safety pattern in the file.
 
 Live file is `buybot5m.py`. The stopped hourly and 15m copies use the
 same comment banners; cadence-specific constants differ (seconds vs
-minutes, Chainlink TWAP 30s vs Binance, tick `0.001` vs `0.01`).
+minutes, Chainlink last-print vs Binance, tick `0.001` vs `0.01`).
 
 `buybot5m.py` is one long scroll with **comment banners** as chapters:
 
@@ -706,7 +706,7 @@ With the live JSON paste:
   is false). `0` is legal in `load_strategy`.
 
 `BUY_HORIZON_S` is **45**, so hot poll / WS subscribe start around T-75.
-The `$25` Chainlink `|TWAP−PTB|` gate lives in the 5m loop, not this
+The last-print vs PTB underlying gate lives in the 5m loop, not this
 helper. 91–99 at TTM 46–120 is a no because those windows are closed.
 
 **Stopped hourly** (`applicable_hourly_entry_bands`) uses
@@ -897,8 +897,8 @@ Shared `evaluate_held_bag` steps (live **5m** numbers):
    also dumps at the live bid while bid **<75¢** so a 70¢ walk does not
    HOLD at recovery 53. Missing/stale REST uses
    WS/last-good (`pick_held_quote`).
-2. **Oracle veto on persist.** `hold_while_oracle_agrees` reads live
-   Chainlink TWAP versus PTB with a $0 minimum edge. Missing/stale or still
+2. **Oracle veto on persist.** `hold_while_oracle_agrees` reads last live
+   BTC versus PTB with a $0 minimum edge. Missing/stale or still
    on the held side → clear persist and hold
    (`hedge_skip_oracle` / `hedge_skip_oracle_still_winning`).
 3. Before persistence completes, a fresh bid above 50¢ is a healthy bounce
@@ -1031,9 +1031,12 @@ One `BtcUnderlyingFeed` per source. Daemon thread on
 `wss://ws-live-data.polymarket.com`. Ring buffer ~12,000 samples (~3 hours
 at 1 Hz). `live_price()` returns `None` if older than 5s (stale). PTB:
 nearest tick to `start_ts` within 2s skew, persisted to `ptb_*_buy*.json`.
-Missed the open → no PTB → no buy. The live 5m feed uses Chainlink TWAP
-30s and persists `ptb_twap30_buy5m.json`; the stopped hourly bot
-subscribes to `crypto_prices` / `btcusdt` instead.
+Missed the open → no PTB → no buy. Trading gates use last-print vs
+window-open PTB: 5m/15m subscribe to `crypto_prices_chainlink` / `btc/usd`
+and persist `ptb_chainlink_buy5m.json` / `ptb_chainlink_buy.json`. The
+stopped hourly bot subscribes to `crypto_prices` / `btcusdt`. TWAP 30s/60s
+feeds exist only for optional resolution logging; `underlying_check`
+refuses them.
 
 `append_research` appends one JSON line and rotates at 50 MiB so a skip
 storm cannot fill the disk.
@@ -1256,6 +1259,6 @@ implemented. `sell_market_with_retry` stays hedge-only.
 | **TTM** | Time to market end (minutes in hourly/15m; seconds in 5m) |
 | **Token ID** | CLOB id of UP or DOWN |
 | **toxic_fill** | Flag for average below 75¢; live 5m dump ≤40¢ is independent of the flag; flatten sells walks while bid <75¢ |
-| **TWAP** | Time-weighted average price (live 5m: Chainlink TWAP 30s vs PTB) |
+| **TWAP** | Time-weighted average price (resolution logging only; trading gates use last print vs PTB) |
 | **Websocket (WS)** | Push connection; fast cache, not an order |
 | **Write-ahead** | Save order id to disk **before** POST |

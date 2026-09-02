@@ -522,9 +522,9 @@ def live_bag_log_fields(
 
 
 def hedge_oracle_allows_sell(held_leg, check, *, enabled=True):
-    """Once holding, do not sell while live BTC is still on the held side of PTB.
+    """Once holding, do not sell while last live BTC is still on the held side of PTB.
 
-    CLOB one-ticks and unreflective TOB are not a hedge if the resolution
+    CLOB one-ticks and unreflective TOB are not a hedge if the last-print
     oracle still says the held leg wins. Missing/stale oracle also blocks
     the sell (fail closed against false hedges). A flipped or exactly-flat
     oracle lets the book persist/dump path continue.

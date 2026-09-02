@@ -3,9 +3,11 @@
 **Agents: read this after `AGENTS.md`.** Update this file when ops/strategy decisions change.
 Do not put secrets, API keys, or live wallet material here.
 
-Last updated: **2026-09-01** — **90–96¢ $10 production** (5m last **60s**
-90–96 + 15m last **3 min** 90–96). Paper week 25 Aug–1 Sep was scored
-at 92¢ (last-trade 1s, $10/fill): 5m dump-hold **2s** **+$109.43**
+Last updated: **2026-09-02** — trading oracle is **last live BTC vs
+window-open PTB** (never a 30s/60s TWAP). Overlay remains **90–96¢ $10
+production** (5m last **60s** 90–96 + 15m last **3 min** 90–96). Paper week
+25 Aug–1 Sep 2026 was scored at 92¢ (last-trade 1s, $10/fill): 5m dump-hold
+**2s** **+$109.43**
 (275 fills, WR 95.6%); 15m inverted 35/40 **+$29.08** (234 fills,
 WR 93.2%); combined **~$138/wk**. Wider 90–96 takes more prints than
 that 92-only tape. Live JSON overlay still wins until the paste below.
@@ -16,6 +18,8 @@ account is in `.env.complement`. Do **not** re-enable last-30s persist
 Clip size is **$10** per fill on both bots.
 
 **Live combination after this paste + restart 5m + start 15m.**
+Trading oracle is last live BTC vs window-open PTB (in code, not a JSON
+knob). Pull + restart 5m / start 15m picks it up. TWAP is not “live”.
 
 ### 5m (`polybuybot5m`)
 
@@ -23,7 +27,7 @@ Clip size is **$10** per fill on both bots.
 |---|---|
 | Entry time | last **60s** (`buy_start_s=60`, `late_90_start_s=0`) |
 | Ask | **90–96¢** (FAK **96¢**) |
-| `min_underlying_edge_usd` | **$0** (any non-zero TWAP vs PTB; missing/flat skip) |
+| `min_underlying_edge_usd` | **$0** (any non-zero last print vs PTB; missing/flat skip) |
 | Early / ≥95 | **off** (`early_buy_start_s=60`, `early_95_start_s=0`) |
 | Size | **one $10** (`buy_budget=late_buy_budget=10`, spend **$11**, shares **17**) |
 | Hedge | persist **1s** @ 50/52, dump **40¢** hold **2s**, flatten **<90¢** (avg <75 still arms toxic), recovery 53 |
@@ -309,7 +313,7 @@ amount / HTTP 400), not this NameError.
       0.01 × undercut 2). Merged on main. Needs the same 5m restart as the
       persist/add-min change below.
 - [x] On VM: pathlog restarted onto size-aware ticks; 15m/hourly buy bots stopped.
-- [x] 5m underlying gate **$0** (any non-zero TWAP vs PTB; side must match).
+- [x] 5m underlying gate **$0** (any non-zero last print vs PTB; side must match).
 - [x] Pathlog `--anatomy` / `--compare` so window/band/size alts are scored offline.
 - [x] 5m `known_cost` NameError (#80) — **code** fixed 13 Aug; live process
       needed restart. Confirm `check_buy_skips.py --since 2026-08-19T09:42:23`

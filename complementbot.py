@@ -25,7 +25,7 @@ from dotenv import load_dotenv
 from rich.console import Console
 
 from buy.book import best_from_levels
-from buy.btc_price import SOURCE_TWAP_30, SOURCE_TWAP_60, get_btc_feed
+from buy.btc_price import SOURCE_CHAINLINK, get_btc_feed, require_last_print_source
 from buy.clob_book_ws import get_book_feed
 from buy.complement_gate import (
     apply_balance_evidence,
@@ -36,6 +36,7 @@ from buy.complement_gate import (
     funder_from_env_file,
     mark_submit_quarantine,
     merge_armed,
+    oracle_favors_other_leg,
     primary_and_complement_same_wallet,
     resolve_inflight,
     should_block_post,
@@ -273,8 +274,9 @@ if DRY_RUN:
     STATE_FILE = "positions_complement.dryrun.json"
 
 book_ws = get_book_feed()
-btc_5m = get_btc_feed(SOURCE_TWAP_30, "ptb_twap30_buy5m.json")
-btc_15m = get_btc_feed(SOURCE_TWAP_60, "ptb_twap60_buy.json")
+_chainlink = require_last_print_source(SOURCE_CHAINLINK)
+btc_5m = get_btc_feed(_chainlink, "ptb_chainlink_buy5m.json")
+btc_15m = get_btc_feed(_chainlink, "ptb_chainlink_buy.json")
 console.print(
     f"[bold bright_cyan]▶ COMPLEMENT[/] second account {FUNDER_ADDRESS[:8]}… "
     f"dry_run={DRY_RUN} entry={_strat['entry_enabled']}"
@@ -318,7 +320,7 @@ def oracle_favors(armed):
     if start_ts <= 0:
         return False
     chk = feed.underlying_check(start_ts, float(_strat["min_underlying_edge_usd"]))
-    return bool(chk.get("ok") and str(chk.get("favored") or "") == armed.other_leg)
+    return oracle_favors_other_leg(chk, armed.other_leg)
 
 
 def unmatched_fak(exc):

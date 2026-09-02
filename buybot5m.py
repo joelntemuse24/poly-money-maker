@@ -49,7 +49,12 @@ from py_builder_signing_sdk.config import BuilderConfig
 from py_builder_signing_sdk.sdk_types import BuilderApiKeyCreds
 
 from buy.market import FIVE_M_DURATION_S, MarketGateway, MintMarket, entry_seconds_left
-from buy.btc_price import get_btc_feed, append_research, SOURCE_TWAP_30
+from buy.btc_price import (
+    get_btc_feed,
+    append_research,
+    SOURCE_CHAINLINK,
+    require_last_print_source,
+)
 from buy.clob_book_ws import get_book_feed
 from buy.entry_skip import (
     accumulate_buy_inventory,
@@ -133,8 +138,8 @@ STATE_FILE = "positions_buy5m.json"
 PNL_FILE = "pnl_buy5m.json"
 HEARTBEAT_FILE = ".heartbeat_buy5m"
 RESEARCH_FILE = "underlying_research_buy5m.jsonl"
-PTB_STORE_FILE = "ptb_twap30_buy5m.json"
-UNDERLYING_SOURCE = SOURCE_TWAP_30
+PTB_STORE_FILE = "ptb_chainlink_buy5m.json"
+UNDERLYING_SOURCE = require_last_print_source(SOURCE_CHAINLINK)
 SERIES_SLUG = "btc-up-or-down-5m"
 SLUG_PREFIX = "btc-updown-5m"
 SLUG_EXCLUDES = ("bitcoin-up-or-down",)
@@ -240,7 +245,7 @@ _STRATEGY_DEFAULTS = {
     # Invert the buy GUI 70/30 plus last-trade on the held token. TOB 50/52
     # alone is not consensus (same lesson as not buying a random ask).
     "hedge_require_gui": True,
-    # Once holding: do not persist-sell while Chainlink TWAP is still on
+    # Once holding: do not persist-sell while last live BTC is still on
     # the held side of PTB. $0 = any non-zero tick. Missing/stale holds.
     # Dump ≤ toxic (40¢) is book-only (`hedge_dump_ignore_oracle`).
     # Flatten walks also skip the oracle (`dump=True`).
@@ -565,7 +570,7 @@ if DRY_RUN:
     PNL_FILE = "pnl_buy5m.dryrun.json"
     HEARTBEAT_FILE = ".heartbeat_buy5m_dryrun"
     RESEARCH_FILE = "underlying_research_buy5m_dryrun.jsonl"
-    PTB_STORE_FILE = "ptb_twap30_buy5m_dryrun.json"
+    PTB_STORE_FILE = "ptb_chainlink_buy5m_dryrun.json"
 
 # ------------------------- LOG ROTATION -------------------------
 LOG_FILE = "buybot5m.dryrun.log" if DRY_RUN else "buybot5m.log"
@@ -789,7 +794,7 @@ def log_buy_skip_throttled(skip_reason, condition_id, event="buy_skip", **kwargs
 
 
 def hold_while_oracle_agrees(held_leg, start_ts, condition_id, *, log=True):
-    """True = do not persist-sell; live BTC is still with the bag (or unread).
+    """True = do not persist-sell; last live BTC is still with the bag (or unread).
 
     Dump ≤ toxic can ignore this when ``hedge_dump_ignore_oracle`` is on.
     """
@@ -5784,7 +5789,7 @@ while not _shutdown_requested:
                 up_gui = polymarket_display_price(up_bid, up_ask, up_last)
                 dn_gui = polymarket_display_price(dn_bid, dn_ask, dn_last)
 
-                # Lock Chainlink PTB as soon as the window is open (memory/disk only).
+                # Lock last-print PTB as soon as the window is open (memory/disk only).
                 if m.start_ts and time.time() >= m.start_ts:
                     ptb_rec = btc_feed.capture_ptb(m.start_ts)
                     if ptb_rec and ptb_rec.get("ok") and not meta.get("ptb"):
