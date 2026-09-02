@@ -195,7 +195,7 @@ class ComplementDepositClobClientTests(unittest.TestCase):
         self.assertEqual(inner.posted[0].order_type, "FAK")
         self.assertEqual(inner.posted[0].maker, FUNDER)
 
-    def test_wrong_wallet_type_is_rejected(self):
+    def test_poly_proxy_matching_wallet_is_allowed(self):
         class _Proxy(_FakeSecure):
             def __init__(self, **kwargs):
                 super().__init__(**kwargs)
@@ -203,9 +203,31 @@ class ComplementDepositClobClientTests(unittest.TestCase):
 
         self.factory.client_cls = _Proxy
         client = self._client()
+        creds = client.create_or_derive_api_key()
+        self.assertEqual(creds["api_key"], "derived-key")
+        self.assertEqual(client._inner().wallet, FUNDER)
+        self.assertEqual(client._inner().wallet_type, "POLY_PROXY")
+
+    def test_deposit_wallet_matching_wallet_is_allowed(self):
+        client = self._client()
+        creds = client.create_or_derive_api_key()
+        self.assertEqual(creds["api_key"], "derived-key")
+        self.assertEqual(client._inner().wallet, FUNDER)
+        self.assertEqual(client._inner().wallet_type, "DEPOSIT_WALLET")
+
+    def test_mismatched_wallet_still_raises(self):
+        class _Mismatch(_FakeSecure):
+            def __init__(self, **kwargs):
+                super().__init__(**kwargs)
+                self.wallet_type = "POLY_PROXY"
+                self.wallet = "0x0000000000000000000000000000000000000001"
+
+        self.factory.client_cls = _Mismatch
+        client = self._client()
         with self.assertRaises(RuntimeError) as ctx:
             client.create_or_derive_api_key()
-        self.assertIn("DEPOSIT_WALLET", str(ctx.exception))
+        self.assertIn("FUNDER_ADDRESS", str(ctx.exception))
+        self.assertNotIn("wallet_type must be DEPOSIT_WALLET (signature_type=3)", str(ctx.exception))
 
     def test_rejected_fak_maps_error_text(self):
         data = order_response_to_post_dict(
