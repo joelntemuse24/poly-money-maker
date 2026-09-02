@@ -3,7 +3,8 @@
 Primary 5m/15m hedge logic is untouched. Gate helpers read a snapshot of
 the first account's positions JSON and decide whether the isolated
 complement wallet should lift the *other* token at ≥80¢. CLOB I/O lives
-only inside the injected client passed to ``build_complement_clob_clients``.
+only inside the injected client passed to ``build_complement_clob_clients``
+(complement uses ``ComplementDepositClobClient`` / signature_type 3).
 """
 
 from __future__ import annotations
@@ -493,13 +494,14 @@ def build_complement_clob_clients(
     funder: str,
     retry_on_error: bool = False,
 ) -> Tuple[Any, Any]:
-    """Build derive + trading CLOB clients with the same proxy/deposit kwargs.
+    """Build derive + trading CLOB clients with the same deposit-wallet kwargs.
 
-    Polymarket rejects orders with ``maker address not allowed, please use
-    the deposit wallet flow`` when API keys are derived on an EOA-only
-    client and then used with ``signature_type`` + ``funder`` on the
-    trading client. Both constructions must pass the same pair.
-    ``funder`` is the caller-supplied deposit/proxy address (from env).
+    Complement uses ``signature_type=3`` (POLY_1271) and ``funder`` = the
+    deposit wallet from env. Both the API-key derive client and the
+    trading client must get that pair. py-clob-client-v2 L1 auth cannot
+    bind the key to the funder (POLY_ADDRESS stays the EOA); pass
+    ``ComplementDepositClobClient`` so ``polymarket.SecureClient.create``
+    sets ``wallet=funder``. 5m/15m/hourly stay on py-clob type 1.
     """
     if creds is None:
         creds = clob_client_cls(

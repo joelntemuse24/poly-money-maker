@@ -285,17 +285,17 @@ class ComplementClobClientBuilderTests(unittest.TestCase):
             key="0xpriv",
             chain_id=137,
             creds=None,
-            signature_type=1,
+            signature_type=3,
             funder="0xFUNDER",
         )
         self.assertEqual(creds["api_key"], "derived")
         self.assertEqual(client.kwargs["funder"], "0xFUNDER")
-        self.assertEqual(client.kwargs["signature_type"], 1)
+        self.assertEqual(client.kwargs["signature_type"], 3)
         self.assertEqual(len(_RecordingClobClient._calls), 2)
         derive_kwargs, trading_kwargs = _RecordingClobClient._calls
         for kwargs in (derive_kwargs, trading_kwargs):
             self.assertEqual(kwargs["funder"], "0xFUNDER")
-            self.assertEqual(kwargs["signature_type"], 1)
+            self.assertEqual(kwargs["signature_type"], 3)
             self.assertEqual(kwargs["host"], "https://clob.polymarket.com")
             self.assertEqual(kwargs["key"], "0xpriv")
             self.assertEqual(kwargs["chain_id"], 137)
@@ -311,16 +311,16 @@ class ComplementClobClientBuilderTests(unittest.TestCase):
             key="0xpriv",
             chain_id=137,
             creds=preset,
-            signature_type=1,
+            signature_type=3,
             funder="0xFUNDER",
         )
         self.assertIs(creds, preset)
         self.assertEqual(len(_RecordingClobClient._calls), 1)
         self.assertEqual(client.kwargs["funder"], "0xFUNDER")
-        self.assertEqual(client.kwargs["signature_type"], 1)
+        self.assertEqual(client.kwargs["signature_type"], 3)
         self.assertEqual(client.kwargs["creds"], preset)
 
-    def test_complementbot_wires_builder_with_proxy_kwargs(self):
+    def test_complementbot_wires_deposit_wallet_type3_builder(self):
         src = (Path(__file__).resolve().parents[1] / "complementbot.py").read_text()
         tree = ast.parse(src)
         calls = [
@@ -331,13 +331,22 @@ class ComplementClobClientBuilderTests(unittest.TestCase):
             and node.func.id == "build_complement_clob_clients"
         ]
         self.assertEqual(len(calls), 1, "complementbot must use the shared CLOB builder")
+        self.assertTrue(
+            isinstance(calls[0].args[0], ast.Name)
+            and calls[0].args[0].id == "ComplementDepositClobClient",
+            "complementbot must pass ComplementDepositClobClient, not ClobClient",
+        )
         by_name = {kw.arg: kw.value for kw in calls[0].keywords}
         self.assertIn("signature_type", by_name)
         self.assertIn("funder", by_name)
         sig = by_name["signature_type"]
         funder = by_name["funder"]
-        self.assertTrue(isinstance(sig, ast.Constant) and sig.value == 1)
+        creds = by_name.get("creds")
+        self.assertTrue(
+            isinstance(sig, ast.Name) and sig.id == "COMPLEMENT_SIGNATURE_TYPE"
+        )
         self.assertTrue(isinstance(funder, ast.Name) and funder.id == "FUNDER_ADDRESS")
+        self.assertTrue(isinstance(creds, ast.Constant) and creds.value is None)
         leftover = [
             node
             for node in ast.walk(tree)
@@ -348,7 +357,7 @@ class ComplementClobClientBuilderTests(unittest.TestCase):
         self.assertEqual(
             leftover,
             [],
-            "complementbot must not construct ClobClient without the proxy builder",
+            "complementbot must not construct ClobClient (py-clob L1 binds the EOA)",
         )
 
 
