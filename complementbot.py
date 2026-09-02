@@ -31,6 +31,7 @@ from buy.complement_gate import (
     apply_balance_evidence,
     apply_complement_outcome,
     arm_from_primary_meta,
+    build_complement_clob_clients,
     complement_fill_from_post,
     evaluate_complement,
     funder_from_env_file,
@@ -254,11 +255,10 @@ if API_KEY and API_SECRET and API_PASSPHRASE:
         api_key=API_KEY, api_secret=API_SECRET, api_passphrase=API_PASSPHRASE,
     )
 else:
-    api_creds = ClobClient(
-        host=HOST, key=PRIVATE_KEY, chain_id=CHAIN_ID,
-    ).create_or_derive_api_key()
+    api_creds = None
 
-client = ClobClient(
+api_creds, client = build_complement_clob_clients(
+    ClobClient,
     host=HOST,
     key=PRIVATE_KEY,
     chain_id=CHAIN_ID,
