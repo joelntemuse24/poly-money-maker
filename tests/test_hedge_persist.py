@@ -313,6 +313,26 @@ class HedgeOracleAllowsSellTests(unittest.TestCase):
         self.assertTrue(allow)
         self.assertEqual(why, "oracle_against")
 
+    def test_last_print_cross_sells_while_lagging_twap_would_hold(self):
+        last_print = {
+            "ok": True,
+            "favored": "down",
+            "edge_usd": -40.0,
+            "live_kind": "last_print",
+        }
+        lagging_twap = {
+            "ok": True,
+            "favored": "up",
+            "edge_usd": 8.0,
+            "live_kind": "twap",
+        }
+        allow, why = hedge_oracle_allows_sell("up", last_print)
+        self.assertTrue(allow)
+        self.assertEqual(why, "oracle_against")
+        hold, hold_why = hedge_oracle_allows_sell("up", lagging_twap)
+        self.assertFalse(hold)
+        self.assertEqual(hold_why, "oracle_still_winning")
+
     def test_flat_allows_book_hedge(self):
         allow, why = hedge_oracle_allows_sell(
             "up", {"ok": False, "favored": None, "reason": "edge_zero"},

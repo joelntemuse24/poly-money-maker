@@ -49,7 +49,12 @@ from py_builder_signing_sdk.config import BuilderConfig
 from py_builder_signing_sdk.sdk_types import BuilderApiKeyCreds
 
 from buy.market import MarketGateway, MintMarket
-from buy.btc_price import get_btc_feed, append_research, SOURCE_BINANCE
+from buy.btc_price import (
+    get_btc_feed,
+    append_research,
+    SOURCE_BINANCE,
+    require_last_print_source,
+)
 from buy.clob_book_ws import get_book_feed
 from buy.entry_skip import (
     accumulate_buy_inventory,
@@ -122,7 +127,7 @@ PNL_FILE = "pnl_buyhourly.json"
 HEARTBEAT_FILE = ".heartbeat_buyhourly"
 RESEARCH_FILE = "underlying_research_buyhourly.jsonl"
 PTB_STORE_FILE = "ptb_binance_buyhourly.json"
-UNDERLYING_SOURCE = SOURCE_BINANCE
+UNDERLYING_SOURCE = require_last_print_source(SOURCE_BINANCE)
 SERIES_SLUG = "btc-up-or-down-hourly"
 SLUG_PREFIX = "bitcoin-up-or-down"
 SLUG_EXCLUDES = ("btc-updown-5m", "btc-updown")
@@ -218,8 +223,8 @@ _STRATEGY_DEFAULTS = {
     # After persist, a fade through 50 still sells (do not wait for 35¢).
     "hedge_sell_fade": True,
     "hedge_require_gui": True,
-    # Once holding: do not sell while Binance BTC is still on the held
-    # side of PTB. $0 = any non-zero tick. Missing/stale feed also holds.
+    # Once holding: do not sell while last live Binance BTC is still on
+    # the held side of PTB. $0 = any non-zero tick. Missing/stale feed also holds.
     "hedge_require_oracle": True,
     "hedge_oracle_min_edge_usd": 0.0,
     # Outer look-ahead / poll horizon (minutes). Window 0 disables A or C.
@@ -707,7 +712,7 @@ def log_buy_skip_throttled(skip_reason, condition_id, event="buy_skip", **kwargs
 
 
 def hold_while_oracle_agrees(held_leg, start_ts, condition_id):
-    """True = do not sell; live BTC is still with the bag (or feed is unread)."""
+    """True = do not sell; last live BTC is still with the bag (or feed is unread)."""
     if not HEDGE_REQUIRE_ORACLE:
         return False
     uchk = btc_feed.underlying_check(start_ts, float(HEDGE_ORACLE_MIN_EDGE_USD))

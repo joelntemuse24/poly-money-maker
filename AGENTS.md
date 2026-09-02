@@ -42,7 +42,7 @@ Bid ≥ **53¢** holds and **clears persist**. Last-30s ladder is **off**
 (`hedge_late_ttm_s=0`) — persist 58 on 92¢-style fills dumped winners. Dump
 stays **40¢** but must hold **2s** (`hedge_dump_persist_s`) so a
 one-tick V-reversal rides. Once holding, do **not persist-sell** while
-live Chainlink TWAP is still on the held side of PTB
+last live BTC is still on the held side of PTB
 (`hedge_require_oracle`). Missing/stale BTC also holds. **Any live bag**
 dumps bid-only at **≤40¢** after 2s even if BTC has not crossed yet
 (`hedge_dump_ignore_oracle`). Walks **avg <75¢** flatten at the live bid
@@ -54,11 +54,11 @@ unless the operator asks. **Start 15m** after the paste (`polybuybot`).
 
 | File | Service | Markets | Oracle | Budget | Window |
 |---|---|---|---|---|---|
-| `buybot.py` | `polybuybot` **start** | 15m | Chainlink TWAP 60s | $10 | last **3 min**, 90–96¢, hedge 35/40 inverted |
-| `buybot5m.py` | `polybuybot5m` **live** | 5m | Chainlink TWAP 30s | $10 | last **60s** 90–96, edge **$0**; persist **1s @ 50/52** (dump 40¢ hold **2s**; last-30s **off**; flatten <90¢) |
-| `buybothourly.py` | `polybuybothourly` **stopped** | hourly | Binance BTCUSDT | $10 cap | last **20 min** 75–90¢; persist **5s @ 50/52** + oracle veto |
+| `buybot.py` | `polybuybot` **start** | 15m | Chainlink last vs PTB | $10 | last **3 min**, 90–96¢, hedge 35/40 inverted |
+| `buybot5m.py` | `polybuybot5m` **live** | 5m | Chainlink last vs PTB | $10 | last **60s** 90–96, edge **$0**; persist **1s @ 50/52** (dump 40¢ hold **2s**; last-30s **off**; flatten <90¢) |
+| `buybothourly.py` | `polybuybothourly` **stopped** | hourly | Binance last vs PTB | $10 cap | last **20 min** 75–90¢; persist **5s @ 50/52** + oracle veto |
 | `pathlog.py` | `polypathlog` **live** | all three | — (CLOB books only) | — | whole 5m; last 8m of 15m; last **20m** of hourly |
-| `complementbot.py` | `polycomplement` **stopped** | other leg of 5m/15m fills | same TWAP as the source bot | share-match, cap $16 | other ask **80–99¢** after a primary fill |
+| `complementbot.py` | `polycomplement` **stopped** | other leg of 5m/15m fills | same last-print as the source bot | share-match, cap $16 | other ask **80–99¢** after a primary fill |
 
 Plus: `check_book.py`, `check_participation.py`, `check_path_backtest.py`,
 `check_fetch_trades.py`, `check_buy_skips.py`, `check_buy_rejects.py`,
@@ -76,7 +76,7 @@ Plus: `check_book.py`, `check_participation.py`, `check_path_backtest.py`,
 | `buybot5m.py` (~5177 lines) | 5m buy bot (**live**) | `buybot.py`, `buybothourly.py` |
 | `buybothourly.py` (~5061 lines) | Hourly buy bot (**stopped**) | `buybot.py`, `buybot5m.py` |
 | `buy/market.py` | MarketGateway — Gamma discovery + metadata | — |
-| `buy/btc_price.py` | Resolution-aligned BTC feeds (TWAP 30/60, Binance) + PTB | — |
+| `buy/btc_price.py` | Last-print BTC feeds (Chainlink BTC/USD, Binance) + PTB; TWAP logging-only | — |
 | `buy/clob_book_ws.py` | CLOB market-channel WS top-of-book (buy/hedge speed path) | — |
 | `buy/entry_skip.py` | **5m + hourly:** band union, skip labels, add-min, three-slice hourly budgets | not imported by 15m |
 | `buy/hedge_gate.py` | 5m + hourly persist, recovery, fade, CLOB tick; 5m TTM ladder | not imported by 15m |
@@ -225,7 +225,7 @@ Live 5m (after this change is deployed, JSON pasted, and `polybuybot5m` restarte
 - `buy_attempt` `band=late` / `late_90` / `early` / `early_95` and `slice=early|late` — which 5m window armed. Live overlay is **late 90–96 last 60s** only.
 - `hedge_attempt` / `hedge_fill` — persist **1s @ 50/52** then sell live bid **< 53¢**. Dump ≤ **40¢** after **2s** (`dump_waiting` / `dump_armed`). Walk flatten (`reason=flatten_walk`) sells toxic bags while bid **<90¢**. Bid ≥ **53¢** holds (unless flattening). Last-30s ladder is **off**.
 - `hedge_skip_recovery` — persist_done but held bid ≥ 53¢; HOLD and clear persist. Do **not** sell 55–69. Flatten walks skip this early-out while bid <90¢.
-- `hedge_skip_oracle_still_winning` / `hedge_skip_oracle` — live TWAP still on held side of PTB, or feed missing/stale; do not persist-sell.
+- `hedge_skip_oracle_still_winning` / `hedge_skip_oracle` — last live BTC still on held side of PTB, or feed missing/stale; do not persist-sell.
 - `hedge_skip_persist` — 50/52 + GUI passed but has not stayed qualified for 1s, **or** dump ≤40 has not held 2s (`dump_armed` / `dump_waiting`).
 - `buy_skip_other_leg` — late winner is the other side of an early fill (no straddle)
 - `buy_skip_hedge_closed` — market already dumped; no re-entry.
@@ -399,7 +399,7 @@ Cloud agents: `CLOUD_RESEARCH.md`.
   50/52**; toxic dump **40¢** book-only after **2s** (`hedge_dump_persist_s`,
   `hedge_dump_ignore_oracle`);
   walks **avg <75¢** flatten at live bid **<90¢** (`hedge_flatten_walks`);
-  recovery **53¢**; `hedge_sell_fade`; persist still needs Chainlink TWAP
+  recovery **53¢**; `hedge_sell_fade`; persist still needs last live BTC
   against/flat (`hedge_require_oracle`). Last-30s ladder is **off**.
   Stopped hourly template is the same
   50/52 persist with dump **35¢** still oracle-gated. 15m remains 35/40.

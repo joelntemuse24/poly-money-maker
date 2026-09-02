@@ -16,6 +16,7 @@ from buy.complement_gate import (
     funder_from_env_file,
     mark_submit_quarantine,
     other_leg_token,
+    oracle_favors_other_leg,
     primary_and_complement_same_wallet,
     resolve_inflight,
     should_block_post,
@@ -229,6 +230,23 @@ class EvaluateComplementTests(unittest.TestCase):
         )
         self.assertFalse(fire)
         self.assertEqual(why, "oracle_still_held")
+
+    def test_oracle_favors_other_follows_last_print_check(self):
+        last_print = {"ok": True, "favored": "down", "live_kind": "last_print"}
+        self.assertTrue(oracle_favors_other_leg(last_print, "down"))
+        self.assertFalse(oracle_favors_other_leg(last_print, "up"))
+        twap_refused = {"ok": False, "favored": None, "reason": "twap_not_live"}
+        self.assertFalse(oracle_favors_other_leg(twap_refused, "down"))
+        fire, why, _ = evaluate_complement(
+            other_ask=0.86,
+            other_bid=0.84,
+            held_shares=10.87,
+            already_bought=False,
+            primary_still_holding=True,
+            oracle_favors_other=oracle_favors_other_leg(last_print, "down"),
+        )
+        self.assertTrue(fire)
+        self.assertEqual(why, "fire")
 
     def test_skips_missing_ask(self):
         fire, why, _ = evaluate_complement(

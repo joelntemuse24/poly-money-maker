@@ -49,7 +49,12 @@ from py_builder_signing_sdk.config import BuilderConfig
 from py_builder_signing_sdk.sdk_types import BuilderApiKeyCreds
 
 from buy.market import MarketGateway, MintMarket
-from buy.btc_price import get_btc_feed, append_research, SOURCE_TWAP_60
+from buy.btc_price import (
+    get_btc_feed,
+    append_research,
+    SOURCE_CHAINLINK,
+    require_last_print_source,
+)
 from buy.clob_book_ws import get_book_feed
 
 
@@ -94,8 +99,8 @@ STATE_FILE = "positions_buy.json"
 PNL_FILE = "pnl_buy.json"
 HEARTBEAT_FILE = ".heartbeat_buy"
 RESEARCH_FILE = "underlying_research_buy.jsonl"
-PTB_STORE_FILE = "ptb_twap60_buy.json"
-UNDERLYING_SOURCE = SOURCE_TWAP_60
+PTB_STORE_FILE = "ptb_chainlink_buy.json"
+UNDERLYING_SOURCE = require_last_print_source(SOURCE_CHAINLINK)
 SERIES_SLUG = "btc-up-or-down-15m"
 SLUG_PREFIX = "btc-updown"
 SLUG_EXCLUDES = ("btc-updown-5m", "bitcoin-up-or-down")
@@ -384,7 +389,7 @@ if DRY_RUN:
     PNL_FILE = "pnl_buy.dryrun.json"
     HEARTBEAT_FILE = ".heartbeat_buy_dryrun"
     RESEARCH_FILE = "underlying_research_buy_dryrun.jsonl"
-    PTB_STORE_FILE = "ptb_twap60_buy_dryrun.json"
+    PTB_STORE_FILE = "ptb_chainlink_buy_dryrun.json"
 
 # ------------------------- LOG ROTATION -------------------------
 LOG_FILE = "buybot.dryrun.log" if DRY_RUN else "buybot.log"
@@ -4528,7 +4533,7 @@ while not _shutdown_requested:
                 up_gui = polymarket_display_price(up_bid, up_ask, up_last)
                 dn_gui = polymarket_display_price(dn_bid, dn_ask, dn_last)
 
-                # Lock Chainlink PTB as soon as the window is open (memory/disk only).
+                # Lock last-print PTB as soon as the window is open (memory/disk only).
                 if m.start_ts and time.time() >= m.start_ts:
                     ptb_rec = btc_feed.capture_ptb(m.start_ts)
                     if ptb_rec and ptb_rec.get("ok") and not meta.get("ptb"):

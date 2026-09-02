@@ -199,6 +199,21 @@ def complement_target_shares(
     return 0.0
 
 
+def oracle_favors_other_leg(check: Any, other_leg: object) -> bool:
+    """True when last live BTC vs PTB favors the complement (other) leg.
+
+    ``check`` is ``BtcUnderlyingFeed.underlying_check`` output. A TWAP feed
+    fails closed (``ok`` is false / ``twap_not_live``).
+    """
+    if not isinstance(check, dict) or not check.get("ok"):
+        return False
+    favored = str(check.get("favored") or "").strip().lower()
+    want = str(other_leg or "").strip().lower()
+    if want in {"dn"}:
+        want = "down"
+    return favored in {"up", "down"} and favored == want
+
+
 def evaluate_complement(
     *,
     other_ask: Optional[float],

@@ -1,19 +1,27 @@
-"""Underlying BTC feeds aligned to each Up/Down market's resolution source.
+"""Underlying BTC feeds for trading gates and optional resolution logging.
 
-| Bot / window | Resolution oracle | RTDS topic |
+Trading gates (entry, hedge, complement) compare **last live BTC** to the
+window-open Price To Beat. They must never treat a 30s/60s/any TWAP as live.
+
+| Bot / window | Trading live vs PTB | RTDS topic |
 |---|---|---|
-| 5m (`buybot5m`) | Chainlink BTC/USD TWAP 30s | `crypto_prices_twap_thirty` |
-| 15m (`buybot`) | Chainlink BTC/USD TWAP 60s | `crypto_prices_twap_sixty` |
-| Hourly (`buybothourly`) | Binance BTC/USDT spot | `crypto_prices` filter `btcusdt` |
+| 5m (`buybot5m`) | Chainlink BTC/USD last | `crypto_prices_chainlink` `btc/usd` |
+| 15m (`buybot`) | Chainlink BTC/USD last | `crypto_prices_chainlink` `btc/usd` |
+| Hourly (`buybothourly`) | Binance BTC/USDT last | `crypto_prices` `btcusdt` |
+
+TWAP 30s/60s sources remain for optional resolution-feed logging only.
+`underlying_check` refuses them (`twap_not_live`).
 
 Refs:
+- https://docs.polymarket.com/market-data/realtime
 - https://data.chain.link/streams/btc-usd-twap-30s-streams
 - https://data.chain.link/streams/btc-usd-twap-60s-streams
 - https://www.binance.com/en/trade/BTC_USDT?type=spot
 - https://docs.polymarket.com/market-data/chainlink-twap
 
-Price To Beat = nearest tick from that same feed to market `start_ts` (≤2s skew).
-If the bot missed the open, PTB is missing and buys are refused.
+Price To Beat = nearest last-print tick from that same trading feed to
+market `start_ts` (≤2s skew). If the bot missed the open, PTB is missing
+and buys are refused.
 """
 
 from __future__ import annotations
@@ -39,27 +47,27 @@ PTB_CACHE_MAX = 512
 RESEARCH_MAX_BYTES = 50 * 1024 * 1024  # 50 MiB per research file
 RESEARCH_BACKUP_COUNT = 2
 
-# Canonical sources used by buy bots
-SOURCE_TWAP_30 = "twap_30"  # 5m
-SOURCE_TWAP_60 = "twap_60"  # 15m
-SOURCE_BINANCE = "binance"  # hourly
+# Last-print sources used by trading gates (entry / hedge / complement).
+SOURCE_CHAINLINK = "chainlink"  # 5m + 15m last BTC/USD vs window-open PTB
+SOURCE_BINANCE = "binance"  # hourly last BTCUSDT vs window-open PTB
+
+# Resolution-feed logging only. Not a trading live quote.
+SOURCE_TWAP_30 = "twap_30"
+SOURCE_TWAP_60 = "twap_60"
+
+LIVE_KIND_LAST_PRINT = "last_print"
+LIVE_KIND_TWAP = "twap"
 
 SOURCE_META = {
-    SOURCE_TWAP_30: {
-        "label": "chainlink_twap_30s",
-        "resolution_url": "https://data.chain.link/streams/btc-usd-twap-30s-streams",
-        "rtds_topic": "crypto_prices_twap_thirty",
-        "rtds_type": "update",
-        "filters": '{"symbol":"btc/usd"}',
+    SOURCE_CHAINLINK: {
+        "label": "chainlink_btc_usd",
+        "resolution_url": "https://data.chain.link/streams",
+        "rtds_topic": "crypto_prices_chainlink",
+        "rtds_type": "*",
+        # Filter string form is unreliable on RTDS; subscribe broadly and filter by symbol.
+        "filters": None,
         "symbol": "btc/usd",
-    },
-    SOURCE_TWAP_60: {
-        "label": "chainlink_twap_60s",
-        "resolution_url": "https://data.chain.link/streams/btc-usd-twap-60s-streams",
-        "rtds_topic": "crypto_prices_twap_sixty",
-        "rtds_type": "update",
-        "filters": '{"symbol":"btc/usd"}',
-        "symbol": "btc/usd",
+        "live_kind": LIVE_KIND_LAST_PRINT,
     },
     SOURCE_BINANCE: {
         "label": "binance_btcusdt",
@@ -69,8 +77,84 @@ SOURCE_META = {
         "rtds_type": "*",
         "filters": None,
         "symbol": "btcusdt",
+        "live_kind": LIVE_KIND_LAST_PRINT,
+    },
+    SOURCE_TWAP_30: {
+        "label": "chainlink_twap_30s",
+        "resolution_url": "https://data.chain.link/streams/btc-usd-twap-30s-streams",
+        "rtds_topic": "crypto_prices_twap_thirty",
+        "rtds_type": "update",
+        "filters": '{"symbol":"btc/usd"}',
+        "symbol": "btc/usd",
+        "live_kind": LIVE_KIND_TWAP,
+    },
+    SOURCE_TWAP_60: {
+        "label": "chainlink_twap_60s",
+        "resolution_url": "https://data.chain.link/streams/btc-usd-twap-60s-streams",
+        "rtds_topic": "crypto_prices_twap_sixty",
+        "rtds_type": "update",
+        "filters": '{"symbol":"btc/usd"}',
+        "symbol": "btc/usd",
+        "live_kind": LIVE_KIND_TWAP,
     },
 }
+
+
+def live_kind_for(source: str) -> str:
+    meta = SOURCE_META.get(source) or {}
+    return str(meta.get("live_kind") or "")
+
+
+def is_last_print_source(source: str) -> bool:
+    return live_kind_for(source) == LIVE_KIND_LAST_PRINT
+
+
+def require_last_print_source(source: str) -> str:
+    """Refuse TWAP (or unknown) sources as a trading oracle."""
+    kind = live_kind_for(source)
+    if kind != LIVE_KIND_LAST_PRINT:
+        raise ValueError(
+            f"trading oracle {source!r} must be last-print vs PTB, not {kind or 'unknown'}"
+        )
+    return source
+
+
+def side_from_live_vs_ptb(
+    live: float,
+    ptb: float,
+    min_edge_usd: float,
+) -> Dict[str, Any]:
+    """Favored Up/Down from last live BTC vs window-open PTB. No averaging."""
+    out: Dict[str, Any] = {
+        "ok": False,
+        "favored": None,
+        "ptb": float(ptb),
+        "live_btc": float(live),
+        "edge_usd": None,
+        "reason": None,
+    }
+    try:
+        ptb_f = float(ptb)
+        live_f = float(live)
+    except (TypeError, ValueError):
+        out["reason"] = "non_finite_price"
+        return out
+    if not math.isfinite(ptb_f) or not math.isfinite(live_f):
+        out["reason"] = "non_finite_price"
+        return out
+    edge = live_f - ptb_f
+    out["edge_usd"] = edge
+    # Fail-closed: flat underlying never picks a side (even if min_edge is 0).
+    if edge == 0:
+        out["reason"] = "edge_zero"
+        return out
+    if abs(edge) < float(min_edge_usd or 0):
+        out["reason"] = "edge_too_small"
+        return out
+    out["ok"] = True
+    out["favored"] = "up" if edge > 0 else "down"
+    out["reason"] = None
+    return out
 
 
 def append_research(path: str, record: Dict[str, Any]) -> None:
@@ -135,7 +219,12 @@ class BtcUnderlyingFeed:
         self._stop.set()
 
     def live_quote(self) -> Tuple[Optional[float], str, Optional[float]]:
-        """Return (price, source_label, age_s). Memory only."""
+        """Return (price, source_label, age_s). Memory only.
+
+        On a last-print source this is the last tick, not a TWAP. TWAP
+        sources still return their rolling average here for logging, but
+        ``underlying_check`` refuses them as a trading live quote.
+        """
         with self._lock:
             live = self._live
             received_mono = self._live_received_mono
@@ -218,10 +307,11 @@ class BtcUnderlyingFeed:
             return dict(rec)
 
     def underlying_check(self, start_ts: float, min_edge_usd: float) -> Dict[str, Any]:
-        """Fast memory-only gate result for the buy loop."""
+        """Fast memory-only trading gate: last live BTC vs window-open PTB."""
         ptb_rec = self.ptb_record(start_ts) or {}
         live, live_src, live_age = self.live_quote()
         ptb = ptb_rec.get("ptb") if ptb_rec.get("ok") else None
+        live_kind = str(self.meta.get("live_kind") or "")
         out: Dict[str, Any] = {
             "ok": False,
             "favored": None,
@@ -233,21 +323,16 @@ class BtcUnderlyingFeed:
             "ptb_ok": bool(ptb_rec.get("ok")),
             "live_source": live_src,
             "live_age_s": live_age,
+            "live_kind": live_kind,
             "feed": self.source,
             "feed_label": self.meta["label"],
             "resolution_url": self.meta["resolution_url"],
         }
+        if live_kind != LIVE_KIND_LAST_PRINT:
+            out["reason"] = "twap_not_live"
+            return out
         if ptb is None or live is None:
             out["reason"] = "missing_ptb" if ptb is None else "missing_live"
-            return out
-        try:
-            ptb_f = float(ptb)
-            live_f = float(live)
-        except (TypeError, ValueError):
-            out["reason"] = "non_finite_price"
-            return out
-        if not math.isfinite(ptb_f) or not math.isfinite(live_f):
-            out["reason"] = "non_finite_price"
             return out
         if live_age is None or not math.isfinite(live_age) or live_age < 0:
             out["reason"] = "invalid_live_age"
@@ -255,18 +340,11 @@ class BtcUnderlyingFeed:
         if live_age > LIVE_STALE_S:
             out["reason"] = "live_stale"
             return out
-        edge = live_f - ptb_f
-        out["edge_usd"] = edge
-        # Fail-closed: flat underlying never picks a side (even if min_edge is 0).
-        if edge == 0:
-            out["reason"] = "edge_zero"
-            return out
-        if abs(edge) < float(min_edge_usd or 0):
-            out["reason"] = "edge_too_small"
-            return out
-        out["ok"] = True
-        out["favored"] = "up" if edge > 0 else "down"
-        out["reason"] = None
+        side = side_from_live_vs_ptb(live, ptb, min_edge_usd)
+        out["ok"] = bool(side.get("ok"))
+        out["favored"] = side.get("favored")
+        out["edge_usd"] = side.get("edge_usd")
+        out["reason"] = side.get("reason")
         return out
 
     def _trim_ptb_unlocked(self) -> None:

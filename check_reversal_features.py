@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """Correlate BTC level, short-horizon vol, and momentum with 5m reversals.
 
-No orders. No .env. Binance BTCUSDT is a proxy for Chainlink TWAP 30s (the
-live 5m oracle). Pathlog ~1s books are not required.
+No orders. No .env. Binance BTCUSDT is a research proxy for BTC level/vol.
+Live trading gates use last-print vs window-open PTB (not a 30s/60s TWAP).
+Pathlog ~1s books are not required.
 
 Session tape (operator UI export):
 
@@ -1727,8 +1728,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     report.append("")
     report.append("NOTES")
-    report.append("- Live 5m requires TWAP vs PTB side match and |edge| ≥ $10 (after the $10 paste). This study still ranks |dist| / vol / against-momentum on top of that.")
-    report.append("- Binance 1s/1m is not Chainlink TWAP 30s. Directional level/vol should still rank; exact dollar thresholds will not match the live feed tick-for-tick.")
+    report.append("- Live 5m requires last-print vs PTB side match (missing/flat skip). This study still ranks |dist| / vol / against-momentum on top of that.")
+    report.append("- Binance 1s/1m is a research proxy, not the live last-print feed. Directional level/vol should still rank; exact dollar thresholds will not match the live feed tick-for-tick.")
     report.append("- 1m klines are stamped at closeTime. Open-time stamps of the close look up to 60s ahead (TTM 45 can see settlement). Prefer --binance-interval 1s.")
     report.append("- BTC-only rows include 50/50 windows the bot would never buy. CLOB late-band rows are the closer analog to a 75–90 fill.")
     report.append("- Combo $/h uses implied fill from |dist| (session-calibrated). live_shaped_union is early ≥90 analog + late 75–90 + last-45 ≥90 on that map.")
@@ -1739,7 +1740,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     report.append("RECOMMENDATION (do not paste last-45 + $25 — that probe already lived empty/−EV)")
     report.append("  entry: last 120s / 75–90 / edge $10 (skip 0–10 |dist|; not $25)")
     report.append("  early / ≥95 / late_90 overlay: stay off")
-    report.append("  oracle: min_underlying_edge_usd=10 (Binance |dist| here is research; live is Chainlink TWAP)")
+    report.append("  oracle: min_underlying_edge_usd=10 (Binance |dist| here is research; live trading is last-print vs PTB)")
     report.append("  size: stay $2.50; do not size up from this table")
     report.append("  hedge: persist 1s @ 50/52, dump 40, flatten walks <75 (B+C); recovery 53")
     report.append("  do not add a vol or against-momentum skip")
