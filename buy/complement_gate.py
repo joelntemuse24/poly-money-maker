@@ -51,9 +51,12 @@ def funder_from_env_file(path: object) -> str:
             continue
         if stripped.startswith("export "):
             stripped = stripped[7:].strip()
-        if not stripped.startswith("FUNDER_ADDRESS="):
+        if "=" not in stripped:
             continue
-        value = stripped.split("=", 1)[1].strip()
+        key, value = stripped.split("=", 1)
+        if key.strip() != "FUNDER_ADDRESS":
+            continue
+        value = value.strip()
         if len(value) >= 2 and value[0] == value[-1] and value[0] in {"'", '"'}:
             value = value[1:-1]
         return value.strip()
