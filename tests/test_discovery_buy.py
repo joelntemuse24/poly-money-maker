@@ -285,6 +285,15 @@ class BotWiringTests(unittest.TestCase):
                 buy_chunk,
                 bot.name,
             )
+        five_m = BOT5M.read_text()
+        buy_5m = five_m[five_m.index("# --- BUY CHECK"):]
+        self.assertIn("in_live_window=late_slice", buy_5m)
+        fifteen = BOT.read_text()
+        buy_15 = fifteen[fifteen.index("# --- BUY CHECK"):]
+        self.assertIn("in_live_window=0 < minutes_left <= BUY_WINDOW_MIN", buy_15)
+        hourly = BOT_HR.read_text()
+        buy_hr = hourly[hourly.index("# --- BUY CHECK"):]
+        self.assertIn("in_live_window=bool(bands)", buy_hr)
 
     def test_5m_stale_discovery_log_only_after_helper_rejects(self):
         src = BOT5M.read_text()

@@ -5400,7 +5400,7 @@ while not _shutdown_requested:
                     continue
                 if not discovery_allows_buy_look(
                     _discovery_fresh,
-                    in_live_window=True,
+                    in_live_window=bool(bands),
                     market=m,
                 ):
                     log_buy_skip_throttled(
