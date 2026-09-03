@@ -138,6 +138,9 @@ class LaggingTwapWouldSkipLastPrintFires(unittest.TestCase):
             already_bought=False,
             primary_still_holding=True,
             oracle_favors_other=oracle_favors_other_leg(chk, "down"),
+            spend_cap=16.0,
+            share_cap=20.0,
+            share_multiple=1.0,
         )
         self.assertTrue(fire)
         self.assertEqual(why, "fire")
