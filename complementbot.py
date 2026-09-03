@@ -2,8 +2,7 @@
 
 Does not change 5m/15m hedge logic. After the first account confirms a
 fill, this process (separate CLOB key / funder) watches the *other* token
-and lifts it at ≥80¢ so a reversal is not a full −$10 if the sell-hedge
-misses.
+and lifts **2×** that bag at ≥80¢ (spend cap ~2× the 5m $2.50 clip).
 
 Requires ``.env.complement`` (second Polymarket account). Refuses to start
 if that funder matches the primary ``.env`` wallet.
@@ -30,6 +29,7 @@ from buy.clob_book_ws import get_book_feed
 from buy.complement_clob import (
     COMPLEMENT_SIGNATURE_TYPE,
     ComplementDepositClobClient,
+    complement_wallet_from_env,
 )
 from buy.complement_gate import (
     apply_balance_evidence,
@@ -64,8 +64,8 @@ _STRATEGY_DEFAULTS = {
     "buy_min_price": 0.80,
     "buy_max_price": 0.99,
     "max_entry_spread": 0.05,
-    "buy_max_spend": 16.0,
-    "buy_max_shares": 20.0,
+    "buy_max_spend": 5.0,
+    "buy_max_shares": 8.0,
     "require_oracle": True,
     "min_underlying_edge_usd": 0.0,
     "poll_s": 0.01,
@@ -229,15 +229,22 @@ load_dotenv(".env.complement", override=True)
 
 PRIVATE_KEY = os.getenv("PRIVATE_KEY")
 FUNDER_ADDRESS = os.getenv("FUNDER_ADDRESS") or funder_from_env_file(".env.complement")
+# Live FUNDER / COMPLEMENT_WALLET must be the deposit wallet
+# 0x2b2D1dA1a49E8BF73EbBC3EAC35D79cc88cd4ad2. Cash may still be on the
+# Magic proxy until Joel moves it. Relayer EOA is RELAYER_ADDRESS.
+COMPLEMENT_WALLET = complement_wallet_from_env() or FUNDER_ADDRESS
 
-if primary_and_complement_same_wallet(PRIMARY_FUNDER, FUNDER_ADDRESS):
+if primary_and_complement_same_wallet(PRIMARY_FUNDER, COMPLEMENT_WALLET):
     console.print(
         "[bold red]Complement funder matches the primary wallet. "
         "Refusing to start — use a second Polymarket account in .env.complement.[/]"
     )
     raise SystemExit(1)
-if not PRIVATE_KEY or not FUNDER_ADDRESS:
-    console.print("[bold red].env.complement is missing PRIVATE_KEY or FUNDER_ADDRESS.[/]")
+if not PRIVATE_KEY or not COMPLEMENT_WALLET:
+    console.print(
+        "[bold red].env.complement is missing PRIVATE_KEY or "
+        "COMPLEMENT_WALLET/FUNDER_ADDRESS.[/]"
+    )
     raise SystemExit(1)
 
 from py_clob_client_v2 import (  # noqa: E402
@@ -259,7 +266,7 @@ api_creds, client = build_complement_clob_clients(
     chain_id=CHAIN_ID,
     creds=None,
     signature_type=COMPLEMENT_SIGNATURE_TYPE,
-    funder=FUNDER_ADDRESS,
+    funder=COMPLEMENT_WALLET,
     retry_on_error=False,
 )
 
@@ -273,7 +280,7 @@ _chainlink = require_last_print_source(SOURCE_CHAINLINK)
 btc_5m = get_btc_feed(_chainlink, "ptb_chainlink_buy5m.json")
 btc_15m = get_btc_feed(_chainlink, "ptb_chainlink_buy.json")
 console.print(
-    f"[bold bright_cyan]▶ COMPLEMENT[/] second account {FUNDER_ADDRESS[:8]}… "
+    f"[bold bright_cyan]▶ COMPLEMENT[/] second account {COMPLEMENT_WALLET[:8]}… "
     f"dry_run={DRY_RUN} entry={_strat['entry_enabled']}"
 )
 

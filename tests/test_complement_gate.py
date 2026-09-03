@@ -128,6 +128,7 @@ class TargetSharesTests(unittest.TestCase):
     def test_share_match_at_80(self):
         shares = complement_target_shares(
             10.87, ask=0.80, limit=0.99, spend_cap=16.0, share_cap=20.0,
+            share_multiple=1.0,
         )
         # 10.87 × 99¢ is not exact maker cents; snap down to a legal 2dp size.
         self.assertAlmostEqual(shares, 10.00, places=2)
@@ -136,6 +137,7 @@ class TargetSharesTests(unittest.TestCase):
     def test_spend_cap_clips(self):
         shares = complement_target_shares(
             20.0, ask=0.80, limit=0.99, spend_cap=10.0, share_cap=40.0,
+            share_multiple=1.0,
         )
         self.assertLessEqual(shares * 0.99, 10.0 + 1e-9)
         self.assertGreaterEqual(shares, 10.0)
@@ -145,6 +147,26 @@ class TargetSharesTests(unittest.TestCase):
             complement_target_shares(0.0, ask=0.80, limit=0.99, spend_cap=16.0),
             0.0,
         )
+
+    def test_2x_primary_shares_for_2_50_clip_capped_near_5(self):
+        """5m $2.50 @ 75¢ ≈ 3.33 sh; complement wants 2×, spend ~$5."""
+        held = 2.50 / 0.75
+        shares = complement_target_shares(
+            held, ask=0.80, limit=0.99, spend_cap=5.0, share_cap=8.0,
+        )
+        self.assertGreater(shares, held + 0.01)
+        self.assertLessEqual(shares * 0.99, 5.0 + 1e-9)
+        self.assertGreaterEqual(shares * 0.99, 4.50)
+
+    def test_default_multiple_is_two(self):
+        one = complement_target_shares(
+            3.0, ask=0.80, limit=0.99, spend_cap=16.0, share_cap=20.0,
+            share_multiple=1.0,
+        )
+        two = complement_target_shares(
+            3.0, ask=0.80, limit=0.99, spend_cap=16.0, share_cap=20.0,
+        )
+        self.assertAlmostEqual(two, min(6.0, one * 2.0), places=2)
 
 
 class EvaluateComplementTests(unittest.TestCase):
@@ -156,6 +178,8 @@ class EvaluateComplementTests(unittest.TestCase):
             already_bought=False,
             primary_still_holding=True,
             oracle_favors_other=True,
+            spend_cap=16.0,
+            share_cap=20.0,
         )
         self.assertTrue(fire)
         self.assertEqual(why, "fire")
@@ -345,7 +369,7 @@ class ComplementClobClientBuilderTests(unittest.TestCase):
         self.assertTrue(
             isinstance(sig, ast.Name) and sig.id == "COMPLEMENT_SIGNATURE_TYPE"
         )
-        self.assertTrue(isinstance(funder, ast.Name) and funder.id == "FUNDER_ADDRESS")
+        self.assertTrue(isinstance(funder, ast.Name) and funder.id == "COMPLEMENT_WALLET")
         self.assertTrue(isinstance(creds, ast.Constant) and creds.value is None)
         leftover = [
             node
@@ -404,6 +428,8 @@ class ExampleJsonTests(unittest.TestCase):
         self.assertIs(data["entry_enabled"], False)
         self.assertEqual(data["buy_min_price"], 0.80)
         self.assertEqual(data["buy_max_price"], 0.99)
+        self.assertEqual(data["buy_max_spend"], 5.0)
+        self.assertLessEqual(float(data["buy_max_spend"]), 5.5)
         self.assertIs(data["require_oracle"], True)
         self.assertIn("positions_buy5m.json", data["primary_state_files"])
         self.assertIn("positions_buy.json", data["primary_state_files"])

@@ -8,17 +8,26 @@ address has to be the address of the API KEY``.
 
 5m/15m/hourly stay on py-clob-client-v2 + Magic/proxy type 1. This
 module is imported only by ``complementbot.py``. Trading goes through
-``polymarket.SecureClient.create(private_key=..., wallet=funder)``.
-Gamma names that address ``proxyWallet``, so the official client may
-classify it ``POLY_PROXY`` rather than ``DEPOSIT_WALLET``; both are
+``polymarket.SecureClient.create(private_key=..., wallet=funder,
+api_key=RelayerApiKey(key=..., address=...))``.
+
+Live complement ``FUNDER_ADDRESS`` / ``COMPLEMENT_WALLET`` must be the
+deposit wallet ``0x2b2D1dA1a49E8BF73EbBC3EAC35D79cc88cd4ad2``. Cash may
+still sit on the Magic proxy until the operator moves it. That proxy
+(``0xCfF52577…``) still 400s ``maker address not allowed`` even when a
+Relayer key is present — do not silently fall back to type 1.
+
+Gamma names the deposit address ``proxyWallet``, so the official client
+may classify it ``POLY_PROXY`` rather than ``DEPOSIT_WALLET``; both are
 allowed when ``inner.wallet`` equals the funder.
 """
 
 from __future__ import annotations
 
 import inspect
+import os
 from dataclasses import is_dataclass, replace
-from typing import Any, Callable, Dict, Optional
+from typing import Any, Callable, Dict, Mapping, Optional
 
 COMPLEMENT_SIGNATURE_TYPE = 3
 # Gamma labels this account's deposit address ``proxyWallet``. Official
@@ -178,16 +187,51 @@ def _optional_secure_create_kwargs(create_fn: Any) -> Dict[str, Any]:
     return extra
 
 
+def complement_wallet_from_env(environ: Optional[Mapping[str, str]] = None) -> str:
+    """Deposit wallet for SecureClient.create. ``COMPLEMENT_WALLET`` or ``FUNDER_ADDRESS``.
+
+    Live funder must be the deposit wallet ``0x2b2D1dA1a49E8BF73EbBC3EAC35D79cc88cd4ad2``.
+    """
+    env = os.environ if environ is None else environ
+    return str(env.get("COMPLEMENT_WALLET") or env.get("FUNDER_ADDRESS") or "").strip()
+
+
+def relayer_api_key_from_env(environ: Optional[Mapping[str, str]] = None) -> Any:
+    """Build ``RelayerApiKey(key=..., address=...)`` from env. Fail closed if missing.
+
+    Requires ``RELAYER_API_KEY`` and ``RELAYER_ADDRESS`` (the Relayer EOA).
+    Never falls back to Magic/proxy type 1.
+    """
+    env = os.environ if environ is None else environ
+    key = str(env.get("RELAYER_API_KEY") or "").strip()
+    address = str(env.get("RELAYER_ADDRESS") or "").strip()
+    if not key or not address:
+        raise RuntimeError(
+            "complement CLOB requires RELAYER_API_KEY and RELAYER_ADDRESS "
+            "(Relayer API key + EOA). Refusing to start without Relayer — "
+            "will not fall back to Magic/proxy signature_type=1."
+        )
+    from polymarket.auth import RelayerApiKey
+
+    return RelayerApiKey(key=key, address=address)
+
+
 def default_secure_factory(
     *,
     private_key: str,
     wallet: str,
     credentials: Any = None,
+    api_key: Any = None,
 ) -> Any:
-    """Build the official sync client with ``wallet`` = deposit funder."""
+    """Build the official sync client with deposit ``wallet`` + Relayer ``api_key``."""
     from polymarket import SecureClient
 
-    kwargs: Dict[str, Any] = {"private_key": private_key, "wallet": wallet}
+    relayer = api_key if api_key is not None else relayer_api_key_from_env()
+    kwargs: Dict[str, Any] = {
+        "private_key": private_key,
+        "wallet": wallet,
+        "api_key": relayer,
+    }
     if credentials is not None:
         kwargs["credentials"] = creds_to_secure(credentials)
     kwargs.update(_optional_secure_create_kwargs(SecureClient.create))
@@ -247,6 +291,7 @@ class ComplementDepositClobClient:
         funder_s = str(funder or "").strip()
         if not funder_s:
             raise ValueError("complement CLOB requires funder (deposit wallet)")
+        # Live FUNDER / COMPLEMENT_WALLET must be deposit 0x2b2D1dA1a49E8BF73EbBC3EAC35D79cc88cd4ad2.
         if not str(key or "").strip():
             raise ValueError("complement CLOB requires a private key")
         self.host = host
@@ -328,8 +373,10 @@ class ComplementDepositClobClient:
 __all__ = [
     "COMPLEMENT_SIGNATURE_TYPE",
     "ComplementDepositClobClient",
+    "complement_wallet_from_env",
     "creds_to_dict",
     "creds_to_secure",
     "default_secure_factory",
     "order_response_to_post_dict",
+    "relayer_api_key_from_env",
 ]
