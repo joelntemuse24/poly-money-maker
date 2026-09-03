@@ -1,9 +1,9 @@
-"""CURRENT 5m rails — today's live bugs must fail before the fix and pass after.
+"""Historical 5m helper-default cases — not the live overlay.
 
-22 Aug 2026 (Europe/Dublin): 09:35 / 11:20 / 11:25 bags expired instead of
-dumping. These cases are the spec. 5m is back live: $2.50 two-slice, last-45s
-≥90 overlay, persist 5s @ 50/52 + dump 32 ignore-oracle (hourly false-hedge
-crackdown). Hourly stays last-20m 75–90 with persist 50/52 + dump 35.
+``decide_5m_entry()`` without kwargs uses ``FIVE_M_BAND_DEFAULTS``
+(``late_90_start_s=45``, early windows on). Live 5m overlay is last-120
+75–90 $2.50 with ``late_90_start_s=0`` — see ``RestoredFiveMLate7590Tests``.
+These cases keep the 22 Aug dump / last-45 helper contract from regressing.
 
 
 22 Aug 16:08 UTC: polybuybot5m crashed twice in the 12:05 ET window —

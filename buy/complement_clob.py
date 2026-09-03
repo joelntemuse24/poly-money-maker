@@ -8,19 +8,34 @@ address has to be the address of the API KEY``.
 
 5m/15m/hourly stay on py-clob-client-v2 + Magic/proxy type 1. This
 module is imported only by ``complementbot.py``. Trading goes through
-``polymarket.SecureClient.create(private_key=..., wallet=funder)``.
-Gamma names that address ``proxyWallet``, so the official client may
-classify it ``POLY_PROXY`` rather than ``DEPOSIT_WALLET``; both are
+``polymarket.SecureClient.create(private_key=..., wallet=funder,
+api_key=RelayerApiKey(key=..., address=...))``.
+
+Live complement ``FUNDER_ADDRESS`` / ``COMPLEMENT_WALLET`` must be the
+deposit wallet ``0x2b2D1dA1a49E8BF73EbBC3EAC35D79cc88cd4ad2``. Cash may
+still sit on the Magic proxy until the operator moves it. That proxy
+(``0xCfF52577…``) still 400s ``maker address not allowed`` even when a
+Relayer key is present — do not silently fall back to type 1.
+
+Gamma names the deposit address ``proxyWallet``, so the official client
+may classify it ``POLY_PROXY`` rather than ``DEPOSIT_WALLET``; both are
 allowed when ``inner.wallet`` equals the funder.
 """
 
 from __future__ import annotations
 
 import inspect
+import os
 from dataclasses import is_dataclass, replace
-from typing import Any, Callable, Dict, Optional
+from typing import Any, Callable, Dict, Mapping, Optional
 
 COMPLEMENT_SIGNATURE_TYPE = 3
+# Live FUNDER / COMPLEMENT_WALLET must be this deposit wallet. Cash may
+# still sit on MAGIC_PROXY_WALLET until the operator moves it.
+DEPOSIT_WALLET_LIVE = "0x2b2D1dA1a49E8BF73EbBC3EAC35D79cc88cd4ad2"
+# Verified on the VM: this Magic proxy still 400s ``maker address not
+# allowed`` even when RelayerApiKey is present. Refuse it at startup.
+MAGIC_PROXY_WALLET = "0xCfF52577f80222e4b36f03B5d58443781b9D2433"
 # Gamma labels this account's deposit address ``proxyWallet``. Official
 # SecureClient.create(wallet=funder) therefore classifies it POLY_PROXY,
 # not DEPOSIT_WALLET. Either is allowed when inner.wallet == funder.
@@ -164,12 +179,34 @@ def order_response_to_post_dict(result: Any) -> Dict[str, Any]:
     return data
 
 
+def _secure_create_params(create_fn: Any) -> Optional[Mapping[str, inspect.Parameter]]:
+    try:
+        return inspect.signature(create_fn).parameters
+    except (TypeError, ValueError):
+        return None
+
+
+def _require_secure_create_accepts_relayer(create_fn: Any) -> None:
+    """Fail closed if SecureClient.create cannot take Relayer ``api_key``."""
+    params = _secure_create_params(create_fn)
+    if params is None:
+        return
+    if "api_key" in params:
+        return
+    if any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values()):
+        return
+    raise RuntimeError(
+        "SecureClient.create must accept api_key=RelayerApiKey(key=..., address=...). "
+        "Refusing to start without Relayer on the CLOB client — "
+        "will not fall back to Magic/proxy signature_type=1."
+    )
+
+
 def _optional_secure_create_kwargs(create_fn: Any) -> Dict[str, Any]:
     """Pass wallet_type / signature_type only if SecureClient.create accepts them."""
     extra: Dict[str, Any] = {}
-    try:
-        params = inspect.signature(create_fn).parameters
-    except (TypeError, ValueError):
+    params = _secure_create_params(create_fn)
+    if params is None:
         return extra
     if "wallet_type" in params:
         extra["wallet_type"] = "DEPOSIT_WALLET"
@@ -178,16 +215,83 @@ def _optional_secure_create_kwargs(create_fn: Any) -> Dict[str, Any]:
     return extra
 
 
+def complement_wallet_from_env(environ: Optional[Mapping[str, str]] = None) -> str:
+    """Deposit wallet for SecureClient.create. ``COMPLEMENT_WALLET`` or ``FUNDER_ADDRESS``.
+
+    Live funder must be the deposit wallet ``DEPOSIT_WALLET_LIVE``.
+    Relayer vars are read from the process env — on the VM that is
+    ``.env.complement`` (systemd EnvironmentFile), not the primary ``.env``.
+    """
+    env = os.environ if environ is None else environ
+    return str(env.get("COMPLEMENT_WALLET") or env.get("FUNDER_ADDRESS") or "").strip()
+
+
+def is_magic_proxy_wallet(value: object) -> bool:
+    return _norm_addr(value) == _norm_addr(MAGIC_PROXY_WALLET)
+
+
+def require_complement_deposit_wallet(wallet: object) -> str:
+    """Refuse an empty funder or the known-bad Magic proxy.
+
+    Does not hard-require ``DEPOSIT_WALLET_LIVE`` so ``COMPLEMENT_WALLET``
+    can switch accounts without another code PR. The Magic proxy is the
+    one address verified to 400 ``maker address not allowed`` with Relayer.
+    """
+    wallet_s = str(wallet or "").strip()
+    if not wallet_s:
+        raise RuntimeError(
+            "complement CLOB requires COMPLEMENT_WALLET or FUNDER_ADDRESS "
+            f"(deposit wallet {DEPOSIT_WALLET_LIVE})"
+        )
+    if is_magic_proxy_wallet(wallet_s):
+        raise RuntimeError(
+            "complement CLOB funder is the Magic proxy "
+            f"({MAGIC_PROXY_WALLET}). That address 400s "
+            "maker address not allowed even with Relayer. "
+            "Set COMPLEMENT_WALLET / FUNDER_ADDRESS in .env.complement to "
+            f"the deposit wallet {DEPOSIT_WALLET_LIVE} and move cash first."
+        )
+    return wallet_s
+
+
+def relayer_api_key_from_env(environ: Optional[Mapping[str, str]] = None) -> Any:
+    """Build ``RelayerApiKey(key=..., address=...)`` from env. Fail closed if missing.
+
+    Requires ``RELAYER_API_KEY`` and ``RELAYER_ADDRESS`` (the Relayer EOA).
+    Never falls back to Magic/proxy type 1.
+    """
+    env = os.environ if environ is None else environ
+    key = str(env.get("RELAYER_API_KEY") or "").strip()
+    address = str(env.get("RELAYER_ADDRESS") or "").strip()
+    if not key or not address:
+        raise RuntimeError(
+            "complement CLOB requires RELAYER_API_KEY and RELAYER_ADDRESS "
+            "(Relayer API key + EOA). Refusing to start without Relayer — "
+            "will not fall back to Magic/proxy signature_type=1."
+        )
+    from polymarket.auth import RelayerApiKey
+
+    return RelayerApiKey(key=key, address=address)
+
+
 def default_secure_factory(
     *,
     private_key: str,
     wallet: str,
     credentials: Any = None,
+    api_key: Any = None,
 ) -> Any:
-    """Build the official sync client with ``wallet`` = deposit funder."""
+    """Build the official sync client with deposit ``wallet`` + Relayer ``api_key``."""
     from polymarket import SecureClient
 
-    kwargs: Dict[str, Any] = {"private_key": private_key, "wallet": wallet}
+    _require_secure_create_accepts_relayer(SecureClient.create)
+    relayer = api_key if api_key is not None else relayer_api_key_from_env()
+    require_complement_deposit_wallet(wallet)
+    kwargs: Dict[str, Any] = {
+        "private_key": private_key,
+        "wallet": wallet,
+        "api_key": relayer,
+    }
     if credentials is not None:
         kwargs["credentials"] = creds_to_secure(credentials)
     kwargs.update(_optional_secure_create_kwargs(SecureClient.create))
@@ -247,6 +351,7 @@ class ComplementDepositClobClient:
         funder_s = str(funder or "").strip()
         if not funder_s:
             raise ValueError("complement CLOB requires funder (deposit wallet)")
+        # Live FUNDER / COMPLEMENT_WALLET must be deposit 0x2b2D1dA1a49E8BF73EbBC3EAC35D79cc88cd4ad2.
         if not str(key or "").strip():
             raise ValueError("complement CLOB requires a private key")
         self.host = host
@@ -327,9 +432,15 @@ class ComplementDepositClobClient:
 
 __all__ = [
     "COMPLEMENT_SIGNATURE_TYPE",
+    "DEPOSIT_WALLET_LIVE",
+    "MAGIC_PROXY_WALLET",
     "ComplementDepositClobClient",
+    "complement_wallet_from_env",
     "creds_to_dict",
     "creds_to_secure",
     "default_secure_factory",
+    "is_magic_proxy_wallet",
     "order_response_to_post_dict",
+    "relayer_api_key_from_env",
+    "require_complement_deposit_wallet",
 ]

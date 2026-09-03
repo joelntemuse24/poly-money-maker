@@ -2,9 +2,10 @@
 
 Primary 5m/15m hedge logic is untouched. Gate helpers read a snapshot of
 the first account's positions JSON and decide whether the isolated
-complement wallet should lift the *other* token at ≥80¢. CLOB I/O lives
-only inside the injected client passed to ``build_complement_clob_clients``
-(complement uses ``ComplementDepositClobClient`` / signature_type 3).
+complement wallet should lift **2×** the *other* token at ≥80¢ (spend ~$5).
+CLOB I/O lives only inside the injected client passed to
+``build_complement_clob_clients`` (complement uses
+``ComplementDepositClobClient`` / Relayer + signature_type 3).
 """
 
 from __future__ import annotations
@@ -169,17 +170,21 @@ def complement_target_shares(
     limit: float,
     spend_cap: float,
     share_cap: float = 0.0,
+    share_multiple: float = 2.0,
 ) -> float:
-    """Share-match the primary bag, clipped to spend/share caps. 2 dp shares."""
+    """2× share-match the primary bag, clipped to spend/share caps. 2 dp shares."""
     held = _finite(held_shares, minimum=0) or 0.0
     lim = _finite(limit, minimum=0) or 0.0
     ask_f = _finite(ask, minimum=0) or 0.0
     cap = _finite(spend_cap, minimum=0) or 0.0
-    if held < 0.01 or lim <= 0 or ask_f <= 0 or cap < 0.01:
+    mult = _finite(share_multiple, minimum=0) or 0.0
+    if held < 0.01 or lim <= 0 or ask_f <= 0 or cap < 0.01 or mult < 0.01:
         return 0.0
     share_tick = Decimal("0.01")
     cent = Decimal("0.01")
-    want = Decimal(str(held)).quantize(share_tick, rounding=ROUND_DOWN)
+    want = (Decimal(str(held)) * Decimal(str(mult))).quantize(
+        share_tick, rounding=ROUND_DOWN,
+    )
     cap_d = Decimal(str(cap)).quantize(cent, rounding=ROUND_DOWN)
     lim_d = Decimal(str(lim))
     max_sh = (cap_d / lim_d).quantize(share_tick, rounding=ROUND_DOWN)
@@ -227,8 +232,9 @@ def evaluate_complement(
     min_price: float = 0.80,
     max_price: float = 0.99,
     max_spread: float = 0.05,
-    spend_cap: float = 16.0,
-    share_cap: float = 20.0,
+    spend_cap: float = 5.0,
+    share_cap: float = 8.0,
+    share_multiple: float = 2.0,
     require_oracle: bool = True,
 ) -> Tuple[bool, str, float]:
     """Whether the complement wallet should FAK the other token.
@@ -259,6 +265,7 @@ def evaluate_complement(
         limit=float(max_price),
         spend_cap=float(spend_cap),
         share_cap=float(share_cap),
+        share_multiple=float(share_multiple),
     )
     if shares < 0.01:
         return False, "size_zero", 0.0

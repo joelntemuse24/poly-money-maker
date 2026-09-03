@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import sys
 import unittest
 from dataclasses import dataclass
@@ -11,13 +12,18 @@ from unittest.mock import patch
 
 from buy.complement_clob import (
     COMPLEMENT_SIGNATURE_TYPE,
+    DEPOSIT_WALLET_LIVE,
+    MAGIC_PROXY_WALLET,
     ComplementDepositClobClient,
     order_response_to_post_dict,
+    require_complement_deposit_wallet,
 )
 from buy.complement_gate import build_complement_clob_clients
 
 
 FUNDER = "0xCfF52577f80222e4b36f03B5d58443781b9D2433"
+DEPOSIT_WALLET = "0x2b2D1dA1a49E8BF73EbBC3EAC35D79cc88cd4ad2"
+RELAYER_EOA = "0x481Bb1cb2a5321397cE228B3F2f235359cAAFBB5"
 HOST = "https://clob.polymarket.com"
 
 
@@ -240,8 +246,15 @@ class ComplementDepositClobClientTests(unittest.TestCase):
         self.assertFalse(data["success"])
         self.assertIn("no orders found to match", data["errorMsg"])
 
-    def test_default_factory_passes_deposit_wallet(self):
+    def test_default_factory_passes_deposit_wallet_and_relayer_api_key(self):
         created = {}
+        relayer_kwargs = []
+
+        class _RelayerApiKey:
+            def __init__(self, *, key, address):
+                relayer_kwargs.append({"key": key, "address": address})
+                self.key = key
+                self.address = address
 
         class _SecureClient:
             @staticmethod
@@ -252,13 +265,146 @@ class ComplementDepositClobClientTests(unittest.TestCase):
                     wallet_type="DEPOSIT_WALLET",
                 )
 
-        with patch.dict(sys.modules, {"polymarket": SimpleNamespace(SecureClient=_SecureClient)}):
-            from buy.complement_clob import default_secure_factory
+        env = {
+            "RELAYER_API_KEY": "test-relayer-key",
+            "RELAYER_ADDRESS": RELAYER_EOA,
+        }
+        auth_mod = SimpleNamespace(RelayerApiKey=_RelayerApiKey)
+        with patch.dict(os.environ, env, clear=False):
+            with patch.dict(
+                sys.modules,
+                {
+                    "polymarket": SimpleNamespace(SecureClient=_SecureClient),
+                    "polymarket.auth": auth_mod,
+                },
+            ):
+                from buy.complement_clob import default_secure_factory
 
-            default_secure_factory(private_key="0xpriv", wallet=FUNDER)
-        self.assertEqual(created["wallet"], FUNDER)
+                default_secure_factory(private_key="0xpriv", wallet=DEPOSIT_WALLET)
+        self.assertEqual(created["wallet"], DEPOSIT_WALLET)
         self.assertEqual(created["private_key"], "0xpriv")
         self.assertNotIn("credentials", created)
+        self.assertIn("api_key", created)
+        self.assertEqual(created["api_key"].key, "test-relayer-key")
+        self.assertEqual(created["api_key"].address, RELAYER_EOA)
+        self.assertEqual(len(relayer_kwargs), 1)
+        self.assertEqual(relayer_kwargs[0]["key"], "test-relayer-key")
+        self.assertEqual(relayer_kwargs[0]["address"], RELAYER_EOA)
+
+    def test_default_factory_fails_closed_without_relayer_env(self):
+        created = {}
+
+        class _SecureClient:
+            @staticmethod
+            def create(**kwargs):
+                created.update(kwargs)
+                return SimpleNamespace(
+                    wallet=kwargs["wallet"],
+                    wallet_type="POLY_PROXY",
+                )
+
+        env = {k: "" for k in ("RELAYER_API_KEY", "RELAYER_ADDRESS", "RELAYER_API_KEY_ADDRESS")}
+        with patch.dict(os.environ, env, clear=False):
+            with patch.dict(
+                sys.modules,
+                {"polymarket": SimpleNamespace(SecureClient=_SecureClient)},
+            ):
+                from buy.complement_clob import default_secure_factory
+
+                with self.assertRaises(RuntimeError) as ctx:
+                    default_secure_factory(private_key="0xpriv", wallet=FUNDER)
+        self.assertEqual(created, {})
+        msg = str(ctx.exception)
+        self.assertIn("RELAYER_API_KEY", msg)
+        self.assertIn("RELAYER_ADDRESS", msg)
+        self.assertIn("signature_type=1", msg)
+        self.assertIn("will not fall back", msg.lower())
+
+    def test_relayer_api_key_from_env_uses_keyword_only_constructor(self):
+        class _RelayerApiKey:
+            def __init__(self, *args, **kwargs):
+                if args:
+                    raise TypeError("RelayerApiKey() takes 0 positional arguments")
+                if set(kwargs) != {"key", "address"}:
+                    raise TypeError(f"unexpected kwargs {sorted(kwargs)}")
+                self.key = kwargs["key"]
+                self.address = kwargs["address"]
+
+        env = {
+            "RELAYER_API_KEY": "rk",
+            "RELAYER_ADDRESS": RELAYER_EOA,
+        }
+        with patch.dict(os.environ, env, clear=False):
+            with patch.dict(
+                sys.modules, {"polymarket.auth": SimpleNamespace(RelayerApiKey=_RelayerApiKey)}
+            ):
+                from buy.complement_clob import relayer_api_key_from_env
+
+                key = relayer_api_key_from_env()
+        self.assertEqual(key.key, "rk")
+        self.assertEqual(key.address, RELAYER_EOA)
+
+    def test_default_factory_refuses_magic_proxy_even_with_relayer(self):
+        created = {}
+
+        class _RelayerApiKey:
+            def __init__(self, *, key, address):
+                self.key = key
+                self.address = address
+
+        class _SecureClient:
+            @staticmethod
+            def create(**kwargs):
+                created.update(kwargs)
+                return SimpleNamespace(
+                    wallet=kwargs["wallet"],
+                    wallet_type="POLY_PROXY",
+                )
+
+        env = {
+            "RELAYER_API_KEY": "test-relayer-key",
+            "RELAYER_ADDRESS": RELAYER_EOA,
+        }
+        with patch.dict(os.environ, env, clear=False):
+            with patch.dict(
+                sys.modules,
+                {
+                    "polymarket": SimpleNamespace(SecureClient=_SecureClient),
+                    "polymarket.auth": SimpleNamespace(RelayerApiKey=_RelayerApiKey),
+                },
+            ):
+                from buy.complement_clob import default_secure_factory
+
+                with self.assertRaises(RuntimeError) as ctx:
+                    default_secure_factory(private_key="0xpriv", wallet=MAGIC_PROXY_WALLET)
+        self.assertEqual(created, {})
+        self.assertIn("Magic proxy", str(ctx.exception))
+        self.assertIn("maker address not allowed", str(ctx.exception))
+
+    def test_require_complement_deposit_wallet_refuses_proxy_keeps_deposit(self):
+        self.assertEqual(
+            require_complement_deposit_wallet(DEPOSIT_WALLET_LIVE),
+            DEPOSIT_WALLET_LIVE,
+        )
+        with self.assertRaises(RuntimeError) as ctx:
+            require_complement_deposit_wallet(MAGIC_PROXY_WALLET)
+        self.assertIn("Magic proxy", str(ctx.exception))
+        with self.assertRaises(RuntimeError):
+            require_complement_deposit_wallet("")
+
+    def test_complement_wallet_prefers_complement_wallet_env(self):
+        from buy.complement_clob import complement_wallet_from_env
+
+        env = {
+            "COMPLEMENT_WALLET": DEPOSIT_WALLET,
+            "FUNDER_ADDRESS": FUNDER,
+        }
+        self.assertEqual(complement_wallet_from_env(env), DEPOSIT_WALLET)
+        self.assertEqual(
+            complement_wallet_from_env({"FUNDER_ADDRESS": DEPOSIT_WALLET}),
+            DEPOSIT_WALLET,
+        )
+        self.assertEqual(complement_wallet_from_env({}), "")
 
     def test_signature_type_constant_is_poly_1271(self):
         self.assertEqual(COMPLEMENT_SIGNATURE_TYPE, 3)

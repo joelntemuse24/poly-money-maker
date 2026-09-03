@@ -3,68 +3,48 @@
 **Agents: read this after `AGENTS.md`.** Update this file when ops/strategy decisions change.
 Do not put secrets, API keys, or live wallet material here.
 
-Last updated: **2026-09-02** — trading oracle is **last live BTC vs
-window-open PTB** (never a 30s/60s TWAP). Overlay remains **90–96¢ $10
-production** (5m last **60s** 90–96 + 15m last **3 min** 90–96).
-Gamma is a background directory only: a known last-60s / last-3min
-market with tokens + `end_ts` already in `_cached_markets` no longer
-skips as `stale_discovery` when the Gamma snapshot is older than
-max(10s, 2×`discover_cache_s`). Overnight 2026-09-02 07:54 IST ate
-real 90–96 seconds on that veto. Unknown markets still cannot buy.
-Hedge never waited on Gamma freshness. Paper week
-25 Aug–1 Sep 2026 was scored at 92¢ (last-trade 1s, $10/fill): 5m dump-hold
-**2s** **+$109.43**
-(275 fills, WR 95.6%); 15m inverted 35/40 **+$29.08** (234 fills,
-WR 93.2%); combined **~$138/wk**. Wider 90–96 takes more prints than
-that 92-only tape. Live JSON overlay still wins until the paste below.
-**Do not paste last-45 + $25.** Do **not** start hourly or mint.
-Do **not** start `polybuybot` / `polybuybot5m` from the complement CLOB
-fix. After that merge, the operator restarts `polycomplement` on the VM
-(not from a cloud agent). Do **not** re-enable last-30s persist
-58/60 on these fills.
-Clip size is **$10** per fill on both bots.
+Last updated: **2026-09-03** — trading oracle is **last live BTC vs
+window-open PTB** (never a 30s/60s TWAP). Overlay is **5m-only 75–90¢
+$2.50** (last **120s** inclusive, FAK **90¢**). **15m stays off.**
+Gamma is a background directory only: a known last-120s market with
+tokens + `end_ts` already in `_cached_markets` no longer skips as
+`stale_discovery` when the Gamma snapshot is older than
+max(10s, 2×`discover_cache_s`). Unknown markets still cannot buy.
+Hedge never waited on Gamma freshness. Live JSON overlay still wins
+until the paste below. **Do not paste last-45 + $25.** Do **not**
+start 15m, hourly, or mint. Do **not** start units from a cloud agent.
+After this merge, the operator pastes 5m JSON, restarts
+`polybuybot5m`, and restarts `polycomplement` on the VM. Do **not**
+re-enable last-30s persist 58/60.
+Clip size is **$2.50** per 5m fill. Complement is **2×** that clip
+(spend ~$5) at ≥80¢ via Relayer + deposit wallet.
 
-**Live combination after this paste + restart 5m + start 15m.**
+**Live combination after this paste + restart 5m only.**
 Trading oracle is last live BTC vs window-open PTB (in code, not a JSON
-knob). Pull + restart 5m / start 15m picks it up. TWAP is not “live”.
+knob). Pull + restart 5m picks it up. TWAP is not “live”.
 
 ### 5m (`polybuybot5m`)
 
 | Knob | Value |
 |---|---|
-| Entry time | last **60s** (`buy_start_s=60`, `late_90_start_s=0`) |
-| Ask | **90–96¢** (FAK **96¢**) |
+| Entry time | last **120s** (`buy_start_s=120`, `late_90_start_s=0`) |
+| Ask | **75–90¢** (FAK **90¢**) |
 | `min_underlying_edge_usd` | **$0** (any non-zero last print vs PTB; missing/flat skip) |
-| Early / ≥95 | **off** (`early_buy_start_s=60`, `early_95_start_s=0`) |
-| Size | **one $10** (`buy_budget=late_buy_budget=10`, spend **$11**, shares **17**) |
-| Hedge | persist **1s** @ 50/52, dump **40¢** hold **2s**, flatten **<90¢** (avg <75 still arms toxic), recovery 53 |
+| Early / ≥95 | **off** (`early_buy_start_s=120`, `early_95_start_s=0`) |
+| Size | **one $2.50** (`buy_budget=late_buy_budget=2.5`, spend **$3**, shares **5**) |
+| Hedge | persist **1s** @ 50/52, dump **40¢** hold **2s**, flatten **<75¢** (avg <75 still arms toxic), recovery 53 |
 | Last-30s ladder | **off** (`hedge_late_ttm_s=0`) |
-| Look / WS | `BUY_HORIZON_S` **60s** |
+| Look / WS | `BUY_HORIZON_S` **120s** |
 
-### 15m (`polybuybot`) — **start this**
+### 15m (`polybuybot`) — **leave stopped**
 
-| Knob | Value |
-|---|---|
-| Entry time | last **3 min** (`buy_window_min=3.0`) |
-| Ask | **90–96¢** (FAK pins to the live ask) |
-| `min_underlying_edge_usd` | **$0** |
-| Size | **one $10** (spend **$11**, shares **17**) |
-| Hedge | keep inverted **35/40** + 70/30 GUI (not last-minute 58/60) |
-| Look | `poll_buy_window_s` / `poll_held_s` **0.01** |
-
-**Expected P&L (paper, hedge-adjusted, $10/fill, week of 25 Aug–1 Sep):**
-5m **+$109/wk** (~$0.65/h) after dump-hold 2s (5 false dumps vs 14 on
-last-30s 58). 15m **+$29/wk** (~$0.17/h) after inverted 35/40. Combined
-**+$138/wk** paper. Haircut for TOB vs last-trade, empty FAK, POST RTT,
-90–91 extra takes, live WR compression: plan **+$70–100/wk** (~$0.40–0.60/h)
-until a live tape. Ride-only was +$113 / +$29; the 2s dump hold keeps
-almost all of that. Last-30s 58 cut 5m to +$65 — leave it off.
+Do **not** start. Last-3min 90–96 / $10 code stays in `buybot.py`.
 
 **Paste + start (after `git pull`).** Live JSON overlays code defaults.
-Print `dry_run` / `entry` before restart. Confirm both files. Then
-restart 5m and **start 15m**. Hourly stays stopped.
-`early_95_min_price` must be **0.97** (current VM validator is
-`buy_max < early_95_min`). Leftover **0.95** rejects a 96¢ cap.
+Print `dry_run` / `entry` before restart. Confirm `strategy_buy5m.json`
+and `strategy_complement.json` spend **$5**. Then restart **5m only**.
+15m / hourly / mint stay stopped. Restart `polycomplement` yourself
+after Relayer is in `.env.complement` (not from a cloud agent).
 
 ```bash
 cd ~/poly-money-maker && git pull
@@ -77,18 +57,15 @@ def patch(path, updates):
     d = json.loads(p.read_text())
     d.update(updates)
     p.write_text(json.dumps(d, indent=2) + "\n")
-    print(path, "start", d.get("buy_start_s") or d.get("buy_window_min"),
-          "band", d["buy_threshold"], d["buy_max_price"],
-          "budget", d["buy_budget"], "edge", d["min_underlying_edge_usd"],
-          "dry_run", d.get("dry_run"), "entry", d.get("entry_enabled"))
+    print(path, {k: d.get(k) for k in updates})
 
 patch("strategy_buy5m.json", {
-    "buy_start_s": 60, "early_buy_start_s": 60, "early_95_start_s": 0,
+    "buy_start_s": 120, "early_buy_start_s": 120, "early_95_start_s": 0,
     "early_95_min_s": 0, "late_90_start_s": 0,
-    "buy_threshold": 0.90, "buy_max_price": 0.96,
-    "early_buy_max_price": 0.99, "early_95_min_price": 0.97,
-    "buy_budget": 10.0, "late_buy_budget": 10.0,
-    "buy_max_spend": 11.0, "buy_max_shares": 17.0,
+    "buy_threshold": 0.75, "buy_max_price": 0.90,
+    "early_buy_max_price": 0.99, "early_95_min_price": 0.95,
+    "buy_budget": 2.5, "late_buy_budget": 2.5,
+    "buy_max_spend": 3.0, "buy_max_shares": 5.0,
     "min_underlying_edge_usd": 0.0,
     "hedge_late_ttm_s": 0.0, "hedge_dump_persist_s": 2.0,
     "hedge_persist_s": 1.0, "hedge_toxic_bid_max": 0.40,
@@ -97,30 +74,25 @@ patch("strategy_buy5m.json", {
     "hedge_dump_ignore_oracle": True,
     "dry_run": False, "entry_enabled": True,
 })
-patch("strategy_buy.json", {
-    "buy_window_min": 3.0,
-    "buy_threshold": 0.90, "buy_max_price": 0.96,
-    "buy_budget": 10.0, "buy_max_spend": 11.0, "buy_max_shares": 17.0,
-    "min_underlying_edge_usd": 0.0,
-    "poll_buy_window_s": 0.01, "poll_held_s": 0.01,
-    "hedge_threshold": 0.35, "hedge_require_ask_max": 0.40,
-    "dry_run": False, "entry_enabled": True,
+# Existing live complement JSON keeps $16 unless overwritten.
+patch("strategy_complement.json", {
+    "buy_min_price": 0.80, "buy_max_price": 0.99,
+    "buy_max_spend": 5.0, "buy_max_shares": 8.0,
 })
 '
 sudo systemctl restart polybuybot5m
-sudo systemctl start polybuybot
 systemctl is-active polybuybot polybuybot5m polybuybothourly
-# expect: active active inactive
+# expect: inactive active inactive
 ```
 
-Do **not** paste last-45 + $25. Do **not** start hourly or mint.
-Do **not** re-paste last-120 `$10` edge 10 / start 120.
+Do **not** paste last-45 + $25. Do **not** start 15m, hourly, or mint.
+Do **not** re-paste last-120 `$10` edge 10.
 
 First last-120 tape (27 Aug 17:26Z → 31 Aug 15:12 Dublin): **+$9**, WR ~**82%**,
 take rate **411/1129 = 36%**, **73 walks**, **52 sells / 0 `hedge_fill`**
 (sells ghost via `hedge_uncertain_resolved`). Catalog:
-`docs/2026-08-31-last120-loss-catalog.md`. That overlay is **retired** by
-this 90–96 paste.
+`docs/2026-08-31-last120-loss-catalog.md`. The `$10` / last-60 90–96
+overlay is **retired** by this 75–90 $2.50 restore.
 
 **31 Aug ~20:53Z reversal + participation paste:** SESSION TAPE **n=0**
 and participation **0 `csv` sources** were a join miss (generic title /
@@ -158,20 +130,21 @@ mint complete sets. Operator still sells leftover mint inventory by hand.
 
 **Hourly CLOB bot is stopped.** Do **not** start `polybuybothourly`.
 
-**Active strategy:** **5m + 15m** (`polybuybot5m` + `polybuybot`). Same-leg
-only. After `hedge_closed`, no re-buy. Early slice **off** (one $10, not two).
+**Active strategy:** **5m only** (`polybuybot5m`). 15m stays stopped.
+Same-leg only. After `hedge_closed`, no re-buy. Early slice **off**
+(one $2.50, not two).
 
 | Knob | 5m | 15m |
 |---|---|---|
-| Window | last **60s**, **90–96¢**, FAK **96¢**, `$10` | last **3 min**, **90–96¢**, FAK at ask, `$10` |
+| Window | last **120s**, **75–90¢**, FAK **90¢**, `$2.50` | **stopped** |
 | Last-45 ≥90 overlay | **off** (`late_90_start_s=0`) | n/a |
 | Early / ≥95 | **off** | n/a |
-| Hedge qualify | persist **1s @ 50/52** | instant **35/40** inverted 70/30 |
-| Dump | Bid-only ≤ **40¢** after **2s** (`hedge_dump_persist_s`) | 35¢ book (existing 15m) |
-| Flatten walks | avg **<75¢** arms toxic; sell while bid **<90¢** | n/a (15m has no flatten) |
-| Underlying buy edge | **$0** | **$0** |
-| `max_open_positions` | **0 = unlimited** | **0 = unlimited** |
-| poll | **0.01** | **0.01** |
+| Hedge qualify | persist **1s @ 50/52** | inverted **35/40** (not running) |
+| Dump | Bid-only ≤ **40¢** after **2s** (`hedge_dump_persist_s`) | n/a |
+| Flatten walks | avg **<75¢** arms toxic; sell while bid **<75¢** | n/a |
+| Underlying buy edge | **$0** | n/a |
+| `max_open_positions` | **0 = unlimited** | n/a |
+| poll | **0.01** | n/a |
 
 **Also running (no orders):** `pathlog.py` (`polypathlog`) writes one JSONL file
 per market under `pathlog/ticks/`.
@@ -180,31 +153,36 @@ per market under `pathlog/ticks/`.
 
 Second Polymarket account. First-account 5m/15m hedge is **unchanged**.
 After a confirmed primary fill, this process watches the **other** token
-and lifts it at **80–99¢** (FAK 99¢, share-match, oracle must favor that
-side). If the primary already sold (`hedge_closed`), it does not buy.
+and lifts it at **80–99¢** (FAK 99¢, **2×** share-match, spend cap **$5**,
+oracle must favor that side). If the primary already sold (`hedge_closed`),
+it does not buy.
 
 Needs `.env.complement` with a **different** `FUNDER_ADDRESS` than `.env`.
-Same wallet is a hard refuse (the live 5m loop would see those shares and
-sell them). Compare funders from the **files**, not `os.environ` —
-systemd `EnvironmentFile=.env.complement` pre-sets `FUNDER_ADDRESS` so
-`load_dotenv(".env")` would compare the complement wallet to itself.
+Put `RELAYER_API_KEY` and `RELAYER_ADDRESS` in **`.env.complement`**
+(not the primary `.env` — systemd `EnvironmentFile` is only the
+complement file). Same wallet is a hard refuse (the live 5m loop would
+see those shares and sell them). Compare funders from the **files**,
+not `os.environ` — systemd `EnvironmentFile=.env.complement` pre-sets
+`FUNDER_ADDRESS` so `load_dotenv(".env")` would compare the complement
+wallet to itself. The Magic proxy `0xCfF52577…` is also a hard refuse
+(CLOB 400 `maker address not allowed` even with Relayer).
 
-**CLOB client (2026-09-02):** this account is a **deposit wallet**
-(`signature_type=3` / POLY_1271), not Magic/proxy type 1. py-clob-client-v2
-L1 auth always sets `POLY_ADDRESS` to the EOA, so derive returns a key
-bound to the signer; type 1/2 then 400 `maker address not allowed` and
-type 3 400 `the order signer address has to be the address of the API
-KEY` (issues 70/58/75). Complement **only** now builds
-`ComplementDepositClobClient` → `polymarket.SecureClient.create(
-private_key=…, wallet=FUNDER_ADDRESS)`. Gamma calls that address
-`proxyWallet`; the official client therefore classifies it **POLY_PROXY**,
-not `DEPOSIT_WALLET`. Complement accepts either when
-`inner.wallet == FUNDER_ADDRESS` (startup crash-looped on POLY_PROXY
-after #152). Still refuses a wallet/funder mismatch. 5m/15m/hourly stay
-py-clob type 1. **Unset** any `API_KEY` / `API_SECRET` /
-`API_PASSPHRASE` trio in `.env.complement` (those were EOA-bound; do not
-print the values). `FUNDER_ADDRESS` must be the profile deposit /
-`proxyWallet`, not the EOA.
+**CLOB client (2026-09-03):** this account is a **deposit wallet**
+(`signature_type=3` / POLY_1271), not Magic/proxy type 1. Complement
+**only** now builds `ComplementDepositClobClient` →
+`polymarket.SecureClient.create(private_key=…, wallet=COMPLEMENT_WALLET
+or FUNDER_ADDRESS, api_key=RelayerApiKey(key=RELAYER_API_KEY,
+address=RELAYER_ADDRESS))`. Relayer env is required; missing Relayer
+fails closed (no type-1 fallback). Live funder must be the deposit
+wallet `0x2b2D1dA1a49E8BF73EbBC3EAC35D79cc88cd4ad2` (cash may still
+sit on the Magic proxy until Joel moves it). Size is **2×** the
+primary bag, spend cap **$5** (2× the 5m $2.50 clip), other-leg floor
+**≥80¢**. Gamma may still classify that address `POLY_PROXY`; either
+wallet type is allowed when `inner.wallet` equals the funder. 5m/15m/hourly
+stay py-clob type 1. **Unset** any `API_KEY` / `API_SECRET` /
+`API_PASSPHRASE` trio in `.env.complement` (do not print the values).
+Optional `COMPLEMENT_WALLET` overrides `FUNDER_ADDRESS` without another
+code PR.
 
 A 1¢ FAK that does not fill is enough to prove maker is allowed: CLOB
 must not 400 `maker address not allowed` or `signer address has to be
@@ -213,12 +191,12 @@ success for that probe.
 
 Do **not** start `polybuybot` / `polybuybot5m` from this change. After
 merge on the VM: `git pull`, `.venv/bin/pip install -r requirements.txt`,
-then `sudo systemctl restart polycomplement`. Cloud agents must not
-start it. Hourly/mint stay off.
-Copy `strategy_complement.example.json` →
-`strategy_complement.json` if missing. Keep `dry_run: true` until you
-want live other-leg lifts; `entry_enabled: true` / `dry_run: false` for
-real 80¢ FAKs. A 1¢ probe can be a one-off outside the bot.
+paste complement spend **$5** / **8** shares (script above — do not
+rely on “copy if missing”), then `sudo systemctl restart polycomplement`.
+Cloud agents must not start it. Hourly/mint stay off.
+Keep `dry_run: true` until you want live other-leg lifts;
+`entry_enabled: true` / `dry_run: false` for real 80¢ FAKs. A 1¢ probe
+can be a one-off outside the bot.
 
 POST never invents a full fill (`size_matched` / GET-order only). A
 write-ahead `buy_uncertain` hits disk **before** the FAK. Empty / reject
@@ -323,9 +301,9 @@ amount / HTTP 400), not this NameError.
 
 - **VM:** `~/poly-money-maker` on `instance-20260516-185922`.
 - **Mint:** `sudo systemctl stop polymintbot && sudo systemctl disable polymintbot`
-- **Buy bots:** **5m + 15m.** Stop/disable hourly and mint. Live JSON is
-  90–96 $10 last-60 / last-3min after the paste above. **Do not paste
-  last-45 + $25.** Do **not** start hourly or mint.
+- **Buy bots:** **5m only.** Stop/disable 15m, hourly, and mint. Live JSON
+  is 75–90 $2.50 last-120 after the paste above. **Do not paste
+  last-45 + $25.** Do **not** start 15m, hourly, or mint.
 - **Pathlog:** start `polypathlog` as above (no `.env` required).
 
 ---
@@ -428,15 +406,15 @@ amount / HTTP 400), not this NameError.
 - [x] **Complement second account** — code on main (#146). Do **not**
       start until `.env.complement` is a different funder. Copy example
       JSON, keep dry_run until funded. Primary 5m/15m hedge unchanged.
-- [ ] **90–96 $10 band raise (this PR).** After merge: paste 5m last-60
-      90–96 $10 dump-hold 2s + 15m last-3min 90–96 $10 inverted 35/40
-      (set `early_95_min_price` **0.97** so current validators accept
-      `buy_max` 0.96), `sudo systemctl restart polybuybot5m`,
-      `sudo systemctl start polybuybot`. Expect **active active
-      inactive**. Do not start hourly or mint. Measure 48h: 5m
-      `buy_attempt` band=late 90–96 TTM≤60; dump `hedge_skip_persist`
-      reason dump_waiting/dump_armed then `hedge_fill`; 15m fills last
-      3 min; 97–99 stay skipped; `cycle_error` 0.
+- [ ] **5m 75–90 $2.50 restore + Relayer complement (this PR).** After
+      merge: paste 5m last-120 75–90 $2.50 dump-hold 2s **and**
+      complement `$5` / 8 shares, `sudo systemctl restart
+      polybuybot5m`. Expect **inactive active inactive**. Do not start
+      15m, hourly, or mint. Operator puts Relayer in `.env.complement`
+      and restarts `polycomplement` on the VM (deposit wallet
+      `0x2b2D…`, not the Magic proxy). Measure: `buy_attempt` band=late
+      75–90 TTM≤120, $2.50 FAK 90¢; complement 2× ≥80 spend ≤$5;
+      `cycle_error` 0.
 
 ---
 
@@ -444,9 +422,10 @@ amount / HTTP 400), not this NameError.
 
 1. Read `AGENTS.md` + this file before changing mint/buy/hedge logic.
 2. Do **not** restart minting unless the operator asks. Do **not** start
-   `polybuybothourly` unless the operator asks. Do **not** start
-   `polycomplement` without a second-account `.env.complement`. Live buy
-   bots are **5m + 15m** after the 90–96 paste. Do **not** paste last-45 + $25.
+   `polybuybothourly` or `polybuybot` unless the operator asks. Do **not**
+   start `polycomplement` without a second-account `.env.complement`.
+   Live buy bot is **5m only** (75–90 $2.50 last **120s**). Do **not**
+   paste last-45 + $25.
 3. Never truncate state/PnL/log files; never commit live strategy/state/`.env`.
    Pathlog ticks are **auto-pruned** (14d / 400 MB) — do not `rm` them by hand,
    but **do export** (`check_path_backtest.py --csv` or `scp` the ticks dir)

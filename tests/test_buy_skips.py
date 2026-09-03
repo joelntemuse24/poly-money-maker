@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ast
 import json
 import tempfile
 import unittest
@@ -343,6 +344,77 @@ class FirstFourMinutesAt95Tests(unittest.TestCase):
         bands = self._bands(180)
         self.assertIn("early_95", [b.name for b in bands])
         self.assertTrue(ask_in_any_band(0.95, bands))
+
+
+def _literal_strategy_defaults(src: str) -> dict:
+    tree = ast.parse(src)
+    for node in tree.body:
+        if not isinstance(node, ast.Assign):
+            continue
+        for target in node.targets:
+            if isinstance(target, ast.Name) and target.id == "_STRATEGY_DEFAULTS":
+                return ast.literal_eval(node.value)
+    raise AssertionError("_STRATEGY_DEFAULTS not found")
+
+
+class RestoredFiveMLate7590Tests(unittest.TestCase):
+    """Live 5m restore: last 120s inclusive 75–90 at $2.50, early / last-45 off."""
+
+    def _live_kwargs(self):
+        five = json.loads(
+            (Path(__file__).resolve().parents[1] / "strategy_buy5m.example.json").read_text()
+        )
+        return dict(
+            late_start_s=float(five["buy_start_s"]),
+            late_min=float(five["buy_threshold"]),
+            late_max=float(five["buy_max_price"]),
+            early_start_s=float(five["early_buy_start_s"]),
+            early_min=float(five["buy_max_price"]),
+            early_max=float(five["early_buy_max_price"]),
+            early_95_start_s=float(five["early_95_start_s"]),
+            early_95_min_s=float(five["early_95_min_s"]),
+            early_95_min=float(five["early_95_min_price"]),
+            late_90_start_s=float(five["late_90_start_s"]),
+            late_90_min=float(five["buy_max_price"]),
+            late_90_max=float(five["early_buy_max_price"]),
+        )
+
+    def test_example_and_code_defaults_are_2_50_75_90_last_120(self):
+        root = Path(__file__).resolve().parents[1]
+        five = json.loads((root / "strategy_buy5m.example.json").read_text())
+        defaults = _literal_strategy_defaults((root / "buybot5m.py").read_text())
+        for blob in (five, defaults):
+            self.assertEqual(blob["buy_threshold"], 0.75)
+            self.assertEqual(blob["buy_max_price"], 0.90)
+            self.assertEqual(blob["buy_start_s"], 120)
+            self.assertEqual(blob["buy_budget"], 2.5)
+            self.assertEqual(blob["late_buy_budget"], 2.5)
+            self.assertEqual(blob["buy_max_spend"], 3.0)
+            self.assertEqual(blob["late_90_start_s"], 0)
+            self.assertEqual(blob["early_buy_start_s"], blob["buy_start_s"])
+
+    def test_ttm_90_selects_late_75_90_not_90_96(self):
+        bands = applicable_entry_bands(90, **self._live_kwargs())
+        self.assertEqual([b.name for b in bands], ["late"])
+        self.assertTrue(ask_in_any_band(0.75, bands))
+        self.assertTrue(ask_in_any_band(0.80, bands))
+        self.assertTrue(ask_in_any_band(0.90, bands))
+        self.assertFalse(ask_in_any_band(0.91, bands))
+        self.assertFalse(ask_in_any_band(0.96, bands))
+        band = select_entry_band(0.80, bands)
+        self.assertIsNotNone(band)
+        self.assertEqual(band.name, "late")
+        self.assertAlmostEqual(band.fak_limit, 0.90)
+        self.assertEqual(entry_slice_budget(90, late_start_s=120, early_budget=2.5, late_budget=2.5), 2.5)
+
+    def test_ttm_60_93_is_out_of_band_without_last45_overlay(self):
+        self.assertIsNone(select_entry_band(0.93, applicable_entry_bands(60, **self._live_kwargs())))
+        self.assertIsNone(select_entry_band(0.96, applicable_entry_bands(40, **self._live_kwargs())))
+        self.assertEqual(select_entry_band(0.80, applicable_entry_bands(40, **self._live_kwargs())).name, "late")
+
+    def test_ttm_121_has_no_late_band(self):
+        self.assertEqual(applicable_entry_bands(121, **self._live_kwargs()), [])
+        self.assertIsNone(select_entry_band(0.80, applicable_entry_bands(121, **self._live_kwargs())))
 
 
 class TwoSliceBudgetTests(unittest.TestCase):

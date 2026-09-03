@@ -190,21 +190,20 @@ if _tick_001 is not None and _tick_001.amount > 2:
 # ------------------------- STRATEGY CONFIG -------------------------
 _STRATEGY_DEFAULTS = {
     "entry_enabled": False,
-    # One $10 FAK in the last 60s at 90–96¢ (FAK limit 96¢). Early / ≥95 /
-    # last-45 ≥90 overlays are off. Paper week 25 Aug–1 Sep 2026 scored
-    # 92¢; this overlay widens the cap to 96. Size starts at budget/ask;
-    # 3-share floor still applies when 3 × limit fits in buy_max_spend ($11).
-    "buy_threshold": 0.90,
-    "buy_max_price": 0.96,
+    # One $2.50 FAK in the last 120s at 75–90¢ (FAK limit 90¢). Early / ≥95 /
+    # last-45 ≥90 overlays are off. Size starts at budget/ask; 3-share floor
+    # still applies when 3 × limit fits in buy_max_spend ($3).
+    "buy_threshold": 0.75,
+    "buy_max_price": 0.90,
     # Consensus on Polymarket GUI display price (mid if spread≤10¢ else last trade).
     # Tuned for the 75¢ band (old 92¢/10¢ gates could never arm a 75¢ ask).
     "min_winner_bid": 0.70,
     "max_loser_bid": 0.30,
     "min_bid_edge": 0.05,
     # Skip buys unless live BTC is ≥ this many USD from the window Price To Beat,
-    # and only allow the side matching that underlying move. Live 5m 90–96
-    # last-60s is $0 so paper-scored prints actually take (flat / missing
-    # still fail-closed). Do not paste last-45 + $25.
+    # and only allow the side matching that underlying move. Live 5m last-120s
+    # 75–90 is $0 so paper-scored prints actually take (flat / missing still
+    # fail-closed). Do not paste last-45 + $25.
     "underlying_gate_enabled": True,
     "min_underlying_edge_usd": 0.0,
     # Walks (avg < buy_threshold) arm toxic_fill. Flatten sells those bags
@@ -237,10 +236,9 @@ _STRATEGY_DEFAULTS = {
     # After persist_done, bid ≥ this is a recovered winner: HOLD and clear.
     # Tight 53¢ so we do not sell 50–69 the way 70–84 sold winners.
     "hedge_recovery_cancel": 0.53,
-    # Last-30s ladder keys stay in config but the 90–96 overlay disables
-    # the raise (`hedge_late_ttm_s=0`). Persist-58 on a 92 fill dumped
-    # winners (paper +$65 vs dump-hold-2s +$109). Re-enable only after
-    # a new tape. Late dump may exceed early qualify if set.
+    # Last-30s ladder keys stay in config but stay off (`hedge_late_ttm_s=0`).
+    # Persist-58 on a 92 fill dumped winners. Re-enable only after a new tape.
+    # Late dump may exceed early qualify if set.
     "hedge_late_ttm_s": 0.0,
     "hedge_late_dump": 0.40,
     "hedge_late_qualify": 0.58,
@@ -261,33 +259,33 @@ _STRATEGY_DEFAULTS = {
     # Bid ≤ dump must stay there this many seconds (paper: 1s is a no-op
     # on 1s ticks; 2s cuts 13/14 V-reversal winner dumps). 0 = instant.
     "hedge_dump_persist_s": 2.0,
-    "buy_start_s": 60,
+    "buy_start_s": 120,
     # Early ≥90 is off: same TTM as late so (buy_start, early_start] is empty.
-    "early_buy_start_s": 60,
+    "early_buy_start_s": 120,
     "early_buy_max_price": 0.99,
     # ≥95 overlay off. Pair start_s=0 with min_s=0 so leftover min_s=60
-    # cannot disable the late 90–96 window. min_price must stay strictly
-    # above buy_max (0.96) or load_strategy rejects the file.
+    # cannot disable the late 75–90 window. min_price must stay strictly
+    # above buy_max (0.90) or load_strategy rejects the file.
     "early_95_start_s": 0,
     "early_95_min_s": 0,
-    "early_95_min_price": 0.97,
+    "early_95_min_price": 0.95,
     "late_90_start_s": 0,
     "buy_grace_s": 1,
     "buy_cooldown_s": 1,
     # After a proven-empty FAK, wait this long before another outer attempt.
     # Inner unmatched 400s re-quote immediately (up to max_retries).
     "empty_fak_cooldown_s": 0.15,
-    "buy_budget": 10.0,
+    "buy_budget": 2.5,
     # Second slice only if early filled (it does not on this overlay).
-    "late_buy_budget": 10.0,
-    # Same-leg late add only if ask ≥ this (0.90). Flat first 90–96 still
+    "late_buy_budget": 2.5,
+    # Same-leg late add only if ask ≥ this (0.90). Flat first 75–90 still
     # allowed. 0 disables.
     "add_min_price": 0.90,
-    # Hard ceiling on USDC sent per FAK. $10 clip; never more than $11
-    # on one POST (10.42 sh / $10.00 at 96¢; 3.00 × 0.96 fits).
-    "buy_max_spend": 11.0,
-    # Sanity rail per FAK: $11 / 90¢ ≈ 12.3 sh. 17 covers a cheap walk.
-    "buy_max_shares": 17.0,
+    # Hard ceiling on USDC sent per FAK. $2.50 clip; never more than $3
+    # on one POST (3.33 sh / $2.50 at 75¢; 3.00 × 0.90 fits).
+    "buy_max_spend": 3.0,
+    # Sanity rail per FAK: $3 / 75¢ = 4 sh. 5 covers a cheap walk.
+    "buy_max_shares": 5.0,
     "max_open_positions": 0,  # 0 = unlimited
     "max_open_notional": 10000.0,
     "max_daily_notional": 999999.0,
@@ -839,7 +837,7 @@ def hold_while_oracle_agrees(held_leg, start_ts, condition_id, *, log=True):
 
 
 def current_entry_bands(seconds_left):
-    """Open 5m buy bands at this TTM (late 90–96, last-45 ≥90 off, early off)."""
+    """Open 5m buy bands at this TTM (late 75–90, last-45 ≥90 off, early off)."""
     return applicable_entry_bands(
         seconds_left,
         late_start_s=BUY_START_S,
