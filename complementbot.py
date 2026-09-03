@@ -30,6 +30,8 @@ from buy.complement_clob import (
     COMPLEMENT_SIGNATURE_TYPE,
     ComplementDepositClobClient,
     complement_wallet_from_env,
+    relayer_api_key_from_env,
+    require_complement_deposit_wallet,
 )
 from buy.complement_gate import (
     apply_balance_evidence,
@@ -245,6 +247,24 @@ if not PRIVATE_KEY or not COMPLEMENT_WALLET:
         "[bold red].env.complement is missing PRIVATE_KEY or "
         "COMPLEMENT_WALLET/FUNDER_ADDRESS.[/]"
     )
+    raise SystemExit(1)
+# Relayer + deposit-wallet checks run here so a missing key or the
+# known-bad Magic proxy exits red instead of tracebacking inside derive.
+# systemd EnvironmentFile is .env.complement — Relayer vars in the
+# primary .env are invisible to this process.
+try:
+    relayer_api_key_from_env()
+except RuntimeError as exc:
+    console.print(f"[bold red]{exc}[/]")
+    console.print(
+        "[bold red]Put RELAYER_API_KEY and RELAYER_ADDRESS in "
+        ".env.complement (not the primary .env).[/]"
+    )
+    raise SystemExit(1)
+try:
+    require_complement_deposit_wallet(COMPLEMENT_WALLET)
+except RuntimeError as exc:
+    console.print(f"[bold red]{exc}[/]")
     raise SystemExit(1)
 
 from py_clob_client_v2 import (  # noqa: E402

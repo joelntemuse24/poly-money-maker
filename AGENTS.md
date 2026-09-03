@@ -30,7 +30,7 @@ missing still skip). Code defaults in `buybot5m.py` match this overlay;
 live JSON still wins until paste. `BUY_HORIZON_S` is **120**. **Do not
 paste last-45 + $25.** See `CURRENT.md`.
 
-Missed early does **not** become a second $10 late buy — there is no
+Missed early does **not** become a second $2.50 late buy — there is no
 early slice. Same-leg add only (no straddle), and only if the late ask
 is ≥ **90¢** (`add_min_price`). After a full hedge the market is done.
 5m hedge is **persist 1s @ 50/52** (GUI: held ≤ **52¢**, other ≥
@@ -235,7 +235,7 @@ Complement (`polycomplement`, second account, **restart after merge** — not fr
 - Arms only after a primary `bought_token` in `positions_buy5m.json` / `positions_buy.json`.
 - `complement_fill` = other-leg FAK **80–99¢** (`size_matched` / GET-order, never the requested size). `complement_skip` `primary_flat` / `in_flight` / `cooldown` /
   `ask_below_min` / `oracle_still_held` / `already_bought`.
-- CLOB construction is `ComplementDepositClobClient` / `signature_type=3` / Relayer `api_key=RelayerApiKey(key=RELAYER_API_KEY, address=RELAYER_ADDRESS)` / `wallet=COMPLEMENT_WALLET` or `FUNDER_ADDRESS` (deposit `0x2b2D…`). Size **2×** primary, spend **$5**. A 1¢ FAK must not 400 `maker address not allowed` or `signer address has to be the address of the API KEY`. Missing Relayer env fails closed.
+- CLOB construction is `ComplementDepositClobClient` / `signature_type=3` / Relayer `api_key=RelayerApiKey(key=RELAYER_API_KEY, address=RELAYER_ADDRESS)` / `wallet=COMPLEMENT_WALLET` or `FUNDER_ADDRESS` (deposit `0x2b2D…`). Relayer vars live in **`.env.complement`**. Size **2×** primary, spend **$5**. A 1¢ FAK must not 400 `maker address not allowed` or `signer address has to be the address of the API KEY`. Missing Relayer env or the Magic proxy funder fails closed.
 - First-account hedge is unchanged. If the primary already sold, complement does not buy.
 
 Stopped hourly (do not start unless asked):
@@ -270,11 +270,11 @@ Stopped hourly (do not start unless asked):
 - `buy_ghost_fill` — balance reconciliation after null/delayed BUY confirm
 - `buy_uncertain` — POST outcome unresolved; durable token/baseline quarantine blocks re-buy
 - `buy_skip_incomplete_book` — missing GUI price on a leg (no mid and no last trade)
-- `buy_skip_underlying_edge` — underlying gate failed (missing/stale/flat vs PTB; live 5m is **$10**)
+- `buy_skip_underlying_edge` — underlying gate failed (missing/stale/flat vs PTB; live 5m is **$0**)
 - `buy_skip_underlying_side` — book wants the opposite leg from the underlying move
-- `buy_window` — market first entered a 5m buy window (late 75–90 or last-45 ≥90; early/≥95 are off; one line per market)
+- `buy_window` — market first entered a 5m buy window (late 75–90 last **120s**; early / last-45 / ≥95 are off; one line per market)
 - `buy_skip` `ask_below_band` / `ask_above_band` / `ask_out_of_band` / `no_ask` / `stale_positions` / `no_quote` — in window, winning ask not in any open band, or the look had no book / stale wallet snapshot (throttled 8s)
-- `buy_skip` `stale_discovery` — in window but Gamma is stale **and** this market is not already in `_cached_markets` with tokens + `end_ts`. Known last-60s (5m) / last-window (15m) markets still look at the CLOB; hedge never waits on Gamma age.
+- `buy_skip` `stale_discovery` — in window but Gamma is stale **and** this market is not already in `_cached_markets` with tokens + `end_ts`. Known last-120s (5m) / last-window (15m) markets still look at the CLOB; hedge never waits on Gamma age.
 - `buy_skip_add_below_min` — same-leg late add but ask < `add_min_price` (90¢). Flat first late 75–90 still buys.
 - `buy_skip_hedge_closed` — this market already dumped; no other-leg chase and no re-entry
 - `buy_skip_max_positions` — only if `max_open_positions > 0` (probe uses **0 = unlimited**)

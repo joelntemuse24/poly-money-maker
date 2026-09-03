@@ -412,6 +412,10 @@ class RestoredFiveMLate7590Tests(unittest.TestCase):
         self.assertIsNone(select_entry_band(0.96, applicable_entry_bands(40, **self._live_kwargs())))
         self.assertEqual(select_entry_band(0.80, applicable_entry_bands(40, **self._live_kwargs())).name, "late")
 
+    def test_ttm_121_has_no_late_band(self):
+        self.assertEqual(applicable_entry_bands(121, **self._live_kwargs()), [])
+        self.assertIsNone(select_entry_band(0.80, applicable_entry_bands(121, **self._live_kwargs())))
+
 
 class TwoSliceBudgetTests(unittest.TestCase):
     def test_late_window_is_ttm_le_120(self):

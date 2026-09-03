@@ -383,6 +383,15 @@ class ComplementClobClientBuilderTests(unittest.TestCase):
             [],
             "complementbot must not construct ClobClient (py-clob L1 binds the EOA)",
         )
+        called = {
+            node.func.id
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+        }
+        self.assertIn("relayer_api_key_from_env", called)
+        self.assertIn("require_complement_deposit_wallet", called)
+        self.assertIn("RELAYER_API_KEY and RELAYER_ADDRESS in", src)
+        self.assertIn(".env.complement", src)
 
 
 class WalletIsolationTests(unittest.TestCase):

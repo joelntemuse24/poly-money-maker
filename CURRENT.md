@@ -41,8 +41,10 @@ knob). Pull + restart 5m picks it up. TWAP is not “live”.
 Do **not** start. Last-3min 90–96 / $10 code stays in `buybot.py`.
 
 **Paste + start (after `git pull`).** Live JSON overlays code defaults.
-Print `dry_run` / `entry` before restart. Confirm `strategy_buy5m.json`.
-Then restart **5m only**. 15m / hourly / mint stay stopped.
+Print `dry_run` / `entry` before restart. Confirm `strategy_buy5m.json`
+and `strategy_complement.json` spend **$5**. Then restart **5m only**.
+15m / hourly / mint stay stopped. Restart `polycomplement` yourself
+after Relayer is in `.env.complement` (not from a cloud agent).
 
 ```bash
 cd ~/poly-money-maker && git pull
@@ -55,10 +57,7 @@ def patch(path, updates):
     d = json.loads(p.read_text())
     d.update(updates)
     p.write_text(json.dumps(d, indent=2) + "\n")
-    print(path, "start", d.get("buy_start_s") or d.get("buy_window_min"),
-          "band", d["buy_threshold"], d["buy_max_price"],
-          "budget", d["buy_budget"], "edge", d["min_underlying_edge_usd"],
-          "dry_run", d.get("dry_run"), "entry", d.get("entry_enabled"))
+    print(path, {k: d.get(k) for k in updates})
 
 patch("strategy_buy5m.json", {
     "buy_start_s": 120, "early_buy_start_s": 120, "early_95_start_s": 0,
@@ -75,6 +74,11 @@ patch("strategy_buy5m.json", {
     "hedge_dump_ignore_oracle": True,
     "dry_run": False, "entry_enabled": True,
 })
+# Existing live complement JSON keeps $16 unless overwritten.
+patch("strategy_complement.json", {
+    "buy_min_price": 0.80, "buy_max_price": 0.99,
+    "buy_max_spend": 5.0, "buy_max_shares": 8.0,
+})
 '
 sudo systemctl restart polybuybot5m
 systemctl is-active polybuybot polybuybot5m polybuybothourly
@@ -87,8 +91,8 @@ Do **not** re-paste last-120 `$10` edge 10.
 First last-120 tape (27 Aug 17:26Z → 31 Aug 15:12 Dublin): **+$9**, WR ~**82%**,
 take rate **411/1129 = 36%**, **73 walks**, **52 sells / 0 `hedge_fill`**
 (sells ghost via `hedge_uncertain_resolved`). Catalog:
-`docs/2026-08-31-last120-loss-catalog.md`. That overlay is **retired** by
-this 90–96 paste.
+`docs/2026-08-31-last120-loss-catalog.md`. The `$10` / last-60 90–96
+overlay is **retired** by this 75–90 $2.50 restore.
 
 **31 Aug ~20:53Z reversal + participation paste:** SESSION TAPE **n=0**
 and participation **0 `csv` sources** were a join miss (generic title /
@@ -149,14 +153,19 @@ per market under `pathlog/ticks/`.
 
 Second Polymarket account. First-account 5m/15m hedge is **unchanged**.
 After a confirmed primary fill, this process watches the **other** token
-and lifts it at **80–99¢** (FAK 99¢, share-match, oracle must favor that
-side). If the primary already sold (`hedge_closed`), it does not buy.
+and lifts it at **80–99¢** (FAK 99¢, **2×** share-match, spend cap **$5**,
+oracle must favor that side). If the primary already sold (`hedge_closed`),
+it does not buy.
 
 Needs `.env.complement` with a **different** `FUNDER_ADDRESS` than `.env`.
-Same wallet is a hard refuse (the live 5m loop would see those shares and
-sell them). Compare funders from the **files**, not `os.environ` —
-systemd `EnvironmentFile=.env.complement` pre-sets `FUNDER_ADDRESS` so
-`load_dotenv(".env")` would compare the complement wallet to itself.
+Put `RELAYER_API_KEY` and `RELAYER_ADDRESS` in **`.env.complement`**
+(not the primary `.env` — systemd `EnvironmentFile` is only the
+complement file). Same wallet is a hard refuse (the live 5m loop would
+see those shares and sell them). Compare funders from the **files**,
+not `os.environ` — systemd `EnvironmentFile=.env.complement` pre-sets
+`FUNDER_ADDRESS` so `load_dotenv(".env")` would compare the complement
+wallet to itself. The Magic proxy `0xCfF52577…` is also a hard refuse
+(CLOB 400 `maker address not allowed` even with Relayer).
 
 **CLOB client (2026-09-03):** this account is a **deposit wallet**
 (`signature_type=3` / POLY_1271), not Magic/proxy type 1. Complement
@@ -182,12 +191,12 @@ success for that probe.
 
 Do **not** start `polybuybot` / `polybuybot5m` from this change. After
 merge on the VM: `git pull`, `.venv/bin/pip install -r requirements.txt`,
-then `sudo systemctl restart polycomplement`. Cloud agents must not
-start it. Hourly/mint stay off.
-Copy `strategy_complement.example.json` →
-`strategy_complement.json` if missing. Keep `dry_run: true` until you
-want live other-leg lifts; `entry_enabled: true` / `dry_run: false` for
-real 80¢ FAKs. A 1¢ probe can be a one-off outside the bot.
+paste complement spend **$5** / **8** shares (script above — do not
+rely on “copy if missing”), then `sudo systemctl restart polycomplement`.
+Cloud agents must not start it. Hourly/mint stay off.
+Keep `dry_run: true` until you want live other-leg lifts;
+`entry_enabled: true` / `dry_run: false` for real 80¢ FAKs. A 1¢ probe
+can be a one-off outside the bot.
 
 POST never invents a full fill (`size_matched` / GET-order only). A
 write-ahead `buy_uncertain` hits disk **before** the FAK. Empty / reject
@@ -398,12 +407,14 @@ amount / HTTP 400), not this NameError.
       start until `.env.complement` is a different funder. Copy example
       JSON, keep dry_run until funded. Primary 5m/15m hedge unchanged.
 - [ ] **5m 75–90 $2.50 restore + Relayer complement (this PR).** After
-      merge: paste 5m last-120 75–90 $2.50 dump-hold 2s, `sudo
-      systemctl restart polybuybot5m`. Expect **inactive active
-      inactive**. Do not start 15m, hourly, or mint. Operator restarts
-      `polycomplement` on the VM (Relayer env + deposit wallet
-      `0x2b2D…`). Measure: `buy_attempt` band=late 75–90 TTM≤120,
-      $2.50 FAK 90¢; complement 2× ≥80 spend ≤$5; `cycle_error` 0.
+      merge: paste 5m last-120 75–90 $2.50 dump-hold 2s **and**
+      complement `$5` / 8 shares, `sudo systemctl restart
+      polybuybot5m`. Expect **inactive active inactive**. Do not start
+      15m, hourly, or mint. Operator puts Relayer in `.env.complement`
+      and restarts `polycomplement` on the VM (deposit wallet
+      `0x2b2D…`, not the Magic proxy). Measure: `buy_attempt` band=late
+      75–90 TTM≤120, $2.50 FAK 90¢; complement 2× ≥80 spend ≤$5;
+      `cycle_error` 0.
 
 ---
 

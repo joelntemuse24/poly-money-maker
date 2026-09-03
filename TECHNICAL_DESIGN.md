@@ -139,11 +139,12 @@ lifts **2×** the other token at ≥80¢ (FAK 99¢, spend cap ~$5 = 2× the
 `buy/complement_clob.py`
 (`polymarket.SecureClient.create(private_key=…, wallet=funder,
 api_key=RelayerApiKey(key=…, address=…))`). Relayer env
-(`RELAYER_API_KEY`, `RELAYER_ADDRESS`) is required; missing Relayer
-fails closed (no Magic/proxy type-1 fallback). Live funder /
-`COMPLEMENT_WALLET` (defaults to `FUNDER_ADDRESS`) must be the deposit
-wallet `0x2b2D1dA1a49E8BF73EbBC3EAC35D79cc88cd4ad2`. Cash may still sit
-on the Magic proxy until the operator moves it. Gamma's
+(`RELAYER_API_KEY`, `RELAYER_ADDRESS` in **`.env.complement`**) is
+required; missing Relayer fails closed (no Magic/proxy type-1 fallback).
+Live funder / `COMPLEMENT_WALLET` (defaults to `FUNDER_ADDRESS`) must be
+the deposit wallet `0x2b2D1dA1a49E8BF73EbBC3EAC35D79cc88cd4ad2`. Cash
+may still sit on the Magic proxy until the operator moves it. Startup
+refuses that Magic proxy (`0xCfF52577…`) even when Relayer is present. Gamma's
 `proxyWallet` field is that same address; the official client may
 report `wallet_type=POLY_PROXY` rather than `DEPOSIT_WALLET`. Complement
 allows either when `inner.wallet` equals the funder and still
@@ -563,8 +564,9 @@ dict **is the schema**.
   tick is a CLOB tick and equals this bot’s `EXPECTED_TICK_SIZE`,
   `one_entry_per_market` stays true, live mode cannot disable hedge,
   `buy_max_shares` is large enough for
-  `max(budget, buy_max_spend) / buy_threshold` ($2.50 / 75¢ needs 5;
-  $5 needs **7**), `max_open_positions == 0` means unlimited, no NaNs.
+  `max(budget, buy_max_spend) / buy_threshold` (spend **$3** / 75¢
+  needs 4; JSON rail is **5**), `max_open_positions == 0` means
+  unlimited, no NaNs.
 
 **Hot reload vs restart:**
 
@@ -764,7 +766,7 @@ live and logs `buy_skip_other_leg` for a side switch.
 1. `ENTRY_ENABLED`
 2. Gamma discovery is a background directory. A stale catalog still
    allows a buy look on a market already in `_cached_markets` with
-   tokens + `end_ts` that is inside the live window (5m last-60s /
+   tokens + `end_ts` that is inside the live window (5m last-120s /
    15m last-3min / hourly open slice). `stale_discovery` only skips
    markets we never stored. Hedge never waits on Gamma freshness.
 3. Fresh positions snapshot and USDC balance

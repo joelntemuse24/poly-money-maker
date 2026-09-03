@@ -12,8 +12,11 @@ from unittest.mock import patch
 
 from buy.complement_clob import (
     COMPLEMENT_SIGNATURE_TYPE,
+    DEPOSIT_WALLET_LIVE,
+    MAGIC_PROXY_WALLET,
     ComplementDepositClobClient,
     order_response_to_post_dict,
+    require_complement_deposit_wallet,
 )
 from buy.complement_gate import build_complement_clob_clients
 
@@ -314,7 +317,8 @@ class ComplementDepositClobClientTests(unittest.TestCase):
         msg = str(ctx.exception)
         self.assertIn("RELAYER_API_KEY", msg)
         self.assertIn("RELAYER_ADDRESS", msg)
-        self.assertNotIn("type 1", msg.lower() + " fallback")
+        self.assertIn("signature_type=1", msg)
+        self.assertIn("will not fall back", msg.lower())
 
     def test_relayer_api_key_from_env_uses_keyword_only_constructor(self):
         class _RelayerApiKey:
@@ -339,6 +343,54 @@ class ComplementDepositClobClientTests(unittest.TestCase):
                 key = relayer_api_key_from_env()
         self.assertEqual(key.key, "rk")
         self.assertEqual(key.address, RELAYER_EOA)
+
+    def test_default_factory_refuses_magic_proxy_even_with_relayer(self):
+        created = {}
+
+        class _RelayerApiKey:
+            def __init__(self, *, key, address):
+                self.key = key
+                self.address = address
+
+        class _SecureClient:
+            @staticmethod
+            def create(**kwargs):
+                created.update(kwargs)
+                return SimpleNamespace(
+                    wallet=kwargs["wallet"],
+                    wallet_type="POLY_PROXY",
+                )
+
+        env = {
+            "RELAYER_API_KEY": "test-relayer-key",
+            "RELAYER_ADDRESS": RELAYER_EOA,
+        }
+        with patch.dict(os.environ, env, clear=False):
+            with patch.dict(
+                sys.modules,
+                {
+                    "polymarket": SimpleNamespace(SecureClient=_SecureClient),
+                    "polymarket.auth": SimpleNamespace(RelayerApiKey=_RelayerApiKey),
+                },
+            ):
+                from buy.complement_clob import default_secure_factory
+
+                with self.assertRaises(RuntimeError) as ctx:
+                    default_secure_factory(private_key="0xpriv", wallet=MAGIC_PROXY_WALLET)
+        self.assertEqual(created, {})
+        self.assertIn("Magic proxy", str(ctx.exception))
+        self.assertIn("maker address not allowed", str(ctx.exception))
+
+    def test_require_complement_deposit_wallet_refuses_proxy_keeps_deposit(self):
+        self.assertEqual(
+            require_complement_deposit_wallet(DEPOSIT_WALLET_LIVE),
+            DEPOSIT_WALLET_LIVE,
+        )
+        with self.assertRaises(RuntimeError) as ctx:
+            require_complement_deposit_wallet(MAGIC_PROXY_WALLET)
+        self.assertIn("Magic proxy", str(ctx.exception))
+        with self.assertRaises(RuntimeError):
+            require_complement_deposit_wallet("")
 
     def test_complement_wallet_prefers_complement_wallet_env(self):
         from buy.complement_clob import complement_wallet_from_env
