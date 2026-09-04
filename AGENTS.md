@@ -232,11 +232,11 @@ Live 5m (after this change is deployed, JSON pasted, and `polybuybot5m` restarte
 
 Complement (`polycomplement`, second account, **restart after merge** — not from the cloud VM):
 
-- Arms only after a primary `bought_token` in `positions_buy5m.json` / `positions_buy.json`.
+- Arms after a primary `bought_token` in `positions_buy5m.json` / `positions_buy.json`, **including after `hedge_closed`** (dump at 40¢ is before the other side hits 80¢).
 - `complement_fill` = other-leg FAK **80–99¢** (`size_matched` / GET-order, never the requested size). `complement_skip` `primary_flat` / `in_flight` / `cooldown` /
-  `ask_below_min` / `oracle_still_held` / `already_bought`.
-- CLOB construction is `ComplementDepositClobClient` / `signature_type=3` / Relayer `api_key=RelayerApiKey(key=RELAYER_API_KEY, address=RELAYER_ADDRESS)` / `wallet=COMPLEMENT_WALLET` or `FUNDER_ADDRESS` (deposit `0x2b2D…`). Relayer vars live in **`.env.complement`**. Size **2×** primary, spend **$5**. A 1¢ FAK must not 400 `maker address not allowed` or `signer address has to be the address of the API KEY`. Missing Relayer env or the Magic proxy funder fails closed.
-- First-account hedge is unchanged. If the primary already sold, complement does not buy.
+  `ask_below_min` / `already_bought`. An in-band ≥80¢ ask is the trigger (oracle lag and a wide crash book do not skip).
+- CLOB construction is `ComplementDepositClobClient` / `signature_type=3` / Relayer `api_key=RelayerApiKey(key=RELAYER_API_KEY, address=RELAYER_ADDRESS or RELAYER_API_KEY_ADDRESS)` / `wallet=COMPLEMENT_WALLET` or `FUNDER_ADDRESS` (deposit `0x2b2D…`). Relayer vars live in **`.env.complement`**. Size **2×** primary, spend **$5**. A 1¢ FAK must not 400 `maker address not allowed` or `signer address has to be the address of the API KEY`. Missing Relayer env or the Magic proxy funder fails closed.
+- First-account hedge is unchanged. Complement still lifts the other leg after the primary dump.
 
 Stopped hourly (do not start unless asked):
 

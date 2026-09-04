@@ -153,12 +153,16 @@ per market under `pathlog/ticks/`.
 
 Second Polymarket account. First-account 5m/15m hedge is **unchanged**.
 After a confirmed primary fill, this process watches the **other** token
-and lifts it at **80–99¢** (FAK 99¢, **2×** share-match, spend cap **$5**,
-oracle must favor that side). If the primary already sold (`hedge_closed`),
-it does not buy.
+and lifts it at **80–99¢** (FAK 99¢, **2×** share-match, spend cap **$5**).
+The **80¢ other-leg ask is the trigger** — a lagging Chainlink print or a
+wide crash book must not skip it. Primary dump at 40¢ happens *before*
+the other side reaches 80¢, so complement still arms after
+`hedge_closed` (uses the original fill size, not leftover 0). Redeemed
+markets stay skipped.
 
 Needs `.env.complement` with a **different** `FUNDER_ADDRESS` than `.env`.
-Put `RELAYER_API_KEY` and `RELAYER_ADDRESS` in **`.env.complement`**
+Put `RELAYER_API_KEY` and `RELAYER_ADDRESS` (or the primary-bot name
+`RELAYER_API_KEY_ADDRESS`) in **`.env.complement`**
 (not the primary `.env` — systemd `EnvironmentFile` is only the
 complement file). Same wallet is a hard refuse (the live 5m loop would
 see those shares and sell them). Compare funders from the **files**,

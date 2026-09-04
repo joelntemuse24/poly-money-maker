@@ -11,6 +11,7 @@ from buy.complement_gate import (
     apply_balance_evidence,
     apply_complement_outcome,
     arm_from_primary_meta,
+    balance_to_shares,
     build_complement_clob_clients,
     complement_fill_from_post,
     complement_target_shares,
@@ -68,9 +69,28 @@ class ArmFromPrimaryTests(unittest.TestCase):
         self.assertAlmostEqual(armed[0].held_shares, 10.87)
         self.assertEqual(armed[0].source, "5m")
 
-    def test_skips_hedge_closed(self):
+    def test_arms_after_hedge_closed_using_original_fill_size(self):
+        """Other-leg 80¢ only happens after the primary dump (~20¢ held)."""
         armed = arm_from_primary_meta(
-            {"c1": _meta(hedge_closed=True)},
+            {
+                "c1": _meta(
+                    hedge_closed=True,
+                    bought_size=0.0,
+                    quoted_buy_shares_total=3.33,
+                    fill_price=0.75,
+                    pnl_entry_cost=2.50,
+                )
+            },
+            source="5m",
+            now_s=1_799_999_900,
+        )
+        self.assertEqual(len(armed), 1)
+        self.assertEqual(armed[0].other_token, "UP1")
+        self.assertAlmostEqual(armed[0].held_shares, 3.33)
+
+    def test_skips_redeemed(self):
+        armed = arm_from_primary_meta(
+            {"c1": _meta(redeem_confirmed=True)},
             source="5m",
             now_s=1_799_999_900,
         )
@@ -109,6 +129,19 @@ class ArmFromPrimaryTests(unittest.TestCase):
             grace_s=30.0,
         )
         self.assertEqual(len(armed), 1)
+
+    def test_infers_start_ts_from_end_date_when_end_ts_missing(self):
+        from datetime import datetime, timezone
+
+        end = datetime.fromtimestamp(1_800_000_000, tz=timezone.utc)
+        armed = arm_from_primary_meta(
+            {"c1": _meta(end_ts=0, end_date=end.isoformat(), start_ts=0)},
+            source="5m",
+            now_s=1_799_999_900,
+        )
+        self.assertEqual(len(armed), 1)
+        self.assertAlmostEqual(armed[0].end_ts, 1_800_000_000, places=0)
+        self.assertAlmostEqual(armed[0].start_ts, 1_800_000_000 - 300, places=0)
 
     def test_merges_5m_and_15m(self):
         rows = []
@@ -209,8 +242,8 @@ class EvaluateComplementTests(unittest.TestCase):
         self.assertFalse(fire)
         self.assertEqual(why, "ask_below_min")
 
-    def test_skips_wide_book(self):
-        fire, why, _ = evaluate_complement(
+    def test_wide_book_still_fires_fak_lifts_ask(self):
+        fire, why, shares = evaluate_complement(
             other_ask=0.80,
             other_bid=0.10,
             held_shares=10.87,
@@ -218,8 +251,9 @@ class EvaluateComplementTests(unittest.TestCase):
             primary_still_holding=True,
             oracle_favors_other=True,
         )
-        self.assertFalse(fire)
-        self.assertEqual(why, "wide_book")
+        self.assertTrue(fire)
+        self.assertEqual(why, "fire")
+        self.assertGreater(shares, 0)
 
     def test_skips_when_primary_already_sold(self):
         fire, why, _ = evaluate_complement(
@@ -245,17 +279,19 @@ class EvaluateComplementTests(unittest.TestCase):
         self.assertFalse(fire)
         self.assertEqual(why, "already_bought")
 
-    def test_skips_oracle_still_on_held_side(self):
-        fire, why, _ = evaluate_complement(
+    def test_eighty_cent_ask_fires_even_if_oracle_lags(self):
+        fire, why, shares = evaluate_complement(
             other_ask=0.80,
             other_bid=0.78,
             held_shares=10.87,
             already_bought=False,
             primary_still_holding=True,
             oracle_favors_other=False,
+            require_oracle=True,
         )
-        self.assertFalse(fire)
-        self.assertEqual(why, "oracle_still_held")
+        self.assertTrue(fire)
+        self.assertEqual(why, "fire")
+        self.assertGreater(shares, 0)
 
     def test_oracle_favors_other_follows_last_print_check(self):
         last_print = {"ok": True, "favored": "down", "live_kind": "last_print"}
@@ -477,6 +513,21 @@ class PostOutcomeTests(unittest.TestCase):
         )
         self.assertEqual((status, shares), ("ambiguous", 0.0))
 
+    def test_live_zero_matched_fak_is_empty(self):
+        status, shares = complement_fill_from_post(
+            {"status": "live", "size_matched": "0", "takingAmount": "0", "success": True},
+            requested=5.0,
+        )
+        self.assertEqual((status, shares), ("empty", 0.0))
+
+    def test_live_with_matched_size_is_fill(self):
+        status, shares = complement_fill_from_post(
+            {"status": "live", "size_matched": "5.05"},
+            requested=5.05,
+        )
+        self.assertEqual(status, "filled")
+        self.assertAlmostEqual(shares, 5.05)
+
     def test_none_result_is_ambiguous(self):
         status, shares = complement_fill_from_post(None, requested=10.0)
         self.assertEqual((status, shares), ("ambiguous", 0.0))
@@ -514,6 +565,12 @@ class PostOutcomeTests(unittest.TestCase):
             "empty", 0.0, baseline=1.0, after=1.0,
         )
         self.assertEqual((status, shares), ("empty", 0.0))
+
+    def test_balance_to_shares_accepts_human_or_fixed_point(self):
+        self.assertAlmostEqual(balance_to_shares("3.33"), 3.33)
+        self.assertAlmostEqual(balance_to_shares("3330000"), 3.33)
+        self.assertIsNone(balance_to_shares(None))
+        self.assertAlmostEqual(balance_to_shares(0), 0.0)
 
 
 class QuarantineAndCooldownTests(unittest.TestCase):

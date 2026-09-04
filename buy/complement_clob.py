@@ -257,16 +257,29 @@ def require_complement_deposit_wallet(wallet: object) -> str:
 def relayer_api_key_from_env(environ: Optional[Mapping[str, str]] = None) -> Any:
     """Build ``RelayerApiKey(key=..., address=...)`` from env. Fail closed if missing.
 
-    Requires ``RELAYER_API_KEY`` and ``RELAYER_ADDRESS`` (the Relayer EOA).
-    Never falls back to Magic/proxy type 1.
+    Requires ``RELAYER_API_KEY`` plus ``RELAYER_ADDRESS`` or
+    ``RELAYER_API_KEY_ADDRESS`` (the Relayer EOA). Never falls back to
+    Magic/proxy type 1.
     """
     env = os.environ if environ is None else environ
-    key = str(env.get("RELAYER_API_KEY") or "").strip()
-    address = str(env.get("RELAYER_ADDRESS") or "").strip()
+    key = str(
+        env.get("RELAYER_API_KEY")
+        or env.get("POLYMARKET_RELAYER_API_KEY")
+        or ""
+    ).strip()
+    # Primary bots / official docs use RELAYER_API_KEY_ADDRESS. Complement
+    # previously required RELAYER_ADDRESS only, so a copied .env.complement
+    # failed closed at startup and never posted.
+    address = str(
+        env.get("RELAYER_ADDRESS")
+        or env.get("RELAYER_API_KEY_ADDRESS")
+        or env.get("POLYMARKET_RELAYER_API_KEY_ADDRESS")
+        or ""
+    ).strip()
     if not key or not address:
         raise RuntimeError(
             "complement CLOB requires RELAYER_API_KEY and RELAYER_ADDRESS "
-            "(Relayer API key + EOA). Refusing to start without Relayer — "
+            "(or RELAYER_API_KEY_ADDRESS). Refusing to start without Relayer — "
             "will not fall back to Magic/proxy signature_type=1."
         )
     from polymarket.auth import RelayerApiKey

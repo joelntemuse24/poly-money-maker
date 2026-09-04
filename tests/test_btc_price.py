@@ -149,7 +149,9 @@ class LaggingTwapWouldSkipLastPrintFires(unittest.TestCase):
         twap_side = side_from_live_vs_ptb(self.lagging_twap, self.ptb, 0.0)
         self.assertEqual(twap_side["favored"], "up")
         self.assertFalse(oracle_favors_other_leg(twap_side, "down"))
-        skip, skip_why, _ = evaluate_complement(
+        # 86¢ other-leg ask is the trigger even if a lagging print still
+        # says Up. The live bot no longer skips that as oracle_still_held.
+        fire_lag, why_lag, _ = evaluate_complement(
             other_ask=0.86,
             other_bid=0.84,
             held_shares=10.87,
@@ -157,8 +159,8 @@ class LaggingTwapWouldSkipLastPrintFires(unittest.TestCase):
             primary_still_holding=True,
             oracle_favors_other=oracle_favors_other_leg(twap_side, "down"),
         )
-        self.assertFalse(skip)
-        self.assertEqual(skip_why, "oracle_still_held")
+        self.assertTrue(fire_lag)
+        self.assertEqual(why_lag, "fire")
 
     def test_hedge_require_oracle_follows_last_print(self):
         live_feed = BtcUnderlyingFeed(SOURCE_CHAINLINK, "")

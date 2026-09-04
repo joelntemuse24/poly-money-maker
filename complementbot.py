@@ -3,6 +3,7 @@
 Does not change 5m/15m hedge logic. After the first account confirms a
 fill, this process (separate CLOB key / funder) watches the *other* token
 and lifts **2×** that bag at ≥80¢ (spend cap ~2× the 5m $2.50 clip).
+The 80¢ other-leg ask is the trigger, including after the primary dump.
 
 Requires ``.env.complement`` (second Polymarket account). Refuses to start
 if that funder matches the primary ``.env`` wallet.
@@ -37,6 +38,7 @@ from buy.complement_gate import (
     apply_balance_evidence,
     apply_complement_outcome,
     arm_from_primary_meta,
+    balance_to_shares,
     build_complement_clob_clients,
     complement_fill_from_post,
     evaluate_complement,
@@ -364,7 +366,7 @@ def token_balance(token_id):
         )
         if raw is None or raw == "":
             return None
-        return float(raw) / 1_000_000.0
+        return balance_to_shares(raw)
     except Exception as exc:
         log_event("complement_balance_fail", token_id=token_id, error=str(exc)[:200])
         return None
@@ -580,7 +582,7 @@ while not _shutdown:
             other_ask=ask,
             other_bid=bid,
             held_shares=row.held_shares,
-            already_bought=False,
+            already_bought=bool(own.get("bought_token") and float(own.get("bought_size") or 0) > 0.01),
             primary_still_holding=True,
             oracle_favors_other=oracle_ok,
             min_price=float(_strat["buy_min_price"]),

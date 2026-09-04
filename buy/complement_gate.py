@@ -11,6 +11,7 @@ CLOB I/O lives only inside the injected client passed to
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime
 from decimal import Decimal, ROUND_DOWN
 from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
 
@@ -27,6 +28,12 @@ class ArmedMarket:
     end_ts: float
     slug: str
     start_ts: float = 0.0
+
+
+_SOURCE_WINDOW_S = {
+    "5m": 5 * 60.0,
+    "15m": 15 * 60.0,
+}
 
 
 def _norm_addr(value: object) -> str:
@@ -107,6 +114,67 @@ def _finite(value: object, *, minimum: Optional[float] = None) -> Optional[float
     return parsed
 
 
+def _parse_end_date(value: object) -> float:
+    raw = str(value or "").strip()
+    if not raw:
+        return 0.0
+    try:
+        return datetime.fromisoformat(raw.replace("Z", "+00:00")).timestamp()
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def meta_end_ts(meta: Any) -> float:
+    """Unix end time from ``end_ts`` or ISO ``end_date`` (5m writes both, but
+    ``end_ts`` is only stamped on a successful PTB capture)."""
+    if not isinstance(meta, dict):
+        return 0.0
+    end_ts = _finite(meta.get("end_ts", 0), minimum=0) or 0.0
+    if end_ts > 0:
+        return float(end_ts)
+    return _parse_end_date(meta.get("end_date"))
+
+
+def meta_start_ts(meta: Any, *, source: str = "", end_ts: float = 0.0) -> float:
+    if not isinstance(meta, dict):
+        start = 0.0
+    else:
+        start = _finite(meta.get("start_ts", 0), minimum=0) or 0.0
+    if start > 0:
+        return float(start)
+    window = _SOURCE_WINDOW_S.get(str(source), 5 * 60.0)
+    if end_ts > window:
+        return float(end_ts) - float(window)
+    return 0.0
+
+
+def primary_fill_shares(meta: Any, *, min_size: float = 0.01) -> float:
+    """Original primary bag, not leftover after a dump.
+
+    After ``hedge_closed`` the 5m ledger sets ``bought_size`` to ~0. Complement
+    still needs the fill size to 2×-match the other leg at ≥80¢.
+    """
+    if not isinstance(meta, dict):
+        return 0.0
+    floor = float(min_size)
+    size = _finite(meta.get("bought_size", 0), minimum=0) or 0.0
+    if size > floor:
+        return float(size)
+    quoted = _finite(meta.get("quoted_buy_shares_total", 0), minimum=0) or 0.0
+    if quoted > floor:
+        return float(quoted)
+    quoted_one = _finite(meta.get("quoted_buy_shares", 0), minimum=0) or 0.0
+    if quoted_one > floor:
+        return float(quoted_one)
+    cost = _finite(meta.get("pnl_entry_cost", 0), minimum=0) or 0.0
+    px = _finite(meta.get("fill_price", 0), minimum=0) or 0.0
+    if cost > 0 and px > 0:
+        inferred = cost / px
+        if inferred > floor:
+            return float(inferred)
+    return 0.0
+
+
 def arm_from_primary_meta(
     blob: Any,
     *,
@@ -115,7 +183,13 @@ def arm_from_primary_meta(
     grace_s: float = 45.0,
     min_size: float = 0.01,
 ) -> List[ArmedMarket]:
-    """Arm complement watch from one first-account positions JSON object."""
+    """Arm complement watch from one first-account positions JSON object.
+
+    A confirmed ``bought_token`` arms the other leg even after the primary
+    dumped (``hedge_closed``). When the other ask hits 80¢ the held bid is
+    already ~20¢, so waiting for an open primary bag never fires. Redeemed
+    markets stay skipped.
+    """
     if not isinstance(blob, dict):
         return []
     out: List[ArmedMarket] = []
@@ -123,12 +197,12 @@ def arm_from_primary_meta(
     for raw_cid, meta in blob.items():
         if not isinstance(meta, dict):
             continue
-        if meta.get("hedge_closed") or meta.get("redeem_pending") or meta.get("redeem_confirmed"):
+        if meta.get("redeem_pending") or meta.get("redeem_confirmed"):
             continue
         if meta.get("buy_uncertain") and not meta.get("bought_token"):
             continue
         token = str(meta.get("bought_token") or "")
-        size = _finite(meta.get("bought_size", 0), minimum=0) or 0.0
+        size = primary_fill_shares(meta, min_size=min_size)
         if not token or size <= float(min_size):
             continue
         up = str(meta.get("up_token") or "")
@@ -138,7 +212,7 @@ def arm_from_primary_meta(
         )
         if not other or other == token:
             continue
-        end_ts = _finite(meta.get("end_ts", 0), minimum=0) or 0.0
+        end_ts = meta_end_ts(meta)
         if end_ts > 0 and float(now_s) > end_ts + grace:
             continue
         held_leg = str(meta.get("bought_leg") or "").strip().lower()
@@ -146,6 +220,7 @@ def arm_from_primary_meta(
             held_leg = "down"
         elif held_leg != "up":
             held_leg = "up" if token == up else "down"
+        start_ts = meta_start_ts(meta, source=str(source), end_ts=end_ts)
         out.append(
             ArmedMarket(
                 condition_id=str(raw_cid),
@@ -157,7 +232,7 @@ def arm_from_primary_meta(
                 other_leg=other_leg,
                 end_ts=float(end_ts),
                 slug=str(meta.get("slug") or raw_cid),
-                start_ts=_finite(meta.get("start_ts", 0), minimum=0) or 0.0,
+                start_ts=float(start_ts),
             )
         )
     return out
@@ -227,7 +302,7 @@ def evaluate_complement(
     other_bid: Optional[float],
     held_shares: float,
     already_bought: bool,
-    primary_still_holding: bool,
+    primary_still_holding: bool = True,
     oracle_favors_other: Optional[bool] = True,
     min_price: float = 0.80,
     max_price: float = 0.99,
@@ -239,8 +314,17 @@ def evaluate_complement(
 ) -> Tuple[bool, str, float]:
     """Whether the complement wallet should FAK the other token.
 
+    The trigger is the **other ask ≥ 80¢**. A 99¢ FAK lifts that ask, so a
+    wide bid/ask during a reversal must not block. An in-band ask is also
+    stronger than a lagging Chainlink print — ``require_oracle`` only
+    vetoes when the book is *not* yet at the floor.
+
+    ``primary_still_holding`` is kept for callers/tests; the live bot arms
+    from a confirmed primary fill even after ``hedge_closed``.
+
     Returns ``(fire, reason, shares)``. Shares are 0 when not firing.
     """
+    del max_spread  # FAK at max_price lifts the ask; spread is not a gate.
     if already_bought:
         return False, "already_bought", 0.0
     if not primary_still_holding:
@@ -255,9 +339,8 @@ def evaluate_complement(
     bid = _finite(other_bid, minimum=0)
     if bid is None or bid <= 0:
         return False, "no_bid", 0.0
-    if (ask - bid) > float(max_spread) + 1e-12:
-        return False, "wide_book", 0.0
-    if require_oracle and not oracle_favors_other:
+    in_band = ask + 1e-12 >= float(min_price)
+    if require_oracle and not oracle_favors_other and not in_band:
         return False, "oracle_still_held", 0.0
     shares = complement_target_shares(
         held_shares,
@@ -302,6 +385,22 @@ def _amount_to_shares(raw: object, expected: float) -> Optional[float]:
     return value
 
 
+def balance_to_shares(raw: object) -> Optional[float]:
+    """CLOB balance → human shares. Accepts 1e6 fixed-point or already-human."""
+    if raw is None or raw == "":
+        return None
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return None
+    if value != value or value < 0 or value in (float("inf"), float("-inf")):
+        return None
+    text = str(raw).strip().lower()
+    if value >= 10_000 and "." not in text and "e" not in text:
+        return value / 1_000_000.0
+    return value
+
+
 def complement_fill_from_post(result: Any, requested: float) -> Tuple[str, float]:
     """Classify a CLOB POST body. Never treat a missing body as a full fill.
 
@@ -338,11 +437,16 @@ def complement_fill_from_post(result: Any, requested: float) -> Tuple[str, float
         return "ambiguous", 0.0
     # size_matched is fill evidence. takingAmount without a terminal
     # matched status can be the signed order size on a delayed POST.
-    if matched is not None and matched > 0 and status in {"", "matched", "order_status_matched"}:
+    if matched is not None and matched > 0 and status in {
+        "", "matched", "order_status_matched", "live",
+    }:
         return "filled", float(matched)
     if taking is not None and taking > 0 and status in {"matched", "order_status_matched"}:
         return "filled", float(taking)
     if status in {"matched", "order_status_matched"} and shares <= 0:
+        return "empty", 0.0
+    # FAK does not rest. A LIVE/0 body is an empty kill, not in-flight.
+    if status in {"live", "unmatched", "canceled", "cancelled"} and shares <= 0:
         return "empty", 0.0
     if data.get("success") is False:
         return "rejected", 0.0
