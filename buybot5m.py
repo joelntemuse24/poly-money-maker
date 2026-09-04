@@ -5682,6 +5682,9 @@ while not _shutdown_requested:
                     meta["dn_token"] = m.dn_token
                     meta["question"] = m.question
                     meta["end_date"] = datetime.fromtimestamp(m.end_ts, tz=datetime.now().astimezone().tzinfo).isoformat()
+                    meta["start_ts"] = m.start_ts
+                    meta["end_ts"] = m.end_ts
+                    meta["slug"] = getattr(m, "slug", None)
                     meta["pnl_entry_cost"] = 0.0
                     meta["pnl_hedge_proceeds"] = 0.0
                     meta["pnl_redeem_value"] = 0.0

@@ -291,6 +291,44 @@ class ComplementDepositClobClientTests(unittest.TestCase):
         self.assertEqual(relayer_kwargs[0]["key"], "test-relayer-key")
         self.assertEqual(relayer_kwargs[0]["address"], RELAYER_EOA)
 
+    def test_relayer_api_key_address_alias_is_accepted(self):
+        created = {}
+        relayer_kwargs = []
+
+        class _RelayerApiKey:
+            def __init__(self, *, key, address):
+                relayer_kwargs.append({"key": key, "address": address})
+                self.key = key
+                self.address = address
+
+        class _SecureClient:
+            @staticmethod
+            def create(**kwargs):
+                created.update(kwargs)
+                return SimpleNamespace(
+                    wallet=kwargs["wallet"],
+                    wallet_type="DEPOSIT_WALLET",
+                )
+
+        env = {
+            "RELAYER_API_KEY": "copied-from-primary",
+            "RELAYER_API_KEY_ADDRESS": RELAYER_EOA,
+            "RELAYER_ADDRESS": "",
+        }
+        with patch.dict(os.environ, env, clear=False):
+            with patch.dict(
+                sys.modules,
+                {
+                    "polymarket": SimpleNamespace(SecureClient=_SecureClient),
+                    "polymarket.auth": SimpleNamespace(RelayerApiKey=_RelayerApiKey),
+                },
+            ):
+                from buy.complement_clob import default_secure_factory
+
+                default_secure_factory(private_key="0xpriv", wallet=DEPOSIT_WALLET)
+        self.assertEqual(created["api_key"].address, RELAYER_EOA)
+        self.assertEqual(relayer_kwargs[0]["address"], RELAYER_EOA)
+
     def test_default_factory_fails_closed_without_relayer_env(self):
         created = {}
 

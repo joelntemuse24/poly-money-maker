@@ -132,7 +132,9 @@ persist 50/52 / dump 35 / Binance $10 buy-edge code remains in
 **Complement (`complementbot.py`) is a second Polymarket account.** It
 does not change 5m sell-hedge. After a confirmed primary fill it
 lifts **2×** the other token at ≥80¢ (FAK 99¢, spend cap ~$5 = 2× the
-5m $2.50 clip). Same-wallet start is refused. Do not start
+5m $2.50 clip). The 80¢ other-leg ask is the trigger: complement still
+arms after the primary `hedge_closed` dump (that dump fires near 40¢,
+before the other side can be 80¢). Same-wallet start is refused. Do not start
 `polycomplement` without `.env.complement`. This account is a
 **deposit wallet**: complement stamps `signature_type=3` + `funder` on
 **both** the API-key derive client and the trading client, via
