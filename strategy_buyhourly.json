@@ -1,5 +1,5 @@
 {
-  "entry_enabled": false,
+  "entry_enabled": true,
   "buy_threshold": 0.9,
   "buy_max_price": 0.94,
   "min_winner_bid": 0.9,
@@ -27,7 +27,7 @@
   "one_entry_per_market": true,
   "redeem_throttle_s": 30,
   "max_redeem_age_days": 7,
-  "dry_run": true,
+  "dry_run": false,
   "poll_buy_window_s": 0.01,
   "poll_held_s": 0.01,
   "positions_refresh_s": 1,

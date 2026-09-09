@@ -897,7 +897,11 @@ class AmbiguousCrossCyclePolicy(unittest.TestCase):
             elif bot == BOT_HR:
                 self.assertIn('"buy_max_spend": 11.0', src, bot.name)
                 self.assertIn('"buy_max_shares": 14.0', src, bot.name)
+                self.assertIn('"size_to_ref_price": True', src, bot.name)
+                self.assertIn('"a22_size_ref_price": 0.0', src, bot.name)
                 self.assertIn("quoted_buy_shares_up_to_limit(", src, bot.name)
+                self.assertIn("hourly_size_ref_price(", src, bot.name)
+                self.assertIn("size_ref_price=", src, bot.name)
                 self.assertIn("price=limit_price", src, bot.name)
                 self.assertNotIn(
                     "quoted_buy_shares(remaining_budget, fresh_ask, BUY_MAX_SHARES)",
@@ -1527,8 +1531,155 @@ class FiveMinuteBandLimitFakTests(unittest.TestCase):
         self.assertFalse(toxic)
 
 
+class HourlyShareTargetFakTests(unittest.TestCase):
+    """Share-target sizing: budget/ref shares so win size stays stable above ref."""
+
+    @staticmethod
+    def _fns():
+        return _load_funcs(
+            "finite_float",
+            "quoted_buy_shares",
+            "quoted_buy_shares_up_to_limit",
+            "target_buy_shares",
+            "hourly_size_ref_price",
+            bot=BOT_HR,
+        )
+
+    def test_target_shares_formula_scales_with_budget(self):
+        ns = self._fns()
+        self.assertAlmostEqual(ns["target_buy_shares"](5.0, 0.95), 5 / 0.95, places=6)
+        self.assertAlmostEqual(ns["target_buy_shares"](50.0, 0.95), 50 / 0.95, places=6)
+        self.assertAlmostEqual(ns["target_buy_shares"](2.5, 0.90), 2.5 / 0.90, places=6)
+        self.assertAlmostEqual(ns["target_buy_shares"](20.0, 0.90), 20 / 0.90, places=6)
+
+    def test_a22_ref_at_99_buys_more_than_flat_budget_maximize(self):
+        """Ideal ~5.26 sh; exact-cent at 0.99 is integer — still beat $5-max when scaled.
+
+        At $5 the 0.99 tick only allows 5.00 sh under ceiling ~$5.21 (same as
+        flat maximize). At $50, share-target posts ~52 sh not 50.
+        """
+        ns = self._fns()
+        fn = ns["quoted_buy_shares_up_to_limit"]
+        target = ns["target_buy_shares"](5.0, 0.95)
+        self.assertAlmostEqual(target, 5.263157, places=5)
+        small = fn(5.0, 0.98, 0.99, 14.0, spend_cap=8.5, ref_price=0.95)
+        flat_small = fn(5.0, 0.98, 0.99, 14.0, spend_cap=5.0)
+        # Granularity: both land on 5.00 at 0.99 for a $5 slice.
+        self.assertAlmostEqual(small, 5.0, places=2)
+        self.assertAlmostEqual(flat_small, 5.0, places=2)
+        scaled = fn(50.0, 0.98, 0.99, 100.0, spend_cap=60.0, ref_price=0.95)
+        flat_scaled = fn(50.0, 0.98, 0.99, 100.0, spend_cap=50.0)
+        self.assertGreaterEqual(scaled, 52.0 - 1e-9)
+        self.assertAlmostEqual(flat_scaled, 50.0, places=2)
+        self.assertGreater(scaled, flat_scaled + 1e-9)
+        maker = Decimal(str(scaled)) * Decimal("0.99")
+        self.assertEqual(maker.quantize(Decimal("0.01")), maker)
+
+    def test_a22_ref_at_95_limit_near_target_spend_near_budget(self):
+        ns = self._fns()
+        fn = ns["quoted_buy_shares_up_to_limit"]
+        shares = fn(5.0, 0.95, 0.95, 14.0, spend_cap=8.5, ref_price=0.95)
+        # Exact-cent at 0.95 steps of 0.20 → 5.20 sh / $4.94.
+        self.assertAlmostEqual(shares, 5.20, places=2)
+        self.assertAlmostEqual(shares * 0.95, 4.94, places=2)
+        self.assertGreater(shares, 5.0 + 1e-9)
+
+    def test_a22_entry_at_98_vs_95_keeps_share_target(self):
+        """Entering at 98¢ still sizes as $budget@95, not maximize under $budget."""
+        ns = self._fns()
+        fn = ns["quoted_buy_shares_up_to_limit"]
+        # Use limit 0.98 so fractional exact-cent sizes exist (0.50 steps).
+        at_98 = fn(5.0, 0.98, 0.98, 14.0, spend_cap=8.5, ref_price=0.95)
+        at_95 = fn(5.0, 0.95, 0.95, 14.0, spend_cap=8.5, ref_price=0.95)
+        flat_98 = fn(5.0, 0.98, 0.98, 14.0, spend_cap=5.0)
+        # Share-target ≈ 5.26 → legal 5.50 @0.98 ($5.39) or 5.00; prefer max under ceiling.
+        # ceiling = max(5, 5.263*0.98)=5.158 → max legal ≤5.158/0.98 is 5.00 ($4.90).
+        # At 0.95: 5.20. Both beat or match flat; 95-limit case clearly > flat 5.0.
+        self.assertAlmostEqual(at_95, 5.20, places=2)
+        self.assertGreaterEqual(at_98, flat_98 - 1e-9)
+        # Conceptual target stable across entry prices:
+        self.assertAlmostEqual(
+            ns["target_buy_shares"](5.0, 0.95),
+            ns["target_buy_shares"](5.0, 0.95),
+        )
+
+    def test_b15_ref_mid_band_buys_shares_as_budget_over_90(self):
+        ns = self._fns()
+        fn = ns["quoted_buy_shares_up_to_limit"]
+        target = ns["target_buy_shares"](2.5, 0.90)
+        self.assertAlmostEqual(target, 2.5 / 0.90, places=6)
+        shares = fn(2.5, 0.93, 0.94, 10.0, spend_cap=8.5, ref_price=0.90)
+        # ceiling = max(2.5, 2.778*0.94)=2.611 → legal 0.50 steps → 2.50 sh.
+        self.assertAlmostEqual(shares, 2.50, places=2)
+        flat = fn(2.5, 0.93, 0.94, 10.0, spend_cap=2.5)
+        self.assertAlmostEqual(flat, 2.50, places=2)
+        # Larger budget shows the mid-band uplift vs flat maximize.
+        shares20 = fn(20.0, 0.93, 0.94, 40.0, spend_cap=30.0, ref_price=0.90)
+        flat20 = fn(20.0, 0.93, 0.94, 40.0, spend_cap=20.0)
+        self.assertGreaterEqual(shares20, 22.0 - 1e-9)
+        self.assertLess(flat20, shares20)
+
+    def test_hourly_size_ref_derives_from_floors_or_explicit(self):
+        ns = self._fns()
+        ref = ns["hourly_size_ref_price"]
+        self.assertAlmostEqual(
+            ref("a22", size_to_ref=True, a22_ref=0.0, a22_min=0.949),
+            0.949,
+            places=4,
+        )
+        self.assertAlmostEqual(
+            ref("a22", size_to_ref=True, a22_ref=0.95, a22_min=0.949),
+            0.95,
+            places=4,
+        )
+        self.assertAlmostEqual(
+            ref("b15", size_to_ref=True, b15_ref=0.0, buy_threshold=0.90),
+            0.90,
+            places=4,
+        )
+        self.assertIsNone(ref("a22", size_to_ref=False, a22_ref=0.95))
+        self.assertIsNone(ref("unknown", size_to_ref=True))
+
+    def test_without_ref_price_keeps_maximize_under_budget(self):
+        ns = self._fns()
+        fn = ns["quoted_buy_shares_up_to_limit"]
+        shares = fn(5.0, 0.979, 0.99, 14.0, spend_cap=5.0)
+        self.assertAlmostEqual(shares, 5.0, places=2)
+
+
 class HourlyBandLimitFakTests(unittest.TestCase):
     """Hourly FAK: A/C limit 99¢ ($5 or remaining to $10), B limit 90¢."""
+
+    def test_fak_size_maximizes_spend_at_limit_any_ask(self):
+        """Non-exact ask must not collapse to the 3-share floor (10AM Sep 7 bug)."""
+        ns = _load_funcs(
+            "finite_float",
+            "quoted_buy_shares",
+            "quoted_buy_shares_up_to_limit",
+            bot=BOT_HR,
+        )
+        fn = ns["quoted_buy_shares_up_to_limit"]
+        cases = (
+            # ask, limit, budget, share_cap, spend_cap, min_shares, min_spend
+            (0.979, 0.99, 5.0, 14.0, 5.0, 5.0, 4.95),  # live miss: was 3.0/$2.97
+            (0.98, 0.99, 5.0, 14.0, 5.0, 5.0, 4.95),
+            (0.95, 0.99, 5.0, 14.0, 5.0, 5.0, 4.95),
+            (0.91, 0.94, 2.5, 5.0, 2.5, 2.5, 2.35),  # b15-style
+            (0.50, 0.55, 1.0, 5.0, 1.0, 1.0, 0.55),  # tiny budget still works
+        )
+        for ask, limit, budget, share_cap, spend_cap, min_sh, min_spend in cases:
+            shares = fn(budget, ask, limit, share_cap, spend_cap=spend_cap)
+            maker = Decimal(str(shares)) * Decimal(str(limit))
+            self.assertEqual(
+                maker.quantize(Decimal("0.01")), maker, (ask, limit, shares)
+            )
+            self.assertLessEqual(float(maker), spend_cap + 1e-9, (ask, limit))
+            self.assertGreaterEqual(shares, min_sh - 1e-9, (ask, limit, shares))
+            self.assertGreaterEqual(float(maker), min_spend - 1e-9, (ask, limit))
+            # Must beat the old 3-share floor collapse for the $5/99¢ case
+            if budget >= 5.0 and abs(limit - 0.99) < 1e-12:
+                self.assertGreater(shares, 3.0 + 1e-9, (ask, shares))
+                self.assertAlmostEqual(shares, 5.0, places=2)
 
     def test_sizes_maker_valid_at_99_and_90(self):
         ns = _load_funcs(
@@ -1607,6 +1758,7 @@ class HourlyBandLimitFakTests(unittest.TestCase):
                 "_fill_fee_usdc": lambda *_args, **_kwargs: None,
                 "entry_book_ok": lambda *_a, **_k: (True, "ok"),
                 "safe_api_call": lambda fn, *a, **k: fn(*a, **k),
+                "emit_buy_depth_ladder": lambda **_k: None,
                 "client": SimpleNamespace(
                     create_order=create_order,
                     post_order=post,
@@ -1956,33 +2108,15 @@ class BalanceAndGcSemantics(unittest.TestCase):
         self.assertNotIn("early_95_start_s", fifteen)
         self.assertNotIn("late_buy_budget", hourly)
         self.assertNotIn("late_buy_budget", fifteen)
-        self.assertEqual(hourly["a22_window_min"], 0.0)
-        self.assertEqual(hourly["b15_window_min"], 20.0)
-        self.assertEqual(hourly["c5_window_min"], 0.0)
-        self.assertEqual(hourly["buy_window_min"], 20.0)
-        self.assertEqual(hourly["a22_min_price"], 0.93)
-        self.assertEqual(hourly["c5_min_price"], 0.95)
-        self.assertEqual(hourly["high_buy_max_price"], 0.99)
-        self.assertEqual(hourly["a22_buy_budget"], 5.0)
-        self.assertEqual(hourly["b15_buy_budget"], 10.0)
-        self.assertEqual(hourly["c5_buy_budget"], 10.0)
-        self.assertEqual(hourly["market_spend_cap"], 10.0)
-        self.assertEqual(hourly["buy_max_spend"], 11.0)
-        self.assertEqual(hourly["buy_max_shares"], 14.0)
-        self.assertEqual(hourly["buy_budget"], 10.0)
-        self.assertEqual(hourly["hedge_threshold"], 0.50)
-        self.assertEqual(hourly["hedge_require_ask_max"], 0.52)
-        self.assertEqual(hourly["hedge_persist_s"], 5.0)
-        self.assertEqual(hourly["hedge_toxic_bid_max"], 0.35)
-        self.assertEqual(hourly["hedge_recovery_cancel"], 0.53)
-        self.assertEqual(hourly["hedge_sell_fade"], True)
-        self.assertEqual(hourly["hedge_require_oracle"], True)
-        self.assertEqual(hourly["hedge_oracle_min_edge_usd"], 0.0)
-        self.assertEqual(hourly["hedge_undercut_ticks"], 0)
-        self.assertEqual(hourly["poll_buy_window_s"], 0.01)
-        self.assertEqual(hourly["poll_held_s"], 0.01)
-        self.assertEqual(hourly["min_underlying_edge_usd"], 10.0)
-        self.assertEqual(hourly["tick_size"], "0.01")
+        captured = json.loads((root / "strategy_buyhourly.json").read_text())
+        self.assertIs(captured["dry_run"], False)
+        self.assertIs(captured["entry_enabled"], True)
+        captured.update(dry_run=True, entry_enabled=False)
+        self.assertEqual(hourly, captured)
+        self.assertEqual(hourly["a22_buy_budget"], 40.0)
+        self.assertEqual(hourly["b15_buy_budget"], 6.0)
+        self.assertEqual(hourly["entry_book_persist_s"], 8.0)
+        self.assertEqual(hourly["b15_entry_book_persist_s"], 20.0)
         self.assertEqual(fifteen["hedge_threshold"], 0.35)
         self.assertEqual(fifteen["buy_threshold"], 0.90)
         self.assertEqual(fifteen["buy_max_price"], 0.96)
@@ -2018,32 +2152,18 @@ class BalanceAndGcSemantics(unittest.TestCase):
             src,
         )
 
-    def test_docs_live_overlay_is_75_90_2_50_5m_only(self):
-        root = BOT5M.parent
+    def test_docs_identify_hourly_vm_snapshot(self):
+        root = BOT_HR.parent
         current = (root / "CURRENT.md").read_text()
         agents = (root / "AGENTS.md").read_text()
-        for name, text in (("CURRENT.md", current), ("AGENTS.md", agents)):
-            self.assertIn("last **120s**", text, name)
-            self.assertIn("75–90", text, name)
-            self.assertNotIn('d["buy_start_s"]=45', text, name)
-            self.assertNotIn('d["min_underlying_edge_usd"]=25.0', text, name)
-        self.assertIn("`min_underlying_edge_usd`", current)
-        self.assertIn("$2.50", current)
-        self.assertIn('"buy_start_s": 120', current)
-        self.assertIn('"buy_max_price": 0.90', current)
-        self.assertIn('"buy_threshold": 0.75', current)
-        self.assertIn('"buy_max_spend": 5.0', current)
-        self.assertIn('"buy_max_shares": 8.0', current)
-        self.assertIn("strategy_complement.json", current)
-        self.assertIn(".env.complement", current)
-        self.assertIn("2×", current)
-        self.assertIn("docs/2026-08-31-last120-loss-catalog.md", current)
-        self.assertIn("docs/2026-08-31-last120-loss-catalog.md", agents)
-        ttd = (root / "TECHNICAL_DESIGN.md").read_text()
-        self.assertIn("last **120s**", ttd)
-        self.assertIn("75–90", ttd)
-        self.assertNotIn("Live hourly B uses 90¢", ttd)
-        self.assertIn("Walking `buybot5m.py`", ttd)
+        self.assertIn("2026-09-09", current)
+        self.assertIn("polybuybothourly.service", current)
+        self.assertIn("$40", current)
+        self.assertIn("$6", current)
+        self.assertIn("live VM is the source of truth", agents)
+        self.assertIn("does not restart services", agents)
+        self.assertNotIn("Hourly is **stopped**", agents)
+        self.assertNotIn("Active strategy:** **5m only", current)
 
 
 class FiveMFastPollHelpers(unittest.TestCase):

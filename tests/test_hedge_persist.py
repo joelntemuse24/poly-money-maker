@@ -898,6 +898,313 @@ class FiveMTtmHedgeLadderTests(unittest.TestCase):
         )
 
 
+
+
+class DumpTightLevelTests(unittest.TestCase):
+    """Hourly dump_require_tight: spread vs both-underwater levels."""
+
+    def test_wide_spread_blocks_when_ask_still_rich(self):
+        from buy.hedge_gate import evaluate_held_bag
+        intent = evaluate_held_bag(
+            0.335, 0.99,
+            now_s=10.0,
+            persist_armed_ts=None,
+            persist_s=5.0,
+            dump_bid_max=0.35,
+            qualify_bid=0.60,
+            qualify_ask_max=0.62,
+            max_spread=0.20,
+            dump_persist_s=0.0,
+            dump_require_tight=True,
+            dump_ignore_spread_ask_max=0.60,
+        )
+        self.assertEqual(intent.action, "hold")
+        self.assertEqual(intent.reason, "dump_wide_spread")
+
+    def test_both_underwater_skips_spread(self):
+        from buy.hedge_gate import evaluate_held_bag
+        # Textbook 33/50: spread 16.7¢ > 20? actually 0.167 < 0.20 would pass spread
+        # Use 33/55 spread 22¢ > 20 so only level exception saves it.
+        intent = evaluate_held_bag(
+            0.335, 0.55,
+            now_s=10.0,
+            persist_armed_ts=None,
+            persist_s=5.0,
+            dump_bid_max=0.35,
+            qualify_bid=0.60,
+            qualify_ask_max=0.62,
+            max_spread=0.20,
+            dump_persist_s=0.0,
+            dump_require_tight=True,
+            dump_ignore_spread_ask_max=0.60,
+        )
+        self.assertTrue(intent.dump)
+        self.assertEqual(intent.reason, "bid_le_dump")
+
+
+class OracleEdgeBandTests(unittest.TestCase):
+    def test_edge_too_small_blocks_when_still_favoring_held(self):
+        from buy.hedge_gate import hedge_oracle_allows_sell
+        allow, why = hedge_oracle_allows_sell(
+            "up",
+            {"ok": False, "favored": None, "reason": "edge_too_small", "edge_usd": 1.01},
+        )
+        self.assertFalse(allow)
+        self.assertEqual(why, "oracle_still_winning_small")
+
+    def test_edge_too_small_allows_when_against_held(self):
+        from buy.hedge_gate import hedge_oracle_allows_sell
+        allow, why = hedge_oracle_allows_sell(
+            "up",
+            {"ok": False, "favored": None, "reason": "edge_too_small", "edge_usd": -1.01},
+        )
+        self.assertTrue(allow)
+        self.assertEqual(why, "oracle_against_small")
+
+
+
+class TakeProfitGateTests(unittest.TestCase):
+    """Take-profit: bid >= vwap + edge; grandfather start_ts; oracle bypass."""
+
+    def test_blended_cost_prefers_entry_over_fill(self):
+        from buy.hedge_gate import blended_cost_per_share
+        self.assertAlmostEqual(
+            blended_cost_per_share(7.3, 7.71052, 0.99), 7.3 / 7.71052, places=6,
+        )
+        self.assertAlmostEqual(
+            blended_cost_per_share(0, 7.71, 0.947), 0.947, places=6,
+        )
+        self.assertIsNone(blended_cost_per_share(0, 0, None))
+
+    def test_ready_at_vwap_plus_edge(self):
+        from buy.hedge_gate import take_profit_ready
+        # Joel example: vwap 0.947 -> take profit at bid >= 0.987
+        self.assertTrue(take_profit_ready(0.987, 0.947, 0.04))
+        self.assertTrue(take_profit_ready(0.99, 0.947, 0.04))
+        self.assertFalse(take_profit_ready(0.986, 0.947, 0.04))
+        self.assertFalse(take_profit_ready(None, 0.947, 0.04))
+
+    def test_grandfather_excludes_9am_includes_10am(self):
+        from buy.hedge_gate import take_profit_market_armed
+        floor = 1788789600.0  # 10:00 ET 2026-09-07
+        self.assertFalse(take_profit_market_armed(1788786000.0, floor))  # 9am
+        self.assertTrue(take_profit_market_armed(1788789600.0, floor))   # 10am
+        self.assertTrue(take_profit_market_armed(1788793200.0, floor))   # 11am
+        self.assertTrue(take_profit_market_armed(1788786000.0, 0.0))     # 0 = all
+
+    def test_overrides_oracle_when_armed(self):
+        from buy.hedge_gate import take_profit_overrides_oracle
+        floor = 1788789600.0
+        self.assertTrue(
+            take_profit_overrides_oracle(
+                0.987, 0.947, 0.04,
+                enabled=True,
+                market_start_ts=1788789600.0,
+                from_start_ts=floor,
+            )
+        )
+        self.assertFalse(
+            take_profit_overrides_oracle(
+                0.99, 0.947, 0.04,
+                enabled=True,
+                market_start_ts=1788786000.0,
+                from_start_ts=floor,
+            )
+        )
+        self.assertFalse(
+            take_profit_overrides_oracle(
+                0.99, 0.947, 0.04,
+                enabled=False,
+                market_start_ts=1788789600.0,
+                from_start_ts=floor,
+            )
+        )
+
+    def test_persist_dip_before_hold_does_not_fire(self):
+        """Bid hits target at t=0, dips at t=2 -> timer reset, no sell."""
+        from buy.hedge_gate import hedge_persist_ready, take_profit_ready
+        persist_s = 5.0
+        vwap, edge = 0.947, 0.04
+        # t=0: qualifies -> arm, no fire
+        q0 = take_profit_ready(0.987, vwap, edge)
+        self.assertTrue(q0)
+        fire, armed, why = hedge_persist_ready(
+            q0, now_s=1000.0, armed_ts=None, persist_s=persist_s, toxic=False,
+        )
+        self.assertFalse(fire)
+        self.assertEqual(why, "armed")
+        self.assertEqual(armed, 1000.0)
+        # t=2: still qualifies -> waiting
+        fire, armed, why = hedge_persist_ready(
+            take_profit_ready(0.988, vwap, edge),
+            now_s=1002.0, armed_ts=armed, persist_s=persist_s, toxic=False,
+        )
+        self.assertFalse(fire)
+        self.assertEqual(why, "waiting")
+        self.assertEqual(armed, 1000.0)
+        # t=2.1: dips below target -> reset
+        fire, armed, why = hedge_persist_ready(
+            take_profit_ready(0.986, vwap, edge),
+            now_s=1002.1, armed_ts=armed, persist_s=persist_s, toxic=False,
+        )
+        self.assertFalse(fire)
+        self.assertEqual(why, "reset")
+        self.assertIsNone(armed)
+
+    def test_persist_hold_then_fire(self):
+        """Bid stays qualifying for persist_s -> fire."""
+        from buy.hedge_gate import hedge_persist_ready, take_profit_ready
+        persist_s = 5.0
+        vwap, edge = 0.947, 0.04
+        fire, armed, why = hedge_persist_ready(
+            take_profit_ready(0.987, vwap, edge),
+            now_s=2000.0, armed_ts=None, persist_s=persist_s, toxic=False,
+        )
+        self.assertFalse(fire)
+        self.assertEqual(why, "armed")
+        fire, armed, why = hedge_persist_ready(
+            take_profit_ready(0.99, vwap, edge),
+            now_s=2005.0, armed_ts=armed, persist_s=persist_s, toxic=False,
+        )
+        self.assertTrue(fire)
+        self.assertEqual(why, "ready")
+        self.assertEqual(armed, 2000.0)
+
+    def test_grandfather_still_blocks_9am_even_with_persist(self):
+        """9AM bag remains excluded; persist must not arm take-profit for it."""
+        from buy.hedge_gate import (
+            hedge_persist_ready,
+            take_profit_overrides_oracle,
+        )
+        floor = 1788789600.0
+        qualifies = take_profit_overrides_oracle(
+            0.99, 0.947, 0.04,
+            enabled=True,
+            market_start_ts=1788786000.0,  # 9AM
+            from_start_ts=floor,
+        )
+        self.assertFalse(qualifies)
+        fire, armed, why = hedge_persist_ready(
+            qualifies, now_s=1.0, armed_ts=None, persist_s=5.0, toxic=False,
+        )
+        self.assertFalse(fire)
+        self.assertEqual(why, "reset")
+        self.assertIsNone(armed)
+
+
+    def test_log_event_no_duplicate_bid_kwarg(self):
+        """Regression: take_profit must not pass bid= and bag bid together.
+
+        live_bag_log_fields already includes bid; an extra bid= raises
+        TypeError on log_event and re-arms persist forever (1pm Sep 7).
+        """
+        from pathlib import Path as _Path
+        import re
+        from buy.hedge_gate import live_bag_log_fields
+
+        def log_event(event, **kwargs):
+            return kwargs
+
+        bag = live_bag_log_fields(
+            slug="btc-updown-1h-test",
+            ttm=42.0,
+            bid=round(0.9851, 4),
+            ask=round(0.99, 4),
+            tick=0.01,
+        )
+        ok = log_event(
+            "take_profit_armed",
+            condition_id="0xabc",
+            leg="up",
+            size=7.76,
+            vwap=0.9401,
+            edge=0.04,
+            target=0.9801,
+            **bag,
+        )
+        self.assertEqual(ok["bid"], 0.9851)
+        self.assertEqual(ok["ask"], 0.99)
+        with self.assertRaises(TypeError) as ctx:
+            log_event(
+                "take_profit_armed",
+                condition_id="0xabc",
+                leg="up",
+                size=7.76,
+                bid=0.9851,
+                vwap=0.9401,
+                **bag,
+            )
+        self.assertIn("bid", str(ctx.exception))
+        lines = _Path(__file__).resolve().parents[1].joinpath(
+            "buybothourly.py"
+        ).read_text().splitlines()
+        for i, line in enumerate(lines):
+            if "**_tp_bag" not in line:
+                continue
+            window = lines[max(0, i - 18): i + 1]
+            joined = "\n".join(window)
+            self.assertIn("take_profit_", joined)
+            self.assertTrue(any("log_event(" in l for l in window))
+            start = next(j for j, l in enumerate(window) if "log_event(" in l)
+            call = window[start:]
+            for l in call:
+                self.assertFalse(
+                    bool(re.match(r"[ \t]*bid=", l)),
+                    msg="duplicate bid= in TP log_event:\n" + "\n".join(call),
+                )
+
+    def test_take_profit_sell_size_half_2dp(self):
+        """1pm bag 7.76 @ fraction 0.5 -> sell 3.88 (2dp ROUND_DOWN)."""
+        from buy.hedge_gate import take_profit_sell_size
+        self.assertEqual(take_profit_sell_size(7.76, 0.5), 3.88)
+        self.assertEqual(take_profit_sell_size(7.76, 1.0), 7.76)
+        self.assertEqual(take_profit_sell_size(0.015, 0.5), 0.0)
+        self.assertEqual(take_profit_sell_size(0.02, 0.5), 0.01)
+        self.assertEqual(take_profit_sell_size(None, 0.5), 0.0)
+        self.assertEqual(take_profit_sell_size(7.76, 0.0), 0.0)
+        self.assertEqual(take_profit_sell_size(7.75, 0.5), 3.87)
+
+
+    def test_take_profit_full_ready(self):
+        from buy.hedge_gate import take_profit_full_ready
+        self.assertTrue(take_profit_full_ready(0.99, 0.99))
+        self.assertTrue(take_profit_full_ready(0.991, 0.99))
+        self.assertFalse(take_profit_full_ready(0.989, 0.99))
+        self.assertFalse(take_profit_full_ready(0.99, 0.0))  # disabled
+        self.assertFalse(take_profit_full_ready(None, 0.99))
+
+    def test_take_profit_full_lock_reentry_in_source(self):
+        """After half-TP, full-lock may still fire; half path stays one-shot."""
+        from pathlib import Path
+        src = Path("buybothourly.py").read_text()
+        self.assertIn("take_profit_full_ready", src)
+        self.assertIn("TAKE_PROFIT_FULL_BID", src)
+        self.assertIn("full_lock", src)
+        # leftover after half-TP is not permanently blocked
+        self.assertIn(
+            'if meta.get("take_profit_done") and not _tp_full_lock',
+            src,
+        )
+
+    def test_take_profit_once_per_bag_gate_in_source(self):
+        """Half-TP sets take_profit_done; full-lock may re-enter afterward."""
+        from pathlib import Path as _Path
+        import re
+        src = _Path(__file__).resolve().parents[1].joinpath(
+            "buybothourly.py"
+        ).read_text()
+        # Half path still marks done; full-lock re-entry is explicit.
+        self.assertIn('meta.get("take_profit_done") and not _tp_full_lock', src)
+        self.assertIn('meta["take_profit_done"] = True', src)
+        self.assertIn("take_profit_sell_size(", src)
+        self.assertIn("_tp_sell_size", src)
+        self.assertRegex(
+            src,
+            r"sell_market_with_retry\(\s*\n\s*held_token,\s*\n\s*_tp_sell_size,",
+        )
+
+
+
 if __name__ == "__main__":
     unittest.main()
 

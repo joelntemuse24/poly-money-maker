@@ -74,3 +74,7 @@ Polymarket-History-*.csv
 exports/*.csv
 exports/*.parquet
 exports/*.json
+
+# Runtime rotations and operator backups
+*.log.*
+*.bak-*

@@ -20,8 +20,9 @@ Refs:
 - https://docs.polymarket.com/market-data/chainlink-twap
 
 Price To Beat = nearest last-print tick from that same trading feed to
-market `start_ts` (≤2s skew). If the bot missed the open, PTB is missing
-and buys are refused.
+market `start_ts` (≤2s skew). If the ring missed the open (mid-window
+restart), Binance last-print feeds backfill PTB from a 1s kline open at
+`start_ts` via REST; only then fail closed if that also fails.
 """
 
 from __future__ import annotations
@@ -32,6 +33,8 @@ import math
 import os
 import threading
 import time
+import urllib.error
+import urllib.request
 from collections import deque
 from typing import Any, Deque, Dict, Optional, Tuple
 
@@ -42,6 +45,11 @@ RTDS_URL = "wss://ws-live-data.polymarket.com"
 # Keep ~3h of ~1Hz ticks so windows still resolve PTB after brief blips.
 RING_MAX_SAMPLES = 12_000
 PTB_MAX_SKEW_MS = 2000
+BINANCE_KLINE_PTB_URL = (
+    "https://api.binance.com/api/v3/klines"
+    "?symbol=BTCUSDT&interval=1s&startTime={start_ms}&limit=1"
+)
+BINANCE_PTB_REST_TIMEOUT_S = 3.0
 LIVE_STALE_S = 5.0
 PTB_CACHE_MAX = 512
 RESEARCH_MAX_BYTES = 50 * 1024 * 1024  # 50 MiB per research file
@@ -257,7 +265,11 @@ class BtcUnderlyingFeed:
         return self.capture_ptb(start_ts)
 
     def capture_ptb(self, start_ts: float) -> Optional[Dict[str, Any]]:
-        """Lock PTB from this feed's ticks nearest to start_ts."""
+        """Lock PTB from this feed's ticks nearest to start_ts.
+
+        If the ring missed the open (skew > PTB_MAX_SKEW_MS or empty), Binance
+        last-print feeds backfill from a 1s BTCUSDT kline open at start_ts.
+        """
         key = int(start_ts)
         target_ms = key * 1000
         now = time.time()
@@ -267,44 +279,102 @@ class BtcUnderlyingFeed:
         with self._lock:
             if key in self._ptb:
                 return dict(self._ptb[key])
+            label = self.meta["label"]
+            ring_rec: Optional[Dict[str, Any]] = None
             if not self._ticks:
-                rec = {
+                ring_rec = {
                     "ok": False,
                     "reason": "no_ticks",
                     "start_ts": key,
                     "source": "missing",
                     "feed": self.source,
-                    "feed_label": self.meta["label"],
+                    "feed_label": label,
                     "resolution_url": self.meta["resolution_url"],
                     "captured_at": now,
                 }
-                # RTDS has no snapshot/replay for TWAP streams. A feed that
-                # connects just after market open can briefly have no tick;
-                # do not permanently poison this market's PTB cache.
-                return dict(rec)
+            else:
+                best_ts, best_px = min(self._ticks, key=lambda t: abs(t[0] - target_ms))
+                skew_ms = abs(best_ts - target_ms)
+                ok = skew_ms <= PTB_MAX_SKEW_MS
+                ring_rec = {
+                    "ok": ok,
+                    "ptb": float(best_px),
+                    "ptb_tick_ts_ms": int(best_ts),
+                    "ptb_skew_ms": int(skew_ms),
+                    "start_ts": key,
+                    "source": label if ok else f"{label}_skewed",
+                    "feed": self.source,
+                    "feed_label": label,
+                    "resolution_url": self.meta["resolution_url"],
+                    "reason": None if ok else "skew_too_large",
+                    "captured_at": now,
+                }
+                if ok:
+                    self._ptb[key] = ring_rec
+                    self._trim_ptb_unlocked()
+                    self._save_ptb_store_unlocked()
+                    return dict(ring_rec)
 
-            best_ts, best_px = min(self._ticks, key=lambda t: abs(t[0] - target_ms))
-            skew_ms = abs(best_ts - target_ms)
-            ok = skew_ms <= PTB_MAX_SKEW_MS
-            label = self.meta["label"]
-            rec = {
-                "ok": ok,
-                "ptb": float(best_px),
-                "ptb_tick_ts_ms": int(best_ts),
-                "ptb_skew_ms": int(skew_ms),
-                "start_ts": key,
-                "source": label if ok else f"{label}_skewed",
-                "feed": self.source,
-                "feed_label": label,
-                "resolution_url": self.meta["resolution_url"],
-                "reason": None if ok else "skew_too_large",
-                "captured_at": now,
-            }
-            if ok:
-                self._ptb[key] = rec
-                self._trim_ptb_unlocked()
-                self._save_ptb_store_unlocked()
-            return dict(rec)
+        # Outside the lock: REST backfill for Binance when ring missed open.
+        if self.source == SOURCE_BINANCE:
+            rest = self._fetch_binance_ptb_kline(target_ms)
+            if rest is not None:
+                px, open_ms = rest
+                skew_ms = abs(int(open_ms) - target_ms)
+                if skew_ms <= PTB_MAX_SKEW_MS:
+                    now2 = time.time()
+                    rec = {
+                        "ok": True,
+                        "ptb": float(px),
+                        "ptb_tick_ts_ms": int(open_ms),
+                        "ptb_skew_ms": int(skew_ms),
+                        "start_ts": key,
+                        "source": f"{label}_kline_1s",
+                        "feed": self.source,
+                        "feed_label": label,
+                        "resolution_url": self.meta["resolution_url"],
+                        "reason": None,
+                        "captured_at": now2,
+                        "backfill": "binance_kline_1s",
+                    }
+                    with self._lock:
+                        if key in self._ptb:
+                            return dict(self._ptb[key])
+                        self._ptb[key] = rec
+                        self._trim_ptb_unlocked()
+                        self._save_ptb_store_unlocked()
+                        return dict(rec)
+
+        return dict(ring_rec) if ring_rec is not None else None
+
+    def _fetch_binance_ptb_kline(self, start_ms: int) -> Optional[Tuple[float, int]]:
+        """Return (open_price, open_time_ms) for the 1s BTCUSDT kline at start_ms."""
+        url = BINANCE_KLINE_PTB_URL.format(start_ms=int(start_ms))
+        try:
+            req = urllib.request.Request(
+                url, headers={"User-Agent": "poly-money-maker-ptb/1"}
+            )
+            with urllib.request.urlopen(req, timeout=BINANCE_PTB_REST_TIMEOUT_S) as resp:
+                raw = resp.read().decode("utf-8")
+            rows = json.loads(raw)
+            if not rows or not isinstance(rows, list):
+                return None
+            row = rows[0]
+            open_ms = int(row[0])
+            px = float(row[1])
+            if not math.isfinite(px) or px <= 0:
+                return None
+            return px, open_ms
+        except (
+            urllib.error.URLError,
+            TimeoutError,
+            ValueError,
+            TypeError,
+            IndexError,
+            OSError,
+        ) as e:
+            log.warning("binance_ptb_kline_fail start_ms=%s: %s", start_ms, e)
+            return None
 
     def underlying_check(self, start_ts: float, min_edge_usd: float) -> Dict[str, Any]:
         """Fast memory-only trading gate: last live BTC vs window-open PTB."""
