@@ -815,7 +815,7 @@ class AmbiguousCrossCyclePolicy(unittest.TestCase):
         self.assertIn('"hedge_threshold": 0.50', hourly)
         self.assertIn('"hedge_require_ask_max": 0.52', hourly)
         self.assertIn('"hedge_persist_s": 5.0', hourly)
-        self.assertIn('"hedge_toxic_bid_max": 0.35', hourly)
+        self.assertIn('"hedge_toxic_bid_max": 0.0', hourly)
         self.assertIn('"hedge_recovery_cancel": 0.53', hourly)
         self.assertIn('"hedge_sell_fade": True', hourly)
         self.assertIn('"hedge_require_oracle": True', hourly)
