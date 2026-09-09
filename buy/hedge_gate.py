@@ -1,11 +1,15 @@
 """Hedge persist gate and CLOB tick helpers (no I/O).
 
 Toxic dumps stay instant unless ``dump_persist_s`` > 0 (5m V-reversal hold).
+``dump_require_tight`` (hourly) needs ask + spread ≤ max_spread, unless ask ≤ dump_ignore_spread_ask_max (both sides underwater).
 """
 
 from __future__ import annotations
 
+import math
+
 import re
+from decimal import Decimal, ROUND_DOWN
 from typing import NamedTuple, Optional, Tuple
 
 _CLOB_TICKS = (0.1, 0.01, 0.005, 0.0025, 0.001, 0.0001)
@@ -280,11 +284,18 @@ def evaluate_held_bag(
     flatten_max=None,
     dump_persist_s=0.0,
     dump_armed_ts=None,
+    dump_require_tight=False,
+    dump_ignore_spread_ask_max=0.60,
 ):
     """Dump / persist-sell / hold for one live bag.
 
-    * Bid ≤ dump dumps every bag. Bid-only. No GUI / last-trade veto.
-      Wide 22/77 still dumps. ``dump_persist_s`` ≤ 0 is instant (hourly).
+    * Bid ≤ dump dumps every bag. Default is bid-only (no GUI / last-trade
+      veto) so wide 22/77 still dumps. ``dump_persist_s`` ≤ 0 is instant.
+      When ``dump_require_tight`` (hourly live), also require ask and
+      ``ask-bid ≤ max_spread`` for the whole dump persist window — blocks
+      34/99 phantom bids. If ask ≤ ``dump_ignore_spread_ask_max``
+      (default 60¢), skip the spread check: both sides underwater
+      (textbook 33/50 loser). 5m keeps bid-only.
       5m live is **2s**: a one-tick 40¢ V-reversal must stay ≤ dump
       before the sell. Flatten walks stay instant.
     * Flatten (5m walks): when ``flatten`` and bid < ``flatten_max``
@@ -327,6 +338,31 @@ def evaluate_held_bag(
         )
 
     if bid_f <= dump_max + 1e-12:
+        # Optional tight-book gate (hourly): phantom penny bids under a
+        # still-high ask must not arm/fire dump.
+        if dump_require_tight:
+            if ask_f is None:
+                return HedgeIntent(
+                    "hold", "dump_missing_ask", None, persist_armed_ts if done else None,
+                    done, True, None, False, None,
+                )
+            # Both sides ≤ level → real toxic book; spread alone is a bad
+            # proxy (33/50 dumps; 34/99 phantom still blocked below).
+            try:
+                ignore_ask_max = float(dump_ignore_spread_ask_max)
+            except (TypeError, ValueError):
+                ignore_ask_max = 0.60
+            both_underwater = ask_f <= ignore_ask_max + 1e-12
+            if not both_underwater:
+                try:
+                    spread_max = float(max_spread)
+                except (TypeError, ValueError):
+                    spread_max = 0.20
+                if (ask_f - bid_f) > spread_max + 1e-12:
+                    return HedgeIntent(
+                        "hold", "dump_wide_spread", None, persist_armed_ts if done else None,
+                        done, True, None, False, None,
+                    )
         try:
             dump_wait = float(dump_persist_s or 0)
         except (TypeError, ValueError):
@@ -522,12 +558,14 @@ def live_bag_log_fields(
 
 
 def hedge_oracle_allows_sell(held_leg, check, *, enabled=True):
-    """Once holding, do not sell while last live BTC is still on the held side of PTB.
+    """Once holding, do not sell while last live BTC clearly favors the held leg.
 
     CLOB one-ticks and unreflective TOB are not a hedge if the last-print
     oracle still says the held leg wins. Missing/stale oracle also blocks
     the sell (fail closed against false hedges). A flipped or exactly-flat
-    oracle lets the book persist/dump path continue.
+    oracle lets the book path continue. For ``edge_too_small``, use the
+    signed edge: still-agreeing (favorable) blocks; against allows. Near-PTB
+    dumps that ignore oracle remain a separate override.
     """
     if not enabled:
         return True, "oracle_off"
@@ -541,8 +579,22 @@ def hedge_oracle_allows_sell(held_leg, check, *, enabled=True):
         return False, "oracle_still_winning"
     if favored in ("up", "down") and favored != leg:
         return True, "oracle_against"
-    if str(check.get("reason") or "") == "edge_zero":
+    reason = str(check.get("reason") or "")
+    if reason == "edge_zero":
         return True, "oracle_flat"
+    if reason == "edge_too_small":
+        try:
+            edge = float(check.get("edge_usd"))
+        except (TypeError, ValueError):
+            return False, "oracle_unknown"
+        if not math.isfinite(edge):
+            return False, "oracle_unknown"
+        if edge == 0:
+            return True, "oracle_flat"
+        favored_small = "up" if edge > 0 else "down"
+        if favored_small == leg:
+            return False, "oracle_still_winning_small"
+        return True, "oracle_against_small"
     return False, "oracle_unknown"
 
 
@@ -597,6 +649,132 @@ def hedge_oracle_blocks_sell(*, dump, oracle_agrees, dump_ignore_oracle=True) ->
     return bool(oracle_agrees)
 
 
+
+def blended_cost_per_share(pnl_entry_cost, bought_size, fill_price=None):
+    """Blended VWAP: pnl_entry_cost / bought_size, else fill_price fallback."""
+    try:
+        size = float(bought_size or 0)
+    except (TypeError, ValueError):
+        size = 0.0
+    try:
+        cost = float(pnl_entry_cost or 0)
+    except (TypeError, ValueError):
+        cost = 0.0
+    if size > 1e-12 and cost > 0:
+        return cost / size
+    return _finite_px(fill_price)
+
+
+def take_profit_market_armed(market_start_ts, from_start_ts) -> bool:
+    """True when take-profit may apply to this market window.
+
+    from_start_ts <= 0 means all markets (no grandfather floor).
+    Live deploy sets from_start_ts to 10:00 America/New_York 2026-09-07
+    (= 1788789600) so the open 9AM ET bag (start 1788786000) is excluded.
+    """
+    try:
+        floor = float(from_start_ts or 0)
+    except (TypeError, ValueError):
+        floor = 0.0
+    if floor <= 1e-12:
+        return True
+    try:
+        start = float(market_start_ts)
+    except (TypeError, ValueError):
+        return False
+    return start + 1e-12 >= floor
+
+
+def take_profit_ready(bid, vwap, edge) -> bool:
+    """True when live bid >= blended cost + edge (e.g. vwap 0.947 -> bid >= 0.987)."""
+    bid_f = _finite_px(bid)
+    vwap_f = _finite_px(vwap)
+    if bid_f is None or vwap_f is None:
+        return False
+    try:
+        edge_f = float(edge)
+    except (TypeError, ValueError):
+        return False
+    if edge_f < 0:
+        return False
+    return bid_f + 1e-12 >= vwap_f + edge_f
+
+
+
+
+def take_profit_full_ready(bid, full_bid) -> bool:
+    """True when live bid is locked at/above the full-exit threshold.
+
+    Polymarket UI often shows ~99.9¢ while the 0.01-tick book prints bid
+    0.99 / ask 0.999. Default full_bid 0.999 means: if bid holds at/above 99.9¢, sell the whole bag — including leftover after a half TP.
+    full_bid <= 0 disables the lock path.
+    """
+    bid_f = _finite_px(bid)
+    if bid_f is None:
+        return False
+    try:
+        lock = float(full_bid)
+    except (TypeError, ValueError):
+        return False
+    if lock <= 1e-12:
+        return False
+    if lock > 1.0:
+        return False
+    return bid_f + 1e-12 >= lock
+
+
+def take_profit_sell_size(held_size, fraction=0.5) -> float:
+    """Shares to FAK on take-profit: fraction of bag, CLOB 2dp ROUND_DOWN.
+
+    Returns 0.0 when the rounded size is below one cent-share (0.01), so
+    callers can skip rather than posting a dust order. Default fraction 0.5
+    locks half the bag and leaves the rest for resolution / hedge / dump.
+    """
+    try:
+        held = float(held_size or 0)
+    except (TypeError, ValueError):
+        return 0.0
+    try:
+        frac = float(fraction)
+    except (TypeError, ValueError):
+        return 0.0
+    if held <= 1e-12 or frac <= 1e-12:
+        return 0.0
+    if frac > 1.0:
+        frac = 1.0
+    raw = Decimal(str(held)) * Decimal(str(frac))
+    shares = raw.quantize(Decimal("0.01"), rounding=ROUND_DOWN)
+    if shares < Decimal("0.01"):
+        return 0.0
+    out = float(shares)
+    if out > held + 1e-12:
+        out = float(
+            Decimal(str(held)).quantize(Decimal("0.01"), rounding=ROUND_DOWN)
+        )
+    return out
+
+
+def take_profit_overrides_oracle(
+    bid,
+    vwap,
+    edge,
+    *,
+    enabled=True,
+    market_start_ts=None,
+    from_start_ts=0.0,
+) -> bool:
+    """True when a take-profit sell should proceed even if oracle still agrees.
+
+    Same spirit as hedge_dump_overrides_oracle / toxic flatten: book + cost
+    edge alone is enough; do not wait for BTC to flip against a winning bag.
+    """
+    if not enabled:
+        return False
+    if not take_profit_market_armed(market_start_ts, from_start_ts):
+        return False
+    return take_profit_ready(bid, vwap, edge)
+
+
 def held_hedge_decision(
     rest_bid,
     rest_ask,
@@ -629,6 +807,8 @@ def held_hedge_decision(
     late_qualify=0.58,
     late_ask_max=0.60,
     late_recovery=0.62,
+    dump_require_tight=False,
+    dump_ignore_spread_ask_max=0.60,
 ):
     """REST + pick + evaluate + oracle block for one held tick (no I/O).
 
@@ -688,6 +868,8 @@ def held_hedge_decision(
         flatten_max=flatten_max,
         dump_persist_s=dump_persist_s,
         dump_armed_ts=dump_armed_ts,
+        dump_require_tight=dump_require_tight,
+        dump_ignore_spread_ask_max=dump_ignore_spread_ask_max,
     )
     if hedge_oracle_blocks_sell(
         dump=bool(intent.dump),

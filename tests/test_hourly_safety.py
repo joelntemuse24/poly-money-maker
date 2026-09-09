@@ -270,6 +270,7 @@ class HourlyExecutorSafetyTests(unittest.TestCase):
                 "get_quote_fast": lambda *_a, **_k: (
                     0.84, 10.0, 0.85, 10.0, 0.845,
                 ),
+                "emit_buy_depth_ladder": lambda *_a, **_k: None,
                 "entry_book_ok": lambda *_a, **_k: (True, "ok"),
                 "safe_api_call": lambda fn, *a, **k: fn(*a, **k),
                 "client": SimpleNamespace(
@@ -618,11 +619,12 @@ class HourlySafetyWiringTests(unittest.TestCase):
     def test_production_calls_wire_hooks_and_deadlines(self):
         for name in ("buy_market_with_retry", "sell_market_with_retry"):
             calls = self._calls(name)
-            self.assertEqual(len(calls), 1, name)
-            keywords = {kw.arg for kw in calls[0].keywords}
-            self.assertIn("pre_submit", keywords, name)
-            self.assertIn("deadline_ts", keywords, name)
-            self.assertIn("on_abort", keywords, name)
+            self.assertEqual(len(calls), 1 if name == "buy_market_with_retry" else 2, name)
+            for call in calls:
+                keywords = {kw.arg for kw in call.keywords}
+                self.assertIn("pre_submit", keywords, name)
+                self.assertIn("deadline_ts", keywords, name)
+                self.assertIn("on_abort", keywords, name)
 
     def test_nested_final_gates_cover_oracle_time_side_and_closed_state(self):
         nested = {

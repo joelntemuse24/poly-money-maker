@@ -149,9 +149,7 @@ class LaggingTwapWouldSkipLastPrintFires(unittest.TestCase):
         twap_side = side_from_live_vs_ptb(self.lagging_twap, self.ptb, 0.0)
         self.assertEqual(twap_side["favored"], "up")
         self.assertFalse(oracle_favors_other_leg(twap_side, "down"))
-        # 86¢ other-leg ask is the trigger even if a lagging print still
-        # says Up. The live bot no longer skips that as oracle_still_held.
-        fire_lag, why_lag, _ = evaluate_complement(
+        skip, skip_why, _ = evaluate_complement(
             other_ask=0.86,
             other_bid=0.84,
             held_shares=10.87,
@@ -159,8 +157,8 @@ class LaggingTwapWouldSkipLastPrintFires(unittest.TestCase):
             primary_still_holding=True,
             oracle_favors_other=oracle_favors_other_leg(twap_side, "down"),
         )
-        self.assertTrue(fire_lag)
-        self.assertEqual(why_lag, "fire")
+        self.assertFalse(skip)
+        self.assertEqual(skip_why, "oracle_still_held")
 
     def test_hedge_require_oracle_follows_last_print(self):
         live_feed = BtcUnderlyingFeed(SOURCE_CHAINLINK, "")
@@ -209,6 +207,50 @@ class BotsWireLastPrintOracle(unittest.TestCase):
         self.assertIn("SOURCE_BINANCE", hourly)
         self.assertIn("ptb_binance_buyhourly.json", hourly)
         self.assertIn("oracle_favors_other_leg", complement)
+
+class BinancePtbKlineBackfill(unittest.TestCase):
+    """Mid-window restart: ring only has late ticks → REST 1s kline PTB."""
+
+    def test_skewed_ring_backfills_binance_kline(self):
+        start = time.time() - 600.0  # bot joined ~10m late
+        feed = BtcUnderlyingFeed(SOURCE_BINANCE, "")
+        # Only a live tick far from open — classic post-restart ring.
+        late_ms = int(time.time() * 1000)
+        self.assertTrue(feed._push_tick(late_ms, 111_000.0, live=True))
+
+        def fake_fetch(start_ms: int):
+            self.assertEqual(start_ms, int(start) * 1000)
+            return 110_000.0, int(start) * 1000
+
+        feed._fetch_binance_ptb_kline = fake_fetch  # type: ignore[method-assign]
+        rec = feed.capture_ptb(start)
+        self.assertIsNotNone(rec)
+        self.assertTrue(rec["ok"])
+        self.assertEqual(rec["source"], "binance_btcusdt_kline_1s")
+        self.assertEqual(rec["backfill"], "binance_kline_1s")
+        self.assertAlmostEqual(rec["ptb"], 110_000.0)
+        chk = feed.underlying_check(start, 0.0)
+        self.assertTrue(chk["ok"])
+        self.assertEqual(chk["favored"], "up")
+        self.assertNotEqual(chk["reason"], "missing_ptb")
+
+    def test_chainlink_does_not_call_binance_rest(self):
+        start = time.time() - 600.0
+        feed = BtcUnderlyingFeed(SOURCE_CHAINLINK, "")
+        late_ms = int(time.time() * 1000)
+        self.assertTrue(feed._push_tick(late_ms, 100_000.0, live=True))
+        called = {"n": 0}
+
+        def boom(_start_ms: int):
+            called["n"] += 1
+            raise AssertionError("chainlink must not hit Binance REST")
+
+        feed._fetch_binance_ptb_kline = boom  # type: ignore[method-assign]
+        rec = feed.capture_ptb(start)
+        self.assertFalse(rec["ok"])
+        self.assertEqual(called["n"], 0)
+        chk = feed.underlying_check(start, 0.0)
+        self.assertEqual(chk["reason"], "missing_ptb")
 
 
 if __name__ == "__main__":
