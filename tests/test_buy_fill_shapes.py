@@ -1008,6 +1008,7 @@ class BuyExecutionAmbiguity(unittest.TestCase):
                 "get_quote_fast": lambda *_a, **_k: (0.97, None, 0.98, 100.0, None),
                 "entry_book_ok": lambda *_a, **_k: (True, "ok"),
                 "safe_api_call": lambda fn, *a, **k: fn(*a, **k),
+                "emit_buy_depth_ladder": lambda **_k: None,
                 "client": SimpleNamespace(
                     create_order=create_order,
                     post_order=post,

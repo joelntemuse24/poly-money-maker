@@ -63,6 +63,12 @@ from buy.hedge_gate import (
 )
 from buy.probe_15m import probe_spend_usd, should_evaluate_entries
 from buy.strategy_coherence import validate_15m_strategy_coherence
+from buy.depth_ladder import (
+    DEFAULT_TOPUP_TARGETS,
+    DepthPathTracker,
+    available_at_limit,
+    emit_depth_ladder_event,
+)
 
 
 class ImmediateResponseClobClient(ClobClient):
@@ -106,6 +112,13 @@ STATE_FILE = "positions_buy.json"
 PNL_FILE = "pnl_buy.json"
 HEARTBEAT_FILE = ".heartbeat_buy"
 RESEARCH_FILE = "underlying_research_buy.jsonl"
+DEPTH_LADDER_JSONL = "buy_data_15m/depth_ladder.jsonl"
+DEPTH_LADDER_BUDGETS = (5.0, 10.0, 20.0, 32.0, 40.0, 50.0, 100.0)
+DEPTH_TOPUP_JSONL = "buy_data_15m/depth_topup.jsonl"
+DEPTH_TOPUP_TARGETS = DEFAULT_TOPUP_TARGETS
+DEPTH_PATH_BUFFER_MAX = 120
+DEPTH_PATH_SAMPLE_MIN_INTERVAL_S = 1.0
+DEPTH_TOPUP_EMIT_MIN_INTERVAL_S = 12.0
 PTB_STORE_FILE = "ptb_chainlink_buy.json"
 UNDERLYING_SOURCE = require_last_print_source(SOURCE_CHAINLINK)
 SERIES_SLUG = "btc-up-or-down-15m"
@@ -1061,6 +1074,9 @@ def get_book_quote(token_id, expected_condition_id=None):
             "min_order_size": min_order_size,
             "tick_size": tick_size,
             "hash": book.get("hash"),
+            # Full ask ladder for depth telemetry (sorted ascending).
+            "asks": asks,
+            "bids": bids,
         }
         return bid_price, bid_size, ask_price, ask_size, mid_price
     except Exception as e:
@@ -1073,10 +1089,177 @@ _REST_QUOTE_MIN_INTERVAL_S = 0.2
 _REST_QUOTE_CACHE_MAX = 64
 _last_trade_cache = {}
 _LAST_TRADE_MIN_INTERVAL_S = 0.25
+_depth_path_tracker = DepthPathTracker(
+    jsonl_path=DEPTH_TOPUP_JSONL,
+    targets=DEPTH_TOPUP_TARGETS,
+    maxlen=DEPTH_PATH_BUFFER_MAX,
+    sample_min_interval_s=DEPTH_PATH_SAMPLE_MIN_INTERVAL_S,
+    emit_min_interval_s=DEPTH_TOPUP_EMIT_MIN_INTERVAL_S,
+)
+
+
+def get_cached_ask_levels(token_id, max_age_s=2.0):
+    """Return ask (price, size) levels from the latest REST book snapshot if fresh."""
+    meta = _book_snapshot_meta.get(str(token_id))
+    if not meta:
+        return []
+    received = meta.get("received_mono")
+    if received is None:
+        return []
+    age = time.monotonic() - float(received)
+    if age < 0 or age > float(max_age_s):
+        return []
+    asks = meta.get("asks") or []
+    return list(asks)
+
+
+def emit_buy_depth_ladder(
+    *,
+    token_id,
+    ask,
+    limit_price,
+    condition_id=None,
+    slug=None,
+    leg=None,
+    slice_name=None,
+    ttm=None,
+    attempt=None,
+    outcome=None,
+    asks=None,
+    budgets=DEPTH_LADDER_BUDGETS,
+):
+    """Log structured ask-depth telemetry (telemetry only; never blocks buys)."""
+    try:
+        levels = asks
+        if levels is None:
+            levels = get_cached_ask_levels(token_id, max_age_s=2.5)
+        if not levels:
+            # One best-effort REST pull when cache empty (order-path only).
+            try:
+                get_book_quote(token_id, expected_condition_id=condition_id)
+                levels = get_cached_ask_levels(token_id, max_age_s=2.5)
+            except Exception:
+                levels = []
+        emit_depth_ladder_event(
+            log_event=log_event,
+            jsonl_path=DEPTH_LADDER_JSONL,
+            asks=levels,
+            limit_price=limit_price,
+            budgets=budgets,
+            ask=ask,
+            condition_id=condition_id,
+            token_id=token_id,
+            slug=slug,
+            leg=leg,
+            slice_name=slice_name,
+            ttm=ttm,
+            attempt=attempt,
+            outcome=outcome,
+        )
+        gates_for_sample = outcome not in ("no_ask", "dry", None)
+        avail = available_at_limit(levels or [], limit_price, best_ask=ask)
+        _depth_path_tracker.record_sample(
+            available_notional=avail.get("available_notional") or 0.0,
+            available_shares=avail.get("available_shares") or 0.0,
+            best_ask=avail.get("best_ask") if avail.get("best_ask") is not None else ask,
+            gates_ok=bool(gates_for_sample),
+            ttm=ttm,
+            limit=limit_price,
+            source=avail.get("source"),
+            condition_id=condition_id,
+            token_id=token_id,
+            leg=leg,
+            slice_name=slice_name,
+            force=True,
+        )
+        _depth_path_tracker.emit_topup(
+            log_event=log_event,
+            condition_id=condition_id,
+            token_id=token_id,
+            slug=slug,
+            leg=leg,
+            slice_name=slice_name,
+            limit_price=limit_price,
+            ttm=ttm,
+            outcome=outcome,
+            force=True,
+        )
+    except Exception as exc:
+        try:
+            log_event(
+                "buy_depth_ladder_fail",
+                token_id=token_id,
+                error=str(exc)[:200],
+            )
+        except Exception:
+            pass
+
+
+def maybe_sample_depth_path_leg(
+    *,
+    condition_id,
+    token_id,
+    leg,
+    ask,
+    bid,
+    slug=None,
+    ask_size=None,
+    ttm=None,
+    limit_price=None,
+    gates_ok=None,
+):
+    """Cheap main-loop sample when we already have a quote (telemetry only)."""
+    if ask is None or not token_id:
+        return
+    try:
+        limit = finite_float(limit_price, minimum=0, maximum=1)
+        if limit is None:
+            limit = finite_float(ask, minimum=0, maximum=1)
+        if limit is None:
+            return
+        levels = get_cached_ask_levels(token_id, max_age_s=5.0)
+        if gates_ok is None:
+            book_ok, _why = entry_book_ok(bid, ask, MAX_ENTRY_SPREAD, MIN_WINNER_BID)
+            gates_ok = bool(book_ok)
+        avail = available_at_limit(
+            levels or [],
+            limit,
+            best_ask=ask,
+            best_ask_size=ask_size,
+        )
+        _depth_path_tracker.record_sample(
+            available_notional=avail.get("available_notional") or 0.0,
+            available_shares=avail.get("available_shares") or 0.0,
+            best_ask=avail.get("best_ask") if avail.get("best_ask") is not None else ask,
+            gates_ok=bool(gates_ok),
+            ttm=ttm,
+            limit=limit,
+            source=avail.get("source"),
+            condition_id=condition_id,
+            token_id=token_id,
+            leg=leg,
+        )
+        _depth_path_tracker.emit_topup(
+            log_event=log_event,
+            condition_id=condition_id,
+            token_id=token_id,
+            slug=slug,
+            leg=leg,
+            limit_price=limit,
+            ttm=ttm,
+            outcome="window_tick",
+            force=False,
+        )
+    except Exception:
+        pass
 
 
 def prune_rest_caches(keep_tokens=None):
     """Drop REST cache entries for tokens we no longer watch (market rollover)."""
+    try:
+        _depth_path_tracker.prune(keep_tokens=keep_tokens)
+    except Exception:
+        pass
     keep = {str(t) for t in (keep_tokens or []) if t}
     if keep:
         for cache in (_rest_quote_cache, _last_trade_cache):
@@ -2278,6 +2461,9 @@ def buy_market_with_retry(
     on_submit=None,
     condition_id=None,
     pre_submit=None,
+    depth_slug=None,
+    depth_leg=None,
+    depth_ttm=None,
 ):
     """Buy token_id via FAK, sized in shares at the quoted ask.
 
@@ -2317,6 +2503,30 @@ def buy_market_with_retry(
             f"{str(token_id)[:12]}… at the quoted ask (band {min_price:.3f}–{max_price:.3f})"
         )
         log_event("dry_buy", token_id=token_id, budget=budget, max_price=max_price, min_price=min_price)
+        dry_ask = None
+        dry_limit = float(max_price)
+        try:
+            _bid, _, dry_ask, _, _ = get_quote_fast(
+                token_id,
+                prefer_rest=True,
+                force_rest=False,
+                expected_condition_id=condition_id,
+            )
+            if dry_ask is not None:
+                dry_limit = float(dry_ask)
+        except Exception:
+            pass
+        emit_buy_depth_ladder(
+            token_id=token_id,
+            ask=dry_ask,
+            limit_price=dry_limit,
+            condition_id=condition_id,
+            slug=depth_slug,
+            leg=depth_leg,
+            ttm=depth_ttm,
+            attempt=1,
+            outcome="dry",
+        )
         return 0.0, 0.0, "dry"
     fee_schedule = None
 
@@ -2393,6 +2603,18 @@ def buy_market_with_retry(
         )
         if fresh_ask is None:
             console.print(f"  [dim yellow][NO ASK][/] no asks available · attempt {attempt + 1}/{max_retries}")
+            emit_buy_depth_ladder(
+                token_id=token_id,
+                ask=None,
+                limit_price=float(max_price),
+                condition_id=condition_id,
+                slug=depth_slug,
+                leg=depth_leg,
+                ttm=depth_ttm,
+                attempt=attempt + 1,
+                outcome="no_ask",
+                asks=[],
+            )
             break
         if fresh_ask > max_price:
             console.print(f"  [dim yellow][SKIP][/] ask {fresh_ask:.3f} > cap {max_price:.3f} · attempt {attempt + 1}/{max_retries}")
@@ -2424,6 +2646,18 @@ def buy_market_with_retry(
         price = fresh_ask
         spend = shares * price
         max_shares = shares
+        # Research telemetry: depth at the live FAK ask for $5–$100 (no trade effect).
+        emit_buy_depth_ladder(
+            token_id=token_id,
+            ask=fresh_ask,
+            limit_price=price,
+            condition_id=condition_id,
+            slug=depth_slug,
+            leg=depth_leg,
+            ttm=depth_ttm,
+            attempt=attempt + 1,
+            outcome="order_path",
+        )
         ambiguous = False
         result = None
         if pre_submit:
@@ -2539,6 +2773,17 @@ def buy_market_with_retry(
                         f"  [dim yellow][FAK EMPTY][/] no match · re-quote "
                         f"{attempt + 2}/{max_retries}"
                     )
+                    emit_buy_depth_ladder(
+                        token_id=token_id,
+                        ask=fresh_ask,
+                        limit_price=price,
+                        condition_id=condition_id,
+                        slug=depth_slug,
+                        leg=depth_leg,
+                        ttm=depth_ttm,
+                        attempt=attempt + 1,
+                        outcome="fak_empty",
+                    )
                     continue
                 else:
                     break
@@ -2618,6 +2863,17 @@ def buy_market_with_retry(
                     f"  [dim yellow][FAK NULL][/] explicit {response_status or 'empty'} "
                     "with 0 confirmed fill · stopping"
                 )
+                emit_buy_depth_ladder(
+                    token_id=token_id,
+                    ask=fresh_ask,
+                    limit_price=price,
+                    condition_id=condition_id,
+                    slug=depth_slug,
+                    leg=depth_leg,
+                    ttm=depth_ttm,
+                    attempt=attempt + 1,
+                    outcome="fak_null",
+                )
                 break
             log_event(
                 "buy_attempt_ambiguous_status", token_id=token_id,
@@ -2687,6 +2943,17 @@ def buy_market_with_retry(
             "buy_fill", token_id=token_id, filled=filled, price=price, avg_price=round(avg, 4),
             spend=round(spend, 4), spent=round(spent, 4),
             remaining_budget=round(remaining_budget, 4), attempt=attempt + 1,
+        )
+        emit_buy_depth_ladder(
+            token_id=token_id,
+            ask=fresh_ask,
+            limit_price=price,
+            condition_id=condition_id,
+            slug=depth_slug,
+            leg=depth_leg,
+            ttm=depth_ttm,
+            attempt=attempt + 1,
+            outcome="filled",
         )
         if remaining_budget < 0.01:
             return total_bought, spent, "filled"
@@ -4704,8 +4971,8 @@ while not _shutdown_requested:
                 )
                 fut_ul = _entry_executor.submit(get_last_trade_price, m.up_token)
                 fut_dl = _entry_executor.submit(get_last_trade_price, m.dn_token)
-                up_bid, _, up_ask, _, up_mid = fut_up.result()
-                dn_bid, _, dn_ask, _, dn_mid = fut_dn.result()
+                up_bid, _, up_ask, up_ask_size, up_mid = fut_up.result()
+                dn_bid, _, dn_ask, dn_ask_size, dn_mid = fut_dn.result()
                 up_last = fut_ul.result()
                 dn_last = fut_dl.result()
                 if up_last is None:
@@ -4764,6 +5031,31 @@ while not _shutdown_requested:
                 dn_ask_ok = dn_ask is not None and BUY_THRESHOLD <= dn_ask <= BUY_MAX_PRICE
                 up_book_ok, up_book_why = entry_book_ok(up_bid, up_ask, MAX_ENTRY_SPREAD, MIN_WINNER_BID)
                 dn_book_ok, dn_book_why = entry_book_ok(dn_bid, dn_ask, MAX_ENTRY_SPREAD, MIN_WINNER_BID)
+                _depth_ttm = round(minutes_left, 2)
+                maybe_sample_depth_path_leg(
+                    condition_id=cond,
+                    token_id=m.up_token,
+                    slug=getattr(m, "slug", None),
+                    leg="up",
+                    ask=up_ask,
+                    bid=up_bid,
+                    ask_size=up_ask_size,
+                    ttm=_depth_ttm,
+                    limit_price=up_ask if up_ask is not None else BUY_MAX_PRICE,
+                    gates_ok=bool(up_ask_ok and up_book_ok),
+                )
+                maybe_sample_depth_path_leg(
+                    condition_id=cond,
+                    token_id=m.dn_token,
+                    slug=getattr(m, "slug", None),
+                    leg="down",
+                    ask=dn_ask,
+                    bid=dn_bid,
+                    ask_size=dn_ask_size,
+                    ttm=_depth_ttm,
+                    limit_price=dn_ask if dn_ask is not None else BUY_MAX_PRICE,
+                    gates_ok=bool(dn_ask_ok and dn_book_ok),
+                )
                 up_consensus = (
                     up_gui is not None and dn_gui is not None
                     and up_gui >= MIN_WINNER_BID and dn_gui <= MAX_LOSER_BID
@@ -5028,6 +5320,9 @@ while not _shutdown_requested:
                     buy_token, spend_usd, BUY_MAX_PRICE, tick_size=tick, min_price=BUY_THRESHOLD,
                     on_fill=_persist_buy_fill, on_submit=_persist_buy_submit,
                     condition_id=cond,
+                    depth_slug=getattr(m, "slug", None),
+                    depth_leg=buy_leg,
+                    depth_ttm=round(minutes_left, 2),
                 )
                 wall_ms = time.time() * 1000
                 if bought > 0:
