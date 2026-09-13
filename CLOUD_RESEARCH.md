@@ -28,8 +28,29 @@ repo root → `pathlog/ticks/*.jsonl`. Do **not** attach `.env` or live JSON.
 (GET only). Wait until 5m markets **resolve**, then `--sweep --paper` on
 those files. Unresolved markets have no redeem P&L.
 
-Environment install: `.cursor/environment.json` (`python3.12-venv` + pip).
-Leave **Start** empty.
+Environment install: `.cursor/environment.json` (`python3.12-venv` + pip,
+plus optional `poly-vm` SSH when `POLY_VM_SSH_KEY` is set).
+**Start** only writes that optional SSH key (no bots, no systemd).
+
+## Cursor Cloud → poly-vm SSH
+
+Cloud agents can optionally SSH to the live Google VM as the read-only
+`poly-auditor` user. This is for logs, strategy JSON, and check scripts only.
+Paper research still works when the secret is unset.
+
+1. In **Cursor Dashboard → Cloud Agents → Secrets**, add Runtime Secret
+   `POLY_VM_SSH_KEY` = the `poly-auditor` ed25519 private key (PEM/OpenSSH
+   text). Never commit this key, and never paste it into chat or the repo.
+2. If the environment uses allowlist egress, allow SSH to `35.228.146.195`.
+3. After install or start, `ssh poly-vm` connects as `poly-auditor`
+   (`HostName 35.228.146.195`, key `~/.ssh/id_ed25519_poly_auditor`).
+4. Still never read `.env`, never POST live orders, and never start/stop
+   trading systemd units unless the operator explicitly asks.
+
+Install/start are idempotent: missing `POLY_VM_SSH_KEY` is a no-op; a
+second run rewrites the key file and does not duplicate the `Host poly-vm`
+block. `start` repeats the same helper so a runtime secret still works when
+agents boot from an environment snapshot (install does not rerun).
 
 ## 2. Paste prompt (live paper P&L — use this)
 

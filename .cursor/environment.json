@@ -1,3 +1,4 @@
 {
-  "install": "sudo apt-get update\nsudo apt-get install -y python3.12-venv\npython3 -m venv .venv\n.venv/bin/pip install -U pip\n.venv/bin/pip install -r requirements.txt"
+  "install": "sudo apt-get update\nsudo apt-get install -y python3.12-venv\npython3 -m venv .venv\n.venv/bin/pip install -U pip\n.venv/bin/pip install -r requirements.txt\nbash .cursor/setup_poly_vm_ssh.sh",
+  "start": "bash .cursor/setup_poly_vm_ssh.sh"
 }
