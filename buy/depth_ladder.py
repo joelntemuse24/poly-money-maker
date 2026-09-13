@@ -1,8 +1,8 @@
 """Ask-side depth ladder for research telemetry (no trading).
 
 Given ask levels and a FAK buy limit, report how much size is available for
-fixed dollar budgets. Used by the hourly buy bot to log book depth on every
-order-path attempt / fill without changing trade sizes.
+fixed dollar budgets. Used by the hourly and 15m buy bots to log book depth
+on every order-path attempt / fill without changing trade sizes.
 
 Also provides a short ring-buffer + ``simulate_topup_path`` so research can ask:
 if the single-tick max fill was only $18 against a $50 target, would topping up
@@ -392,6 +392,273 @@ def simulate_topup_path(
         "n_usable": len(usable),
         "buffer_span_s": span_s,
     }
+
+
+def build_depth_ladder_event(
+    asks: Any,
+    limit_price: Any,
+    *,
+    budgets: Iterable[float] = DEFAULT_BUDGETS,
+    ask: Any = None,
+    condition_id: Any = None,
+    token_id: Any = None,
+    slug: Any = None,
+    leg: Any = None,
+    slice_name: Any = None,
+    ttm: Any = None,
+    attempt: Any = None,
+    outcome: Any = None,
+) -> Dict[str, Any]:
+    """Build the ``buy_depth_ladder`` log payload (telemetry only)."""
+    ladder = compute_depth_ladder(asks, limit_price, budgets=budgets)
+    ask_f = _finite(ask, minimum=0, maximum=1)
+    limit_f = _finite(limit_price, minimum=0, maximum=1)
+    return {
+        "condition_id": condition_id,
+        "token_id": token_id,
+        "slug": slug,
+        "leg": leg,
+        "slice": slice_name,
+        "ask": round(float(ask_f), 4) if ask_f is not None else None,
+        "limit": round(float(limit_f), 4) if limit_f is not None else None,
+        "ttm": ttm,
+        "attempt": attempt,
+        "outcome": outcome,
+        "available_shares": ladder.get("available_shares"),
+        "available_notional": ladder.get("available_notional"),
+        "max_fill_shares": ladder.get("max_fill_shares"),
+        "max_fill_usd": ladder.get("max_fill_usd"),
+        "max_fill_vwap": ladder.get("max_fill_vwap"),
+        "clips_above_usd": ladder.get("clips_above_usd"),
+        "scale_summary": ladder.get("scale_summary"),
+        "budgets": ladder.get("budgets"),
+        "top_asks": ladder.get("top_asks") or summarize_ask_levels(asks, n=5),
+    }
+
+
+def emit_depth_ladder_event(
+    *,
+    log_event: Any,
+    jsonl_path: str,
+    asks: Any,
+    limit_price: Any,
+    budgets: Iterable[float] = DEFAULT_BUDGETS,
+    ask: Any = None,
+    condition_id: Any = None,
+    token_id: Any = None,
+    slug: Any = None,
+    leg: Any = None,
+    slice_name: Any = None,
+    ttm: Any = None,
+    attempt: Any = None,
+    outcome: Any = None,
+) -> Optional[Dict[str, Any]]:
+    """Compute, log, and append one ``buy_depth_ladder`` event.
+
+    Failures are swallowed (telemetry must never block a buy).
+    """
+    try:
+        payload = build_depth_ladder_event(
+            asks,
+            limit_price,
+            budgets=budgets,
+            ask=ask,
+            condition_id=condition_id,
+            token_id=token_id,
+            slug=slug,
+            leg=leg,
+            slice_name=slice_name,
+            ttm=ttm,
+            attempt=attempt,
+            outcome=outcome,
+        )
+        if log_event is not None:
+            log_event("buy_depth_ladder", **{
+                k: v for k, v in payload.items() if v is not None
+            })
+        if jsonl_path:
+            append_depth_ladder_jsonl(jsonl_path, {
+                "event": "buy_depth_ladder",
+                **payload,
+            })
+        return payload
+    except Exception as exc:
+        try:
+            if log_event is not None:
+                log_event(
+                    "buy_depth_ladder_fail",
+                    token_id=token_id,
+                    error=str(exc)[:200],
+                )
+        except Exception:
+            pass
+        return None
+
+
+class DepthPathTracker:
+    """Per-leg ring buffer + top-up path sim (research only)."""
+
+    def __init__(
+        self,
+        *,
+        jsonl_path: str,
+        targets: Iterable[float] = DEFAULT_TOPUP_TARGETS,
+        maxlen: int = DEFAULT_PATH_BUFFER_MAX,
+        sample_min_interval_s: float = 1.0,
+        emit_min_interval_s: float = 12.0,
+    ):
+        self.jsonl_path = jsonl_path
+        self.targets = tuple(targets)
+        self.maxlen = max(1, int(maxlen))
+        self.sample_min_interval_s = float(sample_min_interval_s)
+        self.emit_min_interval_s = float(emit_min_interval_s)
+        self._buffers: Dict[str, DepthPathBuffer] = {}
+        self._last_sample_mono: Dict[str, float] = {}
+        self._last_emit_mono: Dict[str, float] = {}
+
+    @staticmethod
+    def _key(condition_id=None, leg=None, token_id=None) -> Optional[str]:
+        if condition_id and leg:
+            return f"{condition_id}|{leg}"
+        if token_id:
+            return str(token_id)
+        return None
+
+    def _buffer(self, key: str) -> DepthPathBuffer:
+        buf = self._buffers.get(key)
+        if buf is None:
+            buf = DepthPathBuffer(maxlen=self.maxlen)
+            self._buffers[key] = buf
+        return buf
+
+    def prune(self, keep_tokens=None) -> None:
+        keep = {str(t) for t in (keep_tokens or []) if t}
+        if not keep:
+            if len(self._buffers) > 64:
+                for stale in list(self._buffers.keys())[:32]:
+                    self._buffers.pop(stale, None)
+                    self._last_sample_mono.pop(stale, None)
+                    self._last_emit_mono.pop(stale, None)
+            return
+        for key in list(self._buffers.keys()):
+            if "|" not in key and key not in keep:
+                self._buffers.pop(key, None)
+                self._last_sample_mono.pop(key, None)
+                self._last_emit_mono.pop(key, None)
+        if len(self._buffers) > 128:
+            ordered = sorted(
+                self._buffers.items(),
+                key=lambda kv: self._last_sample_mono.get(kv[0], 0.0),
+            )
+            for stale, _buf in ordered[:40]:
+                self._buffers.pop(stale, None)
+                self._last_sample_mono.pop(stale, None)
+                self._last_emit_mono.pop(stale, None)
+
+    def record_sample(
+        self,
+        *,
+        available_notional: float,
+        available_shares: float = 0.0,
+        best_ask: Optional[float] = None,
+        gates_ok: bool = False,
+        ttm: Optional[float] = None,
+        limit: Optional[float] = None,
+        source: Optional[str] = None,
+        condition_id=None,
+        token_id=None,
+        leg=None,
+        slice_name=None,
+        force: bool = False,
+        min_interval_s: Optional[float] = None,
+    ) -> Optional[Dict[str, Any]]:
+        key = self._key(condition_id, leg, token_id)
+        if not key:
+            return None
+        now_mono = time.monotonic()
+        interval = self.sample_min_interval_s if min_interval_s is None else float(min_interval_s)
+        if not force:
+            prev = self._last_sample_mono.get(key, 0.0)
+            if now_mono - prev < interval:
+                return None
+        sample = make_depth_sample(
+            available_notional=available_notional,
+            available_shares=available_shares,
+            best_ask=best_ask,
+            gates_ok=bool(gates_ok),
+            ttm=ttm,
+            limit=limit,
+            ts_mono=now_mono,
+            source=source,
+        )
+        if slice_name:
+            sample["slice"] = slice_name
+        self._buffer(key).append(sample)
+        self._last_sample_mono[key] = now_mono
+        return sample
+
+    def emit_topup(
+        self,
+        *,
+        log_event: Any,
+        condition_id=None,
+        token_id=None,
+        slug=None,
+        leg=None,
+        slice_name=None,
+        limit_price=None,
+        ttm=None,
+        outcome=None,
+        force: bool = False,
+        targets: Optional[Iterable[float]] = None,
+        min_interval_s: Optional[float] = None,
+    ) -> Optional[Dict[str, Any]]:
+        key = self._key(condition_id, leg, token_id)
+        if not key:
+            return None
+        buf = self._buffers.get(key)
+        if buf is None or len(buf) < 2:
+            return None
+        now_mono = time.monotonic()
+        interval = self.emit_min_interval_s if min_interval_s is None else float(min_interval_s)
+        if not force:
+            prev = self._last_emit_mono.get(key, 0.0)
+            if now_mono - prev < interval:
+                return None
+        samples = buf.samples()
+        use_targets = self.targets if targets is None else targets
+        sim = simulate_topup_path(samples, targets=use_targets)
+        limit = _finite(limit_price, minimum=0, maximum=1)
+        if limit is None and samples:
+            limit = _finite(samples[-1].get("limit"), minimum=0, maximum=1)
+        payload = {
+            "condition_id": condition_id,
+            "token_id": token_id,
+            "slug": slug,
+            "leg": leg,
+            "slice": slice_name,
+            "limit": round(float(limit), 4) if limit is not None else None,
+            "ttm": ttm,
+            "outcome": outcome,
+            "targets": sim.get("targets"),
+            "max_single_sample_fill_usd": sim.get("max_single_sample_fill_usd"),
+            "assumption": sim.get("assumption") or TOPUP_ASSUMPTION,
+            "buffer_span_s": sim.get("buffer_span_s"),
+            "n_samples": sim.get("n_samples"),
+            "n_gates_ok": sim.get("n_gates_ok"),
+            "n_usable": sim.get("n_usable"),
+        }
+        if log_event is not None:
+            log_event("buy_depth_topup_sim", **{
+                k: v for k, v in payload.items() if v is not None
+            })
+        if self.jsonl_path:
+            append_depth_ladder_jsonl(self.jsonl_path, {
+                "event": "buy_depth_topup_sim",
+                **payload,
+            })
+        self._last_emit_mono[key] = now_mono
+        return payload
 
 
 def append_depth_ladder_jsonl(path: str, record: Mapping[str, Any]) -> None:

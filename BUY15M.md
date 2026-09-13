@@ -58,7 +58,10 @@ POLY_BUY15M_STRATEGY=strategy_buy15m_probe.example.json .venv/bin/python buybot.
 
 Dry-run writes `buybot.dryrun.log`, `positions_buy.dryrun.json`, and
 `underlying_research_buy_dryrun.jsonl`. Watch for `dry_buy` / `dry_sell`
-and `buy_skip_*`. **No CLOB POST.**
+and `buy_skip_*`. Live (and dry) order-path attempts also log
+`buy_depth_ladder` — visible ask depth / max fill at $5/$10/$20/$32/$40/$50/$100,
+same shape as hourly — plus `buy_depth_topup_sim` when the path buffer has
+enough samples. **No CLOB POST.**
 
 Now-snapshot (no bot import, Gamma + CLOB GET only):
 

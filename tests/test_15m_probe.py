@@ -176,6 +176,7 @@ class BuybotWiringTests(unittest.TestCase):
         self.assertIn("validate_15m_strategy_coherence", src)
         self.assertIn("should_evaluate_entries(DRY_RUN, ENTRY_ENABLED)", src)
         self.assertIn("probe_spend_usd", src)
+        self.assertIn("emit_buy_depth_ladder", src)
         self.assertIn("entry_book_persist_ready", src)
         self.assertIn("hold_while_oracle_agrees", src)
         self.assertIn("hedge_persist_ready", src)
