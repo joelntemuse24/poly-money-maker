@@ -815,7 +815,7 @@ class AmbiguousCrossCyclePolicy(unittest.TestCase):
         self.assertIn('"hedge_threshold": 0.50', hourly)
         self.assertIn('"hedge_require_ask_max": 0.52', hourly)
         self.assertIn('"hedge_persist_s": 5.0', hourly)
-        self.assertIn('"hedge_toxic_bid_max": 0.35', hourly)
+        self.assertIn('"hedge_toxic_bid_max": 0.0', hourly)
         self.assertIn('"hedge_recovery_cancel": 0.53', hourly)
         self.assertIn('"hedge_sell_fade": True', hourly)
         self.assertIn('"hedge_require_oracle": True', hourly)
@@ -1771,6 +1771,8 @@ class HourlyBandLimitFakTests(unittest.TestCase):
                 "confirm_fill_size": lambda *_a, **_k: 0.0,
                 "fill_cost_usdc": lambda *_a, **_k: 0.0,
                 "time": SimpleNamespace(time=lambda: 1.0, sleep=lambda _s: None),
+                "buy_exec_tick": lambda tick: str(tick or "0.01"),
+                "buy_limit_price": lambda limit, tick: float(limit),
             }
         )
         return ns, calls
@@ -2174,32 +2176,24 @@ class BalanceAndGcSemantics(unittest.TestCase):
             src,
         )
 
-    def test_docs_live_overlay_is_75_90_2_50_5m_only(self):
+    def test_docs_live_overlay_is_hourly_not_5m_last120(self):
         root = BOT5M.parent
         current = (root / "CURRENT.md").read_text()
         agents = (root / "AGENTS.md").read_text()
-        for name, text in (("CURRENT.md", current), ("AGENTS.md", agents)):
-            self.assertIn("last **120s**", text, name)
-            self.assertIn("75–90", text, name)
+        ttd = (root / "TECHNICAL_DESIGN.md").read_text()
+        for name, text in (
+            ("CURRENT.md", current),
+            ("AGENTS.md", agents),
+            ("TECHNICAL_DESIGN.md", ttd),
+        ):
+            self.assertNotIn("last **120s**", text, name)
             self.assertNotIn('d["buy_start_s"]=45', text, name)
             self.assertNotIn('d["min_underlying_edge_usd"]=25.0', text, name)
-        self.assertIn("`min_underlying_edge_usd`", current)
-        self.assertIn("$2.50", current)
-        self.assertIn('"buy_start_s": 120', current)
-        self.assertIn('"buy_max_price": 0.90', current)
-        self.assertIn('"buy_threshold": 0.75', current)
-        self.assertIn('"buy_max_spend": 5.0', current)
-        self.assertIn('"buy_max_shares": 8.0', current)
-        self.assertIn("strategy_complement.json", current)
-        self.assertIn(".env.complement", current)
-        self.assertIn("2×", current)
-        self.assertIn("docs/2026-08-31-last120-loss-catalog.md", current)
-        self.assertIn("docs/2026-08-31-last120-loss-catalog.md", agents)
-        ttd = (root / "TECHNICAL_DESIGN.md").read_text()
-        self.assertIn("last **120s**", ttd)
-        self.assertIn("75–90", ttd)
-        self.assertNotIn("Live hourly B uses 90¢", ttd)
-        self.assertIn("Walking `buybot5m.py`", ttd)
+        self.assertIn("polybuybothourly.service", current)
+        self.assertIn("buybothourly.py", agents)
+        self.assertIn("buybothourly.py", ttd)
+        self.assertNotIn("Hourly is **stopped**", agents)
+        self.assertNotIn("Active strategy:** **5m only", current)
 
 
 class FiveMFastPollHelpers(unittest.TestCase):

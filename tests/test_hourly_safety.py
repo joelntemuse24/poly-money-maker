@@ -316,6 +316,9 @@ class HourlyExecutorSafetyTests(unittest.TestCase):
                     time=lambda: calls["clock"],
                     sleep=lambda _s: None,
                 ),
+                "buy_exec_tick": lambda tick: str(tick or "0.01"),
+                "buy_limit_price": lambda limit, tick: float(limit),
+                "emit_buy_depth_ladder": lambda **_k: None,
             }
         )
         return ns, calls
@@ -645,13 +648,25 @@ class HourlySafetyWiringTests(unittest.TestCase):
         ]
 
     def test_production_calls_wire_hooks_and_deadlines(self):
-        for name in ("buy_market_with_retry", "sell_market_with_retry"):
-            calls = self._calls(name)
-            self.assertEqual(len(calls), 1, name)
-            keywords = {kw.arg for kw in calls[0].keywords}
-            self.assertIn("pre_submit", keywords, name)
-            self.assertIn("deadline_ts", keywords, name)
-            self.assertIn("on_abort", keywords, name)
+        buy_calls = self._calls("buy_market_with_retry")
+        self.assertEqual(len(buy_calls), 1, "buy_market_with_retry")
+        buy_kw = {kw.arg for kw in buy_calls[0].keywords}
+        for key in ("pre_submit", "deadline_ts", "on_abort"):
+            self.assertIn(key, buy_kw, "buy_market_with_retry")
+
+        sell_calls = self._calls("sell_market_with_retry")
+        # Hedge + take-profit wire the abort/pre-submit gates. Soft-edge dump
+        # reuses sell_market_with_retry with deadline_ts only.
+        self.assertEqual(len(sell_calls), 3, "sell_market_with_retry")
+        hooked = [
+            call for call in sell_calls
+            if {"pre_submit", "deadline_ts", "on_abort"}
+            <= {kw.arg for kw in call.keywords}
+        ]
+        self.assertEqual(len(hooked), 2, "sell_market_with_retry hooked")
+        self.assertTrue(
+            any("deadline_ts" in {kw.arg for kw in call.keywords} for call in sell_calls)
+        )
 
     def test_nested_final_gates_cover_oracle_time_side_and_closed_state(self):
         nested = {
