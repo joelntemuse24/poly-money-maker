@@ -27,8 +27,6 @@
   "buy_max_spend": 11.0,
   "buy_max_shares": 17.0,
   "max_open_positions": 0,
-  "max_open_notional": 10000.0,
-  "max_daily_notional": 999999.0,
   "one_entry_per_market": true,
   "redeem_throttle_s": 30,
   "max_redeem_age_days": 7,

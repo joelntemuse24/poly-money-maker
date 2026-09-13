@@ -84,8 +84,8 @@ class ProbeJsonTests(unittest.TestCase):
         self.assertEqual(data["buy_budget"], 5.0)
         self.assertEqual(data["buy_max_spend"], 5.0)
         self.assertEqual(data["market_spend_cap"], 5.0)
-        self.assertEqual(data["max_open_notional"], 5.0)
-        self.assertEqual(data["max_daily_notional"], 5.0)
+        self.assertNotIn("max_open_notional", data)
+        self.assertNotIn("max_daily_notional", data)
         self.assertEqual(data["entry_book_persist_s"], 2.0)
         self.assertEqual(data["hedge_persist_s"], 1.0)
         self.assertEqual(data["hedge_dump_persist_s"], 2.0)
@@ -159,6 +159,8 @@ class BuybotWiringTests(unittest.TestCase):
         self.assertEqual(defaults["min_underlying_edge_usd"], 10.0)
         self.assertEqual(defaults["buy_budget"], 5.0)
         self.assertEqual(defaults["market_spend_cap"], 5.0)
+        self.assertNotIn("max_open_notional", defaults)
+        self.assertNotIn("max_daily_notional", defaults)
         self.assertEqual(defaults["entry_book_persist_s"], 2.0)
         self.assertEqual(defaults["hedge_persist_s"], 1.0)
         self.assertEqual(defaults["hedge_dump_persist_s"], 2.0)
@@ -183,6 +185,11 @@ class BuybotWiringTests(unittest.TestCase):
         self.assertNotIn("hedge_late_ttm_s", src)
         self.assertNotIn("SOURCE_TWAP_30", src)
         self.assertNotIn("SOURCE_TWAP_60", src)
+        self.assertNotIn("max_open_notional", src)
+        self.assertNotIn("max_daily_notional", src)
+        self.assertNotIn("buy_skip_max_notional", src)
+        self.assertNotIn("MAX_OPEN_NOTIONAL", src)
+        self.assertNotIn("MAX_DAILY_NOTIONAL", src)
 
     def test_load_strategy_rejects_soft_edge_above_floor(self):
         src = BOT.read_text()
@@ -267,6 +274,50 @@ class BuybotWiringTests(unittest.TestCase):
         self.assertIs(cfg["entry_enabled"], False)
         self.assertEqual(cfg["buy_budget"], 5.0)
         self.assertEqual(cfg["buy_threshold"], 0.95)
+        self.assertNotIn("max_open_notional", cfg)
+        self.assertNotIn("max_daily_notional", cfg)
+
+    def test_leftover_notional_keys_are_unknown(self):
+        src = BOT.read_text()
+        tree = ast.parse(src)
+        defaults = None
+        load_fn = None
+        for node in tree.body:
+            if isinstance(node, ast.Assign):
+                for target in node.targets:
+                    if isinstance(target, ast.Name) and target.id == "_STRATEGY_DEFAULTS":
+                        defaults = ast.literal_eval(node.value)
+            if isinstance(node, ast.FunctionDef) and node.name == "load_strategy":
+                load_fn = ast.get_source_segment(src, node)
+        if defaults is None or load_fn is None:
+            raise AssertionError("could not extract load_strategy")
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        path = Path(tmp.name) / "strategy_buy.json"
+        payload = json.loads(PROBE.read_text())
+        payload["max_open_notional"] = 5.0
+        payload["max_daily_notional"] = 5.0
+        path.write_text(json.dumps(payload))
+        ns = {
+            "os": __import__("os"),
+            "json": json,
+            "math": __import__("math"),
+            "STRATEGY_FILE": str(path),
+            "_STRATEGY_DEFAULTS": dict(defaults),
+            "_STRATEGY_DOC_KEYS": {
+                "_comment", "_canonical", "_source_tape", "_notes", "_live_flip",
+            },
+            "_strat_cache": None,
+            "_strat_mtime": 0.0,
+            "EXPECTED_TICK_SIZE": "0.01",
+            "validate_15m_strategy_coherence": validate_15m_strategy_coherence,
+            "probe_spend_usd": probe_spend_usd,
+            "console": type("C", (), {"print": staticmethod(lambda *_a, **_k: None)})(),
+        }
+        exec(compile(load_fn, "buybot.py", "exec"), ns, ns)
+        with self.assertRaises(RuntimeError) as ctx:
+            ns["load_strategy"]()
+        self.assertIn("unknown strategy keys", str(ctx.exception.__cause__))
 
 
 class ProbeNowDecisionTests(unittest.TestCase):
@@ -305,6 +356,10 @@ class HourlyUntouchedTests(unittest.TestCase):
         self.assertTrue(HOURLY_EXAMPLE.is_file())
         hourly = json.loads(HOURLY_EXAMPLE.read_text())
         self.assertEqual(hourly["buy_window_min"], 20.0)
+        self.assertIn("max_open_notional", hourly)
+        self.assertIn("max_daily_notional", hourly)
+        self.assertIn("MAX_OPEN_NOTIONAL", src)
+        self.assertIn("buy_skip_max_notional", src)
 
 
 if __name__ == "__main__":

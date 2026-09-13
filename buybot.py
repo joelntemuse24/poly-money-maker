@@ -10,7 +10,7 @@ import threading
 import traceback
 import logging
 from logging.handlers import RotatingFileHandler
-from datetime import datetime, timezone
+from datetime import datetime
 from decimal import Decimal, InvalidOperation, ROUND_DOWN
 import requests
 from concurrent.futures import ThreadPoolExecutor
@@ -206,8 +206,6 @@ _STRATEGY_DEFAULTS = {
     # 0 = disabled (use buy_max_spend). Probe $5; later ~$20 without rewrite.
     "market_spend_cap": 5.0,
     "max_open_positions": 0,  # 0 = unlimited
-    "max_open_notional": 5.0,
-    "max_daily_notional": 5.0,
     "one_entry_per_market": True,
     "redeem_throttle_s": 30,
     "max_redeem_age_days": 7,
@@ -330,8 +328,8 @@ def load_strategy():
         if not cfg["dry_run"] and not cfg["hedge_enabled"]:
             raise ValueError("live mode requires hedge_enabled=true")
         for key in (
-            "buy_budget", "buy_max_spend", "buy_max_shares", "max_open_notional",
-            "max_daily_notional", "poll_buy_window_s", "poll_held_s",
+            "buy_budget", "buy_max_spend", "buy_max_shares",
+            "poll_buy_window_s", "poll_held_s",
             "positions_refresh_s", "balance_refresh_s", "buy_window_min",
             "ui_every_n_cycles",
         ):
@@ -431,8 +429,6 @@ TAKE_PROFIT_FRACTION = _strat["take_profit_fraction"]
 TAKE_PROFIT_FULL_BID = _strat["take_profit_full_bid"]
 TAKE_PROFIT_PERSIST_S = _strat["take_profit_persist_s"]
 MAX_OPEN_POSITIONS = _strat["max_open_positions"]
-MAX_OPEN_NOTIONAL = _strat["max_open_notional"]
-MAX_DAILY_NOTIONAL = _strat["max_daily_notional"]
 ONE_ENTRY_PER_MARKET = _strat["one_entry_per_market"]
 REDEEM_THROTTLE_S = _strat["redeem_throttle_s"]
 MAX_REDEEM_AGE_DAYS = _strat["max_redeem_age_days"]
@@ -3317,11 +3313,6 @@ def _discover_markets_snapshot():
     return markets, bool(market_gateway.discovery_fresh)
 
 
-def _today_start_ms():
-    now = datetime.fromtimestamp(time.time(), tz=timezone.utc)
-    return datetime(now.year, now.month, now.day, tzinfo=timezone.utc).timestamp() * 1000
-
-
 while not _shutdown_requested:
     try:
         CYCLE += 1
@@ -3378,8 +3369,6 @@ while not _shutdown_requested:
         TAKE_PROFIT_FULL_BID = _strat["take_profit_full_bid"]
         TAKE_PROFIT_PERSIST_S = _strat["take_profit_persist_s"]
         MAX_OPEN_POSITIONS = _strat["max_open_positions"]
-        MAX_OPEN_NOTIONAL = _strat["max_open_notional"]
-        MAX_DAILY_NOTIONAL = _strat["max_daily_notional"]
         ONE_ENTRY_PER_MARKET = _strat["one_entry_per_market"]
         REDEEM_THROTTLE_S = _strat["redeem_throttle_s"]
         MAX_REDEEM_AGE_DAYS = _strat["max_redeem_age_days"]
@@ -4665,10 +4654,10 @@ while not _shutdown_requested:
                 if now_ms - meta["entered_at"] < BUY_GRACE_S * 1000:
                     continue
 
-                # Risk caps (in dollars / active markets). Redeemable Data-API
-                # leftovers are settlement backlog — they must NOT consume the
+                # Risk caps (active markets). Redeemable Data-API leftovers
+                # are settlement backlog — they must NOT consume the
                 # max_open_positions budget or a redeem lag freezes all entries
-                # (silent continue). Only non-redeemable size counts as open risk.
+                # (silent continue). Only non-redeemable size counts as open.
                 open_conditions = set()
                 for c, p in held.items():
                     up_sz = float(p.get("up", {}).get("size", 0) or 0)
@@ -4681,25 +4670,6 @@ while not _shutdown_requested:
                     c for c, pm in positions_meta.items() if pm.get("buy_uncertain")
                 }
                 open_count = len(open_conditions)
-                open_notional = sum(
-                    float(pm.get("pnl_entry_cost", 0) or 0)
-                    + (
-                        float(pm.get("buy_uncertain_spend", 0) or 0)
-                        if pm.get("buy_uncertain") else 0
-                    )
-                    for pm in positions_meta.values()
-                    if pm.get("bought_token") or pm.get("buy_uncertain")
-                )
-                daily_notional = sum(
-                    float(pm.get("pnl_entry_cost", 0) or 0)
-                    + (
-                        float(pm.get("buy_uncertain_spend", 0) or 0)
-                        if pm.get("buy_uncertain") else 0
-                    )
-                    for pm in positions_meta.values()
-                    if (pm.get("bought_token") or pm.get("buy_uncertain"))
-                    and pm.get("entered_at", 0) >= _today_start_ms()
-                )
                 est_cost = probe_spend_usd(BUY_BUDGET, BUY_MAX_SPEND, MARKET_SPEND_CAP)
                 if MAX_OPEN_POSITIONS > 0 and open_count >= MAX_OPEN_POSITIONS:
                     log_event(
@@ -4714,24 +4684,6 @@ while not _shutdown_requested:
                                 float(p.get("dn", {}).get("size", 0) or 0),
                             ) > 0.01
                         ),
-                    )
-                    continue
-                if open_notional + est_cost > MAX_OPEN_NOTIONAL + 1e-9:
-                    log_event(
-                        "buy_skip_max_notional",
-                        condition_id=cond,
-                        open_notional=round(open_notional, 4),
-                        max_open_notional=MAX_OPEN_NOTIONAL,
-                        budget=est_cost,
-                    )
-                    continue
-                if daily_notional + est_cost > MAX_DAILY_NOTIONAL + 1e-9:
-                    log_event(
-                        "buy_skip_max_daily_notional",
-                        condition_id=cond,
-                        daily_notional=round(daily_notional, 4),
-                        max_daily_notional=MAX_DAILY_NOTIONAL,
-                        budget=est_cost,
                     )
                     continue
                 if float(pusd_bal or 0) + 1e-9 < est_cost:
