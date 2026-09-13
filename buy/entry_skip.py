@@ -635,6 +635,28 @@ def hourly_remaining_to_cap(meta, market_cap=10.0) -> float:
     return max(0.0, float(market_cap) - hourly_spent_so_far(meta))
 
 
+
+def a22_budget_with_orphan_b15(meta, a22_budget, b15_budget) -> float:
+    """Raise a22 budget by unused b15 when the b15 sleeve never filled.
+
+    Late rich books (e.g. 97c) never enter the 75-90c b15 band. Without this,
+    a22 alone spends only ``a22_budget`` and leaves the market under-allocated
+    vs the intended a22+b15 bag. Once ``t15_bought`` is set, orphan is 0.
+    """
+    base = float(a22_budget or 0)
+    if base < 0:
+        base = 0.0
+    if (meta or {}).get("t15_bought"):
+        return base
+    try:
+        orphan = float(b15_budget or 0)
+    except (TypeError, ValueError):
+        orphan = 0.0
+    if orphan < 0:
+        orphan = 0.0
+    return base + orphan
+
+
 def hourly_slice_budget(
     slice_name,
     meta,
@@ -646,15 +668,20 @@ def hourly_slice_budget(
 ) -> float:
     """USDC this slice may still POST.
 
-    A is never more than ``a22_budget`` ($5) even if the $10 cap is unused.
-    B and C spend remaining to ``market_cap`` ($10 if flat, $5 if $5 already in).
+    A room is ``a22_budget - a22_spent_usd`` (early-hot half + later top-up).
+    Callers may already fold unused b15 into ``a22_budget`` via
+    ``a22_budget_with_orphan_b15`` so a late >=95c bag still targets ~a22+b15
+    when b15 never armed. Still capped by ``market_cap`` remaining.
+    B and C spend remaining to ``market_cap``.
     """
     remaining = hourly_remaining_to_cap(meta, market_cap)
     if remaining < 0.01:
         return 0.0
     name = str(slice_name or "")
     if name == HOURLY_SLICE_A:
-        return min(float(a22_budget), remaining)
+        spent = float((meta or {}).get("a22_spent_usd") or 0)
+        room = max(0.0, float(a22_budget) - spent)
+        return min(room, remaining)
     if name == HOURLY_SLICE_B:
         return min(float(b15_budget), remaining)
     if name == HOURLY_SLICE_C:
@@ -680,27 +707,55 @@ def can_arm_hourly_slice(
     a22_budget=5.0,
     b15_budget=10.0,
     c5_budget=10.0,
+    allow_a22_topup=False,
+    a22_full_budget=None,
 ):
     """Whether this named hourly slice may still POST.
 
-    One fill per slice. Same-leg add only. After a full hedge the market is
-    permanently closed, including legacy records with no token/size/slice
-    fields. ``buy_token=None`` skips the other-leg check (caller does not know
-    the winner yet).
+    One fill per slice. Same-leg add only. A full hedge closes inventory for
+    that bag, but does **not** permanently disqualify the market: an unfilled
+    higher sleeve (e.g. a22 after a b15 hedge) may still arm when its band
+    and budget remain. ``buy_token=None`` skips the other-leg check (caller
+    does not know the winner yet).
+
+    Early-hot half-cap: after an a22 partial (``a22_early_hot_partial``) with
+    ``t22_bought`` stamped, ``allow_a22_topup=True`` (caller: early-hot cleared)
+    re-arms a22 when room vs the full a22 budget remains.
+
+    ``hedge_closed`` is accepted for call-site compatibility; arming is gated
+    by per-slice flags + spend cap + live inventory, not a market-wide ban.
 
     Returns ``(ok, skip_reason)``.
     """
     meta = meta or {}
-    closed = bool(hedge_closed or meta.get("hedge_closed"))
-    if closed:
-        return False, "hedge_closed"
     if meta.get("buy_uncertain"):
         return False, "buy_uncertain"
     name = str(slice_name or "")
     flag = HOURLY_SLICE_FLAGS.get(name)
+    a22_topup = False
     if flag and meta.get(flag):
-        return False, "slice_filled"
-    if hourly_slice_budget(
+        if (
+            name == HOURLY_SLICE_A
+            and allow_a22_topup
+            and meta.get("a22_early_hot_partial")
+            and not meta.get("a22_early_hot_complete")
+        ):
+            full_bud = float(
+                a22_full_budget if a22_full_budget is not None else a22_budget
+            )
+            if hourly_slice_budget(
+                name, meta,
+                a22_budget=full_bud,
+                b15_budget=b15_budget,
+                c5_budget=c5_budget,
+                market_cap=market_cap,
+            ) >= 0.01:
+                a22_topup = True
+            else:
+                return False, "slice_filled"
+        else:
+            return False, "slice_filled"
+    if not a22_topup and hourly_slice_budget(
         name, meta,
         a22_budget=a22_budget,
         b15_budget=b15_budget,
@@ -709,9 +764,12 @@ def can_arm_hourly_slice(
     ) < 0.01:
         return False, "spend_cap"
     held = float(held_size or 0) > 0.01
+    # Flat after a hedge: allow a fresh sleeve. Still holding: same-leg only.
     tracked = meta.get("bought_token")
     if held and buy_token is not None and tracked and not same_token(tracked, buy_token):
         return False, "other_leg"
+    # Ignore hedge_closed for unfilled sleeves (re-entry after b15 salvage).
+    _ = bool(hedge_closed or meta.get("hedge_closed"))
     return True, None
 
 
@@ -735,8 +793,8 @@ def hourly_entry_final_gate(
 ):
     """Final pure hourly BUY gate, evaluated immediately before every POST.
 
-    The selected slice must still contain the live ask, the market must remain
-    open and unhedged, the Binance/PTB gate must be enabled and fresh/favor
+    The selected slice must still contain the live ask, the Binance/PTB gate
+    must be enabled and fresh/favor
     the selected leg, and the selected leg must still be the CLOB/GUI winner.
     """
     try:
@@ -745,8 +803,9 @@ def hourly_entry_final_gate(
         return False, "invalid_ttm"
     if ttm <= 0:
         return False, "expired"
-    if bool(hedge_closed):
-        return False, "hedge_closed"
+    # hedge_closed no longer blocks POST: unfilled sleeves (a22 after b15
+    # hedge) must still clear final gates. Per-slice arming already ran.
+    _ = bool(hedge_closed)
 
     live_band = select_hourly_entry_band(buy_ask, bands)
     if live_band is None or live_band.name != str(selected_slice or ""):

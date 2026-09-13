@@ -223,6 +223,36 @@ def _finite_px(value) -> Optional[float]:
     return px
 
 
+def implied_held_bid_from_other(other_ask, other_bid=None):
+    """Infer held-side bid when the held TOB bid is missing.
+
+    Complementary YES/NO books: if the *other* ask is 99¢, held fair value
+    is ~1¢. Use that as a synthetic bid so dump/qualify can still arm when
+    the held book has emptied (5m reverse + ``no_bid`` rode to zero).
+
+    Prefer ``1 - other_ask`` (offer to buy the other side). Fall back to
+    ``1 - other_bid`` when only the other bid exists. Returns None when
+    neither side yields a usable price.
+    """
+    for raw in (other_ask, other_bid):
+        px = _finite_px(raw)
+        if px is None:
+            continue
+        implied = 1.0 - float(px)
+        if implied != implied or implied in (float("inf"), float("-inf")):
+            continue
+        if implied < 0.0:
+            implied = 0.0
+        if implied > 1.0:
+            implied = 1.0
+        # Never treat a full-dollar complement as a real held bid — that
+        # would mean other_ask ~0 and we are still winning hard.
+        if implied >= 1.0 - 1e-12:
+            continue
+        return implied
+    return None
+
+
 def pick_held_quote(rest_bid, rest_ask, ws_bid, ws_ask, last_bid, last_ask):
     """REST, then WS, then last-good. Bid-only is enough to dump.
 
