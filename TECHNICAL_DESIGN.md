@@ -144,6 +144,7 @@ The code checks these boundaries. For example, `submit_proxy_tx` refuses a deriv
 | `buy_data_hourly/depth_ladder.jsonl` | Depth-based estimates | Hypothetical capacity at sampled prices |
 | `buy_data_hourly/depth_topup.jsonl` | Additional depth-path diagnostics | Simulated follow-on sizing, not orders |
 | `pathlog/ticks/*.jsonl` | Recorder observations and resolution labels | Check timestamp gaps before replaying |
+| `late_edge_bleed.jsonl` | Post-hour |live−PTB| late-vs-early bleed (VM-local) | Written by `check_late_edge_bleed.py`; not a trading input |
 
 JSON Lines, or JSONL, stores one JSON object per line. An event log can append a line without rewriting a whole collection. The position file is instead one structured snapshot: replacing that file safely matters because a partially written snapshot could erase the only record of a submitted order.
 
@@ -933,6 +934,8 @@ PR #156's final CI passed after test-only fixtures were aligned to the synchroni
 After the end time plus a grace period, the recorder may append a `resolved` event with `src="gamma"` at `pathlog.py:456`. That is a useful source label. It is not an on-chain redemption receipt for the trading wallet. A hypothetical hold-to-payout return can use a resolved market label, while realized cash P&L needs the wallet's actual acquisition and exit history.
 
 The recorder prunes its files. `RETAIN_S` is fourteen days and `MAX_TICK_BYTES` is 400 MiB at `pathlog.py:74`. Pruning protects the machine but limits later research. Export a specific immutable sample before making a claim that depends on a period staying available. Keep each file's first/last timestamp, observation count, missing intervals and resolution source with the result.
+
+Hourly pathlog is not an |live−PTB| tape: it stores CLOB top-of-book for the last twenty minutes, often a handful of ticks, with no Binance print. `underlying_research_buyhourly.jsonl` has `ptb_capture` plus sparse skip/fill rows — useful PTB alignment, not a 58m+2m edge path. `check_late_edge_bleed.py` reconstructs signed `live − ptb` from Binance 1s klines (same fetch as `check_reversal_features.py`) versus captured PTB, then writes `late_edge_bleed_hour` / `late_edge_bleed_summary` for a post-hour read. That script does not arm, skip, or hedge.
 
 A sparse path cannot establish continuous eight-second agreement. If two qualifying quotes are six minutes apart, neither proves what happened between them. Carrying the earlier state across the gap can manufacture persistence, fills and stop-outs. Resetting at gaps is more honest about observation coverage, but does not mean the real bot had no opportunity. It means the dataset cannot answer that question.
 
