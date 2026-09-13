@@ -39,6 +39,8 @@ pathlog/
 widget/.address
 underlying_research_buy*.jsonl
 underlying_research_buy*.jsonl.*
+late_edge_bleed.jsonl
+late_edge_bleed.jsonl.*
 ptb_*_buy*.json
 ptb_chainlink*.json
 *.json.tmp

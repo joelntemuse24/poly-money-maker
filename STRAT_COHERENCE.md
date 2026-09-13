@@ -60,8 +60,20 @@ These still load. They are desk choices, not validator bugs.
   loop*. This tree only adds keys + validation so the $40/$50 absurdity
   cannot load once that code is synced. Merge is not a restart.
 
+## Late-window |edge| bleed (telemetry, not a knob)
+
+`check_late_edge_bleed.py` measures whether the largest |live−PTB| fade toward
+flat/flip sits in the last 2 minutes versus the prior 58. It does not change
+entry, hedge, or size. On the VM after an hour:
+
+```text
+.venv/bin/python check_late_edge_bleed.py --last 12
+.venv/bin/python check_late_edge_bleed.py --today --write
+```
+
 ## How to check
 
 ```text
 python -m unittest discover -s tests -p 'test_strategy_coherence.py' -v
+python -m unittest discover -s tests -p 'test_late_edge_bleed.py' -v
 ```
