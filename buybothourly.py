@@ -84,6 +84,7 @@ from buy.entry_skip import (
     uncertain_buy_spend_cap,
     window_no_buy_reason,
 )
+from buy.strategy_coherence import validate_hourly_strategy_coherence
 from buy.hedge_gate import (
     blended_cost_per_share,
     evaluate_held_bag,
@@ -352,6 +353,9 @@ _STRATEGY_DEFAULTS = {
     "take_profit_full_bid": 0.99,
     # Soft-edge paranoia exit (Joel): if entry favor-edge <= max_usd and
     # held bid >= exit_bid for persist_s, full-sell (bypass oracle).
+    # max_usd is entry Binance-vs-PTB favor edge (same units as
+    # min_underlying_edge_usd). Must stay strictly below the buy floor
+    # when enabled — see buy/strategy_coherence.py. Off by default.
     "soft_edge_exit_enabled": False,
     "soft_edge_exit_max_usd": 50.0,
     "soft_edge_exit_bid": 0.95,
@@ -512,6 +516,7 @@ def load_strategy():
             raise ValueError("entry_persist_ttm_frac must be >= 0")
         if float(cfg.get("entry_persist_ttm_floor_s", 0.0) or 0.0) < 0:
             raise ValueError("entry_persist_ttm_floor_s must be >= 0")
+        validate_hourly_strategy_coherence(cfg)
         if str(cfg["tick_size"]) not in {
             "0.1", "0.01", "0.005", "0.0025", "0.001", "0.0001",
         }:

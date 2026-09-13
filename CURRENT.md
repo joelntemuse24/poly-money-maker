@@ -26,6 +26,15 @@ Hourly polybuybothourly.service is the primary live money path; polypathlog.serv
 
 strategy_buyhourly.example.json mirrors the captured strategy parameters with dry_run=true and entry_enabled=false; strategy_buyhourly.json preserves the exact live bytes. Code under buy/ and matching tests were copied from the VM, including depth_ladder.py. No audit-proposed refactors were applied as part of this sync. Source equality does not certify profitability, execution safety or passing tests; validation is reported separately in the PR.
 
+## Live drift and knob coherence
+
+VM strategy as of 2026-09-13 ~02:05 UTC has moved past this snapshot
+(a22 last 10m / $160, b15 last 15m / $40, underlying floor $40, soft-edge
+max $7, hedge 50/53/35). Fail-closed load rules and the remaining live
+tensions (99¢ a22 vs 95¢ thesis, TP +4¢ dead on 99¢ fills, soft-edge now
+inert under the $40 floor, hedge oracle $10 vs buy $40) are in
+`STRAT_COHERENCE.md`. Do not treat the table above as today’s live JSON.
+
 ## Deployment boundary
 
 No live files or services are changed by preparation of this PR. The existing deploy workflow runs on qualifying main-branch pushes and performs git pull plus pip install on the VM. Merge only through the operator's deployment process; do not merge automatically.
