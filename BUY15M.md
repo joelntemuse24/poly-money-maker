@@ -22,7 +22,7 @@ logging-only and fail-closes).
 | Ask band | **0.95–0.99** (ge95 only; FAK pins the live ask) |
 | Oracle floor | **$10** Chainlink last vs PTB |
 | Entry persist | **2s** |
-| Size | **$5** `buy_budget` = `buy_max_spend` = `market_spend_cap`; open/daily notional **$5** |
+| Size | **$5** `buy_budget` = `buy_max_spend` = `market_spend_cap`. Open/daily notional caps **removed**. |
 | Hedge | **0.35 / 0.40** ask, persist **1s**, dump persist **2s**, oracle required |
 | Soft-edge | **off** (load rejects max ≥ floor if turned on) |
 | Take-profit | full-lock at **0.99** (15m tick is 0.01; half +4¢ **off**) |
@@ -31,8 +31,9 @@ logging-only and fail-closes).
 | Posting | **`dry_run=true` and `entry_enabled=false`** |
 
 Later live $1–2 test or ~$20 cap: change `buy_budget`, `buy_max_spend`,
-`buy_max_shares`, `market_spend_cap`, `max_open_notional`,
-`max_daily_notional`. No bot rewrite.
+`buy_max_shares`, `market_spend_cap`. Open/daily notional caps are gone
+from the 15m path — do not add them back. Per-market spend rails and
+`max_open_positions` (0 = unlimited) remain. No bot rewrite.
 
 `strategy_buy.example.json` stays the historical 90–96¢ / $10 paper
 template. Do not treat it as this probe.
