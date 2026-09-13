@@ -231,13 +231,37 @@ class BuybotEmitExtractTests(unittest.TestCase):
         rows = Path(jsonl).read_text().strip().splitlines()
         self.assertEqual(json.loads(rows[0])["event"], "buy_depth_ladder")
 
+    def test_extracted_dry_buy_uses_live_ask_not_band_max(self):
+        src = BOT.read_text()
+        tree = ast.parse(src)
+        buy_src = None
+        for node in tree.body:
+            if isinstance(node, ast.FunctionDef) and node.name == "buy_market_with_retry":
+                buy_src = ast.get_source_segment(src, node)
+        if buy_src is None:
+            raise AssertionError("buy_market_with_retry not found")
+        calls = []
+        ns = {
+            "DRY_RUN": True,
+            "console": type("C", (), {"print": staticmethod(lambda *_a, **_k: None)})(),
+            "log_event": lambda *_a, **_k: None,
+            "get_quote_fast": lambda *_a, **_k: (0.94, 10.0, 0.96, 8.0, 0.95),
+            "emit_buy_depth_ladder": lambda **kw: calls.append(kw),
+        }
+        exec(compile(buy_src, "buybot.py", "exec"), ns, ns)
+        result = ns["buy_market_with_retry"]("tok", 5.0, 0.99, condition_id="cond")
+        self.assertEqual(result, (0.0, 0.0, "dry"))
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0]["ask"], 0.96)
+        self.assertEqual(calls[0]["limit_price"], 0.96)
+        self.assertEqual(calls[0]["outcome"], "dry")
+
 
 class BuybotDepthWiringTests(unittest.TestCase):
     def test_15m_buy_path_emits_shared_ladder(self):
         src = BOT.read_text()
         buy_fn = _fn_source(BOT, "buy_market_with_retry")
         self.assertIn("from buy.depth_ladder import", src)
-        self.assertIn("compute_depth_ladder", src)
         self.assertIn("emit_depth_ladder_event", src)
         self.assertIn("DEPTH_LADDER_BUDGETS", src)
         self.assertIn("5.0", src)
@@ -248,6 +272,9 @@ class BuybotDepthWiringTests(unittest.TestCase):
         self.assertIn('outcome="order_path"', buy_fn)
         self.assertIn('outcome="filled"', buy_fn)
         self.assertIn('outcome="no_ask"', buy_fn)
+        self.assertIn("limit_price=price", buy_fn)
+        self.assertIn("dry_limit = float(dry_ask)", buy_fn)
+        self.assertIn("limit_price=dry_limit", buy_fn)
         self.assertIn("emit_topup", src)
         helper = (ROOT / "buy" / "depth_ladder.py").read_text()
         self.assertIn("available_notional", helper)

@@ -67,7 +67,6 @@ from buy.depth_ladder import (
     DEFAULT_TOPUP_TARGETS,
     DepthPathTracker,
     available_at_limit,
-    compute_depth_ladder,
     emit_depth_ladder_event,
 )
 
@@ -1157,7 +1156,7 @@ def emit_buy_depth_ladder(
             attempt=attempt,
             outcome=outcome,
         )
-        gates_for_sample = outcome not in ("no_ask", None)
+        gates_for_sample = outcome not in ("no_ask", "dry", None)
         avail = available_at_limit(levels or [], limit_price, best_ask=ask)
         _depth_path_tracker.record_sample(
             available_notional=avail.get("available_notional") or 0.0,
@@ -2504,10 +2503,23 @@ def buy_market_with_retry(
             f"{str(token_id)[:12]}… at the quoted ask (band {min_price:.3f}–{max_price:.3f})"
         )
         log_event("dry_buy", token_id=token_id, budget=budget, max_price=max_price, min_price=min_price)
+        dry_ask = None
+        dry_limit = float(max_price)
+        try:
+            _bid, _, dry_ask, _, _ = get_quote_fast(
+                token_id,
+                prefer_rest=True,
+                force_rest=False,
+                expected_condition_id=condition_id,
+            )
+            if dry_ask is not None:
+                dry_limit = float(dry_ask)
+        except Exception:
+            pass
         emit_buy_depth_ladder(
             token_id=token_id,
-            ask=None,
-            limit_price=float(max_price),
+            ask=dry_ask,
+            limit_price=dry_limit,
             condition_id=condition_id,
             slug=depth_slug,
             leg=depth_leg,
@@ -2634,7 +2646,7 @@ def buy_market_with_retry(
         price = fresh_ask
         spend = shares * price
         max_shares = shares
-        # Research telemetry: depth at FAK limit for $5/$20/$50/$100 (no trade effect).
+        # Research telemetry: depth at the live FAK ask for $5–$100 (no trade effect).
         emit_buy_depth_ladder(
             token_id=token_id,
             ask=fresh_ask,
