@@ -83,6 +83,7 @@ from buy.entry_skip import (
     uncertain_buy_spend_cap,
     window_no_buy_reason,
 )
+from buy.strategy_coherence import validate_hourly_strategy_coherence
 from buy.hedge_gate import (
     blended_cost_per_share,
     evaluate_held_bag,
@@ -321,6 +322,15 @@ _STRATEGY_DEFAULTS = {
     "take_profit_fraction": 0.5,
     # Full-bag exit when bid holds at/above this (UI ~99.9¢ → 0.99 tick).
     "take_profit_full_bid": 0.99,
+    # Soft-edge: full-sell small-edge bags when held bid >= exit_bid.
+    # max_usd is entry Binance-vs-PTB favor edge (same units as
+    # min_underlying_edge_usd). Must stay strictly below the buy floor
+    # when enabled — see buy/strategy_coherence.py. Off by default.
+    "soft_edge_exit_enabled": False,
+    "soft_edge_exit_max_usd": 50.0,
+    "soft_edge_exit_bid": 0.95,
+    "soft_edge_exit_persist_s": 2.0,
+    "soft_edge_exit_quote_max_age_s": 1.5,
 }
 STRATEGY_FILE = "strategy_buyhourly.json"
 
@@ -460,6 +470,9 @@ def load_strategy():
                 raise ValueError("entry_book_persist_s must be >= 0")
         if float(cfg.get("b15_entry_book_persist_s", 0.0) or 0.0) < 0:
             raise ValueError("b15_entry_book_persist_s must be >= 0")
+        if float(cfg.get("soft_edge_exit_quote_max_age_s", 0.0) or 0.0) < 0:
+            raise ValueError("soft_edge_exit_quote_max_age_s must be >= 0")
+        validate_hourly_strategy_coherence(cfg)
         if str(cfg["tick_size"]) not in {
             "0.1", "0.01", "0.005", "0.0025", "0.001", "0.0001",
         }:
