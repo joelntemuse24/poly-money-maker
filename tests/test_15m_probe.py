@@ -188,6 +188,7 @@ class BuybotWiringTests(unittest.TestCase):
         self.assertNotIn("max_open_notional", src)
         self.assertNotIn("max_daily_notional", src)
         self.assertNotIn("buy_skip_max_notional", src)
+        self.assertNotIn("buy_skip_max_daily_notional", src)
         self.assertNotIn("MAX_OPEN_NOTIONAL", src)
         self.assertNotIn("MAX_DAILY_NOTIONAL", src)
 

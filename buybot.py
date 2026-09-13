@@ -4622,7 +4622,7 @@ while not _shutdown_requested:
                     or _now_mono - _positions_received_mono
                     > max(5.0, float(POSITIONS_REFRESH_S) * 3)
                 ):
-                    continue  # open-position/notional checks require a recent snapshot
+                    continue  # open-position checks require a recent snapshot
                 if (
                     _balance_received_mono <= 0
                     or _now_mono - _balance_received_mono
