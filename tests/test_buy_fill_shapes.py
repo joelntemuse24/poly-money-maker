@@ -913,8 +913,8 @@ class AmbiguousCrossCyclePolicy(unittest.TestCase):
                 self.assertIn('ROUNDING_CONFIG.get("0.01")', src, bot.name)
                 self.assertIn("_tick_01.amount = 2", src, bot.name)
             else:
-                self.assertIn('"buy_max_spend": 11.0', src, bot.name)
-                self.assertIn('"buy_max_shares": 17.0', src, bot.name)
+                self.assertIn('"buy_max_spend": 5.0', src, bot.name)
+                self.assertIn('"buy_max_shares": 8.0', src, bot.name)
                 self.assertIn(
                     "quoted_buy_shares(remaining_budget, fresh_ask, BUY_MAX_SHARES)",
                     src,
@@ -2060,6 +2060,7 @@ class BalanceAndGcSemantics(unittest.TestCase):
             "strategy_buy.example.json",
             "strategy_buy5m.example.json",
             "strategy_buyhourly.example.json",
+            "strategy_buy15m_probe.example.json",
         ):
             data = json.loads((root / name).read_text())
             self.assertIs(data["dry_run"], True)
@@ -2151,6 +2152,13 @@ class BalanceAndGcSemantics(unittest.TestCase):
         self.assertEqual(fifteen["min_underlying_edge_usd"], 0.0)
         self.assertEqual(fifteen["poll_buy_window_s"], 0.01)
         self.assertEqual(fifteen["poll_held_s"], 0.01)
+        probe = json.loads((root / "strategy_buy15m_probe.example.json").read_text())
+        self.assertEqual(probe["buy_threshold"], 0.95)
+        self.assertEqual(probe["buy_max_price"], 0.99)
+        self.assertEqual(probe["buy_budget"], 5.0)
+        self.assertEqual(probe["market_spend_cap"], 5.0)
+        self.assertEqual(probe["min_underlying_edge_usd"], 10.0)
+        self.assertEqual(probe["entry_book_persist_s"], 2.0)
 
     def test_example_json_passes_5m_load_strategy_sign_rails(self):
         src = BOT5M.read_text()

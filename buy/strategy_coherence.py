@@ -118,3 +118,31 @@ def validate_hourly_strategy_coherence(cfg: Mapping[str, Any]) -> None:
     """Raise ValueError on knob combos that must not load."""
     validate_hedge_dump_ladder(cfg)
     validate_soft_edge_coherence(cfg)
+
+
+def validate_15m_strategy_coherence(cfg: Mapping[str, Any]) -> None:
+    """Fail-closed 15m probe knobs (single sleeve; no hourly a22/b15 rewrite).
+
+    Soft-edge max must sit strictly below the Chainlink last-vs-PTB buy floor
+    when both gates are on. Early-hot is meaningless on a 15m clock.
+    ``market_spend_cap`` 0 means “use buy_max_spend only”.
+    """
+    validate_soft_edge_coherence(cfg)
+    if "hedge_recovery_cancel" in cfg:
+        validate_hedge_dump_ladder(cfg)
+    if _b(cfg, "early_hot_defer_enabled", False):
+        raise ValueError(
+            "early_hot_defer_enabled must be false on 15m "
+            "(hourly early-hot is meaningless on a 15m clock)"
+        )
+    cap = _f(cfg, "market_spend_cap", 0.0)
+    if cap < 0:
+        raise ValueError("market_spend_cap must be >= 0 (0 = disabled)")
+    budget = _f(cfg, "buy_budget", 0.0)
+    if cap > 0 and cap + EPS < budget:
+        raise ValueError(
+            "market_spend_cap must be >= buy_budget when market_spend_cap > 0"
+        )
+    window_min = _f(cfg, "buy_window_min", 0.0)
+    if window_min <= 0 or window_min > 15 + EPS:
+        raise ValueError("buy_window_min must satisfy 0 < minutes <= 15")

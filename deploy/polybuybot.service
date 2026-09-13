@@ -1,5 +1,5 @@
 [Unit]
-Description=Polymarket BTC 15m buy-side bot (buybot.py)
+Description=Polymarket BTC 15m buy-side bot (buybot.py). Do not enable until Joel says. Probe: strategy_buy15m_probe.example.json (dry_run=true, entry_enabled=false).
 After=network-online.target
 Wants=network-online.target
 

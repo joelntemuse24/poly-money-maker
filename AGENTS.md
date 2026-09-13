@@ -20,6 +20,8 @@ Hourly buy-side trading is the primary live system. Never infer service state fr
 
 buybothourly.py is the hourly entry point. buy/entry_skip.py controls slice eligibility and caps; buy/hedge_gate.py contains exit helpers; buy/btc_price.py provides underlying prices; buy/clob_book_ws.py and buy/market.py provide books and discovery; buy/depth_ladder.py supports depth diagnostics. buy/strategy_coherence.py fail-closes nonsense hourly knob combos (soft-edge max vs buy floor, exit bid vs a22/b15 bands, dump < qualify <= recovery). See STRAT_COHERENCE.md for live tensions the validator does not rewrite.
 
+buybot.py is the BTC 15m sibling. The $5 dry-run probe is `strategy_buy15m_probe.example.json` (`dry_run=true`, `entry_enabled=false`). See BUY15M.md. Do not enable `polybuybot` or flip those knobs live until Joel says. Do not import buybot.py in tests.
+
 Run tests with python -m unittest discover -s tests -p 'test_*.py' -v in a disposable sandbox. Keep temporary files and Python caches in that sandbox. The hourly example mirrors captured strategy parameters with dry_run=true and entry_enabled=false. The separately committed live snapshot has dry_run=false; neither is authorization to launch the bot.
 
 ## Repository policy
