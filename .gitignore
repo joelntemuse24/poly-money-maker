@@ -59,6 +59,7 @@ strategy_hourly.json
 sim_data/
 buy_data/
 buy_data_5m/
+buy_data_15m/
 buy_data_hourly/
 strategy.buy.json
 strategy.buy.5m.json
