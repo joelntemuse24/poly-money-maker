@@ -132,11 +132,9 @@ class HourlyEntryFinalGateTests(unittest.TestCase):
             hourly_entry_final_gate(10.0, **changed),
             (False, "band_closed"),
         )
+        # Prior hedge no longer fails the final POST gate; arming is per-slice.
         changed = dict(self.base, hedge_closed=True)
-        self.assertEqual(
-            hourly_entry_final_gate(10.0, **changed),
-            (False, "hedge_closed"),
-        )
+        self.assertEqual(hourly_entry_final_gate(10.0, **changed), (True, "ok"))
 
     def test_rejects_oracle_stale_or_side_flip(self):
         changed = dict(self.base, oracle_gate_enabled=False)
@@ -173,7 +171,7 @@ class HourlyEntryFinalGateTests(unittest.TestCase):
             (False, "clob_gui_side_flip"),
         )
 
-    def test_hedge_closed_wins_for_every_legacy_slice(self):
+    def test_filled_slices_block_even_when_hedge_closed(self):
         legacy = {
             "hedge_closed": True,
             "buy_uncertain": True,
@@ -190,8 +188,39 @@ class HourlyEntryFinalGateTests(unittest.TestCase):
                         slice_name=slice_name,
                         held_size=0.0,
                     ),
-                    (False, "hedge_closed"),
+                    (False, "buy_uncertain"),
                 )
+
+    def test_b15_hedge_allows_unfilled_a22_reentry(self):
+        meta = {
+            "hedge_closed": True,
+            "t15_bought": True,
+            "pnl_entry_cost": 0.0,  # fully exited; cost basis cleared
+        }
+        self.assertEqual(
+            can_arm_hourly_slice(
+                meta,
+                slice_name="b15",
+                held_size=0.0,
+                hedge_closed=True,
+                a22_budget=100.0,
+                b15_budget=10.0,
+                market_cap=115.0,
+            ),
+            (False, "slice_filled"),
+        )
+        self.assertEqual(
+            can_arm_hourly_slice(
+                meta,
+                slice_name="a22",
+                held_size=0.0,
+                hedge_closed=True,
+                a22_budget=100.0,
+                b15_budget=10.0,
+                market_cap=115.0,
+            ),
+            (True, None),
+        )
 
 
 class HourlyHedgeGuiBoundaryTests(unittest.TestCase):
@@ -270,7 +299,6 @@ class HourlyExecutorSafetyTests(unittest.TestCase):
                 "get_quote_fast": lambda *_a, **_k: (
                     0.84, 10.0, 0.85, 10.0, 0.845,
                 ),
-                "emit_buy_depth_ladder": lambda *_a, **_k: None,
                 "entry_book_ok": lambda *_a, **_k: (True, "ok"),
                 "safe_api_call": lambda fn, *a, **k: fn(*a, **k),
                 "client": SimpleNamespace(
@@ -619,12 +647,11 @@ class HourlySafetyWiringTests(unittest.TestCase):
     def test_production_calls_wire_hooks_and_deadlines(self):
         for name in ("buy_market_with_retry", "sell_market_with_retry"):
             calls = self._calls(name)
-            self.assertEqual(len(calls), 1 if name == "buy_market_with_retry" else 2, name)
-            for call in calls:
-                keywords = {kw.arg for kw in call.keywords}
-                self.assertIn("pre_submit", keywords, name)
-                self.assertIn("deadline_ts", keywords, name)
-                self.assertIn("on_abort", keywords, name)
+            self.assertEqual(len(calls), 1, name)
+            keywords = {kw.arg for kw in calls[0].keywords}
+            self.assertIn("pre_submit", keywords, name)
+            self.assertIn("deadline_ts", keywords, name)
+            self.assertIn("on_abort", keywords, name)
 
     def test_nested_final_gates_cover_oracle_time_side_and_closed_state(self):
         nested = {

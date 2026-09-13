@@ -705,6 +705,85 @@ class HourlyThreeSliceTests(unittest.TestCase):
     def test_horizon_is_22_minutes(self):
         self.assertEqual(hourly_horizon_min(22, 15, 5, 13), 22.0)
 
+    def test_early_hot_a22_half_cap_and_topup_arm(self):
+        """Early-hot half spend leaves room; top-up re-arms after clear."""
+        full = 200.0
+        half = 100.0
+        meta = {
+            "pnl_entry_cost": 100.0,
+            "t22_bought": True,
+            "bought_token": "up",
+            "a22_spent_usd": 100.0,
+            "a22_early_hot_partial": True,
+        }
+        # While early-hot: effective half budget -> no room, no top-up.
+        self.assertEqual(
+            hourly_slice_budget(
+                "a22", meta, a22_budget=half, market_cap=230.0,
+            ),
+            0.0,
+        )
+        blocked, why = can_arm_hourly_slice(
+            meta,
+            slice_name="a22",
+            held_size=105.0,
+            buy_token="up",
+            a22_budget=half,
+            market_cap=230.0,
+            allow_a22_topup=False,
+            a22_full_budget=full,
+        )
+        self.assertFalse(blocked)
+        self.assertEqual(why, "slice_filled")
+        # After early-hot clears: full budget restores $100 room; top-up arms.
+        self.assertEqual(
+            hourly_slice_budget(
+                "a22", meta, a22_budget=full, market_cap=230.0,
+            ),
+            100.0,
+        )
+        ok, why2 = can_arm_hourly_slice(
+            meta,
+            slice_name="a22",
+            held_size=105.0,
+            buy_token="up",
+            a22_budget=full,
+            market_cap=230.0,
+            allow_a22_topup=True,
+            a22_full_budget=full,
+        )
+        self.assertTrue(ok)
+        self.assertIsNone(why2)
+        # Completed top-up: no further a22 arm.
+        meta["a22_early_hot_complete"] = True
+        meta["a22_spent_usd"] = 200.0
+        meta["pnl_entry_cost"] = 200.0
+        done, why3 = can_arm_hourly_slice(
+            meta,
+            slice_name="a22",
+            held_size=210.0,
+            buy_token="up",
+            a22_budget=full,
+            market_cap=230.0,
+            allow_a22_topup=True,
+            a22_full_budget=full,
+        )
+        self.assertFalse(done)
+        self.assertEqual(why3, "slice_filled")
+        # b15 still arms on its own flag (early-hot must not block b15 path).
+        b_ok, b_why = can_arm_hourly_slice(
+            meta,
+            slice_name="b15",
+            held_size=210.0,
+            buy_token="up",
+            a22_budget=full,
+            b15_budget=20.0,
+            market_cap=230.0,
+            allow_a22_topup=False,
+        )
+        self.assertTrue(b_ok)
+        self.assertIsNone(b_why)
+
     def test_uncertain_blocks_hourly_slices(self):
         ok, why = can_arm_hourly_slice(
             {"buy_uncertain": True}, slice_name="a22",
