@@ -1771,6 +1771,8 @@ class HourlyBandLimitFakTests(unittest.TestCase):
                 "confirm_fill_size": lambda *_a, **_k: 0.0,
                 "fill_cost_usdc": lambda *_a, **_k: 0.0,
                 "time": SimpleNamespace(time=lambda: 1.0, sleep=lambda _s: None),
+                "buy_exec_tick": lambda tick: str(tick or "0.01"),
+                "buy_limit_price": lambda limit, tick: float(limit),
             }
         )
         return ns, calls
@@ -2108,15 +2110,37 @@ class BalanceAndGcSemantics(unittest.TestCase):
         self.assertNotIn("early_95_start_s", fifteen)
         self.assertNotIn("late_buy_budget", hourly)
         self.assertNotIn("late_buy_budget", fifteen)
-        captured = json.loads((root / "strategy_buyhourly.json").read_text())
-        self.assertIs(captured["dry_run"], False)
-        self.assertIs(captured["entry_enabled"], True)
-        captured.update(dry_run=True, entry_enabled=False)
-        self.assertEqual(hourly, captured)
-        self.assertEqual(hourly["a22_buy_budget"], 40.0)
-        self.assertEqual(hourly["b15_buy_budget"], 6.0)
-        self.assertEqual(hourly["entry_book_persist_s"], 8.0)
-        self.assertEqual(hourly["b15_entry_book_persist_s"], 20.0)
+        self.assertEqual(hourly["a22_window_min"], 20.0)
+        self.assertEqual(hourly["b15_window_min"], 0.0)
+        self.assertEqual(hourly["c5_window_min"], 0.0)
+        self.assertEqual(hourly["buy_window_min"], 20.0)
+        self.assertEqual(hourly["a22_min_price"], 0.949)
+        self.assertEqual(hourly["c5_min_price"], 0.95)
+        self.assertEqual(hourly["high_buy_max_price"], 0.99)
+        self.assertEqual(hourly["a22_buy_budget"], 5.0)
+        self.assertEqual(hourly["b15_buy_budget"], 10.0)
+        self.assertEqual(hourly["c5_buy_budget"], 10.0)
+        self.assertEqual(hourly["market_spend_cap"], 5.01)
+        self.assertEqual(hourly["buy_max_spend"], 12.05)
+        self.assertEqual(hourly["buy_max_shares"], 14.0)
+        self.assertEqual(hourly["buy_budget"], 5.0)
+        self.assertTrue(hourly["size_to_ref_price"])
+        self.assertEqual(hourly["a22_size_ref_price"], 0.0)
+        self.assertEqual(hourly["b15_size_ref_price"], 0.0)
+        self.assertEqual(hourly["c5_size_ref_price"], 0.0)
+        self.assertEqual(hourly["hedge_threshold"], 0.6)
+        self.assertEqual(hourly["hedge_require_ask_max"], 0.62)
+        self.assertEqual(hourly["hedge_persist_s"], 5.0)
+        self.assertEqual(hourly["hedge_toxic_bid_max"], 0.0)
+        self.assertEqual(hourly["hedge_recovery_cancel"], 0.63)
+        self.assertEqual(hourly["hedge_sell_fade"], True)
+        self.assertEqual(hourly["hedge_require_oracle"], True)
+        self.assertEqual(hourly["hedge_oracle_min_edge_usd"], 0.0)
+        self.assertEqual(hourly["hedge_undercut_ticks"], 0)
+        self.assertEqual(hourly["poll_buy_window_s"], 0.01)
+        self.assertEqual(hourly["poll_held_s"], 0.01)
+        self.assertEqual(hourly["min_underlying_edge_usd"], 10.0)
+        self.assertEqual(hourly["tick_size"], "0.01")
         self.assertEqual(fifteen["hedge_threshold"], 0.35)
         self.assertEqual(fifteen["buy_threshold"], 0.90)
         self.assertEqual(fifteen["buy_max_price"], 0.96)
@@ -2152,16 +2176,22 @@ class BalanceAndGcSemantics(unittest.TestCase):
             src,
         )
 
-    def test_docs_identify_hourly_vm_snapshot(self):
-        root = BOT_HR.parent
+    def test_docs_live_overlay_is_hourly_not_5m_last120(self):
+        root = BOT5M.parent
         current = (root / "CURRENT.md").read_text()
         agents = (root / "AGENTS.md").read_text()
-        self.assertIn("2026-09-09", current)
+        ttd = (root / "TECHNICAL_DESIGN.md").read_text()
+        for name, text in (
+            ("CURRENT.md", current),
+            ("AGENTS.md", agents),
+            ("TECHNICAL_DESIGN.md", ttd),
+        ):
+            self.assertNotIn("last **120s**", text, name)
+            self.assertNotIn('d["buy_start_s"]=45', text, name)
+            self.assertNotIn('d["min_underlying_edge_usd"]=25.0', text, name)
         self.assertIn("polybuybothourly.service", current)
-        self.assertIn("$40", current)
-        self.assertIn("$6", current)
-        self.assertIn("live VM is the source of truth", agents)
-        self.assertIn("does not restart services", agents)
+        self.assertIn("buybothourly.py", agents)
+        self.assertIn("buybothourly.py", ttd)
         self.assertNotIn("Hourly is **stopped**", agents)
         self.assertNotIn("Active strategy:** **5m only", current)
 

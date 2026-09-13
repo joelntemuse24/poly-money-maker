@@ -76,6 +76,7 @@ from buy.entry_skip import (
     hourly_horizon_min,
     hourly_remaining_to_cap,
     hourly_slice_budget,
+    a22_budget_with_orphan_b15,
     hourly_spent_so_far,
     same_token,
     select_hourly_entry_band,
@@ -216,6 +217,17 @@ _STRATEGY_DEFAULTS = {
     # (5m is $0). Binance BTCUSDT is this bot's resolution feed.
     "underlying_gate_enabled": True,
     "min_underlying_edge_usd": 10.0,
+    # Early-hour hot deferral: while TTM > ttm_min, skip buy when ask is already
+    # expensive and oracle favor-edge is large (wait for <=15m a22/b15 rules).
+    "early_hot_defer_enabled": True,
+    "early_hot_defer_ttm_min": 15.0,
+    "early_hot_defer_ask_min": 0.95,
+    "early_hot_defer_edge_usd": 200.0,
+    # While early-hot is active, a22 may spend only this fraction of a22_buy_budget;
+    # remaining is available as a top-up once early-hot clears. b15 is never
+    # continue-skipped by early-hot (early_hot_allow_b15 documents that).
+    "early_hot_a22_fraction": 0.5,
+    "early_hot_allow_b15": True,
     # Force-dump only when FAK avg is worse than this. Fills in
     # [toxic_force_exit_below, buy_threshold) stay on the normal hedge path.
     # Must be <= buy_threshold (validator); 65¢ ≈ walk well below the 75¢ floor.
@@ -241,6 +253,10 @@ _STRATEGY_DEFAULTS = {
     # (blocks one-tick tight mirages on otherwise wide books).
     "entry_book_persist_s": 8.0,
     "b15_entry_book_persist_s": 20.0,
+    # When TTM < required persist, clamp to frac*TTM (floor) so last-minute
+    # in-band prints can still clear (1am/5am structural block).
+    "entry_persist_ttm_frac": 0.5,
+    "entry_persist_ttm_floor_s": 5.0,
     # Hedge: penny bids under a still-high ask are fake — require a tight book
     # and ask also collapsed (same lesson sell-side already learned on mids).
     "hedge_max_spread": 0.20,
@@ -250,6 +266,19 @@ _STRATEGY_DEFAULTS = {
     "hedge_toxic_bid_max": 0.0,
     # Toxic dump must stay <= dump this many seconds (0 = instant).
     "hedge_dump_persist_s": 0.0,
+    # Mid window: TTM <= hedge_dump_mid_ttm_s → hedge_dump_mid_persist_s
+    # (last 5 minutes → 6s).
+    "hedge_dump_mid_ttm_s": 300.0,
+    "hedge_dump_mid_persist_s": 6.0,
+    # Late window: TTM <= hedge_dump_late_ttm_s → hedge_dump_late_persist_s
+    # (last 1 minute → 2s; was 15s/2s after 10pm cliff).
+    "hedge_dump_late_ttm_s": 60.0,
+    "hedge_dump_late_persist_s": 2.0,
+    # If favor-edge peaked >= peak_usd then bled to <= now_usd while still
+    # favoring the held leg, allow hedge/dump (do not block on
+    # oracle_still_winning_small).
+    "hedge_edge_collapse_peak_usd": 40.0,
+    "hedge_edge_collapse_now_usd": 10.0,
     # Hourly: dump needs ask + spread <= hedge_max_spread (blocks 34/99).
     "hedge_dump_require_tight": True,
     "hedge_dump_ignore_spread_ask_max": 0.60,
@@ -322,7 +351,8 @@ _STRATEGY_DEFAULTS = {
     "take_profit_fraction": 0.5,
     # Full-bag exit when bid holds at/above this (UI ~99.9¢ → 0.99 tick).
     "take_profit_full_bid": 0.99,
-    # Soft-edge: full-sell small-edge bags when held bid >= exit_bid.
+    # Soft-edge paranoia exit (Joel): if entry favor-edge <= max_usd and
+    # held bid >= exit_bid for persist_s, full-sell (bypass oracle).
     # max_usd is entry Binance-vs-PTB favor edge (same units as
     # min_underlying_edge_usd). Must stay strictly below the buy floor
     # when enabled — see buy/strategy_coherence.py. Off by default.
@@ -330,6 +360,9 @@ _STRATEGY_DEFAULTS = {
     "soft_edge_exit_max_usd": 50.0,
     "soft_edge_exit_bid": 0.95,
     "soft_edge_exit_persist_s": 2.0,
+    # Soft-edge may use a stale-tolerant WS age (hedge stays at 0.25s).
+    # Live 12am ET 2026-09-12: arm re-armed ~every 8s and never fired because
+    # HEDGE_QUOTE_MAX_AGE_S gaps cleared qualifies before persist_s.
     "soft_edge_exit_quote_max_age_s": 1.5,
 }
 STRATEGY_FILE = "strategy_buyhourly.json"
@@ -412,8 +445,9 @@ def load_strategy():
             raise ValueError("at least one hourly window must be > 0")
         if c5_w > 0 and b15_w + 1e-12 < c5_w:
             raise ValueError("b15_window_min must be >= c5_window_min when C is on")
-        if a22_w > 0 and b15_w > 0 and a22_w + 1e-12 < b15_w:
-            raise ValueError("a22_window_min must be >= b15_window_min when both are on")
+        # Joel 2026-09-12: allow a22 tighter/later than b15 (e.g. a22 last-10m,
+        # b15 last-15m). window_min means enter when TTM <= N, so smaller a22
+        # starts later than b15 — intentional.
         if not (0 < cfg["toxic_force_exit_below"] <= cfg["buy_threshold"]):
             raise ValueError("toxic_force_exit_below must satisfy 0 < below <= buy_threshold")
         if not (0 <= cfg["hedge_min_price"] <= cfg["hedge_threshold"] <= 1):
@@ -459,6 +493,14 @@ def load_strategy():
             raise ValueError("take_profit_from_start_ts must be >= 0 (0 = all markets)")
         if float(cfg.get("take_profit_persist_s", 5.0)) < 0:
             raise ValueError("take_profit_persist_s must be >= 0")
+        if float(cfg.get("soft_edge_exit_max_usd", 0.0) or 0.0) < 0:
+            raise ValueError("soft_edge_exit_max_usd must be >= 0")
+        if not (0 <= float(cfg.get("soft_edge_exit_bid", 0.0) or 0.0) <= 1):
+            raise ValueError("soft_edge_exit_bid must satisfy 0 <= bid <= 1")
+        if float(cfg.get("soft_edge_exit_persist_s", 0.0) or 0.0) < 0:
+            raise ValueError("soft_edge_exit_persist_s must be >= 0")
+        if float(cfg.get("soft_edge_exit_quote_max_age_s", 0.0) or 0.0) < 0:
+            raise ValueError("soft_edge_exit_quote_max_age_s must be >= 0")
         _tp_frac = float(cfg.get("take_profit_fraction", 0.5))
         if not (0 < _tp_frac <= 1):
             raise ValueError("take_profit_fraction must satisfy 0 < fraction <= 1")
@@ -470,8 +512,10 @@ def load_strategy():
                 raise ValueError("entry_book_persist_s must be >= 0")
         if float(cfg.get("b15_entry_book_persist_s", 0.0) or 0.0) < 0:
             raise ValueError("b15_entry_book_persist_s must be >= 0")
-        if float(cfg.get("soft_edge_exit_quote_max_age_s", 0.0) or 0.0) < 0:
-            raise ValueError("soft_edge_exit_quote_max_age_s must be >= 0")
+        if float(cfg.get("entry_persist_ttm_frac", 0.0) or 0.0) < 0:
+            raise ValueError("entry_persist_ttm_frac must be >= 0")
+        if float(cfg.get("entry_persist_ttm_floor_s", 0.0) or 0.0) < 0:
+            raise ValueError("entry_persist_ttm_floor_s must be >= 0")
         validate_hourly_strategy_coherence(cfg)
         if str(cfg["tick_size"]) not in {
             "0.1", "0.01", "0.005", "0.0025", "0.001", "0.0001",
@@ -563,11 +607,16 @@ def load_strategy():
             "hedge_ghost_sleep_s", "buy_grace_s", "buy_cooldown_s",
             "empty_fak_cooldown_s",
             "redeem_throttle_s", "max_redeem_age_days", "hedge_persist_s",
-            "hedge_dump_persist_s", "take_profit_persist_s",
+            "hedge_dump_persist_s", "hedge_dump_mid_ttm_s", "hedge_dump_mid_persist_s", "hedge_dump_late_ttm_s", "hedge_dump_late_persist_s", "take_profit_persist_s",
             "a22_window_min", "c5_window_min", "hedge_oracle_min_edge_usd",
+            "early_hot_defer_ttm_min", "early_hot_defer_ask_min",
+            "early_hot_defer_edge_usd",
         ):
             if float(cfg[key]) < 0:
                 raise ValueError(f"{key} must be non-negative")
+        _eh_frac = float(cfg.get("early_hot_a22_fraction", 0.5) or 0.5)
+        if not (0 < _eh_frac <= 1):
+            raise ValueError("early_hot_a22_fraction must satisfy 0 < fraction <= 1")
     except Exception as e:
         console.print(f"[bold red]▶ STRATEGY [WARN][/] [dim]failed to load {STRATEGY_FILE}: {e}[/]")
         if _strat_cache is None:
@@ -591,6 +640,12 @@ MAX_LOSER_BID = _strat["max_loser_bid"]
 MIN_BID_EDGE = _strat["min_bid_edge"]
 UNDERLYING_GATE_ENABLED = _strat["underlying_gate_enabled"]
 MIN_UNDERLYING_EDGE_USD = _strat["min_underlying_edge_usd"]
+EARLY_HOT_DEFER_ENABLED = bool(_strat.get("early_hot_defer_enabled", True))
+EARLY_HOT_DEFER_TTM_MIN = float(_strat.get("early_hot_defer_ttm_min", 15.0) or 0.0)
+EARLY_HOT_DEFER_ASK_MIN = float(_strat.get("early_hot_defer_ask_min", 0.95) or 0.0)
+EARLY_HOT_DEFER_EDGE_USD = float(_strat.get("early_hot_defer_edge_usd", 200.0) or 0.0)
+EARLY_HOT_A22_FRACTION = float(_strat.get("early_hot_a22_fraction", 0.5) or 0.5)
+EARLY_HOT_ALLOW_B15 = bool(_strat.get("early_hot_allow_b15", True))
 TOXIC_FORCE_EXIT_BELOW = _strat["toxic_force_exit_below"]
 HEDGE_ENABLED = _strat["hedge_enabled"]
 HEDGE_THRESHOLD = _strat["hedge_threshold"]
@@ -602,11 +657,19 @@ HEDGE_GHOST_SLEEP_S = _strat["hedge_ghost_sleep_s"]
 MAX_ENTRY_SPREAD = _strat["max_entry_spread"]
 ENTRY_BOOK_PERSIST_S = float(_strat.get("entry_book_persist_s", 8.0) or 0.0)
 B15_ENTRY_BOOK_PERSIST_S = float(_strat.get("b15_entry_book_persist_s", 20.0) or 0.0)
+ENTRY_PERSIST_TTM_FRAC = float(_strat.get("entry_persist_ttm_frac", 0.5) or 0.5)
+ENTRY_PERSIST_TTM_FLOOR_S = float(_strat.get("entry_persist_ttm_floor_s", 5.0) or 5.0)
 HEDGE_MAX_SPREAD = _strat["hedge_max_spread"]
 HEDGE_REQUIRE_ASK_MAX = _strat["hedge_require_ask_max"]
 HEDGE_PERSIST_S = _strat["hedge_persist_s"]
 HEDGE_TOXIC_BID_MAX = _strat["hedge_toxic_bid_max"]
 HEDGE_DUMP_PERSIST_S = float(_strat.get("hedge_dump_persist_s", 0.0) or 0.0)
+HEDGE_DUMP_MID_TTM_S = float(_strat.get("hedge_dump_mid_ttm_s", 300.0) or 0.0)
+HEDGE_DUMP_MID_PERSIST_S = float(_strat.get("hedge_dump_mid_persist_s", 6.0) or 0.0)
+HEDGE_DUMP_LATE_TTM_S = float(_strat.get("hedge_dump_late_ttm_s", 60.0) or 0.0)
+HEDGE_DUMP_LATE_PERSIST_S = float(_strat.get("hedge_dump_late_persist_s", 2.0) or 0.0)
+HEDGE_EDGE_COLLAPSE_PEAK_USD = float(_strat.get("hedge_edge_collapse_peak_usd", 40.0) or 0.0)
+HEDGE_EDGE_COLLAPSE_NOW_USD = float(_strat.get("hedge_edge_collapse_now_usd", 10.0) or 0.0)
 HEDGE_DUMP_REQUIRE_TIGHT = bool(_strat.get("hedge_dump_require_tight", True))
 HEDGE_DUMP_IGNORE_SPREAD_ASK_MAX = float(_strat.get("hedge_dump_ignore_spread_ask_max", 0.60))
 HEDGE_RECOVERY_CANCEL = _strat["hedge_recovery_cancel"]
@@ -620,6 +683,13 @@ TAKE_PROFIT_FROM_START_TS = float(_strat.get("take_profit_from_start_ts", 0.0) o
 TAKE_PROFIT_PERSIST_S = float(_strat.get("take_profit_persist_s", 5.0) or 0.0)
 TAKE_PROFIT_FRACTION = float(_strat.get("take_profit_fraction", 0.5) or 0.5)
 TAKE_PROFIT_FULL_BID = float(_strat.get("take_profit_full_bid", 0.0) or 0.0)
+SOFT_EDGE_EXIT_ENABLED = bool(_strat.get("soft_edge_exit_enabled", False))
+SOFT_EDGE_EXIT_MAX_USD = float(_strat.get("soft_edge_exit_max_usd", 50.0) or 0.0)
+SOFT_EDGE_EXIT_BID = float(_strat.get("soft_edge_exit_bid", 0.95) or 0.0)
+SOFT_EDGE_EXIT_PERSIST_S = float(_strat.get("soft_edge_exit_persist_s", 2.0) or 0.0)
+SOFT_EDGE_EXIT_QUOTE_MAX_AGE_S = float(
+    _strat.get("soft_edge_exit_quote_max_age_s", 1.5) or 0.0
+)
 BUY_WINDOW_MIN = _strat["buy_window_min"]
 A22_WINDOW_MIN = _strat["a22_window_min"]
 B15_WINDOW_MIN = _strat["b15_window_min"]
@@ -669,7 +739,7 @@ if DRY_RUN:
 # ------------------------- LOG ROTATION -------------------------
 LOG_FILE = "buybothourly.dryrun.log" if DRY_RUN else "buybothourly.log"
 LOG_MAX_BYTES = 5 * 1024 * 1024
-LOG_BACKUP_COUNT = 3
+LOG_BACKUP_COUNT = 30  # keep more local rotates; Drive/log_archive is long-term SoT
 
 _file_logger = logging.getLogger("buybothourly")
 _file_logger.setLevel(logging.INFO)
@@ -839,7 +909,8 @@ _buy_window_logged = {}
 _hedge_persist_armed = {}
 _hedge_dump_armed = {}  # cond -> monotonic ts when bid first <= toxic dump
 _take_profit_persist_armed = {}  # cond -> monotonic ts when bid first >= TP target
-_entry_book_persist_armed = {}  # cond|leg -> monotonic ts when book first ok
+_soft_edge_exit_armed = {}  # cond -> monotonic ts when soft-edge exit bid armed
+_entry_book_persist_armed = {}  # cond|leg|band -> monotonic ts when book first ok
 _depth_path_buffers = {}  # cond|leg -> DepthPathBuffer
 _depth_path_last_sample_mono = {}  # cond|leg -> mono ts of last sample
 _depth_topup_last_emit_mono = {}  # cond|leg -> mono ts of last topup emit
@@ -870,18 +941,90 @@ def log_buy_skip_throttled(skip_reason, condition_id, event="buy_skip", **kwargs
     log_event(event, reason=reason, condition_id=condition_id, **kwargs)
 
 
-def hold_while_oracle_agrees(held_leg, start_ts, condition_id):
-    """True = do not sell; last live BTC is still with the bag (or feed is unread)."""
+
+def dump_persist_for_ttm(minutes_left) -> float:
+    """Dump persist seconds: shorten near expiry so wire cliffs can still fire.
+
+    Tiers (live): default → mid (last 5m / 6s) → late (last 1m / 2s).
+    Late is checked first so the tightest window wins.
+    """
+    try:
+        ttm_s = float(minutes_left) * 60.0
+    except (TypeError, ValueError):
+        return float(HEDGE_DUMP_PERSIST_S)
+    late_s = float(HEDGE_DUMP_LATE_TTM_S or 0)
+    if late_s > 0 and ttm_s <= late_s + 1e-12:
+        return float(HEDGE_DUMP_LATE_PERSIST_S)
+    mid_s = float(HEDGE_DUMP_MID_TTM_S or 0)
+    if mid_s > 0 and ttm_s <= mid_s + 1e-12:
+        return float(HEDGE_DUMP_MID_PERSIST_S)
+    return float(HEDGE_DUMP_PERSIST_S)
+
+
+def hold_while_oracle_agrees(held_leg, start_ts, condition_id, meta=None):
+    """True = do not sell; last live BTC is still with the bag (or feed is unread).
+
+    Tracks peak favor-edge on ``meta``. If the edge collapsed from a large
+    peak to a small still-winning residual, allow the sell/dump path
+    (10pm-style cliff where oracle_still_winning_small blocked too long).
+    """
     if not HEDGE_REQUIRE_ORACLE:
         return False
     uchk = btc_feed.underlying_check(start_ts, float(HEDGE_ORACLE_MIN_EDGE_USD))
     allow, why = hedge_oracle_allows_sell(held_leg, uchk, enabled=True)
+    edge = uchk.get("edge_usd")
+    favor = None
+    try:
+        if edge is not None:
+            e = float(edge)
+            if math.isfinite(e):
+                favor = e if str(held_leg).lower() == "up" else -e
+    except (TypeError, ValueError):
+        favor = None
+    if meta is not None and favor is not None and favor > 0:
+        try:
+            peak = float(meta.get("oracle_peak_favor_edge") or 0)
+        except (TypeError, ValueError):
+            peak = 0.0
+        if favor > peak + 1e-12:
+            meta["oracle_peak_favor_edge"] = round(float(favor), 2)
     if allow:
+        return False
+    # Hard edge collapse while still slightly favoring held → allow sell/dump.
+    try:
+        peak = float((meta or {}).get("oracle_peak_favor_edge") or 0)
+    except (TypeError, ValueError):
+        peak = 0.0
+    now_favor = float(favor) if favor is not None else None
+    peak_need = float(HEDGE_EDGE_COLLAPSE_PEAK_USD or 0)
+    now_max = float(HEDGE_EDGE_COLLAPSE_NOW_USD or 0)
+    if (
+        peak_need > 0
+        and now_max > 0
+        and peak + 1e-12 >= peak_need
+        and now_favor is not None
+        and 0 < now_favor <= now_max + 1e-12
+        and why in ("oracle_still_winning_small", "oracle_still_winning")
+    ):
+        log_buy_skip_throttled(
+            "oracle_edge_collapse",
+            condition_id,
+            event="hedge_oracle_edge_collapse",
+            leg=held_leg,
+            ptb=uchk.get("ptb"),
+            live_btc=uchk.get("live_btc"),
+            edge_usd=None if edge is None else round(float(edge), 2),
+            favor_edge=round(float(now_favor), 2),
+            peak_favor_edge=round(float(peak), 2),
+            peak_need_usd=peak_need,
+            now_max_usd=now_max,
+            oracle_why=why,
+            favored=uchk.get("favored"),
+        )
         return False
     _hedge_persist_armed.pop(condition_id, None)
     _hedge_persist_done.discard(condition_id)
     _hedge_dump_armed.pop(condition_id, None)
-    edge = uchk.get("edge_usd")
     event = (
         "hedge_skip_oracle_still_winning"
         if why == "oracle_still_winning"
@@ -901,6 +1044,7 @@ def hold_while_oracle_agrees(held_leg, start_ts, condition_id):
         live_source=uchk.get("live_source"),
         min_edge_usd=HEDGE_ORACLE_MIN_EDGE_USD,
         feed=uchk.get("feed"),
+        peak_favor_edge=None if meta is None else meta.get("oracle_peak_favor_edge"),
     )
     return True
 
@@ -2035,7 +2179,7 @@ def look_last_trade(token_id):
 def remember_held_quote(token_id, bid, ask):
     if token_id is None or bid is None:
         return
-    _last_good_held_quote[str(token_id)] = (bid, ask)
+    _last_good_held_quote[str(token_id)] = (bid, ask, time.monotonic())
 
 
 def last_good_held_quote(token_id):
@@ -2045,8 +2189,27 @@ def last_good_held_quote(token_id):
     return rec[0], rec[1]
 
 
+def last_good_held_age(token_id):
+    """Seconds since remember_held_quote; None if never stored."""
+    rec = _last_good_held_quote.get(str(token_id or ""))
+    if not rec or len(rec) < 3 or rec[2] is None:
+        return None
+    try:
+        age = time.monotonic() - float(rec[2])
+    except (TypeError, ValueError):
+        return None
+    if age < 0:
+        return None
+    return age
+
+
 def hedge_exec_tick(tick_size):
     """CLOB tick for this hedge FAK. Honor a coarser market minimum."""
+    return hedge_market_tick(tick_size, EXPECTED_TICK_SIZE)
+
+
+def buy_exec_tick(tick_size):
+    """CLOB tick for this buy FAK. Same floor as hedge — never post finer than market min."""
     return hedge_market_tick(tick_size, EXPECTED_TICK_SIZE)
 
 
@@ -2064,6 +2227,23 @@ def hedge_sell_price(bid, tick_size, undercut_ticks, min_price=None):
     raw = float(bid or 0) - undercut
     aligned = (int(raw / tick + 1e-12)) * tick
     return max(tick, aligned)
+
+
+def buy_limit_price(limit, tick_size):
+    """FAK buy limit, rounded *up* to the market tick so the order still crosses.
+
+    WS/books can advertise millitick levels while CLOB signing requires 0.01
+    (live hourly 12 Sep 4pm a22: ``invalid tick size (0.001), minimum is 0.01``).
+    Sells floor via hedge_sell_price; buys ceil so a 0.987 ask-cap becomes 0.99.
+    """
+    tick = float(buy_exec_tick(tick_size))
+    raw = float(limit or 0)
+    if raw <= 0:
+        return tick
+    aligned = math.ceil(raw / tick - 1e-12) * tick
+    if aligned > 1.0 + 1e-12:
+        aligned = math.floor(1.0 / tick + 1e-12) * tick
+    return max(tick, min(1.0, round(aligned, 10)))
 
 
 # Polymarket UI display rule (docs.polymarket.com/concepts/prices-orderbook):
@@ -2155,13 +2335,57 @@ def entry_persist_for_ask(ask, bands):
         return float(B15_ENTRY_BOOK_PERSIST_S or ENTRY_BOOK_PERSIST_S)
     return float(ENTRY_BOOK_PERSIST_S)
 
-def entry_book_persist_ready(cond, leg, book_ok, *, now_s=None, persist_s=None):
+
+def entry_persist_clamp_for_ttm(persist_s, minutes_left):
+    """If TTM < required persist, shorten so a last-minute in-band print can clear.
+
+    Uses frac*TTM with a floor, capped so we still leave ~2s of wire before expiry.
+    """
+    try:
+        wait = float(persist_s or 0.0)
+    except (TypeError, ValueError):
+        return float(ENTRY_BOOK_PERSIST_S)
+    if wait <= 1e-12:
+        return wait
+    try:
+        ttm_s = float(minutes_left) * 60.0
+    except (TypeError, ValueError):
+        return wait
+    if not (ttm_s > 0) or ttm_s + 1e-12 >= wait:
+        return wait
+    frac = float(ENTRY_PERSIST_TTM_FRAC or 0.5)
+    if frac <= 0:
+        frac = 0.5
+    floor_s = float(ENTRY_PERSIST_TTM_FLOOR_S or 0.0)
+    clamped = max(floor_s, frac * ttm_s)
+    # Never demand more hold than remaining time minus a small wire buffer.
+    wire_room = max(0.0, ttm_s - 2.0)
+    return min(wait, clamped, wire_room) if wire_room > 1e-12 else min(wait, max(0.5, 0.5 * ttm_s))
+
+def entry_book_persist_key(cond, leg, band=None):
+    """Persist arm key: separate timers per entry band/level (b15 vs a22 vs c5)."""
+    band_s = str(band or "").strip() or "none"
+    return f"{cond}|{leg}|{band_s}"
+
+
+def clear_entry_book_persist_leg(cond, leg):
+    """Drop every band-level persist arm for this condition|leg."""
+    prefix = f"{cond}|{leg}|"
+    for key in list(_entry_book_persist_armed):
+        if key.startswith(prefix) or key == f"{cond}|{leg}":
+            _entry_book_persist_armed.pop(key, None)
+
+
+def entry_book_persist_ready(cond, leg, book_ok, *, now_s=None, persist_s=None, band=None):
     """Require entry_book_ok to hold for persist_s before BUY.
+
+    Arms are keyed by condition|leg|band so a b15 (~90–94¢) timer cannot
+    satisfy a later a22 (≥95¢) buy on the same leg.
 
     Returns (ready, why, armed_age_s). Clears arm when book is not ok.
     persist_s <= 0 disables (always ready when book_ok).
     """
-    key = f"{cond}|{leg}"
+    key = entry_book_persist_key(cond, leg, band)
     wait = float(ENTRY_BOOK_PERSIST_S if persist_s is None else persist_s)
     if now_s is None:
         now_s = time.monotonic()
@@ -3346,6 +3570,8 @@ def buy_market_with_retry(
     total_bought = 0.0
     spent = 0.0
     budget = float(budget)
+    # Honor coarser CLOB minimum (WS may cache 0.001 while market min is 0.01).
+    tick_size = str(buy_exec_tick(tick_size))
     submit_aborted = False
     abort_cleanup_failed = False
     write_ahead_written = False
@@ -3533,7 +3759,7 @@ def buy_market_with_retry(
             )
         if shares < 0.01:
             break
-        limit_price = float(max_price)
+        limit_price = buy_limit_price(float(max_price), tick_size)
         price = limit_price
         spend = shares * price
         max_shares = shares
@@ -3576,6 +3802,22 @@ def buy_market_with_retry(
                 "quoted_shares": shares,
             }
         except Exception as e:
+            next_tick = hedge_tick_after_build_error(tick_size, e)
+            if next_tick is not None:
+                log_event(
+                    "buy_tick_retry",
+                    token_id=token_id,
+                    from_tick=tick_size,
+                    to_tick=next_tick,
+                    error=str(e)[:200],
+                    attempt=attempt + 1,
+                    spend=round(spend, 4),
+                )
+                tick_size = str(next_tick)
+                cache = globals().get("_tick_size_cache")
+                if isinstance(cache, dict) and token_id:
+                    cache[token_id] = tick_size
+                continue
             log_event(
                 "buy_build_rejected", token_id=token_id, error=str(e)[:200],
                 attempt=attempt + 1, spend=round(spend, 4),
@@ -4723,6 +4965,12 @@ while not _shutdown_requested:
         MIN_BID_EDGE = _strat["min_bid_edge"]
         UNDERLYING_GATE_ENABLED = _strat["underlying_gate_enabled"]
         MIN_UNDERLYING_EDGE_USD = _strat["min_underlying_edge_usd"]
+        EARLY_HOT_DEFER_ENABLED = bool(_strat.get("early_hot_defer_enabled", True))
+        EARLY_HOT_DEFER_TTM_MIN = float(_strat.get("early_hot_defer_ttm_min", 15.0) or 0.0)
+        EARLY_HOT_DEFER_ASK_MIN = float(_strat.get("early_hot_defer_ask_min", 0.95) or 0.0)
+        EARLY_HOT_DEFER_EDGE_USD = float(_strat.get("early_hot_defer_edge_usd", 200.0) or 0.0)
+        EARLY_HOT_A22_FRACTION = float(_strat.get("early_hot_a22_fraction", 0.5) or 0.5)
+        EARLY_HOT_ALLOW_B15 = bool(_strat.get("early_hot_allow_b15", True))
         TOXIC_FORCE_EXIT_BELOW = _strat["toxic_force_exit_below"]
         HEDGE_ENABLED = _strat["hedge_enabled"]
         HEDGE_THRESHOLD = _strat["hedge_threshold"]
@@ -4734,11 +4982,19 @@ while not _shutdown_requested:
         MAX_ENTRY_SPREAD = _strat["max_entry_spread"]
         ENTRY_BOOK_PERSIST_S = float(_strat.get("entry_book_persist_s", 8.0) or 0.0)
         B15_ENTRY_BOOK_PERSIST_S = float(_strat.get("b15_entry_book_persist_s", 20.0) or 0.0)
+        ENTRY_PERSIST_TTM_FRAC = float(_strat.get("entry_persist_ttm_frac", 0.5) or 0.5)
+        ENTRY_PERSIST_TTM_FLOOR_S = float(_strat.get("entry_persist_ttm_floor_s", 5.0) or 5.0)
         HEDGE_MAX_SPREAD = _strat["hedge_max_spread"]
         HEDGE_REQUIRE_ASK_MAX = _strat["hedge_require_ask_max"]
         HEDGE_PERSIST_S = _strat["hedge_persist_s"]
         HEDGE_TOXIC_BID_MAX = _strat["hedge_toxic_bid_max"]
         HEDGE_DUMP_PERSIST_S = float(_strat.get("hedge_dump_persist_s", 0.0) or 0.0)
+        HEDGE_DUMP_MID_TTM_S = float(_strat.get("hedge_dump_mid_ttm_s", 300.0) or 0.0)
+        HEDGE_DUMP_MID_PERSIST_S = float(_strat.get("hedge_dump_mid_persist_s", 6.0) or 0.0)
+        HEDGE_DUMP_LATE_TTM_S = float(_strat.get("hedge_dump_late_ttm_s", 60.0) or 0.0)
+        HEDGE_DUMP_LATE_PERSIST_S = float(_strat.get("hedge_dump_late_persist_s", 2.0) or 0.0)
+        HEDGE_EDGE_COLLAPSE_PEAK_USD = float(_strat.get("hedge_edge_collapse_peak_usd", 40.0) or 0.0)
+        HEDGE_EDGE_COLLAPSE_NOW_USD = float(_strat.get("hedge_edge_collapse_now_usd", 10.0) or 0.0)
         HEDGE_DUMP_REQUIRE_TIGHT = bool(_strat.get("hedge_dump_require_tight", True))
         HEDGE_DUMP_IGNORE_SPREAD_ASK_MAX = float(_strat.get("hedge_dump_ignore_spread_ask_max", 0.60))
         HEDGE_RECOVERY_CANCEL = _strat["hedge_recovery_cancel"]
@@ -4752,6 +5008,13 @@ while not _shutdown_requested:
         TAKE_PROFIT_PERSIST_S = float(_strat.get("take_profit_persist_s", 5.0) or 0.0)
         TAKE_PROFIT_FRACTION = float(_strat.get("take_profit_fraction", 0.5) or 0.5)
         TAKE_PROFIT_FULL_BID = float(_strat.get("take_profit_full_bid", 0.0) or 0.0)
+        SOFT_EDGE_EXIT_ENABLED = bool(_strat.get("soft_edge_exit_enabled", False))
+        SOFT_EDGE_EXIT_MAX_USD = float(_strat.get("soft_edge_exit_max_usd", 50.0) or 0.0)
+        SOFT_EDGE_EXIT_BID = float(_strat.get("soft_edge_exit_bid", 0.95) or 0.0)
+        SOFT_EDGE_EXIT_PERSIST_S = float(_strat.get("soft_edge_exit_persist_s", 2.0) or 0.0)
+        SOFT_EDGE_EXIT_QUOTE_MAX_AGE_S = float(
+            _strat.get("soft_edge_exit_quote_max_age_s", 1.5) or 0.0
+        )
         BUY_WINDOW_MIN = _strat["buy_window_min"]
         A22_WINDOW_MIN = _strat["a22_window_min"]
         B15_WINDOW_MIN = _strat["b15_window_min"]
@@ -5606,6 +5869,189 @@ while not _shutdown_requested:
                             save_json(STATE_FILE, positions_meta)
 
                 # --- TAKE PROFIT (oracle-bypass; next-hour+ bags only) ---
+                # Soft-edge paranoia exit (Joel): soft entry favor-edge bags
+                # that print a rich held bid get a full discretionary sell
+                # every tick — constant in-bot watch without waiting on me.
+                if (
+                    bool(held_token)
+                    and held_size > 0.01
+                    and not meta.get("hedge_closed")
+                    and not meta.get("soft_edge_exit_done")
+                    and SOFT_EDGE_EXIT_ENABLED
+                    and float(SOFT_EDGE_EXIT_BID or 0) > 1e-12
+                    and float(SOFT_EDGE_EXIT_MAX_USD or 0) > 1e-12
+                ):
+                    try:
+                        _se_entry = float(meta.get("entry_favor_edge_usd"))
+                    except (TypeError, ValueError):
+                        _se_entry = None
+                    if _se_entry is None:
+                        try:
+                            _raw = float(meta.get("entry_edge_usd"))
+                            if math.isfinite(_raw):
+                                _se_entry = _raw if held_leg == "up" else -_raw
+                        except (TypeError, ValueError):
+                            _se_entry = None
+                    if (
+                        _se_entry is not None
+                        and math.isfinite(_se_entry)
+                        and 0 < float(_se_entry) <= float(SOFT_EDGE_EXIT_MAX_USD) + 1e-12
+                    ):
+                        # Soft-edge uses its own quote max-age (default 1.5s),
+                        # not hedge_quote_max_age_s (0.25s). Winner bags never
+                        # reach remember_held_quote on the hedge path
+                        # (oracle_still_winning), so requiring ultra-fresh WS
+                        # alone reset the persist arm before 2s could elapse.
+                        _se_max_age = float(SOFT_EDGE_EXIT_QUOTE_MAX_AGE_S or 0.0)
+                        if _se_max_age <= 1e-12:
+                            _se_max_age = float(HEDGE_QUOTE_MAX_AGE_S)
+                        _se_age = book_ws.quote_age(held_token)
+                        _se_bid = _se_ask = None
+                        if _se_age is not None and _se_age <= _se_max_age:
+                            _se_q = book_ws.quote(
+                                held_token, max_age_s=_se_max_age,
+                            )
+                            if _se_q is not None:
+                                _se_bid = _se_q[0]
+                                _se_ask = _se_q[2]
+                        if _se_bid is not None:
+                            remember_held_quote(held_token, _se_bid, _se_ask)
+                        else:
+                            _lg_bid, _lg_ask = last_good_held_quote(held_token)
+                            _lg_age = last_good_held_age(held_token)
+                            if (
+                                _lg_bid is not None
+                                and _lg_age is not None
+                                and _lg_age <= _se_max_age + 1e-12
+                            ):
+                                _se_bid = _lg_bid
+                                _se_ask = _lg_ask
+                        _se_ok = (
+                            _se_bid is not None
+                            and float(_se_bid) + 1e-12 >= float(SOFT_EDGE_EXIT_BID)
+                        )
+                        # Keep the armed timer across a brief quote gap when
+                        # last-good is still rich and within soft max-age
+                        # (do not force a re-arm from zero).
+                        if (
+                            not _se_ok
+                            and _soft_edge_exit_armed.get(cond) is not None
+                        ):
+                            _lg_bid2, _ = last_good_held_quote(held_token)
+                            _lg_age2 = last_good_held_age(held_token)
+                            if (
+                                _lg_bid2 is not None
+                                and _lg_age2 is not None
+                                and _lg_age2 <= _se_max_age + 1e-12
+                                and float(_lg_bid2) + 1e-12
+                                >= float(SOFT_EDGE_EXIT_BID)
+                            ):
+                                _se_bid = _lg_bid2
+                                _se_ok = True
+                        _se_now = time.monotonic()
+                        _se_fire, _se_armed, _se_why = hedge_persist_ready(
+                            bool(_se_ok),
+                            now_s=_se_now,
+                            armed_ts=_soft_edge_exit_armed.get(cond),
+                            persist_s=float(SOFT_EDGE_EXIT_PERSIST_S),
+                            toxic=False,
+                        )
+                        if _se_armed is None:
+                            _soft_edge_exit_armed.pop(cond, None)
+                        else:
+                            _soft_edge_exit_armed[cond] = _se_armed
+                        if _se_ok and not _se_fire:
+                            log_buy_skip_throttled(
+                                _se_why,
+                                cond,
+                                event="soft_edge_exit_persist_wait",
+                                leg=held_leg,
+                                bid=round(float(_se_bid), 4),
+                                entry_favor_edge_usd=round(float(_se_entry), 2),
+                                exit_bid=float(SOFT_EDGE_EXIT_BID),
+                                persist_s=float(SOFT_EDGE_EXIT_PERSIST_S),
+                            )
+                        if _se_fire:
+                            _soft_edge_exit_armed.pop(cond, None)
+                            _se_tick = hedge_exec_tick(
+                                get_tick_size_cached(held_token),
+                            )
+                            _se_floor = float(_se_tick)
+                            _se_px = hedge_sell_price(
+                                _se_bid, _se_tick, 0, _se_floor,
+                            )
+                            log_event(
+                                "soft_edge_exit_sell",
+                                condition_id=cond,
+                                leg=held_leg,
+                                size=held_size,
+                                bid=round(float(_se_bid), 4),
+                                price_limit=_se_px,
+                                entry_favor_edge_usd=round(float(_se_entry), 2),
+                                exit_bid=float(SOFT_EDGE_EXIT_BID),
+                                slug=getattr(m, "slug", None),
+                                ttm=round(float(minutes_left), 2),
+                            )
+                            # Reuse dump-style full sell (oracle bypass).
+                            sold, sell_res, hedge_proceeds = sell_market_with_retry(
+                                held_token,
+                                held_size,
+                                _se_bid,
+                                tick_size=_se_tick,
+                                min_price=_se_floor,
+                                undercut_ticks=0,
+                                retry_sleep_s=HEDGE_RETRY_SLEEP_S,
+                                abort_above=1.0,
+                                require_ask_max=None,
+                                max_spread=None,
+                                condition_id=cond,
+                                initial_quote=(_se_bid, None),
+                                dump=True,
+                                persist_done=True,
+                                market_tick=_se_tick,
+                                max_retries=12,
+                                deadline_ts=m.end_ts,
+                            )
+                            sell_status = (
+                                sell_res.get("bot_status")
+                                if isinstance(sell_res, dict) else None
+                            )
+                            if sold and float(sold) > 0.01:
+                                rem = max(0.0, float(held_size) - float(sold))
+                                meta["bought_size"] = rem
+                                if rem <= 0.01:
+                                    meta["hedge_closed"] = True
+                                    meta["soft_edge_exit_done"] = True
+                                    _hedge_persist_armed.pop(cond, None)
+                                    _hedge_dump_armed.pop(cond, None)
+                                    _take_profit_persist_armed.pop(cond, None)
+                                    _hedge_persist_done.discard(cond)
+                                prior = float(meta.get("pnl_hedge_proceeds") or 0)
+                                meta["pnl_hedge_proceeds"] = round(
+                                    prior + float(hedge_proceeds or 0), 4
+                                )
+                                save_json(STATE_FILE, positions_meta)
+                                log_event(
+                                    "soft_edge_exit_filled",
+                                    condition_id=cond,
+                                    leg=held_leg,
+                                    sold=float(sold),
+                                    proceeds=float(hedge_proceeds or 0),
+                                    remaining=rem,
+                                    entry_favor_edge_usd=round(float(_se_entry), 2),
+                                    sell_status=sell_status,
+                                    slug=getattr(m, "slug", None),
+                                )
+                            else:
+                                log_event(
+                                    "soft_edge_exit_fail",
+                                    condition_id=cond,
+                                    leg=held_leg,
+                                    sell_status=sell_status,
+                                    slug=getattr(m, "slug", None),
+                                )
+                            continue
+
                 # Sell when live bid >= blended cost (pnl_entry_cost/bought_size,
                 # else fill_price) + take_profit_edge AND bid has stayed
                 # qualifying for take_profit_persist_s (hedge_persist_ready).
@@ -6092,7 +6538,7 @@ while not _shutdown_requested:
                 if (
                     hedge_open
                     and (not toxic_oracle_override)
-                    and hold_while_oracle_agrees(held_leg, m.start_ts, cond)
+                    and hold_while_oracle_agrees(held_leg, m.start_ts, cond, meta)
                 ):
                     hedge_open = False
                 if hedge_open:
@@ -6207,7 +6653,7 @@ while not _shutdown_requested:
                             gui_why="pending_gui",
                             recovery_cancel=HEDGE_RECOVERY_CANCEL,
                             sell_fade=HEDGE_SELL_FADE,
-                            dump_persist_s=HEDGE_DUMP_PERSIST_S,
+                            dump_persist_s=dump_persist_for_ttm(minutes_left),
                             dump_armed_ts=_hedge_dump_armed.get(cond),
                             dump_require_tight=HEDGE_DUMP_REQUIRE_TIGHT,
                             dump_ignore_spread_ask_max=HEDGE_DUMP_IGNORE_SPREAD_ASK_MAX,
@@ -6268,7 +6714,7 @@ while not _shutdown_requested:
                                 gui_why=gui_why,
                                 recovery_cancel=HEDGE_RECOVERY_CANCEL,
                                 sell_fade=HEDGE_SELL_FADE,
-                                dump_persist_s=HEDGE_DUMP_PERSIST_S,
+                                dump_persist_s=dump_persist_for_ttm(minutes_left),
                                 dump_armed_ts=_hedge_dump_armed.get(cond),
                                 dump_require_tight=HEDGE_DUMP_REQUIRE_TIGHT,
                                 dump_ignore_spread_ask_max=HEDGE_DUMP_IGNORE_SPREAD_ASK_MAX,
@@ -6479,7 +6925,7 @@ while not _shutdown_requested:
                                 if dump:
                                     return True, "dump_oracle_override"
                                 if hold_while_oracle_agrees(
-                                    held_leg, m.start_ts, cond,
+                                    held_leg, m.start_ts, cond, meta,
                                 ):
                                     return False, "oracle_veto"
                                 return True, "ok"
@@ -6671,6 +7117,14 @@ while not _shutdown_requested:
                     a22_budget=A22_BUY_BUDGET,
                     b15_budget=B15_BUY_BUDGET,
                     c5_budget=C5_BUY_BUDGET,
+                    # Coarse gate: let early-hot partials reach the buy path so
+                    # the later can_arm (with allow_a22_topup=not early_hot_active)
+                    # can decide. Full budget so room for top-up is visible.
+                    allow_a22_topup=bool(
+                        meta.get("a22_early_hot_partial")
+                        and not meta.get("a22_early_hot_complete")
+                    ),
+                    a22_full_budget=A22_BUY_BUDGET,
                 )
                 _any_slice_ok = False
                 _arm_reasons = []
@@ -6922,15 +7376,20 @@ while not _shutdown_requested:
                 dn_buy = dn_winning and dn_ask_ok and dn_consensus
 
                 # Tight-book persist: one-tick mirages (wide→briefly tight→wide) must
-                # not POST. Clear arm whenever consensus/book fails.
+                # not POST. Clear arms whenever consensus/book fails. Persist is
+                # per entry band/level so b15 cannot satisfy a later a22 buy.
                 if not up_buy:
-                    _entry_book_persist_armed.pop(f"{cond}|up", None)
+                    clear_entry_book_persist_leg(cond, "up")
                 if not dn_buy:
-                    _entry_book_persist_armed.pop(f"{cond}|down", None)
+                    clear_entry_book_persist_leg(cond, "down")
                 if up_buy:
-                    _up_persist = entry_persist_for_ask(up_ask, bands)
+                    _up_band = select_hourly_entry_band(up_ask, bands)
+                    _up_band_name = None if _up_band is None else str(_up_band.name)
+                    _up_persist = entry_persist_clamp_for_ttm(
+                        entry_persist_for_ask(up_ask, bands), minutes_left,
+                    )
                     ready, why, age = entry_book_persist_ready(
-                        cond, "up", True, persist_s=_up_persist,
+                        cond, "up", True, persist_s=_up_persist, band=_up_band_name,
                     )
                     if not ready:
                         log_buy_skip_throttled(
@@ -6938,6 +7397,7 @@ while not _shutdown_requested:
                             cond,
                             event="buy_skip_entry_book_persist",
                             leg="up",
+                            band=_up_band_name,
                             persist_why=why,
                             persist_s=_up_persist,
                             armed_age_s=None if age is None else round(age, 3),
@@ -6945,9 +7405,13 @@ while not _shutdown_requested:
                         )
                         up_buy = False
                 if dn_buy:
-                    _dn_persist = entry_persist_for_ask(dn_ask, bands)
+                    _dn_band = select_hourly_entry_band(dn_ask, bands)
+                    _dn_band_name = None if _dn_band is None else str(_dn_band.name)
+                    _dn_persist = entry_persist_clamp_for_ttm(
+                        entry_persist_for_ask(dn_ask, bands), minutes_left,
+                    )
                     ready, why, age = entry_book_persist_ready(
-                        cond, "down", True, persist_s=_dn_persist,
+                        cond, "down", True, persist_s=_dn_persist, band=_dn_band_name,
                     )
                     if not ready:
                         log_buy_skip_throttled(
@@ -6955,6 +7419,7 @@ while not _shutdown_requested:
                             cond,
                             event="buy_skip_entry_book_persist",
                             leg="down",
+                            band=_dn_band_name,
                             persist_why=why,
                             persist_s=_dn_persist,
                             armed_age_s=None if age is None else round(age, 3),
@@ -7043,6 +7508,74 @@ while not _shutdown_requested:
                             )},
                         })
                         continue
+
+                # Early-hot: TTM > threshold + expensive ask + large oracle
+                # favor-edge -> half-cap a22 (no hard skip). b15 is never
+                # continue-skipped here (early_hot_allow_b15 documents that;
+                # b15 also cannot take asks >= ask_min given its max).
+                early_hot_active = False
+                early_hot_favor_edge = None
+                early_hot_ask = None
+                if (
+                    EARLY_HOT_DEFER_ENABLED
+                    and (up_buy or dn_buy)
+                    and favored
+                    and uchk is not None
+                    and minutes_left > EARLY_HOT_DEFER_TTM_MIN
+                ):
+                    _edge = uchk.get("edge_usd")
+                    if _edge is not None:
+                        favor_edge = float(_edge) if favored == "up" else -float(_edge)
+                        ask = up_ask if up_buy else dn_ask
+                        if (
+                            ask is not None
+                            and float(ask) >= EARLY_HOT_DEFER_ASK_MIN
+                            and favor_edge >= EARLY_HOT_DEFER_EDGE_USD
+                        ):
+                            early_hot_active = True
+                            early_hot_favor_edge = favor_edge
+                            early_hot_ask = float(ask)
+                _eh_frac = float(EARLY_HOT_A22_FRACTION or 0.5)
+                if _eh_frac <= 0 or _eh_frac > 1:
+                    _eh_frac = 0.5
+                # If b15 never filled, fold its budget into a22 so a late
+                # rich ask (no 90s print) still targets ~a22+b15. Early-hot
+                # first clip stays half of base a22; full/top-up includes orphan.
+                _a22_full_with_orphan = a22_budget_with_orphan_b15(
+                    meta, float(A22_BUY_BUDGET), float(B15_BUY_BUDGET),
+                )
+                effective_a22_budget = (
+                    float(A22_BUY_BUDGET) * _eh_frac
+                    if early_hot_active
+                    else float(_a22_full_with_orphan)
+                )
+                _arm_kwargs["a22_budget"] = effective_a22_budget
+                _arm_kwargs["allow_a22_topup"] = not early_hot_active
+                _arm_kwargs["a22_full_budget"] = float(_a22_full_with_orphan)
+                if early_hot_active:
+                    log_buy_skip_throttled(
+                        "early_hot_half_cap",
+                        cond,
+                        event="early_hot_half_cap",
+                        minutes_left=round(float(minutes_left), 2),
+                        ask=round(float(early_hot_ask), 4),
+                        favor_edge=round(float(early_hot_favor_edge), 2),
+                        favored=favored,
+                        a22_fraction=round(_eh_frac, 4),
+                        a22_effective_budget=round(float(effective_a22_budget), 4),
+                        a22_full_budget=round(float(_a22_full_with_orphan), 4),
+                        a22_orphan_b15=round(float(_a22_full_with_orphan) - float(A22_BUY_BUDGET), 4),
+                        a22_spent_usd=round(float(meta.get("a22_spent_usd") or 0), 4),
+                        a22_early_hot_partial=bool(meta.get("a22_early_hot_partial")),
+                        allow_b15=bool(EARLY_HOT_ALLOW_B15),
+                        ttm_min=EARLY_HOT_DEFER_TTM_MIN,
+                        ask_min=EARLY_HOT_DEFER_ASK_MIN,
+                        edge_usd_min=EARLY_HOT_DEFER_EDGE_USD,
+                        ptb=uchk.get("ptb") if uchk else None,
+                        live_btc=uchk.get("live_btc") if uchk else None,
+                        up_ask=up_ask,
+                        dn_ask=dn_ask,
+                    )
 
                 if not (up_buy or dn_buy):
                     skip_why = window_no_buy_reason(
@@ -7212,7 +7745,7 @@ while not _shutdown_requested:
 
                 spend_usd = hourly_slice_budget(
                     band.name, meta,
-                    a22_budget=A22_BUY_BUDGET,
+                    a22_budget=effective_a22_budget,
                     b15_budget=B15_BUY_BUDGET,
                     c5_budget=C5_BUY_BUDGET,
                     market_cap=MARKET_SPEND_CAP,
@@ -7220,6 +7753,16 @@ while not _shutdown_requested:
                 spend_usd = min(float(spend_usd), float(BUY_MAX_SPEND))
                 if spend_usd < 0.01:
                     continue
+                _a22_early_hot_cap_buy = (
+                    band.name == "a22" and early_hot_active
+                )
+                _a22_topup_buy = (
+                    band.name == "a22"
+                    and (not early_hot_active)
+                    and bool(meta.get("a22_early_hot_partial"))
+                    and not bool(meta.get("a22_early_hot_complete"))
+                )
+                _a22_spent_before = float(meta.get("a22_spent_usd") or 0)
 
                 # Cooldown (empty FAKs use the short empty_fak_cooldown_s).
                 last_buy_at = meta.get("last_buy_at") or 0
@@ -7320,6 +7863,14 @@ while not _shutdown_requested:
                     meta["quoted_buy_shares_total"] = float(total_quoted or 0)
                     meta["toxic_fill"] = bool(force_exit or meta.get("toxic_fill"))
                     stamp_hourly_slice_bought(meta, band.name)
+                    if band.name == "a22":
+                        meta["a22_spent_usd"] = round(
+                            _a22_spent_before + float(spent_total or 0), 4
+                        )
+                        if _a22_early_hot_cap_buy:
+                            meta["a22_early_hot_partial"] = True
+                        if _a22_topup_buy:
+                            meta["a22_early_hot_complete"] = True
                     leg_key = "up" if buy_leg == "up" else "dn"
                     _cached_positions.setdefault(cond, {})[leg_key] = {
                         "asset": buy_token,
@@ -7502,12 +8053,35 @@ while not _shutdown_requested:
                     meta["pnl_entry_cost"] = round(total_cost, 4)
                     meta["quoted_buy_shares_total"] = float(total_quoted or 0)
                     meta["toxic_fill"] = bool(force_exit or meta.get("toxic_fill"))
+                    # Fresh sleeve after a prior full hedge must be hedgeable.
+                    if meta.get("hedge_closed") and float(slice_prior_size or 0) <= 0.01:
+                        meta["hedge_closed"] = False
+                        meta.pop("take_profit_done", None)
+                        meta["pnl_hedge_proceeds"] = float(
+                            meta.get("pnl_hedge_proceeds") or 0
+                        )
                     stamp_hourly_slice_bought(meta, band.name)
+                    if band.name == "a22":
+                        meta["a22_spent_usd"] = round(
+                            _a22_spent_before + float(spent or 0), 4
+                        )
+                        if _a22_early_hot_cap_buy:
+                            meta["a22_early_hot_partial"] = True
+                        if _a22_topup_buy:
+                            meta["a22_early_hot_complete"] = True
                     if uchk:
                         meta["ptb"] = uchk.get("ptb")
                         meta["ptb_source"] = uchk.get("ptb_source")
                         meta["entry_live_btc"] = uchk.get("live_btc")
                         meta["entry_edge_usd"] = uchk.get("edge_usd")
+                        try:
+                            _ee = float(uchk.get("edge_usd"))
+                            if math.isfinite(_ee):
+                                meta["entry_favor_edge_usd"] = round(
+                                    _ee if buy_leg == "up" else -_ee, 2
+                                )
+                        except (TypeError, ValueError):
+                            pass
                     log_event(
                         "buy_success", condition_id=cond, leg=buy_leg, bought=bought,
                         size=total_size,
@@ -7519,6 +8093,10 @@ while not _shutdown_requested:
                         ptb=meta.get("ptb"), live_btc=meta.get("entry_live_btc"),
                         edge_usd=meta.get("entry_edge_usd"),
                         toxic_fill=bool(meta.get("toxic_fill")),
+                        a22_spent_usd=meta.get("a22_spent_usd"),
+                        a22_early_hot_partial=meta.get("a22_early_hot_partial"),
+                        a22_early_hot_complete=meta.get("a22_early_hot_complete"),
+                        early_hot_active=bool(early_hot_active),
                     )
                     append_research(RESEARCH_FILE, {
                         "event": "buy_fill",
