@@ -532,15 +532,77 @@ _HOURLY_SLICE_PRIORITY = {
 }
 
 
-def hourly_horizon_min(a22_window_min, b15_window_min, c5_window_min, buy_window_min=0.0) -> float:
-    """Widest hourly look-ahead in minutes (slice A is 22)."""
+def hourly_horizon_min(
+    a22_window_min,
+    b15_window_min,
+    c5_window_min,
+    buy_window_min=0.0,
+    early_rich_window_min=0.0,
+) -> float:
+    """Widest hourly look-ahead in minutes (early-rich a22 may outrun last-10m a22)."""
     try:
         return max(
             float(a22_window_min),
             float(b15_window_min),
             float(c5_window_min),
             float(buy_window_min or 0),
+            float(early_rich_window_min or 0),
         )
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def early_rich_a22_window_open(
+    minutes_left,
+    *,
+    enabled=False,
+    window_min=20.0,
+    a22_window_min=10.0,
+) -> bool:
+    """True when TTM is inside the early-rich look-ahead and normal a22 is still closed.
+
+    Inclusive ``0 < ttm <= window_min``. Disabled when ``enabled`` is false, any
+    window is ``<= 0``, or ``a22_window_min <= 0`` (a22 slice off). Once
+    ``ttm <= a22_window_min`` the last-10m a22 floor/persist apply instead.
+    This does **not** replace last-10m a22 and does not close b15.
+    """
+    if not enabled:
+        return False
+    try:
+        ttm = float(minutes_left)
+        win = float(window_min or 0.0)
+        a22_w = float(a22_window_min or 0.0)
+    except (TypeError, ValueError):
+        return False
+    if ttm <= 0 or win <= 0 or a22_w <= 0:
+        return False
+    if ttm > win + 1e-12:
+        return False
+    if ttm <= a22_w + 1e-12:
+        return False
+    return True
+
+
+def hourly_entry_persist_s(
+    band_name,
+    *,
+    a22_persist_s,
+    b15_persist_s,
+    early_rich_persist_s=90.0,
+    early_rich_active=False,
+) -> float:
+    """Seconds the selected hourly band must hold before BUY.
+
+    Early-rich a22 (open before ``a22_window_min``) uses ``early_rich_persist_s``.
+    Last-10m a22 keeps ``a22_persist_s``. b15 is unchanged.
+    """
+    name = str(band_name or "")
+    try:
+        if name == HOURLY_SLICE_B:
+            return float(b15_persist_s or 0.0)
+        if name == HOURLY_SLICE_A and early_rich_active:
+            return float(early_rich_persist_s or 0.0)
+        return float(a22_persist_s or 0.0)
     except (TypeError, ValueError):
         return 0.0
 
@@ -556,21 +618,27 @@ def applicable_hourly_entry_bands(
     a22_min=0.93,
     c5_min=0.95,
     high_max=0.99,
+    early_rich_enabled=False,
+    early_rich_window_min=0.0,
+    early_rich_ask_min=0.97,
 ) -> List[EntryBand]:
     """Open hourly bands at this TTM (minutes). Inclusive ``0 < ttm <= window``.
 
-    A window ``<= 0`` disables that slice. Live hourly is **B only**: last
-    **20 min**, ask **75–90¢ inclusive**, FAK **90¢**. A (last 22, >93) and
-    C (last 5, >95) stay in the helper for tests / re-enable.
+    A window ``<= 0`` disables that slice.
 
-    Slice A (last 22 min when ``a22_window_min > 0``): ask **> 0.93**. FAK
-    limit **99¢**. Cap **$5**. When slice C is also open, A only matches
-    **> 0.93 and ≤ 0.95** so a >95¢ print in the last 5 min uses C, not A.
+    Slice A (when ``a22_window_min > 0`` and ``ttm <= a22_window_min``): ask
+    **> a22_min** (live ~0.949). FAK **99¢**.
 
-    Slice B: ask **75–90¢ inclusive**. FAK limit **90¢**. Spend remaining to
-    the $10 market cap.
+    Early-rich A overlay (when enabled, a22 is on, and
+    ``a22_window_min < ttm <= early_rich_window_min``): ask **>= early_rich_ask_min**
+    (live 0.97) up to ``high_max``. This is an extra gate so a sticky 97¢+
+    book can arm a22 beside b15 before the last-10m window. It does not
+    raise last-10m a22's floor or persist.
 
-    Slice C (when ``c5_window_min > 0``): ask **> 0.95**. FAK limit **99¢**.
+    Slice B: ask **b15_min–b15_max inclusive** (live 90–94¢). FAK at b15_max.
+
+    Slice C (when ``c5_window_min > 0``): ask **> c5_min**. FAK **99¢**.
+    When C is also open, last-10m A only matches **> a22_min and ≤ c5_min**.
     """
     try:
         ttm = float(minutes_left)
@@ -582,10 +650,15 @@ def applicable_hourly_entry_bands(
     if ttm <= 0:
         return []
     bands: List[EntryBand] = []
-    # Window ≤ 0 disables that slice (live hourly: A/C off, B last 20 min 75–90).
     a22_open = a22_w > 0 and ttm <= a22_w + 1e-12
     b15_open = b15_w > 0 and ttm <= b15_w + 1e-12
     c5_open = c5_w > 0 and ttm <= c5_w + 1e-12
+    early_rich_open = early_rich_a22_window_open(
+        ttm,
+        enabled=bool(early_rich_enabled),
+        window_min=early_rich_window_min,
+        a22_window_min=a22_w,
+    )
     if b15_open:
         bands.append(EntryBand(
             float(b15_min), float(b15_max), False, HOURLY_SLICE_B, float(b15_max),
@@ -595,6 +668,15 @@ def applicable_hourly_entry_bands(
         a_max = float(c5_min) if c5_open else float(high_max)
         bands.append(EntryBand(
             float(a22_min), a_max, True, HOURLY_SLICE_A, float(high_max),
+        ))
+    elif early_rich_open:
+        try:
+            er_min = float(early_rich_ask_min)
+        except (TypeError, ValueError):
+            er_min = 0.97
+        a_max = float(c5_min) if c5_open else float(high_max)
+        bands.append(EntryBand(
+            float(er_min), a_max, False, HOURLY_SLICE_A, float(high_max),
         ))
     if c5_open:
         bands.append(EntryBand(

@@ -72,7 +72,9 @@ from buy.entry_skip import (
     applicable_hourly_entry_bands,
     ask_in_any_band,
     can_arm_hourly_slice,
+    early_rich_a22_window_open,
     hourly_entry_final_gate,
+    hourly_entry_persist_s,
     hourly_horizon_min,
     hourly_remaining_to_cap,
     hourly_slice_budget,
@@ -200,10 +202,9 @@ _STRATEGY_DEFAULTS = {
     # Explicit hot-reloadable entry arm. A missing/invalid file disables new
     # entries while existing positions continue through the hedge path.
     "entry_enabled": False,
-    # Live hourly is one slice: last 20 min, 75–90¢, $10 cap. A/C windows
-    # 0 = disabled (helper still supports 22/15/5 if re-enabled). buy_max_price
-    # is the 75–90¢ cap and FAK limit; high_buy_max_price is unused while A/C
-    # are off.
+    # Hourly sleeves: last-10m a22 (>= ~0.949 / ~15s persist), last-20m b15
+    # (90–94¢ live / 20s persist), plus optional early-rich a22 in the last
+    # 20m when ask holds >= 0.97 for 90s. buy_max_price is the b15 cap.
     "buy_threshold": 0.75,
     "buy_max_price": 0.90,
     "high_buy_max_price": 0.99,
@@ -217,8 +218,11 @@ _STRATEGY_DEFAULTS = {
     # (5m is $0). Binance BTCUSDT is this bot's resolution feed.
     "underlying_gate_enabled": True,
     "min_underlying_edge_usd": 10.0,
-    # Early-hour hot deferral: while TTM > ttm_min, skip buy when ask is already
-    # expensive and oracle favor-edge is large (wait for <=15m a22/b15 rules).
+    # Early-hour hot deferral: half-cap a22 when TTM > ttm_min AND ask is
+    # already expensive AND oracle favor-edge is large. This never opens
+    # a22 early (band still requires ttm <= a22_window_min). Kept as a
+    # legacy half-cap for configs where a22_window_min > ttm_min. The
+    # early-rich path below is the real last-20m 97¢/90s a22 arm.
     "early_hot_defer_enabled": True,
     "early_hot_defer_ttm_min": 15.0,
     "early_hot_defer_ask_min": 0.95,
@@ -228,6 +232,18 @@ _STRATEGY_DEFAULTS = {
     # continue-skipped by early-hot (early_hot_allow_b15 documents that).
     "early_hot_a22_fraction": 0.5,
     "early_hot_allow_b15": True,
+    # Extra a22 gate before last-10m: last ``early_rich_a22_window_min`` if the
+    # favored-side ask holds >= ask_min for persist_s. Does not replace last-10m
+    # a22 (0.949 / ~15s) and does not close b15.
+    # Live VM JSON is SoT (2026-09-14: a22 $180 / b15 $50 / caps $250/$255 /
+    # a22_size_ref 0.92 / a22 last-10m). VM bot already matches GitHub main;
+    # pull this PR then set b15_window_min=20, buy_window_min=20, and these
+    # four keys on the live file (or omit them and these defaults apply).
+    # Do not copy GitHub strategy_buyhourly.json onto the VM.
+    "early_rich_a22_enabled": True,
+    "early_rich_a22_ask_min": 0.97,
+    "early_rich_a22_persist_s": 90.0,
+    "early_rich_a22_window_min": 20.0,
     # Force-dump only when FAK avg is worse than this. Fills in
     # [toxic_force_exit_below, buy_threshold) stay on the normal hedge path.
     # Must be <= buy_threshold (validator); 65¢ ≈ walk well below the 75¢ floor.
@@ -250,8 +266,9 @@ _STRATEGY_DEFAULTS = {
     # Entry: refuse wide books (ask≃97¢ over bid≃1¢ is not a real price).
     "max_entry_spread": 0.05,
     # Require entry_book_ok to hold this many seconds before BUY POST
-    # (blocks one-tick tight mirages on otherwise wide books).
-    "entry_book_persist_s": 8.0,
+    # (blocks one-tick tight mirages on otherwise wide books). Last-10m
+    # a22 uses this; early-rich a22 uses early_rich_a22_persist_s instead.
+    "entry_book_persist_s": 15.0,
     "b15_entry_book_persist_s": 20.0,
     # When TTM < required persist, clamp to frac*TTM (floor) so last-minute
     # in-band prints can still clear (1am/5am structural block).
@@ -293,8 +310,9 @@ _STRATEGY_DEFAULTS = {
     "hedge_require_oracle": True,
     "hedge_oracle_min_edge_usd": 10.0,
     # Outer look-ahead / poll horizon (minutes). Window 0 disables A or C.
+    # Last-10m a22 + last-20m b15; early-rich may open a22 in 10–20m at 97¢/90s.
     "buy_window_min": 20.0,
-    "a22_window_min": 0.0,
+    "a22_window_min": 10.0,
     "b15_window_min": 20.0,
     "c5_window_min": 0.0,
     "a22_min_price": 0.93,
@@ -512,6 +530,22 @@ def load_strategy():
                 raise ValueError("entry_book_persist_s must be >= 0")
         if float(cfg.get("b15_entry_book_persist_s", 0.0) or 0.0) < 0:
             raise ValueError("b15_entry_book_persist_s must be >= 0")
+        if float(cfg.get("early_rich_a22_persist_s", 0.0) or 0.0) < 0:
+            raise ValueError("early_rich_a22_persist_s must be >= 0")
+        if float(cfg.get("early_rich_a22_window_min", 0.0) or 0.0) < 0:
+            raise ValueError("early_rich_a22_window_min must be >= 0")
+        _er_ask = float(cfg.get("early_rich_a22_ask_min", 0.0) or 0.0)
+        if not (0 <= _er_ask <= 1):
+            raise ValueError("early_rich_a22_ask_min must satisfy 0 <= ask <= 1")
+        if bool(cfg.get("early_rich_a22_enabled", False)) and float(cfg["a22_window_min"]) > 0:
+            if _er_ask + 1e-12 < float(cfg["a22_min_price"]):
+                raise ValueError(
+                    "early_rich_a22_ask_min must be >= a22_min_price when early-rich a22 is on"
+                )
+            if _er_ask - 1e-12 > float(cfg["high_buy_max_price"]):
+                raise ValueError(
+                    "early_rich_a22_ask_min must be <= high_buy_max_price when early-rich a22 is on"
+                )
         if float(cfg.get("entry_persist_ttm_frac", 0.0) or 0.0) < 0:
             raise ValueError("entry_persist_ttm_frac must be >= 0")
         if float(cfg.get("entry_persist_ttm_floor_s", 0.0) or 0.0) < 0:
@@ -611,6 +645,8 @@ def load_strategy():
             "a22_window_min", "c5_window_min", "hedge_oracle_min_edge_usd",
             "early_hot_defer_ttm_min", "early_hot_defer_ask_min",
             "early_hot_defer_edge_usd",
+            "early_rich_a22_persist_s", "early_rich_a22_window_min",
+            "early_rich_a22_ask_min",
         ):
             if float(cfg[key]) < 0:
                 raise ValueError(f"{key} must be non-negative")
@@ -646,6 +682,10 @@ EARLY_HOT_DEFER_ASK_MIN = float(_strat.get("early_hot_defer_ask_min", 0.95) or 0
 EARLY_HOT_DEFER_EDGE_USD = float(_strat.get("early_hot_defer_edge_usd", 200.0) or 0.0)
 EARLY_HOT_A22_FRACTION = float(_strat.get("early_hot_a22_fraction", 0.5) or 0.5)
 EARLY_HOT_ALLOW_B15 = bool(_strat.get("early_hot_allow_b15", True))
+EARLY_RICH_A22_ENABLED = bool(_strat.get("early_rich_a22_enabled", True))
+EARLY_RICH_A22_ASK_MIN = float(_strat.get("early_rich_a22_ask_min", 0.97) or 0.0)
+EARLY_RICH_A22_PERSIST_S = float(_strat.get("early_rich_a22_persist_s", 90.0) or 0.0)
+EARLY_RICH_A22_WINDOW_MIN = float(_strat.get("early_rich_a22_window_min", 20.0) or 0.0)
 TOXIC_FORCE_EXIT_BELOW = _strat["toxic_force_exit_below"]
 HEDGE_ENABLED = _strat["hedge_enabled"]
 HEDGE_THRESHOLD = _strat["hedge_threshold"]
@@ -655,7 +695,7 @@ HEDGE_QUOTE_MAX_AGE_S = _strat["hedge_quote_max_age_s"]
 HEDGE_RETRY_SLEEP_S = _strat["hedge_retry_sleep_s"]
 HEDGE_GHOST_SLEEP_S = _strat["hedge_ghost_sleep_s"]
 MAX_ENTRY_SPREAD = _strat["max_entry_spread"]
-ENTRY_BOOK_PERSIST_S = float(_strat.get("entry_book_persist_s", 8.0) or 0.0)
+ENTRY_BOOK_PERSIST_S = float(_strat.get("entry_book_persist_s", 15.0) or 0.0)
 B15_ENTRY_BOOK_PERSIST_S = float(_strat.get("b15_entry_book_persist_s", 20.0) or 0.0)
 ENTRY_PERSIST_TTM_FRAC = float(_strat.get("entry_persist_ttm_frac", 0.5) or 0.5)
 ENTRY_PERSIST_TTM_FLOOR_S = float(_strat.get("entry_persist_ttm_floor_s", 5.0) or 5.0)
@@ -703,6 +743,7 @@ C5_BUY_BUDGET = _strat["c5_buy_budget"]
 MARKET_SPEND_CAP = _strat["market_spend_cap"]
 BUY_HORIZON_MIN = hourly_horizon_min(
     A22_WINDOW_MIN, B15_WINDOW_MIN, C5_WINDOW_MIN, BUY_WINDOW_MIN,
+    early_rich_window_min=EARLY_RICH_A22_WINDOW_MIN if EARLY_RICH_A22_ENABLED else 0.0,
 )
 BUY_GRACE_S = _strat["buy_grace_s"]
 BUY_COOLDOWN_S = _strat["buy_cooldown_s"]
@@ -1050,7 +1091,7 @@ def hold_while_oracle_agrees(held_leg, start_ts, condition_id, meta=None):
 
 
 def current_entry_bands(minutes_left):
-    """Open hourly buy bands at this TTM (live: B 75–90 last 20 min)."""
+    """Open hourly buy bands at this TTM (b15 last 20m; a22 last 10m + early-rich)."""
     return applicable_hourly_entry_bands(
         minutes_left,
         a22_window_min=A22_WINDOW_MIN,
@@ -1061,6 +1102,9 @@ def current_entry_bands(minutes_left):
         a22_min=A22_MIN_PRICE,
         c5_min=C5_MIN_PRICE,
         high_max=HIGH_BUY_MAX_PRICE,
+        early_rich_enabled=EARLY_RICH_A22_ENABLED,
+        early_rich_window_min=EARLY_RICH_A22_WINDOW_MIN,
+        early_rich_ask_min=EARLY_RICH_A22_ASK_MIN,
     )
 
 
@@ -2328,12 +2372,23 @@ def entry_book_ok(bid, ask, max_spread, min_bid):
 
 
 
-def entry_persist_for_ask(ask, bands):
-    """Longer persist for b15 (90¢ sleeve); a22 keeps ENTRY_BOOK_PERSIST_S."""
+def entry_persist_for_ask(ask, bands, *, minutes_left=None):
+    """b15 uses B15 persist; early-rich a22 uses 90s; last-10m a22 uses ENTRY persist."""
     band = select_hourly_entry_band(ask, bands) if ask is not None and bands else None
-    if band is not None and str(band.name) == "b15":
-        return float(B15_ENTRY_BOOK_PERSIST_S or ENTRY_BOOK_PERSIST_S)
-    return float(ENTRY_BOOK_PERSIST_S)
+    name = None if band is None else str(band.name)
+    early_rich_active = early_rich_a22_window_open(
+        minutes_left,
+        enabled=EARLY_RICH_A22_ENABLED,
+        window_min=EARLY_RICH_A22_WINDOW_MIN,
+        a22_window_min=A22_WINDOW_MIN,
+    )
+    return hourly_entry_persist_s(
+        name,
+        a22_persist_s=ENTRY_BOOK_PERSIST_S,
+        b15_persist_s=B15_ENTRY_BOOK_PERSIST_S or ENTRY_BOOK_PERSIST_S,
+        early_rich_persist_s=EARLY_RICH_A22_PERSIST_S,
+        early_rich_active=early_rich_active,
+    )
 
 
 def entry_persist_clamp_for_ttm(persist_s, minutes_left):
@@ -2402,6 +2457,52 @@ def entry_book_persist_ready(cond, leg, book_ok, *, now_s=None, persist_s=None, 
     if age + 1e-12 < wait:
         return False, "waiting", age
     return True, "ok", age
+
+
+def _maybe_log_early_rich_cleared(cond, leg, *, early_rich_open, ask, minutes_left):
+    """Log one clear when an early-rich a22 persist arm is dropped (ask flicker)."""
+    if not early_rich_open:
+        return
+    key = entry_book_persist_key(cond, leg, "a22")
+    if key not in _entry_book_persist_armed:
+        return
+    log_event(
+        "early_rich_a22_cleared",
+        condition_id=cond,
+        leg=leg,
+        ask=None if ask is None else round(float(ask), 4),
+        ask_min=EARLY_RICH_A22_ASK_MIN,
+        persist_s=EARLY_RICH_A22_PERSIST_S,
+        minutes_left=round(float(minutes_left), 2),
+        window_min=EARLY_RICH_A22_WINDOW_MIN,
+    )
+
+
+def _log_early_rich_persist(cond, leg, *, why, ready, age, persist_s, ask, minutes_left):
+    """Lifecycle logs for the early-rich a22 persist (arm / wait / fire-ready)."""
+    payload = dict(
+        condition_id=cond,
+        leg=leg,
+        persist_why=why,
+        persist_s=persist_s,
+        armed_age_s=None if age is None else round(float(age), 3),
+        ask=None if ask is None else round(float(ask), 4),
+        ask_min=EARLY_RICH_A22_ASK_MIN,
+        minutes_left=round(float(minutes_left), 2),
+        window_min=EARLY_RICH_A22_WINDOW_MIN,
+    )
+    if why == "armed":
+        log_event("early_rich_a22_armed", **payload)
+    elif why == "waiting":
+        log_buy_skip_throttled(
+            "early_rich_a22_waiting",
+            cond,
+            event="early_rich_a22_waiting",
+            **{k: v for k, v in payload.items() if k != "condition_id"},
+        )
+    elif ready:
+        log_event("early_rich_a22_ready", **payload)
+
 
 def hedge_book_ok(bid, ask, threshold, max_spread, require_ask_max):
     """True only when the held book actually collapsed — not a lone penny bid.
@@ -4971,6 +5072,10 @@ while not _shutdown_requested:
         EARLY_HOT_DEFER_EDGE_USD = float(_strat.get("early_hot_defer_edge_usd", 200.0) or 0.0)
         EARLY_HOT_A22_FRACTION = float(_strat.get("early_hot_a22_fraction", 0.5) or 0.5)
         EARLY_HOT_ALLOW_B15 = bool(_strat.get("early_hot_allow_b15", True))
+        EARLY_RICH_A22_ENABLED = bool(_strat.get("early_rich_a22_enabled", True))
+        EARLY_RICH_A22_ASK_MIN = float(_strat.get("early_rich_a22_ask_min", 0.97) or 0.0)
+        EARLY_RICH_A22_PERSIST_S = float(_strat.get("early_rich_a22_persist_s", 90.0) or 0.0)
+        EARLY_RICH_A22_WINDOW_MIN = float(_strat.get("early_rich_a22_window_min", 20.0) or 0.0)
         TOXIC_FORCE_EXIT_BELOW = _strat["toxic_force_exit_below"]
         HEDGE_ENABLED = _strat["hedge_enabled"]
         HEDGE_THRESHOLD = _strat["hedge_threshold"]
@@ -4980,7 +5085,7 @@ while not _shutdown_requested:
         HEDGE_RETRY_SLEEP_S = _strat["hedge_retry_sleep_s"]
         HEDGE_GHOST_SLEEP_S = _strat["hedge_ghost_sleep_s"]
         MAX_ENTRY_SPREAD = _strat["max_entry_spread"]
-        ENTRY_BOOK_PERSIST_S = float(_strat.get("entry_book_persist_s", 8.0) or 0.0)
+        ENTRY_BOOK_PERSIST_S = float(_strat.get("entry_book_persist_s", 15.0) or 0.0)
         B15_ENTRY_BOOK_PERSIST_S = float(_strat.get("b15_entry_book_persist_s", 20.0) or 0.0)
         ENTRY_PERSIST_TTM_FRAC = float(_strat.get("entry_persist_ttm_frac", 0.5) or 0.5)
         ENTRY_PERSIST_TTM_FLOOR_S = float(_strat.get("entry_persist_ttm_floor_s", 5.0) or 5.0)
@@ -5028,6 +5133,7 @@ while not _shutdown_requested:
         MARKET_SPEND_CAP = _strat["market_spend_cap"]
         BUY_HORIZON_MIN = hourly_horizon_min(
             A22_WINDOW_MIN, B15_WINDOW_MIN, C5_WINDOW_MIN, BUY_WINDOW_MIN,
+            early_rich_window_min=EARLY_RICH_A22_WINDOW_MIN if EARLY_RICH_A22_ENABLED else 0.0,
         )
         BUY_GRACE_S = _strat["buy_grace_s"]
         BUY_COOLDOWN_S = _strat["buy_cooldown_s"]
@@ -7378,19 +7484,40 @@ while not _shutdown_requested:
                 # Tight-book persist: one-tick mirages (wide→briefly tight→wide) must
                 # not POST. Clear arms whenever consensus/book fails. Persist is
                 # per entry band/level so b15 cannot satisfy a later a22 buy.
+                _early_rich_open = early_rich_a22_window_open(
+                    minutes_left,
+                    enabled=EARLY_RICH_A22_ENABLED,
+                    window_min=EARLY_RICH_A22_WINDOW_MIN,
+                    a22_window_min=A22_WINDOW_MIN,
+                )
                 if not up_buy:
+                    _maybe_log_early_rich_cleared(
+                        cond, "up", early_rich_open=_early_rich_open,
+                        ask=up_ask, minutes_left=minutes_left,
+                    )
                     clear_entry_book_persist_leg(cond, "up")
                 if not dn_buy:
+                    _maybe_log_early_rich_cleared(
+                        cond, "down", early_rich_open=_early_rich_open,
+                        ask=dn_ask, minutes_left=minutes_left,
+                    )
                     clear_entry_book_persist_leg(cond, "down")
                 if up_buy:
                     _up_band = select_hourly_entry_band(up_ask, bands)
                     _up_band_name = None if _up_band is None else str(_up_band.name)
                     _up_persist = entry_persist_clamp_for_ttm(
-                        entry_persist_for_ask(up_ask, bands), minutes_left,
+                        entry_persist_for_ask(up_ask, bands, minutes_left=minutes_left),
+                        minutes_left,
                     )
                     ready, why, age = entry_book_persist_ready(
                         cond, "up", True, persist_s=_up_persist, band=_up_band_name,
                     )
+                    if _early_rich_open and _up_band_name == "a22":
+                        _log_early_rich_persist(
+                            cond, "up", why=why, ready=ready, age=age,
+                            persist_s=_up_persist, ask=up_ask,
+                            minutes_left=minutes_left,
+                        )
                     if not ready:
                         log_buy_skip_throttled(
                             "entry_book_persist",
@@ -7401,6 +7528,7 @@ while not _shutdown_requested:
                             persist_why=why,
                             persist_s=_up_persist,
                             armed_age_s=None if age is None else round(age, 3),
+                            early_rich_a22=bool(_early_rich_open and _up_band_name == "a22"),
                             up_ask=up_ask, up_bid=up_bid, up_gui=up_gui,
                         )
                         up_buy = False
@@ -7408,11 +7536,18 @@ while not _shutdown_requested:
                     _dn_band = select_hourly_entry_band(dn_ask, bands)
                     _dn_band_name = None if _dn_band is None else str(_dn_band.name)
                     _dn_persist = entry_persist_clamp_for_ttm(
-                        entry_persist_for_ask(dn_ask, bands), minutes_left,
+                        entry_persist_for_ask(dn_ask, bands, minutes_left=minutes_left),
+                        minutes_left,
                     )
                     ready, why, age = entry_book_persist_ready(
                         cond, "down", True, persist_s=_dn_persist, band=_dn_band_name,
                     )
+                    if _early_rich_open and _dn_band_name == "a22":
+                        _log_early_rich_persist(
+                            cond, "down", why=why, ready=ready, age=age,
+                            persist_s=_dn_persist, ask=dn_ask,
+                            minutes_left=minutes_left,
+                        )
                     if not ready:
                         log_buy_skip_throttled(
                             "entry_book_persist",
@@ -7423,6 +7558,7 @@ while not _shutdown_requested:
                             persist_why=why,
                             persist_s=_dn_persist,
                             armed_age_s=None if age is None else round(age, 3),
+                            early_rich_a22=bool(_early_rich_open and _dn_band_name == "a22"),
                             dn_ask=dn_ask, dn_bid=dn_bid, dn_gui=dn_gui,
                         )
                         dn_buy = False
@@ -7513,11 +7649,20 @@ while not _shutdown_requested:
                 # favor-edge -> half-cap a22 (no hard skip). b15 is never
                 # continue-skipped here (early_hot_allow_b15 documents that;
                 # b15 also cannot take asks >= ask_min given its max).
+                # Do not half-cap the early-rich 97¢/90s path: that path exists
+                # to buy those rich books, and early-hot never opens a22.
                 early_hot_active = False
                 early_hot_favor_edge = None
                 early_hot_ask = None
+                _early_rich_for_hot = early_rich_a22_window_open(
+                    minutes_left,
+                    enabled=EARLY_RICH_A22_ENABLED,
+                    window_min=EARLY_RICH_A22_WINDOW_MIN,
+                    a22_window_min=A22_WINDOW_MIN,
+                )
                 if (
                     EARLY_HOT_DEFER_ENABLED
+                    and (not _early_rich_for_hot)
                     and (up_buy or dn_buy)
                     and favored
                     and uchk is not None
@@ -7794,6 +7939,27 @@ while not _shutdown_requested:
                 spent_before = hourly_spent_so_far(meta)
                 if uchk is None and m.start_ts:
                     uchk = btc_feed.underlying_check(m.start_ts, 0)  # snapshot only
+                _early_rich_fire = bool(
+                    band.name == "a22"
+                    and early_rich_a22_window_open(
+                        minutes_left,
+                        enabled=EARLY_RICH_A22_ENABLED,
+                        window_min=EARLY_RICH_A22_WINDOW_MIN,
+                        a22_window_min=A22_WINDOW_MIN,
+                    )
+                )
+                if _early_rich_fire:
+                    log_event(
+                        "early_rich_a22_fired",
+                        condition_id=cond,
+                        leg=buy_leg,
+                        ask=None if buy_ask is None else round(float(buy_ask), 4),
+                        ask_min=EARLY_RICH_A22_ASK_MIN,
+                        persist_s=EARLY_RICH_A22_PERSIST_S,
+                        minutes_left=round(float(minutes_left), 2),
+                        window_min=EARLY_RICH_A22_WINDOW_MIN,
+                        budget=spend_usd,
+                    )
                 log_event(
                     "buy_attempt", condition_id=cond, leg=buy_leg, budget=spend_usd,
                     ask=buy_ask, gui=buy_gui, up_gui=up_gui, dn_gui=dn_gui,
@@ -7802,6 +7968,7 @@ while not _shutdown_requested:
                     slice=band.name,
                     add=slice_prior_size > 0.01,
                     spent_so_far=round(spent_before, 4),
+                    early_rich_a22=_early_rich_fire,
                     ptb=(uchk or {}).get("ptb"),
                     live_btc=(uchk or {}).get("live_btc"),
                     edge_usd=(uchk or {}).get("edge_usd"),
