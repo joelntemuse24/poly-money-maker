@@ -37,7 +37,7 @@
   "toxic_force_exit_below": 0.65,
   "high_buy_max_price": 0.99,
   "hedge_require_gui": true,
-  "a22_window_min": 20.0,
+  "a22_window_min": 10.0,
   "b15_window_min": 20.0,
   "c5_window_min": 0.0,
   "a22_min_price": 0.949,
@@ -55,7 +55,7 @@
   "hedge_sell_fade": true,
   "hedge_require_oracle": true,
   "hedge_oracle_min_edge_usd": 10.0,
-  "entry_book_persist_s": 8.0,
+  "entry_book_persist_s": 15.0,
   "hedge_dump_persist_s": 8.0,
   "hedge_dump_require_tight": true,
   "hedge_dump_ignore_spread_ask_max": 0.6,
@@ -69,5 +69,9 @@
   "b15_size_ref_price": 0.9,
   "c5_size_ref_price": 0.0,
   "take_profit_full_bid": 0.999,
-  "b15_entry_book_persist_s": 20.0
+  "b15_entry_book_persist_s": 20.0,
+  "early_rich_a22_enabled": true,
+  "early_rich_a22_ask_min": 0.97,
+  "early_rich_a22_persist_s": 90.0,
+  "early_rich_a22_window_min": 20.0
 }

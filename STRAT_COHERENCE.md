@@ -51,11 +51,36 @@ These still load. They are desk choices, not validator bugs.
 | Soft-edge bid vs a22 band | `soft_edge_exit_bid=0.95` vs a22 `0.949–0.99` | Load allows it (`0.95 > 0.949`). Cheapest a22 has 0.1¢ of book edge; 99¢ fills would sell *below* entry if soft-edge were not already dead under the $40 floor. |
 | Dump persist vs entry persist | dump 8s / 6s@5m / 2s@1m; entry 15s (a22) / 20s (b15) | Exits can arm faster than entries, especially in the last minute. Intentional, but easy to forget when raising entry persist. |
 
+## Early-rich a22 vs old early_hot
+
+`early_hot_defer_*` is a **half-cap**, not an early-open: it only fires when
+`TTM > early_hot_defer_ttm_min` (15) *and* a22 is already in band
+(`ttm <= a22_window_min`). Live last-10m a22 / last-15m b15 meant no sleeve
+was open when early_hot could activate, so the day logged 0 early_hot events
+while 98–99¢ last-10m a22 still filled.
+
+Early-rich is a **separate additional gate** (does not replace last-10m a22):
+
+| Knob | Default | Meaning |
+|---|---|---|
+| `b15_window_min` / `buy_window_min` | 20 | b15 90–94¢ band opens at 20 minutes (persist still `b15_entry_book_persist_s` ~20s) |
+| `a22_window_min` | 10 | Normal a22 still last 10 minutes, floor `a22_min_price` ~0.949, persist `entry_book_persist_s` ~15s |
+| `early_rich_a22_enabled` | true | Master switch |
+| `early_rich_a22_window_min` | 20 | May open a22 *before* last-10m, while `a22_window_min < ttm <= 20` |
+| `early_rich_a22_ask_min` | 0.97 | Inclusive floor for that overlay (up to `high_buy_max_price`) |
+| `early_rich_a22_persist_s` | 90 | Favored-side ask must hold continuously; flicker below 97¢ clears the arm (`cond\|leg\|a22`) |
+
+b15 stays allowed while early-rich a22 is active. Last-10m a22 does not
+require 97¢ or 90s. Logs: `early_rich_a22_armed`, `early_rich_a22_waiting`,
+`early_rich_a22_cleared`, `early_rich_a22_ready`, `early_rich_a22_fired`.
+Early-hot half-cap is not applied inside the early-rich window.
+
 ## What this repo does not change
 
-- Example / snapshot JSON bytes stay the Sep 9 captured shape
-  (`dry_run` / `entry_enabled` differ only on the example). Soft-edge
-  keys are code defaults (`enabled=false`) so those files still load.
+- Soft-edge keys stay code defaults (`enabled=false`) so older snapshots
+  still load. Example / snapshot JSON now also carry early-rich knobs and
+  last-10m a22 / last-20m b15 windows (`dry_run` / `entry_enabled` still
+  differ only on the example).
 - Live VM `buybothourly.py` already implements the soft-edge *exit
   loop*. This tree only adds keys + validation so the $40/$50 absurdity
   cannot load once that code is synced. Merge is not a restart.
