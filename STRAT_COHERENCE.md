@@ -7,9 +7,11 @@ Rules live in `buy/strategy_coherence.py` (pure; tests must not import
 The live VM is still the operational source of truth. This file records
 tensions that validation cannot “fix” without changing the desk’s intent.
 GitHub `strategy_buyhourly.json` remains the reviewed 2026-09-09 snapshot
-(`dry_run=false` is not authorization to run it). Live knobs below are
-from `/home/ntemusejoel/poly-money-maker/strategy_buyhourly.json` at
-**2026-09-13 ~02:05 UTC**.
+(`dry_run=false` is not authorization to run it). **Do not copy that file
+onto the VM.** Live strategy is a dirty working-tree file on the VM and is
+the day-to-day source of truth. Live knobs in the tensions table are from
+2026-09-13; the early-rich deploy table below is from a read-only check at
+**2026-09-14 ~22:25 UTC**.
 
 ## Fail-closed rules
 
@@ -75,15 +77,66 @@ require 97¢ or 90s. Logs: `early_rich_a22_armed`, `early_rich_a22_waiting`,
 `early_rich_a22_cleared`, `early_rich_a22_ready`, `early_rich_a22_fired`.
 Early-hot half-cap is not applied inside the early-rich window.
 
+## Deploy onto the live VM (do not overwrite)
+
+Checked read-only as `poly-auditor` on 2026-09-14: VM `HEAD` `8459e5e`
+(merge of `origin/main` + older VM-only commits; **ahead 6**).
+`buybothourly.py` sha256 `8c2a5594…` matches GitHub main; it does **not**
+yet contain early-rich. `strategy_buyhourly.json` is **modified in the
+working tree** (not committed) and must stay that way.
+
+Deploy is a careful code pull/merge, then a **manual live-JSON edit**.
+Never `git checkout -- strategy_buyhourly.json`, `git reset --hard`, or
+copy GitHub’s snapshot over the VM file.
+
+Live values to **keep** (do not replace with the Sep-9 snapshot):
+
+| Knob | Live VM 2026-09-14 |
+|---|---|
+| `a22_buy_budget` | 180 |
+| `b15_buy_budget` | 50 |
+| `buy_budget` | 50 |
+| `market_spend_cap` | 250 |
+| `buy_max_spend` | 255 |
+| `buy_max_shares` | 280 |
+| `a22_size_ref_price` | 0.92 |
+| `b15_size_ref_price` | 0.90 |
+| `a22_window_min` | 10 (already last-10m) |
+| `a22_min_price` | 0.949 |
+| `buy_threshold` / `buy_max_price` | 0.90 / 0.94 |
+| `entry_book_persist_s` | 15 |
+| `b15_entry_book_persist_s` | 20 |
+| `min_underlying_edge_usd` | 40 |
+
+Live values to **set** after the Python lands (hot-reload reads JSON;
+**Python changes need an authorized process reload**):
+
+| Knob | Set on VM | Why |
+|---|---|---|
+| `b15_window_min` | **20** (now 15) | Open the 90–94¢ sleeve at 20 minutes |
+| `buy_window_min` | **20** (now 15) | Outer look-ahead matches b15 |
+| `early_rich_a22_enabled` | true | Optional explicit; code default is true if the key is absent |
+| `early_rich_a22_ask_min` | 0.97 | Inclusive floor for the overlay |
+| `early_rich_a22_persist_s` | 90 | Continuous hold; flicker below 97¢ clears |
+| `early_rich_a22_window_min` | 20 | Overlay window (`10 < TTM ≤ 20`) |
+
+If the new keys are omitted, `load_strategy` fills them from
+`_STRATEGY_DEFAULTS` (enabled / 0.97 / 90s / 20m). `b15_window_min` and
+`buy_window_min` are already in the live file, so they **will not**
+change until edited.
+
+Suggested order: copy the live JSON aside → merge/cherry-pick **code only**
+(`buybothourly.py`, `buy/entry_skip.py`, tests, example) → confirm the
+live JSON still has $180 / $50 / $250 / 0.92 → add the six knobs above →
+reload the hourly service only when Joel authorizes it.
+
 ## What this repo does not change
 
+- GitHub `strategy_buyhourly.json` stays the Sep-9 captured snapshot.
+  New knobs live in `_STRATEGY_DEFAULTS` and `strategy_buyhourly.example.json`.
 - Soft-edge keys stay code defaults (`enabled=false`) so older snapshots
-  still load. Example / snapshot JSON now also carry early-rich knobs and
-  last-10m a22 / last-20m b15 windows (`dry_run` / `entry_enabled` still
-  differ only on the example).
-- Live VM `buybothourly.py` already implements the soft-edge *exit
-  loop*. This tree only adds keys + validation so the $40/$50 absurdity
-  cannot load once that code is synced. Merge is not a restart.
+  still load. Example `dry_run` / `entry_enabled` stay disarmed.
+- Merge is not a restart and is not authorization to overwrite the VM.
 
 ## Late-window |edge| bleed (telemetry, not a knob)
 

@@ -235,6 +235,11 @@ _STRATEGY_DEFAULTS = {
     # Extra a22 gate before last-10m: last ``early_rich_a22_window_min`` if the
     # favored-side ask holds >= ask_min for persist_s. Does not replace last-10m
     # a22 (0.949 / ~15s) and does not close b15.
+    # Live VM JSON is SoT (2026-09-14: a22 $180 / b15 $50 / cap $250 /
+    # a22_size_ref 0.92 / a22 last-10m). Do not copy GitHub
+    # strategy_buyhourly.json onto the VM. After this code lands, set
+    # b15_window_min=20, buy_window_min=20, and these four keys on the live file
+    # (or omit them and these defaults apply).
     "early_rich_a22_enabled": True,
     "early_rich_a22_ask_min": 0.97,
     "early_rich_a22_persist_s": 90.0,
