@@ -77,58 +77,59 @@ require 97¢ or 90s. Logs: `early_rich_a22_armed`, `early_rich_a22_waiting`,
 `early_rich_a22_cleared`, `early_rich_a22_ready`, `early_rich_a22_fired`.
 Early-hot half-cap is not applied inside the early-rich window.
 
-## Deploy onto the live VM (do not overwrite)
+## Deploy onto the live VM (already on GitHub main)
 
-Checked read-only as `poly-auditor` on 2026-09-14: VM `HEAD` `8459e5e`
-(merge of `origin/main` + older VM-only commits; **ahead 6**).
-`buybothourly.py` sha256 `8c2a5594…` matches GitHub main; it does **not**
-yet contain early-rich. `strategy_buyhourly.json` is **modified in the
-working tree** (not committed) and must stay that way.
+Checked read-only as `poly-auditor` on 2026-09-14 after the operator
+merged `origin/main` (conflicts favored GitHub for `buybothourly.py`)
+and restarted the hourly service:
 
-Deploy is a careful code pull/merge, then a **manual live-JSON edit**.
-Never `git checkout -- strategy_buyhourly.json`, `git reset --hard`, or
-copy GitHub’s snapshot over the VM file.
+- VM `HEAD` `8459e5e` (ahead of `origin/main` `c9e97c2` by older VM-only
+  commits). **`buybothourly.py` sha256 `8c2a5594…` matches GitHub main.**
+- Live `strategy_buyhourly.json` was **kept** (`a22 $180` / `b15 $50` /
+  caps `$250` / `$255`). It is a dirty working-tree file. Do not replace
+  it with GitHub’s Sep-9 snapshot.
+- This tree still has **no** early-rich code (`early_rich_a22` count 0).
 
-Live values to **keep** (do not replace with the Sep-9 snapshot):
+Apply path: pull **PR #165** onto this already-synced tree, then edit
+the live JSON. Never `git checkout -- strategy_buyhourly.json`,
+`git reset --hard`, or copy the GitHub snapshot over the VM file.
+
+Live values to **keep**:
 
 | Knob | Live VM 2026-09-14 |
 |---|---|
 | `a22_buy_budget` | 180 |
 | `b15_buy_budget` | 50 |
 | `buy_budget` | 50 |
-| `market_spend_cap` | 250 |
-| `buy_max_spend` | 255 |
+| `market_spend_cap` / `buy_max_spend` | 250 / 255 |
 | `buy_max_shares` | 280 |
-| `a22_size_ref_price` | 0.92 |
-| `b15_size_ref_price` | 0.90 |
+| `a22_size_ref_price` / `b15_size_ref_price` | 0.92 / 0.90 |
 | `a22_window_min` | 10 (already last-10m) |
 | `a22_min_price` | 0.949 |
 | `buy_threshold` / `buy_max_price` | 0.90 / 0.94 |
-| `entry_book_persist_s` | 15 |
-| `b15_entry_book_persist_s` | 20 |
+| `entry_book_persist_s` / `b15_entry_book_persist_s` | 15 / 20 |
 | `min_underlying_edge_usd` | 40 |
 
-Live values to **set** after the Python lands (hot-reload reads JSON;
-**Python changes need an authorized process reload**):
+Live values to **set** after the PR Python lands (JSON hot-reloads;
+**Python changes need another authorized process reload**):
 
-| Knob | Set on VM | Why |
+| Knob | Set on VM | Now |
 |---|---|---|
-| `b15_window_min` | **20** (now 15) | Open the 90–94¢ sleeve at 20 minutes |
-| `buy_window_min` | **20** (now 15) | Outer look-ahead matches b15 |
-| `early_rich_a22_enabled` | true | Optional explicit; code default is true if the key is absent |
-| `early_rich_a22_ask_min` | 0.97 | Inclusive floor for the overlay |
-| `early_rich_a22_persist_s` | 90 | Continuous hold; flicker below 97¢ clears |
-| `early_rich_a22_window_min` | 20 | Overlay window (`10 < TTM ≤ 20`) |
+| `b15_window_min` | **20** | 15 |
+| `buy_window_min` | **20** | 15 |
+| `early_rich_a22_enabled` | true | absent (code default true) |
+| `early_rich_a22_ask_min` | 0.97 | absent |
+| `early_rich_a22_persist_s` | 90 | absent |
+| `early_rich_a22_window_min` | 20 | absent |
 
-If the new keys are omitted, `load_strategy` fills them from
-`_STRATEGY_DEFAULTS` (enabled / 0.97 / 90s / 20m). `b15_window_min` and
-`buy_window_min` are already in the live file, so they **will not**
-change until edited.
+Missing `early_rich_*` keys are filled from `_STRATEGY_DEFAULTS`.
+`b15_window_min` / `buy_window_min` are already in the live file, so
+they will **not** change until edited.
 
-Suggested order: copy the live JSON aside → merge/cherry-pick **code only**
-(`buybothourly.py`, `buy/entry_skip.py`, tests, example) → confirm the
-live JSON still has $180 / $50 / $250 / 0.92 → add the six knobs above →
-reload the hourly service only when Joel authorizes it.
+Suggested order: copy the live JSON aside → `git fetch` + merge/cherry-pick
+PR #165 (`buybothourly.py`, `buy/entry_skip.py`, tests, example) → confirm
+`$180` / `$50` / `$250` / `$255` / `0.92` still on disk → set the six knobs
+→ reload the hourly service only when Joel authorizes it.
 
 ## What this repo does not change
 
