@@ -82,6 +82,7 @@ from buy.entry_skip import (
     hourly_spent_so_far,
     same_token,
     select_hourly_entry_band,
+    stamp_early_rich_a22_on_fill,
     stamp_hourly_slice_bought,
     uncertain_buy_spend_cap,
     window_no_buy_reason,
@@ -104,6 +105,9 @@ from buy.hedge_gate import (
     take_profit_ready,
     take_profit_sell_size,
     take_profit_full_ready,
+    early_rich_take_profit_full_ready,
+    early_rich_skip_half_take_profit,
+    early_rich_take_profit_persist_s,
 )
 
 
@@ -369,6 +373,11 @@ _STRATEGY_DEFAULTS = {
     "take_profit_fraction": 0.5,
     # Full-bag exit when bid holds at/above this (UI ~99.9¢ → 0.99 tick).
     "take_profit_full_bid": 0.99,
+    # Early-rich bags only (stamped on fill). Full-sell when bid holds at/above
+    # this for persist_s. Does not lower take_profit_full_bid for normal a22/b15.
+    "early_rich_take_profit_enabled": True,
+    "early_rich_take_profit_bid": 0.99,
+    "early_rich_take_profit_persist_s": 5.0,
     # Soft-edge paranoia exit (Joel): if entry favor-edge <= max_usd and
     # held bid >= exit_bid for persist_s, full-sell (bypass oracle).
     # max_usd is entry Binance-vs-PTB favor edge (same units as
@@ -525,6 +534,13 @@ def load_strategy():
         _tp_full = float(cfg.get("take_profit_full_bid", 0.0) or 0.0)
         if _tp_full < 0 or _tp_full > 1:
             raise ValueError("take_profit_full_bid must satisfy 0 <= bid <= 1 (0 = disabled)")
+        _er_tp_bid = float(cfg.get("early_rich_take_profit_bid", 0.0) or 0.0)
+        if _er_tp_bid < 0 or _er_tp_bid > 1:
+            raise ValueError(
+                "early_rich_take_profit_bid must satisfy 0 <= bid <= 1 (0 = disabled)"
+            )
+        if float(cfg.get("early_rich_take_profit_persist_s", 0.0) or 0.0) < 0:
+            raise ValueError("early_rich_take_profit_persist_s must be >= 0")
         if "entry_book_persist_s" in cfg:
             if float(cfg["entry_book_persist_s"]) < 0:
                 raise ValueError("entry_book_persist_s must be >= 0")
@@ -545,6 +561,16 @@ def load_strategy():
             if _er_ask - 1e-12 > float(cfg["high_buy_max_price"]):
                 raise ValueError(
                     "early_rich_a22_ask_min must be <= high_buy_max_price when early-rich a22 is on"
+                )
+        if (
+            bool(cfg.get("early_rich_take_profit_enabled", False))
+            and _er_tp_bid > 1e-12
+            and bool(cfg.get("early_rich_a22_enabled", False))
+        ):
+            if _er_tp_bid + 1e-12 < _er_ask:
+                raise ValueError(
+                    "early_rich_take_profit_bid must be >= early_rich_a22_ask_min "
+                    "when early-rich take-profit is on"
                 )
         if float(cfg.get("entry_persist_ttm_frac", 0.0) or 0.0) < 0:
             raise ValueError("entry_persist_ttm_frac must be >= 0")
@@ -647,6 +673,7 @@ def load_strategy():
             "early_hot_defer_edge_usd",
             "early_rich_a22_persist_s", "early_rich_a22_window_min",
             "early_rich_a22_ask_min",
+            "early_rich_take_profit_persist_s", "early_rich_take_profit_bid",
         ):
             if float(cfg[key]) < 0:
                 raise ValueError(f"{key} must be non-negative")
@@ -723,6 +750,15 @@ TAKE_PROFIT_FROM_START_TS = float(_strat.get("take_profit_from_start_ts", 0.0) o
 TAKE_PROFIT_PERSIST_S = float(_strat.get("take_profit_persist_s", 5.0) or 0.0)
 TAKE_PROFIT_FRACTION = float(_strat.get("take_profit_fraction", 0.5) or 0.5)
 TAKE_PROFIT_FULL_BID = float(_strat.get("take_profit_full_bid", 0.0) or 0.0)
+EARLY_RICH_TAKE_PROFIT_ENABLED = bool(
+    _strat.get("early_rich_take_profit_enabled", True)
+)
+EARLY_RICH_TAKE_PROFIT_BID = float(
+    _strat.get("early_rich_take_profit_bid", 0.99) or 0.0
+)
+EARLY_RICH_TAKE_PROFIT_PERSIST_S = float(
+    _strat.get("early_rich_take_profit_persist_s", 5.0) or 0.0
+)
 SOFT_EDGE_EXIT_ENABLED = bool(_strat.get("soft_edge_exit_enabled", False))
 SOFT_EDGE_EXIT_MAX_USD = float(_strat.get("soft_edge_exit_max_usd", 50.0) or 0.0)
 SOFT_EDGE_EXIT_BID = float(_strat.get("soft_edge_exit_bid", 0.95) or 0.0)
@@ -5113,6 +5149,15 @@ while not _shutdown_requested:
         TAKE_PROFIT_PERSIST_S = float(_strat.get("take_profit_persist_s", 5.0) or 0.0)
         TAKE_PROFIT_FRACTION = float(_strat.get("take_profit_fraction", 0.5) or 0.5)
         TAKE_PROFIT_FULL_BID = float(_strat.get("take_profit_full_bid", 0.0) or 0.0)
+        EARLY_RICH_TAKE_PROFIT_ENABLED = bool(
+            _strat.get("early_rich_take_profit_enabled", True)
+        )
+        EARLY_RICH_TAKE_PROFIT_BID = float(
+            _strat.get("early_rich_take_profit_bid", 0.99) or 0.0
+        )
+        EARLY_RICH_TAKE_PROFIT_PERSIST_S = float(
+            _strat.get("early_rich_take_profit_persist_s", 5.0) or 0.0
+        )
         SOFT_EDGE_EXIT_ENABLED = bool(_strat.get("soft_edge_exit_enabled", False))
         SOFT_EDGE_EXIT_MAX_USD = float(_strat.get("soft_edge_exit_max_usd", 50.0) or 0.0)
         SOFT_EDGE_EXIT_BID = float(_strat.get("soft_edge_exit_bid", 0.95) or 0.0)
@@ -6165,6 +6210,15 @@ while not _shutdown_requested:
                 # flip the oracle. Grandfather: m.start_ts >=
                 # TAKE_PROFIT_FROM_START_TS (10:00 ET 2026-09-07 = 1788789600).
                 # Open 9AM ET start_ts 1788786000 is excluded.
+                # Early-rich bags (meta.early_rich_a22): skip half-TP and
+                # full-sell when bid holds at early_rich_take_profit_bid
+                # (default 99¢). Ordinary bags still use take_profit_full_bid.
+                _er_stamped = bool(meta.get("early_rich_a22"))
+                _er_skip_half = early_rich_skip_half_take_profit(
+                    stamped=_er_stamped,
+                    enabled=EARLY_RICH_TAKE_PROFIT_ENABLED,
+                    full_bid=EARLY_RICH_TAKE_PROFIT_BID,
+                )
                 if (
                     bool(held_token)
                     and held_size > 0.01
@@ -6176,6 +6230,7 @@ while not _shutdown_requested:
                     and (
                         not meta.get("take_profit_done")
                         or float(TAKE_PROFIT_FULL_BID or 0) > 1e-12
+                        or _er_skip_half
                     )
                 ):
                     _tp_age = book_ws.quote_age(held_token)
@@ -6208,16 +6263,25 @@ while not _shutdown_requested:
                         held_size,
                         meta.get("fill_price"),
                     )
-                    _tp_full_lock = take_profit_full_ready(
+                    _tp_normal_full = take_profit_full_ready(
                         _tp_bid, TAKE_PROFIT_FULL_BID,
                     )
-                    _tp_edge_ok = take_profit_overrides_oracle(
+                    _er_full_lock = early_rich_take_profit_full_ready(
                         _tp_bid,
-                        _tp_vwap,
-                        TAKE_PROFIT_EDGE,
-                        enabled=True,
-                        market_start_ts=m.start_ts,
-                        from_start_ts=TAKE_PROFIT_FROM_START_TS,
+                        EARLY_RICH_TAKE_PROFIT_BID,
+                        stamped=_er_stamped,
+                        enabled=EARLY_RICH_TAKE_PROFIT_ENABLED,
+                    )
+                    _tp_full_lock = bool(_tp_normal_full or _er_full_lock)
+                    _tp_edge_ok = (
+                        False if _er_skip_half else take_profit_overrides_oracle(
+                            _tp_bid,
+                            _tp_vwap,
+                            TAKE_PROFIT_EDGE,
+                            enabled=True,
+                            market_start_ts=m.start_ts,
+                            from_start_ts=TAKE_PROFIT_FROM_START_TS,
+                        )
                     )
                     # After a half-TP, only the full-lock path may fire again.
                     if meta.get("take_profit_done") and not _tp_full_lock:
@@ -6227,12 +6291,17 @@ while not _shutdown_requested:
                     _tp_frac = (
                         1.0 if _tp_full_lock else float(TAKE_PROFIT_FRACTION)
                     )
+                    _tp_persist_s = early_rich_take_profit_persist_s(
+                        TAKE_PROFIT_PERSIST_S,
+                        EARLY_RICH_TAKE_PROFIT_PERSIST_S,
+                        skip_half=_er_skip_half,
+                    )
                     _tp_now = time.monotonic()
                     _tp_fire, _tp_new_armed, _tp_pwhy = hedge_persist_ready(
                         bool(_tp_qualifies),
                         now_s=_tp_now,
                         armed_ts=_take_profit_persist_armed.get(cond),
-                        persist_s=TAKE_PROFIT_PERSIST_S,
+                        persist_s=_tp_persist_s,
                         toxic=False,
                     )
                     if _tp_new_armed is None:
@@ -6240,10 +6309,15 @@ while not _shutdown_requested:
                     else:
                         _take_profit_persist_armed[cond] = _tp_new_armed
                     if _tp_qualifies and not _tp_fire:
-                        _tp_target_w = (
-                            None if _tp_vwap is None
-                            else float(_tp_vwap) + float(TAKE_PROFIT_EDGE)
-                        )
+                        if _er_full_lock:
+                            _tp_target_w = float(EARLY_RICH_TAKE_PROFIT_BID)
+                        elif _tp_normal_full:
+                            _tp_target_w = float(TAKE_PROFIT_FULL_BID)
+                        else:
+                            _tp_target_w = (
+                                None if _tp_vwap is None
+                                else float(_tp_vwap) + float(TAKE_PROFIT_EDGE)
+                            )
                         log_buy_skip_throttled(
                             _tp_pwhy,
                             cond,
@@ -6262,12 +6336,14 @@ while not _shutdown_requested:
                                 None if _tp_target_w is None
                                 else round(_tp_target_w, 4)
                             ),
-                            persist_s=float(TAKE_PROFIT_PERSIST_S),
+                            persist_s=float(_tp_persist_s),
                             persist_why=_tp_pwhy,
                             armed_ago_s=(
                                 None if _tp_new_armed is None
                                 else round(_tp_now - float(_tp_new_armed), 3)
                             ),
+                            early_rich_a22=bool(_er_stamped),
+                            early_rich_full_lock=bool(_er_full_lock),
                         )
                     if _tp_fire:
                         _take_profit_persist_armed.pop(cond, None)
@@ -6275,7 +6351,9 @@ while not _shutdown_requested:
                             get_tick_size_cached(held_token),
                         )
                         _tp_floor = float(_tp_tick)
-                        if _tp_full_lock:
+                        if _er_full_lock:
+                            _tp_target = float(EARLY_RICH_TAKE_PROFIT_BID)
+                        elif _tp_full_lock:
                             _tp_target = float(TAKE_PROFIT_FULL_BID)
                         else:
                             _tp_target = float(_tp_vwap) + float(TAKE_PROFIT_EDGE)
@@ -6294,6 +6372,7 @@ while not _shutdown_requested:
                                 fraction=float(_tp_frac),
                                 sell_size=_tp_sell_size,
                                 full_lock=bool(_tp_full_lock),
+                                early_rich_a22=bool(_er_stamped),
                             )
                             continue
                         _tp_bag = live_bag_log_fields(
@@ -6317,6 +6396,8 @@ while not _shutdown_requested:
                             sell_size=_tp_sell_size,
                             fraction=float(_tp_frac),
                             full_lock=bool(_tp_full_lock),
+                            early_rich_a22=bool(_er_stamped),
+                            early_rich_full_lock=bool(_er_full_lock),
                             vwap=round(float(_tp_vwap), 4),
                             edge=float(TAKE_PROFIT_EDGE),
                             target=round(_tp_target, 4),
@@ -6461,6 +6542,8 @@ while not _shutdown_requested:
                             sell_size=_tp_sell_size,
                             fraction=float(_tp_frac),
                             full_lock=bool(_tp_full_lock),
+                            early_rich_a22=bool(_er_stamped),
+                            early_rich_full_lock=bool(_er_full_lock),
                             vwap=round(float(_tp_vwap), 4),
                             edge=float(TAKE_PROFIT_EDGE),
                             target=round(_tp_target, 4),
@@ -6559,6 +6642,7 @@ while not _shutdown_requested:
                                 proceeds=round(rec["proceeds"], 4),
                                 sell_size=_tp_sell_size,
                                 fraction=float(_tp_frac), full_lock=bool(_tp_full_lock),
+                                early_rich_a22=bool(_er_stamped),
                                 take_profit_done=True,
                                 vwap=round(float(_tp_vwap), 4),
                                 edge=float(TAKE_PROFIT_EDGE),
@@ -8030,6 +8114,7 @@ while not _shutdown_requested:
                     meta["quoted_buy_shares_total"] = float(total_quoted or 0)
                     meta["toxic_fill"] = bool(force_exit or meta.get("toxic_fill"))
                     stamp_hourly_slice_bought(meta, band.name)
+                    stamp_early_rich_a22_on_fill(meta, _early_rich_fire)
                     if band.name == "a22":
                         meta["a22_spent_usd"] = round(
                             _a22_spent_before + float(spent_total or 0), 4
@@ -8228,6 +8313,7 @@ while not _shutdown_requested:
                             meta.get("pnl_hedge_proceeds") or 0
                         )
                     stamp_hourly_slice_bought(meta, band.name)
+                    stamp_early_rich_a22_on_fill(meta, _early_rich_fire)
                     if band.name == "a22":
                         meta["a22_spent_usd"] = round(
                             _a22_spent_before + float(spent or 0), 4
@@ -8264,6 +8350,7 @@ while not _shutdown_requested:
                         a22_early_hot_partial=meta.get("a22_early_hot_partial"),
                         a22_early_hot_complete=meta.get("a22_early_hot_complete"),
                         early_hot_active=bool(early_hot_active),
+                        early_rich_a22=bool(meta.get("early_rich_a22")),
                     )
                     append_research(RESEARCH_FILE, {
                         "event": "buy_fill",

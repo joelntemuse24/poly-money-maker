@@ -1173,6 +1173,96 @@ class TakeProfitGateTests(unittest.TestCase):
         self.assertFalse(take_profit_full_ready(0.99, 0.0))  # disabled
         self.assertFalse(take_profit_full_ready(None, 0.99))
 
+    def test_early_rich_full_ready_only_when_stamped(self):
+        from buy.hedge_gate import (
+            early_rich_skip_half_take_profit,
+            early_rich_take_profit_full_ready,
+            take_profit_full_ready,
+            take_profit_ready,
+        )
+        # Stamped early-rich bag at 99¢: 99¢ lock, not the live 99.9¢ lock.
+        self.assertTrue(
+            early_rich_take_profit_full_ready(
+                0.99, 0.99, stamped=True, enabled=True,
+            )
+        )
+        self.assertFalse(take_profit_full_ready(0.99, 0.999))
+        self.assertFalse(
+            early_rich_take_profit_full_ready(
+                0.989, 0.99, stamped=True, enabled=True,
+            )
+        )
+        self.assertFalse(
+            early_rich_take_profit_full_ready(
+                0.99, 0.99, stamped=False, enabled=True,
+            )
+        )
+        self.assertFalse(
+            early_rich_take_profit_full_ready(
+                0.99, 0.99, stamped=True, enabled=False,
+            )
+        )
+        skip = early_rich_skip_half_take_profit(
+            stamped=True, enabled=True, full_bid=0.99,
+        )
+        self.assertTrue(skip)
+        # Half-TP is skipped even though VWAP+4¢ cannot print on 97¢ anyway.
+        self.assertFalse(take_profit_ready(0.99, 0.97, 0.04))
+        edge_ok = False if skip else take_profit_ready(0.99, 0.947, 0.04)
+        self.assertFalse(edge_ok)
+        # Ordinary bag at 99¢ still uses 0.999 / half-TP, not the 99¢ lock.
+        self.assertFalse(
+            early_rich_skip_half_take_profit(
+                stamped=False, enabled=True, full_bid=0.99,
+            )
+        )
+        self.assertTrue(take_profit_ready(0.987, 0.947, 0.04))
+
+    def test_early_rich_99c_persist_then_full_size(self):
+        from buy.hedge_gate import (
+            early_rich_skip_half_take_profit,
+            early_rich_take_profit_full_ready,
+            early_rich_take_profit_persist_s,
+            hedge_persist_ready,
+            take_profit_full_ready,
+            take_profit_sell_size,
+        )
+        skip = early_rich_skip_half_take_profit(
+            stamped=True, enabled=True, full_bid=0.99,
+        )
+        persist = early_rich_take_profit_persist_s(
+            5.0, 5.0, skip_half=skip,
+        )
+        self.assertEqual(persist, 5.0)
+        self.assertEqual(
+            early_rich_take_profit_persist_s(5.0, 3.0, skip_half=False),
+            5.0,
+        )
+        qualifies = early_rich_take_profit_full_ready(
+            0.99, 0.99, stamped=True, enabled=True,
+        )
+        fire, armed, why = hedge_persist_ready(
+            qualifies, now_s=1000.0, armed_ts=None, persist_s=persist,
+            toxic=False,
+        )
+        self.assertFalse(fire)
+        self.assertEqual(why, "armed")
+        fire, armed, why = hedge_persist_ready(
+            qualifies, now_s=1004.0, armed_ts=armed, persist_s=persist,
+            toxic=False,
+        )
+        self.assertFalse(fire)
+        self.assertEqual(why, "waiting")
+        fire, _, why = hedge_persist_ready(
+            qualifies, now_s=1005.0, armed_ts=armed, persist_s=persist,
+            toxic=False,
+        )
+        self.assertTrue(fire)
+        self.assertEqual(why, "ready")
+        self.assertEqual(take_profit_sell_size(40.0, 1.0 if qualifies else 0.5), 40.0)
+        # Normal bag at 99¢ with live 0.999 lock does not qualify.
+        self.assertFalse(take_profit_full_ready(0.99, 0.999))
+
     def test_take_profit_full_lock_reentry_in_source(self):
         """After half-TP, full-lock may still fire; half path stays one-shot."""
         from pathlib import Path
