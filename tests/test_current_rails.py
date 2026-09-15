@@ -838,7 +838,11 @@ class BotWiresCurrentRails(unittest.TestCase):
         self.assertIn("hold_while_oracle_agrees(", src)
         self.assertIn("hedge_skip_oracle_still_winning", src)
         self.assertIn('"b15_window_min": 20.0', src)
-        self.assertIn('"a22_window_min": 0.0', src)
+        self.assertIn('"a22_window_min": 10.0', src)
+        self.assertIn('"early_rich_a22_enabled": True', src)
+        self.assertIn('"early_rich_a22_ask_min": 0.97', src)
+        self.assertIn('"early_rich_a22_persist_s": 90.0', src)
+        self.assertIn('"early_rich_a22_window_min": 20.0', src)
         self.assertNotIn(
             "seconds_left = (end_ts_ms - now_ms) / 1000",
             src,
