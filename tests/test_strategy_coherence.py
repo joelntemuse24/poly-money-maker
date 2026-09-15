@@ -232,6 +232,34 @@ class LoadStrategyFailClosedTests(unittest.TestCase):
         self.assertEqual(cfg["soft_edge_exit_max_usd"], 7.0)
         self.assertIs(cfg["entry_enabled"], False)  # example stays disarmed
 
+    def test_early_rich_take_profit_keys_load(self):
+        good = json.loads((ROOT / "strategy_buyhourly.example.json").read_text())
+        cfg = self._load(good)
+        self.assertIs(cfg["early_rich_take_profit_enabled"], True)
+        self.assertEqual(cfg["early_rich_take_profit_bid"], 0.99)
+        self.assertEqual(cfg["early_rich_take_profit_persist_s"], 5.0)
+        self.assertEqual(self.defaults["take_profit_full_bid"], 0.99)
+
+    def test_early_rich_take_profit_bid_below_ask_min_cannot_load(self):
+        good = json.loads((ROOT / "strategy_buyhourly.example.json").read_text())
+        payload = dict(good)
+        payload.update(
+            early_rich_a22_enabled=True,
+            early_rich_take_profit_enabled=True,
+            early_rich_a22_ask_min=0.97,
+            early_rich_take_profit_bid=0.96,
+        )
+        with self.assertRaises(RuntimeError) as ctx:
+            self._load(payload)
+        self.assertIn("valid strategy file", str(ctx.exception))
+
+    def test_early_rich_take_profit_persist_negative_cannot_load(self):
+        good = json.loads((ROOT / "strategy_buyhourly.example.json").read_text())
+        payload = dict(good, early_rich_take_profit_persist_s=-1.0)
+        with self.assertRaises(RuntimeError) as ctx:
+            self._load(payload)
+        self.assertIn("valid strategy file", str(ctx.exception))
+
 
 if __name__ == "__main__":
     unittest.main()

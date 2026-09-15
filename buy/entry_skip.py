@@ -778,6 +778,19 @@ def stamp_hourly_slice_bought(meta, slice_name):
         meta[key] = True
 
 
+def stamp_early_rich_a22_on_fill(meta, fire) -> bool:
+    """Persist early-rich identity on fill. Never clears a prior stamp.
+
+    ``fire`` is ``_early_rich_fire`` at buy time (a22 while the early-rich
+    window is open). Held-bag take-profit later reads ``meta["early_rich_a22"]``.
+    """
+    if not isinstance(meta, dict):
+        return False
+    if fire:
+        meta["early_rich_a22"] = True
+    return bool(meta.get("early_rich_a22"))
+
+
 def can_arm_hourly_slice(
     meta,
     *,

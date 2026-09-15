@@ -753,6 +753,58 @@ def take_profit_full_ready(bid, full_bid) -> bool:
     return bid_f + 1e-12 >= lock
 
 
+def early_rich_take_profit_full_ready(
+    bid, full_bid, *, stamped, enabled=True,
+) -> bool:
+    """True when a stamped early-rich bag may full-exit at ``full_bid``.
+
+    Does not change ``take_profit_full_bid`` for ordinary a22/b15 bags.
+    ``full_bid <= 0`` disables this path (same as ``take_profit_full_ready``).
+    """
+    if not enabled or not stamped:
+        return False
+    return take_profit_full_ready(bid, full_bid)
+
+
+def early_rich_skip_half_take_profit(
+    *, stamped, enabled=True, full_bid=0.99,
+) -> bool:
+    """True when half-TP must not fire; wait for the early-rich full exit.
+
+    Edge half-TP (VWAP+4¢) cannot print on ~97¢ early-rich VWAP. Callers
+    skip that path and only full-sell at ``full_bid``. ``full_bid <= 0``
+    leaves ordinary half-TP / 99.9¢ lock in place.
+    """
+    if not enabled or not stamped:
+        return False
+    try:
+        lock = float(full_bid)
+    except (TypeError, ValueError):
+        return False
+    return lock > 1e-12
+
+
+def early_rich_take_profit_persist_s(
+    default_persist_s, early_rich_persist_s, *, skip_half,
+) -> float:
+    """Persist seconds for the take-profit arm: early-rich bags use their own."""
+    try:
+        fallback = float(default_persist_s or 0.0)
+    except (TypeError, ValueError):
+        fallback = 0.0
+    if fallback < 0:
+        fallback = 0.0
+    if not skip_half:
+        return fallback
+    try:
+        persist = float(early_rich_persist_s)
+    except (TypeError, ValueError):
+        return fallback
+    if persist < 0:
+        return fallback
+    return persist
+
+
 def take_profit_sell_size(held_size, fraction=0.5) -> float:
     """Shares to FAK on take-profit: fraction of bag, CLOB 2dp ROUND_DOWN.
 

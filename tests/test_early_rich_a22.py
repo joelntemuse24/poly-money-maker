@@ -14,6 +14,7 @@ from buy.entry_skip import (
     hourly_horizon_min,
     hourly_slice_budget,
     select_hourly_entry_band,
+    stamp_early_rich_a22_on_fill,
 )
 from buy.hedge_gate import hedge_persist_ready
 
@@ -251,6 +252,20 @@ class EarlyRichWiringTests(unittest.TestCase):
         self.assertEqual(defaults["buy_window_min"], 20.0)
         self.assertEqual(defaults["entry_book_persist_s"], 15.0)
         self.assertEqual(defaults["b15_entry_book_persist_s"], 20.0)
+        self.assertIs(defaults["early_rich_take_profit_enabled"], True)
+        self.assertEqual(defaults["early_rich_take_profit_bid"], 0.99)
+        self.assertEqual(defaults["early_rich_take_profit_persist_s"], 5.0)
+        # Ordinary full-lock default stays independent of the 99¢ early-rich path.
+        self.assertEqual(defaults["take_profit_full_bid"], 0.99)
+
+    def test_stamp_early_rich_on_fill_never_clears(self):
+        meta = {}
+        self.assertFalse(stamp_early_rich_a22_on_fill(meta, False))
+        self.assertNotIn("early_rich_a22", meta)
+        self.assertTrue(stamp_early_rich_a22_on_fill(meta, True))
+        self.assertIs(meta["early_rich_a22"], True)
+        self.assertTrue(stamp_early_rich_a22_on_fill(meta, False))
+        self.assertIs(meta["early_rich_a22"], True)
 
     def test_bot_wires_early_rich_and_logs_lifecycle(self):
         src = BOT_HR.read_text()
@@ -265,8 +280,19 @@ class EarlyRichWiringTests(unittest.TestCase):
             "early_rich_a22_cleared",
             "early_rich_a22_fired",
             "EARLY_RICH_A22_ENABLED",
+            "stamp_early_rich_a22_on_fill(meta, _early_rich_fire)",
+            "EARLY_RICH_TAKE_PROFIT_BID",
+            "EARLY_RICH_TAKE_PROFIT_PERSIST_S",
+            "early_rich_take_profit_full_ready",
+            "early_rich_skip_half_take_profit",
         ):
             self.assertIn(marker, src)
+        self.assertGreaterEqual(
+            src.count("stamp_early_rich_a22_on_fill(meta, _early_rich_fire)"),
+            2,
+        )
+        self.assertIn('"early_rich_take_profit_bid": 0.99', src)
+        self.assertIn('"take_profit_full_bid": 0.99', src)
 
 
 if __name__ == "__main__":

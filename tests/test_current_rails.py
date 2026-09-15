@@ -843,6 +843,9 @@ class BotWiresCurrentRails(unittest.TestCase):
         self.assertIn('"early_rich_a22_ask_min": 0.97', src)
         self.assertIn('"early_rich_a22_persist_s": 90.0', src)
         self.assertIn('"early_rich_a22_window_min": 20.0', src)
+        self.assertIn('"early_rich_take_profit_enabled": True', src)
+        self.assertIn('"early_rich_take_profit_bid": 0.99', src)
+        self.assertIn('"early_rich_take_profit_persist_s": 5.0', src)
         self.assertNotIn(
             "seconds_left = (end_ts_ms - now_ms) / 1000",
             src,
