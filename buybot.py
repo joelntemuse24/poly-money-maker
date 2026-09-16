@@ -58,6 +58,7 @@ from buy.btc_price import (
 from buy.clob_book_ws import get_book_feed
 from buy.hedge_gate import (
     build_dump_exit_price_ladder,
+    dump_tight_book_hold_reason,
     hedge_dump_overrides_oracle,
     hedge_oracle_allows_sell,
     hedge_persist_ready,
@@ -209,8 +210,13 @@ _STRATEGY_DEFAULTS = {
     "hedge_persist_s": 1.0,
     "hedge_require_oracle": True,
     "hedge_oracle_min_edge_usd": 0.0,
-    "hedge_dump_ignore_oracle": True,
+    # Toxic dump must still consult oracle (hourly dump+oracle). False = dump
+    # does not skip hold_while_oracle_agrees.
+    "hedge_dump_ignore_oracle": False,
     "hedge_dump_persist_s": 2.0,
+    # Dump needs ask + spread <= hedge_max_spread (blocks 34/99 phantoms).
+    "hedge_dump_require_tight": True,
+    "hedge_dump_ignore_spread_ask_max": 0.60,
     # Dump freshness: WS age <= this OR successful REST this tick.
     # Blocks frozen last_good prints (hourly Sep15 false dump lesson).
     "hedge_dump_max_quote_age_s": 2.0,
@@ -338,6 +344,7 @@ def load_strategy():
         for key in (
             "min_winner_bid", "max_loser_bid", "min_bid_edge",
             "max_entry_spread", "hedge_max_spread", "hedge_require_ask_max",
+            "hedge_dump_ignore_spread_ask_max",
         ):
             if not 0 <= float(cfg[key]) <= 1:
                 raise ValueError(f"{key} must be between 0 and 1")
@@ -403,6 +410,7 @@ def load_strategy():
                 raise ValueError(f"{key} must be non-negative")
         for _bk in (
             "hedge_dump_require_fresh_book",
+            "hedge_dump_require_tight",
             "hedge_edge_collapse_allows_dump",
             "hedge_dump_ladder_enabled",
         ):
@@ -468,6 +476,10 @@ HEDGE_REQUIRE_ORACLE = _strat["hedge_require_oracle"]
 HEDGE_ORACLE_MIN_EDGE_USD = _strat["hedge_oracle_min_edge_usd"]
 HEDGE_DUMP_IGNORE_ORACLE = _strat["hedge_dump_ignore_oracle"]
 HEDGE_DUMP_PERSIST_S = _strat["hedge_dump_persist_s"]
+HEDGE_DUMP_REQUIRE_TIGHT = bool(_strat.get("hedge_dump_require_tight", True))
+HEDGE_DUMP_IGNORE_SPREAD_ASK_MAX = float(
+    _strat.get("hedge_dump_ignore_spread_ask_max", 0.60)
+)
 HEDGE_DUMP_MAX_QUOTE_AGE_S = float(_strat.get("hedge_dump_max_quote_age_s", 2.0) or 0.0)
 HEDGE_DUMP_REQUIRE_FRESH_BOOK = bool(_strat.get("hedge_dump_require_fresh_book", True))
 HEDGE_DUMP_MAX_FAVOR_EDGE_USD = float(_strat.get("hedge_dump_max_favor_edge_usd", 0.0) or 0.0)
@@ -3791,6 +3803,10 @@ while not _shutdown_requested:
         HEDGE_ORACLE_MIN_EDGE_USD = _strat["hedge_oracle_min_edge_usd"]
         HEDGE_DUMP_IGNORE_ORACLE = _strat["hedge_dump_ignore_oracle"]
         HEDGE_DUMP_PERSIST_S = _strat["hedge_dump_persist_s"]
+        HEDGE_DUMP_REQUIRE_TIGHT = bool(_strat.get("hedge_dump_require_tight", True))
+        HEDGE_DUMP_IGNORE_SPREAD_ASK_MAX = float(
+            _strat.get("hedge_dump_ignore_spread_ask_max", 0.60)
+        )
         HEDGE_DUMP_MAX_QUOTE_AGE_S = float(_strat.get("hedge_dump_max_quote_age_s", 2.0) or 0.0)
         HEDGE_DUMP_REQUIRE_FRESH_BOOK = bool(_strat.get("hedge_dump_require_fresh_book", True))
         HEDGE_DUMP_MAX_FAVOR_EDGE_USD = float(_strat.get("hedge_dump_max_favor_edge_usd", 0.0) or 0.0)
@@ -4805,6 +4821,32 @@ while not _shutdown_requested:
                                                 hedge_bid, HEDGE_THRESHOLD,
                                             )
                                         )
+                                    if do_dump:
+                                        tight_why = dump_tight_book_hold_reason(
+                                            hedge_bid, hedge_ask,
+                                            dump_require_tight=HEDGE_DUMP_REQUIRE_TIGHT,
+                                            max_spread=HEDGE_MAX_SPREAD,
+                                            dump_ignore_spread_ask_max=(
+                                                HEDGE_DUMP_IGNORE_SPREAD_ASK_MAX
+                                            ),
+                                        )
+                                        if tight_why:
+                                            log_event(
+                                                "hedge_skip_dump_book",
+                                                condition_id=cond, leg=held_leg,
+                                                bid=hedge_bid, ask=hedge_ask,
+                                                reason=tight_why,
+                                                max_spread=HEDGE_MAX_SPREAD,
+                                                dump_bid_max=float(_dump_cap),
+                                                dump_require_tight=(
+                                                    HEDGE_DUMP_REQUIRE_TIGHT
+                                                ),
+                                                dump_ignore_spread_ask_max=float(
+                                                    HEDGE_DUMP_IGNORE_SPREAD_ASK_MAX
+                                                ),
+                                            )
+                                            _hedge_dump_armed.pop(cond, None)
+                                            continue
                                     persist_s = (
                                         float(TAKE_PROFIT_PERSIST_S) if tp_full
                                         else (

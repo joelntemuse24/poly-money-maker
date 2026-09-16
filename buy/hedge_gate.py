@@ -1,7 +1,7 @@
 """Hedge persist gate and CLOB tick helpers (no I/O).
 
 Toxic dumps stay instant unless ``dump_persist_s`` > 0 (5m V-reversal hold).
-``dump_require_tight`` (hourly) needs ask + spread ≤ max_spread, unless ask ≤ dump_ignore_spread_ask_max (both sides underwater).
+``dump_require_tight`` (hourly and 15m) needs ask + spread ≤ max_spread, unless ask ≤ dump_ignore_spread_ask_max (both sides underwater).
 """
 
 from __future__ import annotations
@@ -294,6 +294,46 @@ def hedge_qualify_ok(bid, ask, threshold, max_spread, require_ask_max):
     return True, "ok"
 
 
+def dump_tight_book_hold_reason(
+    bid,
+    ask,
+    *,
+    dump_require_tight=False,
+    max_spread=0.15,
+    dump_ignore_spread_ask_max=0.60,
+):
+    """If dump must hold for tightness, return the reason; else None.
+
+    Shared by hourly ``evaluate_held_bag`` and the 15m dump arm. Phantom
+    penny bids under a still-high ask (34/99) must not dump. Both sides
+    underwater (33/50, ask ≤ ``dump_ignore_spread_ask_max``) skip the
+    spread check. 5m keeps bid-only dump by leaving ``dump_require_tight``
+    off.
+    """
+    if not dump_require_tight:
+        return None
+    ask_f = _finite_px(ask)
+    if ask_f is None:
+        return "dump_missing_ask"
+    try:
+        ignore_ask_max = float(dump_ignore_spread_ask_max)
+    except (TypeError, ValueError):
+        ignore_ask_max = 0.60
+    both_underwater = ask_f <= ignore_ask_max + 1e-12
+    if both_underwater:
+        return None
+    bid_f = _finite_px(bid)
+    if bid_f is None:
+        return None
+    try:
+        spread_max = float(max_spread)
+    except (TypeError, ValueError):
+        spread_max = 0.20
+    if (ask_f - bid_f) > spread_max + 1e-12:
+        return "dump_wide_spread"
+    return None
+
+
 def evaluate_held_bag(
     bid,
     ask=None,
@@ -368,31 +408,19 @@ def evaluate_held_bag(
         )
 
     if bid_f <= dump_max + 1e-12:
-        # Optional tight-book gate (hourly): phantom penny bids under a
+        # Optional tight-book gate (hourly + 15m): phantom penny bids under a
         # still-high ask must not arm/fire dump.
-        if dump_require_tight:
-            if ask_f is None:
-                return HedgeIntent(
-                    "hold", "dump_missing_ask", None, persist_armed_ts if done else None,
-                    done, True, None, False, None,
-                )
-            # Both sides ≤ level → real toxic book; spread alone is a bad
-            # proxy (33/50 dumps; 34/99 phantom still blocked below).
-            try:
-                ignore_ask_max = float(dump_ignore_spread_ask_max)
-            except (TypeError, ValueError):
-                ignore_ask_max = 0.60
-            both_underwater = ask_f <= ignore_ask_max + 1e-12
-            if not both_underwater:
-                try:
-                    spread_max = float(max_spread)
-                except (TypeError, ValueError):
-                    spread_max = 0.20
-                if (ask_f - bid_f) > spread_max + 1e-12:
-                    return HedgeIntent(
-                        "hold", "dump_wide_spread", None, persist_armed_ts if done else None,
-                        done, True, None, False, None,
-                    )
+        tight_why = dump_tight_book_hold_reason(
+            bid_f, ask_f,
+            dump_require_tight=dump_require_tight,
+            max_spread=max_spread,
+            dump_ignore_spread_ask_max=dump_ignore_spread_ask_max,
+        )
+        if tight_why:
+            return HedgeIntent(
+                "hold", tight_why, None, persist_armed_ts if done else None,
+                done, True, None, False, None,
+            )
         try:
             dump_wait = float(dump_persist_s or 0)
         except (TypeError, ValueError):

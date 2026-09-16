@@ -2157,6 +2157,8 @@ class BalanceAndGcSemantics(unittest.TestCase):
         self.assertEqual(fifteen["min_underlying_edge_usd"], 0.0)
         self.assertEqual(fifteen["poll_buy_window_s"], 0.01)
         self.assertEqual(fifteen["poll_held_s"], 0.01)
+        self.assertIs(fifteen["hedge_dump_ignore_oracle"], False)
+        self.assertIs(fifteen["hedge_dump_require_tight"], True)
         probe = json.loads((root / "strategy_buy15m_probe.example.json").read_text())
         self.assertEqual(probe["buy_threshold"], 0.95)
         self.assertEqual(probe["buy_max_price"], 0.99)
@@ -2164,6 +2166,9 @@ class BalanceAndGcSemantics(unittest.TestCase):
         self.assertEqual(probe["market_spend_cap"], 5.0)
         self.assertEqual(probe["min_underlying_edge_usd"], 10.0)
         self.assertEqual(probe["entry_book_persist_s"], 2.0)
+        self.assertIs(probe["hedge_dump_ignore_oracle"], False)
+        self.assertIs(probe["hedge_dump_require_tight"], True)
+        self.assertEqual(probe["hedge_dump_ignore_spread_ask_max"], 0.60)
 
     def test_example_json_passes_5m_load_strategy_sign_rails(self):
         src = BOT5M.read_text()
