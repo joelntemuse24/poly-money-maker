@@ -34,23 +34,37 @@ plus optional `poly-vm` SSH when `POLY_VM_SSH_KEY` is set).
 
 ## Cursor Cloud → poly-vm SSH
 
-Cloud agents can optionally SSH to the live Google VM as the read-only
-`poly-auditor` user. This is for logs, strategy JSON, and check scripts only.
-Paper research still works when the secret is unset.
+Cloud agents can optionally SSH to the live Google VM. Two identities:
 
-1. In **Cursor Dashboard → Cloud Agents → Secrets**, add Runtime Secret
-   `POLY_VM_SSH_KEY` = the `poly-auditor` ed25519 private key (PEM/OpenSSH
-   text). Never commit this key, and never paste it into chat or the repo.
-2. If the environment uses allowlist egress, allow SSH to `35.228.146.195`.
-3. After install or start, `ssh poly-vm` connects as `poly-auditor`
-   (`HostName 35.228.146.195`, key `~/.ssh/id_ed25519_poly_auditor`).
-4. Still never read `.env`, never POST live orders, and never start/stop
-   trading systemd units unless the operator explicitly asks.
+- `ssh poly-vm` — read-only `poly-auditor` (logs, strategy JSON, check scripts).
+- `ssh poly-vm-rw` — allowlisted `poly-operator`. No shell. The VM forced
+  command accepts only `who`, `status`, `git-status`, `pull`, `restart UNIT`,
+  `unit-status UNIT`, `tail-log FILE`, and `write-strategy FILE`. `.env` is
+  ACL-deny. This is not an unrestricted `ntemusejoel` login.
 
-Install/start are idempotent: missing `POLY_VM_SSH_KEY` is a no-op; a
-second run rewrites the key file and does not duplicate the `Host poly-vm`
-block. `start` repeats the same helper so a runtime secret still works when
-agents boot from an environment snapshot (install does not rerun).
+Paper research still works when both secrets are unset. Scope secrets to
+**this environment / this repo only**, not team-wide all repositories.
+
+1. In **Cursor Dashboard → Cloud Agents → Secrets** on this environment,
+   add Runtime Secret `POLY_VM_SSH_KEY` = the `poly-auditor` ed25519
+   private key (PEM/OpenSSH text).
+2. Optionally add Runtime Secret `POLY_VM_SSH_OPERATOR_KEY` = the
+   `poly-operator` ed25519 private key. Do this only after the VM wrapper
+   and `authorized_keys` `command=` line are in place.
+3. Never commit either key, and never paste them into chat or the repo.
+   Do not add `PRIVATE_KEY` or `.env` as Cloud secrets.
+4. If the environment uses allowlist egress, allow SSH to `35.228.146.195`.
+5. After install or start, `ssh poly-vm` is `poly-auditor`
+   (`~/.ssh/id_ed25519_poly_auditor`). `ssh poly-vm-rw` is `poly-operator`
+   (`~/.ssh/id_ed25519_poly_operator`) when that secret is set.
+6. Still never read `.env`, never POST live orders, and never `pull` /
+   `restart` / `write-strategy` unless the operator explicitly asks.
+
+Install/start are idempotent: missing secrets are a no-op; a second run
+rewrites key files and does not duplicate `Host poly-vm` / `Host poly-vm-rw`.
+`start` repeats the same helper so a runtime secret still works when agents
+boot from an environment snapshot (install does not rerun). Secrets inject
+at agent start; already-running agents do not pick up a newly added secret.
 
 ## 2. Paste prompt (live paper P&L — use this)
 

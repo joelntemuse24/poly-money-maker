@@ -10,7 +10,7 @@ Hourly buy-side trading is the primary live system. Never infer service state fr
 
 - Never read or commit .env files, credentials, private keys, or API secrets.
 - Never start, stop, restart or signal live services without explicit operator authorization.
-- Optional Cloud Agent SSH: when runtime secret `POLY_VM_SSH_KEY` is set, `ssh poly-vm` is read-only as `poly-auditor` (logs, strategy JSON, check scripts). See CLOUD_RESEARCH.md ("Cursor Cloud → poly-vm SSH"). Still never read `.env` or place live orders.
+- Optional Cloud Agent SSH: runtime secret `POLY_VM_SSH_KEY` → `ssh poly-vm` as read-only `poly-auditor` (logs, strategy JSON, check scripts). Runtime secret `POLY_VM_SSH_OPERATOR_KEY` → `ssh poly-vm-rw` as `poly-operator`, which has no shell: allowlisted `who` / `status` / `git-status` / `pull` / `restart UNIT` / `write-strategy FILE` / `tail-log` only. `.env` ACL is deny. See CLOUD_RESEARCH.md ("Cursor Cloud → poly-vm SSH"). Still never read `.env`, never POST live orders, and never `pull` / `restart` / `write-strategy` unless the operator explicitly asks.
 - Do not import buybothourly.py in tests: module initialization loads credentials, acquires a process lock and creates clients. Use pure buy/ helpers or AST-extracted functions with stubs.
 - Perform development and tests in an isolated clone. Never install into the live virtualenv or write live runtime state.
 - Preserve confirmed order identity, durable uncertain-order state, exact financial evidence, and expiry checks. A matched status or a transient zero balance alone is not proof of settled execution.
