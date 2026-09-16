@@ -20,9 +20,13 @@ Refs:
 - https://docs.polymarket.com/market-data/chainlink-twap
 
 Price To Beat = nearest last-print tick from that same trading feed to
-market `start_ts` (≤2s skew). If the ring missed the open (mid-window
-restart), Binance last-print feeds backfill PTB from a 1s kline open at
-`start_ts` via REST; only then fail closed if that also fails.
+market `start_ts` (≤2s skew). RTDS subscribe snapshots are only ~2
+minutes of history, so a mid-window restart cannot see the open tick.
+If the ring missed the open, last-print feeds REST-backfill PTB from
+the same oracle: Binance uses a 1s BTCUSDT kline open at `start_ts`;
+Chainlink uses Polymarket `crypto-price` `openPrice` at `start_ts`
+(`variant=fiveminute` = Chainlink print at exactly t — omitting variant
+silently serves Binance hourly). Only then fail closed.
 """
 
 from __future__ import annotations
@@ -50,6 +54,14 @@ BINANCE_KLINE_PTB_URL = (
     "?symbol=BTCUSDT&interval=1s&startTime={start_ms}&limit=1"
 )
 BINANCE_PTB_REST_TIMEOUT_S = 3.0
+# Same-oracle Chainlink open print the GUI uses. variant=fiveminute is
+# required: the default path is Binance hourly. openPrice is the print at
+# exactly eventStartTime, so 5m and 15m share this backfill.
+CHAINLINK_PTB_REST_URL = (
+    "https://polymarket.com/api/crypto/crypto-price"
+    "?symbol=btc&eventStartTime={start_s}&variant=fiveminute"
+)
+CHAINLINK_PTB_REST_TIMEOUT_S = 3.0
 LIVE_STALE_S = 5.0
 PTB_CACHE_MAX = 512
 RESEARCH_MAX_BYTES = 50 * 1024 * 1024  # 50 MiB per research file
@@ -267,8 +279,8 @@ class BtcUnderlyingFeed:
     def capture_ptb(self, start_ts: float) -> Optional[Dict[str, Any]]:
         """Lock PTB from this feed's ticks nearest to start_ts.
 
-        If the ring missed the open (skew > PTB_MAX_SKEW_MS or empty), Binance
-        last-print feeds backfill from a 1s BTCUSDT kline open at start_ts.
+        If the ring missed the open (skew > PTB_MAX_SKEW_MS or empty), REST
+        backfill: Binance 1s kline open, or Chainlink crypto-price openPrice.
         """
         key = int(start_ts)
         target_ms = key * 1000
@@ -315,35 +327,44 @@ class BtcUnderlyingFeed:
                     self._save_ptb_store_unlocked()
                     return dict(ring_rec)
 
-        # Outside the lock: REST backfill for Binance when ring missed open.
+        # Outside the lock: REST backfill when ring missed open.
+        rest: Optional[Tuple[float, int]] = None
+        rest_source: Optional[str] = None
+        rest_backfill: Optional[str] = None
         if self.source == SOURCE_BINANCE:
             rest = self._fetch_binance_ptb_kline(target_ms)
-            if rest is not None:
-                px, open_ms = rest
-                skew_ms = abs(int(open_ms) - target_ms)
-                if skew_ms <= PTB_MAX_SKEW_MS:
-                    now2 = time.time()
-                    rec = {
-                        "ok": True,
-                        "ptb": float(px),
-                        "ptb_tick_ts_ms": int(open_ms),
-                        "ptb_skew_ms": int(skew_ms),
-                        "start_ts": key,
-                        "source": f"{label}_kline_1s",
-                        "feed": self.source,
-                        "feed_label": label,
-                        "resolution_url": self.meta["resolution_url"],
-                        "reason": None,
-                        "captured_at": now2,
-                        "backfill": "binance_kline_1s",
-                    }
-                    with self._lock:
-                        if key in self._ptb:
-                            return dict(self._ptb[key])
-                        self._ptb[key] = rec
-                        self._trim_ptb_unlocked()
-                        self._save_ptb_store_unlocked()
-                        return dict(rec)
+            rest_source = f"{label}_kline_1s"
+            rest_backfill = "binance_kline_1s"
+        elif self.source == SOURCE_CHAINLINK:
+            rest = self._fetch_chainlink_ptb_open(target_ms)
+            rest_source = f"{label}_crypto_price"
+            rest_backfill = "polymarket_crypto_price"
+        if rest is not None and rest_source and rest_backfill:
+            px, open_ms = rest
+            skew_ms = abs(int(open_ms) - target_ms)
+            if skew_ms <= PTB_MAX_SKEW_MS:
+                now2 = time.time()
+                rec = {
+                    "ok": True,
+                    "ptb": float(px),
+                    "ptb_tick_ts_ms": int(open_ms),
+                    "ptb_skew_ms": int(skew_ms),
+                    "start_ts": key,
+                    "source": rest_source,
+                    "feed": self.source,
+                    "feed_label": label,
+                    "resolution_url": self.meta["resolution_url"],
+                    "reason": None,
+                    "captured_at": now2,
+                    "backfill": rest_backfill,
+                }
+                with self._lock:
+                    if key in self._ptb:
+                        return dict(self._ptb[key])
+                    self._ptb[key] = rec
+                    self._trim_ptb_unlocked()
+                    self._save_ptb_store_unlocked()
+                    return dict(rec)
 
         return dict(ring_rec) if ring_rec is not None else None
 
@@ -374,6 +395,42 @@ class BtcUnderlyingFeed:
             OSError,
         ) as e:
             log.warning("binance_ptb_kline_fail start_ms=%s: %s", start_ms, e)
+            return None
+
+    def _fetch_chainlink_ptb_open(self, start_ms: int) -> Optional[Tuple[float, int]]:
+        """Return (openPrice, start_ms) for the Chainlink print at start_ms.
+
+        Polymarket crypto-price openPrice is the Chainlink last print at
+        exactly eventStartTime when variant=fiveminute (shared by 5m/15m).
+        Do not omit variant: the default is Binance hourly.
+        """
+        start_s = int(start_ms) // 1000
+        url = CHAINLINK_PTB_REST_URL.format(start_s=start_s)
+        try:
+            req = urllib.request.Request(
+                url, headers={"User-Agent": "poly-money-maker-ptb/1"}
+            )
+            with urllib.request.urlopen(req, timeout=CHAINLINK_PTB_REST_TIMEOUT_S) as resp:
+                raw = resp.read().decode("utf-8")
+            data = json.loads(raw)
+            if not isinstance(data, dict):
+                return None
+            raw_px = data.get("openPrice")
+            if raw_px is None:
+                return None
+            px = float(raw_px)
+            if not math.isfinite(px) or px <= 0:
+                return None
+            return px, int(start_s) * 1000
+        except (
+            urllib.error.URLError,
+            TimeoutError,
+            ValueError,
+            TypeError,
+            KeyError,
+            OSError,
+        ) as e:
+            log.warning("chainlink_ptb_open_fail start_ms=%s: %s", start_ms, e)
             return None
 
     def underlying_check(self, start_ts: float, min_edge_usd: float) -> Dict[str, Any]:

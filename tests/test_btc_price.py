@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import json
 import time
 import unittest
 from pathlib import Path
+from unittest.mock import patch
+from urllib.request import Request
 
 from buy.btc_price import (
     BtcUnderlyingFeed,
@@ -246,11 +249,149 @@ class BinancePtbKlineBackfill(unittest.TestCase):
             raise AssertionError("chainlink must not hit Binance REST")
 
         feed._fetch_binance_ptb_kline = boom  # type: ignore[method-assign]
+        feed._fetch_chainlink_ptb_open = lambda _start_ms: None  # type: ignore[method-assign]
         rec = feed.capture_ptb(start)
         self.assertFalse(rec["ok"])
         self.assertEqual(called["n"], 0)
         chk = feed.underlying_check(start, 0.0)
         self.assertEqual(chk["reason"], "missing_ptb")
+        self.assertEqual(chk["ptb_source"], "chainlink_btc_usd_skewed")
+        self.assertIsNone(chk["ptb"])
+        self.assertEqual(chk["live_source"], "chainlink_btc_usd")
+
+
+class ChainlinkPtbCryptoPriceBackfill(unittest.TestCase):
+    """Mid-window restart: RTDS snapshot is only ~2 min, so a 15m/5m open
+    tick is gone. Live polybuybot 2026-09-16 ~01:26Z logged
+    buy_skip_underlying_edge reason=missing_ptb with
+    ptb_source=chainlink_btc_usd_skewed while live BTC and a buyable GUI
+    ask were present. Hourly already REST-backfills Binance 1s klines;
+    Chainlink must REST-backfill the same-oracle open print — not Binance.
+    """
+
+    def _skewed_chainlink(self, start: float, live: float = 100_080.0):
+        feed = BtcUnderlyingFeed(SOURCE_CHAINLINK, "")
+        late_ms = int(time.time() * 1000)
+        self.assertTrue(feed._push_tick(late_ms, live, live=True))
+        return feed
+
+    def test_skewed_ring_backfills_chainlink_crypto_price(self):
+        start = time.time() - 600.0  # joined ~10m late, like the 01:23Z restart
+        feed = self._skewed_chainlink(start, live=100_160.0)
+        called = {"n": 0}
+
+        def fake_fetch(start_ms: int):
+            called["n"] += 1
+            self.assertEqual(start_ms, int(start) * 1000)
+            return 100_000.0, int(start) * 1000
+
+        def boom(_start_ms: int):
+            raise AssertionError("chainlink must not hit Binance REST")
+
+        feed._fetch_chainlink_ptb_open = fake_fetch  # type: ignore[method-assign]
+        feed._fetch_binance_ptb_kline = boom  # type: ignore[method-assign]
+        rec = feed.capture_ptb(start)
+        self.assertIsNotNone(rec)
+        self.assertTrue(rec["ok"])
+        self.assertEqual(called["n"], 1)
+        self.assertEqual(rec["source"], "chainlink_btc_usd_crypto_price")
+        self.assertEqual(rec["backfill"], "polymarket_crypto_price")
+        self.assertAlmostEqual(rec["ptb"], 100_000.0)
+        chk = feed.underlying_check(start, 10.0)
+        self.assertTrue(chk["ok"])
+        self.assertEqual(chk["favored"], "up")
+        self.assertNotEqual(chk["reason"], "missing_ptb")
+        self.assertAlmostEqual(chk["edge_usd"], 160.0)
+        self.assertEqual(chk["ptb_source"], "chainlink_btc_usd_crypto_price")
+        self.assertEqual(chk["live_source"], "chainlink_btc_usd")
+
+    def test_empty_ring_also_backfills_chainlink_open(self):
+        start = time.time() - 180.0
+        feed = BtcUnderlyingFeed(SOURCE_CHAINLINK, "")
+        feed._fetch_chainlink_ptb_open = (  # type: ignore[method-assign]
+            lambda start_ms: (75_728.12, int(start_ms))
+        )
+        rec = feed.capture_ptb(start)
+        self.assertTrue(rec["ok"])
+        self.assertAlmostEqual(rec["ptb"], 75_728.12)
+        self.assertEqual(rec["backfill"], "polymarket_crypto_price")
+
+    def test_chainlink_rest_failure_still_missing_ptb(self):
+        start = time.time() - 600.0
+        feed = self._skewed_chainlink(start)
+        feed._fetch_chainlink_ptb_open = lambda _start_ms: None  # type: ignore[method-assign]
+        rec = feed.capture_ptb(start)
+        self.assertFalse(rec["ok"])
+        self.assertEqual(rec["source"], "chainlink_btc_usd_skewed")
+        chk = feed.underlying_check(start, 10.0)
+        self.assertEqual(chk["reason"], "missing_ptb")
+        self.assertIsNone(chk["ptb"])
+        self.assertIsNone(chk["edge_usd"])
+        self.assertIsNotNone(chk["live_btc"])
+
+    def test_ring_hit_skips_chainlink_rest(self):
+        start = time.time() - 45.0
+        feed = BtcUnderlyingFeed(SOURCE_CHAINLINK, "")
+        self.assertTrue(feed._push_tick(int(start * 1000), 100_000.0, live=False))
+        called = {"n": 0}
+
+        def boom(_start_ms: int):
+            called["n"] += 1
+            raise AssertionError("ring hit must not REST")
+
+        feed._fetch_chainlink_ptb_open = boom  # type: ignore[method-assign]
+        rec = feed.capture_ptb(start)
+        self.assertTrue(rec["ok"])
+        self.assertEqual(rec["source"], "chainlink_btc_usd")
+        self.assertEqual(called["n"], 0)
+
+    def test_crypto_price_url_uses_fiveminute_chainlink_not_hourly_binance(self):
+        """Unspecified variant silently serves Binance hourly opens."""
+        feed = BtcUnderlyingFeed(SOURCE_CHAINLINK, "")
+        seen: dict = {}
+
+        class FakeResp:
+            def read(self):
+                return json.dumps({"openPrice": 75728.12487456207}).encode()
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+        def fake_urlopen(req: Request, timeout=None):
+            seen["url"] = req.full_url
+            seen["timeout"] = timeout
+            return FakeResp()
+
+        with patch("buy.btc_price.urllib.request.urlopen", fake_urlopen):
+            out = feed._fetch_chainlink_ptb_open(1_789_521_300_000)
+
+        self.assertIsNotNone(out)
+        px, ts_ms = out
+        self.assertAlmostEqual(px, 75728.12487456207)
+        self.assertEqual(ts_ms, 1_789_521_300_000)
+        self.assertIn("eventStartTime=1789521300", seen["url"])
+        self.assertIn("variant=fiveminute", seen["url"])
+        self.assertNotIn("variant=hourly", seen["url"])
+        self.assertNotIn("variant=fifteen", seen["url"])
+
+    def test_crypto_price_null_open_is_not_a_ptb(self):
+        feed = BtcUnderlyingFeed(SOURCE_CHAINLINK, "")
+
+        class FakeResp:
+            def read(self):
+                return json.dumps({"openPrice": None, "incomplete": True}).encode()
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+        with patch("buy.btc_price.urllib.request.urlopen", lambda *a, **k: FakeResp()):
+            self.assertIsNone(feed._fetch_chainlink_ptb_open(1_789_521_300_000))
 
 
 if __name__ == "__main__":
