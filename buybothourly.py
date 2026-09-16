@@ -2546,6 +2546,9 @@ def entry_book_persist_ready(cond, leg, book_ok, *, now_s=None, persist_s=None, 
 
     Returns (ready, why, armed_age_s). Clears arm when book is not ok.
     persist_s <= 0 disables (always ready when book_ok).
+
+    15m trial arms persist at a floor below the buy band. Hourly still
+    requires the band book; the same floor can land here later.
     """
     key = entry_book_persist_key(cond, leg, band)
     wait = float(ENTRY_BOOK_PERSIST_S if persist_s is None else persist_s)

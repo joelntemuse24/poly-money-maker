@@ -64,7 +64,12 @@ from buy.hedge_gate import (
     hedge_persist_ready,
     take_profit_full_ready,
 )
-from buy.probe_15m import probe_spend_usd, should_evaluate_entries
+from buy.probe_15m import (
+    entry_may_buy,
+    persist_quote_ok,
+    probe_spend_usd,
+    should_evaluate_entries,
+)
 from buy.strategy_coherence import validate_15m_strategy_coherence
 from buy.depth_ladder import (
     DEFAULT_TOPUP_TARGETS,
@@ -256,6 +261,9 @@ _STRATEGY_DEFAULTS = {
     "ui_every_n_cycles": 5,
     "tick_size": "0.01",
     "entry_book_persist_s": 2.0,
+    # Persist arm floor (anti-flash). Start/keep the timer once ask >= this,
+    # including 95→99 cascades. Not the buy band. Hourly may get the same later.
+    "entry_persist_min_price": 0.95,
     # Hourly early-hot is meaningless on a 15m clock. Load rejects true.
     "early_hot_defer_enabled": False,
     "soft_edge_exit_enabled": False,
@@ -345,6 +353,7 @@ def load_strategy():
             "min_winner_bid", "max_loser_bid", "min_bid_edge",
             "max_entry_spread", "hedge_max_spread", "hedge_require_ask_max",
             "hedge_dump_ignore_spread_ask_max",
+            "entry_persist_min_price",
         ):
             if not 0 <= float(cfg[key]) <= 1:
                 raise ValueError(f"{key} must be between 0 and 1")
@@ -400,7 +409,7 @@ def load_strategy():
             "hedge_dump_price_floor", "hedge_dump_ladder_start",
             "hedge_dump_ladder_step", "hedge_dump_ladder_step_sleep_s",
             "hedge_dump_late_sweep_ttm_s",
-            "entry_book_persist_s",
+            "entry_book_persist_s", "entry_persist_min_price",
             "market_spend_cap", "soft_edge_exit_max_usd",
             "soft_edge_exit_persist_s", "take_profit_edge",
             "take_profit_fraction", "take_profit_full_bid",
@@ -503,6 +512,7 @@ BUY_MAX_SPEND = _strat["buy_max_spend"]
 BUY_MAX_SHARES = _strat["buy_max_shares"]
 MARKET_SPEND_CAP = _strat["market_spend_cap"]
 ENTRY_BOOK_PERSIST_S = _strat["entry_book_persist_s"]
+ENTRY_PERSIST_MIN_PRICE = _strat["entry_persist_min_price"]
 EARLY_HOT_DEFER_ENABLED = _strat["early_hot_defer_enabled"]
 SOFT_EDGE_EXIT_ENABLED = _strat["soft_edge_exit_enabled"]
 TAKE_PROFIT_ENABLED = _strat["take_profit_enabled"]
@@ -1569,7 +1579,11 @@ def clear_entry_book_persist_leg(cond, leg):
 
 
 def entry_book_persist_ready(cond, leg, book_ok, *, now_s=None, persist_s=None):
-    """(ready, why, age_s) — 15m ge95 book must hold for entry_book_persist_s."""
+    """(ready, why, age_s) — persist-eligible book must hold entry_book_persist_s.
+
+    ``book_ok`` here is persist-eligible (ask/GUI >= entry_persist_min_price
+    plus a tight book), not “already inside buy_threshold…buy_max_price”.
+    """
     if now_s is None:
         now_s = time.monotonic()
     wait = float(ENTRY_BOOK_PERSIST_S if persist_s is None else persist_s)
@@ -3830,6 +3844,7 @@ while not _shutdown_requested:
         BUY_MAX_SHARES = _strat["buy_max_shares"]
         MARKET_SPEND_CAP = _strat["market_spend_cap"]
         ENTRY_BOOK_PERSIST_S = _strat["entry_book_persist_s"]
+        ENTRY_PERSIST_MIN_PRICE = _strat["entry_persist_min_price"]
         EARLY_HOT_DEFER_ENABLED = _strat["early_hot_defer_enabled"]
         SOFT_EDGE_EXIT_ENABLED = _strat["soft_edge_exit_enabled"]
         TAKE_PROFIT_ENABLED = _strat["take_profit_enabled"]
@@ -5318,6 +5333,31 @@ while not _shutdown_requested:
                     dn_last = get_book_snapshot_last_trade(m.dn_token)
                 up_gui = polymarket_display_price(up_bid, up_ask, up_last)
                 dn_gui = polymarket_display_price(dn_bid, dn_ask, dn_last)
+                up_book_ok, up_book_why = entry_book_ok(
+                    up_bid, up_ask, MAX_ENTRY_SPREAD, MIN_WINNER_BID,
+                )
+                dn_book_ok, dn_book_why = entry_book_ok(
+                    dn_bid, dn_ask, MAX_ENTRY_SPREAD, MIN_WINNER_BID,
+                )
+                # Persist is anti-flash: arm at entry_persist_min_price (default
+                # 0.95), not the buy band. Keep the arm through 95→99. Hourly
+                # may get the same later. Update even on incomplete/ambiguous
+                # GUI so a dip below the floor still resets.
+                _persist_now = time.monotonic()
+                persist_up_ok, persist_up_why, persist_up_age = entry_book_persist_ready(
+                    cond,
+                    "up",
+                    persist_quote_ok(up_ask, ENTRY_PERSIST_MIN_PRICE, gui=up_gui)
+                    and bool(up_book_ok),
+                    now_s=_persist_now,
+                )
+                persist_dn_ok, persist_dn_why, persist_dn_age = entry_book_persist_ready(
+                    cond,
+                    "down",
+                    persist_quote_ok(dn_ask, ENTRY_PERSIST_MIN_PRICE, gui=dn_gui)
+                    and bool(dn_book_ok),
+                    now_s=_persist_now,
+                )
 
                 # Lock last-print PTB as soon as the window is open (memory/disk only).
                 if m.start_ts and time.time() >= m.start_ts:
@@ -5366,8 +5406,6 @@ while not _shutdown_requested:
                 # Ask in band + GUI consensus + tight real book (bid under the ask).
                 up_ask_ok = up_ask is not None and BUY_THRESHOLD <= up_ask <= BUY_MAX_PRICE
                 dn_ask_ok = dn_ask is not None and BUY_THRESHOLD <= dn_ask <= BUY_MAX_PRICE
-                up_book_ok, up_book_why = entry_book_ok(up_bid, up_ask, MAX_ENTRY_SPREAD, MIN_WINNER_BID)
-                dn_book_ok, dn_book_why = entry_book_ok(dn_bid, dn_ask, MAX_ENTRY_SPREAD, MIN_WINNER_BID)
                 _depth_ttm = round(minutes_left, 2)
                 maybe_sample_depth_path_leg(
                     condition_id=cond,
@@ -5501,23 +5539,25 @@ while not _shutdown_requested:
                         continue
 
                 if not (up_buy or dn_buy):
-                    clear_entry_book_persist_leg(cond, "up")
-                    clear_entry_book_persist_leg(cond, "down")
                     continue
 
                 persist_leg = "up" if up_buy else "down"
-                persist_ok, persist_why, persist_age = entry_book_persist_ready(
-                    cond, persist_leg, True, now_s=time.monotonic(),
-                )
-                if not persist_ok:
+                persist_ok = persist_up_ok if up_buy else persist_dn_ok
+                persist_why = persist_up_why if up_buy else persist_dn_why
+                persist_age = persist_up_age if up_buy else persist_dn_age
+                buy_ask_for_persist = up_ask if up_buy else dn_ask
+                if not entry_may_buy(
+                    persist_ok, buy_ask_for_persist, BUY_THRESHOLD, BUY_MAX_PRICE,
+                ):
                     log_event(
                         "buy_skip_entry_book_persist",
                         condition_id=cond,
                         leg=persist_leg,
                         persist_s=ENTRY_BOOK_PERSIST_S,
+                        persist_min=ENTRY_PERSIST_MIN_PRICE,
                         persist_why=persist_why,
                         persist_age_s=round(persist_age, 3),
-                        ask=up_ask if persist_leg == "up" else dn_ask,
+                        ask=buy_ask_for_persist,
                     )
                     continue
 

@@ -21,7 +21,7 @@ logging-only and fail-closes).
 | Window | last **3.0 min (180s)** |
 | Ask band | **0.95–0.99** (ge95 only; FAK pins the live ask) |
 | Oracle floor | **$10** Chainlink last vs PTB |
-| Entry persist | **2s** |
+| Entry persist | **2s**, arm floor **0.95** (`entry_persist_min_price`; not the buy band) |
 | Size | **$5** `buy_budget` = `buy_max_spend` = `market_spend_cap`. Open/daily notional caps **removed**. |
 | Hedge | **0.35 / 0.40** ask, persist **1s**, dump persist **2s**, oracle required |
 | Soft-edge | **off** (load rejects max ≥ floor if turned on) |
@@ -37,6 +37,15 @@ from the 15m path — do not add them back. Per-market spend rails and
 
 `strategy_buy.example.json` stays the historical 90–96¢ / $10 paper
 template. Do not treat it as this probe.
+
+Persist (`entry_book_persist_s`) is anti-flash integrity. It arms once the
+CLOB ask (GUI only if ask is missing) is ≥ `entry_persist_min_price`
+(default **0.95**) and holds through 95→99; it resets if the ask dips
+below that floor. The actual buy still needs the existing buy band
+(`buy_threshold`…`buy_max_price`, live often ~96.5–99¢) plus persist
+ready and the other gates. Live `strategy_buy.json` is gitignored — set
+`entry_persist_min_price` on the VM. Hourly is unchanged (same floor can
+land there later).
 
 ## Dry-run on the VM (Joel-safe)
 
@@ -94,3 +103,4 @@ logs `dry_buy` even while `entry_enabled` is false.
 - `early_hot_defer_enabled` must stay false
 - `market_spend_cap` ≥ `buy_budget` when cap > 0
 - `buy_window_min` in `(0, 15]`
+- `entry_persist_min_price` in `[0, 1]` and ≤ `buy_max_price` when both are set

@@ -2169,6 +2169,7 @@ class BalanceAndGcSemantics(unittest.TestCase):
         self.assertEqual(probe["market_spend_cap"], 5.0)
         self.assertEqual(probe["min_underlying_edge_usd"], 10.0)
         self.assertEqual(probe["entry_book_persist_s"], 2.0)
+        self.assertEqual(probe["entry_persist_min_price"], 0.95)
         self.assertIs(probe["hedge_dump_ignore_oracle"], False)
         self.assertIs(probe["hedge_dump_require_tight"], True)
         self.assertEqual(probe["hedge_dump_ignore_spread_ask_max"], 0.60)
