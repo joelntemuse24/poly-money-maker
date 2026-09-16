@@ -7,6 +7,7 @@ from pathlib import Path
 
 from buy.hedge_gate import (
     clob_min_tick_from_error,
+    dump_tight_book_hold_reason,
     evaluate_held_bag,
     hedge_dump_overrides_oracle,
     hedge_flatten_overrides_oracle,
@@ -901,10 +902,15 @@ class FiveMTtmHedgeLadderTests(unittest.TestCase):
 
 
 class DumpTightLevelTests(unittest.TestCase):
-    """Hourly dump_require_tight: spread vs both-underwater levels."""
+    """Hourly/15m dump_require_tight: spread vs both-underwater levels."""
+
+    KW = dict(
+        dump_require_tight=True,
+        max_spread=0.20,
+        dump_ignore_spread_ask_max=0.60,
+    )
 
     def test_wide_spread_blocks_when_ask_still_rich(self):
-        from buy.hedge_gate import evaluate_held_bag
         intent = evaluate_held_bag(
             0.335, 0.99,
             now_s=10.0,
@@ -913,16 +919,17 @@ class DumpTightLevelTests(unittest.TestCase):
             dump_bid_max=0.35,
             qualify_bid=0.60,
             qualify_ask_max=0.62,
-            max_spread=0.20,
             dump_persist_s=0.0,
-            dump_require_tight=True,
-            dump_ignore_spread_ask_max=0.60,
+            **self.KW,
         )
         self.assertEqual(intent.action, "hold")
         self.assertEqual(intent.reason, "dump_wide_spread")
+        self.assertEqual(
+            dump_tight_book_hold_reason(0.335, 0.99, **self.KW),
+            "dump_wide_spread",
+        )
 
     def test_both_underwater_skips_spread(self):
-        from buy.hedge_gate import evaluate_held_bag
         # Textbook 33/50: spread 16.7¢ > 20? actually 0.167 < 0.20 would pass spread
         # Use 33/55 spread 22¢ > 20 so only level exception saves it.
         intent = evaluate_held_bag(
@@ -933,13 +940,55 @@ class DumpTightLevelTests(unittest.TestCase):
             dump_bid_max=0.35,
             qualify_bid=0.60,
             qualify_ask_max=0.62,
-            max_spread=0.20,
             dump_persist_s=0.0,
-            dump_require_tight=True,
-            dump_ignore_spread_ask_max=0.60,
+            **self.KW,
         )
         self.assertTrue(intent.dump)
         self.assertEqual(intent.reason, "bid_le_dump")
+        self.assertIsNone(dump_tight_book_hold_reason(0.335, 0.55, **self.KW))
+
+    def test_missing_ask_blocks_when_require_tight(self):
+        intent = evaluate_held_bag(
+            0.335, None,
+            now_s=10.0,
+            persist_armed_ts=None,
+            persist_s=5.0,
+            dump_bid_max=0.35,
+            qualify_bid=0.60,
+            qualify_ask_max=0.62,
+            dump_persist_s=0.0,
+            **self.KW,
+        )
+        self.assertEqual(intent.action, "hold")
+        self.assertEqual(intent.reason, "dump_missing_ask")
+        self.assertEqual(
+            dump_tight_book_hold_reason(0.335, None, **self.KW),
+            "dump_missing_ask",
+        )
+
+    def test_require_tight_off_allows_phantom_34_99(self):
+        intent = evaluate_held_bag(
+            0.335, 0.99,
+            now_s=10.0,
+            persist_armed_ts=None,
+            persist_s=5.0,
+            dump_bid_max=0.35,
+            qualify_bid=0.60,
+            qualify_ask_max=0.62,
+            max_spread=0.20,
+            dump_persist_s=0.0,
+            dump_require_tight=False,
+            dump_ignore_spread_ask_max=0.60,
+        )
+        self.assertTrue(intent.dump)
+        self.assertIsNone(
+            dump_tight_book_hold_reason(
+                0.335, 0.99,
+                dump_require_tight=False,
+                max_spread=0.20,
+                dump_ignore_spread_ask_max=0.60,
+            )
+        )
 
 
 class OracleEdgeBandTests(unittest.TestCase):
