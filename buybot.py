@@ -57,6 +57,8 @@ from buy.btc_price import (
 )
 from buy.clob_book_ws import get_book_feed
 from buy.hedge_gate import (
+    build_dump_exit_price_ladder,
+    hedge_dump_overrides_oracle,
     hedge_oracle_allows_sell,
     hedge_persist_ready,
     take_profit_full_ready,
@@ -183,6 +185,9 @@ _STRATEGY_DEFAULTS = {
     "toxic_force_exit_below": 0.65,
     "hedge_enabled": True,
     "hedge_threshold": 0.35,
+    # Held-bag dump when live bid <= this (hourly sell-fade sibling). Ladder +
+    # hard gates arm on book toxicity, not only on toxic FAK avg fill.
+    "hedge_toxic_bid_max": 0.35,
     # Kept in config (live JSON still sends it). Not a FAK floor: after 35/40
     # integrity, the sell follows the live bid so a 20¢ print is not $0.
     "hedge_min_price": 0.32,
@@ -206,6 +211,18 @@ _STRATEGY_DEFAULTS = {
     "hedge_oracle_min_edge_usd": 0.0,
     "hedge_dump_ignore_oracle": True,
     "hedge_dump_persist_s": 2.0,
+    # Dump freshness: WS age <= this OR successful REST this tick.
+    # Blocks frozen last_good prints (hourly Sep15 false dump lesson).
+    "hedge_dump_max_quote_age_s": 2.0,
+    "hedge_dump_require_fresh_book": True,
+    "hedge_dump_max_favor_edge_usd": 0.0,
+    "hedge_edge_collapse_allows_dump": False,
+    "hedge_dump_ladder_enabled": True,
+    "hedge_dump_price_floor": 0.45,
+    "hedge_dump_ladder_start": 0.55,
+    "hedge_dump_ladder_step": 0.05,
+    "hedge_dump_ladder_step_sleep_s": 0.4,
+    "hedge_dump_late_sweep_ttm_s": 20.0,
     "buy_window_min": 3.0,
     "buy_grace_s": 2,
     "buy_cooldown_s": 3,
@@ -371,7 +388,12 @@ def load_strategy():
             "empty_fak_cooldown_s",
             "redeem_throttle_s", "max_redeem_age_days",
             "hedge_persist_s", "hedge_oracle_min_edge_usd",
-            "hedge_dump_persist_s", "entry_book_persist_s",
+            "hedge_dump_persist_s", "hedge_dump_max_quote_age_s",
+            "hedge_dump_max_favor_edge_usd",
+            "hedge_dump_price_floor", "hedge_dump_ladder_start",
+            "hedge_dump_ladder_step", "hedge_dump_ladder_step_sleep_s",
+            "hedge_dump_late_sweep_ttm_s",
+            "entry_book_persist_s",
             "market_spend_cap", "soft_edge_exit_max_usd",
             "soft_edge_exit_persist_s", "take_profit_edge",
             "take_profit_fraction", "take_profit_full_bid",
@@ -379,6 +401,25 @@ def load_strategy():
         ):
             if float(cfg[key]) < 0:
                 raise ValueError(f"{key} must be non-negative")
+        for _bk in (
+            "hedge_dump_require_fresh_book",
+            "hedge_edge_collapse_allows_dump",
+            "hedge_dump_ladder_enabled",
+        ):
+            if _bk in cfg and type(cfg[_bk]) is not bool:
+                raise ValueError(f"{_bk} must be a boolean")
+        if not (0 <= float(cfg.get("hedge_dump_price_floor", 0.45) or 0) <= 1):
+            raise ValueError("hedge_dump_price_floor must satisfy 0 <= floor <= 1")
+        if not (0 <= float(cfg.get("hedge_dump_ladder_start", 0.55) or 0) <= 1):
+            raise ValueError("hedge_dump_ladder_start must satisfy 0 <= start <= 1")
+        _dstep = float(cfg.get("hedge_dump_ladder_step", 0.05) or 0)
+        if _dstep <= 0 or _dstep > 1:
+            raise ValueError("hedge_dump_ladder_step must satisfy 0 < step <= 1")
+        _toxic_max = float(cfg.get("hedge_toxic_bid_max", 0.0) or 0.0)
+        if not (0 <= _toxic_max <= 1):
+            raise ValueError("hedge_toxic_bid_max must satisfy 0 <= max <= 1")
+        if _toxic_max > float(cfg["hedge_threshold"]) + 1e-12:
+            raise ValueError("hedge_toxic_bid_max must be <= hedge_threshold")
         if not (0 <= float(cfg["soft_edge_exit_bid"]) <= 1):
             raise ValueError("soft_edge_exit_bid must satisfy 0 <= bid <= 1")
         if not (0 <= float(cfg["take_profit_full_bid"]) <= 1):
@@ -412,6 +453,7 @@ MIN_UNDERLYING_EDGE_USD = _strat["min_underlying_edge_usd"]
 TOXIC_FORCE_EXIT_BELOW = _strat["toxic_force_exit_below"]
 HEDGE_ENABLED = _strat["hedge_enabled"]
 HEDGE_THRESHOLD = _strat["hedge_threshold"]
+HEDGE_TOXIC_BID_MAX = float(_strat.get("hedge_toxic_bid_max", 0.0) or 0.0)
 HEDGE_MIN_PRICE = _strat["hedge_min_price"]
 HEDGE_UNDERCUT_TICKS = _strat["hedge_undercut_ticks"]
 HEDGE_QUOTE_MAX_AGE_S = _strat["hedge_quote_max_age_s"]
@@ -426,6 +468,20 @@ HEDGE_REQUIRE_ORACLE = _strat["hedge_require_oracle"]
 HEDGE_ORACLE_MIN_EDGE_USD = _strat["hedge_oracle_min_edge_usd"]
 HEDGE_DUMP_IGNORE_ORACLE = _strat["hedge_dump_ignore_oracle"]
 HEDGE_DUMP_PERSIST_S = _strat["hedge_dump_persist_s"]
+HEDGE_DUMP_MAX_QUOTE_AGE_S = float(_strat.get("hedge_dump_max_quote_age_s", 2.0) or 0.0)
+HEDGE_DUMP_REQUIRE_FRESH_BOOK = bool(_strat.get("hedge_dump_require_fresh_book", True))
+HEDGE_DUMP_MAX_FAVOR_EDGE_USD = float(_strat.get("hedge_dump_max_favor_edge_usd", 0.0) or 0.0)
+HEDGE_EDGE_COLLAPSE_ALLOWS_DUMP = bool(_strat.get("hedge_edge_collapse_allows_dump", False))
+HEDGE_DUMP_LADDER_ENABLED = bool(_strat.get("hedge_dump_ladder_enabled", True))
+HEDGE_DUMP_PRICE_FLOOR = float(_strat.get("hedge_dump_price_floor", 0.45) or 0.45)
+HEDGE_DUMP_LADDER_START = float(_strat.get("hedge_dump_ladder_start", 0.55) or 0.55)
+HEDGE_DUMP_LADDER_STEP = float(_strat.get("hedge_dump_ladder_step", 0.05) or 0.05)
+HEDGE_DUMP_LADDER_STEP_SLEEP_S = float(
+    _strat.get("hedge_dump_ladder_step_sleep_s", 0.4) or 0.0
+)
+HEDGE_DUMP_LATE_SWEEP_TTM_S = float(
+    _strat.get("hedge_dump_late_sweep_ttm_s", 20.0) or 0.0
+)
 BUY_WINDOW_MIN = _strat["buy_window_min"]
 BUY_GRACE_S = _strat["buy_grace_s"]
 BUY_COOLDOWN_S = _strat["buy_cooldown_s"]
@@ -2987,6 +3043,10 @@ def sell_market_with_retry(
     on_fill=None,
     condition_id=None,
     initial_quote=None,
+    dump=False,
+    price_ladder=False,
+    ttm_s=None,
+    ladder_meta=None,
 ):
     """Sell `size` shares via FAK. Used for hedge exits only — no max_price cap.
 
@@ -3002,6 +3062,11 @@ def sell_market_with_retry(
     remaining = float(size)
     floor = float(min_price) if min_price is not None else float(tick_size)
     last_limit = float(price_limit) if price_limit is not None else floor
+    dump = bool(dump)
+    use_price_ladder = bool(price_ladder) and bool(dump)
+    ladder_levels = []
+    ladder_idx = 0
+    ladder_built = False
     start_bal = check_clob_token_balance(token_id, refresh=False)
     if DRY_RUN:
         price = hedge_sell_price(price_limit, tick_size, undercut_ticks, floor)
@@ -3085,8 +3150,78 @@ def sell_market_with_retry(
                 f"  [dim][CANCEL][/] hedge retry abort — bid recovered to {live_bid:.3f} > {float(abort_above):.3f}"
             )
             break
-        price = hedge_sell_price(live_bid, tick_size, undercut_ticks, floor)
+        if use_price_ladder:
+            if (not ladder_built) or (not ladder_levels):
+                try:
+                    _l_enabled = bool(HEDGE_DUMP_LADDER_ENABLED)
+                except NameError:
+                    _l_enabled = True
+                try:
+                    _l_floor = float(HEDGE_DUMP_PRICE_FLOOR)
+                except (NameError, TypeError, ValueError):
+                    _l_floor = 0.45
+                try:
+                    _l_start = float(HEDGE_DUMP_LADDER_START)
+                except (NameError, TypeError, ValueError):
+                    _l_start = 0.55
+                try:
+                    _l_step = float(HEDGE_DUMP_LADDER_STEP)
+                except (NameError, TypeError, ValueError):
+                    _l_step = 0.05
+                try:
+                    _l_late = float(HEDGE_DUMP_LATE_SWEEP_TTM_S)
+                except (NameError, TypeError, ValueError):
+                    _l_late = 20.0
+                ladder_levels = build_dump_exit_price_ladder(
+                    live_bid,
+                    live_ask,
+                    tick=float(tick_size),
+                    ladder_start=_l_start,
+                    price_floor=_l_floor,
+                    step=_l_step,
+                    late_sweep_ttm_s=_l_late,
+                    ttm_s=ttm_s,
+                    meta=ladder_meta,
+                    enabled=_l_enabled,
+                )
+                ladder_idx = 0
+                ladder_built = True
+                log_event(
+                    "hedge_dump_ladder_built",
+                    token_id=token_id,
+                    condition_id=condition_id,
+                    levels=list(ladder_levels),
+                    live_bid=live_bid,
+                    live_ask=live_ask,
+                    ttm_s=None if ttm_s is None else round(float(ttm_s), 2),
+                )
+            if ladder_levels:
+                if ladder_idx >= len(ladder_levels):
+                    ladder_idx = len(ladder_levels) - 1
+                _target = float(ladder_levels[ladder_idx])
+                if (
+                    live_bid is not None
+                    and ladder_idx == len(ladder_levels) - 1
+                ):
+                    _target = max(float(live_bid), float(tick_size))
+                price = hedge_sell_price(_target, tick_size, undercut_ticks, floor)
+            else:
+                price = hedge_sell_price(live_bid, tick_size, undercut_ticks, floor)
+        else:
+            price = hedge_sell_price(live_bid, tick_size, undercut_ticks, floor)
         last_limit = price
+        if use_price_ladder and ladder_levels:
+            log_event(
+                "hedge_dump_ladder_step",
+                token_id=token_id,
+                condition_id=condition_id,
+                limit=float(price),
+                ladder_idx=int(ladder_idx),
+                levels=len(ladder_levels),
+                remaining=float(remaining),
+                live_bid=live_bid,
+                attempt=attempt + 1,
+            )
         try:
             signed_order = safe_api_call(
                 client.create_market_order,
@@ -3186,6 +3321,24 @@ def sell_market_with_retry(
                         }, total_proceeds
                 console.print(f"  [bold green][EXIT FAK][/]{filled} @ ≥{price:.3f}  [dim]id={str(oid)[:16]}…[/]")
                 log_event("sell_fill", token_id=token_id, filled=filled, price=price, remaining=remaining, attempt=attempt + 1)
+                if use_price_ladder:
+                    log_event(
+                        "hedge_dump_ladder_fill",
+                        token_id=token_id,
+                        condition_id=condition_id,
+                        limit=float(price),
+                        filled=float(filled),
+                        remaining=float(remaining),
+                        ladder_idx=int(ladder_idx),
+                    )
+                    if remaining >= 0.01 and ladder_idx + 1 < len(ladder_levels):
+                        ladder_idx += 1
+                        try:
+                            _ls = float(HEDGE_DUMP_LADDER_STEP_SLEEP_S)
+                        except (NameError, TypeError, ValueError):
+                            _ls = 0.4
+                        if _ls > 0:
+                            time.sleep(_ls)
                 if response_status not in {"matched", "order_status_matched"}:
                     return total_sold, {
                         "bot_status": "ambiguous", "last_limit": last_limit,
@@ -3260,7 +3413,24 @@ def sell_market_with_retry(
                         f"  [dim yellow][FAK EMPTY][/] hedge no match · re-quote "
                         f"{attempt + 2}/{max_retries}"
                     )
-                    time.sleep(float(retry_sleep_s))
+                    if use_price_ladder and ladder_levels and ladder_idx + 1 < len(ladder_levels):
+                        ladder_idx += 1
+                        log_event(
+                            "hedge_dump_ladder_empty_step",
+                            token_id=token_id,
+                            condition_id=condition_id,
+                            next_idx=int(ladder_idx),
+                            next_limit=float(ladder_levels[ladder_idx]),
+                            remaining=float(remaining),
+                            attempt=attempt + 1,
+                        )
+                        try:
+                            _ls = float(HEDGE_DUMP_LADDER_STEP_SLEEP_S)
+                        except (NameError, TypeError, ValueError):
+                            _ls = 0.4
+                        time.sleep(float(_ls) if _ls > 0 else float(retry_sleep_s))
+                    else:
+                        time.sleep(float(retry_sleep_s))
                     continue
                 break
             if definitive_order_rejection(e):
@@ -3606,6 +3776,7 @@ while not _shutdown_requested:
         TOXIC_FORCE_EXIT_BELOW = _strat["toxic_force_exit_below"]
         HEDGE_ENABLED = _strat["hedge_enabled"]
         HEDGE_THRESHOLD = _strat["hedge_threshold"]
+        HEDGE_TOXIC_BID_MAX = float(_strat.get("hedge_toxic_bid_max", 0.0) or 0.0)
         HEDGE_MIN_PRICE = _strat["hedge_min_price"]
         HEDGE_UNDERCUT_TICKS = _strat["hedge_undercut_ticks"]
         HEDGE_QUOTE_MAX_AGE_S = _strat["hedge_quote_max_age_s"]
@@ -3620,6 +3791,20 @@ while not _shutdown_requested:
         HEDGE_ORACLE_MIN_EDGE_USD = _strat["hedge_oracle_min_edge_usd"]
         HEDGE_DUMP_IGNORE_ORACLE = _strat["hedge_dump_ignore_oracle"]
         HEDGE_DUMP_PERSIST_S = _strat["hedge_dump_persist_s"]
+        HEDGE_DUMP_MAX_QUOTE_AGE_S = float(_strat.get("hedge_dump_max_quote_age_s", 2.0) or 0.0)
+        HEDGE_DUMP_REQUIRE_FRESH_BOOK = bool(_strat.get("hedge_dump_require_fresh_book", True))
+        HEDGE_DUMP_MAX_FAVOR_EDGE_USD = float(_strat.get("hedge_dump_max_favor_edge_usd", 0.0) or 0.0)
+        HEDGE_EDGE_COLLAPSE_ALLOWS_DUMP = bool(_strat.get("hedge_edge_collapse_allows_dump", False))
+        HEDGE_DUMP_LADDER_ENABLED = bool(_strat.get("hedge_dump_ladder_enabled", True))
+        HEDGE_DUMP_PRICE_FLOOR = float(_strat.get("hedge_dump_price_floor", 0.45) or 0.45)
+        HEDGE_DUMP_LADDER_START = float(_strat.get("hedge_dump_ladder_start", 0.55) or 0.55)
+        HEDGE_DUMP_LADDER_STEP = float(_strat.get("hedge_dump_ladder_step", 0.05) or 0.05)
+        HEDGE_DUMP_LADDER_STEP_SLEEP_S = float(
+            _strat.get("hedge_dump_ladder_step_sleep_s", 0.4) or 0.0
+        )
+        HEDGE_DUMP_LATE_SWEEP_TTM_S = float(
+            _strat.get("hedge_dump_late_sweep_ttm_s", 20.0) or 0.0
+        )
         BUY_WINDOW_MIN = _strat["buy_window_min"]
         BUY_GRACE_S = _strat["buy_grace_s"]
         BUY_COOLDOWN_S = _strat["buy_cooldown_s"]
@@ -4392,10 +4577,11 @@ while not _shutdown_requested:
 
                 # --- HEDGE CHECK (for held positions) ---
                 if held_token and held_size > 0.01 and HEDGE_ENABLED and not meta.get("hedge_closed"):
-                    # FAK avg < toxic_force_exit_below arms toxic_fill. Dump only while
-                    # held bid ≤ hedge_threshold (no GUI / 35/40/15). Recovered book
-                    # (bid > 35¢) logs hedge_skip_toxic_recovered and stays armed.
-                    # Mild below-band fills (≥ that floor) use the normal hedge path.
+                    # FAK avg < toxic_force_exit_below arms toxic_fill (force-exit
+                    # book path). Dump ladder + hard gates also arm when held bid
+                    # ≤ hedge_toxic_bid_max (held-bag / hourly sibling) — not only
+                    # after a toxic FAK print. Recovered book (bid > threshold)
+                    # logs hedge_skip_toxic_recovered and stays armed.
                     toxic_fill = bool(meta.get("toxic_fill"))
                     # Skip REST when a *fresh* WS bid is clearly above threshold
                     # (normal hedge and toxic recovered). Stale-high WS must not
@@ -4599,17 +4785,37 @@ while not _shutdown_requested:
                                         and not toxic_fill
                                         and hedge_bid > HEDGE_THRESHOLD
                                     )
+                                    # Held-bag dump (hourly sibling): live bid <=
+                                    # hedge_toxic_bid_max arms dump ladder + hard
+                                    # gates — not only toxic FAK avg fill.
+                                    _dump_cap = (
+                                        float(HEDGE_TOXIC_BID_MAX)
+                                        if float(HEDGE_TOXIC_BID_MAX) > 1e-12
+                                        else float(HEDGE_THRESHOLD)
+                                    )
+                                    if float(HEDGE_TOXIC_BID_MAX) > 1e-12:
+                                        do_dump = (not tp_full) and hedge_dump_overrides_oracle(
+                                            hedge_bid, _dump_cap,
+                                        )
+                                    else:
+                                        # Knob off: legacy toxic_fill-only dump.
+                                        do_dump = (not tp_full) and bool(
+                                            toxic_fill
+                                            and toxic_dump_book_ok(
+                                                hedge_bid, HEDGE_THRESHOLD,
+                                            )
+                                        )
                                     persist_s = (
                                         float(TAKE_PROFIT_PERSIST_S) if tp_full
                                         else (
-                                            float(HEDGE_DUMP_PERSIST_S) if toxic_fill
+                                            float(HEDGE_DUMP_PERSIST_S) if do_dump
                                             else float(HEDGE_PERSIST_S)
                                         )
                                     )
                                     persist_map = (
                                         _take_profit_persist_armed if tp_full
                                         else (
-                                            _hedge_dump_armed if toxic_fill
+                                            _hedge_dump_armed if do_dump
                                             else _hedge_persist_armed
                                         )
                                     )
@@ -4627,14 +4833,92 @@ while not _shutdown_requested:
                                             condition_id=cond, leg=held_leg,
                                             persist_s=persist_s, persist_why=pwhy,
                                             bid=hedge_bid, ask=hedge_ask,
-                                            toxic_fill=toxic_fill, take_profit=tp_full,
+                                            toxic_fill=toxic_fill, dump=bool(do_dump),
+                                            take_profit=tp_full,
                                         )
                                         continue
                                     persist_map.pop(cond, None)
+                                    # --- hard anti-false-dump gates (hourly Sep15) ---
+                                    _dump_max_age = float(HEDGE_DUMP_MAX_QUOTE_AGE_S or 0.0)
+                                    if _dump_max_age <= 1e-12:
+                                        _dump_max_age = float(HEDGE_QUOTE_MAX_AGE_S)
+                                    ws_dump_fresh = (
+                                        quote_age is not None
+                                        and quote_age <= _dump_max_age + 1e-12
+                                    )
+                                    dump_book_fresh = bool(ws_dump_fresh) or (fresh_bid is not None)
+                                    edge_collapse_unlock = bool(
+                                        (meta or {}).get("_edge_collapse_unlock")
+                                    )
+                                    if (
+                                        do_dump
+                                        and edge_collapse_unlock
+                                        and (not HEDGE_EDGE_COLLAPSE_ALLOWS_DUMP)
+                                    ):
+                                        log_event(
+                                            "hedge_skip_dump_collapse_disabled",
+                                            condition_id=cond, leg=held_leg,
+                                            bid=hedge_bid, ask=hedge_ask,
+                                            edge_collapse_unlock=True,
+                                            allows_dump=False,
+                                        )
+                                        _hedge_dump_armed.pop(cond, None)
+                                        continue
+                                    if (
+                                        do_dump
+                                        and HEDGE_DUMP_REQUIRE_FRESH_BOOK
+                                        and (not dump_book_fresh)
+                                    ):
+                                        log_event(
+                                            "hedge_skip_dump_stale_quote",
+                                            condition_id=cond, leg=held_leg,
+                                            bid=hedge_bid, ask=hedge_ask,
+                                            quote_age_s=(
+                                                None if quote_age is None
+                                                else round(quote_age, 3)
+                                            ),
+                                            dump_max_quote_age_s=_dump_max_age,
+                                            rest_ok=fresh_bid is not None,
+                                        )
+                                        _hedge_dump_armed.pop(cond, None)
+                                        continue
+                                    if do_dump and (not tp_full):
+                                        _df_favor = None
+                                        try:
+                                            _df_uchk = btc_feed.underlying_check(
+                                                m.start_ts, 0.0,
+                                            )
+                                            _df_edge = _df_uchk.get("edge_usd")
+                                            if _df_edge is not None:
+                                                _df_e = float(_df_edge)
+                                                if math.isfinite(_df_e):
+                                                    _df_favor = (
+                                                        _df_e
+                                                        if str(held_leg).lower() == "up"
+                                                        else -_df_e
+                                                    )
+                                        except Exception:
+                                            _df_favor = None
+                                        if (
+                                            _df_favor is not None
+                                            and float(_df_favor)
+                                            > float(HEDGE_DUMP_MAX_FAVOR_EDGE_USD) + 1e-12
+                                        ):
+                                            log_event(
+                                                "hedge_skip_dump_oracle_favor",
+                                                condition_id=cond, leg=held_leg,
+                                                bid=hedge_bid, ask=hedge_ask,
+                                                favor_edge=round(float(_df_favor), 2),
+                                                max_favor_edge_usd=float(
+                                                    HEDGE_DUMP_MAX_FAVOR_EDGE_USD
+                                                ),
+                                            )
+                                            _hedge_dump_armed.pop(cond, None)
+                                            continue
                                     if (
                                         (not tp_full)
                                         and HEDGE_REQUIRE_ORACLE
-                                        and not (toxic_fill and HEDGE_DUMP_IGNORE_ORACLE)
+                                        and not (do_dump and HEDGE_DUMP_IGNORE_ORACLE)
                                     ):
                                         if hold_while_oracle_agrees(
                                             held_leg, m.start_ts, cond,
@@ -4650,12 +4934,14 @@ while not _shutdown_requested:
                                         hedge_bid, hedge_tick, HEDGE_UNDERCUT_TICKS, hedge_floor,
                                     )
                                     hedge_title = (
-                                        "[bold bright_red]▼ TOXIC FILL — FORCE EXIT[/]"
-                                        if toxic_fill
+                                        "[bold bright_red]▼ HELD DUMP — FORCE EXIT[/]"
+                                        if do_dump
                                         else "[bold bright_red]▼ HEDGE SELL — CUTTING LOSSES[/]"
                                     )
                                     hedge_label = (
-                                        "TOXIC FILL EXIT" if toxic_fill else "REVERSAL DETECTED"
+                                        "DUMP ≤{:.0f}¢".format(float(_dump_cap) * 100)
+                                        if do_dump
+                                        else "REVERSAL DETECTED"
                                     )
                                     console.print(Panel(
                                         f"  [bright_white]{m.question}[/]\n"
@@ -4674,6 +4960,8 @@ while not _shutdown_requested:
                                         quote_age_s=None if quote_age is None else round(quote_age, 3),
                                         ws_fast_path=False,
                                         toxic_fill=toxic_fill,
+                                        dump=bool(do_dump),
+                                        dump_bid_max=float(_dump_cap),
                                         hedge_floor=hedge_floor,
                                     )
                                     prior_hedge_proceeds = float(
@@ -4745,14 +5033,21 @@ while not _shutdown_requested:
                                         min_price=hedge_floor,
                                         undercut_ticks=HEDGE_UNDERCUT_TICKS,
                                         retry_sleep_s=HEDGE_RETRY_SLEEP_S,
-                                        # Toxic: never abort on bounce / integrity — dump inventory.
-                                        abort_above=None if toxic_fill else HEDGE_THRESHOLD,
-                                        require_ask_max=None if toxic_fill else HEDGE_REQUIRE_ASK_MAX,
-                                        max_spread=None if toxic_fill else HEDGE_MAX_SPREAD,
+                                        # Dump: never abort on bounce / integrity — dump inventory.
+                                        abort_above=None if do_dump else HEDGE_THRESHOLD,
+                                        require_ask_max=None if do_dump else HEDGE_REQUIRE_ASK_MAX,
+                                        max_spread=None if do_dump else HEDGE_MAX_SPREAD,
                                         on_submit=_persist_hedge_submit,
                                         on_fill=_persist_hedge_fill,
                                         condition_id=cond,
                                         initial_quote=(hedge_bid, hedge_ask),
+                                        dump=bool(do_dump),
+                                        max_retries=12 if do_dump else 3,
+                                        price_ladder=bool(
+                                            do_dump and HEDGE_DUMP_LADDER_ENABLED
+                                        ),
+                                        ttm_s=max(0.0, float(m.end_ts) - time.time()),
+                                        ladder_meta=meta,
                                     )
                                     sell_status = (
                                         sell_res.get("bot_status")

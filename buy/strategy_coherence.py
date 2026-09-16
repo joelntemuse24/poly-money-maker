@@ -114,9 +114,34 @@ def validate_soft_edge_coherence(cfg: Mapping[str, Any]) -> None:
             )
 
 
+def validate_hedge_dump_price_ladder(cfg: Mapping[str, Any]) -> None:
+    """Validate DUMP exit FAK price-ladder knobs (seek-high then step down)."""
+    enabled = _b(cfg, "hedge_dump_ladder_enabled", True)
+    floor = _f(cfg, "hedge_dump_price_floor", 0.45)
+    start = _f(cfg, "hedge_dump_ladder_start", 0.55)
+    step = _f(cfg, "hedge_dump_ladder_step", 0.05)
+    sleep_s = _f(cfg, "hedge_dump_ladder_step_sleep_s", 0.4)
+    late_s = _f(cfg, "hedge_dump_late_sweep_ttm_s", 45.0)
+    if not (0 <= floor <= 1):
+        raise ValueError("hedge_dump_price_floor must satisfy 0 <= floor <= 1")
+    if not (0 <= start <= 1):
+        raise ValueError("hedge_dump_ladder_start must satisfy 0 <= start <= 1")
+    if step <= 0 or step > 1:
+        raise ValueError("hedge_dump_ladder_step must satisfy 0 < step <= 1")
+    if sleep_s < 0:
+        raise ValueError("hedge_dump_ladder_step_sleep_s must be >= 0")
+    if late_s < 0:
+        raise ValueError("hedge_dump_late_sweep_ttm_s must be >= 0")
+    if enabled and not (floor <= start + EPS):
+        raise ValueError(
+            "hedge_dump_ladder_start must be >= hedge_dump_price_floor "
+            "when hedge_dump_ladder_enabled"
+        )
+
 def validate_hourly_strategy_coherence(cfg: Mapping[str, Any]) -> None:
     """Raise ValueError on knob combos that must not load."""
     validate_hedge_dump_ladder(cfg)
+    validate_hedge_dump_price_ladder(cfg)
     validate_soft_edge_coherence(cfg)
 
 
@@ -128,6 +153,8 @@ def validate_15m_strategy_coherence(cfg: Mapping[str, Any]) -> None:
     ``market_spend_cap`` 0 means “use buy_max_spend only”.
     """
     validate_soft_edge_coherence(cfg)
+    if "hedge_dump_ladder_enabled" in cfg or "hedge_dump_price_floor" in cfg:
+        validate_hedge_dump_price_ladder(cfg)
     if "hedge_recovery_cancel" in cfg:
         validate_hedge_dump_ladder(cfg)
     if _b(cfg, "early_hot_defer_enabled", False):

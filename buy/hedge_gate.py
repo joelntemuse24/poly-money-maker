@@ -910,3 +910,166 @@ def held_hedge_decision(
             "hold", "oracle_still_winning", None, None, False, True, None, False,
         )
     return intent
+
+def dump_exit_best_reasonable(meta, ladder_start: float) -> float:
+    """Prefer a recent recovery/tight bid logged on meta; else ladder_start."""
+    try:
+        start = float(ladder_start)
+    except (TypeError, ValueError):
+        start = 0.55
+    if start != start or start <= 0:
+        start = 0.55
+    if not isinstance(meta, dict):
+        return start
+    for key in (
+        "dump_ladder_tight_bid",
+        "last_tight_bid",
+        "hedge_tight_bid",
+        "last_good_bid",
+    ):
+        raw = meta.get(key)
+        if raw is None:
+            continue
+        try:
+            value = float(raw)
+        except (TypeError, ValueError):
+            continue
+        if value == value and 0.0 < value <= 1.0:
+            return value
+    return start
+
+
+def align_dump_sell_limit(price, tick) -> float:
+    """Tick-align a SELL FAK limit downward; never below one tick."""
+    try:
+        tick_f = float(tick)
+    except (TypeError, ValueError):
+        tick_f = 0.01
+    if tick_f <= 0:
+        tick_f = 0.01
+    try:
+        raw = float(price or 0)
+    except (TypeError, ValueError):
+        raw = 0.0
+    if raw != raw or raw <= 0:
+        return tick_f
+    aligned = (int(raw / tick_f + 1e-12)) * tick_f
+    return max(tick_f, round(aligned, 10))
+
+
+def build_dump_exit_price_ladder(
+    live_bid,
+    live_ask=None,
+    *,
+    tick=0.01,
+    ladder_start=0.55,
+    price_floor=0.45,
+    step=0.05,
+    late_sweep_ttm_s=45.0,
+    ttm_s=None,
+    meta=None,
+    enabled=True,
+):
+    """Descending SELL FAK limits for toxic DUMP exits.
+
+    Always HIGH→LOW from ``ladder_start`` toward ``max(live_bid, tick)``.
+    Prefer spending time at ≥ ``price_floor`` first (same start/step).
+    If still unfilled after the floor, keep stepping by ``step`` down to
+    live bid even when ``live_bid < price_floor`` (do not require late TTM).
+    When very late (``ttm <= late_sweep_ttm_s``), skip straight to
+    ``max(live_bid, tick)``.
+    """
+    if not enabled:
+        return []
+    try:
+        tick_f = float(tick) if tick not in (None, "") else 0.01
+    except (TypeError, ValueError):
+        tick_f = 0.01
+    if tick_f <= 0:
+        tick_f = 0.01
+    bid = None
+    if live_bid is not None:
+        try:
+            bid = float(live_bid)
+        except (TypeError, ValueError):
+            bid = None
+        if bid is not None and (bid != bid or bid <= 0):
+            bid = None
+    ask = None
+    if live_ask is not None:
+        try:
+            ask = float(live_ask)
+        except (TypeError, ValueError):
+            ask = None
+        if ask is not None and (ask != ask or ask <= 0):
+            ask = None
+    try:
+        start_cfg = float(ladder_start)
+    except (TypeError, ValueError):
+        start_cfg = 0.55
+    try:
+        floor = float(price_floor)
+    except (TypeError, ValueError):
+        floor = 0.45
+    try:
+        step_f = float(step)
+    except (TypeError, ValueError):
+        step_f = 0.05
+    if step_f <= 0:
+        step_f = tick_f
+    best = dump_exit_best_reasonable(meta, start_cfg)
+    seed = min(start_cfg, best)
+    start = max(bid, seed) if bid is not None else seed
+    # SELL FAK limit is a min-accept price: intentionally try ABOVE the live
+    # bid first (may not fill). Do not clamp to ask-tick — that collapsed the
+    # seek-high ladder whenever ask sat under ladder_start.
+    _ = ask  # retained for call-site / future book-aware starts
+    start = align_dump_sell_limit(start, tick_f)
+    floor_al = align_dump_sell_limit(floor, tick_f)
+    bottom = (
+        align_dump_sell_limit(max(bid, tick_f), tick_f)
+        if bid is not None
+        else floor_al
+    )
+
+    late = False
+    try:
+        if ttm_s is not None and float(late_sweep_ttm_s) > 0:
+            late = float(ttm_s) <= float(late_sweep_ttm_s) + 1e-12
+    except (TypeError, ValueError):
+        late = False
+
+    # Very late: skip straight to live bid (optional fast sweep).
+    if late and bid is not None:
+        return [round(bottom, 10)]
+
+    # Prefer ≥ floor first: never start below floor on the seek-high path.
+    if start + 1e-12 < floor_al:
+        start = floor_al
+
+    # Ladder bottoms at max(live_bid, tick) when known; else stop at floor.
+    stop_at = bottom if bid is not None else floor_al
+    if stop_at + 1e-12 > start:
+        stop_at = start
+
+    levels = []
+    p = start
+    for _ in range(64):
+        levels.append(round(p, 10))
+        if p <= stop_at + 1e-12:
+            break
+        nxt = align_dump_sell_limit(p - step_f, tick_f)
+        if nxt + 1e-12 >= p:
+            break
+        if nxt + 1e-12 < stop_at:
+            if abs(levels[-1] - stop_at) > 1e-12:
+                levels.append(round(stop_at, 10))
+            break
+        p = nxt
+
+    out = []
+    for lv in levels:
+        if not out or abs(out[-1] - lv) > 1e-12:
+            out.append(lv)
+    return out
+
