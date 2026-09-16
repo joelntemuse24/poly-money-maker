@@ -133,7 +133,7 @@ class ProbeJsonTests(unittest.TestCase):
         self.assertEqual(data["late_buy_budget"], 5.0)
         self.assertEqual(data["buy_max_spend"], 5.0)
         self.assertEqual(data["market_spend_cap"], 5.0)
-        self.assertEqual(data["entry_book_persist_s"], 2.0)
+        self.assertEqual(data["entry_book_persist_s"], 5.0)
         self.assertEqual(data["hedge_persist_s"], 1.0)
         self.assertEqual(data["hedge_dump_persist_s"], 2.0)
         self.assertEqual(data["hedge_threshold"], 0.50)
@@ -189,7 +189,7 @@ class Coherence5mTests(unittest.TestCase):
     def test_probe_window_and_persist_load(self):
         validate_5m_strategy_coherence({
             "buy_start_s": 90,
-            "entry_book_persist_s": 2.0,
+            "entry_book_persist_s": 5.0,
             "buy_budget": 5.0,
             "market_spend_cap": 5.0,
         })
@@ -206,7 +206,7 @@ class Buybot5mWiringTests(unittest.TestCase):
         self.assertEqual(defaults["buy_budget"], 5.0)
         self.assertEqual(defaults["late_buy_budget"], 5.0)
         self.assertEqual(defaults["market_spend_cap"], 5.0)
-        self.assertEqual(defaults["entry_book_persist_s"], 2.0)
+        self.assertEqual(defaults["entry_book_persist_s"], 5.0)
         self.assertEqual(defaults["hedge_persist_s"], 1.0)
         self.assertEqual(defaults["hedge_dump_persist_s"], 2.0)
         self.assertIs(defaults["hedge_require_oracle"], True)

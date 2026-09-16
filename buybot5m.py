@@ -319,7 +319,7 @@ _STRATEGY_DEFAULTS = {
     "balance_refresh_s": 15,
     "ui_every_n_cycles": 50,
     "tick_size": "0.001",
-    "entry_book_persist_s": 2.0,
+    "entry_book_persist_s": 5.0,
 }
 _STRATEGY_DOC_KEYS = frozenset({
     "_comment", "_canonical", "_source_tape", "_notes", "_live_flip", "_vs_15m",

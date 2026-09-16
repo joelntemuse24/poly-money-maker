@@ -17,10 +17,10 @@ $2.50 paper template. Do not treat it as this probe.
 
 | Pillar | Probe value | vs 15m |
 |---|---|---|
-| Window | last **90s** (`buy_start_s=90`) | 15m last **180s**. 90s leaves room for 2s persist + FAK without chasing early 5m chop. 12 windows/hr exist; missing most is fine (~2–3 fills/hr target). |
+| Window | last **90s** (`buy_start_s=90`) | 15m last **180s**. 90s leaves room for 5s persist + FAK without chasing early 5m chop. 12 windows/hr exist; missing most is fine (~2–3 fills/hr target). |
 | Ask band | **0.975–0.99** | 15m **0.95–0.99**. 5m tick is 0.001 so 97.5¢ is a real level; prefer 98–99, allow 97.5. |
 | Oracle floor | **$10** Chainlink last vs PTB | Same $10 as 15m (operator range $10–15). |
-| Entry persist | **2s** | Same as 15m. Not hourly 8–20s — that would eat a 90s window. |
+| Entry persist | **5s** | 15m is 2s. 5s is a longer flicker filter on the 5m tape; still far under hourly 8–20s so it fits a 90s window. |
 | Size | **$5** `buy_budget` = `late_buy_budget` = `buy_max_spend` = `market_spend_cap` | Same $5 start. Later ~$40: raise those four plus `buy_max_shares` (≥ spend / 0.975). |
 | Overlays | **off** (`early_buy_start_s=90`, `early_95_*=0`, `late_90_start_s=0`) | 15m is already a single sleeve. |
 | Hedge book | **0.50 / 0.52** ask, dump **≤0.40**, persist **1s**, dump persist **2s** | 15m is 0.35/0.40. 5m 50/52/40 is the 5m-tuned book; do not blindly copy 15m levels. |
