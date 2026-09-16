@@ -160,11 +160,15 @@ POLY_BUILDER_PASSPHRASE = (
 )
 EXPECTED_TICK_SIZE = "0.01"
 
-# CLOB market orders reject taker amounts with more than four decimal places.
-# py-clob-client-v2 1.1.0 still exposes wider configs for sub-cent markets.
+# CLOB BUY: maker USDC max 2 decimals, taker shares max 4. Clamp every tick
+# to 4, then 15m's 0.01 maker to cents so a dirty float cannot sign 4dp
+# (live 16 Sep: $50/$100 FAK → HTTP 400 invalid amounts).
 for _rounding in ROUNDING_CONFIG.values():
     if _rounding.amount > 4:
         _rounding.amount = 4
+_tick_01 = ROUNDING_CONFIG.get("0.01")
+if _tick_01 is not None and _tick_01.amount > 2:
+    _tick_01.amount = 2
 
 # ------------------------- STRATEGY CONFIG -------------------------
 _STRATEGY_DEFAULTS = {
@@ -2761,12 +2765,15 @@ def buy_market_with_retry(
         try:
             signed_order = safe_api_call(
                 client.create_order,
+                # Omit user_usdc_balance. A leftover/fake wallet (live $100
+                # at 97–99¢ → spend 99.91/99.96) makes the v2 SDK shrink
+                # size to a dirty float → maker > 2 dp → HTTP 400 invalid
+                # amounts. Size is already exact cents; fees come out of NAV.
                 OrderArgs(
                     token_id=token_id,
                     price=price,
                     size=shares,
                     side=BUY,
-                    user_usdc_balance=remaining_budget,
                 ),
                 options=PartialCreateOrderOptions(
                     tick_size=tick_size, neg_risk=False,

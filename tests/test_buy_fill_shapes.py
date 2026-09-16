@@ -381,6 +381,16 @@ class BuyFillProductionHelpers(unittest.TestCase):
             self.assertEqual(maker.quantize(Decimal("0.01")), maker, ask)
         self.assertLess(quoted(2.50, 0.82, 5.0) * 0.82, 2.5000001)
         self.assertAlmostEqual(quoted(2.50, 0.82), 3.0)
+        # Live 16 Sep $50/$100 15m FAK: 50@99¢ and 100@97/98¢ must already
+        # be exact cents before create_order (CLOB maker max 2 dp).
+        self.assertAlmostEqual(quoted(50.0, 0.99, 115.0), 50.0)
+        self.assertEqual(float(Decimal("50.0") * Decimal("0.99")), 49.50)
+        self.assertAlmostEqual(quoted(100.0, 0.99, 115.0), 101.0)
+        self.assertEqual(float(Decimal("101.0") * Decimal("0.99")), 99.99)
+        self.assertAlmostEqual(quoted(100.0, 0.97, 115.0), 103.0)
+        self.assertEqual(float(Decimal("103.0") * Decimal("0.97")), 99.91)
+        self.assertAlmostEqual(quoted(100.0, 0.98, 115.0), 102.0)
+        self.assertEqual(float(Decimal("102.0") * Decimal("0.98")), 99.96)
 
     def test_classify_buy_fill_walk_and_cheap_avg_are_toxic(self):
         classify = self.ns["classify_buy_fill"]
@@ -924,7 +934,10 @@ class AmbiguousCrossCyclePolicy(unittest.TestCase):
                 )
                 self.assertIn("price = fresh_ask", src, bot.name)
                 self.assertNotIn("quoted_buy_shares_up_to_limit(", src, bot.name)
-                self.assertIn("user_usdc_balance=remaining_budget", src, bot.name)
+                order_chunk = src[src.index("OrderArgs(") : src.index("OrderArgs(") + 420]
+                self.assertNotIn("user_usdc_balance", order_chunk, bot.name)
+                self.assertIn('ROUNDING_CONFIG.get("0.01")', src, bot.name)
+                self.assertIn("_tick_01.amount = 2", src, bot.name)
             self.assertIn("[THIN ASK]", src, bot.name)
             self.assertNotIn("min(budget / ask, ask_size)", src, bot.name)
             self.assertNotIn("[NO SIZE]", src, bot.name)
@@ -1188,6 +1201,27 @@ class BuyExecutionAmbiguity(unittest.TestCase):
         )
         self.assertEqual(result, (0.0, 0.0, "empty"))
         self.assertEqual(calls["post"], 1)
+
+    def test_live_100_dollar_ask_omits_usdc_balance(self):
+        """Live 16 Sep: $100 FAK at 97¢ logged spend 99.91 then HTTP 400."""
+        ns, calls = self._namespace({"status": "unmatched", "orderID": "order-1"})
+        ns["BUY_MAX_SHARES"] = 115.0
+        ns["get_quote_fast"] = lambda *_a, **_k: (0.96, 0.5, 0.97, 200.0, None)
+        result = ns["buy_market_with_retry"](
+            "token", 100.0, 0.99, min_price=0.965, max_retries=1,
+            on_submit=lambda *args: calls["submit"].append(args),
+        )
+        self.assertEqual(result, (0.0, 0.0, "empty"))
+        self.assertEqual(len(calls["orders"]), 1)
+        order = calls["orders"][0]
+        self.assertNotIn("user_usdc_balance", order)
+        self.assertAlmostEqual(order["price"], 0.97)
+        quoted = ns["quoted_buy_shares"](100.0, 0.97, 115.0)
+        self.assertAlmostEqual(order["size"], quoted)
+        self.assertAlmostEqual(order["size"], 103.0)
+        maker = Decimal(str(order["size"])) * Decimal("0.97")
+        self.assertEqual(maker.quantize(Decimal("0.01")), maker)
+        self.assertEqual(float(maker), 99.91)
 
     def test_unmatched_400_stops_if_balance_appeared(self):
         ns, calls = self._namespace({"status": "unmatched"})
@@ -1852,6 +1886,53 @@ class FiveMinuteClobMakerRoundingTests(unittest.TestCase):
         self.assertEqual(shares, 2.99)
         self.assertEqual(usdc, 2.96)
         self.assertEqual(Decimal(str(usdc)).as_tuple().exponent, -2)
+
+
+class FifteenMinuteClobMakerRoundingTests(unittest.TestCase):
+    """Live 16 Sep 2026: $100 @ 97–99¢ + leftover wallet → maker > 2 dp → 400."""
+
+    def tearDown(self):
+        from py_clob_client_v2.clob_types import RoundConfig
+        from py_clob_client_v2.order_builder.builder import ROUNDING_CONFIG
+
+        ROUNDING_CONFIG["0.01"] = RoundConfig(price=2, size=2, amount=4)
+
+    def _amounts(self, size, price, amount_dp):
+        from py_clob_client_v2.clob_types import RoundConfig
+        from py_clob_client_v2.order_builder.builder import OrderBuilder
+        from py_clob_client_v2.order_builder.constants import BUY
+
+        cfg = RoundConfig(price=2, size=2, amount=amount_dp)
+        builder = OrderBuilder.__new__(OrderBuilder)
+        _side, maker, taker = builder.get_order_amounts(BUY, size, price, cfg)
+        return maker / 1e6, taker / 1e6
+
+    def test_omitting_balance_keeps_50_shares_at_4950_cents(self):
+        usdc, shares = self._amounts(50.0, 0.99, 4)
+        self.assertEqual(shares, 50.0)
+        self.assertEqual(usdc, 49.50)
+        self.assertGreaterEqual(Decimal(str(usdc)).as_tuple().exponent, -2)
+
+    def test_omitting_balance_keeps_103_shares_at_9991_cents(self):
+        usdc, shares = self._amounts(103.0, 0.97, 4)
+        self.assertEqual(shares, 103.0)
+        self.assertEqual(usdc, 99.91)
+        self.assertGreaterEqual(Decimal(str(usdc)).as_tuple().exponent, -2)
+
+    def test_fake_balance_equal_to_notional_makes_4dp_maker(self):
+        from py_clob_client_v2.fees import adjust_buy_amount_for_fees
+
+        price = 0.97
+        spend = 103.0 * price
+        balance = min(100.0, max(50.0, spend))
+        adjusted = adjust_buy_amount_for_fees(spend, price, balance, 0.0, 0.0, 0.0)
+        usdc, _shares = self._amounts(adjusted / price, price, 4)
+        self.assertGreater(Decimal(str(usdc)).as_tuple().exponent * -1, 2)
+
+    def test_15m_amount_2_patch_rounds_dirty_maker_to_cents(self):
+        usdc, _shares = self._amounts(102.99999999999999, 0.97, 2)
+        self.assertGreaterEqual(Decimal(str(usdc)).as_tuple().exponent, -2)
+        self.assertLessEqual(usdc, 99.91 + 1e-9)
 
 
 class SellExecutionAmbiguity(unittest.TestCase):
