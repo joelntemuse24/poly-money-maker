@@ -883,8 +883,8 @@ class AmbiguousCrossCyclePolicy(unittest.TestCase):
             self.assertIn('quoted = meta.get("quoted_buy_shares")', src, bot.name)
             self.assertIn("BUY_MAX_SHARES", src, bot.name)
             if bot == BOT5M:
-                self.assertIn('"buy_max_spend": 3.0', src, bot.name)
-                self.assertIn('"buy_max_shares": 5.0', src, bot.name)
+                self.assertIn('"buy_max_spend": 5.0', src, bot.name)
+                self.assertIn('"buy_max_shares": 8.0', src, bot.name)
                 self.assertIn("quoted_buy_shares_up_to_limit(", src, bot.name)
                 self.assertIn("price=limit_price", src, bot.name)
                 self.assertNotIn(
