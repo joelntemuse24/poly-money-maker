@@ -304,11 +304,10 @@ def dump_tight_book_hold_reason(
 ):
     """If dump must hold for tightness, return the reason; else None.
 
-    Shared by hourly ``evaluate_held_bag`` and the 15m dump arm. Phantom
+    Shared by hourly ``evaluate_held_bag`` and the 15m dump arm.     Phantom
     penny bids under a still-high ask (34/99) must not dump. Both sides
     underwater (33/50, ask ≤ ``dump_ignore_spread_ask_max``) skip the
-    spread check. 5m keeps bid-only dump by leaving ``dump_require_tight``
-    off.
+    spread check. 5m probe and 15m pass ``dump_require_tight=True``.
     """
     if not dump_require_tight:
         return None
@@ -361,18 +360,19 @@ def evaluate_held_bag(
 
     * Bid ≤ dump dumps every bag. Default is bid-only (no GUI / last-trade
       veto) so wide 22/77 still dumps. ``dump_persist_s`` ≤ 0 is instant.
-      When ``dump_require_tight`` (hourly live), also require ask and
+      When ``dump_require_tight`` (hourly + 15m + 5m probe), also require ask and
       ``ask-bid ≤ max_spread`` for the whole dump persist window — blocks
       34/99 phantom bids. If ask ≤ ``dump_ignore_spread_ask_max``
       (default 60¢), skip the spread check: both sides underwater
-      (textbook 33/50 loser). 5m keeps bid-only.
+      (textbook 33/50 loser). 5m probe now passes ``dump_require_tight``.
       5m live is **2s**: a one-tick 40¢ V-reversal must stay ≤ dump
       before the sell. Flatten walks stay instant.
     * Flatten (5m walks): when ``flatten`` and bid < ``flatten_max``
       (live 75¢ = ``buy_threshold``), dump immediately at the live bid.
       This runs *before* recovery_cancel so a 70¢ walk does not HOLD at
-      53¢. ``dump=True`` so the oracle is ignored. Do not raise
-      ``dump_bid_max`` to 75¢ — that breaks dump < qualify.
+      53¢. Flatten still sets ``dump=True``; with ``hedge_dump_ignore_oracle``
+      false the probe still consults oracle / favor-edge before posting.
+      Do not raise ``dump_bid_max`` to 75¢ — that breaks dump < qualify.
     * 5m default: do not sell in (dump, qualify). Persist-not-done 61/70
       is a hold. After persist, qualify–recovery live-bid sells (70–84).
       Bid ≥ recovery_cancel (default 85¢) is a recovered winner: HOLD and

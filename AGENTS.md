@@ -22,6 +22,8 @@ buybothourly.py is the hourly entry point. buy/entry_skip.py controls slice elig
 
 buybot.py is the BTC 15m sibling. The $5 dry-run probe is `strategy_buy15m_probe.example.json` (`dry_run=true`, `entry_enabled=false`). See BUY15M.md. Do not enable `polybuybot` or flip those knobs live until Joel says. Do not import buybot.py in tests.
 
+buybot5m.py is the BTC 5m sibling. The $5 dry-run probe is `strategy_buy5m_probe.example.json` (`dry_run=true`, `entry_enabled=false`). See BUY5M.md. Do not enable `polybuybot5m` or flip those knobs live until Joel says. Do not import buybot5m.py in tests. `strategy_buy5m.example.json` stays the historical last-120 75–90 paper template.
+
 Run tests with python -m unittest discover -s tests -p 'test_*.py' -v in a disposable sandbox. Keep temporary files and Python caches in that sandbox. The hourly example mirrors captured strategy parameters with dry_run=true and entry_enabled=false. The separately committed live snapshot has dry_run=false; neither is authorization to launch the bot.
 
 ## Repository policy

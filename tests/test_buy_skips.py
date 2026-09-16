@@ -382,8 +382,7 @@ class RestoredFiveMLate7590Tests(unittest.TestCase):
     def test_example_and_code_defaults_are_2_50_75_90_last_120(self):
         root = Path(__file__).resolve().parents[1]
         five = json.loads((root / "strategy_buy5m.example.json").read_text())
-        defaults = _literal_strategy_defaults((root / "buybot5m.py").read_text())
-        for blob in (five, defaults):
+        for blob in (five,):
             self.assertEqual(blob["buy_threshold"], 0.75)
             self.assertEqual(blob["buy_max_price"], 0.90)
             self.assertEqual(blob["buy_start_s"], 120)

@@ -173,3 +173,34 @@ def validate_15m_strategy_coherence(cfg: Mapping[str, Any]) -> None:
     window_min = _f(cfg, "buy_window_min", 0.0)
     if window_min <= 0 or window_min > 15 + EPS:
         raise ValueError("buy_window_min must satisfy 0 < minutes <= 15")
+
+
+def validate_5m_strategy_coherence(cfg: Mapping[str, Any]) -> None:
+    """Fail-closed 5m probe knobs (single late sleeve; overlays stay off).
+
+    ``buy_start_s`` is the last-N-seconds window on a 300s clock.
+    ``market_spend_cap`` 0 means “use buy_max_spend only”.
+    """
+    if "hedge_dump_ladder_enabled" in cfg or "hedge_dump_price_floor" in cfg:
+        validate_hedge_dump_price_ladder(cfg)
+    if "hedge_recovery_cancel" in cfg:
+        validate_hedge_dump_ladder(cfg)
+    cap = _f(cfg, "market_spend_cap", 0.0)
+    if cap < 0:
+        raise ValueError("market_spend_cap must be >= 0 (0 = disabled)")
+    budget = _f(cfg, "buy_budget", 0.0)
+    if cap > 0 and cap + EPS < budget:
+        raise ValueError(
+            "market_spend_cap must be >= buy_budget when market_spend_cap > 0"
+        )
+    late_s = _f(cfg, "buy_start_s", 0.0)
+    if late_s <= 0 or late_s > 300 + EPS:
+        raise ValueError("buy_start_s must satisfy 0 < seconds <= 300")
+    persist_s = _f(cfg, "entry_book_persist_s", 0.0)
+    if persist_s < 0:
+        raise ValueError("entry_book_persist_s must be >= 0")
+    if persist_s > late_s + EPS:
+        raise ValueError(
+            "entry_book_persist_s must be <= buy_start_s "
+            "(persist must fit inside the 5m entry window)"
+        )

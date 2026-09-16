@@ -82,6 +82,8 @@ from buy.entry_skip import (
     window_no_buy_reason,
 )
 from buy.hedge_gate import (
+    build_dump_exit_price_ladder,
+    dump_tight_book_hold_reason,
     evaluate_held_bag,
     hedge_dump_overrides_oracle,
     hedge_fail_is_terminal,
@@ -101,6 +103,8 @@ from buy.hedge_gate import (
     should_mark_hedge_closed,
 )
 from buy.live_journal import is_journal_event
+from buy.probe_5m import probe_spend_usd, should_evaluate_entries
+from buy.strategy_coherence import validate_5m_strategy_coherence
 
 
 class ImmediateResponseClobClient(ClobClient):
@@ -190,24 +194,24 @@ if _tick_001 is not None and _tick_001.amount > 2:
 # ------------------------- STRATEGY CONFIG -------------------------
 _STRATEGY_DEFAULTS = {
     "entry_enabled": False,
-    # One $2.50 FAK in the last 120s at 75–90¢ (FAK limit 90¢). Early / ≥95 /
-    # last-45 ≥90 overlays are off. Size starts at budget/ask; 3-share floor
-    # still applies when 3 × limit fits in buy_max_spend ($3).
-    "buy_threshold": 0.75,
-    "buy_max_price": 0.90,
+    # Conservative 5m probe: last 90s at 97.5–99¢, $5. Early / ≥95 /
+    # last-45 overlays stay off. Later ~$40 is JSON (budget / spend / cap /
+    # shares). Historical last-120 75–90 paper stays in
+    # strategy_buy5m.example.json.
+    "buy_threshold": 0.975,
+    "buy_max_price": 0.99,
     # Consensus on Polymarket GUI display price (mid if spread≤10¢ else last trade).
     # Tuned for the 75¢ band (old 92¢/10¢ gates could never arm a 75¢ ask).
     "min_winner_bid": 0.70,
     "max_loser_bid": 0.30,
     "min_bid_edge": 0.05,
     # Skip buys unless live BTC is ≥ this many USD from the window Price To Beat,
-    # and only allow the side matching that underlying move. Live 5m last-120s
-    # 75–90 is $0 so paper-scored prints actually take (flat / missing still
-    # fail-closed). Do not paste last-45 + $25.
+    # and only allow the side matching that underlying move. 5m resolves
+    # Chainlink (last vs PTB + crypto-price variant=fiveminute backfill).
     "underlying_gate_enabled": True,
-    "min_underlying_edge_usd": 0.0,
-    # Walks (avg < buy_threshold) arm toxic_fill. Flatten sells those bags
-    # at the live bid while bid < 75¢ — do not wait for dump 40. Must be
+    "min_underlying_edge_usd": 10.0,
+    # Walks (avg < this) arm toxic_fill. Flatten sells those bags at the
+    # live bid while bid < 75¢ — do not wait for dump 40. Must be
     # <= buy_threshold (validator).
     "toxic_force_exit_below": 0.75,
     "hedge_enabled": True,
@@ -251,41 +255,54 @@ _STRATEGY_DEFAULTS = {
     "hedge_require_gui": True,
     # Once holding: do not persist-sell while last live BTC is still on
     # the held side of PTB. $0 = any non-zero tick. Missing/stale holds.
-    # Dump ≤ toxic (40¢) is book-only (`hedge_dump_ignore_oracle`).
-    # Flatten walks also skip the oracle (`dump=True`).
+    # Dump still consults oracle (post-PR #168 15m intent). Tight book +
+    # fresh quote + favor-edge block stop phantom/false dumps.
     "hedge_require_oracle": True,
     "hedge_oracle_min_edge_usd": 0.0,
-    "hedge_dump_ignore_oracle": True,
+    "hedge_dump_ignore_oracle": False,
     # Bid ≤ dump must stay there this many seconds (paper: 1s is a no-op
     # on 1s ticks; 2s cuts 13/14 V-reversal winner dumps). 0 = instant.
     "hedge_dump_persist_s": 2.0,
-    "buy_start_s": 120,
+    "hedge_dump_require_tight": True,
+    "hedge_dump_ignore_spread_ask_max": 0.60,
+    "hedge_dump_max_quote_age_s": 2.0,
+    "hedge_dump_require_fresh_book": True,
+    "hedge_dump_max_favor_edge_usd": 0.0,
+    "hedge_edge_collapse_allows_dump": False,
+    "hedge_dump_ladder_enabled": True,
+    "hedge_dump_price_floor": 0.45,
+    "hedge_dump_ladder_start": 0.55,
+    "hedge_dump_ladder_step": 0.05,
+    "hedge_dump_ladder_step_sleep_s": 0.4,
+    "hedge_dump_late_sweep_ttm_s": 15.0,
+    "buy_start_s": 90,
     # Early ≥90 is off: same TTM as late so (buy_start, early_start] is empty.
-    "early_buy_start_s": 120,
-    "early_buy_max_price": 0.99,
+    "early_buy_start_s": 90,
+    "early_buy_max_price": 1.0,
     # ≥95 overlay off. Pair start_s=0 with min_s=0 so leftover min_s=60
-    # cannot disable the late 75–90 window. min_price must stay strictly
-    # above buy_max (0.90) or load_strategy rejects the file.
+    # cannot disable the late window. min_price must stay strictly
+    # above buy_max (0.99) or load_strategy rejects the file.
     "early_95_start_s": 0,
     "early_95_min_s": 0,
-    "early_95_min_price": 0.95,
+    "early_95_min_price": 0.995,
     "late_90_start_s": 0,
     "buy_grace_s": 1,
     "buy_cooldown_s": 1,
     # After a proven-empty FAK, wait this long before another outer attempt.
     # Inner unmatched 400s re-quote immediately (up to max_retries).
     "empty_fak_cooldown_s": 0.15,
-    "buy_budget": 2.5,
+    "buy_budget": 5.0,
     # Second slice only if early filled (it does not on this overlay).
-    "late_buy_budget": 2.5,
-    # Same-leg late add only if ask ≥ this (0.90). Flat first 75–90 still
-    # allowed. 0 disables.
-    "add_min_price": 0.90,
-    # Hard ceiling on USDC sent per FAK. $2.50 clip; never more than $3
-    # on one POST (3.33 sh / $2.50 at 75¢; 3.00 × 0.90 fits).
-    "buy_max_spend": 3.0,
-    # Sanity rail per FAK: $3 / 75¢ = 4 sh. 5 covers a cheap walk.
-    "buy_max_shares": 5.0,
+    "late_buy_budget": 5.0,
+    # Same-leg late add only if ask ≥ this. 0 disables.
+    "add_min_price": 0.975,
+    # Hard ceiling on USDC sent per FAK. Probe $5; later ~$40 is JSON.
+    "buy_max_spend": 5.0,
+    # Sanity rail: $5 / 97.5¢ ≈ 5.13 sh. 8 covers a cheap walk. ~$40 later
+    # needs >= spend / buy_threshold (~41).
+    "buy_max_shares": 8.0,
+    # 0 = disabled (use buy_max_spend). Probe $5; later ~$40 without rewrite.
+    "market_spend_cap": 5.0,
     "max_open_positions": 0,  # 0 = unlimited
     "max_open_notional": 10000.0,
     "max_daily_notional": 999999.0,
@@ -302,8 +319,12 @@ _STRATEGY_DEFAULTS = {
     "balance_refresh_s": 15,
     "ui_every_n_cycles": 50,
     "tick_size": "0.001",
+    "entry_book_persist_s": 2.0,
 }
-STRATEGY_FILE = "strategy_buy5m.json"
+_STRATEGY_DOC_KEYS = frozenset({
+    "_comment", "_canonical", "_source_tape", "_notes", "_live_flip", "_vs_15m",
+})
+STRATEGY_FILE = os.environ.get("POLY_BUY5M_STRATEGY") or "strategy_buy5m.json"
 
 _strat_cache = None
 _strat_mtime = 0.0
@@ -342,7 +363,7 @@ def load_strategy():
             overrides = json.load(f)
         if not isinstance(overrides, dict):
             raise ValueError("strategy root must be an object")
-        unknown = set(overrides) - set(cfg) - {"shares"}
+        unknown = set(overrides) - set(cfg) - {"shares"} - _STRATEGY_DOC_KEYS
         if unknown:
             raise ValueError(f"unknown strategy keys: {sorted(unknown)}")
         for k, v in overrides.items():
@@ -466,14 +487,16 @@ def load_strategy():
             raise ValueError(
                 "buy_max_spend must be >= max(buy_budget, late_buy_budget)"
             )
-        _need_shares = max(
-            _slice_budget, float(cfg["buy_max_spend"]),
-        ) / float(cfg["buy_threshold"])
+        _need_spend = probe_spend_usd(
+            _slice_budget,
+            float(cfg["buy_max_spend"]),
+            float(cfg.get("market_spend_cap") or 0),
+        )
+        _need_shares = _need_spend / float(cfg["buy_threshold"])
         if float(cfg["buy_max_shares"]) + 1e-9 < _need_shares:
             raise ValueError(
-                "buy_max_shares must be >= max(buy_budget, late_buy_budget, "
-                "buy_max_spend) / buy_threshold (raise it when you raise "
-                "the dollar size)"
+                "buy_max_shares must be >= spend / buy_threshold "
+                "(raise it when you raise the dollar size)"
             )
         # 0 = unlimited open markets (probe: redeem lag must not freeze entries).
         if float(cfg["max_open_positions"]) < 0:
@@ -486,9 +509,32 @@ def load_strategy():
             "late_90_start_s", "hedge_late_ttm_s",
             "redeem_throttle_s", "max_redeem_age_days", "hedge_persist_s",
             "hedge_oracle_min_edge_usd", "hedge_dump_persist_s",
+            "hedge_dump_max_quote_age_s", "hedge_dump_max_favor_edge_usd",
+            "hedge_dump_price_floor", "hedge_dump_ladder_start",
+            "hedge_dump_ladder_step", "hedge_dump_ladder_step_sleep_s",
+            "hedge_dump_late_sweep_ttm_s",
+            "entry_book_persist_s", "market_spend_cap",
         ):
             if float(cfg[key]) < 0:
                 raise ValueError(f"{key} must be non-negative")
+        for _bk in (
+            "hedge_dump_require_fresh_book",
+            "hedge_dump_require_tight",
+            "hedge_edge_collapse_allows_dump",
+            "hedge_dump_ladder_enabled",
+        ):
+            if _bk in cfg and type(cfg[_bk]) is not bool:
+                raise ValueError(f"{_bk} must be a boolean")
+        if not (0 <= float(cfg.get("hedge_dump_price_floor", 0.45) or 0) <= 1):
+            raise ValueError("hedge_dump_price_floor must satisfy 0 <= floor <= 1")
+        if not (0 <= float(cfg.get("hedge_dump_ladder_start", 0.55) or 0) <= 1):
+            raise ValueError("hedge_dump_ladder_start must satisfy 0 <= start <= 1")
+        _dstep = float(cfg.get("hedge_dump_ladder_step", 0.05) or 0)
+        if _dstep <= 0 or _dstep > 1:
+            raise ValueError("hedge_dump_ladder_step must satisfy 0 < step <= 1")
+        if not (0 <= float(cfg.get("hedge_dump_ignore_spread_ask_max", 0.60) or 0) <= 1):
+            raise ValueError("hedge_dump_ignore_spread_ask_max must be between 0 and 1")
+        validate_5m_strategy_coherence(cfg)
     except Exception as e:
         console.print(f"[bold red]▶ STRATEGY [WARN][/] [dim]failed to load {STRATEGY_FILE}: {e}[/]")
         if _strat_cache is None:
@@ -536,6 +582,24 @@ HEDGE_REQUIRE_ORACLE = _strat["hedge_require_oracle"]
 HEDGE_ORACLE_MIN_EDGE_USD = _strat["hedge_oracle_min_edge_usd"]
 HEDGE_DUMP_IGNORE_ORACLE = _strat["hedge_dump_ignore_oracle"]
 HEDGE_DUMP_PERSIST_S = _strat["hedge_dump_persist_s"]
+HEDGE_DUMP_REQUIRE_TIGHT = bool(_strat.get("hedge_dump_require_tight", True))
+HEDGE_DUMP_IGNORE_SPREAD_ASK_MAX = float(
+    _strat.get("hedge_dump_ignore_spread_ask_max", 0.60)
+)
+HEDGE_DUMP_MAX_QUOTE_AGE_S = float(_strat.get("hedge_dump_max_quote_age_s", 2.0) or 0.0)
+HEDGE_DUMP_REQUIRE_FRESH_BOOK = bool(_strat.get("hedge_dump_require_fresh_book", True))
+HEDGE_DUMP_MAX_FAVOR_EDGE_USD = float(_strat.get("hedge_dump_max_favor_edge_usd", 0.0) or 0.0)
+HEDGE_EDGE_COLLAPSE_ALLOWS_DUMP = bool(_strat.get("hedge_edge_collapse_allows_dump", False))
+HEDGE_DUMP_LADDER_ENABLED = bool(_strat.get("hedge_dump_ladder_enabled", True))
+HEDGE_DUMP_PRICE_FLOOR = float(_strat.get("hedge_dump_price_floor", 0.45) or 0.45)
+HEDGE_DUMP_LADDER_START = float(_strat.get("hedge_dump_ladder_start", 0.55) or 0.55)
+HEDGE_DUMP_LADDER_STEP = float(_strat.get("hedge_dump_ladder_step", 0.05) or 0.05)
+HEDGE_DUMP_LADDER_STEP_SLEEP_S = float(
+    _strat.get("hedge_dump_ladder_step_sleep_s", 0.4) or 0.0
+)
+HEDGE_DUMP_LATE_SWEEP_TTM_S = float(
+    _strat.get("hedge_dump_late_sweep_ttm_s", 15.0) or 0.0
+)
 ADD_MIN_PRICE = _strat["add_min_price"]
 BUY_START_S = _strat["buy_start_s"]
 EARLY_BUY_START_S = _strat["early_buy_start_s"]
@@ -554,6 +618,8 @@ BUY_BUDGET = _strat["buy_budget"]
 LATE_BUY_BUDGET = _strat["late_buy_budget"]
 BUY_MAX_SPEND = _strat["buy_max_spend"]
 BUY_MAX_SHARES = _strat["buy_max_shares"]
+MARKET_SPEND_CAP = float(_strat.get("market_spend_cap") or 0)
+ENTRY_BOOK_PERSIST_S = float(_strat.get("entry_book_persist_s") or 0)
 MAX_OPEN_POSITIONS = _strat["max_open_positions"]
 MAX_OPEN_NOTIONAL = _strat["max_open_notional"]
 MAX_DAILY_NOTIONAL = _strat["max_daily_notional"]
@@ -771,6 +837,7 @@ _buy_window_logged = {}
 _hedge_persist_armed = {}
 _hedge_persist_done = set()
 _hedge_dump_armed = {}
+_entry_book_persist_armed = {}
 _last_good_held_quote = {}
 
 
@@ -795,6 +862,34 @@ def log_buy_skip_throttled(skip_reason, condition_id, event="buy_skip", **kwargs
         for stale, _ts in sorted(_skip_log_mono.items(), key=lambda kv: kv[1])[:64]:
             _skip_log_mono.pop(stale, None)
     log_event(event, reason=reason, condition_id=condition_id, **kwargs)
+
+
+def entry_book_persist_key(cond, leg):
+    return f"{cond}|{str(leg or '').strip().lower()}"
+
+
+def clear_entry_book_persist_leg(cond, leg):
+    _entry_book_persist_armed.pop(entry_book_persist_key(cond, leg), None)
+
+
+def entry_book_persist_ready(cond, leg, book_ok, *, now_s=None, persist_s=None):
+    """(ready, why, age_s) — 5m probe book must hold for entry_book_persist_s."""
+    if now_s is None:
+        now_s = time.monotonic()
+    wait = float(ENTRY_BOOK_PERSIST_S if persist_s is None else persist_s)
+    key = entry_book_persist_key(cond, leg)
+    fire, armed, why = hedge_persist_ready(
+        bool(book_ok),
+        now_s=float(now_s),
+        armed_ts=_entry_book_persist_armed.get(key),
+        persist_s=wait,
+    )
+    if armed is None:
+        _entry_book_persist_armed.pop(key, None)
+        return False, why, 0.0
+    _entry_book_persist_armed[key] = armed
+    age = float(now_s) - float(armed)
+    return bool(fire), why, age
 
 
 def hold_while_oracle_agrees(held_leg, start_ts, condition_id, *, log=True):
@@ -837,7 +932,7 @@ def hold_while_oracle_agrees(held_leg, start_ts, condition_id, *, log=True):
 
 
 def current_entry_bands(seconds_left):
-    """Open 5m buy bands at this TTM (late 75–90, last-45 ≥90 off, early off)."""
+    """Open 5m buy bands at this TTM (late 97.5–99 last 90s; overlays off)."""
     return applicable_entry_bands(
         seconds_left,
         late_start_s=BUY_START_S,
@@ -3277,6 +3372,9 @@ def sell_market_with_retry(
     dump_bid_max=None,
     qualify_bid=None,
     recovery_cancel=None,
+    price_ladder=False,
+    ttm_s=None,
+    ladder_meta=None,
 ):
     """Sell `size` shares via FAK. Used for hedge exits only — no max_price cap.
 
@@ -3303,6 +3401,10 @@ def sell_market_with_retry(
     last_limit = float(price_limit) if price_limit is not None else floor
     dump = bool(dump)
     persist_done = bool(persist_done)
+    use_price_ladder = bool(price_ladder) and bool(dump)
+    ladder_levels = []
+    ladder_idx = 0
+    ladder_built = False
     submit_aborted = False
     abort_cleanup_failed = False
     write_ahead_written = False
@@ -3511,6 +3613,72 @@ def sell_market_with_retry(
             )
             break
         price = hedge_sell_price(live_bid, tick_size, undercut_ticks, floor)
+        if use_price_ladder:
+            if (not ladder_built) or (not ladder_levels):
+                try:
+                    _l_enabled = bool(HEDGE_DUMP_LADDER_ENABLED)
+                except NameError:
+                    _l_enabled = True
+                try:
+                    _l_floor = float(HEDGE_DUMP_PRICE_FLOOR)
+                except (NameError, TypeError, ValueError):
+                    _l_floor = 0.45
+                try:
+                    _l_start = float(HEDGE_DUMP_LADDER_START)
+                except (NameError, TypeError, ValueError):
+                    _l_start = 0.55
+                try:
+                    _l_step = float(HEDGE_DUMP_LADDER_STEP)
+                except (NameError, TypeError, ValueError):
+                    _l_step = 0.05
+                try:
+                    _l_late = float(HEDGE_DUMP_LATE_SWEEP_TTM_S)
+                except (NameError, TypeError, ValueError):
+                    _l_late = 15.0
+                ladder_levels = build_dump_exit_price_ladder(
+                    live_bid,
+                    live_ask,
+                    tick=float(tick_size),
+                    ladder_start=_l_start,
+                    price_floor=_l_floor,
+                    step=_l_step,
+                    late_sweep_ttm_s=_l_late,
+                    ttm_s=ttm_s,
+                    meta=ladder_meta,
+                    enabled=_l_enabled,
+                )
+                ladder_idx = 0
+                ladder_built = True
+                log_event(
+                    "hedge_dump_ladder_built",
+                    token_id=token_id,
+                    condition_id=condition_id,
+                    levels=list(ladder_levels),
+                    live_bid=live_bid,
+                    live_ask=live_ask,
+                    ttm_s=None if ttm_s is None else round(float(ttm_s), 2),
+                )
+            if ladder_levels:
+                if ladder_idx >= len(ladder_levels):
+                    ladder_idx = len(ladder_levels) - 1
+                _target = float(ladder_levels[ladder_idx])
+                if (
+                    live_bid is not None
+                    and ladder_idx == len(ladder_levels) - 1
+                ):
+                    _target = max(float(live_bid), float(tick_size))
+                price = hedge_sell_price(_target, tick_size, undercut_ticks, floor)
+            log_event(
+                "hedge_dump_ladder_step",
+                token_id=token_id,
+                condition_id=condition_id,
+                limit=float(price),
+                ladder_idx=int(ladder_idx),
+                levels=len(ladder_levels),
+                remaining=float(remaining),
+                live_bid=live_bid,
+                attempt=attempt + 1,
+            )
         last_limit = price
         try:
             signed_order = safe_api_call(
@@ -3646,6 +3814,23 @@ def sell_market_with_retry(
                         }, total_proceeds
                 console.print(f"  [bold green][EXIT FAK][/]{filled} @ ≥{price:.3f}  [dim]id={str(oid)[:16]}…[/]")
                 log_event("sell_fill", token_id=token_id, filled=filled, price=price, remaining=remaining, attempt=attempt + 1)
+                if use_price_ladder:
+                    log_event(
+                        "hedge_dump_ladder_fill",
+                        token_id=token_id,
+                        condition_id=condition_id,
+                        limit=float(price),
+                        filled=float(filled),
+                        remaining=float(remaining),
+                        ladder_idx=int(ladder_idx),
+                    )
+                    if remaining >= 0.01 and ladder_idx + 1 < len(ladder_levels):
+                        ladder_idx += 1
+                        try:
+                            _ls = float(HEDGE_DUMP_LADDER_STEP_SLEEP_S)
+                        except (NameError, TypeError, ValueError):
+                            _ls = 0.4
+                        time.sleep(float(_ls) if _ls > 0 else float(retry_sleep_s))
                 if response_status not in {"matched", "order_status_matched"}:
                     return total_sold, {
                         "bot_status": "ambiguous", "last_limit": last_limit,
@@ -3752,7 +3937,24 @@ def sell_market_with_retry(
                         f"  [dim yellow][FAK EMPTY][/] hedge no match · re-quote "
                         f"{attempt + 2}/{max_retries}"
                     )
-                    time.sleep(float(retry_sleep_s))
+                    if use_price_ladder and ladder_levels and ladder_idx + 1 < len(ladder_levels):
+                        ladder_idx += 1
+                        log_event(
+                            "hedge_dump_ladder_empty_step",
+                            token_id=token_id,
+                            condition_id=condition_id,
+                            next_idx=int(ladder_idx),
+                            next_limit=float(ladder_levels[ladder_idx]),
+                            remaining=float(remaining),
+                            attempt=attempt + 1,
+                        )
+                        try:
+                            _ls = float(HEDGE_DUMP_LADDER_STEP_SLEEP_S)
+                        except (NameError, TypeError, ValueError):
+                            _ls = 0.4
+                        time.sleep(float(_ls) if _ls > 0 else float(retry_sleep_s))
+                    else:
+                        time.sleep(float(retry_sleep_s))
                     continue
                 break
             if definitive_order_rejection(e):
@@ -4151,6 +4353,24 @@ while not _shutdown_requested:
         HEDGE_ORACLE_MIN_EDGE_USD = _strat["hedge_oracle_min_edge_usd"]
         HEDGE_DUMP_IGNORE_ORACLE = _strat["hedge_dump_ignore_oracle"]
         HEDGE_DUMP_PERSIST_S = _strat["hedge_dump_persist_s"]
+        HEDGE_DUMP_REQUIRE_TIGHT = bool(_strat.get("hedge_dump_require_tight", True))
+        HEDGE_DUMP_IGNORE_SPREAD_ASK_MAX = float(
+            _strat.get("hedge_dump_ignore_spread_ask_max", 0.60)
+        )
+        HEDGE_DUMP_MAX_QUOTE_AGE_S = float(_strat.get("hedge_dump_max_quote_age_s", 2.0) or 0.0)
+        HEDGE_DUMP_REQUIRE_FRESH_BOOK = bool(_strat.get("hedge_dump_require_fresh_book", True))
+        HEDGE_DUMP_MAX_FAVOR_EDGE_USD = float(_strat.get("hedge_dump_max_favor_edge_usd", 0.0) or 0.0)
+        HEDGE_EDGE_COLLAPSE_ALLOWS_DUMP = bool(_strat.get("hedge_edge_collapse_allows_dump", False))
+        HEDGE_DUMP_LADDER_ENABLED = bool(_strat.get("hedge_dump_ladder_enabled", True))
+        HEDGE_DUMP_PRICE_FLOOR = float(_strat.get("hedge_dump_price_floor", 0.45) or 0.45)
+        HEDGE_DUMP_LADDER_START = float(_strat.get("hedge_dump_ladder_start", 0.55) or 0.55)
+        HEDGE_DUMP_LADDER_STEP = float(_strat.get("hedge_dump_ladder_step", 0.05) or 0.05)
+        HEDGE_DUMP_LADDER_STEP_SLEEP_S = float(
+            _strat.get("hedge_dump_ladder_step_sleep_s", 0.4) or 0.0
+        )
+        HEDGE_DUMP_LATE_SWEEP_TTM_S = float(
+            _strat.get("hedge_dump_late_sweep_ttm_s", 15.0) or 0.0
+        )
         ADD_MIN_PRICE = _strat["add_min_price"]
         BUY_START_S = _strat["buy_start_s"]
         EARLY_BUY_START_S = _strat["early_buy_start_s"]
@@ -4169,6 +4389,8 @@ while not _shutdown_requested:
         LATE_BUY_BUDGET = _strat["late_buy_budget"]
         BUY_MAX_SPEND = _strat["buy_max_spend"]
         BUY_MAX_SHARES = _strat["buy_max_shares"]
+        MARKET_SPEND_CAP = float(_strat.get("market_spend_cap") or 0)
+        ENTRY_BOOK_PERSIST_S = float(_strat.get("entry_book_persist_s") or 0)
         MAX_OPEN_POSITIONS = _strat["max_open_positions"]
         MAX_OPEN_NOTIONAL = _strat["max_open_notional"]
         MAX_DAILY_NOTIONAL = _strat["max_daily_notional"]
@@ -5176,6 +5398,8 @@ while not _shutdown_requested:
                             flatten_max=flatten_max,
                             dump_persist_s=HEDGE_DUMP_PERSIST_S,
                             dump_armed_ts=dump_armed_ts,
+                            dump_require_tight=HEDGE_DUMP_REQUIRE_TIGHT,
+                            dump_ignore_spread_ask_max=HEDGE_DUMP_IGNORE_SPREAD_ASK_MAX,
                         )
                         qualify_fail = preview.reason in {
                             "missing_side", "bid_above", "ask_too_high",
@@ -5237,6 +5461,8 @@ while not _shutdown_requested:
                                 flatten_max=flatten_max,
                                 dump_persist_s=HEDGE_DUMP_PERSIST_S,
                                 dump_armed_ts=dump_armed_ts,
+                                dump_require_tight=HEDGE_DUMP_REQUIRE_TIGHT,
+                                dump_ignore_spread_ask_max=HEDGE_DUMP_IGNORE_SPREAD_ASK_MAX,
                             )
                             if not gui_ok and intent.action == "hold":
                                 log_event(
@@ -5299,6 +5525,8 @@ while not _shutdown_requested:
                                 "ask_too_high": "hedge_skip_toxic_book",
                                 "wide_spread": "hedge_skip_toxic_book",
                                 "crossed": "hedge_skip_toxic_book",
+                                "dump_wide_spread": "hedge_skip_dump_book",
+                                "dump_missing_ask": "hedge_skip_dump_book",
                             }.get(intent.reason, "hedge_skip")
                             if intent.reason == "no_bid":
                                 log_event(
@@ -5336,6 +5564,109 @@ while not _shutdown_requested:
                                 hedge_bid, hedge_tick, 0, hedge_floor,
                             )
                             dump = bool(intent.dump)
+                            do_dump = dump
+                            if do_dump:
+                                tight_why = dump_tight_book_hold_reason(
+                                    hedge_bid, hedge_ask,
+                                    dump_require_tight=HEDGE_DUMP_REQUIRE_TIGHT,
+                                    max_spread=HEDGE_MAX_SPREAD,
+                                    dump_ignore_spread_ask_max=(
+                                        HEDGE_DUMP_IGNORE_SPREAD_ASK_MAX
+                                    ),
+                                )
+                                if tight_why:
+                                    log_event(
+                                        "hedge_skip_dump_book",
+                                        condition_id=cond, leg=held_leg,
+                                        bid=hedge_bid, ask=hedge_ask,
+                                        reason=tight_why,
+                                        max_spread=HEDGE_MAX_SPREAD,
+                                        dump_bid_max=float(ladder.dump),
+                                        dump_require_tight=HEDGE_DUMP_REQUIRE_TIGHT,
+                                        dump_ignore_spread_ask_max=float(
+                                            HEDGE_DUMP_IGNORE_SPREAD_ASK_MAX
+                                        ),
+                                    )
+                                    _hedge_dump_armed.pop(cond, None)
+                                    continue
+                                _dump_max_age = float(HEDGE_DUMP_MAX_QUOTE_AGE_S or 0.0)
+                                if _dump_max_age <= 1e-12:
+                                    _dump_max_age = float(HEDGE_QUOTE_MAX_AGE_S)
+                                ws_dump_fresh = (
+                                    quote_age is not None
+                                    and quote_age <= _dump_max_age + 1e-12
+                                )
+                                dump_book_fresh = bool(ws_dump_fresh) or (rest_bid is not None)
+                                edge_collapse_unlock = bool(
+                                    (meta or {}).get("_edge_collapse_unlock")
+                                )
+                                if (
+                                    edge_collapse_unlock
+                                    and (not HEDGE_EDGE_COLLAPSE_ALLOWS_DUMP)
+                                ):
+                                    log_event(
+                                        "hedge_skip_dump_collapse_disabled",
+                                        condition_id=cond, leg=held_leg,
+                                        bid=hedge_bid, ask=hedge_ask,
+                                        edge_collapse_unlock=True,
+                                        allows_dump=False,
+                                    )
+                                    _hedge_dump_armed.pop(cond, None)
+                                    continue
+                                if (
+                                    HEDGE_DUMP_REQUIRE_FRESH_BOOK
+                                    and (not dump_book_fresh)
+                                ):
+                                    log_event(
+                                        "hedge_skip_dump_stale_quote",
+                                        condition_id=cond, leg=held_leg,
+                                        bid=hedge_bid, ask=hedge_ask,
+                                        quote_age_s=(
+                                            None if quote_age is None
+                                            else round(quote_age, 3)
+                                        ),
+                                        dump_max_quote_age_s=_dump_max_age,
+                                        rest_ok=rest_bid is not None,
+                                    )
+                                    _hedge_dump_armed.pop(cond, None)
+                                    continue
+                                _df_favor = None
+                                try:
+                                    _df_uchk = btc_feed.underlying_check(
+                                        m.start_ts, 0.0,
+                                    )
+                                    _df_edge = _df_uchk.get("edge_usd")
+                                    if _df_edge is not None:
+                                        _df_e = float(_df_edge)
+                                        if math.isfinite(_df_e):
+                                            _df_favor = (
+                                                _df_e
+                                                if str(held_leg).lower() == "up"
+                                                else -_df_e
+                                            )
+                                except Exception:
+                                    _df_favor = None
+                                if (
+                                    _df_favor is not None
+                                    and float(_df_favor)
+                                    > float(HEDGE_DUMP_MAX_FAVOR_EDGE_USD) + 1e-12
+                                ):
+                                    log_event(
+                                        "hedge_skip_dump_oracle_favor",
+                                        condition_id=cond, leg=held_leg,
+                                        bid=hedge_bid, ask=hedge_ask,
+                                        favor_edge=round(float(_df_favor), 2),
+                                        max_favor_edge_usd=float(
+                                            HEDGE_DUMP_MAX_FAVOR_EDGE_USD
+                                        ),
+                                    )
+                                    _hedge_dump_armed.pop(cond, None)
+                                    continue
+                                if HEDGE_REQUIRE_ORACLE and not (do_dump and HEDGE_DUMP_IGNORE_ORACLE):
+                                    if hold_while_oracle_agrees(
+                                        held_leg, m.start_ts, cond,
+                                    ):
+                                        continue
                             hedge_title = (
                                 "[bold bright_red]▼ TOXIC FILL — FORCE EXIT[/]"
                                 if dump
@@ -5487,6 +5818,11 @@ while not _shutdown_requested:
                                 dump_bid_max=ladder.dump,
                                 qualify_bid=ladder.qualify,
                                 recovery_cancel=ladder.recovery,
+                                price_ladder=bool(
+                                    dump and HEDGE_DUMP_LADDER_ENABLED
+                                ),
+                                ttm_s=max(0.0, float(seconds_left)),
+                                ladder_meta=meta,
                             )
                             sell_status = (
                                 sell_res.get("bot_status")
@@ -5632,8 +5968,8 @@ while not _shutdown_requested:
                     cond, m.end_ts, seconds_left, slug=getattr(m, "slug", None),
                     window=",".join(b.name for b in bands),
                 )
-                if not ENTRY_ENABLED:
-                    continue  # explicit operator arm is required for every live entry
+                if not should_evaluate_entries(DRY_RUN, ENTRY_ENABLED):
+                    continue  # live with entries off does not walk; dry-run still logs
                 if not discovery_allows_buy_look(
                     _discovery_fresh,
                     in_live_window=late_slice,
@@ -5723,7 +6059,7 @@ while not _shutdown_requested:
                     if (pm.get("bought_token") or pm.get("buy_uncertain"))
                     and pm.get("entered_at", 0) >= _today_start_ms()
                 )
-                est_cost = min(
+                est_cost = probe_spend_usd(
                     entry_slice_budget(
                         seconds_left,
                         late_start_s=BUY_START_S,
@@ -5731,6 +6067,7 @@ while not _shutdown_requested:
                         late_budget=LATE_BUY_BUDGET,
                     ),
                     float(BUY_MAX_SPEND),
+                    float(MARKET_SPEND_CAP),
                 )
                 already_open = (
                     cond in open_conditions
@@ -6072,6 +6409,8 @@ while not _shutdown_requested:
                 up_buy = up_winning and up_ask_ok and up_consensus
                 dn_buy = dn_winning and dn_ask_ok and dn_consensus
                 if not (up_buy or dn_buy):
+                    clear_entry_book_persist_leg(cond, "up")
+                    clear_entry_book_persist_leg(cond, "down")
                     log_buy_skip_throttled(
                         "rest_confirm",
                         cond,
@@ -6132,6 +6471,21 @@ while not _shutdown_requested:
                     )
                     continue
 
+                persist_ok, persist_why, persist_age = entry_book_persist_ready(
+                    cond, buy_leg, True, now_s=time.monotonic(),
+                )
+                if not persist_ok:
+                    log_event(
+                        "buy_skip_entry_book_persist",
+                        condition_id=cond,
+                        leg=buy_leg,
+                        persist_s=ENTRY_BOOK_PERSIST_S,
+                        persist_why=persist_why,
+                        persist_age_s=round(persist_age, 3),
+                        ask=buy_ask,
+                    )
+                    continue
+
                 # Cooldown (empty FAKs use the short empty_fak_cooldown_s).
                 last_buy_at = meta.get("last_buy_at") or 0
                 cooldown_s = (
@@ -6154,7 +6508,7 @@ while not _shutdown_requested:
                 ))
 
                 tick = get_tick_size_cached(buy_token)
-                spend_usd = min(
+                spend_usd = probe_spend_usd(
                     entry_slice_budget(
                         seconds_left,
                         late_start_s=BUY_START_S,
@@ -6162,6 +6516,7 @@ while not _shutdown_requested:
                         late_budget=LATE_BUY_BUDGET,
                     ),
                     float(BUY_MAX_SPEND),
+                    float(MARKET_SPEND_CAP),
                 )
                 slice_prior_size = float(meta.get("bought_size") or 0)
                 slice_prior_cost = float(meta.get("pnl_entry_cost") or 0)
