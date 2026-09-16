@@ -304,7 +304,7 @@ def dump_tight_book_hold_reason(
 ):
     """If dump must hold for tightness, return the reason; else None.
 
-    Shared by hourly ``evaluate_held_bag`` and the 15m dump arm.     Phantom
+    Shared by hourly ``evaluate_held_bag`` and the 15m dump arm. Phantom
     penny bids under a still-high ask (34/99) must not dump. Both sides
     underwater (33/50, ask ≤ ``dump_ignore_spread_ask_max``) skip the
     spread check. 5m probe and 15m pass ``dump_require_tight=True``.
