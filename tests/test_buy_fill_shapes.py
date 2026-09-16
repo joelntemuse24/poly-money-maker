@@ -1920,14 +1920,30 @@ class FifteenMinuteClobMakerRoundingTests(unittest.TestCase):
         self.assertGreaterEqual(Decimal(str(usdc)).as_tuple().exponent, -2)
 
     def test_fake_balance_equal_to_notional_makes_4dp_maker(self):
+        """Same 3@99¢ dirty float 5m hit, on 15m's 0.01 tick."""
+        from py_clob_client_v2.fees import adjust_buy_amount_for_fees
+
+        price = 0.99
+        spend = 3.0 * price
+        balance = min(3.0, max(2.50, spend))
+        adjusted = adjust_buy_amount_for_fees(spend, price, balance, 0.0, 0.0, 0.0)
+        usdc, shares = self._amounts(adjusted / price, price, 4)
+        self.assertEqual(shares, 2.99)
+        self.assertEqual(usdc, 2.9601)
+        self.assertGreater(Decimal(str(usdc)).as_tuple().exponent * -1, 2)
+
+    def test_live_100_wallet_with_fees_makes_4dp_maker(self):
+        """Live 16 Sep: remaining_budget $100 + fee_rate shrinks 103@97¢ to 4dp."""
         from py_clob_client_v2.fees import adjust_buy_amount_for_fees
 
         price = 0.97
         spend = 103.0 * price
-        balance = min(100.0, max(50.0, spend))
-        adjusted = adjust_buy_amount_for_fees(spend, price, balance, 0.0, 0.0, 0.0)
-        usdc, _shares = self._amounts(adjusted / price, price, 4)
-        self.assertGreater(Decimal(str(usdc)).as_tuple().exponent * -1, 2)
+        adjusted = adjust_buy_amount_for_fees(spend, price, 100.0, 0.25, 1.0, 0.0)
+        usdc4, _shares = self._amounts(adjusted / price, price, 4)
+        self.assertGreater(Decimal(str(usdc4)).as_tuple().exponent * -1, 2)
+        usdc2, _ = self._amounts(adjusted / price, price, 2)
+        self.assertGreaterEqual(Decimal(str(usdc2)).as_tuple().exponent, -2)
+        self.assertLessEqual(usdc2, usdc4 + 1e-9)
 
     def test_15m_amount_2_patch_rounds_dirty_maker_to_cents(self):
         usdc, _shares = self._amounts(102.99999999999999, 0.97, 2)
