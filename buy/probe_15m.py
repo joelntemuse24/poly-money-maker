@@ -68,6 +68,39 @@ def entry_persist_key(condition_id: str, leg: str) -> str:
     return f"{condition_id}|{str(leg or '').strip().lower()}"
 
 
+def persist_quote_ok(
+    ask: Optional[float],
+    persist_min_price: float,
+    gui: Optional[float] = None,
+) -> bool:
+    """True when the entry quote is at/above the persist arm floor.
+
+    Anti-flash: start/keep the timer once the CLOB ask is >= persist_min.
+    GUI is used only when ask is missing (display quote at the entry gate).
+    No upper cap — 95→99 keeps the arm. Below the floor is a reset.
+    This is not the buy band (``buy_threshold``…``buy_max_price``).
+    """
+    px = ask if ask is not None else gui
+    try:
+        price = float(px)  # type: ignore[arg-type]
+        floor = float(persist_min_price)
+    except (TypeError, ValueError):
+        return False
+    if price != price or floor != floor:
+        return False
+    return price + EPS >= floor
+
+
+def entry_may_buy(
+    persist_ready: bool,
+    ask: Optional[float],
+    buy_threshold: float,
+    buy_max_price: float,
+) -> bool:
+    """Buy still needs persist elapsed AND the existing FAK buy band."""
+    return bool(persist_ready) and ask_in_band(ask, buy_threshold, buy_max_price)
+
+
 def shares_rail_needed(spend_usd: float, buy_threshold: float) -> float:
     """Minimum ``buy_max_shares`` so $spend at the band floor can size."""
     floor = float(buy_threshold)
