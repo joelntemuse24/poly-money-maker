@@ -173,6 +173,23 @@ def validate_15m_strategy_coherence(cfg: Mapping[str, Any]) -> None:
     window_min = _f(cfg, "buy_window_min", 0.0)
     if window_min <= 0 or window_min > 15 + EPS:
         raise ValueError("buy_window_min must satisfy 0 < minutes <= 15")
+    if "entry_persist_min_price" in cfg:
+        persist_min = _f(cfg, "entry_persist_min_price", 0.95)
+        if not (0 < persist_min <= 1):
+            raise ValueError("entry_persist_min_price must satisfy 0 < price <= 1")
+        if "buy_threshold" in cfg:
+            floor = _f(cfg, "buy_threshold", 0.95)
+            if persist_min > floor + EPS:
+                raise ValueError(
+                    "entry_persist_min_price must be <= buy_threshold "
+                    "(persist starts at or below the buy floor)"
+                )
+        if "buy_max_price" in cfg:
+            hi = _f(cfg, "buy_max_price", 0.99)
+            if persist_min > hi + EPS:
+                raise ValueError(
+                    "entry_persist_min_price must be <= buy_max_price"
+                )
 
 
 def validate_5m_strategy_coherence(cfg: Mapping[str, Any]) -> None:

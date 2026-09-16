@@ -12,8 +12,11 @@ from buy.probe_15m import (
     ask_in_band,
     in_buy_window,
     live_posting_armed,
+    persist_ask_ok,
+    persist_leg_for_asks,
     probe_live_flip_note,
     probe_spend_usd,
+    replay_entry_persist,
     shares_rail_needed,
     should_evaluate_entries,
 )
@@ -87,6 +90,7 @@ class ProbeJsonTests(unittest.TestCase):
         self.assertNotIn("max_open_notional", data)
         self.assertNotIn("max_daily_notional", data)
         self.assertEqual(data["entry_book_persist_s"], 2.0)
+        self.assertEqual(data["entry_persist_min_price"], 0.95)
         self.assertEqual(data["hedge_persist_s"], 1.0)
         self.assertEqual(data["hedge_dump_persist_s"], 2.0)
         self.assertEqual(data["hedge_threshold"], 0.35)
@@ -165,6 +169,7 @@ class BuybotWiringTests(unittest.TestCase):
         self.assertNotIn("max_open_notional", defaults)
         self.assertNotIn("max_daily_notional", defaults)
         self.assertEqual(defaults["entry_book_persist_s"], 2.0)
+        self.assertEqual(defaults["entry_persist_min_price"], 0.95)
         self.assertEqual(defaults["hedge_persist_s"], 1.0)
         self.assertEqual(defaults["hedge_dump_persist_s"], 2.0)
         self.assertIs(defaults["hedge_require_oracle"], True)
@@ -186,6 +191,12 @@ class BuybotWiringTests(unittest.TestCase):
         self.assertIn("probe_spend_usd", src)
         self.assertIn("emit_buy_depth_ladder", src)
         self.assertIn("entry_book_persist_ready", src)
+        self.assertIn("persist_leg_for_asks", src)
+        self.assertIn("ENTRY_PERSIST_MIN_PRICE", src)
+        self.assertNotIn(
+            'if not (up_buy or dn_buy):\n                    clear_entry_book_persist_leg',
+            src,
+        )
         self.assertIn("hold_while_oracle_agrees", src)
         self.assertIn("hedge_persist_ready", src)
         self.assertIn("dump_tight_book_hold_reason(", src)
@@ -293,6 +304,7 @@ class BuybotWiringTests(unittest.TestCase):
         self.assertIs(cfg["entry_enabled"], False)
         self.assertEqual(cfg["buy_budget"], 5.0)
         self.assertEqual(cfg["buy_threshold"], 0.95)
+        self.assertEqual(cfg["entry_persist_min_price"], 0.95)
         self.assertNotIn("max_open_notional", cfg)
         self.assertNotIn("max_daily_notional", cfg)
 
@@ -366,11 +378,111 @@ class ProbeNowDecisionTests(unittest.TestCase):
         self.assertTrue(armed["live_posting"])
 
 
+class PersistFrom95Tests(unittest.TestCase):
+    def test_persist_ask_starts_at_95(self):
+        self.assertTrue(persist_ask_ok(0.95))
+        self.assertTrue(persist_ask_ok(0.97))
+        self.assertTrue(persist_ask_ok(0.99))
+        self.assertFalse(persist_ask_ok(0.94))
+        self.assertFalse(persist_ask_ok(1.00))
+        self.assertFalse(persist_ask_ok(None))
+
+    def test_persist_leg_ignores_buy_threshold(self):
+        # 95¢ starts persist even if the buy floor is later 96.5 / 97.
+        self.assertEqual(
+            persist_leg_for_asks(
+                up_winning=True, dn_winning=False,
+                up_ask=0.95, dn_ask=0.05, persist_min=0.95, persist_max=0.99,
+            ),
+            "up",
+        )
+        self.assertIsNone(
+            persist_leg_for_asks(
+                up_winning=True, dn_winning=False,
+                up_ask=0.94, dn_ask=0.06, persist_min=0.95, persist_max=0.99,
+            )
+        )
+
+    def test_cascade_95_to_97_keeps_the_same_clock(self):
+        # 95 @ t=0, 96 @ 0.5, 97 @ 2.0 → ready for the 97 buy without restart.
+        rows = replay_entry_persist(
+            (
+                (1000.0, 0.95, 0.05, True, False),
+                (1000.5, 0.96, 0.04, True, False),
+                (1002.0, 0.97, 0.03, True, False),
+            ),
+            persist_s=2.0,
+        )
+        self.assertEqual(rows[0][1], "armed")
+        self.assertFalse(rows[0][0])
+        self.assertEqual(rows[1][1], "waiting")
+        self.assertEqual(rows[1][3], "up")
+        self.assertTrue(rows[2][0])
+        self.assertEqual(rows[2][1], "ready")
+        self.assertGreaterEqual(rows[2][2], 2.0)
+
+    def test_ninety_four_resets_then_rearms(self):
+        rows = replay_entry_persist(
+            (
+                (10.0, 0.95, 0.05, True, False),
+                (11.0, 0.94, 0.06, True, False),
+                (11.1, 0.97, 0.03, True, False),
+                (13.1, 0.97, 0.03, True, False),
+            ),
+            persist_s=2.0,
+        )
+        self.assertEqual(rows[1][1], "reset")
+        self.assertFalse(rows[1][0])
+        self.assertEqual(rows[2][1], "armed")
+        self.assertFalse(rows[2][0])
+        self.assertTrue(rows[3][0])
+
+    def test_buy_gate_failure_does_not_reset_persist(self):
+        # Consensus / oracle miss is a buy skip, not a persist clear.
+        rows = replay_entry_persist(
+            (
+                (50.0, 0.95, 0.05, True, False),
+                (51.0, 0.96, 0.04, True, False),
+                (52.0, 0.965, 0.035, True, False),
+            ),
+            persist_s=2.0,
+        )
+        self.assertTrue(rows[-1][0])
+        self.assertGreaterEqual(rows[-1][2], 2.0)
+
+    def test_persist_min_above_buy_floor_is_rejected(self):
+        bad = {
+            "entry_persist_min_price": 0.97,
+            "buy_threshold": 0.95,
+            "buy_max_price": 0.99,
+            "buy_window_min": 3.0,
+            "buy_budget": 5.0,
+            "market_spend_cap": 5.0,
+            "early_hot_defer_enabled": False,
+        }
+        with self.assertRaises(ValueError) as ctx:
+            validate_15m_strategy_coherence(bad)
+        self.assertIn("entry_persist_min_price", str(ctx.exception))
+
+    def test_persist_min_below_later_97_floor_is_ok(self):
+        validate_15m_strategy_coherence({
+            "entry_persist_min_price": 0.95,
+            "buy_threshold": 0.97,
+            "buy_max_price": 0.99,
+            "buy_window_min": 3.0,
+            "buy_budget": 5.0,
+            "market_spend_cap": 5.0,
+            "early_hot_defer_enabled": False,
+        })
+
+
 class HourlyUntouchedTests(unittest.TestCase):
     def test_hourly_entry_still_uses_hourly_coherence(self):
         src = HOURLY.read_text()
         self.assertIn("validate_hourly_strategy_coherence", src)
         self.assertNotIn("validate_15m_strategy_coherence", src)
+        self.assertIn("cond}|{leg}|{band_s}", src)
+        self.assertNotIn("entry_persist_min_price", src)
         self.assertTrue(HOURLY_JSON.is_file())
         self.assertTrue(HOURLY_EXAMPLE.is_file())
         hourly = json.loads(HOURLY_EXAMPLE.read_text())

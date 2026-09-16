@@ -21,7 +21,7 @@ logging-only and fail-closes).
 | Window | last **3.0 min (180s)** |
 | Ask band | **0.95–0.99** (ge95 only; FAK pins the live ask) |
 | Oracle floor | **$10** Chainlink last vs PTB |
-| Entry persist | **2s** |
+| Entry persist | **2s from 95¢+** (same clock through 96 / 96.5 / 97; buy at 95 is ok) |
 | Size | **$5** `buy_budget` = `buy_max_spend` = `market_spend_cap`. Open/daily notional caps **removed**. |
 | Hedge | **0.35 / 0.40** ask, persist **1s**, dump persist **2s**, oracle required |
 | Soft-edge | **off** (load rejects max ≥ floor if turned on) |
@@ -34,6 +34,14 @@ Later live $1–2 test or ~$20 cap: change `buy_budget`, `buy_max_spend`,
 `buy_max_shares`, `market_spend_cap`. Open/daily notional caps are gone
 from the 15m path — do not add them back. Per-market spend rails and
 `max_open_positions` (0 = unlimited) remain. No bot rewrite.
+
+`entry_persist_min_price` is the flash filter, not the buy floor. A
+winning ask at **95¢** starts the 2s clock; ticks to 96 / 97 / 98 keep
+that arm. Consensus, oracle, or raising `buy_threshold` to 96.5 / 97
+must not restart persist. A 94¢ print or a side flip clears it. 15m
+tick is 0.01 so 96.5 is a later JSON floor, not a distinct CLOB level.
+Hourly persist (b15 vs a22 restart) is unchanged — trial this on 15m
+first.
 
 `strategy_buy.example.json` stays the historical 90–96¢ / $10 paper
 template. Do not treat it as this probe.
@@ -94,3 +102,4 @@ logs `dry_buy` even while `entry_enabled` is false.
 - `early_hot_defer_enabled` must stay false
 - `market_spend_cap` ≥ `buy_budget` when cap > 0
 - `buy_window_min` in `(0, 15]`
+- `entry_persist_min_price` ≤ `buy_threshold` when both are set

@@ -76,7 +76,7 @@ Draft file: `strategy_buy15m_probe.example.json`
 | market spend cap | **~$20** |
 | hedge dump | **~0.35–0.40** (`hedge_require_ask_max` ~0.40) |
 | oracle | **Chainlink TWAP** (not Binance) |
-| persist (vs hourly 8s) | `entry_book_persist_s≈2`, `hedge_dump_persist_s≈2`, `hedge_persist_s≈1` |
+| persist (vs hourly 8s) | `entry_book_persist_s≈2` from **95¢+** (`entry_persist_min_price`), `hedge_dump_persist_s≈2`, `hedge_persist_s≈1` |
 | one entry / market | true |
 
 Caveats: last-print ≠ ask; no depth; denser hold edge slightly negative — research probe only.

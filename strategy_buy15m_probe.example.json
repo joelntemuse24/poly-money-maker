@@ -50,6 +50,7 @@
   "ui_every_n_cycles": 5,
   "tick_size": "0.01",
   "entry_book_persist_s": 2.0,
+  "entry_persist_min_price": 0.95,
   "early_hot_defer_enabled": false,
   "soft_edge_exit_enabled": false,
   "soft_edge_exit_max_usd": 0.0,

@@ -164,6 +164,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     )
     print(
         f"band={cfg.get('buy_threshold')}–{cfg.get('buy_max_price')} "
+        f"persist_min={cfg.get('entry_persist_min_price', 0.95)} "
         f"window={cfg.get('buy_window_min')}m "
         f"oracle=${cfg.get('min_underlying_edge_usd')} "
         f"spend=${probe_spend_usd(cfg['buy_budget'], cfg['buy_max_spend'], cfg.get('market_spend_cap') or 0):.2f}"
