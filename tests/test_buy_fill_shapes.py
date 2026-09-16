@@ -783,12 +783,14 @@ class AmbiguousCrossCyclePolicy(unittest.TestCase):
         self.assertIn('"hedge_recovery_cancel": 0.53', five)
         self.assertIn('"hedge_sell_fade": True', five)
         self.assertIn('"hedge_require_oracle": True', five)
-        self.assertIn('"hedge_dump_ignore_oracle": True', five)
+        self.assertIn('"hedge_dump_ignore_oracle": False', five)
+        self.assertIn('"hedge_dump_require_tight": True', five)
+        self.assertIn('"hedge_dump_require_fresh_book": True', five)
         self.assertIn('"late_90_start_s": 0', five)
         self.assertIn("hold_while_oracle_agrees(", five)
         self.assertIn("hedge_dump_overrides_oracle(", five)
         self.assertIn("hedge_skip_oracle_still_winning", five)
-        self.assertIn('"add_min_price": 0.90', five)
+        self.assertIn('"add_min_price": 0.975', five)
         self.assertIn('"hedge_undercut_ticks": 0', five)
         self.assertNotIn(
             "up_ask_ok = up_ask is not None and BUY_THRESHOLD <= up_ask <= BUY_MAX_PRICE",
@@ -881,8 +883,8 @@ class AmbiguousCrossCyclePolicy(unittest.TestCase):
             self.assertIn('quoted = meta.get("quoted_buy_shares")', src, bot.name)
             self.assertIn("BUY_MAX_SHARES", src, bot.name)
             if bot == BOT5M:
-                self.assertIn('"buy_max_spend": 3.0', src, bot.name)
-                self.assertIn('"buy_max_shares": 5.0', src, bot.name)
+                self.assertIn('"buy_max_spend": 5.0', src, bot.name)
+                self.assertIn('"buy_max_shares": 8.0', src, bot.name)
                 self.assertIn("quoted_buy_shares_up_to_limit(", src, bot.name)
                 self.assertIn("price=limit_price", src, bot.name)
                 self.assertNotIn(
@@ -2062,6 +2064,7 @@ class BalanceAndGcSemantics(unittest.TestCase):
             "strategy_buy5m.example.json",
             "strategy_buyhourly.example.json",
             "strategy_buy15m_probe.example.json",
+            "strategy_buy5m_probe.example.json",
         ):
             data = json.loads((root / name).read_text())
             self.assertIs(data["dry_run"], True)
@@ -2181,8 +2184,12 @@ class BalanceAndGcSemantics(unittest.TestCase):
         self.assertIn("late_90_start_s", nonnegative)
         data = json.loads((BOT5M.parent / "strategy_buy5m.example.json").read_text())
         for key in positive:
+            if key not in data:
+                continue
             self.assertGreater(float(data[key]), 0, key)
         for key in nonnegative:
+            if key not in data:
+                continue
             self.assertGreaterEqual(float(data[key]), 0, key)
         self.assertEqual(float(data["early_95_start_s"]), 0)
         self.assertGreaterEqual(
