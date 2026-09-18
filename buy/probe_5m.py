@@ -16,6 +16,7 @@ from buy.probe_15m import (  # noqa: F401 — re-export for 5m callers
     EPS,
     ask_in_band,
     live_posting_armed,
+    persist_quote_ok,
     probe_spend_usd,
     shares_rail_needed,
     should_evaluate_entries,

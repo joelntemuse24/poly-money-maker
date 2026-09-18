@@ -165,6 +165,9 @@ EXPECTED_TICK_SIZE = "0.01"
 for _rounding in ROUNDING_CONFIG.values():
     if _rounding.amount > 4:
         _rounding.amount = 4
+_tick_01 = ROUNDING_CONFIG.get("0.01")
+if _tick_01 is not None and _tick_01.amount > 2:
+    _tick_01.amount = 2
 
 # ------------------------- STRATEGY CONFIG -------------------------
 _STRATEGY_DEFAULTS = {
@@ -1635,7 +1638,8 @@ def quoted_buy_shares(budget, ask, share_cap=None):
     Posts a **limit** FAK at ``ask`` sized ``budget/ask``, clipped to
     ``share_cap`` (strategy ``buy_max_shares`` — a tunable "that's too
     many shares, wrong price" rail). Leftover USDC cannot walk cheaper
-    levels. Displayed top size is not a cap.
+    levels. Displayed top size is applied after quoting via
+    ``clip_buy_shares_to_displayed_ask``.
 
     CLOB FAK BUY rejects amounts that are not **2 dp USDC** (maker) and
     **4 dp shares** (taker). The SDK also ``round_down``s size to **2 dp**
@@ -1668,6 +1672,41 @@ def quoted_buy_shares(budget, ask, share_cap=None):
             return float(shares)
         shares -= share_tick
         shares = shares.quantize(share_tick, rounding=ROUND_DOWN)
+    return 0.0
+
+
+def clip_buy_shares_to_displayed_ask(shares, ask, ask_size, maker_price=None):
+    """Cap a quoted FAK to displayed best-ask size.
+
+    A BUY limit at 0.97 matches every ask ≤ 0.97. Sizing past the 0.97
+    level walks into 0.94 (live 18 Sep 01:13: 103 sh @ 0.97 → 106 sh avg
+    0.9408). Missing or sub-tick displayed size fail-closes to 0.
+    ``maker_price`` is the posted limit (15m = ask; 5m = band max).
+    """
+    shares_f = finite_float(shares, minimum=0)
+    ask_f = finite_float(ask, minimum=0, maximum=1)
+    size_f = finite_float(ask_size, minimum=0)
+    if shares_f is None or ask_f is None or size_f is None:
+        return 0.0
+    if shares_f < 0.01 or ask_f <= 0 or size_f < 0.01:
+        return 0.0
+    maker_f = finite_float(maker_price, minimum=0, maximum=1)
+    if maker_f is None:
+        maker_f = ask_f
+    share_tick = Decimal("0.01")
+    min_shares = Decimal("0.01")
+    cent = Decimal("0.01")
+    maker_d = Decimal(str(maker_f))
+    clipped = min(
+        Decimal(str(shares_f)).quantize(share_tick, rounding=ROUND_DOWN),
+        Decimal(str(size_f)).quantize(share_tick, rounding=ROUND_DOWN),
+    )
+    while clipped >= min_shares:
+        maker = clipped * maker_d
+        if maker.quantize(cent) == maker:
+            return float(clipped)
+        clipped -= share_tick
+        clipped = clipped.quantize(share_tick, rounding=ROUND_DOWN)
     return 0.0
 
 
@@ -2553,12 +2592,14 @@ def buy_market_with_retry(
     by ``buy_max_spend`` and ``buy_max_shares``). Maker USDC is exact cents
     (2 dp) and taker shares 4 dp — otherwise CLOB FAK BUY returns 400
     ``invalid amounts``. This is not a USDC market order: leftover dollars
-    would walk cheaper asks (9¢ junk under an 80¢ quote). Displayed top size
-    does not shrink the order — a thin book fills what it can at that ask.
+    would walk cheaper asks (9¢ junk under an 80¢ quote). After quoting,
+    ``clip_buy_shares_to_displayed_ask`` caps size to the displayed best
+    ask; missing or sub-tick size fail-closes so a $100 FAK at 0.97 cannot
+    walk into 0.94.
 
     Band is still min_price–max_price; this only pins execution to an
     in-band ask. $2.50 / 75¢ is ~3.3 shares; ``buy_max_shares`` (default 5)
-    is the "wrong price" rail, not a displayed-size cap.
+    is the "wrong price" rail. Displayed top size is a separate clip.
 
     Returns (shares_bought, usdc_spent, status). status is filled|ambiguous|empty|aborted|persist_fail|dry.
     spent may be estimated when the exchange
@@ -2717,13 +2758,17 @@ def buy_market_with_retry(
             )
             break
         fresh_ask_size = finite_float(fresh_ask_size, minimum=0)
-        if fresh_ask_size is None or fresh_ask_size < 0.01:
-            console.print(
-                f"  [dim yellow][THIN ASK][/] displayed size {fresh_ask_size} · "
-                f"posting budget/ask anyway · attempt {attempt + 1}/{max_retries}"
-            )
         shares = quoted_buy_shares(remaining_budget, fresh_ask, BUY_MAX_SHARES)
+        shares = clip_buy_shares_to_displayed_ask(shares, fresh_ask, fresh_ask_size)
         if shares < 0.01:
+            console.print(
+                f"  [dim yellow][NO SIZE][/] displayed {fresh_ask_size} at {fresh_ask} · "
+                f"abort (no walk) · attempt {attempt + 1}/{max_retries}"
+            )
+            log_event(
+                "buy_retry_stop_thin_ask", token_id=token_id, ask=fresh_ask,
+                ask_size=fresh_ask_size, attempt=attempt + 1,
+            )
             break
         price = fresh_ask
         spend = shares * price
@@ -2766,7 +2811,6 @@ def buy_market_with_retry(
                     price=price,
                     size=shares,
                     side=BUY,
-                    user_usdc_balance=remaining_budget,
                 ),
                 options=PartialCreateOrderOptions(
                     tick_size=tick_size, neg_risk=False,
@@ -4770,13 +4814,40 @@ while not _shutdown_requested:
                                         get_last_trade_price(other_token)
                                         if other_token else None
                                     )
+                                    # Dump cap is 45c; loser/winner floors are 30/70.
+                                    # A tight live mid (40/42 -> 41c, other ~59c) is a
+                                    # real book, not a stale last-trade GUI. Only then
+                                    # let consensus match the dump cap. Wide books stay
+                                    # on 30/70 so a ghost 30c bid under a rich print
+                                    # still cannot dump.
+                                    _spread = None
+                                    if hedge_bid is not None and hedge_ask is not None:
+                                        _spread = float(hedge_ask) - float(hedge_bid)
+                                    _dump_cap = float(HEDGE_TOXIC_BID_MAX)
+                                    _live_mid_dump = (
+                                        _spread is not None
+                                        and _spread <= float(POLYMARKET_GUI_SPREAD) + 1e-12
+                                        and _dump_cap > 1e-12
+                                        and float(hedge_bid) <= _dump_cap + 1e-12
+                                    )
+                                    if _live_mid_dump:
+                                        _gui_max = max(
+                                            float(MAX_LOSER_BID),
+                                            float(HEDGE_REQUIRE_ASK_MAX),
+                                        )
+                                        _winner_min = min(float(MIN_WINNER_BID), 0.5)
+                                        _last_max = 1.0
+                                    else:
+                                        _gui_max = MAX_LOSER_BID
+                                        _winner_min = MIN_WINNER_BID
+                                        _last_max = HEDGE_REQUIRE_ASK_MAX
                                     gui_ok, gui_why = hedge_consensus_ok(
                                         hedge_bid, hedge_ask, held_last,
                                         other_bid, other_ask, other_last,
-                                        held_gui_max=MAX_LOSER_BID,
-                                        other_gui_min=MIN_WINNER_BID,
+                                        held_gui_max=_gui_max,
+                                        other_gui_min=_winner_min,
                                         min_edge=MIN_BID_EDGE,
-                                        last_trade_max=HEDGE_REQUIRE_ASK_MAX,
+                                        last_trade_max=_last_max,
                                     )
                                     held_gui = polymarket_display_price(
                                         hedge_bid, hedge_ask, held_last,
@@ -4793,9 +4864,10 @@ while not _shutdown_requested:
                                         held_gui=held_gui, other_gui=other_gui,
                                         other_bid=other_bid, other_ask=other_ask,
                                         reason=gui_why,
-                                        held_gui_max=MAX_LOSER_BID,
-                                        other_gui_min=MIN_WINNER_BID,
-                                        last_trade_max=HEDGE_REQUIRE_ASK_MAX,
+                                        held_gui_max=_gui_max,
+                                        other_gui_min=_winner_min,
+                                        last_trade_max=_last_max,
+                                        live_mid_dump=_live_mid_dump,
                                     )
                                 elif (
                                     toxic_fill
