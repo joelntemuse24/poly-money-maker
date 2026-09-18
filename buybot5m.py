@@ -112,6 +112,7 @@ from buy.entry_rest_gtd import (
     live_rest_from_meta,
     persist_rest_meta,
     rest_fill_state,
+    rest_gtd_post_is_rejected,
     rest_maker_shares,
     rest_persist_eligible,
 )
@@ -2922,9 +2923,10 @@ def post_5m_rest_gtd(
     end_ts,
     tick_size="0.001",
     on_submit=None,
+    now=None,
 ):
-    """One GTD bid. ``expiration`` is this market's ``end_ts`` (unix seconds)."""
-    expiration = gtd_expiration(end_ts)
+    """One GTD bid. Expiration is ``end_ts``, lifted to now+180 if CLOB requires it."""
+    expiration = gtd_expiration(end_ts, now=now)
     if expiration is None or shares is None or float(shares) < 0.01:
         return None, "bad_args"
     price = float(tick)
@@ -2976,12 +2978,16 @@ def post_5m_rest_gtd(
             order_type=OrderType.GTD,
         )
     except Exception as e:
+        rejected = definitive_order_rejection(e) or rest_gtd_post_is_rejected(e)
         log_event(
             "rest_gtd_post_fail",
             token_id=token_id,
             order_id=expected_order_id,
             error=str(e)[:200],
+            rejected=rejected,
         )
+        if rejected:
+            return None, "rejected"
         return {"orderID": expected_order_id}, "ambiguous"
     oid = extract_order_id(result) or expected_order_id
     if isinstance(result, dict):
@@ -6387,6 +6393,7 @@ while not _shutdown_requested:
 
                 hybrid_intent = None
                 if ENTRY_REST_GTD or live_rest_from_meta(meta):
+                    rest_now = time.time()
                     hybrid_intent = hybrid_late_intent(
                         live=live_rest_from_meta(meta),
                         up_gui=up_gui,
@@ -6407,6 +6414,7 @@ while not _shutdown_requested:
                             meta.get("late_bought")
                             or (held_size > 0.01 and late_slice)
                         ),
+                        now=rest_now,
                     )
                     if hybrid_intent.action == "keep":
                         log_event(
@@ -6433,7 +6441,9 @@ while not _shutdown_requested:
                         rest_leg = hybrid_intent.leg
                         rest_tick = hybrid_intent.tick
                         rest_token = hybrid_intent.token
-                        rest_exp = hybrid_intent.expiration or gtd_expiration(m.end_ts)
+                        rest_exp = hybrid_intent.expiration or gtd_expiration(
+                            m.end_ts, now=rest_now,
+                        )
                         persist_ok, persist_why, persist_age = entry_book_persist_ready(
                             cond,
                             rest_leg,
@@ -6494,6 +6504,7 @@ while not _shutdown_requested:
                             m.end_ts,
                             tick_size=get_tick_size_cached(rest_token),
                             on_submit=_persist_rest_submit,
+                            now=rest_now,
                         )
                         if rest_status == "posted" or rest_status == "dry":
                             oid = extract_order_id(posted) or (
@@ -6514,6 +6525,15 @@ while not _shutdown_requested:
                             console.print(
                                 f"  [bold cyan][REST GTD][/] {rest_leg.upper()} "
                                 f"{shares:.2f} @ {rest_tick:.3f} exp={rest_exp}"
+                            )
+                        elif rest_status == "rejected":
+                            clear_rest_meta(meta)
+                            save_json(STATE_FILE, positions_meta)
+                            log_event(
+                                "rest_gtd_rejected",
+                                condition_id=cond,
+                                tick=rest_tick,
+                                why="clob_rejected",
                             )
                         elif rest_status == "ambiguous":
                             log_event(

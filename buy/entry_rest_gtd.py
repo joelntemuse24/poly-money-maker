@@ -6,11 +6,13 @@ on that tick until the market ``end_ts``. Hedge/sell/redeem stay FAK.
 
 from __future__ import annotations
 
+import time
 from decimal import Decimal, ROUND_DOWN
 from typing import Any, Mapping, NamedTuple, Optional, Sequence
 
 EPS = 1e-12
 REST_TICKS = (0.97, 0.98, 0.99)
+CLOB_GTD_MIN_LEAD_S = 180
 REST_SNAP_MAX_ABS = 0.005
 LOSER_GUI_MAX = 0.05
 REST_META_KEYS = (
@@ -190,15 +192,54 @@ def rest_maker_shares(
     return 0.0
 
 
-def gtd_expiration(end_ts) -> Optional[int]:
-    """Unix seconds of this market's ``end_ts``. Must not leak into the next 5m."""
+def unix_ts(value) -> Optional[int]:
+    """Parse a positive unix-seconds timestamp. No CLOB floor."""
     try:
-        ts = int(float(end_ts))
+        ts = int(float(value))
     except (TypeError, ValueError):
         return None
     if ts <= 0:
         return None
     return ts
+
+
+def gtd_expiration(
+    end_ts,
+    now=None,
+    min_lead_s: int = CLOB_GTD_MIN_LEAD_S,
+) -> Optional[int]:
+    """GTD unix seconds for CLOB POST.
+
+    Prefer this market's ``end_ts``. CLOB rejects expiration < now+180, and
+    the last-120s window is always inside that floor, so we lift to
+    ``now + min_lead_s``. The bot still cancels this ``order_id`` at TTM<=0
+    / window close; CLOB expiry is only the backstop if cancel fails. Next
+    5m uses different tokens.
+    """
+    ts = unix_ts(end_ts)
+    if ts is None:
+        return None
+    lead = int(min_lead_s)
+    if lead <= 0:
+        return ts
+    try:
+        now_s = time.time() if now is None else float(now)
+    except (TypeError, ValueError):
+        now_s = time.time()
+    floor = int(now_s) + lead
+    return ts if ts >= floor else floor
+
+
+def rest_gtd_post_is_rejected(error) -> bool:
+    """True when CLOB refused the GTD (never booked). Do not keep/uncertain."""
+    text = str(error or "").lower()
+    if not text:
+        return False
+    if "expiration is less than" in text:
+        return True
+    if "invalid expiration" in text:
+        return True
+    return False
 
 
 def live_rest_from_meta(meta: Optional[Mapping[str, Any]]) -> Optional[dict]:
@@ -208,7 +249,7 @@ def live_rest_from_meta(meta: Optional[Mapping[str, Any]]) -> Optional[dict]:
     if not order_id:
         return None
     price = _finite(meta.get("rest_gtd_price"))
-    expiration = gtd_expiration(meta.get("rest_gtd_expiration"))
+    expiration = unix_ts(meta.get("rest_gtd_expiration"))
     token = meta.get("rest_gtd_token")
     leg = str(meta.get("rest_gtd_leg") or "").strip().lower() or None
     return {
@@ -299,6 +340,7 @@ def hybrid_late_intent(
     enabled: bool = False,
     already_filled: bool = False,
     ticks: Sequence[float] = REST_TICKS,
+    now=None,
 ) -> HybridIntent:
     """Keep / replace / cancel / FAK / rest / skip for one 5m market."""
     live_id = None
@@ -332,7 +374,7 @@ def hybrid_late_intent(
             return _cancel("already_filled")
         return HybridIntent(action="skip", why="already_filled")
 
-    expiration = gtd_expiration(end_ts)
+    expiration = gtd_expiration(end_ts, now=now)
     leg, tick, why = rest_winner_leg(
         up_gui=up_gui,
         dn_gui=dn_gui,

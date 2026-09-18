@@ -82,9 +82,11 @@ logs `dry_buy` even while `entry_enabled` is false.
 Default **false** (code defaults + both example JSONs). When true, the last
 120s 97–99 band may **GTD-rest** the GUI tick if the favorite ask is gone
 (people hitting the 99¢ bid). Hedge/sell/redeem stay FAK. One rest order per
-market, `expiration = end_ts`, cancel by that `order_id` only (never
-`cancel_all`). First GTD POST needs `buybot5m.py` on disk + restart; the knob
-is hot-reload after that.
+market. CLOB requires GTD `expiration >= now+180`, so last-120s rests lift
+past `end_ts`; the bot still cancels that `order_id` at TTM<=0 / window
+close (never `cancel_all`). A CLOB 400 expiration reject clears the ghost
+id instead of `rest_gtd_keep`. First GTD POST needs `buybot5m.py` on disk +
+restart; the knob is hot-reload after that.
 
 ## Coherence
 

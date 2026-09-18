@@ -9,6 +9,7 @@ import unittest
 from pathlib import Path
 
 from buy.entry_rest_gtd import (
+    CLOB_GTD_MIN_LEAD_S,
     REST_TICKS,
     ask_allows_fak_take,
     book_level_kept_for_display,
@@ -18,6 +19,7 @@ from buy.entry_rest_gtd import (
     live_rest_from_meta,
     persist_rest_meta,
     rest_fill_state,
+    rest_gtd_post_is_rejected,
     rest_maker_shares,
     rest_persist_eligible,
     rest_winner_leg,
@@ -185,6 +187,7 @@ class HybridIntentTests(unittest.TestCase):
             seconds_left=90.0,
             late_start_s=120.0,
             end_ts=1_700_000_300,
+            now=1_700_000_210,
             enabled=True,
             already_filled=False,
         )
@@ -197,7 +200,9 @@ class HybridIntentTests(unittest.TestCase):
         self.assertEqual(intent.leg, "up")
         self.assertEqual(intent.tick, 0.99)
         self.assertEqual(intent.token, "UP")
-        self.assertEqual(intent.expiration, 1_700_000_300)
+        # last-120s end_ts is < now+180; CLOB needs the floor.
+        self.assertEqual(intent.expiration, 1_700_000_210 + CLOB_GTD_MIN_LEAD_S)
+        self.assertGreaterEqual(intent.expiration - 1_700_000_210, 180)
         self.assertIsNone(intent.cancel_order_id)
 
     def test_ask_at_tick_faks(self):
@@ -250,7 +255,7 @@ class HybridIntentTests(unittest.TestCase):
         self.assertEqual(intent.action, "replace")
         self.assertEqual(intent.tick, 0.98)
         self.assertEqual(intent.cancel_order_id, "rest-97")
-        self.assertEqual(intent.expiration, 1_700_000_300)
+        self.assertEqual(intent.expiration, 1_700_000_210 + CLOB_GTD_MIN_LEAD_S)
 
     def test_gui_leaves_set_cancels(self):
         live = {
@@ -364,10 +369,31 @@ class MakerCentsTests(unittest.TestCase):
             self.assertNotEqual(maker, 1.01)
             self.assertEqual(round(maker, 2), maker)
 
-    def test_gtd_expiration_is_end_ts(self):
-        self.assertEqual(gtd_expiration(1_700_000_300), 1_700_000_300)
-        self.assertIsNone(gtd_expiration(None))
-        self.assertIsNone(gtd_expiration(0))
+    def test_gtd_expiration_is_end_ts_when_lead_ok(self):
+        now = 1_700_000_000
+        self.assertEqual(gtd_expiration(1_700_000_300, now=now), 1_700_000_300)
+        self.assertIsNone(gtd_expiration(None, now=now))
+        self.assertIsNone(gtd_expiration(0, now=now))
+
+    def test_last_120s_gtd_meets_clob_180s_floor(self):
+        end_ts = 1_700_000_300
+        self.assertEqual(CLOB_GTD_MIN_LEAD_S, 180)
+        for ttm in (120, 90, 60, 30, 1):
+            now = end_ts - ttm
+            exp = gtd_expiration(end_ts, now=now)
+            self.assertGreaterEqual(exp - now, 180)
+            self.assertGreaterEqual(exp, end_ts)
+            self.assertEqual(exp, now + 180)
+
+    def test_clob_expiration_400_is_rejected_not_uncertain(self):
+        err = (
+            "PolyApiException[status_code=400, error_message="
+            "{'error': 'expiration is less than 180 seconds in the future'}]"
+        )
+        self.assertTrue(rest_gtd_post_is_rejected(err))
+        self.assertTrue(rest_gtd_post_is_rejected("invalid expiration"))
+        self.assertFalse(rest_gtd_post_is_rejected("timeout contacting CLOB"))
+        self.assertFalse(rest_gtd_post_is_rejected(""))
 
 
 class RestMetaAndFillTests(unittest.TestCase):
@@ -449,6 +475,10 @@ class Buybot5mWiringTests(unittest.TestCase):
         self.assertIn("gtd_expiration", src)
         self.assertIn("expiration=int(expiration)", src)
         self.assertIn("OrderPayload(orderID=", src)
+        self.assertIn("gtd_expiration(end_ts, now=", src)
+        self.assertIn('return None, "rejected"', src)
+        self.assertIn("rest_gtd_rejected", src)
+        self.assertIn("rest_gtd_post_is_rejected", src)
 
     def test_hourly_and_15m_untouched(self):
         hourly_src = HOURLY.read_text()
