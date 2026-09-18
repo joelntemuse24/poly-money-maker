@@ -134,6 +134,7 @@ class ProbeJsonTests(unittest.TestCase):
         self.assertEqual(data["buy_max_spend"], 5.0)
         self.assertEqual(data["market_spend_cap"], 5.0)
         self.assertEqual(data["entry_book_persist_s"], 5.0)
+        self.assertEqual(data["entry_persist_min_price"], 0.96)
         self.assertEqual(data["hedge_persist_s"], 1.0)
         self.assertEqual(data["hedge_dump_persist_s"], 2.0)
         self.assertEqual(data["hedge_threshold"], 0.50)
@@ -158,6 +159,7 @@ class ProbeJsonTests(unittest.TestCase):
         self.assertEqual(five["buy_threshold"], 0.75)
         self.assertEqual(five["buy_max_price"], 0.90)
         self.assertEqual(five["buy_budget"], 2.5)
+        self.assertEqual(five["entry_persist_min_price"], 0.75)
         self.assertIs(five["dry_run"], True)
         self.assertIs(five["entry_enabled"], False)
 
@@ -176,6 +178,16 @@ class Coherence5mTests(unittest.TestCase):
                 "buy_budget": 5.0,
             })
         self.assertIn("entry_book_persist_s", str(ctx.exception))
+
+    def test_rejects_persist_min_above_buy_max(self):
+        with self.assertRaises(ValueError) as ctx:
+            validate_5m_strategy_coherence({
+                "buy_start_s": 90,
+                "buy_budget": 5.0,
+                "buy_max_price": 0.90,
+                "entry_persist_min_price": 0.96,
+            })
+        self.assertIn("entry_persist_min_price", str(ctx.exception))
 
     def test_rejects_spend_cap_below_budget(self):
         with self.assertRaises(ValueError) as ctx:
@@ -207,6 +219,7 @@ class Buybot5mWiringTests(unittest.TestCase):
         self.assertEqual(defaults["late_buy_budget"], 5.0)
         self.assertEqual(defaults["market_spend_cap"], 5.0)
         self.assertEqual(defaults["entry_book_persist_s"], 5.0)
+        self.assertEqual(defaults["entry_persist_min_price"], 0.96)
         self.assertEqual(defaults["hedge_persist_s"], 1.0)
         self.assertEqual(defaults["hedge_dump_persist_s"], 2.0)
         self.assertIs(defaults["hedge_require_oracle"], True)
@@ -228,6 +241,9 @@ class Buybot5mWiringTests(unittest.TestCase):
         self.assertIn("should_evaluate_entries(DRY_RUN, ENTRY_ENABLED)", src)
         self.assertIn("probe_spend_usd", src)
         self.assertIn("entry_book_persist_ready", src)
+        self.assertIn("persist_quote_ok", src)
+        self.assertIn("ENTRY_PERSIST_MIN_PRICE", src)
+        self.assertIn("entry_persist_min_price", src)
         self.assertIn("hold_while_oracle_agrees", src)
         self.assertIn("hedge_persist_ready", src)
         self.assertIn("dump_tight_book_hold_reason(", src)

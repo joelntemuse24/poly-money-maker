@@ -103,7 +103,7 @@ from buy.hedge_gate import (
     should_mark_hedge_closed,
 )
 from buy.live_journal import is_journal_event
-from buy.probe_5m import probe_spend_usd, should_evaluate_entries
+from buy.probe_5m import persist_quote_ok, probe_spend_usd, should_evaluate_entries
 from buy.strategy_coherence import validate_5m_strategy_coherence
 
 
@@ -320,6 +320,9 @@ _STRATEGY_DEFAULTS = {
     "ui_every_n_cycles": 50,
     "tick_size": "0.001",
     "entry_book_persist_s": 5.0,
+    # Persist arm floor (anti-flash). Start/keep the timer once ask >= this,
+    # including 96→99 cascades. Not the buy band. REST confirm must not reset it.
+    "entry_persist_min_price": 0.96,
 }
 _STRATEGY_DOC_KEYS = frozenset({
     "_comment", "_canonical", "_source_tape", "_notes", "_live_flip", "_vs_15m",
@@ -419,6 +422,7 @@ def load_strategy():
             "hedge_toxic_bid_max", "hedge_recovery_cancel",
             "hedge_late_dump", "hedge_late_qualify",
             "hedge_late_ask_max", "hedge_late_recovery",
+            "entry_persist_min_price",
         ):
             if not 0 <= float(cfg[key]) <= 1:
                 raise ValueError(f"{key} must be between 0 and 1")
@@ -513,7 +517,7 @@ def load_strategy():
             "hedge_dump_price_floor", "hedge_dump_ladder_start",
             "hedge_dump_ladder_step", "hedge_dump_ladder_step_sleep_s",
             "hedge_dump_late_sweep_ttm_s",
-            "entry_book_persist_s", "market_spend_cap",
+            "entry_book_persist_s", "entry_persist_min_price", "market_spend_cap",
         ):
             if float(cfg[key]) < 0:
                 raise ValueError(f"{key} must be non-negative")
@@ -620,6 +624,7 @@ BUY_MAX_SPEND = _strat["buy_max_spend"]
 BUY_MAX_SHARES = _strat["buy_max_shares"]
 MARKET_SPEND_CAP = float(_strat.get("market_spend_cap") or 0)
 ENTRY_BOOK_PERSIST_S = float(_strat.get("entry_book_persist_s") or 0)
+ENTRY_PERSIST_MIN_PRICE = _strat["entry_persist_min_price"]
 MAX_OPEN_POSITIONS = _strat["max_open_positions"]
 MAX_OPEN_NOTIONAL = _strat["max_open_notional"]
 MAX_DAILY_NOTIONAL = _strat["max_daily_notional"]
@@ -873,7 +878,12 @@ def clear_entry_book_persist_leg(cond, leg):
 
 
 def entry_book_persist_ready(cond, leg, book_ok, *, now_s=None, persist_s=None):
-    """(ready, why, age_s) — 5m probe book must hold for entry_book_persist_s."""
+    """(ready, why, age_s) — persist-eligible book must hold entry_book_persist_s.
+
+    ``book_ok`` here is persist-eligible (ask/GUI >= entry_persist_min_price
+    and a tight book). Not the buy band. A REST confirm miss must not
+    restart the timer.
+    """
     if now_s is None:
         now_s = time.monotonic()
     wait = float(ENTRY_BOOK_PERSIST_S if persist_s is None else persist_s)
@@ -4391,6 +4401,7 @@ while not _shutdown_requested:
         BUY_MAX_SHARES = _strat["buy_max_shares"]
         MARKET_SPEND_CAP = float(_strat.get("market_spend_cap") or 0)
         ENTRY_BOOK_PERSIST_S = float(_strat.get("entry_book_persist_s") or 0)
+        ENTRY_PERSIST_MIN_PRICE = _strat["entry_persist_min_price"]
         MAX_OPEN_POSITIONS = _strat["max_open_positions"]
         MAX_OPEN_NOTIONAL = _strat["max_open_notional"]
         MAX_DAILY_NOTIONAL = _strat["max_daily_notional"]
@@ -6136,6 +6147,31 @@ while not _shutdown_requested:
                 dn_last = look_last_trade(m.dn_token)
                 up_gui = polymarket_display_price(up_bid, up_ask, up_last)
                 dn_gui = polymarket_display_price(dn_bid, dn_ask, dn_last)
+                up_book_ok, up_book_why = entry_book_ok(
+                    up_bid, up_ask, MAX_ENTRY_SPREAD, MIN_WINNER_BID,
+                )
+                dn_book_ok, dn_book_why = entry_book_ok(
+                    dn_bid, dn_ask, MAX_ENTRY_SPREAD, MIN_WINNER_BID,
+                )
+                # Persist is anti-flash: arm at entry_persist_min_price (default
+                # 0.96), not the buy band. Keep the arm through 96→99. REST
+                # confirm must not restart the timer. Update even on incomplete
+                # GUI so a dip below the floor still resets.
+                _persist_now = time.monotonic()
+                persist_up_ok, persist_up_why, persist_up_age = entry_book_persist_ready(
+                    cond,
+                    "up",
+                    persist_quote_ok(up_ask, ENTRY_PERSIST_MIN_PRICE, gui=up_gui)
+                    and bool(up_book_ok),
+                    now_s=_persist_now,
+                )
+                persist_dn_ok, persist_dn_why, persist_dn_age = entry_book_persist_ready(
+                    cond,
+                    "down",
+                    persist_quote_ok(dn_ask, ENTRY_PERSIST_MIN_PRICE, gui=dn_gui)
+                    and bool(dn_book_ok),
+                    now_s=_persist_now,
+                )
 
                 # Lock last-print PTB as soon as the window is open (memory/disk only).
                 if m.start_ts and time.time() >= m.start_ts:
@@ -6186,8 +6222,6 @@ while not _shutdown_requested:
                 # Ask in band + GUI consensus + tight real book (bid under the ask).
                 up_ask_ok = ask_in_any_band(up_ask, bands)
                 dn_ask_ok = ask_in_any_band(dn_ask, bands)
-                up_book_ok, up_book_why = entry_book_ok(up_bid, up_ask, MAX_ENTRY_SPREAD, MIN_WINNER_BID)
-                dn_book_ok, dn_book_why = entry_book_ok(dn_bid, dn_ask, MAX_ENTRY_SPREAD, MIN_WINNER_BID)
                 up_consensus = (
                     up_gui is not None and dn_gui is not None
                     and up_gui >= MIN_WINNER_BID and dn_gui <= MAX_LOSER_BID
@@ -6375,6 +6409,32 @@ while not _shutdown_requested:
                     dn_last = get_book_snapshot_last_trade(m.dn_token)
                 up_gui = polymarket_display_price(up_bid, up_ask, up_last)
                 dn_gui = polymarket_display_price(dn_bid, dn_ask, dn_last)
+                up_book_ok, _ = entry_book_ok(
+                    up_bid, up_ask, MAX_ENTRY_SPREAD, MIN_WINNER_BID,
+                )
+                dn_book_ok, _ = entry_book_ok(
+                    dn_bid, dn_ask, MAX_ENTRY_SPREAD, MIN_WINNER_BID,
+                )
+                # REST may omit an ask (live 18 Sep 01:39 up_ask=null). Tick
+                # persist only for a real REST quote so a miss cannot restart
+                # the WS arm. A printed ask below the floor still resets.
+                _persist_now = time.monotonic()
+                if up_ask is not None:
+                    persist_up_ok, persist_up_why, persist_up_age = entry_book_persist_ready(
+                        cond,
+                        "up",
+                        persist_quote_ok(up_ask, ENTRY_PERSIST_MIN_PRICE, gui=up_gui)
+                        and bool(up_book_ok),
+                        now_s=_persist_now,
+                    )
+                if dn_ask is not None:
+                    persist_dn_ok, persist_dn_why, persist_dn_age = entry_book_persist_ready(
+                        cond,
+                        "down",
+                        persist_quote_ok(dn_ask, ENTRY_PERSIST_MIN_PRICE, gui=dn_gui)
+                        and bool(dn_book_ok),
+                        now_s=_persist_now,
+                    )
                 if up_gui is None or dn_gui is None:
                     log_buy_skip_throttled(
                         "incomplete_book",
@@ -6392,12 +6452,6 @@ while not _shutdown_requested:
                 dn_winning = dn_gui > up_gui
                 up_ask_ok = ask_in_any_band(up_ask, bands)
                 dn_ask_ok = ask_in_any_band(dn_ask, bands)
-                up_book_ok, _ = entry_book_ok(
-                    up_bid, up_ask, MAX_ENTRY_SPREAD, MIN_WINNER_BID,
-                )
-                dn_book_ok, _ = entry_book_ok(
-                    dn_bid, dn_ask, MAX_ENTRY_SPREAD, MIN_WINNER_BID,
-                )
                 up_consensus = (
                     up_gui >= MIN_WINNER_BID and dn_gui <= MAX_LOSER_BID
                     and up_book_ok
@@ -6409,8 +6463,6 @@ while not _shutdown_requested:
                 up_buy = up_winning and up_ask_ok and up_consensus
                 dn_buy = dn_winning and dn_ask_ok and dn_consensus
                 if not (up_buy or dn_buy):
-                    clear_entry_book_persist_leg(cond, "up")
-                    clear_entry_book_persist_leg(cond, "down")
                     log_buy_skip_throttled(
                         "rest_confirm",
                         cond,
@@ -6471,15 +6523,16 @@ while not _shutdown_requested:
                     )
                     continue
 
-                persist_ok, persist_why, persist_age = entry_book_persist_ready(
-                    cond, buy_leg, True, now_s=time.monotonic(),
-                )
+                persist_ok = persist_up_ok if buy_leg == "up" else persist_dn_ok
+                persist_why = persist_up_why if buy_leg == "up" else persist_dn_why
+                persist_age = persist_up_age if buy_leg == "up" else persist_dn_age
                 if not persist_ok:
                     log_event(
                         "buy_skip_entry_book_persist",
                         condition_id=cond,
                         leg=buy_leg,
                         persist_s=ENTRY_BOOK_PERSIST_S,
+                        persist_min=ENTRY_PERSIST_MIN_PRICE,
                         persist_why=persist_why,
                         persist_age_s=round(persist_age, 3),
                         ask=buy_ask,

@@ -2,7 +2,7 @@
   "_comment": "BTC 5m ge975 dry-run probe. Copy to strategy_buy5m.json. Do NOT enable polybuybot5m or flip live until Joel says. Trading oracle is Chainlink last vs window-open PTB (crypto-price variant=fiveminute REST backfill on mid-window restart) — not Binance.",
   "_canonical": "BUY5M.md",
   "_source_tape": "5m resolves Chainlink (not Binance). PTB backfill: polymarket crypto-price variant=fiveminute.",
-  "_vs_15m": "Window last 90s (not 180s). Band 0.975–0.99 (not 0.95–0.99). Persist 5s (15m is 2s) — still far under hourly 8–20s so it fits the 90s window. Size $5 with JSON path to ~$40. Hedge 50/52/40 dump is the 5m-tuned book; dump harden flags match post-PR #168 15m (tight book + oracle + fresh + favor block + ladder). late_sweep_ttm 15s (15m uses 20s) because 5m TTM is short.",
+  "_vs_15m": "Window last 90s (not 180s). Band 0.975–0.99 (not 0.95–0.99). Persist 5s arm floor 0.96 (15m is 2s / 0.95) — timer starts on WS once ask ≥ 0.96 and REST confirm must not reset it. Size $5 with JSON path to ~$40. Hedge 50/52/40 dump is the 5m-tuned book; dump harden flags match post-PR #168 15m (tight book + oracle + fresh + favor block + ladder). late_sweep_ttm 15s (15m uses 20s) because 5m TTM is short.",
   "_live_flip": "Later (Joel only): set dry_run=false, restart polybuybot5m, then entry_enabled=true. Size later with buy_budget / late_buy_budget / buy_max_spend / buy_max_shares / market_spend_cap (~$40) — no code rewrite.",
   "entry_enabled": false,
   "dry_run": true,
@@ -77,5 +77,6 @@
   "balance_refresh_s": 15,
   "ui_every_n_cycles": 50,
   "tick_size": "0.001",
-  "entry_book_persist_s": 5.0
+  "entry_book_persist_s": 5.0,
+  "entry_persist_min_price": 0.96
 }

@@ -60,5 +60,6 @@
   "positions_refresh_s": 1,
   "balance_refresh_s": 15,
   "ui_every_n_cycles": 50,
-  "tick_size": "0.001"
+  "tick_size": "0.001",
+  "entry_persist_min_price": 0.75
 }

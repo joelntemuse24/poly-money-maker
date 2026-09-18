@@ -217,3 +217,16 @@ def validate_5m_strategy_coherence(cfg: Mapping[str, Any]) -> None:
             "entry_book_persist_s must be <= buy_start_s "
             "(persist must fit inside the 5m entry window)"
         )
+    if "entry_persist_min_price" in cfg:
+        persist_min = _f(cfg, "entry_persist_min_price", 0.96)
+        if persist_min < 0 or persist_min > 1 + EPS:
+            raise ValueError(
+                "entry_persist_min_price must satisfy 0 <= price <= 1"
+            )
+        if "buy_max_price" in cfg:
+            buy_max = _f(cfg, "buy_max_price", 0.0)
+            if persist_min > buy_max + EPS:
+                raise ValueError(
+                    "entry_persist_min_price must be <= buy_max_price "
+                    "(persist floor above the buy band can never arm a buy)"
+                )
