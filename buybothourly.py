@@ -618,8 +618,9 @@ def load_strategy():
             raise ValueError("hedge_min_price must be at least one tick")
         if not cfg["one_entry_per_market"]:
             raise ValueError("one_entry_per_market must remain true")
+        # Operator may run live with hedge_enabled=false (false-dump audit 2026-09-16).
         if not cfg["dry_run"] and not cfg["hedge_enabled"]:
-            raise ValueError("live mode requires hedge_enabled=true")
+            pass  # allowed: hold-to-settle; no depressed hedge/dump exits
         for key in (
             "buy_budget", "a22_buy_budget", "b15_buy_budget", "c5_buy_budget",
             "market_spend_cap", "buy_max_spend", "buy_max_shares",
