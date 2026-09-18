@@ -111,6 +111,7 @@ HELPERS = (
     "polymarket_display_price",
     "hedge_consensus_ok",
     "quoted_buy_shares",
+    "clip_buy_shares_to_displayed_ask",
     "buy_fill_walked",
     "classify_buy_fill",
     "implied_buy_average",
@@ -363,12 +364,27 @@ class BuyFillProductionHelpers(unittest.TestCase):
         # SDK round_downs size to 2 dp → 3.12 * 80¢ = $2.496 (CLOB 400).
         self.assertAlmostEqual(quoted(2.50, 0.80), 3.10)
         self.assertAlmostEqual(quoted(2.50, 0.80, 5.0), 3.10)
-        # Displayed top size is not an argument — a 1-sh book still sizes 3.10.
-        # share_cap=1.0 is the tunable rail, not the book.
+        # Displayed top size is not an argument here — clip_buy_shares_to_displayed_ask
+        # is the book cap applied after quoting.
         self.assertAlmostEqual(quoted(2.50, 0.80, 1.0), 1.0)
         # $2.50 at 40¢ would be 6.25 sh — rail clips to 5.
         self.assertAlmostEqual(quoted(2.50, 0.40, 5.0), 5.0)
         self.assertEqual(quoted(2.50, 0.0, 5.0), 0.0)
+
+    def test_clip_buy_shares_to_displayed_ask_blocks_94c_walk(self):
+        quoted = self.ns["quoted_buy_shares"]
+        clip = self.ns["clip_buy_shares_to_displayed_ask"]
+        # Live 18 Sep 01:13: $100 FAK @ 0.97 quoted 103 sh, filled 106.29
+        # @ avg 0.9408 because the 0.97 buy limit walked cheaper asks.
+        want = quoted(100.0, 0.97, 200.0)
+        self.assertGreaterEqual(want, 100.0)
+        self.assertAlmostEqual(clip(want, 0.97, 20.0), 20.0)
+        self.assertAlmostEqual(clip(want, 0.97, want), want)
+        self.assertEqual(clip(want, 0.97, None), 0.0)
+        self.assertEqual(clip(want, 0.97, 0.0), 0.0)
+        self.assertEqual(clip(want, 0.97, 0.004), 0.0)
+        # 5m posts at band max; clip re-validates maker cents at that limit.
+        self.assertAlmostEqual(clip(3.0, 0.83, 10.0, 0.90), 3.0)
 
     def test_quoted_buy_shares_maker_usdc_is_two_decimals(self):
         quoted = self.ns["quoted_buy_shares"]
@@ -886,6 +902,7 @@ class AmbiguousCrossCyclePolicy(unittest.TestCase):
                 self.assertIn('"buy_max_spend": 5.0', src, bot.name)
                 self.assertIn('"buy_max_shares": 8.0', src, bot.name)
                 self.assertIn("quoted_buy_shares_up_to_limit(", src, bot.name)
+                self.assertIn("clip_buy_shares_to_displayed_ask(", src, bot.name)
                 self.assertIn("price=limit_price", src, bot.name)
                 self.assertNotIn(
                     "quoted_buy_shares(remaining_budget, fresh_ask, BUY_MAX_SHARES)",
@@ -922,12 +939,19 @@ class AmbiguousCrossCyclePolicy(unittest.TestCase):
                     src,
                     bot.name,
                 )
+                self.assertIn("clip_buy_shares_to_displayed_ask(", src, bot.name)
                 self.assertIn("price = fresh_ask", src, bot.name)
                 self.assertNotIn("quoted_buy_shares_up_to_limit(", src, bot.name)
                 self.assertIn("user_usdc_balance=remaining_budget", src, bot.name)
-            self.assertIn("[THIN ASK]", src, bot.name)
-            self.assertNotIn("min(budget / ask, ask_size)", src, bot.name)
-            self.assertNotIn("[NO SIZE]", src, bot.name)
+            if bot == BOT_HR:
+                self.assertIn("[THIN ASK]", src, bot.name)
+                self.assertNotIn("clip_buy_shares_to_displayed_ask(", src, bot.name)
+                self.assertNotIn("[NO SIZE]", src, bot.name)
+                self.assertNotIn("min(budget / ask, ask_size)", src, bot.name)
+            else:
+                self.assertIn("[NO SIZE]", src, bot.name)
+                self.assertIn("buy_retry_stop_thin_ask", src, bot.name)
+                self.assertNotIn("posting budget/ask anyway", src, bot.name)
             self.assertNotIn(
                 'quoted = meta.get("quoted_buy_shares") or meta.get(',
                 src,
@@ -971,6 +995,7 @@ class BuyExecutionAmbiguity(unittest.TestCase):
             "finite_float",
             "_result_as_dict",
             "quoted_buy_shares",
+            "clip_buy_shares_to_displayed_ask",
             "buy_fill_walked",
             "classify_buy_fill",
             "implied_buy_average",
@@ -1060,7 +1085,7 @@ class BuyExecutionAmbiguity(unittest.TestCase):
         self.assertAlmostEqual(calls["orders"][0]["size"], 5.0)
         self.assertAlmostEqual(calls["orders"][0]["price"], 0.80)
 
-    def test_thin_displayed_ask_still_posts_budget_shares(self):
+    def test_thin_displayed_ask_aborts_without_walk(self):
         ns, calls = self._namespace({"status": "unmatched", "orderID": "order-1"})
         ns["get_quote_fast"] = lambda *_a, **_k: (0.79, 0.5, 0.80, 0.01, None)
         result = ns["buy_market_with_retry"](
@@ -1068,9 +1093,34 @@ class BuyExecutionAmbiguity(unittest.TestCase):
             on_submit=lambda *args: calls["submit"].append(args),
         )
         self.assertEqual(result, (0.0, 0.0, "empty"))
+        self.assertEqual(len(calls["orders"]), 0)
+        self.assertEqual(calls["post"], 0)
+        self.assertEqual(calls["submit"], [])
+
+    def test_missing_displayed_ask_size_fail_closes(self):
+        ns, calls = self._namespace({"status": "unmatched", "orderID": "order-1"})
+        ns["get_quote_fast"] = lambda *_a, **_k: (0.79, 0.5, 0.80, None, None)
+        result = ns["buy_market_with_retry"](
+            "token", 2.50, 0.90, min_price=0.75, max_retries=1,
+            on_submit=lambda *args: calls["submit"].append(args),
+        )
+        self.assertEqual(result, (0.0, 0.0, "empty"))
+        self.assertEqual(len(calls["orders"]), 0)
+        self.assertEqual(calls["post"], 0)
+
+    def test_displayed_ask_caps_100_at_97_to_top_size(self):
+        # Live 18 Sep 01:13: $100 FAK @ 0.97 quoted 103 sh and walked to 0.94.
+        ns, calls = self._namespace({"status": "unmatched", "orderID": "order-1"})
+        ns["BUY_MAX_SHARES"] = 200.0
+        ns["get_quote_fast"] = lambda *_a, **_k: (0.96, 50.0, 0.97, 20.0, None)
+        result = ns["buy_market_with_retry"](
+            "token", 100.0, 0.97, min_price=0.965, max_retries=1,
+            on_submit=lambda *args: calls["submit"].append(args),
+        )
+        self.assertEqual(result, (0.0, 0.0, "empty"))
         self.assertEqual(len(calls["orders"]), 1)
-        self.assertAlmostEqual(calls["orders"][0]["size"], 3.10)
-        self.assertAlmostEqual(calls["orders"][0]["price"], 0.80)
+        self.assertAlmostEqual(calls["orders"][0]["size"], 20.0)
+        self.assertAlmostEqual(calls["orders"][0]["price"], 0.97)
 
     def test_explicit_unmatched_zero_fill_is_terminal_empty(self):
         ns, calls = self._namespace({"status": "unmatched", "orderID": "order-1"})
@@ -1401,6 +1451,7 @@ class FiveMinuteBandLimitFakTests(unittest.TestCase):
             "_result_as_dict",
             "quoted_buy_shares",
             "quoted_buy_shares_up_to_limit",
+            "clip_buy_shares_to_displayed_ask",
             "buy_fill_walked",
             "classify_buy_fill",
             "implied_buy_average",
@@ -1458,6 +1509,17 @@ class FiveMinuteBandLimitFakTests(unittest.TestCase):
             }
         )
         return ns, calls
+
+    def test_thin_displayed_ask_aborts_without_walk(self):
+        ns, calls = self._namespace()
+        ns["get_quote_fast"] = lambda *_a, **_k: (0.82, 0.5, 0.83, 0.01, None)
+        result = ns["buy_market_with_retry"](
+            "token", 2.50, 0.90, min_price=0.75, max_retries=1,
+            on_submit=lambda *args: calls["submit"].append(args),
+        )
+        self.assertEqual(result, (0.0, 0.0, "empty"))
+        self.assertEqual(len(calls["orders"]), 0)
+        self.assertEqual(calls["post"], 0)
 
     def test_late_window_posts_90_limit_sized_at_83_ask(self):
         ns, calls = self._namespace()

@@ -631,6 +631,7 @@ class FiveMBuyRetryPinRails(unittest.TestCase):
             "_result_as_dict",
             "quoted_buy_shares",
             "quoted_buy_shares_up_to_limit",
+            "clip_buy_shares_to_displayed_ask",
             "buy_fill_walked",
             "classify_buy_fill",
             "implied_buy_average",

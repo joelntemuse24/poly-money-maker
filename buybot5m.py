@@ -1946,7 +1946,8 @@ def quoted_buy_shares(budget, ask, share_cap=None):
     Posts a **limit** FAK at ``ask`` sized ``budget/ask``, clipped to
     ``share_cap`` (strategy ``buy_max_shares`` — a tunable "that's too
     many shares, wrong price" rail). Leftover USDC cannot walk cheaper
-    levels. Displayed top size is not a cap.
+    levels. Displayed top size is applied after quoting via
+    ``clip_buy_shares_to_displayed_ask``.
 
     CLOB FAK BUY rejects amounts that are not **2 dp USDC** (maker) and
     **4 dp shares** (taker). The SDK also ``round_down``s size to **2 dp**
@@ -1979,6 +1980,41 @@ def quoted_buy_shares(budget, ask, share_cap=None):
             return float(shares)
         shares -= share_tick
         shares = shares.quantize(share_tick, rounding=ROUND_DOWN)
+    return 0.0
+
+
+def clip_buy_shares_to_displayed_ask(shares, ask, ask_size, maker_price=None):
+    """Cap a quoted FAK to displayed best-ask size.
+
+    A BUY limit at 0.97 matches every ask ≤ 0.97. Sizing past the 0.97
+    level walks into 0.94 (live 18 Sep 01:13: 103 sh @ 0.97 → 106 sh avg
+    0.9408). Missing or sub-tick displayed size fail-closes to 0.
+    ``maker_price`` is the posted limit (15m = ask; 5m = band max).
+    """
+    shares_f = finite_float(shares, minimum=0)
+    ask_f = finite_float(ask, minimum=0, maximum=1)
+    size_f = finite_float(ask_size, minimum=0)
+    if shares_f is None or ask_f is None or size_f is None:
+        return 0.0
+    if shares_f < 0.01 or ask_f <= 0 or size_f < 0.01:
+        return 0.0
+    maker_f = finite_float(maker_price, minimum=0, maximum=1)
+    if maker_f is None:
+        maker_f = ask_f
+    share_tick = Decimal("0.01")
+    min_shares = Decimal("0.01")
+    cent = Decimal("0.01")
+    maker_d = Decimal(str(maker_f))
+    clipped = min(
+        Decimal(str(shares_f)).quantize(share_tick, rounding=ROUND_DOWN),
+        Decimal(str(size_f)).quantize(share_tick, rounding=ROUND_DOWN),
+    )
+    while clipped >= min_shares:
+        maker = clipped * maker_d
+        if maker.quantize(cent) == maker:
+            return float(clipped)
+        clipped -= share_tick
+        clipped = clipped.quantize(share_tick, rounding=ROUND_DOWN)
     return 0.0
 
 
@@ -2904,7 +2940,9 @@ def buy_market_with_retry(
     returns 400 ``invalid amounts``. This is not a USDC market order:
     leftover dollars would walk cheaper asks (9¢ junk under an 80¢ quote).
     Share size is still ``budget/ask``, clipped so ``size × limit`` cannot
-    exceed ``buy_max_spend``. Displayed top size does not shrink the order.
+    exceed ``buy_max_spend``, then ``clip_buy_shares_to_displayed_ask``
+    caps to displayed best-ask size (fail-closed if missing/thin). The
+    clip re-validates maker cents at the posted band-max limit.
 
     Band is still min_price–max_price for *whether* to fire. The limit is
     max_price so the FAK can take depth behind the touch (83¢ clip gone,
@@ -2913,7 +2951,7 @@ def buy_market_with_retry(
     late 90¢ band pins a late_90 FAK to 90¢ instead of aborting or walking
     99. $2.50 / 75¢ is ~3.3 shares;
     ``buy_max_shares`` (default 5) is the per-FAK "wrong price" rail, not a
-    displayed-size cap or a lifetime share limit.
+    lifetime share limit. Displayed top size is a separate clip.
 
     Returns (shares_bought, usdc_spent, status). status is filled|ambiguous|empty|aborted|persist_fail|dry.
     spent may be estimated when the exchange
@@ -3062,11 +3100,6 @@ def buy_market_with_retry(
             )
             break
         fresh_ask_size = finite_float(fresh_ask_size, minimum=0)
-        if fresh_ask_size is None or fresh_ask_size < 0.01:
-            console.print(
-                f"  [dim yellow][THIN ASK][/] displayed size {fresh_ask_size} · "
-                f"posting budget/ask anyway · attempt {attempt + 1}/{max_retries}"
-            )
         shares = quoted_buy_shares_up_to_limit(
             remaining_budget,
             fresh_ask,
@@ -3074,7 +3107,18 @@ def buy_market_with_retry(
             BUY_MAX_SHARES,
             spend_cap=max(0.0, float(BUY_MAX_SPEND) - spent),
         )
+        shares = clip_buy_shares_to_displayed_ask(
+            shares, fresh_ask, fresh_ask_size, float(max_price),
+        )
         if shares < 0.01:
+            console.print(
+                f"  [dim yellow][NO SIZE][/] displayed {fresh_ask_size} at {fresh_ask} · "
+                f"abort (no walk) · attempt {attempt + 1}/{max_retries}"
+            )
+            log_event(
+                "buy_retry_stop_thin_ask", token_id=token_id, ask=fresh_ask,
+                ask_size=fresh_ask_size, attempt=attempt + 1,
+            )
             break
         limit_price = float(max_price)
         price = limit_price
