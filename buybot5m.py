@@ -25,6 +25,7 @@ from py_clob_client_v2 import (
     ClobClient,
     MarketOrderArgs,
     OrderArgs,
+    OrderPayload,
     OrderType,
     PartialCreateOrderOptions,
     ApiCreds,
@@ -103,6 +104,17 @@ from buy.hedge_gate import (
     should_mark_hedge_closed,
 )
 from buy.live_journal import is_journal_event
+from buy.entry_rest_gtd import (
+    ask_allows_fak_take,
+    clear_rest_meta,
+    gtd_expiration,
+    hybrid_late_intent,
+    live_rest_from_meta,
+    persist_rest_meta,
+    rest_fill_state,
+    rest_maker_shares,
+    rest_persist_eligible,
+)
 from buy.probe_5m import probe_spend_usd, should_evaluate_entries
 from buy.strategy_coherence import validate_5m_strategy_coherence
 
@@ -320,6 +332,9 @@ _STRATEGY_DEFAULTS = {
     "ui_every_n_cycles": 50,
     "tick_size": "0.001",
     "entry_book_persist_s": 5.0,
+    # Last-120s 97–99 hybrid: GTD rest when the favorite ask is gone.
+    # Default off. Live trial flips this true after buybot5m.py is on disk.
+    "entry_rest_gtd": False,
 }
 _STRATEGY_DOC_KEYS = frozenset({
     "_comment", "_canonical", "_source_tape", "_notes", "_live_flip", "_vs_15m",
@@ -522,6 +537,7 @@ def load_strategy():
             "hedge_dump_require_tight",
             "hedge_edge_collapse_allows_dump",
             "hedge_dump_ladder_enabled",
+            "entry_rest_gtd",
         ):
             if _bk in cfg and type(cfg[_bk]) is not bool:
                 raise ValueError(f"{_bk} must be a boolean")
@@ -620,6 +636,7 @@ BUY_MAX_SPEND = _strat["buy_max_spend"]
 BUY_MAX_SHARES = _strat["buy_max_shares"]
 MARKET_SPEND_CAP = float(_strat.get("market_spend_cap") or 0)
 ENTRY_BOOK_PERSIST_S = float(_strat.get("entry_book_persist_s") or 0)
+ENTRY_REST_GTD = bool(_strat.get("entry_rest_gtd", False))
 MAX_OPEN_POSITIONS = _strat["max_open_positions"]
 MAX_OPEN_NOTIONAL = _strat["max_open_notional"]
 MAX_DAILY_NOTIONAL = _strat["max_daily_notional"]
@@ -1589,7 +1606,7 @@ def _valid_book_levels(levels):
             continue
         price = finite_float(level.get("price"), minimum=0, maximum=1)
         size = finite_float(level.get("size"), minimum=0)
-        if price is None or size is None or not 0 < price < 1 or size <= 0:
+        if price is None or size is None or not 0 < price <= 1 or size <= 0:
             continue
         valid.append((price, size))
     return valid
@@ -2879,6 +2896,210 @@ _HEDGE_UNCERTAIN_KEYS = (
 def clear_uncertain_fields(meta, keys):
     for key in keys:
         meta.pop(key, None)
+
+
+def cancel_5m_rest_order(order_id):
+    """Cancel this 5m rest ``order_id`` only. Never ``cancel_all``."""
+    oid = str(order_id or "").strip()
+    if not oid:
+        return False
+    if DRY_RUN:
+        log_event("dry_rest_gtd_cancel", order_id=oid)
+        return True
+    try:
+        safe_api_call(client.cancel_order, OrderPayload(orderID=oid))
+        log_event("rest_gtd_cancel", order_id=oid)
+        return True
+    except Exception as e:
+        log_event("rest_gtd_cancel_fail", order_id=oid[:32], error=str(e)[:200])
+        return False
+
+
+def post_5m_rest_gtd(
+    token_id,
+    tick,
+    shares,
+    end_ts,
+    tick_size="0.001",
+    on_submit=None,
+):
+    """One GTD bid. ``expiration`` is this market's ``end_ts`` (unix seconds)."""
+    expiration = gtd_expiration(end_ts)
+    if expiration is None or shares is None or float(shares) < 0.01:
+        return None, "bad_args"
+    price = float(tick)
+    size = float(shares)
+    if DRY_RUN:
+        log_event(
+            "dry_rest_gtd",
+            token_id=token_id,
+            price=price,
+            size=size,
+            expiration=expiration,
+        )
+        return {"orderID": "dry-rest", "status": "dry", "expiration": expiration}, "dry"
+    try:
+        signed_order = safe_api_call(
+            client.create_order,
+            OrderArgs(
+                token_id=token_id,
+                price=price,
+                size=size,
+                side=BUY,
+                expiration=int(expiration),
+            ),
+            options=PartialCreateOrderOptions(
+                tick_size=tick_size, neg_risk=False,
+            ),
+        )
+        expected_order_id = signed_order_id(signed_order, neg_risk=False)
+        intent = {
+            "order_id": expected_order_id,
+            "token_id": str(token_id),
+            "side": "BUY",
+            "quoted_shares": size,
+            "expiration": int(expiration),
+        }
+    except Exception as e:
+        log_event("rest_gtd_build_rejected", token_id=token_id, error=str(e)[:200])
+        return None, "build_fail"
+    if on_submit:
+        try:
+            on_submit(intent)
+        except Exception as e:
+            log_event("rest_gtd_on_submit_fail", token_id=token_id, error=str(e)[:200])
+            return None, "persist_fail"
+    try:
+        result = safe_api_call(
+            client.post_order,
+            signed_order,
+            order_type=OrderType.GTD,
+        )
+    except Exception as e:
+        log_event(
+            "rest_gtd_post_fail",
+            token_id=token_id,
+            order_id=expected_order_id,
+            error=str(e)[:200],
+        )
+        return {"orderID": expected_order_id}, "ambiguous"
+    oid = extract_order_id(result) or expected_order_id
+    if isinstance(result, dict):
+        result = dict(result)
+        result.setdefault("orderID", oid)
+        result.setdefault("expiration", expiration)
+    log_event(
+        "rest_gtd_post",
+        token_id=token_id,
+        order_id=oid,
+        price=price,
+        size=size,
+        expiration=expiration,
+    )
+    return result, "posted"
+
+
+def credit_5m_rest_fill(
+    meta,
+    *,
+    cond,
+    filled,
+    spent,
+    token,
+    leg,
+    tick,
+    late_slice,
+):
+    """Same inventory + hedge path as a FAK fill."""
+    filled = float(filled or 0)
+    spent = float(spent or 0)
+    if filled <= 0.01:
+        return False
+    if spent <= 0:
+        spent = filled * float(tick)
+    prior_size = float(meta.get("bought_size") or 0)
+    prior_cost = float(meta.get("pnl_entry_cost") or 0)
+    prior_quoted = float(meta.get("quoted_buy_shares_total") or 0)
+    avg = (spent / filled) if filled else float(tick)
+    _, force_exit = classify_buy_fill(
+        avg, filled, filled,
+        0.97, TOXIC_FORCE_EXIT_BELOW, 0.99,
+    )
+    total_size, total_cost, total_quoted, vwap = accumulate_buy_inventory(
+        prior_size, prior_cost, filled, spent, prior_quoted, filled,
+    )
+    meta["last_buy_at"] = time.time() * 1000
+    meta["bought_token"] = token
+    meta.pop("last_buy_empty", None)
+    meta["bought_leg"] = leg
+    meta["bought_size"] = total_size
+    meta["fill_price"] = round(vwap or avg, 4)
+    meta["pnl_entry_cost"] = round(total_cost, 4)
+    meta["quoted_buy_shares"] = float(filled)
+    meta["quoted_buy_shares_total"] = float(total_quoted or 0)
+    meta["entry_band_min"] = 0.97
+    meta["entry_band_max"] = 0.99
+    meta["toxic_fill"] = bool(force_exit or meta.get("toxic_fill"))
+    stamp_slice_on_inventory(meta, late_slice, filled)
+    clear_rest_meta(meta)
+    clear_uncertain_fields(meta, _BUY_UNCERTAIN_KEYS)
+    leg_key = "up" if leg == "up" else "dn"
+    _cached_positions.setdefault(cond, {})[leg_key] = {
+        "asset": token,
+        "size": float(total_size),
+        "redeemable": False,
+        "avgPrice": float(vwap or avg),
+    }
+    save_json(STATE_FILE, positions_meta)
+    log_event(
+        "rest_gtd_fill",
+        condition_id=cond,
+        leg=leg,
+        bought=filled,
+        size=total_size,
+        price=meta["fill_price"],
+        entry_cost=meta["pnl_entry_cost"],
+    )
+    return True
+
+
+def reconcile_5m_rest_gtd(meta, *, cond, token_id, seconds_left):
+    """Credit a matched GTD or drop a dead empty rest. Reconcile before replace."""
+    live = live_rest_from_meta(meta)
+    if not live:
+        return None
+    token = live.get("token") or token_id
+    details = get_order_details(live["order_id"], expected_size=live.get("size"))
+    status = (details or {}).get("status")
+    matched = float((details or {}).get("size_matched") or 0)
+    baseline = finite_float(meta.get("rest_gtd_baseline"), minimum=0)
+    delta = 0.0
+    if token:
+        bal = check_clob_token_balance(token, refresh=True)
+        if bal is not None and baseline is not None:
+            delta = float(bal) - float(baseline)
+    state = rest_fill_state(status, size_matched=matched, token_delta=delta)
+    if state == "filled":
+        filled = matched if matched > 0.01 else delta
+        tick = live.get("price") or 0.99
+        spent = filled * float(tick)
+        credit_5m_rest_fill(
+            meta,
+            cond=cond,
+            filled=filled,
+            spent=spent,
+            token=token,
+            leg=live.get("leg") or "up",
+            tick=tick,
+            late_slice=is_late_entry_window(seconds_left, BUY_START_S),
+        )
+        return "filled"
+    if state == "dead_empty":
+        clear_rest_meta(meta)
+        save_json(STATE_FILE, positions_meta)
+        log_event("rest_gtd_dead_empty", condition_id=cond, order_id=live["order_id"])
+        return "dead_empty"
+    return "live"
 
 
 # ------------------------- BUY -------------------------
@@ -4391,6 +4612,7 @@ while not _shutdown_requested:
         BUY_MAX_SHARES = _strat["buy_max_shares"]
         MARKET_SPEND_CAP = float(_strat.get("market_spend_cap") or 0)
         ENTRY_BOOK_PERSIST_S = float(_strat.get("entry_book_persist_s") or 0)
+        ENTRY_REST_GTD = bool(_strat.get("entry_rest_gtd", False))
         MAX_OPEN_POSITIONS = _strat["max_open_positions"]
         MAX_OPEN_NOTIONAL = _strat["max_open_notional"]
         MAX_DAILY_NOTIONAL = _strat["max_daily_notional"]
@@ -4887,6 +5109,26 @@ while not _shutdown_requested:
                             up_size = tracked_size
                         elif held_leg == "down":
                             dn_size = tracked_size
+
+                rest_state = reconcile_5m_rest_gtd(
+                    meta,
+                    cond=cond,
+                    token_id=meta.get("rest_gtd_token") or held_token,
+                    seconds_left=seconds_left,
+                )
+                if rest_state == "filled":
+                    held_size = max(held_size, float(meta.get("bought_size") or 0))
+                    held_token = meta.get("bought_token") or held_token
+                    held_leg = meta.get("bought_leg") or held_leg
+                live_rest = live_rest_from_meta(meta)
+                if live_rest and (
+                    not ENTRY_REST_GTD
+                    or seconds_left <= 0
+                    or seconds_left > float(BUY_START_S) + 1e-12
+                ):
+                    cancel_5m_rest_order(live_rest["order_id"])
+                    clear_rest_meta(meta)
+                    save_json(STATE_FILE, positions_meta)
 
                 # Resolve an ambiguous BUY by its deterministic signed order id
                 # before consulting eventually-consistent balance snapshots.
@@ -6123,11 +6365,17 @@ while not _shutdown_requested:
                 dn_bid, _, dn_ask, _, dn_mid = look_book_quote(
                     m.dn_token, _book_cache,
                 )
-                if up_ask is None:
-                    up_bid, _, up_ask, _, up_mid = get_quote_fast(m.up_token)
-                if dn_ask is None:
-                    dn_bid, _, dn_ask, _, dn_mid = get_quote_fast(m.dn_token)
-                if up_ask is None and dn_ask is None:
+                if not (ENTRY_REST_GTD and late_slice):
+                    if up_ask is None:
+                        up_bid, _, up_ask, _, up_mid = get_quote_fast(m.up_token)
+                    if dn_ask is None:
+                        dn_bid, _, dn_ask, _, dn_mid = get_quote_fast(m.dn_token)
+                    if up_ask is None and dn_ask is None:
+                        log_buy_skip_throttled(
+                            "no_quote", cond, event="buy_skip",
+                        )
+                        continue
+                elif up_bid is None and dn_bid is None and up_ask is None and dn_ask is None:
                     log_buy_skip_throttled(
                         "no_quote", cond, event="buy_skip",
                     )
@@ -6136,6 +6384,148 @@ while not _shutdown_requested:
                 dn_last = look_last_trade(m.dn_token)
                 up_gui = polymarket_display_price(up_bid, up_ask, up_last)
                 dn_gui = polymarket_display_price(dn_bid, dn_ask, dn_last)
+
+                hybrid_intent = None
+                if ENTRY_REST_GTD or live_rest_from_meta(meta):
+                    hybrid_intent = hybrid_late_intent(
+                        live=live_rest_from_meta(meta),
+                        up_gui=up_gui,
+                        dn_gui=dn_gui,
+                        up_bid=up_bid,
+                        up_ask=up_ask,
+                        up_last=up_last,
+                        dn_bid=dn_bid,
+                        dn_ask=dn_ask,
+                        dn_last=dn_last,
+                        up_token=m.up_token,
+                        dn_token=m.dn_token,
+                        seconds_left=seconds_left,
+                        late_start_s=BUY_START_S,
+                        end_ts=m.end_ts,
+                        enabled=bool(ENTRY_REST_GTD),
+                        already_filled=bool(
+                            meta.get("late_bought")
+                            or (held_size > 0.01 and late_slice)
+                        ),
+                    )
+                    if hybrid_intent.action == "keep":
+                        log_event(
+                            "rest_gtd_keep",
+                            condition_id=cond,
+                            order_id=(live_rest_from_meta(meta) or {}).get("order_id"),
+                            tick=hybrid_intent.tick,
+                            leg=hybrid_intent.leg,
+                        )
+                        continue
+                    if hybrid_intent.action in {"cancel", "replace"}:
+                        if hybrid_intent.cancel_order_id:
+                            cancel_5m_rest_order(hybrid_intent.cancel_order_id)
+                        clear_rest_meta(meta)
+                        save_json(STATE_FILE, positions_meta)
+                        if hybrid_intent.action == "cancel":
+                            log_event(
+                                "rest_gtd_cancel_intent",
+                                condition_id=cond,
+                                why=hybrid_intent.why,
+                            )
+                            continue
+                    if hybrid_intent.action in {"rest", "replace"}:
+                        rest_leg = hybrid_intent.leg
+                        rest_tick = hybrid_intent.tick
+                        rest_token = hybrid_intent.token
+                        rest_exp = hybrid_intent.expiration or gtd_expiration(m.end_ts)
+                        persist_ok, persist_why, persist_age = entry_book_persist_ready(
+                            cond,
+                            rest_leg,
+                            rest_persist_eligible(
+                                tick=rest_tick,
+                                bid=up_bid if rest_leg == "up" else dn_bid,
+                                ask=up_ask if rest_leg == "up" else dn_ask,
+                                last=up_last if rest_leg == "up" else dn_last,
+                                gui=up_gui if rest_leg == "up" else dn_gui,
+                            ),
+                            now_s=time.monotonic(),
+                        )
+                        if not persist_ok:
+                            log_event(
+                                "buy_skip_entry_book_persist",
+                                condition_id=cond,
+                                leg=rest_leg,
+                                persist_s=ENTRY_BOOK_PERSIST_S,
+                                persist_why=persist_why,
+                                persist_age_s=round(persist_age, 3),
+                                via="rest_gtd",
+                                tick=rest_tick,
+                            )
+                            continue
+                        shares = rest_maker_shares(
+                            est_cost, rest_tick, share_cap=BUY_MAX_SHARES,
+                        )
+                        if shares < 0.01 or rest_token is None or rest_exp is None:
+                            log_event(
+                                "rest_gtd_skip_size",
+                                condition_id=cond,
+                                tick=rest_tick,
+                                budget=est_cost,
+                            )
+                            continue
+                        baseline = check_clob_token_balance(rest_token, refresh=True)
+                        if baseline is None and not DRY_RUN:
+                            log_event("rest_gtd_abort_no_baseline", condition_id=cond)
+                            continue
+
+                        def _persist_rest_submit(intent):
+                            persist_rest_meta(
+                                meta,
+                                order_id=intent["order_id"],
+                                price=rest_tick,
+                                leg=rest_leg,
+                                token=rest_token,
+                                expiration=rest_exp,
+                                size=shares,
+                                baseline=baseline,
+                            )
+                            save_json(STATE_FILE, positions_meta)
+
+                        posted, rest_status = post_5m_rest_gtd(
+                            rest_token,
+                            rest_tick,
+                            shares,
+                            m.end_ts,
+                            tick_size=get_tick_size_cached(rest_token),
+                            on_submit=_persist_rest_submit,
+                        )
+                        if rest_status == "posted" or rest_status == "dry":
+                            oid = extract_order_id(posted) or (
+                                (posted or {}).get("orderID") if isinstance(posted, dict) else None
+                            )
+                            if oid:
+                                persist_rest_meta(
+                                    meta,
+                                    order_id=oid,
+                                    price=rest_tick,
+                                    leg=rest_leg,
+                                    token=rest_token,
+                                    expiration=rest_exp,
+                                    size=shares,
+                                    baseline=baseline,
+                                )
+                                save_json(STATE_FILE, positions_meta)
+                            console.print(
+                                f"  [bold cyan][REST GTD][/] {rest_leg.upper()} "
+                                f"{shares:.2f} @ {rest_tick:.3f} exp={rest_exp}"
+                            )
+                        elif rest_status == "ambiguous":
+                            log_event(
+                                "rest_gtd_uncertain",
+                                condition_id=cond,
+                                tick=rest_tick,
+                                order_id=(live_rest_from_meta(meta) or {}).get("order_id"),
+                            )
+                        continue
+                    if hybrid_intent.action == "skip":
+                        if hybrid_intent.why in {"already_filled", "knob_off", "window_closed"}:
+                            continue
 
                 # Lock last-print PTB as soon as the window is open (memory/disk only).
                 if m.start_ts and time.time() >= m.start_ts:
@@ -6158,7 +6548,8 @@ while not _shutdown_requested:
                         })
                         save_json(STATE_FILE, positions_meta)
 
-                if up_gui is None or dn_gui is None:
+                hybrid_fak = bool(hybrid_intent and hybrid_intent.action == "fak")
+                if (up_gui is None or dn_gui is None) and not hybrid_fak:
                     log_buy_skip_throttled(
                         "incomplete_book",
                         cond,
@@ -6169,8 +6560,11 @@ while not _shutdown_requested:
                     continue
 
                 # Winner by GUI display price (not raw mid — wide spreads poison mid).
-                gui_edge = abs(up_gui - dn_gui)
-                if gui_edge < MIN_BID_EDGE:
+                if hybrid_fak:
+                    gui_edge = 1.0
+                else:
+                    gui_edge = abs(up_gui - dn_gui)
+                if (not hybrid_fak) and gui_edge < MIN_BID_EDGE:
                     log_buy_skip_throttled(
                         "ambiguous",
                         cond,
@@ -6180,8 +6574,12 @@ while not _shutdown_requested:
                     )
                     continue
 
-                up_winning = up_gui > dn_gui
-                dn_winning = dn_gui > up_gui
+                if hybrid_fak:
+                    up_winning = hybrid_intent.leg == "up"
+                    dn_winning = hybrid_intent.leg == "down"
+                else:
+                    up_winning = up_gui > dn_gui
+                    dn_winning = dn_gui > up_gui
 
                 # Ask in band + GUI consensus + tight real book (bid under the ask).
                 up_ask_ok = ask_in_any_band(up_ask, bands)
@@ -6226,6 +6624,9 @@ while not _shutdown_requested:
 
                 up_buy = up_winning and up_ask_ok and up_consensus
                 dn_buy = dn_winning and dn_ask_ok and dn_consensus
+                if hybrid_fak:
+                    up_buy = hybrid_intent.leg == "up"
+                    dn_buy = hybrid_intent.leg == "down"
 
                 # Underlying BTC (Chainlink RTDS) vs Price To Beat at window open.
                 uchk = None
@@ -6375,55 +6776,65 @@ while not _shutdown_requested:
                     dn_last = get_book_snapshot_last_trade(m.dn_token)
                 up_gui = polymarket_display_price(up_bid, up_ask, up_last)
                 dn_gui = polymarket_display_price(dn_bid, dn_ask, dn_last)
-                if up_gui is None or dn_gui is None:
-                    log_buy_skip_throttled(
-                        "incomplete_book",
-                        cond,
-                        event="buy_skip_incomplete_book",
-                        via="rest_confirm",
-                        up_bid=up_bid, dn_bid=dn_bid, up_ask=up_ask, dn_ask=dn_ask,
-                        up_last=up_last, dn_last=dn_last, up_gui=up_gui, dn_gui=dn_gui,
+                if hybrid_fak:
+                    buy_leg = hybrid_intent.leg
+                    buy_token = hybrid_intent.token
+                    buy_ask = up_ask if buy_leg == "up" else dn_ask
+                    buy_gui = up_gui if buy_leg == "up" else dn_gui
+                    if not ask_allows_fak_take(buy_ask, hybrid_intent.tick):
+                        # REST missing ask must not reset persist; next tick rests.
+                        continue
+                    up_buy = buy_leg == "up"
+                    dn_buy = buy_leg == "down"
+                else:
+                    if up_gui is None or dn_gui is None:
+                        log_buy_skip_throttled(
+                            "incomplete_book",
+                            cond,
+                            event="buy_skip_incomplete_book",
+                            via="rest_confirm",
+                            up_bid=up_bid, dn_bid=dn_bid, up_ask=up_ask, dn_ask=dn_ask,
+                            up_last=up_last, dn_last=dn_last, up_gui=up_gui, dn_gui=dn_gui,
+                        )
+                        continue
+                    gui_edge = abs(up_gui - dn_gui)
+                    if gui_edge < MIN_BID_EDGE:
+                        continue
+                    up_winning = up_gui > dn_gui
+                    dn_winning = dn_gui > up_gui
+                    up_ask_ok = ask_in_any_band(up_ask, bands)
+                    dn_ask_ok = ask_in_any_band(dn_ask, bands)
+                    up_book_ok, _ = entry_book_ok(
+                        up_bid, up_ask, MAX_ENTRY_SPREAD, MIN_WINNER_BID,
                     )
-                    continue
-                gui_edge = abs(up_gui - dn_gui)
-                if gui_edge < MIN_BID_EDGE:
-                    continue
-                up_winning = up_gui > dn_gui
-                dn_winning = dn_gui > up_gui
-                up_ask_ok = ask_in_any_band(up_ask, bands)
-                dn_ask_ok = ask_in_any_band(dn_ask, bands)
-                up_book_ok, _ = entry_book_ok(
-                    up_bid, up_ask, MAX_ENTRY_SPREAD, MIN_WINNER_BID,
-                )
-                dn_book_ok, _ = entry_book_ok(
-                    dn_bid, dn_ask, MAX_ENTRY_SPREAD, MIN_WINNER_BID,
-                )
-                up_consensus = (
-                    up_gui >= MIN_WINNER_BID and dn_gui <= MAX_LOSER_BID
-                    and up_book_ok
-                )
-                dn_consensus = (
-                    dn_gui >= MIN_WINNER_BID and up_gui <= MAX_LOSER_BID
-                    and dn_book_ok
-                )
-                up_buy = up_winning and up_ask_ok and up_consensus
-                dn_buy = dn_winning and dn_ask_ok and dn_consensus
-                if not (up_buy or dn_buy):
-                    clear_entry_book_persist_leg(cond, "up")
-                    clear_entry_book_persist_leg(cond, "down")
-                    log_buy_skip_throttled(
-                        "rest_confirm",
-                        cond,
-                        event="buy_skip_rest_confirm",
-                        up_ask=up_ask, dn_ask=dn_ask,
-                        up_gui=up_gui, dn_gui=dn_gui,
+                    dn_book_ok, _ = entry_book_ok(
+                        dn_bid, dn_ask, MAX_ENTRY_SPREAD, MIN_WINNER_BID,
                     )
-                    continue
-
-                buy_token = m.up_token if up_buy else m.dn_token
-                buy_ask = up_ask if up_buy else dn_ask
-                buy_leg = "up" if up_buy else "down"
-                buy_gui = up_gui if up_buy else dn_gui
+                    up_consensus = (
+                        up_gui >= MIN_WINNER_BID and dn_gui <= MAX_LOSER_BID
+                        and up_book_ok
+                    )
+                    dn_consensus = (
+                        dn_gui >= MIN_WINNER_BID and up_gui <= MAX_LOSER_BID
+                        and dn_book_ok
+                    )
+                    up_buy = up_winning and up_ask_ok and up_consensus
+                    dn_buy = dn_winning and dn_ask_ok and dn_consensus
+                    if not (up_buy or dn_buy):
+                        clear_entry_book_persist_leg(cond, "up")
+                        clear_entry_book_persist_leg(cond, "down")
+                        log_buy_skip_throttled(
+                            "rest_confirm",
+                            cond,
+                            event="buy_skip_rest_confirm",
+                            up_ask=up_ask, dn_ask=dn_ask,
+                            up_gui=up_gui, dn_gui=dn_gui,
+                        )
+                        continue
+                    buy_token = m.up_token if up_buy else m.dn_token
+                    buy_ask = up_ask if up_buy else dn_ask
+                    buy_leg = "up" if up_buy else "down"
+                    buy_gui = up_gui if up_buy else dn_gui
                 # REST confirm can cross T-120. Recompute slug TTM so a 93¢
                 # ask cannot POST as an early 99¢ FAK (22 Aug late_gt_90).
                 seconds_left = entry_seconds_left(
@@ -6499,8 +6910,8 @@ while not _shutdown_requested:
                 _ttm_disp = f"{seconds_left:>3.0f}s"
                 console.print(Panel(
                     f"  [bright_white]{m.question}[/]\n"
-                    f"  [bright_green]UP[/]   gui [bold]{up_gui:.3f}[/]  ask [bold]{up_ask or 0:.3f}[/]   │   "
-                    f"[bright_red]DN[/]  gui [bold]{dn_gui:.3f}[/]  ask [bold]{dn_ask or 0:.3f}[/]   │   "
+                    f"  [bright_green]UP[/]   gui [bold]{(up_gui or 0):.3f}[/]  ask [bold]{up_ask or 0:.3f}[/]   │   "
+                    f"[bright_red]DN[/]  gui [bold]{(dn_gui or 0):.3f}[/]  ask [bold]{dn_ask or 0:.3f}[/]   │   "
                     f"[bold green]TTM {_ttm_disp}[/]",
                     title=f"[bold bright_green]▲ BUY TRIGGER — {buy_leg.upper()} LEG[/]",
                     border_style="bright_green",
@@ -6650,13 +7061,24 @@ while not _shutdown_requested:
                     meta["last_buy_at"] = submit_ms
                     save_json(STATE_FILE, positions_meta)
 
-                retry_pins = [float(band.max_price), float(band.retry_min_price)]
+                fak_limit = float(band.max_price)
+                fak_min = float(band.retry_min_price)
+                if hybrid_fak and hybrid_intent.fak_limit:
+                    fak_limit = float(hybrid_intent.fak_limit)
+                    fak_min = float(hybrid_intent.fak_min or 0.97)
+                retry_pins = [fak_limit, fak_min]
 
                 def _pre_submit_ttm(fresh_bid, fresh_ask, attempt):
                     ttm = entry_seconds_left(
                         time.time(), m.end_ts, getattr(m, "slug", None),
                         FIVE_M_DURATION_S,
                     )
+                    if hybrid_fak:
+                        if not ask_allows_fak_take(fresh_ask, hybrid_intent.tick):
+                            return False, "ask_left_tick"
+                        retry_pins[0] = float(hybrid_intent.fak_limit or fak_limit)
+                        retry_pins[1] = float(hybrid_intent.fak_min or fak_min)
+                        return True, "hybrid_fak"
                     live_band = decide_entry_at(ttm, fresh_ask)
                     pinned = buy_retry_fak_limit(band.max_price, live_band)
                     if pinned is None:
@@ -6666,8 +7088,8 @@ while not _shutdown_requested:
                     return True, live_band.name
 
                 bought, spent, buy_status = buy_market_with_retry(
-                    buy_token, spend_usd, band.max_price, tick_size=tick,
-                    min_price=band.retry_min_price,
+                    buy_token, spend_usd, fak_limit, tick_size=tick,
+                    min_price=fak_min,
                     on_fill=_persist_buy_fill, on_submit=_persist_buy_submit,
                     condition_id=cond,
                     pre_submit=_pre_submit_ttm,

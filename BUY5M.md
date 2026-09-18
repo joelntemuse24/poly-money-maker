@@ -77,6 +77,15 @@ Real POSTs require `dry_run=false` **and** `entry_enabled=true`. Either
 safety alone keeps live posting off. Dry-run still evaluates gates and
 logs `dry_buy` even while `entry_enabled` is false.
 
+## Last-120s GTD rest (`entry_rest_gtd`)
+
+Default **false** (code defaults + both example JSONs). When true, the last
+120s 97–99 band may **GTD-rest** the GUI tick if the favorite ask is gone
+(people hitting the 99¢ bid). Hedge/sell/redeem stay FAK. One rest order per
+market, `expiration = end_ts`, cancel by that `order_id` only (never
+`cancel_all`). First GTD POST needs `buybot5m.py` on disk + restart; the knob
+is hot-reload after that.
+
 ## Coherence
 
 `buy/strategy_coherence.py` `validate_5m_strategy_coherence` fail-closes:

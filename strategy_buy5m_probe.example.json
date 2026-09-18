@@ -77,5 +77,6 @@
   "balance_refresh_s": 15,
   "ui_every_n_cycles": 50,
   "tick_size": "0.001",
-  "entry_book_persist_s": 5.0
+  "entry_book_persist_s": 5.0,
+  "entry_rest_gtd": false
 }

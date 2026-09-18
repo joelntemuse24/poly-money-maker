@@ -873,7 +873,10 @@ class AmbiguousCrossCyclePolicy(unittest.TestCase):
     def test_buy_is_budget_limit_fak_not_top_capped(self):
         for bot in (BOT, BOT5M, BOT_HR):
             src = bot.read_text()
-            self.assertEqual(src.count("client.create_order"), 1, bot.name)
+            if bot == BOT5M:
+                self.assertEqual(src.count("client.create_order"), 2, bot.name)
+            else:
+                self.assertEqual(src.count("client.create_order"), 1, bot.name)
             self.assertEqual(src.count("client.create_market_order"), 1, bot.name)
             self.assertIn("quoted_buy_shares(", src, bot.name)
             self.assertIn("size=shares", src, bot.name)
