@@ -136,7 +136,7 @@ class Buybot5mPersistFloorWiringTests(unittest.TestCase):
                 src,
             )
         )
-        self.assertIn("REST confirm must not restart the timer", src)
+        self.assertIn("A REST confirm miss must not", src)
         self.assertIn("if up_ask is not None:", src)
 
     def test_historical_paper_keeps_persist_min_inside_75_90(self):
