@@ -114,6 +114,7 @@ from buy.entry_rest_gtd import (
     rest_fill_state,
     rest_gtd_post_is_rejected,
     rest_maker_shares,
+    rest_open_s,
     rest_persist_eligible,
 )
 from buy.probe_5m import probe_spend_usd, should_evaluate_entries
@@ -625,8 +626,10 @@ EARLY_95_START_S = _strat["early_95_start_s"]
 EARLY_95_MIN_S = _strat["early_95_min_s"]
 EARLY_95_MIN_PRICE = _strat["early_95_min_price"]
 LATE_90_START_S = _strat["late_90_start_s"]
+ENTRY_REST_GTD = bool(_strat.get("entry_rest_gtd", False))
 BUY_HORIZON_S = max(
     float(BUY_START_S), float(EARLY_BUY_START_S), float(EARLY_95_START_S),
+    float(rest_open_s(BUY_START_S)) if ENTRY_REST_GTD else 0.0,
 )
 BUY_GRACE_S = _strat["buy_grace_s"]
 BUY_COOLDOWN_S = _strat["buy_cooldown_s"]
@@ -637,7 +640,6 @@ BUY_MAX_SPEND = _strat["buy_max_spend"]
 BUY_MAX_SHARES = _strat["buy_max_shares"]
 MARKET_SPEND_CAP = float(_strat.get("market_spend_cap") or 0)
 ENTRY_BOOK_PERSIST_S = float(_strat.get("entry_book_persist_s") or 0)
-ENTRY_REST_GTD = bool(_strat.get("entry_rest_gtd", False))
 MAX_OPEN_POSITIONS = _strat["max_open_positions"]
 MAX_OPEN_NOTIONAL = _strat["max_open_notional"]
 MAX_DAILY_NOTIONAL = _strat["max_daily_notional"]
@@ -2985,6 +2987,7 @@ def post_5m_rest_gtd(
             order_id=expected_order_id,
             error=str(e)[:200],
             rejected=rejected,
+            expiration=expiration,
         )
         if rejected:
             return None, "rejected"
@@ -4606,8 +4609,10 @@ while not _shutdown_requested:
         EARLY_95_MIN_S = _strat["early_95_min_s"]
         EARLY_95_MIN_PRICE = _strat["early_95_min_price"]
         LATE_90_START_S = _strat["late_90_start_s"]
+        ENTRY_REST_GTD = bool(_strat.get("entry_rest_gtd", False))
         BUY_HORIZON_S = max(
             float(BUY_START_S), float(EARLY_BUY_START_S), float(EARLY_95_START_S),
+            float(rest_open_s(BUY_START_S)) if ENTRY_REST_GTD else 0.0,
         )
         BUY_GRACE_S = _strat["buy_grace_s"]
         BUY_COOLDOWN_S = _strat["buy_cooldown_s"]
@@ -4618,7 +4623,6 @@ while not _shutdown_requested:
         BUY_MAX_SHARES = _strat["buy_max_shares"]
         MARKET_SPEND_CAP = float(_strat.get("market_spend_cap") or 0)
         ENTRY_BOOK_PERSIST_S = float(_strat.get("entry_book_persist_s") or 0)
-        ENTRY_REST_GTD = bool(_strat.get("entry_rest_gtd", False))
         MAX_OPEN_POSITIONS = _strat["max_open_positions"]
         MAX_OPEN_NOTIONAL = _strat["max_open_notional"]
         MAX_DAILY_NOTIONAL = _strat["max_daily_notional"]
@@ -5130,7 +5134,7 @@ while not _shutdown_requested:
                 if live_rest and (
                     not ENTRY_REST_GTD
                     or seconds_left <= 0
-                    or seconds_left > float(BUY_START_S) + 1e-12
+                    or seconds_left > float(rest_open_s(BUY_START_S)) + 1e-12
                 ):
                     cancel_5m_rest_order(live_rest["order_id"])
                     clear_rest_meta(meta)
@@ -6210,8 +6214,11 @@ while not _shutdown_requested:
                 if held_size > 0.01 and meta.get("late_bought"):
                     continue  # late $2.50 already used
                 bands = current_entry_bands(seconds_left)
-                if not bands:
-                    continue  # not in late 75–90¢, early ≥90¢, or ≥95¢ overlay
+                rest_look = bool(ENTRY_REST_GTD) and (
+                    0 < float(seconds_left) <= float(rest_open_s(BUY_START_S)) + 1e-12
+                )
+                if not bands and not rest_look:
+                    continue  # not in a FAK band or the GTD rest-open window
                 note_buy_window(
                     cond, m.end_ts, seconds_left, slug=getattr(m, "slug", None),
                     window=",".join(b.name for b in bands),
@@ -6220,7 +6227,7 @@ while not _shutdown_requested:
                     continue  # live with entries off does not walk; dry-run still logs
                 if not discovery_allows_buy_look(
                     _discovery_fresh,
-                    in_live_window=late_slice,
+                    in_live_window=late_slice or rest_look,
                     market=m,
                 ):
                     log_buy_skip_throttled(
@@ -6371,7 +6378,7 @@ while not _shutdown_requested:
                 dn_bid, _, dn_ask, _, dn_mid = look_book_quote(
                     m.dn_token, _book_cache,
                 )
-                if not (ENTRY_REST_GTD and late_slice):
+                if not (ENTRY_REST_GTD and (late_slice or rest_look)):
                     if up_ask is None:
                         up_bid, _, up_ask, _, up_mid = get_quote_fast(m.up_token)
                     if dn_ask is None:
@@ -6471,7 +6478,15 @@ while not _shutdown_requested:
                         shares = rest_maker_shares(
                             est_cost, rest_tick, share_cap=BUY_MAX_SHARES,
                         )
-                        if shares < 0.01 or rest_token is None or rest_exp is None:
+                        if rest_exp is None:
+                            log_event(
+                                "rest_gtd_skip_clob_lead",
+                                condition_id=cond,
+                                tick=rest_tick,
+                                why="clob_lead",
+                            )
+                            continue
+                        if shares < 0.01 or rest_token is None:
                             log_event(
                                 "rest_gtd_skip_size",
                                 condition_id=cond,

@@ -10,6 +10,8 @@ from pathlib import Path
 
 from buy.entry_rest_gtd import (
     CLOB_GTD_MIN_LEAD_S,
+    CLOB_GTD_POST_SLACK_S,
+    CLOB_GTD_SECURITY_S,
     REST_TICKS,
     ask_allows_fak_take,
     book_level_kept_for_display,
@@ -21,6 +23,7 @@ from buy.entry_rest_gtd import (
     rest_fill_state,
     rest_gtd_post_is_rejected,
     rest_maker_shares,
+    rest_open_s,
     rest_persist_eligible,
     rest_winner_leg,
     snap_gui_to_rest_tick,
@@ -194,16 +197,25 @@ class HybridIntentTests(unittest.TestCase):
         q.update(kwargs)
         return q
 
-    def test_missing_ask_bid_099_rests(self):
-        intent = hybrid_late_intent(live=None, **self._quotes())
+    def test_missing_ask_bid_099_rests_when_ttm_meets_clob_lead(self):
+        end_ts = 1_700_000_300
+        now = end_ts - 200
+        intent = hybrid_late_intent(
+            live=None,
+            **self._quotes(seconds_left=200.0, end_ts=end_ts, now=now),
+        )
         self.assertEqual(intent.action, "rest")
         self.assertEqual(intent.leg, "up")
         self.assertEqual(intent.tick, 0.99)
         self.assertEqual(intent.token, "UP")
-        # last-120s end_ts is < now+180; CLOB needs the floor.
-        self.assertEqual(intent.expiration, 1_700_000_210 + CLOB_GTD_MIN_LEAD_S)
-        self.assertGreaterEqual(intent.expiration - 1_700_000_210, 180)
+        self.assertEqual(intent.expiration, end_ts + CLOB_GTD_SECURITY_S)
         self.assertIsNone(intent.cancel_order_id)
+
+    def test_last_120s_without_live_gtd_skips_clob_lead(self):
+        intent = hybrid_late_intent(live=None, **self._quotes())
+        self.assertEqual(intent.action, "skip")
+        self.assertEqual(intent.why, "clob_lead")
+        self.assertIsNone(intent.expiration)
 
     def test_ask_at_tick_faks(self):
         intent = hybrid_late_intent(
@@ -252,10 +264,9 @@ class HybridIntentTests(unittest.TestCase):
                 up_gui=0.98, up_bid=0.98, up_ask=None, up_last=0.98,
             ),
         )
-        self.assertEqual(intent.action, "replace")
-        self.assertEqual(intent.tick, 0.98)
+        self.assertEqual(intent.action, "cancel")
+        self.assertEqual(intent.why, "clob_lead")
         self.assertEqual(intent.cancel_order_id, "rest-97")
-        self.assertEqual(intent.expiration, 1_700_000_210 + CLOB_GTD_MIN_LEAD_S)
 
     def test_gui_leaves_set_cancels(self):
         live = {
@@ -272,7 +283,7 @@ class HybridIntentTests(unittest.TestCase):
         self.assertEqual(intent.action, "cancel")
         self.assertEqual(intent.cancel_order_id, "rest-99")
 
-    def test_ttm_over_120_cancels(self):
+    def test_ttm_over_rest_open_cancels(self):
         live = {
             "order_id": "rest-99",
             "price": 0.99,
@@ -281,10 +292,21 @@ class HybridIntentTests(unittest.TestCase):
             "expiration": 1_700_000_300,
         }
         intent = hybrid_late_intent(
-            live=live, **self._quotes(seconds_left=121.0)
+            live=live, **self._quotes(seconds_left=201.0, now=1_700_000_099)
         )
         self.assertEqual(intent.action, "cancel")
         self.assertEqual(intent.cancel_order_id, "rest-99")
+
+    def test_live_gtd_kept_through_last_120s(self):
+        live = {
+            "order_id": "rest-99",
+            "price": 0.99,
+            "leg": "up",
+            "token": "UP",
+            "expiration": 1_700_000_360,
+        }
+        intent = hybrid_late_intent(live=live, **self._quotes(seconds_left=90.0))
+        self.assertEqual(intent.action, "keep")
 
     def test_become_loser_cancels(self):
         live = {
@@ -369,21 +391,23 @@ class MakerCentsTests(unittest.TestCase):
             self.assertNotEqual(maker, 1.01)
             self.assertEqual(round(maker, 2), maker)
 
-    def test_gtd_expiration_is_end_ts_when_lead_ok(self):
+    def test_gtd_expiration_is_end_ts_plus_security_when_lead_ok(self):
         now = 1_700_000_000
-        self.assertEqual(gtd_expiration(1_700_000_300, now=now), 1_700_000_300)
+        self.assertEqual(CLOB_GTD_MIN_LEAD_S, 180)
+        self.assertEqual(CLOB_GTD_SECURITY_S, 60)
+        self.assertEqual(CLOB_GTD_POST_SLACK_S, 20)
+        self.assertEqual(rest_open_s(120), 200)
+        self.assertEqual(gtd_expiration(1_700_000_300, now=now), 1_700_000_360)
         self.assertIsNone(gtd_expiration(None, now=now))
         self.assertIsNone(gtd_expiration(0, now=now))
 
-    def test_last_120s_gtd_meets_clob_180s_floor(self):
+    def test_last_120s_cannot_post_gtd(self):
         end_ts = 1_700_000_300
-        self.assertEqual(CLOB_GTD_MIN_LEAD_S, 180)
-        for ttm in (120, 90, 60, 30, 1):
+        for ttm in (179, 120, 90, 60, 1):
             now = end_ts - ttm
-            exp = gtd_expiration(end_ts, now=now)
-            self.assertGreaterEqual(exp - now, 180)
-            self.assertGreaterEqual(exp, end_ts)
-            self.assertEqual(exp, now + 180)
+            self.assertIsNone(gtd_expiration(end_ts, now=now))
+        now = end_ts - 200
+        self.assertEqual(gtd_expiration(end_ts, now=now), end_ts + 60)
 
     def test_clob_expiration_400_is_rejected_not_uncertain(self):
         err = (
@@ -479,6 +503,10 @@ class Buybot5mWiringTests(unittest.TestCase):
         self.assertIn('return None, "rejected"', src)
         self.assertIn("rest_gtd_rejected", src)
         self.assertIn("rest_gtd_post_is_rejected", src)
+        self.assertIn("expiration=expiration", src)
+        self.assertIn("clob_lead", src)
+        self.assertIn("rest_open_s", src)
+        self.assertIn("rest_look", src)
 
     def test_hourly_and_15m_untouched(self):
         hourly_src = HOURLY.read_text()

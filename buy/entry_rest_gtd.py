@@ -13,6 +13,8 @@ from typing import Any, Mapping, NamedTuple, Optional, Sequence
 EPS = 1e-12
 REST_TICKS = (0.97, 0.98, 0.99)
 CLOB_GTD_MIN_LEAD_S = 180
+CLOB_GTD_SECURITY_S = 60
+CLOB_GTD_POST_SLACK_S = 20
 REST_SNAP_MAX_ABS = 0.005
 LOSER_GUI_MAX = 0.05
 REST_META_KEYS = (
@@ -203,31 +205,44 @@ def unix_ts(value) -> Optional[int]:
     return ts
 
 
+def rest_open_s(
+    late_start_s=120.0,
+    min_open_s: float = CLOB_GTD_MIN_LEAD_S + CLOB_GTD_POST_SLACK_S,
+) -> float:
+    """Earliest TTM that may look for a GTD rest. CLOB needs ≥180s to ``end_ts``."""
+    try:
+        late = float(late_start_s)
+    except (TypeError, ValueError):
+        late = 120.0
+    return max(late, float(min_open_s))
+
+
 def gtd_expiration(
     end_ts,
     now=None,
     min_lead_s: int = CLOB_GTD_MIN_LEAD_S,
+    security_s: int = CLOB_GTD_SECURITY_S,
+    slack_s: int = CLOB_GTD_POST_SLACK_S,
 ) -> Optional[int]:
-    """GTD unix seconds for CLOB POST.
+    """Stated GTD unix seconds, or None if CLOB will 400.
 
-    Prefer this market's ``end_ts``. CLOB rejects expiration < now+180, and
-    the last-120s window is always inside that floor, so we lift to
-    ``now + min_lead_s``. The bot still cancels this ``order_id`` at TTM<=0
-    / window close; CLOB expiry is only the backstop if cancel fails. Next
-    5m uses different tokens.
+    CLOB rejects expiration < now+180 and GTD dies 60s before the stated
+    time. Last-120s ``end_ts`` cannot satisfy that (even ``now+180`` still
+    400s live — they will not take an expiry after market end). POST only
+    when ``end_ts`` itself is ≥ now+180+slack. Stated expiry is
+    ``end_ts + 60`` so the order lives until market end if they honor it.
     """
     ts = unix_ts(end_ts)
     if ts is None:
         return None
-    lead = int(min_lead_s)
-    if lead <= 0:
-        return ts
     try:
         now_s = time.time() if now is None else float(now)
     except (TypeError, ValueError):
         now_s = time.time()
-    floor = int(now_s) + lead
-    return ts if ts >= floor else floor
+    floor = int(now_s) + int(min_lead_s) + int(slack_s)
+    if ts < floor:
+        return None
+    return ts + int(security_s)
 
 
 def rest_gtd_post_is_rejected(error) -> bool:
@@ -361,10 +376,11 @@ def hybrid_late_intent(
 
     try:
         ttm = float(seconds_left)
-        window = float(late_start_s)
+        late_window = float(late_start_s)
+        rest_window = rest_open_s(late_start_s)
     except (TypeError, ValueError):
         return _cancel("invalid_ttm") if live_id else HybridIntent(action="skip", why="invalid_ttm")
-    if ttm <= 0 or ttm > window + EPS:
+    if ttm <= 0 or ttm > rest_window + EPS:
         if live_id:
             return _cancel("window_closed")
         return HybridIntent(action="skip", why="window_closed")
@@ -375,6 +391,8 @@ def hybrid_late_intent(
         return HybridIntent(action="skip", why="already_filled")
 
     expiration = gtd_expiration(end_ts, now=now)
+    late_slice = ttm <= late_window + EPS
+    can_post = expiration is not None
     leg, tick, why = rest_winner_leg(
         up_gui=up_gui,
         dn_gui=dn_gui,
@@ -406,6 +424,8 @@ def hybrid_late_intent(
                 expiration=expiration,
                 cancel_order_id=None,
             )
+        if not can_post:
+            return _cancel("clob_lead")
         return HybridIntent(
             action="replace",
             why="tick_moved",
@@ -416,7 +436,7 @@ def hybrid_late_intent(
             cancel_order_id=live_id,
         )
 
-    if ask_allows_fak_take(ask, tick):
+    if late_slice and ask_allows_fak_take(ask, tick):
         return HybridIntent(
             action="fak",
             why="ask_at_tick",
@@ -427,6 +447,8 @@ def hybrid_late_intent(
             fak_limit=float(tick),
             fak_min=float(ticks[0]),
         )
+    if not can_post:
+        return HybridIntent(action="skip", why="clob_lead")
     return HybridIntent(
         action="rest",
         why="no_ask_at_tick",
