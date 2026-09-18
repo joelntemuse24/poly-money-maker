@@ -15,6 +15,7 @@ from buy.probe_5m import (
     live_posting_armed,
     probe_live_flip_note,
     probe_spend_usd,
+    raise_spend_for_clob_min_notional,
     shares_rail_needed,
     should_evaluate_entries,
 )
@@ -74,6 +75,7 @@ def _load_ns(defaults, load_fn, path: Path) -> dict:
         "validate_5m_strategy_coherence": validate_5m_strategy_coherence,
         "validate_late_90_start_s": validate_late_90_start_s,
         "probe_spend_usd": probe_spend_usd,
+        "raise_spend_for_clob_min_notional": raise_spend_for_clob_min_notional,
         "console": type("C", (), {"print": staticmethod(lambda *_a, **_k: None)})(),
     }
     exec(compile(load_fn, "buybot5m.py", "exec"), ns, ns)

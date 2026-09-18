@@ -103,7 +103,13 @@ from buy.hedge_gate import (
     should_mark_hedge_closed,
 )
 from buy.live_journal import is_journal_event
-from buy.probe_5m import persist_quote_ok, probe_spend_usd, should_evaluate_entries
+from buy.probe_5m import (
+    min_marketable_buy_shares,
+    persist_quote_ok,
+    probe_spend_usd,
+    raise_spend_for_clob_min_notional,
+    should_evaluate_entries,
+)
 from buy.strategy_coherence import validate_5m_strategy_coherence
 
 
@@ -477,6 +483,13 @@ def load_strategy():
             raise ValueError("one_entry_per_market must remain true")
         if not cfg["dry_run"] and not cfg["hedge_enabled"]:
             raise ValueError("live mode requires hedge_enabled=true")
+        _clob_bumped = raise_spend_for_clob_min_notional(cfg)
+        if _clob_bumped:
+            _shown = {k: v["to"] for k, v in _clob_bumped.items()}
+            console.print(
+                "[yellow]▶ STRATEGY[/] CLOB min BUY is $1; 99¢ needs 2.00 sh / "
+                f"$1.98 exact cents — in-memory {_shown}"
+            )
         for key in (
             "buy_budget", "late_buy_budget", "buy_max_spend", "buy_max_shares",
             "max_open_notional", "max_daily_notional", "poll_buy_window_s",
@@ -1995,10 +2008,11 @@ def quoted_buy_shares(budget, ask, share_cap=None):
 def quoted_buy_shares_up_to_limit(budget, ask, limit, share_cap=None, spend_cap=None):
     """Shares for a FAK at ``limit`` that can spend the slice budget.
 
-    Starts at ``budget/ask``. A 99¢ (or 90¢) maker must be exact cents, so
-    rounding **down** landed on 2.00 sh / $1.98. Prefer at least 3.00 sh
-    when ``3 × limit ≤ spend_cap`` (early $2.97, late $2.70), then snap to
-    the nearest legal size that is still ≤ ``buy_max_spend``. ``ask`` still
+    Starts at ``budget/ask``. CLOB marketable BUY min is $1 exact cents:
+    1.00 sh @ 99¢ = $0.99 (HTTP 400) and 1.01 × 0.99 is not cents, so the
+    floor is 2.00 sh / $1.98. Prefer at least 3.00 sh when
+    ``3 × limit ≤ spend_cap`` (early $2.97, late $2.70), then snap to the
+    nearest legal size that is still ≤ ``buy_max_spend``. ``ask`` still
     has to be in band; the FAK walks from the touch up to the cap.
     """
     shares = quoted_buy_shares(budget, ask, share_cap)
@@ -2026,6 +2040,9 @@ def quoted_buy_shares_up_to_limit(budget, ask, limit, share_cap=None, spend_cap=
     three = Decimal("3.00")
     if three <= max_sh and three * lim <= cap_d:
         target = max(target, three)
+    min_legal = Decimal(str(min_marketable_buy_shares(limit_f) or 0))
+    if min_legal >= min_shares and min_legal <= max_sh and min_legal * lim <= cap_d:
+        target = max(target, min_legal)
     if target < min_shares:
         return 0.0
 
@@ -2033,7 +2050,10 @@ def quoted_buy_shares_up_to_limit(budget, ask, limit, share_cap=None, spend_cap=
         if sh < min_shares or sh > max_sh:
             return False
         maker = sh * lim
-        return maker.quantize(cent) == maker and maker <= cap_d
+        if maker.quantize(cent) != maker or maker > cap_d:
+            return False
+        # CLOB marketable BUY min is $1. 1.00 @ 99¢ = $0.99 → HTTP 400.
+        return maker >= Decimal("1.00")
 
     up = target.quantize(share_tick, rounding=ROUND_DOWN)
     if up < target:

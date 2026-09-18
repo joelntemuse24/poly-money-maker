@@ -46,6 +46,9 @@ def _load_funcs(*names: str, bot: Path = BOT):
         "POLYMARKET_GUI_SPREAD": 0.10,
         "datetime": datetime,
     }
+    if bot == BOT5M:
+        from buy.probe_5m import min_marketable_buy_shares as _min_mkt_sh
+        ns["min_marketable_buy_shares"] = _min_mkt_sh
     exec(compile("\n\n".join(chunks), str(bot), "exec"), ns, ns)
     return ns
 
