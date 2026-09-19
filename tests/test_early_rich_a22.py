@@ -97,7 +97,7 @@ class EarlyRichBandAndPersistTests(unittest.TestCase):
         a22 = next(b for b in _bands(18) if b.name == "a22")
         self.assertAlmostEqual(a22.min_price, 0.97)
         self.assertFalse(a22.min_exclusive)
-        self.assertAlmostEqual(a22.fak_limit, 0.99)
+        self.assertAlmostEqual(a22.fak_limit, 0.98)
         band = _pick(18, 0.98)
         self.assertIsNotNone(band)
         self.assertEqual(band.name, "a22")

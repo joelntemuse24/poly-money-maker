@@ -675,6 +675,7 @@ class FiveMBuyRetryPinRails(unittest.TestCase):
                     round(float(ask) - 0.01, 4), 10.0, float(ask), 10.0, None,
                 ),
                 "entry_book_ok": lambda *_a, **_k: (True, "ok"),
+                "buy_entry_book_gate": lambda *_a, **_k: (True, "ok", None, None, None),
                 "safe_api_call": lambda fn, *a, **k: fn(*a, **k),
                 "client": SimpleNamespace(
                     create_order=create_order,

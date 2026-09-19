@@ -873,8 +873,6 @@ class AmbiguousCrossCyclePolicy(unittest.TestCase):
     def test_buy_is_budget_limit_fak_not_top_capped(self):
         for bot in (BOT, BOT5M, BOT_HR):
             src = bot.read_text()
-            self.assertEqual(src.count("client.create_order"), 1, bot.name)
-            self.assertEqual(src.count("client.create_market_order"), 1, bot.name)
             self.assertIn("quoted_buy_shares(", src, bot.name)
             self.assertIn("size=shares", src, bot.name)
             self.assertIn("buy_fill_walk", src, bot.name)
@@ -882,6 +880,12 @@ class AmbiguousCrossCyclePolicy(unittest.TestCase):
             self.assertIn('reason="no_bid"', src, bot.name)
             self.assertIn('quoted = meta.get("quoted_buy_shares")', src, bot.name)
             self.assertIn("BUY_MAX_SHARES", src, bot.name)
+            self.assertEqual(src.count("client.create_market_order"), 1, bot.name)
+            if bot == BOT5M:
+                # FAK buy + rest GTD both call create_order.
+                self.assertEqual(src.count("client.create_order"), 2, bot.name)
+            else:
+                self.assertEqual(src.count("client.create_order"), 1, bot.name)
             if bot == BOT5M:
                 self.assertIn('"buy_max_spend": 5.0', src, bot.name)
                 self.assertIn('"buy_max_shares": 8.0', src, bot.name)
@@ -924,10 +928,16 @@ class AmbiguousCrossCyclePolicy(unittest.TestCase):
                 )
                 self.assertIn("price = fresh_ask", src, bot.name)
                 self.assertNotIn("quoted_buy_shares_up_to_limit(", src, bot.name)
-                self.assertIn("user_usdc_balance=remaining_budget", src, bot.name)
-            self.assertIn("[THIN ASK]", src, bot.name)
+                self.assertIn("clip_buy_shares_to_displayed_ask(", src, bot.name)
+                self.assertNotIn("user_usdc_balance=remaining_budget", src, bot.name)
             self.assertNotIn("min(budget / ask, ask_size)", src, bot.name)
-            self.assertNotIn("[NO SIZE]", src, bot.name)
+            if bot == BOT:
+                self.assertIn("[NO SIZE]", src, bot.name)
+            elif bot == BOT_HR:
+                self.assertIn("[THIN ASK]", src, bot.name)
+                self.assertNotIn("[NO SIZE]", src, bot.name)
+            else:
+                self.assertIn("abort (no blind FAK)", src, bot.name)
             self.assertNotIn(
                 'quoted = meta.get("quoted_buy_shares") or meta.get(',
                 src,
@@ -974,6 +984,7 @@ class BuyExecutionAmbiguity(unittest.TestCase):
             "buy_fill_walked",
             "classify_buy_fill",
             "implied_buy_average",
+            "clip_buy_shares_to_displayed_ask",
             "buy_market_with_retry",
             "unmatched_fak_rejection",
             "definitive_order_rejection",
@@ -1060,7 +1071,7 @@ class BuyExecutionAmbiguity(unittest.TestCase):
         self.assertAlmostEqual(calls["orders"][0]["size"], 5.0)
         self.assertAlmostEqual(calls["orders"][0]["price"], 0.80)
 
-    def test_thin_displayed_ask_still_posts_budget_shares(self):
+    def test_thin_displayed_ask_aborts_without_walking(self):
         ns, calls = self._namespace({"status": "unmatched", "orderID": "order-1"})
         ns["get_quote_fast"] = lambda *_a, **_k: (0.79, 0.5, 0.80, 0.01, None)
         result = ns["buy_market_with_retry"](
@@ -1068,9 +1079,8 @@ class BuyExecutionAmbiguity(unittest.TestCase):
             on_submit=lambda *args: calls["submit"].append(args),
         )
         self.assertEqual(result, (0.0, 0.0, "empty"))
-        self.assertEqual(len(calls["orders"]), 1)
-        self.assertAlmostEqual(calls["orders"][0]["size"], 3.10)
-        self.assertAlmostEqual(calls["orders"][0]["price"], 0.80)
+        self.assertEqual(len(calls["orders"]), 0)
+        self.assertEqual(calls["post"], 0)
 
     def test_explicit_unmatched_zero_fill_is_terminal_empty(self):
         ns, calls = self._namespace({"status": "unmatched", "orderID": "order-1"})
@@ -1442,6 +1452,7 @@ class FiveMinuteBandLimitFakTests(unittest.TestCase):
                 "check_clob_token_balance": lambda *_args, **_kwargs: 0.0,
                 "_fill_fee_usdc": lambda *_args, **_kwargs: None,
                 "entry_book_ok": lambda *_a, **_k: (True, "ok"),
+                "buy_entry_book_gate": lambda *_a, **_k: (True, "ok", None, None, None),
                 "safe_api_call": lambda fn, *a, **k: fn(*a, **k),
                 "client": SimpleNamespace(
                     create_order=create_order,
