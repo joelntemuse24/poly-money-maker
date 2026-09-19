@@ -75,7 +75,7 @@ class MintDefaultsTests(unittest.TestCase):
             self.assertEqual(blob["sell_floor"], 0.02, label)
             self.assertAlmostEqual(blob["sell_opposite_min"], 0.90, msg=label)
             self.assertEqual(blob["sell_persist_s"], 5.0, label)
-            self.assertAlmostEqual(blob["sell_winner_min"], 0.999, msg=label)
+            self.assertAlmostEqual(blob["sell_winner_min"], 0.99, msg=label)
             self.assertEqual(blob["sell_min_bid_size"], 1.0, label)
 
     def test_open_intent_count_ignores_expired_redeem_holds(self):
@@ -157,6 +157,10 @@ class DeployUnitsTests(unittest.TestCase):
             src,
         )
         self.assertNotIn("if bal + 1e-9 < tol:", src)
+        # Winner FAK must sit on the live sized bid, not a knob that can
+        # print above the book (15m tops at 0.99, not 0.999).
+        self.assertIn("[round(float(bids[winner] or winner_min), 4)]", src)
+        self.assertNotIn("[round(winner_min, 4)]", src)
 
     def test_docs_do_not_start_hourly_dense_or_dangerzone(self):
         for path in (

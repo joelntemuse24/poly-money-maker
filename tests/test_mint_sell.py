@@ -6,6 +6,7 @@ import unittest
 
 from buy.book import best_bid_with_min_size
 from buy.mint_sell import (
+    DEFAULT_SELL_KNOBS,
     classify_loser,
     inventory_latch,
     loser_ladder_limits,
@@ -168,6 +169,9 @@ class PersistReadyTests(unittest.TestCase):
 
 
 class WinnerCashoutTests(unittest.TestCase):
+    def test_default_winner_min_matches_099_book_top(self):
+        self.assertAlmostEqual(DEFAULT_SELL_KNOBS["sell_winner_min"], 0.99)
+
     def test_winner_at_999(self):
         self.assertEqual(
             winner_cashout_leg(up_bid=0.999, dn_bid=0.001, winner_min=0.999),
@@ -175,6 +179,16 @@ class WinnerCashoutTests(unittest.TestCase):
         )
         self.assertIsNone(
             winner_cashout_leg(up_bid=0.90, dn_bid=0.10, winner_min=0.999),
+        )
+
+    def test_winner_arms_at_99_when_min_is_99_not_999(self):
+        """Polymarket 15m books top at 0.99; 0.999 never prints."""
+        self.assertEqual(
+            winner_cashout_leg(up_bid=0.01, dn_bid=0.99, winner_min=0.99),
+            "dn",
+        )
+        self.assertIsNone(
+            winner_cashout_leg(up_bid=0.01, dn_bid=0.99, winner_min=0.999),
         )
 
     def test_both_at_999_is_skipped(self):

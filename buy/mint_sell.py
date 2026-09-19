@@ -3,7 +3,7 @@
 Loser dump: arm when a sized loser bid is at/under ``sell_threshold`` (~3¢)
 and the opposite sized bid is at/over ``sell_opposite_min`` (~90¢). Persist
 that book for ``sell_persist_s`` (~5s), then FAK 3¢ → 2¢. Keep the winner
-for redeem unless its sized bid reaches ``sell_winner_min`` (~99.9¢).
+for redeem unless its sized bid reaches ``sell_winner_min`` (~99¢).
 """
 
 from __future__ import annotations
@@ -18,7 +18,7 @@ DEFAULT_SELL_KNOBS = {
     "sell_opposite_min": 0.90,
     "sell_persist_s": 5.0,
     "sell_cooldown_s": 3.0,
-    "sell_winner_min": 0.999,
+    "sell_winner_min": 0.99,
     "sell_min_bid_size": 1.0,
 }
 

@@ -27,6 +27,6 @@
   "sell_opposite_min": 0.90,
   "sell_persist_s": 5.0,
   "sell_cooldown_s": 3.0,
-  "sell_winner_min": 0.999,
+  "sell_winner_min": 0.99,
   "sell_min_bid_size": 1.0
 }

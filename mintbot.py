@@ -7,7 +7,7 @@ and open within enter_max_ttm_min, if collateral is available.
 
 Optional sell (``sell_enabled``, default off): persist a loser dump at ~3¢
 for ~5s while the opposite bid is ≥ ~90¢, then FAK 3¢ → 2¢. Keep the
-winner for redeem unless its bid reaches ~99.9¢. Off unless live
+winner for redeem unless its bid reaches ~99¢. Off unless live
 ``strategy_mint.json`` turns it on.
 
 Usage:
@@ -86,7 +86,7 @@ DEFAULTS = {
     "sell_opposite_min": 0.90,
     "sell_persist_s": 5.0,
     "sell_cooldown_s": 3.0,
-    "sell_winner_min": 0.999,
+    "sell_winner_min": 0.99,
     "sell_min_bid_size": 1.0,
     "rpc_url": "https://polygon.drpc.org",
     "gamma_url": "https://gamma-api.polymarket.com",
@@ -720,7 +720,7 @@ def _run_fak_ladder(
 
 
 def manage_sells(cfg: dict, state: dict, chain: ChainReader) -> None:
-    """Loser persist dump at 3¢→2¢; optional winner cash-out at ~99.9¢."""
+    """Loser persist dump at 3¢→2¢; optional winner cash-out at ~99¢."""
     if not cfg.get("sell_enabled"):
         return
     now = time.time()
@@ -729,7 +729,7 @@ def manage_sells(cfg: dict, state: dict, chain: ChainReader) -> None:
     opp_min = float(cfg.get("sell_opposite_min") or 0.90)
     persist_s = float(cfg.get("sell_persist_s") or 0.0)
     cooldown = float(cfg.get("sell_cooldown_s") or 3.0)
-    winner_min = float(cfg.get("sell_winner_min") or 0.999)
+    winner_min = float(cfg.get("sell_winner_min") or 0.99)
     min_bid_size = float(cfg.get("sell_min_bid_size") or 1.0)
     tol = float(cfg.get("position_tolerance") or 0.01)
     dry_run = bool(cfg.get("dry_run"))
@@ -809,7 +809,7 @@ def manage_sells(cfg: dict, state: dict, chain: ChainReader) -> None:
             else:
                 intent["last_sell_attempt_at"] = now
                 sold_total, last_status, last_px = _run_fak_ladder(
-                    w_tok, size, [round(winner_min, 4)],
+                    w_tok, size, [round(float(bids[winner] or winner_min), 4)],
                     dry_run=dry_run,
                     bid=float(bids[winner] or winner_min),
                     label=f"win {winner}",
