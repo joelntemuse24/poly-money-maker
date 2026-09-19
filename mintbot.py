@@ -335,7 +335,8 @@ def already_minted(state: dict, condition_id: str, cfg: dict) -> bool:
     intent = state.get("intents", {}).get(condition_id)
     if not intent:
         return False
-    return intent.get("status") in ACTIVE_STATUSES | {"completed"}
+    # "failed" counts as attempted — do not hot-loop remint the same window.
+    return intent.get("status") in ACTIVE_STATUSES | {"completed", "failed"}
 
 
 def get_relayer_headers(body: dict) -> Optional[dict]:

@@ -218,6 +218,31 @@ class MintSlotChainTests(unittest.TestCase):
         )
         self.assertGreaterEqual(cycle.count('"start_ts": pick.start_ts'), 2)
 
+    def test_already_minted_treats_failed_as_attempted(self):
+        fn = _fn("already_minted", {"ACTIVE_STATUSES": _ACTIVE})
+        cfg = {"one_entry_per_market": True}
+        cid = "btc-updown-15m-1789798500"
+        state = {"intents": {cid: {"status": "failed", "condition_id": cid}}}
+        self.assertTrue(fn(state, cid, cfg))
+        self.assertTrue(
+            fn(
+                {"intents": {cid: {"status": "completed"}}},
+                cid,
+                cfg,
+            )
+        )
+        self.assertTrue(
+            fn(
+                {"intents": {cid: {"status": "confirmed"}}},
+                cid,
+                cfg,
+            )
+        )
+        self.assertFalse(fn({"intents": {}}, cid, cfg))
+        self.assertFalse(
+            fn(state, cid, {"one_entry_per_market": False}),
+        )
+
 
 class DeployUnitsTests(unittest.TestCase):
     def test_live_units_are_mint_and_pathlog(self):
