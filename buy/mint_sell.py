@@ -31,6 +31,8 @@ DEFAULT_SELL_KNOBS = {
     "sell_winner_min": 0.999,
     "sell_winner_cheap_if_loser_le": 0.03,
     "sell_winner_min_cheap": 0.99,
+    "sell_clob_max_price": 0.99,
+    "sell_clob_min_price": 0.01,
     "sell_dump_enabled": True,
     "sell_dump_below": 0.80,
     "sell_dump_persist_s": 5.0,
@@ -222,6 +224,31 @@ def winner_cheap_decision(
     if round(loser + cheap, 4) <= 1.0:
         return base, False, "flat_or_negative_edge"
     return min(base, cheap), True, "positive_edge"
+
+
+def winner_sell_limit(
+    live_bid: float,
+    *,
+    clob_max: float = 0.99,
+    clob_min: float = 0.01,
+) -> Tuple[float, bool, str]:
+    """Clamp live-bid winner FAK to a valid CLOB price.
+
+    Resting books may quote 0.995–0.999; posting those limits is rejected
+    (``invalid price (...), min: 0.01 - max: 0.99``). A sell FAK at
+    ``clob_max`` still fills those richer bids.
+
+    Returns ``(posted, clamped, reason)``. ``reason`` is ``clob_max`` or
+    ``clob_min`` when the live bid is outside the CLOB range, else ``""``.
+    """
+    live = round(float(live_bid), 4)
+    lo = round(float(clob_min), 4)
+    hi = round(float(clob_max), 4)
+    if live > hi + 1e-12:
+        return hi, True, "clob_max"
+    if live + 1e-12 < lo:
+        return lo, True, "clob_min"
+    return live, False, ""
 
 
 def empty_fak_status(status: Any) -> bool:

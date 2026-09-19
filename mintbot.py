@@ -58,6 +58,7 @@ from buy.mint_sell import (
     sell_window_open,
     winner_cashout_leg,
     winner_cheap_decision,
+    winner_sell_limit,
 )
 
 load_dotenv()
@@ -100,6 +101,9 @@ DEFAULTS = {
     # Cheap 0.99 winner only if loser ≤ this AND loser+cheap_min > 1.0 (else redeem).
     "sell_winner_cheap_if_loser_le": 0.03,
     "sell_winner_min_cheap": 0.99,
+    # Winner FAK live bid is clamped into this CLOB range (rich 0.995–0.999 books).
+    "sell_clob_max_price": 0.99,
+    "sell_clob_min_price": 0.01,
     # After loser sold: if held leg stays under this for sell_dump_persist_s, live-bid FAK dump.
     "sell_dump_enabled": True,
     "sell_dump_below": 0.80,
@@ -898,6 +902,8 @@ def manage_sells(cfg: dict, state: dict, chain: ChainReader) -> None:
     last_min_window_s = float(cfg.get("sell_persist_last_min_window_s", 60.0))
     cooldown = float(cfg.get("sell_cooldown_s") or 3.0)
     winner_min = float(cfg.get("sell_winner_min") or 0.999)
+    clob_max = float(cfg.get("sell_clob_max_price") or 0.99)
+    clob_min = float(cfg.get("sell_clob_min_price") or 0.01)
     min_bid_size = float(cfg.get("sell_min_bid_size") or 1.0)
     tol = float(cfg.get("position_tolerance") or 0.01)
     dry_run = bool(cfg.get("dry_run"))
@@ -1017,12 +1023,25 @@ def manage_sells(cfg: dict, state: dict, chain: ChainReader) -> None:
                 intent["sell_winner_note"] = "already_flat"
             else:
                 intent["last_sell_attempt_at"] = now
-                # Once effective_winner_min is met, take the live sized bid (not a stale 0.999 limit).
+                # Live sized bid once allowed, clamped to CLOB max (0.99) so
+                # rich 0.995–0.999 books still fill instead of invalid-price.
                 live_px = float(bids[winner] or effective_winner_min)
+                posted, clamped, clamp_why = winner_sell_limit(
+                    live_px, clob_max=clob_max, clob_min=clob_min
+                )
+                if clamped and live_px > posted + 1e-12:
+                    log_event(
+                        "sell_winner_limit_clamped",
+                        condition_id=cid,
+                        slug=intent.get("slug"),
+                        live=live_px,
+                        posted=posted,
+                        reason=clamp_why or "clob_max",
+                    )
                 sold_total, last_status, last_px = _run_fak_ladder(
                     w_tok,
                     size,
-                    [round(live_px, 4)],
+                    [posted],
                     dry_run=dry_run,
                     bid=live_px,
                     label=f"win {winner}",

@@ -37,8 +37,11 @@ Loser dump: sized opposite bid ≥ `sell_opposite_min` (~0.90), loser ≤
 `sell_persist_last_min_window_s` (~60s), then FAK
 threshold → `sell_floor` (0.02) when the live sized bid is ≥ floor, or
 at the live bid if it is below the floor (empty FAK keeps the arm).
-Winner cash-out is a separate path at `sell_winner_min` (~0.999). Do not
-import `mintbot.py` in tests.
+Winner cash-out is a separate path at `sell_winner_min` (~0.999).
+Live-bid FAK the winner, then clamp `limit = min(live_sized_bid,
+sell_clob_max_price=0.99)` (floor `sell_clob_min_price=0.01`) so rich
+0.995–0.999 books fill; log `sell_winner_limit_clamped` when live >
+posted. Do not import `mintbot.py` in tests.
 
 `pathlog.py` records public CLOB books for **btc-up-or-down-15m** only.
 Keep `deploy/polypathlog.service`. Do not start `pathlog_hourly_dense.py`

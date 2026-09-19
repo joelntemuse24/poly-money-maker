@@ -443,8 +443,10 @@ class DeployUnitsTests(unittest.TestCase):
         self.assertIn("loser_persist_ready", src)
         self.assertIn("winner_cashout_leg", src)
         self.assertIn("winner_cheap_decision", src)
+        self.assertIn("winner_sell_limit", src)
         self.assertIn("sell_winner_cheap_denied", src)
         self.assertIn("sell_winner_cheap_allowed", src)
+        self.assertIn("sell_winner_limit_clamped", src)
         self.assertIn("last_status=intent.get(\"sell_last_status\")", src)
         self.assertIn("effective_loser_persist_s", src)
         self.assertIn("sell_window_open", src)
@@ -459,6 +461,7 @@ class DeployUnitsTests(unittest.TestCase):
         self.assertIn("def empty_fak_status", mint_sell_src)
         self.assertIn("def loser_persist_ready", mint_sell_src)
         self.assertIn("def effective_loser_persist_s", mint_sell_src)
+        self.assertIn("def winner_sell_limit", mint_sell_src)
         manage = src[src.find("def manage_sells") : src.find("\ndef run_cycle")]
         self.assertIn("persist_s=loser_persist_s", manage)
         self.assertIn("persist_s=dump_persist_s", manage)

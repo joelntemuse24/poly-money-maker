@@ -334,7 +334,7 @@ Default `sell_winner_min=0.999`. Unconditional 0.99 cash-out was rejected: it cu
 
 **Cheap-loser gate:** if `sold_loser` and recorded loser price ≤ `sell_winner_cheap_if_loser_le` (0.03) **and** `loser_fill + sell_winner_min_cheap > 1.0`, then `effective_winner_min = min(0.999, sell_winner_min_cheap=0.99)`. Flat 1¢+99¢ stays at 0.999 and waits for redeem.
 
-When the sized winner bid meets `effective_winner_min` for `sell_persist_s`, **live-bid FAK** the winner (limit = current sized bid). Mark `sold_winner`.
+When the sized winner bid meets `effective_winner_min` for `sell_persist_s`, **live-bid FAK** the winner, then clamp `limit = min(live_sized_bid, sell_clob_max_price=0.99)` (and floor `sell_clob_min_price=0.01`). A 0.99 sell FAK still fills resting 0.995–0.999 bids. Log `sell_winner_limit_clamped` when live > posted (`reason=clob_max`). Mark `sold_winner`.
 
 If the book never reaches 0.999 and the cheap gate is closed, the bot holds for redeem after expiry (sells stop at `end_ts`).
 
@@ -363,10 +363,10 @@ Action: live-bid FAK the held token; on success set `sold_dump=true` and `sold_w
 | Path | Limit choice | Why |
 |---|---|---|
 | Loser | Ladder 0.03 → 0.02, or live bid if below floor | Walk down to floor when the book is there; take a sub-floor scrap rather than miss `sold_loser` |
-| Winner (allowed) | Current sized bid | Book often tops at 0.99; posting 0.999 is rejected |
+| Winner (allowed) | `min(live sized bid, 0.99)` | Resting books quote 0.995–0.999; posting those limits is rejected (`max: 0.99`). A 0.99 FAK still fills the rich book. |
 | Held dump | Current sized bid | Same rejection class; dump fires precisely when bid is *weak* |
 
-Observed failure mode before the fix: winner armed at bid 0.99 but FAK posted 0.999 → `invalid price … max: 0.99`.
+Observed failure modes: (1) winner armed at bid 0.99 but FAK posted 0.999 → `invalid price … max: 0.99`. (2) bag `btc-updown-15m-1789810200`: cheap gate open, Down sized 0.995–0.999, live-bid FAK without clamp → 12× same rejection, winner never sold.
 
 <a id="section-21"></a>
 ## Hypothetical lifecycle: $5 mint, loser @2¢, redeem winner
@@ -421,6 +421,7 @@ Observed failure mode before the fix: winner armed at bid 0.99 but FAK posted 0.
 - `loser_persist_ready` — persist_ready plus empty-FAK keep/re-arm.
 - `winner_cashout_leg` — unique leg whose sized bid ≥ winner_min.
 - `winner_cheap_decision` — 0.99 only if sold_loser, loser ≤ gate, and loser+cheap > $1.
+- `winner_sell_limit` — clamp live-bid FAK into CLOB [0.01, 0.99]; 0.99 still fills 0.995–0.999 books.
 - `loser_ladder_limits` — [threshold, floor] when bid ≥ floor; live bid when below floor.
 
 Defaults mirror mintbot sell knobs including dump keys.
@@ -495,7 +496,7 @@ Do not import `mintbot.py` in unit tests (credentials, lock, clients). Test `buy
 
 1. **Failed remint storm** — `failed` stays in `already_minted` during cooldown and after `mint_max_attempts`.
 2. **Skipping the next window** — without adjacent lookahead, `max_open_sets=1` + “never mint open markets” skips a quarter-hour.
-3. **Winner at 0.999 on a 0.99 book** — use live-bid FAK once allowed.
+3. **Winner at 0.999 on a 0.99 book** — live-bid FAK once allowed, then clamp to CLOB max 0.99 (do not POST 0.995–0.999).
 4. **Dump without `sold_leg`** — held leg cannot be inferred; loser path must set `sold_leg`.
 5. **Sells stop at `end_ts`** — no dump/cash-out after expiry in `manage_sells`; redeem is the remaining path.
 6. **Importing mintbot in tests** — can take the flock or load `.env`.
@@ -565,7 +566,7 @@ every poll_s seconds:
 | Precondition | Persist | Action | Flags set |
 |---|---|---|---|
 | Loser sized bid ≤ 0.03 AND opposite ≥ 0.90 AND not both cheap | 5s | FAK ladder 0.03→0.02, or live bid if below floor | `sold_loser`, `sold_leg` |
-| Winner sized bid ≥ effective_winner_min (0.999, or 0.99 if loser ≤0.03 *and* loser+0.99 > $1) | 5s | Live-bid FAK winner | `sold_winner` |
+| Winner sized bid ≥ effective_winner_min (0.999, or 0.99 if loser ≤0.03 *and* loser+0.99 > $1) | 5s | Live-bid FAK winner, clamped to CLOB max 0.99 | `sold_winner` |
 | `sold_loser` AND held sized bid < 0.80 | 5s | Live-bid FAK held | `sold_dump`, `sold_winner` |
 | `now > end_ts` | — | No CLOB sells | (redeem outside this loop) |
 | Within `sell_cooldown_s` of last attempt | — | Skip fire | — |
