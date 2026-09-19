@@ -7,7 +7,8 @@ and open within enter_max_ttm_min, if collateral is available.
 
 Optional sell (``sell_enabled``, default off): persist a loser dump at ~3¢
 for ~5s while the opposite bid is ≥ ~90¢, then FAK 3¢ → 2¢. Keep the
-winner for redeem unless its bid reaches ~99¢. Off unless live
+winner for redeem unless its bid reaches ~99.9¢ (0.99 only after a
+≤3¢ loser dump). Off unless live
 ``strategy_mint.json`` turns it on.
 
 Usage:
@@ -46,6 +47,7 @@ from buy.contracts import ContractCall, build_atomic_mint_calls
 from buy.market import MarketGateway, MintMarket
 from buy.mint_sell import (
     classify_loser,
+    effective_winner_min,
     inventory_latch,
     loser_ladder_limits,
     parse_sell_fill_shares,
@@ -86,7 +88,7 @@ DEFAULTS = {
     "sell_opposite_min": 0.90,
     "sell_persist_s": 5.0,
     "sell_cooldown_s": 3.0,
-    "sell_winner_min": 0.99,
+    "sell_winner_min": 0.999,
     "sell_min_bid_size": 1.0,
     "rpc_url": "https://polygon.drpc.org",
     "gamma_url": "https://gamma-api.polymarket.com",
@@ -720,7 +722,7 @@ def _run_fak_ladder(
 
 
 def manage_sells(cfg: dict, state: dict, chain: ChainReader) -> None:
-    """Loser persist dump at 3¢→2¢; optional winner cash-out at ~99¢."""
+    """Loser persist dump at 3¢→2¢; winner cash-out at ~99.9¢ (0.99 after ≤3¢ loser)."""
     if not cfg.get("sell_enabled"):
         return
     now = time.time()
@@ -729,7 +731,7 @@ def manage_sells(cfg: dict, state: dict, chain: ChainReader) -> None:
     opp_min = float(cfg.get("sell_opposite_min") or 0.90)
     persist_s = float(cfg.get("sell_persist_s") or 0.0)
     cooldown = float(cfg.get("sell_cooldown_s") or 3.0)
-    winner_min = float(cfg.get("sell_winner_min") or 0.99)
+    redeem_winner_min = float(cfg.get("sell_winner_min") or 0.999)
     min_bid_size = float(cfg.get("sell_min_bid_size") or 1.0)
     tol = float(cfg.get("position_tolerance") or 0.01)
     dry_run = bool(cfg.get("dry_run"))
@@ -772,6 +774,12 @@ def manage_sells(cfg: dict, state: dict, chain: ChainReader) -> None:
         sold_loser = bool(intent.get("sold_loser") or intent.get("sold_leg"))
         sold_winner = bool(intent.get("sold_winner"))
 
+        winner_min = effective_winner_min(
+            redeem_winner_min,
+            sold_loser=sold_loser,
+            loser_sold_px=intent.get("sell_limit"),
+            cheap_loser_max=thr,
+        )
         winner = winner_cashout_leg(up_bid, dn_bid, winner_min)
         fire_w, armed_w, why_w = persist_ready(
             winner is not None and not sold_winner,

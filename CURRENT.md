@@ -27,15 +27,15 @@ operational decision.
 - Loser dump knobs (used only after Joel flips `sell_enabled` on the VM):
   arm at `sell_threshold` 0.03 while opposite ≥ `sell_opposite_min` 0.90,
   persist `sell_persist_s` 5s, then FAK to `sell_floor` 0.02. Winner
-  cash-out at `sell_winner_min` 0.99 (15m books top at 99¢, not
-  99.9¢); FAK uses the live sized bid. Sized bids need
+  stays for redeem at `sell_winner_min` 0.999. After a loser dump at
+  ≤ 3¢, winner FAK may use the live sized bid ≥ 0.99. Sized bids need
   `sell_min_bid_size` 1.0. Live `strategy_mint.json` still has
   `sell_opposite_min` 0.5 until Joel raises it.
 
 To enable sells on the VM (after this code is pulled, operator-only):
 set `sell_enabled=true` in gitignored `strategy_mint.json`, set
 `sell_opposite_min` to 0.90 (live is still 0.5), keep persist 5s /
-threshold 0.03 / floor 0.02 / `sell_winner_min` 0.99, then restart
+threshold 0.03 / floor 0.02 / `sell_winner_min` 0.999, then restart
 **only** `polymintbot` when the operator asks. Leave `sell_enabled=false`
 in the committed example.
 

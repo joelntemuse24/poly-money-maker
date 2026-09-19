@@ -3,13 +3,19 @@
 Loser dump: arm when a sized loser bid is at/under ``sell_threshold`` (~3¢)
 and the opposite sized bid is at/over ``sell_opposite_min`` (~90¢). Persist
 that book for ``sell_persist_s`` (~5s), then FAK 3¢ → 2¢. Keep the winner
-for redeem unless its sized bid reaches ``sell_winner_min`` (~99¢).
+for redeem unless its sized bid reaches ``sell_winner_min`` (~99.9¢). A
+0.99 book-top cash-out is allowed only after a loser dump at ≤ 3¢.
 """
 
 from __future__ import annotations
 
 import math
 from typing import Any, Optional, Sequence, Tuple
+
+# 15m books often top at 0.99. That print is not the default cash-out;
+# it is only allowed after a cheap loser dump has locked ~$1 margin.
+WINNER_REDEEM_MIN = 0.999
+WINNER_AFTER_CHEAP_LOSER_MIN = 0.99
 
 DEFAULT_SELL_KNOBS = {
     "sell_enabled": False,
@@ -18,7 +24,7 @@ DEFAULT_SELL_KNOBS = {
     "sell_opposite_min": 0.90,
     "sell_persist_s": 5.0,
     "sell_cooldown_s": 3.0,
-    "sell_winner_min": 0.99,
+    "sell_winner_min": WINNER_REDEEM_MIN,
     "sell_min_bid_size": 1.0,
 }
 
@@ -127,6 +133,34 @@ def persist_ready(
     if float(now_s) + 1e-12 < float(armed_ts) + persist:
         return False, float(armed_ts), "waiting"
     return True, float(armed_ts), "ready"
+
+
+def effective_winner_min(
+    winner_min: float,
+    *,
+    sold_loser: bool,
+    loser_sold_px: Optional[float],
+    cheap_loser_max: float,
+    cheap_winner_min: float = WINNER_AFTER_CHEAP_LOSER_MIN,
+) -> float:
+    """Winner arm price: redeem (~99.9¢) unless a cheap loser dump locked margin.
+
+    Selling the winner at 0.99 after a 2¢ loser dump cuts the mint edge
+    roughly in half vs redeeming at $1. That 0.99 path is allowed only
+    when the loser already sold at ≤ ``cheap_loser_max`` (~3¢). A leftover
+    ``sell_winner_min=0.99`` knob cannot skip this gate.
+    """
+    redeem_min = max(float(winner_min), float(WINNER_REDEEM_MIN))
+    cheap_min = float(cheap_winner_min)
+    if not sold_loser or loser_sold_px is None or loser_sold_px == "":
+        return redeem_min
+    try:
+        px = float(loser_sold_px)
+    except (TypeError, ValueError):
+        return redeem_min
+    if not math.isfinite(px) or px > float(cheap_loser_max) + 1e-12:
+        return redeem_min
+    return min(redeem_min, cheap_min)
 
 
 def winner_cashout_leg(

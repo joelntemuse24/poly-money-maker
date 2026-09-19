@@ -75,7 +75,7 @@ class MintDefaultsTests(unittest.TestCase):
             self.assertEqual(blob["sell_floor"], 0.02, label)
             self.assertAlmostEqual(blob["sell_opposite_min"], 0.90, msg=label)
             self.assertEqual(blob["sell_persist_s"], 5.0, label)
-            self.assertAlmostEqual(blob["sell_winner_min"], 0.99, msg=label)
+            self.assertAlmostEqual(blob["sell_winner_min"], 0.999, msg=label)
             self.assertEqual(blob["sell_min_bid_size"], 1.0, label)
 
     def test_open_intent_count_ignores_expired_redeem_holds(self):
@@ -152,13 +152,14 @@ class DeployUnitsTests(unittest.TestCase):
         self.assertIn("best_bid_with_min_size", src)
         self.assertIn("persist_ready", src)
         self.assertIn("winner_cashout_leg", src)
+        self.assertIn("effective_winner_min", src)
         self.assertNotIn(
             'for key in ("takingAmount", "makingAmount"',
             src,
         )
         self.assertNotIn("if bal + 1e-9 < tol:", src)
-        # Winner FAK must sit on the live sized bid, not a knob that can
-        # print above the book (15m tops at 0.99, not 0.999).
+        # Winner FAK sits on the live sized bid so a 0.99 book can fill
+        # after a cheap loser dump; never hard-code round(winner_min).
         self.assertIn("[round(float(bids[winner] or winner_min), 4)]", src)
         self.assertNotIn("[round(winner_min, 4)]", src)
 

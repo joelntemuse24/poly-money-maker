@@ -8,6 +8,7 @@ from buy.book import best_bid_with_min_size
 from buy.mint_sell import (
     DEFAULT_SELL_KNOBS,
     classify_loser,
+    effective_winner_min,
     inventory_latch,
     loser_ladder_limits,
     parse_sell_fill_shares,
@@ -169,8 +170,8 @@ class PersistReadyTests(unittest.TestCase):
 
 
 class WinnerCashoutTests(unittest.TestCase):
-    def test_default_winner_min_matches_099_book_top(self):
-        self.assertAlmostEqual(DEFAULT_SELL_KNOBS["sell_winner_min"], 0.99)
+    def test_default_winner_min_stays_999_for_redeem(self):
+        self.assertAlmostEqual(DEFAULT_SELL_KNOBS["sell_winner_min"], 0.999)
 
     def test_winner_at_999(self):
         self.assertEqual(
@@ -181,7 +182,7 @@ class WinnerCashoutTests(unittest.TestCase):
             winner_cashout_leg(up_bid=0.90, dn_bid=0.10, winner_min=0.999),
         )
 
-    def test_winner_arms_at_99_when_min_is_99_not_999(self):
+    def test_raw_helper_arms_at_99_only_when_min_is_99(self):
         """Polymarket 15m books top at 0.99; 0.999 never prints."""
         self.assertEqual(
             winner_cashout_leg(up_bid=0.01, dn_bid=0.99, winner_min=0.99),
@@ -194,6 +195,54 @@ class WinnerCashoutTests(unittest.TestCase):
     def test_both_at_999_is_skipped(self):
         self.assertIsNone(
             winner_cashout_leg(up_bid=0.999, dn_bid=0.999, winner_min=0.999),
+        )
+
+    def _effective(self, **kwargs):
+        defaults = dict(
+            winner_min=0.999,
+            sold_loser=False,
+            loser_sold_px=None,
+            cheap_loser_max=0.03,
+        )
+        defaults.update(kwargs)
+        return effective_winner_min(**defaults)
+
+    def test_cheap_loser_dump_allows_99_cashout(self):
+        for loser_px in (0.02, 0.03):
+            thr = self._effective(sold_loser=True, loser_sold_px=loser_px)
+            self.assertAlmostEqual(thr, 0.99, msg=str(loser_px))
+            self.assertEqual(
+                winner_cashout_leg(up_bid=0.01, dn_bid=0.99, winner_min=thr),
+                "dn",
+                msg=str(loser_px),
+            )
+
+    def test_no_loser_sale_keeps_999(self):
+        thr = self._effective(sold_loser=False, loser_sold_px=None)
+        self.assertAlmostEqual(thr, 0.999)
+        self.assertIsNone(
+            winner_cashout_leg(up_bid=0.01, dn_bid=0.99, winner_min=thr),
+        )
+
+    def test_loser_sold_above_3c_keeps_999(self):
+        thr = self._effective(sold_loser=True, loser_sold_px=0.04)
+        self.assertAlmostEqual(thr, 0.999)
+        self.assertIsNone(
+            winner_cashout_leg(up_bid=0.01, dn_bid=0.99, winner_min=thr),
+        )
+
+    def test_sold_loser_without_px_does_not_cheap_cashout(self):
+        thr = self._effective(sold_loser=True, loser_sold_px=None)
+        self.assertAlmostEqual(thr, 0.999)
+
+    def test_config_99_without_cheap_loser_still_requires_999(self):
+        """Leftover sell_winner_min=0.99 must not skip the cheap-loser gate."""
+        thr = self._effective(
+            winner_min=0.99, sold_loser=False, loser_sold_px=None,
+        )
+        self.assertAlmostEqual(thr, 0.999)
+        self.assertIsNone(
+            winner_cashout_leg(up_bid=0.01, dn_bid=0.99, winner_min=thr),
         )
 
 
