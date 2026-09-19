@@ -5,8 +5,10 @@ No CLOB buys. No hedges. Discovers **btc-up-or-down-15m** only, mints
 `shares` for markets that are **not yet open** (start_ts in the future)
 and open within enter_max_ttm_min, if collateral is available.
 
-Optional loser-leg FAK ladder (sell_enabled; 3c then 2c) keeps the winner
-for redeem. Off unless strategy_mint.json turns it on.
+Optional sell (``sell_enabled``, default off): persist a loser dump at ~3¢
+for ~5s while the opposite bid is ≥ ~90¢, then FAK 3¢ → 2¢. Keep the
+winner for redeem unless its bid reaches ~99.9¢. Off unless live
+``strategy_mint.json`` turns it on.
 
 Usage:
   # dry-run (default when strategy_mint.json has dry_run true / entry_enabled false)
@@ -28,7 +30,7 @@ import time
 from datetime import datetime, timezone
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import requests
 from dotenv import load_dotenv
@@ -38,9 +40,18 @@ from rich.align import Align
 from rich.console import Console
 from rich.panel import Panel
 
+from buy.book import best_bid_with_min_size
 from buy.chain import ChainReader
 from buy.contracts import ContractCall, build_atomic_mint_calls
 from buy.market import MarketGateway, MintMarket
+from buy.mint_sell import (
+    classify_loser,
+    inventory_latch,
+    loser_ladder_limits,
+    parse_sell_fill_shares,
+    persist_ready,
+    winner_cashout_leg,
+)
 
 load_dotenv()
 
@@ -72,8 +83,11 @@ DEFAULTS = {
     "sell_enabled": False,
     "sell_threshold": 0.03,
     "sell_floor": 0.02,
-    "sell_opposite_min": 0.50,
+    "sell_opposite_min": 0.90,
+    "sell_persist_s": 5.0,
     "sell_cooldown_s": 3.0,
+    "sell_winner_min": 0.999,
+    "sell_min_bid_size": 1.0,
     "rpc_url": "https://polygon.drpc.org",
     "gamma_url": "https://gamma-api.polymarket.com",
     "data_api_url": "https://data-api.polymarket.com",
@@ -207,6 +221,19 @@ def validate_strategy(cfg: dict) -> None:
         raise ValueError("max_daily_notional must cover one mint")
     if float(cfg["poll_s"]) < 2:
         raise ValueError("poll_s must be >= 2")
+    floor = float(cfg.get("sell_floor") or 0)
+    threshold = float(cfg.get("sell_threshold") or 0)
+    opposite = float(cfg.get("sell_opposite_min") or 0)
+    winner = float(cfg.get("sell_winner_min") or 0)
+    if not (0 < floor <= threshold < opposite < winner < 1):
+        raise ValueError(
+            "sell_floor <= sell_threshold < sell_opposite_min < "
+            "sell_winner_min must hold in (0, 1)"
+        )
+    if float(cfg.get("sell_persist_s") or 0) < 0:
+        raise ValueError("sell_persist_s must be >= 0")
+    if float(cfg.get("sell_min_bid_size") or 0) < 0:
+        raise ValueError("sell_min_bid_size must be >= 0")
 
 
 def today_key(now: float) -> str:
@@ -501,7 +528,7 @@ _clob_client = None
 _clob_init_error = None
 
 
-def _best_bid(token_id: str):
+def _fetch_sized_bid(token_id: str, min_size: float):
     try:
         response = requests.get(
             "https://clob.polymarket.com/book",
@@ -509,21 +536,13 @@ def _best_bid(token_id: str):
             timeout=5,
         )
         if response.status_code != 200:
-            return None
+            return None, 0.0
         payload = response.json()
         book = payload if isinstance(payload, dict) else {}
-        best = None
-        for level in book.get("bids") or []:
-            try:
-                px = float(level["price"] if isinstance(level, dict) else level[0])
-            except (TypeError, ValueError, KeyError, IndexError):
-                continue
-            if best is None or px > best:
-                best = px
-        return best
+        return best_bid_with_min_size(book.get("bids") or [], min_size=min_size)
     except Exception as exc:
         log_event("book_fetch_fail", token_id=str(token_id)[:18], error=str(exc)[:160])
-        return None
+        return None, 0.0
 
 
 def _get_clob_client():
@@ -626,19 +645,7 @@ def _fak_sell(token_id: str, size: float, price: float, dry_run: bool):
         status = "posted"
         if isinstance(result, dict):
             status = str(result.get("status") or "posted")
-            for key in ("takingAmount", "makingAmount", "size_matched", "matched"):
-                raw = result.get(key)
-                if raw is None:
-                    continue
-                try:
-                    val = float(raw)
-                    if val > size * 10:
-                        val = val / 1_000_000.0
-                    if 0 < val <= size * 1.01:
-                        sold = val
-                        break
-                except (TypeError, ValueError):
-                    continue
+            sold = parse_sell_fill_shares(result, size)
         log_event(
             "sell_fak_result",
             token_id=str(token_id),
@@ -654,17 +661,78 @@ def _fak_sell(token_id: str, size: float, price: float, dry_run: bool):
         return 0.0, f"error:{str(exc)[:80]}"
 
 
+def _sell_inventory(
+    chain: ChainReader,
+    ctf: str,
+    funder_cs: Optional[str],
+    token_id: str,
+    shares: float,
+    tol: float,
+    seen_key: str,
+    intent: dict,
+) -> Tuple[float, str]:
+    size = float(shares)
+    if not (funder_cs and ctf):
+        return size, "unknown"
+    try:
+        bal = chain.position_balance(ctf, funder_cs, token_id)
+    except Exception as exc:
+        log_event("sell_balance_fail", error=str(exc)[:160])
+        return size, "unknown"
+    latch = inventory_latch(
+        bal, tol=tol, seen_inventory=bool(intent.get(seen_key))
+    )
+    if latch == "has_inventory":
+        intent[seen_key] = True
+        return min(size, float(bal)), latch
+    return size, latch
+
+
+def _run_fak_ladder(
+    token_id: str,
+    size: float,
+    limits: Sequence[float],
+    *,
+    dry_run: bool,
+    bid: float,
+    label: str,
+    slug: Any,
+    tol: float,
+) -> Tuple[float, str, Optional[float]]:
+    sold_total = 0.0
+    last_status = "none"
+    last_px: Optional[float] = None
+    for use_px in limits:
+        remaining = size - sold_total
+        if remaining < 0.01:
+            break
+        console.print(
+            f"  [bold bright_yellow][SELL {label.upper()}][/] {slug}  "
+            f"bid={bid:.3f}  limit>={use_px:.3f}  size={remaining:.2f}"
+        )
+        sold, last_status = _fak_sell(token_id, remaining, use_px, dry_run=dry_run)
+        sold_total += float(sold or 0)
+        last_px = float(use_px)
+        if dry_run or sold_total >= size - tol:
+            break
+        time.sleep(0.35)
+    return sold_total, last_status, last_px
+
+
 def manage_sells(cfg: dict, state: dict, chain: ChainReader) -> None:
-    """Sell cheap leg at sell_threshold then sell_floor; never both legs."""
+    """Loser persist dump at 3¢→2¢; optional winner cash-out at ~99.9¢."""
     if not cfg.get("sell_enabled"):
         return
     now = time.time()
     thr = float(cfg.get("sell_threshold") or 0.03)
     floor = float(cfg.get("sell_floor") or 0.02)
-    opp_min = float(cfg.get("sell_opposite_min") or 0.50)
+    opp_min = float(cfg.get("sell_opposite_min") or 0.90)
+    persist_s = float(cfg.get("sell_persist_s") or 0.0)
     cooldown = float(cfg.get("sell_cooldown_s") or 3.0)
-    ladder = sorted({round(thr, 4), round(floor, 4)}, reverse=True)
+    winner_min = float(cfg.get("sell_winner_min") or 0.999)
+    min_bid_size = float(cfg.get("sell_min_bid_size") or 1.0)
     tol = float(cfg.get("position_tolerance") or 0.01)
+    dry_run = bool(cfg.get("dry_run"))
     funder = os.getenv("FUNDER_ADDRESS") or ""
     funder_cs = to_checksum_address(funder) if funder else None
     dirty = False
@@ -678,13 +746,8 @@ def manage_sells(cfg: dict, state: dict, chain: ChainReader) -> None:
             "executed",
         ):
             continue
-        if intent.get("sold_leg"):
-            continue
         end_ts = float(intent.get("end_ts") or 0)
         if end_ts and now > end_ts:
-            continue
-        last = float(intent.get("last_sell_attempt_at") or 0)
-        if last and now - last < cooldown:
             continue
 
         up_tok = str(intent.get("up_token") or "")
@@ -692,15 +755,102 @@ def manage_sells(cfg: dict, state: dict, chain: ChainReader) -> None:
         if not up_tok or not dn_tok:
             continue
 
-        up_bid = _best_bid(up_tok)
-        dn_bid = _best_bid(dn_tok)
+        up_bid, up_sz = _fetch_sized_bid(up_tok, min_bid_size)
+        dn_bid, dn_sz = _fetch_sized_bid(dn_tok, min_bid_size)
         intent["last_up_bid"] = up_bid
         intent["last_dn_bid"] = dn_bid
+        intent["last_up_bid_size"] = up_sz
+        intent["last_dn_bid_size"] = dn_sz
         intent["updated_at"] = now
+        dirty = True
 
-        up_cheap = up_bid is not None and up_bid <= thr
-        dn_cheap = dn_bid is not None and dn_bid <= thr
-        if up_cheap and dn_cheap:
+        last = float(intent.get("last_sell_attempt_at") or 0)
+        cooling = bool(last and now - last < cooldown)
+        tokens = {"up": up_tok, "dn": dn_tok}
+        bids = {"up": up_bid, "dn": dn_bid}
+        shares = float(intent.get("shares") or cfg["shares"])
+        sold_loser = bool(intent.get("sold_loser") or intent.get("sold_leg"))
+        sold_winner = bool(intent.get("sold_winner"))
+
+        winner = winner_cashout_leg(up_bid, dn_bid, winner_min)
+        fire_w, armed_w, why_w = persist_ready(
+            winner is not None and not sold_winner,
+            now_s=now,
+            armed_ts=intent.get("sell_winner_armed_at"),
+            persist_s=persist_s,
+        )
+        intent["sell_winner_armed_at"] = armed_w
+        if winner and why_w in {"armed", "waiting"}:
+            log_event(
+                "sell_winner_persist",
+                condition_id=cid,
+                slug=intent.get("slug"),
+                leg=winner,
+                why=why_w,
+                bid=bids.get(winner),
+            )
+
+        if fire_w and winner and not cooling:
+            w_tok = tokens[winner]
+            size, latch = _sell_inventory(
+                chain, ctf, funder_cs, w_tok, shares, tol,
+                "seen_winner_inventory", intent,
+            )
+            if latch == "await_inventory":
+                log_event(
+                    "sell_skip_await_inventory",
+                    condition_id=cid,
+                    leg=winner,
+                    path="winner",
+                )
+            elif latch == "already_flat":
+                intent["sold_winner"] = True
+                intent["sell_winner_note"] = "already_flat"
+            else:
+                intent["last_sell_attempt_at"] = now
+                sold_total, last_status, last_px = _run_fak_ladder(
+                    w_tok, size, [round(winner_min, 4)],
+                    dry_run=dry_run,
+                    bid=float(bids[winner] or winner_min),
+                    label=f"win {winner}",
+                    slug=intent.get("slug"),
+                    tol=tol,
+                )
+                intent["sell_winner_attempts"] = int(
+                    intent.get("sell_winner_attempts") or 0
+                ) + 1
+                intent["sell_winner_last_status"] = last_status
+                if dry_run or sold_total >= size - tol:
+                    intent["sold_winner"] = True
+                    intent["sell_winner_filled"] = float(
+                        intent.get("sell_winner_filled") or 0
+                    ) + sold_total
+                    intent["sell_winner_limit"] = last_px
+                    if dry_run:
+                        intent["sell_winner_dry"] = True
+                    log_event(
+                        "sell_winner_done",
+                        condition_id=cid,
+                        slug=intent.get("slug"),
+                        leg=winner,
+                        sold=sold_total,
+                        bid=bids[winner],
+                        status=last_status,
+                    )
+                    notify(
+                        "Mint winner sold",
+                        f"{intent.get('slug')}\n{winner} x{sold_total:.1f} @>={winner_min:.3f}",
+                        priority="default",
+                    )
+                elif sold_total >= tol:
+                    intent["sell_winner_filled"] = float(
+                        intent.get("sell_winner_filled") or 0
+                    ) + sold_total
+
+        loser, loser_reason = classify_loser(
+            up_bid, dn_bid, threshold=thr, opposite_min=opp_min,
+        )
+        if loser_reason == "both_cheap":
             log_event(
                 "sell_skip_both_cheap",
                 condition_id=cid,
@@ -708,101 +858,93 @@ def manage_sells(cfg: dict, state: dict, chain: ChainReader) -> None:
                 dn_bid=dn_bid,
                 slug=intent.get("slug"),
             )
-            dirty = True
-            continue
-        if not up_cheap and not dn_cheap:
-            continue
-
-        if up_cheap:
-            if dn_bid is None or dn_bid < opp_min:
-                log_event(
-                    "sell_skip_wick_unconfirmed",
-                    condition_id=cid,
-                    loser="up",
-                    up_bid=up_bid,
-                    dn_bid=dn_bid,
-                )
-                dirty = True
-                continue
-            loser, loser_tok, loser_bid = "up", up_tok, float(up_bid)
-        else:
-            if up_bid is None or up_bid < opp_min:
-                log_event(
-                    "sell_skip_wick_unconfirmed",
-                    condition_id=cid,
-                    loser="dn",
-                    up_bid=up_bid,
-                    dn_bid=dn_bid,
-                )
-                dirty = True
-                continue
-            loser, loser_tok, loser_bid = "dn", dn_tok, float(dn_bid)
-
-        size = float(intent.get("shares") or cfg["shares"])
-        if funder_cs and ctf:
-            try:
-                bal = chain.position_balance(ctf, funder_cs, loser_tok)
-                if bal + 1e-9 < tol:
-                    intent["sold_leg"] = loser
-                    intent["sell_note"] = "already_flat"
-                    dirty = True
-                    continue
-                size = min(size, float(bal))
-            except Exception as exc:
-                log_event("sell_balance_fail", error=str(exc)[:160])
-
-        intent["last_sell_attempt_at"] = now
-        dirty = True
-        sold_total = 0.0
-        last_status = "none"
-        for limit in ladder:
-            if loser_bid + 1e-12 < limit and limit > floor + 1e-12:
-                continue
-            use_px = max(floor, min(limit, loser_bid))
-            remaining = size - sold_total
-            if remaining < 0.01:
-                break
-            console.print(
-                f"  [bold bright_yellow][SELL {loser.upper()}][/] {intent.get('slug')}  "
-                f"bid={loser_bid:.3f}  limit>={use_px:.3f}  size={remaining:.2f}"
-            )
-            sold, last_status = _fak_sell(
-                loser_tok, remaining, use_px, dry_run=bool(cfg.get("dry_run"))
-            )
-            sold_total += float(sold or 0)
-            if cfg.get("dry_run"):
-                intent["sold_leg"] = loser
-                intent["sell_dry"] = True
-                intent["sell_limit"] = use_px
-                break
-            if sold_total >= size - tol:
-                break
-            time.sleep(0.35)
-
-        intent["sell_attempts"] = int(intent.get("sell_attempts") or 0) + 1
-        intent["sell_last_status"] = last_status
-        if sold_total >= tol or cfg.get("dry_run"):
-            intent["sold_leg"] = loser
-            intent["sell_filled"] = float(intent.get("sell_filled") or 0) + sold_total
-            intent["sell_limit"] = ladder[-1]
+        elif loser_reason == "wick_unconfirmed":
             log_event(
-                "sell_loser_done",
+                "sell_skip_wick_unconfirmed",
+                condition_id=cid,
+                up_bid=up_bid,
+                dn_bid=dn_bid,
+                slug=intent.get("slug"),
+            )
+
+        fire_l, armed_l, why_l = persist_ready(
+            loser is not None and not sold_loser,
+            now_s=now,
+            armed_ts=intent.get("sell_loser_armed_at"),
+            persist_s=persist_s,
+        )
+        intent["sell_loser_armed_at"] = armed_l
+        if loser and why_l in {"armed", "waiting"}:
+            log_event(
+                "sell_loser_persist",
                 condition_id=cid,
                 slug=intent.get("slug"),
                 leg=loser,
-                sold=sold_total,
-                bid=loser_bid,
-                status=last_status,
+                why=why_l,
+                bid=bids.get(loser),
             )
-            notify(
-                "Mint loser sold",
-                f"{intent.get('slug')}\n{loser} x{sold_total:.1f} @<={thr:.2f}/{floor:.2f}",
-                priority="default",
+
+        if fire_l and loser and not cooling:
+            l_tok = tokens[loser]
+            loser_bid = float(bids[loser] or thr)
+            size, latch = _sell_inventory(
+                chain, ctf, funder_cs, l_tok, shares, tol,
+                "seen_loser_inventory", intent,
             )
-            console.print(
-                f"  [bold bright_green][SELL OK][/] {loser} {sold_total:.2f}  "
-                f"kept opposite for redeem"
-            )
+            if latch == "await_inventory":
+                log_event(
+                    "sell_skip_await_inventory",
+                    condition_id=cid,
+                    leg=loser,
+                    path="loser",
+                )
+            elif latch == "already_flat":
+                intent["sold_leg"] = loser
+                intent["sold_loser"] = True
+                intent["sell_note"] = "already_flat"
+            else:
+                limits = loser_ladder_limits(thr, floor, loser_bid)
+                intent["last_sell_attempt_at"] = now
+                sold_total, last_status, last_px = _run_fak_ladder(
+                    l_tok, size, limits,
+                    dry_run=dry_run,
+                    bid=loser_bid,
+                    label=loser,
+                    slug=intent.get("slug"),
+                    tol=tol,
+                )
+                intent["sell_attempts"] = int(intent.get("sell_attempts") or 0) + 1
+                intent["sell_last_status"] = last_status
+                done = dry_run or sold_total >= size - tol
+                if sold_total >= tol or dry_run:
+                    intent["sell_filled"] = float(
+                        intent.get("sell_filled") or 0
+                    ) + sold_total
+                    intent["sell_limit"] = last_px
+                if done:
+                    intent["sold_leg"] = loser
+                    intent["sold_loser"] = True
+                    if dry_run:
+                        intent["sell_dry"] = True
+                    log_event(
+                        "sell_loser_done",
+                        condition_id=cid,
+                        slug=intent.get("slug"),
+                        leg=loser,
+                        sold=sold_total,
+                        bid=loser_bid,
+                        status=last_status,
+                    )
+                    notify(
+                        "Mint loser sold",
+                        f"{intent.get('slug')}\n{loser} x{sold_total:.1f} "
+                        f"@<={thr:.2f}/{floor:.2f}",
+                        priority="default",
+                    )
+                    console.print(
+                        f"  [bold bright_green][SELL OK][/] {loser} {sold_total:.2f}  "
+                        f"kept opposite for redeem"
+                    )
 
     if dirty:
         atomic_save(STATE_FILE, state)

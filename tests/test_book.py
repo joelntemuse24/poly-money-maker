@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import unittest
 
-from buy.book import best_from_levels
+from buy.book import best_bid_with_min_size, best_from_levels
 
 
 class BestFromLevelsTests(unittest.TestCase):
@@ -45,5 +45,28 @@ class BestFromLevelsTests(unittest.TestCase):
         self.assertEqual(size, 1.25)
 
 
+class BestBidWithMinSizeTests(unittest.TestCase):
+    def test_requires_displayed_size(self):
+        price, size = best_bid_with_min_size(
+            [
+                {"price": "0.03", "size": "0.2"},
+                {"price": "0.028", "size": "8"},
+            ],
+            min_size=1.0,
+        )
+        self.assertEqual(price, 0.028)
+        self.assertEqual(size, 8.0)
+
+    def test_none_when_all_thin(self):
+        self.assertEqual(
+            best_bid_with_min_size(
+                [{"price": 0.99, "size": 0.1}],
+                min_size=1.0,
+            ),
+            (None, 0.0),
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
+

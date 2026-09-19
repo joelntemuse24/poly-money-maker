@@ -30,8 +30,11 @@ work.
 `mintbot.py` is the live entry point. It mints complete sets on
 **btc-up-or-down-15m** only (`strategy_mint.example.json` mirrors the
 template: dry_run=true, entry_enabled=false, sell_enabled=false). Optional
-loser-leg FAK (3c then 2c) is off until live `strategy_mint.json` enables
-it. Do not import `mintbot.py` in tests.
+sell stays off until live `strategy_mint.json` sets `sell_enabled=true`.
+Loser dump: sized opposite bid ≥ `sell_opposite_min` (~0.90), loser ≤
+`sell_threshold` (0.03) persists `sell_persist_s` (~5s), then FAK
+threshold → `sell_floor` (0.02). Winner cash-out is a separate path at
+`sell_winner_min` (~0.999). Do not import `mintbot.py` in tests.
 
 `pathlog.py` records public CLOB books for **btc-up-or-down-15m** only.
 Keep `deploy/polypathlog.service`. Do not start `pathlog_hourly_dense.py`
@@ -39,7 +42,8 @@ or add 5m/hourly back to `SERIES`.
 
 Shared `buy/` helpers exist only for mint and pathlog:
 
-- `buy/book.py` — CLOB top-of-book parsing (`pathlog`)
+- `buy/book.py` — CLOB top-of-book parsing (`pathlog`, mint sized bids)
+- `buy/mint_sell.py` — sell fill parse, inventory latch, arm/persist
 - `buy/market.py` — Gamma/CLOB discovery (`mintbot`, `pathlog`)
 - `buy/chain.py` — Polygon eth_call prechecks (`mintbot`)
 - `buy/contracts.py` — atomic mint calldata (`mintbot`)

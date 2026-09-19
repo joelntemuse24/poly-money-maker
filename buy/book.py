@@ -50,3 +50,37 @@ def best_from_levels(levels: Any, side: str) -> Tuple[Optional[float], float]:
         return min(valid, key=lambda level: level[0])
     except Exception:
         return None, 0.0
+
+
+def best_bid_with_min_size(
+    levels: Any, min_size: float = 0.0
+) -> Tuple[Optional[float], float]:
+    """Highest bid whose displayed size is at least ``min_size``.
+
+    Zero-size and dust levels are skipped so a 1-lot 3¢ print cannot mask a
+    real 2.9¢ book. Empty/unusable book → ``(None, 0.0)``.
+    """
+    need = float(min_size or 0.0)
+    if not levels:
+        return None, 0.0
+    try:
+        valid = []
+        for level in levels:
+            if not isinstance(level, dict):
+                continue
+            price = finite_float(level.get("price"))
+            size = finite_float(level.get("size"))
+            if (
+                price is None
+                or size is None
+                or not 0 < price < 1
+                or size <= 0
+                or size + 1e-12 < need
+            ):
+                continue
+            valid.append((price, size))
+        if not valid:
+            return None, 0.0
+        return max(valid, key=lambda level: level[0])
+    except Exception:
+        return None, 0.0

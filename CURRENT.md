@@ -23,7 +23,20 @@ operational decision.
 - Shares: 50
 - Enter when the window opens within 16 minutes and is not yet open
 - `max_open_sets`: 1 (expired redeem holds do not consume this cap)
-- Optional loser sell ladder 3c → 2c, opposite bid ≥ 50c — off in the example
+- Optional sell is **off** in the example (`sell_enabled=false`)
+- Loser dump knobs (used only after Joel flips `sell_enabled` on the VM):
+  arm at `sell_threshold` 0.03 while opposite ≥ `sell_opposite_min` 0.90,
+  persist `sell_persist_s` 5s, then FAK to `sell_floor` 0.02. Winner
+  cash-out at `sell_winner_min` 0.999. Sized bids need
+  `sell_min_bid_size` 1.0. Live `strategy_mint.json` still has
+  `sell_opposite_min` 0.5 until Joel raises it.
+
+To enable sells on the VM (after this code is pulled, operator-only):
+set `sell_enabled=true` in gitignored `strategy_mint.json`, set
+`sell_opposite_min` to 0.90 (live is still 0.5), keep persist 5s /
+threshold 0.03 / floor 0.02 / `sell_winner_min` 0.999, then restart
+**only** `polymintbot` when the operator asks. Leave `sell_enabled=false`
+in the committed example.
 
 Live knobs are in gitignored `strategy_mint.json` on the VM.
 
