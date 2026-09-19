@@ -14,6 +14,7 @@ from buy.mint_sell import (
     parse_sell_fill_shares,
     persist_ready,
     winner_cashout_leg,
+    winner_cheap_decision,
 )
 
 
@@ -183,6 +184,52 @@ class WinnerCashoutTests(unittest.TestCase):
         self.assertIsNone(
             winner_cashout_leg(up_bid=0.999, dn_bid=0.999, winner_min=0.999),
         )
+
+
+class WinnerCheapDecisionTests(unittest.TestCase):
+    """Incident: 1¢ loser + 99¢ winner is flat vs mint; prefer redeem."""
+
+    _KNOBS = dict(winner_min=0.999, cheap_gate=0.03, cheap_min=0.99)
+
+    def test_loser_1c_plus_cheap_99c_does_not_enable_cheap(self):
+        effective, cheap, reason = winner_cheap_decision(
+            sold_loser=True, loser_fill=0.01, **self._KNOBS
+        )
+        self.assertEqual(effective, 0.999)
+        self.assertFalse(cheap)
+        self.assertEqual(reason, "flat_or_negative_edge")
+        # CLOB max is 0.99; holding 0.999 means the winner cannot fill.
+        self.assertIsNone(
+            winner_cashout_leg(up_bid=0.01, dn_bid=0.99, winner_min=effective)
+        )
+
+    def test_loser_2c_plus_cheap_99c_enables_cheap(self):
+        effective, cheap, reason = winner_cheap_decision(
+            sold_loser=True, loser_fill=0.02, **self._KNOBS
+        )
+        self.assertEqual(effective, 0.99)
+        self.assertTrue(cheap)
+        self.assertEqual(reason, "positive_edge")
+        self.assertEqual(
+            winner_cashout_leg(up_bid=0.02, dn_bid=0.99, winner_min=effective),
+            "dn",
+        )
+
+    def test_loser_3c_plus_cheap_99c_enables_cheap(self):
+        effective, cheap, reason = winner_cheap_decision(
+            sold_loser=True, loser_fill=0.03, **self._KNOBS
+        )
+        self.assertEqual(effective, 0.99)
+        self.assertTrue(cheap)
+        self.assertEqual(reason, "positive_edge")
+
+    def test_without_sold_loser_no_cheap(self):
+        effective, cheap, reason = winner_cheap_decision(
+            sold_loser=False, loser_fill=0.02, **self._KNOBS
+        )
+        self.assertEqual(effective, 0.999)
+        self.assertFalse(cheap)
+        self.assertEqual(reason, "no_sold_loser")
 
 
 class LoserLadderTests(unittest.TestCase):

@@ -53,6 +53,7 @@ from buy.mint_sell import (
     parse_sell_fill_shares,
     persist_ready,
     winner_cashout_leg,
+    winner_cheap_decision,
 )
 
 load_dotenv()
@@ -88,7 +89,7 @@ DEFAULTS = {
     "sell_persist_s": 5.0,
     "sell_cooldown_s": 3.0,
     "sell_winner_min": 0.999,
-    # If loser filled at/under this, allow winner cash-out at sell_winner_min_cheap (0.99).
+    # Cheap 0.99 winner only if loser ≤ this AND loser+cheap_min > 1.0 (else redeem).
     "sell_winner_cheap_if_loser_le": 0.03,
     "sell_winner_min_cheap": 0.99,
     # After loser sold: if held leg stays under this for sell_dump_persist_s, live-bid FAK dump.
@@ -780,8 +781,8 @@ def manage_sells(cfg: dict, state: dict, chain: ChainReader) -> None:
         sold_loser = bool(intent.get("sold_loser") or intent.get("sold_leg"))
         sold_winner = bool(intent.get("sold_winner"))
 
-        # Prefer redeem at ~$1. Only allow 0.99 cash-out if loser already sold ≤3¢
-        # (locks enough margin that giving up the last cent is OK).
+        # Prefer redeem at ~$1. Cheap 0.99 only if loser sold ≤ cheap_gate AND
+        # loser_fill + cheap_min > 1.0 (beats mint). Flat 1¢+99¢ waits for redeem.
         loser_px = intent.get("sell_limit")
         try:
             loser_px_f = float(loser_px) if loser_px is not None else None
@@ -789,13 +790,35 @@ def manage_sells(cfg: dict, state: dict, chain: ChainReader) -> None:
             loser_px_f = None
         cheap_gate = float(cfg.get("sell_winner_cheap_if_loser_le") or 0.03)
         cheap_min = float(cfg.get("sell_winner_min_cheap") or 0.99)
-        effective_winner_min = float(winner_min)
-        if (
-            sold_loser
-            and loser_px_f is not None
-            and loser_px_f <= cheap_gate + 1e-12
-        ):
-            effective_winner_min = min(float(winner_min), cheap_min)
+        effective_winner_min, cheap_on, cheap_why = winner_cheap_decision(
+            sold_loser,
+            loser_px_f,
+            winner_min=winner_min,
+            cheap_gate=cheap_gate,
+            cheap_min=cheap_min,
+        )
+        prev_cheap_why = intent.get("sell_winner_cheap_reason")
+        if cheap_why != prev_cheap_why and cheap_why in {
+            "flat_or_negative_edge",
+            "positive_edge",
+        }:
+            combined = (
+                None
+                if loser_px_f is None
+                else round(float(loser_px_f) + float(cheap_min), 4)
+            )
+            log_event(
+                "sell_winner_cheap_allowed" if cheap_on else "sell_winner_cheap_denied",
+                condition_id=cid,
+                slug=intent.get("slug"),
+                loser_px=loser_px_f,
+                cheap_min=cheap_min,
+                cheap_gate=cheap_gate,
+                combined=combined,
+                reason=cheap_why,
+                effective_winner_min=effective_winner_min,
+            )
+        intent["sell_winner_cheap_reason"] = cheap_why
 
         winner = winner_cashout_leg(up_bid, dn_bid, effective_winner_min)
         fire_w, armed_w, why_w = persist_ready(
