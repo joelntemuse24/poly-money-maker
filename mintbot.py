@@ -73,7 +73,9 @@ DEFAULTS = {
     "dry_run": True,
     "shares": 50.0,
     "enter_min_ttm_min": 0.0,
-    "enter_max_ttm_min": 16.0,
+    "enter_max_ttm_min": 30.0,
+    "mint_fail_cooldown_s": 90.0,
+    "mint_max_attempts": 3,
     "series_slugs": [
         "btc-up-or-down-15m",
     ],
@@ -213,6 +215,10 @@ def validate_strategy(cfg: dict) -> None:
         raise ValueError("enter_min_ttm_min must be >= 0")
     if float(cfg["enter_max_ttm_min"]) <= float(cfg["enter_min_ttm_min"]):
         raise ValueError("enter_max_ttm_min must be > enter_min_ttm_min")
+    if float(cfg.get("mint_fail_cooldown_s") or 0) < 0:
+        raise ValueError("mint_fail_cooldown_s must be >= 0")
+    if int(cfg.get("mint_max_attempts") or 0) < 1:
+        raise ValueError("mint_max_attempts must be >= 1")
     if not cfg["series_slugs"]:
         raise ValueError("series_slugs must not be empty")
     if int(cfg["max_open_sets"]) < 1:
@@ -309,14 +315,92 @@ def mint_slots_full(state: dict, cfg: dict, now: float, candidate_start_ts: floa
         return False
     return True
 
-def already_minted(state: dict, condition_id: str, cfg: dict) -> bool:
+def already_minted(
+    state: dict,
+    condition_id: str,
+    cfg: dict,
+    now: float | None = None,
+) -> bool:
+    """True if this market must not be minted again this cycle.
+
+    Confirmed / completed / in-flight intents stay blocked. A ``failed``
+    intent is also blocked during ``mint_fail_cooldown_s`` and after
+    ``mint_max_attempts`` tries, then becomes eligible for remint.
+    """
     if not cfg.get("one_entry_per_market", True):
         return False
     intent = state.get("intents", {}).get(condition_id)
     if not intent:
         return False
-    # "failed" counts as attempted — do not hot-loop remint the same window.
-    return intent.get("status") in ACTIVE_STATUSES | {"completed", "failed"}
+    status = intent.get("status")
+    if status in ACTIVE_STATUSES | {"completed"}:
+        return True
+    if status != "failed":
+        return False
+    try:
+        max_attempts = int(cfg.get("mint_max_attempts") or 3)
+    except (TypeError, ValueError):
+        max_attempts = 3
+    try:
+        attempts = int(intent.get("mint_attempts") or 1)
+    except (TypeError, ValueError):
+        attempts = 1
+    if attempts < 1:
+        attempts = 1
+    if attempts >= max_attempts:
+        return True
+    try:
+        cooldown = float(cfg.get("mint_fail_cooldown_s") or 90.0)
+    except (TypeError, ValueError):
+        cooldown = 90.0
+    now_ts = time.time() if now is None else float(now)
+    try:
+        last_fail = float(intent.get("last_fail_ts") or intent.get("updated_at") or 0)
+    except (TypeError, ValueError):
+        last_fail = 0.0
+    if last_fail and now_ts < last_fail + cooldown:
+        return True
+    return False
+
+
+def relayer_error_detail(record: dict) -> tuple[str, str]:
+    """Pull errorMsg and a tx hash from a relayer status payload."""
+    if not isinstance(record, dict):
+        return "", ""
+    msg = record.get("errorMsg")
+    if msg is None or str(msg).strip() == "":
+        msg = record.get("error") or record.get("message") or ""
+    tx_hash = (
+        record.get("transactionHash")
+        or record.get("txHash")
+        or record.get("hash")
+        or record.get("transaction_hash")
+        or ""
+    )
+    return str(msg)[:400], (str(tx_hash) if tx_hash else "")
+
+
+def mark_intent_failed(
+    intent: dict,
+    now: float,
+    error_msg: str = "",
+    transaction_hash: str = "",
+) -> None:
+    """Persist a failed mint: status, last_fail_ts, errorMsg, optional hash."""
+    intent["status"] = "failed"
+    intent["updated_at"] = now
+    intent["last_fail_ts"] = now
+    if error_msg:
+        intent["errorMsg"] = str(error_msg)[:400]
+        intent["error"] = str(error_msg)[:400]
+    if transaction_hash:
+        intent["transaction_hash"] = str(transaction_hash)
+    try:
+        attempts = int(intent.get("mint_attempts") or 0)
+    except (TypeError, ValueError):
+        attempts = 0
+    if attempts < 1:
+        intent["mint_attempts"] = 1
 
 def get_relayer_headers(body: dict) -> Optional[dict]:
     relayer_key = os.getenv("RELAYER_API_KEY")
@@ -478,8 +562,21 @@ def reconcile_intents(
                 intent["relayer_state"] = relayer_state
                 intent["updated_at"] = now
                 if relayer_state in ("STATE_FAILED", "STATE_INVALID"):
-                    intent["status"] = "failed"
-                    log_event("mint_failed", condition_id=cid, state=relayer_state, slug=intent.get("slug"))
+                    error_msg, tx_hash = relayer_error_detail(record)
+                    mark_intent_failed(
+                        intent,
+                        now,
+                        error_msg=error_msg,
+                        transaction_hash=tx_hash,
+                    )
+                    log_event(
+                        "mint_failed",
+                        condition_id=cid,
+                        state=relayer_state,
+                        slug=intent.get("slug"),
+                        errorMsg=intent.get("errorMsg"),
+                        transaction_hash=intent.get("transaction_hash"),
+                    )
                 elif relayer_state == "STATE_CONFIRMED":
                     intent["status"] = "confirmed_waiting_inventory"
                 elif relayer_state == "STATE_MINED":
@@ -1164,7 +1261,7 @@ def run_cycle(
     tol = float(cfg["position_tolerance"])
     pick: Optional[MintMarket] = None
     for market in candidates:
-        if already_minted(state, market.condition_id, cfg):
+        if already_minted(state, market.condition_id, cfg, now):
             continue
         if float(data_positions.get(market.up_token, 0)) > tol:
             continue
@@ -1262,8 +1359,13 @@ def run_cycle(
         condition_id=pick.condition_id,
         shares=shares,
     )
+    prev = state.get("intents", {}).get(pick.condition_id) or {}
+    try:
+        prev_attempts = int(prev.get("mint_attempts") or 0)
+    except (TypeError, ValueError):
+        prev_attempts = 0
     intent = {
-        "created_at": now,
+        "created_at": float(prev.get("created_at") or now),
         "updated_at": now,
         "submitted_at": 0.0,
         "status": "submitting",
@@ -1280,6 +1382,9 @@ def run_cycle(
         "before_dn": before_dn,
         "transaction_id": None,
         "dry_run": False,
+        "mint_attempts": prev_attempts + 1,
+        "last_fail_ts": prev.get("last_fail_ts"),
+        "errorMsg": prev.get("errorMsg"),
     }
     state.setdefault("intents", {})[pick.condition_id] = intent
     atomic_save(STATE_FILE, state)
@@ -1302,17 +1407,22 @@ def run_cycle(
         opens_in_min=round(mts, 2),
         start_ts=pick.start_ts,
         balance=balance,
+        mint_attempts=intent.get("mint_attempts"),
     )
 
     tx_id, err = submit_mint_batch(calls, metadata=f"mintbot:split:{pick.condition_id}:{int(now)}")
     intent = state["intents"][pick.condition_id]
     intent["updated_at"] = time.time()
     if not tx_id:
-        intent["status"] = "failed"
-        intent["error"] = err
+        mark_intent_failed(intent, time.time(), error_msg=str(err or ""))
         atomic_save(STATE_FILE, state)
         console.print(f"  [dim red][MINT FAIL][/] {err}")
-        log_event("mint_submit_fail", condition_id=pick.condition_id, error=err)
+        log_event(
+            "mint_submit_fail",
+            condition_id=pick.condition_id,
+            error=err,
+            errorMsg=intent.get("errorMsg"),
+        )
         notify("Mint submit failed", f"{pick.slug}\n{err}", priority="high")
         write_heartbeat("submit_fail")
         return "submit_fail"
