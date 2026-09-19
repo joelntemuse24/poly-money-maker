@@ -5,8 +5,9 @@ and the opposite sized bid is at/over ``sell_opposite_min`` (~90¢). Persist
 that book for ``sell_persist_s`` (~9s), or ``sell_persist_last_min_s`` (~5s)
 when time-to-end is within ``sell_persist_last_min_window_s`` (~60s), then
 FAK 3¢ → 2¢ when the live sized bid is at/over the floor; if the live bid
-is below the floor, FAK at that live bid. Empty FAK keeps or re-arms the
-persist latch. Keep the winner for redeem unless its sized bid reaches
+is below the floor, FAK at that live bid. Empty FAK, or a vanished loser
+book after arm, keeps ``armed_ts`` (do not fire until a sized bid at/under
+threshold returns). Keep the winner for redeem unless its sized bid reaches
 ``sell_winner_min`` (~99¢).
 
 After the loser is sold, optional held-leg dump: if the remaining leg's sized
@@ -256,6 +257,52 @@ def empty_fak_status(status: Any) -> bool:
     return "no orders found" in str(status or "").lower()
 
 
+def loser_empty_keep_qualify(
+    *,
+    armed_ts: Optional[float],
+    up_bid: Optional[float],
+    dn_bid: Optional[float],
+    opposite_min: float,
+    prev_leg: Optional[str] = None,
+    sold_loser: bool = False,
+) -> Tuple[bool, Optional[str]]:
+    """Whether an existing loser arm should survive a missing loser book.
+
+    Keep when already armed and the loser leg's sized bid is ``None``, as long
+    as the opposite is still ≥ ``opposite_min`` *or* the opposite book is also
+    empty (active arm, late book vanished). Full reset when the opposite is
+    visibly below min, the loser bid is visible, never armed, or already sold.
+    Returns ``(keep, loser_leg)``.
+    """
+    if armed_ts is None or sold_loser:
+        return False, None
+    bids = {"up": up_bid, "dn": dn_bid}
+    leg: Optional[str] = prev_leg if prev_leg in ("up", "dn") else None
+    if leg is None:
+        if up_bid is None and dn_bid is None:
+            return True, None
+        if (
+            up_bid is None
+            and dn_bid is not None
+            and float(dn_bid) + 1e-12 >= float(opposite_min)
+        ):
+            return True, "up"
+        if (
+            dn_bid is None
+            and up_bid is not None
+            and float(up_bid) + 1e-12 >= float(opposite_min)
+        ):
+            return True, "dn"
+        return False, None
+    loser_bid = bids[leg]
+    opp_bid = bids["dn" if leg == "up" else "up"]
+    if loser_bid is not None:
+        return False, leg
+    if opp_bid is not None and float(opp_bid) + 1e-12 < float(opposite_min):
+        return False, leg
+    return True, leg
+
+
 def loser_persist_ready(
     qualify: bool,
     *,
@@ -265,15 +312,19 @@ def loser_persist_ready(
     last_status: Optional[str] = None,
     book_empty: bool = False,
 ) -> Tuple[bool, Optional[float], str]:
-    """Like persist_ready; empty FAK must not drop the loser arm forever."""
+    """Like persist_ready; empty loser book / empty FAK must not drop the arm."""
     fire, armed, why = persist_ready(
         qualify, now_s=now_s, armed_ts=armed_ts, persist_s=persist_s
     )
-    if why != "reset" or not book_empty or not empty_fak_status(last_status):
+    if why != "reset" or not book_empty:
         return fire, armed, why
     if armed_ts is not None:
-        return False, float(armed_ts), "empty_fak_keep_arm"
-    return False, float(now_s), "empty_fak_rearm"
+        if empty_fak_status(last_status):
+            return False, float(armed_ts), "empty_fak_keep_arm"
+        return False, float(armed_ts), "empty_keep_arm"
+    if empty_fak_status(last_status):
+        return False, float(now_s), "empty_fak_rearm"
+    return fire, armed, why
 
 
 def loser_ladder_limits(

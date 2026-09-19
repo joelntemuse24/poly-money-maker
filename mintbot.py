@@ -50,7 +50,9 @@ from buy.market import MarketGateway, MintMarket
 from buy.mint_sell import (
     classify_loser,
     effective_loser_persist_s,
+    empty_fak_status,
     inventory_latch,
+    loser_empty_keep_qualify,
     loser_ladder_limits,
     loser_persist_ready,
     parse_sell_fill_shares,
@@ -1217,6 +1219,9 @@ def manage_sells(cfg: dict, state: dict, chain: ChainReader) -> None:
             )
         intent["sell_persist_effective_s"] = loser_persist_s
 
+        prev_leg = intent.get("sell_loser_leg")
+        if prev_leg not in ("up", "dn"):
+            prev_leg = None
         loser, loser_reason = classify_loser(
             up_bid, dn_bid, threshold=thr, opposite_min=opp_min,
         )
@@ -1237,15 +1242,35 @@ def manage_sells(cfg: dict, state: dict, chain: ChainReader) -> None:
                 slug=intent.get("slug"),
             )
 
+        keep_empty, keep_leg = loser_empty_keep_qualify(
+            armed_ts=intent.get("sell_loser_armed_at"),
+            up_bid=up_bid,
+            dn_bid=dn_bid,
+            opposite_min=opp_min,
+            prev_leg=prev_leg or loser,
+            sold_loser=sold_loser,
+        )
+        # Rearm only when the latch is already gone; do not treat an empty
+        # *opposite* book as keep (that is wick_unconfirmed / reset).
+        fak_rearm = (
+            intent.get("sell_loser_armed_at") is None
+            and empty_fak_status(intent.get("sell_last_status"))
+            and (up_bid is None or dn_bid is None)
+        )
         fire_l, armed_l, why_l = loser_persist_ready(
             loser is not None and not sold_loser,
             now_s=now,
             armed_ts=intent.get("sell_loser_armed_at"),
             persist_s=loser_persist_s,
             last_status=intent.get("sell_last_status"),
-            book_empty=up_bid is None or dn_bid is None,
+            book_empty=keep_empty or fak_rearm,
         )
         intent["sell_loser_armed_at"] = armed_l
+        if why_l == "reset":
+            intent["sell_loser_leg"] = None
+        else:
+            intent["sell_loser_leg"] = loser or keep_leg or prev_leg
+        persist_leg = loser or intent.get("sell_loser_leg")
         if loser and why_l in {"ready", "immediate"}:
             loser_bid = float(bids[loser] or thr)
             preview = loser_ladder_limits(thr, floor, loser_bid)
@@ -1270,14 +1295,14 @@ def manage_sells(cfg: dict, state: dict, chain: ChainReader) -> None:
                 why=why_l,
                 bid=bids.get(loser),
             )
-        elif why_l in {"empty_fak_keep_arm", "empty_fak_rearm"}:
+        elif why_l in {"empty_fak_keep_arm", "empty_fak_rearm", "empty_keep_arm"}:
             log_event(
                 "sell_loser_persist",
                 condition_id=cid,
                 slug=intent.get("slug"),
-                leg=loser,
+                leg=persist_leg,
                 why=why_l,
-                bid=bids.get(loser) if loser else None,
+                bid=bids.get(persist_leg) if persist_leg in bids else None,
             )
 
         if fire_l and loser and not cooling:

@@ -36,7 +36,9 @@ Loser dump: sized opposite bid ≥ `sell_opposite_min` (~0.90), loser ≤
 `sell_persist_last_min_s` (~5s) when time-to-end is within
 `sell_persist_last_min_window_s` (~60s), then FAK
 threshold → `sell_floor` (0.02) when the live sized bid is ≥ floor, or
-at the live bid if it is below the floor (empty FAK keeps the arm).
+at the live bid if it is below the floor (empty FAK or a vanished loser
+book after arm keeps `armed_ts`; do not fire until a sized bid ≤ threshold
+returns).
 Winner cash-out is a separate path at `sell_winner_min` (~0.999).
 Live-bid FAK the winner, then clamp `limit = min(live_sized_bid,
 sell_clob_max_price=0.99)` (floor `sell_clob_min_price=0.01`) so rich

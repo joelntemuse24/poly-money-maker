@@ -323,7 +323,7 @@ Policy (`classify_loser` / equivalent):
 - Sized opposite bid ≥ `sell_opposite_min` (0.90)
 - Not both cheap (ambiguous)
 - Persist that condition for `sell_persist_s` (9s) via `persist_ready`. In the last `sell_persist_last_min_window_s` (60s) before `end_ts`, use `sell_persist_last_min_s` (5s) instead. Effective persist is re-evaluated each tick; an arm started on the 9s clock is not reset when the last minute begins, and becomes ready once elapsed ≥ 5s.
-- Then FAK ladder: threshold → floor (3¢ → 2¢), sized to inventory latch. If the live sized loser bid is below `sell_floor`, FAK at that live bid; empty FAK keeps or re-arms the persist latch so a later tick can retry before `end_ts`.
+- Then FAK ladder: threshold → floor (3¢ → 2¢), sized to inventory latch. If the live sized loser bid is below `sell_floor`, FAK at that live bid. Empty FAK **or a vanished loser book after arm** keeps `armed_ts` (do not fire until a sized bid ≤ threshold returns); persist resets only if the visible bid goes back above threshold, opposite is below min, both cheap, or never armed.
 
 On full fill: set `sold_loser=true`, `sold_leg="up"|"dn"`, store `sell_limit` (fill/limit evidence). Inventory latch distinguishes “await mint settlement” zeros from true flat.
 
@@ -418,7 +418,8 @@ Observed failure modes: (1) winner armed at bid 0.99 but FAK posted 0.999 → `i
 - `persist_ready` — arm → waiting → ready over `persist_s` (resets when qualify drops).
 - `effective_loser_persist_s` — 9s normally, 5s when `0 < TTM ≤ 60`; `None` at/after `end_ts`.
 - `sell_window_open` — CLOB sells only while TTM is strictly positive.
-- `loser_persist_ready` — persist_ready plus empty-FAK keep/re-arm.
+- `loser_empty_keep_qualify` — armed + empty loser book (opposite still ok or also empty) should keep the arm.
+- `loser_persist_ready` — persist_ready plus empty-book / empty-FAK keep/re-arm (`empty_keep_arm`).
 - `winner_cashout_leg` — unique leg whose sized bid ≥ winner_min.
 - `winner_cheap_decision` — 0.99 only if sold_loser, loser ≤ gate, and loser+cheap > $1.
 - `winner_sell_limit` — clamp live-bid FAK into CLOB [0.01, 0.99]; 0.99 still fills 0.995–0.999 books.
