@@ -14,7 +14,7 @@ ROOT = Path(__file__).resolve().parents[1]
 MINT = ROOT / "mintbot.py"
 MINT_EXAMPLE = ROOT / "strategy_mint.example.json"
 DEPLOY = ROOT / "deploy"
-ARCHIVE_DEPLOY = ROOT / "archive" / "deploy"
+BUY = ROOT / "buy"
 
 
 def _assign(name: str):
@@ -100,21 +100,32 @@ class DeployUnitsTests(unittest.TestCase):
         live = {p.name for p in DEPLOY.glob("*.service")}
         self.assertEqual(live, {"polymintbot.service", "polypathlog.service"})
 
-    def test_buy_and_complement_units_are_archived(self):
-        archived = {p.name for p in ARCHIVE_DEPLOY.glob("*.service")}
-        self.assertIn("polybuybot.service", archived)
-        self.assertIn("polybuybot5m.service", archived)
-        self.assertIn("polybuybothourly.service", archived)
-        self.assertIn("polycomplement.service", archived)
+    def test_buybot_sources_and_units_are_gone(self):
+        for name in (
+            "buybot.py",
+            "buybot5m.py",
+            "buybothourly.py",
+            "complementbot.py",
+        ):
+            self.assertFalse((ROOT / name).exists(), name)
+        self.assertFalse((ROOT / "archive").exists())
         self.assertFalse((DEPLOY / "polybuybot.service").exists())
+        self.assertFalse((DEPLOY / "polybuybot5m.service").exists())
+        self.assertFalse((DEPLOY / "polybuybothourly.service").exists())
+        self.assertFalse((DEPLOY / "polycomplement.service").exists())
         self.assertFalse((DEPLOY / "polydangerzone.service").exists())
+
+    def test_buy_helpers_are_mint_and_pathlog_only(self):
+        self.assertEqual(
+            {p.name for p in BUY.glob("*.py")},
+            {"__init__.py", "book.py", "chain.py", "contracts.py", "market.py"},
+        )
 
     def test_docs_do_not_start_hourly_dense_or_dangerzone(self):
         for path in (
             ROOT / "AGENTS.md",
             ROOT / "CURRENT.md",
             ROOT / "deploy" / "DISK_OPS.md",
-            ROOT / "archive" / "README.md",
         ):
             text = path.read_text()
             self.assertNotIn("systemctl start pathlog_hourly_dense", text, path.name)

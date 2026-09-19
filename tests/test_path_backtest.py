@@ -8,6 +8,7 @@ import unittest
 from pathlib import Path
 
 from check_path_backtest import (
+    default_paper_template,
     evaluate_rule,
     first_entry,
     hedge_sweep_variants,
@@ -20,6 +21,7 @@ from check_path_backtest import (
     summarize,
     sweep_variants,
     template_from_strategy,
+    template_from_strategy_data,
 )
 
 
@@ -487,10 +489,8 @@ class PaperExitTests(unittest.TestCase):
 
 
 class SweepTemplateTests(unittest.TestCase):
-    def test_template_reads_5m_example(self):
-        tmpl = template_from_strategy(
-            Path(__file__).resolve().parents[1] / "strategy_buy5m.example.json"
-        )
+    def test_template_reads_5m_shaped_json(self):
+        tmpl = default_paper_template()
         self.assertEqual(tmpl["ask_min"], 0.75)
         self.assertEqual(tmpl["ask_max"], 0.90)
         self.assertEqual(tmpl["ttm_max"], 120.0)
@@ -506,9 +506,19 @@ class SweepTemplateTests(unittest.TestCase):
         self.assertEqual(tmpl["hedge_other_gui_min"], 0.48)
         self.assertFalse(tmpl["require_gui_reversed"])
 
-    def test_template_reads_hourly_example(self):
-        tmpl = template_from_strategy(
-            Path(__file__).resolve().parents[1] / "strategy_buyhourly.example.json"
+    def test_template_reads_hourly_and_15m_shaped_json(self):
+        tmpl = template_from_strategy_data(
+            {
+                "buy_threshold": 0.75,
+                "buy_max_price": 0.90,
+                "buy_window_min": 20.0,
+                "b15_window_min": 20.0,
+                "buy_budget": 5.0,
+                "hedge_threshold": 0.60,
+                "hedge_require_ask_max": 0.62,
+                "hedge_toxic_bid_max": 0.0,
+                "hedge_persist_s": 5.0,
+            }
         )
         self.assertEqual(tmpl["ask_min"], 0.75)
         self.assertEqual(tmpl["ask_max"], 0.90)
@@ -522,18 +532,40 @@ class SweepTemplateTests(unittest.TestCase):
         self.assertEqual(tmpl["hedge_held_gui_max"], 0.62)
         self.assertEqual(tmpl["hedge_other_gui_min"], 0.38)
         self.assertFalse(tmpl["require_gui_reversed"])
-        tmpl = template_from_strategy(
-            Path(__file__).resolve().parents[1] / "strategy_buy.example.json"
+        tmpl = template_from_strategy_data(
+            {
+                "buy_threshold": 0.90,
+                "buy_max_price": 0.96,
+                "buy_window_min": 3.0,
+                "buy_budget": 10.0,
+            }
         )
         self.assertEqual(tmpl["ask_max"], 0.96)
         self.assertEqual(tmpl["ask_min"], 0.90)
         self.assertEqual(tmpl["ttm_max"], 3.0 * 60.0)
         self.assertEqual(tmpl["budget"], 10.0)
 
+    def test_template_from_strategy_reads_json_file(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "paper.json"
+            path.write_text(
+                json.dumps(
+                    {
+                        "buy_threshold": 0.75,
+                        "buy_max_price": 0.90,
+                        "buy_start_s": 120,
+                        "buy_budget": 2.5,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            tmpl = template_from_strategy(path)
+        self.assertEqual(tmpl["ask_min"], 0.75)
+        self.assertEqual(tmpl["ttm_max"], 120.0)
+        self.assertEqual(tmpl["budget"], 2.5)
+
     def test_sweep_starts_from_live_template(self):
-        tmpl = template_from_strategy(
-            Path(__file__).resolve().parents[1] / "strategy_buy5m.example.json"
-        )
+        tmpl = default_paper_template()
         names = [row["name"] for row in sweep_variants(tmpl)]
         self.assertEqual(names[0], "live_5m_paper")
         self.assertEqual(sweep_variants(tmpl)[0]["ask_max"], 0.90)
@@ -549,9 +581,7 @@ class SweepTemplateTests(unittest.TestCase):
         self.assertIn("no_spread_cap", names)
 
     def test_hedge_sweep_includes_earlier_stops(self):
-        tmpl = template_from_strategy(
-            Path(__file__).resolve().parents[1] / "strategy_buy5m.example.json"
-        )
+        tmpl = default_paper_template()
         names = [row["name"] for row in hedge_sweep_variants(tmpl)]
         self.assertIn("hedge_53", names)
         self.assertIn("hedge_70", names)

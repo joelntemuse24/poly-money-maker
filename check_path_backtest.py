@@ -446,9 +446,29 @@ def paper_settle(
     return _redeem()
 
 
-def template_from_strategy(path: Path) -> dict:
+# Built-in paper knobs matching the retired 5m example (75–90¢ / last 120s / $2.50).
+DEFAULT_PAPER_STRATEGY = {
+    "buy_threshold": 0.75,
+    "buy_max_price": 0.90,
+    "buy_start_s": 120,
+    "buy_budget": 2.5,
+    "max_entry_spread": 0.05,
+    "hedge_threshold": 0.50,
+    "hedge_require_ask_max": 0.52,
+    "hedge_max_spread": 0.15,
+    "hedge_require_gui": True,
+    "hedge_persist_s": 1.0,
+    "hedge_toxic_bid_max": 0.40,
+    "hedge_flatten_walks": True,
+    "min_winner_bid": 0.70,
+    "max_loser_bid": 0.30,
+    "min_bid_edge": 0.05,
+    "toxic_force_exit_below": 0.75,
+}
+
+
+def template_from_strategy_data(data: dict) -> dict:
     """Map example/live-shaped strategy JSON to backtest knobs. Never loads secrets."""
-    data = json.loads(path.read_text())
     if data.get("buy_start_s") is not None:
         ttm_max = float(data["buy_start_s"])
     else:
@@ -499,6 +519,15 @@ def template_from_strategy(path: Path) -> dict:
             else float(data["hedge_drop_from_fill"])
         ),
     }
+
+
+def template_from_strategy(path: Path) -> dict:
+    """Map example/live-shaped strategy JSON to backtest knobs. Never loads secrets."""
+    return template_from_strategy_data(json.loads(path.read_text()))
+
+
+def default_paper_template() -> dict:
+    return template_from_strategy_data(DEFAULT_PAPER_STRATEGY)
 
 
 PAPER_KEYS = (
@@ -1136,7 +1165,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     ap.add_argument(
         "--sweep",
         action="store_true",
-        help="one-at-a-time variants of --template (default strategy_buy5m.example.json)",
+        help="one-at-a-time variants of --template (default: built-in 75–90 / last-120s paper knobs)",
     )
     ap.add_argument(
         "--hedge-sweep",
@@ -1146,8 +1175,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     ap.add_argument(
         "--template",
         type=Path,
-        default=REPO / "strategy_buy5m.example.json",
-        help="example strategy JSON used as the sweep/paper template (not live JSON)",
+        default=None,
+        help="optional strategy JSON for sweep/paper knobs (default: built-in 75–90 / last-120s)",
     )
     ap.add_argument(
         "--min-edge",
@@ -1164,7 +1193,15 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             if matches_series(m.series, m.slug, args.series)
         ]
 
-    tmpl = template_from_strategy(args.template) if args.template.exists() else {}
+    if args.template is None:
+        tmpl = default_paper_template()
+        template_label = "built-in paper knobs"
+    elif args.template.exists():
+        tmpl = template_from_strategy(args.template)
+        template_label = str(args.template)
+    else:
+        tmpl = {}
+        template_label = str(args.template)
     paper_kwargs = paper_kwargs_from(tmpl)
 
     if not markets and (
@@ -1285,7 +1322,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         print(
             "Same late 75–90 / 120s first touch as --sweep. winner_dumps = paper "
             "sold a market that still resolved to the held leg. Not live. "
-            "Pathlog has no last-trade / empty-FAK. Template: " + str(args.template)
+            "Pathlog has no last-trade / empty-FAK. Template: " + template_label
         )
         return 0
 
@@ -1326,7 +1363,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         print(
             "Paper = recorded CLOB path + GUI-proxy hedge (no last-trade, no BTC/PTB, "
             "no POST latency). Ride = fill then $1 or $0. Not live. "
-            "Template: " + str(args.template)
+            "Template: " + template_label
         )
         return 0
 

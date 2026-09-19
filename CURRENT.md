@@ -10,8 +10,9 @@ and not permission to start or restart services.
 
 Buybots (`polybuybot`, `polybuybot5m`, `polybuybothourly`), complement,
 hedge, DangerZone, shadow bots, and hourly-dense pathlog are **stopped /
-retired**. Recheck read-only service status before any operational
-decision.
+retired**. Their Python sources and systemd units are not in this tree.
+Do not start them. Recheck read-only service status before any
+operational decision.
 
 ## Live mint template (example file)
 
@@ -25,12 +26,6 @@ decision.
 - Optional loser sell ladder 3c → 2c, opposite bid ≥ 50c — off in the example
 
 Live knobs are in gitignored `strategy_mint.json` on the VM.
-
-## Retired buy/hedge snapshot
-
-`strategy_buyhourly.json` remains a reviewed non-secret snapshot with
-`entry_enabled=false` (buy path off). Do not enable buy units. Historical
-hourly knob tensions stay in `STRAT_COHERENCE.md`; they do not apply to mint.
 
 ## Deployment boundary
 
