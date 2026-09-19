@@ -10,6 +10,7 @@ from buy.mint_sell import (
     effective_loser_persist_s,
     empty_fak_status,
     inventory_latch,
+    loser_empty_keep_qualify,
     loser_ladder_limits,
     loser_persist_ready,
     parse_sell_fill_shares,
@@ -490,14 +491,187 @@ class EmptyFakArmTests(unittest.TestCase):
         self.assertEqual(armed, 20.0)
         self.assertEqual(why, "empty_fak_rearm")
 
-    def test_qualify_drop_without_empty_fak_still_resets(self):
+    def test_qualify_drop_with_visible_book_still_resets(self):
         fire, armed, why = loser_persist_ready(
             False,
             now_s=20.0,
             armed_ts=10.0,
             persist_s=5.0,
             last_status="matched",
+            book_empty=False,
+        )
+        self.assertFalse(fire)
+        self.assertIsNone(armed)
+        self.assertEqual(why, "reset")
+
+
+class EmptyLoserBookKeepArmTests(unittest.TestCase):
+    """Late empty loser book must not wipe persist; 3→2→1 stays continuous."""
+
+    _THR = 0.03
+    _OPP = 0.90
+    _PERSIST = 9.0
+
+    def _tick(self, up_bid, dn_bid, now_s, armed_ts, prev_leg=None, last_status=None):
+        loser, _reason = classify_loser(
+            up_bid, dn_bid, threshold=self._THR, opposite_min=self._OPP,
+        )
+        keep, keep_leg = loser_empty_keep_qualify(
+            armed_ts=armed_ts,
+            up_bid=up_bid,
+            dn_bid=dn_bid,
+            opposite_min=self._OPP,
+            prev_leg=prev_leg or loser,
+        )
+        fire, armed, why = loser_persist_ready(
+            loser is not None,
+            now_s=now_s,
+            armed_ts=armed_ts,
+            persist_s=self._PERSIST,
+            last_status=last_status,
+            book_empty=keep,
+        )
+        if why == "reset":
+            leg = None
+        else:
+            leg = loser or keep_leg or prev_leg
+        return fire, armed, why, leg
+
+    def test_empty_after_arm_keeps_clock_then_fires_on_return(self):
+        """Arm at 3¢, bid None for 3s, then 2¢: armed_ts unchanged; fire if elapsed ≥ persist_s."""
+        fire, armed, why, leg = self._tick(0.03, 0.90, 10.0, None)
+        self.assertFalse(fire)
+        self.assertEqual(armed, 10.0)
+        self.assertEqual(why, "armed")
+        self.assertEqual(leg, "up")
+
+        fire, armed, why, leg = self._tick(
+            None, 0.90, 13.0, armed, prev_leg=leg, last_status=None,
+        )
+        self.assertFalse(fire)
+        self.assertEqual(armed, 10.0)
+        self.assertEqual(why, "empty_keep_arm")
+        self.assertEqual(leg, "up")
+
+        fire, armed, why, _leg = self._tick(0.02, 0.90, 19.0, armed, prev_leg=leg)
+        self.assertTrue(fire)
+        self.assertEqual(armed, 10.0)
+        self.assertEqual(why, "ready")
+
+    def test_empty_past_persist_fires_immediately_when_bid_returns(self):
+        fire, armed, why, leg = self._tick(0.03, 0.91, 10.0, None)
+        self.assertEqual(why, "armed")
+        fire, armed, why, leg = self._tick(None, 0.91, 20.0, armed, prev_leg=leg)
+        self.assertFalse(fire)
+        self.assertEqual(armed, 10.0)
+        self.assertEqual(why, "empty_keep_arm")
+        fire, armed, why, _leg = self._tick(0.01, 0.91, 20.1, armed, prev_leg=leg)
+        self.assertTrue(fire)
+        self.assertEqual(armed, 10.0)
+        self.assertEqual(why, "ready")
+
+    def test_bid_above_threshold_resets(self):
+        fire, armed, why, leg = self._tick(0.03, 0.90, 10.0, None)
+        self.assertEqual(armed, 10.0)
+        fire, armed, why, leg = self._tick(0.04, 0.90, 12.0, armed, prev_leg=leg)
+        self.assertFalse(fire)
+        self.assertIsNone(armed)
+        self.assertEqual(why, "reset")
+        self.assertIsNone(leg)
+
+    def test_never_armed_empty_does_not_keep(self):
+        keep, keep_leg = loser_empty_keep_qualify(
+            armed_ts=None, up_bid=None, dn_bid=0.92, opposite_min=self._OPP,
+        )
+        self.assertFalse(keep)
+        self.assertIsNone(keep_leg)
+        fire, armed, why = loser_persist_ready(
+            False, now_s=10.0, armed_ts=None, persist_s=self._PERSIST, book_empty=False,
+        )
+        self.assertFalse(fire)
+        self.assertIsNone(armed)
+        self.assertEqual(why, "reset")
+        fire, armed, why, leg = self._tick(None, 0.92, 10.0, None)
+        self.assertFalse(fire)
+        self.assertIsNone(armed)
+        self.assertEqual(why, "reset")
+        self.assertIsNone(leg)
+
+    def test_step_3_2_1_is_continuous(self):
+        fire, armed, why, leg = self._tick(0.03, 0.90, 10.0, None)
+        self.assertEqual(why, "armed")
+        self.assertEqual(armed, 10.0)
+        fire, armed, why, leg = self._tick(0.02, 0.90, 13.0, armed, prev_leg=leg)
+        self.assertFalse(fire)
+        self.assertEqual(armed, 10.0)
+        self.assertEqual(why, "waiting")
+        fire, armed, why, leg = self._tick(0.01, 0.90, 16.0, armed, prev_leg=leg)
+        self.assertFalse(fire)
+        self.assertEqual(armed, 10.0)
+        self.assertEqual(why, "waiting")
+        fire, armed, why, _leg = self._tick(0.01, 0.90, 19.0, armed, prev_leg=leg)
+        self.assertTrue(fire)
+        self.assertEqual(armed, 10.0)
+        self.assertEqual(why, "ready")
+
+    def test_opposite_below_min_resets_even_if_loser_empty(self):
+        fire, armed, why, leg = self._tick(0.03, 0.90, 10.0, None)
+        fire, armed, why, _leg = self._tick(None, 0.50, 12.0, armed, prev_leg=leg)
+        self.assertFalse(fire)
+        self.assertIsNone(armed)
+        self.assertEqual(why, "reset")
+
+    def test_both_cheap_resets(self):
+        fire, armed, why, leg = self._tick(0.03, 0.90, 10.0, None)
+        fire, armed, why, _leg = self._tick(0.02, 0.03, 12.0, armed, prev_leg=leg)
+        self.assertFalse(fire)
+        self.assertIsNone(armed)
+        self.assertEqual(why, "reset")
+
+    def test_plain_empty_keep_does_not_require_fak_status(self):
+        fire, armed, why = loser_persist_ready(
+            False,
+            now_s=13.0,
+            armed_ts=10.0,
+            persist_s=9.0,
+            last_status=None,
             book_empty=True,
+        )
+        self.assertFalse(fire)
+        self.assertEqual(armed, 10.0)
+        self.assertEqual(why, "empty_keep_arm")
+
+    def test_down_loser_empty_keep_and_both_books_empty(self):
+        fire, armed, why, leg = self._tick(0.91, 0.03, 10.0, None)
+        self.assertEqual(leg, "dn")
+        fire, armed, why, leg = self._tick(0.91, None, 13.0, armed, prev_leg=leg)
+        self.assertEqual(why, "empty_keep_arm")
+        self.assertEqual(armed, 10.0)
+        self.assertEqual(leg, "dn")
+        fire, armed, why, leg = self._tick(None, None, 16.0, armed, prev_leg=leg)
+        self.assertEqual(why, "empty_keep_arm")
+        self.assertEqual(armed, 10.0)
+        fire, armed, why, _leg = self._tick(0.91, 0.01, 19.0, armed, prev_leg=leg)
+        self.assertTrue(fire)
+        self.assertEqual(armed, 10.0)
+        self.assertEqual(why, "ready")
+
+    def test_sold_loser_does_not_keep_empty_arm(self):
+        keep, _leg = loser_empty_keep_qualify(
+            armed_ts=10.0,
+            up_bid=None,
+            dn_bid=0.92,
+            opposite_min=self._OPP,
+            prev_leg="up",
+            sold_loser=True,
+        )
+        self.assertFalse(keep)
+
+    def test_empty_opposite_with_visible_loser_resets(self):
+        fire, armed, why, leg = self._tick(0.03, 0.90, 10.0, None)
+        fire, armed, why, _leg = self._tick(
+            0.03, None, 12.0, armed, prev_leg=leg,
+            last_status="error:no orders found to match with FAK order",
         )
         self.assertFalse(fire)
         self.assertIsNone(armed)
