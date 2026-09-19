@@ -33,8 +33,10 @@ template: dry_run=true, entry_enabled=false, sell_enabled=false). Optional
 sell stays off until live `strategy_mint.json` sets `sell_enabled=true`.
 Loser dump: sized opposite bid ≥ `sell_opposite_min` (~0.90), loser ≤
 `sell_threshold` (0.03) persists `sell_persist_s` (~5s), then FAK
-threshold → `sell_floor` (0.02). Winner cash-out is a separate path at
-`sell_winner_min` (~0.999). Do not import `mintbot.py` in tests.
+threshold → `sell_floor` (0.02) when the live sized bid is ≥ floor, or
+at the live bid if it is below the floor (empty FAK keeps the arm).
+Winner cash-out is a separate path at `sell_winner_min` (~0.999). Do not
+import `mintbot.py` in tests.
 
 `pathlog.py` records public CLOB books for **btc-up-or-down-15m** only.
 Keep `deploy/polypathlog.service`. Do not start `pathlog_hourly_dense.py`

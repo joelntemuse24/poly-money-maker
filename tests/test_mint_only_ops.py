@@ -293,7 +293,12 @@ class DeployUnitsTests(unittest.TestCase):
         self.assertIn("inventory_latch", src)
         self.assertIn("best_bid_with_min_size", src)
         self.assertIn("persist_ready", src)
+        self.assertIn("loser_persist_ready", src)
         self.assertIn("winner_cashout_leg", src)
+        self.assertIn("last_status=intent.get(\"sell_last_status\")", src)
+        mint_sell_src = (BUY / "mint_sell.py").read_text()
+        self.assertIn("def empty_fak_status", mint_sell_src)
+        self.assertIn("def loser_persist_ready", mint_sell_src)
         self.assertNotIn(
             'for key in ("takingAmount", "makingAmount"',
             src,
