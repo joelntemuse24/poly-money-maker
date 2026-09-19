@@ -31,7 +31,7 @@ Read Parts I and II straight through. Part III walks mint and sell. Part IV cove
   - [The cycle: sells first, then mint](#section-10)
   - [Eligibility: not-yet-open 15m windows](#section-11)
   - [Capacity: max_open_sets=1 and adjacent lookahead](#section-12)
-  - [already_minted includes failed](#section-13)
+  - [already_minted: failed remint after cooldown](#section-13)
   - [Relayer submit: approve + split as one PROXY batch](#section-14)
   - [Reconcile: relayer state → inventory confirm](#section-15)
   - [Sell path overview](#section-16)
@@ -78,7 +78,7 @@ With a $5 trial (`shares=5`), you pay about $5 to mint 5 Up + 5 Down. If you sel
 
 **What this bot is not:** it is not the old hourly FAK entry bot. It does not chase 90–95¢ asks on one side with an oracle. It does not “hedge” by buying the opposite leg after entry. The post-loser exit under 80¢ is deliberately named a **held dump / sell-side pass**, not a hedge.
 
-**Risk concentration:** `max_open_sets=1` means at most one full unsold bag blocks capacity (with a special adjacent-window exception described below). A failed relayer mint that used to remint-loop is treated as already attempted. A single toxic loser fill or a missed dump still matters at small size; scaling share count scales both edge and left-tail together.
+**Risk concentration:** `max_open_sets=1` means at most one full unsold bag blocks capacity (with a special adjacent-window exception described below). A failed relayer mint is blocked for `mint_fail_cooldown_s` (~90s) and gives up after `mint_max_attempts` (3) tries so a hot remint loop cannot run. A single toxic loser fill or a missed dump still matters at small size; scaling share count scales both edge and left-tail together.
 
 <a id="section-2"></a>
 ## Processes, wallet identities and files
@@ -247,7 +247,7 @@ Sells-before-mint matters: selling the loser can clear the `max_open_sets` block
 `eligible_markets` keeps markets that:
 
 - have **not** started (`start_ts > now`),
-- open within `(enter_min_ttm_min, enter_max_ttm_min]` minutes (live 0–16),
+- open within `(enter_min_ttm_min, enter_max_ttm_min]` minutes (default 0–30 so N+1 can mint mid-N),
 - are active, not closed, not neg-risk,
 - optionally `accepting_orders`.
 
@@ -267,13 +267,16 @@ Sells-before-mint matters: selling the loser can clear the `max_open_sets` block
 Live: `max_open_sets=1`. Holding 1:30–1:45 still permits minting 1:45–2:00 beforehand; it does **not** permit minting 2:00–2:15 while 1:30 is still a full bag.
 
 <a id="section-13"></a>
-## already_minted includes failed
+## already_minted: failed remint after cooldown
 
 ```text
-status in ACTIVE_STATUSES ∪ {completed, failed}
+confirmed / completed / ACTIVE_STATUSES → always blocked
+failed → blocked while now < last_fail_ts + mint_fail_cooldown_s (~90s)
+failed → blocked if mint_attempts >= mint_max_attempts (3)
+failed → eligible again after cooldown if attempts remain
 ```
 
-A relayer `STATE_FAILED` marks the intent `failed`. Without counting `failed`, the bot reminted the same `condition_id` in a hot loop (seen on the 2:15 window). There is **no** automatic retry/backoff yet — failed means skip that window.
+A relayer `STATE_FAILED` marks the intent `failed` and persists `errorMsg` / tx hash when the API returns them. Without counting `failed` at all, the bot reminted the same `condition_id` in a hot loop (seen on the 2:15 window). Incident `btc-updown-15m-1789805700` then showed the opposite bug: `failed` blocked forever, so after `STATE_FAILED` the desk sat idle for the rest of the 15m window. Cooldown + max attempts is the middle path.
 
 <a id="section-14"></a>
 ## Relayer submit: approve + split as one PROXY batch
@@ -294,7 +297,7 @@ On success the intent is stored with tokens, shares, `start_ts`/`end_ts`, and `t
 
 While status is submitting/pending/executed/mined, poll relayer:
 
-- `STATE_FAILED` / `STATE_INVALID` → `failed`
+- `STATE_FAILED` / `STATE_INVALID` → `failed` (persist `errorMsg` and tx hash; set `last_fail_ts`)
 - `STATE_CONFIRMED` → `confirmed_waiting_inventory` (naming may vary slightly in logs)
 - mined/executed intermediate states update accordingly
 
@@ -452,9 +455,11 @@ From VM `strategy_mint.json`:
 | `entry_enabled` | true | Allow new mints |
 | `dry_run` | false | Real mint/sell |
 | `shares` | 5 | Complete set size ($5 trial) |
-| `enter_max_ttm_min` | 16 | Mint when window opens within 16m |
+| `enter_max_ttm_min` | 30 | Mint when window opens within 30m (N+1 mid-N) |
 | `series_slugs` | `[btc-up-or-down-15m]` | 15m only |
 | `max_open_sets` | 1 | Capacity (see adjacent rule) |
+| `mint_fail_cooldown_s` | 90 | Wait after `failed` before remint |
+| `mint_max_attempts` | 3 | Total mint tries per market |
 | `max_daily_notional` | 100 | Daily mint spend cap |
 | `poll_s` | 5 | Cycle sleep |
 | `sell_enabled` | true | Enable manage_sells |
@@ -484,7 +489,7 @@ Do not import `mintbot.py` in unit tests (credentials, lock, clients). Test `buy
 <a id="section-32"></a>
 ## Landmines
 
-1. **Failed remint storm** — `failed` must remain in `already_minted`.
+1. **Failed remint storm** — `failed` stays in `already_minted` during cooldown and after `mint_max_attempts`.
 2. **Skipping the next window** — without adjacent lookahead, `max_open_sets=1` + “never mint open markets” skips a quarter-hour.
 3. **Winner at 0.999 on a 0.99 book** — use live-bid FAK once allowed.
 4. **Dump without `sold_leg`** — held leg cannot be inferred; loser path must set `sold_leg`.
@@ -536,7 +541,7 @@ every poll_s seconds:
   markets = gateway.discover(cfg.series_slugs)
   candidates = eligible_markets(markets, cfg, now)   # NOT YET OPEN, within TTM band
   pick = first candidate where:
-           not already_minted(condition_id)          # includes failed
+           not already_minted(condition_id, now)     # failed remints after cooldown
            and wallet does not already hold tokens
   if no pick: return "idle"
 
@@ -576,7 +581,7 @@ if sold_loser and sell_limit <= sell_winner_cheap_if_loser_le
 ```
 submitting → pending → executed/mined → confirmed_waiting_inventory → confirmed
                                                                   ↘ completed (flat after end)
-                 ↘ failed   (STATE_FAILED / STATE_INVALID; already_minted forever)
+                 ↘ failed   (STATE_FAILED / STATE_INVALID; remint after cooldown, max 3)
 ```
 
 `ACTIVE_STATUSES` (count toward open bags unless loser sold / expired+120s):
@@ -662,9 +667,10 @@ operator/systemd          mintbot               Gamma/CLOB         Relayer      
       |                      | discover series      |                  |                   |
       |                      |--------------------->|                  |                   |
       |                      | eligible: not open,  |                  |                   |
-      |                      |   TTM in (0,16] min  |                  |                   |
+      |                      |   TTM in (0,30] min  |                  |                   |
       |                      | skip already_minted  |                  |                   |
-      |                      |   (incl. failed)     |                  |                   |
+      |                      |   (failed remints    |                  |                   |
+      |                      |    after 90s, max 3) |                  |                   |
       |                      | mint_slots_full?     |                  |                   |
       |                      |   allow adjacent     |                  |                   |
       |                      |   next window only   |                  |                   |
@@ -685,7 +691,7 @@ Notes:
 
 1. **Sells run before mint** each cycle. A mid-window loser fill can free `max_open_sets` so the adjacent mint is allowed sooner.
 2. **Never mints an already-open window.** If adjacent lookahead fails, that quarter-hour is skipped forever for this bot.
-3. Relayer `STATE_FAILED` → intent `failed` → `already_minted` stays true → no remint loop.
+3. Relayer `STATE_FAILED` → intent `failed` + `errorMsg` → cooldown 90s, then remint until `mint_max_attempts`.
 
 <a id="section-36"></a>
 ## Sell-side sequence (loser → winner / held dump)

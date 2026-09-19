@@ -68,7 +68,14 @@ class MintDefaultsTests(unittest.TestCase):
             self.assertIs(blob["dry_run"], True, label)
             self.assertIs(blob["sell_enabled"], False, label)
         self.assertEqual(defaults["shares"], example["shares"])
+        self.assertEqual(defaults["enter_max_ttm_min"], 30.0)
+        self.assertEqual(example["enter_max_ttm_min"], 30.0)
         self.assertEqual(defaults["enter_max_ttm_min"], example["enter_max_ttm_min"])
+        self.assertEqual(defaults["enter_min_ttm_min"], 0.0)
+        self.assertEqual(defaults["mint_fail_cooldown_s"], 90.0)
+        self.assertEqual(example["mint_fail_cooldown_s"], 90.0)
+        self.assertEqual(defaults["mint_max_attempts"], 3)
+        self.assertEqual(example["mint_max_attempts"], 3)
         self.assertEqual(defaults["max_open_sets"], example["max_open_sets"])
         for blob, label in ((example, "example"), (defaults, "defaults")):
             self.assertEqual(blob["sell_threshold"], 0.03, label)
@@ -217,31 +224,168 @@ class MintSlotChainTests(unittest.TestCase):
             cycle,
         )
         self.assertGreaterEqual(cycle.count('"start_ts": pick.start_ts'), 2)
+        self.assertIn("already_minted(state, market.condition_id, cfg, now)", cycle)
+        self.assertIn("mint_attempts", cycle)
+        self.assertIn("last_fail_ts", cycle)
 
-    def test_already_minted_treats_failed_as_attempted(self):
-        fn = _fn("already_minted", {"ACTIVE_STATUSES": _ACTIVE})
-        cfg = {"one_entry_per_market": True}
+
+def _mint_market(*, start_ts: float, condition_id: str = "cid-1"):
+    from buy.market import MintMarket
+
+    return MintMarket(
+        condition_id=condition_id,
+        slug=f"btc-updown-15m-{int(start_ts)}",
+        question="Bitcoin Up or Down",
+        end_ts=start_ts + 900.0,
+        series_slug="btc-up-or-down-15m",
+        up_token="1",
+        dn_token="2",
+        active=True,
+        closed=False,
+        accepting_orders=True,
+        neg_risk=False,
+        start_ts=start_ts,
+    )
+
+
+_REMINT_CFG = {
+    "one_entry_per_market": True,
+    "mint_fail_cooldown_s": 90.0,
+    "mint_max_attempts": 3,
+}
+_INCIDENT_CID = "btc-updown-15m-1789805700"
+
+
+class MintEligibilityLeadTests(unittest.TestCase):
+    def test_eligible_when_opens_in_25m_and_max_is_30(self):
+        defaults = _assign("DEFAULTS")
+        fn = _fn("eligible_markets")
+        now = 1_000_000.0
+        market = _mint_market(start_ts=now + 25.0 * 60.0, condition_id=_INCIDENT_CID)
+        out = fn([market], defaults, now)
+        self.assertEqual([item.condition_id for item in out], [_INCIDENT_CID])
+
+    def test_not_eligible_when_opens_beyond_enter_max(self):
+        defaults = _assign("DEFAULTS")
+        fn = _fn("eligible_markets")
+        now = 1_000_000.0
+        market = _mint_market(start_ts=now + 30.1 * 60.0, condition_id=_INCIDENT_CID)
+        self.assertEqual(fn([market], defaults, now), [])
+
+
+class MintRemintTests(unittest.TestCase):
+    def _already(self):
+        return _fn("already_minted", {"ACTIVE_STATUSES": _ACTIVE})
+
+    def test_failed_intent_blocked_during_cooldown(self):
+        fn = self._already()
+        t0 = 2_000_000.0
+        state = {
+            "intents": {
+                _INCIDENT_CID: {
+                    "status": "failed",
+                    "condition_id": _INCIDENT_CID,
+                    "mint_attempts": 1,
+                    "last_fail_ts": t0,
+                }
+            }
+        }
+        self.assertTrue(fn(state, _INCIDENT_CID, _REMINT_CFG, now=t0 + 89.0))
+
+    def test_failed_intent_eligible_after_90s_if_attempts_under_3(self):
+        fn = self._already()
+        t0 = 2_000_000.0
+        state = {
+            "intents": {
+                _INCIDENT_CID: {
+                    "status": "failed",
+                    "condition_id": _INCIDENT_CID,
+                    "mint_attempts": 2,
+                    "last_fail_ts": t0,
+                }
+            }
+        }
+        self.assertFalse(fn(state, _INCIDENT_CID, _REMINT_CFG, now=t0 + 90.0))
+        self.assertFalse(fn(state, _INCIDENT_CID, _REMINT_CFG, now=t0 + 91.0))
+
+    def test_failed_intent_not_eligible_when_attempts_at_max(self):
+        fn = self._already()
+        t0 = 2_000_000.0
+        state = {
+            "intents": {
+                _INCIDENT_CID: {
+                    "status": "failed",
+                    "condition_id": _INCIDENT_CID,
+                    "mint_attempts": 3,
+                    "last_fail_ts": t0,
+                }
+            }
+        }
+        self.assertTrue(fn(state, _INCIDENT_CID, _REMINT_CFG, now=t0 + 10_000.0))
+
+    def test_confirmed_intent_still_blocks_remint(self):
+        fn = self._already()
         cid = "btc-updown-15m-1789798500"
-        state = {"intents": {cid: {"status": "failed", "condition_id": cid}}}
-        self.assertTrue(fn(state, cid, cfg))
+        cfg = dict(_REMINT_CFG)
+        self.assertTrue(
+            fn(
+                {"intents": {cid: {"status": "confirmed", "mint_attempts": 1}}},
+                cid,
+                cfg,
+                now=9_999_999.0,
+            )
+        )
         self.assertTrue(
             fn(
                 {"intents": {cid: {"status": "completed"}}},
                 cid,
                 cfg,
+                now=9_999_999.0,
             )
         )
-        self.assertTrue(
-            fn(
-                {"intents": {cid: {"status": "confirmed"}}},
-                cid,
-                cfg,
-            )
-        )
-        self.assertFalse(fn({"intents": {}}, cid, cfg))
+        self.assertFalse(fn({"intents": {}}, cid, cfg, now=9_999_999.0))
         self.assertFalse(
-            fn(state, cid, {"one_entry_per_market": False}),
+            fn(
+                {"intents": {cid: {"status": "failed", "mint_attempts": 1}}},
+                cid,
+                {"one_entry_per_market": False},
+                now=9_999_999.0,
+            )
         )
+
+
+class MintFailErrorMsgTests(unittest.TestCase):
+    def test_errorMsg_threaded_into_fail_state_and_log(self):
+        detail = _fn("relayer_error_detail")
+        record = {
+            "state": "STATE_FAILED",
+            "errorMsg": "relay hub: internal transaction failure",
+            "transactionHash": "0xabc123",
+        }
+        msg, txh = detail(record)
+        self.assertEqual(msg, "relay hub: internal transaction failure")
+        self.assertEqual(txh, "0xabc123")
+
+        mark = _fn("mark_intent_failed")
+        intent = {"status": "pending", "mint_attempts": 1, "slug": _INCIDENT_CID}
+        now = 2_000_000.0
+        mark(intent, now, error_msg=msg, transaction_hash=txh)
+        self.assertEqual(intent["status"], "failed")
+        self.assertEqual(intent["errorMsg"], msg)
+        self.assertEqual(intent["error"], msg)
+        self.assertEqual(intent["last_fail_ts"], now)
+        self.assertEqual(intent["transaction_hash"], txh)
+
+        src = MINT.read_text()
+        recon = src[src.find("def reconcile_intents") : src.find("\ndef acquire_lock")]
+        self.assertIn("relayer_error_detail", recon)
+        self.assertIn("mark_intent_failed", recon)
+        self.assertIn('"mint_failed"', recon)
+        self.assertIn("errorMsg=", recon)
+        cycle = src[src.find("def run_cycle") : src.find("\ndef main")]
+        self.assertIn("mark_intent_failed", cycle)
+        self.assertIn("last_fail_ts", cycle)
+        self.assertIn("mint_attempts", cycle)
 
 
 class DeployUnitsTests(unittest.TestCase):
