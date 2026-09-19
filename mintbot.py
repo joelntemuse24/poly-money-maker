@@ -6,9 +6,10 @@ No CLOB buys. No hedges. Discovers **btc-up-or-down-15m** only, mints
 and open within enter_max_ttm_min, if collateral is available.
 
 Optional sell (``sell_enabled``, default off): persist a loser dump at ~3¢
-for ~5s while the opposite bid is ≥ ~90¢, then FAK 3¢ → 2¢. Keep the
-winner for redeem unless its bid reaches ~99.9¢. Off unless live
-``strategy_mint.json`` turns it on.
+for ~5s while the opposite bid is ≥ ~90¢, then FAK 3¢ → 2¢ when the live
+sized bid is at/over the floor, or at the live bid if it is below the
+floor. Keep the winner for redeem unless its bid reaches ~99.9¢. Off
+unless live ``strategy_mint.json`` turns it on.
 
 Usage:
   # dry-run (default when strategy_mint.json has dry_run true / entry_enabled false)
@@ -48,6 +49,7 @@ from buy.mint_sell import (
     classify_loser,
     inventory_latch,
     loser_ladder_limits,
+    loser_persist_ready,
     parse_sell_fill_shares,
     persist_ready,
     winner_cashout_leg,
@@ -726,7 +728,7 @@ def _run_fak_ladder(
     return sold_total, last_status, last_px
 
 def manage_sells(cfg: dict, state: dict, chain: ChainReader) -> None:
-    """Loser persist dump at 3¢→2¢; optional winner cash-out; held-leg dump under 80¢."""
+    """Loser persist dump at 3¢→2¢ (or live bid if below floor); winner; held dump."""
     if not cfg.get("sell_enabled"):
         return
     now = time.time()
@@ -999,11 +1001,13 @@ def manage_sells(cfg: dict, state: dict, chain: ChainReader) -> None:
                 slug=intent.get("slug"),
             )
 
-        fire_l, armed_l, why_l = persist_ready(
+        fire_l, armed_l, why_l = loser_persist_ready(
             loser is not None and not sold_loser,
             now_s=now,
             armed_ts=intent.get("sell_loser_armed_at"),
             persist_s=persist_s,
+            last_status=intent.get("sell_last_status"),
+            book_empty=up_bid is None or dn_bid is None,
         )
         intent["sell_loser_armed_at"] = armed_l
         if loser and why_l in {"armed", "waiting"}:
@@ -1014,6 +1018,15 @@ def manage_sells(cfg: dict, state: dict, chain: ChainReader) -> None:
                 leg=loser,
                 why=why_l,
                 bid=bids.get(loser),
+            )
+        elif why_l in {"empty_fak_keep_arm", "empty_fak_rearm"}:
+            log_event(
+                "sell_loser_persist",
+                condition_id=cid,
+                slug=intent.get("slug"),
+                leg=loser,
+                why=why_l,
+                bid=bids.get(loser) if loser else None,
             )
 
         if fire_l and loser and not cooling:

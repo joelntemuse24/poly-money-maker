@@ -320,7 +320,7 @@ Policy (`classify_loser` / equivalent):
 - Sized opposite bid ≥ `sell_opposite_min` (0.90)
 - Not both cheap (ambiguous)
 - Persist that condition for `sell_persist_s` (5s) via `persist_ready`
-- Then FAK ladder: threshold → floor (3¢ → 2¢), sized to inventory latch
+- Then FAK ladder: threshold → floor (3¢ → 2¢), sized to inventory latch. If the live sized loser bid is below `sell_floor`, FAK at that live bid; empty FAK keeps or re-arms the persist latch so a later tick can retry before `end_ts`.
 
 On full fill: set `sold_loser=true`, `sold_leg="up"|"dn"`, store `sell_limit` (fill/limit evidence). Inventory latch distinguishes “await mint settlement” zeros from true flat.
 
@@ -359,7 +359,7 @@ Action: live-bid FAK the held token; on success set `sold_dump=true` and `sold_w
 
 | Path | Limit choice | Why |
 |---|---|---|
-| Loser | Ladder 0.03 → 0.02 | Intentionally walk down to floor |
+| Loser | Ladder 0.03 → 0.02, or live bid if below floor | Walk down to floor when the book is there; take a sub-floor scrap rather than miss `sold_loser` |
 | Winner (allowed) | Current sized bid | Book often tops at 0.99; posting 0.999 is rejected |
 | Held dump | Current sized bid | Same rejection class; dump fires precisely when bid is *weak* |
 
@@ -413,8 +413,9 @@ Observed failure mode before the fix: winner armed at bid 0.99 but FAK posted 0.
 - `inventory_latch` — await vs already_flat vs has_inventory.
 - `classify_loser` — which leg is loser / both_cheap / wick_unconfirmed.
 - `persist_ready` — arm → waiting → ready over `persist_s` (resets when qualify drops).
+- `loser_persist_ready` — persist_ready plus empty-FAK keep/re-arm.
 - `winner_cashout_leg` — unique leg whose sized bid ≥ winner_min.
-- `loser_ladder_limits` — [threshold, floor] style limits.
+- `loser_ladder_limits` — [threshold, floor] when bid ≥ floor; live bid when below floor.
 
 Defaults mirror mintbot sell knobs including dump keys.
 
@@ -553,7 +554,7 @@ every poll_s seconds:
 
 | Precondition | Persist | Action | Flags set |
 |---|---|---|---|
-| Loser sized bid ≤ 0.03 AND opposite ≥ 0.90 AND not both cheap | 5s | FAK ladder 0.03→0.02 | `sold_loser`, `sold_leg` |
+| Loser sized bid ≤ 0.03 AND opposite ≥ 0.90 AND not both cheap | 5s | FAK ladder 0.03→0.02, or live bid if below floor | `sold_loser`, `sold_leg` |
 | Winner sized bid ≥ effective_winner_min (0.999, or 0.99 if loser ≤0.03) | 5s | Live-bid FAK winner | `sold_winner` |
 | `sold_loser` AND held sized bid < 0.80 | 5s | Live-bid FAK held | `sold_dump`, `sold_winner` |
 | `now > end_ts` | — | No CLOB sells | (redeem outside this loop) |

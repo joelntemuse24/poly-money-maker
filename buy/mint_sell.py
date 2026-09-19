@@ -2,7 +2,9 @@
 
 Loser dump: arm when a sized loser bid is at/under ``sell_threshold`` (~3¢)
 and the opposite sized bid is at/over ``sell_opposite_min`` (~90¢). Persist
-that book for ``sell_persist_s`` (~5s), then FAK 3¢ → 2¢. Keep the winner
+that book for ``sell_persist_s`` (~5s), then FAK 3¢ → 2¢ when the live sized
+bid is at/over the floor; if the live bid is below the floor, FAK at that
+live bid. Empty FAK keeps or re-arms the persist latch. Keep the winner
 for redeem unless its sized bid reaches ``sell_winner_min`` (~99¢).
 
 After the loser is sold, optional held-leg dump: if the remaining leg's sized
@@ -151,13 +153,40 @@ def winner_cashout_leg(
     return "up" if up_hit else "dn"
 
 
+def empty_fak_status(status: Any) -> bool:
+    """True when CLOB rejected a FAK because no resting bid matched."""
+    return "no orders found" in str(status or "").lower()
+
+
+def loser_persist_ready(
+    qualify: bool,
+    *,
+    now_s: float,
+    armed_ts: Optional[float],
+    persist_s: float,
+    last_status: Optional[str] = None,
+    book_empty: bool = False,
+) -> Tuple[bool, Optional[float], str]:
+    """Like persist_ready; empty FAK must not drop the loser arm forever."""
+    fire, armed, why = persist_ready(
+        qualify, now_s=now_s, armed_ts=armed_ts, persist_s=persist_s
+    )
+    if why != "reset" or not book_empty or not empty_fak_status(last_status):
+        return fire, armed, why
+    if armed_ts is not None:
+        return False, float(armed_ts), "empty_fak_keep_arm"
+    return False, float(now_s), "empty_fak_rearm"
+
+
 def loser_ladder_limits(
     threshold: float, floor: float, loser_bid: float
 ) -> Sequence[float]:
-    """FAK limits: live bid capped at the arm threshold, then the floor."""
+    """FAK limits: threshold→floor when bid ≥ floor; live bid when below floor."""
     thr = round(float(threshold), 4)
     fl = round(float(floor), 4)
-    bid = float(loser_bid)
+    bid = round(float(loser_bid), 4)
+    if bid + 1e-12 < fl:
+        return [bid] if bid > 1e-12 else []
     limits: list[float] = []
     for limit in sorted({thr, fl}, reverse=True):
         use_px = round(max(fl, min(limit, bid)), 4)

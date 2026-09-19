@@ -7,8 +7,10 @@ import unittest
 from buy.book import best_bid_with_min_size
 from buy.mint_sell import (
     classify_loser,
+    empty_fak_status,
     inventory_latch,
     loser_ladder_limits,
+    loser_persist_ready,
     parse_sell_fill_shares,
     persist_ready,
     winner_cashout_leg,
@@ -195,6 +197,93 @@ class LoserLadderTests(unittest.TestCase):
             loser_ladder_limits(threshold=0.03, floor=0.02, loser_bid=0.025),
             [0.025, 0.02],
         )
+
+    def test_bid_below_floor_limit_equals_live_bid(self):
+        """Incident 1789800300: 1¢ book must FAK at 1¢, not clamp to the 2¢ floor."""
+        self.assertEqual(
+            loser_ladder_limits(threshold=0.03, floor=0.02, loser_bid=0.01),
+            [0.01],
+        )
+        self.assertEqual(
+            loser_ladder_limits(threshold=0.03, floor=0.02, loser_bid=0.015),
+            [0.015],
+        )
+
+    def test_floor_and_above_still_use_threshold_then_floor(self):
+        self.assertEqual(
+            loser_ladder_limits(threshold=0.03, floor=0.02, loser_bid=0.02),
+            [0.02],
+        )
+        self.assertEqual(
+            loser_ladder_limits(threshold=0.03, floor=0.02, loser_bid=0.04),
+            [0.03, 0.02],
+        )
+
+
+class EmptyFakArmTests(unittest.TestCase):
+    def test_empty_fak_status_matches_clob_miss(self):
+        self.assertTrue(
+            empty_fak_status("error:no orders found to match with FAK order")
+        )
+        self.assertTrue(
+            empty_fak_status(
+                "error:PolyApiException[status_code=400, error_message="
+                "{'error': 'no orders found to match with FAK order'}]"
+            )
+        )
+        self.assertFalse(empty_fak_status("matched"))
+        self.assertFalse(empty_fak_status("error:timeout"))
+
+    def test_empty_fak_does_not_clear_arm_forever(self):
+        fire, armed, why = loser_persist_ready(
+            False,
+            now_s=20.0,
+            armed_ts=10.0,
+            persist_s=5.0,
+            last_status="error:no orders found to match with FAK order",
+            book_empty=True,
+        )
+        self.assertFalse(fire)
+        self.assertEqual(armed, 10.0)
+        self.assertEqual(why, "empty_fak_keep_arm")
+
+        fire, armed, why = loser_persist_ready(
+            True,
+            now_s=21.0,
+            armed_ts=armed,
+            persist_s=5.0,
+            last_status="error:no orders found to match with FAK order",
+            book_empty=False,
+        )
+        self.assertTrue(fire)
+        self.assertEqual(armed, 10.0)
+        self.assertEqual(why, "ready")
+
+    def test_empty_fak_rearms_when_latch_already_gone(self):
+        fire, armed, why = loser_persist_ready(
+            False,
+            now_s=20.0,
+            armed_ts=None,
+            persist_s=5.0,
+            last_status="error:no orders found to match with FAK order",
+            book_empty=True,
+        )
+        self.assertFalse(fire)
+        self.assertEqual(armed, 20.0)
+        self.assertEqual(why, "empty_fak_rearm")
+
+    def test_qualify_drop_without_empty_fak_still_resets(self):
+        fire, armed, why = loser_persist_ready(
+            False,
+            now_s=20.0,
+            armed_ts=10.0,
+            persist_s=5.0,
+            last_status="matched",
+            book_empty=True,
+        )
+        self.assertFalse(fire)
+        self.assertIsNone(armed)
+        self.assertEqual(why, "reset")
 
 
 class SizedBidTests(unittest.TestCase):
