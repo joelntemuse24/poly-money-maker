@@ -1,19 +1,19 @@
 # Cloud research agents (no live orders, no `.env`)
 
-Cloud agents paper-score BTC Up/Down **books** against the live 5m template.
-They do **not** replace `polybuybot5m`. They never receive `.env`, never
-load live `strategy_buy5m.json`, and never start systemd.
+Cloud agents paper-score BTC Up/Down **books** against pathlog ticks.
+They do **not** replace live `polymintbot`. They never receive `.env`,
+never load live `strategy_mint.json`, and never start systemd.
 
 The point is **paper P&L** (hedge proceeds or $1 / $0), not “would it have
 clicked.” Hits without `pnl` are incomplete.
 
 Pathlog **cannot** replay Polymarket last-trade GUI, Chainlink/PTB, or POST
 latency. Paper mode: fill at the recorded ask, walk later ticks for a
-50/52/15 hedge from the 5m example JSON (paper honors `hedge_persist_s`,
-1s on that file; dump **40¢**; flatten walks **<75¢**) using
-mid-as-GUI when spread ≤ 10¢ (held ≤ 52¢ / other ≥ 48¢; other need not be
-ahead). Wide books fail closed. Toxic dumps while bid ≤ 40¢, or flatten
-while bid < 75¢.
+50/52/15 hedge from the built-in paper knobs (paper honors
+`hedge_persist_s`, 1s on that template; dump **40¢**; flatten walks
+**<75¢**) using mid-as-GUI when spread ≤ 10¢ (held ≤ 52¢ / other ≥ 48¢;
+other need not be ahead). Wide books fail closed. Toxic dumps while bid
+≤ 40¢, or flatten while bid < 75¢.
 
 Live books are **public** (Gamma + CLOB). `pathlog.py` records them with no
 keys. Do not put `PRIVATE_KEY` on a Cloud Agent.
@@ -25,8 +25,10 @@ keys. Do not put `PRIVATE_KEY` on a Cloud Agent.
 repo root → `pathlog/ticks/*.jsonl`. Do **not** attach `.env` or live JSON.
 
 **Live tape (markets happening now):** run `pathlog.py` in this environment
-(GET only). Wait until 5m markets **resolve**, then `--sweep --paper` on
-those files. Unresolved markets have no redeem P&L.
+(GET only; live `SERIES` is **15m only**). Wait until 15m markets
+**resolve**, then `--sweep --paper` on those files. Unresolved markets have
+no redeem P&L. Do not start `pathlog_hourly_dense`. Historical 5m tick
+archives can still be scored with `--series 5m`.
 
 Environment install: `.cursor/environment.json` (`python3.12-venv` + pip,
 plus optional `poly-vm` SSH when `POLY_VM_SSH_KEY` is set).
@@ -59,20 +61,17 @@ You are a paper P&L research agent for joelntemuse24/poly-money-maker.
 
 Goal: rank strategy variants by money made, not by how often they would fire.
 Money = paper P&L after a 50/52/15 hedge (or toxic dump at 32¢) or after redeem at
-$1.00 / $0.00. A skip with no fill is $0, not a win. Unresolved markets do
-not get a redeem P&L — wait or mark them unresolved.
+$1.00 / $0.00. A skip with no fill is $0, not a win. Unresolved markets
+do not get a redeem P&L — wait or mark them unresolved.
 
 Hard rules:
-- Do not start polybuybot, polybuybot5m, polybuybothourly, or polymintbot.
+- Do not start polybuybot, polybuybot5m, polybuybothourly, polymintbot,
+  polycomplement, polydangerzone, or pathlog_hourly_dense.
 - Do not create ClobClient with a private key. No POST /order. No relayer.
 - Do not read, write, or ask for .env. Do not set dry_run false.
-- Do not edit strategy_buy.json / strategy_buy5m.json / strategy_buyhourly.json
-  (non-example). Template file is strategy_buy5m.example.json. `--sweep`
-  scores the **late** keys only (75–90¢ / last 45s probe / $2.50).
-  `live_5m_paper` is that file, not the live last-120 bot. `window_120s` is
-  an explicit variant. It does
-  **not** replay the live early ≥90 / ≥95 union or two $2.50 slices.
-- pathlog.py is allowed (recorder only). check_book.py is allowed.
+- Do not edit live strategy_mint.json. Buybot sources are not in this tree.
+  `--sweep` uses built-in paper knobs (75–90¢ / last 120s / $2.50).
+- pathlog.py is allowed (recorder only).
 - Gamma GET and CLOB GET only: gamma-api.polymarket.com, clob.polymarket.com.
 
 Setup:
@@ -82,45 +81,34 @@ If a zip/tgz was attached, unpack at repo root so pathlog/ticks/*.jsonl exists.
 Never scrape a substitute for missing ticks by placing orders.
 
 NOW snapshot (30 seconds, public APIs):
-- Find the current btc-up-or-down-5m market (and 15m/hourly if open).
+- Find the current btc-up-or-down-15m market (and 5m/hourly if open).
 - Print slug, seconds left, up/down best bid/ask/size.
-- Print whether the live 5m template WOULD BUY on this tick (ask in 75–90,
-  ttm ≤ 120, spread ≤ 5¢, one winning leg). This is a call, not P&L yet.
-  `--sweep` live_5m_paper is the example JSON (last 45s today).
 
 LIVE recorder (markets that are happening):
 - Start: .venv/bin/python pathlog.py
   (background). It writes pathlog/ticks, no orders.
-- Let it run until at least 6 distinct 5m markets have a resolved winner
+- Let it run until at least 6 distinct 15m markets have a resolved winner
   OR 40 minutes wall clock, whichever first. Do not busy-loop the user;
   wait on the process.
 - Stop: touch STOP_PATHLOG and wait for pathlog to exit. Do not kill -9
   mid-write if you can avoid it.
 - Then score the session tape with paper hedge:
 
-.venv/bin/python check_path_backtest.py --sweep --series 5m
-.venv/bin/python check_path_backtest.py --hedge-sweep --series 5m --budget 2.5
-.venv/bin/python check_path_backtest.py --anatomy --series 5m --ttm-max 120
-.venv/bin/python check_path_backtest.py --compare --paper --series 5m --budget 2.5
-.venv/bin/python check_path_backtest.py --compare --paper --series 5m --budget 15
+.venv/bin/python check_path_backtest.py --sweep --series 15m
+.venv/bin/python check_path_backtest.py --hedge-sweep --series 15m --budget 2.5
+.venv/bin/python check_path_backtest.py --anatomy --series 15m --ttm-max 120
+.venv/bin/python check_path_backtest.py --compare --paper --series 15m --budget 2.5
+.venv/bin/python check_path_backtest.py --compare --paper --series 15m --budget 15
 
 If older ticks were unpacked from a zip, run the same --sweep/--compare on
-that full tape TOO and label tables HISTORICAL vs SESSION.
+that full tape TOO and label tables HISTORICAL vs SESSION. Historical 5m
+archives: add --series 5m on the same commands.
 
-HISTORICAL extras if ticks exist for those series:
-.venv/bin/python check_path_backtest.py --sweep --series 15m --template strategy_buy.example.json
-.venv/bin/python check_path_backtest.py --sweep --series hourly --template strategy_buyhourly.example.json
-.venv/bin/python check_path_backtest.py --grid --series 5m --budget 2.5
-
-If buybot5m.log exists:
-.venv/bin/python check_buy_skips.py --since 2026-08-20T02:46:00
-
-After the tables: at most 5 extra 5m combos that anatomy/grid suggest
-(not a cartesian bomb). --paper --series 5m --max-spread 0.05.
+After the tables: at most 5 extra 15m combos that anatomy/grid suggest
+(not a cartesian bomb). --paper --series 15m --max-spread 0.05.
 
 How to pick a winner (this is the whole exercise):
-- Baseline = live_5m_paper (example JSON late keys: 75–90, last 45s probe,
-  $2.50, paper 50/52). Compare `window_120s` if you want the live TTM.
+- Baseline = live_5m_paper (built-in knobs: 75–90, last 120s, $2.50, paper 50/52).
 - Rank by pnl_sum first, then win_rate, then hits.
 - Ignore a variant with fewer than 5 hits on HISTORICAL or fewer than 3
   fills on SESSION. Lucky n=1 is not an edge.
@@ -136,8 +124,8 @@ How to pick a winner (this is the whole exercise):
 Write a draft PR that:
 - does NOT change live JSON or bots unless a test/docs bug blocks the sweep
 - pastes HISTORICAL and SESSION tables in the PR body
-- recommends at most one next live experiment, or “keep 75–90/120s”
-- says operator must git pull + systemctl restart polybuybot5m to go live
+- recommends at most one next live experiment, or “keep mint-only”
+- does not tell anyone to enable buybots; live mint/pathlog restarts are operator-only
 ```
 
 ## 3. Tape-only prompt (zip already attached, no waiting)
@@ -148,31 +136,24 @@ Use section 2 if you want live markets. This one only scores files on disk.
 You are a research agent for joelntemuse24/poly-money-maker. Paper P&L only.
 
 Hard rules:
-- Do not start polybuybot, polybuybot5m, polybuybothourly, or polymintbot.
-- Do not edit strategy_buy.json / strategy_buy5m.json / strategy_buyhourly.json (non-example).
+- Do not start polybuybot, polybuybot5m, polybuybothourly, polymintbot,
+  polycomplement, polydangerzone, or pathlog_hourly_dense.
+- Do not edit live strategy_mint.json. Buybot sources are not in this tree.
 - Do not read or write .env. Do not set dry_run false. Do not place orders.
-- Template file is strategy_buy5m.example.json. `--sweep` scores late
-  75–90¢ / last 45s (probe template) / $2.50 plus paper 50/52 — not the early ≥90 / ≥95 union.
+- `--sweep` uses built-in paper knobs (75–90¢ / last 120s / $2.50 plus paper 50/52).
 - Rank by paper pnl_sum vs live_5m_paper, not by hit count. If pathlog/ticks
   is missing, run pathlog.py (no orders) instead of inventing books.
 
 Setup:
 .venv/bin/python -m unittest discover -s tests -p 'test_*.py'
 
-.venv/bin/python check_path_backtest.py --sweep --series 5m
-.venv/bin/python check_path_backtest.py --sweep --series 15m --template strategy_buy.example.json
-.venv/bin/python check_path_backtest.py --sweep --series hourly --template strategy_buyhourly.example.json
-.venv/bin/python check_path_backtest.py --anatomy --series 5m --ttm-max 120
-.venv/bin/python check_path_backtest.py --grid --series 5m --budget 2.5
-.venv/bin/python check_path_backtest.py --compare --paper --series 5m --budget 2.5
-.venv/bin/python check_path_backtest.py --compare --paper --series 5m --budget 15
-.venv/bin/python check_reversal_features.py --hours 72
-.venv/bin/python check_reversal_features.py --hours 168
+.venv/bin/python check_path_backtest.py --sweep --series 15m
+.venv/bin/python check_path_backtest.py --anatomy --series 15m --ttm-max 120
+.venv/bin/python check_path_backtest.py --grid --series 15m --budget 2.5
+.venv/bin/python check_path_backtest.py --compare --paper --series 15m --budget 2.5
+.venv/bin/python check_path_backtest.py --compare --paper --series 15m --budget 15
 
-If buybot5m.log exists:
-.venv/bin/python check_buy_skips.py --since 2026-08-20T02:46:00
-
-After the tables: at most 5 extra combos; --paper --series 5m --max-spread 0.05.
+After the tables: at most 5 extra combos; --paper --series 15m --max-spread 0.05.
 Name the money winner vs live_5m_paper (pnl, win_rate, hits, hedges, toxic_dumps)
 or say baseline wins. Draft PR: tables only; no live JSON; operator restart to go live.
 ```
@@ -183,11 +164,11 @@ or say baseline wins. Draft PR: tables only; no live JSON; operator restart to g
 Paper P&L only. No bots, no .env, no live strategy_*.json.
 
 .venv/bin/python -m unittest discover -s tests -p 'test_*.py'
-.venv/bin/python check_path_backtest.py --sweep --series 5m
+.venv/bin/python check_path_backtest.py --sweep --series 15m
 
 If that exits 2 (no ticks), comment: snapshot missing pathlog/ticks.
 Otherwise paste the sweep table and name the best variant vs live_5m_paper
-by pnl_sum (min 5 hits). Do not merge. Do not edit strategy_buy5m.json.
+by pnl_sum (min 5 hits). Do not merge. Do not edit strategy_mint.json.
 ```
 
 ## 5. What “money” means here
@@ -195,10 +176,10 @@ by pnl_sum (min 5 hits). Do not merge. Do not edit strategy_buy5m.json.
 | Live | Paper (`--paper` / `--sweep`) |
 |---|---|
 | Limit FAK at quoted ask, `budget/ask` | Same size model; displayed top is fillable cap |
-| GUI + last trade for hedge | Mid if spread ≤ 10¢; 5m held ≤ 52¢ / other ≥ 48¢ from example JSON; wide book = no hedge |
+| GUI + last trade for hedge | Mid if spread ≤ 10¢; held ≤ 52¢ / other ≥ 48¢ from built-in knobs; wide book = no hedge |
 | BTC/PTB side gate | Not replayed (pathlog is books only) |
 | Unmatched FAK / POST RTT | Not replayed (optimistic fill at that tick) |
-| Toxic dump if bid ≤ 40¢ (5m example); flatten walks while bid < 75¢ | Same from template; recovered bid ≥ 75¢ rides |
+| Toxic dump if bid ≤ 40¢; flatten walks while bid < 75¢ | Same from built-in template; recovered bid ≥ 75¢ rides |
 | Redeem $1 / wipeout $0 | After no hedge: same — this is the P&L |
 
 `--sweep` is **one change at a time** from the template (window, band, $15,

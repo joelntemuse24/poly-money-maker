@@ -1,18 +1,16 @@
 {
   "entry_enabled": false,
   "dry_run": true,
-  "shares": 6.0,
+  "shares": 50.0,
   "enter_min_ttm_min": 0.0,
-  "enter_max_ttm_min": 70.0,
+  "enter_max_ttm_min": 16.0,
   "series_slugs": [
-    "btc-up-or-down-5m",
-    "btc-up-or-down-15m",
-    "btc-up-or-down-hourly"
+    "btc-up-or-down-15m"
   ],
   "one_entry_per_market": true,
-  "max_open_sets": 40,
-  "max_daily_notional": 500.0,
-  "poll_s": 10.0,
+  "max_open_sets": 1,
+  "max_daily_notional": 200.0,
+  "poll_s": 5.0,
   "position_tolerance": 0.01,
   "require_accepting_orders": true,
   "rpc_url": "https://polygon.drpc.org",
@@ -22,5 +20,10 @@
   "chain_id": 137,
   "pUSD_address": "0xC011a7E12a19f7B1f670d46F03B03f3342E82DFB",
   "ctf_address": "0x4D97DCd97eC945f40cF65F87097ACe5EA0476045",
-  "standard_adapter_address": "0xAdA100Db00Ca00073811820692005400218FcE1f"
+  "standard_adapter_address": "0xAdA100Db00Ca00073811820692005400218FcE1f",
+  "sell_enabled": false,
+  "sell_threshold": 0.03,
+  "sell_floor": 0.02,
+  "sell_opposite_min": 0.5,
+  "sell_cooldown_s": 3.0
 }

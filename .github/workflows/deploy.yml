@@ -4,9 +4,7 @@ on:
   push:
     branches: [main]
     paths:
-      - 'buybot.py'
-      - 'buybot5m.py'
-      - 'buybothourly.py'
+      - 'mintbot.py'
       - 'pathlog.py'
       - 'check_path_backtest.py'
       - 'buy/**'
@@ -28,10 +26,13 @@ jobs:
             git pull origin main
             .venv/bin/python -m pip install -r requirements.txt --quiet
             # Do NOT systemctl restart here. A blind restart starts disabled units
-            # and can re-enable bleeding bots after a force-stop. Code is pulled;
-            # operators start/restart services deliberately after validation.
+            # and can re-enable retired buy/hedge/complement bots after a force-stop.
+            # Live units are polymintbot + polypathlog (15m) only; operators
+            # start/restart those deliberately after validation.
             echo "Pulled $(git rev-parse --short HEAD) at $(date)"
-            echo "Services NOT restarted. Active:"
-            systemctl is-active polybuybot polybuybot5m polybuybothourly polymintbot polypathlog || true
+            echo "Services NOT restarted. Live (mint + 15m pathlog):"
+            systemctl is-active polymintbot polypathlog || true
             echo "Enabled:"
-            systemctl is-enabled polybuybot polybuybot5m polybuybothourly polymintbot polypathlog || true
+            systemctl is-enabled polymintbot polypathlog || true
+            echo "Retired (must stay inactive):"
+            systemctl is-active polybuybot polybuybot5m polybuybothourly polycomplement polydangerzone 2>/dev/null || true

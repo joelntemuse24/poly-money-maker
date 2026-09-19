@@ -1,8 +1,7 @@
 """Shared CLOB book helpers — top-of-book price and displayed size.
 
-Used by the market-channel WS cache and by pathlog so REST `/book` samples
-and WS snapshots parse levels the same way. Buy-bot copies keep their own
-quote path; do not fork a second parser here.
+Used by pathlog so REST `/book` samples parse levels the same way.
+Do not fork a second parser in mintbot or pathlog.
 """
 
 from __future__ import annotations

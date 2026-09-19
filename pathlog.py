@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
-"""Record CLOB top-of-book paths for BTC Up/Down markets.
+"""Record CLOB top-of-book paths for BTC 15m Up/Down markets.
 
 No orders. One JSONL file per market under pathlog/ticks/. Later,
 check_path_backtest.py answers: if we had entered at price X with Y
 seconds left, would that leg have won? New ticks also store displayed
 top-of-book size so the backtest can share-cap FAK fills.
+
+Live SERIES is btc-up-or-down-15m only. Do not start pathlog_hourly_dense.
 
 Ticks are auto-pruned (14 days / 400 MB, oldest first) so they fit the
 small VM disk. Export with check_path_backtest.py (or scp the ticks
@@ -47,16 +49,15 @@ CLOB = "https://clob.polymarket.com"
 GAMMA = "https://gamma-api.polymarket.com"
 
 SERIES = [
-    "btc-up-or-down-5m",
+    # Mint-only stack (2026-09-19): pathlog records 15m only.
     "btc-up-or-down-15m",
-    "btc-up-or-down-hourly",
 ]
 
 # Seconds before end to start sampling. Whole 5m window; last 8m of 15m; last 15m of hourly.
 RECORD_BEFORE_END_S = {
     "btc-up-or-down-5m": 5 * 60,
     "btc-up-or-down-15m": 8 * 60,
-    "btc-up-or-down-hourly": 15 * 60,  # Joel 2026-09-12: last 15m only
+    "btc-up-or-down-hourly": 15 * 60,
 }
 
 POLL_S = 1.0
