@@ -329,7 +329,7 @@ On full fill: set `sold_loser=true`, `sold_leg="up"|"dn"`, store `sell_limit` (f
 
 Default `sell_winner_min=0.999`. Unconditional 0.99 cash-out was rejected: it cuts margin versus redeeming at $1.
 
-**Cheap-loser gate:** if `sold_loser` and recorded loser price ≤ `sell_winner_cheap_if_loser_le` (0.03), then `effective_winner_min = min(0.999, sell_winner_min_cheap=0.99)`.
+**Cheap-loser gate:** if `sold_loser` and recorded loser price ≤ `sell_winner_cheap_if_loser_le` (0.03) **and** `loser_fill + sell_winner_min_cheap > 1.0`, then `effective_winner_min = min(0.999, sell_winner_min_cheap=0.99)`. Flat 1¢+99¢ stays at 0.999 and waits for redeem.
 
 When the sized winner bid meets `effective_winner_min` for `sell_persist_s`, **live-bid FAK** the winner (limit = current sized bid). Mark `sold_winner`.
 
@@ -415,6 +415,7 @@ Observed failure mode before the fix: winner armed at bid 0.99 but FAK posted 0.
 - `persist_ready` — arm → waiting → ready over `persist_s` (resets when qualify drops).
 - `loser_persist_ready` — persist_ready plus empty-FAK keep/re-arm.
 - `winner_cashout_leg` — unique leg whose sized bid ≥ winner_min.
+- `winner_cheap_decision` — 0.99 only if sold_loser, loser ≤ gate, and loser+cheap > $1.
 - `loser_ladder_limits` — [threshold, floor] when bid ≥ floor; live bid when below floor.
 
 Defaults mirror mintbot sell knobs including dump keys.
@@ -462,8 +463,8 @@ From VM `strategy_mint.json`:
 | `sell_persist_s` | 5 | Loser/winner persist |
 | `sell_cooldown_s` | 3 | Between attempts |
 | `sell_winner_min` | 0.999 | Prefer redeem-quality bid |
-| `sell_winner_cheap_if_loser_le` | 0.03 | Gate for 0.99 winner |
-| `sell_winner_min_cheap` | 0.99 | Winner limit if gated |
+| `sell_winner_cheap_if_loser_le` | 0.03 | Cheap-loser price cap (still needs edge > $1) |
+| `sell_winner_min_cheap` | 0.99 | Winner limit if gated *and* loser+cheap > $1 |
 | `sell_dump_enabled` | true | Held-leg dump on |
 | `sell_dump_below` | 0.80 | Dump arm threshold |
 | `sell_dump_persist_s` | 5 | Dump persist |
@@ -555,7 +556,7 @@ every poll_s seconds:
 | Precondition | Persist | Action | Flags set |
 |---|---|---|---|
 | Loser sized bid ≤ 0.03 AND opposite ≥ 0.90 AND not both cheap | 5s | FAK ladder 0.03→0.02, or live bid if below floor | `sold_loser`, `sold_leg` |
-| Winner sized bid ≥ effective_winner_min (0.999, or 0.99 if loser ≤0.03) | 5s | Live-bid FAK winner | `sold_winner` |
+| Winner sized bid ≥ effective_winner_min (0.999, or 0.99 if loser ≤0.03 *and* loser+0.99 > $1) | 5s | Live-bid FAK winner | `sold_winner` |
 | `sold_loser` AND held sized bid < 0.80 | 5s | Live-bid FAK held | `sold_dump`, `sold_winner` |
 | `now > end_ts` | — | No CLOB sells | (redeem outside this loop) |
 | Within `sell_cooldown_s` of last attempt | — | Skip fire | — |
@@ -564,7 +565,8 @@ every poll_s seconds:
 
 ```
 effective = sell_winner_min                           # 0.999
-if sold_loser and sell_limit <= sell_winner_cheap_if_loser_le:
+if sold_loser and sell_limit <= sell_winner_cheap_if_loser_le
+   and sell_limit + sell_winner_min_cheap > 1.0:
     effective = min(effective, sell_winner_min_cheap) # 0.99
 ```
 
@@ -699,7 +701,8 @@ mintbot                 CLOB book              inventory latch           flags o
    | [A] winner path        |                        |                        |
    | effective_min = 0.999  |                        |                        |
    | if sold_loser and      |                        |                        |
-   |   sell_limit<=0.03:    |                        |                        |
+   |   sell_limit<=0.03 and |                        |                        |
+   |   sell_limit+0.99>$1:  |                        |                        |
    |   effective_min=0.99   |                        |                        |
    | if sized winner bid    |                        |                        |
    |   >= effective_min     |                        |                        |

@@ -20,7 +20,7 @@ pathlog are **stopped / retired**. Do not start them.
 - `already_minted` includes `failed` (no remint storm)
 - Sells on:
   - Loser: opposite ≥ 0.90, loser ≤ 0.03 persist 5s, FAK 0.03 → 0.02
-  - Winner: prefer 0.999 / redeem; allow 0.99 live-bid FAK only if loser sold ≤ 0.03
+  - Winner: prefer 0.999 / redeem; allow 0.99 live-bid FAK only if loser sold ≤ 0.03 and loser+0.99 > $1
   - Held dump: after loser sold, if held sized bid < 0.80 for 5s → live-bid FAK
 
 See `TECHNICAL_DESIGN.md` for the full guided tour.

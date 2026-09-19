@@ -153,6 +153,40 @@ def winner_cashout_leg(
     return "up" if up_hit else "dn"
 
 
+def winner_cheap_decision(
+    sold_loser: bool,
+    loser_fill: Optional[float],
+    *,
+    winner_min: float,
+    cheap_gate: float,
+    cheap_min: float,
+) -> Tuple[float, bool, str]:
+    """Return ``(effective_winner_min, cheap_enabled, reason)``.
+
+    Cheap cash-out (typically 0.99) opens only when the loser is already sold
+    at/under ``cheap_gate`` *and* ``loser_fill + cheap_min > 1.0`` (beats mint).
+    Near-flat 1¢ + 99¢ keeps ``winner_min`` (0.999) so CLOB max 0.99 cannot fill
+    and the winner waits for redeem.
+    """
+    base = float(winner_min)
+    if not sold_loser:
+        return base, False, "no_sold_loser"
+    if loser_fill is None:
+        return base, False, "no_loser_fill"
+    try:
+        loser = float(loser_fill)
+    except (TypeError, ValueError):
+        return base, False, "no_loser_fill"
+    if not math.isfinite(loser):
+        return base, False, "no_loser_fill"
+    if loser > float(cheap_gate) + 1e-12:
+        return base, False, "loser_above_cheap_gate"
+    cheap = float(cheap_min)
+    if round(loser + cheap, 4) <= 1.0:
+        return base, False, "flat_or_negative_edge"
+    return min(base, cheap), True, "positive_edge"
+
+
 def empty_fak_status(status: Any) -> bool:
     """True when CLOB rejected a FAK because no resting bid matched."""
     return "no orders found" in str(status or "").lower()
