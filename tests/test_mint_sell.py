@@ -17,6 +17,7 @@ from buy.mint_sell import (
     sell_window_open,
     winner_cashout_leg,
     winner_cheap_decision,
+    winner_sell_limit,
 )
 
 
@@ -320,6 +321,86 @@ class WinnerCheapDecisionTests(unittest.TestCase):
         self.assertEqual(effective, 0.999)
         self.assertFalse(cheap)
         self.assertEqual(reason, "no_sold_loser")
+
+
+class WinnerSellLimitTests(unittest.TestCase):
+    """Incident 1789810200: live-bid FAK at 0.995–0.999 is rejected (CLOB max 0.99)."""
+
+    def test_live_999_posts_clob_max(self):
+        posted, clamped, reason = winner_sell_limit(0.999)
+        self.assertEqual(posted, 0.99)
+        self.assertTrue(clamped)
+        self.assertEqual(reason, "clob_max")
+
+    def test_live_995_posts_clob_max(self):
+        posted, clamped, reason = winner_sell_limit(0.995)
+        self.assertEqual(posted, 0.99)
+        self.assertTrue(clamped)
+        self.assertEqual(reason, "clob_max")
+
+    def test_live_99_is_already_valid(self):
+        posted, clamped, reason = winner_sell_limit(0.99)
+        self.assertEqual(posted, 0.99)
+        self.assertFalse(clamped)
+        self.assertEqual(reason, "")
+
+    def test_live_below_tick_floors_to_clob_min(self):
+        posted, clamped, reason = winner_sell_limit(0.005)
+        self.assertEqual(posted, 0.01)
+        self.assertTrue(clamped)
+        self.assertEqual(reason, "clob_min")
+
+    def test_rich_path_999_bid_still_posts_99(self):
+        """Joel: take winner when sized bid ≥ 0.999, but FAK must be a valid CLOB price."""
+        self.assertEqual(
+            winner_cashout_leg(up_bid=0.001, dn_bid=0.999, winner_min=0.999),
+            "dn",
+        )
+        posted, clamped, reason = winner_sell_limit(0.999)
+        self.assertEqual(posted, 0.99)
+        self.assertTrue(clamped)
+        self.assertEqual(reason, "clob_max")
+
+    def test_cheap_gate_995_book_still_posts_99(self):
+        """Incident: loser @0.03 opened cheap (1.02); Down 0.995 must FAK 0.99 not 0.995."""
+        effective, cheap, why = winner_cheap_decision(
+            sold_loser=True,
+            loser_fill=0.03,
+            winner_min=0.999,
+            cheap_gate=0.03,
+            cheap_min=0.99,
+        )
+        self.assertEqual(effective, 0.99)
+        self.assertTrue(cheap)
+        self.assertEqual(why, "positive_edge")
+        self.assertEqual(
+            winner_cashout_leg(up_bid=0.03, dn_bid=0.995, winner_min=effective),
+            "dn",
+        )
+        posted, clamped, reason = winner_sell_limit(0.995)
+        self.assertEqual(posted, 0.99)
+        self.assertTrue(clamped)
+        self.assertEqual(reason, "clob_max")
+
+    def test_live_98_with_min_99_does_not_fire(self):
+        self.assertIsNone(
+            winner_cashout_leg(up_bid=0.02, dn_bid=0.98, winner_min=0.99)
+        )
+
+    def test_cheap_gate_still_requires_loser_plus_99_beats_one(self):
+        effective, cheap, reason = winner_cheap_decision(
+            sold_loser=True,
+            loser_fill=0.01,
+            winner_min=0.999,
+            cheap_gate=0.03,
+            cheap_min=0.99,
+        )
+        self.assertEqual(effective, 0.999)
+        self.assertFalse(cheap)
+        self.assertEqual(reason, "flat_or_negative_edge")
+        self.assertIsNone(
+            winner_cashout_leg(up_bid=0.01, dn_bid=0.99, winner_min=effective)
+        )
 
 
 class LoserLadderTests(unittest.TestCase):
