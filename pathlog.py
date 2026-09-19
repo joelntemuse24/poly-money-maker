@@ -48,13 +48,12 @@ TICK_DIR = REPO / "pathlog" / "ticks"
 CLOB = "https://clob.polymarket.com"
 GAMMA = "https://gamma-api.polymarket.com"
 
-# Live recorder is 15m only. Do not add 5m or hourly back without operator OK.
-# Retired series stay in RECORD_BEFORE_END_S so old tick files still prune/resolve.
 SERIES = [
+    # Mint-only stack (2026-09-19): pathlog records 15m only.
     "btc-up-or-down-15m",
 ]
 
-# Seconds before end to start sampling.
+# Seconds before end to start sampling. Whole 5m window; last 8m of 15m; last 15m of hourly.
 RECORD_BEFORE_END_S = {
     "btc-up-or-down-5m": 5 * 60,
     "btc-up-or-down-15m": 8 * 60,

@@ -51,6 +51,11 @@ class PathlogSeriesTests(unittest.TestCase):
         self.assertEqual(pathlog.SERIES, ["btc-up-or-down-15m"])
         self.assertNotIn("btc-up-or-down-5m", pathlog.SERIES)
         self.assertNotIn("btc-up-or-down-hourly", pathlog.SERIES)
+        src = (ROOT / "pathlog.py").read_text()
+        self.assertIn(
+            "Mint-only stack (2026-09-19): pathlog records 15m only.",
+            src,
+        )
 
 
 class MintDefaultsTests(unittest.TestCase):
