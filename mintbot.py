@@ -6,10 +6,12 @@ No CLOB buys. No hedges. Discovers **btc-up-or-down-15m** only, mints
 and open within enter_max_ttm_min, if collateral is available.
 
 Optional sell (``sell_enabled``, default off): persist a loser dump at ~3¢
-for ~5s while the opposite bid is ≥ ~90¢, then FAK 3¢ → 2¢ when the live
-sized bid is at/over the floor, or at the live bid if it is below the
-floor. Keep the winner for redeem unless its bid reaches ~99.9¢. Off
-unless live ``strategy_mint.json`` turns it on.
+for ``sell_persist_s`` (~9s), or ``sell_persist_last_min_s`` (~5s) in the
+last ``sell_persist_last_min_window_s`` (~60s) before ``end_ts``, while the
+opposite bid is ≥ ~90¢, then FAK 3¢ → 2¢ when the live sized bid is at/over
+the floor, or at the live bid if it is below the floor. Keep the winner for
+redeem unless its bid reaches ~99.9¢. Off unless live ``strategy_mint.json``
+turns it on.
 
 Usage:
   # dry-run (default when strategy_mint.json has dry_run true / entry_enabled false)
@@ -41,17 +43,19 @@ from rich.align import Align
 from rich.console import Console
 from rich.panel import Panel
 
-from buy.book import best_bid_with_min_size
+from buy.book import best_bid_with_min_size, bid_fill_depth
 from buy.chain import ChainReader
 from buy.contracts import ContractCall, build_atomic_mint_calls
 from buy.market import MarketGateway, MintMarket
 from buy.mint_sell import (
     classify_loser,
+    effective_loser_persist_s,
     inventory_latch,
     loser_ladder_limits,
     loser_persist_ready,
     parse_sell_fill_shares,
     persist_ready,
+    sell_window_open,
     winner_cashout_leg,
     winner_cheap_decision,
 )
@@ -88,7 +92,9 @@ DEFAULTS = {
     "sell_threshold": 0.03,
     "sell_floor": 0.02,
     "sell_opposite_min": 0.90,
-    "sell_persist_s": 5.0,
+    "sell_persist_s": 9.0,
+    "sell_persist_last_min_s": 5.0,
+    "sell_persist_last_min_window_s": 60.0,
     "sell_cooldown_s": 3.0,
     "sell_winner_min": 0.999,
     # Cheap 0.99 winner only if loser ≤ this AND loser+cheap_min > 1.0 (else redeem).
@@ -236,6 +242,10 @@ def validate_strategy(cfg: dict) -> None:
         )
     if float(cfg.get("sell_persist_s") or 0) < 0:
         raise ValueError("sell_persist_s must be >= 0")
+    if float(cfg.get("sell_persist_last_min_s") or 0) < 0:
+        raise ValueError("sell_persist_last_min_s must be >= 0")
+    if float(cfg.get("sell_persist_last_min_window_s") or 0) < 0:
+        raise ValueError("sell_persist_last_min_window_s must be >= 0")
     if float(cfg.get("sell_min_bid_size") or 0) < 0:
         raise ValueError("sell_min_bid_size must be >= 0")
 
@@ -639,7 +649,8 @@ def write_heartbeat(status: str, **fields: Any) -> None:
 _clob_client = None
 _clob_init_error = None
 
-def _fetch_sized_bid(token_id: str, min_size: float):
+def _fetch_book(token_id: str, min_size: float):
+    """REST `/book` → sized best bid plus raw bid levels for depth logs."""
     try:
         response = requests.get(
             "https://clob.polymarket.com/book",
@@ -647,13 +658,45 @@ def _fetch_sized_bid(token_id: str, min_size: float):
             timeout=5,
         )
         if response.status_code != 200:
-            return None, 0.0
+            return None, 0.0, []
         payload = response.json()
         book = payload if isinstance(payload, dict) else {}
-        return best_bid_with_min_size(book.get("bids") or [], min_size=min_size)
+        bids = book.get("bids") or []
+        price, size = best_bid_with_min_size(bids, min_size=min_size)
+        return price, size, bids
     except Exception as exc:
         log_event("book_fetch_fail", token_id=str(token_id)[:18], error=str(exc)[:160])
-        return None, 0.0
+        return None, 0.0, []
+
+
+def _log_sell_book_depth(
+    *,
+    slug: Any,
+    leg: Any,
+    limit: Optional[float],
+    our_size: float,
+    bids: Any,
+    ttm_s: Optional[float],
+    path: str,
+    phase: str,
+    condition_id: Any = None,
+) -> None:
+    snap = bid_fill_depth(bids, limit)
+    log_event(
+        "sell_book_depth",
+        condition_id=condition_id,
+        slug=slug,
+        leg=leg,
+        limit=None if limit is None else round(float(limit), 4),
+        our_size=round(float(our_size or 0), 4),
+        best_bid=snap["best_bid"],
+        best_bid_size=snap["best_bid_size"],
+        depth_at_limit=snap["depth_at_limit"],
+        ladder=snap["ladder"],
+        ttm_s=None if ttm_s is None else round(float(ttm_s), 3),
+        path=path,
+        phase=phase,
+    )
 
 def _get_clob_client():
     global _clob_client, _clob_init_error
@@ -805,6 +848,11 @@ def _run_fak_ladder(
     label: str,
     slug: Any,
     tol: float,
+    depth_bids: Any = None,
+    depth_path: Optional[str] = None,
+    depth_leg: Any = None,
+    ttm_s: Optional[float] = None,
+    condition_id: Any = None,
 ) -> Tuple[float, str, Optional[float]]:
     sold_total = 0.0
     last_status = "none"
@@ -813,6 +861,18 @@ def _run_fak_ladder(
         remaining = size - sold_total
         if remaining < 0.01:
             break
+        if depth_path:
+            _log_sell_book_depth(
+                slug=slug,
+                leg=depth_leg,
+                limit=use_px,
+                our_size=remaining,
+                bids=depth_bids or [],
+                ttm_s=ttm_s,
+                path=depth_path,
+                phase="fak",
+                condition_id=condition_id,
+            )
         console.print(
             f"  [bold bright_yellow][SELL {label.upper()}][/] {slug}  "
             f"bid={bid:.3f}  limit>={use_px:.3f}  size={remaining:.2f}"
@@ -834,6 +894,8 @@ def manage_sells(cfg: dict, state: dict, chain: ChainReader) -> None:
     floor = float(cfg.get("sell_floor") or 0.02)
     opp_min = float(cfg.get("sell_opposite_min") or 0.90)
     persist_s = float(cfg.get("sell_persist_s") or 0.0)
+    last_min_s = float(cfg.get("sell_persist_last_min_s", 5.0))
+    last_min_window_s = float(cfg.get("sell_persist_last_min_window_s", 60.0))
     cooldown = float(cfg.get("sell_cooldown_s") or 3.0)
     winner_min = float(cfg.get("sell_winner_min") or 0.999)
     min_bid_size = float(cfg.get("sell_min_bid_size") or 1.0)
@@ -853,7 +915,7 @@ def manage_sells(cfg: dict, state: dict, chain: ChainReader) -> None:
         ):
             continue
         end_ts = float(intent.get("end_ts") or 0)
-        if end_ts and now > end_ts:
+        if not sell_window_open(now, end_ts):
             continue
 
         up_tok = str(intent.get("up_token") or "")
@@ -861,8 +923,10 @@ def manage_sells(cfg: dict, state: dict, chain: ChainReader) -> None:
         if not up_tok or not dn_tok:
             continue
 
-        up_bid, up_sz = _fetch_sized_bid(up_tok, min_bid_size)
-        dn_bid, dn_sz = _fetch_sized_bid(dn_tok, min_bid_size)
+        up_bid, up_sz, up_bids = _fetch_book(up_tok, min_bid_size)
+        dn_bid, dn_sz, dn_bids = _fetch_book(dn_tok, min_bid_size)
+        books = {"up": up_bids, "dn": dn_bids}
+        ttm_s = (end_ts - now) if end_ts else None
         intent["last_up_bid"] = up_bid
         intent["last_dn_bid"] = dn_bid
         intent["last_up_bid_size"] = up_sz
@@ -964,6 +1028,11 @@ def manage_sells(cfg: dict, state: dict, chain: ChainReader) -> None:
                     label=f"win {winner}",
                     slug=intent.get("slug"),
                     tol=tol,
+                    depth_bids=books.get(winner),
+                    depth_path="winner_cheap" if cheap_on else None,
+                    depth_leg=winner,
+                    ttm_s=ttm_s,
+                    condition_id=cid,
                 )
                 intent["sell_winner_attempts"] = int(
                     intent.get("sell_winner_attempts") or 0
@@ -1063,6 +1132,11 @@ def manage_sells(cfg: dict, state: dict, chain: ChainReader) -> None:
                     label=f"dump {held}",
                     slug=intent.get("slug"),
                     tol=tol,
+                    depth_bids=books.get(held),
+                    depth_path="dump",
+                    depth_leg=held,
+                    ttm_s=ttm_s,
+                    condition_id=cid,
                 )
                 intent["sell_dump_attempts"] = int(
                     intent.get("sell_dump_attempts") or 0
@@ -1101,6 +1175,29 @@ def manage_sells(cfg: dict, state: dict, chain: ChainReader) -> None:
                         intent.get("sell_dump_filled") or 0
                     ) + sold_total
 
+        loser_persist_s = effective_loser_persist_s(
+            now_s=now,
+            end_ts=end_ts,
+            persist_s=persist_s,
+            last_min_s=last_min_s,
+            last_min_window_s=last_min_window_s,
+        )
+        if loser_persist_s is None:
+            continue
+        prev_persist = intent.get("sell_persist_effective_s")
+        if (
+            prev_persist is not None
+            and abs(float(prev_persist) - float(loser_persist_s)) > 1e-12
+        ):
+            log_event(
+                "sell_persist_effective",
+                condition_id=cid,
+                slug=intent.get("slug"),
+                ttm=round(end_ts - now, 3) if end_ts else None,
+                effective_s=loser_persist_s,
+            )
+        intent["sell_persist_effective_s"] = loser_persist_s
+
         loser, loser_reason = classify_loser(
             up_bid, dn_bid, threshold=thr, opposite_min=opp_min,
         )
@@ -1125,11 +1222,26 @@ def manage_sells(cfg: dict, state: dict, chain: ChainReader) -> None:
             loser is not None and not sold_loser,
             now_s=now,
             armed_ts=intent.get("sell_loser_armed_at"),
-            persist_s=persist_s,
+            persist_s=loser_persist_s,
             last_status=intent.get("sell_last_status"),
             book_empty=up_bid is None or dn_bid is None,
         )
         intent["sell_loser_armed_at"] = armed_l
+        if loser and why_l in {"ready", "immediate"}:
+            loser_bid = float(bids[loser] or thr)
+            preview = loser_ladder_limits(thr, floor, loser_bid)
+            first_limit = preview[0] if preview else loser_bid
+            _log_sell_book_depth(
+                slug=intent.get("slug"),
+                leg=loser,
+                limit=first_limit,
+                our_size=shares,
+                bids=books.get(loser) or [],
+                ttm_s=ttm_s,
+                path="loser",
+                phase="ready",
+                condition_id=cid,
+            )
         if loser and why_l in {"armed", "waiting"}:
             log_event(
                 "sell_loser_persist",
@@ -1177,6 +1289,11 @@ def manage_sells(cfg: dict, state: dict, chain: ChainReader) -> None:
                     label=loser,
                     slug=intent.get("slug"),
                     tol=tol,
+                    depth_bids=books.get(loser),
+                    depth_path="loser",
+                    depth_leg=loser,
+                    ttm_s=ttm_s,
+                    condition_id=cid,
                 )
                 intent["sell_attempts"] = int(intent.get("sell_attempts") or 0) + 1
                 intent["sell_last_status"] = last_status

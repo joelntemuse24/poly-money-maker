@@ -322,7 +322,7 @@ Policy (`classify_loser` / equivalent):
 - Sized loser bid ≤ `sell_threshold` (0.03)
 - Sized opposite bid ≥ `sell_opposite_min` (0.90)
 - Not both cheap (ambiguous)
-- Persist that condition for `sell_persist_s` (5s) via `persist_ready`
+- Persist that condition for `sell_persist_s` (9s) via `persist_ready`. In the last `sell_persist_last_min_window_s` (60s) before `end_ts`, use `sell_persist_last_min_s` (5s) instead. Effective persist is re-evaluated each tick; an arm started on the 9s clock is not reset when the last minute begins, and becomes ready once elapsed ≥ 5s.
 - Then FAK ladder: threshold → floor (3¢ → 2¢), sized to inventory latch. If the live sized loser bid is below `sell_floor`, FAK at that live bid; empty FAK keeps or re-arms the persist latch so a later tick can retry before `end_ts`.
 
 On full fill: set `sold_loser=true`, `sold_leg="up"|"dn"`, store `sell_limit` (fill/limit evidence). Inventory latch distinguishes “await mint settlement” zeros from true flat.
@@ -416,6 +416,8 @@ Observed failure mode before the fix: winner armed at bid 0.99 but FAK posted 0.
 - `inventory_latch` — await vs already_flat vs has_inventory.
 - `classify_loser` — which leg is loser / both_cheap / wick_unconfirmed.
 - `persist_ready` — arm → waiting → ready over `persist_s` (resets when qualify drops).
+- `effective_loser_persist_s` — 9s normally, 5s when `0 < TTM ≤ 60`; `None` at/after `end_ts`.
+- `sell_window_open` — CLOB sells only while TTM is strictly positive.
 - `loser_persist_ready` — persist_ready plus empty-FAK keep/re-arm.
 - `winner_cashout_leg` — unique leg whose sized bid ≥ winner_min.
 - `winner_cheap_decision` — 0.99 only if sold_loser, loser ≤ gate, and loser+cheap > $1.
@@ -426,7 +428,7 @@ Defaults mirror mintbot sell knobs including dump keys.
 <a id="section-26"></a>
 ## buy/market.py, book.py, chain.py, contracts.py
 
-Discovery builds `MintMarket` with `condition_id`, `up_token`, `dn_token`, `start_ts`, `end_ts`, `slug`, flags. Book helper returns best bid with minimum size. Chain helper reads ERC-1155 positions. Contracts helper encodes the atomic mint path used by the relayer batch.
+Discovery builds `MintMarket` with `condition_id`, `up_token`, `dn_token`, `start_ts`, `end_ts`, `slug`, flags. Book helper returns best bid with minimum size and `bid_fill_depth` (cumulative bids at/through a FAK limit; mint logs `sell_book_depth`, does not gate on it). Chain helper reads ERC-1155 positions. Contracts helper encodes the atomic mint path used by the relayer batch.
 
 <a id="section-27"></a>
 ## pathlog.py: public book recorder
@@ -465,7 +467,9 @@ From VM `strategy_mint.json`:
 | `sell_enabled` | true | Enable manage_sells |
 | `sell_threshold` / `sell_floor` | 0.03 / 0.02 | Loser ladder |
 | `sell_opposite_min` | 0.90 | Opposite must be rich |
-| `sell_persist_s` | 5 | Loser/winner persist |
+| `sell_persist_s` | 9 | Loser/winner persist (normal) |
+| `sell_persist_last_min_s` | 5 | Loser persist when TTM ≤ last-min window |
+| `sell_persist_last_min_window_s` | 60 | Seconds-to-end that select the short persist |
 | `sell_cooldown_s` | 3 | Between attempts |
 | `sell_winner_min` | 0.999 | Prefer redeem-quality bid |
 | `sell_winner_cheap_if_loser_le` | 0.03 | Cheap-loser price cap (still needs edge > $1) |

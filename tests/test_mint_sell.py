@@ -7,12 +7,14 @@ import unittest
 from buy.book import best_bid_with_min_size
 from buy.mint_sell import (
     classify_loser,
+    effective_loser_persist_s,
     empty_fak_status,
     inventory_latch,
     loser_ladder_limits,
     loser_persist_ready,
     parse_sell_fill_shares,
     persist_ready,
+    sell_window_open,
     winner_cashout_leg,
     winner_cheap_decision,
 )
@@ -168,6 +170,94 @@ class PersistReadyTests(unittest.TestCase):
         )
         self.assertTrue(fire)
         self.assertEqual(why, "immediate")
+
+
+class EffectiveLoserPersistTests(unittest.TestCase):
+    """Last 60s before end_ts uses 5s persist so a short qualify window can fire."""
+
+    _KNOBS = dict(persist_s=9.0, last_min_s=5.0, last_min_window_s=60.0)
+
+    def test_ttm_over_60_uses_normal_9s(self):
+        end = 10_000.0
+        self.assertEqual(
+            effective_loser_persist_s(now_s=end - 61.0, end_ts=end, **self._KNOBS),
+            9.0,
+        )
+        self.assertEqual(
+            effective_loser_persist_s(now_s=end - 90.0, end_ts=end, **self._KNOBS),
+            9.0,
+        )
+
+    def test_ttm_30_uses_last_min_5s(self):
+        end = 10_000.0
+        self.assertEqual(
+            effective_loser_persist_s(now_s=end - 30.0, end_ts=end, **self._KNOBS),
+            5.0,
+        )
+
+    def test_ttm_exactly_60_uses_last_min(self):
+        end = 10_000.0
+        self.assertEqual(
+            effective_loser_persist_s(now_s=end - 60.0, end_ts=end, **self._KNOBS),
+            5.0,
+        )
+
+    def test_ttm_zero_or_past_end_is_no_sell(self):
+        end = 10_000.0
+        self.assertIsNone(
+            effective_loser_persist_s(now_s=end, end_ts=end, **self._KNOBS)
+        )
+        self.assertIsNone(
+            effective_loser_persist_s(now_s=end + 0.01, end_ts=end, **self._KNOBS)
+        )
+        self.assertFalse(sell_window_open(now_s=end, end_ts=end))
+        self.assertFalse(sell_window_open(now_s=end + 1.0, end_ts=end))
+        self.assertTrue(sell_window_open(now_s=end - 0.01, end_ts=end))
+
+    def test_arm_across_last_min_boundary_uses_shorter_threshold_without_reset(self):
+        """Incident: 9s arm started before T-60; last minute re-evaluates at 5s.
+
+        Arm at T-63 (9s). At T-58 elapsed is 5s: still waiting under 9s, ready
+        under 5s, and armed_ts is unchanged (do not reset on the switch).
+        """
+        end = 10_000.0
+        arm_now = end - 63.0
+        tick_now = end - 58.0
+        persist_at_arm = effective_loser_persist_s(
+            now_s=arm_now, end_ts=end, **self._KNOBS
+        )
+        self.assertEqual(persist_at_arm, 9.0)
+        fire, armed, why = persist_ready(
+            True, now_s=arm_now, armed_ts=None, persist_s=persist_at_arm,
+        )
+        self.assertFalse(fire)
+        self.assertEqual(armed, arm_now)
+        self.assertEqual(why, "armed")
+
+        persist_inside = effective_loser_persist_s(
+            now_s=tick_now, end_ts=end, **self._KNOBS
+        )
+        self.assertEqual(persist_inside, 5.0)
+        still_waiting, armed_9, why_9 = persist_ready(
+            True, now_s=tick_now, armed_ts=armed, persist_s=9.0,
+        )
+        self.assertFalse(still_waiting)
+        self.assertEqual(armed_9, armed)
+        self.assertEqual(why_9, "waiting")
+
+        fire, armed_5, why_5 = persist_ready(
+            True, now_s=tick_now, armed_ts=armed, persist_s=persist_inside,
+        )
+        self.assertTrue(fire)
+        self.assertEqual(armed_5, armed)
+        self.assertEqual(why_5, "ready")
+
+        fire_l, armed_l, why_l = loser_persist_ready(
+            True, now_s=tick_now, armed_ts=armed, persist_s=persist_inside,
+        )
+        self.assertTrue(fire_l)
+        self.assertEqual(armed_l, armed)
+        self.assertEqual(why_l, "ready")
 
 
 class WinnerCashoutTests(unittest.TestCase):
