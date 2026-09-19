@@ -97,9 +97,151 @@ class MintDefaultsTests(unittest.TestCase):
                 "expired": {"status": "confirmed", "end_ts": now - 121},
                 "pending": {"status": "pending", "end_ts": now + 10},
                 "done": {"status": "completed", "end_ts": now + 10},
+                "winner_only": {
+                    "status": "confirmed",
+                    "end_ts": now + 60,
+                    "sold_loser": True,
+                },
+                "sold_leg_only": {
+                    "status": "confirmed",
+                    "end_ts": now + 60,
+                    "sold_leg": "dn",
+                },
             }
         }
         self.assertEqual(count(state, now=now), 2)
+
+
+_ACTIVE = frozenset(
+    {
+        "submitting",
+        "pending",
+        "executed",
+        "mined",
+        "confirmed_waiting_inventory",
+        "confirmed",
+    }
+)
+_WIN = 900.0
+_START_A = 10_000.0  # 1:30
+_END_A = _START_A + _WIN  # 1:45
+_START_B = _END_A  # 1:45
+_END_B = _START_B + _WIN  # 2:00
+_START_C = _END_B  # 2:00
+_NOW = _END_A - 60.0  # ~1:44, still holding 1:30–1:45
+
+
+def _slots():
+    extras = {"ACTIVE_STATUSES": _ACTIVE}
+    return (
+        _fn("open_intent_count", extras),
+        _fn("mint_slots_full", extras),
+    )
+
+
+class MintSlotChainTests(unittest.TestCase):
+    def test_redeem_hold_does_not_block(self):
+        count, slots = _slots()
+        cfg = {"max_open_sets": 1}
+        for flag in (
+            {"sold_loser": True},
+            {"sold_leg": "dn"},
+        ):
+            state = {
+                "intents": {
+                    "a": {
+                        "status": "confirmed",
+                        "start_ts": _START_A,
+                        "end_ts": _END_A,
+                        **flag,
+                    }
+                }
+            }
+            self.assertEqual(count(state, now=_NOW), 0, flag)
+            self.assertFalse(slots(state, cfg, _NOW, _START_B), flag)
+
+    def test_adjacent_next_window_allowed_at_cap(self):
+        _, slots = _slots()
+        state = {
+            "intents": {
+                "a": {
+                    "status": "confirmed",
+                    "start_ts": _START_A,
+                    "end_ts": _END_A,
+                }
+            }
+        }
+        self.assertFalse(slots(state, {"max_open_sets": 1}, _NOW, _START_B))
+
+    def test_second_lookahead_blocked_if_adjacent_already_held(self):
+        _, slots = _slots()
+        state = {
+            "intents": {
+                "a": {
+                    "status": "confirmed",
+                    "start_ts": _START_A,
+                    "end_ts": _END_A,
+                },
+                "b": {
+                    "status": "confirmed",
+                    "start_ts": _START_B,
+                    "end_ts": _END_B,
+                },
+            }
+        }
+        self.assertTrue(slots(state, {"max_open_sets": 1}, _NOW, _START_C))
+
+    def test_non_adjacent_future_window_blocked_at_cap(self):
+        _, slots = _slots()
+        state = {
+            "intents": {
+                "a": {
+                    "status": "confirmed",
+                    "start_ts": _START_A,
+                    "end_ts": _END_A,
+                }
+            }
+        }
+        self.assertTrue(slots(state, {"max_open_sets": 1}, _NOW, _START_C))
+
+    def test_run_cycle_picks_then_gates_and_records_start_ts(self):
+        src = MINT.read_text()
+        cycle = src[src.find("def run_cycle") : src.find("\ndef main")]
+        self.assertLess(cycle.find("pick = market"), cycle.find("if mint_slots_full"))
+        self.assertIn(
+            "if mint_slots_full(state, cfg, now, float(pick.start_ts)):",
+            cycle,
+        )
+        self.assertNotIn(
+            'if open_intent_count(state) >= int(cfg["max_open_sets"]):',
+            cycle,
+        )
+        self.assertGreaterEqual(cycle.count('"start_ts": pick.start_ts'), 2)
+
+    def test_already_minted_treats_failed_as_attempted(self):
+        fn = _fn("already_minted", {"ACTIVE_STATUSES": _ACTIVE})
+        cfg = {"one_entry_per_market": True}
+        cid = "btc-updown-15m-1789798500"
+        state = {"intents": {cid: {"status": "failed", "condition_id": cid}}}
+        self.assertTrue(fn(state, cid, cfg))
+        self.assertTrue(
+            fn(
+                {"intents": {cid: {"status": "completed"}}},
+                cid,
+                cfg,
+            )
+        )
+        self.assertTrue(
+            fn(
+                {"intents": {cid: {"status": "confirmed"}}},
+                cid,
+                cfg,
+            )
+        )
+        self.assertFalse(fn({"intents": {}}, cid, cfg))
+        self.assertFalse(
+            fn(state, cid, {"one_entry_per_market": False}),
+        )
 
 
 class DeployUnitsTests(unittest.TestCase):
