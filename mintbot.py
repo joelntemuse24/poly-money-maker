@@ -274,7 +274,11 @@ def eligible_markets(markets: List[MintMarket], cfg: dict, now: float) -> List[M
 
 
 def open_intent_count(state: dict, now: float | None = None) -> int:
-    """Live bags only; post-expiry redeem holds do not block the next window."""
+    """Count bags that still block a new mint (unsold loser).
+
+    Post-expiry redeem holds do not block. After the loser is sold we only
+    hold the winner for redeem — that must not skip the next 15m window.
+    """
     now = time.time() if now is None else float(now)
     n = 0
     for intent in state.get("intents", {}).values():
@@ -283,8 +287,46 @@ def open_intent_count(state: dict, now: float | None = None) -> int:
         end_ts = float(intent.get("end_ts") or 0)
         if end_ts and now > end_ts + 120:
             continue
+        if intent.get("sold_loser") or intent.get("sold_leg"):
+            continue
         n += 1
     return n
+
+
+def mint_slots_full(state: dict, cfg: dict, now: float, candidate_start_ts: float) -> bool:
+    """True if minting candidate would exceed capacity.
+
+    At max_open_sets full bags we still allow the *adjacent* next window
+    (candidate.start_ts >= soonest full-bag end_ts) so we do not skip e.g.
+    1:45–2:00 while holding 1:30–1:45. Only one such lookahead is allowed.
+    A later (non-adjacent) window stays blocked at the cap.
+    """
+    max_open = int(cfg["max_open_sets"])
+    full = []
+    for intent in state.get("intents", {}).values():
+        if intent.get("status") not in ACTIVE_STATUSES:
+            continue
+        end_ts = float(intent.get("end_ts") or 0)
+        if end_ts and now > end_ts + 120:
+            continue
+        if intent.get("sold_loser") or intent.get("sold_leg"):
+            continue
+        full.append(intent)
+    if len(full) < max_open:
+        return False
+    soonest_end = min((float(i.get("end_ts") or 0) for i in full), default=0.0)
+    if not soonest_end or not candidate_start_ts:
+        return True
+    # Already holding a full bag that *is* that next window → block further.
+    for intent in full:
+        st = float(intent.get("start_ts") or 0)
+        if st + 1e-6 >= soonest_end:
+            return True
+    # Adjacent next 15m window starts at soonest_end. A later start is a skip.
+    candidate = float(candidate_start_ts)
+    if soonest_end <= candidate + 1e-6 < soonest_end + 900:
+        return False
+    return True
 
 
 def already_minted(state: dict, condition_id: str, cfg: dict) -> bool:
@@ -988,10 +1030,6 @@ def run_cycle(
         write_heartbeat("idle", markets=len(markets), eligible=0)
         return "idle"
 
-    if open_intent_count(state) >= int(cfg["max_open_sets"]):
-        write_heartbeat("capped_open", open=open_intent_count(state))
-        return "capped_open"
-
     spent = daily_spent(state, now)
     if spent + float(cfg["shares"]) > float(cfg["max_daily_notional"]) + 1e-9:
         write_heartbeat("capped_daily", spent=spent)
@@ -1020,6 +1058,14 @@ def run_cycle(
         write_heartbeat("idle", markets=len(markets), eligible=len(candidates), reason="owned")
         return "idle_owned"
 
+    if mint_slots_full(state, cfg, now, float(pick.start_ts)):
+        write_heartbeat(
+            "capped_open",
+            open=open_intent_count(state),
+            next_start=float(pick.start_ts),
+        )
+        return "capped_open"
+
     shares = float(cfg["shares"])
     mts = pick.minutes_to_start(now)
 
@@ -1046,6 +1092,7 @@ def run_cycle(
             "slug": pick.slug,
             "question": pick.question,
             "series_slug": pick.series_slug,
+            "start_ts": pick.start_ts,
             "end_ts": pick.end_ts,
             "shares": shares,
             "up_token": pick.up_token,
@@ -1106,6 +1153,7 @@ def run_cycle(
         "slug": pick.slug,
         "question": pick.question,
         "series_slug": pick.series_slug,
+        "start_ts": pick.start_ts,
         "end_ts": pick.end_ts,
         "up_token": pick.up_token,
         "dn_token": pick.dn_token,
