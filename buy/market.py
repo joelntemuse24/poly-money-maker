@@ -98,37 +98,6 @@ def slug_window_end_ts(slug: str, duration_s: float = FIVE_M_DURATION_S) -> Opti
         return None
 
 
-def entry_seconds_left(
-    now_s,
-    gamma_end_ts,
-    slug=None,
-    duration_s: float = FIVE_M_DURATION_S,
-) -> float:
-    """TTM for entry/hedge clocks.
-
-    Gamma ``endDate`` can sit several seconds off ``slug+300``. Live 22 Aug
-    late 91–99 posts hugged TTM 113–120: Gamma still said early (99¢ FAK)
-    while the slug clock was already inside the last 120s. Use the
-    **earliest** close so a 93¢ ask at slug-TTM 116 cannot POST.
-    """
-    ends = []
-    try:
-        if gamma_end_ts not in (None, ""):
-            ends.append(float(gamma_end_ts))
-    except (TypeError, ValueError):
-        pass
-    slug_end = slug_window_end_ts(slug, duration_s) if slug else None
-    if slug_end is not None:
-        ends.append(float(slug_end))
-    if not ends:
-        return 0.0
-    try:
-        now = float(now_s)
-    except (TypeError, ValueError):
-        return 0.0
-    return min(ends) - now
-
-
 def _parse_event(event: dict, series_slug: str) -> Iterable[MintMarket]:
     for market in event.get("markets") or []:
         end = market.get("endDate") or event.get("endDate")
@@ -200,37 +169,6 @@ def _parse_event(event: dict, series_slug: str) -> Iterable[MintMarket]:
             neg_risk=_bool(market.get("negRisk", event.get("negRisk", False))),
             start_ts=start_ts,
         )
-
-
-def market_is_known_for_buy(market) -> bool:
-    """True when we already have CLOB tokens and a close time for this market."""
-    if market is None:
-        return False
-    try:
-        end_ts = float(getattr(market, "end_ts", 0) or 0)
-    except (TypeError, ValueError):
-        return False
-    if not math.isfinite(end_ts) or end_ts <= 0:
-        return False
-    up = str(getattr(market, "up_token", "") or "").strip()
-    dn = str(getattr(market, "dn_token", "") or "").strip()
-    return bool(up) and bool(dn) and up != dn
-
-
-def discovery_allows_buy_look(
-    discovery_fresh: bool,
-    *,
-    in_live_window: bool,
-    market,
-) -> bool:
-    """Gamma age must not veto a known market already in its live buy window.
-
-    Fresh discovery still allows the CLOB look (other gates apply). A stale
-    Gamma snapshot only blocks markets we never stored tokens/end_ts for.
-    """
-    if discovery_fresh:
-        return True
-    return bool(in_live_window) and market_is_known_for_buy(market)
 
 
 class MarketGateway:

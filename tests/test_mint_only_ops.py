@@ -120,6 +120,16 @@ class DeployUnitsTests(unittest.TestCase):
             {p.name for p in BUY.glob("*.py")},
             {"__init__.py", "book.py", "chain.py", "contracts.py", "market.py"},
         )
+        market_src = (BUY / "market.py").read_text()
+        self.assertNotIn("def entry_seconds_left", market_src)
+        self.assertNotIn("def market_is_known_for_buy", market_src)
+        self.assertNotIn("def discovery_allows_buy_look", market_src)
+
+    def test_manage_sells_is_noop_when_disabled(self):
+        manage = _fn("manage_sells")
+        state = {"intents": {"x": {"status": "confirmed", "end_ts": 9_999_999}}}
+        manage({"sell_enabled": False}, state, object())
+        self.assertNotIn("sold_leg", state["intents"]["x"])
 
     def test_docs_do_not_start_hourly_dense_or_dangerzone(self):
         for path in (
