@@ -1,17 +1,20 @@
 #!/usr/bin/env python3
-"""Mint-only bot: split pUSD into Up+Down complete sets for manual selling.
+"""15m atomic mint: split pUSD into Up+Down complete sets.
 
-No CLOB buys. No hedges/sells. Discovers BTC Up/Down markets (5m/15m/hourly),
-mints `shares` (default 6) only for markets that are **not yet open**
-(start_ts in the future) and open within enter_max_ttm_min (default 70)
-minutes, if collateral is available.
+No CLOB buys. No hedges. Discovers **btc-up-or-down-15m** only, mints
+`shares` for markets that are **not yet open** (start_ts in the future)
+and open within enter_max_ttm_min, if collateral is available.
+
+Optional loser-leg FAK ladder (sell_enabled; 3c then 2c) keeps the winner
+for redeem. Off unless strategy_mint.json turns it on.
 
 Usage:
   # dry-run (default when strategy_mint.json has dry_run true / entry_enabled false)
   python mintbot.py
 
 Live requires strategy_mint.json with dry_run=false and entry_enabled=true.
-Keep polybuybot* stopped while using this.
+Keep polybuybot* / polycomplement / DangerZone stopped. Do not start
+pathlog_hourly_dense.
 """
 
 from __future__ import annotations
@@ -54,18 +57,16 @@ STOP_FILE = REPO / "STOP_MINT"
 DEFAULTS = {
     "entry_enabled": False,
     "dry_run": True,
-    "shares": 6.0,
+    "shares": 50.0,
     "enter_min_ttm_min": 0.0,
-    "enter_max_ttm_min": 70.0,
+    "enter_max_ttm_min": 16.0,
     "series_slugs": [
-        "btc-up-or-down-5m",
         "btc-up-or-down-15m",
-        "btc-up-or-down-hourly",
     ],
     "one_entry_per_market": True,
-    "max_open_sets": 40,
-    "max_daily_notional": 500.0,
-    "poll_s": 10.0,
+    "max_open_sets": 1,
+    "max_daily_notional": 200.0,
+    "poll_s": 5.0,
     "position_tolerance": 0.01,
     "require_accepting_orders": True,
     "sell_enabled": False,

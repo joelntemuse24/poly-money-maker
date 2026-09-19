@@ -1,4 +1,8 @@
-# Hourly strategy coherence
+# Hourly strategy coherence (retired buy path)
+
+As of 2026-09-19 the live desk is **15m atomic mint**, not hourly buy/hedge.
+This file still documents fail-closed hourly knob rules for the retired
+`buybothourly.py` source. It is not an instruction to run that bot.
 
 `load_strategy` fail-closes on knob combos that cannot mean what they say.
 Rules live in `buy/strategy_coherence.py` (pure; tests must not import

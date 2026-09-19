@@ -1,40 +1,43 @@
-# Operational snapshot ? 2026-09-09
+# Operational snapshot — 2026-09-19
 
-Source: /home/ntemusejoel/poly-money-maker on the live VM. This is a source/configuration sync, not a strategy change or deployment. GitHub previously lagged the VM. Historical documents are not operational truth.
+Source: live Google VM (`/home/ntemusejoel/poly-money-maker`). VM is the
+source of truth. This is a source/configuration sync, not a deployment
+and not permission to start or restart services.
 
-Hourly polybuybothourly.service is the primary live money path; polypathlog.service records market paths. The audit observed 5m, 15m and complement inactive. Recheck read-only service status before any operational decision; this document is a dated snapshot.
+**Live money path:** atomic mint on **15m only** (`polymintbot` /
+`mintbot.py` + gitignored `strategy_mint.json`). **Live recorder:**
+`polypathlog` / `pathlog.py` with `SERIES = ["btc-up-or-down-15m"]`.
 
-## Captured configuration
+Buybots (`polybuybot`, `polybuybot5m`, `polybuybothourly`), complement,
+hedge, DangerZone, shadow bots, and hourly-dense pathlog are **stopped /
+retired**. Recheck read-only service status before any operational
+decision.
 
-- a22: last 20 minutes, minimum ask 0.949, $40 reference budget, 8-second book persistence, reference price 0.95.
-- b15: last 20 minutes, ask 0.90?0.94, $6 reference budget, 20-second book persistence, reference price 0.90.
-- c5 disabled. One entry per named slice; both enabled slices can enter a market.
-- Share-target sizing enabled. Market spend cap $48.50; buy_max_spend $49; buy_max_shares 55.
-- Hedge threshold 0.60, oracle required, minimum oracle edge $10, dump persistence 8 seconds. Consult code for the exact oracle and toxic-dump exceptions.
-- TP enabled: half at remaining-basis VWAP + 0.04, persistence 5 seconds; full-lock trigger 0.999. Trigger price and submitted limit are distinct.
-- dry_run=false. This is a configuration snapshot, not permission to run it.
+## Live mint template (example file)
 
-## Byte-identical truth files
+`strategy_mint.example.json` is the committed dry-run template
+(`dry_run=true`, `entry_enabled=false`, `sell_enabled=false`):
 
-| File | SHA-256 |
-|---|---|
-| buybothourly.py | 99266a0f1222095af9f4ea9f4c4470ceb3b5452b8ae078e0573c83b770d0cfff |
-| buy/hedge_gate.py | 36db2ed1e5923e0eb3534e6e07a48c1609d9bd0773ee360b08eac392626f8283 |
-| buy/entry_skip.py | ac6417e66f11e811d717a3ea93ef51b5a93531fae46058d801ccf34a88fb272b |
-| buy/btc_price.py | 10a043d2fdd6f8e52a65a9d20d40355a9cded827ca30629351ac3ab314028aca |
-| strategy_buyhourly.json | bebb505e1140fced394a1cccb90bbc91f80d0ccf880bc489837cec476d6897b9 |
+- Series: `btc-up-or-down-15m` only
+- Shares: 50
+- Enter when the window opens within 16 minutes and is not yet open
+- `max_open_sets`: 1 (expired redeem holds do not consume this cap)
+- Optional loser sell ladder 3c → 2c, opposite bid ≥ 50c — off in the example
 
-strategy_buyhourly.example.json mirrors the captured strategy parameters with dry_run=true and entry_enabled=false; strategy_buyhourly.json preserves the exact live bytes. Code under buy/ and matching tests were copied from the VM, including depth_ladder.py. No audit-proposed refactors were applied as part of this sync. Source equality does not certify profitability, execution safety or passing tests; validation is reported separately in the PR.
+Live knobs are in gitignored `strategy_mint.json` on the VM.
 
-## Live drift and knob coherence
+## Retired buy/hedge snapshot
 
-VM strategy as of 2026-09-13 ~02:05 UTC has moved past this snapshot
-(a22 last 10m / $160, b15 last 15m / $40, underlying floor $40, soft-edge
-max $7, hedge 50/53/35). Fail-closed load rules and the remaining live
-tensions (99¢ a22 vs 95¢ thesis, TP +4¢ dead on 99¢ fills, soft-edge now
-inert under the $40 floor, hedge oracle $10 vs buy $40) are in
-`STRAT_COHERENCE.md`. Do not treat the table above as today’s live JSON.
+`strategy_buyhourly.json` remains a reviewed non-secret snapshot with
+`entry_enabled=false` (buy path off). Do not enable buy units. Historical
+hourly knob tensions stay in `STRAT_COHERENCE.md`; they do not apply to mint.
 
 ## Deployment boundary
 
-No live files or services are changed by preparation of this PR. The existing deploy workflow runs on qualifying main-branch pushes and performs git pull plus pip install on the VM. Merge only through the operator's deployment process; do not merge automatically.
+No live files or services are changed by preparation of this PR. The
+existing deploy workflow runs on qualifying main-branch pushes and
+performs git pull plus pip install on the VM. It must not restart
+retired buy units. Merge only through the operator's process; do not
+merge automatically. After a pull, restart **only** `polymintbot` and
+`polypathlog` when the operator asks. Do not start
+`pathlog_hourly_dense` or DangerZone.

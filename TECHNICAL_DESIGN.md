@@ -1,6 +1,13 @@
-# Poly Money Maker: a guided tour of the live hourly system
+# Poly Money Maker: a guided tour of the (retired) hourly buy system
 
-This tour explains the system captured on 9 September 2026. It follows `buybothourly.py`, the primary hourly trader, from a quoted opportunity to a confirmed acquisition, a sale or redemption, and the local accounting that survives a restart. Python examples are taken from the source snapshot named in the footer. Hypothetical trades illustrate arithmetic; they are not performance claims.
+**Operational status 2026-09-19:** live money path is **15m atomic mint**
+(`polymintbot` / `mintbot.py`) plus **15m-only** `polypathlog`. Hourly
+buy/hedge, 5m/15m buybots, complement, DangerZone, and hourly-dense
+pathlog stay **off**. This tour still explains the 9 September 2026
+hourly buy snapshot so the retired code remains readable. It is not an
+instruction to start `polybuybothourly`.
+
+This tour follows `buybothourly.py` from a quoted opportunity to a confirmed acquisition, a sale or redemption, and the local accounting that survives a restart. Python examples are taken from the source snapshot named in the footer. Hypothetical trades illustrate arithmetic; they are not performance claims.
 
 Three documents have different jobs:
 
@@ -115,14 +122,14 @@ The live tree is `/home/ntemusejoel/poly-money-maker` on a Linux VM. The trader 
 
 **systemd** is Linux's service manager: it launches a configured process, tracks its state and applies the unit's restart policy. A repository file named `buybot5m.py` says nothing about whether it is running. A unit being enabled describes startup policy, not necessarily its current activity. The service state was read during this tour:
 
-| Unit | Program | Observed state |
+| Unit | Program | Observed state (2026-09-19) |
 |---|---|---|
-| `polybuybothourly.service` | `buybothourly.py` | Active, running; process start 2026-09-09 03:08:38 UTC |
-| `polypathlog.service` | `pathlog.py` | Active, running; records without placing orders |
-| `polybuybot5m.service` | `buybot5m.py` | Inactive |
-| `polybuybot.service` | `buybot.py` | Inactive |
-| `polycomplement.service` | `complementbot.py` | Inactive |
-| `polymintbot.service` | `mintbot.py` | Inactive |
+| `polymintbot.service` | `mintbot.py` | Live 15m atomic mint (operator-controlled) |
+| `polypathlog.service` | `pathlog.py` | Live 15m recorder; `SERIES` is `btc-up-or-down-15m` only |
+| `polybuybothourly.service` | `buybothourly.py` | Retired / must stay inactive (unit archived) |
+| `polybuybot5m.service` | `buybot5m.py` | Retired / must stay inactive (unit archived) |
+| `polybuybot.service` | `buybot.py` | Retired / must stay inactive (unit archived) |
+| `polycomplement.service` | `complementbot.py` | Retired / must stay inactive (unit archived) |
 
 A stray `polybuy5m.service` also appeared as not-found/failed. It is not the active trader and is not the correctly named `polybuybot5m` unit. Operational inspection should keep those names distinct.
 
@@ -862,8 +869,8 @@ The service manager is outside all three. `systemctl show` supplies process stat
 Read-only inspection can establish the current process and configuration without importing the bot:
 
 ```sh
-systemctl show polybuybothourly.service   --property=ActiveState,SubState,ExecMainStartTimestamp,User
-sha256sum buybothourly.py buy/hedge_gate.py strategy_buyhourly.json
+systemctl show polymintbot.service polypathlog.service   --property=ActiveState,SubState,ExecMainStartTimestamp,User
+sha256sum mintbot.py pathlog.py strategy_mint.example.json
 ```
 
 These commands do not start or stop anything. Inspect settings as data, and keep private environment files out of terminal transcripts. A configuration key named `dry_run` does not make module import safe: the startup path still has side effects, and the selected file paths and process lock belong to startup rather than to an arbitrary test fixture.
@@ -927,7 +934,7 @@ PR #156's final CI passed after test-only fixtures were aligned to the synchroni
 <a id="section-45"></a>
 ## The recorder and the limits of replay
 
-`pathlog.py` records public books without placing orders. Its configured series include 5m, 15m and hourly at `pathlog.py:49`. The intended windows are the full 5m market, the final eight minutes of 15m, and the final twenty minutes of hourly. `POLL_S = 1.0` at line 62 is an intended loop delay, not a promise that every market has one observation each second.
+`pathlog.py` records public books without placing orders. Live `SERIES` is **only** `btc-up-or-down-15m` (final eight minutes). 5m and hourly are not recorded. Do not start `pathlog_hourly_dense`. `POLL_S = 1.0` is an intended loop delay, not a promise that every market has one observation each second.
 
 `run_cycle` at `pathlog.py:400` discovers markets, selects those within their recording horizon, samples due markets using a worker pool, and appends successful ticks. The timestamp supplied to a sample and the completion time of its network requests need not be identical. Failed or delayed requests leave gaps. Resolution lookup is bounded separately so searching old unresolved markets does not consume the entire sampling cycle.
 

@@ -1,5 +1,5 @@
 [Unit]
-Description=Polymarket BTC Up/Down CLOB path recorder (no orders)
+Description=Polymarket BTC 15m Up/Down CLOB path recorder (no orders; SERIES is 15m only)
 After=network-online.target
 Wants=network-online.target
 

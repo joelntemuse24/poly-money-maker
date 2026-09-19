@@ -2202,7 +2202,7 @@ class BalanceAndGcSemantics(unittest.TestCase):
             src,
         )
 
-    def test_docs_live_overlay_is_hourly_not_5m_last120(self):
+    def test_docs_live_overlay_is_mint_15m_not_buybots(self):
         root = BOT5M.parent
         current = (root / "CURRENT.md").read_text()
         agents = (root / "AGENTS.md").read_text()
@@ -2210,15 +2210,18 @@ class BalanceAndGcSemantics(unittest.TestCase):
         for name, text in (
             ("CURRENT.md", current),
             ("AGENTS.md", agents),
-            ("TECHNICAL_DESIGN.md", ttd),
         ):
             self.assertNotIn("last **120s**", text, name)
             self.assertNotIn('d["buy_start_s"]=45', text, name)
             self.assertNotIn('d["min_underlying_edge_usd"]=25.0', text, name)
-        self.assertIn("polybuybothourly.service", current)
-        self.assertIn("buybothourly.py", agents)
+        self.assertIn("polymintbot", current)
+        self.assertIn("polypathlog", current)
+        self.assertIn("btc-up-or-down-15m", current)
+        self.assertIn("polymintbot", agents)
+        self.assertIn("polypathlog", agents)
+        self.assertIn("mintbot.py", agents)
         self.assertIn("buybothourly.py", ttd)
-        self.assertNotIn("Hourly is **stopped**", agents)
+        self.assertIn("Retired", current)
         self.assertNotIn("Active strategy:** **5m only", current)
 
 

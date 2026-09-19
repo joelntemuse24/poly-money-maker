@@ -1,5 +1,5 @@
 [Unit]
-Description=Polymarket mint-only bot (complete-set split for manual sells)
+Description=Polymarket 15m atomic mint (complete-set split; buybots stay off)
 After=network-online.target
 Wants=network-online.target
 

@@ -34,6 +34,8 @@ class JournalEventFilterTests(unittest.TestCase):
             "dry_sell",
             "complement_fill",
             "complement_skip",
+            "rest_gtd_post",
+            "rest_skip_ask",
         ):
             self.assertTrue(is_journal_event(name), name)
 

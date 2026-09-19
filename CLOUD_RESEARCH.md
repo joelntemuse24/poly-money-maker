@@ -1,8 +1,9 @@
 # Cloud research agents (no live orders, no `.env`)
 
-Cloud agents paper-score BTC Up/Down **books** against the live 5m template.
-They do **not** replace `polybuybot5m`. They never receive `.env`, never
-load live `strategy_buy5m.json`, and never start systemd.
+Cloud agents paper-score BTC Up/Down **books** against historical 5m
+templates. They do **not** replace live `polymintbot`. They never receive
+`.env`, never load live `strategy_mint.json` / `strategy_buy5m.json`, and
+never start systemd.
 
 The point is **paper P&L** (hedge proceeds or $1 / $0), not “would it have
 clicked.” Hits without `pnl` are incomplete.
@@ -25,8 +26,10 @@ keys. Do not put `PRIVATE_KEY` on a Cloud Agent.
 repo root → `pathlog/ticks/*.jsonl`. Do **not** attach `.env` or live JSON.
 
 **Live tape (markets happening now):** run `pathlog.py` in this environment
-(GET only). Wait until 5m markets **resolve**, then `--sweep --paper` on
-those files. Unresolved markets have no redeem P&L.
+(GET only; live `SERIES` is **15m only**). Wait until 15m markets
+**resolve**, then `--sweep --paper` on those files. Unresolved markets have
+no redeem P&L. Do not start `pathlog_hourly_dense`. Historical 5m tick
+archives can still be scored with `--series 5m`.
 
 Environment install: `.cursor/environment.json` (`python3.12-venv` + pip,
 plus optional `poly-vm` SSH when `POLY_VM_SSH_KEY` is set).
@@ -63,7 +66,8 @@ $1.00 / $0.00. A skip with no fill is $0, not a win. Unresolved markets do
 not get a redeem P&L — wait or mark them unresolved.
 
 Hard rules:
-- Do not start polybuybot, polybuybot5m, polybuybothourly, or polymintbot.
+- Do not start polybuybot, polybuybot5m, polybuybothourly, polymintbot,
+  polycomplement, polydangerzone, or pathlog_hourly_dense.
 - Do not create ClobClient with a private key. No POST /order. No relayer.
 - Do not read, write, or ask for .env. Do not set dry_run false.
 - Do not edit strategy_buy.json / strategy_buy5m.json / strategy_buyhourly.json
@@ -137,7 +141,7 @@ Write a draft PR that:
 - does NOT change live JSON or bots unless a test/docs bug blocks the sweep
 - pastes HISTORICAL and SESSION tables in the PR body
 - recommends at most one next live experiment, or “keep 75–90/120s”
-- says operator must git pull + systemctl restart polybuybot5m to go live
+- does not tell anyone to enable buybots; live mint/pathlog restarts are operator-only
 ```
 
 ## 3. Tape-only prompt (zip already attached, no waiting)
@@ -148,7 +152,8 @@ Use section 2 if you want live markets. This one only scores files on disk.
 You are a research agent for joelntemuse24/poly-money-maker. Paper P&L only.
 
 Hard rules:
-- Do not start polybuybot, polybuybot5m, polybuybothourly, or polymintbot.
+- Do not start polybuybot, polybuybot5m, polybuybothourly, polymintbot,
+  polycomplement, polydangerzone, or pathlog_hourly_dense.
 - Do not edit strategy_buy.json / strategy_buy5m.json / strategy_buyhourly.json (non-example).
 - Do not read or write .env. Do not set dry_run false. Do not place orders.
 - Template file is strategy_buy5m.example.json. `--sweep` scores late

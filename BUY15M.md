@@ -1,8 +1,13 @@
-# BTC 15m dry-run probe ($5)
+# BTC 15m dry-run probe ($5) — RETIRED
 
-Hourly (`buybothourly.py` / `polybuybothourly`) is untouched. This is the
-**15m** sibling (`buybot.py` / `polybuybot`). Joel: do **not** turn live
-entries on until he says.
+**2026-09-19:** 15m CLOB buy (`polybuybot` / `buybot.py`) is retired. Live
+money path is atomic mint (`polymintbot`). Do **not** enable
+`polybuybot`. The unit file is `archive/deploy/polybuybot.service`.
+
+Historical probe notes below are not authorization to run this bot.
+
+Hourly (`buybothourly.py` / `polybuybothourly`) is also retired. This was the
+**15m** sibling (`buybot.py` / `polybuybot`).
 
 Research backing (ge95 last 180s; skip 90–94 midband):
 `docs/15m-regime-panel-canonical.md`. Historical sweep:
@@ -79,17 +84,15 @@ Now-snapshot (no bot import, Gamma + CLOB GET only):
 .venv/bin/python check_15m_probe_now.py --strategy strategy_buy15m_probe.example.json
 ```
 
-Unit file: `deploy/polybuybot.service`. Do **not** `systemctl enable` or
+Unit file (archived, do not enable): `archive/deploy/polybuybot.service`. Do **not** `systemctl enable` or
 `start` it in this task. Merge is not a restart and is not authorization
 to arm 15m.
 
-## One-knob later live flip (still off)
+## Later live flip — retired
 
-Probe ships with both safeties on. `dry_run` is **startup-locked**.
-
-1. In `strategy_buy.json` set `"dry_run": false`.
-2. Restart `polybuybot` (only when Joel says).
-3. **One hot-reload knob:** `"entry_enabled": true`.
+Do **not** set `dry_run=false`, do **not** restart `polybuybot`, and do
+**not** set `entry_enabled=true`. 15m CLOB buy is retired; mint is the
+live 15m path.
 
 Real POSTs require `dry_run=false` **and** `entry_enabled=true`. Either
 safety alone keeps live posting off. Dry-run still evaluates gates and
