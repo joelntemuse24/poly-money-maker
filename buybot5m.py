@@ -106,6 +106,7 @@ from buy.hedge_gate import (
 from buy.live_journal import is_journal_event
 from buy.entry_rest_gtd import (
     ask_allows_fak_take,
+    ask_allows_rest_post,
     clear_rest_meta,
     gtd_expiration,
     hybrid_late_intent,
@@ -902,12 +903,20 @@ def entry_book_persist_ready(cond, leg, book_ok, *, now_s=None, persist_s=None):
         armed_ts=_entry_book_persist_armed.get(key),
         persist_s=wait,
     )
+    # persist_s <= 0 returns fire=True with armed_ts still None.
+    # That used to fall through the armed-is-None reset and skip the buy.
+    if fire:
+        if armed is None:
+            _entry_book_persist_armed.pop(key, None)
+            return True, why, 0.0
+        _entry_book_persist_armed[key] = armed
+        return True, why, max(0.0, float(now_s) - float(armed))
     if armed is None:
         _entry_book_persist_armed.pop(key, None)
         return False, why, 0.0
     _entry_book_persist_armed[key] = armed
     age = float(now_s) - float(armed)
-    return bool(fire), why, age
+    return False, why, age
 
 
 def hold_while_oracle_agrees(held_leg, start_ts, condition_id, *, log=True):
@@ -2072,6 +2081,71 @@ def buy_fill_walked(filled, quoted_shares, ratio=1.05):
     return filled > quoted * float(ratio) + 1e-9
 
 
+
+def buy_entry_book_gate(token_id, min_price, max_price, shares, expected_condition_id=None, dust=0.05):
+    """Fresh REST book check before a FAK buy.
+
+    Buy FAKs match lowest asks first. A limit at 99c will sweep 2c junk if it
+    exists under a 96c touch we thought we saw. Refuse any book with ask size
+    below ``min_price``, and require enough in-band depth that VWAP for
+    ``shares`` stays >= ``min_price``.
+
+    Returns (ok, reason, best_ask, vwap, limit_cap).
+    """
+    shares = finite_float(shares, minimum=0) or 0.0
+    min_price = finite_float(min_price, minimum=0, maximum=1)
+    max_price = finite_float(max_price, minimum=0, maximum=1)
+    if shares < 0.01 or min_price is None or max_price is None:
+        return False, "bad_args", None, None, None
+    try:
+        book = safe_api_call(client.get_order_book, token_id)
+    except Exception as e:
+        return False, f"book_err:{str(e)[:80]}", None, None, None
+    if not isinstance(book, dict):
+        return False, "book_not_object", None, None, None
+    asset_id = str(book.get("asset_id") or "")
+    if asset_id and asset_id != str(token_id):
+        return False, "asset_mismatch", None, None, None
+    market_id = str(book.get("market") or "")
+    if expected_condition_id and market_id and market_id.lower() != str(expected_condition_id).lower():
+        return False, "market_mismatch", None, None, None
+    asks = _valid_book_levels(book.get("asks"))
+    if not asks:
+        return False, "no_asks", None, None, None
+    asks_sorted = sorted(asks, key=lambda level: level[0])
+    best_ask = asks_sorted[0][0]
+    junk = [(p, s) for p, s in asks_sorted if p < float(min_price) - 1e-12 and s >= float(dust)]
+    if junk:
+        jp, js = junk[0]
+        return False, f"junk_below_band:{jp:.4f}x{js:.2f}", best_ask, None, None
+    need = float(shares)
+    got = 0.0
+    notional = 0.0
+    limit_cap = None
+    for p, s in asks_sorted:
+        if p > float(max_price) + 1e-12:
+            break
+        if p < float(min_price) - 1e-12:
+            continue
+        take = min(s, need - got)
+        if take <= 0:
+            continue
+        got += take
+        notional += take * p
+        limit_cap = p if limit_cap is None else max(limit_cap, p)
+        if got >= need - 1e-9:
+            break
+    if got < need - 0.01:
+        return False, f"thin_in_band:{got:.2f}<{need:.2f}", best_ask, None, None
+    vwap = notional / got if got > 0 else None
+    if vwap is None or vwap < float(min_price) - 1e-9:
+        return False, f"vwap_below_band:{vwap}", best_ask, vwap, limit_cap
+    cap = min(float(max_price), float(limit_cap if limit_cap is not None else best_ask))
+    cap = max(cap, float(min_price))
+    return True, "ok", best_ask, vwap, cap
+
+
+
 def classify_buy_fill(avg, filled, quoted_shares, min_price, toxic_below, max_price=None):
     """below/above the open band; toxic when the average is outside it.
 
@@ -2336,6 +2410,8 @@ def get_order_details(order_id, expected_size=None):
                 "price": finite_float(
                     result.get("price"), minimum=0, maximum=1,
                 ),
+                "makingAmount": result.get("makingAmount", result.get("making_amount")),
+                "takingAmount": result.get("takingAmount", result.get("taking_amount")),
             }
         return {
             "status": getattr(result, "status", "UNKNOWN"),
@@ -2359,6 +2435,12 @@ def get_order_details(order_id, expected_size=None):
             "side": getattr(result, "side", None),
             "price": finite_float(
                 getattr(result, "price", None), minimum=0, maximum=1,
+            ),
+            "makingAmount": getattr(
+                result, "makingAmount", getattr(result, "making_amount", None)
+            ),
+            "takingAmount": getattr(
+                result, "takingAmount", getattr(result, "taking_amount", None)
             ),
         }
     except Exception as e:
@@ -3016,22 +3098,39 @@ def credit_5m_rest_fill(
     leg,
     tick,
     late_slice,
+    avg_source="confirmed_trades",
 ):
-    """Same inventory + hedge path as a FAK fill."""
+    """Same inventory + hedge path as a FAK fill.
+
+    ``spent`` must be real USDC (confirmed trades / makingAmount). Never
+    invent ``filled * limit`` — that booked junk penny fills as 99¢.
+    """
     filled = float(filled or 0)
     spent = float(spent or 0)
     if filled <= 0.01:
         return False
     if spent <= 0:
-        spent = filled * float(tick)
+        log_event(
+            "rest_gtd_fill_refuse_no_cost",
+            condition_id=cond,
+            filled=filled,
+            tick=tick,
+            avg_source=avg_source,
+        )
+        return False
     prior_size = float(meta.get("bought_size") or 0)
     prior_cost = float(meta.get("pnl_entry_cost") or 0)
     prior_quoted = float(meta.get("quoted_buy_shares_total") or 0)
-    avg = (spent / filled) if filled else float(tick)
-    _, force_exit = classify_buy_fill(
+    avg = (spent / filled) if filled else 0.0
+    band_min = float(BUY_THRESHOLD)
+    band_max = float(BUY_MAX_PRICE)
+    below_band, force_exit = classify_buy_fill(
         avg, filled, filled,
-        0.97, TOXIC_FORCE_EXIT_BELOW, 0.99,
+        band_min, TOXIC_FORCE_EXIT_BELOW, band_max,
     )
+    # Unified with FAK walks: any avg below the open entry band is toxic.
+    if below_band:
+        force_exit = True
     total_size, total_cost, total_quoted, vwap = accumulate_buy_inventory(
         prior_size, prior_cost, filled, spent, prior_quoted, filled,
     )
@@ -3044,8 +3143,8 @@ def credit_5m_rest_fill(
     meta["pnl_entry_cost"] = round(total_cost, 4)
     meta["quoted_buy_shares"] = float(filled)
     meta["quoted_buy_shares_total"] = float(total_quoted or 0)
-    meta["entry_band_min"] = 0.97
-    meta["entry_band_max"] = 0.99
+    meta["entry_band_min"] = band_min
+    meta["entry_band_max"] = band_max
     meta["toxic_fill"] = bool(force_exit or meta.get("toxic_fill"))
     stamp_slice_on_inventory(meta, late_slice, filled)
     clear_rest_meta(meta)
@@ -3066,7 +3165,20 @@ def credit_5m_rest_fill(
         size=total_size,
         price=meta["fill_price"],
         entry_cost=meta["pnl_entry_cost"],
+        avg_source=avg_source,
+        toxic_fill=bool(meta.get("toxic_fill")),
+        below_band=bool(below_band),
     )
+    if meta.get("toxic_fill"):
+        log_event(
+            "rest_gtd_toxic_fill",
+            condition_id=cond,
+            leg=leg,
+            avg_price=round(avg, 4),
+            band_min=band_min,
+            filled=filled,
+            spent=round(spent, 4),
+        )
     return True
 
 
@@ -3088,9 +3200,53 @@ def reconcile_5m_rest_gtd(meta, *, cond, token_id, seconds_left):
     state = rest_fill_state(status, size_matched=matched, token_delta=delta)
     if state == "filled":
         filled = matched if matched > 0.01 else delta
-        tick = live.get("price") or 0.99
-        spent = filled * float(tick)
-        credit_5m_rest_fill(
+        tick = live.get("price")
+        trade_ids = (details or {}).get("trade_ids") or []
+        trade_financials = None
+        if trade_ids:
+            trade_financials = _confirmed_trade_financials(
+                trade_ids,
+                expected_size=filled,
+                fee_schedule=None,
+            )
+        spent = None
+        avg_source = None
+        if trade_financials is not None:
+            spent = float(trade_financials["gross"] or 0)
+            fee = trade_financials.get("fee")
+            if fee is not None:
+                spent = spent + float(fee)
+            filled = float(trade_financials["shares"] or filled)
+            avg_source = "confirmed_trades"
+        else:
+            # Order row may expose makingAmount (USDC) without settled trades yet.
+            making_raw = (details or {}).get("makingAmount")
+            if making_raw is None:
+                making_raw = (details or {}).get("making_amount")
+            if making_raw is not None and filled > 0.01:
+                making_f = _decode_clob_response_amount(
+                    making_raw,
+                    expected=filled * float(tick or BUY_THRESHOLD),
+                )
+                if making_f is not None and making_f > 1e-12:
+                    spent = float(making_f)
+                    avg_source = "making_amount"
+        if spent is None or spent <= 0 or filled <= 0.01:
+            log_event(
+                "rest_gtd_fill_uncertain_cost",
+                condition_id=cond,
+                order_id=live["order_id"],
+                filled=filled,
+                matched=matched,
+                token_delta=delta,
+                tick=tick,
+                trade_ids=len(trade_ids),
+                status=status,
+            )
+            # Do NOT credit as a 99¢ conviction fill. Leave rest meta so the
+            # next cycle can retry once trades confirm; do not stamp late_bought.
+            return "uncertain_cost"
+        credited = credit_5m_rest_fill(
             meta,
             cond=cond,
             filled=filled,
@@ -3099,8 +3255,9 @@ def reconcile_5m_rest_gtd(meta, *, cond, token_id, seconds_left):
             leg=live.get("leg") or "up",
             tick=tick,
             late_slice=is_late_entry_window(seconds_left, BUY_START_S),
+            avg_source=avg_source or "confirmed_trades",
         )
-        return "filled"
+        return "filled" if credited else "uncertain_cost"
     if state == "dead_empty":
         clear_rest_meta(meta)
         save_json(STATE_FILE, positions_meta)
@@ -3171,7 +3328,10 @@ def buy_market_with_retry(
     fee_schedule = None
 
     def _token_balance():
-        clob_balance = check_clob_token_balance(token_id, refresh=True)
+        # Cached read. update_balance_allowance before the first FAK sat
+        # 10-20s and the 5m ask was gone by post time. The unmatched
+        # guard still refreshes after a reject.
+        clob_balance = check_clob_token_balance(token_id, refresh=False)
         if clob_balance is not None:
             return clob_balance
         if condition_id:
@@ -3212,7 +3372,8 @@ def buy_market_with_retry(
             delta = bal_after - expected
             if delta > 0.01:
                 # Walked bags spent the posted USDC, not extra shares × gate ask.
-                if buy_fill_walked(delta, max_shares):
+                walked = buy_fill_walked(delta, max_shares)
+                if walked:
                     fill_cost = float(spend_cap)
                 else:
                     gross = delta * float(price)
@@ -3221,12 +3382,26 @@ def buy_market_with_retry(
                         float(spend_cap),
                         gross + (fee or 0.0),
                     )
+                avg = (fill_cost / delta) if delta > 0 else None
+                toxic_walk = bool(
+                    walked
+                    and avg is not None
+                    and avg < float(min_price) - 1e-9
+                )
                 log_event(
                     "buy_ghost_fill", token_id=token_id, filled=delta,
                     fill_cost=round(fill_cost, 4), ask=price, attempt=attempt,
                     bal_after=bal_after, expected=expected, via=via,
                     quoted_shares=max_shares,
+                    avg_price=round(avg, 4) if avg else None,
+                    toxic_walk=toxic_walk, min_price=float(min_price),
                 )
+                if toxic_walk:
+                    log_event(
+                        "buy_ghost_walk_toxic", token_id=token_id, filled=delta,
+                        avg_price=round(avg, 4), quoted_shares=max_shares,
+                        min_price=float(min_price), via=via,
+                    )
                 return delta, fill_cost
         return 0.0, 0.0
 
@@ -3292,9 +3467,14 @@ def buy_market_with_retry(
         fresh_ask_size = finite_float(fresh_ask_size, minimum=0)
         if fresh_ask_size is None or fresh_ask_size < 0.01:
             console.print(
-                f"  [dim yellow][THIN ASK][/] displayed size {fresh_ask_size} · "
-                f"posting budget/ask anyway · attempt {attempt + 1}/{max_retries}"
+                f"  [dim yellow][STOP][/] thin/missing ask size {fresh_ask_size} · "
+                f"abort (no blind FAK)"
             )
+            log_event(
+                "buy_retry_stop_thin_ask", token_id=token_id, ask=fresh_ask,
+                ask_size=fresh_ask_size, attempt=attempt + 1,
+            )
+            break
         shares = quoted_buy_shares_up_to_limit(
             remaining_budget,
             fresh_ask,
@@ -3304,7 +3484,27 @@ def buy_market_with_retry(
         )
         if shares < 0.01:
             break
-        limit_price = float(max_price)
+        # Re-read the book: FAK buys match lowest asks first, so a 99c limit
+        # will sweep 2c junk that a stale 96c touch quote never showed.
+        book_ok, book_why, book_ask, book_vwap, limit_cap = buy_entry_book_gate(
+            token_id,
+            float(min_price),
+            float(max_price),
+            shares,
+            expected_condition_id=condition_id,
+        )
+        if not book_ok:
+            console.print(
+                f"  [dim yellow][STOP][/] entry book {book_why} · abort FAK"
+            )
+            log_event(
+                "buy_retry_stop_book_gate", token_id=token_id, reason=book_why,
+                ask=fresh_ask, book_ask=book_ask, vwap=book_vwap,
+                min_price=min_price, shares=round(shares, 4), attempt=attempt + 1,
+            )
+            break
+        limit_price = float(limit_cap if limit_cap is not None else max_price)
+        limit_price = min(float(max_price), max(float(min_price), limit_price))
         price = limit_price
         spend = shares * price
         max_shares = shares
@@ -6415,6 +6615,7 @@ while not _shutdown_requested:
                             meta.get("late_bought")
                             or (held_size > 0.01 and late_slice)
                         ),
+                        band_min=float(BUY_THRESHOLD),
                         now=rest_now,
                     )
                     if hybrid_intent.action == "keep":
@@ -6480,6 +6681,29 @@ while not _shutdown_requested:
                                 budget=est_cost,
                             )
                             continue
+                        rest_ask = up_ask if rest_leg == "up" else dn_ask
+                        rest_bid = up_bid if rest_leg == "up" else dn_bid
+                        if rest_ask is None or rest_bid is None:
+                            log_event(
+                                "rest_skip_incomplete_book",
+                                condition_id=cond,
+                                leg=rest_leg,
+                                tick=rest_tick,
+                                ask=rest_ask,
+                                bid=rest_bid,
+                            )
+                            continue
+                        if not ask_allows_rest_post(rest_ask, band_min=float(BUY_THRESHOLD)):
+                            log_event(
+                                "rest_skip_ask_below_band",
+                                condition_id=cond,
+                                leg=rest_leg,
+                                tick=rest_tick,
+                                ask=rest_ask,
+                                band_min=float(BUY_THRESHOLD),
+                            )
+                            continue
+
                         baseline = check_clob_token_balance(rest_token, refresh=True)
                         if baseline is None and not DRY_RUN:
                             log_event("rest_gtd_abort_no_baseline", condition_id=cond)
@@ -6546,6 +6770,25 @@ while not _shutdown_requested:
                         continue
                     if hybrid_intent.action == "skip":
                         if hybrid_intent.why in {"already_filled", "knob_off", "window_closed"}:
+                            continue
+                        if hybrid_intent.why == "ask_below_band":
+                            log_event(
+                                "rest_skip_ask_below_band",
+                                condition_id=cond,
+                                why=hybrid_intent.why,
+                                tick=hybrid_intent.tick,
+                                leg=hybrid_intent.leg,
+                                band_min=float(BUY_THRESHOLD),
+                            )
+                            continue
+                        if hybrid_intent.why == "incomplete_book":
+                            log_event(
+                                "rest_skip_incomplete_book",
+                                condition_id=cond,
+                                why=hybrid_intent.why,
+                                tick=hybrid_intent.tick,
+                                leg=hybrid_intent.leg,
+                            )
                             continue
 
                 # Lock last-print PTB as soon as the window is open (memory/disk only).

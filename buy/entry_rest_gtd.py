@@ -127,6 +127,19 @@ def rest_winner_leg(
     return _winner("down", dn_tick, dn_bid, dn_last, up_gui)
 
 
+def ask_allows_rest_post(ask, band_min: float = REST_TICKS[0]) -> bool:
+    """True when best ask is present and at/above the entry band floor.
+
+    Junk ~1¢ asks must never trigger a rest@97–99 POST (CLOB would fill
+    against the ask via price improvement). Missing ask = incomplete book.
+    """
+    px = _finite(ask)
+    lo = _finite(band_min)
+    if px is None or lo is None:
+        return False
+    return px + EPS >= lo
+
+
 def ask_allows_fak_take(ask, tick, band_min: float = REST_TICKS[0]) -> bool:
     """True when a real ask sits at the GUI tick, or ≤ tick and ≥ 0.97."""
     px = _finite(ask)
@@ -344,6 +357,7 @@ def hybrid_late_intent(
     enabled: bool = False,
     already_filled: bool = False,
     ticks: Sequence[float] = REST_TICKS,
+    band_min: float = REST_TICKS[0],
     now=None,
 ) -> HybridIntent:
     """Keep / replace / cancel / FAK / rest / skip for one 5m market."""
@@ -431,6 +445,20 @@ def hybrid_late_intent(
             fak_limit=float(tick),
             fak_min=float(ticks[0]),
         )
+    # Never fall back to rest@97–99 when the ask is junk/missing — that is
+    # how CLOB price-improvement filled ~1¢ asks against a 99¢ GTD bid.
+    rest_floor = _finite(band_min)
+    if rest_floor is None:
+        rest_floor = float(ticks[0]) if ticks else float(REST_TICKS[0])
+    leg_bid = up_bid if leg == "up" else dn_bid
+    if _finite(ask) is None or _finite(leg_bid) is None:
+        if live_id:
+            return _cancel("incomplete_book")
+        return HybridIntent(action="skip", why="incomplete_book")
+    if not ask_allows_rest_post(ask, band_min=rest_floor):
+        if live_id:
+            return _cancel("ask_below_band")
+        return HybridIntent(action="skip", why="ask_below_band")
     return HybridIntent(
         action="rest",
         why="no_ask_at_tick",

@@ -68,6 +68,11 @@ DEFAULTS = {
     "poll_s": 10.0,
     "position_tolerance": 0.01,
     "require_accepting_orders": True,
+    "sell_enabled": False,
+    "sell_threshold": 0.03,
+    "sell_floor": 0.02,
+    "sell_opposite_min": 0.50,
+    "sell_cooldown_s": 3.0,
     "rpc_url": "https://polygon.drpc.org",
     "gamma_url": "https://gamma-api.polymarket.com",
     "data_api_url": "https://data-api.polymarket.com",
@@ -240,12 +245,18 @@ def eligible_markets(markets: List[MintMarket], cfg: dict, now: float) -> List[M
     return sorted(out, key=lambda m: m.start_ts)
 
 
-def open_intent_count(state: dict) -> int:
-    return sum(
-        1
-        for intent in state.get("intents", {}).values()
-        if intent.get("status") in ACTIVE_STATUSES
-    )
+def open_intent_count(state: dict, now: float | None = None) -> int:
+    """Live bags only; post-expiry redeem holds do not block the next window."""
+    now = time.time() if now is None else float(now)
+    n = 0
+    for intent in state.get("intents", {}).values():
+        if intent.get("status") not in ACTIVE_STATUSES:
+            continue
+        end_ts = float(intent.get("end_ts") or 0)
+        if end_ts and now > end_ts + 120:
+            continue
+        n += 1
+    return n
 
 
 def already_minted(state: dict, condition_id: str, cfg: dict) -> bool:
@@ -484,6 +495,319 @@ def write_heartbeat(status: str, **fields: Any) -> None:
     os.replace(temporary, HEARTBEAT_FILE)
 
 
+
+_clob_client = None
+_clob_init_error = None
+
+
+def _best_bid(token_id: str):
+    try:
+        response = requests.get(
+            "https://clob.polymarket.com/book",
+            params={"token_id": str(token_id)},
+            timeout=5,
+        )
+        if response.status_code != 200:
+            return None
+        payload = response.json()
+        book = payload if isinstance(payload, dict) else {}
+        best = None
+        for level in book.get("bids") or []:
+            try:
+                px = float(level["price"] if isinstance(level, dict) else level[0])
+            except (TypeError, ValueError, KeyError, IndexError):
+                continue
+            if best is None or px > best:
+                best = px
+        return best
+    except Exception as exc:
+        log_event("book_fetch_fail", token_id=str(token_id)[:18], error=str(exc)[:160])
+        return None
+
+
+def _get_clob_client():
+    global _clob_client, _clob_init_error
+    if _clob_client is not None:
+        return _clob_client
+    if _clob_init_error is not None:
+        return None
+    private_key = os.getenv("PRIVATE_KEY") or ""
+    funder = os.getenv("FUNDER_ADDRESS") or ""
+    if not private_key or not funder:
+        _clob_init_error = "missing PRIVATE_KEY or FUNDER_ADDRESS"
+        return None
+    try:
+        from py_clob_client_v2 import (
+            ClobClient,
+            MarketOrderArgs,
+            OrderType,
+            ApiCreds,
+            BalanceAllowanceParams,
+            AssetType,
+        )
+        from py_clob_client_v2.order_builder.constants import SELL
+
+        host = "https://clob.polymarket.com"
+        chain_id = int(os.getenv("CHAIN_ID") or 137)
+        api_key = os.getenv("API_KEY") or ""
+        api_secret = os.getenv("API_SECRET") or ""
+        api_passphrase = os.getenv("API_PASSPHRASE") or ""
+        if api_key and api_secret and api_passphrase:
+            creds = ApiCreds(
+                api_key=api_key,
+                api_secret=api_secret,
+                api_passphrase=api_passphrase,
+            )
+        else:
+            tmp = ClobClient(host=host, key=private_key, chain_id=chain_id)
+            creds = tmp.create_or_derive_api_key()
+        client = ClobClient(
+            host=host,
+            key=private_key,
+            chain_id=chain_id,
+            creds=creds,
+            signature_type=1,
+            funder=funder,
+        )
+        try:
+            client.update_balance_allowance(
+                BalanceAllowanceParams(asset_type=AssetType.COLLATERAL)
+            )
+        except Exception:
+            pass
+        _clob_client = client
+        log_event("clob_client_ready")
+        return _clob_client
+    except Exception as exc:
+        _clob_init_error = str(exc)[:200]
+        log_event("clob_client_init_fail", error=_clob_init_error)
+        return None
+
+
+def _fak_sell(token_id: str, size: float, price: float, dry_run: bool):
+    size = float(size)
+    price = float(price)
+    if size < 0.01 or price <= 0:
+        return 0.0, "bad_args"
+    if dry_run:
+        console.print(
+            f"  [bold black on yellow][DRY SELL][/] {size:.2f} @ >={price:.3f} "
+            f"token={str(token_id)[:12]}..."
+        )
+        log_event("dry_sell", token_id=str(token_id), size=size, price=price)
+        return 0.0, "dry"
+    client = _get_clob_client()
+    if client is None:
+        return 0.0, f"no_clob:{_clob_init_error or 'unknown'}"
+    try:
+        from py_clob_client_v2 import MarketOrderArgs, OrderType, BalanceAllowanceParams, AssetType
+        from py_clob_client_v2.order_builder.constants import SELL
+
+        try:
+            client.update_balance_allowance(
+                BalanceAllowanceParams(
+                    asset_type=AssetType.CONDITIONAL, token_id=str(token_id)
+                )
+            )
+        except Exception as exc:
+            log_event("sell_allowance_warn", error=str(exc)[:160])
+
+        signed = client.create_market_order(
+            MarketOrderArgs(
+                token_id=str(token_id),
+                amount=size,
+                side=SELL,
+                price=price,
+            )
+        )
+        result = client.post_order(signed, order_type=OrderType.FAK)
+        sold = 0.0
+        status = "posted"
+        if isinstance(result, dict):
+            status = str(result.get("status") or "posted")
+            for key in ("takingAmount", "makingAmount", "size_matched", "matched"):
+                raw = result.get(key)
+                if raw is None:
+                    continue
+                try:
+                    val = float(raw)
+                    if val > size * 10:
+                        val = val / 1_000_000.0
+                    if 0 < val <= size * 1.01:
+                        sold = val
+                        break
+                except (TypeError, ValueError):
+                    continue
+        log_event(
+            "sell_fak_result",
+            token_id=str(token_id),
+            size=size,
+            price=price,
+            sold=sold,
+            status=status,
+            raw=str(result)[:240] if result is not None else None,
+        )
+        return sold, status
+    except Exception as exc:
+        log_event("sell_fak_fail", token_id=str(token_id)[:18], error=str(exc)[:200])
+        return 0.0, f"error:{str(exc)[:80]}"
+
+
+def manage_sells(cfg: dict, state: dict, chain: ChainReader) -> None:
+    """Sell cheap leg at sell_threshold then sell_floor; never both legs."""
+    if not cfg.get("sell_enabled"):
+        return
+    now = time.time()
+    thr = float(cfg.get("sell_threshold") or 0.03)
+    floor = float(cfg.get("sell_floor") or 0.02)
+    opp_min = float(cfg.get("sell_opposite_min") or 0.50)
+    cooldown = float(cfg.get("sell_cooldown_s") or 3.0)
+    ladder = sorted({round(thr, 4), round(floor, 4)}, reverse=True)
+    tol = float(cfg.get("position_tolerance") or 0.01)
+    funder = os.getenv("FUNDER_ADDRESS") or ""
+    funder_cs = to_checksum_address(funder) if funder else None
+    dirty = False
+    ctf = str(cfg.get("ctf_address") or "")
+
+    for cid, intent in list(state.get("intents", {}).items()):
+        if intent.get("status") not in (
+            "confirmed",
+            "confirmed_waiting_inventory",
+            "mined",
+            "executed",
+        ):
+            continue
+        if intent.get("sold_leg"):
+            continue
+        end_ts = float(intent.get("end_ts") or 0)
+        if end_ts and now > end_ts:
+            continue
+        last = float(intent.get("last_sell_attempt_at") or 0)
+        if last and now - last < cooldown:
+            continue
+
+        up_tok = str(intent.get("up_token") or "")
+        dn_tok = str(intent.get("dn_token") or "")
+        if not up_tok or not dn_tok:
+            continue
+
+        up_bid = _best_bid(up_tok)
+        dn_bid = _best_bid(dn_tok)
+        intent["last_up_bid"] = up_bid
+        intent["last_dn_bid"] = dn_bid
+        intent["updated_at"] = now
+
+        up_cheap = up_bid is not None and up_bid <= thr
+        dn_cheap = dn_bid is not None and dn_bid <= thr
+        if up_cheap and dn_cheap:
+            log_event(
+                "sell_skip_both_cheap",
+                condition_id=cid,
+                up_bid=up_bid,
+                dn_bid=dn_bid,
+                slug=intent.get("slug"),
+            )
+            dirty = True
+            continue
+        if not up_cheap and not dn_cheap:
+            continue
+
+        if up_cheap:
+            if dn_bid is None or dn_bid < opp_min:
+                log_event(
+                    "sell_skip_wick_unconfirmed",
+                    condition_id=cid,
+                    loser="up",
+                    up_bid=up_bid,
+                    dn_bid=dn_bid,
+                )
+                dirty = True
+                continue
+            loser, loser_tok, loser_bid = "up", up_tok, float(up_bid)
+        else:
+            if up_bid is None or up_bid < opp_min:
+                log_event(
+                    "sell_skip_wick_unconfirmed",
+                    condition_id=cid,
+                    loser="dn",
+                    up_bid=up_bid,
+                    dn_bid=dn_bid,
+                )
+                dirty = True
+                continue
+            loser, loser_tok, loser_bid = "dn", dn_tok, float(dn_bid)
+
+        size = float(intent.get("shares") or cfg["shares"])
+        if funder_cs and ctf:
+            try:
+                bal = chain.position_balance(ctf, funder_cs, loser_tok)
+                if bal + 1e-9 < tol:
+                    intent["sold_leg"] = loser
+                    intent["sell_note"] = "already_flat"
+                    dirty = True
+                    continue
+                size = min(size, float(bal))
+            except Exception as exc:
+                log_event("sell_balance_fail", error=str(exc)[:160])
+
+        intent["last_sell_attempt_at"] = now
+        dirty = True
+        sold_total = 0.0
+        last_status = "none"
+        for limit in ladder:
+            if loser_bid + 1e-12 < limit and limit > floor + 1e-12:
+                continue
+            use_px = max(floor, min(limit, loser_bid))
+            remaining = size - sold_total
+            if remaining < 0.01:
+                break
+            console.print(
+                f"  [bold bright_yellow][SELL {loser.upper()}][/] {intent.get('slug')}  "
+                f"bid={loser_bid:.3f}  limit>={use_px:.3f}  size={remaining:.2f}"
+            )
+            sold, last_status = _fak_sell(
+                loser_tok, remaining, use_px, dry_run=bool(cfg.get("dry_run"))
+            )
+            sold_total += float(sold or 0)
+            if cfg.get("dry_run"):
+                intent["sold_leg"] = loser
+                intent["sell_dry"] = True
+                intent["sell_limit"] = use_px
+                break
+            if sold_total >= size - tol:
+                break
+            time.sleep(0.35)
+
+        intent["sell_attempts"] = int(intent.get("sell_attempts") or 0) + 1
+        intent["sell_last_status"] = last_status
+        if sold_total >= tol or cfg.get("dry_run"):
+            intent["sold_leg"] = loser
+            intent["sell_filled"] = float(intent.get("sell_filled") or 0) + sold_total
+            intent["sell_limit"] = ladder[-1]
+            log_event(
+                "sell_loser_done",
+                condition_id=cid,
+                slug=intent.get("slug"),
+                leg=loser,
+                sold=sold_total,
+                bid=loser_bid,
+                status=last_status,
+            )
+            notify(
+                "Mint loser sold",
+                f"{intent.get('slug')}\n{loser} x{sold_total:.1f} @<={thr:.2f}/{floor:.2f}",
+                priority="default",
+            )
+            console.print(
+                f"  [bold bright_green][SELL OK][/] {loser} {sold_total:.2f}  "
+                f"kept opposite for redeem"
+            )
+
+    if dirty:
+        atomic_save(STATE_FILE, state)
+
+
+
 def run_cycle(
     cfg: dict,
     state: dict,
@@ -491,6 +815,10 @@ def run_cycle(
     chain: ChainReader,
 ) -> str:
     now = time.time()
+    try:
+        manage_sells(cfg, state, chain)
+    except Exception as sell_exc:
+        log_event("sell_cycle_error", error=str(sell_exc)[:240])
     if STOP_FILE.exists():
         write_heartbeat("stopped")
         return "stopped"
@@ -719,7 +1047,7 @@ def main() -> int:
                 f"[dim]shares={cfg['shares']} · not-yet-open · opens within "
                 f"{cfg['enter_max_ttm_min']}m · "
                 f"dry_run={cfg['dry_run']} · entry_enabled={cfg['entry_enabled']}[/]\n"
-                "[dim]no CLOB buys · no auto-sells · you sell manually[/]",
+                "[dim]atomic mint · loser sell ladder 3c->2c · keep winner[/]",
                 vertical="middle",
             ),
             title="[bold]polymintbot[/]",
