@@ -76,7 +76,6 @@ DEFAULTS = {
     ],
     "one_entry_per_market": True,
     "max_open_sets": 1,
-    "max_daily_notional": 200.0,
     "poll_s": 5.0,
     "position_tolerance": 0.01,
     "require_accepting_orders": True,
@@ -118,11 +117,9 @@ ACTIVE_STATUSES = frozenset(
 
 _shutdown = False
 
-
 def _signal_handler(signum, frame):
     global _shutdown
     _shutdown = True
-
 
 def log_setup() -> None:
     import logging
@@ -138,13 +135,11 @@ def log_setup() -> None:
     sh.setFormatter(fmt)
     logger.addHandler(sh)
 
-
 def log_event(event: str, **kwargs: Any) -> None:
     import logging
 
     payload = {"ts": time.time(), "event": event, **kwargs}
     logging.getLogger("mintbot").info(json.dumps(payload, default=str))
-
 
 def notify(title: str, message: str, priority: str = "default") -> None:
     topic = os.getenv("NTFY_TOPIC") or os.getenv("NTFY_TOPIC_BUY") or "polybot-joel-btc"
@@ -157,7 +152,6 @@ def notify(title: str, message: str, priority: str = "default") -> None:
         )
     except Exception:
         return
-
 
 def atomic_save(path: Path, payload: dict) -> None:
     temporary = path.with_suffix(path.suffix + ".tmp")
@@ -176,18 +170,15 @@ def atomic_save(path: Path, payload: dict) -> None:
     except OSError:
         pass
 
-
 def load_state() -> dict:
     if not STATE_FILE.exists():
-        return {"intents": {}, "daily": {}}
+        return {"intents": {}}
     with open(STATE_FILE, encoding="utf-8") as handle:
         payload = json.load(handle)
     if not isinstance(payload, dict):
         raise ValueError("positions_mint.json must be an object")
     payload.setdefault("intents", {})
-    payload.setdefault("daily", {})
     return payload
-
 
 def load_strategy() -> dict:
     if not STRATEGY_FILE.exists():
@@ -209,7 +200,6 @@ def load_strategy() -> dict:
     validate_strategy(cfg)
     return cfg
 
-
 def validate_strategy(cfg: dict) -> None:
     if float(cfg["shares"]) <= 0:
         raise ValueError("shares must be positive")
@@ -224,8 +214,6 @@ def validate_strategy(cfg: dict) -> None:
         raise ValueError("series_slugs must not be empty")
     if int(cfg["max_open_sets"]) < 1:
         raise ValueError("max_open_sets must be >= 1")
-    if float(cfg["max_daily_notional"]) < float(cfg["shares"]):
-        raise ValueError("max_daily_notional must cover one mint")
     if float(cfg["poll_s"]) < 2:
         raise ValueError("poll_s must be >= 2")
     floor = float(cfg.get("sell_floor") or 0)
@@ -241,21 +229,6 @@ def validate_strategy(cfg: dict) -> None:
         raise ValueError("sell_persist_s must be >= 0")
     if float(cfg.get("sell_min_bid_size") or 0) < 0:
         raise ValueError("sell_min_bid_size must be >= 0")
-
-
-def today_key(now: float) -> str:
-    return datetime.fromtimestamp(now, tz=timezone.utc).strftime("%Y-%m-%d")
-
-
-def daily_spent(state: dict, now: float) -> float:
-    return float(state.get("daily", {}).get(today_key(now), 0) or 0)
-
-
-def add_daily(state: dict, now: float, amount: float) -> None:
-    key = today_key(now)
-    daily = state.setdefault("daily", {})
-    daily[key] = float(daily.get(key, 0) or 0) + amount
-
 
 def eligible_markets(markets: List[MintMarket], cfg: dict, now: float) -> List[MintMarket]:
     """Only markets that have not opened yet, starting within the configured window.
@@ -279,7 +252,6 @@ def eligible_markets(markets: List[MintMarket], cfg: dict, now: float) -> List[M
         out.append(market)
     return sorted(out, key=lambda m: m.start_ts)
 
-
 def open_intent_count(state: dict, now: float | None = None) -> int:
     """Count bags that still block a new mint (unsold loser).
 
@@ -298,7 +270,6 @@ def open_intent_count(state: dict, now: float | None = None) -> int:
             continue
         n += 1
     return n
-
 
 def mint_slots_full(state: dict, cfg: dict, now: float, candidate_start_ts: float) -> bool:
     """True if minting candidate would exceed capacity.
@@ -335,7 +306,6 @@ def mint_slots_full(state: dict, cfg: dict, now: float, candidate_start_ts: floa
         return False
     return True
 
-
 def already_minted(state: dict, condition_id: str, cfg: dict) -> bool:
     if not cfg.get("one_entry_per_market", True):
         return False
@@ -344,7 +314,6 @@ def already_minted(state: dict, condition_id: str, cfg: dict) -> bool:
         return False
     # "failed" counts as attempted — do not hot-loop remint the same window.
     return intent.get("status") in ACTIVE_STATUSES | {"completed", "failed"}
-
 
 def get_relayer_headers(body: dict) -> Optional[dict]:
     relayer_key = os.getenv("RELAYER_API_KEY")
@@ -380,7 +349,6 @@ def get_relayer_headers(body: dict) -> Optional[dict]:
     headers = dict(payload)
     headers["Content-Type"] = "application/json"
     return headers
-
 
 def submit_mint_batch(calls: List[ContractCall], metadata: str) -> Tuple[Optional[str], Optional[str]]:
     """Submit approve+split as one PROXY batch via Polymarket relayer."""
@@ -469,7 +437,6 @@ def submit_mint_batch(calls: List[ContractCall], metadata: str) -> Tuple[Optiona
     except Exception as exc:
         return None, f"relayer request failed: {str(exc)[:200]}"
 
-
 def get_relayer_transaction(relayer_url: str, transaction_id: str) -> Optional[dict]:
     try:
         response = requests.get(
@@ -487,7 +454,6 @@ def get_relayer_transaction(relayer_url: str, transaction_id: str) -> Optional[d
     except Exception as exc:
         log_event("relayer_status_fail", transaction_id=str(transaction_id)[:36], error=str(exc)[:160])
         return None
-
 
 def reconcile_intents(
     state: dict,
@@ -554,7 +520,6 @@ def reconcile_intents(
                 if max(up, dn) <= tol:
                     intent["status"] = "completed"
 
-
 def acquire_lock():
     handle = open(LOCK_FILE, "a+")
     try:
@@ -564,7 +529,6 @@ def acquire_lock():
         raise SystemExit("another mintbot instance holds the lock")
     return handle
 
-
 def write_heartbeat(status: str, **fields: Any) -> None:
     payload = {"ts": time.time(), "status": status, **fields}
     temporary = str(HEARTBEAT_FILE) + ".tmp"
@@ -572,11 +536,8 @@ def write_heartbeat(status: str, **fields: Any) -> None:
         json.dump(payload, handle, sort_keys=True)
     os.replace(temporary, HEARTBEAT_FILE)
 
-
-
 _clob_client = None
 _clob_init_error = None
-
 
 def _fetch_sized_bid(token_id: str, min_size: float):
     try:
@@ -593,7 +554,6 @@ def _fetch_sized_bid(token_id: str, min_size: float):
     except Exception as exc:
         log_event("book_fetch_fail", token_id=str(token_id)[:18], error=str(exc)[:160])
         return None, 0.0
-
 
 def _get_clob_client():
     global _clob_client, _clob_init_error
@@ -653,7 +613,6 @@ def _get_clob_client():
         log_event("clob_client_init_fail", error=_clob_init_error)
         return None
 
-
 def _fak_sell(token_id: str, size: float, price: float, dry_run: bool):
     size = float(size)
     price = float(price)
@@ -710,7 +669,6 @@ def _fak_sell(token_id: str, size: float, price: float, dry_run: bool):
         log_event("sell_fak_fail", token_id=str(token_id)[:18], error=str(exc)[:200])
         return 0.0, f"error:{str(exc)[:80]}"
 
-
 def _sell_inventory(
     chain: ChainReader,
     ctf: str,
@@ -736,7 +694,6 @@ def _sell_inventory(
         intent[seen_key] = True
         return min(size, float(bal)), latch
     return size, latch
-
 
 def _run_fak_ladder(
     token_id: str,
@@ -767,7 +724,6 @@ def _run_fak_ladder(
             break
         time.sleep(0.35)
     return sold_total, last_status, last_px
-
 
 def manage_sells(cfg: dict, state: dict, chain: ChainReader) -> None:
     """Loser persist dump at 3¢→2¢; optional winner cash-out; held-leg dump under 80¢."""
@@ -917,7 +873,6 @@ def manage_sells(cfg: dict, state: dict, chain: ChainReader) -> None:
                     intent["sell_winner_filled"] = float(
                         intent.get("sell_winner_filled") or 0
                     ) + sold_total
-
 
         # Held-leg dump: after loser is sold, if the remaining leg stays under
         # sell_dump_below for sell_dump_persist_s, live-bid FAK (not a "hedge").
@@ -1126,8 +1081,6 @@ def manage_sells(cfg: dict, state: dict, chain: ChainReader) -> None:
     if dirty:
         atomic_save(STATE_FILE, state)
 
-
-
 def run_cycle(
     cfg: dict,
     state: dict,
@@ -1164,11 +1117,6 @@ def run_cycle(
     if not candidates:
         write_heartbeat("idle", markets=len(markets), eligible=0)
         return "idle"
-
-    spent = daily_spent(state, now)
-    if spent + float(cfg["shares"]) > float(cfg["max_daily_notional"]) + 1e-9:
-        write_heartbeat("capped_daily", spent=spent)
-        return "capped_daily"
 
     data_positions: Dict[str, float] = {}
     if funder:
@@ -1233,7 +1181,6 @@ def run_cycle(
             "up_token": pick.up_token,
             "dn_token": pick.dn_token,
         }
-        add_daily(state, now, 0.0)  # dry does not spend
         atomic_save(STATE_FILE, state)
         write_heartbeat("dry_mint", slug=pick.slug)
         return "dry_mint"
@@ -1337,14 +1284,12 @@ def run_cycle(
     intent["transaction_id"] = tx_id
     intent["submitted_at"] = time.time()
     intent["status"] = "pending"
-    add_daily(state, now, shares)
     atomic_save(STATE_FILE, state)
     console.print(f"  [bold bright_green][MINT ▶][/] tx={tx_id[:18]}…")
     log_event("mint_submitted", condition_id=pick.condition_id, transaction_id=tx_id)
     notify("Mint submitted", f"{pick.slug}\n{shares:.0f} sets · {tx_id[:18]}…", priority="default")
     write_heartbeat("submitted", slug=pick.slug)
     return "submitted"
-
 
 def main() -> int:
     signal.signal(signal.SIGINT, _signal_handler)
@@ -1420,7 +1365,6 @@ def main() -> int:
     except Exception:
         pass
     return 0
-
 
 if __name__ == "__main__":
     raise SystemExit(main())
