@@ -19,7 +19,7 @@ pathlog are **stopped / retired**. Do not start them.
 - `max_open_sets`: 1 with **adjacent-window lookahead**; `sold_loser` frees the slot
 - `already_minted` blocks confirmed/in-flight; `failed` remints after `mint_fail_cooldown_s` (90s) up to `mint_max_attempts` (3)
 - Sells on:
-  - Loser: opposite ≥ 0.90, loser ≤ 0.03 persist 5s, FAK 0.03 → 0.02
+  - Loser: opposite ≥ 0.90, loser ≤ 0.03 persist 9s (5s in last 60s before end_ts), FAK 0.03 → 0.02
   - Winner: prefer 0.999 / redeem; allow 0.99 live-bid FAK only if loser sold ≤ 0.03 and loser+0.99 > $1
   - Held dump: after loser sold, if held sized bid < 0.80 for 5s → live-bid FAK
 

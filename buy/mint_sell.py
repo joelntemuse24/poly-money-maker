@@ -2,10 +2,12 @@
 
 Loser dump: arm when a sized loser bid is at/under ``sell_threshold`` (~3¢)
 and the opposite sized bid is at/over ``sell_opposite_min`` (~90¢). Persist
-that book for ``sell_persist_s`` (~5s), then FAK 3¢ → 2¢ when the live sized
-bid is at/over the floor; if the live bid is below the floor, FAK at that
-live bid. Empty FAK keeps or re-arms the persist latch. Keep the winner
-for redeem unless its sized bid reaches ``sell_winner_min`` (~99¢).
+that book for ``sell_persist_s`` (~9s), or ``sell_persist_last_min_s`` (~5s)
+when time-to-end is within ``sell_persist_last_min_window_s`` (~60s), then
+FAK 3¢ → 2¢ when the live sized bid is at/over the floor; if the live bid
+is below the floor, FAK at that live bid. Empty FAK keeps or re-arms the
+persist latch. Keep the winner for redeem unless its sized bid reaches
+``sell_winner_min`` (~99¢).
 
 After the loser is sold, optional held-leg dump: if the remaining leg's sized
 bid stays under ``sell_dump_below`` (~80¢) for ``sell_dump_persist_s`` (~5s),
@@ -22,7 +24,9 @@ DEFAULT_SELL_KNOBS = {
     "sell_threshold": 0.03,
     "sell_floor": 0.02,
     "sell_opposite_min": 0.90,
-    "sell_persist_s": 5.0,
+    "sell_persist_s": 9.0,
+    "sell_persist_last_min_s": 5.0,
+    "sell_persist_last_min_window_s": 60.0,
     "sell_cooldown_s": 3.0,
     "sell_winner_min": 0.999,
     "sell_winner_cheap_if_loser_le": 0.03,
@@ -117,6 +121,39 @@ def classify_loser(
             return None, "wick_unconfirmed"
         return "dn", "loser"
     return None, "none"
+
+
+def sell_window_open(now_s: float, end_ts: float) -> bool:
+    """CLOB sells run only while time-to-end is strictly positive."""
+    if not end_ts:
+        return True
+    return float(end_ts) - float(now_s) > 0
+
+
+def effective_loser_persist_s(
+    *,
+    now_s: float,
+    end_ts: float,
+    persist_s: float,
+    last_min_s: float,
+    last_min_window_s: float,
+) -> Optional[float]:
+    """Loser persist for this tick, or None when the market has ended.
+
+    Uses ``last_min_s`` when ``0 < end_ts - now_s <= last_min_window_s``.
+    Callers pass this into ``persist_ready`` / ``loser_persist_ready`` each
+    tick so an arm started on the 9s clock can become ready on the 5s
+    clock without resetting ``armed_ts``.
+    """
+    if not end_ts:
+        return float(persist_s)
+    ttm = float(end_ts) - float(now_s)
+    if ttm <= 0:
+        return None
+    window = float(last_min_window_s or 0)
+    if window > 0 and ttm <= window + 1e-12:
+        return float(last_min_s)
+    return float(persist_s)
 
 
 def persist_ready(

@@ -81,7 +81,10 @@ class MintDefaultsTests(unittest.TestCase):
             self.assertEqual(blob["sell_threshold"], 0.03, label)
             self.assertEqual(blob["sell_floor"], 0.02, label)
             self.assertAlmostEqual(blob["sell_opposite_min"], 0.90, msg=label)
-            self.assertEqual(blob["sell_persist_s"], 5.0, label)
+            self.assertEqual(blob["sell_persist_s"], 9.0, label)
+            self.assertEqual(blob["sell_persist_last_min_s"], 5.0, label)
+            self.assertEqual(blob["sell_persist_last_min_window_s"], 60.0, label)
+            self.assertEqual(blob["sell_dump_persist_s"], 5.0, label)
             self.assertAlmostEqual(blob["sell_winner_min"], 0.999, msg=label)
             self.assertEqual(blob["sell_min_bid_size"], 1.0, label)
 
@@ -443,9 +446,19 @@ class DeployUnitsTests(unittest.TestCase):
         self.assertIn("sell_winner_cheap_denied", src)
         self.assertIn("sell_winner_cheap_allowed", src)
         self.assertIn("last_status=intent.get(\"sell_last_status\")", src)
+        self.assertIn("effective_loser_persist_s", src)
+        self.assertIn("sell_window_open", src)
+        self.assertIn("sell_persist_effective", src)
+        self.assertIn("sell_persist_last_min_s", src)
+        self.assertIn("sell_persist_last_min_window_s", src)
         mint_sell_src = (BUY / "mint_sell.py").read_text()
         self.assertIn("def empty_fak_status", mint_sell_src)
         self.assertIn("def loser_persist_ready", mint_sell_src)
+        self.assertIn("def effective_loser_persist_s", mint_sell_src)
+        manage = src[src.find("def manage_sells") : src.find("\ndef run_cycle")]
+        self.assertIn("persist_s=loser_persist_s", manage)
+        self.assertIn("persist_s=dump_persist_s", manage)
+        self.assertNotIn("persist_s=persist_s", manage.split("loser_persist_ready")[1][:400])
         self.assertNotIn(
             'for key in ("takingAmount", "makingAmount"',
             src,

@@ -32,7 +32,9 @@ work.
 template: dry_run=true, entry_enabled=false, sell_enabled=false). Optional
 sell stays off until live `strategy_mint.json` sets `sell_enabled=true`.
 Loser dump: sized opposite bid ≥ `sell_opposite_min` (~0.90), loser ≤
-`sell_threshold` (0.03) persists `sell_persist_s` (~5s), then FAK
+`sell_threshold` (0.03) persists `sell_persist_s` (~9s), or
+`sell_persist_last_min_s` (~5s) when time-to-end is within
+`sell_persist_last_min_window_s` (~60s), then FAK
 threshold → `sell_floor` (0.02) when the live sized bid is ≥ floor, or
 at the live bid if it is below the floor (empty FAK keeps the arm).
 Winner cash-out is a separate path at `sell_winner_min` (~0.999). Do not
