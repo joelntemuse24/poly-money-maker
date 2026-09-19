@@ -70,6 +70,13 @@ class MintDefaultsTests(unittest.TestCase):
         self.assertEqual(defaults["shares"], example["shares"])
         self.assertEqual(defaults["enter_max_ttm_min"], example["enter_max_ttm_min"])
         self.assertEqual(defaults["max_open_sets"], example["max_open_sets"])
+        for blob, label in ((example, "example"), (defaults, "defaults")):
+            self.assertEqual(blob["sell_threshold"], 0.03, label)
+            self.assertEqual(blob["sell_floor"], 0.02, label)
+            self.assertAlmostEqual(blob["sell_opposite_min"], 0.90, msg=label)
+            self.assertEqual(blob["sell_persist_s"], 5.0, label)
+            self.assertAlmostEqual(blob["sell_winner_min"], 0.999, msg=label)
+            self.assertEqual(blob["sell_min_bid_size"], 1.0, label)
 
     def test_open_intent_count_ignores_expired_redeem_holds(self):
         statuses = frozenset(
@@ -118,7 +125,14 @@ class DeployUnitsTests(unittest.TestCase):
     def test_buy_helpers_are_mint_and_pathlog_only(self):
         self.assertEqual(
             {p.name for p in BUY.glob("*.py")},
-            {"__init__.py", "book.py", "chain.py", "contracts.py", "market.py"},
+            {
+                "__init__.py",
+                "book.py",
+                "chain.py",
+                "contracts.py",
+                "market.py",
+                "mint_sell.py",
+            },
         )
         market_src = (BUY / "market.py").read_text()
         self.assertNotIn("def entry_seconds_left", market_src)
@@ -130,6 +144,19 @@ class DeployUnitsTests(unittest.TestCase):
         state = {"intents": {"x": {"status": "confirmed", "end_ts": 9_999_999}}}
         manage({"sell_enabled": False}, state, object())
         self.assertNotIn("sold_leg", state["intents"]["x"])
+
+    def test_mintbot_sell_uses_share_leg_sized_bids_and_latch(self):
+        src = MINT.read_text()
+        self.assertIn("parse_sell_fill_shares", src)
+        self.assertIn("inventory_latch", src)
+        self.assertIn("best_bid_with_min_size", src)
+        self.assertIn("persist_ready", src)
+        self.assertIn("winner_cashout_leg", src)
+        self.assertNotIn(
+            'for key in ("takingAmount", "makingAmount"',
+            src,
+        )
+        self.assertNotIn("if bal + 1e-9 < tol:", src)
 
     def test_docs_do_not_start_hourly_dense_or_dangerzone(self):
         for path in (
