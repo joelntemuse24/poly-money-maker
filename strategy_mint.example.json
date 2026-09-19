@@ -9,7 +9,6 @@
   ],
   "one_entry_per_market": true,
   "max_open_sets": 1,
-  "max_daily_notional": 200.0,
   "poll_s": 5.0,
   "position_tolerance": 0.01,
   "require_accepting_orders": true,
