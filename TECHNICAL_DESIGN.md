@@ -55,6 +55,11 @@ Read Parts I and II straight through. Part III walks mint and sell. Part IV cove
   - [Landmines](#section-32)
   - [Glossary](#section-33)
   - [Source snapshot](#section-34)
+- [Part VI — Sequences & redeem](#part-vi)
+  - [End-to-end mint sequence](#section-35)
+  - [Sell-side sequence (loser → winner/dump)](#section-36)
+  - [Redeem path (what exists vs what does not)](#section-37)
+  - [State after expiry](#section-38)
 
 <a id="part-i"></a>
 # Part I — Picture
@@ -508,7 +513,7 @@ Do not import `mintbot.py` in unit tests (credentials, lock, clients). Test `buy
 - Services: `polymintbot.service`, `polypathlog.service` active
 - Primary sources: `mintbot.py` (~1426 lines), `buy/mint_sell.py` (~166), `pathlog.py` (~527)
 - Strategy: gitignored `strategy_mint.json` as tabulated in §29
-- Document date: 19 September 2026
+- Document date: 19 September 2026 (rev: sequences + redeem)
 - Prior document replaced: hourly `buybothourly.py` guided tour (9 Sep 2026 era)
 
 ---
@@ -623,6 +628,174 @@ Assume shares=5, lossless fees for arithmetic only.
 4. After a `mint_failed`, expect **no** remint of that slug; wait for next window.
 5. Code change on VM → restart **only** `polymintbot` when you ask.
 6. GitHub sync is backup; VM remains SoT.
+
+
+
+
+<a id="part-vi"></a>
+# Part VI — Sequences and redeem
+
+ASCII diagrams below are the PDF-safe form of sequence charts. They match the live `mintbot.py` control flow on 19 September 2026.
+
+<a id="section-35"></a>
+## End-to-end mint sequence
+
+```
+operator/systemd          mintbot               Gamma/CLOB         Relayer            Polygon CTF
+      |                      |                      |                  |                   |
+      | start unit           |                      |                  |                   |
+      |--------------------->|                      |                  |                   |
+      |                      | load strategy_mint   |                  |                   |
+      |                      | flock .mintbot.lock  |                  |                   |
+      |                      |                      |                  |                   |
+      |                      | every poll_s (~5s)   |                  |                   |
+      |                      |---- manage_sells --->| sized bids       |                   |
+      |                      |<---------------------|                  |                   |
+      |                      |---- reconcile ------>|                  | get tx state      |
+      |                      |                      |                  |------------------>|
+      |                      |                      |                  |   balances        |
+      |                      |<----------------------------------------|-------------------|
+      |                      |                      |                  |                   |
+      |                      | discover series      |                  |                   |
+      |                      |--------------------->|                  |                   |
+      |                      | eligible: not open,  |                  |                   |
+      |                      |   TTM in (0,16] min  |                  |                   |
+      |                      | skip already_minted  |                  |                   |
+      |                      |   (incl. failed)     |                  |                   |
+      |                      | mint_slots_full?     |                  |                   |
+      |                      |   allow adjacent     |                  |                   |
+      |                      |   next window only   |                  |                   |
+      |                      |                      |                  |                   |
+      |                      | build approve+split  |                  |                   |
+      |                      |---------------------------------------->| PROXY submit      |
+      |                      |                      |                  |------------------>|
+      |                      | persist intent       |                  |                   |
+      |                      |   status=pending     |                  |                   |
+      |                      | poll until inventory |                  |                   |
+      |                      |   matches shares     |                  |                   |
+      |                      | status=confirmed     |                  |                   |
+      | ntfy (optional)      |                      |                  |                   |
+      |<---------------------|                      |                  |                   |
+```
+
+Notes:
+
+1. **Sells run before mint** each cycle. A mid-window loser fill can free `max_open_sets` so the adjacent mint is allowed sooner.
+2. **Never mints an already-open window.** If adjacent lookahead fails, that quarter-hour is skipped forever for this bot.
+3. Relayer `STATE_FAILED` → intent `failed` → `already_minted` stays true → no remint loop.
+
+<a id="section-36"></a>
+## Sell-side sequence (loser → winner / held dump)
+
+```
+mintbot                 CLOB book              inventory latch           flags on intent
+   |                        |                        |                        |
+   | for each confirmed     |                        |                        |
+   | intent with now<=end   |                        |                        |
+   |---- sized Up/Dn bids ->|                        |                        |
+   |<-----------------------|                        |                        |
+   |                        |                        |                        |
+   | [A] winner path        |                        |                        |
+   | effective_min = 0.999  |                        |                        |
+   | if sold_loser and      |                        |                        |
+   |   sell_limit<=0.03:    |                        |                        |
+   |   effective_min=0.99   |                        |                        |
+   | if sized winner bid    |                        |                        |
+   |   >= effective_min     |                        |                        |
+   |   for persist_s:       |                        |                        |
+   |---- live-bid FAK ----->|                        |                        |
+   |                        |                        |---- has shares? ------>|
+   |                        |                        |                        | sold_winner
+   |                        |                        |                        |
+   | [B] held dump path     |                        |                        |
+   | requires sold_loser    |                        |                        |
+   | held = opposite of     |                        |                        |
+   |   sold_leg             |                        |                        |
+   | if sized held bid      |                        |                        |
+   |   < 0.80 for 5s:       |                        |                        |
+   |---- live-bid FAK ----->|                        |                        |
+   |                        |                        |                        | sold_dump
+   |                        |                        |                        | + sold_winner
+   |                        |                        |                        |
+   | [C] loser path         |                        |                        |
+   | loser<=0.03 and        |                        |                        |
+   | opposite>=0.90 for 5s  |                        |                        |
+   |---- FAK 0.03 then 0.02>|                        |                        |
+   |                        |                        |                        | sold_loser
+   |                        |                        |                        | sold_leg=up|dn
+   |                        |                        |                        | sell_limit≈fill
+```
+
+Ordering in code is **A → B → C** inside one intent iteration. That matters: a bag that already sold the loser can cash out or dump the held leg before another loser attempt (loser already flagged off).
+
+Cooldown: after any sell attempt, `sell_cooldown_s` (3s) suppresses the next fire.
+
+<a id="section-37"></a>
+## Redeem path — what exists vs what does not
+
+### What “redeem” means
+
+After a 15m window resolves, the winning outcome token can be **redeemed** through the CTF for ~$1 collateral per share. That is an on-chain call (or Polymarket UI / relayer helper), separate from CLOB sells.
+
+Economically the mint thesis prefers:
+
+1. Sell loser for scraps (2–3¢),
+2. **Redeem** winner at $1,
+
+rather than selling the winner at 0.99 on the CLOB (which donates ~1¢ × shares plus fees versus redeem).
+
+### What mintbot does today
+
+| Step | Implemented? | Where |
+|---|---|---|
+| Stop CLOB sells after `end_ts` | **Yes** | `manage_sells` skips intents with `now > end_ts` |
+| Keep winner inventory unmarked if never cashed out | **Yes** | no forced sell at expiry |
+| Free mint slot while winner sits for redeem | **Yes** | `sold_loser` excluded from open-slot count; also expiry+120s |
+| Call CTF `redeemPositions` / merge automatically | **No** | not in `mintbot.py` |
+| Relayer batch for redeem | **No** | mint-only submit path |
+| Mark intent `redeemed` after payout | **No** | status may become `completed` when flat post-expiry |
+
+So “kept opposite for redeem” in logs is an **inventory policy**, not an automated redeem worker. Today, redemption is expected via:
+
+- Polymarket portfolio UI / built-in redeem, or
+- a future/manual script the operator runs,
+
+not via the mint loop itself.
+
+### Why the design stops at “hold for redeem”
+
+1. **Margin:** live-bid 0.99 cash-out was explicitly gated; unconditional 0.99 was rejected.
+2. **Window boundary:** once `end_ts` passes, CLOB prices for that market become resolution-driven and the bot refuses further FAK risk.
+3. **Scope control:** mint + sell-side pass is already enough surface area; auto-redeem adds another relayer/CTF path and failure mode (wrong condition index, partial redeem, gas/relayer auth).
+
+### Honest gap / future work
+
+If you want the bot to close the cash loop without the UI, a follow-on would look like:
+
+1. After `end_ts` + short delay, read resolution (Gamma or CTF payout vector),
+2. If winner tokens remain and payout is live, submit redeem via relayer PROXY,
+3. Confirm collateral increase; set `redeemed_at` / status `completed`,
+4. Never redeem while CLOB dump/cash-out still eligible (`now <= end_ts`).
+
+Until that exists, treat redeem as **operator-owned**, and treat mintbot as **mint + intra-window sell policy**.
+
+<a id="section-38"></a>
+## State after expiry
+
+```
+now <= end_ts
+  └─ manage_sells active (loser / winner / dump)
+
+now > end_ts
+  ├─ manage_sells: skip this intent
+  ├─ open_intent_count: still counts full bag until end_ts+120
+  │     unless sold_loser already cleared the slot
+  ├─ after end_ts+120: intent no longer blocks mint capacity
+  └─ if balances flat → reconcile may mark completed
+        else tokens sit until human/UI/future redeem
+```
+
+Adjacent mint may already have been submitted **before** expiry (lookahead). That is intentional and is the main fix for the “skipped 15m” bug.
 
 
 *End of technical design.*
