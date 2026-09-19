@@ -428,7 +428,7 @@ Defaults mirror mintbot sell knobs including dump keys.
 <a id="section-26"></a>
 ## buy/market.py, book.py, chain.py, contracts.py
 
-Discovery builds `MintMarket` with `condition_id`, `up_token`, `dn_token`, `start_ts`, `end_ts`, `slug`, flags. Book helper returns best bid with minimum size. Chain helper reads ERC-1155 positions. Contracts helper encodes the atomic mint path used by the relayer batch.
+Discovery builds `MintMarket` with `condition_id`, `up_token`, `dn_token`, `start_ts`, `end_ts`, `slug`, flags. Book helper returns best bid with minimum size and `bid_fill_depth` (cumulative bids at/through a FAK limit; mint logs `sell_book_depth`, does not gate on it). Chain helper reads ERC-1155 positions. Contracts helper encodes the atomic mint path used by the relayer batch.
 
 <a id="section-27"></a>
 ## pathlog.py: public book recorder

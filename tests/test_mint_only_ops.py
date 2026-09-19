@@ -451,6 +451,10 @@ class DeployUnitsTests(unittest.TestCase):
         self.assertIn("sell_persist_effective", src)
         self.assertIn("sell_persist_last_min_s", src)
         self.assertIn("sell_persist_last_min_window_s", src)
+        self.assertIn("bid_fill_depth", src)
+        self.assertIn("sell_book_depth", src)
+        self.assertIn("_fetch_book", src)
+        self.assertNotIn("def _fetch_sized_bid", src)
         mint_sell_src = (BUY / "mint_sell.py").read_text()
         self.assertIn("def empty_fak_status", mint_sell_src)
         self.assertIn("def loser_persist_ready", mint_sell_src)
@@ -458,12 +462,57 @@ class DeployUnitsTests(unittest.TestCase):
         manage = src[src.find("def manage_sells") : src.find("\ndef run_cycle")]
         self.assertIn("persist_s=loser_persist_s", manage)
         self.assertIn("persist_s=dump_persist_s", manage)
+        self.assertIn('depth_path="loser"', manage)
+        self.assertIn('depth_path="winner_cheap" if cheap_on else None', manage)
+        self.assertIn('depth_path="dump"', manage)
+        self.assertIn('phase="ready"', manage)
+        self.assertNotIn("depth_at_limit >", src)
+        self.assertNotIn("depth_at_limit <", src)
         self.assertNotIn("persist_s=persist_s", manage.split("loser_persist_ready")[1][:400])
         self.assertNotIn(
             'for key in ("takingAmount", "makingAmount"',
             src,
         )
         self.assertNotIn("if bal + 1e-9 < tol:", src)
+
+    def test_sell_book_depth_log_shape_is_observability_only(self):
+        from buy.book import bid_fill_depth
+
+        events: list = []
+        fn = _fn(
+            "_log_sell_book_depth",
+            {
+                "bid_fill_depth": bid_fill_depth,
+                "log_event": lambda event, **kwargs: events.append((event, kwargs)),
+            },
+        )
+        fn(
+            slug="btc-updown-15m-1",
+            leg="up",
+            limit=0.02,
+            our_size=5.0,
+            bids=[
+                {"price": "0.02", "size": "5"},
+                {"price": "0.01", "size": "20"},
+            ],
+            ttm_s=30.0,
+            path="loser",
+            phase="ready",
+            condition_id="cid",
+        )
+        self.assertEqual(len(events), 1)
+        event, payload = events[0]
+        self.assertEqual(event, "sell_book_depth")
+        self.assertEqual(payload["slug"], "btc-updown-15m-1")
+        self.assertEqual(payload["leg"], "up")
+        self.assertEqual(payload["limit"], 0.02)
+        self.assertEqual(payload["our_size"], 5.0)
+        self.assertEqual(payload["best_bid"], 0.02)
+        self.assertEqual(payload["depth_at_limit"], 5.0)
+        self.assertEqual(payload["ladder"][1]["depth"], 25.0)
+        self.assertEqual(payload["ttm_s"], 30.0)
+        self.assertEqual(payload["path"], "loser")
+        self.assertEqual(payload["phase"], "ready")
 
     def test_docs_do_not_start_hourly_dense_or_dangerzone(self):
         for path in (
