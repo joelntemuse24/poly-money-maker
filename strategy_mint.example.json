@@ -27,8 +27,8 @@
   "sell_threshold": 0.03,
   "sell_floor": 0.02,
   "sell_opposite_min": 0.9,
-  "sell_persist_s": 9.0,
-  "sell_persist_last_min_s": 5.0,
+  "sell_persist_s": 5.0,
+  "sell_persist_last_min_s": 2.0,
   "sell_persist_last_min_window_s": 60.0,
   "sell_cooldown_s": 3.0,
   "sell_winner_min": 0.999,
@@ -37,5 +37,5 @@
   "sell_winner_min_cheap": 0.99,
   "sell_dump_enabled": true,
   "sell_dump_below": 0.8,
-  "sell_dump_persist_s": 5.0
+  "sell_dump_persist_s": 2.0
 }

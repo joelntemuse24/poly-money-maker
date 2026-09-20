@@ -2,16 +2,17 @@
 
 Loser dump: arm when a sized loser bid is at/under ``sell_threshold`` (~3¢)
 and the opposite sized bid is at/over ``sell_opposite_min`` (~90¢). Persist
-that book for ``sell_persist_s`` (~9s), or ``sell_persist_last_min_s`` (~5s)
+that book for ``sell_persist_s`` (~5s), or ``sell_persist_last_min_s`` (~2s)
 when time-to-end is within ``sell_persist_last_min_window_s`` (~60s), then
-FAK 3¢ → 2¢ when the live sized bid is at/over the floor; if the live bid
-is below the floor, FAK at that live bid. Empty FAK, or a vanished loser
-book after arm, keeps ``armed_ts`` (do not fire until a sized bid at/under
-threshold returns). Keep the winner for redeem unless its sized bid reaches
-``sell_winner_min`` (~99¢).
+re-check in-range at fire and FAK 3¢ → 2¢ when the live sized bid is at/over
+the floor; if the live bid is below the floor, FAK at that live bid. Persist
+waits fold typical ~4s sell-tick/FAK lag so wall-clock stays ~9s (last-min
+~5–6s). Empty FAK, or a vanished loser book after arm, keeps ``armed_ts``
+(do not fire until a sized bid at/under threshold returns). Keep the winner
+for redeem unless its sized bid reaches ``sell_winner_min`` (~99¢).
 
 After the loser is sold, optional held-leg dump: if the remaining leg's sized
-bid stays under ``sell_dump_below`` (~80¢) for ``sell_dump_persist_s`` (~5s),
+bid stays under ``sell_dump_below`` (~80¢) for ``sell_dump_persist_s`` (~2s),
 live-bid FAK the held leg.
 """
 
@@ -25,8 +26,8 @@ DEFAULT_SELL_KNOBS = {
     "sell_threshold": 0.03,
     "sell_floor": 0.02,
     "sell_opposite_min": 0.90,
-    "sell_persist_s": 9.0,
-    "sell_persist_last_min_s": 5.0,
+    "sell_persist_s": 5.0,
+    "sell_persist_last_min_s": 2.0,
     "sell_persist_last_min_window_s": 60.0,
     "sell_cooldown_s": 3.0,
     "sell_winner_min": 0.999,
@@ -36,7 +37,7 @@ DEFAULT_SELL_KNOBS = {
     "sell_clob_min_price": 0.01,
     "sell_dump_enabled": True,
     "sell_dump_below": 0.80,
-    "sell_dump_persist_s": 5.0,
+    "sell_dump_persist_s": 2.0,
     "sell_min_bid_size": 1.0,
     # Cycle sleep while a loser persist arm is live. Does not change persist_s.
     "sell_armed_poll_s": 2.0,
@@ -153,11 +154,11 @@ def sell_intent_hot(intent: Any, now_s: float) -> bool:
 
     This is sell-loop scheduling only. Concurrent mint must not skip
     discovery because a bag is hot — that was the #193 serial-cycle
-    bandage. Persist knobs are unchanged.
+    bandage. Persist waits fold typical tick/FAK lag (defaults 5/2/60).
 
     Live audit (bag ``btc-updown-15m-1789880400``): ``poll_s=5`` plus
     manage_sells/reconcile/discover made sell ticks ≈8.6–10.5s. Persist
-    ready is +9s; first post-ready look was empty_keep_arm at +10.7s.
+    ready was +9s; first post-ready look was empty_keep_arm at +10.7s.
     Incident ``btc-updown-15m-1789905600``: after ``loser_done``, dump
     stayed cold so next-window mint stole the shared cycle (~16s).
     """
@@ -246,7 +247,7 @@ def effective_loser_persist_s(
 
     Uses ``last_min_s`` when ``0 < end_ts - now_s <= last_min_window_s``.
     Callers pass this into ``persist_ready`` / ``loser_persist_ready`` each
-    tick so an arm started on the 9s clock can become ready on the 5s
+    tick so an arm started on the 5s clock can become ready on the 2s
     clock without resetting ``armed_ts``.
     """
     if not end_ts:
@@ -443,3 +444,49 @@ def loser_ladder_limits(
         if not limits or abs(use_px - limits[-1]) > 1e-12:
             limits.append(use_px)
     return limits
+
+
+def sell_fire_decision(
+    path: str,
+    *,
+    bid: Optional[float],
+    opposite_bid: Optional[float] = None,
+    threshold: float = 0.03,
+    floor: float = 0.02,
+    opposite_min: float = 0.90,
+    dump_below: float = 0.80,
+    winner_min: float = 0.999,
+    cheap_on: bool = False,
+) -> Tuple[str, str]:
+    """Last in-range check before a sell FAK.
+
+    Returns ``("fire", reason)`` or
+    ``("cancel_reset"|"cancel_keep_arm", reason)``. Persist-ready is not
+    enough: if the live book left the path's range, do not POST. Empty loser
+    books keep the arm; dump/winner empty books reset. Opposite-min and
+    cheap-winner edge gates stay in force.
+    """
+    kind = str(path or "")
+    if kind == "loser":
+        if bid is None:
+            return "cancel_keep_arm", "empty_book"
+        if opposite_bid is None or float(opposite_bid) + 1e-12 < float(opposite_min):
+            return "cancel_reset", "wick_unconfirmed"
+        if float(bid) > float(threshold) + 1e-12:
+            return "cancel_reset", "loser_above_threshold"
+        if not loser_ladder_limits(threshold, floor, float(bid)):
+            return "cancel_reset", "no_ladder_limit"
+        return "fire", "loser"
+    if kind == "dump":
+        if bid is None:
+            return "cancel_reset", "empty_book"
+        if float(bid) + 1e-12 >= float(dump_below):
+            return "cancel_reset", "dump_at_or_above_below"
+        return "fire", "dump"
+    if kind == "winner":
+        if bid is None:
+            return "cancel_reset", "empty_book"
+        if float(bid) + 1e-12 < float(winner_min):
+            return "cancel_reset", "winner_below_min"
+        return "fire", "winner_cheap" if cheap_on else "winner"
+    return "cancel_reset", "unknown_path"

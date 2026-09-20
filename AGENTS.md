@@ -32,13 +32,15 @@ work.
 template: dry_run=true, entry_enabled=false, sell_enabled=false). Optional
 sell stays off until live `strategy_mint.json` sets `sell_enabled=true`.
 Loser dump: sized opposite bid ≥ `sell_opposite_min` (~0.90), loser ≤
-`sell_threshold` (0.03) persists `sell_persist_s` (~9s), or
-`sell_persist_last_min_s` (~5s) when time-to-end is within
-`sell_persist_last_min_window_s` (~60s), then FAK
-threshold → `sell_floor` (0.02) when the live sized bid is ≥ floor, or
-at the live bid if it is below the floor (empty FAK or a vanished loser
+`sell_threshold` (0.03) persists `sell_persist_s` (~5s), or
+`sell_persist_last_min_s` (~2s) when time-to-end is within
+`sell_persist_last_min_window_s` (~60s), then re-check in-range at fire
+and FAK threshold → `sell_floor` (0.02) when the live sized bid is ≥ floor,
+or at the live bid if it is below the floor (empty FAK or a vanished loser
 book after arm keeps `armed_ts`; do not fire until a sized bid ≤ threshold
-returns).
+returns). Persist waits fold typical ~4s sell-tick/FAK lag so wall-clock
+stays ~9s (last-min ~5–6s). Out of range at fire logs
+`sell_cancel_out_of_range` and does not POST.
 Winner cash-out is a separate path at `sell_winner_min` (~0.999).
 Live-bid FAK the winner, then clamp `limit = min(live_sized_bid,
 sell_clob_max_price=0.99)` (floor `sell_clob_min_price=0.01`) so rich
@@ -51,8 +53,10 @@ or add 5m/hourly back to `SERIES`.
 
 `mintbot.py` runs sell and mint as independent loops so Gamma/relayer
 work cannot steal a dump tick. Do not re-serialize them into one
-`manage_sells → discover → sleep` cycle. Persist / dump / loser knobs
-stay 9/5/60; `sell_armed_poll_s` is sell-loop cadence only.
+`manage_sells → discover → sleep` cycle. Persist / dump / loser defaults
+are 5/2/60 (dump persist 2s); `sell_armed_poll_s` is sell-loop cadence
+only. Live `strategy_mint.json` persist values stay until the operator
+merges.
 
 Shared `buy/` helpers exist only for mint and pathlog:
 

@@ -6,6 +6,7 @@ import unittest
 
 from buy.book import best_bid_with_min_size
 from buy.mint_sell import (
+    DEFAULT_SELL_KNOBS,
     classify_loser,
     cycle_sleep_s,
     mint_cycle_sleep_s,
@@ -17,6 +18,7 @@ from buy.mint_sell import (
     loser_persist_ready,
     parse_sell_fill_shares,
     persist_ready,
+    sell_fire_decision,
     sell_intent_hot,
     sell_window_open,
     skip_mint_discovery_for_sell,
@@ -179,34 +181,85 @@ class PersistReadyTests(unittest.TestCase):
         self.assertEqual(why, "immediate")
 
 
+class PersistLagFoldTests(unittest.TestCase):
+    """Persist waits fold ~4s sell-tick/FAK lag so wall-clock stays ~9s / last-min ~5-6s."""
+
+    def test_default_persist_ready_at_5s_not_9(self):
+        persist = DEFAULT_SELL_KNOBS["sell_persist_s"]
+        self.assertEqual(persist, 5.0)
+        fire, _, why = persist_ready(
+            True, now_s=14.9, armed_ts=10.0, persist_s=persist,
+        )
+        self.assertFalse(fire)
+        self.assertEqual(why, "waiting")
+        fire, _, why = persist_ready(
+            True, now_s=15.0, armed_ts=10.0, persist_s=persist,
+        )
+        self.assertTrue(fire)
+        self.assertEqual(why, "ready")
+        still_waiting, _, why_9 = persist_ready(
+            True, now_s=18.9, armed_ts=10.0, persist_s=9.0,
+        )
+        self.assertFalse(still_waiting)
+        self.assertEqual(why_9, "waiting")
+
+    def test_default_last_min_persist_ready_at_2s(self):
+        last = DEFAULT_SELL_KNOBS["sell_persist_last_min_s"]
+        self.assertEqual(last, 2.0)
+        fire, _, why = persist_ready(
+            True, now_s=11.9, armed_ts=10.0, persist_s=last,
+        )
+        self.assertFalse(fire)
+        self.assertEqual(why, "waiting")
+        fire, _, why = persist_ready(
+            True, now_s=12.0, armed_ts=10.0, persist_s=last,
+        )
+        self.assertTrue(fire)
+        self.assertEqual(why, "ready")
+
+    def test_default_dump_persist_ready_at_2s(self):
+        dump = DEFAULT_SELL_KNOBS["sell_dump_persist_s"]
+        self.assertEqual(dump, 2.0)
+        fire, _, why = persist_ready(
+            True, now_s=11.9, armed_ts=10.0, persist_s=dump,
+        )
+        self.assertFalse(fire)
+        self.assertEqual(why, "waiting")
+        fire, _, why = persist_ready(
+            True, now_s=12.0, armed_ts=10.0, persist_s=dump,
+        )
+        self.assertTrue(fire)
+        self.assertEqual(why, "ready")
+
+
 class EffectiveLoserPersistTests(unittest.TestCase):
-    """Last 60s before end_ts uses 5s persist so a short qualify window can fire."""
+    """Last 60s before end_ts uses 2s persist so wait + lag ≈ last-min wall-clock."""
 
-    _KNOBS = dict(persist_s=9.0, last_min_s=5.0, last_min_window_s=60.0)
+    _KNOBS = dict(persist_s=5.0, last_min_s=2.0, last_min_window_s=60.0)
 
-    def test_ttm_over_60_uses_normal_9s(self):
+    def test_ttm_over_60_uses_normal_5s(self):
         end = 10_000.0
         self.assertEqual(
             effective_loser_persist_s(now_s=end - 61.0, end_ts=end, **self._KNOBS),
-            9.0,
+            5.0,
         )
         self.assertEqual(
             effective_loser_persist_s(now_s=end - 90.0, end_ts=end, **self._KNOBS),
-            9.0,
+            5.0,
         )
 
-    def test_ttm_30_uses_last_min_5s(self):
+    def test_ttm_30_uses_last_min_2s(self):
         end = 10_000.0
         self.assertEqual(
             effective_loser_persist_s(now_s=end - 30.0, end_ts=end, **self._KNOBS),
-            5.0,
+            2.0,
         )
 
     def test_ttm_exactly_60_uses_last_min(self):
         end = 10_000.0
         self.assertEqual(
             effective_loser_persist_s(now_s=end - 60.0, end_ts=end, **self._KNOBS),
-            5.0,
+            2.0,
         )
 
     def test_ttm_zero_or_past_end_is_no_sell(self):
@@ -222,18 +275,18 @@ class EffectiveLoserPersistTests(unittest.TestCase):
         self.assertTrue(sell_window_open(now_s=end - 0.01, end_ts=end))
 
     def test_arm_across_last_min_boundary_uses_shorter_threshold_without_reset(self):
-        """Incident: 9s arm started before T-60; last minute re-evaluates at 5s.
+        """Arm on 5s clock; last minute re-evaluates at 2s without resetting armed_ts.
 
-        Arm at T-63 (9s). At T-58 elapsed is 5s: still waiting under 9s, ready
-        under 5s, and armed_ts is unchanged (do not reset on the switch).
+        Arm at T-62 (5s). At T-60 elapsed is 2s: still waiting under 5s, ready
+        under 2s, and armed_ts is unchanged (do not reset on the switch).
         """
         end = 10_000.0
-        arm_now = end - 63.0
-        tick_now = end - 58.0
+        arm_now = end - 62.0
+        tick_now = end - 60.0
         persist_at_arm = effective_loser_persist_s(
             now_s=arm_now, end_ts=end, **self._KNOBS
         )
-        self.assertEqual(persist_at_arm, 9.0)
+        self.assertEqual(persist_at_arm, 5.0)
         fire, armed, why = persist_ready(
             True, now_s=arm_now, armed_ts=None, persist_s=persist_at_arm,
         )
@@ -244,20 +297,20 @@ class EffectiveLoserPersistTests(unittest.TestCase):
         persist_inside = effective_loser_persist_s(
             now_s=tick_now, end_ts=end, **self._KNOBS
         )
-        self.assertEqual(persist_inside, 5.0)
-        still_waiting, armed_9, why_9 = persist_ready(
-            True, now_s=tick_now, armed_ts=armed, persist_s=9.0,
+        self.assertEqual(persist_inside, 2.0)
+        still_waiting, armed_5, why_5 = persist_ready(
+            True, now_s=tick_now, armed_ts=armed, persist_s=5.0,
         )
         self.assertFalse(still_waiting)
-        self.assertEqual(armed_9, armed)
-        self.assertEqual(why_9, "waiting")
+        self.assertEqual(armed_5, armed)
+        self.assertEqual(why_5, "waiting")
 
-        fire, armed_5, why_5 = persist_ready(
+        fire, armed_2, why_2 = persist_ready(
             True, now_s=tick_now, armed_ts=armed, persist_s=persist_inside,
         )
         self.assertTrue(fire)
-        self.assertEqual(armed_5, armed)
-        self.assertEqual(why_5, "ready")
+        self.assertEqual(armed_2, armed)
+        self.assertEqual(why_2, "ready")
 
         fire_l, armed_l, why_l = loser_persist_ready(
             True, now_s=tick_now, armed_ts=armed, persist_s=persist_inside,
@@ -699,8 +752,8 @@ class SellArmedPollTests(unittest.TestCase):
     _CFG = {
         "poll_s": 5.0,
         "sell_armed_poll_s": 2.0,
-        "sell_persist_s": 9.0,
-        "sell_persist_last_min_s": 5.0,
+        "sell_persist_s": 5.0,
+        "sell_persist_last_min_s": 2.0,
         "sell_persist_last_min_window_s": 60.0,
     }
 
@@ -805,22 +858,118 @@ class SellArmedPollTests(unittest.TestCase):
 
     def test_armed_poll_does_not_change_persist_math(self):
         fire, armed, why = persist_ready(
-            True, now_s=18.9, armed_ts=10.0, persist_s=9.0,
+            True, now_s=14.9, armed_ts=10.0, persist_s=5.0,
         )
         self.assertFalse(fire)
         self.assertEqual(why, "waiting")
         fire, _, why = persist_ready(
-            True, now_s=19.0, armed_ts=10.0, persist_s=self._CFG["sell_persist_s"],
+            True, now_s=15.0, armed_ts=10.0, persist_s=self._CFG["sell_persist_s"],
         )
         self.assertTrue(fire)
         self.assertEqual(why, "ready")
-        self.assertEqual(self._CFG["sell_persist_s"], 9.0)
-        self.assertEqual(self._CFG["sell_persist_last_min_s"], 5.0)
+        self.assertEqual(self._CFG["sell_persist_s"], 5.0)
+        self.assertEqual(self._CFG["sell_persist_last_min_s"], 2.0)
 
     def test_missing_armed_knob_falls_back_to_poll_s(self):
         cfg = {"poll_s": 5.0}
         state = {"intents": {"a": self._intent(sell_loser_armed_at=1.0)}}
         self.assertEqual(cycle_sleep_s(cfg, state, now_s=2.0), 5.0)
+
+
+class SellFireDecisionTests(unittest.TestCase):
+    """At FAK time, cancel if the path is no longer in range; do not POST."""
+
+    def test_loser_cancels_when_bid_rose_above_threshold(self):
+        fire, _, why = persist_ready(
+            True, now_s=15.0, armed_ts=10.0, persist_s=5.0,
+        )
+        self.assertTrue(fire)
+        self.assertEqual(why, "ready")
+        action, reason = sell_fire_decision(
+            "loser", bid=0.04, opposite_bid=0.95, threshold=0.03, opposite_min=0.90,
+        )
+        self.assertEqual(action, "cancel_reset")
+        self.assertEqual(reason, "loser_above_threshold")
+
+    def test_loser_fires_when_still_in_range_including_below_floor(self):
+        action, reason = sell_fire_decision(
+            "loser", bid=0.03, opposite_bid=0.92, threshold=0.03, opposite_min=0.90,
+        )
+        self.assertEqual(action, "fire")
+        self.assertEqual(reason, "loser")
+        action, reason = sell_fire_decision(
+            "loser", bid=0.01, opposite_bid=0.97, threshold=0.03, floor=0.02,
+            opposite_min=0.90,
+        )
+        self.assertEqual(action, "fire")
+        self.assertEqual(reason, "loser")
+
+    def test_loser_empty_book_keeps_arm_and_does_not_fire(self):
+        action, reason = sell_fire_decision(
+            "loser", bid=None, opposite_bid=0.95, threshold=0.03, opposite_min=0.90,
+        )
+        self.assertEqual(action, "cancel_keep_arm")
+        self.assertEqual(reason, "empty_book")
+
+    def test_loser_still_requires_opposite_min(self):
+        action, reason = sell_fire_decision(
+            "loser", bid=0.02, opposite_bid=0.80, threshold=0.03, opposite_min=0.90,
+        )
+        self.assertEqual(action, "cancel_reset")
+        self.assertEqual(reason, "wick_unconfirmed")
+        action, reason = sell_fire_decision(
+            "loser", bid=0.02, opposite_bid=None, threshold=0.03, opposite_min=0.90,
+        )
+        self.assertEqual(action, "cancel_reset")
+        self.assertEqual(reason, "wick_unconfirmed")
+
+    def test_dump_cancels_when_bid_rises_to_or_above_below(self):
+        fire, _, why = persist_ready(
+            True, now_s=12.0, armed_ts=10.0, persist_s=2.0,
+        )
+        self.assertTrue(fire)
+        action, reason = sell_fire_decision("dump", bid=0.80, dump_below=0.80)
+        self.assertEqual(action, "cancel_reset")
+        self.assertEqual(reason, "dump_at_or_above_below")
+        action, reason = sell_fire_decision("dump", bid=0.81, dump_below=0.80)
+        self.assertEqual(action, "cancel_reset")
+        self.assertEqual(reason, "dump_at_or_above_below")
+
+    def test_dump_fires_when_still_below_and_cancels_empty(self):
+        action, reason = sell_fire_decision("dump", bid=0.74, dump_below=0.80)
+        self.assertEqual(action, "fire")
+        self.assertEqual(reason, "dump")
+        action, reason = sell_fire_decision("dump", bid=None, dump_below=0.80)
+        self.assertEqual(action, "cancel_reset")
+        self.assertEqual(reason, "empty_book")
+
+    def test_winner_cheap_cancels_when_bid_drops_below_min(self):
+        fire, _, why = persist_ready(
+            True, now_s=15.0, armed_ts=10.0, persist_s=5.0,
+        )
+        self.assertTrue(fire)
+        action, reason = sell_fire_decision(
+            "winner", bid=0.97, winner_min=0.99, cheap_on=True,
+        )
+        self.assertEqual(action, "cancel_reset")
+        self.assertEqual(reason, "winner_below_min")
+
+    def test_winner_cheap_fires_when_still_allowed(self):
+        action, reason = sell_fire_decision(
+            "winner", bid=0.995, winner_min=0.99, cheap_on=True,
+        )
+        self.assertEqual(action, "fire")
+        self.assertEqual(reason, "winner_cheap")
+        action, reason = sell_fire_decision(
+            "winner", bid=0.999, winner_min=0.999, cheap_on=False,
+        )
+        self.assertEqual(action, "fire")
+        self.assertEqual(reason, "winner")
+        action, reason = sell_fire_decision(
+            "winner", bid=0.99, winner_min=0.999, cheap_on=False,
+        )
+        self.assertEqual(action, "cancel_reset")
+        self.assertEqual(reason, "winner_below_min")
 
 
 class SizedBidTests(unittest.TestCase):
