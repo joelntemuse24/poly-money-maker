@@ -502,12 +502,14 @@ class DeployUnitsTests(unittest.TestCase):
 
         cycle = src[src.find("def run_cycle") : src.find("\ndef main")]
         self.assertIn("skip_mint_discovery_for_sell", cycle)
+        self.assertIn("skip_mint_discovery_this_tick", cycle)
         self.assertLess(
-            cycle.find("skip_mint_discovery_for_sell"),
+            cycle.find("skip_mint_discovery_this_tick"),
             cycle.find("gateway.discover"),
         )
         self.assertIn('return "sell_hot"', cycle)
         self.assertIn("skip_confirmed_inventory", src)
+        self.assertIn("_last_mint_discover_at is None", cycle)
         main = src[src.find("def main") :]
         self.assertIn("cycle_sleep_s", main)
         self.assertIn("sell_hot_poll_s", src)

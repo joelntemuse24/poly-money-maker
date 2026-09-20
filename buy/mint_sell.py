@@ -172,11 +172,43 @@ def sell_intent_hot(intent: Any, now_s: float) -> bool:
 
 
 def skip_mint_discovery_for_sell(state: Any, now_s: float) -> bool:
-    """Skip Gamma/positions/mint while a sell arm is live (capped anyway)."""
+    """True when any intent still has an unsold persist arm (hot-poll).
+
+    This is *not* a hard skip of Gamma/mint for the rest of the window.
+    Adjacent-window mint can still run; ``skip_mint_discovery_this_tick``
+    only paces discovery to once per ``poll_s`` while hot.
+    """
     intents = (state or {}).get("intents") or {}
     if not isinstance(intents, dict):
         return False
     return any(sell_intent_hot(intent, now_s) for intent in intents.values())
+
+
+def skip_mint_discovery_this_tick(
+    *,
+    sell_hot: bool,
+    now_s: float,
+    last_mint_discover_at: Optional[float],
+    poll_s: float,
+) -> bool:
+    """While a sell is hot, run Gamma/mint at most once per ``poll_s``.
+
+    Live ``max_open_sets=1`` still allows minting the adjacent next 15m
+    while the current loser is unsold. Empty-keep-arm must not suppress
+    that for the rest of the window. Idle ticks (not hot) always discover.
+    """
+    if not sell_hot:
+        return False
+    if last_mint_discover_at is None:
+        return True
+    try:
+        last = float(last_mint_discover_at)
+        poll = float(poll_s or 0)
+    except (TypeError, ValueError):
+        return True
+    if poll <= 0:
+        return True
+    return float(now_s) + 1e-12 < last + poll
 
 
 def cycle_sleep_s(cfg: Any, state: Any, now_s: float) -> float:

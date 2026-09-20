@@ -234,7 +234,7 @@ Each `run_cycle`:
 
 1. **`manage_sells`** (always attempted first if `sell_enabled`) — can free capacity by marking `sold_loser`.
 2. Reconcile open relayer intents / inventory (skip confirmed inventory RPC while a sell is armed).
-3. If a sell persist arm is live → return `sell_hot` (skip Gamma/mint so the next book look is ~1s away).
+3. If a sell persist arm is live → return `sell_hot` on most ticks (skip Gamma/mint so the next book look is ~1s away). Still discover at most once per `poll_s` so adjacent-window mint is not starved by `empty_keep_arm`.
 4. If entry disabled → return.
 5. Discover series markets; filter eligible; skip `already_minted`; skip owned tokens.
 6. Pick earliest eligible; if `mint_slots_full(..., pick.start_ts)` → capped.
@@ -544,7 +544,8 @@ every poll_s seconds (sell_hot_poll_s while a sell arm is live):
   manage_sells(cfg, state, chain)        # may set sold_loser / sold_winner / sold_dump
   reconcile_intents(...)                 # relayer poll + inventory confirm
 
-  if sell arm live: return "sell_hot"    # skip Gamma/mint; persist knobs unchanged
+  if sell arm live and last mint discover < poll_s ago:
+      return "sell_hot"                 # 1s book looks; persist knobs unchanged
   if not cfg.entry_enabled: return "disabled"
 
   markets = gateway.discover(cfg.series_slugs)

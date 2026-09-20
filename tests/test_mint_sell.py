@@ -19,6 +19,7 @@ from buy.mint_sell import (
     sell_intent_hot,
     sell_window_open,
     skip_mint_discovery_for_sell,
+    skip_mint_discovery_this_tick,
     winner_cashout_leg,
     winner_cheap_decision,
     winner_sell_limit,
@@ -725,6 +726,41 @@ class SellHotPollTests(unittest.TestCase):
         self.assertTrue(sell_intent_hot(state["intents"]["a"], now))
         self.assertEqual(cycle_sleep_s(self._CFG, state, now_s=now), 1.0)
         self.assertTrue(skip_mint_discovery_for_sell(state, now_s=now))
+        # First hot tick skips mint so the next book look is ~1s, not +5s Gamma.
+        self.assertTrue(
+            skip_mint_discovery_this_tick(
+                sell_hot=True, now_s=now, last_mint_discover_at=None, poll_s=5.0,
+            )
+        )
+        # Caller must stamp last on that first skip (mintbot does); otherwise
+        # last stays None and every hot tick would skip mint forever.
+        # After poll_s, adjacent-window mint is allowed even while still armed.
+        self.assertFalse(
+            skip_mint_discovery_this_tick(
+                sell_hot=True,
+                now_s=now + 5.0,
+                last_mint_discover_at=now,
+                poll_s=5.0,
+            )
+        )
+        self.assertTrue(
+            skip_mint_discovery_this_tick(
+                sell_hot=True,
+                now_s=now + 4.9,
+                last_mint_discover_at=now,
+                poll_s=5.0,
+            )
+        )
+
+    def test_not_hot_never_skips_mint_discovery(self):
+        self.assertFalse(
+            skip_mint_discovery_this_tick(
+                sell_hot=False,
+                now_s=10.0,
+                last_mint_discover_at=None,
+                poll_s=5.0,
+            )
+        )
 
     def test_empty_keep_arm_stays_hot_until_window_ends(self):
         # Armed + unsold loser inside the window (book may be empty).

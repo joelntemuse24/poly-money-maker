@@ -60,9 +60,9 @@ from buy.mint_sell import (
     loser_persist_ready,
     parse_sell_fill_shares,
     persist_ready,
-    sell_intent_hot,
     sell_window_open,
     skip_mint_discovery_for_sell,
+    skip_mint_discovery_this_tick,
     winner_cashout_leg,
     winner_cheap_decision,
     winner_sell_limit,
@@ -665,6 +665,9 @@ def write_heartbeat(status: str, **fields: Any) -> None:
 
 _clob_client = None
 _clob_init_error = None
+# Last Gamma/mint pass. While a sell is armed we still discover at most
+# once per poll_s so adjacent-window mint is not starved by empty_keep_arm.
+_last_mint_discover_at: Optional[float] = None
 
 def _fetch_book(token_id: str, min_size: float):
     """REST `/book` → sized best bid plus raw bid levels for depth logs."""
@@ -1404,7 +1407,7 @@ def run_cycle(
         write_heartbeat("stopped")
         return "stopped"
 
-    sell_hot = skip_mint_discovery_for_sell(state, now)
+    sell_hot = skip_mint_discovery_for_sell(state, now)  # any sell_intent_hot
     funder = os.getenv("FUNDER_ADDRESS") or ""
     if funder:
         reconcile_intents(
@@ -1424,12 +1427,24 @@ def run_cycle(
         write_heartbeat("wait_submit")
         return "wait_submit"
 
-    # While a sell is armed, skip Gamma/positions/mint (~5s on live VM)
-    # so the next book look happens after sell_hot_poll_s instead of
-    # poll_s plus discovery. Persist knobs are unchanged.
-    if sell_hot:
+    # While a sell is armed, skip Gamma/positions on most ticks so the
+    # next book look is ~sell_hot_poll_s, not poll_s plus discovery.
+    # Still discover at most once per poll_s so adjacent-window mint
+    # (allowed while the current loser is unsold) is not starved.
+    global _last_mint_discover_at
+    if skip_mint_discovery_this_tick(
+        sell_hot=sell_hot,
+        now_s=now,
+        last_mint_discover_at=_last_mint_discover_at,
+        poll_s=float(cfg.get("poll_s") or 5),
+    ):
+        # Start the poll_s clock on the first hot skip so adjacent mint
+        # is not starved forever while last_mint_discover_at stays None.
+        if _last_mint_discover_at is None:
+            _last_mint_discover_at = now
         write_heartbeat("sell_hot")
         return "sell_hot"
+    _last_mint_discover_at = now
 
     if not cfg.get("entry_enabled"):
         write_heartbeat("disabled")
