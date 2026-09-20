@@ -224,7 +224,7 @@ Statuses move roughly: `submitting` → `pending`/`executed`/`mined` → `confir
 <a id="section-9"></a>
 ## Startup, lock, strategy load
 
-`main()` installs signal handlers, acquires `.mintbot.lock`, loads `strategy_mint.json` merged over `DEFAULTS`, validates knobs, constructs market gateway + chain reader, then loops: reload strategy → `run_cycle` → sleep `poll_s` (live 5s).
+`main()` installs signal handlers, acquires `.mintbot.lock`, loads `strategy_mint.json` merged over `DEFAULTS`, validates knobs, constructs market gateway + chain reader, then loops: reload strategy → `run_cycle` → sleep `poll_s` (live 5s), or `sell_armed_poll_s` (2s, allowed below the `poll_s >= 2` floor) while a loser persist arm is live. Armed poll does **not** shorten `sell_persist_s`. Live bag `btc-updown-15m-1789880400`: sell ticks were ≈8.6–10.5s (`poll_s` plus manage_sells/reconcile/discover); persist-ready FAK uses the same tick's book (no extra refetch). That bag's DN bid vanished +1.5s after arm and never returned — miss was empty-book on the first post-ready look plus coarse tick. ROI is catching fleeting 2¢ books after persist.
 
 `dry_run=true` must not submit mints or live sells. Live VM has `dry_run=false`, `entry_enabled=true`, `sell_enabled=true`.
 
@@ -234,11 +234,12 @@ Statuses move roughly: `submitting` → `pending`/`executed`/`mined` → `confir
 Each `run_cycle`:
 
 1. **`manage_sells`** (always attempted first if `sell_enabled`) — can free capacity by marking `sold_loser`.
-2. Reconcile open relayer intents / inventory.
-3. If entry disabled → return.
-4. Discover series markets; filter eligible; skip `already_minted`; skip owned tokens.
-5. Pick earliest eligible; if `mint_slots_full(..., pick.start_ts)` → capped.
-6. Daily notional cap; balance precheck; build approve+split; `submit_mint_batch`; record intent.
+2. Reconcile open relayer intents / inventory (skip confirmed inventory RPC while a loser is armed).
+3. If a loser persist arm is live **and** mint would be `capped_open` (adjacent window already held) → return `sell_armed` (skip Gamma so `sell_armed_poll_s` is the real period). Adjacent slot still discovers.
+4. If entry disabled → return.
+5. Discover series markets; filter eligible; skip `already_minted`; skip owned tokens.
+6. Pick earliest eligible; if `mint_slots_full(..., pick.start_ts)` → capped.
+7. Daily notional cap; balance precheck; build approve+split; `submit_mint_batch`; record intent.
 
 Sells-before-mint matters: selling the loser can clear the `max_open_sets` blocker for the adjacent window.
 
@@ -486,7 +487,8 @@ From VM `strategy_mint.json`:
 | `mint_fail_cooldown_s` | 90 | Wait after `failed` before remint |
 | `mint_max_attempts` | 3 | Total mint tries per market |
 | `max_daily_notional` | 100 | Daily mint spend cap |
-| `poll_s` | 5 | Cycle sleep |
+| `poll_s` | 5 | Cycle sleep when no loser arm |
+| `sell_armed_poll_s` | 2 | Cycle sleep while loser is armed (not persist; code default, not yet in live JSON) |
 | `sell_enabled` | true | Enable manage_sells |
 | `sell_threshold` / `sell_floor` | 0.03 / 0.02 | Loser ladder |
 | `sell_opposite_min` | 0.90 | Opposite must be rich |
@@ -559,11 +561,13 @@ Do not import `mintbot.py` in unit tests (credentials, lock, clients). Test `buy
 # Appendix A — Cycle pseudocode (faithful to live control flow)
 
 ```
-every poll_s seconds:
+every poll_s seconds (sell_armed_poll_s while a loser arm is live):
   cfg = load_strategy()                  # merge strategy_mint.json over DEFAULTS
   manage_sells(cfg, state, chain)        # may set sold_loser / sold_winner / sold_dump
   reconcile_intents(...)                 # relayer poll + inventory confirm
 
+  if loser armed and mint would be capped_open:
+      return "sell_armed"               # skip Gamma; persist knobs unchanged
   if not cfg.entry_enabled: return "disabled"
 
   markets = gateway.discover(cfg.series_slugs)

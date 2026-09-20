@@ -11,7 +11,10 @@ last ``sell_persist_last_min_window_s`` (~60s) before ``end_ts``, while the
 opposite bid is ≥ ~90¢, then FAK 3¢ → 2¢ when the live sized bid is at/over
 the floor, or at the live bid if it is below the floor. Keep the winner for
 redeem unless its bid reaches ~99.9¢. Off unless live ``strategy_mint.json``
-turns it on.
+turns it on. While a loser persist arm is live, the cycle sleeps
+``sell_armed_poll_s`` (~2s, allowed below the ``poll_s >= 2`` floor) so
+persist-ready FAK is not delayed by ``poll_s`` plus Gamma (~8.6–10.5s
+ticks on live VM). Persist knobs stay 9/5/60.
 
 Usage:
   # dry-run (default when strategy_mint.json has dry_run true / entry_enabled false)
@@ -30,6 +33,7 @@ import os
 import signal
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
@@ -49,6 +53,7 @@ from buy.contracts import ContractCall, build_atomic_mint_calls
 from buy.market import MarketGateway, MintMarket
 from buy.mint_sell import (
     classify_loser,
+    cycle_sleep_s,
     effective_loser_persist_s,
     empty_fak_status,
     inventory_latch,
@@ -58,6 +63,8 @@ from buy.mint_sell import (
     parse_sell_fill_shares,
     persist_ready,
     sell_window_open,
+    skip_mint_discovery_for_sell,
+    skip_mint_discovery_when_armed_and_capped,
     winner_cashout_leg,
     winner_cheap_decision,
     winner_sell_limit,
@@ -89,6 +96,7 @@ DEFAULTS = {
     "one_entry_per_market": True,
     "max_open_sets": 1,
     "poll_s": 5.0,
+    "sell_armed_poll_s": 2.0,
     "position_tolerance": 0.01,
     "require_accepting_orders": True,
     "sell_enabled": False,
@@ -237,6 +245,8 @@ def validate_strategy(cfg: dict) -> None:
         raise ValueError("max_open_sets must be >= 1")
     if float(cfg["poll_s"]) < 2:
         raise ValueError("poll_s must be >= 2")
+    if float(cfg.get("sell_armed_poll_s") or 0) < 0.2:
+        raise ValueError("sell_armed_poll_s must be >= 0.2")
     floor = float(cfg.get("sell_floor") or 0)
     threshold = float(cfg.get("sell_threshold") or 0)
     opposite = float(cfg.get("sell_opposite_min") or 0)
@@ -330,6 +340,35 @@ def mint_slots_full(state: dict, cfg: dict, now: float, candidate_start_ts: floa
     if soonest_end <= candidate + 1e-6 < soonest_end + 900:
         return False
     return True
+
+def mint_discovery_capped(state: dict, cfg: dict, now: float) -> bool:
+    """True when Gamma/mint would only return capped_open.
+
+    At max_open_sets full bags the adjacent next 15m is still allowed
+    unless we already hold that window. Skip discover only when that
+    slot is gone, so an armed loser does not starve N+1 mint.
+    """
+    max_open = int(cfg["max_open_sets"])
+    full = []
+    for intent in state.get("intents", {}).values():
+        if intent.get("status") not in ACTIVE_STATUSES:
+            continue
+        end_ts = float(intent.get("end_ts") or 0)
+        if end_ts and now > end_ts + 120:
+            continue
+        if intent.get("sold_loser") or intent.get("sold_leg"):
+            continue
+        full.append(intent)
+    if len(full) < max_open:
+        return False
+    soonest_end = min((float(i.get("end_ts") or 0) for i in full), default=0.0)
+    if not soonest_end:
+        return True
+    for intent in full:
+        st = float(intent.get("start_ts") or 0)
+        if st + 1e-6 >= soonest_end:
+            return True
+    return False
 
 def already_minted(
     state: dict,
@@ -564,6 +603,7 @@ def reconcile_intents(
     chain: ChainReader,
     funder: str,
     now: float,
+    skip_confirmed_inventory: bool = False,
 ) -> None:
     relayer_url = str(cfg["relayer_url"])
     ctf = str(cfg["ctf_address"])
@@ -600,6 +640,8 @@ def reconcile_intents(
                 elif relayer_state == "STATE_EXECUTED":
                     intent["status"] = "executed"
         if intent.get("status") in ("confirmed_waiting_inventory", "confirmed", "mined"):
+            if skip_confirmed_inventory and intent.get("status") == "confirmed":
+                continue
             try:
                 up = chain.position_balance(ctf, funder, intent["up_token"])
                 dn = chain.position_balance(ctf, funder, intent["dn_token"])
@@ -654,6 +696,7 @@ def write_heartbeat(status: str, **fields: Any) -> None:
 
 _clob_client = None
 _clob_init_error = None
+_book_pool = ThreadPoolExecutor(max_workers=2)
 
 def _fetch_book(token_id: str, min_size: float):
     """REST `/book` → sized best bid plus raw bid levels for depth logs."""
@@ -673,6 +716,13 @@ def _fetch_book(token_id: str, min_size: float):
     except Exception as exc:
         log_event("book_fetch_fail", token_id=str(token_id)[:18], error=str(exc)[:160])
         return None, 0.0, []
+
+
+def _fetch_books(up_tok: str, dn_tok: str, min_size: float):
+    """Parallel UP/DN `/book` GETs (same-tick persist + FAK, no extra refetch)."""
+    fut_up = _book_pool.submit(_fetch_book, up_tok, min_size)
+    fut_dn = _book_pool.submit(_fetch_book, dn_tok, min_size)
+    return fut_up.result(), fut_dn.result()
 
 
 def _log_sell_book_depth(
@@ -931,8 +981,12 @@ def manage_sells(cfg: dict, state: dict, chain: ChainReader) -> None:
         if not up_tok or not dn_tok:
             continue
 
-        up_bid, up_sz, up_bids = _fetch_book(up_tok, min_bid_size)
-        dn_bid, dn_sz, dn_bids = _fetch_book(dn_tok, min_bid_size)
+        # Same-tick books feed persist_ready and FAK; do not refetch after
+        # persist-ready. Parallel UP/DN cuts sequential REST wait on the
+        # armed path. The ~8.6–10.5s gap was poll_s plus mint-path work.
+        (up_bid, up_sz, up_bids), (dn_bid, dn_sz, dn_bids) = _fetch_books(
+            up_tok, dn_tok, min_bid_size
+        )
         books = {"up": up_bids, "dn": dn_bids}
         ttm_s = (end_ts - now) if end_ts else None
         intent["last_up_bid"] = up_bid
@@ -1390,9 +1444,17 @@ def run_cycle(
         write_heartbeat("stopped")
         return "stopped"
 
+    sell_armed = skip_mint_discovery_for_sell(state, now)  # any sell_intent_hot
     funder = os.getenv("FUNDER_ADDRESS") or ""
     if funder:
-        reconcile_intents(state, cfg, chain, to_checksum_address(funder), now)
+        reconcile_intents(
+            state,
+            cfg,
+            chain,
+            to_checksum_address(funder),
+            now,
+            skip_confirmed_inventory=sell_armed,
+        )
         atomic_save(STATE_FILE, state)
 
     if any(
@@ -1401,6 +1463,15 @@ def run_cycle(
     ):
         write_heartbeat("wait_submit")
         return "wait_submit"
+
+    # While loser armed and mint would be capped_open, skip Gamma so
+    # sell_armed_poll_s is the real period. Adjacent slot still discovers.
+    if skip_mint_discovery_when_armed_and_capped(
+        loser_armed=sell_armed,
+        mint_capped=mint_discovery_capped(state, cfg, now),
+    ):
+        write_heartbeat("sell_armed")
+        return "sell_armed"
 
     if not cfg.get("entry_enabled"):
         write_heartbeat("disabled")
@@ -1657,14 +1728,14 @@ def main() -> int:
 
         try:
             status = run_cycle(cfg, state, gateway, chain)
-            if status not in ("idle", "idle_owned", "disabled", "wait_submit"):
+            if status not in ("idle", "idle_owned", "disabled", "wait_submit", "sell_armed"):
                 log_event("cycle", status=status)
         except Exception as exc:
             log_event("cycle_error", error=str(exc)[:300])
             console.print(f"[red]cycle_error[/] {exc}")
             write_heartbeat("error", error=str(exc)[:120])
 
-        time.sleep(float(cfg.get("poll_s") or 10))
+        time.sleep(cycle_sleep_s(cfg, state, time.time()))
 
     console.print("[dim]mintbot stopped[/]")
     try:

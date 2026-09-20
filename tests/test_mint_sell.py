@@ -7,6 +7,7 @@ import unittest
 from buy.book import best_bid_with_min_size
 from buy.mint_sell import (
     classify_loser,
+    cycle_sleep_s,
     effective_loser_persist_s,
     empty_fak_status,
     inventory_latch,
@@ -15,7 +16,10 @@ from buy.mint_sell import (
     loser_persist_ready,
     parse_sell_fill_shares,
     persist_ready,
+    sell_intent_hot,
     sell_window_open,
+    skip_mint_discovery_for_sell,
+    skip_mint_discovery_when_armed_and_capped,
     winner_cashout_leg,
     winner_cheap_decision,
     winner_sell_limit,
@@ -676,6 +680,123 @@ class EmptyLoserBookKeepArmTests(unittest.TestCase):
         self.assertFalse(fire)
         self.assertIsNone(armed)
         self.assertEqual(why, "reset")
+
+
+class SellArmedPollTests(unittest.TestCase):
+    """Armed-fast poll is sleep + skip-capped-Gamma, not persist knobs.
+
+    VM audit bag btc-updown-15m-1789880400: poll_s=5, effective sell tick
+    ≈8.6–10.5s. Armed DN@0.02; persist ready +9s; first empty_keep_arm at
+    +10.7s; never FAKed. Miss = empty book on first post-ready look + coarse
+    tick, not a stuck POST. ROI is catching fleeting 2¢ books after persist.
+    """
+
+    _CFG = {
+        "poll_s": 5.0,
+        "sell_armed_poll_s": 2.0,
+        "sell_persist_s": 9.0,
+        "sell_persist_last_min_s": 5.0,
+        "sell_persist_last_min_window_s": 60.0,
+    }
+
+    def _intent(self, **fields):
+        base = {
+            "status": "confirmed",
+            "end_ts": 2_000_000.0,
+            "sold_loser": False,
+            "sold_winner": False,
+        }
+        base.update(fields)
+        return base
+
+    def test_idle_uses_poll_s(self):
+        state = {"intents": {"a": self._intent()}}
+        self.assertEqual(cycle_sleep_s(self._CFG, state, now_s=1_000_000.0), 5.0)
+        self.assertFalse(skip_mint_discovery_for_sell(state, now_s=1_000_000.0))
+
+    def test_loser_armed_selects_armed_poll(self):
+        state = {
+            "intents": {
+                "a": self._intent(sell_loser_armed_at=1_000_000.0),
+            }
+        }
+        now = 1_000_009.0
+        self.assertTrue(sell_intent_hot(state["intents"]["a"], now))
+        self.assertEqual(cycle_sleep_s(self._CFG, state, now_s=now), 2.0)
+        self.assertTrue(skip_mint_discovery_for_sell(state, now_s=now))
+        self.assertTrue(
+            skip_mint_discovery_when_armed_and_capped(
+                loser_armed=True, mint_capped=True,
+            )
+        )
+        self.assertFalse(
+            skip_mint_discovery_when_armed_and_capped(
+                loser_armed=True, mint_capped=False,
+            )
+        )
+        self.assertFalse(
+            skip_mint_discovery_when_armed_and_capped(
+                loser_armed=False, mint_capped=True,
+            )
+        )
+
+    def test_armed_poll_may_be_below_poll_s_floor(self):
+        cfg = {**self._CFG, "poll_s": 5.0, "sell_armed_poll_s": 2.0}
+        state = {"intents": {"a": self._intent(sell_loser_armed_at=1.0)}}
+        self.assertEqual(cycle_sleep_s(cfg, state, now_s=2.0), 2.0)
+        self.assertGreaterEqual(cfg["poll_s"], 2.0)
+        self.assertLess(cfg["sell_armed_poll_s"], cfg["poll_s"])
+
+    def test_empty_keep_arm_stays_hot_until_window_ends(self):
+        intent = self._intent(sell_loser_armed_at=10.0, sell_loser_leg="dn")
+        self.assertTrue(sell_intent_hot(intent, now_s=20.0))
+        expired = self._intent(
+            sell_loser_armed_at=10.0, end_ts=15.0, sell_loser_leg="dn",
+        )
+        self.assertFalse(sell_intent_hot(expired, now_s=15.0))
+
+    def test_sold_loser_and_winner_dump_do_not_select_armed_poll(self):
+        sold = self._intent(
+            sold_loser=True, sold_leg="dn", sell_loser_armed_at=10.0,
+        )
+        self.assertFalse(sell_intent_hot(sold, now_s=20.0))
+        winner_arm = self._intent(
+            sold_loser=True,
+            sold_leg="dn",
+            sell_winner_armed_at=18.0,
+        )
+        self.assertFalse(sell_intent_hot(winner_arm, now_s=20.0))
+        self.assertEqual(
+            cycle_sleep_s(
+                self._CFG, {"intents": {"a": winner_arm}}, now_s=20.0,
+            ),
+            5.0,
+        )
+        dump_arm = self._intent(
+            sold_loser=True,
+            sold_leg="dn",
+            sell_dump_armed_at=18.0,
+        )
+        self.assertFalse(sell_intent_hot(dump_arm, now_s=20.0))
+
+    def test_armed_poll_does_not_change_persist_math(self):
+        fire, armed, why = persist_ready(
+            True, now_s=18.9, armed_ts=10.0, persist_s=9.0,
+        )
+        self.assertFalse(fire)
+        self.assertEqual(why, "waiting")
+        fire, _, why = persist_ready(
+            True, now_s=19.0, armed_ts=10.0, persist_s=self._CFG["sell_persist_s"],
+        )
+        self.assertTrue(fire)
+        self.assertEqual(why, "ready")
+        self.assertEqual(self._CFG["sell_persist_s"], 9.0)
+        self.assertEqual(self._CFG["sell_persist_last_min_s"], 5.0)
+
+    def test_missing_armed_knob_falls_back_to_poll_s(self):
+        cfg = {"poll_s": 5.0}
+        state = {"intents": {"a": self._intent(sell_loser_armed_at=1.0)}}
+        self.assertEqual(cycle_sleep_s(cfg, state, now_s=2.0), 5.0)
 
 
 class SizedBidTests(unittest.TestCase):
