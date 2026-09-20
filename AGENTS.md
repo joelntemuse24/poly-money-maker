@@ -49,10 +49,16 @@ posted. Do not import `mintbot.py` in tests.
 Keep `deploy/polypathlog.service`. Do not start `pathlog_hourly_dense.py`
 or add 5m/hourly back to `SERIES`.
 
+`mintbot.py` runs sell and mint as independent loops so Gamma/relayer
+work cannot steal a dump tick. Do not re-serialize them into one
+`manage_sells → discover → sleep` cycle. Persist / dump / loser knobs
+stay 9/5/60; `sell_armed_poll_s` is sell-loop cadence only.
+
 Shared `buy/` helpers exist only for mint and pathlog:
 
 - `buy/book.py` — CLOB top-of-book parsing (`pathlog`, mint sized bids)
 - `buy/mint_sell.py` — sell fill parse, inventory latch, arm/persist
+- `buy/mint_loops.py` — concurrent sell vs mint job runner + intent claim
 - `buy/market.py` — Gamma/CLOB discovery (`mintbot`, `pathlog`)
 - `buy/chain.py` — Polygon eth_call prechecks (`mintbot`)
 - `buy/contracts.py` — atomic mint calldata (`mintbot`)

@@ -222,7 +222,7 @@ class MintSlotChainTests(unittest.TestCase):
 
     def test_run_cycle_picks_then_gates_and_records_start_ts(self):
         src = MINT.read_text()
-        cycle = src[src.find("def run_cycle") : src.find("\ndef main")]
+        cycle = src[src.find("def run_mint_cycle") : src.find("\ndef _reload_cfg")]
         self.assertLess(cycle.find("pick = market"), cycle.find("if mint_slots_full"))
         self.assertIn(
             "if mint_slots_full(state, cfg, now, float(pick.start_ts)):",
@@ -236,6 +236,7 @@ class MintSlotChainTests(unittest.TestCase):
         self.assertIn("already_minted(state, market.condition_id, cfg, now)", cycle)
         self.assertIn("mint_attempts", cycle)
         self.assertIn("last_fail_ts", cycle)
+        self.assertIn("_claim_mint_intent", cycle)
 
 
 def _mint_market(*, start_ts: float, condition_id: str = "cid-1"):
@@ -391,7 +392,7 @@ class MintFailErrorMsgTests(unittest.TestCase):
         self.assertIn("mark_intent_failed", recon)
         self.assertIn('"mint_failed"', recon)
         self.assertIn("errorMsg=", recon)
-        cycle = src[src.find("def run_cycle") : src.find("\ndef main")]
+        cycle = src[src.find("def run_mint_cycle") : src.find("\ndef _reload_cfg")]
         self.assertIn("mark_intent_failed", cycle)
         self.assertIn("last_fail_ts", cycle)
         self.assertIn("mint_attempts", cycle)
@@ -427,6 +428,7 @@ class DeployUnitsTests(unittest.TestCase):
                 "contracts.py",
                 "market.py",
                 "mint_sell.py",
+                "mint_loops.py",
             },
         )
         market_src = (BUY / "market.py").read_text()
@@ -470,7 +472,7 @@ class DeployUnitsTests(unittest.TestCase):
         self.assertIn("def effective_loser_persist_s", mint_sell_src)
         self.assertIn("def winner_sell_limit", mint_sell_src)
         self.assertIn("empty_keep_arm", mint_sell_src)
-        manage = src[src.find("def manage_sells") : src.find("\ndef run_cycle")]
+        manage = src[src.find("def manage_sells") : src.find("\ndef _claim_mint_intent")]
         self.assertIn("persist_s=loser_persist_s", manage)
         self.assertIn("persist_s=dump_persist_s", manage)
         self.assertIn("loser_empty_keep_qualify", manage)
@@ -490,7 +492,7 @@ class DeployUnitsTests(unittest.TestCase):
         )
         self.assertNotIn("if bal + 1e-9 < tol:", src)
 
-    def test_sell_armed_poll_skips_capped_mint_path_without_changing_persist(self):
+    def test_concurrent_loops_do_not_skip_mint_or_change_persist(self):
         src = MINT.read_text()
         defaults = _assign("DEFAULTS")
         example = json.loads(MINT_EXAMPLE.read_text())
@@ -505,23 +507,28 @@ class DeployUnitsTests(unittest.TestCase):
         self.assertGreaterEqual(float(defaults["poll_s"]), 2.0)
         self.assertLess(float(defaults["sell_armed_poll_s"]), 2.0 + 1e-12)
 
-        cycle = src[src.find("def run_cycle") : src.find("\ndef main")]
-        self.assertIn("skip_mint_discovery_for_sell", cycle)
-        self.assertIn("skip_mint_discovery_when_armed_and_capped", cycle)
-        self.assertIn("mint_discovery_capped", cycle)
-        self.assertLess(
-            cycle.find("skip_mint_discovery_when_armed_and_capped"),
-            cycle.find("gateway.discover"),
-        )
-        self.assertIn('return "sell_armed"', cycle)
+        sell = src[src.find("def run_sell_cycle") : src.find("\ndef run_mint_cycle")]
+        mint = src[src.find("def run_mint_cycle") : src.find("\ndef _reload_cfg")]
+        self.assertIn("manage_sells", sell)
+        self.assertNotIn("gateway.discover", sell)
+        self.assertNotIn("submit_mint_batch", sell)
+        self.assertNotIn("manage_sells", mint)
+        self.assertNotIn("skip_mint_discovery_when_armed_and_capped", mint)
+        self.assertNotIn('return "sell_armed"', mint)
+        self.assertIn("gateway.discover", mint)
+        self.assertIn("_claim_mint_intent", mint)
         self.assertIn("skip_confirmed_inventory", src)
         self.assertIn("_fetch_books", src)
         self.assertIn("ThreadPoolExecutor", src)
+        self.assertIn("_io_unlocked", src)
         main = src[src.find("def main") :]
+        self.assertIn("start_mint_sell_loops", main)
         self.assertIn("cycle_sleep_s", main)
+        self.assertIn("mint_cycle_sleep_s", main)
         self.assertIn("sell_armed_poll_s", src)
-        self.assertIn("sell_intent_hot", src)
+        self.assertIn("skip_mint_discovery_for_sell", src)
         self.assertNotIn("sell_hot_poll_s", src)
+        self.assertNotIn("def run_cycle", src)
         validate = src[src.find("def validate_strategy") : src.find("def eligible_markets")]
         self.assertIn("sell_armed_poll_s", validate)
         self.assertIn("poll_s must be >= 2", validate)
