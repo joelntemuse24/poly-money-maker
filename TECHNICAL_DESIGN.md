@@ -226,7 +226,7 @@ Statuses move roughly: `submitting` → `pending`/`executed`/`mined` → `confir
 <a id="section-9"></a>
 ## Startup, lock, strategy load
 
-`main()` installs signal handlers, acquires `.mintbot.lock`, loads `strategy_mint.json` merged over `DEFAULTS`, validates knobs, constructs market gateway + two chain readers, then starts **two threads**: `run_sell_cycle` and `run_mint_cycle`. Sell sleeps `poll_s` (live 5s), or `sell_armed_poll_s` (2s, allowed below the `poll_s >= 2` floor) while a bag is sell-hot (loser armed, or loser sold and dump/winner not done). Mint always sleeps `poll_s`. Armed poll does **not** shorten `sell_persist_s`. Shared intent writes take `STATE_LOCK`; book / FAK / Gamma / relayer / RPC stay outside that lock.
+`main()` installs signal handlers, acquires `.mintbot.lock`, loads `strategy_mint.json` merged over `DEFAULTS`, validates knobs, constructs market gateway + two chain readers, then starts **two threads**: `run_sell_cycle` and `run_mint_cycle`. Sell sleeps `poll_s` (live 5s), or `sell_armed_poll_s` (2s, allowed below the `poll_s >= 2` floor) while a bag is sell-hot (loser armed, or loser sold and dump/winner not done). Mint always sleeps `poll_s`. Armed poll does **not** replace persist math. Persist waits are shortened so typical ~4s tick/FAK lag is folded in: code defaults `sell_persist_s=5` / `sell_persist_last_min_s=2` (wall-clock ~9s / last-min ~5–6s). Shared intent writes take `STATE_LOCK`; book / FAK / Gamma / relayer / RPC stay outside that lock.
 
 Incident `btc-updown-15m-1789905600`: after `loser_done`, next-window mint ran on the same thread and delayed the first dump look ~16s while UP cliffed 97→31. A skip-Gamma bandage (draft PR #193) is unnecessary once the loops are independent. Live bag `btc-updown-15m-1789880400`: sell ticks were ≈8.6–10.5s (`poll_s` plus manage_sells/reconcile/discover) on the old serial cycle; persist-ready FAK uses the same tick's book (no extra refetch).
 
@@ -374,7 +374,8 @@ Policy (`classify_loser` / equivalent):
 - Sized loser bid ≤ `sell_threshold` (0.03)
 - Sized opposite bid ≥ `sell_opposite_min` (0.90)
 - Not both cheap (ambiguous)
-- Persist that condition for `sell_persist_s` (9s) via `persist_ready`. In the last `sell_persist_last_min_window_s` (60s) before `end_ts`, use `sell_persist_last_min_s` (5s) instead. Effective persist is re-evaluated each tick; an arm started on the 9s clock is not reset when the last minute begins, and becomes ready once elapsed ≥ 5s.
+- Persist that condition for `sell_persist_s` (5s wait; ~9s wall with tick/FAK lag) via `persist_ready`. In the last `sell_persist_last_min_window_s` (60s) before `end_ts`, use `sell_persist_last_min_s` (2s wait; ~5–6s wall) instead. Effective persist is re-evaluated each tick; an arm started on the 5s clock is not reset when the last minute begins, and becomes ready once elapsed ≥ 2s.
+- At fire, `sell_fire_decision` re-checks the path is still in range (loser ≤ threshold and opposite ≥ min; dump still `< sell_dump_below`; winner still ≥ effective min). Out of range logs `sell_cancel_out_of_range` and does **not** POST; empty loser book keeps `armed_ts`, a visible bid that left range resets the arm.
 - Then FAK ladder: threshold → floor (3¢ → 2¢), sized to inventory latch. If the live sized loser bid is below `sell_floor`, FAK at that live bid. Empty FAK **or a vanished loser book after arm** keeps `armed_ts` (do not fire until a sized bid ≤ threshold returns); persist resets only if the visible bid goes back above threshold, opposite is below min, both cheap, or never armed.
 
 On full fill: set `sold_loser=true`, `sold_leg="up"|"dn"`, store `sell_limit` (fill/limit evidence). Inventory latch distinguishes “await mint settlement” zeros from true flat.
@@ -386,7 +387,7 @@ Default `sell_winner_min=0.999`. Unconditional 0.99 cash-out was rejected: it cu
 
 **Cheap-loser gate:** if `sold_loser` and recorded loser price ≤ `sell_winner_cheap_if_loser_le` (0.03) **and** `loser_fill + sell_winner_min_cheap > 1.0`, then `effective_winner_min = min(0.999, sell_winner_min_cheap=0.99)`. Flat 1¢+99¢ stays at 0.999 and waits for redeem.
 
-When the sized winner bid meets `effective_winner_min` for `sell_persist_s`, **live-bid FAK** the winner, then clamp `limit = min(live_sized_bid, sell_clob_max_price=0.99)` (and floor `sell_clob_min_price=0.01`). A 0.99 sell FAK still fills resting 0.995–0.999 bids. Log `sell_winner_limit_clamped` when live > posted (`reason=clob_max`). Mark `sold_winner`.
+When the sized winner bid meets `effective_winner_min` for `sell_persist_s`, **live-bid FAK** the winner after the same in-range re-check, then clamp `limit = min(live_sized_bid, sell_clob_max_price=0.99)` (and floor `sell_clob_min_price=0.01`). A 0.99 sell FAK still fills resting 0.995–0.999 bids. Log `sell_winner_limit_clamped` when live > posted (`reason=clob_max`). Mark `sold_winner`.
 
 If the book never reaches 0.999 and the cheap gate is closed, the bot holds for redeem after expiry (sells stop at `end_ts`).
 
@@ -402,7 +403,8 @@ Preconditions (all required):
 - not already `sold_dump` / `sold_winner`
 - `sold_leg` is `"up"` or `"dn"` so the held leg is well-defined
 - sized held bid is not `None` and `< sell_dump_below` (0.80)
-- that condition persists `sell_dump_persist_s` (5.0)
+- that condition persists `sell_dump_persist_s` (2.0 wait; lag-folded from 5s)
+- at fire, still `< sell_dump_below` or cancel (`sell_cancel_out_of_range`)
 - not in sell cooldown
 
 Action: live-bid FAK the held token; on success set `sold_dump=true` and `sold_winner=true` (so winner cash-out will not double-sell).
@@ -433,7 +435,7 @@ Observed failure modes: (1) winner armed at bid 0.99 but FAK posted 0.999 → `i
 ## Hypothetical lifecycle: held dump after a flip
 
 1. Loser sold as above; holding Down.
-2. Tape flips: Down sized bid falls to 0.74 and stays ≤5s under 0.80.
+2. Tape flips: Down sized bid falls to 0.74 and stays ≤2s under 0.80.
 3. Dump arms → live-bid FAK Down @~0.74; `sold_dump=true`.
 4. Result is a realized loss versus redeem, accepted as left-tail control after the loser already paid a scrap.
 
@@ -469,10 +471,11 @@ Observed failure modes: (1) winner armed at bid 0.99 but FAK posted 0.999 → `i
 - `inventory_latch` — await vs already_flat vs has_inventory.
 - `classify_loser` — which leg is loser / both_cheap / wick_unconfirmed.
 - `persist_ready` — arm → waiting → ready over `persist_s` (resets when qualify drops).
-- `effective_loser_persist_s` — 9s normally, 5s when `0 < TTM ≤ 60`; `None` at/after `end_ts`.
+- `effective_loser_persist_s` — 5s normally, 2s when `0 < TTM ≤ 60`; `None` at/after `end_ts`.
 - `sell_window_open` — CLOB sells only while TTM is strictly positive.
 - `loser_empty_keep_qualify` — armed + empty loser book (opposite still ok or also empty) should keep the arm.
 - `loser_persist_ready` — persist_ready plus empty-book / empty-FAK keep/re-arm (`empty_keep_arm`).
+- `sell_fire_decision` — last in-range check before FAK (`fire` / `cancel_reset` / `cancel_keep_arm`).
 - `winner_cashout_leg` — unique leg whose sized bid ≥ winner_min.
 - `winner_cheap_decision` — 0.99 only if sold_loser, loser ≤ gate, and loser+cheap > $1.
 - `winner_sell_limit` — clamp live-bid FAK into CLOB [0.01, 0.99]; 0.99 still fills 0.995–0.999 books.
@@ -523,8 +526,8 @@ From VM `strategy_mint.json`:
 | `sell_enabled` | true | Enable manage_sells |
 | `sell_threshold` / `sell_floor` | 0.03 / 0.02 | Loser ladder |
 | `sell_opposite_min` | 0.90 | Opposite must be rich |
-| `sell_persist_s` | 9 | Loser/winner persist (normal) |
-| `sell_persist_last_min_s` | 5 | Loser persist when TTM ≤ last-min window |
+| `sell_persist_s` | 9 live / **5 code default** | Loser/winner persist wait (normal). Fold ~4s lag so wall ≈ 9s. Operator must merge live JSON. |
+| `sell_persist_last_min_s` | 5 live / **2 code default** | Loser persist wait when TTM ≤ last-min window. Wall ≈ 5–6s. |
 | `sell_persist_last_min_window_s` | 60 | Seconds-to-end that select the short persist |
 | `sell_cooldown_s` | 3 | Between attempts |
 | `sell_winner_min` | 0.999 | Prefer redeem-quality bid |
@@ -532,7 +535,7 @@ From VM `strategy_mint.json`:
 | `sell_winner_min_cheap` | 0.99 | Winner limit if gated *and* loser+cheap > $1 |
 | `sell_dump_enabled` | true | Held-leg dump on |
 | `sell_dump_below` | 0.80 | Dump arm threshold |
-| `sell_dump_persist_s` | 5 | Dump persist |
+| `sell_dump_persist_s` | 5 live / **2 code default** | Dump persist wait (lag-folded from 5s) |
 
 <a id="section-30"></a>
 ## Deploy boundary (VM is source of truth)
@@ -619,9 +622,10 @@ mint loop (always poll_s):
 
 | Precondition | Persist | Action | Flags set |
 |---|---|---|---|
-| Loser sized bid ≤ 0.03 AND opposite ≥ 0.90 AND not both cheap | 5s | FAK ladder 0.03→0.02, or live bid if below floor | `sold_loser`, `sold_leg` |
-| Winner sized bid ≥ effective_winner_min (0.999, or 0.99 if loser ≤0.03 *and* loser+0.99 > $1) | 5s | Live-bid FAK winner, clamped to CLOB max 0.99 | `sold_winner` |
-| `sold_loser` AND held sized bid < 0.80 | 5s | Live-bid FAK held | `sold_dump`, `sold_winner` |
+| Loser sized bid ≤ 0.03 AND opposite ≥ 0.90 AND not both cheap | 5s wait (~9s wall) | FAK ladder 0.03→0.02, or live bid if below floor; cancel if out of range at fire | `sold_loser`, `sold_leg` |
+| Same, TTM ≤ 60s | 2s wait (~5–6s wall) | Same loser FAK / cancel-at-fire | `sold_loser`, `sold_leg` |
+| Winner sized bid ≥ effective_winner_min (0.999, or 0.99 if loser ≤0.03 *and* loser+0.99 > $1) | 5s wait | Live-bid FAK winner, clamped to CLOB max 0.99; cancel if bid dropped below min | `sold_winner` |
+| `sold_loser` AND held sized bid < 0.80 | 2s wait | Live-bid FAK held; cancel if bid ≥ 0.80 | `sold_dump`, `sold_winner` |
 | `now > end_ts` | — | No CLOB sells | (redeem outside this loop) |
 | Within `sell_cooldown_s` of last attempt | — | Skip fire | — |
 

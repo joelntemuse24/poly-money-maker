@@ -81,10 +81,10 @@ class MintDefaultsTests(unittest.TestCase):
             self.assertEqual(blob["sell_threshold"], 0.03, label)
             self.assertEqual(blob["sell_floor"], 0.02, label)
             self.assertAlmostEqual(blob["sell_opposite_min"], 0.90, msg=label)
-            self.assertEqual(blob["sell_persist_s"], 9.0, label)
-            self.assertEqual(blob["sell_persist_last_min_s"], 5.0, label)
+            self.assertEqual(blob["sell_persist_s"], 5.0, label)
+            self.assertEqual(blob["sell_persist_last_min_s"], 2.0, label)
             self.assertEqual(blob["sell_persist_last_min_window_s"], 60.0, label)
-            self.assertEqual(blob["sell_dump_persist_s"], 5.0, label)
+            self.assertEqual(blob["sell_dump_persist_s"], 2.0, label)
             self.assertAlmostEqual(blob["sell_winner_min"], 0.999, msg=label)
             self.assertEqual(blob["sell_min_bid_size"], 1.0, label)
             self.assertEqual(blob["poll_s"], 5.0, label)
@@ -455,6 +455,8 @@ class DeployUnitsTests(unittest.TestCase):
         self.assertIn("sell_winner_cheap_denied", src)
         self.assertIn("sell_winner_cheap_allowed", src)
         self.assertIn("sell_winner_limit_clamped", src)
+        self.assertIn("sell_fire_decision", src)
+        self.assertIn("sell_cancel_out_of_range", src)
         self.assertIn("last_status=intent.get(\"sell_last_status\")", src)
         self.assertIn("effective_loser_persist_s", src)
         self.assertIn("sell_window_open", src)
@@ -470,11 +472,14 @@ class DeployUnitsTests(unittest.TestCase):
         self.assertIn("def loser_persist_ready", mint_sell_src)
         self.assertIn("def loser_empty_keep_qualify", mint_sell_src)
         self.assertIn("def effective_loser_persist_s", mint_sell_src)
+        self.assertIn("def sell_fire_decision", mint_sell_src)
         self.assertIn("def winner_sell_limit", mint_sell_src)
         self.assertIn("empty_keep_arm", mint_sell_src)
         manage = src[src.find("def manage_sells") : src.find("\ndef _claim_mint_intent")]
         self.assertIn("persist_s=loser_persist_s", manage)
         self.assertIn("persist_s=dump_persist_s", manage)
+        self.assertIn("sell_fire_decision", manage)
+        self.assertIn("_apply_sell_fire_cancel", manage)
         self.assertIn("loser_empty_keep_qualify", manage)
         self.assertIn("empty_keep_arm", manage)
         self.assertIn("sell_loser_leg", manage)
@@ -492,16 +497,76 @@ class DeployUnitsTests(unittest.TestCase):
         )
         self.assertNotIn("if bal + 1e-9 < tol:", src)
 
+    def test_sell_fire_cancel_resets_or_keeps_arm(self):
+        events: list = []
+        fn = _fn(
+            "_apply_sell_fire_cancel",
+            {
+                "Optional": __import__("typing").Optional,
+                "log_event": lambda event, **kwargs: events.append((event, kwargs)),
+            },
+        )
+        loser = {"slug": "x", "sell_loser_armed_at": 10.0, "sell_loser_leg": "dn"}
+        fn(
+            loser,
+            path="loser",
+            action="cancel_reset",
+            reason="loser_above_threshold",
+            bid=0.04,
+            cid="c",
+        )
+        self.assertIsNone(loser["sell_loser_armed_at"])
+        self.assertIsNone(loser["sell_loser_leg"])
+        self.assertEqual(events[-1][0], "sell_cancel_out_of_range")
+        self.assertEqual(events[-1][1]["reason"], "loser_above_threshold")
+        self.assertEqual(events[-1][1]["path"], "loser")
+
+        keep = {"slug": "x", "sell_loser_armed_at": 10.0, "sell_loser_leg": "dn"}
+        fn(
+            keep,
+            path="loser",
+            action="cancel_keep_arm",
+            reason="empty_book",
+            bid=None,
+            cid="c",
+        )
+        self.assertEqual(keep["sell_loser_armed_at"], 10.0)
+        self.assertEqual(keep["sell_loser_leg"], "dn")
+
+        dump = {"sell_dump_armed_at": 11.0}
+        fn(
+            dump,
+            path="dump",
+            action="cancel_reset",
+            reason="dump_at_or_above_below",
+            bid=0.81,
+            cid="c",
+        )
+        self.assertIsNone(dump["sell_dump_armed_at"])
+
+        winner = {"sell_winner_armed_at": 12.0}
+        fn(
+            winner,
+            path="winner",
+            action="cancel_reset",
+            reason="winner_below_min",
+            bid=0.97,
+            cid="c",
+        )
+        self.assertIsNone(winner["sell_winner_armed_at"])
+
     def test_concurrent_loops_do_not_skip_mint_or_change_persist(self):
         src = MINT.read_text()
         defaults = _assign("DEFAULTS")
         example = json.loads(MINT_EXAMPLE.read_text())
-        self.assertEqual(defaults["sell_persist_s"], 9.0)
-        self.assertEqual(defaults["sell_persist_last_min_s"], 5.0)
+        self.assertEqual(defaults["sell_persist_s"], 5.0)
+        self.assertEqual(defaults["sell_persist_last_min_s"], 2.0)
         self.assertEqual(defaults["sell_persist_last_min_window_s"], 60.0)
-        self.assertEqual(example["sell_persist_s"], 9.0)
-        self.assertEqual(example["sell_persist_last_min_s"], 5.0)
+        self.assertEqual(example["sell_persist_s"], 5.0)
+        self.assertEqual(example["sell_persist_last_min_s"], 2.0)
         self.assertEqual(example["sell_persist_last_min_window_s"], 60.0)
+        self.assertEqual(defaults["sell_dump_persist_s"], 2.0)
+        self.assertEqual(example["sell_dump_persist_s"], 2.0)
         self.assertEqual(defaults["poll_s"], 5.0)
         self.assertEqual(defaults["sell_armed_poll_s"], 2.0)
         self.assertGreaterEqual(float(defaults["poll_s"]), 2.0)

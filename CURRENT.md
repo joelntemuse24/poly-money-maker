@@ -19,10 +19,10 @@ pathlog are **stopped / retired**. Do not start them.
 - `max_open_sets`: 1 with **adjacent-window lookahead**; `sold_loser` frees the slot
 - `already_minted` blocks confirmed/in-flight; `failed` remints after `mint_fail_cooldown_s` (90s) up to `mint_max_attempts` (3)
 - Sells on:
-  - Loser: opposite ≥ 0.90, loser ≤ 0.03 persist 9s (5s in last 60s before end_ts), FAK 0.03 → 0.02
-  - Winner: prefer 0.999 / redeem; allow 0.99 live-bid FAK only if loser sold ≤ 0.03 and loser+0.99 > $1
-  - Held dump: after loser sold, if held sized bid < 0.80 for 5s → live-bid FAK
-- Two loops: sell (`manage_sells`) and mint/discover run concurrently. Sell keeps `sell_armed_poll_s=2` while a bag is sell-hot (loser armed, or loser sold and dump/winner not done). Mint keeps `poll_s=5` and does not skip Gamma because a bag is hot. Persist 9/5/60 unchanged. Live JSON is untouched.
+  - Loser: opposite ≥ 0.90, loser ≤ 0.03 persist **5s wait** (2s in last 60s before end_ts) so wait + typical ~4s tick/FAK ≈ 9s wall (last-min ~5–6s). At fire, re-check in-range; out of range logs `sell_cancel_out_of_range` and does not POST. FAK 0.03 → 0.02
+  - Winner: prefer 0.999 / redeem; allow 0.99 live-bid FAK only if loser sold ≤ 0.03 and loser+0.99 > $1; same persist + cancel-at-fire
+  - Held dump: after loser sold, if held sized bid < 0.80 for **2s** → live-bid FAK (same lag fold + cancel-at-fire)
+- Two loops: sell (`manage_sells`) and mint/discover run concurrently. Sell keeps `sell_armed_poll_s=2` while a bag is sell-hot (loser armed, or loser sold and dump/winner not done). Mint keeps `poll_s=5` and does not skip Gamma because a bag is hot. Code defaults persist 5/2/60 and dump persist 2s. **Live JSON is untouched** until the operator merges.
 
 See `TECHNICAL_DESIGN.md` for the full guided tour.
 

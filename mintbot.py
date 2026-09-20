@@ -6,17 +6,18 @@ No CLOB buys. No hedges. Discovers **btc-up-or-down-15m** only, mints
 and open within enter_max_ttm_min, if collateral is available.
 
 Optional sell (``sell_enabled``, default off): persist a loser dump at ~3¢
-for ``sell_persist_s`` (~9s), or ``sell_persist_last_min_s`` (~5s) in the
+for ``sell_persist_s`` (~5s), or ``sell_persist_last_min_s`` (~2s) in the
 last ``sell_persist_last_min_window_s`` (~60s) before ``end_ts``, while the
-opposite bid is ≥ ~90¢, then FAK 3¢ → 2¢ when the live sized bid is at/over
-the floor, or at the live bid if it is below the floor. Keep the winner for
-redeem unless its bid reaches ~99.9¢. Off unless live ``strategy_mint.json``
-turns it on. Sell and mint run as independent loops so Gamma/relayer
-work cannot steal a dump tick (bag ``btc-updown-15m-1789905600``). The
-sell loop sleeps ``sell_armed_poll_s`` (~2s, allowed below the
-``poll_s >= 2`` floor) while a bag is sell-hot (loser armed, or loser
-sold and dump/winner not done). Mint keeps ``poll_s``. Persist knobs
-stay 9/5/60.
+opposite bid is ≥ ~90¢, then re-check in-range at fire and FAK 3¢ → 2¢ when
+the live sized bid is at/over the floor, or at the live bid if it is below
+the floor. Persist waits fold typical ~4s sell-tick/FAK lag so wall-clock
+stays ~9s (last-min ~5–6s). Keep the winner for redeem unless its bid
+reaches ~99.9¢. Off unless live ``strategy_mint.json`` turns it on. Sell
+and mint run as independent loops so Gamma/relayer work cannot steal a
+dump tick (bag ``btc-updown-15m-1789905600``). The sell loop sleeps
+``sell_armed_poll_s`` (~2s, allowed below the ``poll_s >= 2`` floor) while
+a bag is sell-hot (loser armed, or loser sold and dump/winner not done).
+Mint keeps ``poll_s``. Persist defaults are 5/2/60.
 
 Usage:
   # dry-run (default when strategy_mint.json has dry_run true / entry_enabled false)
@@ -68,6 +69,7 @@ from buy.mint_sell import (
     mint_cycle_sleep_s,
     parse_sell_fill_shares,
     persist_ready,
+    sell_fire_decision,
     sell_window_open,
     skip_mint_discovery_for_sell,
     winner_cashout_leg,
@@ -108,8 +110,8 @@ DEFAULTS = {
     "sell_threshold": 0.03,
     "sell_floor": 0.02,
     "sell_opposite_min": 0.90,
-    "sell_persist_s": 9.0,
-    "sell_persist_last_min_s": 5.0,
+    "sell_persist_s": 5.0,
+    "sell_persist_last_min_s": 2.0,
     "sell_persist_last_min_window_s": 60.0,
     "sell_cooldown_s": 3.0,
     "sell_winner_min": 0.999,
@@ -122,7 +124,7 @@ DEFAULTS = {
     # After loser sold: if held leg stays under this for sell_dump_persist_s, live-bid FAK dump.
     "sell_dump_enabled": True,
     "sell_dump_below": 0.80,
-    "sell_dump_persist_s": 5.0,
+    "sell_dump_persist_s": 2.0,
     "sell_min_bid_size": 1.0,
     "rpc_url": "https://polygon.drpc.org",
     "gamma_url": "https://gamma-api.polymarket.com",
@@ -1021,6 +1023,40 @@ def _run_fak_ladder(
         time.sleep(0.35)
     return sold_total, last_status, last_px
 
+
+def _apply_sell_fire_cancel(
+    intent: dict,
+    *,
+    path: str,
+    action: str,
+    reason: str,
+    bid: Optional[float],
+    cid: str,
+    extra: Optional[dict] = None,
+) -> None:
+    """Log sell_cancel_out_of_range and drop the arm on cancel_reset."""
+    payload = dict(extra or {})
+    log_event(
+        "sell_cancel_out_of_range",
+        condition_id=cid,
+        slug=intent.get("slug"),
+        path=path,
+        action=action,
+        reason=reason,
+        bid=bid,
+        **payload,
+    )
+    if action != "cancel_reset":
+        return
+    if path == "loser":
+        intent["sell_loser_armed_at"] = None
+        intent["sell_loser_leg"] = None
+    elif path == "dump":
+        intent["sell_dump_armed_at"] = None
+    elif path == "winner":
+        intent["sell_winner_armed_at"] = None
+
+
 def manage_sells(cfg: dict, state: dict, chain: ChainReader) -> None:
     """Loser persist dump at 3¢→2¢ (or live bid if below floor); winner; held dump."""
     if not cfg.get("sell_enabled"):
@@ -1038,7 +1074,7 @@ def _manage_sells_locked(cfg: dict, state: dict, chain: ChainReader) -> None:
     floor = float(cfg.get("sell_floor") or 0.02)
     opp_min = float(cfg.get("sell_opposite_min") or 0.90)
     persist_s = float(cfg.get("sell_persist_s") or 0.0)
-    last_min_s = float(cfg.get("sell_persist_last_min_s", 5.0))
+    last_min_s = float(cfg.get("sell_persist_last_min_s", 2.0))
     last_min_window_s = float(cfg.get("sell_persist_last_min_window_s", 60.0))
     cooldown = float(cfg.get("sell_cooldown_s") or 3.0)
     winner_min = float(cfg.get("sell_winner_min") or 0.999)
@@ -1151,91 +1187,109 @@ def _manage_sells_locked(cfg: dict, state: dict, chain: ChainReader) -> None:
             )
 
         if fire_w and winner and not cooling:
-            w_tok = tokens[winner]
-            size, latch = _sell_inventory(
-                chain, ctf, funder_cs, w_tok, shares, tol,
-                "seen_winner_inventory", intent,
+            w_bid = bids.get(winner)
+            fire_action, fire_reason = sell_fire_decision(
+                "winner",
+                bid=w_bid,
+                winner_min=effective_winner_min,
+                cheap_on=cheap_on,
             )
-            if latch == "await_inventory":
-                log_event(
-                    "sell_skip_await_inventory",
-                    condition_id=cid,
-                    leg=winner,
+            if fire_action != "fire":
+                _apply_sell_fire_cancel(
+                    intent,
                     path="winner",
+                    action=fire_action,
+                    reason=fire_reason,
+                    bid=w_bid,
+                    cid=cid,
+                    extra={"cheap_on": cheap_on, "winner_min": effective_winner_min},
                 )
-            elif latch == "already_flat":
-                intent["sold_winner"] = True
-                intent["sell_winner_note"] = "already_flat"
             else:
-                intent["last_sell_attempt_at"] = now
-                # Live sized bid once allowed, clamped to CLOB max (0.99) so
-                # rich 0.995–0.999 books still fill instead of invalid-price.
-                live_px = float(bids[winner] or effective_winner_min)
-                posted, clamped, clamp_why = winner_sell_limit(
-                    live_px, clob_max=clob_max, clob_min=clob_min
+                w_tok = tokens[winner]
+                size, latch = _sell_inventory(
+                    chain, ctf, funder_cs, w_tok, shares, tol,
+                    "seen_winner_inventory", intent,
                 )
-                if clamped and live_px > posted + 1e-12:
+                if latch == "await_inventory":
                     log_event(
-                        "sell_winner_limit_clamped",
+                        "sell_skip_await_inventory",
                         condition_id=cid,
-                        slug=intent.get("slug"),
-                        live=live_px,
-                        posted=posted,
-                        reason=clamp_why or "clob_max",
-                    )
-                with _io_unlocked():
-                    sold_total, last_status, last_px = _run_fak_ladder(
-                        w_tok,
-                        size,
-                        [posted],
-                        dry_run=dry_run,
-                        bid=live_px,
-                        label=f"win {winner}",
-                        slug=intent.get("slug"),
-                        tol=tol,
-                        depth_bids=books.get(winner),
-                        depth_path="winner_cheap" if cheap_on else None,
-                        depth_leg=winner,
-                        ttm_s=ttm_s,
-                        condition_id=cid,
-                    )
-                intent["sell_winner_attempts"] = int(
-                    intent.get("sell_winner_attempts") or 0
-                ) + 1
-                intent["sell_winner_last_status"] = last_status
-                if dry_run or sold_total >= size - tol:
-                    intent["sold_winner"] = True
-                    intent["sell_winner_filled"] = float(
-                        intent.get("sell_winner_filled") or 0
-                    ) + sold_total
-                    intent["sell_winner_limit"] = last_px
-                    if dry_run:
-                        intent["sell_winner_dry"] = True
-                    log_event(
-                        "sell_winner_done",
-                        condition_id=cid,
-                        slug=intent.get("slug"),
                         leg=winner,
-                        sold=sold_total,
-                        bid=bids[winner],
-                        status=last_status,
+                        path="winner",
                     )
-                    notify(
-                        "Mint winner sold",
-                        f"{intent.get('slug')}\n{winner} x{sold_total:.1f} @>={effective_winner_min:.3f}",
-                        priority="default",
+                elif latch == "already_flat":
+                    intent["sold_winner"] = True
+                    intent["sell_winner_note"] = "already_flat"
+                else:
+                    intent["last_sell_attempt_at"] = now
+                    # Live sized bid once allowed, clamped to CLOB max (0.99) so
+                    # rich 0.995–0.999 books still fill instead of invalid-price.
+                    live_px = float(bids[winner] or effective_winner_min)
+                    posted, clamped, clamp_why = winner_sell_limit(
+                        live_px, clob_max=clob_max, clob_min=clob_min
                     )
-                elif sold_total >= tol:
-                    intent["sell_winner_filled"] = float(
-                        intent.get("sell_winner_filled") or 0
-                    ) + sold_total
+                    if clamped and live_px > posted + 1e-12:
+                        log_event(
+                            "sell_winner_limit_clamped",
+                            condition_id=cid,
+                            slug=intent.get("slug"),
+                            live=live_px,
+                            posted=posted,
+                            reason=clamp_why or "clob_max",
+                        )
+                    with _io_unlocked():
+                        sold_total, last_status, last_px = _run_fak_ladder(
+                            w_tok,
+                            size,
+                            [posted],
+                            dry_run=dry_run,
+                            bid=live_px,
+                            label=f"win {winner}",
+                            slug=intent.get("slug"),
+                            tol=tol,
+                            depth_bids=books.get(winner),
+                            depth_path="winner_cheap" if cheap_on else None,
+                            depth_leg=winner,
+                            ttm_s=ttm_s,
+                            condition_id=cid,
+                        )
+                    intent["sell_winner_attempts"] = int(
+                        intent.get("sell_winner_attempts") or 0
+                    ) + 1
+                    intent["sell_winner_last_status"] = last_status
+                    if dry_run or sold_total >= size - tol:
+                        intent["sold_winner"] = True
+                        intent["sell_winner_filled"] = float(
+                            intent.get("sell_winner_filled") or 0
+                        ) + sold_total
+                        intent["sell_winner_limit"] = last_px
+                        if dry_run:
+                            intent["sell_winner_dry"] = True
+                        log_event(
+                            "sell_winner_done",
+                            condition_id=cid,
+                            slug=intent.get("slug"),
+                            leg=winner,
+                            sold=sold_total,
+                            bid=bids[winner],
+                            status=last_status,
+                        )
+                        notify(
+                            "Mint winner sold",
+                            f"{intent.get('slug')}\n{winner} x{sold_total:.1f} @>={effective_winner_min:.3f}",
+                            priority="default",
+                        )
+                    elif sold_total >= tol:
+                        intent["sell_winner_filled"] = float(
+                            intent.get("sell_winner_filled") or 0
+                        ) + sold_total
 
         # Held-leg dump: after loser is sold, if the remaining leg stays under
         # sell_dump_below for sell_dump_persist_s, live-bid FAK (not a "hedge").
         sold_dump = bool(intent.get("sold_dump") or intent.get("sold_winner"))
         dump_enabled = bool(cfg.get("sell_dump_enabled", True))
         dump_below = float(cfg.get("sell_dump_below") or 0.80)
-        dump_persist_s = float(cfg.get("sell_dump_persist_s") or 5.0)
+        dump_persist_s = float(cfg.get("sell_dump_persist_s") or 2.0)
         sold_leg = intent.get("sold_leg")
         held = None
         if sold_leg == "up":
@@ -1269,77 +1323,91 @@ def _manage_sells_locked(cfg: dict, state: dict, chain: ChainReader) -> None:
                 below=dump_below,
             )
         if fire_d and held and not cooling:
-            d_tok = tokens[held]
-            size, latch = _sell_inventory(
-                chain, ctf, funder_cs, d_tok, shares, tol,
-                "seen_dump_inventory", intent,
+            fire_action, fire_reason = sell_fire_decision(
+                "dump", bid=dump_bid, dump_below=dump_below,
             )
-            if latch == "await_inventory":
-                log_event(
-                    "sell_skip_await_inventory",
-                    condition_id=cid,
-                    leg=held,
+            if fire_action != "fire":
+                _apply_sell_fire_cancel(
+                    intent,
                     path="dump",
+                    action=fire_action,
+                    reason=fire_reason,
+                    bid=dump_bid,
+                    cid=cid,
+                    extra={"below": dump_below},
                 )
-            elif latch == "already_flat":
-                intent["sold_dump"] = True
-                intent["sold_winner"] = True
-                intent["sell_dump_note"] = "already_flat"
             else:
-                live_px = float(dump_bid or 0)
-                intent["last_sell_attempt_at"] = now
-                with _io_unlocked():
-                    sold_total, last_status, last_px = _run_fak_ladder(
-                        d_tok,
-                        size,
-                        [round(live_px, 4)],
-                        dry_run=dry_run,
-                        bid=live_px,
-                        label=f"dump {held}",
-                        slug=intent.get("slug"),
-                        tol=tol,
-                        depth_bids=books.get(held),
-                        depth_path="dump",
-                        depth_leg=held,
-                        ttm_s=ttm_s,
+                d_tok = tokens[held]
+                size, latch = _sell_inventory(
+                    chain, ctf, funder_cs, d_tok, shares, tol,
+                    "seen_dump_inventory", intent,
+                )
+                if latch == "await_inventory":
+                    log_event(
+                        "sell_skip_await_inventory",
                         condition_id=cid,
+                        leg=held,
+                        path="dump",
                     )
-                intent["sell_dump_attempts"] = int(
-                    intent.get("sell_dump_attempts") or 0
-                ) + 1
-                intent["sell_dump_last_status"] = last_status
-                if dry_run or sold_total >= size - tol:
+                elif latch == "already_flat":
                     intent["sold_dump"] = True
                     intent["sold_winner"] = True
-                    intent["sell_dump_filled"] = float(
-                        intent.get("sell_dump_filled") or 0
-                    ) + sold_total
-                    intent["sell_dump_limit"] = last_px
-                    if dry_run:
-                        intent["sell_dump_dry"] = True
-                    log_event(
-                        "sell_dump_done",
-                        condition_id=cid,
-                        slug=intent.get("slug"),
-                        leg=held,
-                        sold=sold_total,
-                        bid=dump_bid,
-                        status=last_status,
-                    )
-                    notify(
-                        "Mint held dump",
-                        f"{intent.get('slug')}\n{held} x{sold_total:.1f} "
-                        f"@<{dump_below:.2f} (live {live_px:.3f})",
-                        priority="default",
-                    )
-                    console.print(
-                        f"  [bold bright_yellow][DUMP OK][/] {held} {sold_total:.2f}  "
-                        f"bid={live_px:.3f} (<{dump_below:.2f})"
-                    )
-                elif sold_total >= tol:
-                    intent["sell_dump_filled"] = float(
-                        intent.get("sell_dump_filled") or 0
-                    ) + sold_total
+                    intent["sell_dump_note"] = "already_flat"
+                else:
+                    live_px = float(dump_bid or 0)
+                    intent["last_sell_attempt_at"] = now
+                    with _io_unlocked():
+                        sold_total, last_status, last_px = _run_fak_ladder(
+                            d_tok,
+                            size,
+                            [round(live_px, 4)],
+                            dry_run=dry_run,
+                            bid=live_px,
+                            label=f"dump {held}",
+                            slug=intent.get("slug"),
+                            tol=tol,
+                            depth_bids=books.get(held),
+                            depth_path="dump",
+                            depth_leg=held,
+                            ttm_s=ttm_s,
+                            condition_id=cid,
+                        )
+                    intent["sell_dump_attempts"] = int(
+                        intent.get("sell_dump_attempts") or 0
+                    ) + 1
+                    intent["sell_dump_last_status"] = last_status
+                    if dry_run or sold_total >= size - tol:
+                        intent["sold_dump"] = True
+                        intent["sold_winner"] = True
+                        intent["sell_dump_filled"] = float(
+                            intent.get("sell_dump_filled") or 0
+                        ) + sold_total
+                        intent["sell_dump_limit"] = last_px
+                        if dry_run:
+                            intent["sell_dump_dry"] = True
+                        log_event(
+                            "sell_dump_done",
+                            condition_id=cid,
+                            slug=intent.get("slug"),
+                            leg=held,
+                            sold=sold_total,
+                            bid=dump_bid,
+                            status=last_status,
+                        )
+                        notify(
+                            "Mint held dump",
+                            f"{intent.get('slug')}\n{held} x{sold_total:.1f} "
+                            f"@<{dump_below:.2f} (live {live_px:.3f})",
+                            priority="default",
+                        )
+                        console.print(
+                            f"  [bold bright_yellow][DUMP OK][/] {held} {sold_total:.2f}  "
+                            f"bid={live_px:.3f} (<{dump_below:.2f})"
+                        )
+                    elif sold_total >= tol:
+                        intent["sell_dump_filled"] = float(
+                            intent.get("sell_dump_filled") or 0
+                        ) + sold_total
 
         loser_persist_s = effective_loser_persist_s(
             now_s=now,
@@ -1451,72 +1519,92 @@ def _manage_sells_locked(cfg: dict, state: dict, chain: ChainReader) -> None:
             )
 
         if fire_l and loser and not cooling:
-            l_tok = tokens[loser]
-            loser_bid = float(bids[loser] or thr)
-            size, latch = _sell_inventory(
-                chain, ctf, funder_cs, l_tok, shares, tol,
-                "seen_loser_inventory", intent,
+            opp_leg = "dn" if loser == "up" else "up"
+            fire_action, fire_reason = sell_fire_decision(
+                "loser",
+                bid=bids.get(loser),
+                opposite_bid=bids.get(opp_leg),
+                threshold=thr,
+                floor=floor,
+                opposite_min=opp_min,
             )
-            if latch == "await_inventory":
-                log_event(
-                    "sell_skip_await_inventory",
-                    condition_id=cid,
-                    leg=loser,
+            if fire_action != "fire":
+                _apply_sell_fire_cancel(
+                    intent,
                     path="loser",
+                    action=fire_action,
+                    reason=fire_reason,
+                    bid=bids.get(loser),
+                    cid=cid,
+                    extra={"opposite_bid": bids.get(opp_leg), "threshold": thr},
                 )
-            elif latch == "already_flat":
-                intent["sold_leg"] = loser
-                intent["sold_loser"] = True
-                intent["sell_note"] = "already_flat"
             else:
-                limits = loser_ladder_limits(thr, floor, loser_bid)
-                intent["last_sell_attempt_at"] = now
-                with _io_unlocked():
-                    sold_total, last_status, last_px = _run_fak_ladder(
-                        l_tok, size, limits,
-                        dry_run=dry_run,
-                        bid=loser_bid,
-                        label=loser,
-                        slug=intent.get("slug"),
-                        tol=tol,
-                        depth_bids=books.get(loser),
-                        depth_path="loser",
-                        depth_leg=loser,
-                        ttm_s=ttm_s,
+                l_tok = tokens[loser]
+                loser_bid = float(bids[loser] or thr)
+                size, latch = _sell_inventory(
+                    chain, ctf, funder_cs, l_tok, shares, tol,
+                    "seen_loser_inventory", intent,
+                )
+                if latch == "await_inventory":
+                    log_event(
+                        "sell_skip_await_inventory",
                         condition_id=cid,
+                        leg=loser,
+                        path="loser",
                     )
-                intent["sell_attempts"] = int(intent.get("sell_attempts") or 0) + 1
-                intent["sell_last_status"] = last_status
-                done = dry_run or sold_total >= size - tol
-                if sold_total >= tol or dry_run:
-                    intent["sell_filled"] = float(
-                        intent.get("sell_filled") or 0
-                    ) + sold_total
-                    intent["sell_limit"] = last_px
-                if done:
+                elif latch == "already_flat":
                     intent["sold_leg"] = loser
                     intent["sold_loser"] = True
-                    if dry_run:
-                        intent["sell_dry"] = True
-                    log_event(
-                        "sell_loser_done",
-                        condition_id=cid,
-                        slug=intent.get("slug"),
-                        leg=loser,
-                        sold=sold_total,
-                        bid=loser_bid,
-                        status=last_status,
-                    )
-                    notify(
-                        "Mint loser sold",
-                        f"{intent.get('slug')}\n{loser} x{sold_total:.1f} "
-                        f"@<={thr:.2f}/{floor:.2f}",
-                        priority="default",
-                    )
-                    console.print(
-                        f"  [bold bright_green][SELL OK][/] {loser} {sold_total:.2f}  "
-                        f"kept opposite for redeem"
-                    )
+                    intent["sell_note"] = "already_flat"
+                else:
+                    limits = loser_ladder_limits(thr, floor, loser_bid)
+                    intent["last_sell_attempt_at"] = now
+                    with _io_unlocked():
+                        sold_total, last_status, last_px = _run_fak_ladder(
+                            l_tok, size, limits,
+                            dry_run=dry_run,
+                            bid=loser_bid,
+                            label=loser,
+                            slug=intent.get("slug"),
+                            tol=tol,
+                            depth_bids=books.get(loser),
+                            depth_path="loser",
+                            depth_leg=loser,
+                            ttm_s=ttm_s,
+                            condition_id=cid,
+                        )
+                    intent["sell_attempts"] = int(intent.get("sell_attempts") or 0) + 1
+                    intent["sell_last_status"] = last_status
+                    done = dry_run or sold_total >= size - tol
+                    if sold_total >= tol or dry_run:
+                        intent["sell_filled"] = float(
+                            intent.get("sell_filled") or 0
+                        ) + sold_total
+                        intent["sell_limit"] = last_px
+                    if done:
+                        intent["sold_leg"] = loser
+                        intent["sold_loser"] = True
+                        if dry_run:
+                            intent["sell_dry"] = True
+                        log_event(
+                            "sell_loser_done",
+                            condition_id=cid,
+                            slug=intent.get("slug"),
+                            leg=loser,
+                            sold=sold_total,
+                            bid=loser_bid,
+                            status=last_status,
+                        )
+                        notify(
+                            "Mint loser sold",
+                            f"{intent.get('slug')}\n{loser} x{sold_total:.1f} "
+                            f"@<={thr:.2f}/{floor:.2f}",
+                            priority="default",
+                        )
+                        console.print(
+                            f"  [bold bright_green][SELL OK][/] {loser} {sold_total:.2f}  "
+                            f"kept opposite for redeem"
+                        )
 
     if dirty:
         atomic_save(STATE_FILE, state)
