@@ -247,7 +247,7 @@ Sells-before-mint matters: selling the loser can clear the `max_open_sets` block
 
 `eligible_markets` keeps markets that:
 
-- have **not started** (`start_ts > now`),
+- have **not** started (`start_ts > now`),
 - open within `(enter_min_ttm_min, enter_max_ttm_min]` minutes (default 0–30 so N+1 can mint mid-N),
 - are active, not closed, not neg-risk,
 - optionally `accepting_orders`.
