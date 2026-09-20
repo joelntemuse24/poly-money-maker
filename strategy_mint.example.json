@@ -12,7 +12,7 @@
   "one_entry_per_market": true,
   "max_open_sets": 1,
   "poll_s": 5.0,
-  "sell_hot_poll_s": 1.0,
+  "sell_armed_poll_s": 2.0,
   "position_tolerance": 0.01,
   "require_accepting_orders": true,
   "rpc_url": "https://polygon.drpc.org",

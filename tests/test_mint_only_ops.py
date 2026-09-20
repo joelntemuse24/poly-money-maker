@@ -88,7 +88,7 @@ class MintDefaultsTests(unittest.TestCase):
             self.assertAlmostEqual(blob["sell_winner_min"], 0.999, msg=label)
             self.assertEqual(blob["sell_min_bid_size"], 1.0, label)
             self.assertEqual(blob["poll_s"], 5.0, label)
-            self.assertEqual(blob["sell_hot_poll_s"], 1.0, label)
+            self.assertEqual(blob["sell_armed_poll_s"], 2.0, label)
 
     def test_open_intent_count_ignores_expired_redeem_holds(self):
         statuses = frozenset(
@@ -148,12 +148,13 @@ def _slots():
     return (
         _fn("open_intent_count", extras),
         _fn("mint_slots_full", extras),
+        _fn("mint_discovery_capped", extras),
     )
 
 
 class MintSlotChainTests(unittest.TestCase):
     def test_redeem_hold_does_not_block(self):
-        count, slots = _slots()
+        count, slots, _capped = _slots()
         cfg = {"max_open_sets": 1}
         for flag in (
             {"sold_loser": True},
@@ -173,7 +174,7 @@ class MintSlotChainTests(unittest.TestCase):
             self.assertFalse(slots(state, cfg, _NOW, _START_B), flag)
 
     def test_adjacent_next_window_allowed_at_cap(self):
-        _, slots = _slots()
+        _, slots, capped = _slots()
         state = {
             "intents": {
                 "a": {
@@ -184,9 +185,10 @@ class MintSlotChainTests(unittest.TestCase):
             }
         }
         self.assertFalse(slots(state, {"max_open_sets": 1}, _NOW, _START_B))
+        self.assertFalse(capped(state, {"max_open_sets": 1}, _NOW))
 
     def test_second_lookahead_blocked_if_adjacent_already_held(self):
-        _, slots = _slots()
+        _, slots, capped = _slots()
         state = {
             "intents": {
                 "a": {
@@ -202,9 +204,10 @@ class MintSlotChainTests(unittest.TestCase):
             }
         }
         self.assertTrue(slots(state, {"max_open_sets": 1}, _NOW, _START_C))
+        self.assertTrue(capped(state, {"max_open_sets": 1}, _NOW))
 
     def test_non_adjacent_future_window_blocked_at_cap(self):
-        _, slots = _slots()
+        _, slots, capped = _slots()
         state = {
             "intents": {
                 "a": {
@@ -215,6 +218,7 @@ class MintSlotChainTests(unittest.TestCase):
             }
         }
         self.assertTrue(slots(state, {"max_open_sets": 1}, _NOW, _START_C))
+        self.assertFalse(capped(state, {"max_open_sets": 1}, _NOW))
 
     def test_run_cycle_picks_then_gates_and_records_start_ts(self):
         src = MINT.read_text()
@@ -486,7 +490,7 @@ class DeployUnitsTests(unittest.TestCase):
         )
         self.assertNotIn("if bal + 1e-9 < tol:", src)
 
-    def test_sell_hot_poll_skips_mint_path_without_changing_persist(self):
+    def test_sell_armed_poll_skips_capped_mint_path_without_changing_persist(self):
         src = MINT.read_text()
         defaults = _assign("DEFAULTS")
         example = json.loads(MINT_EXAMPLE.read_text())
@@ -497,25 +501,29 @@ class DeployUnitsTests(unittest.TestCase):
         self.assertEqual(example["sell_persist_last_min_s"], 5.0)
         self.assertEqual(example["sell_persist_last_min_window_s"], 60.0)
         self.assertEqual(defaults["poll_s"], 5.0)
-        self.assertEqual(defaults["sell_hot_poll_s"], 1.0)
+        self.assertEqual(defaults["sell_armed_poll_s"], 2.0)
         self.assertGreaterEqual(float(defaults["poll_s"]), 2.0)
+        self.assertLess(float(defaults["sell_armed_poll_s"]), 2.0 + 1e-12)
 
         cycle = src[src.find("def run_cycle") : src.find("\ndef main")]
         self.assertIn("skip_mint_discovery_for_sell", cycle)
-        self.assertIn("skip_mint_discovery_this_tick", cycle)
+        self.assertIn("skip_mint_discovery_when_armed_and_capped", cycle)
+        self.assertIn("mint_discovery_capped", cycle)
         self.assertLess(
-            cycle.find("skip_mint_discovery_this_tick"),
+            cycle.find("skip_mint_discovery_when_armed_and_capped"),
             cycle.find("gateway.discover"),
         )
-        self.assertIn('return "sell_hot"', cycle)
+        self.assertIn('return "sell_armed"', cycle)
         self.assertIn("skip_confirmed_inventory", src)
-        self.assertIn("_last_mint_discover_at is None", cycle)
+        self.assertIn("_fetch_books", src)
+        self.assertIn("ThreadPoolExecutor", src)
         main = src[src.find("def main") :]
         self.assertIn("cycle_sleep_s", main)
-        self.assertIn("sell_hot_poll_s", src)
+        self.assertIn("sell_armed_poll_s", src)
         self.assertIn("sell_intent_hot", src)
+        self.assertNotIn("sell_hot_poll_s", src)
         validate = src[src.find("def validate_strategy") : src.find("def eligible_markets")]
-        self.assertIn("sell_hot_poll_s", validate)
+        self.assertIn("sell_armed_poll_s", validate)
         self.assertIn("poll_s must be >= 2", validate)
 
     def test_sell_book_depth_log_shape_is_observability_only(self):

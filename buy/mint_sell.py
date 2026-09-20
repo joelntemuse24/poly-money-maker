@@ -38,8 +38,8 @@ DEFAULT_SELL_KNOBS = {
     "sell_dump_below": 0.80,
     "sell_dump_persist_s": 5.0,
     "sell_min_bid_size": 1.0,
-    # Cycle sleep while a sell arm is live. Does not change persist_s.
-    "sell_hot_poll_s": 1.0,
+    # Cycle sleep while a loser persist arm is live. Does not change persist_s.
+    "sell_armed_poll_s": 2.0,
 }
 
 
@@ -144,14 +144,15 @@ _SELL_HOT_STATUSES = (
 
 
 def sell_intent_hot(intent: Any, now_s: float) -> bool:
-    """True when this intent still has an unsold persist arm inside the window.
+    """True when this intent has an unsold loser persist arm in the window.
 
-    Live bag ``btc-updown-15m-1789880400``: loser FAK uses the same tick's
-    book (no extra refetch). The avoidable wait was the *next* observation:
-    ``poll_s=5`` plus ~5s of Gamma/positions after ``manage_sells`` → ~10s
-    between sell ticks. Persist 9s was unchanged; DN vanished at +1.5s so
-    that miss was empty-book luck. Hot poll exists so persist-ready + live
-    bid is not delayed another mint cycle.
+    Live audit (bag ``btc-updown-15m-1789880400``): ``poll_s=5`` plus
+    manage_sells/reconcile/discover made sell ticks ≈8.6–10.5s. Persist
+    ready is +9s; first post-ready look was empty_keep_arm at +10.7s.
+    Miss = empty book on that look + coarse tick, not a stuck POST.
+    Same-tick FAK already uses the fetched book. Faster sleep while the
+    loser is armed (``sell_armed_poll_s``, default 2s) is so a fleeting
+    2¢ bid between arms can be posted after persist, not to shorten persist.
     """
     if not isinstance(intent, dict):
         return False
@@ -159,79 +160,55 @@ def sell_intent_hot(intent: Any, now_s: float) -> bool:
         return False
     if not sell_window_open(now_s, float(intent.get("end_ts") or 0)):
         return False
-    sold_loser = bool(intent.get("sold_loser") or intent.get("sold_leg"))
-    sold_winner = bool(intent.get("sold_winner"))
-    sold_dump = bool(intent.get("sold_dump") or sold_winner)
-    if not sold_loser and intent.get("sell_loser_armed_at") is not None:
-        return True
-    if not sold_winner and intent.get("sell_winner_armed_at") is not None:
-        return True
-    if sold_loser and not sold_dump and intent.get("sell_dump_armed_at") is not None:
-        return True
-    return False
+    if intent.get("sold_loser") or intent.get("sold_leg"):
+        return False
+    return intent.get("sell_loser_armed_at") is not None
 
 
 def skip_mint_discovery_for_sell(state: Any, now_s: float) -> bool:
-    """True when any intent still has an unsold persist arm (hot-poll).
-
-    This is *not* a hard skip of Gamma/mint for the rest of the window.
-    Adjacent-window mint can still run; ``skip_mint_discovery_this_tick``
-    only paces discovery to once per ``poll_s`` while hot.
-    """
+    """True when any open intent still has an unsold loser arm."""
     intents = (state or {}).get("intents") or {}
     if not isinstance(intents, dict):
         return False
     return any(sell_intent_hot(intent, now_s) for intent in intents.values())
 
 
-def skip_mint_discovery_this_tick(
+def skip_mint_discovery_when_armed_and_capped(
     *,
-    sell_hot: bool,
-    now_s: float,
-    last_mint_discover_at: Optional[float],
-    poll_s: float,
+    loser_armed: bool,
+    mint_capped: bool,
 ) -> bool:
-    """While a sell is hot, run Gamma/mint at most once per ``poll_s``.
+    """Defer Gamma/mint only when a loser is armed *and* mint is capped.
 
-    Live ``max_open_sets=1`` still allows minting the adjacent next 15m
-    while the current loser is unsold. Empty-keep-arm must not suppress
-    that for the rest of the window. Idle ticks (not hot) always discover.
+    Adjacent-window mint stays available while the current loser is unsold
+    unless we already hold that next window (``capped_open``). Empty-keep-arm
+    must not skip that path.
     """
-    if not sell_hot:
-        return False
-    if last_mint_discover_at is None:
-        return True
-    try:
-        last = float(last_mint_discover_at)
-        poll = float(poll_s or 0)
-    except (TypeError, ValueError):
-        return True
-    if poll <= 0:
-        return True
-    return float(now_s) + 1e-12 < last + poll
+    return bool(loser_armed) and bool(mint_capped)
 
 
 def cycle_sleep_s(cfg: Any, state: Any, now_s: float) -> float:
-    """``poll_s`` normally; ``min(poll_s, sell_hot_poll_s)`` while armed.
+    """``poll_s`` normally; ``min(poll_s, sell_armed_poll_s)`` while loser armed.
 
-    Missing/invalid ``sell_hot_poll_s`` keeps ``poll_s`` so persist math is
-    never replaced by the hot interval.
+    Missing/invalid ``sell_armed_poll_s`` keeps ``poll_s`` so persist math is
+    never replaced by the armed interval. Armed poll may be below the
+    ``poll_s >= 2`` floor (live default 2.0).
     """
     poll = float((cfg or {}).get("poll_s") or 10)
     if poll < 0:
         poll = 0.0
     if not skip_mint_discovery_for_sell(state, now_s):
         return poll
-    raw = (cfg or {}).get("sell_hot_poll_s")
+    raw = (cfg or {}).get("sell_armed_poll_s")
     if raw is None or raw == "":
         return poll
     try:
-        hot = float(raw)
+        armed = float(raw)
     except (TypeError, ValueError):
         return poll
-    if hot <= 0:
+    if armed <= 0:
         return poll
-    return min(poll, hot)
+    return min(poll, armed)
 
 
 def effective_loser_persist_s(
