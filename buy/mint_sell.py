@@ -144,15 +144,22 @@ _SELL_HOT_STATUSES = (
 
 
 def sell_intent_hot(intent: Any, now_s: float) -> bool:
-    """True when this intent has an unsold loser persist arm in the window.
+    """True when the sell loop should keep ``sell_armed_poll_s`` cadence.
+
+    Hot while the window is open and any of:
+    - loser persist arm is live and the loser is not yet sold
+    - loser is sold and dump/winner exit is not done (``sold_dump`` /
+      ``sold_winner``)
+
+    This is sell-loop scheduling only. Concurrent mint must not skip
+    discovery because a bag is hot — that was the #193 serial-cycle
+    bandage. Persist knobs are unchanged.
 
     Live audit (bag ``btc-updown-15m-1789880400``): ``poll_s=5`` plus
     manage_sells/reconcile/discover made sell ticks ≈8.6–10.5s. Persist
     ready is +9s; first post-ready look was empty_keep_arm at +10.7s.
-    Miss = empty book on that look + coarse tick, not a stuck POST.
-    Same-tick FAK already uses the fetched book. Faster sleep while the
-    loser is armed (``sell_armed_poll_s``, default 2s) is so a fleeting
-    2¢ bid between arms can be posted after persist, not to shorten persist.
+    Incident ``btc-updown-15m-1789905600``: after ``loser_done``, dump
+    stayed cold so next-window mint stole the shared cycle (~16s).
     """
     if not isinstance(intent, dict):
         return False
@@ -160,13 +167,18 @@ def sell_intent_hot(intent: Any, now_s: float) -> bool:
         return False
     if not sell_window_open(now_s, float(intent.get("end_ts") or 0)):
         return False
+    sold_exit = bool(intent.get("sold_dump") or intent.get("sold_winner"))
     if intent.get("sold_loser") or intent.get("sold_leg"):
-        return False
+        return not sold_exit
     return intent.get("sell_loser_armed_at") is not None
 
 
 def skip_mint_discovery_for_sell(state: Any, now_s: float) -> bool:
-    """True when any open intent still has an unsold loser arm."""
+    """True when any open intent is sell-hot (sell-loop cadence only).
+
+    Name is historical. Concurrent mint no longer skips Gamma because
+    this is true.
+    """
     intents = (state or {}).get("intents") or {}
     if not isinstance(intents, dict):
         return False
@@ -178,21 +190,32 @@ def skip_mint_discovery_when_armed_and_capped(
     loser_armed: bool,
     mint_capped: bool,
 ) -> bool:
-    """Defer Gamma/mint only when a loser is armed *and* mint is capped.
+    """Serial-cycle bandage: skip Gamma only when armed *and* capped.
 
-    Adjacent-window mint stays available while the current loser is unsold
-    unless we already hold that next window (``capped_open``). Empty-keep-arm
-    must not skip that path.
+    Kept for tests of the old single-thread policy. Concurrent mint/sell
+    loops must not call this — mint proceeds while sell stays hot.
     """
     return bool(loser_armed) and bool(mint_capped)
 
 
+def mint_cycle_sleep_s(cfg: Any) -> float:
+    """Mint/discover loop always uses ``poll_s``. Sell cadence is independent."""
+    try:
+        poll = float((cfg or {}).get("poll_s") or 10)
+    except (TypeError, ValueError):
+        poll = 10.0
+    if poll < 0:
+        return 0.0
+    return poll
+
+
 def cycle_sleep_s(cfg: Any, state: Any, now_s: float) -> float:
-    """``poll_s`` normally; ``min(poll_s, sell_armed_poll_s)`` while loser armed.
+    """Sell-loop sleep: ``poll_s``, or ``sell_armed_poll_s`` while hot.
 
     Missing/invalid ``sell_armed_poll_s`` keeps ``poll_s`` so persist math is
     never replaced by the armed interval. Armed poll may be below the
-    ``poll_s >= 2`` floor (live default 2.0).
+    ``poll_s >= 2`` floor (live default 2.0). Mint uses
+    ``mint_cycle_sleep_s`` and is not gated by this.
     """
     poll = float((cfg or {}).get("poll_s") or 10)
     if poll < 0:

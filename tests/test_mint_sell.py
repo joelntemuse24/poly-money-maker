@@ -8,6 +8,7 @@ from buy.book import best_bid_with_min_size
 from buy.mint_sell import (
     classify_loser,
     cycle_sleep_s,
+    mint_cycle_sleep_s,
     effective_loser_persist_s,
     empty_fak_status,
     inventory_latch,
@@ -683,12 +684,16 @@ class EmptyLoserBookKeepArmTests(unittest.TestCase):
 
 
 class SellArmedPollTests(unittest.TestCase):
-    """Armed-fast poll is sleep + skip-capped-Gamma, not persist knobs.
+    """Armed-fast poll is sell-loop sleep, not persist knobs and not skip-mint.
 
     VM audit bag btc-updown-15m-1789880400: poll_s=5, effective sell tick
     ≈8.6–10.5s. Armed DN@0.02; persist ready +9s; first empty_keep_arm at
     +10.7s; never FAKed. Miss = empty book on first post-ready look + coarse
     tick, not a stuck POST. ROI is catching fleeting 2¢ books after persist.
+
+    Incident btc-updown-15m-1789905600: after loser_done the bag went cold
+    and next-window mint stole the serial cycle. Sell stays hot through
+    dump/winner exit; mint_cycle_sleep_s stays poll_s.
     """
 
     _CFG = {
@@ -755,29 +760,48 @@ class SellArmedPollTests(unittest.TestCase):
         )
         self.assertFalse(sell_intent_hot(expired, now_s=15.0))
 
-    def test_sold_loser_and_winner_dump_do_not_select_armed_poll(self):
+    def test_sold_loser_stays_hot_until_dump_or_winner_done(self):
         sold = self._intent(
             sold_loser=True, sold_leg="dn", sell_loser_armed_at=10.0,
         )
-        self.assertFalse(sell_intent_hot(sold, now_s=20.0))
+        self.assertTrue(sell_intent_hot(sold, now_s=20.0))
+        self.assertEqual(
+            cycle_sleep_s(self._CFG, {"intents": {"a": sold}}, now_s=20.0),
+            2.0,
+        )
         winner_arm = self._intent(
             sold_loser=True,
             sold_leg="dn",
             sell_winner_armed_at=18.0,
         )
-        self.assertFalse(sell_intent_hot(winner_arm, now_s=20.0))
+        self.assertTrue(sell_intent_hot(winner_arm, now_s=20.0))
         self.assertEqual(
             cycle_sleep_s(
                 self._CFG, {"intents": {"a": winner_arm}}, now_s=20.0,
             ),
-            5.0,
+            2.0,
         )
         dump_arm = self._intent(
             sold_loser=True,
             sold_leg="dn",
             sell_dump_armed_at=18.0,
         )
-        self.assertFalse(sell_intent_hot(dump_arm, now_s=20.0))
+        self.assertTrue(sell_intent_hot(dump_arm, now_s=20.0))
+        done = self._intent(
+            sold_loser=True,
+            sold_leg="dn",
+            sold_dump=True,
+            sold_winner=True,
+        )
+        self.assertFalse(sell_intent_hot(done, now_s=20.0))
+        self.assertEqual(
+            cycle_sleep_s(self._CFG, {"intents": {"a": done}}, now_s=20.0),
+            5.0,
+        )
+        self.assertEqual(mint_cycle_sleep_s(self._CFG), 5.0)
+        hot_state = {"intents": {"a": sold}}
+        self.assertTrue(skip_mint_discovery_for_sell(hot_state, now_s=20.0))
+        self.assertEqual(mint_cycle_sleep_s(self._CFG), self._CFG["poll_s"])
 
     def test_armed_poll_does_not_change_persist_math(self):
         fire, armed, why = persist_ready(

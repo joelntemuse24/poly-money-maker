@@ -11,10 +11,12 @@ last ``sell_persist_last_min_window_s`` (~60s) before ``end_ts``, while the
 opposite bid is ≥ ~90¢, then FAK 3¢ → 2¢ when the live sized bid is at/over
 the floor, or at the live bid if it is below the floor. Keep the winner for
 redeem unless its bid reaches ~99.9¢. Off unless live ``strategy_mint.json``
-turns it on. While a loser persist arm is live, the cycle sleeps
-``sell_armed_poll_s`` (~2s, allowed below the ``poll_s >= 2`` floor) so
-persist-ready FAK is not delayed by ``poll_s`` plus Gamma (~8.6–10.5s
-ticks on live VM). Persist knobs stay 9/5/60.
+turns it on. Sell and mint run as independent loops so Gamma/relayer
+work cannot steal a dump tick (bag ``btc-updown-15m-1789905600``). The
+sell loop sleeps ``sell_armed_poll_s`` (~2s, allowed below the
+``poll_s >= 2`` floor) while a bag is sell-hot (loser armed, or loser
+sold and dump/winner not done). Mint keeps ``poll_s``. Persist knobs
+stay 9/5/60.
 
 Usage:
   # dry-run (default when strategy_mint.json has dry_run true / entry_enabled false)
@@ -32,8 +34,10 @@ import json
 import os
 import signal
 import sys
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
@@ -51,6 +55,7 @@ from buy.book import best_bid_with_min_size, bid_fill_depth
 from buy.chain import ChainReader
 from buy.contracts import ContractCall, build_atomic_mint_calls
 from buy.market import MarketGateway, MintMarket
+from buy.mint_loops import IntentStore, start_mint_sell_loops
 from buy.mint_sell import (
     classify_loser,
     cycle_sleep_s,
@@ -60,11 +65,11 @@ from buy.mint_sell import (
     loser_empty_keep_qualify,
     loser_ladder_limits,
     loser_persist_ready,
+    mint_cycle_sleep_s,
     parse_sell_fill_shares,
     persist_ready,
     sell_window_open,
     skip_mint_discovery_for_sell,
-    skip_mint_discovery_when_armed_and_capped,
     winner_cashout_leg,
     winner_cheap_decision,
     winner_sell_limit,
@@ -141,6 +146,11 @@ ACTIVE_STATUSES = frozenset(
 )
 
 _shutdown = False
+STATE_LOCK = threading.RLock()
+_intent_store: Optional[IntentStore] = None
+_heartbeat_lock = threading.Lock()
+_heartbeat_parts: Dict[str, dict] = {}
+_notify_pool = ThreadPoolExecutor(max_workers=2, thread_name_prefix="ntfy")
 
 def _signal_handler(signum, frame):
     global _shutdown
@@ -168,13 +178,20 @@ def log_event(event: str, **kwargs: Any) -> None:
 
 def notify(title: str, message: str, priority: str = "default") -> None:
     topic = os.getenv("NTFY_TOPIC") or os.getenv("NTFY_TOPIC_BUY") or "polybot-joel-btc"
+
+    def _post() -> None:
+        try:
+            requests.post(
+                f"https://ntfy.sh/{topic}",
+                data=message.encode("utf-8"),
+                headers={"Title": title, "Priority": priority},
+                timeout=5,
+            )
+        except Exception:
+            return
+
     try:
-        requests.post(
-            f"https://ntfy.sh/{topic}",
-            data=message.encode("utf-8"),
-            headers={"Title": title, "Priority": priority},
-            timeout=5,
-        )
+        _notify_pool.submit(_post)
     except Exception:
         return
 
@@ -608,13 +625,29 @@ def reconcile_intents(
     relayer_url = str(cfg["relayer_url"])
     ctf = str(cfg["ctf_address"])
     tol = float(cfg["position_tolerance"])
-    for cid, intent in list(state.get("intents", {}).items()):
-        status = intent.get("status")
-        tx_id = intent.get("transaction_id")
+    with STATE_LOCK:
+        items = list(state.get("intents", {}).items())
+        snapshots = [
+            (
+                cid,
+                str(intent.get("status") or ""),
+                intent.get("transaction_id"),
+                str(intent.get("up_token") or ""),
+                str(intent.get("dn_token") or ""),
+            )
+            for cid, intent in items
+            if isinstance(intent, dict)
+        ]
+    for cid, status, tx_id, up_tok, dn_tok in snapshots:
+        record = None
         if status in ("submitting", "pending", "executed", "mined") and tx_id:
             record = get_relayer_transaction(relayer_url, str(tx_id))
-            if record:
-                relayer_state = str(record.get("state") or "")
+        if record:
+            relayer_state = str(record.get("state") or "")
+            with STATE_LOCK:
+                intent = state.get("intents", {}).get(cid)
+                if not isinstance(intent, dict):
+                    continue
                 intent["relayer_state"] = relayer_state
                 intent["updated_at"] = now
                 if relayer_state in ("STATE_FAILED", "STATE_INVALID"):
@@ -639,14 +672,27 @@ def reconcile_intents(
                     intent["status"] = "mined"
                 elif relayer_state == "STATE_EXECUTED":
                     intent["status"] = "executed"
-        if intent.get("status") in ("confirmed_waiting_inventory", "confirmed", "mined"):
-            if skip_confirmed_inventory and intent.get("status") == "confirmed":
+                status = str(intent.get("status") or status)
+        with STATE_LOCK:
+            intent = state.get("intents", {}).get(cid)
+            if not isinstance(intent, dict):
                 continue
-            try:
-                up = chain.position_balance(ctf, funder, intent["up_token"])
-                dn = chain.position_balance(ctf, funder, intent["dn_token"])
-            except Exception as exc:
-                log_event("inventory_check_fail", condition_id=cid, error=str(exc)[:160])
+            status = str(intent.get("status") or "")
+            if status not in ("confirmed_waiting_inventory", "confirmed", "mined"):
+                continue
+            if skip_confirmed_inventory and status == "confirmed":
+                continue
+            up_tok = str(intent.get("up_token") or up_tok)
+            dn_tok = str(intent.get("dn_token") or dn_tok)
+        try:
+            up = chain.position_balance(ctf, funder, up_tok)
+            dn = chain.position_balance(ctf, funder, dn_tok)
+        except Exception as exc:
+            log_event("inventory_check_fail", condition_id=cid, error=str(exc)[:160])
+            continue
+        with STATE_LOCK:
+            intent = state.get("intents", {}).get(cid)
+            if not isinstance(intent, dict):
                 continue
             intent["observed_up"] = up
             intent["observed_dn"] = dn
@@ -688,11 +734,44 @@ def acquire_lock():
     return handle
 
 def write_heartbeat(status: str, **fields: Any) -> None:
-    payload = {"ts": time.time(), "status": status, **fields}
-    temporary = str(HEARTBEAT_FILE) + ".tmp"
-    with open(temporary, "w", encoding="utf-8") as handle:
-        json.dump(payload, handle, sort_keys=True)
-    os.replace(temporary, HEARTBEAT_FILE)
+    write_loop_heartbeat("mint", status, **fields)
+
+
+def write_loop_heartbeat(loop: str, status: str, **fields: Any) -> None:
+    part = {"ts": time.time(), "status": status, **fields}
+    with _heartbeat_lock:
+        _heartbeat_parts[str(loop)] = part
+        sell = _heartbeat_parts.get("sell") or {}
+        mint = _heartbeat_parts.get("mint") or {}
+        payload = {
+            "ts": time.time(),
+            "status": f"sell:{sell.get('status', '?')}|mint:{mint.get('status', '?')}",
+            "sell": sell,
+            "mint": mint,
+        }
+        if loop == "mint" and not sell:
+            payload = {"ts": part["ts"], "status": status, "mint": part, **fields}
+        temporary = str(HEARTBEAT_FILE) + ".tmp"
+        with open(temporary, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle, sort_keys=True)
+        os.replace(temporary, HEARTBEAT_FILE)
+
+
+@contextmanager
+def _io_unlocked():
+    """Release STATE_LOCK around I/O; reacquire even if the call fails.
+
+    CPython RLock._is_owned lets AST-extracted helpers fetch books without
+    a held lock.
+    """
+    owned = STATE_LOCK._is_owned()
+    if owned:
+        STATE_LOCK.release()
+    try:
+        yield
+    finally:
+        if owned:
+            STATE_LOCK.acquire()
 
 _clob_client = None
 _clob_init_error = None
@@ -882,7 +961,8 @@ def _sell_inventory(
     if not (funder_cs and ctf):
         return size, "unknown"
     try:
-        bal = chain.position_balance(ctf, funder_cs, token_id)
+        with _io_unlocked():
+            bal = chain.position_balance(ctf, funder_cs, token_id)
     except Exception as exc:
         log_event("sell_balance_fail", error=str(exc)[:160])
         return size, "unknown"
@@ -945,6 +1025,14 @@ def manage_sells(cfg: dict, state: dict, chain: ChainReader) -> None:
     """Loser persist dump at 3¢→2¢ (or live bid if below floor); winner; held dump."""
     if not cfg.get("sell_enabled"):
         return
+    STATE_LOCK.acquire()
+    try:
+        _manage_sells_locked(cfg, state, chain)
+    finally:
+        STATE_LOCK.release()
+
+
+def _manage_sells_locked(cfg: dict, state: dict, chain: ChainReader) -> None:
     now = time.time()
     thr = float(cfg.get("sell_threshold") or 0.03)
     floor = float(cfg.get("sell_floor") or 0.02)
@@ -984,9 +1072,10 @@ def manage_sells(cfg: dict, state: dict, chain: ChainReader) -> None:
         # Same-tick books feed persist_ready and FAK; do not refetch after
         # persist-ready. Parallel UP/DN cuts sequential REST wait on the
         # armed path. The ~8.6–10.5s gap was poll_s plus mint-path work.
-        (up_bid, up_sz, up_bids), (dn_bid, dn_sz, dn_bids) = _fetch_books(
-            up_tok, dn_tok, min_bid_size
-        )
+        with _io_unlocked():
+            (up_bid, up_sz, up_bids), (dn_bid, dn_sz, dn_bids) = _fetch_books(
+                up_tok, dn_tok, min_bid_size
+            )
         books = {"up": up_bids, "dn": dn_bids}
         ttm_s = (end_ts - now) if end_ts else None
         intent["last_up_bid"] = up_bid
@@ -1094,21 +1183,22 @@ def manage_sells(cfg: dict, state: dict, chain: ChainReader) -> None:
                         posted=posted,
                         reason=clamp_why or "clob_max",
                     )
-                sold_total, last_status, last_px = _run_fak_ladder(
-                    w_tok,
-                    size,
-                    [posted],
-                    dry_run=dry_run,
-                    bid=live_px,
-                    label=f"win {winner}",
-                    slug=intent.get("slug"),
-                    tol=tol,
-                    depth_bids=books.get(winner),
-                    depth_path="winner_cheap" if cheap_on else None,
-                    depth_leg=winner,
-                    ttm_s=ttm_s,
-                    condition_id=cid,
-                )
+                with _io_unlocked():
+                    sold_total, last_status, last_px = _run_fak_ladder(
+                        w_tok,
+                        size,
+                        [posted],
+                        dry_run=dry_run,
+                        bid=live_px,
+                        label=f"win {winner}",
+                        slug=intent.get("slug"),
+                        tol=tol,
+                        depth_bids=books.get(winner),
+                        depth_path="winner_cheap" if cheap_on else None,
+                        depth_leg=winner,
+                        ttm_s=ttm_s,
+                        condition_id=cid,
+                    )
                 intent["sell_winner_attempts"] = int(
                     intent.get("sell_winner_attempts") or 0
                 ) + 1
@@ -1198,21 +1288,22 @@ def manage_sells(cfg: dict, state: dict, chain: ChainReader) -> None:
             else:
                 live_px = float(dump_bid or 0)
                 intent["last_sell_attempt_at"] = now
-                sold_total, last_status, last_px = _run_fak_ladder(
-                    d_tok,
-                    size,
-                    [round(live_px, 4)],
-                    dry_run=dry_run,
-                    bid=live_px,
-                    label=f"dump {held}",
-                    slug=intent.get("slug"),
-                    tol=tol,
-                    depth_bids=books.get(held),
-                    depth_path="dump",
-                    depth_leg=held,
-                    ttm_s=ttm_s,
-                    condition_id=cid,
-                )
+                with _io_unlocked():
+                    sold_total, last_status, last_px = _run_fak_ladder(
+                        d_tok,
+                        size,
+                        [round(live_px, 4)],
+                        dry_run=dry_run,
+                        bid=live_px,
+                        label=f"dump {held}",
+                        slug=intent.get("slug"),
+                        tol=tol,
+                        depth_bids=books.get(held),
+                        depth_path="dump",
+                        depth_leg=held,
+                        ttm_s=ttm_s,
+                        condition_id=cid,
+                    )
                 intent["sell_dump_attempts"] = int(
                     intent.get("sell_dump_attempts") or 0
                 ) + 1
@@ -1380,19 +1471,20 @@ def manage_sells(cfg: dict, state: dict, chain: ChainReader) -> None:
             else:
                 limits = loser_ladder_limits(thr, floor, loser_bid)
                 intent["last_sell_attempt_at"] = now
-                sold_total, last_status, last_px = _run_fak_ladder(
-                    l_tok, size, limits,
-                    dry_run=dry_run,
-                    bid=loser_bid,
-                    label=loser,
-                    slug=intent.get("slug"),
-                    tol=tol,
-                    depth_bids=books.get(loser),
-                    depth_path="loser",
-                    depth_leg=loser,
-                    ttm_s=ttm_s,
-                    condition_id=cid,
-                )
+                with _io_unlocked():
+                    sold_total, last_status, last_px = _run_fak_ladder(
+                        l_tok, size, limits,
+                        dry_run=dry_run,
+                        bid=loser_bid,
+                        label=loser,
+                        slug=intent.get("slug"),
+                        tol=tol,
+                        depth_bids=books.get(loser),
+                        depth_path="loser",
+                        depth_leg=loser,
+                        ttm_s=ttm_s,
+                        condition_id=cid,
+                    )
                 intent["sell_attempts"] = int(intent.get("sell_attempts") or 0) + 1
                 intent["sell_last_status"] = last_status
                 done = dry_run or sold_total >= size - tol
@@ -1429,24 +1521,71 @@ def manage_sells(cfg: dict, state: dict, chain: ChainReader) -> None:
     if dirty:
         atomic_save(STATE_FILE, state)
 
-def run_cycle(
+def _claim_mint_intent(
+    state: dict,
+    condition_id: str,
+    intent: dict,
+    cfg: dict,
+    now: float,
+    candidate_start_ts: float,
+) -> Optional[str]:
+    """Under STATE_LOCK: refuse if already minted or slots full; else write intent."""
+    if already_minted(state, condition_id, cfg, now):
+        return "already_minted"
+    if mint_slots_full(state, cfg, now, float(candidate_start_ts)):
+        return "capped_open"
+    store = _intent_store
+    if store is not None:
+        claimed = store.try_claim_condition(
+            condition_id,
+            intent,
+            is_blocked=lambda current: already_minted(
+                {"intents": {condition_id: current}} if current else {"intents": {}},
+                condition_id,
+                cfg,
+                now,
+            ),
+        )
+        if not claimed:
+            return "already_minted"
+        return None
+    state.setdefault("intents", {})[condition_id] = intent
+    return None
+
+
+def run_sell_cycle(cfg: dict, state: dict, chain: ChainReader) -> str:
+    """Sell-only tick. Never waits on Gamma / relayer / mint precheck."""
+    if STOP_FILE.exists():
+        write_loop_heartbeat("sell", "stopped")
+        return "stopped"
+    try:
+        manage_sells(cfg, state, chain)
+    except Exception as sell_exc:
+        log_event("sell_cycle_error", error=str(sell_exc)[:240])
+        write_loop_heartbeat("sell", "error", error=str(sell_exc)[:120])
+        return "error"
+    with STATE_LOCK:
+        hot = skip_mint_discovery_for_sell(state, time.time())
+    write_loop_heartbeat("sell", "hot" if hot else "idle")
+    return "hot" if hot else "idle"
+
+
+def run_mint_cycle(
     cfg: dict,
     state: dict,
     gateway: MarketGateway,
     chain: ChainReader,
 ) -> str:
+    """Discover / reconcile / mint. Sell ticks live on the sibling loop."""
     now = time.time()
-    try:
-        manage_sells(cfg, state, chain)
-    except Exception as sell_exc:
-        log_event("sell_cycle_error", error=str(sell_exc)[:240])
     if STOP_FILE.exists():
-        write_heartbeat("stopped")
+        write_loop_heartbeat("mint", "stopped")
         return "stopped"
 
-    sell_armed = skip_mint_discovery_for_sell(state, now)  # any sell_intent_hot
     funder = os.getenv("FUNDER_ADDRESS") or ""
     if funder:
+        with STATE_LOCK:
+            sell_armed = skip_mint_discovery_for_sell(state, now)
         reconcile_intents(
             state,
             cfg,
@@ -1455,32 +1594,26 @@ def run_cycle(
             now,
             skip_confirmed_inventory=sell_armed,
         )
-        atomic_save(STATE_FILE, state)
+        with STATE_LOCK:
+            atomic_save(STATE_FILE, state)
 
-    if any(
-        intent.get("status") == "submitting"
-        for intent in state.get("intents", {}).values()
-    ):
-        write_heartbeat("wait_submit")
+    with STATE_LOCK:
+        submitting = any(
+            intent.get("status") == "submitting"
+            for intent in state.get("intents", {}).values()
+        )
+    if submitting:
+        write_loop_heartbeat("mint", "wait_submit")
         return "wait_submit"
 
-    # While loser armed and mint would be capped_open, skip Gamma so
-    # sell_armed_poll_s is the real period. Adjacent slot still discovers.
-    if skip_mint_discovery_when_armed_and_capped(
-        loser_armed=sell_armed,
-        mint_capped=mint_discovery_capped(state, cfg, now),
-    ):
-        write_heartbeat("sell_armed")
-        return "sell_armed"
-
     if not cfg.get("entry_enabled"):
-        write_heartbeat("disabled")
+        write_loop_heartbeat("mint", "disabled")
         return "disabled"
 
     markets = gateway.discover(list(cfg["series_slugs"]))
     candidates = eligible_markets(markets, cfg, now)
     if not candidates:
-        write_heartbeat("idle", markets=len(markets), eligible=0)
+        write_loop_heartbeat("mint", "idle", markets=len(markets), eligible=0)
         return "idle"
 
     data_positions: Dict[str, float] = {}
@@ -1492,27 +1625,31 @@ def run_cycle(
 
     tol = float(cfg["position_tolerance"])
     pick: Optional[MintMarket] = None
-    for market in candidates:
-        if already_minted(state, market.condition_id, cfg, now):
-            continue
-        if float(data_positions.get(market.up_token, 0)) > tol:
-            continue
-        if float(data_positions.get(market.dn_token, 0)) > tol:
-            continue
-        pick = market
-        break
+    with STATE_LOCK:
+        for market in candidates:
+            if already_minted(state, market.condition_id, cfg, now):
+                continue
+            if float(data_positions.get(market.up_token, 0)) > tol:
+                continue
+            if float(data_positions.get(market.dn_token, 0)) > tol:
+                continue
+            pick = market
+            break
 
-    if pick is None:
-        write_heartbeat("idle", markets=len(markets), eligible=len(candidates), reason="owned")
-        return "idle_owned"
+        if pick is None:
+            write_loop_heartbeat(
+                "mint", "idle", markets=len(markets), eligible=len(candidates), reason="owned"
+            )
+            return "idle_owned"
 
-    if mint_slots_full(state, cfg, now, float(pick.start_ts)):
-        write_heartbeat(
-            "capped_open",
-            open=open_intent_count(state),
-            next_start=float(pick.start_ts),
-        )
-        return "capped_open"
+        if mint_slots_full(state, cfg, now, float(pick.start_ts)):
+            write_loop_heartbeat(
+                "mint",
+                "capped_open",
+                open=open_intent_count(state),
+                next_start=float(pick.start_ts),
+            )
+            return "capped_open"
 
     shares = float(cfg["shares"])
     mts = pick.minutes_to_start(now)
@@ -1530,8 +1667,7 @@ def run_cycle(
             opens_in_min=round(mts, 2),
             question=pick.question,
         )
-        # Record dry intent so we don't spam the same market every poll.
-        state.setdefault("intents", {})[pick.condition_id] = {
+        dry_intent = {
             "created_at": now,
             "updated_at": now,
             "status": "completed",
@@ -1546,8 +1682,16 @@ def run_cycle(
             "up_token": pick.up_token,
             "dn_token": pick.dn_token,
         }
-        atomic_save(STATE_FILE, state)
-        write_heartbeat("dry_mint", slug=pick.slug)
+        with STATE_LOCK:
+            reason = _claim_mint_intent(
+                state, pick.condition_id, dry_intent, cfg, now, float(pick.start_ts)
+            )
+            if reason is None:
+                atomic_save(STATE_FILE, state)
+        if reason is not None:
+            write_loop_heartbeat("mint", reason, slug=pick.slug)
+            return reason
+        write_loop_heartbeat("mint", "dry_mint", slug=pick.slug)
         return "dry_mint"
 
     if not funder:
@@ -1568,7 +1712,7 @@ def run_cycle(
                 f"  [dim red][SKIP][/] insufficient pUSD  bal={balance:.2f} need={shares:.2f}"
             )
             log_event("mint_skip_balance", balance=balance, need=shares)
-            write_heartbeat("no_balance", balance=balance)
+            write_loop_heartbeat("mint", "no_balance", balance=balance)
             return "no_balance"
         before_up = chain.position_balance(str(cfg["ctf_address"]), funder_cs, pick.up_token)
         before_dn = chain.position_balance(str(cfg["ctf_address"]), funder_cs, pick.dn_token)
@@ -1591,35 +1735,42 @@ def run_cycle(
         condition_id=pick.condition_id,
         shares=shares,
     )
-    prev = state.get("intents", {}).get(pick.condition_id) or {}
-    try:
-        prev_attempts = int(prev.get("mint_attempts") or 0)
-    except (TypeError, ValueError):
-        prev_attempts = 0
-    intent = {
-        "created_at": float(prev.get("created_at") or now),
-        "updated_at": now,
-        "submitted_at": 0.0,
-        "status": "submitting",
-        "condition_id": pick.condition_id,
-        "slug": pick.slug,
-        "question": pick.question,
-        "series_slug": pick.series_slug,
-        "start_ts": pick.start_ts,
-        "end_ts": pick.end_ts,
-        "up_token": pick.up_token,
-        "dn_token": pick.dn_token,
-        "shares": shares,
-        "before_up": before_up,
-        "before_dn": before_dn,
-        "transaction_id": None,
-        "dry_run": False,
-        "mint_attempts": prev_attempts + 1,
-        "last_fail_ts": prev.get("last_fail_ts"),
-        "errorMsg": prev.get("errorMsg"),
-    }
-    state.setdefault("intents", {})[pick.condition_id] = intent
-    atomic_save(STATE_FILE, state)
+    with STATE_LOCK:
+        prev = state.get("intents", {}).get(pick.condition_id) or {}
+        try:
+            prev_attempts = int(prev.get("mint_attempts") or 0)
+        except (TypeError, ValueError):
+            prev_attempts = 0
+        intent = {
+            "created_at": float(prev.get("created_at") or now),
+            "updated_at": now,
+            "submitted_at": 0.0,
+            "status": "submitting",
+            "condition_id": pick.condition_id,
+            "slug": pick.slug,
+            "question": pick.question,
+            "series_slug": pick.series_slug,
+            "start_ts": pick.start_ts,
+            "end_ts": pick.end_ts,
+            "up_token": pick.up_token,
+            "dn_token": pick.dn_token,
+            "shares": shares,
+            "before_up": before_up,
+            "before_dn": before_dn,
+            "transaction_id": None,
+            "dry_run": False,
+            "mint_attempts": prev_attempts + 1,
+            "last_fail_ts": prev.get("last_fail_ts"),
+            "errorMsg": prev.get("errorMsg"),
+        }
+        reason = _claim_mint_intent(
+            state, pick.condition_id, intent, cfg, now, float(pick.start_ts)
+        )
+        if reason is None:
+            atomic_save(STATE_FILE, state)
+    if reason is not None:
+        write_loop_heartbeat("mint", reason, slug=pick.slug)
+        return reason
 
     console.print(
         Panel(
@@ -1643,33 +1794,51 @@ def run_cycle(
     )
 
     tx_id, err = submit_mint_batch(calls, metadata=f"mintbot:split:{pick.condition_id}:{int(now)}")
-    intent = state["intents"][pick.condition_id]
-    intent["updated_at"] = time.time()
+    with STATE_LOCK:
+        intent = state["intents"][pick.condition_id]
+        intent["updated_at"] = time.time()
+        if not tx_id:
+            mark_intent_failed(intent, time.time(), error_msg=str(err or ""))
+            atomic_save(STATE_FILE, state)
+            fail_msg = intent.get("errorMsg")
+        else:
+            intent["transaction_id"] = tx_id
+            intent["submitted_at"] = time.time()
+            intent["status"] = "pending"
+            atomic_save(STATE_FILE, state)
+            fail_msg = None
     if not tx_id:
-        mark_intent_failed(intent, time.time(), error_msg=str(err or ""))
-        atomic_save(STATE_FILE, state)
         console.print(f"  [dim red][MINT FAIL][/] {err}")
         log_event(
             "mint_submit_fail",
             condition_id=pick.condition_id,
             error=err,
-            errorMsg=intent.get("errorMsg"),
+            errorMsg=fail_msg,
         )
         notify("Mint submit failed", f"{pick.slug}\n{err}", priority="high")
-        write_heartbeat("submit_fail")
+        write_loop_heartbeat("mint", "submit_fail")
         return "submit_fail"
 
-    intent["transaction_id"] = tx_id
-    intent["submitted_at"] = time.time()
-    intent["status"] = "pending"
-    atomic_save(STATE_FILE, state)
     console.print(f"  [bold bright_green][MINT ▶][/] tx={tx_id[:18]}…")
     log_event("mint_submitted", condition_id=pick.condition_id, transaction_id=tx_id)
     notify("Mint submitted", f"{pick.slug}\n{shares:.0f} sets · {tx_id[:18]}…", priority="default")
-    write_heartbeat("submitted", slug=pick.slug)
+    write_loop_heartbeat("mint", "submitted", slug=pick.slug)
     return "submitted"
 
+
+def _reload_cfg(cfg_box: Dict[str, Any]) -> dict:
+    try:
+        loaded = load_strategy()
+    except Exception as exc:
+        log_event("strategy_reload_fail", error=str(exc)[:200])
+        current = cfg_box.get("cfg") or {}
+        loaded = {**current, "entry_enabled": False}
+    cfg_box["cfg"] = loaded
+    return loaded
+
+
 def main() -> int:
+    global _intent_store
     signal.signal(signal.SIGINT, _signal_handler)
     signal.signal(signal.SIGTERM, _signal_handler)
     log_setup()
@@ -1682,12 +1851,15 @@ def main() -> int:
         return 1
 
     state = load_state()
+    _intent_store = IntentStore(state, lock=STATE_LOCK)
     gateway = MarketGateway(
         gamma_url=str(cfg["gamma_url"]),
         data_api_url=str(cfg["data_api_url"]),
         discover_cache_s=8.0,
     )
-    chain = ChainReader(str(cfg["rpc_url"]))
+    sell_chain = ChainReader(str(cfg["rpc_url"]))
+    mint_chain = ChainReader(str(cfg["rpc_url"]))
+    cfg_box: Dict[str, Any] = {"cfg": cfg}
 
     console.print(
         Panel(
@@ -1696,7 +1868,8 @@ def main() -> int:
                 f"[dim]shares={cfg['shares']} · not-yet-open · opens within "
                 f"{cfg['enter_max_ttm_min']}m · "
                 f"dry_run={cfg['dry_run']} · entry_enabled={cfg['entry_enabled']}[/]\n"
-                "[dim]atomic mint · loser sell ladder 3c->2c · keep winner[/]",
+                "[dim]atomic mint · loser sell ladder 3c->2c · keep winner[/]\n"
+                "[dim]sell loop ⊥ mint/discover loop[/]",
                 vertical="middle",
             ),
             title="[bold]polymintbot[/]",
@@ -1716,26 +1889,53 @@ def main() -> int:
         shares=cfg["shares"],
         max_ttm=cfg["enter_max_ttm_min"],
         series=cfg["series_slugs"],
+        loops=("sell", "mint"),
     )
 
-    while not _shutdown:
-        try:
-            cfg = load_strategy()
-        except Exception as exc:
-            log_event("strategy_reload_fail", error=str(exc)[:200])
-            # Fail closed on entries; keep reconciling with last-good cfg if any.
-            cfg = {**cfg, "entry_enabled": False}
+    def should_stop() -> bool:
+        return _shutdown or STOP_FILE.exists()
 
-        try:
-            status = run_cycle(cfg, state, gateway, chain)
-            if status not in ("idle", "idle_owned", "disabled", "wait_submit", "sell_armed"):
-                log_event("cycle", status=status)
-        except Exception as exc:
-            log_event("cycle_error", error=str(exc)[:300])
-            console.print(f"[red]cycle_error[/] {exc}")
-            write_heartbeat("error", error=str(exc)[:120])
+    def sell_tick() -> None:
+        current = _reload_cfg(cfg_box)
+        status = run_sell_cycle(current, state, sell_chain)
+        if status not in ("idle", "hot", "stopped"):
+            log_event("sell_cycle", status=status)
 
-        time.sleep(cycle_sleep_s(cfg, state, time.time()))
+    def mint_tick() -> None:
+        current = _reload_cfg(cfg_box)
+        status = run_mint_cycle(current, state, gateway, mint_chain)
+        if status not in ("idle", "idle_owned", "disabled", "wait_submit"):
+            log_event("cycle", status=status)
+
+    def sell_sleep() -> float:
+        current = cfg_box.get("cfg") or cfg
+        with STATE_LOCK:
+            return cycle_sleep_s(current, state, time.time())
+
+    def mint_sleep() -> float:
+        current = cfg_box.get("cfg") or cfg
+        return mint_cycle_sleep_s(current)
+
+    sell_thread, mint_thread = start_mint_sell_loops(
+        sell_tick=sell_tick,
+        sell_sleep_s=sell_sleep,
+        mint_tick=mint_tick,
+        mint_sleep_s=mint_sleep,
+        should_stop=should_stop,
+        on_sell_error=lambda exc: (
+            log_event("sell_cycle_error", error=str(exc)[:300]),
+            write_loop_heartbeat("sell", "error", error=str(exc)[:120]),
+        ),
+        on_mint_error=lambda exc: (
+            log_event("cycle_error", error=str(exc)[:300]),
+            console.print(f"[red]cycle_error[/] {exc}"),
+            write_loop_heartbeat("mint", "error", error=str(exc)[:120]),
+        ),
+    )
+    while not should_stop():
+        time.sleep(0.25)
+    sell_thread.join(timeout=5)
+    mint_thread.join(timeout=5)
 
     console.print("[dim]mintbot stopped[/]")
     try:

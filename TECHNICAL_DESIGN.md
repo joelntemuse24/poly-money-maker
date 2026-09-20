@@ -28,7 +28,8 @@ Read Parts I and II straight through. Part III walks mint and sell. Part IV cove
   - [JSON as durable memory](#section-8)
 - [Part III — Walking mintbot.py](#part-iii)
   - [Startup, lock, strategy load](#section-9)
-  - [The cycle: sells first, then mint](#section-10)
+  - [Two loops: sell vs mint/discover](#section-10)
+  - [Sync-loop audit](#section-10b)
   - [Eligibility: not-yet-open 15m windows](#section-11)
   - [Capacity: max_open_sets=1 and adjacent lookahead](#section-12)
   - [already_minted: failed remint after cooldown](#section-13)
@@ -121,6 +122,7 @@ strategy_mint.example.json
 positions_mint.json     # LIVE state (gitignored)
 buy/
   mint_sell.py          # pure sell policy (persist, classify, ladders)
+  mint_loops.py         # concurrent sell vs mint jobs + intent claim
   market.py             # Gamma/CLOB discovery → MintMarket
   book.py               # sized top-of-book
   chain.py              # eth_call balances / prechecks
@@ -132,7 +134,7 @@ tests/                  # unit tests; do not import mintbot.py wholesale
 CURRENT.md / AGENTS.md / TECHNICAL_DESIGN.md
 ```
 
-Reading order for a new engineer: this file Parts I–II, then `buy/mint_sell.py`, then `manage_sells` and `run_cycle` in `mintbot.py`, then `CURRENT.md` for today’s knobs.
+Reading order for a new engineer: this file Parts I–II, then `buy/mint_sell.py` and `buy/mint_loops.py`, then `manage_sells` / `run_sell_cycle` / `run_mint_cycle` in `mintbot.py`, then `CURRENT.md` for today’s knobs.
 
 <a id="part-ii"></a>
 # Part II — Ideas the code assumes
@@ -224,24 +226,52 @@ Statuses move roughly: `submitting` → `pending`/`executed`/`mined` → `confir
 <a id="section-9"></a>
 ## Startup, lock, strategy load
 
-`main()` installs signal handlers, acquires `.mintbot.lock`, loads `strategy_mint.json` merged over `DEFAULTS`, validates knobs, constructs market gateway + chain reader, then loops: reload strategy → `run_cycle` → sleep `poll_s` (live 5s), or `sell_armed_poll_s` (2s, allowed below the `poll_s >= 2` floor) while a loser persist arm is live. Armed poll does **not** shorten `sell_persist_s`. Live bag `btc-updown-15m-1789880400`: sell ticks were ≈8.6–10.5s (`poll_s` plus manage_sells/reconcile/discover); persist-ready FAK uses the same tick's book (no extra refetch). That bag's DN bid vanished +1.5s after arm and never returned — miss was empty-book on the first post-ready look plus coarse tick. ROI is catching fleeting 2¢ books after persist.
+`main()` installs signal handlers, acquires `.mintbot.lock`, loads `strategy_mint.json` merged over `DEFAULTS`, validates knobs, constructs market gateway + two chain readers, then starts **two threads**: `run_sell_cycle` and `run_mint_cycle`. Sell sleeps `poll_s` (live 5s), or `sell_armed_poll_s` (2s, allowed below the `poll_s >= 2` floor) while a bag is sell-hot (loser armed, or loser sold and dump/winner not done). Mint always sleeps `poll_s`. Armed poll does **not** shorten `sell_persist_s`. Shared intent writes take `STATE_LOCK`; book / FAK / Gamma / relayer / RPC stay outside that lock.
+
+Incident `btc-updown-15m-1789905600`: after `loser_done`, next-window mint ran on the same thread and delayed the first dump look ~16s while UP cliffed 97→31. A skip-Gamma bandage (draft PR #193) is unnecessary once the loops are independent. Live bag `btc-updown-15m-1789880400`: sell ticks were ≈8.6–10.5s (`poll_s` plus manage_sells/reconcile/discover) on the old serial cycle; persist-ready FAK uses the same tick's book (no extra refetch).
 
 `dry_run=true` must not submit mints or live sells. Live VM has `dry_run=false`, `entry_enabled=true`, `sell_enabled=true`.
 
 <a id="section-10"></a>
-## The cycle: sells first, then mint
+## Two loops: sell vs mint/discover
 
-Each `run_cycle`:
+Sell and mint are independent jobs (`buy/mint_loops.py`). They share `positions_mint.json` through `STATE_LOCK` / `IntentStore.try_claim_condition`. Neither loop awaits the other's I/O.
 
-1. **`manage_sells`** (always attempted first if `sell_enabled`) — can free capacity by marking `sold_loser`.
-2. Reconcile open relayer intents / inventory (skip confirmed inventory RPC while a loser is armed).
-3. If a loser persist arm is live **and** mint would be `capped_open` (adjacent window already held) → return `sell_armed` (skip Gamma so `sell_armed_poll_s` is the real period). Adjacent slot still discovers.
-4. If entry disabled → return.
-5. Discover series markets; filter eligible; skip `already_minted`; skip owned tokens.
-6. Pick earliest eligible; if `mint_slots_full(..., pick.start_ts)` → capped.
-7. Daily notional cap; balance precheck; build approve+split; `submit_mint_batch`; record intent.
+**Sell loop** (`run_sell_cycle`):
 
-Sells-before-mint matters: selling the loser can clear the `max_open_sets` blocker for the adjacent window.
+1. `manage_sells` if `sell_enabled` — books, persist, FAK. Releases the state lock around book GET / inventory RPC / FAK POST.
+2. Heartbeat `hot` or `idle`. Sleep `cycle_sleep_s` (2s while sell-hot).
+
+**Mint loop** (`run_mint_cycle`):
+
+1. Reconcile open relayer intents / inventory (RPC outside the lock; skip confirmed inventory RPC while a bag is sell-hot to save RPC, not to unblock sell).
+2. If any intent is `submitting` → wait; if entry disabled → return.
+3. Discover series markets; filter eligible; skip `already_minted`; skip owned tokens.
+4. Pick earliest eligible; if `mint_slots_full(..., pick.start_ts)` → capped.
+5. Balance precheck (no lock); then claim `submitting` under the lock (`already_minted` + slots + same-slug claim); `submit_mint_batch`; record pending/failed.
+
+`sold_loser` still frees the `max_open_sets` slot. The mint loop can claim the adjacent window **while** the sell loop starts dump persist on the previous bag. Do not skip Gamma because a bag is hot.
+
+<a id="section-10b"></a>
+## Sync-loop audit (same class as mint stealing the dump cycle)
+
+| Hole | Severity | Status |
+|---|---|---|
+| Serial `manage_sells → Gamma/mint/submit → sleep` (incident 1789905600, ~16s dump delay) | Critical | **Fixed** — two loops |
+| Relayer poll + inventory RPC on the sell thread | High | **Fixed** — mint loop; I/O off the lock |
+| Shared sleep after `loser_done` (dump went cold, `poll_s=5`) | High | **Fixed** — sell stays hot through dump/winner exit |
+| Skip-mint-while-hot (draft PR #193) | Architecture reject | **Not used** — mint proceeds concurrently |
+| `notify()` sync 5s ntfy POST on the tick | Medium | **Fixed** — thread pool |
+| Multi-intent serial in `manage_sells` (N dump FAK then N+1 books) | Medium | Leftover — one intent's FAK can delay the other's look |
+| Sequential chain prechecks (5+ RPCs) | Low-Med | Leftover — mint-only latency |
+| Relayer submit/poll timeouts 15–20s | Low-Med | Leftover — mint-only; sell continues |
+| CLOB `update_balance_allowance` on every FAK | Low | Leftover — extra ~100ms on fire |
+| `atomic_save` fsync every dirty sell tick | Low | Leftover — disk sync |
+| Data API `positions` after Gamma | Low | Leftover — mint-only |
+| Sequential reconcile per pending intent | Low | Leftover — mint-only |
+| pathlog JSONL / Gamma I/O | n/a | Separate process; does not block mintbot |
+| Redeem vs sell | n/a | No automated redeem; sells stop at `end_ts` |
+| Sequential UP/DN `/book` | Already fixed | Parallel `ThreadPoolExecutor` |
 
 <a id="section-11"></a>
 ## Eligibility: not-yet-open 15m windows
@@ -424,6 +454,7 @@ Observed failure modes: (1) winner armed at bid 0.99 but FAK posted 0.999 → `i
 | Module | Owner of |
 |---|---|
 | `mintbot.py` | Process, knobs merge, relayer, CLOB sells, state file |
+| `buy/mint_loops.py` | Concurrent sell/mint job runner + same-slug claim |
 | `buy/mint_sell.py` | Pure sell policy |
 | `buy/market.py` | Discovery / `MintMarket` |
 | `buy/book.py` | Sized BBO parse |
@@ -487,8 +518,8 @@ From VM `strategy_mint.json`:
 | `mint_fail_cooldown_s` | 90 | Wait after `failed` before remint |
 | `mint_max_attempts` | 3 | Total mint tries per market |
 | `max_daily_notional` | 100 | Daily mint spend cap |
-| `poll_s` | 5 | Cycle sleep when no loser arm |
-| `sell_armed_poll_s` | 2 | Cycle sleep while loser is armed (not persist; code default, not yet in live JSON) |
+| `poll_s` | 5 | Mint-loop sleep; sell-loop sleep when not hot |
+| `sell_armed_poll_s` | 2 | Sell-loop sleep while sell-hot (not persist; code default, not yet in live JSON) |
 | `sell_enabled` | true | Enable manage_sells |
 | `sell_threshold` / `sell_floor` | 0.03 / 0.02 | Loser ladder |
 | `sell_opposite_min` | 0.90 | Opposite must be rich |
@@ -526,6 +557,7 @@ Do not import `mintbot.py` in unit tests (credentials, lock, clients). Test `buy
 6. **Sells stop at `end_ts`** — no dump/cash-out after expiry in `manage_sells`; redeem is the remaining path.
 7. **Importing mintbot in tests** — can take the flock or load `.env`.
 8. **Confusing mint with buybot docs** — old hourly TDD describes a different money path.
+9. **Re-serializing sell and mint** — do not fold them back into one `manage_sells → discover → sleep` cycle. That is the 1789905600 hole. Draft PR #193 skip-mint is not the fix.
 
 <a id="section-33"></a>
 ## Glossary
@@ -561,30 +593,25 @@ Do not import `mintbot.py` in unit tests (credentials, lock, clients). Test `buy
 # Appendix A — Cycle pseudocode (faithful to live control flow)
 
 ```
-every poll_s seconds (sell_armed_poll_s while a loser arm is live):
-  cfg = load_strategy()                  # merge strategy_mint.json over DEFAULTS
-  manage_sells(cfg, state, chain)        # may set sold_loser / sold_winner / sold_dump
-  reconcile_intents(...)                 # relayer poll + inventory confirm
+sell loop (cycle_sleep_s: poll_s, or sell_armed_poll_s while sell-hot):
+  cfg = load_strategy()
+  manage_sells(cfg, state, chain)        # lock around intent writes; I/O unlocked
 
-  if loser armed and mint would be capped_open:
-      return "sell_armed"               # skip Gamma; persist knobs unchanged
+mint loop (always poll_s):
+  cfg = load_strategy()
+  reconcile_intents(...)                 # relayer/RPC outside lock
   if not cfg.entry_enabled: return "disabled"
-
   markets = gateway.discover(cfg.series_slugs)
   candidates = eligible_markets(markets, cfg, now)   # NOT YET OPEN, within TTM band
   pick = first candidate where:
            not already_minted(condition_id, now)     # failed remints after cooldown
            and wallet does not already hold tokens
   if no pick: return "idle"
-
   if mint_slots_full(state, cfg, now, pick.start_ts): return "capped_open"
-  if daily_spent + shares > max_daily_notional: return "capped_daily"
-
-  precheck balances / contracts
-  calls = build approve + split(shares)
-  tx_id, err = submit_mint_batch(calls)
-  if err: status=failed; return
-  persist intent{status=pending, start_ts, end_ts, up/dn tokens, shares, tx_id}
+  precheck balances / contracts          # no lock
+  claim submitting under STATE_LOCK      # already_minted + slots + same-slug
+  tx_id, err = submit_mint_batch(calls)  # no lock
+  persist pending / failed
 ```
 
 <a id="appendix-b"></a>
@@ -688,7 +715,7 @@ operator/systemd          mintbot               Gamma/CLOB         Relayer      
       |                      | load strategy_mint   |                  |                   |
       |                      | flock .mintbot.lock  |                  |                   |
       |                      |                      |                  |                   |
-      |                      | every poll_s (~5s)   |                  |                   |
+      |                      | sell loop ⊥ mint loop|                  |                   |
       |                      |---- manage_sells --->| sized bids       |                   |
       |                      |<---------------------|                  |                   |
       |                      |---- reconcile ------>|                  | get tx state      |
