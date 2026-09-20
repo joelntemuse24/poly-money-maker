@@ -11,10 +11,11 @@ last ``sell_persist_last_min_window_s`` (~60s) before ``end_ts``, while the
 opposite bid is ≥ ~90¢, then FAK 3¢ → 2¢ when the live sized bid is at/over
 the floor, or at the live bid if it is below the floor. Keep the winner for
 redeem unless its bid reaches ~99.9¢. Off unless live ``strategy_mint.json``
-turns it on. While a loser persist arm is live, the cycle sleeps
-``sell_armed_poll_s`` (~2s, allowed below the ``poll_s >= 2`` floor) so
+turns it on. While sell is hot (loser persist arm, or after sold_loser
+until dump/winner exit), the cycle sleeps ``sell_armed_poll_s`` (~2s,
+allowed below the ``poll_s >= 2`` floor) and skips Gamma/mint so
 persist-ready FAK is not delayed by ``poll_s`` plus Gamma (~8.6–10.5s
-ticks on live VM). Persist knobs stay 9/5/60.
+ticks on live VM) or by adjacent-window mint. Persist knobs stay 9/5/60.
 
 Usage:
   # dry-run (default when strategy_mint.json has dry_run true / entry_enabled false)
@@ -64,7 +65,6 @@ from buy.mint_sell import (
     persist_ready,
     sell_window_open,
     skip_mint_discovery_for_sell,
-    skip_mint_discovery_when_armed_and_capped,
     winner_cashout_leg,
     winner_cheap_decision,
     winner_sell_limit,
@@ -1464,12 +1464,10 @@ def run_cycle(
         write_heartbeat("wait_submit")
         return "wait_submit"
 
-    # While loser armed and mint would be capped_open, skip Gamma so
-    # sell_armed_poll_s is the real period. Adjacent slot still discovers.
-    if skip_mint_discovery_when_armed_and_capped(
-        loser_armed=sell_armed,
-        mint_capped=mint_discovery_capped(state, cfg, now),
-    ):
+    # While sell is hot, skip Gamma so sell_armed_poll_s is the real period.
+    # Do not require capped_open: sold_loser frees the slot and adjacent mint
+    # stole dump persist (bag btc-updown-15m-1789905600).
+    if sell_armed:
         write_heartbeat("sell_armed")
         return "sell_armed"
 

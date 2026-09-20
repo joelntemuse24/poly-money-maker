@@ -38,7 +38,8 @@ DEFAULT_SELL_KNOBS = {
     "sell_dump_below": 0.80,
     "sell_dump_persist_s": 5.0,
     "sell_min_bid_size": 1.0,
-    # Cycle sleep while a loser persist arm is live. Does not change persist_s.
+    # Cycle sleep while sell is hot (loser arm through dump/winner exit).
+    # Does not change persist_s.
     "sell_armed_poll_s": 2.0,
 }
 
@@ -144,15 +145,25 @@ _SELL_HOT_STATUSES = (
 
 
 def sell_intent_hot(intent: Any, now_s: float) -> bool:
-    """True when this intent has an unsold loser persist arm in the window.
+    """True while this intent still needs fast sell ticks in the window.
+
+    Hot when the window is open and any of: loser persist arm is live and
+    the loser is unsold; ``sold_loser`` / ``sold_leg`` and the held-leg dump
+    or winner cash-out is not done (``sold_dump`` / ``sold_winner``); dump
+    persist arm is live and dump is not done.
 
     Live audit (bag ``btc-updown-15m-1789880400``): ``poll_s=5`` plus
     manage_sells/reconcile/discover made sell ticks ≈8.6–10.5s. Persist
     ready is +9s; first post-ready look was empty_keep_arm at +10.7s.
     Miss = empty book on that look + coarse tick, not a stuck POST.
-    Same-tick FAK already uses the fetched book. Faster sleep while the
-    loser is armed (``sell_armed_poll_s``, default 2s) is so a fleeting
-    2¢ bid between arms can be posted after persist, not to shorten persist.
+    Same-tick FAK already uses the fetched book. Faster sleep
+    (``sell_armed_poll_s``, default 2s) is so a fleeting 2¢ bid between
+    arms can be posted after persist, not to shorten persist.
+
+    Bag ``btc-updown-15m-1789905600``: after ``sold_loser`` the old hot
+    check returned False, sleep went back to ``poll_s=5``, and adjacent
+    mint stole the cycle (loser_done 13:13:14 → first dump arm 13:13:30).
+    Dump persist is 5s; stay hot until dump/winner exit so that gap dies.
     """
     if not isinstance(intent, dict):
         return False
@@ -160,13 +171,22 @@ def sell_intent_hot(intent: Any, now_s: float) -> bool:
         return False
     if not sell_window_open(now_s, float(intent.get("end_ts") or 0)):
         return False
-    if intent.get("sold_loser") or intent.get("sold_leg"):
-        return False
-    return intent.get("sell_loser_armed_at") is not None
+    sold_loser = bool(intent.get("sold_loser") or intent.get("sold_leg"))
+    # manage_sells treats sold_winner as held-leg already exited (dump skip).
+    sold_exit = bool(intent.get("sold_dump") or intent.get("sold_winner"))
+    loser_armed = intent.get("sell_loser_armed_at") is not None
+    dump_armed = intent.get("sell_dump_armed_at") is not None
+    if loser_armed and not sold_loser:
+        return True
+    if sold_loser and not sold_exit:
+        return True
+    if dump_armed and not sold_exit:
+        return True
+    return False
 
 
 def skip_mint_discovery_for_sell(state: Any, now_s: float) -> bool:
-    """True when any open intent still has an unsold loser arm."""
+    """True when any open intent is still in the sell hot-poll window."""
     intents = (state or {}).get("intents") or {}
     if not isinstance(intents, dict):
         return False
@@ -178,17 +198,18 @@ def skip_mint_discovery_when_armed_and_capped(
     loser_armed: bool,
     mint_capped: bool,
 ) -> bool:
-    """Defer Gamma/mint only when a loser is armed *and* mint is capped.
+    """Defer Gamma/mint while sell is hot; ``mint_capped`` is unused.
 
-    Adjacent-window mint stays available while the current loser is unsold
-    unless we already hold that next window (``capped_open``). Empty-keep-arm
-    must not skip that path.
+    Adjacent mint used to stay available unless ``capped_open``. After
+    ``sold_loser`` the slot is free, so that mint stole dump persist
+    (bag ``btc-updown-15m-1789905600``). Hot poll skips discovery
+    regardless of cap.
     """
-    return bool(loser_armed) and bool(mint_capped)
+    return bool(loser_armed)
 
 
 def cycle_sleep_s(cfg: Any, state: Any, now_s: float) -> float:
-    """``poll_s`` normally; ``min(poll_s, sell_armed_poll_s)`` while loser armed.
+    """``poll_s`` normally; ``min(poll_s, sell_armed_poll_s)`` while sell hot.
 
     Missing/invalid ``sell_armed_poll_s`` keeps ``poll_s`` so persist math is
     never replaced by the armed interval. Armed poll may be below the

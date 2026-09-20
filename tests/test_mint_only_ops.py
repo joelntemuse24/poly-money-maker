@@ -490,7 +490,7 @@ class DeployUnitsTests(unittest.TestCase):
         )
         self.assertNotIn("if bal + 1e-9 < tol:", src)
 
-    def test_sell_armed_poll_skips_capped_mint_path_without_changing_persist(self):
+    def test_sell_armed_poll_skips_mint_path_without_changing_persist(self):
         src = MINT.read_text()
         defaults = _assign("DEFAULTS")
         example = json.loads(MINT_EXAMPLE.read_text())
@@ -500,6 +500,7 @@ class DeployUnitsTests(unittest.TestCase):
         self.assertEqual(example["sell_persist_s"], 9.0)
         self.assertEqual(example["sell_persist_last_min_s"], 5.0)
         self.assertEqual(example["sell_persist_last_min_window_s"], 60.0)
+        self.assertEqual(example["sell_dump_persist_s"], 5.0)
         self.assertEqual(defaults["poll_s"], 5.0)
         self.assertEqual(defaults["sell_armed_poll_s"], 2.0)
         self.assertGreaterEqual(float(defaults["poll_s"]), 2.0)
@@ -507,13 +508,17 @@ class DeployUnitsTests(unittest.TestCase):
 
         cycle = src[src.find("def run_cycle") : src.find("\ndef main")]
         self.assertIn("skip_mint_discovery_for_sell", cycle)
-        self.assertIn("skip_mint_discovery_when_armed_and_capped", cycle)
-        self.assertIn("mint_discovery_capped", cycle)
         self.assertLess(
-            cycle.find("skip_mint_discovery_when_armed_and_capped"),
+            cycle.find("skip_mint_discovery_for_sell"),
             cycle.find("gateway.discover"),
         )
-        self.assertIn('return "sell_armed"', cycle)
+        skip_to_discover = cycle[
+            cycle.find("skip_mint_discovery_for_sell") : cycle.find("gateway.discover")
+        ]
+        self.assertIn('return "sell_armed"', skip_to_discover)
+        # Post-loser mint raced dump (bag 1789905600); hot skip must not
+        # require capped_open.
+        self.assertNotIn("mint_discovery_capped", skip_to_discover)
         self.assertIn("skip_confirmed_inventory", src)
         self.assertIn("_fetch_books", src)
         self.assertIn("ThreadPoolExecutor", src)
