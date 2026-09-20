@@ -526,7 +526,7 @@ class DeployUnitsTests(unittest.TestCase):
         self.assertIn("cycle_sleep_s", main)
         self.assertIn("mint_cycle_sleep_s", main)
         self.assertIn("sell_armed_poll_s", src)
-        self.assertIn("sell_intent_hot", src)
+        self.assertIn("skip_mint_discovery_for_sell", src)
         self.assertNotIn("sell_hot_poll_s", src)
         self.assertNotIn("def run_cycle", src)
         validate = src[src.find("def validate_strategy") : src.find("def eligible_markets")]

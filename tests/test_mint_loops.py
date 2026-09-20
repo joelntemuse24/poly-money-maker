@@ -196,8 +196,9 @@ class ConcurrentLoopTests(unittest.TestCase):
             raise RuntimeError("mint_boom")
 
         def sell_tick() -> None:
-            sell_ok.set()
-            stop.set()
+            if mint_errors:
+                sell_ok.set()
+                stop.set()
 
         sell_t, mint_t = start_mint_sell_loops(
             sell_tick=sell_tick,
@@ -207,7 +208,7 @@ class ConcurrentLoopTests(unittest.TestCase):
             should_stop=stop.is_set,
             on_mint_error=lambda exc: mint_errors.append(str(exc)),
         )
-        self.assertTrue(sell_ok.wait(2.0))
+        self.assertTrue(sell_ok.wait(2.0), "sell never ticked after mint error")
         stop.set()
         sell_t.join(timeout=2)
         mint_t.join(timeout=2)
