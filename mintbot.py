@@ -11,7 +11,9 @@ last ``sell_persist_last_min_window_s`` (~60s) before ``end_ts``, while the
 opposite bid is ≥ ~90¢, then FAK 3¢ → 2¢ when the live sized bid is at/over
 the floor, or at the live bid if it is below the floor. Keep the winner for
 redeem unless its bid reaches ~99.9¢. Off unless live ``strategy_mint.json``
-turns it on.
+turns it on. While a sell is armed, the cycle sleeps ``sell_hot_poll_s``
+(~1s) and skips mint discovery so persist-ready FAK is not delayed by
+``poll_s`` plus Gamma/positions (~10s on live VM). Persist knobs stay 9/5/60.
 
 Usage:
   # dry-run (default when strategy_mint.json has dry_run true / entry_enabled false)
@@ -49,6 +51,7 @@ from buy.contracts import ContractCall, build_atomic_mint_calls
 from buy.market import MarketGateway, MintMarket
 from buy.mint_sell import (
     classify_loser,
+    cycle_sleep_s,
     effective_loser_persist_s,
     empty_fak_status,
     inventory_latch,
@@ -57,7 +60,9 @@ from buy.mint_sell import (
     loser_persist_ready,
     parse_sell_fill_shares,
     persist_ready,
+    sell_intent_hot,
     sell_window_open,
+    skip_mint_discovery_for_sell,
     winner_cashout_leg,
     winner_cheap_decision,
     winner_sell_limit,
@@ -89,6 +94,7 @@ DEFAULTS = {
     "one_entry_per_market": True,
     "max_open_sets": 1,
     "poll_s": 5.0,
+    "sell_hot_poll_s": 1.0,
     "position_tolerance": 0.01,
     "require_accepting_orders": True,
     "sell_enabled": False,
@@ -237,6 +243,8 @@ def validate_strategy(cfg: dict) -> None:
         raise ValueError("max_open_sets must be >= 1")
     if float(cfg["poll_s"]) < 2:
         raise ValueError("poll_s must be >= 2")
+    if float(cfg.get("sell_hot_poll_s") or 0) < 0.2:
+        raise ValueError("sell_hot_poll_s must be >= 0.2")
     floor = float(cfg.get("sell_floor") or 0)
     threshold = float(cfg.get("sell_threshold") or 0)
     opposite = float(cfg.get("sell_opposite_min") or 0)
@@ -564,6 +572,7 @@ def reconcile_intents(
     chain: ChainReader,
     funder: str,
     now: float,
+    skip_confirmed_inventory: bool = False,
 ) -> None:
     relayer_url = str(cfg["relayer_url"])
     ctf = str(cfg["ctf_address"])
@@ -600,6 +609,8 @@ def reconcile_intents(
                 elif relayer_state == "STATE_EXECUTED":
                     intent["status"] = "executed"
         if intent.get("status") in ("confirmed_waiting_inventory", "confirmed", "mined"):
+            if skip_confirmed_inventory and intent.get("status") == "confirmed":
+                continue
             try:
                 up = chain.position_balance(ctf, funder, intent["up_token"])
                 dn = chain.position_balance(ctf, funder, intent["dn_token"])
@@ -931,6 +942,9 @@ def manage_sells(cfg: dict, state: dict, chain: ChainReader) -> None:
         if not up_tok or not dn_tok:
             continue
 
+        # Same-tick books feed persist_ready and FAK; do not refetch after
+        # persist-ready (that was not the live delay). The ~10s gap was
+        # poll_s plus mint-path work after this function returns.
         up_bid, up_sz, up_bids = _fetch_book(up_tok, min_bid_size)
         dn_bid, dn_sz, dn_bids = _fetch_book(dn_tok, min_bid_size)
         books = {"up": up_bids, "dn": dn_bids}
@@ -1390,9 +1404,17 @@ def run_cycle(
         write_heartbeat("stopped")
         return "stopped"
 
+    sell_hot = skip_mint_discovery_for_sell(state, now)
     funder = os.getenv("FUNDER_ADDRESS") or ""
     if funder:
-        reconcile_intents(state, cfg, chain, to_checksum_address(funder), now)
+        reconcile_intents(
+            state,
+            cfg,
+            chain,
+            to_checksum_address(funder),
+            now,
+            skip_confirmed_inventory=sell_hot,
+        )
         atomic_save(STATE_FILE, state)
 
     if any(
@@ -1401,6 +1423,13 @@ def run_cycle(
     ):
         write_heartbeat("wait_submit")
         return "wait_submit"
+
+    # While a sell is armed, skip Gamma/positions/mint (~5s on live VM)
+    # so the next book look happens after sell_hot_poll_s instead of
+    # poll_s plus discovery. Persist knobs are unchanged.
+    if sell_hot:
+        write_heartbeat("sell_hot")
+        return "sell_hot"
 
     if not cfg.get("entry_enabled"):
         write_heartbeat("disabled")
@@ -1657,14 +1686,14 @@ def main() -> int:
 
         try:
             status = run_cycle(cfg, state, gateway, chain)
-            if status not in ("idle", "idle_owned", "disabled", "wait_submit"):
+            if status not in ("idle", "idle_owned", "disabled", "wait_submit", "sell_hot"):
                 log_event("cycle", status=status)
         except Exception as exc:
             log_event("cycle_error", error=str(exc)[:300])
             console.print(f"[red]cycle_error[/] {exc}")
             write_heartbeat("error", error=str(exc)[:120])
 
-        time.sleep(float(cfg.get("poll_s") or 10))
+        time.sleep(cycle_sleep_s(cfg, state, time.time()))
 
     console.print("[dim]mintbot stopped[/]")
     try:

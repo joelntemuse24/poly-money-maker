@@ -87,6 +87,8 @@ class MintDefaultsTests(unittest.TestCase):
             self.assertEqual(blob["sell_dump_persist_s"], 5.0, label)
             self.assertAlmostEqual(blob["sell_winner_min"], 0.999, msg=label)
             self.assertEqual(blob["sell_min_bid_size"], 1.0, label)
+            self.assertEqual(blob["poll_s"], 5.0, label)
+            self.assertEqual(blob["sell_hot_poll_s"], 1.0, label)
 
     def test_open_intent_count_ignores_expired_redeem_holds(self):
         statuses = frozenset(
@@ -483,6 +485,36 @@ class DeployUnitsTests(unittest.TestCase):
             src,
         )
         self.assertNotIn("if bal + 1e-9 < tol:", src)
+
+    def test_sell_hot_poll_skips_mint_path_without_changing_persist(self):
+        src = MINT.read_text()
+        defaults = _assign("DEFAULTS")
+        example = json.loads(MINT_EXAMPLE.read_text())
+        self.assertEqual(defaults["sell_persist_s"], 9.0)
+        self.assertEqual(defaults["sell_persist_last_min_s"], 5.0)
+        self.assertEqual(defaults["sell_persist_last_min_window_s"], 60.0)
+        self.assertEqual(example["sell_persist_s"], 9.0)
+        self.assertEqual(example["sell_persist_last_min_s"], 5.0)
+        self.assertEqual(example["sell_persist_last_min_window_s"], 60.0)
+        self.assertEqual(defaults["poll_s"], 5.0)
+        self.assertEqual(defaults["sell_hot_poll_s"], 1.0)
+        self.assertGreaterEqual(float(defaults["poll_s"]), 2.0)
+
+        cycle = src[src.find("def run_cycle") : src.find("\ndef main")]
+        self.assertIn("skip_mint_discovery_for_sell", cycle)
+        self.assertLess(
+            cycle.find("skip_mint_discovery_for_sell"),
+            cycle.find("gateway.discover"),
+        )
+        self.assertIn('return "sell_hot"', cycle)
+        self.assertIn("skip_confirmed_inventory", src)
+        main = src[src.find("def main") :]
+        self.assertIn("cycle_sleep_s", main)
+        self.assertIn("sell_hot_poll_s", src)
+        self.assertIn("sell_intent_hot", src)
+        validate = src[src.find("def validate_strategy") : src.find("def eligible_markets")]
+        self.assertIn("sell_hot_poll_s", validate)
+        self.assertIn("poll_s must be >= 2", validate)
 
     def test_sell_book_depth_log_shape_is_observability_only(self):
         from buy.book import bid_fill_depth
