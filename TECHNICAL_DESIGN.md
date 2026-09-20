@@ -32,6 +32,7 @@ Read Parts I and II straight through. Part III walks mint and sell. Part IV cove
   - [Eligibility: not-yet-open 15m windows](#section-11)
   - [Capacity: max_open_sets=1 and adjacent lookahead](#section-12)
   - [already_minted: failed remint after cooldown](#section-13)
+  - [Relay hub: internal transaction failure](#section-13b)
   - [Relayer submit: approve + split as one PROXY batch](#section-14)
   - [Reconcile: relayer state → inventory confirm](#section-15)
   - [Sell path overview](#section-16)
@@ -278,6 +279,26 @@ failed → eligible again after cooldown if attempts remain
 
 A relayer `STATE_FAILED` marks the intent `failed` and persists `errorMsg` / tx hash when the API returns them. Without counting `failed` at all, the bot reminted the same `condition_id` in a hot loop (seen on the 2:15 window). Incident `btc-updown-15m-1789805700` then showed the opposite bug: `failed` blocked forever, so after `STATE_FAILED` the desk sat idle for the rest of the 15m window. Cooldown + max attempts is the middle path.
 
+<a id="section-13b"></a>
+## Relay hub: internal transaction failure
+
+The most common typed mint failure in the Sep 19–20 2026 trial was the opaque relayer `errorMsg` **`relay hub: internal transaction failure`**.
+
+What it is (and is not):
+
+- **Not** a declared Polymarket status-page outage (green while we saw it).
+- Often the **outer** Polygon tx into RelayHub **succeeds**, while the **inner** relayed call reverts (`RelayedCallFailed`) — so no CTF inventory lands.
+- In our cases it was **not** explained by low balance, market-not-ready, or duplicate submits (distinct tx hashes).
+- Community notes frequently blame RelayHub `gasleft` / proxy gas budget / batching. Treat as an intermittent hub/exec flake until Polymarket documents otherwise.
+
+Trial shape (order of magnitude, not a SLA claim):
+
+- ~19 exact matches of that `errorMsg` over ~26h ≈ **6 windows × 3 retries** (+ one singleton), not nineteen independent daily sprays.
+- Overall mint confirm rate ~**74%** (85/115); this typed fail ~**17%** of attempts in that window.
+- Bot response: mark `failed`, persist `errorMsg`, wait `mint_fail_cooldown_s` (~90s), remint up to `mint_max_attempts` (3), then move on. Pre-mint with `enter_max_ttm_min=30` reduces mid-window timing pressure when a flake burns attempts.
+
+Operational stance: **manageable**. Do not redesign the mint path solely for this message unless the rate worsens or a reproducible gas/batch fix appears.
+
 <a id="section-14"></a>
 ## Relayer submit: approve + split as one PROXY batch
 
@@ -496,12 +517,13 @@ Do not import `mintbot.py` in unit tests (credentials, lock, clients). Test `buy
 ## Landmines
 
 1. **Failed remint storm** — `failed` stays in `already_minted` during cooldown and after `mint_max_attempts`.
-2. **Skipping the next window** — without adjacent lookahead, `max_open_sets=1` + “never mint open markets” skips a quarter-hour.
-3. **Winner at 0.999 on a 0.99 book** — live-bid FAK once allowed, then clamp to CLOB max 0.99 (do not POST 0.995–0.999).
-4. **Dump without `sold_leg`** — held leg cannot be inferred; loser path must set `sold_leg`.
-5. **Sells stop at `end_ts`** — no dump/cash-out after expiry in `manage_sells`; redeem is the remaining path.
-6. **Importing mintbot in tests** — can take the flock or load `.env`.
-7. **Confusing mint with buybot docs** — old hourly TDD describes a different money path.
+2. **`relay hub: internal transaction failure`** — opaque inner RelayHub revert; outer tx may still succeed. Retries absorb clusters; not a status-page outage. See [§13b](#section-13b).
+3. **Skipping the next window** — without adjacent lookahead, `max_open_sets=1` + “never mint open markets” skips a quarter-hour.
+4. **Winner at 0.999 on a 0.99 book** — live-bid FAK once allowed, then clamp to CLOB max 0.99 (do not POST 0.995–0.999).
+5. **Dump without `sold_leg`** — held leg cannot be inferred; loser path must set `sold_leg`.
+6. **Sells stop at `end_ts`** — no dump/cash-out after expiry in `manage_sells`; redeem is the remaining path.
+7. **Importing mintbot in tests** — can take the flock or load `.env`.
+8. **Confusing mint with buybot docs** — old hourly TDD describes a different money path.
 
 <a id="section-33"></a>
 ## Glossary
@@ -666,7 +688,7 @@ operator/systemd          mintbot               Gamma/CLOB         Relayer      
       |                      |---- manage_sells --->| sized bids       |                   |
       |                      |<---------------------|                  |                   |
       |                      |---- reconcile ------>|                  | get tx state      |
-      |                      |                      |                  |------------------>|
+      |                      |                      |                  |------------------>| 
       |                      |                      |                  |   balances        |
       |                      |<----------------------------------------|-------------------|
       |                      |                      |                  |                   |
@@ -683,7 +705,7 @@ operator/systemd          mintbot               Gamma/CLOB         Relayer      
       |                      |                      |                  |                   |
       |                      | build approve+split  |                  |                   |
       |                      |---------------------------------------->| PROXY submit      |
-      |                      |                      |                  |------------------>|
+      |                      |                      |                  |------------------>| 
       |                      | persist intent       |                  |                   |
       |                      |   status=pending     |                  |                   |
       |                      | poll until inventory |                  |                   |
@@ -697,7 +719,7 @@ Notes:
 
 1. **Sells run before mint** each cycle. A mid-window loser fill can free `max_open_sets` so the adjacent mint is allowed sooner.
 2. **Never mints an already-open window.** If adjacent lookahead fails, that quarter-hour is skipped forever for this bot.
-3. Relayer `STATE_FAILED` → intent `failed` + `errorMsg` → cooldown 90s, then remint until `mint_max_attempts`.
+3. Relayer `STATE_FAILED` → intent `failed` + `errorMsg` → cooldown 90s, then remint until `mint_max_attempts`. The common typed message is `relay hub: internal transaction failure` (see [§13b](#section-13b)).
 
 <a id="section-36"></a>
 ## Sell-side sequence (loser → winner / held dump)
