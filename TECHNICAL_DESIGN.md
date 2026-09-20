@@ -369,7 +369,7 @@ Preconditions (all required):
 - `sell_dump_enabled` (live true)
 - `sold_loser` (or truthy `sold_leg`)
 - not already `sold_dump` / `sold_winner`
-- `sold_leg` is "up" or "dn" so the held leg is well-defined
+- `sold_leg` is `"up"` or `"dn"` so the held leg is well-defined
 - sized held bid is not `None` and `< sell_dump_below` (0.80)
 - that condition persists `sell_dump_persist_s` (5.0)
 - not in sell cooldown
@@ -711,7 +711,7 @@ operator/systemd          mintbot               Gamma/CLOB         Relayer      
       |                      | poll until inventory |                  |                   |
       |                      |   matches shares     |                  |                   |
       |                      | status=confirmed     |                  |                   |
-      |                      | ntfy (optional)      |                      |                   |
+      | ntfy (optional)      |                      |                  |                   |
       |<---------------------|                      |                  |                   |
 ```
 
