@@ -111,25 +111,103 @@ def a_token_flat(intent: Any, leg: str) -> tuple[bool, str]:
     ``sell_scrap_rest_id`` does not block that leg: the two wallets are
     different, and A's resting sell into B's bid is the hedge. The other
     leg is the winner A still holds. A rest with no sold flag still means
-    A is long (``a_rest_live``). A missing intent is ``a_absent``.
+    A is long (``a_rest_live``). A missing intent, or a non-held status
+    with no sold flag, is ``a_absent``. ``sold_loser`` / ``sold_leg`` stay
+    ``a_flat`` even when status is ``completed``.
     """
     if leg not in ("up", "dn"):
         return False, "bad_leg"
     if not isinstance(intent, dict):
         return True, "a_absent"
-    status = str(intent.get("status") or "")
-    if status not in _HELD_STATUSES:
-        return True, "a_absent"
+    # Sold flags win over status. ``completed`` is not a held status, but a
+    # loser A already sold is still the post-scrap leg while the window is open.
     sold_leg = _sold_leg(intent)
     if sold_leg == leg:
         return True, "a_flat"
     if sold_leg in ("up", "dn") and sold_leg != leg:
         return False, "a_holds_other"
+    status = str(intent.get("status") or "")
+    if status not in _HELD_STATUSES:
+        return True, "a_absent"
     rest_id = intent.get("sell_scrap_rest_id")
     rest_leg = intent.get("sell_loser_leg") if intent.get("sell_loser_leg") in ("up", "dn") else None
     if rest_id and (rest_leg is None or rest_leg == leg):
         return False, "a_rest_live"
     return False, "a_still_long"
+
+
+def _has_open_order(open_orders: Optional[dict], cid: str) -> bool:
+    slot = (open_orders or {}).get(cid) or {}
+    if not isinstance(slot, dict):
+        return False
+    for leg in ("up", "dn"):
+        order = slot.get(leg)
+        if isinstance(order, dict) and str(order.get("order_id") or ""):
+            return True
+    return False
+
+
+def sister_book_wanted(
+    market: Any,
+    intent: Any,
+    open_orders: Optional[dict],
+    *,
+    now_s: float,
+    active_ttm_s: float = 180.0,
+    cancel_ttm_s: float = 20.0,
+) -> bool:
+    """Whether this pass should read the public book for ``market``.
+
+    Far-future windows are not quoted. A book is needed for an open sister
+    order, a sold leg still before cancel, or any market inside the late
+    ``active_ttm_s`` window.
+    """
+    if not isinstance(market, dict):
+        return False
+    cid = str(market.get("condition_id") or "")
+    if cid and _has_open_order(open_orders, cid):
+        return True
+    try:
+        end_ts = float(market.get("end_ts") or 0)
+    except (TypeError, ValueError):
+        end_ts = 0.0
+    if end_ts <= 0:
+        return isinstance(intent, dict) and _sold_leg(intent) is not None
+    ttm = end_ts - float(now_s)
+    if ttm <= float(cancel_ttm_s) + 1e-12:
+        return False
+    if isinstance(intent, dict) and _sold_leg(intent) is not None:
+        return True
+    return ttm <= float(active_ttm_s) + 1e-12
+
+
+def markets_needing_books(
+    markets: Sequence[dict],
+    intents: Optional[dict],
+    open_orders: Optional[dict],
+    *,
+    now_s: float,
+    active_ttm_s: float = 180.0,
+    cancel_ttm_s: float = 20.0,
+) -> list[dict]:
+    """Markets whose book can change this pass. Pure; no HTTP."""
+    intents = intents or {}
+    chosen: list[dict] = []
+    for market in markets or []:
+        if not isinstance(market, dict):
+            continue
+        cid = str(market.get("condition_id") or "")
+        intent = intents.get(cid) if cid else None
+        if sister_book_wanted(
+            market,
+            intent,
+            open_orders,
+            now_s=now_s,
+            active_ttm_s=active_ttm_s,
+            cancel_ttm_s=cancel_ttm_s,
+        ):
+            chosen.append(market)
+    return chosen
 
 
 def sister_cancel_due(

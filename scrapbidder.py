@@ -31,8 +31,10 @@ from buy.mint_sell import rest_order_matched_shares
 from buy.sister_bid import (
     SISTER_DEFAULTS,
     buy_matched_shares,
+    markets_needing_books,
     plan_sister_bids,
     resolve_sister_client_config,
+    sister_book_wanted,
     sister_miss_events,
     sister_poll_s,
 )
@@ -425,16 +427,58 @@ def apply_actions(actions: list, state: dict, *, dry_run: bool) -> None:
             shares=shares,
             tif=action.get("tif"),
             reason=action.get("reason"),
+            price_why=action.get("price_why"),
             slug=action.get("slug"),
             dry_run=dry_run,
             status=status,
         )
 
 
-def run_once(cfg: dict, now: Optional[float] = None) -> float:
-    now_s = time.time() if now is None else float(now)
+def _mint_intents() -> dict:
     mint = _read_json(MINT_STATE_FILE)
     intents = mint.get("intents") if isinstance(mint.get("intents"), dict) else {}
+    return intents
+
+
+def _fill_books(
+    markets: list,
+    intents: dict,
+    open_orders: dict,
+    now_s: float,
+    cfg: dict,
+) -> int:
+    """Quote markets that can act. Already-quoted rows are left alone."""
+    fetched = 0
+    active = float(cfg["active_ttm_s"])
+    cancel = float(cfg["cancel_ttm_s"])
+    for market in markets:
+        cid = str(market.get("condition_id") or "")
+        intent = intents.get(cid) if cid else None
+        if not sister_book_wanted(
+            market,
+            intent,
+            open_orders,
+            now_s=now_s,
+            active_ttm_s=active,
+            cancel_ttm_s=cancel,
+        ):
+            continue
+        if "up_bid" in market and "dn_bid" in market:
+            continue
+        up_bid, up_ask = _fetch_top(str(market.get("up_token") or ""))
+        dn_bid, dn_ask = _fetch_top(str(market.get("dn_token") or ""))
+        market["up_bid"], market["up_ask"] = up_bid, up_ask
+        market["dn_bid"], market["dn_ask"] = dn_bid, dn_ask
+        fetched += 1
+    return fetched
+
+
+def run_once(cfg: dict, now: Optional[float] = None) -> float:
+    wall = now is None
+    now_s = time.time() if wall else float(now)
+    # First snapshot only chooses which books to read. Planning uses a
+    # second read so a scrap that lands during discovery is not missed.
+    intents = _mint_intents()
     state = _read_json(STATE_FILE)
     if not isinstance(state.get("orders"), dict):
         state["orders"] = {}
@@ -457,16 +501,31 @@ def run_once(cfg: dict, now: Optional[float] = None) -> float:
     except Exception as exc:
         _log("scrapbid_discover_fail", error=str(exc)[:200])
     markets = merge_markets(discovered, intents, now_s)
-    for market in markets:
-        up_bid, up_ask = _fetch_top(str(market.get("up_token") or ""))
-        dn_bid, dn_ask = _fetch_top(str(market.get("dn_token") or ""))
-        market["up_bid"], market["up_ask"] = up_bid, up_ask
-        market["dn_bid"], market["dn_ask"] = dn_bid, dn_ask
+    orders = state.get("orders") or {}
+    fetched = _fill_books(markets, intents, orders, now_s, cfg)
+    intents = _mint_intents()
+    if wall:
+        now_s = time.time()
+    fetched += _fill_books(markets, intents, orders, now_s, cfg)
+    wanted = markets_needing_books(
+        markets,
+        intents,
+        orders,
+        now_s=now_s,
+        active_ttm_s=float(cfg["active_ttm_s"]),
+        cancel_ttm_s=float(cfg["cancel_ttm_s"]),
+    )
+    _log(
+        "scrapbid_books",
+        fetched=fetched,
+        planned=len(wanted),
+        discovered=len(markets),
+    )
     if not isinstance(state.get("filled"), dict):
         state["filled"] = {}
     filled = state["filled"]
     actions = plan_sister_bids(
-        markets=markets,
+        markets=wanted,
         intents=intents,
         open_orders=state.get("orders") or {},
         now_s=now_s,
