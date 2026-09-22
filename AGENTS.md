@@ -89,7 +89,10 @@ winner leg A still holds stays blocked. Markets A never held rest at the
 cap on the cheap live side only inside the last 180s. If sold_loser on L
 has no B bid or fill and the window is still open past cancel, log
 `scrapbid_miss` (condition, leg, ttm, age) after ~10s, throttled ~30s.
-Poll drops to `poll_hot_s` (~1s) while that gap is open. It never mints
+Poll drops to `poll_hot_s` (~1s) while that gap is open. Each pass
+re-reads mint intents after quoting, and quotes only open sister orders,
+the late `active_ttm_s` window, or a sold leg — not every future market.
+It never mints
 and never FAK-sells. `bid_enabled` defaults false and `dry_run` defaults
 true.
 Credentials stay in gitignored `.env.complement` (POLY_1271 / deposit
