@@ -1,10 +1,10 @@
-"""Recording-only Chainlink BTC/USD 60s TWAP tape for 15m mint windows.
+"""Chainlink BTC/USD 60s TWAP tape for 15m mint windows.
 
 Polymarket resolves btc-up-or-down-15m on Chainlink's 60-second TWAP.
-This module records that relay. It must not be imported by sell or mint
-decision helpers (``buy/mint_sell.py`` and the sell/mint cycles). It never
-places orders and never mutates intent state. Feed failures surface as
-``oracle_log_fail`` and trading continues.
+This module records that relay and exposes a read-only bag snapshot for
+mintbot's late-window loser-scrap veto. It must not place orders and must
+not mutate intent state. Feed failures surface as ``oracle_log_fail``;
+outside the late scrap gate, trading continues without the tape.
 
 Source, chosen because it needs no Chainlink Data Streams credentials:
 
@@ -96,6 +96,16 @@ class WindowPrice:
     open_ref: Optional[str]
     close_twap: Optional[str]
     completed: bool
+
+
+@dataclass(frozen=True)
+class OracleBagView:
+    """Read-only TWAP + window-open snapshot for the late loser-scrap gate."""
+
+    twap: Optional[str]
+    open_usd: Optional[str]
+    obs_ts: Optional[float]
+    source: str = RTDS_SOURCE
 
 
 @dataclass(frozen=True)
@@ -578,6 +588,27 @@ class OracleLogService:
         self._idle_since: Optional[float] = None
         self._awaiting_since: Optional[float] = None
         self._on_fail: Optional[FailFn] = None
+
+    def bag_view(self, condition_id: str) -> OracleBagView:
+        """Latest TWAP + open_ref for one bag. Reuses the live feed (no second WS)."""
+        cid = str(condition_id or "")
+        memory = self._memory.get(cid)
+        open_usd = memory.open_ref if memory is not None else None
+        latest: Optional[TwapSample] = None
+        try:
+            latest = self._feed.latest()
+        except Exception:
+            latest = None
+        if latest is None:
+            return OracleBagView(
+                twap=None, open_usd=open_usd, obs_ts=None, source=RTDS_SOURCE
+            )
+        return OracleBagView(
+            twap=latest.twap,
+            open_usd=open_usd,
+            obs_ts=float(latest.obs_ts),
+            source=str(latest.source or RTDS_SOURCE),
+        )
 
     def tick(
         self,

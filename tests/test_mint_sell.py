@@ -15,6 +15,9 @@ from buy.mint_sell import (
     effective_loser_persist_s,
     empty_fak_status,
     inventory_latch,
+    late_oracle_edge_persist,
+    late_oracle_need_usd,
+    late_oracle_scrap_ok,
     loser_empty_keep_qualify,
     loser_ladder_limits,
     loser_persist_ready,
@@ -23,6 +26,7 @@ from buy.mint_sell import (
     sell_fire_decision,
     sell_intent_hot,
     sell_window_open,
+    side_aware_oracle_edge_usd,
     skip_mint_discovery_for_sell,
     skip_mint_discovery_when_armed_and_capped,
     winner_cashout_leg,
@@ -1028,6 +1032,134 @@ class SellFireDecisionTests(unittest.TestCase):
         )
         self.assertEqual(action, "cancel_reset")
         self.assertEqual(reason, "winner_below_min")
+
+
+class LateOracleScrapGateTests(unittest.TestCase):
+    """Combat for true reverse btc-updown-15m-1790078400."""
+
+    def test_defaults_include_late_oracle_knobs(self):
+        self.assertEqual(DEFAULT_SELL_KNOBS["sell_late_window_s"], 120.0)
+        self.assertEqual(DEFAULT_SELL_KNOBS["sell_oracle_edge_per_ttm"], 1.5)
+        self.assertEqual(DEFAULT_SELL_KNOBS["sell_oracle_edge_persist_s"], 3.0)
+        self.assertEqual(DEFAULT_SELL_KNOBS["sell_oracle_stale_s"], 5.0)
+        self.assertEqual(DEFAULT_SELL_KNOBS["sell_oracle_edge_floor_usd"], 25.0)
+
+    def test_side_aware_edge_scraping_dn_keeps_up(self):
+        # Scraping Down (keeping Up): need twap - open.
+        self.assertAlmostEqual(
+            side_aware_oracle_edge_usd(
+                twap_usd=100_020.0, open_usd=100_000.0, scrap_leg="dn"
+            ),
+            20.0,
+        )
+        self.assertAlmostEqual(
+            side_aware_oracle_edge_usd(
+                twap_usd=99_980.0, open_usd=100_000.0, scrap_leg="up"
+            ),
+            20.0,
+        )
+
+    def test_need_uses_floor_and_per_ttm(self):
+        # TTM 42 → 1.5*42 = 63 > floor 25.
+        self.assertAlmostEqual(late_oracle_need_usd(42.0), 63.0)
+        # TTM 10 → 15 < floor 25.
+        self.assertAlmostEqual(late_oracle_need_usd(10.0), 25.0)
+
+    def test_ttm_42_edge_20_scraping_dn_blocks(self):
+        # 1790078400: TTM≈42 need ≳$63; actual edge ~+$20 → block.
+        ok, why, detail = late_oracle_scrap_ok(
+            ttm_s=42.0,
+            scrap_leg="dn",
+            twap_usd=100_020.0,
+            open_usd=100_000.0,
+            twap_age_s=1.0,
+        )
+        self.assertFalse(ok)
+        self.assertEqual(why, "edge_thin")
+        self.assertAlmostEqual(detail["edge"], 20.0)
+        self.assertAlmostEqual(detail["need"], 63.0)
+
+    def test_ttm_42_edge_70_allows_after_persist(self):
+        ok, why, detail = late_oracle_scrap_ok(
+            ttm_s=42.0,
+            scrap_leg="dn",
+            twap_usd=100_070.0,
+            open_usd=100_000.0,
+            twap_age_s=0.5,
+        )
+        self.assertTrue(ok)
+        self.assertEqual(why, "edge_ok")
+        self.assertAlmostEqual(detail["edge"], 70.0)
+        self.assertAlmostEqual(detail["need"], 63.0)
+        # CLOB would allow separately; oracle needs 3s persist.
+        fire, armed, why_p = late_oracle_edge_persist(
+            True, now_s=100.0, armed_ts=None, persist_s=3.0
+        )
+        self.assertFalse(fire)
+        self.assertEqual(why_p, "armed")
+        fire, armed, why_p = late_oracle_edge_persist(
+            True, now_s=101.5, armed_ts=armed, persist_s=3.0
+        )
+        self.assertFalse(fire)
+        self.assertEqual(why_p, "waiting")
+        fire, armed, why_p = late_oracle_edge_persist(
+            True, now_s=103.0, armed_ts=armed, persist_s=3.0
+        )
+        self.assertTrue(fire)
+        self.assertEqual(why_p, "ready")
+
+    def test_ttm_200_oracle_gate_not_applied(self):
+        ok, why, _ = late_oracle_scrap_ok(
+            ttm_s=200.0,
+            scrap_leg="dn",
+            twap_usd=None,
+            open_usd=None,
+            twap_age_s=None,
+        )
+        self.assertTrue(ok)
+        self.assertEqual(why, "outside_late_window")
+
+    def test_missing_or_stale_oracle_in_late_window_blocks(self):
+        ok, why, _ = late_oracle_scrap_ok(
+            ttm_s=42.0,
+            scrap_leg="dn",
+            twap_usd=100_070.0,
+            open_usd=None,
+            twap_age_s=1.0,
+        )
+        self.assertFalse(ok)
+        self.assertEqual(why, "missing_open")
+        ok, why, _ = late_oracle_scrap_ok(
+            ttm_s=42.0,
+            scrap_leg="dn",
+            twap_usd=None,
+            open_usd=100_000.0,
+            twap_age_s=1.0,
+        )
+        self.assertFalse(ok)
+        self.assertEqual(why, "missing_twap")
+        ok, why, _ = late_oracle_scrap_ok(
+            ttm_s=42.0,
+            scrap_leg="dn",
+            twap_usd=100_070.0,
+            open_usd=100_000.0,
+            twap_age_s=6.0,
+        )
+        self.assertFalse(ok)
+        self.assertEqual(why, "stale_twap")
+
+    def test_wrong_sign_edge_scraping_dn_blocks(self):
+        # Scraping DN but twap below open → negative edge.
+        ok, why, detail = late_oracle_scrap_ok(
+            ttm_s=42.0,
+            scrap_leg="dn",
+            twap_usd=99_980.0,
+            open_usd=100_000.0,
+            twap_age_s=1.0,
+        )
+        self.assertFalse(ok)
+        self.assertEqual(why, "edge_thin")
+        self.assertLess(detail["edge"], 0.0)
 
 
 class SizedBidTests(unittest.TestCase):

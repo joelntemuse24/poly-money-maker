@@ -16,6 +16,7 @@ from buy.mint_sell import (
 )
 from buy.oracle_log import (
     CRYPTO_PRICE_VARIANT,
+    OracleBagView,
     OracleLogService,
     RtdsTwapFeed,
     TwapSample,
@@ -54,7 +55,20 @@ DECISION_FNS = (
     "_apply_sell_fire_cancel",
 )
 
-FORBIDDEN = (
+MINT_ONLY_FNS = (
+    "run_mint_cycle",
+    "eligible_markets",
+    "already_minted",
+    "mint_slots_full",
+    "open_intent_count",
+)
+
+SELL_ORACLE_FNS = (
+    "manage_sells",
+    "_manage_sells_locked",
+)
+
+FORBIDDEN_MINT = (
     "oracle_log",
     "oracle_twap",
     "OracleLog",
@@ -62,6 +76,25 @@ FORBIDDEN = (
     "chainlink",
     "open_ref",
     "oracle_log_fail",
+    "late_oracle",
+    "bag_view",
+    "sell_loser_oracle",
+)
+
+# manage_sells may read bag_view for the late scrap veto only.
+FORBIDDEN_SELL_CYCLE = (
+    "crypto_prices_twap",
+    "chainlink",
+)
+
+# Pure mint_sell helpers stay free of the feed / websocket / jsonl path.
+FORBIDDEN_MINT_SELL = (
+    "oracle_log",
+    "OracleLog",
+    "crypto_prices_twap",
+    "chainlink",
+    "oracle_log_fail",
+    "oracle_twap.jsonl",
 )
 
 
@@ -347,6 +380,25 @@ class WriterTests(unittest.TestCase):
         path = folder / "oracle_twap.jsonl"
         return OracleLogService(path, feed=feed, fetch_price=fetch), path
 
+    def test_bag_view_reuses_feed_and_open_ref(self):
+        feed = FakeFeed()
+        now = START + 100
+        feed.latest_sample = _sample(now - 1.0, "85260.5")
+
+        def fetch(start_ts: int) -> WindowPrice:
+            return WindowPrice(open_ref="85224.5", close_twap=None, completed=False)
+
+        svc, _path = self._service(feed, fetch)
+        svc.tick(_bag(), now, enabled=True)
+        view = svc.bag_view("cid-15m")
+        self.assertIsInstance(view, OracleBagView)
+        self.assertEqual(view.twap, "85260.5")
+        self.assertEqual(view.open_usd, "85224.5")
+        self.assertAlmostEqual(view.obs_ts, now - 1.0)
+        missing = svc.bag_view("unknown-cid")
+        self.assertEqual(missing.twap, "85260.5")
+        self.assertIsNone(missing.open_usd)
+
     def test_hot_path_records_samples_without_touching_intents(self):
         feed = FakeFeed()
         now = END - 10
@@ -459,7 +511,7 @@ class WriterTests(unittest.TestCase):
 
 
 class DecisionIsolationTests(unittest.TestCase):
-    def test_sell_policy_ignores_oracle_fields(self):
+    def test_sell_policy_ignores_intent_oracle_fields(self):
         now = START + 400
         intent = _bag()["intents"]["cid-15m"]
         intent["sell_loser_armed_at"] = 1
@@ -492,15 +544,22 @@ class DecisionIsolationTests(unittest.TestCase):
         )
         self.assertEqual(winner_sell_limit(0.995)[0], 0.99)
 
-    def test_decision_functions_do_not_reference_the_oracle(self):
-        for name in DECISION_FNS:
+    def test_mint_path_does_not_reference_the_oracle(self):
+        for name in MINT_ONLY_FNS:
             source = _fn_source(MINT, name)
-            for token in FORBIDDEN:
+            for token in FORBIDDEN_MINT:
                 self.assertNotIn(token, source, f"{name} contains {token}")
-        for module in ("mint_sell.py", "mint_loops.py"):
-            text = (BUY / module).read_text(encoding="utf-8")
-            for token in FORBIDDEN:
-                self.assertNotIn(token, text, f"{module} contains {token}")
+        for name in ("_fak_sell", "_sell_inventory", "_run_fak_ladder", "_run_dump_fak_with_refire"):
+            source = _fn_source(MINT, name)
+            for token in FORBIDDEN_MINT:
+                self.assertNotIn(token, source, f"{name} contains {token}")
+        mint_sell = (BUY / "mint_sell.py").read_text(encoding="utf-8")
+        for token in FORBIDDEN_MINT_SELL:
+            self.assertNotIn(token, mint_sell, f"mint_sell.py contains {token}")
+        self.assertIn("def late_oracle_scrap_ok", mint_sell)
+        loops = (BUY / "mint_loops.py").read_text(encoding="utf-8")
+        for token in FORBIDDEN_MINT:
+            self.assertNotIn(token, loops, f"mint_loops.py contains {token}")
         oracle_src = (BUY / "oracle_log.py").read_text(encoding="utf-8")
         for token in ("manage_sells", "classify_loser", "sell_fire_decision", "submit_mint"):
             self.assertNotIn(token, oracle_src)
@@ -515,6 +574,7 @@ class DecisionIsolationTests(unittest.TestCase):
         self.assertNotIn("buy.mint_sell", imported)
         main = _fn_source(MINT, "main")
         self.assertIn("OracleLogService", main)
+        self.assertIn("_set_oracle_service", main)
         self.assertIn("oracle_log_fail", main)
         self.assertIn("mintbot-oracle", main)
         self.assertIn("oracle_log_enabled", main)
@@ -529,7 +589,27 @@ class DecisionIsolationTests(unittest.TestCase):
                     if isinstance(target, ast.Name) and target.id == "DEFAULTS":
                         defaults_value = ast.literal_eval(node.value)
         self.assertIs(defaults_value["oracle_log_enabled"], True)
+        self.assertEqual(defaults_value["sell_late_window_s"], 120.0)
+        self.assertEqual(defaults_value["sell_oracle_edge_per_ttm"], 1.5)
+        self.assertEqual(defaults_value["sell_oracle_edge_persist_s"], 3.0)
+        self.assertEqual(defaults_value["sell_oracle_stale_s"], 5.0)
+        self.assertEqual(defaults_value["sell_oracle_edge_floor_usd"], 25.0)
         self.assertIs(example["oracle_log_enabled"], True)
+        self.assertEqual(example["sell_late_window_s"], 120.0)
+
+    def test_manage_sells_wires_late_oracle_veto_only(self):
+        manage = _fn_source(MINT, "_manage_sells_locked")
+        self.assertIn("late_oracle_scrap_ok", manage)
+        self.assertIn("sell_loser_oracle_block", manage)
+        self.assertIn("sell_loser_oracle_ok", manage)
+        self.assertIn("_oracle_bag_view", manage)
+        self.assertIn("sell_late_window_s", manage)
+        for token in FORBIDDEN_SELL_CYCLE:
+            self.assertNotIn(token, manage, f"_manage_sells_locked contains {token}")
+        # Winner / dump / mint must not grow a second oracle strategy.
+        self.assertNotIn("late_oracle_scrap_ok", _fn_source(MINT, "run_mint_cycle"))
+        dump_tail = manage[manage.find("Held-leg dump") : manage.find("loser_persist_s")]
+        self.assertNotIn("late_oracle_scrap_ok", dump_tail)
 
 
 if __name__ == "__main__":
