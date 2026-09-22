@@ -1,0 +1,14 @@
+{
+  "bid_enabled": false,
+  "dry_run": true,
+  "shares": 20.0,
+  "bid_max_px": 0.04,
+  "active_ttm_s": 180.0,
+  "cancel_ttm_s": 20.0,
+  "min_gtd_ahead_s": 60.0,
+  "poll_s": 2.0,
+  "series_slugs": [
+    "btc-up-or-down-15m"
+  ],
+  "signature_type": 3
+}

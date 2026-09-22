@@ -8,9 +8,12 @@ this tree; they are not current operational instructions.
 
 **Live services:** `polymintbot` (`mintbot.py` + `strategy_mint.json`) and
 `polypathlog` (`pathlog.py`, **15m only**). Atomic mint on
-`btc-up-or-down-15m`. Buybots, complement, hedge, DangerZone, shadow
+`btc-up-or-down-15m`. Buybots, complementbot, hedge, DangerZone, shadow
 bots, and hourly-dense pathlog stay **off**. Do not start them, and do
-not add their sources back.
+not add those sources back. `scrapbidder.py` /
+`deploy/polyscrapbid.service` is an opt-in bids-only sister process
+(wallet B). It is not a restore of `complementbot.py`. Leave it stopped
+until the operator asks.
 
 Never infer service state from filenames or old documentation. Read
 current configuration and read-only service status before operational
@@ -31,21 +34,29 @@ work.
 **btc-up-or-down-15m** only (`strategy_mint.example.json` mirrors the
 template: dry_run=true, entry_enabled=false, sell_enabled=false). Optional
 sell stays off until live `strategy_mint.json` sets `sell_enabled=true`.
-Loser dump: sized opposite bid ≥ `sell_opposite_min` (~0.90), loser ≤
-`sell_threshold` (0.03) persists `sell_persist_s` (~5s), or
-`sell_persist_last_min_s` (~2s) when time-to-end is within
-`sell_persist_last_min_window_s` (~60s), then re-check in-range at fire
-and FAK threshold → `sell_floor` (0.02) when the live sized bid is ≥ floor,
-or at the live bid if it is below the floor (empty FAK or a vanished loser
-book after arm keeps `armed_ts`; do not fire until a sized bid ≤ threshold
-returns). Persist waits fold typical ~4s sell-tick/FAK lag so wall-clock
-stays ~9s (last-min ~5–6s). Out of range at fire logs
-`sell_cancel_out_of_range` and does not POST. **Late-window oracle veto:**
-when TTM ≤ `sell_late_window_s` (~120), also require side-aware Chainlink
-TWAP edge ≥ `max(sell_oracle_edge_floor_usd, sell_oracle_edge_per_ttm × TTM)`
-for `sell_oracle_edge_persist_s` (~3s), fail-closed on missing/stale tape
-(`sell_oracle_stale_s` ~5); log `sell_loser_oracle_block` /
-`sell_loser_oracle_ok`. Outside that window, CLOB gates only.
+Loser scrap: sized opposite bid ≥ `sell_opposite_min` (~0.90), loser ≤
+`sell_threshold` (0.04) **arms**. 4¢ is the ceiling to start hunting, not
+the print. Persist `sell_persist_s` (~2.5s), or `sell_persist_last_min_s`
+(~1s) when time-to-end is within `sell_persist_last_min_window_s` (~60s).
+Skip that wait when TTM ≤ `sell_persist_skip_ttm_s` (~90s) or when bid
+depth at the FAK rung covers our size. Then re-check in-range at fire and
+FAK `sell_fak_px` (0.03) → `sell_floor` (0.02), or the live bid when the
+book is thinner than the print. Do not post a 4¢ sell. Empty FAK or a
+vanished loser book after arm keeps `armed_ts`. On
+`empty_keep_arm` / `empty_fak_keep_arm`, fire a blind 1¢ FAK
+(`sell_scrap_blind_px`, backoff `sell_scrap_blind_backoff_s` ~3s). After
+the first FAK miss while still armed, rest a GTD/GTC sell at
+`sell_scrap_rest_px` (0.03, the print). Cancel that rest on fill, window
+end, loser no longer qualifies, or a hard late-window oracle block. An
+empty book alone does not pull a rest that still has edge. Out of range
+at fire logs `sell_cancel_out_of_range` and does not POST. **Late-window
+oracle veto:** when TTM ≤ `sell_late_window_s` (~120), also require
+side-aware Chainlink TWAP edge ≥
+`max(sell_oracle_edge_floor_usd, sell_oracle_edge_per_ttm × TTM)` for
+`sell_oracle_edge_persist_s` (~3s) before any new loser post (FAK, blind,
+or rest), fail-closed on missing/stale tape (`sell_oracle_stale_s` ~5);
+log `sell_loser_oracle_block` / `sell_loser_oracle_ok`. Skip-persist does
+not bypass that veto. Outside that window, CLOB gates only.
 Winner cash-out is a separate path at `sell_winner_min` (~0.999).
 Live-bid FAK the winner, then clamp `limit = min(live_sized_bid,
 sell_clob_max_price=0.99)` (floor `sell_clob_min_price=0.01`) so rich
@@ -58,10 +69,24 @@ or add 5m/hourly back to `SERIES`.
 
 `mintbot.py` runs sell and mint as independent loops so Gamma/relayer
 work cannot steal a dump tick. Do not re-serialize them into one
-`manage_sells → discover → sleep` cycle. Persist / dump / loser defaults
-are 5/2/60 (dump persist 2s); `sell_armed_poll_s` is sell-loop cadence
-only. Live `strategy_mint.json` persist values stay until the operator
-merges.
+`manage_sells → discover → sleep` cycle. Persist / last-min / window
+defaults are 2.5/1/60 (dump persist stays 2s); `sell_armed_poll_s` is
+sell-loop cadence only. Live `strategy_mint.json` still wins for keys it
+already sets (`sell_threshold`, `sell_persist_s`, `sell_persist_last_min_s`
+were 0.03 / 5 / 2 on the 19 Sep snapshot). New keys absent from that file
+(`sell_fak_px`, skip-persist, blind, rest) take these defaults after the
+operator pulls and restarts. Do not edit live JSON from this repo.
+
+Wallet A (mintbot) never posts a bid. There is no same-wallet buyback.
+`scrapbidder.py` is a separate process for wallet B: limit BUY only,
+default 20 shares at `bid_max_px` 0.04, last `active_ttm_s` (~180s),
+cancel by T−`cancel_ttm_s` (~20s). It bids a token only after A is flat
+on that token when A held the market (sold loser, no live scrap rest),
+or the cheap live side of a market A never held. It never mints and never
+FAK-sells. `bid_enabled` defaults false and `dry_run` defaults true.
+Credentials stay in gitignored `.env.complement` (POLY_1271 / deposit
+wallet). Refuse the mintbot funder. Do not put `.env.complement` values
+in git. `deploy/polyscrapbid.service` stays off until the operator asks.
 
 Shared `buy/` helpers exist for mint, pathlog, and the recording-only oracle tape:
 
@@ -75,10 +100,12 @@ Shared `buy/` helpers exist for mint, pathlog, and the recording-only oracle tap
   (`logs/oracle_twap.jsonl`) plus read-only `bag_view` for the late
   loser-scrap veto. Not an input to mint, winner, dump, or sell outside
   `sell_late_window_s`.
+- `buy/sister_bid.py` — wallet B resting-bid policy (flat-after-A, cancel
+  near expiry). `scrapbidder.py` posts the bids. Not an input to mint.
 
 Do not restore retired buybot modules (`entry_skip`, `hedge_gate`,
 `btc_price`, `clob_book_ws`, `depth_ladder`, `strategy_coherence`,
-`entry_rest_gtd`, complement/probe/journal helpers).
+`entry_rest_gtd`, complementbot, probe/journal helpers).
 
 Run tests with `python -m unittest discover -s tests -p 'test_*.py' -v`
 in a disposable sandbox. Keep temporary files and Python caches in that
@@ -96,4 +123,5 @@ The existing main-branch deployment workflow pulls code and installs
 dependencies on the VM after merge. It does not restart services.
 Creating a PR is not authorization to merge or deploy it. After a pull,
 only `polymintbot` and `polypathlog` may be restarted, and only when the
-operator asks.
+operator asks. `polyscrapbid` stays stopped until the operator asks to
+start it.

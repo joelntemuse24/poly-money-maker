@@ -1,7 +1,8 @@
 # GCP disk ops (poly-money-maker VM)
 
 Live processes are **polymintbot** and **polypathlog** (15m). Do not start
-retired buy/complement/DangerZone units while recovering disk.
+retired buy/complement/DangerZone units, or the opt-in `polyscrapbid`
+unit, while recovering disk.
 
 ## Why the disk filled (2026-07 incident)
 

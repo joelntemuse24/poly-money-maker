@@ -9,6 +9,7 @@ from buy.mint_sell import (
     DEFAULT_SELL_KNOBS,
     classify_loser,
     cycle_sleep_s,
+    depth_covers_size,
     dump_fast_retry_eligible,
     dump_retry_ladder_limits,
     mint_cycle_sleep_s,
@@ -18,11 +19,18 @@ from buy.mint_sell import (
     late_oracle_edge_persist,
     late_oracle_need_usd,
     late_oracle_scrap_ok,
+    loser_blind_fak_due,
     loser_empty_keep_qualify,
     loser_ladder_limits,
+    loser_partial_fak_shares,
     loser_persist_ready,
+    loser_scrap_persist_s,
     parse_sell_fill_shares,
     persist_ready,
+    posted_order_id,
+    rest_order_matched_shares,
+    resting_tif,
+    scrap_rest_action,
     sell_fire_decision,
     sell_intent_hot,
     sell_window_open,
@@ -190,16 +198,16 @@ class PersistReadyTests(unittest.TestCase):
 class PersistLagFoldTests(unittest.TestCase):
     """Persist waits fold ~4s sell-tick/FAK lag so wall-clock stays ~9s / last-min ~5-6s."""
 
-    def test_default_persist_ready_at_5s_not_9(self):
+    def test_default_persist_ready_at_2_5s(self):
         persist = DEFAULT_SELL_KNOBS["sell_persist_s"]
-        self.assertEqual(persist, 5.0)
+        self.assertEqual(persist, 2.5)
         fire, _, why = persist_ready(
-            True, now_s=14.9, armed_ts=10.0, persist_s=persist,
+            True, now_s=12.4, armed_ts=10.0, persist_s=persist,
         )
         self.assertFalse(fire)
         self.assertEqual(why, "waiting")
         fire, _, why = persist_ready(
-            True, now_s=15.0, armed_ts=10.0, persist_s=persist,
+            True, now_s=12.5, armed_ts=10.0, persist_s=persist,
         )
         self.assertTrue(fire)
         self.assertEqual(why, "ready")
@@ -209,16 +217,16 @@ class PersistLagFoldTests(unittest.TestCase):
         self.assertFalse(still_waiting)
         self.assertEqual(why_9, "waiting")
 
-    def test_default_last_min_persist_ready_at_2s(self):
+    def test_default_last_min_persist_ready_at_1s(self):
         last = DEFAULT_SELL_KNOBS["sell_persist_last_min_s"]
-        self.assertEqual(last, 2.0)
+        self.assertEqual(last, 1.0)
         fire, _, why = persist_ready(
-            True, now_s=11.9, armed_ts=10.0, persist_s=last,
+            True, now_s=10.9, armed_ts=10.0, persist_s=last,
         )
         self.assertFalse(fire)
         self.assertEqual(why, "waiting")
         fire, _, why = persist_ready(
-            True, now_s=12.0, armed_ts=10.0, persist_s=last,
+            True, now_s=11.0, armed_ts=10.0, persist_s=last,
         )
         self.assertTrue(fire)
         self.assertEqual(why, "ready")
@@ -1037,6 +1045,42 @@ class SellFireDecisionTests(unittest.TestCase):
 class LateOracleScrapGateTests(unittest.TestCase):
     """Combat for true reverse btc-updown-15m-1790078400."""
 
+    def test_default_threshold_is_four_cents(self):
+        self.assertEqual(DEFAULT_SELL_KNOBS["sell_threshold"], 0.04)
+        self.assertEqual(DEFAULT_SELL_KNOBS["sell_floor"], 0.02)
+        leg, why = classify_loser(
+            up_bid=0.04, dn_bid=0.95,
+            threshold=DEFAULT_SELL_KNOBS["sell_threshold"],
+            opposite_min=DEFAULT_SELL_KNOBS["sell_opposite_min"],
+        )
+        self.assertEqual((leg, why), ("up", "loser"))
+        leg, why = classify_loser(
+            up_bid=0.05, dn_bid=0.95,
+            threshold=DEFAULT_SELL_KNOBS["sell_threshold"],
+            opposite_min=DEFAULT_SELL_KNOBS["sell_opposite_min"],
+        )
+        self.assertEqual(why, "none")
+        self.assertEqual(DEFAULT_SELL_KNOBS["sell_fak_px"], 0.03)
+        self.assertEqual(DEFAULT_SELL_KNOBS["sell_scrap_rest_px"], 0.03)
+        # 4¢ arms. The print stays ~3¢ → 2¢, never a 4¢ sell.
+        limits = loser_ladder_limits(
+            threshold=0.04, floor=0.02, loser_bid=0.04, fak_px=0.03,
+        )
+        self.assertEqual(limits, [0.03, 0.02])
+        self.assertNotIn(0.04, limits)
+        self.assertEqual(
+            loser_ladder_limits(
+                threshold=0.04, floor=0.02, loser_bid=0.025, fak_px=0.03,
+            ),
+            [0.025, 0.02],
+        )
+        self.assertEqual(
+            loser_ladder_limits(
+                threshold=0.04, floor=0.02, loser_bid=0.01, fak_px=0.03,
+            ),
+            [0.01],
+        )
+
     def test_defaults_include_late_oracle_knobs(self):
         self.assertEqual(DEFAULT_SELL_KNOBS["sell_late_window_s"], 120.0)
         self.assertEqual(DEFAULT_SELL_KNOBS["sell_oracle_edge_per_ttm"], 1.5)
@@ -1184,6 +1228,208 @@ class SizedBidTests(unittest.TestCase):
         )
         self.assertEqual(price, 0.89)
         self.assertEqual(size, 12.0)
+
+
+class ScrapSpeedTests(unittest.TestCase):
+    """Skip-persist, blind 1¢ FAK, and post-miss resting scrap."""
+
+    _END = 1_790_101_800.0  # btc-updown-15m-1790100900 closes 900s after slug
+
+    def _persist(self, *, now_s, depth=0.0, size=50.0, skip_ttm=90.0, sized=True):
+        return loser_scrap_persist_s(
+            now_s=now_s,
+            end_ts=self._END,
+            persist_s=2.5,
+            last_min_s=1.0,
+            last_min_window_s=60.0,
+            skip_ttm_s=skip_ttm,
+            depth_at_limit=depth,
+            our_size=size,
+            skip_when_sized=sized,
+        )
+
+    def test_last_90s_skips_persist(self):
+        persist, why = self._persist(now_s=self._END - 70.0, depth=0.0)
+        self.assertEqual(persist, 0.0)
+        self.assertEqual(why, "late_skip")
+        persist, why = self._persist(now_s=self._END - 90.0, depth=0.0)
+        self.assertEqual((persist, why), (0.0, "late_skip"))
+        persist, why = self._persist(now_s=self._END - 100.0, depth=0.0)
+        self.assertEqual((persist, why), (2.5, "normal"))
+
+    def test_sized_depth_skips_persist(self):
+        self.assertTrue(depth_covers_size(394.0, 50.0))
+        self.assertTrue(depth_covers_size(50.0, 50.0))
+        self.assertFalse(depth_covers_size(10.0, 50.0))
+        self.assertFalse(depth_covers_size(None, 50.0))
+        # Incident shape: ~4m TTM, book shows more size than we hold.
+        persist, why = self._persist(now_s=self._END - 240.0, depth=394.0, size=50.0)
+        self.assertEqual((persist, why), (0.0, "sized_skip"))
+        persist, why = self._persist(now_s=self._END - 240.0, depth=10.0, size=50.0)
+        self.assertEqual((persist, why), (2.5, "normal"))
+
+    def test_partial_fak_clips_to_short_depth(self):
+        self.assertEqual(
+            loser_partial_fak_shares(remaining=50.0, depth_at_limit=10.0),
+            10.0,
+        )
+        self.assertEqual(
+            loser_partial_fak_shares(remaining=50.0, depth_at_limit=80.0),
+            50.0,
+        )
+        self.assertEqual(
+            loser_partial_fak_shares(remaining=50.0, depth_at_limit=0.0),
+            50.0,
+        )
+
+    def test_blind_fak_on_empty_keep_respects_backoff(self):
+        fire, why = loser_blind_fak_due(
+            why="empty_keep_arm",
+            now_s=10.0,
+            last_blind_at=None,
+            backoff_s=3.0,
+            sold_loser=False,
+            has_inventory=True,
+            rest_live=False,
+            oracle_blocks=False,
+        )
+        self.assertTrue(fire)
+        self.assertEqual(why, "blind_fak")
+        fire, why = loser_blind_fak_due(
+            why="empty_fak_keep_arm",
+            now_s=12.0,
+            last_blind_at=10.0,
+            backoff_s=3.0,
+            sold_loser=False,
+            has_inventory=True,
+            rest_live=False,
+            oracle_blocks=False,
+        )
+        self.assertFalse(fire)
+        self.assertEqual(why, "backoff")
+        fire, why = loser_blind_fak_due(
+            why="empty_keep_arm",
+            now_s=13.0,
+            last_blind_at=10.0,
+            backoff_s=3.0,
+            sold_loser=False,
+            has_inventory=True,
+            rest_live=False,
+            oracle_blocks=False,
+        )
+        self.assertTrue(fire)
+        fire, why = loser_blind_fak_due(
+            why="empty_keep_arm",
+            now_s=20.0,
+            last_blind_at=None,
+            backoff_s=3.0,
+            sold_loser=False,
+            has_inventory=True,
+            rest_live=True,
+            oracle_blocks=False,
+        )
+        self.assertEqual(why, "rest_live")
+
+    def test_fak_miss_places_rest_and_window_end_cancels(self):
+        action, why = scrap_rest_action(
+            enabled=True,
+            rest_order_id=None,
+            sold_loser=False,
+            window_open=True,
+            loser_qualifies=True,
+            oracle_blocks=False,
+            fak_miss=True,
+            armed=True,
+        )
+        self.assertEqual((action, why), ("place", "fak_miss"))
+        # 1790100900: FAK miss with minutes left → GTD through the window.
+        now = self._END - 240.0
+        tif, exp = resting_tif(now_s=now, expire_ts=self._END, min_ahead_s=60.0)
+        self.assertEqual((tif, exp), ("GTD", int(self._END)))
+        action, why = scrap_rest_action(
+            enabled=True,
+            rest_order_id="oid-1",
+            sold_loser=False,
+            window_open=False,
+            loser_qualifies=True,
+            oracle_blocks=False,
+            fak_miss=True,
+            armed=True,
+        )
+        self.assertEqual((action, why), ("cancel", "window_end"))
+        action, why = scrap_rest_action(
+            enabled=True,
+            rest_order_id="oid-1",
+            sold_loser=False,
+            window_open=True,
+            loser_qualifies=False,
+            oracle_blocks=False,
+            fak_miss=True,
+            armed=True,
+        )
+        self.assertEqual((action, why), ("cancel", "loser_disqualified"))
+        self.assertEqual(posted_order_id({"orderID": "abc"}), "abc")
+        matched, status = rest_order_matched_shares(
+            {"status": "live", "size_matched": "0"},
+            50.0,
+        )
+        self.assertEqual((matched, status), (0.0, "live"))
+        matched, status = rest_order_matched_shares(
+            {"status": "matched", "size_matched": "50"},
+            50.0,
+        )
+        self.assertEqual(status, "filled")
+
+    def test_gtd_falls_back_to_gtc_inside_security_window(self):
+        tif, exp = resting_tif(now_s=1_000.0, expire_ts=1_030.0, min_ahead_s=60.0)
+        self.assertEqual((tif, exp), ("GTC", 0))
+
+    def test_thin_oracle_still_blocks_when_persist_is_skipped(self):
+        ok, why, _detail = late_oracle_scrap_ok(
+            ttm_s=42.0,
+            scrap_leg="dn",
+            twap_usd=100_020.0,
+            open_usd=100_000.0,
+            twap_age_s=1.0,
+        )
+        self.assertFalse(ok)
+        self.assertEqual(why, "edge_thin")
+        persist, skip_why = self._persist(now_s=self._END - 42.0, depth=400.0)
+        self.assertEqual((persist, skip_why), (0.0, "late_skip"))
+        fire, blind_why = loser_blind_fak_due(
+            why="empty_keep_arm",
+            now_s=self._END - 42.0,
+            last_blind_at=None,
+            backoff_s=3.0,
+            sold_loser=False,
+            has_inventory=True,
+            rest_live=False,
+            oracle_blocks=True,
+        )
+        self.assertFalse(fire)
+        self.assertEqual(blind_why, "oracle_block")
+        action, rest_why = scrap_rest_action(
+            enabled=True,
+            rest_order_id=None,
+            sold_loser=False,
+            window_open=True,
+            loser_qualifies=True,
+            oracle_blocks=True,
+            fak_miss=True,
+            armed=True,
+        )
+        self.assertEqual((action, rest_why), ("none", "oracle_block"))
+        action, rest_why = scrap_rest_action(
+            enabled=True,
+            rest_order_id="oid-live",
+            sold_loser=False,
+            window_open=True,
+            loser_qualifies=True,
+            oracle_blocks=True,
+            fak_miss=True,
+            armed=True,
+        )
+        self.assertEqual((action, rest_why), ("cancel", "oracle_block"))
 
 
 if __name__ == "__main__":

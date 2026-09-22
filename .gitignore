@@ -28,6 +28,10 @@ strategy_buyhourly.json
 strategy_complement.json
 strategy_mint.json
 positions_mint.json
+strategy_scrapbid.json
+positions_scrapbid.json
+STOP_SCRAPBID
+.scrapbid.lock
 positions_complement.json
 positions_complement.dryrun.json
 pnl_complement.json

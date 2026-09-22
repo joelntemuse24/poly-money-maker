@@ -1,20 +1,24 @@
 """Pure mint-sell policy helpers (no CLOB posts, no mintbot import).
 
-Loser dump: arm when a sized loser bid is at/under ``sell_threshold`` (~3¢)
+Loser dump: arm when a sized loser bid is at/under ``sell_threshold`` (~4¢)
 and the opposite sized bid is at/over ``sell_opposite_min`` (~90¢). Persist
-that book for ``sell_persist_s`` (~5s), or ``sell_persist_last_min_s`` (~2s)
-when time-to-end is within ``sell_persist_last_min_window_s`` (~60s), then
-re-check in-range at fire and FAK 3¢ → 2¢ when the live sized bid is at/over
-the floor; if the live bid is below the floor, FAK at that live bid. Persist
-waits fold typical ~4s sell-tick/FAK lag so wall-clock stays ~9s (last-min
-~5–6s). Empty FAK, or a vanished loser book after arm, keeps ``armed_ts``
-(do not fire until a sized bid at/under threshold returns). Keep the winner
-for redeem unless its sized bid reaches ``sell_winner_min`` (~99¢).
+that book for ``sell_persist_s`` (~2.5s), or ``sell_persist_last_min_s`` (~1s)
+when time-to-end is within ``sell_persist_last_min_window_s`` (~60s). Skip
+that wait when TTM ≤ ``sell_persist_skip_ttm_s`` (~90s) or when bid depth at
+the FAK limit covers our size. Then re-check in-range at fire and FAK
+``sell_fak_px`` (~3¢) → ``sell_floor`` (~2¢) when the live sized bid is at/over the floor;
+if the live bid is below the floor, FAK at that live bid. Empty FAK, or a
+vanished loser book after arm, keeps ``armed_ts``. On an empty keep, fire a
+blind 1¢ FAK (backoff ``sell_scrap_blind_backoff_s``). After a FAK miss,
+rest a GTD/GTC sell at ``sell_scrap_rest_px`` (~3¢, the print, not the 4¢
+arm) for the remainder. Keep
+the winner for redeem unless its sized bid reaches ``sell_winner_min`` (~99¢).
 
 In the last ``sell_late_window_s`` (~120s), also require a side-aware
 Chainlink TWAP edge vs window open (≥ ``max(floor, per_ttm × TTM)`` for
-``sell_oracle_edge_persist_s``) before firing the loser scrap. Outside that
-window this module's CLOB gates are unchanged.
+``sell_oracle_edge_persist_s``) before any new loser scrap post (FAK, blind,
+or rest). Outside that window this module's CLOB gates are unchanged. A thin
+edge still blocks; skip-persist does not bypass the veto.
 
 After the loser is sold, optional held-leg dump: if the remaining leg's sized
 bid stays under ``sell_dump_below`` (~80¢) for ``sell_dump_persist_s`` (~2s),
@@ -28,12 +32,27 @@ from typing import Any, Optional, Sequence, Tuple
 
 DEFAULT_SELL_KNOBS = {
     "sell_enabled": False,
-    "sell_threshold": 0.03,
+    "sell_threshold": 0.04,
+    # Arm ceiling is sell_threshold. The scrap print is this rung (~3¢),
+    # then the floor, or the live bid when the book is thinner.
+    "sell_fak_px": 0.03,
     "sell_floor": 0.02,
     "sell_opposite_min": 0.90,
-    "sell_persist_s": 5.0,
-    "sell_persist_last_min_s": 2.0,
+    "sell_persist_s": 2.5,
+    "sell_persist_last_min_s": 1.0,
     "sell_persist_last_min_window_s": 60.0,
+    # Immediate FAK once armed when TTM is inside this window (0 disables).
+    "sell_persist_skip_ttm_s": 90.0,
+    # Immediate FAK when cumulative bid size at the limit covers our shares.
+    "sell_persist_skip_when_sized": True,
+    "sell_scrap_blind_enabled": True,
+    "sell_scrap_blind_px": 0.01,
+    "sell_scrap_blind_backoff_s": 3.0,
+    "sell_scrap_rest_enabled": True,
+    # Post-miss resting sell. Default is the ~3¢ print, not the 4¢ arm.
+    "sell_scrap_rest_px": 0.03,
+    # GTD expiration must be at least this far ahead; otherwise rest GTC.
+    "sell_scrap_rest_min_ahead_s": 60.0,
     "sell_cooldown_s": 3.0,
     "sell_winner_min": 0.999,
     "sell_winner_cheap_if_loser_le": 0.03,
@@ -170,7 +189,7 @@ def sell_intent_hot(intent: Any, now_s: float) -> bool:
 
     This is sell-loop scheduling only. Concurrent mint must not skip
     discovery because a bag is hot — that was the #193 serial-cycle
-    bandage. Persist waits fold typical tick/FAK lag (defaults 5/2/60).
+    bandage. Persist waits fold typical tick/FAK lag (defaults 2.5/1/60).
 
     Live audit (bag ``btc-updown-15m-1789880400``): ``poll_s=5`` plus
     manage_sells/reconcile/discover made sell ticks ≈8.6–10.5s. Persist
@@ -494,16 +513,26 @@ def loser_persist_ready(
 
 
 def loser_ladder_limits(
-    threshold: float, floor: float, loser_bid: float
+    threshold: float,
+    floor: float,
+    loser_bid: float,
+    *,
+    fak_px: Optional[float] = None,
 ) -> Sequence[float]:
-    """FAK limits: threshold→floor when bid ≥ floor; live bid when below floor."""
-    thr = round(float(threshold), 4)
+    """FAK limits. The arm ceiling is not the print.
+
+    Top rung is ``fak_px`` (~3¢) when given, otherwise ``threshold`` for
+    older callers. Each rung is clamped to the live bid, then the floor.
+    A live bid below the floor is the only rung. A 4¢ arm with ``fak_px``
+    0.03 therefore posts 3¢ → 2¢, or the live bid when the book is thinner.
+    """
+    top = round(float(threshold if fak_px is None else fak_px), 4)
     fl = round(float(floor), 4)
     bid = round(float(loser_bid), 4)
     if bid + 1e-12 < fl:
         return [bid] if bid > 1e-12 else []
     limits: list[float] = []
-    for limit in sorted({thr, fl}, reverse=True):
+    for limit in sorted({top, fl}, reverse=True):
         use_px = round(max(fl, min(limit, bid)), 4)
         if not limits or abs(use_px - limits[-1]) > 1e-12:
             limits.append(use_px)
@@ -515,7 +544,7 @@ def sell_fire_decision(
     *,
     bid: Optional[float],
     opposite_bid: Optional[float] = None,
-    threshold: float = 0.03,
+    threshold: float = 0.04,
     floor: float = 0.02,
     opposite_min: float = 0.90,
     dump_below: float = 0.80,
@@ -682,3 +711,207 @@ def late_oracle_edge_persist(
     return persist_ready(
         qualify, now_s=now_s, armed_ts=armed_ts, persist_s=persist_s
     )
+
+
+def depth_covers_size(depth_at_limit: Optional[float], our_size: float) -> bool:
+    """True when displayed bid depth at the FAK limit covers our shares."""
+    try:
+        depth = float(depth_at_limit)  # type: ignore[arg-type]
+        need = float(our_size)
+    except (TypeError, ValueError):
+        return False
+    if not math.isfinite(depth) or not math.isfinite(need) or need <= 1e-12:
+        return False
+    return depth + 1e-9 >= need
+
+
+def loser_partial_fak_shares(
+    *, remaining: float, depth_at_limit: Optional[float]
+) -> float:
+    """Clip a loser FAK to displayed depth when the book is short but present.
+
+    Empty depth returns ``remaining`` so a blind FAK can still post the
+    full remainder. A book that covers us returns ``remaining`` unchanged.
+    """
+    rem = max(0.0, float(remaining or 0))
+    try:
+        depth = float(depth_at_limit)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return rem
+    if not math.isfinite(depth) or depth <= 1e-12:
+        return rem
+    return min(rem, depth)
+
+
+def loser_scrap_persist_s(
+    *,
+    now_s: float,
+    end_ts: float,
+    persist_s: float,
+    last_min_s: float,
+    last_min_window_s: float,
+    skip_ttm_s: float = 0.0,
+    depth_at_limit: Optional[float] = None,
+    our_size: float = 0.0,
+    skip_when_sized: bool = False,
+) -> Tuple[Optional[float], str]:
+    """Loser persist seconds for this tick, plus a reason.
+
+    ``None`` / ``ended`` when the window is over. ``late_skip`` (0s) when
+    ``0 < TTM <= skip_ttm_s``. ``sized_skip`` (0s) when depth at the limit
+    covers ``our_size``. Otherwise the 2.5s / last-minute clock from
+    ``effective_loser_persist_s``. Does not consult the oracle.
+    """
+    base = effective_loser_persist_s(
+        now_s=now_s,
+        end_ts=end_ts,
+        persist_s=persist_s,
+        last_min_s=last_min_s,
+        last_min_window_s=last_min_window_s,
+    )
+    if base is None:
+        return None, "ended"
+    if end_ts:
+        ttm = float(end_ts) - float(now_s)
+        if float(skip_ttm_s or 0) > 0 and 0 < ttm <= float(skip_ttm_s) + 1e-12:
+            return 0.0, "late_skip"
+    if skip_when_sized and depth_covers_size(depth_at_limit, our_size):
+        return 0.0, "sized_skip"
+    if end_ts:
+        ttm = float(end_ts) - float(now_s)
+        window = float(last_min_window_s or 0)
+        if window > 0 and 0 < ttm <= window + 1e-12:
+            return float(base), "last_min"
+    return float(base), "normal"
+
+
+def loser_blind_fak_due(
+    *,
+    why: str,
+    now_s: float,
+    last_blind_at: Optional[float],
+    backoff_s: float,
+    sold_loser: bool,
+    has_inventory: bool,
+    rest_live: bool,
+    oracle_blocks: bool,
+    enabled: bool = True,
+) -> Tuple[bool, str]:
+    """Whether to post a blind floor-tick FAK while the loser arm is kept."""
+    if not enabled:
+        return False, "disabled"
+    if str(why or "") not in ("empty_keep_arm", "empty_fak_keep_arm"):
+        return False, "not_empty_arm"
+    if sold_loser:
+        return False, "sold"
+    if rest_live:
+        return False, "rest_live"
+    if oracle_blocks:
+        return False, "oracle_block"
+    if not has_inventory:
+        return False, "no_inventory"
+    if last_blind_at is not None:
+        wait = float(backoff_s or 0)
+        if float(now_s) + 1e-12 < float(last_blind_at) + wait:
+            return False, "backoff"
+    return True, "blind_fak"
+
+
+def scrap_rest_action(
+    *,
+    enabled: bool,
+    rest_order_id: Optional[str],
+    sold_loser: bool,
+    window_open: bool,
+    loser_qualifies: bool,
+    oracle_blocks: bool,
+    fak_miss: bool,
+    armed: bool,
+) -> Tuple[str, str]:
+    """What to do with the post-miss resting scrap sell.
+
+    Returns ``place``, ``keep``, ``cancel``, or ``none``, plus a reason.
+    An open rest is cancelled when the window ends, the loser is done, the
+    loser no longer qualifies, or the late-window oracle hard-blocks.
+    A new rest is placed only after a FAK miss while still armed, and only
+    when the oracle is not blocking.
+    """
+    if rest_order_id:
+        if not window_open:
+            return "cancel", "window_end"
+        if sold_loser:
+            return "cancel", "filled"
+        if oracle_blocks:
+            return "cancel", "oracle_block"
+        if not loser_qualifies:
+            return "cancel", "loser_disqualified"
+        return "keep", "resting"
+    if not enabled:
+        return "none", "disabled"
+    if not window_open:
+        return "none", "window_end"
+    if sold_loser or not armed:
+        return "none", "not_armed"
+    if oracle_blocks:
+        return "none", "oracle_block"
+    if not loser_qualifies:
+        return "none", "not_qualify"
+    if not fak_miss:
+        return "none", "no_fak_miss"
+    return "place", "fak_miss"
+
+
+def resting_tif(
+    *, now_s: float, expire_ts: float, min_ahead_s: float = 60.0
+) -> Tuple[str, int]:
+    """``(GTD, unix_exp)`` when expiration is far enough ahead, else ``(GTC, 0)``.
+
+    Polymarket rejects a GTD that expires inside the ~60s security threshold.
+    Callers still cancel GTC rests at window end or T−cancel.
+    """
+    try:
+        exp = int(float(expire_ts))
+        now_i = int(float(now_s))
+        ahead = int(float(min_ahead_s or 0))
+    except (TypeError, ValueError):
+        return "GTC", 0
+    if exp >= now_i + max(ahead, 0) + 1:
+        return "GTD", exp
+    return "GTC", 0
+
+
+def posted_order_id(result: Any) -> Optional[str]:
+    """CLOB post response order id, if one was returned."""
+    if isinstance(result, str) and result.strip():
+        return result.strip()
+    if not isinstance(result, dict):
+        return None
+    for key in ("orderID", "orderId", "id"):
+        value = result.get(key)
+        if value:
+            return str(value)
+    return None
+
+
+def rest_order_matched_shares(order: Any, offered: float) -> Tuple[float, str]:
+    """``(matched_shares, live|filled|cancelled|unknown)`` from ``get_order``."""
+    if not isinstance(order, dict):
+        return 0.0, "unknown"
+    status = str(
+        order.get("status") or order.get("order_status") or ""
+    ).lower()
+    probe = {
+        "size_matched": order.get("size_matched", order.get("sizeMatched")),
+        "makingAmount": order.get("makingAmount", order.get("making_amount")),
+    }
+    matched = parse_sell_fill_shares(probe, offered)
+    if "cancel" in status:
+        return matched, "cancelled"
+    offered_f = float(offered or 0)
+    if offered_f > 0 and matched + 1e-9 >= offered_f - 1e-9:
+        return matched, "filled"
+    if status in {"matched", "filled", "order_status_matched"}:
+        if matched <= 0 and offered_f > 0:
+            return offered_f, "filled"
+        return matched, "filled"
+    return matched, "live"
