@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ast
+import json
 import unittest
 from pathlib import Path
 
@@ -13,7 +14,9 @@ from buy.sister_bid import (
     MINTBOT_FUNDER,
     SISTER_DEFAULTS,
     a_token_flat,
+    buy_matched_shares,
     plan_sister_bids,
+    sister_quote,
     resolve_sister_client_config,
     sister_cancel_due,
     sister_funder_ok,
@@ -248,6 +251,13 @@ class SisterAuthTests(unittest.TestCase):
         self.assertEqual(SISTER_DEFAULTS["poll_hot_s"], 1.0)
         self.assertEqual(SISTER_DEFAULTS["miss_after_s"], 10.0)
         self.assertEqual(SISTER_DEFAULTS["miss_throttle_s"], 30.0)
+        self.assertIs(SISTER_DEFAULTS["bid_take_enabled"], True)
+        example = json.loads(
+            (ROOT / "strategy_scrapbid.example.json").read_text(encoding="utf-8")
+        )
+        self.assertIs(example["bid_take_enabled"], True)
+        self.assertEqual(example["bid_max_px"], 0.04)
+        self.assertEqual(example["shares"], 20.0)
 
     def test_poly_1271_and_deposit_funder_are_the_default(self):
         self.assertEqual(int(SignatureTypeV2.POLY_1271), 3)
@@ -278,7 +288,9 @@ class SisterAuthTests(unittest.TestCase):
         self.assertNotIn("load_dotenv()", src)
         self.assertIn("BUY", src)
         self.assertNotIn("side=SELL", src)
-        self.assertNotIn("OrderType.FAK", src)
+        self.assertIn("OrderType.FAK", src)
+        self.assertIn("bid_take_enabled", src)
+        self.assertIn("_fetch_top", src)
         self.assertNotIn("build_atomic_mint", src)
         self.assertNotIn("submit_mint", src)
         self.assertIn("scrapbid_miss", src)
@@ -417,6 +429,144 @@ class PostScrapMissTests(unittest.TestCase):
             enabled=False,
         )
         self.assertEqual(disabled, 2.0)
+
+
+def _sold_up():
+    return {
+        "status": "confirmed",
+        "sold_loser": True,
+        "sold_leg": "up",
+    }
+
+
+def _up_places(market, **kwargs):
+    actions = plan_sister_bids(
+        markets=[market],
+        intents={"cid": _sold_up()},
+        open_orders={},
+        now_s=10_000.0 - 100.0,
+        enabled=True,
+        **kwargs,
+    )
+    return [row for row in actions if row["op"] == "place" and row["leg"] == "up"]
+
+
+class PostScrapPriceTests(unittest.TestCase):
+    def test_takes_two_cent_ask_after_sold(self):
+        places = _up_places(_market(up_bid=0.01, up_ask=0.02, dn_bid=0.99))
+        self.assertEqual(len(places), 1)
+        self.assertEqual(places[0]["style"], "take")
+        self.assertEqual(places[0]["tif"], "FAK")
+        self.assertEqual(places[0]["price"], 0.02)
+        self.assertEqual(places[0]["shares"], 20.0)
+        self.assertEqual(places[0]["price_why"], "live_ask")
+        self.assertEqual(places[0]["reason"], "a_flat")
+
+    def test_rests_at_three_cent_bid_when_ask_is_rich(self):
+        places = _up_places(_market(up_bid=0.03, up_ask=None, dn_bid=0.99))
+        self.assertEqual(len(places), 1)
+        self.assertEqual(places[0]["style"], "rest")
+        self.assertEqual(places[0]["price"], 0.03)
+        self.assertEqual(places[0]["price_why"], "join_bid")
+        self.assertNotEqual(places[0]["tif"], "FAK")
+        places = _up_places(_market(up_bid=0.03, up_ask=0.05, dn_bid=0.99))
+        self.assertEqual(places[0]["style"], "rest")
+        self.assertEqual(places[0]["price"], 0.03)
+        self.assertNotEqual(places[0]["tif"], "FAK")
+
+    def test_never_pays_above_four_cents(self):
+        places = _up_places(_market(up_bid=0.05, up_ask=0.06, dn_bid=0.99))
+        self.assertEqual(places[0]["price"], 0.04)
+        self.assertEqual(places[0]["style"], "rest")
+        self.assertLessEqual(places[0]["price"], 0.04)
+        places = _up_places(_market(up_bid=0.05, up_ask=0.04, dn_bid=0.99))
+        self.assertEqual(places[0]["style"], "take")
+        self.assertEqual(places[0]["price"], 0.04)
+        style, price, why = sister_quote(bid=0.09, ask=0.08, bid_max_px=0.04)
+        self.assertEqual((style, price, why), ("rest", 0.04, "cap"))
+
+    def test_rich_ask_rests_at_cap_instead_of_taking(self):
+        places = _up_places(_market(up_bid=None, up_ask=0.05, dn_bid=0.99))
+        self.assertEqual(len(places), 1)
+        self.assertEqual(places[0]["style"], "rest")
+        self.assertEqual(places[0]["tif"] != "FAK", True)
+        self.assertEqual(places[0]["price"], 0.04)
+        self.assertEqual(places[0]["price_why"], "cap")
+
+    def test_take_disabled_joins_the_bid(self):
+        places = _up_places(
+            _market(up_bid=0.03, up_ask=0.02, dn_bid=0.99),
+            take_enabled=False,
+        )
+        self.assertEqual(places[0]["style"], "rest")
+        self.assertEqual(places[0]["price"], 0.03)
+        self.assertNotEqual(places[0]["tif"], "FAK")
+
+    def test_filled_shares_are_not_bought_again(self):
+        actions = plan_sister_bids(
+            markets=[_market(up_bid=0.01, up_ask=0.02)],
+            intents={"cid": _sold_up()},
+            open_orders={},
+            now_s=10_000.0 - 100.0,
+            enabled=True,
+            filled_shares={"cid": {"up": 20}},
+        )
+        up = [row for row in actions if row["leg"] == "up"]
+        self.assertTrue(all(row["op"] == "skip" for row in up))
+        self.assertTrue(any(row["reason"] == "filled" for row in up))
+        places = _up_places(
+            _market(up_bid=0.01, up_ask=0.02),
+            filled_shares={"cid": {"up": 8}},
+        )
+        self.assertEqual(places[0]["shares"], 12.0)
+        self.assertEqual(places[0]["style"], "take")
+
+    def test_buy_fill_ignores_usdc_making_amount(self):
+        self.assertEqual(
+            buy_matched_shares({"size_matched": 20, "makingAmount": 0.40}, 20),
+            20.0,
+        )
+        self.assertEqual(buy_matched_shares({"makingAmount": 400_000}, 20), 0.0)
+        self.assertEqual(buy_matched_shares({"takingAmount": "20000000"}, 20), 20.0)
+        self.assertEqual(buy_matched_shares({"takingAmount": 8}, 20), 8.0)
+
+    def test_partial_fill_suppresses_miss_and_full_fill_idles(self):
+        intent = {
+            "status": "confirmed",
+            "sold_loser": True,
+            "sold_leg": "up",
+            "end_ts": 10_000.0,
+            "last_sell_attempt_at": 1_000.0,
+        }
+        events, _flat, _emit = sister_miss_events(
+            intents={"cid": intent},
+            open_orders={},
+            now_s=1_030.0,
+            filled_shares={"cid": {"up": 8}},
+        )
+        self.assertEqual(events, [])
+        idle = sister_poll_s(
+            intents={"cid": intent},
+            open_orders={},
+            now_s=9_000.0,
+            poll_s=2.0,
+            hot_poll_s=1.0,
+            enabled=True,
+            filled_shares={"cid": {"up": 20}},
+            shares=20.0,
+        )
+        self.assertEqual(idle, 2.0)
+        hot = sister_poll_s(
+            intents={"cid": intent},
+            open_orders={},
+            now_s=9_000.0,
+            poll_s=2.0,
+            hot_poll_s=1.0,
+            enabled=True,
+            filled_shares={"cid": {"up": 8}},
+            shares=20.0,
+        )
+        self.assertEqual(hot, 1.0)
 
 
 if __name__ == "__main__":

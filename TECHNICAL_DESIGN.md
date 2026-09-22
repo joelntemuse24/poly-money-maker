@@ -532,7 +532,7 @@ Separate systemd unit. `SERIES = ["btc-up-or-down-15m"]` only. Polls CLOB books,
 
 `deploy/polypathlog.service` runs `pathlog.py` (no env file required for public books).
 
-`deploy/polyscrapbid.service` is opt-in and stays disabled. It runs `scrapbidder.py` with `EnvironmentFile=.env.complement` only (not mintbot `.env`). Wallet B rests BUY limits, default 20 shares at `bid_max_px` 0.04, in the last 180s, and cancels by T−20s. It bids a token only after wallet A is flat on that token when A held the market, or the cheap live side of a market A never held. It does not mint and does not sell. `bid_enabled` defaults false and `dry_run` defaults true. Do not commit `.env.complement`. Same-wallet buyback is not implemented. Do not enable this unit unless the operator asks.
+`deploy/polyscrapbid.service` is opt-in and stays disabled. It runs `scrapbidder.py` with `EnvironmentFile=.env.complement` only (not mintbot `.env`). Wallet B buys, cap 20 shares and `bid_max_px` 0.04. After A `sold_loser` on leg L it buys L immediately (A's scrap rest and the 180s window do not block it): FAK the ask when ≤ the cap, else join a cheaper bid, else rest at the cap. Cancel by T−20s. Markets A never held rest at the cap on the cheap live side only in the last 180s. It does not mint and does not FAK-sell. `bid_enabled` defaults false and `dry_run` defaults true. Do not commit `.env.complement`. Same-wallet buyback is not implemented. Do not enable this unit unless the operator asks.
 
 Never enable retired buy units (`polycomplement`, buybots, DangerZone) from memory of old docs. `polyscrapbid` is not a restore of `complementbot.py`.
 
@@ -577,7 +577,7 @@ From VM `strategy_mint.json`:
 | `sell_oracle_stale_s` | 5 | Fail closed if latest TWAP older than this |
 | `sell_oracle_edge_floor_usd` | 25 | `need = max(floor, per_ttm × TTM)` |
 
-Repo code defaults changed 2026-09-22 (`mintbot` `DEFAULTS` / `strategy_mint.example.json`). Live JSON still overrides every key it already sets, including `sell_threshold` 0.03 and persist 5 / 2 in this table. After the operator pulls and restarts, keys missing from the live file pick up: arm `sell_threshold` 0.04, print `sell_fak_px` 0.03 then floor 0.02 (or the live bid), persist 2.5 / 1, skip when TTM ≤ 90 or sized depth covers the clip, blind 1¢ FAK on an empty arm, rest GTD at `sell_scrap_rest_px` 0.03 after a FAK miss. Do not edit live JSON from this repo. Sister bids are a separate opt-in process (`strategy_scrapbid.example.json`): 20 shares BUY at 0.04, not a sell.
+Repo code defaults changed 2026-09-22 (`mintbot` `DEFAULTS` / `strategy_mint.example.json`). Live JSON still overrides every key it already sets, including `sell_threshold` 0.03 and persist 5 / 2 in this table. After the operator pulls and restarts, keys missing from the live file pick up: arm `sell_threshold` 0.04, print `sell_fak_px` 0.03 then floor 0.02 (or the live bid), persist 2.5 / 1, skip when TTM ≤ 90 or sized depth covers the clip, blind 1¢ FAK on an empty arm, rest GTD at `sell_scrap_rest_px` 0.03 after a FAK miss. Do not edit live JSON from this repo. Sister bids are a separate opt-in process (`strategy_scrapbid.example.json`): cap 20 shares and 0.04. Post-scrap FAK-buys the live ask when it is ≤ that cap, else joins a cheaper bid, else rests at the cap. Not a sell.
 
 <a id="section-30"></a>
 ## Deploy boundary (VM is source of truth)

@@ -25,11 +25,12 @@ import requests
 from dotenv import load_dotenv
 from eth_utils import to_checksum_address
 
-from buy.book import best_bid_with_min_size
+from buy.book import best_bid_with_min_size, best_from_levels
 from buy.market import MarketGateway
 from buy.mint_sell import rest_order_matched_shares
 from buy.sister_bid import (
     SISTER_DEFAULTS,
+    buy_matched_shares,
     plan_sister_bids,
     resolve_sister_client_config,
     sister_miss_events,
@@ -159,9 +160,10 @@ def merge_markets(discovered: list, intents: dict, now_s: float) -> list:
     return list(rows.values())
 
 
-def _fetch_bid(token_id: str) -> Optional[float]:
+def _fetch_top(token_id: str) -> tuple[Optional[float], Optional[float]]:
+    """``(best_bid, best_ask)`` from the public book. Dust under 1 share is ignored."""
     if not token_id:
-        return None
+        return None, None
     try:
         response = requests.get(
             "https://clob.polymarket.com/book",
@@ -169,14 +171,17 @@ def _fetch_bid(token_id: str) -> Optional[float]:
             timeout=5,
         )
         if response.status_code != 200:
-            return None
+            return None, None
         payload = response.json()
         book = payload if isinstance(payload, dict) else {}
-        price, _size = best_bid_with_min_size(book.get("bids") or [], min_size=1.0)
-        return price
+        bid, _bid_sz = best_bid_with_min_size(book.get("bids") or [], min_size=1.0)
+        ask, ask_sz = best_from_levels(book.get("asks") or [], "ask")
+        if ask_sz + 1e-12 < 1.0:
+            ask = None
+        return bid, ask
     except Exception as exc:
         _log("scrapbid_book_fail", token_id=str(token_id)[:18], error=str(exc)[:160])
-        return None
+        return None, None
 
 
 def _get_client():
@@ -220,6 +225,7 @@ def _get_client():
 
 
 def _place_bid(token_id: str, price: float, shares: float, tif: str, expiration: int):
+    """BUY only. ``FAK`` lifts an ask at or under the cap. GTC/GTD rests."""
     from py_clob_client_v2 import OrderArgs, OrderType
     from py_clob_client_v2.order_builder.constants import BUY
 
@@ -233,12 +239,20 @@ def _place_bid(token_id: str, price: float, shares: float, tif: str, expiration:
             expiration=int(expiration or 0),
         )
     )
-    order_type = OrderType.GTD if tif == "GTD" else OrderType.GTC
+    if tif == "FAK":
+        order_type = OrderType.FAK
+    elif tif == "GTD":
+        order_type = OrderType.GTD
+    else:
+        order_type = OrderType.GTC
     result = client.post_order(signed, order_type=order_type)
     order_id = ""
+    status = "posted"
     if isinstance(result, dict):
         order_id = str(result.get("orderID") or result.get("orderId") or result.get("id") or "")
-    return order_id, "posted" if order_id else "no_id"
+        status = str(result.get("status") or status)
+    matched = buy_matched_shares(result, shares)
+    return order_id, status, matched
 
 
 def _cancel_order(order_id: str) -> bool:
@@ -255,6 +269,9 @@ def _cancel_order(order_id: str) -> bool:
 
 
 def _poll_order(order_id: str, shares: float):
+    """``(bought_shares, status)``. Status comes from the order; the share
+    count ignores BUY ``makingAmount`` (USDC paid).
+    """
     if not order_id or str(order_id).startswith("dry"):
         return 0.0, "live"
     try:
@@ -262,7 +279,31 @@ def _poll_order(order_id: str, shares: float):
     except Exception as exc:
         _log("scrapbid_poll_fail", order_id=str(order_id)[:18], error=str(exc)[:160])
         return 0.0, "unknown"
-    return rest_order_matched_shares(order, shares)
+    _sell_matched, status = rest_order_matched_shares(order, shares)
+    bought = buy_matched_shares(order, shares)
+    if bought > 0:
+        return bought, status
+    if status == "filled" and float(shares or 0) > 0:
+        return float(shares), status
+    return 0.0, status
+
+
+def _add_filled(state: dict, cid: str, leg: str, shares: float) -> None:
+    if shares <= 0 or not cid or not leg:
+        return
+    filled = state.setdefault("filled", {})
+    if not isinstance(filled, dict):
+        filled = {}
+        state["filled"] = filled
+    slot = filled.setdefault(cid, {})
+    if not isinstance(slot, dict):
+        slot = {}
+        filled[cid] = slot
+    try:
+        prev = float(slot.get(leg) or 0)
+    except (TypeError, ValueError):
+        prev = 0.0
+    slot[leg] = round(prev + float(shares), 4)
 
 
 def apply_actions(actions: list, state: dict, *, dry_run: bool) -> None:
@@ -302,6 +343,8 @@ def apply_actions(actions: list, state: dict, *, dry_run: bool) -> None:
                 continue
             matched, status = _poll_order(oid, float((slot.get(leg) or {}).get("size") or 0))
             if status in {"filled", "cancelled"}:
+                if matched > 0:
+                    _add_filled(state, cid, leg, matched)
                 slot.pop(leg, None)
                 _log(
                     "scrapbid_done",
@@ -318,15 +361,16 @@ def apply_actions(actions: list, state: dict, *, dry_run: bool) -> None:
         price = float(action.get("price") or 0)
         shares = float(action.get("shares") or 0)
         token_id = str(action.get("token_id") or "")
+        tif = str(action.get("tif") or "GTC")
         if dry_run:
-            oid, status = f"dry-{cid}-{leg}", "dry"
+            oid, status, matched = f"dry-{cid}-{leg}", "dry", 0.0
         else:
             try:
-                oid, status = _place_bid(
+                oid, status, matched = _place_bid(
                     token_id,
                     price,
                     shares,
-                    str(action.get("tif") or "GTC"),
+                    tif,
                     int(action.get("expiration") or 0),
                 )
             except Exception as exc:
@@ -338,6 +382,29 @@ def apply_actions(actions: list, state: dict, *, dry_run: bool) -> None:
                     slug=action.get("slug"),
                 )
                 continue
+            if tif == "FAK" and matched <= 0 and oid:
+                polled, polled_status = _poll_order(oid, shares)
+                if polled > matched:
+                    matched = polled
+                    status = polled_status or status
+        if tif == "FAK" and not dry_run:
+            if matched > 0:
+                _add_filled(state, cid, leg, matched)
+            _log(
+                "scrapbid_take",
+                condition_id=cid,
+                leg=leg,
+                order_id=oid,
+                price=price,
+                shares=shares,
+                matched=matched,
+                tif=tif,
+                reason=action.get("reason"),
+                price_why=action.get("price_why"),
+                slug=action.get("slug"),
+                status=status,
+            )
+            continue
         if not oid:
             _log("scrapbid_place_fail", condition_id=cid, leg=leg, status=status)
             continue
@@ -391,8 +458,13 @@ def run_once(cfg: dict, now: Optional[float] = None) -> float:
         _log("scrapbid_discover_fail", error=str(exc)[:200])
     markets = merge_markets(discovered, intents, now_s)
     for market in markets:
-        market["up_bid"] = _fetch_bid(str(market.get("up_token") or ""))
-        market["dn_bid"] = _fetch_bid(str(market.get("dn_token") or ""))
+        up_bid, up_ask = _fetch_top(str(market.get("up_token") or ""))
+        dn_bid, dn_ask = _fetch_top(str(market.get("dn_token") or ""))
+        market["up_bid"], market["up_ask"] = up_bid, up_ask
+        market["dn_bid"], market["dn_ask"] = dn_bid, dn_ask
+    if not isinstance(state.get("filled"), dict):
+        state["filled"] = {}
+    filled = state["filled"]
     actions = plan_sister_bids(
         markets=markets,
         intents=intents,
@@ -404,6 +476,8 @@ def run_once(cfg: dict, now: Optional[float] = None) -> float:
         cancel_ttm_s=float(cfg["cancel_ttm_s"]),
         min_gtd_ahead_s=float(cfg["min_gtd_ahead_s"]),
         enabled=bool(cfg.get("bid_enabled")),
+        take_enabled=bool(cfg.get("bid_take_enabled", True)),
+        filled_shares=filled,
     )
     apply_actions(actions, state, dry_run=bool(cfg.get("dry_run")))
     if bool(cfg.get("bid_enabled")):
@@ -416,6 +490,7 @@ def run_once(cfg: dict, now: Optional[float] = None) -> float:
             cancel_ttm_s=float(cfg["cancel_ttm_s"]),
             miss_after_s=float(cfg.get("miss_after_s") or 10.0),
             throttle_s=float(cfg.get("miss_throttle_s") or 30.0),
+            filled_shares=filled,
         )
         state["miss_flat_at"] = flat_at
         state["miss_emit_at"] = emit_at
@@ -432,6 +507,8 @@ def run_once(cfg: dict, now: Optional[float] = None) -> float:
         hot_poll_s=float(cfg.get("poll_hot_s") or 1.0),
         cancel_ttm_s=float(cfg["cancel_ttm_s"]),
         enabled=bool(cfg.get("bid_enabled")),
+        filled_shares=filled,
+        shares=float(cfg.get("shares") or 20.0),
     )
 
 
@@ -447,6 +524,7 @@ def main() -> None:
         dry_run=bool(cfg.get("dry_run")),
         shares=cfg.get("shares"),
         bid_max_px=cfg.get("bid_max_px"),
+        bid_take_enabled=bool(cfg.get("bid_take_enabled", True)),
     )
     LOCK_FILE.parent.mkdir(parents=True, exist_ok=True)
     lock_fh = open(LOCK_FILE, "a+", encoding="utf-8")
