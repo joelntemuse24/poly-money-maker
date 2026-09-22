@@ -80,7 +80,7 @@ With a $5 trial (`shares=5`), you pay about $5 to mint 5 Up + 5 Down. If you sel
 
 **What this bot is not:** it is not the old hourly FAK entry bot. It does not chase 90–95¢ asks on one side with an oracle. It does not “hedge” by buying the opposite leg after entry. The post-loser exit under 80¢ is deliberately named a **held dump / sell-side pass**, not a hedge.
 
-**Risk concentration:** `max_open_sets=1` means at most one full unsold bag blocks capacity (with a special adjacent-window exception described below). A failed relayer mint is blocked for `mint_fail_cooldown_s` (~90s) and gives up after `mint_max_attempts` (3) tries so a hot remint loop cannot run. A single toxic loser fill or a missed dump still matters at small size; scaling share count scales both edge and left-tail together.
+**Risk concentration:** `max_open_sets=1` means at most one full unsold bag blocks capacity (with a special adjacent-window exception described below). A failed relayer mint is blocked for `mint_fail_cooldown_s` (~90s) and gives up after `mint_max_attempts` (3) tries so a hot remint loop cannot run. A restart ghost intent stuck at `submitting` with no `transaction_id` is auto-failed after `mint_submitting_timeout_s` (default 90s, `0` disables) so `wait_submit` cannot wedge the desk forever. A single toxic loser fill or a missed dump still matters at small size; scaling share count scales both edge and left-tail together.
 
 <a id="section-2"></a>
 ## Processes, wallet identities and files
@@ -245,7 +245,7 @@ Sell and mint are independent jobs (`buy/mint_loops.py`). They share `positions_
 **Mint loop** (`run_mint_cycle`):
 
 1. Reconcile open relayer intents / inventory (RPC outside the lock; skip confirmed inventory RPC while a bag is sell-hot to save RPC, not to unblock sell).
-2. If any intent is `submitting` → wait; if entry disabled → return.
+2. Auto-fail stale `submitting` intents that still have no `transaction_id` after `mint_submitting_timeout_s`, then if any `submitting` remains → wait; if entry disabled → return.
 3. Discover series markets; filter eligible; skip `already_minted`; skip owned tokens.
 4. Pick earliest eligible; if `mint_slots_full(..., pick.start_ts)` → capped.
 5. Balance precheck (no lock); then claim `submitting` under the lock (`already_minted` + slots + same-slug claim); `submit_mint_batch`; record pending/failed.
@@ -526,6 +526,7 @@ From VM `strategy_mint.json`:
 | `series_slugs` | `[btc-up-or-down-15m]` | 15m only |
 | `max_open_sets` | 1 | Capacity (see adjacent rule) |
 | `mint_fail_cooldown_s` | 90 | Wait after `failed` before remint |
+| `mint_submitting_timeout_s` | 90 | Auto-fail tx-less stale `submitting` intents (`0` disables) |
 | `mint_max_attempts` | 3 | Total mint tries per market |
 | `max_daily_notional` | 100 | Daily mint spend cap |
 | `poll_s` | 5 | Mint-loop sleep; sell-loop sleep when not hot |
