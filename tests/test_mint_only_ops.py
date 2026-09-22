@@ -433,6 +433,7 @@ class DeployUnitsTests(unittest.TestCase):
                 "market.py",
                 "mint_sell.py",
                 "mint_loops.py",
+                "oracle_log.py",
             },
         )
         market_src = (BUY / "market.py").read_text()

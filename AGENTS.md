@@ -58,7 +58,7 @@ are 5/2/60 (dump persist 2s); `sell_armed_poll_s` is sell-loop cadence
 only. Live `strategy_mint.json` persist values stay until the operator
 merges.
 
-Shared `buy/` helpers exist only for mint and pathlog:
+Shared `buy/` helpers exist for mint, pathlog, and the recording-only oracle tape:
 
 - `buy/book.py` — CLOB top-of-book parsing (`pathlog`, mint sized bids)
 - `buy/mint_sell.py` — sell fill parse, inventory latch, arm/persist
@@ -66,6 +66,8 @@ Shared `buy/` helpers exist only for mint and pathlog:
 - `buy/market.py` — Gamma/CLOB discovery (`mintbot`, `pathlog`)
 - `buy/chain.py` — Polygon eth_call prechecks (`mintbot`)
 - `buy/contracts.py` — atomic mint calldata (`mintbot`)
+- `buy/oracle_log.py` — recording-only Chainlink BTC/USD 60s TWAP tape
+  (`logs/oracle_twap.jsonl`). Not an input to mint, sell, dump, or winner.
 
 Do not restore retired buybot modules (`entry_skip`, `hedge_gate`,
 `btc_price`, `clob_book_ws`, `depth_ladder`, `strategy_coherence`,

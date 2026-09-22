@@ -19,6 +19,11 @@ dump tick (bag ``btc-updown-15m-1789905600``). The sell loop sleeps
 a bag is sell-hot (loser armed, or loser sold and dump/winner not done).
 Mint keeps ``poll_s``. Persist defaults are 5/2/60.
 
+A third loop records Chainlink BTC/USD 60s TWAP (Polymarket RTDS) to
+``logs/oracle_twap.jsonl`` while a 15m bag is open. That tape is audit
+only: sell and mint never read it. ``oracle_log_enabled`` defaults on.
+If the feed fails, the loop logs ``oracle_log_fail`` and trading continues.
+
 Usage:
   # dry-run (default when strategy_mint.json has dry_run true / entry_enabled false)
   python mintbot.py
@@ -56,7 +61,8 @@ from buy.book import best_bid_with_min_size, bid_fill_depth
 from buy.chain import ChainReader
 from buy.contracts import ContractCall, build_atomic_mint_calls
 from buy.market import MarketGateway, MintMarket
-from buy.mint_loops import IntentStore, start_mint_sell_loops
+from buy.mint_loops import IntentStore, run_job_loop, start_mint_sell_loops
+from buy.oracle_log import OracleLogService, snapshot_intents
 from buy.mint_sell import (
     classify_loser,
     cycle_sleep_s,
@@ -87,6 +93,7 @@ REPO = Path(__file__).resolve().parent
 STRATEGY_FILE = REPO / "strategy_mint.json"
 STATE_FILE = REPO / "positions_mint.json"
 LOG_FILE = REPO / "mintbot.log"
+ORACLE_LOG_FILE = REPO / "logs" / "oracle_twap.jsonl"
 LOCK_FILE = REPO / ".mintbot.lock"
 HEARTBEAT_FILE = REPO / ".heartbeat_mint"
 STOP_FILE = REPO / "STOP_MINT"
@@ -107,6 +114,8 @@ DEFAULTS = {
     "max_open_sets": 1,
     "poll_s": 5.0,
     "sell_armed_poll_s": 2.0,
+    # Recording-only Chainlink 60s TWAP tape. Not an input to mint or sell.
+    "oracle_log_enabled": True,
     "position_tolerance": 0.01,
     "require_accepting_orders": True,
     "sell_enabled": False,
@@ -2172,8 +2181,11 @@ def main() -> int:
         shares=cfg["shares"],
         max_ttm=cfg["enter_max_ttm_min"],
         series=cfg["series_slugs"],
-        loops=("sell", "mint"),
+        loops=("sell", "mint", "oracle"),
+        oracle_log_enabled=bool(cfg.get("oracle_log_enabled", True)),
     )
+    if cfg.get("oracle_log_enabled", True):
+        console.print("[dim]▶ oracle tape[/] logs/oracle_twap.jsonl  [dim](not a trading input)[/]")
 
     def should_stop() -> bool:
         return _shutdown or STOP_FILE.exists()
@@ -2199,6 +2211,26 @@ def main() -> int:
         current = cfg_box.get("cfg") or cfg
         return mint_cycle_sleep_s(current)
 
+    oracle = OracleLogService(ORACLE_LOG_FILE)
+
+    def oracle_tick() -> None:
+        current = cfg_box.get("cfg") or {}
+        enabled = bool(current.get("oracle_log_enabled", True))
+        with STATE_LOCK:
+            snap = snapshot_intents(state)
+        oracle.tick(
+            snap,
+            time.time(),
+            enabled=enabled,
+            on_fail=lambda msg: log_event("oracle_log_fail", error=str(msg)[:240]),
+        )
+
+    def oracle_sleep() -> float:
+        try:
+            return float(oracle.sleep_s)
+        except (TypeError, ValueError):
+            return 5.0
+
     sell_thread, mint_thread = start_mint_sell_loops(
         sell_tick=sell_tick,
         sell_sleep_s=sell_sleep,
@@ -2215,10 +2247,26 @@ def main() -> int:
             write_loop_heartbeat("mint", "error", error=str(exc)[:120]),
         ),
     )
+    oracle_thread = threading.Thread(
+        target=run_job_loop,
+        kwargs={
+            "name": "oracle",
+            "tick": oracle_tick,
+            "sleep_s": oracle_sleep,
+            "should_stop": should_stop,
+            "on_error": lambda exc: log_event(
+                "oracle_log_fail", error=str(exc)[:240]
+            ),
+        },
+        name="mintbot-oracle",
+        daemon=True,
+    )
+    oracle_thread.start()
     while not should_stop():
         time.sleep(0.25)
     sell_thread.join(timeout=5)
     mint_thread.join(timeout=5)
+    oracle_thread.join(timeout=5)
 
     console.print("[dim]mintbot stopped[/]")
     try:
