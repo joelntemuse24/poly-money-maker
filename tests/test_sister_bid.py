@@ -17,6 +17,8 @@ from buy.sister_bid import (
     resolve_sister_client_config,
     sister_cancel_due,
     sister_funder_ok,
+    sister_miss_events,
+    sister_poll_s,
 )
 
 
@@ -59,11 +61,38 @@ class FlatAfterATests(unittest.TestCase):
         self.assertFalse(flat)
         self.assertEqual(why, "a_still_long")
 
-    def test_rest_still_live_blocks_even_after_sold_flag(self):
+    def test_sold_loser_with_live_rest_still_places(self):
+        now = 10_000.0 - 100.0
         intent = {
             "status": "confirmed",
             "sold_loser": True,
             "sold_leg": "up",
+            "sell_loser_leg": "up",
+            "sell_scrap_rest_id": "rest-1",
+            "end_ts": 10_000.0,
+        }
+        flat, why = a_token_flat(intent, "up")
+        self.assertTrue(flat)
+        self.assertEqual(why, "a_flat")
+        actions = plan_sister_bids(
+            markets=[_market()],
+            intents={"cid": intent},
+            open_orders={},
+            now_s=now,
+            enabled=True,
+        )
+        places = [row for row in actions if row["op"] == "place"]
+        self.assertEqual(len(places), 1)
+        self.assertEqual(places[0]["leg"], "up")
+        self.assertEqual(places[0]["reason"], "a_flat")
+        held = [row for row in actions if row["leg"] == "dn"]
+        self.assertTrue(all(row["op"] == "skip" for row in held))
+        self.assertTrue(any(row["reason"] == "a_holds_other" for row in held))
+
+    def test_unsold_rest_still_blocks(self):
+        intent = {
+            "status": "confirmed",
+            "sold_loser": False,
             "sell_loser_leg": "up",
             "sell_scrap_rest_id": "rest-1",
         }
@@ -163,6 +192,38 @@ class CancelAndWindowTests(unittest.TestCase):
         )
         self.assertTrue(all(row["reason"] == "too_early" for row in actions))
 
+    def test_post_scrap_places_before_active_window(self):
+        now = 10_000.0 - 400.0
+        intent = {
+            "status": "confirmed",
+            "sold_loser": True,
+            "sold_leg": "up",
+            "end_ts": 10_000.0,
+        }
+        actions = plan_sister_bids(
+            markets=[_market()],
+            intents={"cid": intent},
+            open_orders={},
+            now_s=now,
+            enabled=True,
+        )
+        places = [row for row in actions if row["op"] == "place"]
+        self.assertEqual([row["leg"] for row in places], ["up"])
+        self.assertEqual(places[0]["reason"], "a_flat")
+        self.assertGreater(places[0]["ttm_s"], 180.0)
+        held = [row for row in actions if row["leg"] == "dn"]
+        self.assertTrue(any(row["reason"] == "a_holds_other" for row in held))
+        self.assertFalse(any(row["op"] == "place" and row["leg"] == "dn" for row in actions))
+        absent = plan_sister_bids(
+            markets=[_market()],
+            intents={},
+            open_orders={},
+            now_s=now,
+            enabled=True,
+        )
+        self.assertTrue(all(row["reason"] == "too_early" for row in absent))
+        self.assertFalse(any(row["op"] == "place" for row in absent))
+
     def test_disabled_cancels_open_and_places_nothing(self):
         now = 10_000.0 - 100.0
         actions = plan_sister_bids(
@@ -184,6 +245,9 @@ class SisterAuthTests(unittest.TestCase):
         self.assertIs(SISTER_DEFAULTS["dry_run"], True)
         self.assertEqual(SISTER_DEFAULTS["active_ttm_s"], 180.0)
         self.assertEqual(SISTER_DEFAULTS["cancel_ttm_s"], 20.0)
+        self.assertEqual(SISTER_DEFAULTS["poll_hot_s"], 1.0)
+        self.assertEqual(SISTER_DEFAULTS["miss_after_s"], 10.0)
+        self.assertEqual(SISTER_DEFAULTS["miss_throttle_s"], 30.0)
 
     def test_poly_1271_and_deposit_funder_are_the_default(self):
         self.assertEqual(int(SignatureTypeV2.POLY_1271), 3)
@@ -217,6 +281,142 @@ class SisterAuthTests(unittest.TestCase):
         self.assertNotIn("OrderType.FAK", src)
         self.assertNotIn("build_atomic_mint", src)
         self.assertNotIn("submit_mint", src)
+        self.assertIn("scrapbid_miss", src)
+        self.assertIn("sister_poll_s", src)
+        self.assertIn("poll_hot_s", src)
+
+
+class PostScrapMissTests(unittest.TestCase):
+    def _intent(self, **extra):
+        row = {
+            "status": "confirmed",
+            "sold_loser": True,
+            "sold_leg": "up",
+            "slug": "btc-updown-15m-1790100900",
+            "end_ts": 10_000.0,
+        }
+        row.update(extra)
+        return row
+
+    def test_miss_fires_once_when_delayed_then_throttles(self):
+        intent = self._intent()
+        events, flat_at, emit_at = sister_miss_events(
+            intents={"cid": intent},
+            open_orders={},
+            now_s=1_000.0,
+            first_flat_at={},
+            last_emit_at={},
+        )
+        self.assertEqual(events, [])
+        self.assertEqual(flat_at["cid:up"], 1_000.0)
+        events, flat_at, emit_at = sister_miss_events(
+            intents={"cid": intent},
+            open_orders={},
+            now_s=1_009.0,
+            first_flat_at=flat_at,
+            last_emit_at=emit_at,
+        )
+        self.assertEqual(events, [])
+        events, flat_at, emit_at = sister_miss_events(
+            intents={"cid": intent},
+            open_orders={},
+            now_s=1_010.0,
+            first_flat_at=flat_at,
+            last_emit_at=emit_at,
+        )
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0]["event"], "scrapbid_miss")
+        self.assertEqual(events[0]["condition_id"], "cid")
+        self.assertEqual(events[0]["leg"], "up")
+        self.assertAlmostEqual(events[0]["age_s"], 10.0)
+        self.assertAlmostEqual(events[0]["ttm"], 9_000.0 - 10.0)
+        events, flat_at, emit_at = sister_miss_events(
+            intents={"cid": intent},
+            open_orders={},
+            now_s=1_020.0,
+            first_flat_at=flat_at,
+            last_emit_at=emit_at,
+        )
+        self.assertEqual(events, [])
+        events, _flat_at, _emit_at = sister_miss_events(
+            intents={"cid": intent},
+            open_orders={},
+            now_s=1_040.0,
+            first_flat_at=flat_at,
+            last_emit_at=emit_at,
+        )
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0]["leg"], "up")
+
+    def test_open_bid_or_winner_or_cancel_window_is_not_a_miss(self):
+        intent = self._intent(last_sell_attempt_at=1_000.0)
+        events, _flat, _emit = sister_miss_events(
+            intents={"cid": intent},
+            open_orders={"cid": {"up": {"order_id": "bid-1"}}},
+            now_s=1_030.0,
+        )
+        self.assertEqual(events, [])
+        events, _flat, _emit = sister_miss_events(
+            intents={"cid": intent},
+            open_orders={},
+            now_s=9_990.0,
+        )
+        self.assertEqual(events, [])
+        events, _flat, _emit = sister_miss_events(
+            intents={"cid": self._intent(sold_leg="dn", sell_loser_leg="dn")},
+            open_orders={},
+            now_s=1_030.0,
+            first_flat_at={},
+        )
+        self.assertEqual([row["leg"] for row in events], [])
+        # dn is the sold leg; with last attempt absent the clock starts now.
+        events, flat_at, _emit = sister_miss_events(
+            intents={"cid": self._intent(sold_leg="dn")},
+            open_orders={},
+            now_s=1_000.0,
+        )
+        self.assertEqual(events, [])
+        self.assertIn("cid:dn", flat_at)
+        self.assertNotIn("cid:up", flat_at)
+
+    def test_attempt_clock_makes_the_first_look_a_miss(self):
+        events, _flat, _emit = sister_miss_events(
+            intents={"cid": self._intent(last_sell_attempt_at=980.0)},
+            open_orders={},
+            now_s=1_000.0,
+        )
+        self.assertEqual(len(events), 1)
+        self.assertAlmostEqual(events[0]["age_s"], 20.0)
+
+    def test_hot_poll_while_sold_leg_has_no_bid(self):
+        intent = self._intent()
+        hot = sister_poll_s(
+            intents={"cid": intent},
+            open_orders={},
+            now_s=9_000.0,
+            poll_s=2.0,
+            hot_poll_s=1.0,
+            enabled=True,
+        )
+        self.assertEqual(hot, 1.0)
+        idle = sister_poll_s(
+            intents={"cid": intent},
+            open_orders={"cid": {"up": {"order_id": "bid-1"}}},
+            now_s=9_000.0,
+            poll_s=2.0,
+            hot_poll_s=1.0,
+            enabled=True,
+        )
+        self.assertEqual(idle, 2.0)
+        disabled = sister_poll_s(
+            intents={"cid": intent},
+            open_orders={},
+            now_s=9_000.0,
+            poll_s=2.0,
+            hot_poll_s=1.0,
+            enabled=False,
+        )
+        self.assertEqual(disabled, 2.0)
 
 
 if __name__ == "__main__":

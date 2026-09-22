@@ -32,6 +32,8 @@ from buy.sister_bid import (
     SISTER_DEFAULTS,
     plan_sister_bids,
     resolve_sister_client_config,
+    sister_miss_events,
+    sister_poll_s,
 )
 
 
@@ -362,7 +364,7 @@ def apply_actions(actions: list, state: dict, *, dry_run: bool) -> None:
         )
 
 
-def run_once(cfg: dict, now: Optional[float] = None) -> int:
+def run_once(cfg: dict, now: Optional[float] = None) -> float:
     now_s = time.time() if now is None else float(now)
     mint = _read_json(MINT_STATE_FILE)
     intents = mint.get("intents") if isinstance(mint.get("intents"), dict) else {}
@@ -404,8 +406,33 @@ def run_once(cfg: dict, now: Optional[float] = None) -> int:
         enabled=bool(cfg.get("bid_enabled")),
     )
     apply_actions(actions, state, dry_run=bool(cfg.get("dry_run")))
+    if bool(cfg.get("bid_enabled")):
+        events, flat_at, emit_at = sister_miss_events(
+            intents=intents,
+            open_orders=state.get("orders") or {},
+            now_s=now_s,
+            first_flat_at=state.get("miss_flat_at") if isinstance(state.get("miss_flat_at"), dict) else {},
+            last_emit_at=state.get("miss_emit_at") if isinstance(state.get("miss_emit_at"), dict) else {},
+            cancel_ttm_s=float(cfg["cancel_ttm_s"]),
+            miss_after_s=float(cfg.get("miss_after_s") or 10.0),
+            throttle_s=float(cfg.get("miss_throttle_s") or 30.0),
+        )
+        state["miss_flat_at"] = flat_at
+        state["miss_emit_at"] = emit_at
+        for row in events:
+            payload = dict(row)
+            payload.pop("event", None)
+            _log("scrapbid_miss", **payload)
     _atomic_save(STATE_FILE, state)
-    return sum(1 for row in actions if row.get("op") == "place")
+    return sister_poll_s(
+        intents=intents,
+        open_orders=state.get("orders") or {},
+        now_s=now_s,
+        poll_s=float(cfg.get("poll_s") or 2.0),
+        hot_poll_s=float(cfg.get("poll_hot_s") or 1.0),
+        cancel_ttm_s=float(cfg["cancel_ttm_s"]),
+        enabled=bool(cfg.get("bid_enabled")),
+    )
 
 
 def main() -> None:
@@ -429,13 +456,16 @@ def main() -> None:
         _log("scrapbid_lock_busy")
         sys.exit(1)
     while not _shutdown and not STOP_FILE.exists():
+        step = float(cfg.get("poll_s") or 2.0)
         try:
-            run_once(cfg)
+            step = float(run_once(cfg))
         except Exception as exc:
             _log("scrapbid_cycle_error", error=str(exc)[:240])
-        cfg = load_strategy()
+        try:
+            cfg = load_strategy()
+        except Exception as exc:
+            _log("scrapbid_strategy_fail", error=str(exc)[:200])
         slept = 0.0
-        step = float(cfg.get("poll_s") or 2.0)
         while slept < step and not _shutdown and not STOP_FILE.exists():
             time.sleep(min(0.5, step - slept))
             slept += 0.5

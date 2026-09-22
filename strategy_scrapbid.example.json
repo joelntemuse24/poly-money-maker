@@ -7,6 +7,9 @@
   "cancel_ttm_s": 20.0,
   "min_gtd_ahead_s": 60.0,
   "poll_s": 2.0,
+  "poll_hot_s": 1.0,
+  "miss_after_s": 10.0,
+  "miss_throttle_s": 30.0,
   "series_slugs": [
     "btc-up-or-down-15m"
   ],

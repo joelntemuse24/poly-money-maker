@@ -1,9 +1,10 @@
 """Sister scrap-bidder policy (wallet B). No CLOB posts, no mintbot import.
 
-Wallet A (mintbot) mints and sells. Wallet B only rests small bids, and only
-on a token A is already flat on when A held that market. Markets A never
-held can take a bid on the cheap live side during the last few minutes.
-B never mints and never sells.
+Wallet A (mintbot) mints and sells. Wallet B only rests small bids. Once A
+has ``sold_loser`` on leg L, B bids L immediately, including while A's scrap
+rest is still up and outside the last ``active_ttm_s``. Markets A never held
+can take a bid on the cheap live side during that late window. The winner
+leg A still holds stays blocked. B never mints and never sells.
 
 Same-wallet buyback is intentionally not here.
 """
@@ -30,6 +31,11 @@ SISTER_DEFAULTS = {
     "cancel_ttm_s": 20.0,
     "min_gtd_ahead_s": 60.0,
     "poll_s": 2.0,
+    # Faster cadence while a sold loser has no resting B bid.
+    "poll_hot_s": 1.0,
+    # Loud miss if B has not bid within this many seconds of A going flat.
+    "miss_after_s": 10.0,
+    "miss_throttle_s": 30.0,
     "series_slugs": ["btc-up-or-down-15m"],
     "signature_type": POLY_1271,
 }
@@ -80,12 +86,28 @@ def resolve_sister_client_config(env: Optional[dict]) -> dict:
     }
 
 
-def a_token_flat(intent: Any, leg: str) -> tuple[bool, str]:
-    """Whether wallet A is flat on ``leg`` (or never held this market).
+def _sold_leg(intent: dict) -> Optional[str]:
+    """Leg A has already scrapped, if the intent says which one."""
+    sold_leg = intent.get("sold_leg") if intent.get("sold_leg") in ("up", "dn") else None
+    sold_flag = bool(intent.get("sold_loser") or sold_leg)
+    if not sold_flag:
+        return None
+    if sold_leg in ("up", "dn"):
+        return sold_leg
+    loser = intent.get("sell_loser_leg")
+    if loser in ("up", "dn"):
+        return loser
+    return None
 
-    When A has a live bag, B may bid ``leg`` only after ``sold_loser`` on
-    that leg and the scrap rest is gone. The other leg is the winner A
-    still holds. A missing intent is ``a_absent`` (B may bid the cheap book).
+
+def a_token_flat(intent: Any, leg: str) -> tuple[bool, str]:
+    """Whether wallet B may bid ``leg``.
+
+    ``sold_loser`` / ``sold_leg`` on L makes L flat immediately. A's
+    ``sell_scrap_rest_id`` does not block that leg: the two wallets are
+    different, and A's resting sell into B's bid is the hedge. The other
+    leg is the winner A still holds. A rest with no sold flag still means
+    A is long (``a_rest_live``). A missing intent is ``a_absent``.
     """
     if leg not in ("up", "dn"):
         return False, "bad_leg"
@@ -94,16 +116,15 @@ def a_token_flat(intent: Any, leg: str) -> tuple[bool, str]:
     status = str(intent.get("status") or "")
     if status not in _HELD_STATUSES:
         return True, "a_absent"
-    sold_leg = intent.get("sold_leg") if intent.get("sold_leg") in ("up", "dn") else None
-    sold = bool(intent.get("sold_loser") or sold_leg)
+    sold_leg = _sold_leg(intent)
+    if sold_leg == leg:
+        return True, "a_flat"
+    if sold_leg in ("up", "dn") and sold_leg != leg:
+        return False, "a_holds_other"
     rest_id = intent.get("sell_scrap_rest_id")
-    rest_leg = intent.get("sell_loser_leg") if intent.get("sell_loser_leg") in ("up", "dn") else sold_leg
+    rest_leg = intent.get("sell_loser_leg") if intent.get("sell_loser_leg") in ("up", "dn") else None
     if rest_id and (rest_leg is None or rest_leg == leg):
         return False, "a_rest_live"
-    if sold and sold_leg == leg and not rest_id:
-        return True, "a_flat"
-    if sold and sold_leg and sold_leg != leg:
-        return False, "a_holds_other"
     return False, "a_still_long"
 
 
@@ -193,14 +214,19 @@ def plan_sister_bids(
             if not window_open:
                 actions.append({**base, "op": "skip", "reason": "window_end"})
                 continue
-            if ttm is None or float(ttm) > float(active_ttm_s) + 1e-12:
+            if not flat:
+                actions.append({**base, "op": "skip", "reason": flat_why})
+                continue
+            # Post-scrap hedge does not wait for the last active_ttm_s.
+            # Markets A never held still do.
+            post_scrap = flat_why == "a_flat"
+            if not post_scrap and (
+                ttm is None or float(ttm) > float(active_ttm_s) + 1e-12
+            ):
                 actions.append({**base, "op": "skip", "reason": "too_early"})
                 continue
             if cancel:
                 actions.append({**base, "op": "skip", "reason": cancel_why})
-                continue
-            if not flat:
-                actions.append({**base, "op": "skip", "reason": flat_why})
                 continue
             if flat_why == "a_absent" and not _cheap_live(bids.get(leg), px):
                 actions.append({**base, "op": "skip", "reason": "not_cheap"})
@@ -241,3 +267,152 @@ def plan_sister_bids(
                 }
             )
     return actions
+
+
+def _finite_ts(value: Any) -> Optional[float]:
+    try:
+        ts = float(value)
+    except (TypeError, ValueError):
+        return None
+    if ts != ts or ts <= 0:
+        return None
+    return ts
+
+
+def flat_since_s(intent: Any, *, now_s: float, remembered: Any = None) -> float:
+    """When B should start the miss clock for a sold leg.
+
+    Prefer an explicit sold timestamp on the intent, then the FAK attempt
+    clock mintbot already stores (``last_sell_attempt_at``). Otherwise the
+    first time this process observed the leg flat.
+    """
+    now = float(now_s)
+    candidates: list[float] = []
+    if isinstance(intent, dict):
+        for key in ("sold_loser_at", "sell_loser_done_at", "last_sell_attempt_at"):
+            ts = _finite_ts(intent.get(key))
+            if ts is not None and ts <= now + 1.0:
+                candidates.append(ts)
+    remembered_ts = _finite_ts(remembered)
+    if remembered_ts is not None and remembered_ts <= now + 1.0:
+        candidates.append(remembered_ts)
+    if not candidates:
+        return now
+    return min(candidates)
+
+
+def _order_id(open_orders: Optional[dict], cid: str, leg: str) -> str:
+    slot = (open_orders or {}).get(cid) or {}
+    if not isinstance(slot, dict):
+        return ""
+    order = slot.get(leg)
+    if not isinstance(order, dict):
+        return ""
+    return str(order.get("order_id") or "")
+
+
+def sister_miss_events(
+    *,
+    intents: Optional[dict],
+    open_orders: Optional[dict],
+    now_s: float,
+    first_flat_at: Optional[dict] = None,
+    last_emit_at: Optional[dict] = None,
+    cancel_ttm_s: float = 20.0,
+    miss_after_s: float = 10.0,
+    throttle_s: float = 30.0,
+) -> tuple[list[dict], dict, dict]:
+    """Miss rows when A sold leg L and B has no bid, throttled.
+
+    Returns ``(events, next_first_flat_at, next_last_emit_at)``. An event
+    fires once ``age_s`` from the sold/first-observed clock is at least
+    ``miss_after_s`` and the previous emit for that leg is older than
+    ``throttle_s``. Window must still be open past ``cancel_ttm_s``.
+    """
+    now = float(now_s)
+    wait = max(0.0, float(miss_after_s or 0))
+    throttle = max(0.0, float(throttle_s or 0))
+    cancel_at = float(cancel_ttm_s or 0)
+    remembered = first_flat_at or {}
+    previous_emit = last_emit_at or {}
+    next_flat: dict[str, float] = {}
+    next_emit: dict[str, float] = {}
+    for key, raw in previous_emit.items():
+        ts = _finite_ts(raw)
+        if ts is not None and now + 1e-12 < ts + throttle:
+            next_emit[str(key)] = ts
+    events: list[dict] = []
+    for cid, intent in (intents or {}).items():
+        if not isinstance(intent, dict):
+            continue
+        end_ts = _finite_ts(intent.get("end_ts"))
+        if end_ts is None:
+            continue
+        ttm = float(end_ts) - now
+        if ttm <= cancel_at + 1e-12:
+            continue
+        for leg in ("up", "dn"):
+            _flat, why = a_token_flat(intent, leg)
+            if why != "a_flat":
+                continue
+            key = f"{cid}:{leg}"
+            since = flat_since_s(
+                intent, now_s=now, remembered=remembered.get(key)
+            )
+            next_flat[key] = since
+            if _order_id(open_orders, str(cid), leg):
+                continue
+            age = now - since
+            if age + 1e-12 < wait:
+                continue
+            prev = next_emit.get(key)
+            if prev is not None and now + 1e-12 < prev + throttle:
+                continue
+            events.append(
+                {
+                    "event": "scrapbid_miss",
+                    "condition_id": str(cid),
+                    "leg": leg,
+                    "slug": intent.get("slug"),
+                    "ttm": round(ttm, 3),
+                    "age_s": round(age, 3),
+                }
+            )
+            next_emit[key] = now
+    return events, next_flat, next_emit
+
+
+def sister_poll_s(
+    *,
+    intents: Optional[dict],
+    open_orders: Optional[dict],
+    now_s: float,
+    poll_s: float = 2.0,
+    hot_poll_s: float = 1.0,
+    cancel_ttm_s: float = 20.0,
+    enabled: bool = True,
+) -> float:
+    """Idle poll, or the hot cadence while a sold leg has no B bid."""
+    idle = max(0.2, float(poll_s or 0))
+    if not enabled:
+        return idle
+    hot = max(0.2, float(hot_poll_s or idle))
+    now = float(now_s)
+    cancel_at = float(cancel_ttm_s or 0)
+    for cid, intent in (intents or {}).items():
+        if not isinstance(intent, dict):
+            continue
+        end_ts = _finite_ts(intent.get("end_ts"))
+        if end_ts is None:
+            continue
+        ttm = float(end_ts) - now
+        if ttm <= cancel_at + 1e-12:
+            continue
+        for leg in ("up", "dn"):
+            _flat, why = a_token_flat(intent, leg)
+            if why != "a_flat":
+                continue
+            if _order_id(open_orders, str(cid), leg):
+                continue
+            return min(idle, hot)
+    return idle
