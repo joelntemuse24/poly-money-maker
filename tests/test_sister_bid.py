@@ -22,6 +22,7 @@ from buy.sister_bid import (
     resolve_sister_client_config,
     sister_cancel_due,
     sister_funder_ok,
+    sister_leg_filled,
     sister_miss_events,
     sister_poll_s,
 )
@@ -126,7 +127,7 @@ class FlatAfterATests(unittest.TestCase):
         self.assertEqual(len(places), 1)
         self.assertEqual(places[0]["leg"], "up")
         self.assertEqual(places[0]["shares"], 20.0)
-        self.assertEqual(places[0]["price"], 0.04)
+        self.assertEqual(places[0]["price"], 0.05)
         self.assertEqual(places[0]["price_why"], "rest_cap")
         self.assertEqual(places[0]["tif"], "GTC")
         self.assertEqual(places[0]["tif_why"], "gtc_short_expiry")
@@ -246,11 +247,12 @@ class CancelAndWindowTests(unittest.TestCase):
 
 
 class SisterAuthTests(unittest.TestCase):
-    def test_defaults_are_20_shares_at_four_cents(self):
+    def test_defaults_are_20_shares_at_five_cents(self):
         self.assertEqual(SISTER_DEFAULTS["shares"], 20.0)
-        self.assertEqual(SISTER_DEFAULTS["bid_max_px"], 0.04)
-        self.assertEqual(SISTER_DEFAULTS["bid_rest_px"], 0.04)
+        self.assertEqual(SISTER_DEFAULTS["bid_max_px"], 0.05)
+        self.assertEqual(SISTER_DEFAULTS["bid_rest_px"], 0.05)
         self.assertEqual(SISTER_DEFAULTS["bid_fak_min_notional"], 1.0)
+        self.assertEqual(SISTER_DEFAULTS["bid_fak_max_notional"], 1.5)
         self.assertEqual(SISTER_DEFAULTS["min_gtd_ahead_s"], 180.0)
         self.assertIs(SISTER_DEFAULTS["bid_enabled"], False)
         self.assertIs(SISTER_DEFAULTS["dry_run"], True)
@@ -264,11 +266,14 @@ class SisterAuthTests(unittest.TestCase):
             (ROOT / "strategy_scrapbid.example.json").read_text(encoding="utf-8")
         )
         self.assertIs(example["bid_take_enabled"], True)
-        self.assertEqual(example["bid_max_px"], 0.04)
-        self.assertEqual(example["bid_rest_px"], 0.04)
+        self.assertEqual(example["bid_max_px"], 0.05)
+        self.assertEqual(example["bid_rest_px"], 0.05)
         self.assertEqual(example["bid_fak_min_notional"], 1.0)
+        self.assertEqual(example["bid_fak_max_notional"], 1.5)
         self.assertEqual(example["min_gtd_ahead_s"], 180.0)
         self.assertEqual(example["shares"], 20.0)
+        self.assertEqual(sister_leg_filled({"cid": {"up": 3}}, "cid", "up"), 3.0)
+        self.assertEqual(sister_leg_filled({}, "cid", "up"), 0.0)
 
     def test_poly_1271_and_deposit_funder_are_the_default(self):
         self.assertEqual(int(SignatureTypeV2.POLY_1271), 3)
@@ -308,6 +313,10 @@ class SisterAuthTests(unittest.TestCase):
         policy = (ROOT / "buy" / "sister_bid.py").read_text(encoding="utf-8")
         self.assertIn("gtc_short_expiry", policy)
         self.assertIn("rest_cap", policy)
+        self.assertIn("fak_floor", policy)
+        self.assertIn("live_ask", policy)
+        self.assertIn("cross_ask", policy)
+        self.assertIn("bid_fak_max_notional", src)
         self.assertIn("_fetch_top", src)
         self.assertIn("sister_book_wanted", src)
         self.assertIn("_mint_intents", src)
@@ -505,71 +514,120 @@ def _up_places(market, **kwargs):
 
 
 class PostScrapPriceTests(unittest.TestCase):
-    def test_twenty_shares_rest_at_four_cents_instead_of_fak(self):
+    def test_twenty_shares_chase_the_ask_inside_the_budget(self):
+        # 20 × 2¢ = $0.40, so the limit lifts to 5¢ ($1) and the fill is the ask.
         places = _up_places(_market(up_bid=0.01, up_ask=0.02, dn_bid=0.99))
         self.assertEqual(len(places), 1)
-        self.assertEqual(places[0]["style"], "rest")
-        self.assertNotEqual(places[0]["tif"], "FAK")
-        self.assertEqual(places[0]["price"], 0.04)
-        self.assertEqual(places[0]["shares"], 20.0)
-        self.assertEqual(places[0]["price_why"], "rest_cap")
-        self.assertEqual(places[0]["reason"], "a_flat")
-        places = _up_places(
-            _market(up_bid=0.01, up_ask=0.02, dn_bid=0.99),
-            shares=100,
-        )
         self.assertEqual(places[0]["style"], "take")
         self.assertEqual(places[0]["tif"], "FAK")
-        self.assertEqual(places[0]["price"], 0.02)
+        self.assertEqual(places[0]["price"], 0.05)
+        self.assertEqual(places[0]["shares"], 20.0)
+        self.assertEqual(places[0]["price_why"], "fak_floor")
+        self.assertEqual(places[0]["reason"], "a_flat")
+        # 6¢ ask is inside $1.50. Take the ask, not a flat 5¢.
+        places = _up_places(_market(up_bid=0.04, up_ask=0.06, dn_bid=0.99))
+        self.assertEqual(places[0]["style"], "take")
+        self.assertEqual(places[0]["tif"], "FAK")
+        self.assertEqual(places[0]["price"], 0.06)
         self.assertEqual(places[0]["price_why"], "live_ask")
+        # 7.5¢ is the budget ceiling: 20 × 0.075 = $1.50.
+        places = _up_places(_market(up_bid=0.05, up_ask=0.075, dn_bid=0.99))
+        self.assertEqual(places[0]["price"], 0.075)
+        self.assertEqual(places[0]["price_why"], "live_ask")
+        self.assertEqual(places[0]["tif"], "FAK")
+        # 100 × 5¢ = $5, above the $1.50 max, and 5¢ would cross a 2¢ ask.
+        actions = plan_sister_bids(
+            markets=[_market(up_bid=0.01, up_ask=0.02, dn_bid=0.99)],
+            intents={"cid": _sold_up()},
+            open_orders={},
+            now_s=10_000.0 - 100.0,
+            enabled=True,
+            shares=100,
+        )
+        up = [row for row in actions if row["leg"] == "up"]
+        self.assertTrue(any(row["reason"] == "cross_ask" for row in up))
+        self.assertFalse(any(row["op"] == "place" for row in up))
+
+    def test_notional_above_max_rests_only_when_it_does_not_cross(self):
+        places = _up_places(
+            _market(up_bid=0.02, up_ask=0.08, dn_bid=0.99),
+            shares=40,
+        )
+        self.assertEqual(places[0]["style"], "rest")
+        self.assertEqual(places[0]["price"], 0.05)
+        self.assertEqual(places[0]["price_why"], "rest_cap")
+        self.assertNotEqual(places[0]["tif"], "FAK")
 
     def test_cheap_bid_still_rests_at_the_cap(self):
         places = _up_places(_market(up_bid=0.03, up_ask=None, dn_bid=0.99))
         self.assertEqual(len(places), 1)
         self.assertEqual(places[0]["style"], "rest")
-        self.assertEqual(places[0]["price"], 0.04)
+        self.assertEqual(places[0]["price"], 0.05)
         self.assertEqual(places[0]["price_why"], "rest_cap")
         self.assertNotEqual(places[0]["tif"], "FAK")
-        places = _up_places(_market(up_bid=0.035, up_ask=0.05, dn_bid=0.99))
-        self.assertEqual(places[0]["price"], 0.04)
+        places = _up_places(_market(up_bid=0.03, up_ask=0.08, dn_bid=0.99))
+        self.assertEqual(places[0]["price"], 0.05)
         self.assertEqual(places[0]["price_why"], "rest_cap")
 
-    def test_empty_book_rests_at_four_cents(self):
+    def test_empty_book_rests_at_five_cents(self):
         places = _up_places(_market(up_bid=None, up_ask=None, dn_bid=0.99))
         self.assertEqual(len(places), 1)
         self.assertEqual(places[0]["style"], "rest")
-        self.assertEqual(places[0]["price"], 0.04)
+        self.assertEqual(places[0]["price"], 0.05)
         self.assertEqual(places[0]["price_why"], "rest_cap")
         self.assertNotEqual(places[0]["tif"], "FAK")
 
-    def test_never_pays_above_four_cents(self):
-        places = _up_places(_market(up_bid=0.05, up_ask=0.06, dn_bid=0.99))
-        self.assertEqual(places[0]["price"], 0.04)
+    def test_never_pays_above_the_dollar_fifty_budget(self):
+        places = _up_places(_market(up_bid=0.04, up_ask=0.08, dn_bid=0.99))
+        self.assertEqual(places[0]["price"], 0.05)
         self.assertEqual(places[0]["price_why"], "rest_cap")
         self.assertEqual(places[0]["style"], "rest")
-        self.assertLessEqual(places[0]["price"], 0.04)
-        places = _up_places(_market(up_bid=0.05, up_ask=0.04, dn_bid=0.99))
-        self.assertEqual(places[0]["style"], "rest")
-        self.assertEqual(places[0]["price"], 0.04)
-        self.assertNotEqual(places[0]["tif"], "FAK")
-        style, price, why = sister_quote(bid=0.03, ask=0.02, bid_max_px=0.04, take_enabled=False)
-        self.assertEqual((style, price, why), ("rest", 0.04, "rest_cap"))
+        self.assertLessEqual(places[0]["price"], 0.075)
+        places = _up_places(_market(up_bid=0.04, up_ask=0.05, dn_bid=0.99))
+        self.assertEqual(places[0]["style"], "take")
+        self.assertEqual(places[0]["price"], 0.05)
+        self.assertEqual(places[0]["price_why"], "live_ask")
+        self.assertEqual(places[0]["tif"], "FAK")
+        style, price, why = sister_quote(
+            bid=0.03,
+            ask=0.02,
+            bid_max_px=0.05,
+            shares=20,
+            take_enabled=False,
+        )
+        self.assertEqual((style, price, why), ("wait", 0.0, "cross_ask"))
 
     def test_rich_ask_rests_at_cap_instead_of_taking(self):
-        places = _up_places(_market(up_bid=None, up_ask=0.05, dn_bid=0.99))
+        places = _up_places(_market(up_bid=None, up_ask=0.08, dn_bid=0.99))
         self.assertEqual(len(places), 1)
         self.assertEqual(places[0]["style"], "rest")
         self.assertNotEqual(places[0]["tif"], "FAK")
-        self.assertEqual(places[0]["price"], 0.04)
+        self.assertEqual(places[0]["price"], 0.05)
         self.assertEqual(places[0]["price_why"], "rest_cap")
 
-    def test_take_disabled_rests_at_cap(self):
+    def test_crossed_rest_is_not_posted_when_fak_is_blocked(self):
         places = _up_places(
             _market(up_bid=0.03, up_ask=0.02, dn_bid=0.99),
             take_enabled=False,
         )
+        self.assertEqual(places, [])
+        actions = plan_sister_bids(
+            markets=[_market(up_bid=0.03, up_ask=0.02, dn_bid=0.99)],
+            intents={"cid": _sold_up()},
+            open_orders={},
+            now_s=10_000.0 - 100.0,
+            enabled=True,
+            take_enabled=False,
+        )
+        up = [row for row in actions if row["leg"] == "up"]
+        self.assertTrue(any(row["reason"] == "cross_ask" for row in up))
+        # Ask above the cap: the 5¢ rest does not cross.
+        places = _up_places(
+            _market(up_bid=0.03, up_ask=0.08, dn_bid=0.99),
+            take_enabled=False,
+        )
         self.assertEqual(places[0]["style"], "rest")
-        self.assertEqual(places[0]["price"], 0.04)
+        self.assertEqual(places[0]["price"], 0.05)
         self.assertNotEqual(places[0]["tif"], "FAK")
 
     def test_filled_shares_are_not_bought_again(self):
@@ -588,9 +646,19 @@ class PostScrapPriceTests(unittest.TestCase):
             _market(up_bid=0.01, up_ask=0.02),
             filled_shares={"cid": {"up": 8}},
         )
+        self.assertEqual(places, [])
+        actions = plan_sister_bids(
+            markets=[_market(up_bid=0.01, up_ask=None)],
+            intents={"cid": _sold_up()},
+            open_orders={},
+            now_s=10_000.0 - 100.0,
+            enabled=True,
+            filled_shares={"cid": {"up": 8}},
+        )
+        places = [row for row in actions if row["op"] == "place" and row["leg"] == "up"]
         self.assertEqual(places[0]["shares"], 12.0)
         self.assertEqual(places[0]["style"], "rest")
-        self.assertEqual(places[0]["price"], 0.04)
+        self.assertEqual(places[0]["price"], 0.05)
 
     def test_buy_fill_ignores_usdc_making_amount(self):
         self.assertEqual(
@@ -718,21 +786,23 @@ class BookFilterTests(unittest.TestCase):
         self.assertEqual(len(places), 1)
         self.assertEqual(places[0]["leg"], "up")
         self.assertEqual(places[0]["reason"], "a_flat")
-        self.assertEqual(places[0]["style"], "rest")
-        self.assertEqual(places[0]["price"], 0.04)
-        self.assertEqual(places[0]["tif"], "GTD")
+        self.assertEqual(places[0]["style"], "take")
+        self.assertEqual(places[0]["price"], 0.05)
+        self.assertEqual(places[0]["price_why"], "fak_floor")
+        self.assertEqual(places[0]["tif"], "FAK")
         self.assertGreater(places[0]["ttm_s"], 180.0)
         held = [row for row in actions if row["leg"] == "dn"]
         self.assertTrue(any(row["reason"] == "a_holds_other" for row in held))
 
 
 class RestCapAndGtcTests(unittest.TestCase):
-    def test_incident_window_posts_gtc_at_four_cents(self):
+    def test_incident_window_posts_gtc_at_five_cents(self):
         # btc-updown-15m-1790109900, about 186s left: GTD expiry is ~166s.
+        # No ask, so the FAK does not fire and the rest is GTC at 5¢.
         end = 17_901_09900.0 + 900.0
         now = end - 186.0
         actions = plan_sister_bids(
-            markets=[_market(end_ts=end, up_bid=0.02, up_ask=0.03, dn_bid=0.97)],
+            markets=[_market(end_ts=end, up_bid=0.02, up_ask=None, dn_bid=0.97)],
             intents={"cid": _sold_up()},
             open_orders={},
             now_s=now,
@@ -741,7 +811,7 @@ class RestCapAndGtcTests(unittest.TestCase):
         places = [row for row in actions if row["op"] == "place"]
         self.assertEqual(len(places), 1)
         self.assertEqual(places[0]["leg"], "up")
-        self.assertEqual(places[0]["price"], 0.04)
+        self.assertEqual(places[0]["price"], 0.05)
         self.assertEqual(places[0]["price_why"], "rest_cap")
         self.assertEqual(places[0]["tif"], "GTC")
         self.assertEqual(places[0]["expiration"], 0)
@@ -761,7 +831,7 @@ class RestCapAndGtcTests(unittest.TestCase):
         places = [row for row in actions if row["op"] == "place" and row["leg"] == "up"]
         self.assertEqual(places[0]["tif"], "GTD")
         self.assertEqual(places[0]["tif_why"], "gtd")
-        self.assertEqual(places[0]["price"], 0.04)
+        self.assertEqual(places[0]["price"], 0.05)
         self.assertGreaterEqual(places[0]["expiration"], int(now) + 180)
 
     def test_resting_order_is_kept_not_escalated(self):

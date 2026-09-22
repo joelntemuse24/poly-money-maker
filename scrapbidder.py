@@ -109,6 +109,9 @@ def load_strategy(path: Path = STRATEGY_FILE) -> dict:
     fak_min = float(cfg["bid_fak_min_notional"])
     if fak_min <= 0:
         raise ValueError("bid_fak_min_notional must be > 0")
+    fak_max = float(cfg["bid_fak_max_notional"])
+    if fak_max + 1e-12 < fak_min:
+        raise ValueError("bid_fak_max_notional must be >= bid_fak_min_notional")
     # A copied example that still says 60s would post a GTD Polymarket rejects.
     if float(cfg["min_gtd_ahead_s"]) < 180:
         cfg["min_gtd_ahead_s"] = 180.0
@@ -547,6 +550,7 @@ def run_once(cfg: dict, now: Optional[float] = None) -> float:
         cancel_ttm_s=float(cfg["cancel_ttm_s"]),
         min_gtd_ahead_s=max(180.0, float(cfg["min_gtd_ahead_s"])),
         fak_min_notional=float(cfg.get("bid_fak_min_notional") or 1.0),
+        fak_max_notional=float(cfg.get("bid_fak_max_notional") or 1.5),
         enabled=bool(cfg.get("bid_enabled")),
         take_enabled=bool(cfg.get("bid_take_enabled", True)),
         filled_shares=filled,
@@ -598,6 +602,7 @@ def main() -> None:
         bid_max_px=cfg.get("bid_max_px"),
         bid_rest_px=cfg.get("bid_rest_px"),
         bid_fak_min_notional=cfg.get("bid_fak_min_notional"),
+        bid_fak_max_notional=cfg.get("bid_fak_max_notional"),
         min_gtd_ahead_s=cfg.get("min_gtd_ahead_s"),
         bid_take_enabled=bool(cfg.get("bid_take_enabled", True)),
     )

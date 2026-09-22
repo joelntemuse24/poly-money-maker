@@ -6,13 +6,13 @@ No CLOB buys. No hedges. Discovers **btc-up-or-down-15m** only, mints
 and open within enter_max_ttm_min, if collateral is available.
 
 Optional sell (``sell_enabled``, default off): arm a loser scrap when the
-sized loser bid is ≤ ``sell_threshold`` (~4¢) and the opposite bid is ≥ ~90¢.
-4¢ is the arm ceiling, not the print. Persist ``sell_persist_s`` (~2.5s), or
+sized loser bid is ≤ ``sell_threshold`` (~5¢) and the opposite bid is ≥ ~90¢.
+5¢ is the arm ceiling, not the print. Persist ``sell_persist_s`` (~2.5s), or
 ``sell_persist_last_min_s`` (~1s) in the last
 ``sell_persist_last_min_window_s`` (~60s). Skip that wait when TTM ≤
 ``sell_persist_skip_ttm_s`` (~90s) or when depth at the FAK rung covers our
 size. At fire, FAK ``sell_fak_px`` (~3¢) → ``sell_floor`` (~2¢), or the live
-bid when the book is thinner. Never post the 4¢ arm. Empty keep fires a
+bid when the book is thinner. Never post the 5¢ arm. Empty keep fires a
 blind 1¢ FAK (backoff ~3s). A FAK miss rests a GTD/GTC sell at
 ``sell_scrap_rest_px`` (~3¢). Wallet A never posts a bid. Keep the winner
 for redeem unless its bid reaches ~99.9¢. Off unless live
@@ -99,11 +99,13 @@ from buy.mint_sell import (
     scrap_rest_action,
     sell_fire_decision,
     sell_window_open,
+    sister_hedge_dump_due,
     skip_mint_discovery_for_sell,
     winner_cashout_leg,
     winner_cheap_decision,
     winner_sell_limit,
 )
+from buy.sister_bid import sister_leg_filled
 
 load_dotenv()
 
@@ -112,6 +114,7 @@ REPO = Path(__file__).resolve().parent
 
 STRATEGY_FILE = REPO / "strategy_mint.json"
 STATE_FILE = REPO / "positions_mint.json"
+SCRAP_STATE_FILE = REPO / "positions_scrapbid.json"
 LOG_FILE = REPO / "mintbot.log"
 ORACLE_LOG_FILE = REPO / "logs" / "oracle_twap.jsonl"
 LOCK_FILE = REPO / ".mintbot.lock"
@@ -139,7 +142,7 @@ DEFAULTS = {
     "position_tolerance": 0.01,
     "require_accepting_orders": True,
     "sell_enabled": False,
-    "sell_threshold": 0.04,
+    "sell_threshold": 0.05,
     "sell_fak_px": 0.03,
     "sell_floor": 0.02,
     "sell_opposite_min": 0.90,
@@ -169,6 +172,8 @@ DEFAULTS = {
     "sell_dump_fak_retries": 2,
     "sell_dump_ladder_step": 0.04,
     "sell_dump_ladder_rungs": 4,
+    # Dump the held leg this long after sold_loser if B matched 0 shares. 0 disables.
+    "sell_dump_if_sister_miss_s": 10.0,
     "sell_min_bid_size": 1.0,
     # Late-window oracle veto on full loser scrap (TTM ≤ window only).
     "sell_late_window_s": 120.0,
@@ -368,6 +373,8 @@ def validate_strategy(cfg: dict) -> None:
         raise ValueError("sell_dump_ladder_step must be > 0")
     if int(cfg.get("sell_dump_ladder_rungs") or 0) < 1:
         raise ValueError("sell_dump_ladder_rungs must be >= 1")
+    if float(cfg.get("sell_dump_if_sister_miss_s") or 0) < 0:
+        raise ValueError("sell_dump_if_sister_miss_s must be >= 0")
     if float(cfg.get("sell_min_bid_size") or 0) < 0:
         raise ValueError("sell_min_bid_size must be >= 0")
 
@@ -1550,10 +1557,7 @@ def _sync_scrap_rest(
     filled = shares > 0 and float(intent.get("sell_filled") or 0) >= shares - tol
     if status == "filled" or filled:
         leg = intent.get("sell_loser_leg")
-        intent["sold_loser"] = True
-        if leg in ("up", "dn"):
-            intent["sold_leg"] = leg
-        intent["sell_oracle_edge_armed_at"] = None
+        _note_loser_sold(intent, leg if leg in ("up", "dn") else None)
         log_event(
             "sell_scrap_rest_fill",
             condition_id=cid,
@@ -1588,16 +1592,24 @@ def _sync_scrap_rest(
         _drop_scrap_rest(intent, cid, reason=why)
 
 
-def _mark_loser_sold(intent: dict, leg: str, *, note: str = "") -> None:
-    intent["sold_leg"] = leg
+def _note_loser_sold(intent: dict, leg: Optional[str] = None, *, note: str = "") -> None:
+    """Mark the scrap filled and start the sister-hedge clock once."""
     intent["sold_loser"] = True
+    if leg in ("up", "dn"):
+        intent["sold_leg"] = leg
     intent["sell_oracle_edge_armed_at"] = None
     if note:
         intent["sell_note"] = note
+    if not intent.get("sold_loser_at"):
+        intent["sold_loser_at"] = time.time()
+
+
+def _mark_loser_sold(intent: dict, leg: str, *, note: str = "") -> None:
+    _note_loser_sold(intent, leg, note=note)
 
 
 def manage_sells(cfg: dict, state: dict, chain: ChainReader) -> None:
-    """Loser scrap: arm ≤4¢, FAK ~3¢→2¢ or live bid; winner; held dump."""
+    """Loser scrap: arm ≤5¢, FAK ~3¢→2¢ or live bid; winner; held dump."""
     if not cfg.get("sell_enabled"):
         return
     STATE_LOCK.acquire()
@@ -1607,9 +1619,22 @@ def manage_sells(cfg: dict, state: dict, chain: ChainReader) -> None:
         STATE_LOCK.release()
 
 
+def _sister_filled_map() -> dict:
+    """Wallet B matched shares from positions_scrapbid.json. Missing file is zero."""
+    if not SCRAP_STATE_FILE.exists():
+        return {}
+    try:
+        payload = json.loads(SCRAP_STATE_FILE.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    filled = payload.get("filled") if isinstance(payload, dict) else None
+    return filled if isinstance(filled, dict) else {}
+
+
 def _manage_sells_locked(cfg: dict, state: dict, chain: ChainReader) -> None:
     now = time.time()
-    thr = float(cfg.get("sell_threshold") or 0.04)
+    sister_fills = _sister_filled_map()
+    thr = float(cfg.get("sell_threshold") or 0.05)
     floor = float(cfg.get("sell_floor") or 0.02)
     opp_min = float(cfg.get("sell_opposite_min") or 0.90)
     persist_s = float(cfg.get("sell_persist_s") or 0.0)
@@ -1678,6 +1703,12 @@ def _manage_sells_locked(cfg: dict, state: dict, chain: ChainReader) -> None:
         bids = {"up": up_bid, "dn": dn_bid}
         shares = float(intent.get("shares") or cfg["shares"])
         sold_loser = bool(intent.get("sold_loser") or intent.get("sold_leg"))
+        if sold_loser and not intent.get("sold_loser_at"):
+            prior = intent.get("last_sell_attempt_at")
+            try:
+                intent["sold_loser_at"] = float(prior) if prior not in (None, "") else now
+            except (TypeError, ValueError):
+                intent["sold_loser_at"] = now
         sold_winner = bool(intent.get("sold_winner"))
 
         # Prefer redeem at ~$1. Cheap 0.99 only if loser sold ≤ cheap_gate AND
@@ -1851,6 +1882,39 @@ def _manage_sells_locked(cfg: dict, state: dict, chain: ChainReader) -> None:
         elif sold_leg == "dn":
             held = "up"
         dump_bid = bids.get(held) if held else None
+        miss_s = float(cfg.get("sell_dump_if_sister_miss_s") or 0)
+        sister_filled = (
+            sister_leg_filled(sister_fills, cid, str(sold_leg))
+            if sold_leg in ("up", "dn")
+            else 0.0
+        )
+        sister_due, _sister_why, sister_age = sister_hedge_dump_due(
+            sold_loser=sold_loser,
+            sold_dump=sold_dump,
+            sold_at=intent.get("sold_loser_at"),
+            now_s=now,
+            sister_filled=sister_filled,
+            miss_s=miss_s,
+        )
+        sister_force = bool(
+            dump_enabled
+            and sister_due
+            and held is not None
+            and dump_bid is not None
+            and not cooling
+        )
+        if sister_due and held is not None and dump_bid is None:
+            log_event(
+                "sell_dump_sister_miss",
+                condition_id=cid,
+                slug=intent.get("slug"),
+                leg=held,
+                scrap_leg=sold_leg,
+                age_s=sister_age,
+                sister_filled=sister_filled,
+                miss_s=miss_s,
+                status="empty_book",
+            )
         dump_armed = (
             dump_enabled
             and sold_loser
@@ -1876,10 +1940,25 @@ def _manage_sells_locked(cfg: dict, state: dict, chain: ChainReader) -> None:
                 bid=dump_bid,
                 below=dump_below,
             )
-        if fire_d and held and not cooling:
-            fire_action, fire_reason = sell_fire_decision(
-                "dump", bid=dump_bid, dump_below=dump_below,
-            )
+        if (fire_d or sister_force) and held and not cooling:
+            if sister_force:
+                log_event(
+                    "sell_dump_sister_miss",
+                    condition_id=cid,
+                    slug=intent.get("slug"),
+                    leg=held,
+                    scrap_leg=sold_leg,
+                    age_s=sister_age,
+                    sister_filled=sister_filled,
+                    miss_s=miss_s,
+                    bid=dump_bid,
+                    status="fire",
+                )
+                fire_action, fire_reason = "fire", "sister_miss"
+            else:
+                fire_action, fire_reason = sell_fire_decision(
+                    "dump", bid=dump_bid, dump_below=dump_below,
+                )
             if fire_action != "fire":
                 _apply_sell_fire_cancel(
                     intent,
@@ -1950,6 +2029,9 @@ def _manage_sells_locked(cfg: dict, state: dict, chain: ChainReader) -> None:
                             sold=sold_total,
                             bid=dump_bid,
                             status=last_status,
+                            sister_miss=bool(sister_force),
+                            age_s=sister_age if sister_force else None,
+                            sister_filled=sister_filled if sister_force else None,
                         )
                         notify(
                             "Mint held dump",
@@ -2273,10 +2355,7 @@ def _manage_sells_locked(cfg: dict, state: dict, chain: ChainReader) -> None:
                         path="loser",
                     )
                 elif latch == "already_flat":
-                    intent["sold_leg"] = loser
-                    intent["sold_loser"] = True
-                    intent["sell_note"] = "already_flat"
-                    intent["sell_oracle_edge_armed_at"] = None
+                    _note_loser_sold(intent, loser, note="already_flat")
                 else:
                     limits = loser_ladder_limits(
                         thr, floor, loser_bid, fak_px=fak_px,
@@ -2308,9 +2387,7 @@ def _manage_sells_locked(cfg: dict, state: dict, chain: ChainReader) -> None:
                         ) + sold_total
                         intent["sell_limit"] = last_px
                     if done:
-                        intent["sold_leg"] = loser
-                        intent["sold_loser"] = True
-                        intent["sell_oracle_edge_armed_at"] = None
+                        _note_loser_sold(intent, loser)
                         if dry_run:
                             intent["sell_dry"] = True
                         log_event(
