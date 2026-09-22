@@ -27,6 +27,14 @@ pathlog are **stopped / retired**. Do not start them.
 
 See `TECHNICAL_DESIGN.md` for the full guided tour.
 
+## Chainlink TWAP tape (recording only)
+
+`oracle_log_enabled` defaults **on**. A missing key in live `strategy_mint.json` stays on; do not edit that file for this tape. While a 15m mint intent is open (including the pre-open bag and ~2 minutes after the end), mintbot appends `logs/oracle_twap.jsonl`.
+
+The live path is Polymarket RTDS topic `crypto_prices_twap_sixty` for `btc/usd` (Chainlink's 60s TWAP, no Data Streams credentials). Window price-to-beat and the completed close come from `GET /api/crypto/crypto-price?symbol=btc&variant=fifteen&eventStartTime=<window start>`. `variant=fifteen` is the 15m Chainlink series; other variant strings fall back to hourly Binance and are not used.
+
+Stored samples are 15s through the middle of the window, 2s around the open and in the last 3 minutes, and 1s in the last 60s and just after the end. The recorder wakes every second while a bag is open so that tighter cadence is not stuck behind a cold sleep. A dead feed appends `oracle_log_fail` and logs the same event. Mint and sell do not read the tape.
+
 ## Deploy boundary
 
 Copy VM → GitHub for backup. Do not blindly merge GitHub onto the VM.

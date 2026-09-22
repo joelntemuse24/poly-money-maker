@@ -29,6 +29,7 @@ Read Parts I and II straight through. Part III walks mint and sell. Part IV cove
 - [Part III — Walking mintbot.py](#part-iii)
   - [Startup, lock, strategy load](#section-9)
   - [Two loops: sell vs mint/discover](#section-10)
+  - [Chainlink TWAP tape (recording only)](#section-10c)
   - [Sync-loop audit](#section-10b)
   - [Eligibility: not-yet-open 15m windows](#section-11)
   - [Capacity: max_open_sets=1 and adjacent lookahead](#section-12)
@@ -127,6 +128,7 @@ buy/
   book.py               # sized top-of-book
   chain.py              # eth_call balances / prechecks
   contracts.py          # approve + split calldata
+  oracle_log.py         # Chainlink 60s TWAP tape; not a sell/mint input
 deploy/
   polymintbot.service
   polypathlog.service
@@ -184,6 +186,7 @@ Three prices that must not be conflated:
 | Data API | Optional position checks |
 | Relayer v2 | Submit PROXY mint batch; poll `STATE_*` |
 | Polygon RPC | CTF balances / inventory confirm |
+| Polymarket RTDS | Recording-only Chainlink BTC/USD 60s TWAP (`crypto_prices_twap_sixty`) |
 | ntfy (optional) | Operator push on mint/sell |
 
 <a id="section-8"></a>
@@ -251,6 +254,17 @@ Sell and mint are independent jobs (`buy/mint_loops.py`). They share `positions_
 5. Balance precheck (no lock); then claim `submitting` under the lock (`already_minted` + slots + same-slug claim); `submit_mint_batch`; record pending/failed.
 
 `sold_loser` still frees the `max_open_sets` slot. The mint loop can claim the adjacent window **while** the sell loop starts dump persist on the previous bag. Do not skip Gamma because a bag is hot.
+
+<a id="section-10c"></a>
+## Chainlink TWAP tape (recording only)
+
+`buy/oracle_log.py` runs on a third thread (`mintbot-oracle`) so a slow RTDS or crypto-price GET cannot take a sell or mint tick. It watches intent snapshots for 15m bags (`submitting` through `completed`, not `failed`), from before the window opens until about two minutes after `end_ts`.
+
+The live value is Polymarket's public RTDS relay of Chainlink's BTC/USD **60s TWAP** (`wss://ws-live-data.polymarket.com`, topic `crypto_prices_twap_sixty`). Direct Chainlink Data Streams would need credentials this bot does not use. The window price-to-beat and the completed close are read from Polymarket's crypto-price endpoint with `variant=fifteen` (the 15m series). Rows land in `logs/oracle_twap.jsonl` with `ts`, slug, `condition_id`, window start/end, `source`, `twap`, optional `open_ref`, and `notes`.
+
+The thread wakes every second while a bag is open. Stored rows are 15s mid-window, 2s near the open and in the last three minutes, and 1s in the last minute and just after the end, so a cold gap cannot skip the open print or the last minute.
+
+`oracle_log_enabled` defaults true. When the feed is down the thread writes `oracle_log_fail` and keeps going. Sell policy, mint eligibility, and order posting do not import this module and do not read the file. Turn the flag off to stop the tape; that does not change how a bag is minted or sold.
 
 <a id="section-10b"></a>
 ## Sync-loop audit (same class as mint stealing the dump cycle)
@@ -469,6 +483,7 @@ Observed failure modes: (1) winner armed at bid 0.99 but FAK posted 0.999 → `i
 | `buy/book.py` | Sized BBO parse |
 | `buy/chain.py` | RPC reads |
 | `buy/contracts.py` | Calldata for mint batch |
+| `buy/oracle_log.py` | Recording-only Chainlink 60s TWAP tape |
 | `pathlog.py` | Separate process; read-only books |
 
 <a id="section-25"></a>
