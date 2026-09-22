@@ -11,8 +11,8 @@ If the take cannot fire, B rests a GTD/GTC BUY at ``bid_rest_px`` (5¢),
 and only when that rest is strictly below the ask. A rest at or above
 the ask would be marketable and get rejected under $1. GTD is used when
 expiration is at least ~180s ahead; otherwise GTC, still cancelled near
-expiry. There is no escalate ladder. Markets A never held use the same
-quote on the cheap live side during the late window. The winner leg A
+expiry. There is no escalate ladder. Markets A never held are not
+bid unless ``bid_absent_enabled`` (default off). The winner leg A
 still holds stays blocked. B never mints and never sells.
 
 Same-wallet buyback is intentionally not here.
@@ -43,6 +43,9 @@ SISTER_DEFAULTS = {
     "bid_fak_max_notional": 1.5,
     # FAK the live ask when it is ≤ max notional / shares.
     "bid_take_enabled": True,
+    # Off: B bids only after A sold_loser on that leg. On: late-window
+    # cheap-side bids on markets A never held.
+    "bid_absent_enabled": False,
     "active_ttm_s": 180.0,
     "cancel_ttm_s": 20.0,
     # Polymarket rejects a GTD that expires inside ~180s. Shorter → GTC.
@@ -372,6 +375,7 @@ def plan_sister_bids(
     fak_max_notional: float = 1.5,
     enabled: bool = True,
     take_enabled: bool = True,
+    absent_enabled: bool = False,
     filled_shares: Optional[dict] = None,
 ) -> list[dict]:
     """Resting-bid plan for one pass. Does not post.
@@ -414,6 +418,14 @@ def plan_sister_bids(
                 "token_id": tokens.get(leg),
                 "ttm_s": ttm,
             }
+            if flat_why == "a_absent" and not absent_enabled:
+                if order_id:
+                    actions.append({
+                        **base, "op": "cancel", "reason": "a_absent", "order_id": order_id,
+                    })
+                else:
+                    actions.append({**base, "op": "skip", "reason": "a_absent"})
+                continue
             if order_id and (not enabled or cancel or not flat):
                 reason = "disabled" if not enabled else (
                     cancel_why if cancel else flat_why
@@ -433,7 +445,7 @@ def plan_sister_bids(
                 actions.append({**base, "op": "skip", "reason": flat_why})
                 continue
             # Post-scrap hedge does not wait for the last active_ttm_s.
-            # Markets A never held still do.
+            # The absent path is off unless bid_absent_enabled.
             post_scrap = flat_why == "a_flat"
             if not post_scrap and (
                 ttm is None or float(ttm) > float(active_ttm_s) + 1e-12

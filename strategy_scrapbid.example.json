@@ -7,6 +7,7 @@
   "bid_fak_min_notional": 1.0,
   "bid_fak_max_notional": 1.5,
   "bid_take_enabled": true,
+  "bid_absent_enabled": false,
   "active_ttm_s": 180.0,
   "cancel_ttm_s": 20.0,
   "min_gtd_ahead_s": 180.0,

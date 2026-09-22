@@ -93,8 +93,8 @@ is posted when expiration is ≥ ~180s ahead; inside that, post GTC and
 still cancel by T−`cancel_ttm_s`. A's `sell_scrap_rest_id` does not
 block that leg, and the last-`active_ttm_s` (~180s) window does not apply
 to that post-scrap hedge. Still cancel by T−`cancel_ttm_s` (~20s). The
-winner leg A still holds stays blocked. Markets A never held use the
-same quote on the cheap live side only inside the last 180s. If B has
+winner leg A still holds stays blocked. Markets A never held are not
+bid (`bid_absent_enabled` defaults false). If B has
 not matched any shares within `sell_dump_if_sister_miss_s` (10s, 0
 disables) of A's confirmed scrap, mintbot dumps the held leg
 (`sell_dump_sister_miss`). Any B fill skips that timeout. The held-leg
