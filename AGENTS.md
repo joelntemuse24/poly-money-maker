@@ -78,12 +78,20 @@ were 0.03 / 5 / 2 on the 19 Sep snapshot). New keys absent from that file
 operator pulls and restarts. Do not edit live JSON from this repo.
 
 Wallet A (mintbot) never posts a bid. There is no same-wallet buyback.
-`scrapbidder.py` is a separate process for wallet B: limit BUY only,
-default 20 shares at `bid_max_px` 0.04, last `active_ttm_s` (~180s),
-cancel by T−`cancel_ttm_s` (~20s). It bids a token only after A is flat
-on that token when A held the market (sold loser, no live scrap rest),
-or the cheap live side of a market A never held. It never mints and never
-FAK-sells. `bid_enabled` defaults false and `dry_run` defaults true.
+`scrapbidder.py` is a separate process for wallet B. Cap is 20 shares
+and `bid_max_px` 0.04 (~$0.80). After A `sold_loser` on leg L, B buys L
+at the live price: FAK the ask when it is ≤ the cap (`bid_take_enabled`,
+default true), otherwise join a bid under the cap, and rest at the cap
+only when the book is empty or richer. A's `sell_scrap_rest_id` does not
+block that leg, and the last-`active_ttm_s` (~180s) window does not apply
+to that post-scrap hedge. Still cancel by T−`cancel_ttm_s` (~20s). The
+winner leg A still holds stays blocked. Markets A never held rest at the
+cap on the cheap live side only inside the last 180s. If sold_loser on L
+has no B bid or fill and the window is still open past cancel, log
+`scrapbid_miss` (condition, leg, ttm, age) after ~10s, throttled ~30s.
+Poll drops to `poll_hot_s` (~1s) while that gap is open. It never mints
+and never FAK-sells. `bid_enabled` defaults false and `dry_run` defaults
+true.
 Credentials stay in gitignored `.env.complement` (POLY_1271 / deposit
 wallet). Refuse the mintbot funder. Do not put `.env.complement` values
 in git. `deploy/polyscrapbid.service` stays off until the operator asks.
@@ -100,8 +108,10 @@ Shared `buy/` helpers exist for mint, pathlog, and the recording-only oracle tap
   (`logs/oracle_twap.jsonl`) plus read-only `bag_view` for the late
   loser-scrap veto. Not an input to mint, winner, dump, or sell outside
   `sell_late_window_s`.
-- `buy/sister_bid.py` — wallet B resting-bid policy (flat-after-A, cancel
-  near expiry). `scrapbidder.py` posts the bids. Not an input to mint.
+- `buy/sister_bid.py` — wallet B buy policy. Post-scrap takes a live ask
+  at or under `bid_max_px`, else joins a cheaper bid, else rests at the
+  cap. A's rest and the 180s window do not block that leg; cancel near
+  expiry. `scrapbidder.py` posts the orders. Not an input to mint.
 
 Do not restore retired buybot modules (`entry_skip`, `hedge_gate`,
 `btc_price`, `clob_book_ws`, `depth_ladder`, `strategy_coherence`,

@@ -41,7 +41,7 @@ pathlog are **stopped / retired**. Do not start them.
 
 ## Sister scrap bidder (wallet B, opt-in, off)
 
-`scrapbidder.py` + `deploy/polyscrapbid.service` rest **BUY** limits from the complement deposit wallet. Default **20 shares at 4¢** (`bid_max_px=0.04`). That 4¢ is a buy, not a sell. Last 180s of the 15m window, cancel by T−20s. Bid a token only after wallet A is flat on it (sold loser, no live scrap rest), or the cheap live side of a market A never held. Never mint. Never FAK-sell. `bid_enabled` false and `dry_run` true until the operator turns them on. Credentials stay in gitignored `.env.complement`. Do not start `polyscrapbid` unless the operator asks. This is not `complementbot`.
+`scrapbidder.py` + `deploy/polyscrapbid.service` buy from the complement deposit wallet. Cap is **20 shares** and **`bid_max_px` 4¢** (~$0.80), not a sell and not a price we always pay. After A `sold_loser` on leg L, B buys L immediately (A's scrap rest and the 180s window do not block it): FAK the live ask when it is ≤ 4¢ (`bid_take_enabled` true), else join a bid under 4¢, else rest at 4¢ when the book is empty or richer. Cancel by T−20s / window end. The other leg (winner A still holds) stays blocked. Markets A never held still wait for the last 180s and a cheap book, then rest at the cap. If that sold leg has no B bid or fill for ~10s while the window is open past cancel, log `scrapbid_miss` (throttled ~30s) and poll at ~1s until the order is up. Never mint. Never FAK-sell. `bid_enabled` false and `dry_run` true until the operator turns them on. Credentials stay in gitignored `.env.complement`. Do not start `polyscrapbid` unless the operator asks. This is not `complementbot`.
 
 See `TECHNICAL_DESIGN.md` for the full guided tour.
 

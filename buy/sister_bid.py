@@ -1,9 +1,12 @@
 """Sister scrap-bidder policy (wallet B). No CLOB posts, no mintbot import.
 
-Wallet A (mintbot) mints and sells. Wallet B only rests small bids, and only
-on a token A is already flat on when A held that market. Markets A never
-held can take a bid on the cheap live side during the last few minutes.
-B never mints and never sells.
+Wallet A (mintbot) mints and sells. Wallet B buys the sold leg. Once A
+has ``sold_loser`` on leg L, B bids L immediately, including while A's scrap
+rest is still up and outside the last ``active_ttm_s``. ``bid_max_px`` is a
+cap: a live ask at or under the cap is a FAK buy, a cheaper bid is joined,
+and an empty or richer book rests at the cap. Markets A never held can rest
+a bid on the cheap live side during that late window. The winner leg A still
+holds stays blocked. B never mints and never sells.
 
 Same-wallet buyback is intentionally not here.
 """
@@ -26,10 +29,17 @@ SISTER_DEFAULTS = {
     "dry_run": True,
     "shares": 20.0,
     "bid_max_px": 0.04,
+    # Post-scrap: FAK the live ask when it is at or under bid_max_px.
+    "bid_take_enabled": True,
     "active_ttm_s": 180.0,
     "cancel_ttm_s": 20.0,
     "min_gtd_ahead_s": 60.0,
     "poll_s": 2.0,
+    # Faster cadence while a sold loser has no resting B bid.
+    "poll_hot_s": 1.0,
+    # Loud miss if B has not bid within this many seconds of A going flat.
+    "miss_after_s": 10.0,
+    "miss_throttle_s": 30.0,
     "series_slugs": ["btc-up-or-down-15m"],
     "signature_type": POLY_1271,
 }
@@ -80,12 +90,28 @@ def resolve_sister_client_config(env: Optional[dict]) -> dict:
     }
 
 
-def a_token_flat(intent: Any, leg: str) -> tuple[bool, str]:
-    """Whether wallet A is flat on ``leg`` (or never held this market).
+def _sold_leg(intent: dict) -> Optional[str]:
+    """Leg A has already scrapped, if the intent says which one."""
+    sold_leg = intent.get("sold_leg") if intent.get("sold_leg") in ("up", "dn") else None
+    sold_flag = bool(intent.get("sold_loser") or sold_leg)
+    if not sold_flag:
+        return None
+    if sold_leg in ("up", "dn"):
+        return sold_leg
+    loser = intent.get("sell_loser_leg")
+    if loser in ("up", "dn"):
+        return loser
+    return None
 
-    When A has a live bag, B may bid ``leg`` only after ``sold_loser`` on
-    that leg and the scrap rest is gone. The other leg is the winner A
-    still holds. A missing intent is ``a_absent`` (B may bid the cheap book).
+
+def a_token_flat(intent: Any, leg: str) -> tuple[bool, str]:
+    """Whether wallet B may bid ``leg``.
+
+    ``sold_loser`` / ``sold_leg`` on L makes L flat immediately. A's
+    ``sell_scrap_rest_id`` does not block that leg: the two wallets are
+    different, and A's resting sell into B's bid is the hedge. The other
+    leg is the winner A still holds. A rest with no sold flag still means
+    A is long (``a_rest_live``). A missing intent is ``a_absent``.
     """
     if leg not in ("up", "dn"):
         return False, "bad_leg"
@@ -94,16 +120,15 @@ def a_token_flat(intent: Any, leg: str) -> tuple[bool, str]:
     status = str(intent.get("status") or "")
     if status not in _HELD_STATUSES:
         return True, "a_absent"
-    sold_leg = intent.get("sold_leg") if intent.get("sold_leg") in ("up", "dn") else None
-    sold = bool(intent.get("sold_loser") or sold_leg)
+    sold_leg = _sold_leg(intent)
+    if sold_leg == leg:
+        return True, "a_flat"
+    if sold_leg in ("up", "dn") and sold_leg != leg:
+        return False, "a_holds_other"
     rest_id = intent.get("sell_scrap_rest_id")
-    rest_leg = intent.get("sell_loser_leg") if intent.get("sell_loser_leg") in ("up", "dn") else sold_leg
+    rest_leg = intent.get("sell_loser_leg") if intent.get("sell_loser_leg") in ("up", "dn") else None
     if rest_id and (rest_leg is None or rest_leg == leg):
         return False, "a_rest_live"
-    if sold and sold_leg == leg and not rest_id:
-        return True, "a_flat"
-    if sold and sold_leg and sold_leg != leg:
-        return False, "a_holds_other"
     return False, "a_still_long"
 
 
@@ -116,6 +141,94 @@ def sister_cancel_due(
     if float(ttm_s) <= float(cancel_ttm_s) + 1e-12:
         return True, "cancel_before_expiry"
     return False, "keep"
+
+
+def _leg_filled(filled: Optional[dict], cid: str, leg: str) -> float:
+    slot = (filled or {}).get(cid) or {}
+    if not isinstance(slot, dict):
+        return 0.0
+    try:
+        shares = float(slot.get(leg) or 0)
+    except (TypeError, ValueError):
+        return 0.0
+    if shares != shares or shares <= 0:
+        return 0.0
+    return shares
+
+
+def buy_matched_shares(result: Any, offered: float) -> float:
+    """Shares bought from a BUY POST or get_order.
+
+    ``takingAmount`` / ``size_matched`` are the share leg. ``makingAmount``
+    is USDC paid and must not be counted as shares.
+    """
+    if not isinstance(result, dict):
+        return 0.0
+    offered_f = float(offered or 0)
+    for key in (
+        "size_matched",
+        "sizeMatched",
+        "matched",
+        "takingAmount",
+        "taking_amount",
+    ):
+        raw = result.get(key)
+        if raw is None or raw == "":
+            continue
+        try:
+            human = float(raw)
+        except (TypeError, ValueError):
+            continue
+        if human != human or human <= 0:
+            continue
+        fixed = human / 1_000_000.0
+        if offered_f > 0:
+            value = human if abs(human - offered_f) <= abs(fixed - offered_f) else fixed
+        else:
+            value = fixed if human >= 10_000 else human
+        if value > 0:
+            return value
+    return 0.0
+
+
+def _px(value: Any) -> Optional[float]:
+    try:
+        price = float(value)
+    except (TypeError, ValueError):
+        return None
+    if price != price or price <= 0 or price >= 1:
+        return None
+    return price
+
+
+def sister_quote(
+    *,
+    bid: Any = None,
+    ask: Any = None,
+    bid_max_px: float = 0.04,
+    take_enabled: bool = True,
+) -> tuple[str, float, str]:
+    """Post-scrap price. ``(style, price, why)``.
+
+    ``style`` is ``take`` (FAK buy) or ``rest``. Price is never above
+    ``bid_max_px``. A live ask at or under the cap is taken. A bid under
+    the cap is joined. An empty book, or a book priced above the cap,
+    rests at the cap.
+    """
+    cap = round(float(bid_max_px or 0), 4)
+    if cap <= 0:
+        return "rest", 0.0, "bad_cap"
+    ask_px = _px(ask)
+    bid_px = _px(bid)
+    if take_enabled and ask_px is not None and ask_px <= cap + 1e-12:
+        return "take", round(min(ask_px, cap), 4), "live_ask"
+    if bid_px is not None and bid_px + 1e-12 < cap:
+        px = bid_px
+        if ask_px is not None and ask_px > bid_px:
+            mid = (bid_px + ask_px) / 2.0
+            px = min(bid_px, mid)
+        return "rest", round(min(px, cap), 4), "join_bid"
+    return "rest", cap, "cap"
 
 
 def _cheap_live(bid: Optional[float], bid_max_px: float) -> bool:
@@ -139,6 +252,8 @@ def plan_sister_bids(
     cancel_ttm_s: float = 20.0,
     min_gtd_ahead_s: float = 60.0,
     enabled: bool = True,
+    take_enabled: bool = True,
+    filled_shares: Optional[dict] = None,
 ) -> list[dict]:
     """Resting-bid plan for one pass. Does not post.
 
@@ -163,6 +278,7 @@ def plan_sister_bids(
         if not isinstance(orders, dict):
             orders = {}
         bids = {"up": market.get("up_bid"), "dn": market.get("dn_bid")}
+        asks = {"up": market.get("up_ask"), "dn": market.get("dn_ask")}
         tokens = {"up": market.get("up_token"), "dn": market.get("dn_token")}
         for leg in ("up", "dn"):
             flat, flat_why = a_token_flat(intent, leg)
@@ -193,19 +309,29 @@ def plan_sister_bids(
             if not window_open:
                 actions.append({**base, "op": "skip", "reason": "window_end"})
                 continue
-            if ttm is None or float(ttm) > float(active_ttm_s) + 1e-12:
+            if not flat:
+                actions.append({**base, "op": "skip", "reason": flat_why})
+                continue
+            # Post-scrap hedge does not wait for the last active_ttm_s.
+            # Markets A never held still do.
+            post_scrap = flat_why == "a_flat"
+            if not post_scrap and (
+                ttm is None or float(ttm) > float(active_ttm_s) + 1e-12
+            ):
                 actions.append({**base, "op": "skip", "reason": "too_early"})
                 continue
             if cancel:
                 actions.append({**base, "op": "skip", "reason": cancel_why})
                 continue
-            if not flat:
-                actions.append({**base, "op": "skip", "reason": flat_why})
-                continue
             if flat_why == "a_absent" and not _cheap_live(bids.get(leg), px):
                 actions.append({**base, "op": "skip", "reason": "not_cheap"})
                 continue
-            if size <= 0 or px <= 0 or not tokens.get(leg):
+            already = _leg_filled(filled_shares, cid, leg)
+            remaining = round(max(0.0, size - already), 4)
+            if size > 0 and remaining < 0.01:
+                actions.append({**base, "op": "skip", "reason": "filled"})
+                continue
+            if remaining <= 0 or px <= 0 or not tokens.get(leg):
                 actions.append({**base, "op": "skip", "reason": "bad_order"})
                 continue
             # One cheap leg when A is absent: if both are cheap, bid the lower.
@@ -224,20 +350,194 @@ def plan_sister_bids(
                     if abs(float(other_bid) - float(this_bid)) <= 1e-12 and leg == "dn":
                         actions.append({**base, "op": "skip", "reason": "other_cheaper"})
                         continue
-            tif, exp = resting_tif(
-                now_s=now_s,
-                expire_ts=float(end_ts) - float(cancel_ttm_s),
-                min_ahead_s=min_gtd_ahead_s,
-            )
+            if post_scrap:
+                style, price, price_why = sister_quote(
+                    bid=bids.get(leg),
+                    ask=asks.get(leg),
+                    bid_max_px=px,
+                    take_enabled=take_enabled,
+                )
+            else:
+                style, price, price_why = "rest", px, "cap"
+            if price <= 0 or price > px + 1e-12:
+                actions.append({**base, "op": "skip", "reason": "bad_order"})
+                continue
+            if style == "take":
+                tif, exp = "FAK", 0
+            else:
+                tif, exp = resting_tif(
+                    now_s=now_s,
+                    expire_ts=float(end_ts) - float(cancel_ttm_s),
+                    min_ahead_s=min_gtd_ahead_s,
+                )
             actions.append(
                 {
                     **base,
                     "op": "place",
                     "reason": flat_why,
-                    "price": px,
-                    "shares": size,
+                    "price_why": price_why,
+                    "style": style,
+                    "price": price,
+                    "shares": remaining,
                     "tif": tif,
                     "expiration": exp,
                 }
             )
     return actions
+
+
+def _finite_ts(value: Any) -> Optional[float]:
+    try:
+        ts = float(value)
+    except (TypeError, ValueError):
+        return None
+    if ts != ts or ts <= 0:
+        return None
+    return ts
+
+
+def flat_since_s(intent: Any, *, now_s: float, remembered: Any = None) -> float:
+    """When B should start the miss clock for a sold leg.
+
+    Prefer an explicit sold timestamp on the intent, then the FAK attempt
+    clock mintbot already stores (``last_sell_attempt_at``). Otherwise the
+    first time this process observed the leg flat.
+    """
+    now = float(now_s)
+    candidates: list[float] = []
+    if isinstance(intent, dict):
+        for key in ("sold_loser_at", "sell_loser_done_at", "last_sell_attempt_at"):
+            ts = _finite_ts(intent.get(key))
+            if ts is not None and ts <= now + 1.0:
+                candidates.append(ts)
+    remembered_ts = _finite_ts(remembered)
+    if remembered_ts is not None and remembered_ts <= now + 1.0:
+        candidates.append(remembered_ts)
+    if not candidates:
+        return now
+    return min(candidates)
+
+
+def _order_id(open_orders: Optional[dict], cid: str, leg: str) -> str:
+    slot = (open_orders or {}).get(cid) or {}
+    if not isinstance(slot, dict):
+        return ""
+    order = slot.get(leg)
+    if not isinstance(order, dict):
+        return ""
+    return str(order.get("order_id") or "")
+
+
+def sister_miss_events(
+    *,
+    intents: Optional[dict],
+    open_orders: Optional[dict],
+    now_s: float,
+    first_flat_at: Optional[dict] = None,
+    last_emit_at: Optional[dict] = None,
+    cancel_ttm_s: float = 20.0,
+    miss_after_s: float = 10.0,
+    throttle_s: float = 30.0,
+    filled_shares: Optional[dict] = None,
+) -> tuple[list[dict], dict, dict]:
+    """Miss rows when A sold leg L and B has no bid, throttled.
+
+    Returns ``(events, next_first_flat_at, next_last_emit_at)``. An event
+    fires once ``age_s`` from the sold/first-observed clock is at least
+    ``miss_after_s`` and the previous emit for that leg is older than
+    ``throttle_s``. Window must still be open past ``cancel_ttm_s``.
+    """
+    now = float(now_s)
+    wait = max(0.0, float(miss_after_s or 0))
+    throttle = max(0.0, float(throttle_s or 0))
+    cancel_at = float(cancel_ttm_s or 0)
+    remembered = first_flat_at or {}
+    previous_emit = last_emit_at or {}
+    next_flat: dict[str, float] = {}
+    next_emit: dict[str, float] = {}
+    for key, raw in previous_emit.items():
+        ts = _finite_ts(raw)
+        if ts is not None and now + 1e-12 < ts + throttle:
+            next_emit[str(key)] = ts
+    events: list[dict] = []
+    for cid, intent in (intents or {}).items():
+        if not isinstance(intent, dict):
+            continue
+        end_ts = _finite_ts(intent.get("end_ts"))
+        if end_ts is None:
+            continue
+        ttm = float(end_ts) - now
+        if ttm <= cancel_at + 1e-12:
+            continue
+        for leg in ("up", "dn"):
+            _flat, why = a_token_flat(intent, leg)
+            if why != "a_flat":
+                continue
+            if _leg_filled(filled_shares, str(cid), leg) > 0:
+                continue
+            key = f"{cid}:{leg}"
+            since = flat_since_s(
+                intent, now_s=now, remembered=remembered.get(key)
+            )
+            next_flat[key] = since
+            if _order_id(open_orders, str(cid), leg):
+                continue
+            age = now - since
+            if age + 1e-12 < wait:
+                continue
+            prev = next_emit.get(key)
+            if prev is not None and now + 1e-12 < prev + throttle:
+                continue
+            events.append(
+                {
+                    "event": "scrapbid_miss",
+                    "condition_id": str(cid),
+                    "leg": leg,
+                    "slug": intent.get("slug"),
+                    "ttm": round(ttm, 3),
+                    "age_s": round(age, 3),
+                }
+            )
+            next_emit[key] = now
+    return events, next_flat, next_emit
+
+
+def sister_poll_s(
+    *,
+    intents: Optional[dict],
+    open_orders: Optional[dict],
+    now_s: float,
+    poll_s: float = 2.0,
+    hot_poll_s: float = 1.0,
+    cancel_ttm_s: float = 20.0,
+    enabled: bool = True,
+    filled_shares: Optional[dict] = None,
+    shares: float = 20.0,
+) -> float:
+    """Idle poll, or the hot cadence while a sold leg still needs a B bid."""
+    idle = max(0.2, float(poll_s or 0))
+    if not enabled:
+        return idle
+    hot = max(0.2, float(hot_poll_s or idle))
+    now = float(now_s)
+    cancel_at = float(cancel_ttm_s or 0)
+    for cid, intent in (intents or {}).items():
+        if not isinstance(intent, dict):
+            continue
+        end_ts = _finite_ts(intent.get("end_ts"))
+        if end_ts is None:
+            continue
+        ttm = float(end_ts) - now
+        if ttm <= cancel_at + 1e-12:
+            continue
+        target = float(shares or 0)
+        for leg in ("up", "dn"):
+            _flat, why = a_token_flat(intent, leg)
+            if why != "a_flat":
+                continue
+            if target > 0 and _leg_filled(filled_shares, str(cid), leg) + 1e-9 >= target:
+                continue
+            if _order_id(open_orders, str(cid), leg):
+                continue
+            return min(idle, hot)
+    return idle
