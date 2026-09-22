@@ -106,6 +106,12 @@ def load_strategy(path: Path = STRATEGY_FILE) -> dict:
     rest_px = float(cfg["bid_rest_px"])
     if not 0 < rest_px <= px + 1e-12:
         raise ValueError("bid_rest_px must be in (0, bid_max_px]")
+    fak_min = float(cfg["bid_fak_min_notional"])
+    if fak_min <= 0:
+        raise ValueError("bid_fak_min_notional must be > 0")
+    # A copied example that still says 60s would post a GTD Polymarket rejects.
+    if float(cfg["min_gtd_ahead_s"]) < 180:
+        cfg["min_gtd_ahead_s"] = 180.0
     if float(cfg["active_ttm_s"]) <= float(cfg["cancel_ttm_s"]):
         raise ValueError("active_ttm_s must be > cancel_ttm_s")
     if float(cfg["cancel_ttm_s"]) < 0:
@@ -406,6 +412,7 @@ def apply_actions(actions: list, state: dict, *, dry_run: bool) -> None:
                 tif=tif,
                 reason=action.get("reason"),
                 price_why=action.get("price_why"),
+                tif_why=action.get("tif_why"),
                 slug=action.get("slug"),
                 status=status,
             )
@@ -431,6 +438,7 @@ def apply_actions(actions: list, state: dict, *, dry_run: bool) -> None:
             tif=action.get("tif"),
             reason=action.get("reason"),
             price_why=action.get("price_why"),
+            tif_why=action.get("tif_why"),
             slug=action.get("slug"),
             dry_run=dry_run,
             status=status,
@@ -537,7 +545,8 @@ def run_once(cfg: dict, now: Optional[float] = None) -> float:
         bid_rest_px=float(cfg["bid_rest_px"]),
         active_ttm_s=float(cfg["active_ttm_s"]),
         cancel_ttm_s=float(cfg["cancel_ttm_s"]),
-        min_gtd_ahead_s=float(cfg["min_gtd_ahead_s"]),
+        min_gtd_ahead_s=max(180.0, float(cfg["min_gtd_ahead_s"])),
+        fak_min_notional=float(cfg.get("bid_fak_min_notional") or 1.0),
         enabled=bool(cfg.get("bid_enabled")),
         take_enabled=bool(cfg.get("bid_take_enabled", True)),
         filled_shares=filled,
@@ -588,6 +597,8 @@ def main() -> None:
         shares=cfg.get("shares"),
         bid_max_px=cfg.get("bid_max_px"),
         bid_rest_px=cfg.get("bid_rest_px"),
+        bid_fak_min_notional=cfg.get("bid_fak_min_notional"),
+        min_gtd_ahead_s=cfg.get("min_gtd_ahead_s"),
         bid_take_enabled=bool(cfg.get("bid_take_enabled", True)),
     )
     LOCK_FILE.parent.mkdir(parents=True, exist_ok=True)

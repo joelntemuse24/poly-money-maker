@@ -1,13 +1,14 @@
 """Sister scrap-bidder policy (wallet B). No CLOB posts, no mintbot import.
 
 Wallet A (mintbot) mints and sells. Wallet B buys the sold leg. Once A
-has ``sold_loser`` on leg L, B bids L immediately, including while A's scrap
-rest is still up and outside the last ``active_ttm_s``. ``bid_max_px`` is a hard cap. A live ask at or under the cap is a FAK buy.
-Otherwise a live bid at or under the cap is joined, chasing above
-``bid_rest_px`` when the book is recovering. An empty or richer book rests
-at ``bid_rest_px`` (3¢), not at the cap. Markets A never held use the same
-quote on the cheap live side during that late window. The winner leg A still
-holds stays blocked. B never mints and never sells.
+has ``sold_loser`` on leg L, B rests a BUY at ``bid_max_px`` (4¢)
+immediately, including while A's scrap rest is still up and outside the
+last ``active_ttm_s``. There is no cheaper rest and no escalate ladder.
+FAK is used only when ``shares * ask`` covers ``bid_fak_min_notional``
+(~$1). GTD is used when expiration is at least ~180s ahead; otherwise
+GTC, still cancelled near expiry. Markets A never held rest at the same
+cap on the cheap live side during that late window. The winner leg A
+still holds stays blocked. B never mints and never sells.
 
 Same-wallet buyback is intentionally not here.
 """
@@ -30,13 +31,16 @@ SISTER_DEFAULTS = {
     "dry_run": True,
     "shares": 20.0,
     "bid_max_px": 0.04,
-    # Passive magnet when the book is empty or richer than the cap. Not the cap.
-    "bid_rest_px": 0.03,
-    # Post-scrap: FAK the live ask when it is at or under bid_max_px.
+    # Same as the cap. Post-scrap does not rest below bid_max_px.
+    "bid_rest_px": 0.04,
+    # 20sh × 4¢ is $0.80, under the CLOB marketable-BUY minimum.
+    "bid_fak_min_notional": 1.0,
+    # FAK only when the ask is ≤ cap and notional clears bid_fak_min_notional.
     "bid_take_enabled": True,
     "active_ttm_s": 180.0,
     "cancel_ttm_s": 20.0,
-    "min_gtd_ahead_s": 60.0,
+    # Polymarket rejects a GTD that expires inside ~180s. Shorter → GTC.
+    "min_gtd_ahead_s": 180.0,
     "poll_s": 2.0,
     # Faster cadence while a sold loser has no resting B bid.
     "poll_hot_s": 1.0,
@@ -287,35 +291,23 @@ def sister_quote(
     bid: Any = None,
     ask: Any = None,
     bid_max_px: float = 0.04,
-    bid_rest_px: float = 0.03,
+    bid_rest_px: float = 0.04,
     take_enabled: bool = True,
 ) -> tuple[str, float, str]:
     """Post-scrap price. ``(style, price, why)``.
 
-    ``style`` is ``take`` (FAK buy) or ``rest``. Price is never above
-    ``bid_max_px``. Preference:
-
-    1. ``live_ask`` — FAK a live ask at or under the cap.
-    2. ``join_bid`` — rest at a live bid at or under ``bid_rest_px``.
-    3. ``rest_live`` — the bid is recovering above the rest and still
-       at or under the cap, so join that live level.
-    4. ``rest_default`` — empty or richer book rests at ``bid_rest_px``.
+    ``style`` is ``take`` (FAK buy) or ``rest``. The rest is always
+    ``bid_max_px``. A cheaper bid is not joined. ``take_enabled`` is set
+    by the planner only when ``shares * ask`` covers the FAK minimum.
     """
+    del bid, bid_rest_px
     cap = round(float(bid_max_px or 0), 4)
-    rest = round(float(bid_rest_px or 0), 4)
-    if cap <= 0 or rest <= 0:
+    if cap <= 0:
         return "rest", 0.0, "bad_cap"
-    if rest > cap:
-        rest = cap
     ask_px = _px(ask)
-    bid_px = _px(bid)
     if take_enabled and ask_px is not None and ask_px <= cap + 1e-12:
         return "take", round(min(ask_px, cap), 4), "live_ask"
-    if bid_px is not None and bid_px <= cap + 1e-12:
-        if bid_px > rest + 1e-12:
-            return "rest", round(min(bid_px, cap), 4), "rest_live"
-        return "rest", round(bid_px, 4), "join_bid"
-    return "rest", rest, "rest_default"
+    return "rest", cap, "rest_cap"
 
 
 def _cheap_live(bid: Optional[float], bid_max_px: float) -> bool:
@@ -335,10 +327,11 @@ def plan_sister_bids(
     now_s: float,
     shares: float = 20.0,
     bid_max_px: float = 0.04,
-    bid_rest_px: float = 0.03,
+    bid_rest_px: float = 0.04,
     active_ttm_s: float = 180.0,
     cancel_ttm_s: float = 20.0,
-    min_gtd_ahead_s: float = 60.0,
+    min_gtd_ahead_s: float = 180.0,
+    fak_min_notional: float = 1.0,
     enabled: bool = True,
     take_enabled: bool = True,
     filled_shares: Optional[dict] = None,
@@ -439,24 +432,30 @@ def plan_sister_bids(
                     if abs(float(other_bid) - float(this_bid)) <= 1e-12 and leg == "dn":
                         actions.append({**base, "op": "skip", "reason": "other_cheaper"})
                         continue
+            ask_px = _px(asks.get(leg))
+            take_notional = remaining * ask_px if ask_px is not None else 0.0
+            allow_take = bool(take_enabled) and take_notional + 1e-9 >= float(
+                fak_min_notional or 0
+            )
             style, price, price_why = sister_quote(
                 bid=bids.get(leg),
                 ask=asks.get(leg),
                 bid_max_px=px,
                 bid_rest_px=rest_px,
-                take_enabled=take_enabled,
+                take_enabled=allow_take,
             )
             if price <= 0 or price > px + 1e-12:
                 actions.append({**base, "op": "skip", "reason": "bad_order"})
                 continue
             if style == "take":
-                tif, exp = "FAK", 0
+                tif, exp, tif_why = "FAK", 0, "fak"
             else:
                 tif, exp = resting_tif(
                     now_s=now_s,
                     expire_ts=float(end_ts) - float(cancel_ttm_s),
                     min_ahead_s=min_gtd_ahead_s,
                 )
+                tif_why = "gtd" if tif == "GTD" else "gtc_short_expiry"
             actions.append(
                 {
                     **base,
@@ -467,6 +466,7 @@ def plan_sister_bids(
                     "price": price,
                     "shares": remaining,
                     "tif": tif,
+                    "tif_why": tif_why,
                     "expiration": exp,
                 }
             )
