@@ -136,11 +136,47 @@ class FlatAfterATests(unittest.TestCase):
         held = [row for row in actions if row["leg"] == "dn"]
         self.assertTrue(any(row["reason"] == "a_holds_other" for row in held))
 
-    def test_absent_market_bids_the_cheap_live_book(self):
+    def test_absent_market_does_not_bid_by_default(self):
+        now = 10_000.0 - 90.0
+        cheap = _market(up_bid=0.02, up_ask=0.03, dn_bid=0.96)
+        actions = plan_sister_bids(
+            markets=[cheap],
+            intents={},
+            open_orders={},
+            now_s=now,
+            enabled=True,
+        )
+        self.assertFalse(any(row["op"] == "place" for row in actions))
+        self.assertTrue(all(row["reason"] == "a_absent" for row in actions))
+        resting = plan_sister_bids(
+            markets=[cheap],
+            intents={},
+            open_orders={"cid": {"up": {"order_id": "dust-1"}}},
+            now_s=now,
+            enabled=True,
+        )
+        cancels = [row for row in resting if row["op"] == "cancel"]
+        self.assertEqual(len(cancels), 1)
+        self.assertEqual(cancels[0]["reason"], "a_absent")
+        self.assertEqual(cancels[0]["order_id"], "dust-1")
+        opted = plan_sister_bids(
+            markets=[cheap],
+            intents={},
+            open_orders={},
+            now_s=now,
+            enabled=True,
+            absent_enabled=True,
+        )
+        places = [row for row in opted if row["op"] == "place"]
+        self.assertEqual(len(places), 1)
+        self.assertEqual(places[0]["leg"], "up")
+        self.assertEqual(places[0]["reason"], "a_absent")
+
+    def test_flat_after_scrap_still_takes(self):
         now = 10_000.0 - 90.0
         actions = plan_sister_bids(
-            markets=[_market(up_bid=0.02, dn_bid=0.96)],
-            intents={},
+            markets=[_market(up_bid=0.02, up_ask=0.03, dn_bid=0.96)],
+            intents={"cid": _sold_up()},
             open_orders={},
             now_s=now,
             enabled=True,
@@ -148,8 +184,10 @@ class FlatAfterATests(unittest.TestCase):
         places = [row for row in actions if row["op"] == "place"]
         self.assertEqual(len(places), 1)
         self.assertEqual(places[0]["leg"], "up")
-        self.assertEqual(places[0]["reason"], "a_absent")
-        self.assertEqual(places[0]["shares"], 20.0)
+        self.assertEqual(places[0]["reason"], "a_flat")
+        self.assertEqual(places[0]["style"], "take")
+        self.assertEqual(places[0]["tif"], "FAK")
+        self.assertFalse(any(row["reason"] == "a_absent" and row["op"] == "place" for row in actions))
 
     def test_absent_market_skips_when_neither_side_is_cheap(self):
         now = 10_000.0 - 90.0
@@ -159,6 +197,7 @@ class FlatAfterATests(unittest.TestCase):
             open_orders={},
             now_s=now,
             enabled=True,
+            absent_enabled=True,
         )
         self.assertFalse(any(row["op"] == "place" for row in actions))
         self.assertTrue(all(row["reason"] == "not_cheap" for row in actions))
@@ -199,7 +238,17 @@ class CancelAndWindowTests(unittest.TestCase):
             now_s=now,
             enabled=True,
         )
-        self.assertTrue(all(row["reason"] == "too_early" for row in actions))
+        self.assertTrue(all(row["reason"] == "a_absent" for row in actions))
+        self.assertFalse(any(row["op"] == "place" for row in actions))
+        opted = plan_sister_bids(
+            markets=[_market()],
+            intents={},
+            open_orders={},
+            now_s=now,
+            enabled=True,
+            absent_enabled=True,
+        )
+        self.assertTrue(all(row["reason"] == "too_early" for row in opted))
 
     def test_post_scrap_places_before_active_window(self):
         now = 10_000.0 - 400.0
@@ -230,7 +279,7 @@ class CancelAndWindowTests(unittest.TestCase):
             now_s=now,
             enabled=True,
         )
-        self.assertTrue(all(row["reason"] == "too_early" for row in absent))
+        self.assertTrue(all(row["reason"] == "a_absent" for row in absent))
         self.assertFalse(any(row["op"] == "place" for row in absent))
 
     def test_disabled_cancels_open_and_places_nothing(self):
@@ -262,10 +311,12 @@ class SisterAuthTests(unittest.TestCase):
         self.assertEqual(SISTER_DEFAULTS["miss_after_s"], 10.0)
         self.assertEqual(SISTER_DEFAULTS["miss_throttle_s"], 30.0)
         self.assertIs(SISTER_DEFAULTS["bid_take_enabled"], True)
+        self.assertIs(SISTER_DEFAULTS["bid_absent_enabled"], False)
         example = json.loads(
             (ROOT / "strategy_scrapbid.example.json").read_text(encoding="utf-8")
         )
         self.assertIs(example["bid_take_enabled"], True)
+        self.assertIs(example["bid_absent_enabled"], False)
         self.assertEqual(example["bid_max_px"], 0.05)
         self.assertEqual(example["bid_rest_px"], 0.05)
         self.assertEqual(example["bid_fak_min_notional"], 1.0)
@@ -306,6 +357,7 @@ class SisterAuthTests(unittest.TestCase):
         self.assertNotIn("side=SELL", src)
         self.assertIn("OrderType.FAK", src)
         self.assertIn("bid_take_enabled", src)
+        self.assertIn("bid_absent_enabled", src)
         self.assertIn("bid_rest_px", src)
         self.assertIn("tif_why", src)
         self.assertNotIn("no_fill_dwell", src)

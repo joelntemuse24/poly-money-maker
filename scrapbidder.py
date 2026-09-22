@@ -553,6 +553,7 @@ def run_once(cfg: dict, now: Optional[float] = None) -> float:
         fak_max_notional=float(cfg.get("bid_fak_max_notional") or 1.5),
         enabled=bool(cfg.get("bid_enabled")),
         take_enabled=bool(cfg.get("bid_take_enabled", True)),
+        absent_enabled=bool(cfg.get("bid_absent_enabled", False)),
         filled_shares=filled,
     )
     apply_actions(actions, state, dry_run=bool(cfg.get("dry_run")))
@@ -605,6 +606,7 @@ def main() -> None:
         bid_fak_max_notional=cfg.get("bid_fak_max_notional"),
         min_gtd_ahead_s=cfg.get("min_gtd_ahead_s"),
         bid_take_enabled=bool(cfg.get("bid_take_enabled", True)),
+        bid_absent_enabled=bool(cfg.get("bid_absent_enabled", False)),
     )
     LOCK_FILE.parent.mkdir(parents=True, exist_ok=True)
     lock_fh = open(LOCK_FILE, "a+", encoding="utf-8")
