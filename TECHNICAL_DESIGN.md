@@ -313,22 +313,27 @@ A relayer `STATE_FAILED` marks the intent `failed` and persists `errorMsg` / tx 
 <a id="section-13b"></a>
 ## Relay hub: internal transaction failure
 
-The most common typed mint failure in the Sep 19–20 2026 trial was the opaque relayer `errorMsg` **`relay hub: internal transaction failure`**.
+Root cause was identified in the manual PROXY submit path: `submit_mint_batch`
+signed requests without `signatureParams.gasLimit`, so
+`py-builder-relayer-client` used its internal fallback
+`DEFAULT_GAS_LIMIT = 500000`. For approve+split batches, observed
+`eth_estimateGas` could be ~519k–549k, so inner relay calls reverted
+out-of-gas while the relayer surfaced `errorMsg` as
+`relay hub: internal transaction failure`.
 
-What it is (and is not):
+Current behavior:
 
-- **Not** a declared Polymarket status-page outage (green while we saw it).
-- Often the **outer** Polygon tx into RelayHub **succeeds**, while the **inner** relayed call reverts (`RelayedCallFailed`) — so no CTF inventory lands.
-- In our cases it was **not** explained by low balance, market-not-ready, or duplicate submits (distinct tx hashes).
-- Community notes frequently blame RelayHub `gasleft` / proxy gas budget / batching. Treat as an intermittent hub/exec flake until Polymarket documents otherwise.
+- Before signing/submitting, mint estimates gas for the **exact proxy-factory
+  call data** (`to=proxy_factory`, encoded approve+split batch) via
+  `eth_estimateGas` on configured `rpc_url`.
+- Chosen `gasLimit = ceil(estimate * 1.18)`, bounded by floor/cap
+  `[450000, 640000]`.
+- Mint logs both raw estimate and chosen gas limit (`mint_proxy_gas_estimate`).
+- If estimation fails, mint **fails closed** (`mint_proxy_gas_estimate_fail`,
+  return error `proxy gas estimate failed: ...`) and does not POST `/submit`.
 
-Trial shape (order of magnitude, not a SLA claim):
-
-- ~19 exact matches of that `errorMsg` over ~26h ≈ **6 windows × 3 retries** (+ one singleton), not nineteen independent daily sprays.
-- Overall mint confirm rate ~**74%** (85/115); this typed fail ~**17%** of attempts in that window.
-- Bot response: mark `failed`, persist `errorMsg`, wait `mint_fail_cooldown_s` (~90s), remint up to `mint_max_attempts` (3), then move on. Pre-mint with `enter_max_ttm_min=30` reduces mid-window timing pressure when a flake burns attempts.
-
-Operational stance: **manageable**. Do not redesign the mint path solely for this message unless the rate worsens or a reproducible gas/batch fix appears.
+Retry and durable failure behavior is unchanged: failed submits still persist
+`errorMsg`, set `last_fail_ts`, and remint only after cooldown/attempt gating.
 
 <a id="section-14"></a>
 ## Relayer submit: approve + split as one PROXY batch
@@ -338,9 +343,11 @@ Operational stance: **manageable**. Do not redesign the mint path solely for thi
 1. Load `PRIVATE_KEY` / `FUNDER_ADDRESS`.
 2. Fetch relay payload (nonce + relay address) for PROXY type.
 3. Encode proxy calls (approve/allowance as needed + split).
-4. Build signed proxy request; require derived `proxyWallet` == funder.
-5. POST `/submit` with relayer auth headers.
-6. Return `transactionID` or error string.
+4. Estimate proxy inner gas on configured RPC (`eth_estimateGas`), apply
+   18% headroom with floor/cap, and set `signatureParams.gasLimit`.
+5. Build signed proxy request; require derived `proxyWallet` == funder.
+6. POST `/submit` with relayer auth headers.
+7. Return `transactionID` or error string.
 
 On success the intent is stored with tokens, shares, `start_ts`/`end_ts`, and `transaction_id`.
 
@@ -555,12 +562,13 @@ Do not import `mintbot.py` in unit tests (credentials, lock, clients). Test `buy
 1. **Failed remint storm** — `failed` stays in `already_minted` during cooldown and after `mint_max_attempts`.
 2. **`relay hub: internal transaction failure`** — opaque inner RelayHub revert; outer tx may still succeed. Retries absorb clusters; not a status-page outage. See [§13b](#section-13b).
 3. **Skipping the next window** — without adjacent lookahead, `max_open_sets=1` + “never mint open markets” skips a quarter-hour.
-4. **Winner at 0.999 on a 0.99 book** — live-bid FAK once allowed, then clamp to CLOB max 0.99 (do not POST 0.995–0.999).
-5. **Dump without `sold_leg`** — held leg cannot be inferred; loser path must set `sold_leg`.
-6. **Sells stop at `end_ts`** — no dump/cash-out after expiry in `manage_sells`; redeem is the remaining path.
-7. **Importing mintbot in tests** — can take the flock or load `.env`.
-8. **Confusing mint with buybot docs** — old hourly TDD describes a different money path.
-9. **Re-serializing sell and mint** — do not fold them back into one `manage_sells → discover → sleep` cycle. That is the 1789905600 hole. Draft PR #193 skip-mint is not the fix.
+4. **Proxy inner gas floor** — omitting PROXY `gasLimit` reverts to SDK fallback 500k and can OOG approve+split. Keep dynamic estimate + headroom (`mint_proxy_gas_estimate`), fail closed on estimate error.
+5. **Winner at 0.999 on a 0.99 book** — live-bid FAK once allowed, then clamp to CLOB max 0.99 (do not POST 0.995–0.999).
+6. **Dump without `sold_leg`** — held leg cannot be inferred; loser path must set `sold_leg`.
+7. **Sells stop at `end_ts`** — no dump/cash-out after expiry in `manage_sells`; redeem is the remaining path.
+8. **Importing mintbot in tests** — can take the flock or load `.env`.
+9. **Confusing mint with buybot docs** — old hourly TDD describes a different money path.
+10. **Re-serializing sell and mint** — do not fold them back into one `manage_sells → discover → sleep` cycle. That is the 1789905600 hole. Draft PR #193 skip-mint is not the fix.
 
 <a id="section-33"></a>
 ## Glossary

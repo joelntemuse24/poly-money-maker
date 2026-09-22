@@ -18,6 +18,10 @@ pathlog are **stopped / retired**. Do not start them.
 - Enter when window opens within 30 minutes and is **not yet open**
 - `max_open_sets`: 1 with **adjacent-window lookahead**; `sold_loser` frees the slot
 - `already_minted` blocks confirmed/in-flight; `failed` remints after `mint_fail_cooldown_s` (90s) up to `mint_max_attempts` (3)
+- Mint PROXY inner gas is estimated on configured `rpc_url` for the exact
+  proxy-factory batch call, then posted as `gasLimit = ceil(estimate*1.18)`
+  bounded to `[450000, 640000]`. Estimation failure is fail-closed
+  (`proxy gas estimate failed`) and does not submit.
 - Sells on:
   - Loser: opposite ≥ 0.90, loser ≤ 0.03 persist **5s wait** (2s in last 60s before end_ts) so wait + typical ~4s tick/FAK ≈ 9s wall (last-min ~5–6s). At fire, re-check in-range; out of range logs `sell_cancel_out_of_range` and does not POST. FAK 0.03 → 0.02
   - Winner: prefer 0.999 / redeem; allow 0.99 live-bid FAK only if loser sold ≤ 0.03 and loser+0.99 > $1; same persist + cancel-at-fire
