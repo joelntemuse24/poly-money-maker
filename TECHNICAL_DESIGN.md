@@ -128,7 +128,7 @@ buy/
   book.py               # sized top-of-book
   chain.py              # eth_call balances / prechecks
   contracts.py          # approve + split calldata
-  oracle_log.py         # Chainlink 60s TWAP tape; not a sell/mint input
+  oracle_log.py         # Chainlink 60s TWAP tape + bag_view for late scrap veto
 deploy/
   polymintbot.service
   polypathlog.service
@@ -264,7 +264,7 @@ The live value is Polymarket's public RTDS relay of Chainlink's BTC/USD **60s TW
 
 The thread wakes every second while a bag is open. Stored rows are 15s mid-window, 2s near the open and in the last three minutes, and 1s in the last minute and just after the end, so a cold gap cannot skip the open print or the last minute.
 
-`oracle_log_enabled` defaults true. When the feed is down the thread writes `oracle_log_fail` and keeps going. Sell policy, mint eligibility, and order posting do not import this module and do not read the file. Turn the flag off to stop the tape; that does not change how a bag is minted or sold.
+`oracle_log_enabled` defaults true. When the feed is down the thread writes `oracle_log_fail` and keeps going. Mint eligibility, winner cash-out, and held dump do not read the tape. **Late loser scrap only:** when TTM ≤ `sell_late_window_s` (120), `manage_sells` reads `OracleLogService.bag_view` (same RTDS feed + `open_ref` already tracked for the bag — no second websocket) and requires a side-aware edge ≥ `max(sell_oracle_edge_floor_usd, sell_oracle_edge_per_ttm × TTM)` for `sell_oracle_edge_persist_s` (3s), fail-closed if missing/stale (`sell_oracle_stale_s`). Outside that window the tape is audit-only. Turn `oracle_log_enabled` off to stop the tape; late scrap then fails closed while TTM ≤ 120.
 
 <a id="section-10b"></a>
 ## Sync-loop audit (same class as mint stealing the dump cycle)
@@ -391,6 +391,7 @@ Policy (`classify_loser` / equivalent):
 - Persist that condition for `sell_persist_s` (5s wait; ~9s wall with tick/FAK lag) via `persist_ready`. In the last `sell_persist_last_min_window_s` (60s) before `end_ts`, use `sell_persist_last_min_s` (2s wait; ~5–6s wall) instead. Effective persist is re-evaluated each tick; an arm started on the 5s clock is not reset when the last minute begins, and becomes ready once elapsed ≥ 2s.
 - At fire, `sell_fire_decision` re-checks the path is still in range (loser ≤ threshold and opposite ≥ min; dump still `< sell_dump_below`; winner still ≥ effective min). Out of range logs `sell_cancel_out_of_range` and does **not** POST; empty loser book keeps `armed_ts`, a visible bid that left range resets the arm.
 - Then FAK ladder: threshold → floor (3¢ → 2¢), sized to inventory latch. If the live sized loser bid is below `sell_floor`, FAK at that live bid. Empty FAK **or a vanished loser book after arm** keeps `armed_ts` (do not fire until a sized bid ≤ threshold returns); persist resets only if the visible bid goes back above threshold, opposite is below min, both cheap, or never armed.
+- **Late-window oracle veto (TTM ≤ `sell_late_window_s` = 120 only):** side-aware TWAP edge vs window open must stay ≥ `max(sell_oracle_edge_floor_usd=25, sell_oracle_edge_per_ttm=1.5 × TTM_s)` for `sell_oracle_edge_persist_s=3` continuous seconds. Scraping Down (keeping Up) needs `twap − open ≥ need`; scraping Up needs `open − twap ≥ need`. Fail closed on missing/stale tape (`sell_oracle_stale_s=5`). Logs `sell_loser_oracle_block` / `sell_loser_oracle_ok`. Combat for true reverse `btc-updown-15m-1790078400` (TTM≈42 → need ≳$63, edge ~+$20 → block). Outside 120s this gate is off.
 
 On full fill: set `sold_loser=true`, `sold_leg="up"|"dn"`, store `sell_limit` (fill/limit evidence). Inventory latch distinguishes “await mint settlement” zeros from true flat.
 
@@ -483,7 +484,7 @@ Observed failure modes: (1) winner armed at bid 0.99 but FAK posted 0.999 → `i
 | `buy/book.py` | Sized BBO parse |
 | `buy/chain.py` | RPC reads |
 | `buy/contracts.py` | Calldata for mint batch |
-| `buy/oracle_log.py` | Recording-only Chainlink 60s TWAP tape |
+| `buy/oracle_log.py` | Chainlink 60s TWAP tape + `bag_view` for late scrap veto |
 | `pathlog.py` | Separate process; read-only books |
 
 <a id="section-25"></a>
@@ -498,6 +499,7 @@ Observed failure modes: (1) winner armed at bid 0.99 but FAK posted 0.999 → `i
 - `loser_empty_keep_qualify` — armed + empty loser book (opposite still ok or also empty) should keep the arm.
 - `loser_persist_ready` — persist_ready plus empty-book / empty-FAK keep/re-arm (`empty_keep_arm`).
 - `sell_fire_decision` — last in-range check before FAK (`fire` / `cancel_reset` / `cancel_keep_arm`).
+- `late_oracle_scrap_ok` / `late_oracle_edge_persist` / `side_aware_oracle_edge_usd` — late-window loser-scrap veto (TTM ≤ 120 only).
 - `winner_cashout_leg` — unique leg whose sized bid ≥ winner_min.
 - `winner_cheap_decision` — 0.99 only if sold_loser, loser ≤ gate, and loser+cheap > $1.
 - `winner_sell_limit` — clamp live-bid FAK into CLOB [0.01, 0.99]; 0.99 still fills 0.995–0.999 books.
@@ -513,7 +515,7 @@ Discovery builds `MintMarket` with `condition_id`, `up_token`, `dn_token`, `star
 <a id="section-27"></a>
 ## pathlog.py: public book recorder
 
-Separate systemd unit. `SERIES = ["btc-up-or-down-15m"]` only. Polls CLOB books, appends JSONL ticks under `pathlog/`, prunes by age/size, optionally records resolution. **No orders.** Used for research/backtests (`check_path_backtest.py`), not for mint decisions today (mint sells are book-only, no pricing oracle).
+Separate systemd unit. `SERIES = ["btc-up-or-down-15m"]` only. Polls CLOB books, appends JSONL ticks under `pathlog/`, prunes by age/size, optionally records resolution. **No orders.** Used for research/backtests (`check_path_backtest.py`). Mint loser scrap uses the Chainlink TWAP tape only inside `sell_late_window_s`; pathlog itself is not a trading input.
 
 <a id="part-v"></a>
 # Part V — Operations, verification and sharp edges
@@ -562,6 +564,11 @@ From VM `strategy_mint.json`:
 | `sell_dump_fak_retries` | 2 | Fast dump re-check/re-fire attempts after first zero-fill miss |
 | `sell_dump_ladder_step` | 0.04 | Dump retry ladder decrement toward floor |
 | `sell_dump_ladder_rungs` | 4 | Max limits per dump retry ladder |
+| `sell_late_window_s` | 120 | TTM window where oracle veto applies to loser scrap |
+| `sell_oracle_edge_per_ttm` | 1.5 | USD edge required per second of TTM |
+| `sell_oracle_edge_persist_s` | 3 | Continuous seconds edge must hold |
+| `sell_oracle_stale_s` | 5 | Fail closed if latest TWAP older than this |
+| `sell_oracle_edge_floor_usd` | 25 | `need = max(floor, per_ttm × TTM)` |
 
 <a id="section-30"></a>
 ## Deploy boundary (VM is source of truth)

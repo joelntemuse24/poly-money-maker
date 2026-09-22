@@ -11,6 +11,11 @@ waits fold typical ~4s sell-tick/FAK lag so wall-clock stays ~9s (last-min
 (do not fire until a sized bid at/under threshold returns). Keep the winner
 for redeem unless its sized bid reaches ``sell_winner_min`` (~99¢).
 
+In the last ``sell_late_window_s`` (~120s), also require a side-aware
+Chainlink TWAP edge vs window open (≥ ``max(floor, per_ttm × TTM)`` for
+``sell_oracle_edge_persist_s``) before firing the loser scrap. Outside that
+window this module's CLOB gates are unchanged.
+
 After the loser is sold, optional held-leg dump: if the remaining leg's sized
 bid stays under ``sell_dump_below`` (~80¢) for ``sell_dump_persist_s`` (~2s),
 live-bid FAK the held leg.
@@ -46,6 +51,12 @@ DEFAULT_SELL_KNOBS = {
     "sell_min_bid_size": 1.0,
     # Cycle sleep while a loser persist arm is live. Does not change persist_s.
     "sell_armed_poll_s": 2.0,
+    # Late-window oracle veto on full loser scrap (TTM ≤ window only).
+    "sell_late_window_s": 120.0,
+    "sell_oracle_edge_per_ttm": 1.5,
+    "sell_oracle_edge_persist_s": 3.0,
+    "sell_oracle_stale_s": 5.0,
+    "sell_oracle_edge_floor_usd": 25.0,
 }
 
 
@@ -543,3 +554,131 @@ def sell_fire_decision(
             return "cancel_reset", "winner_below_min"
         return "fire", "winner_cheap" if cheap_on else "winner"
     return "cancel_reset", "unknown_path"
+
+
+def _finite_usd(value: Any) -> Optional[float]:
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(parsed):
+        return None
+    return parsed
+
+
+def side_aware_oracle_edge_usd(
+    *,
+    twap_usd: Any,
+    open_usd: Any,
+    scrap_leg: str,
+) -> Optional[float]:
+    """Side-aware TWAP edge vs window open that favors the *kept* leg.
+
+    Scraping Down (keeping Up) needs ``twap - open >= 0`` in the caller's
+    threshold check. Scraping Up (keeping Down) needs ``open - twap``.
+    Returns signed edge in USD, or None when inputs are unusable.
+    """
+    twap = _finite_usd(twap_usd)
+    open_px = _finite_usd(open_usd)
+    if twap is None or open_px is None:
+        return None
+    leg = str(scrap_leg or "").lower()
+    if leg in ("dn", "down"):
+        return twap - open_px
+    if leg in ("up",):
+        return open_px - twap
+    return None
+
+
+def late_oracle_need_usd(
+    ttm_s: float,
+    *,
+    edge_per_ttm: float = 1.5,
+    floor_usd: float = 25.0,
+) -> float:
+    """Minimum side-aware edge required at this TTM (floor applied)."""
+    ttm = max(0.0, float(ttm_s))
+    need = float(edge_per_ttm) * ttm
+    floor = float(floor_usd or 0.0)
+    if floor > 0:
+        return max(floor, need)
+    return need
+
+
+def late_oracle_scrap_ok(
+    *,
+    ttm_s: Optional[float],
+    scrap_leg: Optional[str],
+    twap_usd: Any,
+    open_usd: Any,
+    twap_age_s: Optional[float],
+    late_window_s: float = 120.0,
+    edge_per_ttm: float = 1.5,
+    floor_usd: float = 25.0,
+    stale_s: float = 5.0,
+) -> Tuple[bool, str, dict]:
+    """Whether the late-window oracle gate currently qualifies (one tick).
+
+    Outside ``late_window_s`` returns ``(True, "outside_late_window", ...)``
+    so callers skip the gate. Inside the window, fail closed on missing /
+    stale / wrong-sign / thin edge. Does not apply the 3s persist arm —
+    pair with ``persist_ready`` / ``late_oracle_edge_persist``.
+    """
+    detail: dict = {
+        "ttm": None if ttm_s is None else float(ttm_s),
+        "leg": scrap_leg,
+        "twap": None,
+        "open_usd": None,
+        "edge": None,
+        "need": None,
+        "age_s": None if twap_age_s is None else float(twap_age_s),
+    }
+    if ttm_s is None:
+        return False, "missing_ttm", detail
+    ttm = float(ttm_s)
+    detail["ttm"] = ttm
+    window = float(late_window_s or 0.0)
+    if window <= 0 or ttm > window + 1e-12:
+        return True, "outside_late_window", detail
+    if ttm <= 0:
+        return False, "market_ended", detail
+    twap = _finite_usd(twap_usd)
+    open_px = _finite_usd(open_usd)
+    detail["twap"] = twap
+    detail["open_usd"] = open_px
+    if open_px is None:
+        return False, "missing_open", detail
+    if twap is None:
+        return False, "missing_twap", detail
+    if twap_age_s is None:
+        return False, "missing_twap_age", detail
+    age = float(twap_age_s)
+    detail["age_s"] = age
+    if age > float(stale_s) + 1e-12:
+        return False, "stale_twap", detail
+    edge = side_aware_oracle_edge_usd(
+        twap_usd=twap, open_usd=open_px, scrap_leg=str(scrap_leg or "")
+    )
+    detail["edge"] = edge
+    if edge is None:
+        return False, "bad_leg", detail
+    need = late_oracle_need_usd(
+        ttm, edge_per_ttm=edge_per_ttm, floor_usd=floor_usd
+    )
+    detail["need"] = need
+    if edge + 1e-12 < need:
+        return False, "edge_thin", detail
+    return True, "edge_ok", detail
+
+
+def late_oracle_edge_persist(
+    qualify: bool,
+    *,
+    now_s: float,
+    armed_ts: Optional[float],
+    persist_s: float,
+) -> Tuple[bool, Optional[float], str]:
+    """3s (default) continuous edge arm for late loser scrap. Same as persist_ready."""
+    return persist_ready(
+        qualify, now_s=now_s, armed_ts=armed_ts, persist_s=persist_s
+    )

@@ -20,9 +20,14 @@ a bag is sell-hot (loser armed, or loser sold and dump/winner not done).
 Mint keeps ``poll_s``. Persist defaults are 5/2/60.
 
 A third loop records Chainlink BTC/USD 60s TWAP (Polymarket RTDS) to
-``logs/oracle_twap.jsonl`` while a 15m bag is open. That tape is audit
-only: sell and mint never read it. ``oracle_log_enabled`` defaults on.
-If the feed fails, the loop logs ``oracle_log_fail`` and trading continues.
+``logs/oracle_twap.jsonl`` while a 15m bag is open. ``oracle_log_enabled``
+defaults on. In the last ``sell_late_window_s`` (~120s) before ``end_ts``,
+loser scrap also requires a side-aware TWAP edge ≥
+``max(sell_oracle_edge_floor_usd, sell_oracle_edge_per_ttm × TTM)`` for
+``sell_oracle_edge_persist_s`` (~3s), fail-closed on missing/stale tape
+(combat for true reverse ``btc-updown-15m-1790078400``). Outside that
+window the tape is audit-only. If the feed fails outside the late gate,
+the loop logs ``oracle_log_fail`` and trading continues.
 
 Usage:
   # dry-run (default when strategy_mint.json has dry_run true / entry_enabled false)
@@ -62,7 +67,7 @@ from buy.chain import ChainReader
 from buy.contracts import ContractCall, build_atomic_mint_calls
 from buy.market import MarketGateway, MintMarket
 from buy.mint_loops import IntentStore, run_job_loop, start_mint_sell_loops
-from buy.oracle_log import OracleLogService, snapshot_intents
+from buy.oracle_log import OracleBagView, OracleLogService, snapshot_intents
 from buy.mint_sell import (
     classify_loser,
     cycle_sleep_s,
@@ -71,6 +76,8 @@ from buy.mint_sell import (
     effective_loser_persist_s,
     empty_fak_status,
     inventory_latch,
+    late_oracle_edge_persist,
+    late_oracle_scrap_ok,
     loser_empty_keep_qualify,
     loser_ladder_limits,
     loser_persist_ready,
@@ -114,7 +121,7 @@ DEFAULTS = {
     "max_open_sets": 1,
     "poll_s": 5.0,
     "sell_armed_poll_s": 2.0,
-    # Recording-only Chainlink 60s TWAP tape. Not an input to mint or sell.
+    # Chainlink 60s TWAP tape (+ late-window loser-scrap veto only).
     "oracle_log_enabled": True,
     "position_tolerance": 0.01,
     "require_accepting_orders": True,
@@ -141,6 +148,12 @@ DEFAULTS = {
     "sell_dump_ladder_step": 0.04,
     "sell_dump_ladder_rungs": 4,
     "sell_min_bid_size": 1.0,
+    # Late-window oracle veto on full loser scrap (TTM ≤ window only).
+    "sell_late_window_s": 120.0,
+    "sell_oracle_edge_per_ttm": 1.5,
+    "sell_oracle_edge_persist_s": 3.0,
+    "sell_oracle_stale_s": 5.0,
+    "sell_oracle_edge_floor_usd": 25.0,
     "rpc_url": "https://polygon.drpc.org",
     "gamma_url": "https://gamma-api.polymarket.com",
     "data_api_url": "https://data-api.polymarket.com",
@@ -167,6 +180,24 @@ STATE_LOCK = threading.RLock()
 _intent_store: Optional[IntentStore] = None
 _heartbeat_lock = threading.Lock()
 _heartbeat_parts: Dict[str, dict] = {}
+_ORACLE_SERVICE: Optional[OracleLogService] = None
+
+
+def _set_oracle_service(service: Optional[OracleLogService]) -> None:
+    global _ORACLE_SERVICE
+    _ORACLE_SERVICE = service
+
+
+def _oracle_bag_view(condition_id: str) -> OracleBagView:
+    svc = _ORACLE_SERVICE
+    if svc is None:
+        return OracleBagView(twap=None, open_usd=None, obs_ts=None)
+    try:
+        return svc.bag_view(condition_id)
+    except Exception:
+        return OracleBagView(twap=None, open_usd=None, obs_ts=None)
+
+
 _notify_pool = ThreadPoolExecutor(max_workers=2, thread_name_prefix="ntfy")
 
 def _signal_handler(signum, frame):
@@ -1684,9 +1715,88 @@ def _manage_sells_locked(cfg: dict, state: dict, chain: ChainReader) -> None:
         intent["sell_loser_armed_at"] = armed_l
         if why_l == "reset":
             intent["sell_loser_leg"] = None
+            intent["sell_oracle_edge_armed_at"] = None
         else:
             intent["sell_loser_leg"] = loser or keep_leg or prev_leg
         persist_leg = loser or intent.get("sell_loser_leg")
+
+        late_window_s = float(cfg.get("sell_late_window_s", 120.0) or 0.0)
+        edge_per_ttm = float(cfg.get("sell_oracle_edge_per_ttm", 1.5) or 0.0)
+        edge_persist_s = float(cfg.get("sell_oracle_edge_persist_s", 3.0) or 0.0)
+        stale_s = float(cfg.get("sell_oracle_stale_s", 5.0) or 0.0)
+        floor_usd = float(cfg.get("sell_oracle_edge_floor_usd", 25.0) or 0.0)
+        ttm_for_oracle = float(end_ts - now) if end_ts else None
+        in_late = (
+            ttm_for_oracle is not None
+            and late_window_s > 0
+            and float(ttm_for_oracle) <= late_window_s + 1e-12
+            and float(ttm_for_oracle) > 0
+        )
+        oracle_fire = True
+        edge_detail: dict = {}
+        edge_why = "outside_late_window"
+        oracle_block_why = "outside_late_window"
+        if not in_late or sold_loser or persist_leg not in ("up", "dn"):
+            intent["sell_oracle_edge_armed_at"] = None
+        elif in_late:
+            view = _oracle_bag_view(cid)
+            age_s = (
+                None
+                if view.obs_ts is None
+                else max(0.0, float(now) - float(view.obs_ts))
+            )
+            # Gate qualifies on the scrap leg even while CLOB arm waits.
+            scrap_for_edge = loser or persist_leg
+            edge_ok, edge_why, edge_detail = late_oracle_scrap_ok(
+                ttm_s=ttm_for_oracle,
+                scrap_leg=scrap_for_edge,
+                twap_usd=view.twap,
+                open_usd=view.open_usd,
+                twap_age_s=age_s,
+                late_window_s=late_window_s,
+                edge_per_ttm=edge_per_ttm,
+                floor_usd=floor_usd,
+                stale_s=stale_s,
+            )
+            # Only accumulate edge persist while CLOB also still sees a loser.
+            edge_qualify = bool(edge_ok) and loser is not None and not sold_loser
+            oracle_fire, armed_o, why_o = late_oracle_edge_persist(
+                edge_qualify,
+                now_s=now,
+                armed_ts=intent.get("sell_oracle_edge_armed_at"),
+                persist_s=edge_persist_s,
+            )
+            intent["sell_oracle_edge_armed_at"] = armed_o
+            oracle_block_why = edge_why if not edge_ok else why_o
+            if edge_qualify and why_o in {"armed", "waiting"}:
+                log_event(
+                    "sell_loser_oracle_persist",
+                    condition_id=cid,
+                    slug=intent.get("slug"),
+                    leg=scrap_for_edge,
+                    why=why_o,
+                    ttm=edge_detail.get("ttm"),
+                    edge=edge_detail.get("edge"),
+                    need=edge_detail.get("need"),
+                    open_ref=edge_detail.get("open_usd"),
+                    twap=edge_detail.get("twap"),
+                    age_s=edge_detail.get("age_s"),
+                )
+            elif not edge_ok and loser is not None and not sold_loser:
+                log_event(
+                    "sell_loser_oracle_block",
+                    condition_id=cid,
+                    slug=intent.get("slug"),
+                    leg=scrap_for_edge,
+                    why=edge_why,
+                    ttm=edge_detail.get("ttm"),
+                    edge=edge_detail.get("edge"),
+                    need=edge_detail.get("need"),
+                    open_ref=edge_detail.get("open_usd"),
+                    twap=edge_detail.get("twap"),
+                    age_s=edge_detail.get("age_s"),
+                )
+
         if loser and why_l in {"ready", "immediate"}:
             loser_bid = float(bids[loser] or thr)
             preview = loser_ladder_limits(thr, floor, loser_bid)
@@ -1741,7 +1851,36 @@ def _manage_sells_locked(cfg: dict, state: dict, chain: ChainReader) -> None:
                     cid=cid,
                     extra={"opposite_bid": bids.get(opp_leg), "threshold": thr},
                 )
+            elif in_late and not oracle_fire:
+                log_event(
+                    "sell_loser_oracle_block",
+                    condition_id=cid,
+                    slug=intent.get("slug"),
+                    leg=loser,
+                    why=oracle_block_why,
+                    ttm=edge_detail.get("ttm"),
+                    edge=edge_detail.get("edge"),
+                    need=edge_detail.get("need"),
+                    open_ref=edge_detail.get("open_usd"),
+                    twap=edge_detail.get("twap"),
+                    age_s=edge_detail.get("age_s"),
+                    clob_ready=True,
+                )
             else:
+                if in_late:
+                    log_event(
+                        "sell_loser_oracle_ok",
+                        condition_id=cid,
+                        slug=intent.get("slug"),
+                        leg=loser,
+                        why="ready",
+                        ttm=edge_detail.get("ttm"),
+                        edge=edge_detail.get("edge"),
+                        need=edge_detail.get("need"),
+                        open_ref=edge_detail.get("open_usd"),
+                        twap=edge_detail.get("twap"),
+                        age_s=edge_detail.get("age_s"),
+                    )
                 l_tok = tokens[loser]
                 loser_bid = float(bids[loser] or thr)
                 size, latch = _sell_inventory(
@@ -1759,6 +1898,7 @@ def _manage_sells_locked(cfg: dict, state: dict, chain: ChainReader) -> None:
                     intent["sold_leg"] = loser
                     intent["sold_loser"] = True
                     intent["sell_note"] = "already_flat"
+                    intent["sell_oracle_edge_armed_at"] = None
                 else:
                     limits = loser_ladder_limits(thr, floor, loser_bid)
                     intent["last_sell_attempt_at"] = now
@@ -1787,6 +1927,7 @@ def _manage_sells_locked(cfg: dict, state: dict, chain: ChainReader) -> None:
                     if done:
                         intent["sold_leg"] = loser
                         intent["sold_loser"] = True
+                        intent["sell_oracle_edge_armed_at"] = None
                         if dry_run:
                             intent["sell_dry"] = True
                         log_event(
@@ -2185,7 +2326,10 @@ def main() -> int:
         oracle_log_enabled=bool(cfg.get("oracle_log_enabled", True)),
     )
     if cfg.get("oracle_log_enabled", True):
-        console.print("[dim]▶ oracle tape[/] logs/oracle_twap.jsonl  [dim](not a trading input)[/]")
+        console.print(
+            "[dim]▶ oracle tape[/] logs/oracle_twap.jsonl  "
+            "[dim](+ late loser-scrap veto ≤120s TTM)[/]"
+        )
 
     def should_stop() -> bool:
         return _shutdown or STOP_FILE.exists()
@@ -2212,6 +2356,7 @@ def main() -> int:
         return mint_cycle_sleep_s(current)
 
     oracle = OracleLogService(ORACLE_LOG_FILE)
+    _set_oracle_service(oracle)
 
     def oracle_tick() -> None:
         current = cfg_box.get("cfg") or {}

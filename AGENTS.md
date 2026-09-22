@@ -40,7 +40,12 @@ or at the live bid if it is below the floor (empty FAK or a vanished loser
 book after arm keeps `armed_ts`; do not fire until a sized bid ≤ threshold
 returns). Persist waits fold typical ~4s sell-tick/FAK lag so wall-clock
 stays ~9s (last-min ~5–6s). Out of range at fire logs
-`sell_cancel_out_of_range` and does not POST.
+`sell_cancel_out_of_range` and does not POST. **Late-window oracle veto:**
+when TTM ≤ `sell_late_window_s` (~120), also require side-aware Chainlink
+TWAP edge ≥ `max(sell_oracle_edge_floor_usd, sell_oracle_edge_per_ttm × TTM)`
+for `sell_oracle_edge_persist_s` (~3s), fail-closed on missing/stale tape
+(`sell_oracle_stale_s` ~5); log `sell_loser_oracle_block` /
+`sell_loser_oracle_ok`. Outside that window, CLOB gates only.
 Winner cash-out is a separate path at `sell_winner_min` (~0.999).
 Live-bid FAK the winner, then clamp `limit = min(live_sized_bid,
 sell_clob_max_price=0.99)` (floor `sell_clob_min_price=0.01`) so rich
@@ -66,8 +71,10 @@ Shared `buy/` helpers exist for mint, pathlog, and the recording-only oracle tap
 - `buy/market.py` — Gamma/CLOB discovery (`mintbot`, `pathlog`)
 - `buy/chain.py` — Polygon eth_call prechecks (`mintbot`)
 - `buy/contracts.py` — atomic mint calldata (`mintbot`)
-- `buy/oracle_log.py` — recording-only Chainlink BTC/USD 60s TWAP tape
-  (`logs/oracle_twap.jsonl`). Not an input to mint, sell, dump, or winner.
+- `buy/oracle_log.py` — Chainlink BTC/USD 60s TWAP tape
+  (`logs/oracle_twap.jsonl`) plus read-only `bag_view` for the late
+  loser-scrap veto. Not an input to mint, winner, dump, or sell outside
+  `sell_late_window_s`.
 
 Do not restore retired buybot modules (`entry_skip`, `hedge_gate`,
 `btc_price`, `clob_book_ws`, `depth_ladder`, `strategy_coherence`,
