@@ -98,6 +98,7 @@ DEFAULTS = {
     "enter_min_ttm_min": 0.0,
     "enter_max_ttm_min": 30.0,
     "mint_fail_cooldown_s": 90.0,
+    "mint_submitting_timeout_s": 90.0,
     "mint_max_attempts": 3,
     "series_slugs": [
         "btc-up-or-down-15m",
@@ -261,6 +262,8 @@ def validate_strategy(cfg: dict) -> None:
         raise ValueError("enter_max_ttm_min must be > enter_min_ttm_min")
     if float(cfg.get("mint_fail_cooldown_s") or 0) < 0:
         raise ValueError("mint_fail_cooldown_s must be >= 0")
+    if float(cfg.get("mint_submitting_timeout_s") or 0) < 0:
+        raise ValueError("mint_submitting_timeout_s must be >= 0")
     if int(cfg.get("mint_max_attempts") or 0) < 1:
         raise ValueError("mint_max_attempts must be >= 1")
     if not cfg["series_slugs"]:
@@ -486,6 +489,50 @@ def mark_intent_failed(
         attempts = 0
     if attempts < 1:
         intent["mint_attempts"] = 1
+
+
+def fail_stale_submitting_intents(state: dict, cfg: dict, now: float) -> int:
+    """Auto-fail stale ``submitting`` intents that never received a tx id."""
+    try:
+        timeout_s = float(cfg.get("mint_submitting_timeout_s") or 0)
+    except (TypeError, ValueError):
+        timeout_s = 0.0
+    if timeout_s <= 0:
+        return 0
+
+    stale = 0
+    dirty = False
+    with STATE_LOCK:
+        for condition_id, intent in state.get("intents", {}).items():
+            if not isinstance(intent, dict):
+                continue
+            if str(intent.get("status") or "") != "submitting":
+                continue
+            if str(intent.get("transaction_id") or "").strip():
+                continue
+            try:
+                entered_submitting_at = float(intent.get("updated_at") or intent.get("created_at") or 0)
+            except (TypeError, ValueError):
+                entered_submitting_at = 0.0
+            if entered_submitting_at <= 0:
+                continue
+            age_s = float(now) - entered_submitting_at
+            if age_s <= timeout_s:
+                continue
+            mark_intent_failed(intent, now, error_msg="stale_submitting_no_tx")
+            log_event(
+                "mint_submitting_timeout_failed",
+                condition_id=condition_id,
+                slug=intent.get("slug"),
+                age_s=round(age_s, 3),
+                timeout_s=timeout_s,
+                mint_attempts=intent.get("mint_attempts"),
+            )
+            stale += 1
+            dirty = True
+        if dirty:
+            atomic_save(STATE_FILE, state)
+    return stale
 
 def get_relayer_headers(body: dict) -> Optional[dict]:
     relayer_key = os.getenv("RELAYER_API_KEY")
@@ -1816,6 +1863,7 @@ def run_mint_cycle(
     if STOP_FILE.exists():
         write_loop_heartbeat("mint", "stopped")
         return "stopped"
+    fail_stale_submitting_intents(state, cfg, now)
 
     funder = os.getenv("FUNDER_ADDRESS") or ""
     if funder:
