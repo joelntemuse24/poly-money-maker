@@ -2,10 +2,11 @@
 
 Wallet A (mintbot) mints and sells. Wallet B buys the sold leg. Once A
 has ``sold_loser`` on leg L, B bids L immediately, including while A's scrap
-rest is still up and outside the last ``active_ttm_s``. ``bid_max_px`` is a
-cap: a live ask at or under the cap is a FAK buy, a cheaper bid is joined,
-and an empty or richer book rests at the cap. Markets A never held can rest
-a bid on the cheap live side during that late window. The winner leg A still
+rest is still up and outside the last ``active_ttm_s``. ``bid_max_px`` is a hard cap. A live ask at or under the cap is a FAK buy.
+Otherwise a live bid at or under the cap is joined, chasing above
+``bid_rest_px`` when the book is recovering. An empty or richer book rests
+at ``bid_rest_px`` (3¢), not at the cap. Markets A never held use the same
+quote on the cheap live side during that late window. The winner leg A still
 holds stays blocked. B never mints and never sells.
 
 Same-wallet buyback is intentionally not here.
@@ -29,6 +30,8 @@ SISTER_DEFAULTS = {
     "dry_run": True,
     "shares": 20.0,
     "bid_max_px": 0.04,
+    # Passive magnet when the book is empty or richer than the cap. Not the cap.
+    "bid_rest_px": 0.03,
     # Post-scrap: FAK the live ask when it is at or under bid_max_px.
     "bid_take_enabled": True,
     "active_ttm_s": 180.0,
@@ -284,29 +287,35 @@ def sister_quote(
     bid: Any = None,
     ask: Any = None,
     bid_max_px: float = 0.04,
+    bid_rest_px: float = 0.03,
     take_enabled: bool = True,
 ) -> tuple[str, float, str]:
     """Post-scrap price. ``(style, price, why)``.
 
     ``style`` is ``take`` (FAK buy) or ``rest``. Price is never above
-    ``bid_max_px``. A live ask at or under the cap is taken. A bid under
-    the cap is joined. An empty book, or a book priced above the cap,
-    rests at the cap.
+    ``bid_max_px``. Preference:
+
+    1. ``live_ask`` — FAK a live ask at or under the cap.
+    2. ``join_bid`` — rest at a live bid at or under ``bid_rest_px``.
+    3. ``rest_live`` — the bid is recovering above the rest and still
+       at or under the cap, so join that live level.
+    4. ``rest_default`` — empty or richer book rests at ``bid_rest_px``.
     """
     cap = round(float(bid_max_px or 0), 4)
-    if cap <= 0:
+    rest = round(float(bid_rest_px or 0), 4)
+    if cap <= 0 or rest <= 0:
         return "rest", 0.0, "bad_cap"
+    if rest > cap:
+        rest = cap
     ask_px = _px(ask)
     bid_px = _px(bid)
     if take_enabled and ask_px is not None and ask_px <= cap + 1e-12:
         return "take", round(min(ask_px, cap), 4), "live_ask"
-    if bid_px is not None and bid_px + 1e-12 < cap:
-        px = bid_px
-        if ask_px is not None and ask_px > bid_px:
-            mid = (bid_px + ask_px) / 2.0
-            px = min(bid_px, mid)
-        return "rest", round(min(px, cap), 4), "join_bid"
-    return "rest", cap, "cap"
+    if bid_px is not None and bid_px <= cap + 1e-12:
+        if bid_px > rest + 1e-12:
+            return "rest", round(min(bid_px, cap), 4), "rest_live"
+        return "rest", round(bid_px, 4), "join_bid"
+    return "rest", rest, "rest_default"
 
 
 def _cheap_live(bid: Optional[float], bid_max_px: float) -> bool:
@@ -326,6 +335,7 @@ def plan_sister_bids(
     now_s: float,
     shares: float = 20.0,
     bid_max_px: float = 0.04,
+    bid_rest_px: float = 0.03,
     active_ttm_s: float = 180.0,
     cancel_ttm_s: float = 20.0,
     min_gtd_ahead_s: float = 60.0,
@@ -342,6 +352,7 @@ def plan_sister_bids(
     actions: list[dict] = []
     size = float(shares or 0)
     px = round(float(bid_max_px or 0), 4)
+    rest_px = round(float(bid_rest_px or 0), 4)
     for market in markets:
         if not isinstance(market, dict):
             continue
@@ -428,15 +439,13 @@ def plan_sister_bids(
                     if abs(float(other_bid) - float(this_bid)) <= 1e-12 and leg == "dn":
                         actions.append({**base, "op": "skip", "reason": "other_cheaper"})
                         continue
-            if post_scrap:
-                style, price, price_why = sister_quote(
-                    bid=bids.get(leg),
-                    ask=asks.get(leg),
-                    bid_max_px=px,
-                    take_enabled=take_enabled,
-                )
-            else:
-                style, price, price_why = "rest", px, "cap"
+            style, price, price_why = sister_quote(
+                bid=bids.get(leg),
+                ask=asks.get(leg),
+                bid_max_px=px,
+                bid_rest_px=rest_px,
+                take_enabled=take_enabled,
+            )
             if price <= 0 or price > px + 1e-12:
                 actions.append({**base, "op": "skip", "reason": "bad_order"})
                 continue

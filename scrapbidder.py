@@ -103,6 +103,9 @@ def load_strategy(path: Path = STRATEGY_FILE) -> dict:
         raise ValueError("shares must be in (0, 20]")
     if not 0 < px <= 0.10:
         raise ValueError("bid_max_px must be in (0, 0.10]")
+    rest_px = float(cfg["bid_rest_px"])
+    if not 0 < rest_px <= px + 1e-12:
+        raise ValueError("bid_rest_px must be in (0, bid_max_px]")
     if float(cfg["active_ttm_s"]) <= float(cfg["cancel_ttm_s"]):
         raise ValueError("active_ttm_s must be > cancel_ttm_s")
     if float(cfg["cancel_ttm_s"]) < 0:
@@ -531,6 +534,7 @@ def run_once(cfg: dict, now: Optional[float] = None) -> float:
         now_s=now_s,
         shares=float(cfg["shares"]),
         bid_max_px=float(cfg["bid_max_px"]),
+        bid_rest_px=float(cfg["bid_rest_px"]),
         active_ttm_s=float(cfg["active_ttm_s"]),
         cancel_ttm_s=float(cfg["cancel_ttm_s"]),
         min_gtd_ahead_s=float(cfg["min_gtd_ahead_s"]),
@@ -583,6 +587,7 @@ def main() -> None:
         dry_run=bool(cfg.get("dry_run")),
         shares=cfg.get("shares"),
         bid_max_px=cfg.get("bid_max_px"),
+        bid_rest_px=cfg.get("bid_rest_px"),
         bid_take_enabled=bool(cfg.get("bid_take_enabled", True)),
     )
     LOCK_FILE.parent.mkdir(parents=True, exist_ok=True)
