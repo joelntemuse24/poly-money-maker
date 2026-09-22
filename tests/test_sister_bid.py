@@ -15,7 +15,9 @@ from buy.sister_bid import (
     SISTER_DEFAULTS,
     a_token_flat,
     buy_matched_shares,
+    markets_needing_books,
     plan_sister_bids,
+    sister_book_wanted,
     sister_quote,
     resolve_sister_client_config,
     sister_cancel_due,
@@ -291,7 +293,18 @@ class SisterAuthTests(unittest.TestCase):
         self.assertIn("OrderType.FAK", src)
         self.assertIn("bid_take_enabled", src)
         self.assertIn("_fetch_top", src)
+        self.assertIn("sister_book_wanted", src)
+        self.assertIn("_mint_intents", src)
         self.assertNotIn("build_atomic_mint", src)
+        calls = _call_names(_function(tree, "run_once"))
+        first_read = calls.index("_mint_intents")
+        first_books = calls.index("_fill_books")
+        second_read = calls.index("_mint_intents", first_read + 1)
+        second_books = calls.index("_fill_books", first_books + 1)
+        self.assertLess(first_read, first_books)
+        self.assertLess(first_books, second_read)
+        self.assertLess(second_read, second_books)
+        self.assertLess(second_books, calls.index("plan_sister_bids"))
         self.assertNotIn("submit_mint", src)
         self.assertIn("scrapbid_miss", src)
         self.assertIn("sister_poll_s", src)
@@ -431,6 +444,30 @@ class PostScrapMissTests(unittest.TestCase):
         self.assertEqual(disabled, 2.0)
 
 
+def _function(tree: ast.AST, name: str) -> ast.FunctionDef:
+    for node in tree.body if isinstance(tree, ast.Module) else []:
+        if isinstance(node, ast.FunctionDef) and node.name == name:
+            return node
+    raise AssertionError(name)
+
+
+def _call_names(node: ast.AST) -> list[str]:
+    names: list[str] = []
+
+    def walk(current: ast.AST) -> None:
+        if isinstance(current, ast.Call):
+            func = current.func
+            if isinstance(func, ast.Name):
+                names.append(func.id)
+            elif isinstance(func, ast.Attribute):
+                names.append(func.attr)
+        for child in ast.iter_child_nodes(current):
+            walk(child)
+
+    walk(node)
+    return names
+
+
 def _sold_up():
     return {
         "status": "confirmed",
@@ -567,6 +604,91 @@ class PostScrapPriceTests(unittest.TestCase):
             shares=20.0,
         )
         self.assertEqual(hot, 1.0)
+
+
+class BookFilterTests(unittest.TestCase):
+    def test_far_window_is_not_quoted_until_sold(self):
+        # btc-updown-15m-1790106300 ended 20:00 UTC; at the scrap TTM was 316s.
+        end = 17_901_07200.0
+        now = end - 316.0
+        cid = "0x02ce55357529aedc3c7407bf8c30a6e9044679695bcf803a9b724f8e6183aa92"
+        live = _market(condition_id=cid, end_ts=end)
+        future = _market(
+            condition_id="future",
+            end_ts=now + 3600.0,
+            up_token="FUT_UP",
+            dn_token="FUT_DN",
+        )
+        held = {"status": "confirmed", "sold_loser": False, "sell_loser_leg": "up"}
+        before = markets_needing_books(
+            [live, future],
+            {cid: held},
+            {},
+            now_s=now,
+        )
+        self.assertEqual(before, [])
+        self.assertFalse(
+            sister_book_wanted(live, held, {}, now_s=now)
+        )
+        sold = {"status": "confirmed", "sold_loser": True, "sold_leg": "up"}
+        after = markets_needing_books(
+            [live, future],
+            {cid: sold},
+            {},
+            now_s=now,
+        )
+        self.assertEqual([row["condition_id"] for row in after], [cid])
+
+    def test_late_window_and_open_order_are_quoted(self):
+        now = 10_000.0
+        near = _market(condition_id="near", end_ts=now + 100.0)
+        future = _market(condition_id="future", end_ts=now + 3600.0)
+        chosen = markets_needing_books([near, future], {}, {}, now_s=now)
+        self.assertEqual([row["condition_id"] for row in chosen], ["near"])
+        resting = markets_needing_books(
+            [future],
+            {},
+            {"future": {"up": {"order_id": "bid-1"}}},
+            now_s=now,
+        )
+        self.assertEqual([row["condition_id"] for row in resting], ["future"])
+        self.assertFalse(
+            sister_book_wanted(
+                _market(end_ts=now + 10.0),
+                {"status": "confirmed", "sold_loser": True, "sold_leg": "up"},
+                {},
+                now_s=now,
+            )
+        )
+
+    def test_completed_sold_loser_still_posts_scrap(self):
+        intent = {"status": "completed", "sold_loser": True, "sold_leg": "up"}
+        flat, why = a_token_flat(intent, "up")
+        self.assertTrue(flat)
+        self.assertEqual(why, "a_flat")
+        other, other_why = a_token_flat(intent, "dn")
+        self.assertFalse(other)
+        self.assertEqual(other_why, "a_holds_other")
+        absent, absent_why = a_token_flat({"status": "completed"}, "up")
+        self.assertTrue(absent)
+        self.assertEqual(absent_why, "a_absent")
+        now = 10_000.0 - 316.0
+        actions = plan_sister_bids(
+            markets=[_market(up_bid=0.01, up_ask=0.02, dn_bid=0.99)],
+            intents={"cid": intent},
+            open_orders={},
+            now_s=now,
+            enabled=True,
+        )
+        places = [row for row in actions if row["op"] == "place"]
+        self.assertEqual(len(places), 1)
+        self.assertEqual(places[0]["leg"], "up")
+        self.assertEqual(places[0]["reason"], "a_flat")
+        self.assertEqual(places[0]["style"], "take")
+        self.assertEqual(places[0]["price"], 0.02)
+        self.assertGreater(places[0]["ttm_s"], 180.0)
+        held = [row for row in actions if row["leg"] == "dn"]
+        self.assertTrue(any(row["reason"] == "a_holds_other" for row in held))
 
 
 if __name__ == "__main__":
