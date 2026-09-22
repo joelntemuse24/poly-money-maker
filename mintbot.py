@@ -5,19 +5,25 @@ No CLOB buys. No hedges. Discovers **btc-up-or-down-15m** only, mints
 `shares` for markets that are **not yet open** (start_ts in the future)
 and open within enter_max_ttm_min, if collateral is available.
 
-Optional sell (``sell_enabled``, default off): persist a loser dump at ~3¢
-for ``sell_persist_s`` (~5s), or ``sell_persist_last_min_s`` (~2s) in the
-last ``sell_persist_last_min_window_s`` (~60s) before ``end_ts``, while the
-opposite bid is ≥ ~90¢, then re-check in-range at fire and FAK 3¢ → 2¢ when
-the live sized bid is at/over the floor, or at the live bid if it is below
-the floor. Persist waits fold typical ~4s sell-tick/FAK lag so wall-clock
-stays ~9s (last-min ~5–6s). Keep the winner for redeem unless its bid
-reaches ~99.9¢. Off unless live ``strategy_mint.json`` turns it on. Sell
-and mint run as independent loops so Gamma/relayer work cannot steal a
-dump tick (bag ``btc-updown-15m-1789905600``). The sell loop sleeps
-``sell_armed_poll_s`` (~2s, allowed below the ``poll_s >= 2`` floor) while
-a bag is sell-hot (loser armed, or loser sold and dump/winner not done).
-Mint keeps ``poll_s``. Persist defaults are 5/2/60.
+Optional sell (``sell_enabled``, default off): arm a loser scrap when the
+sized loser bid is ≤ ``sell_threshold`` (~4¢) and the opposite bid is ≥ ~90¢.
+4¢ is the arm ceiling, not the print. Persist ``sell_persist_s`` (~2.5s), or
+``sell_persist_last_min_s`` (~1s) in the last
+``sell_persist_last_min_window_s`` (~60s). Skip that wait when TTM ≤
+``sell_persist_skip_ttm_s`` (~90s) or when depth at the FAK rung covers our
+size. At fire, FAK ``sell_fak_px`` (~3¢) → ``sell_floor`` (~2¢), or the live
+bid when the book is thinner. Never post the 4¢ arm. Empty keep fires a
+blind 1¢ FAK (backoff ~3s). A FAK miss rests a GTD/GTC sell at
+``sell_scrap_rest_px`` (~3¢). Wallet A never posts a bid. Keep the winner
+for redeem unless its bid reaches ~99.9¢. Off unless live
+``strategy_mint.json`` turns it on. Sell and mint run as independent loops
+so Gamma/relayer work cannot steal a dump tick (bag
+``btc-updown-15m-1789905600``). The sell loop sleeps ``sell_armed_poll_s``
+(~2s, allowed below the ``poll_s >= 2`` floor) while a bag is sell-hot
+(loser armed, or loser sold and dump/winner not done). Mint keeps
+``poll_s``. Persist defaults are 2.5/1/60. Live JSON keys that already
+exist (threshold, persist) override these defaults until the operator
+edits them.
 
 A third loop records Chainlink BTC/USD 60s TWAP (Polymarket RTDS) to
 ``logs/oracle_twap.jsonl`` while a 15m bag is open. ``oracle_log_enabled``
@@ -78,12 +84,19 @@ from buy.mint_sell import (
     inventory_latch,
     late_oracle_edge_persist,
     late_oracle_scrap_ok,
+    loser_blind_fak_due,
     loser_empty_keep_qualify,
     loser_ladder_limits,
+    loser_partial_fak_shares,
     loser_persist_ready,
+    loser_scrap_persist_s,
     mint_cycle_sleep_s,
     parse_sell_fill_shares,
     persist_ready,
+    posted_order_id,
+    rest_order_matched_shares,
+    resting_tif,
+    scrap_rest_action,
     sell_fire_decision,
     sell_window_open,
     skip_mint_discovery_for_sell,
@@ -126,12 +139,21 @@ DEFAULTS = {
     "position_tolerance": 0.01,
     "require_accepting_orders": True,
     "sell_enabled": False,
-    "sell_threshold": 0.03,
+    "sell_threshold": 0.04,
+    "sell_fak_px": 0.03,
     "sell_floor": 0.02,
     "sell_opposite_min": 0.90,
-    "sell_persist_s": 5.0,
-    "sell_persist_last_min_s": 2.0,
+    "sell_persist_s": 2.5,
+    "sell_persist_last_min_s": 1.0,
     "sell_persist_last_min_window_s": 60.0,
+    "sell_persist_skip_ttm_s": 90.0,
+    "sell_persist_skip_when_sized": True,
+    "sell_scrap_blind_enabled": True,
+    "sell_scrap_blind_px": 0.01,
+    "sell_scrap_blind_backoff_s": 3.0,
+    "sell_scrap_rest_enabled": True,
+    "sell_scrap_rest_px": 0.03,
+    "sell_scrap_rest_min_ahead_s": 60.0,
     "sell_cooldown_s": 3.0,
     "sell_winner_min": 0.999,
     # Cheap 0.99 winner only if loser ≤ this AND loser+cheap_min > 1.0 (else redeem).
@@ -329,6 +351,17 @@ def validate_strategy(cfg: dict) -> None:
         raise ValueError("sell_persist_last_min_s must be >= 0")
     if float(cfg.get("sell_persist_last_min_window_s") or 0) < 0:
         raise ValueError("sell_persist_last_min_window_s must be >= 0")
+    fak_px = float(cfg.get("sell_fak_px", 0.03) or 0)
+    if not (floor <= fak_px <= threshold):
+        raise ValueError("sell_floor <= sell_fak_px <= sell_threshold must hold")
+    if float(cfg.get("sell_persist_skip_ttm_s") or 0) < 0:
+        raise ValueError("sell_persist_skip_ttm_s must be >= 0")
+    if float(cfg.get("sell_scrap_blind_px") or 0) <= 0:
+        raise ValueError("sell_scrap_blind_px must be > 0")
+    if float(cfg.get("sell_scrap_rest_px") or 0) <= 0:
+        raise ValueError("sell_scrap_rest_px must be > 0")
+    if float(cfg.get("sell_scrap_blind_backoff_s") or 0) < 0:
+        raise ValueError("sell_scrap_blind_backoff_s must be >= 0")
     if int(cfg.get("sell_dump_fak_retries") or 0) < 0:
         raise ValueError("sell_dump_fak_retries must be >= 0")
     if float(cfg.get("sell_dump_ladder_step") or 0) <= 0:
@@ -1285,8 +1318,286 @@ def _apply_sell_fire_cancel(
         intent["sell_winner_armed_at"] = None
 
 
+def _limit_sell(
+    token_id: str,
+    size: float,
+    price: float,
+    *,
+    tif: str,
+    expiration: int,
+    dry_run: bool,
+) -> Tuple[str, str]:
+    """Resting GTD/GTC sell. Returns ``(order_id, status)``."""
+    size = float(size)
+    price = float(price)
+    if size < 0.01 or price <= 0:
+        return "", "bad_args"
+    if dry_run:
+        log_event(
+            "dry_scrap_rest",
+            token_id=str(token_id),
+            size=size,
+            price=price,
+            tif=tif,
+            expiration=int(expiration or 0),
+        )
+        return "dry-rest", "dry"
+    client = _get_clob_client()
+    if client is None:
+        return "", f"no_clob:{_clob_init_error or 'unknown'}"
+    try:
+        from py_clob_client_v2 import (
+            BalanceAllowanceParams,
+            AssetType,
+            OrderArgs,
+            OrderType,
+        )
+        from py_clob_client_v2.order_builder.constants import SELL
+
+        try:
+            client.update_balance_allowance(
+                BalanceAllowanceParams(
+                    asset_type=AssetType.CONDITIONAL, token_id=str(token_id)
+                )
+            )
+        except Exception as exc:
+            log_event("sell_allowance_warn", error=str(exc)[:160])
+        signed = client.create_order(
+            OrderArgs(
+                token_id=str(token_id),
+                price=price,
+                size=size,
+                side=SELL,
+                expiration=int(expiration or 0),
+            )
+        )
+        order_type = OrderType.GTD if str(tif) == "GTD" else OrderType.GTC
+        result = client.post_order(signed, order_type=order_type)
+        status = "posted"
+        if isinstance(result, dict):
+            status = str(result.get("status") or "posted")
+        oid = posted_order_id(result) or ""
+        log_event(
+            "sell_scrap_rest_result",
+            token_id=str(token_id),
+            size=size,
+            price=price,
+            tif=tif,
+            order_id=oid,
+            status=status,
+        )
+        return oid, status
+    except Exception as exc:
+        log_event("sell_scrap_rest_fail", error=str(exc)[:200])
+        return "", f"error:{str(exc)[:80]}"
+
+
+def _cancel_clob_order(order_id: str) -> bool:
+    if not order_id or str(order_id).startswith("dry"):
+        return True
+    client = _get_clob_client()
+    if client is None:
+        return False
+    try:
+        from py_clob_client_v2.clob_types import OrderPayload
+
+        client.cancel_order(OrderPayload(orderID=str(order_id)))
+        return True
+    except Exception as exc:
+        log_event(
+            "sell_scrap_rest_cancel_fail",
+            order_id=str(order_id)[:18],
+            error=str(exc)[:160],
+        )
+        return False
+
+
+def _poll_rest_order(order_id: str, offered: float) -> Tuple[float, str]:
+    if not order_id or str(order_id).startswith("dry"):
+        return 0.0, "live"
+    client = _get_clob_client()
+    if client is None:
+        return 0.0, "unknown"
+    try:
+        order = client.get_order(str(order_id))
+    except Exception as exc:
+        log_event("sell_scrap_rest_poll_fail", error=str(exc)[:160])
+        return 0.0, "unknown"
+    return rest_order_matched_shares(order, offered)
+
+
+def _clear_scrap_rest(intent: dict) -> None:
+    intent["sell_scrap_rest_id"] = None
+    intent["sell_scrap_rest_size"] = None
+    intent["sell_scrap_rest_matched"] = None
+
+
+def _drop_scrap_rest(intent: dict, cid: str, reason: str) -> None:
+    oid = intent.get("sell_scrap_rest_id")
+    if not oid:
+        return
+    ok = True
+    if reason != "filled" and not str(oid).startswith("dry"):
+        with _io_unlocked():
+            ok = _cancel_clob_order(str(oid))
+    if not ok:
+        return
+    log_event(
+        "sell_scrap_rest_cancel",
+        condition_id=cid,
+        slug=intent.get("slug"),
+        order_id=oid,
+        reason=reason,
+    )
+    _clear_scrap_rest(intent)
+
+
+def _place_scrap_rest(
+    intent: dict,
+    cid: str,
+    token_id: str,
+    size: float,
+    *,
+    now: float,
+    end_ts: float,
+    rest_px: float,
+    rest_ahead: float,
+    rest_enabled: bool,
+    dry_run: bool,
+    oracle_blocks: bool,
+    loser_qualifies: bool,
+    armed: bool,
+    fak_miss: bool,
+) -> None:
+    action, why = scrap_rest_action(
+        enabled=rest_enabled,
+        rest_order_id=intent.get("sell_scrap_rest_id"),
+        sold_loser=bool(intent.get("sold_loser")),
+        window_open=sell_window_open(now, end_ts),
+        loser_qualifies=loser_qualifies,
+        oracle_blocks=oracle_blocks,
+        fak_miss=fak_miss,
+        armed=armed,
+    )
+    if action != "place" or float(size) < 0.01 or not token_id:
+        return
+    tif, exp = resting_tif(
+        now_s=now, expire_ts=float(end_ts or 0), min_ahead_s=rest_ahead
+    )
+    with _io_unlocked():
+        oid, status = _limit_sell(
+            token_id,
+            float(size),
+            float(rest_px),
+            tif=tif,
+            expiration=exp,
+            dry_run=dry_run,
+        )
+    if not oid:
+        log_event(
+            "sell_scrap_rest_fail",
+            condition_id=cid,
+            slug=intent.get("slug"),
+            status=status,
+            why=why,
+        )
+        return
+    intent["sell_scrap_rest_id"] = oid
+    intent["sell_scrap_rest_px"] = float(rest_px)
+    intent["sell_scrap_rest_size"] = float(size)
+    intent["sell_scrap_rest_matched"] = 0.0
+    intent["sell_scrap_rest_tif"] = tif
+    log_event(
+        "sell_scrap_rest_place",
+        condition_id=cid,
+        slug=intent.get("slug"),
+        order_id=oid,
+        price=float(rest_px),
+        size=float(size),
+        tif=tif,
+        expiration=exp,
+        why=why,
+        status=status,
+    )
+
+
+def _sync_scrap_rest(
+    intent: dict,
+    cid: str,
+    *,
+    shares: float,
+    tol: float,
+    oracle_blocks: bool,
+    loser_qualifies: bool,
+    window_open: bool,
+) -> None:
+    oid = intent.get("sell_scrap_rest_id")
+    if not oid:
+        return
+    offered = float(intent.get("sell_scrap_rest_size") or shares or 0)
+    status = "live"
+    matched = float(intent.get("sell_scrap_rest_matched") or 0)
+    if not str(oid).startswith("dry"):
+        with _io_unlocked():
+            matched, status = _poll_rest_order(str(oid), offered)
+        prev = float(intent.get("sell_scrap_rest_matched") or 0)
+        delta = max(0.0, float(matched) - prev)
+        if delta >= float(tol):
+            intent["sell_filled"] = float(intent.get("sell_filled") or 0) + delta
+            intent["sell_scrap_rest_matched"] = float(matched)
+            if intent.get("sell_scrap_rest_px") is not None:
+                intent["sell_limit"] = intent.get("sell_scrap_rest_px")
+    filled = shares > 0 and float(intent.get("sell_filled") or 0) >= shares - tol
+    if status == "filled" or filled:
+        leg = intent.get("sell_loser_leg")
+        intent["sold_loser"] = True
+        if leg in ("up", "dn"):
+            intent["sold_leg"] = leg
+        intent["sell_oracle_edge_armed_at"] = None
+        log_event(
+            "sell_scrap_rest_fill",
+            condition_id=cid,
+            slug=intent.get("slug"),
+            order_id=oid,
+            matched=matched,
+            leg=leg,
+        )
+        _drop_scrap_rest(intent, cid, reason="filled")
+        return
+    if status == "cancelled":
+        log_event(
+            "sell_scrap_rest_cancel",
+            condition_id=cid,
+            slug=intent.get("slug"),
+            order_id=oid,
+            reason="exchange",
+        )
+        _clear_scrap_rest(intent)
+        return
+    action, why = scrap_rest_action(
+        enabled=True,
+        rest_order_id=oid,
+        sold_loser=bool(intent.get("sold_loser")),
+        window_open=window_open,
+        loser_qualifies=loser_qualifies,
+        oracle_blocks=oracle_blocks,
+        fak_miss=False,
+        armed=intent.get("sell_loser_armed_at") is not None,
+    )
+    if action == "cancel":
+        _drop_scrap_rest(intent, cid, reason=why)
+
+
+def _mark_loser_sold(intent: dict, leg: str, *, note: str = "") -> None:
+    intent["sold_leg"] = leg
+    intent["sold_loser"] = True
+    intent["sell_oracle_edge_armed_at"] = None
+    if note:
+        intent["sell_note"] = note
+
+
 def manage_sells(cfg: dict, state: dict, chain: ChainReader) -> None:
-    """Loser persist dump at 3¢→2¢ (or live bid if below floor); winner; held dump."""
+    """Loser scrap: arm ≤4¢, FAK ~3¢→2¢ or live bid; winner; held dump."""
     if not cfg.get("sell_enabled"):
         return
     STATE_LOCK.acquire()
@@ -1298,12 +1609,21 @@ def manage_sells(cfg: dict, state: dict, chain: ChainReader) -> None:
 
 def _manage_sells_locked(cfg: dict, state: dict, chain: ChainReader) -> None:
     now = time.time()
-    thr = float(cfg.get("sell_threshold") or 0.03)
+    thr = float(cfg.get("sell_threshold") or 0.04)
     floor = float(cfg.get("sell_floor") or 0.02)
     opp_min = float(cfg.get("sell_opposite_min") or 0.90)
     persist_s = float(cfg.get("sell_persist_s") or 0.0)
-    last_min_s = float(cfg.get("sell_persist_last_min_s", 2.0))
+    last_min_s = float(cfg.get("sell_persist_last_min_s", 1.0))
     last_min_window_s = float(cfg.get("sell_persist_last_min_window_s", 60.0))
+    skip_ttm_s = float(cfg.get("sell_persist_skip_ttm_s", 90.0) or 0.0)
+    skip_when_sized = bool(cfg.get("sell_persist_skip_when_sized", True))
+    fak_px = float(cfg.get("sell_fak_px", 0.03) or 0.03)
+    blind_enabled = bool(cfg.get("sell_scrap_blind_enabled", True))
+    blind_px = float(cfg.get("sell_scrap_blind_px", 0.01) or 0.01)
+    blind_backoff = float(cfg.get("sell_scrap_blind_backoff_s", 3.0) or 0.0)
+    rest_enabled = bool(cfg.get("sell_scrap_rest_enabled", True))
+    rest_px = float(cfg.get("sell_scrap_rest_px", 0.03) or 0.03)
+    rest_ahead = float(cfg.get("sell_scrap_rest_min_ahead_s", 60.0) or 60.0)
     cooldown = float(cfg.get("sell_cooldown_s") or 3.0)
     winner_min = float(cfg.get("sell_winner_min") or 0.999)
     clob_max = float(cfg.get("sell_clob_max_price") or 0.99)
@@ -1326,6 +1646,9 @@ def _manage_sells_locked(cfg: dict, state: dict, chain: ChainReader) -> None:
             continue
         end_ts = float(intent.get("end_ts") or 0)
         if not sell_window_open(now, end_ts):
+            if intent.get("sell_scrap_rest_id"):
+                _drop_scrap_rest(intent, cid, reason="window_end")
+                dirty = True
             continue
 
         up_tok = str(intent.get("up_token") or "")
@@ -1643,29 +1966,6 @@ def _manage_sells_locked(cfg: dict, state: dict, chain: ChainReader) -> None:
                             intent.get("sell_dump_filled") or 0
                         ) + sold_total
 
-        loser_persist_s = effective_loser_persist_s(
-            now_s=now,
-            end_ts=end_ts,
-            persist_s=persist_s,
-            last_min_s=last_min_s,
-            last_min_window_s=last_min_window_s,
-        )
-        if loser_persist_s is None:
-            continue
-        prev_persist = intent.get("sell_persist_effective_s")
-        if (
-            prev_persist is not None
-            and abs(float(prev_persist) - float(loser_persist_s)) > 1e-12
-        ):
-            log_event(
-                "sell_persist_effective",
-                condition_id=cid,
-                slug=intent.get("slug"),
-                ttm=round(end_ts - now, 3) if end_ts else None,
-                effective_s=loser_persist_s,
-            )
-        intent["sell_persist_effective_s"] = loser_persist_s
-
         prev_leg = intent.get("sell_loser_leg")
         if prev_leg not in ("up", "dn"):
             prev_leg = None
@@ -1688,6 +1988,62 @@ def _manage_sells_locked(cfg: dict, state: dict, chain: ChainReader) -> None:
                 dn_bid=dn_bid,
                 slug=intent.get("slug"),
             )
+
+        depth_at_limit = 0.0
+        if loser in ("up", "dn") and bids.get(loser) is not None:
+            ladder_preview = loser_ladder_limits(
+                thr, floor, float(bids[loser]), fak_px=fak_px,
+            )
+            if ladder_preview:
+                depth_at_limit = float(
+                    bid_fill_depth(
+                        books.get(loser) or [], ladder_preview[0]
+                    ).get("depth_at_limit")
+                    or 0
+                )
+        remaining_shares = max(
+            0.0, shares - float(intent.get("sell_filled") or 0)
+        )
+        loser_persist_s, persist_why = loser_scrap_persist_s(
+            now_s=now,
+            end_ts=end_ts,
+            persist_s=persist_s,
+            last_min_s=last_min_s,
+            last_min_window_s=last_min_window_s,
+            skip_ttm_s=skip_ttm_s,
+            depth_at_limit=depth_at_limit,
+            our_size=remaining_shares,
+            skip_when_sized=skip_when_sized,
+        )
+        if loser_persist_s is None:
+            continue
+        prev_persist = intent.get("sell_persist_effective_s")
+        if (
+            prev_persist is not None
+            and abs(float(prev_persist) - float(loser_persist_s)) > 1e-12
+        ):
+            log_event(
+                "sell_persist_effective",
+                condition_id=cid,
+                slug=intent.get("slug"),
+                ttm=round(end_ts - now, 3) if end_ts else None,
+                effective_s=loser_persist_s,
+                why=persist_why,
+            )
+        intent["sell_persist_effective_s"] = loser_persist_s
+        if persist_why in {"late_skip", "sized_skip"} and (
+            intent.get("sell_persist_skip_why") != persist_why
+        ):
+            log_event(
+                "sell_persist_skip",
+                condition_id=cid,
+                slug=intent.get("slug"),
+                why=persist_why,
+                ttm=round(end_ts - now, 3) if end_ts else None,
+                depth_at_limit=depth_at_limit,
+                our_size=remaining_shares,
+            )
+        intent["sell_persist_skip_why"] = persist_why
 
         keep_empty, keep_leg = loser_empty_keep_qualify(
             armed_ts=intent.get("sell_loser_armed_at"),
@@ -1797,10 +2153,26 @@ def _manage_sells_locked(cfg: dict, state: dict, chain: ChainReader) -> None:
                     age_s=edge_detail.get("age_s"),
                 )
 
+        oracle_hard_block = bool(
+            in_late and edge_why not in ("edge_ok", "outside_late_window")
+        )
+        oracle_blocks_new = bool(in_late and not oracle_fire)
+        loser_qualifies = bool(loser is not None or keep_empty)
+        _sync_scrap_rest(
+            intent,
+            cid,
+            shares=shares,
+            tol=tol,
+            oracle_blocks=oracle_hard_block,
+            loser_qualifies=loser_qualifies,
+            window_open=True,
+        )
+        sold_loser = bool(intent.get("sold_loser") or intent.get("sold_leg"))
+
         if loser and why_l in {"ready", "immediate"}:
             loser_bid = float(bids[loser] or thr)
-            preview = loser_ladder_limits(thr, floor, loser_bid)
-            first_limit = preview[0] if preview else loser_bid
+            preview = loser_ladder_limits(thr, floor, loser_bid, fak_px=fak_px)
+            first_limit = preview[0] if preview else min(float(loser_bid), fak_px)
             _log_sell_book_depth(
                 slug=intent.get("slug"),
                 leg=loser,
@@ -1831,7 +2203,13 @@ def _manage_sells_locked(cfg: dict, state: dict, chain: ChainReader) -> None:
                 bid=bids.get(persist_leg) if persist_leg in bids else None,
             )
 
-        if fire_l and loser and not cooling:
+        if (
+            fire_l
+            and loser
+            and not cooling
+            and not intent.get("sold_loser")
+            and not intent.get("sell_scrap_rest_id")
+        ):
             opp_leg = "dn" if loser == "up" else "up"
             fire_action, fire_reason = sell_fire_decision(
                 "loser",
@@ -1900,11 +2278,16 @@ def _manage_sells_locked(cfg: dict, state: dict, chain: ChainReader) -> None:
                     intent["sell_note"] = "already_flat"
                     intent["sell_oracle_edge_armed_at"] = None
                 else:
-                    limits = loser_ladder_limits(thr, floor, loser_bid)
+                    limits = loser_ladder_limits(
+                        thr, floor, loser_bid, fak_px=fak_px,
+                    )
+                    post_size = loser_partial_fak_shares(
+                        remaining=size, depth_at_limit=depth_at_limit,
+                    )
                     intent["last_sell_attempt_at"] = now
                     with _io_unlocked():
                         sold_total, last_status, last_px = _run_fak_ladder(
-                            l_tok, size, limits,
+                            l_tok, post_size, limits,
                             dry_run=dry_run,
                             bid=loser_bid,
                             label=loser,
@@ -1949,6 +2332,123 @@ def _manage_sells_locked(cfg: dict, state: dict, chain: ChainReader) -> None:
                             f"  [bold bright_green][SELL OK][/] {loser} {sold_total:.2f}  "
                             f"kept opposite for redeem"
                         )
+                    elif empty_fak_status(last_status):
+                        _place_scrap_rest(
+                            intent,
+                            cid,
+                            l_tok,
+                            max(0.0, size - sold_total),
+                            now=now,
+                            end_ts=end_ts,
+                            rest_px=rest_px,
+                            rest_ahead=rest_ahead,
+                            rest_enabled=rest_enabled,
+                            dry_run=dry_run,
+                            oracle_blocks=oracle_blocks_new,
+                            loser_qualifies=True,
+                            armed=intent.get("sell_loser_armed_at") is not None,
+                            fak_miss=True,
+                        )
+
+        if (
+            not intent.get("sold_loser")
+            and not intent.get("sell_scrap_rest_id")
+            and persist_leg in ("up", "dn")
+            and why_l in {"empty_keep_arm", "empty_fak_keep_arm"}
+        ):
+            b_tok = tokens.get(persist_leg) or ""
+            b_size, b_latch = _sell_inventory(
+                chain, ctf, funder_cs, b_tok, shares, tol,
+                "seen_loser_inventory", intent,
+            )
+            if b_latch == "already_flat":
+                _mark_loser_sold(intent, persist_leg, note="already_flat")
+            else:
+                blind_fire, blind_why = loser_blind_fak_due(
+                    why=why_l,
+                    now_s=now,
+                    last_blind_at=intent.get("sell_blind_last_at"),
+                    backoff_s=blind_backoff,
+                    sold_loser=False,
+                    has_inventory=b_latch == "has_inventory",
+                    rest_live=False,
+                    oracle_blocks=oracle_blocks_new,
+                    enabled=blind_enabled,
+                )
+                if blind_fire and b_tok:
+                    intent["sell_blind_last_at"] = now
+                    with _io_unlocked():
+                        blind_sold, blind_status = _fak_sell(
+                            b_tok, b_size, blind_px, dry_run=dry_run,
+                        )
+                    log_event(
+                        "sell_scrap_blind",
+                        condition_id=cid,
+                        slug=intent.get("slug"),
+                        leg=persist_leg,
+                        price=blind_px,
+                        size=b_size,
+                        sold=blind_sold,
+                        status=blind_status,
+                        why=blind_why,
+                    )
+                    intent["sell_attempts"] = int(intent.get("sell_attempts") or 0) + 1
+                    intent["sell_last_status"] = blind_status
+                    if float(blind_sold or 0) >= tol:
+                        intent["sell_filled"] = float(
+                            intent.get("sell_filled") or 0
+                        ) + float(blind_sold)
+                        intent["sell_limit"] = blind_px
+                    if float(blind_sold or 0) >= b_size - tol and not dry_run:
+                        _mark_loser_sold(intent, persist_leg)
+                        log_event(
+                            "sell_loser_done",
+                            condition_id=cid,
+                            slug=intent.get("slug"),
+                            leg=persist_leg,
+                            sold=blind_sold,
+                            status=blind_status,
+                        )
+                    elif empty_fak_status(blind_status):
+                        _place_scrap_rest(
+                            intent,
+                            cid,
+                            b_tok,
+                            max(0.0, b_size - float(blind_sold or 0)),
+                            now=now,
+                            end_ts=end_ts,
+                            rest_px=rest_px,
+                            rest_ahead=rest_ahead,
+                            rest_enabled=rest_enabled,
+                            dry_run=dry_run,
+                            oracle_blocks=oracle_blocks_new,
+                            loser_qualifies=True,
+                            armed=True,
+                            fak_miss=True,
+                        )
+        elif (
+            why_l in {"empty_fak_keep_arm", "empty_fak_rearm"}
+            and not intent.get("sell_scrap_rest_id")
+            and not intent.get("sold_loser")
+            and persist_leg in ("up", "dn")
+            and empty_fak_status(intent.get("sell_last_status"))
+        ):
+            _place_scrap_rest(
+                intent,
+                cid,
+                tokens.get(persist_leg) or "",
+                remaining_shares,
+                now=now,
+                end_ts=end_ts,
+                rest_px=rest_px,
+                rest_ahead=rest_ahead,
+                rest_enabled=rest_enabled,
+                dry_run=dry_run,
+                oracle_blocks=oracle_blocks_new,
+                loser_qualifies=loser_qualifies,
+                armed=intent.get("sell_loser_armed_at") is not None,
+                fak_miss=True,
+            )
 
     if dirty:
         atomic_save(STATE_FILE, state)

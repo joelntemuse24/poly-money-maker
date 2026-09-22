@@ -1,7 +1,8 @@
 """Shared CLOB book helpers — top-of-book price, displayed size, fill depth.
 
 Used by pathlog so REST `/book` samples parse levels the same way.
-Mint sell logs ``bid_fill_depth`` (log-only; does not change sell decisions).
+Mint sell logs ``bid_fill_depth`` and uses it to skip persist when the
+book covers our size, and to clip a partial loser FAK.
 Do not fork a second parser in mintbot or pathlog.
 """
 

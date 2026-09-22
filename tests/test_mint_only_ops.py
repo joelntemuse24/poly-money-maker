@@ -79,12 +79,19 @@ class MintDefaultsTests(unittest.TestCase):
         self.assertEqual(example["mint_max_attempts"], 3)
         self.assertEqual(defaults["max_open_sets"], example["max_open_sets"])
         for blob, label in ((example, "example"), (defaults, "defaults")):
-            self.assertEqual(blob["sell_threshold"], 0.03, label)
+            self.assertEqual(blob["sell_threshold"], 0.04, label)
+            self.assertEqual(blob["sell_fak_px"], 0.03, label)
             self.assertEqual(blob["sell_floor"], 0.02, label)
             self.assertAlmostEqual(blob["sell_opposite_min"], 0.90, msg=label)
-            self.assertEqual(blob["sell_persist_s"], 5.0, label)
-            self.assertEqual(blob["sell_persist_last_min_s"], 2.0, label)
+            self.assertEqual(blob["sell_persist_s"], 2.5, label)
+            self.assertEqual(blob["sell_persist_last_min_s"], 1.0, label)
             self.assertEqual(blob["sell_persist_last_min_window_s"], 60.0, label)
+            self.assertEqual(blob["sell_persist_skip_ttm_s"], 90.0, label)
+            self.assertIs(blob["sell_persist_skip_when_sized"], True, label)
+            self.assertIs(blob["sell_scrap_blind_enabled"], True, label)
+            self.assertEqual(blob["sell_scrap_blind_px"], 0.01, label)
+            self.assertEqual(blob["sell_scrap_rest_px"], 0.03, label)
+            self.assertIs(blob["sell_scrap_rest_enabled"], True, label)
             self.assertEqual(blob["sell_dump_persist_s"], 2.0, label)
             self.assertEqual(blob["sell_dump_fak_retries"], 2, label)
             self.assertEqual(blob["sell_dump_ladder_step"], 0.04, label)
@@ -405,7 +412,18 @@ class MintFailErrorMsgTests(unittest.TestCase):
 class DeployUnitsTests(unittest.TestCase):
     def test_live_units_are_mint_and_pathlog(self):
         live = {p.name for p in DEPLOY.glob("*.service")}
-        self.assertEqual(live, {"polymintbot.service", "polypathlog.service"})
+        self.assertEqual(
+            live,
+            {
+                "polymintbot.service",
+                "polypathlog.service",
+                "polyscrapbid.service",
+            },
+        )
+        scrap = (DEPLOY / "polyscrapbid.service").read_text(encoding="utf-8")
+        self.assertIn(".env.complement", scrap)
+        self.assertNotIn("EnvironmentFile=/home/ntemusejoel/poly-money-maker/.env\n", scrap)
+        self.assertIn("scrapbidder.py", scrap)
 
     def test_buybot_sources_and_units_are_gone(self):
         for name in (
@@ -434,6 +452,7 @@ class DeployUnitsTests(unittest.TestCase):
                 "mint_sell.py",
                 "mint_loops.py",
                 "oracle_log.py",
+                "sister_bid.py",
             },
         )
         market_src = (BUY / "market.py").read_text()
@@ -464,6 +483,10 @@ class DeployUnitsTests(unittest.TestCase):
         self.assertIn("sell_cancel_out_of_range", src)
         self.assertIn("last_status=intent.get(\"sell_last_status\")", src)
         self.assertIn("effective_loser_persist_s", src)
+        self.assertIn("loser_scrap_persist_s", src)
+        self.assertIn("loser_blind_fak_due", src)
+        self.assertIn("scrap_rest_action", src)
+        self.assertNotIn("side=BUY", src)
         self.assertIn("sell_window_open", src)
         self.assertIn("sell_persist_effective", src)
         self.assertIn("sell_persist_last_min_s", src)
@@ -477,6 +500,9 @@ class DeployUnitsTests(unittest.TestCase):
         self.assertIn("def loser_persist_ready", mint_sell_src)
         self.assertIn("def loser_empty_keep_qualify", mint_sell_src)
         self.assertIn("def effective_loser_persist_s", mint_sell_src)
+        self.assertIn("def loser_scrap_persist_s", mint_sell_src)
+        self.assertIn("def loser_blind_fak_due", mint_sell_src)
+        self.assertIn("def scrap_rest_action", mint_sell_src)
         self.assertIn("def sell_fire_decision", mint_sell_src)
         self.assertIn("def late_oracle_scrap_ok", mint_sell_src)
         self.assertIn("def late_oracle_edge_persist", mint_sell_src)
@@ -486,6 +512,9 @@ class DeployUnitsTests(unittest.TestCase):
         self.assertIn("empty_keep_arm", mint_sell_src)
         manage = src[src.find("def manage_sells") : src.find("\ndef _claim_mint_intent")]
         self.assertIn("persist_s=loser_persist_s", manage)
+        self.assertIn("fak_px=fak_px", manage)
+        self.assertIn("_place_scrap_rest", manage)
+        self.assertIn("loser_blind_fak_due", manage)
         self.assertIn("persist_s=dump_persist_s", manage)
         self.assertIn("sell_fire_decision", manage)
         self.assertIn("late_oracle_scrap_ok", manage)
@@ -764,12 +793,16 @@ class DeployUnitsTests(unittest.TestCase):
         src = MINT.read_text()
         defaults = _assign("DEFAULTS")
         example = json.loads(MINT_EXAMPLE.read_text())
-        self.assertEqual(defaults["sell_persist_s"], 5.0)
-        self.assertEqual(defaults["sell_persist_last_min_s"], 2.0)
+        self.assertEqual(defaults["sell_persist_s"], 2.5)
+        self.assertEqual(defaults["sell_persist_last_min_s"], 1.0)
         self.assertEqual(defaults["sell_persist_last_min_window_s"], 60.0)
-        self.assertEqual(example["sell_persist_s"], 5.0)
-        self.assertEqual(example["sell_persist_last_min_s"], 2.0)
+        self.assertEqual(defaults["sell_threshold"], 0.04)
+        self.assertEqual(defaults["sell_fak_px"], 0.03)
+        self.assertEqual(example["sell_persist_s"], 2.5)
+        self.assertEqual(example["sell_persist_last_min_s"], 1.0)
         self.assertEqual(example["sell_persist_last_min_window_s"], 60.0)
+        self.assertEqual(example["sell_threshold"], 0.04)
+        self.assertEqual(example["sell_fak_px"], 0.03)
         self.assertEqual(defaults["sell_dump_persist_s"], 2.0)
         self.assertEqual(example["sell_dump_persist_s"], 2.0)
         self.assertEqual(defaults["sell_dump_fak_retries"], 2)

@@ -23,7 +23,25 @@ pathlog are **stopped / retired**. Do not start them.
   - Loser: opposite ≥ 0.90, loser ≤ 0.03 persist **5s wait** (2s in last 60s before end_ts) so wait + typical ~4s tick/FAK ≈ 9s wall (last-min ~5–6s). At fire, re-check in-range; out of range logs `sell_cancel_out_of_range` and does not POST. FAK 0.03 → 0.02. **Late-window oracle veto (≤120s TTM):** side-aware Chainlink TWAP edge vs window open must stay ≥ `max(25, 1.5 × TTM_s)` for 3s continuous (fail-closed if tape missing/stale); logs `sell_loser_oracle_block` / `sell_loser_oracle_ok`. Combat for true reverse `btc-updown-15m-1790078400` (TTM≈42 needed ≳$63, edge ~+$20 → block). Outside 120s, CLOB gates only.
   - Winner: prefer 0.999 / redeem; allow 0.99 live-bid FAK only if loser sold ≤ 0.03 and loser+0.99 > $1; same persist + cancel-at-fire
   - Held dump: after loser sold, if held sized bid < 0.80 for **2s** → first shot is live-bid FAK. If that first shot returns no-match / kill with zero fill, immediately re-check and fast re-fire with a short descending ladder from fresh top bid toward `sell_floor` (`sell_dump_fak_retries=2`, `sell_dump_ladder_step=0.04`, `sell_dump_ladder_rungs=4` by default), stopping if the book is empty.
-- Two loops: sell (`manage_sells`) and mint/discover run concurrently. Sell keeps `sell_armed_poll_s=2` while a bag is sell-hot (loser armed, or loser sold and dump/winner not done). Mint keeps `poll_s=5` and does not skip Gamma because a bag is hot. Code defaults persist 5/2/60 and dump persist 2s. **Live JSON is untouched** until the operator merges.
+- Two loops: sell (`manage_sells`) and mint/discover run concurrently. Sell keeps `sell_armed_poll_s=2` while a bag is sell-hot (loser armed, or loser sold and dump/winner not done). Mint keeps `poll_s=5` and does not skip Gamma because a bag is hot. The 19 Sep live file still has persist 5/2 and dump persist 2s. **That live JSON is untouched** until the operator edits it.
+
+## Repo code defaults (22 September 2026 — not live until pull + restart)
+
+`strategy_mint.example.json` and `mintbot` `DEFAULTS` now arm loser scrap at **4¢** (`sell_threshold=0.04`). The sell print is **not** 4¢: FAK `sell_fak_px` **3¢** then `sell_floor` **2¢**, or the live bid when the book is thinner. A 4¢ book still posts 3¢ → 2¢.
+
+- Persist wait is half: `sell_persist_s` **2.5s**, `sell_persist_last_min_s` **1s** (window still 60s). Dump persist stays 2s.
+- Skip persist when TTM ≤ `sell_persist_skip_ttm_s` (90s), or when depth at the FAK rung covers our size.
+- Empty keep: blind FAK at 1¢ with a 3s backoff.
+- After a FAK miss while still armed: resting GTD/GTC sell at `sell_scrap_rest_px` **3¢** (the print). Set that knob to 0.01 or 0.02 if a phantom 1–2¢ book should be caught instead. Cancel on fill, window end, disqualify, or a hard oracle block.
+- Late-window oracle veto is unchanged (TTM ≤ 120s, side-aware TWAP, fail-closed). Skip-persist does not bypass it.
+- Winner cheap 0.99 still requires a recorded loser fill ≤ 0.03. Arming at 4¢ does not open that gate by itself.
+- Wallet A never posts a bid. Same-wallet buyback is not implemented.
+
+`load_strategy` overlays only keys already present in live `strategy_mint.json`. After the operator pulls this code and restarts `polymintbot`, missing keys (fak price, skip, blind, rest) take the defaults above. Keys the live file already sets (`sell_threshold` 0.03, `sell_persist_s` 5, `sell_persist_last_min_s` 2 on the 19 Sep snapshot) stay until the operator edits those keys. Do not edit the live file from git.
+
+## Sister scrap bidder (wallet B, opt-in, off)
+
+`scrapbidder.py` + `deploy/polyscrapbid.service` rest **BUY** limits from the complement deposit wallet. Default **20 shares at 4¢** (`bid_max_px=0.04`). That 4¢ is a buy, not a sell. Last 180s of the 15m window, cancel by T−20s. Bid a token only after wallet A is flat on it (sold loser, no live scrap rest), or the cheap live side of a market A never held. Never mint. Never FAK-sell. `bid_enabled` false and `dry_run` true until the operator turns them on. Credentials stay in gitignored `.env.complement`. Do not start `polyscrapbid` unless the operator asks. This is not `complementbot`.
 
 See `TECHNICAL_DESIGN.md` for the full guided tour.
 

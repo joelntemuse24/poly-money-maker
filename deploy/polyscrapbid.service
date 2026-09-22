@@ -1,0 +1,19 @@
+# Opt-in. Do not enable unless the operator asks.
+# Wallet B bids only. This unit does not mint and does not sell.
+[Unit]
+Description=Opt-in sister scrap bidder (wallet B bids only; does not mint or sell)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ntemusejoel
+WorkingDirectory=/home/ntemusejoel/poly-money-maker
+Environment=PYTHONUNBUFFERED=1
+EnvironmentFile=/home/ntemusejoel/poly-money-maker/.env.complement
+ExecStart=/home/ntemusejoel/poly-money-maker/.venv/bin/python scrapbidder.py
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
