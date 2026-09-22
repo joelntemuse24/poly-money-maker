@@ -9,6 +9,8 @@ from buy.mint_sell import (
     DEFAULT_SELL_KNOBS,
     classify_loser,
     cycle_sleep_s,
+    dump_fast_retry_eligible,
+    dump_retry_ladder_limits,
     mint_cycle_sleep_s,
     effective_loser_persist_s,
     empty_fak_status,
@@ -561,6 +563,62 @@ class EmptyFakArmTests(unittest.TestCase):
         self.assertFalse(fire)
         self.assertIsNone(armed)
         self.assertEqual(why, "reset")
+
+
+class DumpFastRetryTests(unittest.TestCase):
+    def test_fast_retry_triggers_for_empty_fak_or_kill_zero_fill(self):
+        self.assertTrue(
+            dump_fast_retry_eligible(
+                sold=0.0,
+                status="error:no orders found to match with FAK order",
+                tol=0.01,
+            )
+        )
+        self.assertTrue(
+            dump_fast_retry_eligible(
+                sold=0.0,
+                status="killed",
+                tol=0.01,
+            )
+        )
+        self.assertTrue(
+            dump_fast_retry_eligible(
+                sold=0.0,
+                status="cancelled",
+                tol=0.01,
+            )
+        )
+
+    def test_fast_retry_stops_on_fill_or_non_retryable_status(self):
+        self.assertFalse(
+            dump_fast_retry_eligible(
+                sold=0.05,
+                status="error:no orders found to match with FAK order",
+                tol=0.01,
+            )
+        )
+        self.assertFalse(
+            dump_fast_retry_eligible(sold=0.0, status="matched", tol=0.01)
+        )
+        self.assertFalse(
+            dump_fast_retry_eligible(sold=0.0, status="error:timeout", tol=0.01)
+        )
+
+    def test_retry_ladder_descends_from_top_bid_toward_floor(self):
+        self.assertEqual(
+            dump_retry_ladder_limits(0.11, floor=0.02, step=0.04, max_rungs=4),
+            [0.11, 0.07, 0.03, 0.02],
+        )
+
+    def test_retry_ladder_clamps_to_live_bid_when_below_floor(self):
+        self.assertEqual(
+            dump_retry_ladder_limits(0.015, floor=0.02, step=0.01, max_rungs=3),
+            [0.015],
+        )
+        self.assertEqual(
+            dump_retry_ladder_limits(0.0, floor=0.02, step=0.01, max_rungs=3),
+            [],
+        )
 
 
 class EmptyLoserBookKeepArmTests(unittest.TestCase):

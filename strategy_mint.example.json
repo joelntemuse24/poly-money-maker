@@ -37,5 +37,8 @@
   "sell_winner_min_cheap": 0.99,
   "sell_dump_enabled": true,
   "sell_dump_below": 0.8,
-  "sell_dump_persist_s": 2.0
+  "sell_dump_persist_s": 2.0,
+  "sell_dump_fak_retries": 2,
+  "sell_dump_ladder_step": 0.04,
+  "sell_dump_ladder_rungs": 4
 }
