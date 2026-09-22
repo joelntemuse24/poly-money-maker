@@ -32,6 +32,7 @@ from buy.mint_sell import (
     resting_tif,
     scrap_rest_action,
     sell_fire_decision,
+    sister_hedge_dump_due,
     sell_intent_hot,
     sell_window_open,
     side_aware_oracle_edge_usd,
@@ -1045,38 +1046,39 @@ class SellFireDecisionTests(unittest.TestCase):
 class LateOracleScrapGateTests(unittest.TestCase):
     """Combat for true reverse btc-updown-15m-1790078400."""
 
-    def test_default_threshold_is_four_cents(self):
-        self.assertEqual(DEFAULT_SELL_KNOBS["sell_threshold"], 0.04)
+    def test_default_threshold_is_five_cents(self):
+        self.assertEqual(DEFAULT_SELL_KNOBS["sell_threshold"], 0.05)
         self.assertEqual(DEFAULT_SELL_KNOBS["sell_floor"], 0.02)
+        self.assertEqual(DEFAULT_SELL_KNOBS["sell_dump_if_sister_miss_s"], 10.0)
         leg, why = classify_loser(
-            up_bid=0.04, dn_bid=0.95,
+            up_bid=0.05, dn_bid=0.95,
             threshold=DEFAULT_SELL_KNOBS["sell_threshold"],
             opposite_min=DEFAULT_SELL_KNOBS["sell_opposite_min"],
         )
         self.assertEqual((leg, why), ("up", "loser"))
         leg, why = classify_loser(
-            up_bid=0.05, dn_bid=0.95,
+            up_bid=0.06, dn_bid=0.95,
             threshold=DEFAULT_SELL_KNOBS["sell_threshold"],
             opposite_min=DEFAULT_SELL_KNOBS["sell_opposite_min"],
         )
         self.assertEqual(why, "none")
         self.assertEqual(DEFAULT_SELL_KNOBS["sell_fak_px"], 0.03)
         self.assertEqual(DEFAULT_SELL_KNOBS["sell_scrap_rest_px"], 0.03)
-        # 4¢ arms. The print stays ~3¢ → 2¢, never a 4¢ sell.
+        # 5¢ arms. The print stays ~3¢ → 2¢, never a 5¢ sell.
         limits = loser_ladder_limits(
-            threshold=0.04, floor=0.02, loser_bid=0.04, fak_px=0.03,
+            threshold=0.05, floor=0.02, loser_bid=0.05, fak_px=0.03,
         )
         self.assertEqual(limits, [0.03, 0.02])
-        self.assertNotIn(0.04, limits)
+        self.assertNotIn(0.05, limits)
         self.assertEqual(
             loser_ladder_limits(
-                threshold=0.04, floor=0.02, loser_bid=0.025, fak_px=0.03,
+                threshold=0.05, floor=0.02, loser_bid=0.025, fak_px=0.03,
             ),
             [0.025, 0.02],
         )
         self.assertEqual(
             loser_ladder_limits(
-                threshold=0.04, floor=0.02, loser_bid=0.01, fak_px=0.03,
+                threshold=0.05, floor=0.02, loser_bid=0.01, fak_px=0.03,
             ),
             [0.01],
         )
@@ -1430,6 +1432,75 @@ class ScrapSpeedTests(unittest.TestCase):
             armed=True,
         )
         self.assertEqual((action, rest_why), ("cancel", "oracle_block"))
+
+
+class SisterMissDumpTests(unittest.TestCase):
+    def test_dumps_held_leg_when_sister_has_not_filled_in_ten_seconds(self):
+        due, why, age = sister_hedge_dump_due(
+            sold_loser=True,
+            sold_dump=False,
+            sold_at=1_000.0,
+            now_s=1_010.0,
+            sister_filled=0.0,
+            miss_s=10.0,
+        )
+        self.assertTrue(due)
+        self.assertEqual(why, "sister_miss")
+        self.assertAlmostEqual(age, 10.0)
+        waiting, why, age = sister_hedge_dump_due(
+            sold_loser=True,
+            sold_dump=False,
+            sold_at=1_000.0,
+            now_s=1_009.0,
+            sister_filled=0.0,
+            miss_s=10.0,
+        )
+        self.assertFalse(waiting)
+        self.assertEqual(why, "waiting")
+
+    def test_any_sister_fill_skips_the_timeout(self):
+        due, why, _age = sister_hedge_dump_due(
+            sold_loser=True,
+            sold_dump=False,
+            sold_at=1_000.0,
+            now_s=1_030.0,
+            sister_filled=1.0,
+            miss_s=10.0,
+        )
+        self.assertFalse(due)
+        self.assertEqual(why, "sister_filled")
+
+    def test_zero_disables_and_missing_clock_does_not_fire(self):
+        due, why, _age = sister_hedge_dump_due(
+            sold_loser=True,
+            sold_dump=False,
+            sold_at=1_000.0,
+            now_s=1_100.0,
+            sister_filled=0.0,
+            miss_s=0,
+        )
+        self.assertFalse(due)
+        self.assertEqual(why, "disabled")
+        due, why, _age = sister_hedge_dump_due(
+            sold_loser=True,
+            sold_dump=False,
+            sold_at=None,
+            now_s=1_100.0,
+            sister_filled=0.0,
+            miss_s=10.0,
+        )
+        self.assertFalse(due)
+        self.assertEqual(why, "no_clock")
+        due, why, _age = sister_hedge_dump_due(
+            sold_loser=True,
+            sold_dump=True,
+            sold_at=1_000.0,
+            now_s=1_100.0,
+            sister_filled=0.0,
+            miss_s=10.0,
+        )
+        self.assertFalse(due)
+        self.assertEqual(why, "already_dumped")
 
 
 if __name__ == "__main__":

@@ -35,13 +35,13 @@ work.
 template: dry_run=true, entry_enabled=false, sell_enabled=false). Optional
 sell stays off until live `strategy_mint.json` sets `sell_enabled=true`.
 Loser scrap: sized opposite bid ≥ `sell_opposite_min` (~0.90), loser ≤
-`sell_threshold` (0.04) **arms**. 4¢ is the ceiling to start hunting, not
+`sell_threshold` (0.05) **arms**. 5¢ is the ceiling to start hunting, not
 the print. Persist `sell_persist_s` (~2.5s), or `sell_persist_last_min_s`
 (~1s) when time-to-end is within `sell_persist_last_min_window_s` (~60s).
 Skip that wait when TTM ≤ `sell_persist_skip_ttm_s` (~90s) or when bid
 depth at the FAK rung covers our size. Then re-check in-range at fire and
 FAK `sell_fak_px` (0.03) → `sell_floor` (0.02), or the live bid when the
-book is thinner than the print. Do not post a 4¢ sell. Empty FAK or a
+book is thinner than the print. Do not post a 5¢ sell. Empty FAK or a
 vanished loser book after arm keeps `armed_ts`. On
 `empty_keep_arm` / `empty_fak_keep_arm`, fire a blind 1¢ FAK
 (`sell_scrap_blind_px`, backoff `sell_scrap_blind_backoff_s` ~3s). After
@@ -79,15 +79,26 @@ operator pulls and restarts. Do not edit live JSON from this repo.
 
 Wallet A (mintbot) never posts a bid. There is no same-wallet buyback.
 `scrapbidder.py` is a separate process for wallet B. Cap is 20 shares
-and `bid_max_px` 0.04. After A `sold_loser` on leg L, B immediately rests
-a BUY at 4¢. There is no 3¢ magnet and no escalate ladder. FAK runs only
-when `shares * price` is at least `bid_fak_min_notional` (~$1); 20 × 4¢
-does not. GTD is posted when expiration is ≥ ~180s ahead; inside that,
-post GTC and still cancel by T−`cancel_ttm_s`. A's `sell_scrap_rest_id` does not
+and `bid_max_px` 0.05 (`bid_rest_px` 0.05). After A `sold_loser` on leg L,
+B immediately FAK-buys 20 shares at the live ask, as long as the ask is
+≤ `bid_fak_max_notional / shares` (1.50/20 = 7.5¢). If `shares * ask` is
+under `bid_fak_min_notional` ($1), the FAK limit is raised to
+`1/shares` (5¢) so the order notional clears $1; the fill is still the
+cheaper ask. FAK only when that limit × shares is in [$1.00, $1.50].
+If the take cannot fire, B rests a GTD/GTC BUY at `bid_rest_px` (5¢)
+only when that rest is strictly below the ask (or the ask is missing).
+A rest at or above the ask is skipped (`cross_ask`); it would be
+marketable and rejected under $1. There is no escalate ladder. GTD
+is posted when expiration is ≥ ~180s ahead; inside that, post GTC and
+still cancel by T−`cancel_ttm_s`. A's `sell_scrap_rest_id` does not
 block that leg, and the last-`active_ttm_s` (~180s) window does not apply
 to that post-scrap hedge. Still cancel by T−`cancel_ttm_s` (~20s). The
-winner leg A still holds stays blocked. Markets A never held rest at
-the same 4¢ cap on the cheap live side only inside the last 180s. If sold_loser on L
+winner leg A still holds stays blocked. Markets A never held use the
+same quote on the cheap live side only inside the last 180s. If B has
+not matched any shares within `sell_dump_if_sister_miss_s` (10s, 0
+disables) of A's confirmed scrap, mintbot dumps the held leg
+(`sell_dump_sister_miss`). Any B fill skips that timeout. The held-leg
+dump under `sell_dump_below` still applies later. If sold_loser on L
 has no B bid or fill and the window is still open past cancel, log
 `scrapbid_miss` (condition, leg, ttm, age) after ~10s, throttled ~30s.
 Poll drops to `poll_hot_s` (~1s) while that gap is open. Each pass
@@ -111,11 +122,14 @@ Shared `buy/` helpers exist for mint, pathlog, and the recording-only oracle tap
   (`logs/oracle_twap.jsonl`) plus read-only `bag_view` for the late
   loser-scrap veto. Not an input to mint, winner, dump, or sell outside
   `sell_late_window_s`.
-- `buy/sister_bid.py` — wallet B buy policy. Post-scrap rests at
-  `bid_max_px` (4¢) immediately. FAK only when notional covers ~$1.
-  GTD when expiration is ≥ ~180s ahead, else GTC. No escalate ladder.
-  A's rest and the 180s window do not block that leg; cancel near
-  expiry. `scrapbidder.py` posts the orders. Not an input to mint.
+- `buy/sister_bid.py` — wallet B buy policy. Post-scrap FAK at the
+  live ask, limit clipped into [`bid_fak_min_notional/shares`,
+  `bid_fak_max_notional/shares`] (5¢–7.5¢ at 20 shares, $1.00–$1.50).
+  Otherwise rest at `bid_rest_px` (5¢) only if that rest does not cross
+  the ask. GTD when expiration is ≥ ~180s ahead, else GTC. No escalate
+  ladder. A's rest and the 180s window do not block that leg; cancel
+  near expiry. `scrapbidder.py` posts the orders. Mint reads B's
+  `positions_scrapbid.json` fills only for the sister-miss held dump.
 
 Do not restore retired buybot modules (`entry_skip`, `hedge_gate`,
 `btc_price`, `clob_book_ws`, `depth_ladder`, `strategy_coherence`,

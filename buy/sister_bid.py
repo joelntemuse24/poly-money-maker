@@ -1,13 +1,18 @@
 """Sister scrap-bidder policy (wallet B). No CLOB posts, no mintbot import.
 
 Wallet A (mintbot) mints and sells. Wallet B buys the sold leg. Once A
-has ``sold_loser`` on leg L, B rests a BUY at ``bid_max_px`` (4¢)
-immediately, including while A's scrap rest is still up and outside the
-last ``active_ttm_s``. There is no cheaper rest and no escalate ladder.
-FAK is used only when ``shares * ask`` covers ``bid_fak_min_notional``
-(~$1). GTD is used when expiration is at least ~180s ahead; otherwise
-GTC, still cancelled near expiry. Markets A never held rest at the same
-cap on the cheap live side during that late window. The winner leg A
+has ``sold_loser`` on leg L, B FAK-buys that leg at the live ask, up to
+``bid_fak_max_notional / shares`` (20 shares → 7.5¢, $1.50). If
+``shares * ask`` is under ``bid_fak_min_notional`` ($1), the FAK limit
+is raised to ``bid_fak_min_notional / shares`` (5¢) so the marketable
+BUY clears $1; the fill is still the cheaper ask. FAK only when the ask
+is at or under that max and ``limit * shares`` sits in [$1.00, $1.50].
+If the take cannot fire, B rests a GTD/GTC BUY at ``bid_rest_px`` (5¢),
+and only when that rest is strictly below the ask. A rest at or above
+the ask would be marketable and get rejected under $1. GTD is used when
+expiration is at least ~180s ahead; otherwise GTC, still cancelled near
+expiry. There is no escalate ladder. Markets A never held use the same
+quote on the cheap live side during the late window. The winner leg A
 still holds stays blocked. B never mints and never sells.
 
 Same-wallet buyback is intentionally not here.
@@ -30,12 +35,13 @@ SISTER_DEFAULTS = {
     "bid_enabled": False,
     "dry_run": True,
     "shares": 20.0,
-    "bid_max_px": 0.04,
-    # Same as the cap. Post-scrap does not rest below bid_max_px.
-    "bid_rest_px": 0.04,
-    # 20sh × 4¢ is $0.80, under the CLOB marketable-BUY minimum.
+    "bid_max_px": 0.05,
+    # Passive rest. The FAK ceiling is bid_fak_max_notional / shares (7.5¢).
+    "bid_rest_px": 0.05,
+    # 20sh × 5¢ = $1.00 floor. 20sh × 7.5¢ = $1.50 max.
     "bid_fak_min_notional": 1.0,
-    # FAK only when the ask is ≤ cap and notional clears bid_fak_min_notional.
+    "bid_fak_max_notional": 1.5,
+    # FAK the live ask when it is ≤ max notional / shares.
     "bid_take_enabled": True,
     "active_ttm_s": 180.0,
     "cancel_ttm_s": 20.0,
@@ -241,6 +247,16 @@ def _leg_filled(filled: Optional[dict], cid: str, leg: str) -> float:
     return shares
 
 
+def sister_leg_filled(filled: Any, condition_id: str, leg: str) -> float:
+    """Shares wallet B has matched on this condition and leg.
+
+    ``filled`` is the ``filled`` map from ``positions_scrapbid.json``.
+    """
+    if not isinstance(filled, dict):
+        return 0.0
+    return _leg_filled(filled, str(condition_id or ""), str(leg or ""))
+
+
 def buy_matched_shares(result: Any, offered: float) -> float:
     """Shares bought from a BUY POST or get_order.
 
@@ -290,24 +306,45 @@ def sister_quote(
     *,
     bid: Any = None,
     ask: Any = None,
-    bid_max_px: float = 0.04,
-    bid_rest_px: float = 0.04,
+    bid_max_px: float = 0.05,
+    bid_rest_px: float = 0.05,
     take_enabled: bool = True,
+    shares: float = 20.0,
+    fak_min_notional: float = 1.0,
+    fak_max_notional: float = 1.5,
 ) -> tuple[str, float, str]:
     """Post-scrap price. ``(style, price, why)``.
 
-    ``style`` is ``take`` (FAK buy) or ``rest``. The rest is always
-    ``bid_max_px``. A cheaper bid is not joined. ``take_enabled`` is set
-    by the planner only when ``shares * ask`` covers the FAK minimum.
+    ``style`` is ``take`` (FAK buy), ``rest``, or ``wait``. The take limit
+    is the live ask, clipped up to ``fak_min_notional / shares`` when that
+    ask would print under $1, and never above ``fak_max_notional / shares``
+    (20 shares → 5¢–7.5¢). A rest is ``bid_rest_px``, and only when it
+    does not cross the ask.
     """
-    del bid, bid_rest_px
+    del bid
     cap = round(float(bid_max_px or 0), 4)
-    if cap <= 0:
-        return "rest", 0.0, "bad_cap"
+    rest = round(float(bid_rest_px or cap), 4)
+    if rest <= 0 or (cap > 0 and rest > cap + 1e-12):
+        rest = cap
     ask_px = _px(ask)
-    if take_enabled and ask_px is not None and ask_px <= cap + 1e-12:
-        return "take", round(min(ask_px, cap), 4), "live_ask"
-    return "rest", cap, "rest_cap"
+    size = float(shares or 0)
+    lo = float(fak_min_notional or 0)
+    hi = float(fak_max_notional or 0)
+    if take_enabled and ask_px is not None and size > 0 and lo > 0 and hi + 1e-12 >= lo:
+        floor_px = lo / size
+        ceil_px = hi / size
+        if ask_px <= ceil_px + 1e-12 and floor_px <= ceil_px + 1e-12:
+            limit = ask_px if ask_px + 1e-12 >= floor_px else floor_px
+            limit = round(min(limit, ceil_px), 4)
+            notional = size * limit
+            if lo - 1e-9 <= notional <= hi + 1e-9:
+                why = "live_ask" if abs(limit - round(ask_px, 4)) <= 1e-9 else "fak_floor"
+                return "take", limit, why
+    if rest <= 0:
+        return "rest", 0.0, "bad_cap"
+    if ask_px is not None and rest + 1e-12 >= ask_px:
+        return "wait", 0.0, "cross_ask"
+    return "rest", rest, "rest_cap"
 
 
 def _cheap_live(bid: Optional[float], bid_max_px: float) -> bool:
@@ -326,12 +363,13 @@ def plan_sister_bids(
     open_orders: Optional[dict],
     now_s: float,
     shares: float = 20.0,
-    bid_max_px: float = 0.04,
-    bid_rest_px: float = 0.04,
+    bid_max_px: float = 0.05,
+    bid_rest_px: float = 0.05,
     active_ttm_s: float = 180.0,
     cancel_ttm_s: float = 20.0,
     min_gtd_ahead_s: float = 180.0,
     fak_min_notional: float = 1.0,
+    fak_max_notional: float = 1.5,
     enabled: bool = True,
     take_enabled: bool = True,
     filled_shares: Optional[dict] = None,
@@ -432,19 +470,26 @@ def plan_sister_bids(
                     if abs(float(other_bid) - float(this_bid)) <= 1e-12 and leg == "dn":
                         actions.append({**base, "op": "skip", "reason": "other_cheaper"})
                         continue
-            ask_px = _px(asks.get(leg))
-            take_notional = remaining * ask_px if ask_px is not None else 0.0
-            allow_take = bool(take_enabled) and take_notional + 1e-9 >= float(
-                fak_min_notional or 0
-            )
             style, price, price_why = sister_quote(
                 bid=bids.get(leg),
                 ask=asks.get(leg),
                 bid_max_px=px,
                 bid_rest_px=rest_px,
-                take_enabled=allow_take,
+                take_enabled=bool(take_enabled),
+                shares=remaining,
+                fak_min_notional=float(fak_min_notional or 0),
+                fak_max_notional=float(fak_max_notional or 0),
             )
-            if price <= 0 or price > px + 1e-12:
+            if style == "wait":
+                actions.append({**base, "op": "skip", "reason": price_why})
+                continue
+            # Takes may pay up to max notional / size (7.5¢ at 20sh).
+            # Rests stay at bid_rest_px, which is at or under bid_max_px.
+            if style == "take" and remaining > 0 and float(fak_max_notional or 0) > 0:
+                ceiling = float(fak_max_notional) / remaining
+            else:
+                ceiling = max(px, rest_px)
+            if price <= 0 or price > ceiling + 1e-9:
                 actions.append({**base, "op": "skip", "reason": "bad_order"})
                 continue
             if style == "take":
