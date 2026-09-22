@@ -4,8 +4,11 @@ from __future__ import annotations
 
 import ast
 import json
+import math
 import unittest
 from pathlib import Path
+from typing import List, Optional, Tuple
+from unittest import mock
 
 import pathlog
 
@@ -396,6 +399,227 @@ class MintFailErrorMsgTests(unittest.TestCase):
         self.assertIn("mark_intent_failed", cycle)
         self.assertIn("last_fail_ts", cycle)
         self.assertIn("mint_attempts", cycle)
+
+
+class MintProxyGasLimitTests(unittest.TestCase):
+    def test_choose_proxy_gas_limit_applies_headroom_floor_and_cap(self):
+        headroom = float(_assign("PROXY_GAS_HEADROOM_PCT"))
+        floor = int(_assign("PROXY_GAS_LIMIT_FLOOR"))
+        cap = int(_assign("PROXY_GAS_LIMIT_CAP"))
+        choose = _fn(
+            "choose_proxy_gas_limit",
+            {
+                "math": math,
+                "PROXY_GAS_HEADROOM_PCT": headroom,
+                "PROXY_GAS_LIMIT_FLOOR": floor,
+                "PROXY_GAS_LIMIT_CAP": cap,
+            },
+        )
+
+        raw = 519_000
+        expected = min(cap, max(floor, int(math.ceil(raw * (1.0 + headroom)))))
+        chosen = choose(raw)
+        self.assertEqual(chosen, expected)
+        self.assertGreater(chosen, 500_000)
+
+        self.assertEqual(choose(10_000), floor)
+        self.assertEqual(choose(10_000_000), cap)
+
+    def _proxy_wallet_for(self, private_key: str, chain_id: int = 137) -> tuple[str, str]:
+        from py_builder_relayer_client.builder.derive import derive_proxy_wallet
+        from py_builder_relayer_client.config import get_contract_config
+        from py_builder_relayer_client.signer import Signer as RelayerSigner
+
+        signer = RelayerSigner(private_key, chain_id)
+        eoa = signer.address()
+        cfg = get_contract_config(chain_id)
+        funder = derive_proxy_wallet(eoa, cfg.proxy_factory)
+        return eoa, funder
+
+    def test_submit_mint_batch_fail_closed_on_estimate_error(self):
+        private_key = "0x" + ("11" * 32)
+        _, funder = self._proxy_wallet_for(private_key)
+        post_calls = []
+        events = []
+
+        class Resp:
+            def __init__(self, status_code: int, payload: dict):
+                self.status_code = status_code
+                self._payload = payload
+                self.text = json.dumps(payload)
+
+            def json(self):
+                return self._payload
+
+        def fake_get(url, params=None, timeout=None):
+            return Resp(
+                200,
+                {
+                    "nonce": "9",
+                    "address": "0x2222222222222222222222222222222222222222",
+                },
+            )
+
+        def fake_post(url, json=None, headers=None, timeout=None):
+            post_calls.append((url, json, headers, timeout))
+            return Resp(200, {"transactionID": "should-not-submit"})
+
+        class RequestsStub:
+            get = staticmethod(fake_get)
+            post = staticmethod(fake_post)
+
+        def fail_estimate(**_kwargs):
+            raise ProxyGasEstimateError("rpc estimate timeout")
+
+        class ProxyGasEstimateError(RuntimeError):
+            pass
+
+        call = type(
+            "Call",
+            (),
+            {
+                "to": "0x3333333333333333333333333333333333333333",
+                "data": "0x1234",
+            },
+        )()
+        submit = _fn(
+            "submit_mint_batch",
+            {
+                "List": List,
+                "Optional": Optional,
+                "Tuple": Tuple,
+                "ContractCall": object,
+                "PROXY_GAS_HEADROOM_PCT": float(_assign("PROXY_GAS_HEADROOM_PCT")),
+                "PROXY_GAS_LIMIT_FLOOR": int(_assign("PROXY_GAS_LIMIT_FLOOR")),
+                "PROXY_GAS_LIMIT_CAP": int(_assign("PROXY_GAS_LIMIT_CAP")),
+                "requests": RequestsStub,
+                "os": __import__("os"),
+                "get_relayer_headers": lambda _body: {"X-Test": "1"},
+                "estimate_proxy_inner_gas_limit": fail_estimate,
+                "ProxyGasEstimateError": ProxyGasEstimateError,
+                "log_event": lambda event, **kwargs: events.append((event, kwargs)),
+            },
+        )
+
+        with mock.patch.dict(
+            "os.environ",
+            {
+                "PRIVATE_KEY": private_key,
+                "FUNDER_ADDRESS": funder,
+                "CHAIN_ID": "137",
+                "RELAYER_URL": "https://relayer-v2.polymarket.com",
+            },
+            clear=False,
+        ):
+            tx_id, err = submit([call], "mintbot:test", "https://polygon.example")
+
+        self.assertIsNone(tx_id)
+        self.assertIn("proxy gas estimate failed", str(err))
+        self.assertIn("rpc estimate timeout", str(err))
+        self.assertEqual(post_calls, [])
+        self.assertTrue(
+            any(event == "mint_proxy_gas_estimate_fail" for event, _ in events),
+            events,
+        )
+
+    def test_submit_mint_batch_success_still_submits_with_estimated_gas(self):
+        private_key = "0x" + ("22" * 32)
+        _, funder = self._proxy_wallet_for(private_key)
+        submit_posts = []
+        events = []
+        estimate_calls = []
+
+        class Resp:
+            def __init__(self, status_code: int, payload: dict):
+                self.status_code = status_code
+                self._payload = payload
+                self.text = json.dumps(payload)
+
+            def json(self):
+                return self._payload
+
+        def fake_get(url, params=None, timeout=None):
+            return Resp(
+                200,
+                {
+                    "nonce": "11",
+                    "address": "0x2222222222222222222222222222222222222222",
+                },
+            )
+
+        def fake_post(url, json=None, headers=None, timeout=None):
+            submit_posts.append((url, json, headers, timeout))
+            return Resp(200, {"transactionID": "tx-123"})
+
+        class RequestsStub:
+            get = staticmethod(fake_get)
+            post = staticmethod(fake_post)
+
+        def ok_estimate(**kwargs):
+            estimate_calls.append(kwargs)
+            return 549_000, 640_000
+
+        class ProxyGasEstimateError(RuntimeError):
+            pass
+
+        call = type(
+            "Call",
+            (),
+            {
+                "to": "0x3333333333333333333333333333333333333333",
+                "data": "0x1234",
+            },
+        )()
+        submit = _fn(
+            "submit_mint_batch",
+            {
+                "List": List,
+                "Optional": Optional,
+                "Tuple": Tuple,
+                "ContractCall": object,
+                "PROXY_GAS_HEADROOM_PCT": float(_assign("PROXY_GAS_HEADROOM_PCT")),
+                "PROXY_GAS_LIMIT_FLOOR": int(_assign("PROXY_GAS_LIMIT_FLOOR")),
+                "PROXY_GAS_LIMIT_CAP": int(_assign("PROXY_GAS_LIMIT_CAP")),
+                "requests": RequestsStub,
+                "os": __import__("os"),
+                "get_relayer_headers": lambda _body: {"X-Test": "1"},
+                "estimate_proxy_inner_gas_limit": ok_estimate,
+                "ProxyGasEstimateError": ProxyGasEstimateError,
+                "log_event": lambda event, **kwargs: events.append((event, kwargs)),
+            },
+        )
+
+        with mock.patch.dict(
+            "os.environ",
+            {
+                "PRIVATE_KEY": private_key,
+                "FUNDER_ADDRESS": funder,
+                "CHAIN_ID": "137",
+                "RELAYER_URL": "https://relayer-v2.polymarket.com",
+            },
+            clear=False,
+        ):
+            tx_id, err = submit([call], "mintbot:test", "https://polygon.example")
+
+        self.assertEqual(tx_id, "tx-123")
+        self.assertIsNone(err)
+        self.assertEqual(len(estimate_calls), 1)
+        self.assertEqual(estimate_calls[0]["rpc_url"], "https://polygon.example")
+        self.assertEqual(len(submit_posts), 1)
+        body = submit_posts[0][1]
+        self.assertEqual(
+            body.get("signatureParams", {}).get("gasLimit"),
+            "640000",
+        )
+        self.assertTrue(
+            any(
+                event == "mint_proxy_gas_estimate"
+                and payload.get("raw_estimate") == 549000
+                and payload.get("gas_limit") == 640000
+                for event, payload in events
+            ),
+            events,
+        )
 
 
 class DeployUnitsTests(unittest.TestCase):

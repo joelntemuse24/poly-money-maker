@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import fcntl
 import json
+import math
 import os
 import signal
 import sys
@@ -146,6 +147,10 @@ ACTIVE_STATUSES = frozenset(
         "confirmed",
     }
 )
+
+PROXY_GAS_HEADROOM_PCT = 0.18
+PROXY_GAS_LIMIT_FLOOR = 450_000
+PROXY_GAS_LIMIT_CAP = 640_000
 
 _shutdown = False
 STATE_LOCK = threading.RLock()
@@ -511,12 +516,69 @@ def get_relayer_headers(body: dict) -> Optional[dict]:
     headers["Content-Type"] = "application/json"
     return headers
 
-def submit_mint_batch(calls: List[ContractCall], metadata: str) -> Tuple[Optional[str], Optional[str]]:
+class ProxyGasEstimateError(RuntimeError):
+    """Raised when proxy gas estimation cannot provide a safe inner limit."""
+
+
+def choose_proxy_gas_limit(
+    raw_estimate: int,
+    *,
+    headroom_pct: float = PROXY_GAS_HEADROOM_PCT,
+    floor: int = PROXY_GAS_LIMIT_FLOOR,
+    cap: int = PROXY_GAS_LIMIT_CAP,
+) -> int:
+    estimate = int(raw_estimate)
+    if estimate <= 0:
+        raise ValueError("raw proxy gas estimate must be positive")
+    if not (0.0 < float(headroom_pct) < 1.0):
+        raise ValueError("proxy gas headroom_pct must be in (0, 1)")
+    floor_i = int(floor)
+    cap_i = int(cap)
+    if floor_i <= 0 or cap_i < floor_i:
+        raise ValueError("proxy gas floor/cap must satisfy 0 < floor <= cap")
+    padded = int(math.ceil(float(estimate) * (1.0 + float(headroom_pct))))
+    return max(floor_i, min(cap_i, padded))
+
+
+def estimate_proxy_inner_gas_limit(
+    *,
+    rpc_url: str,
+    from_address: str,
+    proxy_factory: str,
+    data: str,
+) -> Tuple[int, int]:
+    from py_builder_relayer_client.gas import estimate_gas
+
+    rpc = str(rpc_url or "").strip()
+    if not rpc:
+        raise ProxyGasEstimateError("missing rpc_url")
+    try:
+        raw_estimate = int(
+            estimate_gas(
+                rpc_url=rpc,
+                from_address=str(from_address),
+                to=str(proxy_factory),
+                data=str(data),
+            )
+        )
+        return raw_estimate, choose_proxy_gas_limit(raw_estimate)
+    except Exception as exc:
+        raise ProxyGasEstimateError(str(exc)[:200]) from exc
+
+
+def submit_mint_batch(
+    calls: List[ContractCall],
+    metadata: str,
+    rpc_url: str,
+) -> Tuple[Optional[str], Optional[str]]:
     """Submit approve+split as one PROXY batch via Polymarket relayer."""
     private_key = os.getenv("PRIVATE_KEY") or ""
     funder = os.getenv("FUNDER_ADDRESS") or ""
     if not private_key or not funder:
         return None, "missing PRIVATE_KEY or FUNDER_ADDRESS"
+    rpc_url = str(rpc_url or "").strip()
+    if not rpc_url:
+        return None, "missing rpc_url for proxy gas estimation"
 
     from py_builder_relayer_client.builder.proxy import build_proxy_transaction_request
     from py_builder_relayer_client.config import get_contract_config as get_relayer_contract_config
@@ -564,6 +626,29 @@ def submit_mint_batch(calls: List[ContractCall], metadata: str) -> Tuple[Optiona
             ]
         )
         config = get_relayer_contract_config(chain_id)
+        try:
+            raw_estimate, gas_limit = estimate_proxy_inner_gas_limit(
+                rpc_url=rpc_url,
+                from_address=eoa,
+                proxy_factory=config.proxy_factory,
+                data=encoded_data,
+            )
+        except ProxyGasEstimateError as exc:
+            msg = f"proxy gas estimate failed: {str(exc)[:200]}"
+            log_event(
+                "mint_proxy_gas_estimate_fail",
+                error=str(exc)[:200],
+                rpc_url=rpc_url,
+            )
+            return None, msg
+        log_event(
+            "mint_proxy_gas_estimate",
+            raw_estimate=raw_estimate,
+            gas_limit=gas_limit,
+            headroom_pct=PROXY_GAS_HEADROOM_PCT,
+            floor=PROXY_GAS_LIMIT_FLOOR,
+            cap=PROXY_GAS_LIMIT_CAP,
+        )
         request = build_proxy_transaction_request(
             signer=signer,
             args=ProxyTransactionArgs(
@@ -572,6 +657,7 @@ def submit_mint_batch(calls: List[ContractCall], metadata: str) -> Tuple[Optiona
                 gas_price="0",
                 data=encoded_data,
                 relay=str(relay),
+                gas_limit=str(gas_limit),
             ),
             config=config,
             metadata=metadata,
@@ -1881,7 +1967,11 @@ def run_mint_cycle(
         mint_attempts=intent.get("mint_attempts"),
     )
 
-    tx_id, err = submit_mint_batch(calls, metadata=f"mintbot:split:{pick.condition_id}:{int(now)}")
+    tx_id, err = submit_mint_batch(
+        calls,
+        metadata=f"mintbot:split:{pick.condition_id}:{int(now)}",
+        rpc_url=str(cfg["rpc_url"]),
+    )
     with STATE_LOCK:
         intent = state["intents"][pick.condition_id]
         intent["updated_at"] = time.time()
