@@ -38,6 +38,11 @@ DEFAULT_SELL_KNOBS = {
     "sell_dump_enabled": True,
     "sell_dump_below": 0.80,
     "sell_dump_persist_s": 2.0,
+    # After first dump no-match/kill-0-fill, quickly refire this many times.
+    "sell_dump_fak_retries": 2,
+    # Dump retry ladder: top bid, then step down toward floor (short burst).
+    "sell_dump_ladder_step": 0.04,
+    "sell_dump_ladder_rungs": 4,
     "sell_min_bid_size": 1.0,
     # Cycle sleep while a loser persist arm is live. Does not change persist_s.
     "sell_armed_poll_s": 2.0,
@@ -357,6 +362,54 @@ def winner_sell_limit(
 def empty_fak_status(status: Any) -> bool:
     """True when CLOB rejected a FAK because no resting bid matched."""
     return "no orders found" in str(status or "").lower()
+
+
+def dump_fast_retry_eligible(*, sold: float, status: Any, tol: float) -> bool:
+    """True when held-dump should immediately re-check and re-fire.
+
+    The fast path only triggers for *zero-fill* misses:
+    - CLOB explicit empty FAK (`no orders found`)
+    - kill/cancel class statuses with zero fill
+    """
+    if float(sold or 0.0) + 1e-12 >= float(tol):
+        return False
+    text = str(status or "").lower()
+    if empty_fak_status(status):
+        return True
+    return "kill" in text or "cancelled" in text or "canceled" in text
+
+
+def dump_retry_ladder_limits(
+    live_bid: float,
+    *,
+    floor: float,
+    step: float,
+    max_rungs: int,
+) -> Sequence[float]:
+    """Descending dump retry limits from live bid toward floor.
+
+    The first retry level is always the current live sized bid. Additional
+    levels descend in fixed ``step`` increments until floor (or rung cap).
+    """
+    bid = round(float(live_bid or 0.0), 4)
+    if bid <= 1e-12:
+        return []
+    fl = round(float(floor or 0.0), 4)
+    if bid + 1e-12 < fl:
+        return [bid]
+    rung_cap = max(1, int(max_rungs or 1))
+    use_step = round(float(step or 0.0), 4)
+    if use_step <= 1e-12:
+        use_step = 0.01
+    out = [bid]
+    cur = bid
+    while len(out) < rung_cap and cur > fl + 1e-12:
+        cur = round(max(fl, cur - use_step), 4)
+        if cur <= 1e-12:
+            break
+        if abs(cur - out[-1]) > 1e-12:
+            out.append(cur)
+    return out
 
 
 def loser_empty_keep_qualify(

@@ -39,7 +39,7 @@ Read Parts I and II straight through. Part III walks mint and sell. Part IV cove
   - [Sell path overview](#section-16)
   - [Loser dump: 3¢ → 2¢ after opposite ≥ 90¢](#section-17)
   - [Winner cash-out: prefer 0.999 / redeem; 0.99 only after cheap loser](#section-18)
-  - [Held-leg dump: under 80¢ for 5s after loser sold](#section-19)
+  - [Held-leg dump: under 80¢ for 2s after loser sold](#section-19)
   - [Live-bid FAK vs fixed-limit FAK](#section-20)
   - [Hypothetical lifecycle: $5 mint, loser @2¢, redeem winner](#section-21)
   - [Hypothetical lifecycle: held dump after a flip](#section-22)
@@ -392,7 +392,7 @@ When the sized winner bid meets `effective_winner_min` for `sell_persist_s`, **l
 If the book never reaches 0.999 and the cheap gate is closed, the bot holds for redeem after expiry (sells stop at `end_ts`).
 
 <a id="section-19"></a>
-## Held-leg dump: under 80¢ for 5s after loser sold
+## Held-leg dump: under 80¢ for 2s after loser sold
 
 This is the sell-side pass added 19 Sep 2026. It is **not** a hedge.
 
@@ -407,7 +407,14 @@ Preconditions (all required):
 - at fire, still `< sell_dump_below` or cancel (`sell_cancel_out_of_range`)
 - not in sell cooldown
 
-Action: live-bid FAK the held token; on success set `sold_dump=true` and `sold_winner=true` (so winner cash-out will not double-sell).
+Action:
+
+1. First shot is unchanged: one **live-bid FAK** at fire time.
+2. If that first shot returns **no-match / kill with zero fill**, the bot immediately re-checks the held-leg book and fast re-fires in the same sell tick (bounded retries), using a short descending ladder from the fresh top bid toward `sell_floor`.
+3. Stop fast retries if the re-check book is empty, a retry status is non-retryable, or retry count is exhausted.
+
+Defaults: `sell_dump_fak_retries=2`, `sell_dump_ladder_step=0.04`, `sell_dump_ladder_rungs=4`.
+These are **dump-only**; loser and winner paths keep their current logic.
 
 **Scope:** only the remaining leg after a loser fill. Full sets with neither leg sold never arm dump. After `end_ts`, manage_sells skips the intent (same as other sells).
 
@@ -536,6 +543,9 @@ From VM `strategy_mint.json`:
 | `sell_dump_enabled` | true | Held-leg dump on |
 | `sell_dump_below` | 0.80 | Dump arm threshold |
 | `sell_dump_persist_s` | 5 live / **2 code default** | Dump persist wait (lag-folded from 5s) |
+| `sell_dump_fak_retries` | 2 | Fast dump re-check/re-fire attempts after first zero-fill miss |
+| `sell_dump_ladder_step` | 0.04 | Dump retry ladder decrement toward floor |
+| `sell_dump_ladder_rungs` | 4 | Max limits per dump retry ladder |
 
 <a id="section-30"></a>
 ## Deploy boundary (VM is source of truth)
@@ -625,7 +635,7 @@ mint loop (always poll_s):
 | Loser sized bid ≤ 0.03 AND opposite ≥ 0.90 AND not both cheap | 5s wait (~9s wall) | FAK ladder 0.03→0.02, or live bid if below floor; cancel if out of range at fire | `sold_loser`, `sold_leg` |
 | Same, TTM ≤ 60s | 2s wait (~5–6s wall) | Same loser FAK / cancel-at-fire | `sold_loser`, `sold_leg` |
 | Winner sized bid ≥ effective_winner_min (0.999, or 0.99 if loser ≤0.03 *and* loser+0.99 > $1) | 5s wait | Live-bid FAK winner, clamped to CLOB max 0.99; cancel if bid dropped below min | `sold_winner` |
-| `sold_loser` AND held sized bid < 0.80 | 2s wait | Live-bid FAK held; cancel if bid ≥ 0.80 | `sold_dump`, `sold_winner` |
+| `sold_loser` AND held sized bid < 0.80 | 2s wait | First live-bid FAK held; on first zero-fill no-match/kill, immediate re-check + short descending ladder retries; cancel if bid ≥ 0.80 | `sold_dump`, `sold_winner` |
 | `now > end_ts` | — | No CLOB sells | (redeem outside this loop) |
 | Within `sell_cooldown_s` of last attempt | — | Skip fire | — |
 

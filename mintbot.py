@@ -60,6 +60,8 @@ from buy.mint_loops import IntentStore, start_mint_sell_loops
 from buy.mint_sell import (
     classify_loser,
     cycle_sleep_s,
+    dump_fast_retry_eligible,
+    dump_retry_ladder_limits,
     effective_loser_persist_s,
     empty_fak_status,
     inventory_latch,
@@ -125,6 +127,9 @@ DEFAULTS = {
     "sell_dump_enabled": True,
     "sell_dump_below": 0.80,
     "sell_dump_persist_s": 2.0,
+    "sell_dump_fak_retries": 2,
+    "sell_dump_ladder_step": 0.04,
+    "sell_dump_ladder_rungs": 4,
     "sell_min_bid_size": 1.0,
     "rpc_url": "https://polygon.drpc.org",
     "gamma_url": "https://gamma-api.polymarket.com",
@@ -281,6 +286,12 @@ def validate_strategy(cfg: dict) -> None:
         raise ValueError("sell_persist_last_min_s must be >= 0")
     if float(cfg.get("sell_persist_last_min_window_s") or 0) < 0:
         raise ValueError("sell_persist_last_min_window_s must be >= 0")
+    if int(cfg.get("sell_dump_fak_retries") or 0) < 0:
+        raise ValueError("sell_dump_fak_retries must be >= 0")
+    if float(cfg.get("sell_dump_ladder_step") or 0) <= 0:
+        raise ValueError("sell_dump_ladder_step must be > 0")
+    if int(cfg.get("sell_dump_ladder_rungs") or 0) < 1:
+        raise ValueError("sell_dump_ladder_rungs must be >= 1")
     if float(cfg.get("sell_min_bid_size") or 0) < 0:
         raise ValueError("sell_min_bid_size must be >= 0")
 
@@ -1024,6 +1035,136 @@ def _run_fak_ladder(
     return sold_total, last_status, last_px
 
 
+def _run_dump_fak_with_refire(
+    *,
+    token_id: str,
+    size: float,
+    initial_bid: float,
+    initial_bids: Any,
+    held: str,
+    slug: Any,
+    condition_id: str,
+    ttm_s: Optional[float],
+    floor: float,
+    min_bid_size: float,
+    retries: int,
+    ladder_step: float,
+    ladder_rungs: int,
+    dry_run: bool,
+    tol: float,
+) -> Tuple[float, str, Optional[float], int, float]:
+    """Held-dump path: first live-bid FAK, then fast refire ladders on miss."""
+    live_bid = float(initial_bid or 0.0)
+    initial_limits = [round(live_bid, 4)] if live_bid > 0 else []
+    sold_total = 0.0
+    last_status = "none"
+    last_px: Optional[float] = None
+    attempts = 0
+    if not initial_limits:
+        return sold_total, "bad_bid", last_px, attempts, live_bid
+
+    with _io_unlocked():
+        sold, last_status, last_px = _run_fak_ladder(
+            token_id,
+            size,
+            initial_limits,
+            dry_run=dry_run,
+            bid=live_bid,
+            label=f"dump {held}",
+            slug=slug,
+            tol=tol,
+            depth_bids=initial_bids,
+            depth_path="dump",
+            depth_leg=held,
+            ttm_s=ttm_s,
+            condition_id=condition_id,
+        )
+    attempts += 1
+    sold_total += float(sold or 0.0)
+    if dry_run or sold_total >= size - tol:
+        return sold_total, last_status, last_px, attempts, live_bid
+    if not dump_fast_retry_eligible(sold=sold, status=last_status, tol=tol):
+        return sold_total, last_status, last_px, attempts, live_bid
+
+    for retry_idx in range(max(0, int(retries or 0))):
+        with _io_unlocked():
+            retry_bid, _retry_sz, retry_bids = _fetch_book(token_id, min_bid_size)
+        if retry_bid is None:
+            log_event(
+                "sell_dump_fast_refire_stop",
+                condition_id=condition_id,
+                slug=slug,
+                leg=held,
+                retry=retry_idx + 1,
+                attempts=attempts,
+                reason="empty_book",
+            )
+            break
+        live_bid = float(retry_bid or 0.0)
+        limits = dump_retry_ladder_limits(
+            live_bid,
+            floor=floor,
+            step=ladder_step,
+            max_rungs=ladder_rungs,
+        )
+        if not limits:
+            log_event(
+                "sell_dump_fast_refire_stop",
+                condition_id=condition_id,
+                slug=slug,
+                leg=held,
+                retry=retry_idx + 1,
+                attempts=attempts,
+                reason="no_ladder_limits",
+                bid=live_bid,
+            )
+            break
+        log_event(
+            "sell_dump_fast_refire_attempt",
+            condition_id=condition_id,
+            slug=slug,
+            leg=held,
+            retry=retry_idx + 1,
+            attempts=attempts + 1,
+            bid=live_bid,
+            limits=limits,
+        )
+        with _io_unlocked():
+            sold, last_status, last_px = _run_fak_ladder(
+                token_id,
+                size - sold_total,
+                limits,
+                dry_run=dry_run,
+                bid=live_bid,
+                label=f"dump {held}",
+                slug=slug,
+                tol=tol,
+                depth_bids=retry_bids,
+                depth_path="dump_refire",
+                depth_leg=held,
+                ttm_s=ttm_s,
+                condition_id=condition_id,
+            )
+        attempts += 1
+        sold_total += float(sold or 0.0)
+        if dry_run or sold_total >= size - tol:
+            break
+        if not dump_fast_retry_eligible(sold=sold, status=last_status, tol=tol):
+            log_event(
+                "sell_dump_fast_refire_stop",
+                condition_id=condition_id,
+                slug=slug,
+                leg=held,
+                retry=retry_idx + 1,
+                attempts=attempts,
+                reason="non_retryable_status",
+                status=last_status,
+                sold=float(sold or 0.0),
+            )
+            break
+    return sold_total, last_status, last_px, attempts, live_bid
+
+
 def _apply_sell_fire_cancel(
     intent: dict,
     *,
@@ -1290,6 +1431,9 @@ def _manage_sells_locked(cfg: dict, state: dict, chain: ChainReader) -> None:
         dump_enabled = bool(cfg.get("sell_dump_enabled", True))
         dump_below = float(cfg.get("sell_dump_below") or 0.80)
         dump_persist_s = float(cfg.get("sell_dump_persist_s") or 2.0)
+        dump_retries = int(cfg.get("sell_dump_fak_retries", 2))
+        dump_ladder_step = float(cfg.get("sell_dump_ladder_step") or 0.04)
+        dump_ladder_rungs = int(cfg.get("sell_dump_ladder_rungs", 4))
         sold_leg = intent.get("sold_leg")
         held = None
         if sold_leg == "up":
@@ -1356,25 +1500,28 @@ def _manage_sells_locked(cfg: dict, state: dict, chain: ChainReader) -> None:
                 else:
                     live_px = float(dump_bid or 0)
                     intent["last_sell_attempt_at"] = now
-                    with _io_unlocked():
-                        sold_total, last_status, last_px = _run_fak_ladder(
-                            d_tok,
-                            size,
-                            [round(live_px, 4)],
-                            dry_run=dry_run,
-                            bid=live_px,
-                            label=f"dump {held}",
+                    sold_total, last_status, last_px, used_attempts, live_px = (
+                        _run_dump_fak_with_refire(
+                            token_id=d_tok,
+                            size=size,
+                            initial_bid=live_px,
+                            initial_bids=books.get(held),
+                            held=held,
                             slug=intent.get("slug"),
-                            tol=tol,
-                            depth_bids=books.get(held),
-                            depth_path="dump",
-                            depth_leg=held,
-                            ttm_s=ttm_s,
                             condition_id=cid,
+                            ttm_s=ttm_s,
+                            floor=floor,
+                            min_bid_size=min_bid_size,
+                            retries=dump_retries,
+                            ladder_step=dump_ladder_step,
+                            ladder_rungs=dump_ladder_rungs,
+                            dry_run=dry_run,
+                            tol=tol,
                         )
+                    )
                     intent["sell_dump_attempts"] = int(
                         intent.get("sell_dump_attempts") or 0
-                    ) + 1
+                    ) + int(used_attempts)
                     intent["sell_dump_last_status"] = last_status
                     if dry_run or sold_total >= size - tol:
                         intent["sold_dump"] = True
