@@ -20,7 +20,9 @@ from buy.sister_bid import (
     plan_dump_hedges,
     plan_sister_bids,
     sister_book_wanted,
+    sister_dump_on,
     sister_quote,
+    sister_scrap_on,
     resolve_sister_client_config,
     sister_cancel_due,
     sister_funder_ok,
@@ -314,8 +316,10 @@ class SisterAuthTests(unittest.TestCase):
         self.assertEqual(SISTER_DEFAULTS["miss_throttle_s"], 30.0)
         self.assertIs(SISTER_DEFAULTS["bid_take_enabled"], True)
         self.assertIs(SISTER_DEFAULTS["bid_absent_enabled"], False)
+        self.assertIs(SISTER_DEFAULTS["scrap_hedge_enabled"], False)
         self.assertIs(SISTER_DEFAULTS["dump_hedge_enabled"], True)
         self.assertEqual(SISTER_DEFAULTS["dump_hedge_shares"], 10.0)
+        self.assertIs(SISTER_DEFAULTS["topup_enabled"], False)
         self.assertEqual(SISTER_DEFAULTS["dump_hedge_rest_px"], 0.10)
         self.assertEqual(SISTER_DEFAULTS["dump_hedge_fak_min_notional"], 1.0)
         self.assertEqual(SISTER_DEFAULTS["dump_hedge_fak_max_notional"], 1.5)
@@ -333,7 +337,9 @@ class SisterAuthTests(unittest.TestCase):
         self.assertEqual(example["min_gtd_ahead_s"], 180.0)
         self.assertEqual(example["shares"], 20.0)
         self.assertEqual(example["dump_hedge_shares"], 10.0)
+        self.assertIs(example["scrap_hedge_enabled"], False)
         self.assertIs(example["dump_hedge_enabled"], True)
+        self.assertIs(example["topup_enabled"], False)
         self.assertIs(example["bid_absent_enabled"], False)
         self.assertEqual(example["topup_usd"], 5.0)
         self.assertEqual(example["topup_need_usd"], 1.5)
@@ -401,8 +407,36 @@ class SisterAuthTests(unittest.TestCase):
         self.assertLess(calls.index("plan_sister_bids"), calls.index("plan_dump_hedges"))
         self.assertNotIn("submit_mint", src)
         self.assertIn("scrapbid_miss", src)
+        self.assertIn("sister_scrap_on", src)
+        self.assertIn("sister_dump_on", src)
+        self.assertIn('cfg.get("topup_enabled", False)', src)
+        topup_src = (ROOT / "sister_topup.py").read_text(encoding="utf-8")
+        self.assertIn('cfg.get("topup_enabled", False)', topup_src)
         self.assertIn("sister_poll_s", src)
         self.assertIn("poll_hot_s", src)
+
+
+class SisterHedgeSwitchTests(unittest.TestCase):
+    def test_scrap_stays_off_when_bids_are_on(self):
+        cfg = dict(SISTER_DEFAULTS)
+        cfg["bid_enabled"] = True
+        self.assertFalse(sister_scrap_on(cfg))
+        self.assertTrue(sister_dump_on(cfg))
+
+    def test_scrap_on_only_when_both_flags_allow(self):
+        cfg = dict(SISTER_DEFAULTS)
+        cfg["bid_enabled"] = True
+        cfg["scrap_hedge_enabled"] = True
+        self.assertTrue(sister_scrap_on(cfg))
+        cfg["dump_hedge_enabled"] = False
+        self.assertFalse(sister_dump_on(cfg))
+
+    def test_master_bid_switch_blocks_both(self):
+        cfg = dict(SISTER_DEFAULTS)
+        cfg["scrap_hedge_enabled"] = True
+        cfg["dump_hedge_enabled"] = True
+        self.assertFalse(sister_scrap_on(cfg))
+        self.assertFalse(sister_dump_on(cfg))
 
 
 class PostScrapMissTests(unittest.TestCase):

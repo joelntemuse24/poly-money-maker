@@ -248,7 +248,7 @@ def run_topup(
         balance=b_balance,
         need_usd=float(cfg.get("topup_need_usd") or 0),
         amount_usd=amount,
-        enabled=bool(cfg.get("topup_enabled", True)),
+        enabled=bool(cfg.get("topup_enabled", False)),
         dry_run=dry,
         force_broke=force_broke,
         cleared=cleared,

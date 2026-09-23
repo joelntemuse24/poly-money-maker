@@ -288,3 +288,75 @@ def start_mint_sell_loops(
     sell_thread.start()
     mint_thread.start()
     return sell_thread, mint_thread
+
+
+# Submitted or in-flight mints whose pUSD has not been released.
+# ``confirmed`` (inventory seen), ``completed``, and ``failed`` drop out,
+# which is how confirm, hard fail, and the stale-submit timeout release.
+PENDING_CASH_STATUSES = frozenset(
+    {
+        "submitting",
+        "pending",
+        "executed",
+        "mined",
+        "confirmed_waiting_inventory",
+    }
+)
+
+
+def pending_mint_reserve(state: Any) -> float:
+    """pUSD promised to mints that are submitted or in flight.
+
+    Live ``pUSD_balance`` still shows this cash until the split lands.
+    Cost is the intent ``shares`` (one pUSD per complete set).
+    """
+    if not isinstance(state, dict):
+        return 0.0
+    intents = state.get("intents") or {}
+    if not isinstance(intents, dict):
+        return 0.0
+    total = 0.0
+    for intent in intents.values():
+        if not isinstance(intent, dict):
+            continue
+        if str(intent.get("status") or "") not in PENDING_CASH_STATUSES:
+            continue
+        try:
+            shares = float(intent.get("shares") or 0)
+        except (TypeError, ValueError):
+            continue
+        if shares > 0:
+            total += shares
+    return total
+
+
+def mint_cash_block(balance: float, need: float, reserved: float) -> Optional[dict]:
+    """None when ``balance - reserved`` covers ``need``.
+
+    ``pending_reserve`` means an in-flight mint is still holding cash the
+    live balance shows as free. ``no_balance`` is a short wallet with
+    nothing reserved.
+    """
+    try:
+        bal = float(balance)
+        cost = float(need)
+        held = float(reserved)
+    except (TypeError, ValueError):
+        return {
+            "reason": "no_balance",
+            "balance": balance,
+            "reserved": reserved,
+            "free": None,
+            "need": need,
+        }
+    free = bal - held
+    if free + 1e-9 >= cost:
+        return None
+    reason = "pending_reserve" if held > 1e-9 else "no_balance"
+    return {
+        "reason": reason,
+        "balance": bal,
+        "reserved": held,
+        "free": free,
+        "need": cost,
+    }

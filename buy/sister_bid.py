@@ -51,6 +51,9 @@ SISTER_DEFAULTS = {
     # Off: B bids only after A sold_loser on that leg. On: late-window
     # cheap-side bids on markets A never held.
     "bid_absent_enabled": False,
+    # Post-scrap buy of the sold leg. Off unless the live file turns it on.
+    # Dump hedges stay separate and default on.
+    "scrap_hedge_enabled": False,
     # After A normal-dumps leg L, B buys dump_hedge_shares of the other leg.
     "dump_hedge_enabled": True,
     "dump_hedge_shares": 10.0,
@@ -58,8 +61,9 @@ SISTER_DEFAULTS = {
     "dump_hedge_rest_px": 0.10,
     "dump_hedge_fak_min_notional": 1.0,
     "dump_hedge_fak_max_notional": 1.5,
-    # One $5 collateral move from A when B cannot fund a hedge. See sister_topup.
-    "topup_enabled": True,
+    # One $5 collateral move from A when B cannot fund a hedge. Off until
+    # the operator sets topup_enabled. See sister_topup.
+    "topup_enabled": False,
     "topup_usd": 5.0,
     "topup_need_usd": 1.5,
     "topup_retry_s": 120.0,
@@ -88,6 +92,28 @@ _HELD_STATUSES = frozenset(
         "confirmed",
     }
 )
+
+
+def sister_scrap_on(cfg: Any) -> bool:
+    """True when B may buy the leg A just scrapped.
+
+    ``bid_enabled`` is the process switch. ``scrap_hedge_enabled`` defaults
+    off so turning bids on does not also turn the 20-share scrap hedge on.
+    """
+    if not isinstance(cfg, dict):
+        return False
+    return bool(cfg.get("bid_enabled")) and bool(cfg.get("scrap_hedge_enabled", False))
+
+
+def sister_dump_on(cfg: Any) -> bool:
+    """True when B may buy the other leg after A's held dump.
+
+    Stays available when ``dump_hedge_enabled`` is on (the default) and
+    the process switch ``bid_enabled`` is on. Independent of the scrap hedge.
+    """
+    if not isinstance(cfg, dict):
+        return False
+    return bool(cfg.get("bid_enabled")) and bool(cfg.get("dump_hedge_enabled", True))
 
 
 def sister_funder_ok(funder: str) -> tuple[bool, str]:

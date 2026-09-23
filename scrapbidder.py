@@ -35,6 +35,8 @@ from buy.sister_bid import (
     markets_needing_books,
     plan_dump_hedges,
     plan_sister_bids,
+    sister_dump_on,
+    sister_scrap_on,
     resolve_sister_client_config,
     sister_book_wanted,
     sister_miss_events,
@@ -392,7 +394,7 @@ def _maybe_topup(
 ) -> None:
     """Spawn the A→B top-up script. Dry-run only logs. Throttled per kind."""
     global _last_topup_spawn, _last_topup_force
-    if not bool(cfg.get("topup_enabled", True)):
+    if not bool(cfg.get("topup_enabled", False)):
         return
     if not want and not force_broke and not cleared:
         return
@@ -666,6 +668,8 @@ def run_once(cfg: dict, now: Optional[float] = None) -> float:
     if not isinstance(state.get("dump_filled"), dict):
         state["dump_filled"] = {}
     filled = state["filled"]
+    scrap_on = sister_scrap_on(cfg)
+    dump_on = sister_dump_on(cfg)
     actions = plan_sister_bids(
         markets=wanted,
         intents=intents,
@@ -679,7 +683,7 @@ def run_once(cfg: dict, now: Optional[float] = None) -> float:
         min_gtd_ahead_s=max(180.0, float(cfg["min_gtd_ahead_s"])),
         fak_min_notional=float(cfg.get("bid_fak_min_notional") or 1.0),
         fak_max_notional=float(cfg.get("bid_fak_max_notional") or 1.5),
-        enabled=bool(cfg.get("bid_enabled")),
+        enabled=scrap_on,
         take_enabled=bool(cfg.get("bid_take_enabled", True)),
         absent_enabled=bool(cfg.get("bid_absent_enabled", False)),
         filled_shares=filled,
@@ -696,7 +700,7 @@ def run_once(cfg: dict, now: Optional[float] = None) -> float:
             min_gtd_ahead_s=max(180.0, float(cfg["min_gtd_ahead_s"])),
             fak_min_notional=float(cfg.get("dump_hedge_fak_min_notional") or 1.0),
             fak_max_notional=float(cfg.get("dump_hedge_fak_max_notional") or 1.5),
-            enabled=bool(cfg.get("bid_enabled")) and bool(cfg.get("dump_hedge_enabled", True)),
+            enabled=dump_on,
             take_enabled=bool(cfg.get("bid_take_enabled", True)),
             filled_shares=state.get("dump_filled") or {},
         )
@@ -717,7 +721,7 @@ def run_once(cfg: dict, now: Optional[float] = None) -> float:
         _maybe_topup(
             cfg, force_broke=False, cleared=True, reason="place_ok", want=True,
         )
-    if bool(cfg.get("bid_enabled")):
+    if scrap_on:
         events, flat_at, emit_at = sister_miss_events(
             intents=intents,
             open_orders=state.get("orders") or {},
@@ -743,10 +747,10 @@ def run_once(cfg: dict, now: Optional[float] = None) -> float:
         poll_s=float(cfg.get("poll_s") or 2.0),
         hot_poll_s=float(cfg.get("poll_hot_s") or 1.0),
         cancel_ttm_s=float(cfg["cancel_ttm_s"]),
-        enabled=bool(cfg.get("bid_enabled")),
+        enabled=scrap_on or dump_on,
         filled_shares=filled,
-        shares=float(cfg.get("shares") or 20.0),
-        dump_shares=float(cfg.get("dump_hedge_shares") or 0),
+        shares=float(cfg.get("shares") or 20.0) if scrap_on else 0.0,
+        dump_shares=float(cfg.get("dump_hedge_shares") or 0) if dump_on else 0.0,
         dump_filled=state.get("dump_filled") or {},
         dump_orders=state.get("dump_orders") or {},
     )
@@ -770,10 +774,11 @@ def main() -> None:
         min_gtd_ahead_s=cfg.get("min_gtd_ahead_s"),
         bid_take_enabled=bool(cfg.get("bid_take_enabled", True)),
         bid_absent_enabled=bool(cfg.get("bid_absent_enabled", False)),
+        scrap_hedge_enabled=bool(cfg.get("scrap_hedge_enabled", False)),
         dump_hedge_enabled=bool(cfg.get("dump_hedge_enabled", True)),
         dump_hedge_shares=cfg.get("dump_hedge_shares"),
         dump_hedge_fak_max_notional=cfg.get("dump_hedge_fak_max_notional"),
-        topup_enabled=bool(cfg.get("topup_enabled", True)),
+        topup_enabled=bool(cfg.get("topup_enabled", False)),
         topup_usd=cfg.get("topup_usd"),
         topup_need_usd=cfg.get("topup_need_usd"),
     )

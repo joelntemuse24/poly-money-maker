@@ -76,6 +76,8 @@ from buy.market import MarketGateway, MintMarket
 from buy.mint_loops import (
     IntentStore,
     held_forward_floor,
+    mint_cash_block,
+    pending_mint_reserve,
     run_job_loop,
     select_mint_candidate,
     start_mint_sell_loops,
@@ -2677,7 +2679,33 @@ def run_mint_cycle(
             log_event("mint_skip_not_binary", condition_id=pick.condition_id, slug=pick.slug)
             return "not_binary"
         balance = chain.pUSD_balance(str(cfg["pUSD_address"]), funder_cs)
-        if balance + 1e-9 < shares:
+        with STATE_LOCK:
+            reserved = pending_mint_reserve(state)
+        block = mint_cash_block(balance, shares, reserved)
+        if block is not None and block["reason"] == "pending_reserve":
+            console.print(
+                "  [dim red][SKIP][/] pending reserve  "
+                f"bal={block['balance']:.2f} reserved={block['reserved']:.2f} "
+                f"free={block['free']:.2f} need={block['need']:.2f}"
+            )
+            log_event(
+                "mint_skip_pending_reserve",
+                balance=block["balance"],
+                reserved=block["reserved"],
+                free=block["free"],
+                need=block["need"],
+                slug=pick.slug,
+            )
+            write_loop_heartbeat(
+                "mint",
+                "pending_reserve",
+                balance=block["balance"],
+                reserved=block["reserved"],
+                free=block["free"],
+                need=block["need"],
+            )
+            return "pending_reserve"
+        if block is not None:
             console.print(
                 f"  [dim red][SKIP][/] insufficient pUSD  bal={balance:.2f} need={shares:.2f}"
             )
