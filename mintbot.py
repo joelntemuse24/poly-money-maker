@@ -28,12 +28,12 @@ edits them.
 A third loop records Chainlink BTC/USD 60s TWAP (Polymarket RTDS) to
 ``logs/oracle_twap.jsonl`` while a 15m bag is open. ``oracle_log_enabled``
 defaults on (audit tape only). ``sell_late_window_s`` defaults to 0,
-which skips the late-window loser-scrap veto entirely. The edge knobs
-``sell_oracle_edge_floor_usd``, ``sell_oracle_edge_per_ttm``,
-``sell_oracle_edge_persist_s``, and ``sell_oracle_stale_s`` also default
-to 0, so setting the window back above 0 does not restore the old
-$25 / 1.5×TTM / 3s veto. Mint, winner cash-out, and held dump do not
-read the tape. If the feed
+which skips the late-window loser-scrap veto entirely.
+``sell_oracle_edge_floor_usd``, ``sell_oracle_edge_per_ttm``, and
+``sell_oracle_stale_s`` also default to 0, so setting the window back
+above 0 does not restore the old $25 / 1.5×TTM / 5s-stale veto.
+``sell_oracle_edge_persist_s`` stays 3s. Mint, winner cash-out, and held
+dump do not read the tape. If the feed
 fails, the loop logs ``oracle_log_fail`` and trading continues.
 
 Usage:
@@ -173,11 +173,11 @@ DEFAULTS = {
     "sell_dump_ladder_rungs": 4,
     "sell_min_bid_size": 1.0,
     # 0 skips the late-window Chainlink veto on loser scrap.
-    # Edge knobs are 0 so a positive window does not restore the old
-    # $25 / 1.5×TTM / 3s / 5s-stale veto. The tape stays on.
+    # Floor, per-TTM, and stale are 0 so a positive window does not
+    # restore the old $25 / 1.5×TTM / 5s-stale veto. Edge persist stays 3s.
     "sell_late_window_s": 0.0,
     "sell_oracle_edge_per_ttm": 0.0,
-    "sell_oracle_edge_persist_s": 0.0,
+    "sell_oracle_edge_persist_s": 3.0,
     "sell_oracle_stale_s": 0.0,
     "sell_oracle_edge_floor_usd": 0.0,
     "rpc_url": "https://polygon.drpc.org",
@@ -2099,7 +2099,7 @@ def _manage_sells_locked(cfg: dict, state: dict, chain: ChainReader) -> None:
         # 0 (the default) skips the veto. A missing key stays off.
         late_window_s = float(cfg.get("sell_late_window_s", 0.0) or 0.0)
         edge_per_ttm = float(cfg.get("sell_oracle_edge_per_ttm", 0.0) or 0.0)
-        edge_persist_s = float(cfg.get("sell_oracle_edge_persist_s", 0.0) or 0.0)
+        edge_persist_s = float(cfg.get("sell_oracle_edge_persist_s", 3.0) or 0.0)
         stale_s = float(cfg.get("sell_oracle_stale_s", 0.0) or 0.0)
         floor_usd = float(cfg.get("sell_oracle_edge_floor_usd", 0.0) or 0.0)
         ttm_for_oracle = float(end_ts - now) if end_ts else None

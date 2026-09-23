@@ -32,7 +32,7 @@ pathlog are **stopped / retired**. Do not start them.
 - `sell_threshold` **0.02**. Print is FAK `sell_fak_px` **0.02**, equal to `sell_floor` **0.02**, or the live bid when the book is thinner. Post-miss rest `sell_scrap_rest_px` is **0.02** (the print). `validate_strategy` requires `sell_floor` ≤ `sell_fak_px` ≤ `sell_threshold`.
 - `sell_persist_s` **5**, `sell_persist_last_min_s` **2** (window still 60s). Dump persist stays 2s.
 - `sell_persist_skip_when_sized` **false**. A sized book waits the full persist. TTM ≤ `sell_persist_skip_ttm_s` (90s) still skips.
-- `sell_late_window_s` **0** skips the late Chainlink scrap veto. `sell_oracle_edge_floor_usd`, `sell_oracle_edge_per_ttm`, `sell_oracle_edge_persist_s`, and `sell_oracle_stale_s` are **0**, so raising only the window does not restore the old $25 / 1.5×TTM / 3s veto. `oracle_log_enabled` stays true (audit tape).
+- `sell_late_window_s` **0** skips the late Chainlink scrap veto. `sell_oracle_edge_floor_usd`, `sell_oracle_edge_per_ttm`, and `sell_oracle_stale_s` are **0**, so raising only the window does not restore the old $25 / 1.5×TTM / 5s-stale veto. `sell_oracle_edge_persist_s` stays **3**. `oracle_log_enabled` stays true (audit tape).
 - The sister-miss held dump is gone. No `sell_dump_if_sister_miss_s`. The bid-under-`sell_dump_below` (0.80) persist dump is unchanged. A filled normal dump sets `sell_dump_leg` (the leg A sold). Inventory already flat does not.
 - Wallet A never posts a bid. Same-wallet buyback is not implemented.
 
@@ -60,7 +60,7 @@ The live path is Polymarket RTDS topic `crypto_prices_twap_sixty` for `btc/usd` 
 
 Stored samples are 15s through the middle of the window, 2s around the open and in the last 3 minutes, and 1s in the last 60s and just after the end. The recorder wakes every second while a bag is open so that tighter cadence is not stuck behind a cold sleep. A dead feed appends `oracle_log_fail` and logs the same event.
 
-**The tape is audit-only.** `oracle_log_enabled` stays on. `sell_late_window_s` and the four edge knobs (`sell_oracle_edge_floor_usd`, `sell_oracle_edge_per_ttm`, `sell_oracle_edge_persist_s`, `sell_oracle_stale_s`) are 0, so loser scrap does not consult the TWAP and those zeros do not re-arm the old veto. Mint eligibility, winner cash-out, and held dump do not read the tape.
+**The tape is audit-only.** `oracle_log_enabled` stays on. `sell_late_window_s` is 0, and `sell_oracle_edge_floor_usd`, `sell_oracle_edge_per_ttm`, and `sell_oracle_stale_s` are 0, so loser scrap does not consult the TWAP and those zeros do not re-arm the old dollar or stale veto. `sell_oracle_edge_persist_s` stays 3. Mint eligibility, winner cash-out, and held dump do not read the tape.
 
 ## Deploy boundary
 

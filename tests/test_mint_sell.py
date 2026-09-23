@@ -1088,7 +1088,7 @@ class LateOracleScrapGateTests(unittest.TestCase):
     def test_defaults_include_late_oracle_knobs(self):
         self.assertEqual(DEFAULT_SELL_KNOBS["sell_late_window_s"], 0.0)
         self.assertEqual(DEFAULT_SELL_KNOBS["sell_oracle_edge_per_ttm"], 0.0)
-        self.assertEqual(DEFAULT_SELL_KNOBS["sell_oracle_edge_persist_s"], 0.0)
+        self.assertEqual(DEFAULT_SELL_KNOBS["sell_oracle_edge_persist_s"], 3.0)
         self.assertEqual(DEFAULT_SELL_KNOBS["sell_oracle_stale_s"], 0.0)
         self.assertEqual(DEFAULT_SELL_KNOBS["sell_oracle_edge_floor_usd"], 0.0)
 

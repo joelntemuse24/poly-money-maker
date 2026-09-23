@@ -836,7 +836,7 @@ class DeployUnitsTests(unittest.TestCase):
         self.assertIs(example["oracle_log_enabled"], True)
         for blob in (defaults, example):
             self.assertEqual(blob["sell_oracle_edge_per_ttm"], 0.0)
-            self.assertEqual(blob["sell_oracle_edge_persist_s"], 0.0)
+            self.assertEqual(blob["sell_oracle_edge_persist_s"], 3.0)
             self.assertEqual(blob["sell_oracle_stale_s"], 0.0)
             self.assertEqual(blob["sell_oracle_edge_floor_usd"], 0.0)
         self.assertEqual(defaults["poll_s"], 5.0)

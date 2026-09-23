@@ -53,10 +53,10 @@ edge. Out of range at fire logs `sell_cancel_out_of_range` and does not
 POST. **Late-window oracle veto is off by default:** `sell_late_window_s`
 = 0 skips the whole block (`in_late` requires the window > 0, and
 `late_oracle_scrap_ok` returns `outside_late_window`). The edge knobs
-`sell_oracle_edge_floor_usd`, `sell_oracle_edge_per_ttm`,
-`sell_oracle_edge_persist_s`, and `sell_oracle_stale_s` also default to 0,
-so setting only the window back above 0 does not restore the old
-$25 / 1.5×TTM / 3s / 5s-stale veto. `oracle_log_enabled` stays true; the
+`sell_oracle_edge_floor_usd`, `sell_oracle_edge_per_ttm`, and
+`sell_oracle_stale_s` also default to 0, so setting only the window back
+above 0 does not restore the old $25 / 1.5×TTM / 5s-stale veto.
+`sell_oracle_edge_persist_s` stays 3. `oracle_log_enabled` stays true; the
 tape is audit-only. With these defaults, CLOB gates only.
 Winner cash-out is a separate path at `sell_winner_min` (~0.999).
 Live-bid FAK the winner, then clamp `limit = min(live_sized_bid,
@@ -75,9 +75,8 @@ defaults are 5/2/60 (dump persist stays 2s); `sell_armed_poll_s` is
 sell-loop cadence only. Live `strategy_mint.json` still wins for keys it
 already sets. Code defaults arm at `sell_threshold` 0.02, print
 `sell_fak_px` / `sell_scrap_rest_px` 0.02, persist 5 / 2, sized-skip off,
-`sell_late_window_s` 0, and the oracle edge knobs
-(`sell_oracle_edge_floor_usd`, `sell_oracle_edge_per_ttm`,
-`sell_oracle_edge_persist_s`, `sell_oracle_stale_s`) 0.
+`sell_late_window_s` 0, floor / per-TTM / stale edge knobs 0, and
+`sell_oracle_edge_persist_s` 3.
 `oracle_log_enabled` stays true. New keys absent from the live file take these
 defaults after the operator pulls and restarts. Do not edit live JSON
 from this repo.
@@ -130,8 +129,9 @@ Shared `buy/` helpers exist for mint, pathlog, and the recording-only oracle tap
 - `buy/contracts.py` — atomic mint calldata (`mintbot`) and the pUSD transfer used by the A→B top-up
 - `buy/oracle_log.py` — Chainlink BTC/USD 60s TWAP tape
   (`logs/oracle_twap.jsonl`). `oracle_log_enabled` stays on. The
-  loser-scrap veto knobs default to 0 (`sell_late_window_s` and the
-  floor / per-TTM / persist / stale edge keys), so the tape is audit-only.
+  loser-scrap veto stays off (`sell_late_window_s` 0, and the floor /
+  per-TTM / stale edge keys 0). `sell_oracle_edge_persist_s` stays 3.
+  The tape is audit-only.
   Not an input to mint, winner, or dump.
 - `buy/sister_bid.py` — wallet B buy policy. Post-scrap FAK at the
   live ask, limit clipped into [`bid_fak_min_notional/shares`,
