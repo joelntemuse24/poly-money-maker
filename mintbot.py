@@ -13,7 +13,10 @@ TTM ≤ ``sell_persist_skip_ttm_s`` (~90s). Sized depth does not skip
 (``sell_persist_skip_when_sized`` default false). At fire, FAK
 ``sell_fak_px`` (~2¢), which equals ``sell_floor`` (~2¢), or the live bid
 when the book is thinner. Empty keep fires a blind 1¢ FAK (backoff ~3s).
-A FAK miss rests a GTD/GTC sell at ``sell_scrap_rest_px`` (~2¢). Wallet A
+A FAK miss rests a GTD/GTC sell at ``min(sell_scrap_rest_px, live or
+last-seen loser bid)`` so a 1¢ book is not posted at the 2¢ print.
+``sell_scrap_rest_px`` stays ~2¢. GTD only when expiration is at least
+``sell_scrap_rest_min_ahead_s`` (~180s) ahead; otherwise GTC. Wallet A
 never posts a bid. Keep the winner for redeem unless its bid reaches
 ~99.9¢. Off unless live
 ``strategy_mint.json`` turns it on. Sell and mint run as independent loops
@@ -106,6 +109,7 @@ from buy.mint_sell import (
     rest_order_matched_shares,
     resting_tif,
     scrap_rest_action,
+    scrap_rest_px,
     sell_fire_decision,
     sell_window_open,
     skip_mint_discovery_for_sell,
@@ -165,7 +169,7 @@ DEFAULTS = {
     "sell_scrap_blind_backoff_s": 3.0,
     "sell_scrap_rest_enabled": True,
     "sell_scrap_rest_px": 0.02,
-    "sell_scrap_rest_min_ahead_s": 60.0,
+    "sell_scrap_rest_min_ahead_s": 180.0,
     "sell_cooldown_s": 3.0,
     "sell_winner_min": 0.999,
     # Cheap 0.99 winner only if loser ≤ this AND loser+cheap_min > 1.0 (else redeem).
@@ -1643,7 +1647,7 @@ def _manage_sells_locked(cfg: dict, state: dict, chain: ChainReader) -> None:
     blind_backoff = float(cfg.get("sell_scrap_blind_backoff_s", 3.0) or 0.0)
     rest_enabled = bool(cfg.get("sell_scrap_rest_enabled", True))
     rest_px = float(cfg.get("sell_scrap_rest_px", 0.02) or 0.02)
-    rest_ahead = float(cfg.get("sell_scrap_rest_min_ahead_s", 60.0) or 60.0)
+    rest_ahead = float(cfg.get("sell_scrap_rest_min_ahead_s", 180.0) or 180.0)
     cooldown = float(cfg.get("sell_cooldown_s") or 3.0)
     winner_min = float(cfg.get("sell_winner_min") or 0.999)
     clob_max = float(cfg.get("sell_clob_max_price") or 0.99)
@@ -1655,6 +1659,19 @@ def _manage_sells_locked(cfg: dict, state: dict, chain: ChainReader) -> None:
     funder_cs = to_checksum_address(funder) if funder else None
     dirty = False
     ctf = str(cfg.get("ctf_address") or "")
+
+    def _observed_loser_bid(leg: Optional[str], live: dict, seen: dict) -> Optional[float]:
+        """Live loser bid, else the last positive bid from the prior tick."""
+        if leg not in ("up", "dn"):
+            return None
+        for value in (live.get(leg), seen.get(leg)):
+            try:
+                px = float(value)
+            except (TypeError, ValueError):
+                continue
+            if px > 0:
+                return px
+        return None
 
     for cid, intent in list(state.get("intents", {}).items()):
         if intent.get("status") not in (
@@ -1685,6 +1702,12 @@ def _manage_sells_locked(cfg: dict, state: dict, chain: ChainReader) -> None:
             )
         books = {"up": up_bids, "dn": dn_bids}
         ttm_s = (end_ts - now) if end_ts else None
+        # Keep the previous positive print so an empty book after a FAK
+        # miss still rests at the bid that armed the scrap, not 2¢.
+        seen_bids = {
+            "up": intent.get("last_up_bid"),
+            "dn": intent.get("last_dn_bid"),
+        }
         intent["last_up_bid"] = up_bid
         intent["last_dn_bid"] = dn_bid
         intent["last_up_bid_size"] = up_sz
@@ -2367,7 +2390,9 @@ def _manage_sells_locked(cfg: dict, state: dict, chain: ChainReader) -> None:
                             max(0.0, size - sold_total),
                             now=now,
                             end_ts=end_ts,
-                            rest_px=rest_px,
+                            rest_px=scrap_rest_px(
+                                rest_px, _observed_loser_bid(loser, bids, seen_bids)
+                            ),
                             rest_ahead=rest_ahead,
                             rest_enabled=rest_enabled,
                             dry_run=dry_run,
@@ -2444,7 +2469,10 @@ def _manage_sells_locked(cfg: dict, state: dict, chain: ChainReader) -> None:
                             max(0.0, b_size - float(blind_sold or 0)),
                             now=now,
                             end_ts=end_ts,
-                            rest_px=rest_px,
+                            rest_px=scrap_rest_px(
+                                rest_px,
+                                _observed_loser_bid(persist_leg, bids, seen_bids),
+                            ),
                             rest_ahead=rest_ahead,
                             rest_enabled=rest_enabled,
                             dry_run=dry_run,
@@ -2467,7 +2495,9 @@ def _manage_sells_locked(cfg: dict, state: dict, chain: ChainReader) -> None:
                 remaining_shares,
                 now=now,
                 end_ts=end_ts,
-                rest_px=rest_px,
+                rest_px=scrap_rest_px(
+                    rest_px, _observed_loser_bid(persist_leg, bids, seen_bids)
+                ),
                 rest_ahead=rest_ahead,
                 rest_enabled=rest_enabled,
                 dry_run=dry_run,

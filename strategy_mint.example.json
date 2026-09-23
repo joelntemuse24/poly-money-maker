@@ -40,7 +40,7 @@
   "sell_scrap_blind_backoff_s": 3.0,
   "sell_scrap_rest_enabled": true,
   "sell_scrap_rest_px": 0.02,
-  "sell_scrap_rest_min_ahead_s": 60.0,
+  "sell_scrap_rest_min_ahead_s": 180.0,
   "sell_cooldown_s": 3.0,
   "sell_winner_min": 0.999,
   "sell_min_bid_size": 1.0,
