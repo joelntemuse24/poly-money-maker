@@ -255,15 +255,39 @@ class SelectMintCandidateTests(unittest.TestCase):
         self.assertIsNone(pick)
         self.assertEqual(status, "idle")
 
-    def test_after_cooldown_retries_nearest_while_attempts_remain(self):
+    def test_after_cooldown_retries_nearest_when_no_virgin_remains(self):
         nearest = _market("near", 100.0)
         later = _market("later", 200.0)
         pick, status = select_mint_candidate(
             [nearest, later],
             is_blocked=lambda cid: False,
+            fail_attempts=lambda cid: 1,
         )
         self.assertEqual(status, "pick")
         self.assertIs(pick, nearest)
+
+    def test_virgin_beats_failed_retry_while_a_slot_is_free(self):
+        failed = _market("failed", 100.0)
+        virgin = _market("virgin", 1_000.0)
+        pick, status = select_mint_candidate(
+            [failed, virgin],
+            is_blocked=lambda cid: False,
+            fail_attempts=lambda cid: 2 if cid == "failed" else 0,
+        )
+        self.assertEqual(status, "pick")
+        self.assertIs(pick, virgin)
+
+    def test_held_bag_floor_skips_every_earlier_start(self):
+        earlier = _market("earlier", 1_000.0)
+        held = _market("held", 1_900.0)
+        nxt = _market("next", 2_800.0)
+        pick, status = select_mint_candidate(
+            [earlier, held, nxt],
+            is_blocked=lambda cid: cid == "held",
+            min_start_ts=1_900.0 + 900.0,
+        )
+        self.assertEqual(status, "pick")
+        self.assertIs(pick, nxt)
 
     def test_capacity_blocked_nearest_does_not_hide_adjacent_window(self):
         nearer = _market("near", 100.0)
@@ -298,6 +322,29 @@ class SelectMintCandidateTests(unittest.TestCase):
         )
         self.assertEqual(status, "pick")
         self.assertIs(pick, fresh)
+
+
+class HeldForwardFloorTests(unittest.TestCase):
+    def test_floor_is_one_window_after_the_latest_active_bag(self):
+        from buy.mint_loops import held_forward_floor
+
+        state = {
+            "intents": {
+                "early": {"status": "confirmed", "start_ts": 1_000.0, "end_ts": 1_900.0},
+                "late": {"status": "confirmed", "start_ts": 1_900.0, "end_ts": 2_800.0},
+                "dead": {"status": "failed", "start_ts": 2_800.0, "end_ts": 3_700.0},
+            }
+        }
+        floor = held_forward_floor(state, now=1_500.0, active_statuses={"confirmed"})
+        self.assertEqual(floor, 1_900.0 + 900.0)
+
+    def test_no_floor_without_an_active_bag(self):
+        from buy.mint_loops import held_forward_floor
+
+        state = {"intents": {"x": {"status": "failed", "start_ts": 1_000.0, "end_ts": 1_900.0}}}
+        self.assertIsNone(
+            held_forward_floor(state, now=1_100.0, active_statuses={"confirmed"})
+        )
 
 
 class InterruptibleSleepTests(unittest.TestCase):

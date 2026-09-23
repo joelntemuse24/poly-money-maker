@@ -81,7 +81,7 @@ With a $5 trial (`shares=5`), you pay about $5 to mint 5 Up + 5 Down. If you sel
 
 **What this bot is not:** it is not the old hourly FAK entry bot. It does not chase 90–95¢ asks on one side with an oracle. It does not “hedge” by buying the opposite leg after entry. The post-loser exit under 80¢ is deliberately named a **held dump / sell-side pass**, not a hedge.
 
-**Risk concentration:** `max_open_sets=1` means at most one full unsold bag blocks capacity (with a special adjacent-window exception described below). A failed relayer mint is blocked for `mint_fail_cooldown_s` (30s) and gives up after `mint_max_attempts` (3) tries so a hot remint loop cannot run. A nearer window in that cooldown, or already at the attempt cap, does not idle the cycle: the next eligible future is selected in the same pass. A restart ghost intent stuck at `submitting` with no `transaction_id` is auto-failed after `mint_submitting_timeout_s` (default 90s, `0` disables) so `wait_submit` cannot wedge the desk forever. A single toxic loser fill or a missed dump still matters at small size; scaling share count scales both edge and left-tail together.
+**Risk concentration:** `max_open_sets=1` means at most one full unsold bag blocks capacity (with a special adjacent-window exception described below). A failed relayer mint is blocked for `mint_fail_cooldown_s` (30s) and gives up after `mint_max_attempts` (3) tries so a hot remint loop cannot run. A nearer window in that cooldown, or already at the attempt cap, does not idle the cycle: the next eligible future is selected in the same pass and `mint_attempt` is logged for that slug. After an active bag at start `T`, selection never goes backwards (`start_ts < T+900`). A zero-fail window is preferred over retrying a failed condition while a slot is free. A restart ghost intent stuck at `submitting` with no `transaction_id` is auto-failed after `mint_submitting_timeout_s` (default 90s, `0` disables) so `wait_submit` cannot wedge the desk forever. A single toxic loser fill or a missed dump still matters at small size; scaling share count scales both edge and left-tail together.
 
 <a id="section-2"></a>
 ## Processes, wallet identities and files
@@ -320,7 +320,7 @@ confirmed / completed / ACTIVE_STATUSES → always blocked
 failed → blocked while now < last_fail_ts + mint_fail_cooldown_s (30s)
 failed → blocked for the rest of that condition if mint_attempts >= mint_max_attempts (3)
 failed → eligible again after cooldown if attempts remain
-selection → a blocked nearer candidate is skipped; the next future in the same list is minted
+selection → skip start_ts < latest held bag + 900s; prefer a zero-fail window over a retry; otherwise the next future in the same pass
 ```
 
 A relayer `STATE_FAILED` marks the intent `failed` and persists `errorMsg` / tx hash when the API returns them. Without counting `failed` at all, the bot reminted the same `condition_id` in a hot loop (seen on the 2:15 window). Incident `btc-updown-15m-1789805700` then showed the opposite bug: `failed` blocked forever, so after `STATE_FAILED` the desk sat idle for the rest of the 15m window. Cooldown + max attempts is the middle path.
@@ -649,12 +649,16 @@ mint loop (always poll_s):
   if not cfg.entry_enabled: return "disabled"
   markets = gateway.discover(cfg.series_slugs)
   candidates = eligible_markets(markets, cfg, now)   # NOT YET OPEN, within TTM band
-  pick = first candidate in start order where:
-           not already_minted(condition_id, now)     # cooldown, or attempts >= max
+  floor = latest active bag start + 900s, or none
+  pick = first zero-fail candidate in start order where:
+           start_ts >= floor                          # no backwards mint
+           not already_minted(condition_id, now)      # cooldown, or attempts >= max
            and wallet does not already hold tokens
-           and not mint_slots_full for that start    # adjacent window still allowed
+           and not mint_slots_full for that start     # adjacent window still allowed
+  if none: repeat, allowing a failed condition under the attempt cap
   if every free candidate is over capacity: return "capped_open"
   if nothing free: return "idle"
+  log mint_attempt for pick.slug                       # same cycle
   precheck balances / contracts          # no lock
   claim submitting under STATE_LOCK      # already_minted + slots + same-slug
   tx_id, err = submit_mint_batch(calls)  # no lock

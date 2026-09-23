@@ -75,6 +75,7 @@ from buy.contracts import ContractCall, build_atomic_mint_calls
 from buy.market import MarketGateway, MintMarket
 from buy.mint_loops import (
     IntentStore,
+    held_forward_floor,
     run_job_loop,
     select_mint_candidate,
     start_mint_sell_loops,
@@ -2582,6 +2583,15 @@ def run_mint_cycle(
 
     tol = float(cfg["position_tolerance"])
     with STATE_LOCK:
+        def _fail_attempts(condition_id: str) -> int:
+            intent = (state.get("intents") or {}).get(condition_id) or {}
+            if not isinstance(intent, dict) or intent.get("status") != "failed":
+                return 0
+            try:
+                return int(intent.get("mint_attempts") or 0)
+            except (TypeError, ValueError):
+                return 0
+
         pick, status = select_mint_candidate(
             candidates,
             is_blocked=lambda condition_id: already_minted(state, condition_id, cfg, now),
@@ -2592,6 +2602,8 @@ def run_mint_cycle(
             slots_full=lambda market: mint_slots_full(
                 state, cfg, now, float(market.start_ts)
             ),
+            min_start_ts=held_forward_floor(state, now, ACTIVE_STATUSES),
+            fail_attempts=_fail_attempts,
         )
 
         if status == "capped" and pick is not None:
