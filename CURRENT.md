@@ -32,7 +32,7 @@ pathlog are **stopped / retired**. Do not start them.
 - `sell_threshold` **0.02**. Print is FAK `sell_fak_px` **0.02**, equal to `sell_floor` **0.02**, or the live bid when the book is thinner. Post-miss rest `sell_scrap_rest_px` is **0.02** (the print). `validate_strategy` requires `sell_floor` ≤ `sell_fak_px` ≤ `sell_threshold`.
 - `sell_persist_s` **5**, `sell_persist_last_min_s` **2** (window still 60s). Dump persist stays 2s.
 - `sell_persist_skip_when_sized` **false**. A sized book waits the full persist. TTM ≤ `sell_persist_skip_ttm_s` (90s) still skips.
-- `sell_late_window_s` **0** skips the late Chainlink scrap veto, including the fail-closed missing/stale path. Set it to a positive TTM in seconds (previously 120) to require side-aware edge ≥ `max(sell_oracle_edge_floor_usd, sell_oracle_edge_per_ttm × TTM)` for `sell_oracle_edge_persist_s`. Those edge knobs stay 25 / 1.5 / 3.
+- `sell_late_window_s` **0** skips the late Chainlink scrap veto. `sell_oracle_edge_floor_usd`, `sell_oracle_edge_per_ttm`, and `sell_oracle_stale_s` are **0**, so raising only the window does not restore the old $25 / 1.5×TTM / 5s-stale veto. `sell_oracle_edge_persist_s` stays **3**. `oracle_log_enabled` stays true (audit tape).
 - The sister-miss held dump is gone. No `sell_dump_if_sister_miss_s`. The bid-under-`sell_dump_below` (0.80) persist dump is unchanged. A filled normal dump sets `sell_dump_leg` (the leg A sold). Inventory already flat does not.
 - Wallet A never posts a bid. Same-wallet buyback is not implemented.
 
@@ -52,7 +52,7 @@ If that sold leg has no B bid or fill for ~10s while the window is open past can
 
 See `TECHNICAL_DESIGN.md` for the full guided tour.
 
-## Chainlink TWAP tape (+ late loser-scrap veto)
+## Chainlink TWAP tape (audit only)
 
 `oracle_log_enabled` defaults **on**. A missing key in live `strategy_mint.json` stays on; do not edit that file for this tape. While a 15m mint intent is open (including the pre-open bag and ~2 minutes after the end), mintbot appends `logs/oracle_twap.jsonl`.
 
@@ -60,7 +60,7 @@ The live path is Polymarket RTDS topic `crypto_prices_twap_sixty` for `btc/usd` 
 
 Stored samples are 15s through the middle of the window, 2s around the open and in the last 3 minutes, and 1s in the last 60s and just after the end. The recorder wakes every second while a bag is open so that tighter cadence is not stuck behind a cold sleep. A dead feed appends `oracle_log_fail` and logs the same event.
 
-**Trading use of the tape is off by default.** `sell_late_window_s` is 0, so loser scrap does not consult the TWAP. Mint eligibility, winner cash-out, and held dump do not read it either. Set `sell_late_window_s` above 0 to block a new loser post unless the side-aware edge holds for `sell_oracle_edge_persist_s` (3), fail-closed on a missing or stale tape. The recorder itself stays on.
+**The tape is audit-only.** `oracle_log_enabled` stays on. `sell_late_window_s` is 0, and `sell_oracle_edge_floor_usd`, `sell_oracle_edge_per_ttm`, and `sell_oracle_stale_s` are 0, so loser scrap does not consult the TWAP and those zeros do not re-arm the old dollar or stale veto. `sell_oracle_edge_persist_s` stays 3. Mint eligibility, winner cash-out, and held dump do not read the tape.
 
 ## Deploy boundary
 
