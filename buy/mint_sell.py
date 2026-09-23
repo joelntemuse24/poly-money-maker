@@ -16,11 +16,10 @@ Keep the winner for redeem unless its sized bid reaches ``sell_winner_min``
 (~99¢).
 
 ``sell_late_window_s`` defaults to 0, which skips the Chainlink TWAP veto
-on new loser posts. A positive window (seconds of TTM) requires a
-side-aware edge vs window open (≥ ``max(floor, per_ttm × TTM)`` for
-``sell_oracle_edge_persist_s``) before any new loser scrap post (FAK,
-blind, or rest), fail-closed on a missing or stale tape. Skip-persist
-does not bypass that veto when the window is on.
+on new loser posts. ``sell_oracle_edge_floor_usd``,
+``sell_oracle_edge_per_ttm``, ``sell_oracle_edge_persist_s``, and
+``sell_oracle_stale_s`` also default to 0, so a positive window does not
+restore the old dollar / persist / stale thresholds. The tape stays on.
 
 After the loser is sold, optional held-leg dump: if the remaining leg's sized
 bid stays under ``sell_dump_below`` (~80¢) for ``sell_dump_persist_s`` (~2s),
@@ -74,12 +73,12 @@ DEFAULT_SELL_KNOBS = {
     # Cycle sleep while a loser persist arm is live. Does not change persist_s.
     "sell_armed_poll_s": 2.0,
     # 0 skips the late-window Chainlink veto on loser scrap.
-    # A positive value is the TTM (seconds) where that veto applies.
+    # Edge knobs are 0 so a positive window does not restore the old veto.
     "sell_late_window_s": 0.0,
-    "sell_oracle_edge_per_ttm": 1.5,
-    "sell_oracle_edge_persist_s": 3.0,
-    "sell_oracle_stale_s": 5.0,
-    "sell_oracle_edge_floor_usd": 25.0,
+    "sell_oracle_edge_per_ttm": 0.0,
+    "sell_oracle_edge_persist_s": 0.0,
+    "sell_oracle_stale_s": 0.0,
+    "sell_oracle_edge_floor_usd": 0.0,
 }
 
 
@@ -658,8 +657,9 @@ def late_oracle_scrap_ok(
     outside it. Inside a positive window, fail closed on missing / stale /
     wrong-sign / thin edge. Does not apply the 3s persist arm — pair with
     ``persist_ready`` / ``late_oracle_edge_persist``. The function default
-    of 120s is the historical window used when a caller omits the argument;
-    mint strategy passes ``sell_late_window_s`` (0 unless re-enabled).
+    of 120s / $1.5 per second / $25 floor is the historical formula used
+    when a caller omits those arguments. Strategy defaults pass 0 for the
+    window and for every edge knob, so the old veto is not armed.
     """
     detail: dict = {
         "ttm": None if ttm_s is None else float(ttm_s),
