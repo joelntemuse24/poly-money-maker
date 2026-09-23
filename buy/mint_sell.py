@@ -1,24 +1,26 @@
 """Pure mint-sell policy helpers (no CLOB posts, no mintbot import).
 
-Loser dump: arm when a sized loser bid is at/under ``sell_threshold`` (~3¢)
+Loser dump: arm when a sized loser bid is at/under ``sell_threshold`` (~2¢)
 and the opposite sized bid is at/over ``sell_opposite_min`` (~90¢). Persist
 that book for ``sell_persist_s`` (~5s), or ``sell_persist_last_min_s`` (~2s)
 when time-to-end is within ``sell_persist_last_min_window_s`` (~60s). Skip
 that wait when TTM ≤ ``sell_persist_skip_ttm_s`` (~90s). Sized depth does
 not skip (``sell_persist_skip_when_sized`` default false). Then re-check
-in-range at fire and FAK ``sell_fak_px`` (~3¢) → ``sell_floor`` (~2¢) when
-the live sized bid is at/over the floor; if the live bid is below the floor,
-FAK at that live bid. Empty FAK, or a vanished loser book after arm, keeps
-``armed_ts``. On an empty keep, fire a blind 1¢ FAK (backoff
-``sell_scrap_blind_backoff_s``). After a FAK miss, rest a GTD/GTC sell at
-``sell_scrap_rest_px`` (~3¢, the print) for the remainder. Keep the winner
-for redeem unless its sized bid reaches ``sell_winner_min`` (~99¢).
+in-range at fire and FAK ``sell_fak_px`` (~2¢). That rung equals
+``sell_floor`` (~2¢) when the live sized bid is at/over the floor; if the
+live bid is below the floor, FAK at that live bid. Empty FAK, or a vanished
+loser book after arm, keeps ``armed_ts``. On an empty keep, fire a blind
+1¢ FAK (backoff ``sell_scrap_blind_backoff_s``). After a FAK miss, rest a
+GTD/GTC sell at ``sell_scrap_rest_px`` (~2¢, the print) for the remainder.
+Keep the winner for redeem unless its sized bid reaches ``sell_winner_min``
+(~99¢).
 
-In the last ``sell_late_window_s`` (~120s), also require a side-aware
-Chainlink TWAP edge vs window open (≥ ``max(floor, per_ttm × TTM)`` for
-``sell_oracle_edge_persist_s``) before any new loser scrap post (FAK, blind,
-or rest). Outside that window this module's CLOB gates are unchanged. A thin
-edge still blocks; skip-persist does not bypass the veto.
+``sell_late_window_s`` defaults to 0, which skips the Chainlink TWAP veto
+on new loser posts. A positive window (seconds of TTM) requires a
+side-aware edge vs window open (≥ ``max(floor, per_ttm × TTM)`` for
+``sell_oracle_edge_persist_s``) before any new loser scrap post (FAK,
+blind, or rest), fail-closed on a missing or stale tape. Skip-persist
+does not bypass that veto when the window is on.
 
 After the loser is sold, optional held-leg dump: if the remaining leg's sized
 bid stays under ``sell_dump_below`` (~80¢) for ``sell_dump_persist_s`` (~2s),
@@ -33,10 +35,10 @@ from typing import Any, Optional, Sequence, Tuple
 
 DEFAULT_SELL_KNOBS = {
     "sell_enabled": False,
-    "sell_threshold": 0.03,
-    # Arm ceiling is sell_threshold. The scrap print is this rung (~3¢),
-    # then the floor, or the live bid when the book is thinner.
-    "sell_fak_px": 0.03,
+    "sell_threshold": 0.02,
+    # Arm ceiling is sell_threshold. The scrap print is this rung (~2¢),
+    # equal to the floor, or the live bid when the book is thinner.
+    "sell_fak_px": 0.02,
     "sell_floor": 0.02,
     "sell_opposite_min": 0.90,
     "sell_persist_s": 5.0,
@@ -50,8 +52,8 @@ DEFAULT_SELL_KNOBS = {
     "sell_scrap_blind_px": 0.01,
     "sell_scrap_blind_backoff_s": 3.0,
     "sell_scrap_rest_enabled": True,
-    # Post-miss resting sell. Default is the ~3¢ print.
-    "sell_scrap_rest_px": 0.03,
+    # Post-miss resting sell. Default is the ~2¢ print.
+    "sell_scrap_rest_px": 0.02,
     # GTD expiration must be at least this far ahead; otherwise rest GTC.
     "sell_scrap_rest_min_ahead_s": 60.0,
     "sell_cooldown_s": 3.0,
@@ -71,8 +73,9 @@ DEFAULT_SELL_KNOBS = {
     "sell_min_bid_size": 1.0,
     # Cycle sleep while a loser persist arm is live. Does not change persist_s.
     "sell_armed_poll_s": 2.0,
-    # Late-window oracle veto on full loser scrap (TTM ≤ window only).
-    "sell_late_window_s": 120.0,
+    # 0 skips the late-window Chainlink veto on loser scrap.
+    # A positive value is the TTM (seconds) where that veto applies.
+    "sell_late_window_s": 0.0,
     "sell_oracle_edge_per_ttm": 1.5,
     "sell_oracle_edge_persist_s": 3.0,
     "sell_oracle_stale_s": 5.0,
@@ -190,7 +193,7 @@ def sell_intent_hot(intent: Any, now_s: float) -> bool:
 
     This is sell-loop scheduling only. Concurrent mint must not skip
     discovery because a bag is hot — that was the #193 serial-cycle
-    bandage. Persist waits fold typical tick/FAK lag (defaults 2.5/1/60).
+    bandage. Persist waits fold typical tick/FAK lag (defaults 5/2/60).
 
     Live audit (bag ``btc-updown-15m-1789880400``): ``poll_s=5`` plus
     manage_sells/reconcile/discover made sell ticks ≈8.6–10.5s. Persist
@@ -522,10 +525,10 @@ def loser_ladder_limits(
 ) -> Sequence[float]:
     """FAK limits. The arm ceiling is not the print.
 
-    Top rung is ``fak_px`` (~3¢) when given, otherwise ``threshold`` for
-    older callers. Each rung is clamped to the live bid, then the floor.
-    A live bid below the floor is the only rung. A 5¢ arm with ``fak_px``
-    0.03 therefore posts 3¢ → 2¢, or the live bid when the book is thinner.
+    Top rung is ``fak_px`` when given, otherwise ``threshold`` for older
+    callers. Each rung is clamped to the live bid, then the floor. A live
+    bid below the floor is the only rung. Defaults post a single 2¢ rung
+    (``fak_px`` equals ``sell_floor``). A thinner book posts the live bid.
     """
     top = round(float(threshold if fak_px is None else fak_px), 4)
     fl = round(float(floor), 4)
@@ -649,10 +652,14 @@ def late_oracle_scrap_ok(
 ) -> Tuple[bool, str, dict]:
     """Whether the late-window oracle gate currently qualifies (one tick).
 
-    Outside ``late_window_s`` returns ``(True, "outside_late_window", ...)``
-    so callers skip the gate. Inside the window, fail closed on missing /
-    stale / wrong-sign / thin edge. Does not apply the 3s persist arm —
-    pair with ``persist_ready`` / ``late_oracle_edge_persist``.
+    ``late_window_s`` <= 0 (the strategy default) returns
+    ``(True, "outside_late_window", ...)`` and skips the gate, including
+    a missing or stale tape. A positive window does the same when TTM is
+    outside it. Inside a positive window, fail closed on missing / stale /
+    wrong-sign / thin edge. Does not apply the 3s persist arm — pair with
+    ``persist_ready`` / ``late_oracle_edge_persist``. The function default
+    of 120s is the historical window used when a caller omits the argument;
+    mint strategy passes ``sell_late_window_s`` (0 unless re-enabled).
     """
     detail: dict = {
         "ttm": None if ttm_s is None else float(ttm_s),

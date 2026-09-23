@@ -6,15 +6,16 @@ No CLOB buys. No hedges. Discovers **btc-up-or-down-15m** only, mints
 and open within enter_max_ttm_min, if collateral is available.
 
 Optional sell (``sell_enabled``, default off): arm a loser scrap when the
-sized loser bid is ≤ ``sell_threshold`` (~3¢) and the opposite bid is ≥ ~90¢.
+sized loser bid is ≤ ``sell_threshold`` (~2¢) and the opposite bid is ≥ ~90¢.
 Persist ``sell_persist_s`` (~5s), or ``sell_persist_last_min_s`` (~2s) in
 the last ``sell_persist_last_min_window_s`` (~60s). Skip that wait when
 TTM ≤ ``sell_persist_skip_ttm_s`` (~90s). Sized depth does not skip
 (``sell_persist_skip_when_sized`` default false). At fire, FAK
-``sell_fak_px`` (~3¢) → ``sell_floor`` (~2¢), or the live bid when the book
-is thinner. Empty keep fires a blind 1¢ FAK (backoff ~3s). A FAK miss rests
-a GTD/GTC sell at ``sell_scrap_rest_px`` (~3¢). Wallet A never posts a bid.
-Keep the winner for redeem unless its bid reaches ~99.9¢. Off unless live
+``sell_fak_px`` (~2¢), which equals ``sell_floor`` (~2¢), or the live bid
+when the book is thinner. Empty keep fires a blind 1¢ FAK (backoff ~3s).
+A FAK miss rests a GTD/GTC sell at ``sell_scrap_rest_px`` (~2¢). Wallet A
+never posts a bid. Keep the winner for redeem unless its bid reaches
+~99.9¢. Off unless live
 ``strategy_mint.json`` turns it on. Sell and mint run as independent loops
 so Gamma/relayer work cannot steal a dump tick (bag
 ``btc-updown-15m-1789905600``). The sell loop sleeps ``sell_armed_poll_s``
@@ -26,13 +27,14 @@ edits them.
 
 A third loop records Chainlink BTC/USD 60s TWAP (Polymarket RTDS) to
 ``logs/oracle_twap.jsonl`` while a 15m bag is open. ``oracle_log_enabled``
-defaults on. In the last ``sell_late_window_s`` (~120s) before ``end_ts``,
-loser scrap also requires a side-aware TWAP edge ≥
+defaults on. ``sell_late_window_s`` defaults to 0, which skips the
+late-window loser-scrap veto entirely (including the fail-closed
+missing/stale path). A positive value is the TTM, in seconds, where a
+new loser post also requires a side-aware TWAP edge ≥
 ``max(sell_oracle_edge_floor_usd, sell_oracle_edge_per_ttm × TTM)`` for
-``sell_oracle_edge_persist_s`` (~3s), fail-closed on missing/stale tape
-(combat for true reverse ``btc-updown-15m-1790078400``). Outside that
-window the tape is audit-only. If the feed fails outside the late gate,
-the loop logs ``oracle_log_fail`` and trading continues.
+``sell_oracle_edge_persist_s``, fail-closed on missing/stale tape.
+Mint, winner cash-out, and held dump do not read the tape. If the feed
+fails, the loop logs ``oracle_log_fail`` and trading continues.
 
 Usage:
   # dry-run (default when strategy_mint.json has dry_run true / entry_enabled false)
@@ -133,13 +135,14 @@ DEFAULTS = {
     "max_open_sets": 1,
     "poll_s": 5.0,
     "sell_armed_poll_s": 2.0,
-    # Chainlink 60s TWAP tape (+ late-window loser-scrap veto only).
+    # Chainlink 60s TWAP tape. The scrap veto is off unless
+    # sell_late_window_s is positive.
     "oracle_log_enabled": True,
     "position_tolerance": 0.01,
     "require_accepting_orders": True,
     "sell_enabled": False,
-    "sell_threshold": 0.03,
-    "sell_fak_px": 0.03,
+    "sell_threshold": 0.02,
+    "sell_fak_px": 0.02,
     "sell_floor": 0.02,
     "sell_opposite_min": 0.90,
     "sell_persist_s": 5.0,
@@ -151,7 +154,7 @@ DEFAULTS = {
     "sell_scrap_blind_px": 0.01,
     "sell_scrap_blind_backoff_s": 3.0,
     "sell_scrap_rest_enabled": True,
-    "sell_scrap_rest_px": 0.03,
+    "sell_scrap_rest_px": 0.02,
     "sell_scrap_rest_min_ahead_s": 60.0,
     "sell_cooldown_s": 3.0,
     "sell_winner_min": 0.999,
@@ -169,8 +172,9 @@ DEFAULTS = {
     "sell_dump_ladder_step": 0.04,
     "sell_dump_ladder_rungs": 4,
     "sell_min_bid_size": 1.0,
-    # Late-window oracle veto on full loser scrap (TTM ≤ window only).
-    "sell_late_window_s": 120.0,
+    # 0 skips the late-window Chainlink veto on loser scrap.
+    # A positive value is the TTM (seconds) where that veto applies.
+    "sell_late_window_s": 0.0,
     "sell_oracle_edge_per_ttm": 1.5,
     "sell_oracle_edge_persist_s": 3.0,
     "sell_oracle_stale_s": 5.0,
@@ -350,7 +354,7 @@ def validate_strategy(cfg: dict) -> None:
         raise ValueError("sell_persist_last_min_s must be >= 0")
     if float(cfg.get("sell_persist_last_min_window_s") or 0) < 0:
         raise ValueError("sell_persist_last_min_window_s must be >= 0")
-    fak_px = float(cfg.get("sell_fak_px", 0.03) or 0)
+    fak_px = float(cfg.get("sell_fak_px", 0.02) or 0)
     if not (floor <= fak_px <= threshold):
         raise ValueError("sell_floor <= sell_fak_px <= sell_threshold must hold")
     if float(cfg.get("sell_persist_skip_ttm_s") or 0) < 0:
@@ -1601,7 +1605,7 @@ def _mark_loser_sold(intent: dict, leg: str, *, note: str = "") -> None:
 
 
 def manage_sells(cfg: dict, state: dict, chain: ChainReader) -> None:
-    """Loser scrap: arm ≤3¢, FAK ~3¢→2¢ or live bid; winner; held dump."""
+    """Loser scrap: arm ≤2¢, FAK at 2¢ or the live bid; winner; held dump."""
     if not cfg.get("sell_enabled"):
         return
     STATE_LOCK.acquire()
@@ -1613,7 +1617,7 @@ def manage_sells(cfg: dict, state: dict, chain: ChainReader) -> None:
 
 def _manage_sells_locked(cfg: dict, state: dict, chain: ChainReader) -> None:
     now = time.time()
-    thr = float(cfg.get("sell_threshold") or 0.03)
+    thr = float(cfg.get("sell_threshold") or 0.02)
     floor = float(cfg.get("sell_floor") or 0.02)
     opp_min = float(cfg.get("sell_opposite_min") or 0.90)
     persist_s = float(cfg.get("sell_persist_s") or 0.0)
@@ -1621,12 +1625,12 @@ def _manage_sells_locked(cfg: dict, state: dict, chain: ChainReader) -> None:
     last_min_window_s = float(cfg.get("sell_persist_last_min_window_s", 60.0))
     skip_ttm_s = float(cfg.get("sell_persist_skip_ttm_s", 90.0) or 0.0)
     skip_when_sized = bool(cfg.get("sell_persist_skip_when_sized", False))
-    fak_px = float(cfg.get("sell_fak_px", 0.03) or 0.03)
+    fak_px = float(cfg.get("sell_fak_px", 0.02) or 0.02)
     blind_enabled = bool(cfg.get("sell_scrap_blind_enabled", True))
     blind_px = float(cfg.get("sell_scrap_blind_px", 0.01) or 0.01)
     blind_backoff = float(cfg.get("sell_scrap_blind_backoff_s", 3.0) or 0.0)
     rest_enabled = bool(cfg.get("sell_scrap_rest_enabled", True))
-    rest_px = float(cfg.get("sell_scrap_rest_px", 0.03) or 0.03)
+    rest_px = float(cfg.get("sell_scrap_rest_px", 0.02) or 0.02)
     rest_ahead = float(cfg.get("sell_scrap_rest_min_ahead_s", 60.0) or 60.0)
     cooldown = float(cfg.get("sell_cooldown_s") or 3.0)
     winner_min = float(cfg.get("sell_winner_min") or 0.999)
@@ -2091,7 +2095,8 @@ def _manage_sells_locked(cfg: dict, state: dict, chain: ChainReader) -> None:
             intent["sell_loser_leg"] = loser or keep_leg or prev_leg
         persist_leg = loser or intent.get("sell_loser_leg")
 
-        late_window_s = float(cfg.get("sell_late_window_s", 120.0) or 0.0)
+        # 0 (the default) skips the veto. A missing key stays off.
+        late_window_s = float(cfg.get("sell_late_window_s", 0.0) or 0.0)
         edge_per_ttm = float(cfg.get("sell_oracle_edge_per_ttm", 1.5) or 0.0)
         edge_persist_s = float(cfg.get("sell_oracle_edge_persist_s", 3.0) or 0.0)
         stale_s = float(cfg.get("sell_oracle_stale_s", 5.0) or 0.0)

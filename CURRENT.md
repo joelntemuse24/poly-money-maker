@@ -27,15 +27,16 @@ pathlog are **stopped / retired**. Do not start them.
 
 ## Repo code defaults (23 September 2026)
 
-Scrap knobs are back to the pre-2026-09-22 rules in `strategy_mint.example.json` and `mintbot` `DEFAULTS`:
+`strategy_mint.example.json` and `mintbot` `DEFAULTS`:
 
-- `sell_threshold` **0.03**. Print stays FAK `sell_fak_px` **0.03** then `sell_floor` **0.02**, or the live bid when the book is thinner.
+- `sell_threshold` **0.02**. Print is FAK `sell_fak_px` **0.02**, equal to `sell_floor` **0.02**, or the live bid when the book is thinner. Post-miss rest `sell_scrap_rest_px` is **0.02** (the print). `validate_strategy` requires `sell_floor` ≤ `sell_fak_px` ≤ `sell_threshold`.
 - `sell_persist_s` **5**, `sell_persist_last_min_s` **2** (window still 60s). Dump persist stays 2s.
 - `sell_persist_skip_when_sized` **false**. A sized book waits the full persist. TTM ≤ `sell_persist_skip_ttm_s` (90s) still skips.
+- `sell_late_window_s` **0** skips the late Chainlink scrap veto, including the fail-closed missing/stale path. Set it to a positive TTM in seconds (previously 120) to require side-aware edge ≥ `max(sell_oracle_edge_floor_usd, sell_oracle_edge_per_ttm × TTM)` for `sell_oracle_edge_persist_s`. Those edge knobs stay 25 / 1.5 / 3.
 - The sister-miss held dump is gone. No `sell_dump_if_sister_miss_s`. The bid-under-`sell_dump_below` (0.80) persist dump is unchanged. A filled normal dump sets `sell_dump_leg` (the leg A sold). Inventory already flat does not.
 - Wallet A never posts a bid. Same-wallet buyback is not implemented.
 
-`load_strategy` overlays only keys already present in live `strategy_mint.json`. If that file still has `sell_threshold` 0.05, persist 2.5/1, or `sell_persist_skip_when_sized` true from the 22 Sep edit, those live values win until the operator patches the VM file. A leftover `sell_dump_if_sister_miss_s` key is ignored because it is no longer in `DEFAULTS`. Do not edit the live file from git.
+`load_strategy` overlays only keys already present in live `strategy_mint.json`. Keys that file already sets (`sell_threshold`, `sell_fak_px`, `sell_scrap_rest_px`, `sell_late_window_s`, persist) stay until the operator edits them. A leftover `sell_dump_if_sister_miss_s` key is ignored because it is no longer in `DEFAULTS`. Do not edit the live file from git.
 
 ## Sister scrap bidder (wallet B, opt-in, off)
 
@@ -59,7 +60,7 @@ The live path is Polymarket RTDS topic `crypto_prices_twap_sixty` for `btc/usd` 
 
 Stored samples are 15s through the middle of the window, 2s around the open and in the last 3 minutes, and 1s in the last 60s and just after the end. The recorder wakes every second while a bag is open so that tighter cadence is not stuck behind a cold sleep. A dead feed appends `oracle_log_fail` and logs the same event.
 
-**Trading use is limited to the late loser-scrap gate:** when TTM ≤ `sell_late_window_s` (120), mintbot reads the live feed + `open_ref` already tracked for the bag (no second websocket) and blocks full loser scrap unless the side-aware edge holds for `sell_oracle_edge_persist_s` (3). Mint eligibility, winner cash-out, and held dump do **not** trade on the oracle. Outside the late window the tape is audit-only.
+**Trading use of the tape is off by default.** `sell_late_window_s` is 0, so loser scrap does not consult the TWAP. Mint eligibility, winner cash-out, and held dump do not read it either. Set `sell_late_window_s` above 0 to block a new loser post unless the side-aware edge holds for `sell_oracle_edge_persist_s` (3), fail-closed on a missing or stale tape. The recorder itself stays on.
 
 ## Deploy boundary
 

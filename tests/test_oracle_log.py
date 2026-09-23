@@ -589,13 +589,13 @@ class DecisionIsolationTests(unittest.TestCase):
                     if isinstance(target, ast.Name) and target.id == "DEFAULTS":
                         defaults_value = ast.literal_eval(node.value)
         self.assertIs(defaults_value["oracle_log_enabled"], True)
-        self.assertEqual(defaults_value["sell_late_window_s"], 120.0)
+        self.assertEqual(defaults_value["sell_late_window_s"], 0.0)
         self.assertEqual(defaults_value["sell_oracle_edge_per_ttm"], 1.5)
         self.assertEqual(defaults_value["sell_oracle_edge_persist_s"], 3.0)
         self.assertEqual(defaults_value["sell_oracle_stale_s"], 5.0)
         self.assertEqual(defaults_value["sell_oracle_edge_floor_usd"], 25.0)
         self.assertIs(example["oracle_log_enabled"], True)
-        self.assertEqual(example["sell_late_window_s"], 120.0)
+        self.assertEqual(example["sell_late_window_s"], 0.0)
 
     def test_manage_sells_wires_late_oracle_veto_only(self):
         manage = _fn_source(MINT, "_manage_sells_locked")
@@ -604,6 +604,7 @@ class DecisionIsolationTests(unittest.TestCase):
         self.assertIn("sell_loser_oracle_ok", manage)
         self.assertIn("_oracle_bag_view", manage)
         self.assertIn("sell_late_window_s", manage)
+        self.assertIn("late_window_s > 0", manage)
         for token in FORBIDDEN_SELL_CYCLE:
             self.assertNotIn(token, manage, f"_manage_sells_locked contains {token}")
         # Winner / dump / mint must not grow a second oracle strategy.

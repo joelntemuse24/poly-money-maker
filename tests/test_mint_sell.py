@@ -1046,48 +1046,47 @@ class SellFireDecisionTests(unittest.TestCase):
 class LateOracleScrapGateTests(unittest.TestCase):
     """Combat for true reverse btc-updown-15m-1790078400."""
 
-    def test_default_threshold_is_three_cents(self):
-        self.assertEqual(DEFAULT_SELL_KNOBS["sell_threshold"], 0.03)
+    def test_default_threshold_is_two_cents(self):
+        thr = DEFAULT_SELL_KNOBS["sell_threshold"]
+        floor = DEFAULT_SELL_KNOBS["sell_floor"]
+        fak = DEFAULT_SELL_KNOBS["sell_fak_px"]
+        self.assertEqual(thr, 0.02)
         self.assertEqual(DEFAULT_SELL_KNOBS["sell_persist_s"], 5.0)
         self.assertEqual(DEFAULT_SELL_KNOBS["sell_persist_last_min_s"], 2.0)
         self.assertIs(DEFAULT_SELL_KNOBS["sell_persist_skip_when_sized"], False)
         self.assertNotIn("sell_dump_if_sister_miss_s", DEFAULT_SELL_KNOBS)
-        self.assertEqual(DEFAULT_SELL_KNOBS["sell_floor"], 0.02)
+        self.assertEqual(floor, 0.02)
+        self.assertEqual(fak, 0.02)
+        self.assertEqual(DEFAULT_SELL_KNOBS["sell_scrap_rest_px"], 0.02)
+        self.assertTrue(floor <= fak <= thr)
         leg, why = classify_loser(
-            up_bid=0.03, dn_bid=0.95,
-            threshold=DEFAULT_SELL_KNOBS["sell_threshold"],
+            up_bid=0.02, dn_bid=0.95,
+            threshold=thr,
             opposite_min=DEFAULT_SELL_KNOBS["sell_opposite_min"],
         )
         self.assertEqual((leg, why), ("up", "loser"))
         leg, why = classify_loser(
-            up_bid=0.04, dn_bid=0.95,
-            threshold=DEFAULT_SELL_KNOBS["sell_threshold"],
+            up_bid=0.03, dn_bid=0.95,
+            threshold=thr,
             opposite_min=DEFAULT_SELL_KNOBS["sell_opposite_min"],
         )
         self.assertEqual(why, "none")
-        self.assertEqual(DEFAULT_SELL_KNOBS["sell_fak_px"], 0.03)
-        self.assertEqual(DEFAULT_SELL_KNOBS["sell_scrap_rest_px"], 0.03)
-        # 5¢ arms. The print stays ~3¢ → 2¢, never a 5¢ sell.
-        limits = loser_ladder_limits(
-            threshold=0.05, floor=0.02, loser_bid=0.05, fak_px=0.03,
-        )
-        self.assertEqual(limits, [0.03, 0.02])
-        self.assertNotIn(0.05, limits)
+        # 2¢ arms and prints. Fak equals the floor, so the ladder is one rung.
         self.assertEqual(
             loser_ladder_limits(
-                threshold=0.05, floor=0.02, loser_bid=0.025, fak_px=0.03,
+                threshold=thr, floor=floor, loser_bid=0.02, fak_px=fak,
             ),
-            [0.025, 0.02],
+            [0.02],
         )
         self.assertEqual(
             loser_ladder_limits(
-                threshold=0.05, floor=0.02, loser_bid=0.01, fak_px=0.03,
+                threshold=thr, floor=floor, loser_bid=0.01, fak_px=fak,
             ),
             [0.01],
         )
 
     def test_defaults_include_late_oracle_knobs(self):
-        self.assertEqual(DEFAULT_SELL_KNOBS["sell_late_window_s"], 120.0)
+        self.assertEqual(DEFAULT_SELL_KNOBS["sell_late_window_s"], 0.0)
         self.assertEqual(DEFAULT_SELL_KNOBS["sell_oracle_edge_per_ttm"], 1.5)
         self.assertEqual(DEFAULT_SELL_KNOBS["sell_oracle_edge_persist_s"], 3.0)
         self.assertEqual(DEFAULT_SELL_KNOBS["sell_oracle_stale_s"], 5.0)
@@ -1156,6 +1155,19 @@ class LateOracleScrapGateTests(unittest.TestCase):
         )
         self.assertTrue(fire)
         self.assertEqual(why_p, "ready")
+
+    def test_zero_late_window_skips_gate_even_with_missing_tape(self):
+        ok, why, detail = late_oracle_scrap_ok(
+            ttm_s=42.0,
+            scrap_leg="dn",
+            twap_usd=None,
+            open_usd=None,
+            twap_age_s=None,
+            late_window_s=DEFAULT_SELL_KNOBS["sell_late_window_s"],
+        )
+        self.assertTrue(ok)
+        self.assertEqual(why, "outside_late_window")
+        self.assertIsNone(detail["need"])
 
     def test_ttm_200_oracle_gate_not_applied(self):
         ok, why, _ = late_oracle_scrap_ok(
