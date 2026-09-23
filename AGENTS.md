@@ -35,11 +35,12 @@ work.
 template: dry_run=true, entry_enabled=false, sell_enabled=false). Optional
 sell stays off until live `strategy_mint.json` sets `sell_enabled=true`.
 Loser scrap: sized opposite bid ≥ `sell_opposite_min` (~0.90), loser ≤
-`sell_threshold` (0.05) **arms**. 5¢ is the ceiling to start hunting, not
-the print. Persist `sell_persist_s` (~2.5s), or `sell_persist_last_min_s`
-(~1s) when time-to-end is within `sell_persist_last_min_window_s` (~60s).
-Skip that wait when TTM ≤ `sell_persist_skip_ttm_s` (~90s) or when bid
-depth at the FAK rung covers our size. Then re-check in-range at fire and
+`sell_threshold` (0.03) **arms**. Persist `sell_persist_s` (~5s), or
+`sell_persist_last_min_s` (~2s) when time-to-end is within
+`sell_persist_last_min_window_s` (~60s). Skip that wait when TTM ≤
+`sell_persist_skip_ttm_s` (~90s). `sell_persist_skip_when_sized` defaults
+false, so a sized book still waits the full persist. Then re-check in-range
+at fire and
 FAK `sell_fak_px` (0.03) → `sell_floor` (0.02), or the live bid when the
 book is thinner than the print. Do not post a 5¢ sell. Empty FAK or a
 vanished loser book after arm keeps `armed_ts`. On
@@ -70,12 +71,12 @@ or add 5m/hourly back to `SERIES`.
 `mintbot.py` runs sell and mint as independent loops so Gamma/relayer
 work cannot steal a dump tick. Do not re-serialize them into one
 `manage_sells → discover → sleep` cycle. Persist / last-min / window
-defaults are 2.5/1/60 (dump persist stays 2s); `sell_armed_poll_s` is
+defaults are 5/2/60 (dump persist stays 2s); `sell_armed_poll_s` is
 sell-loop cadence only. Live `strategy_mint.json` still wins for keys it
-already sets (`sell_threshold`, `sell_persist_s`, `sell_persist_last_min_s`
-were 0.03 / 5 / 2 on the 19 Sep snapshot). New keys absent from that file
-(`sell_fak_px`, skip-persist, blind, rest) take these defaults after the
-operator pulls and restarts. Do not edit live JSON from this repo.
+already sets. Code defaults match the pre-2026-09-22 scrap rules
+(`sell_threshold` 0.03, persist 5 / 2, sized-skip off). New keys absent
+from the live file take these defaults after the operator pulls and
+restarts. Do not edit live JSON from this repo.
 
 Wallet A (mintbot) never posts a bid. There is no same-wallet buyback.
 `scrapbidder.py` is a separate process for wallet B. Cap is 20 shares
@@ -94,11 +95,16 @@ still cancel by T−`cancel_ttm_s`. A's `sell_scrap_rest_id` does not
 block that leg, and the last-`active_ttm_s` (~180s) window does not apply
 to that post-scrap hedge. Still cancel by T−`cancel_ttm_s` (~20s). The
 winner leg A still holds stays blocked. Markets A never held are not
-bid (`bid_absent_enabled` defaults false). If B has
-not matched any shares within `sell_dump_if_sister_miss_s` (10s, 0
-disables) of A's confirmed scrap, mintbot dumps the held leg
-(`sell_dump_sister_miss`). Any B fill skips that timeout. The held-leg
-dump under `sell_dump_below` still applies later. If sold_loser on L
+bid (`bid_absent_enabled` defaults false). There is no sister-miss held
+dump. The normal held dump under `sell_dump_below` still applies. When
+that dump fills, mintbot sets `sell_dump_leg` and B FAK-buys
+`dump_hedge_shares` (10) of the other leg, with its own
+`dump_hedge_fak_min_notional` / `dump_hedge_fak_max_notional` (default
+$1.00–$1.50, so 10 shares price in 10¢–15¢, or a non-crossing rest at
+`dump_hedge_rest_px` 10¢). That clip is separate from the 20-share scrap
+bid. If B's pUSD is under `topup_need_usd` (~$1.50) or a place fails
+balance/allowance, `sister_topup.py` moves `topup_usd` ($5) of pUSD from
+A's proxy to B's deposit wallet once per broke episode. If sold_loser on L
 has no B bid or fill and the window is still open past cancel, log
 `scrapbid_miss` (condition, leg, ttm, age) after ~10s, throttled ~30s.
 Poll drops to `poll_hot_s` (~1s) while that gap is open. Each pass
@@ -117,7 +123,7 @@ Shared `buy/` helpers exist for mint, pathlog, and the recording-only oracle tap
 - `buy/mint_loops.py` — concurrent sell vs mint job runner + intent claim
 - `buy/market.py` — Gamma/CLOB discovery (`mintbot`, `pathlog`)
 - `buy/chain.py` — Polygon eth_call prechecks (`mintbot`)
-- `buy/contracts.py` — atomic mint calldata (`mintbot`)
+- `buy/contracts.py` — atomic mint calldata (`mintbot`) and the pUSD transfer used by the A→B top-up
 - `buy/oracle_log.py` — Chainlink BTC/USD 60s TWAP tape
   (`logs/oracle_twap.jsonl`) plus read-only `bag_view` for the late
   loser-scrap veto. Not an input to mint, winner, dump, or sell outside
@@ -128,8 +134,10 @@ Shared `buy/` helpers exist for mint, pathlog, and the recording-only oracle tap
   Otherwise rest at `bid_rest_px` (5¢) only if that rest does not cross
   the ask. GTD when expiration is ≥ ~180s ahead, else GTC. No escalate
   ladder. A's rest and the 180s window do not block that leg; cancel
-  near expiry. `scrapbidder.py` posts the orders. Mint reads B's
-  `positions_scrapbid.json` fills only for the sister-miss held dump.
+  near expiry. After A sets `sell_dump_leg`, B buys 10 shares of the
+  other leg (`plan_dump_hedges`). `scrapbidder.py` posts both.
+- `buy/sister_topup.py` — one $5 pUSD top-up from A to B per broke episode.
+  `sister_topup.py` submits the PROXY batch. Scrapbidder spawns it.
 
 Do not restore retired buybot modules (`entry_skip`, `hedge_gate`,
 `btc_price`, `clob_book_ws`, `depth_ladder`, `strategy_coherence`,

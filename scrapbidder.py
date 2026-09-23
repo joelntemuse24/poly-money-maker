@@ -16,6 +16,7 @@ import fcntl
 import json
 import os
 import signal
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -32,12 +33,14 @@ from buy.sister_bid import (
     SISTER_DEFAULTS,
     buy_matched_shares,
     markets_needing_books,
+    plan_dump_hedges,
     plan_sister_bids,
     resolve_sister_client_config,
     sister_book_wanted,
     sister_miss_events,
     sister_poll_s,
 )
+from buy.sister_topup import place_error_is_broke
 
 
 REPO = Path(__file__).resolve().parent
@@ -115,6 +118,28 @@ def load_strategy(path: Path = STRATEGY_FILE) -> dict:
     # A copied example that still says 60s would post a GTD Polymarket rejects.
     if float(cfg["min_gtd_ahead_s"]) < 180:
         cfg["min_gtd_ahead_s"] = 180.0
+    dump_shares = float(cfg["dump_hedge_shares"])
+    if not 0 < dump_shares <= 50:
+        raise ValueError("dump_hedge_shares must be in (0, 50]")
+    dump_rest = float(cfg["dump_hedge_rest_px"])
+    if not 0 < dump_rest < 1:
+        raise ValueError("dump_hedge_rest_px must be in (0, 1)")
+    dump_min = float(cfg["dump_hedge_fak_min_notional"])
+    if dump_min <= 0:
+        raise ValueError("dump_hedge_fak_min_notional must be > 0")
+    dump_max = float(cfg["dump_hedge_fak_max_notional"])
+    if dump_max + 1e-12 < dump_min:
+        raise ValueError("dump_hedge_fak_max_notional must be >= dump_hedge_fak_min_notional")
+    topup_usd = float(cfg["topup_usd"])
+    if not 0 < topup_usd <= 50:
+        raise ValueError("topup_usd must be in (0, 50]")
+    topup_need = float(cfg["topup_need_usd"])
+    if not 0 < topup_need <= 50:
+        raise ValueError("topup_need_usd must be in (0, 50]")
+    if float(cfg["topup_retry_s"]) < 0:
+        raise ValueError("topup_retry_s must be >= 0")
+    if float(cfg["topup_check_s"]) < 1:
+        raise ValueError("topup_check_s must be >= 1")
     if float(cfg["active_ttm_s"]) <= float(cfg["cancel_ttm_s"]):
         raise ValueError("active_ttm_s must be > cancel_ttm_s")
     if float(cfg["cancel_ttm_s"]) < 0:
@@ -302,13 +327,34 @@ def _poll_order(order_id: str, shares: float):
     return 0.0, status
 
 
-def _add_filled(state: dict, cid: str, leg: str, shares: float) -> None:
+def _merged_open_orders(state: dict) -> dict:
+    """Scrap and dump rests, so a dump-only order still gets a book quote."""
+    merged: dict = {}
+    for key in ("orders", "dump_orders"):
+        block = state.get(key) or {}
+        if not isinstance(block, dict):
+            continue
+        for cid, legs in block.items():
+            slot = merged.setdefault(str(cid), {})
+            if isinstance(legs, dict):
+                slot.update(legs)
+    return merged
+
+
+def _bucket(state: dict, book: str, kind: str) -> dict:
+    """``orders`` / ``filled`` for scrap, ``dump_orders`` / ``dump_filled`` for dump."""
+    key = f"dump_{kind}" if book == "dump" else kind
+    slot = state.setdefault(key, {})
+    if not isinstance(slot, dict):
+        slot = {}
+        state[key] = slot
+    return slot
+
+
+def _add_filled(state: dict, cid: str, leg: str, shares: float, book: str = "scrap") -> None:
     if shares <= 0 or not cid or not leg:
         return
-    filled = state.setdefault("filled", {})
-    if not isinstance(filled, dict):
-        filled = {}
-        state["filled"] = filled
+    filled = _bucket(state, book, "filled")
     slot = filled.setdefault(cid, {})
     if not isinstance(slot, dict):
         slot = {}
@@ -320,20 +366,89 @@ def _add_filled(state: dict, cid: str, leg: str, shares: float) -> None:
     slot[leg] = round(prev + float(shares), 4)
 
 
-def apply_actions(actions: list, state: dict, *, dry_run: bool) -> None:
-    orders = state.setdefault("orders", {})
+def _sync_collateral() -> None:
+    """Refresh B's CLOB pUSD cache so a top-up is spendable on the next place."""
+    try:
+        from py_clob_client_v2 import AssetType, BalanceAllowanceParams
+
+        _get_client().update_balance_allowance(
+            BalanceAllowanceParams(asset_type=AssetType.COLLATERAL)
+        )
+    except Exception as exc:
+        _log("scrapbid_allowance_warn", error=str(exc)[:160])
+
+
+_last_topup_spawn = 0.0
+_last_topup_force = 0.0
+
+
+def _maybe_topup(
+    cfg: dict,
+    *,
+    force_broke: bool,
+    cleared: bool,
+    reason: str,
+    want: bool,
+) -> None:
+    """Spawn the A→B top-up script. Dry-run only logs. Throttled per kind."""
+    global _last_topup_spawn, _last_topup_force
+    if not bool(cfg.get("topup_enabled", True)):
+        return
+    if not want and not force_broke and not cleared:
+        return
+    now = time.time()
+    wait = float(cfg.get("topup_check_s") or 15)
+    if force_broke:
+        if now < _last_topup_force + wait:
+            return
+        _last_topup_force = now
+    else:
+        if now < _last_topup_spawn + wait:
+            return
+        _last_topup_spawn = now
+    if bool(cfg.get("dry_run", True)):
+        _log(
+            "sister_topup_dry",
+            reason=reason,
+            force_broke=bool(force_broke),
+            cleared=bool(cleared),
+        )
+        return
+    cmd = [
+        sys.executable,
+        str(REPO / "sister_topup.py"),
+        "--once",
+        "--live",
+        "--reason",
+        str(reason or "hedge"),
+    ]
+    if force_broke:
+        cmd.append("--force-broke")
+    if cleared:
+        cmd.append("--cleared")
+    try:
+        subprocess.run(cmd, check=False, timeout=40, cwd=str(REPO))
+    except Exception as exc:
+        _log("sister_topup_spawn_fail", error=str(exc)[:160])
+
+
+def apply_actions(actions: list, state: dict, *, dry_run: bool) -> bool:
+    """Apply the plan. Returns true when a place failed for balance or allowance."""
     skips = state.setdefault("skip_why", {})
+    broke = False
     for action in actions:
         cid = str(action.get("condition_id") or "")
         leg = str(action.get("leg") or "")
         op = action.get("op")
+        book = "dump" if action.get("book") == "dump" else "scrap"
+        orders = _bucket(state, book, "orders")
         slot = orders.setdefault(cid, {})
         if op == "skip":
-            key = f"{cid}:{leg}"
+            key = f"{book}:{cid}:{leg}"
             reason = action.get("reason")
             if skips.get(key) != reason:
                 skips[key] = reason
-                _log("scrapbid_skip", **{k: action.get(k) for k in (
+                _log("scrapbid_skip", book=book, **{k: action.get(k) for k in (
                     "condition_id", "leg", "reason", "slug", "ttm_s",
                 )})
             continue
@@ -358,12 +473,13 @@ def apply_actions(actions: list, state: dict, *, dry_run: bool) -> None:
             matched, status = _poll_order(oid, float((slot.get(leg) or {}).get("size") or 0))
             if status in {"filled", "cancelled"}:
                 if matched > 0:
-                    _add_filled(state, cid, leg, matched)
+                    _add_filled(state, cid, leg, matched, book)
                 slot.pop(leg, None)
                 _log(
                     "scrapbid_done",
                     condition_id=cid,
                     leg=leg,
+                    book=book,
                     order_id=oid,
                     status=status,
                     matched=matched,
@@ -388,12 +504,17 @@ def apply_actions(actions: list, state: dict, *, dry_run: bool) -> None:
                     int(action.get("expiration") or 0),
                 )
             except Exception as exc:
+                message = str(exc)[:200]
+                if place_error_is_broke(message):
+                    broke = True
                 _log(
                     "scrapbid_place_fail",
                     condition_id=cid,
                     leg=leg,
-                    error=str(exc)[:200],
+                    book=book,
+                    error=message,
                     slug=action.get("slug"),
+                    broke=place_error_is_broke(message),
                 )
                 continue
             if tif == "FAK" and matched <= 0 and oid:
@@ -403,11 +524,12 @@ def apply_actions(actions: list, state: dict, *, dry_run: bool) -> None:
                     status = polled_status or status
         if tif == "FAK" and not dry_run:
             if matched > 0:
-                _add_filled(state, cid, leg, matched)
+                _add_filled(state, cid, leg, matched, book)
             _log(
                 "scrapbid_take",
                 condition_id=cid,
                 leg=leg,
+                book=book,
                 order_id=oid,
                 price=price,
                 shares=shares,
@@ -421,7 +543,7 @@ def apply_actions(actions: list, state: dict, *, dry_run: bool) -> None:
             )
             continue
         if not oid:
-            _log("scrapbid_place_fail", condition_id=cid, leg=leg, status=status)
+            _log("scrapbid_place_fail", condition_id=cid, leg=leg, book=book, status=status)
             continue
         slot[leg] = {
             "order_id": oid,
@@ -435,6 +557,7 @@ def apply_actions(actions: list, state: dict, *, dry_run: bool) -> None:
             "scrapbid_place",
             condition_id=cid,
             leg=leg,
+            book=book,
             order_id=oid,
             price=price,
             shares=shares,
@@ -446,6 +569,7 @@ def apply_actions(actions: list, state: dict, *, dry_run: bool) -> None:
             dry_run=dry_run,
             status=status,
         )
+    return broke
 
 
 def _mint_intents() -> dict:
@@ -496,6 +620,8 @@ def run_once(cfg: dict, now: Optional[float] = None) -> float:
     state = _read_json(STATE_FILE)
     if not isinstance(state.get("orders"), dict):
         state["orders"] = {}
+    if not isinstance(state.get("dump_orders"), dict):
+        state["dump_orders"] = {}
     discovered = []
     try:
         gateway = MarketGateway(
@@ -515,7 +641,7 @@ def run_once(cfg: dict, now: Optional[float] = None) -> float:
     except Exception as exc:
         _log("scrapbid_discover_fail", error=str(exc)[:200])
     markets = merge_markets(discovered, intents, now_s)
-    orders = state.get("orders") or {}
+    orders = _merged_open_orders(state)
     fetched = _fill_books(markets, intents, orders, now_s, cfg)
     intents = _mint_intents()
     if wall:
@@ -537,6 +663,8 @@ def run_once(cfg: dict, now: Optional[float] = None) -> float:
     )
     if not isinstance(state.get("filled"), dict):
         state["filled"] = {}
+    if not isinstance(state.get("dump_filled"), dict):
+        state["dump_filled"] = {}
     filled = state["filled"]
     actions = plan_sister_bids(
         markets=wanted,
@@ -556,7 +684,39 @@ def run_once(cfg: dict, now: Optional[float] = None) -> float:
         absent_enabled=bool(cfg.get("bid_absent_enabled", False)),
         filled_shares=filled,
     )
-    apply_actions(actions, state, dry_run=bool(cfg.get("dry_run")))
+    actions.extend(
+        plan_dump_hedges(
+            markets=wanted,
+            intents=intents,
+            open_orders=state.get("dump_orders") or {},
+            now_s=now_s,
+            shares=float(cfg.get("dump_hedge_shares") or 10),
+            bid_rest_px=float(cfg.get("dump_hedge_rest_px") or 0.10),
+            cancel_ttm_s=float(cfg["cancel_ttm_s"]),
+            min_gtd_ahead_s=max(180.0, float(cfg["min_gtd_ahead_s"])),
+            fak_min_notional=float(cfg.get("dump_hedge_fak_min_notional") or 1.0),
+            fak_max_notional=float(cfg.get("dump_hedge_fak_max_notional") or 1.5),
+            enabled=bool(cfg.get("bid_enabled")) and bool(cfg.get("dump_hedge_enabled", True)),
+            take_enabled=bool(cfg.get("bid_take_enabled", True)),
+            filled_shares=state.get("dump_filled") or {},
+        )
+    )
+    want_place = any(row.get("op") == "place" for row in actions)
+    dry_run = bool(cfg.get("dry_run"))
+    if want_place and not dry_run:
+        _sync_collateral()
+    _maybe_topup(
+        cfg, force_broke=False, cleared=False, reason="hedge", want=want_place,
+    )
+    broke = apply_actions(actions, state, dry_run=dry_run)
+    if broke:
+        _maybe_topup(
+            cfg, force_broke=True, cleared=False, reason="place_fail", want=True,
+        )
+    elif want_place:
+        _maybe_topup(
+            cfg, force_broke=False, cleared=True, reason="place_ok", want=True,
+        )
     if bool(cfg.get("bid_enabled")):
         events, flat_at, emit_at = sister_miss_events(
             intents=intents,
@@ -586,6 +746,9 @@ def run_once(cfg: dict, now: Optional[float] = None) -> float:
         enabled=bool(cfg.get("bid_enabled")),
         filled_shares=filled,
         shares=float(cfg.get("shares") or 20.0),
+        dump_shares=float(cfg.get("dump_hedge_shares") or 0),
+        dump_filled=state.get("dump_filled") or {},
+        dump_orders=state.get("dump_orders") or {},
     )
 
 
@@ -607,6 +770,12 @@ def main() -> None:
         min_gtd_ahead_s=cfg.get("min_gtd_ahead_s"),
         bid_take_enabled=bool(cfg.get("bid_take_enabled", True)),
         bid_absent_enabled=bool(cfg.get("bid_absent_enabled", False)),
+        dump_hedge_enabled=bool(cfg.get("dump_hedge_enabled", True)),
+        dump_hedge_shares=cfg.get("dump_hedge_shares"),
+        dump_hedge_fak_max_notional=cfg.get("dump_hedge_fak_max_notional"),
+        topup_enabled=bool(cfg.get("topup_enabled", True)),
+        topup_usd=cfg.get("topup_usd"),
+        topup_need_usd=cfg.get("topup_need_usd"),
     )
     LOCK_FILE.parent.mkdir(parents=True, exist_ok=True)
     lock_fh = open(LOCK_FILE, "a+", encoding="utf-8")

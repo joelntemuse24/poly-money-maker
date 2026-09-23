@@ -13,7 +13,12 @@ the ask would be marketable and get rejected under $1. GTD is used when
 expiration is at least ~180s ahead; otherwise GTC, still cancelled near
 expiry. There is no escalate ladder. Markets A never held are not
 bid unless ``bid_absent_enabled`` (default off). The winner leg A
-still holds stays blocked. B never mints and never sells.
+still holds stays blocked.
+
+When A finishes a normal held dump (``sold_dump`` and ``sell_dump_leg``),
+B FAK-buys ``dump_hedge_shares`` (10) of the other leg. That clip is
+separate from the 20-share scrap bid. Same $1 floor and max-notional
+cap (``dump_hedge_fak_*``). B never mints and never sells.
 
 Same-wallet buyback is intentionally not here.
 """
@@ -46,6 +51,19 @@ SISTER_DEFAULTS = {
     # Off: B bids only after A sold_loser on that leg. On: late-window
     # cheap-side bids on markets A never held.
     "bid_absent_enabled": False,
+    # After A normal-dumps leg L, B buys dump_hedge_shares of the other leg.
+    "dump_hedge_enabled": True,
+    "dump_hedge_shares": 10.0,
+    # 10sh × 10¢ = $1.00, so a resting bid clears the CLOB min notional.
+    "dump_hedge_rest_px": 0.10,
+    "dump_hedge_fak_min_notional": 1.0,
+    "dump_hedge_fak_max_notional": 1.5,
+    # One $5 collateral move from A when B cannot fund a hedge. See sister_topup.
+    "topup_enabled": True,
+    "topup_usd": 5.0,
+    "topup_need_usd": 1.5,
+    "topup_retry_s": 120.0,
+    "topup_check_s": 15.0,
     "active_ttm_s": 180.0,
     "cancel_ttm_s": 20.0,
     # Polymarket rejects a GTD that expires inside ~180s. Shorter → GTC.
@@ -193,6 +211,12 @@ def sister_book_wanted(
     if ttm <= float(cancel_ttm_s) + 1e-12:
         return False
     if isinstance(intent, dict) and _sold_leg(intent) is not None:
+        return True
+    if (
+        isinstance(intent, dict)
+        and intent.get("sold_dump")
+        and intent.get("sell_dump_leg") in ("up", "dn")
+    ):
         return True
     return ttm <= float(active_ttm_s) + 1e-12
 
@@ -530,6 +554,184 @@ def plan_sister_bids(
     return actions
 
 
+def other_leg(leg: Any) -> Optional[str]:
+    """The opposite outcome. ``up`` ↔ ``dn``."""
+    if leg == "up":
+        return "dn"
+    if leg == "dn":
+        return "up"
+    return None
+
+
+def dump_hedge_leg(intent: Any) -> Optional[str]:
+    """Leg B buys after A's normal held dump.
+
+    Mintbot sets ``sell_dump_leg`` only when the under-``sell_dump_below``
+    dump actually fills. ``sold_dump`` without that leg (inventory already
+    flat) and a winner cash-out (``sold_winner`` only) do not qualify.
+    The buy is the other leg: A dumps UP → B buys DN.
+    """
+    if not isinstance(intent, dict) or not intent.get("sold_dump"):
+        return None
+    dumped = intent.get("sell_dump_leg")
+    if dumped not in ("up", "dn"):
+        return None
+    return other_leg(dumped)
+
+
+def plan_dump_hedges(
+    *,
+    markets: Sequence[dict],
+    intents: Optional[dict],
+    open_orders: Optional[dict],
+    now_s: float,
+    shares: float = 10.0,
+    bid_rest_px: float = 0.10,
+    cancel_ttm_s: float = 20.0,
+    min_gtd_ahead_s: float = 180.0,
+    fak_min_notional: float = 1.0,
+    fak_max_notional: float = 1.5,
+    enabled: bool = True,
+    take_enabled: bool = True,
+    filled_shares: Optional[dict] = None,
+) -> list[dict]:
+    """10-share buy of the leg A did not dump. Does not post.
+
+    Separate from the scrap bid (``plan_sister_bids``). Rows carry
+    ``book="dump"`` so the runner can keep its own orders and fills.
+    Absent markets are not bid.
+    """
+    intents = intents or {}
+    open_orders = open_orders or {}
+    actions: list[dict] = []
+    size = float(shares or 0)
+    rest_px = round(float(bid_rest_px or 0), 4)
+    lo = float(fak_min_notional or 0)
+    hi = float(fak_max_notional or 0)
+    # Take ceiling is max notional / size. Rest must be allowed up to that
+    # or the configured rest, whichever is higher, so a $1 rest is not clipped.
+    ceil_px = (hi / size) if size > 0 and hi > 0 else rest_px
+    cap = round(max(rest_px, ceil_px), 4)
+    if size > 0 and lo > 0:
+        floor_rest = round(lo / size, 4)
+        if rest_px + 1e-12 < floor_rest:
+            rest_px = floor_rest
+            cap = round(max(cap, rest_px), 4)
+    for market in markets:
+        if not isinstance(market, dict):
+            continue
+        cid = str(market.get("condition_id") or "")
+        if not cid:
+            continue
+        end_ts = float(market.get("end_ts") or 0)
+        ttm = (end_ts - float(now_s)) if end_ts else None
+        window_open = ttm is not None and ttm > 0
+        intent = intents.get(cid)
+        hedge = dump_hedge_leg(intent)
+        orders = open_orders.get(cid) or {}
+        if not isinstance(orders, dict):
+            orders = {}
+        asks = {"up": market.get("up_ask"), "dn": market.get("dn_ask")}
+        bids = {"up": market.get("up_bid"), "dn": market.get("dn_bid")}
+        tokens = {"up": market.get("up_token"), "dn": market.get("dn_token")}
+        for leg in ("up", "dn"):
+            order = orders.get(leg) if isinstance(orders.get(leg), dict) else None
+            order_id = str(order.get("order_id") or "") if order else ""
+            wanted = hedge == leg
+            base = {
+                "condition_id": cid,
+                "leg": leg,
+                "slug": market.get("slug"),
+                "token_id": tokens.get(leg),
+                "ttm_s": ttm,
+                "book": "dump",
+            }
+            if not wanted:
+                if order_id:
+                    actions.append({
+                        **base, "op": "cancel", "reason": "not_dump_leg", "order_id": order_id,
+                    })
+                continue
+            cancel, cancel_why = sister_cancel_due(
+                ttm_s=ttm, cancel_ttm_s=cancel_ttm_s, window_open=window_open
+            )
+            if order_id and (not enabled or cancel):
+                reason = "disabled" if not enabled else cancel_why
+                actions.append({**base, "op": "cancel", "reason": reason, "order_id": order_id})
+                continue
+            if order_id:
+                actions.append({**base, "op": "keep", "reason": "resting", "order_id": order_id})
+                continue
+            if not enabled:
+                actions.append({**base, "op": "skip", "reason": "disabled"})
+                continue
+            if not window_open:
+                actions.append({**base, "op": "skip", "reason": "window_end"})
+                continue
+            if cancel:
+                actions.append({**base, "op": "skip", "reason": cancel_why})
+                continue
+            already = _leg_filled(filled_shares, cid, leg)
+            remaining = round(max(0.0, size - already), 4)
+            if size > 0 and remaining < 0.01:
+                actions.append({**base, "op": "skip", "reason": "filled"})
+                continue
+            if remaining <= 0 or cap <= 0 or not tokens.get(leg):
+                actions.append({**base, "op": "skip", "reason": "bad_order"})
+                continue
+            # A short remainder still has to clear $1, so lift the rest.
+            use_rest = rest_px
+            if remaining > 0 and lo > 0:
+                floor_rest = round(lo / remaining, 4)
+                if use_rest + 1e-12 < floor_rest:
+                    use_rest = floor_rest
+            use_cap = round(max(cap, use_rest), 4)
+            style, price, price_why = sister_quote(
+                bid=bids.get(leg),
+                ask=asks.get(leg),
+                bid_max_px=use_cap,
+                bid_rest_px=use_rest,
+                take_enabled=bool(take_enabled),
+                shares=remaining,
+                fak_min_notional=lo,
+                fak_max_notional=hi,
+            )
+            if style == "wait":
+                actions.append({**base, "op": "skip", "reason": price_why})
+                continue
+            if style == "take" and remaining > 0 and hi > 0:
+                ceiling = hi / remaining
+            else:
+                ceiling = max(use_cap, use_rest)
+            if price <= 0 or price > ceiling + 1e-9:
+                actions.append({**base, "op": "skip", "reason": "bad_order"})
+                continue
+            if style == "take":
+                tif, exp, tif_why = "FAK", 0, "fak"
+            else:
+                tif, exp = resting_tif(
+                    now_s=now_s,
+                    expire_ts=float(end_ts) - float(cancel_ttm_s),
+                    min_ahead_s=min_gtd_ahead_s,
+                )
+                tif_why = "gtd" if tif == "GTD" else "gtc_short_expiry"
+            actions.append(
+                {
+                    **base,
+                    "op": "place",
+                    "reason": "a_dump",
+                    "price_why": price_why,
+                    "style": style,
+                    "price": price,
+                    "shares": remaining,
+                    "tif": tif,
+                    "tif_why": tif_why,
+                    "expiration": exp,
+                }
+            )
+    return actions
+
+
 def _finite_ts(value: Any) -> Optional[float]:
     try:
         ts = float(value)
@@ -657,8 +859,11 @@ def sister_poll_s(
     enabled: bool = True,
     filled_shares: Optional[dict] = None,
     shares: float = 20.0,
+    dump_shares: float = 0.0,
+    dump_filled: Optional[dict] = None,
+    dump_orders: Optional[dict] = None,
 ) -> float:
-    """Idle poll, or the hot cadence while a sold leg still needs a B bid."""
+    """Idle poll, or the hot cadence while a sold or dumped leg still needs a B bid."""
     idle = max(0.2, float(poll_s or 0))
     if not enabled:
         return idle
@@ -684,4 +889,10 @@ def sister_poll_s(
             if _order_id(open_orders, str(cid), leg):
                 continue
             return min(idle, hot)
+        hedge = dump_hedge_leg(intent)
+        dump_size = float(dump_shares or 0)
+        if hedge and dump_size > 0:
+            if _leg_filled(dump_filled, str(cid), hedge) + 1e-9 < dump_size:
+                if not _order_id(dump_orders, str(cid), hedge):
+                    return min(idle, hot)
     return idle

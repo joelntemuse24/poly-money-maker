@@ -16,6 +16,8 @@ from buy.sister_bid import (
     a_token_flat,
     buy_matched_shares,
     markets_needing_books,
+    dump_hedge_leg,
+    plan_dump_hedges,
     plan_sister_bids,
     sister_book_wanted,
     sister_quote,
@@ -312,6 +314,13 @@ class SisterAuthTests(unittest.TestCase):
         self.assertEqual(SISTER_DEFAULTS["miss_throttle_s"], 30.0)
         self.assertIs(SISTER_DEFAULTS["bid_take_enabled"], True)
         self.assertIs(SISTER_DEFAULTS["bid_absent_enabled"], False)
+        self.assertIs(SISTER_DEFAULTS["dump_hedge_enabled"], True)
+        self.assertEqual(SISTER_DEFAULTS["dump_hedge_shares"], 10.0)
+        self.assertEqual(SISTER_DEFAULTS["dump_hedge_rest_px"], 0.10)
+        self.assertEqual(SISTER_DEFAULTS["dump_hedge_fak_min_notional"], 1.0)
+        self.assertEqual(SISTER_DEFAULTS["dump_hedge_fak_max_notional"], 1.5)
+        self.assertEqual(SISTER_DEFAULTS["topup_usd"], 5.0)
+        self.assertEqual(SISTER_DEFAULTS["topup_need_usd"], 1.5)
         example = json.loads(
             (ROOT / "strategy_scrapbid.example.json").read_text(encoding="utf-8")
         )
@@ -323,6 +332,11 @@ class SisterAuthTests(unittest.TestCase):
         self.assertEqual(example["bid_fak_max_notional"], 1.5)
         self.assertEqual(example["min_gtd_ahead_s"], 180.0)
         self.assertEqual(example["shares"], 20.0)
+        self.assertEqual(example["dump_hedge_shares"], 10.0)
+        self.assertIs(example["dump_hedge_enabled"], True)
+        self.assertIs(example["bid_absent_enabled"], False)
+        self.assertEqual(example["topup_usd"], 5.0)
+        self.assertEqual(example["topup_need_usd"], 1.5)
         self.assertEqual(sister_leg_filled({"cid": {"up": 3}}, "cid", "up"), 3.0)
         self.assertEqual(sister_leg_filled({}, "cid", "up"), 0.0)
 
@@ -358,6 +372,8 @@ class SisterAuthTests(unittest.TestCase):
         self.assertIn("OrderType.FAK", src)
         self.assertIn("bid_take_enabled", src)
         self.assertIn("bid_absent_enabled", src)
+        self.assertIn("plan_dump_hedges", src)
+        self.assertIn("sister_topup.py", src)
         self.assertIn("bid_rest_px", src)
         self.assertIn("tif_why", src)
         self.assertNotIn("no_fill_dwell", src)
@@ -382,6 +398,7 @@ class SisterAuthTests(unittest.TestCase):
         self.assertLess(first_books, second_read)
         self.assertLess(second_read, second_books)
         self.assertLess(second_books, calls.index("plan_sister_bids"))
+        self.assertLess(calls.index("plan_sister_bids"), calls.index("plan_dump_hedges"))
         self.assertNotIn("submit_mint", src)
         self.assertIn("scrapbid_miss", src)
         self.assertIn("sister_poll_s", src)
@@ -909,6 +926,152 @@ class RestCapAndGtcTests(unittest.TestCase):
         src = (ROOT / "buy" / "sister_bid.py").read_text(encoding="utf-8")
         self.assertNotIn("no_fill_dwell", src)
         self.assertNotIn("bid_escalate", src)
+
+
+def _dumped_up():
+    """A scrapped DN, then normal-dumped the held UP leg."""
+    return {
+        "status": "confirmed",
+        "sold_loser": True,
+        "sold_leg": "dn",
+        "sold_dump": True,
+        "sell_dump_leg": "up",
+        "end_ts": 10_000.0,
+    }
+
+
+class DumpHedgeTests(unittest.TestCase):
+    def test_dump_up_buys_ten_dn(self):
+        now = 10_000.0 - 100.0
+        self.assertEqual(dump_hedge_leg(_dumped_up()), "dn")
+        actions = plan_dump_hedges(
+            markets=[_market(dn_bid=0.04, dn_ask=0.08, up_bid=0.70, up_ask=0.72)],
+            intents={"cid": _dumped_up()},
+            open_orders={},
+            now_s=now,
+            enabled=True,
+        )
+        places = [row for row in actions if row["op"] == "place"]
+        self.assertEqual(len(places), 1)
+        self.assertEqual(places[0]["leg"], "dn")
+        self.assertEqual(places[0]["shares"], 10.0)
+        self.assertEqual(places[0]["book"], "dump")
+        self.assertEqual(places[0]["reason"], "a_dump")
+        self.assertEqual(places[0]["style"], "take")
+        self.assertEqual(places[0]["price"], 0.10)
+        self.assertEqual(places[0]["price_why"], "fak_floor")
+        self.assertEqual(places[0]["tif"], "FAK")
+
+    def test_dump_dn_buys_ten_up(self):
+        now = 10_000.0 - 100.0
+        intent = {
+            "status": "confirmed",
+            "sold_loser": True,
+            "sold_leg": "up",
+            "sold_dump": True,
+            "sell_dump_leg": "dn",
+            "end_ts": 10_000.0,
+        }
+        actions = plan_dump_hedges(
+            markets=[_market(up_bid=0.20, up_ask=0.12, dn_bid=0.70, dn_ask=0.72)],
+            intents={"cid": intent},
+            open_orders={},
+            now_s=now,
+            enabled=True,
+        )
+        places = [row for row in actions if row["op"] == "place"]
+        self.assertEqual([row["leg"] for row in places], ["up"])
+        self.assertEqual(places[0]["shares"], 10.0)
+        self.assertEqual(places[0]["price"], 0.12)
+        self.assertEqual(places[0]["price_why"], "live_ask")
+
+    def test_rich_other_side_rests_under_the_ask(self):
+        now = 10_000.0 - 100.0
+        actions = plan_dump_hedges(
+            markets=[_market(dn_bid=0.70, dn_ask=0.72)],
+            intents={"cid": _dumped_up()},
+            open_orders={},
+            now_s=now,
+            enabled=True,
+        )
+        places = [row for row in actions if row["op"] == "place"]
+        self.assertEqual(len(places), 1)
+        self.assertEqual(places[0]["style"], "rest")
+        self.assertEqual(places[0]["price"], 0.10)
+        self.assertEqual(places[0]["shares"], 10.0)
+
+    def test_winner_cashout_and_flat_inventory_do_not_hedge(self):
+        now = 10_000.0 - 100.0
+        winner = {"status": "confirmed", "sold_winner": True, "sold_leg": "up", "end_ts": 10_000.0}
+        flat = {"status": "confirmed", "sold_dump": True, "sold_leg": "dn", "end_ts": 10_000.0}
+        for intent in (winner, flat, None):
+            actions = plan_dump_hedges(
+                markets=[_market(dn_ask=0.08)],
+                intents={"cid": intent} if intent else {},
+                open_orders={},
+                now_s=now,
+                enabled=True,
+            )
+            self.assertFalse(any(row["op"] == "place" for row in actions))
+
+    def test_absent_markets_stay_unbid(self):
+        now = 10_000.0 - 100.0
+        actions = plan_dump_hedges(
+            markets=[_market(dn_ask=0.04)],
+            intents={},
+            open_orders={},
+            now_s=now,
+            enabled=True,
+        )
+        self.assertFalse(any(row["op"] == "place" for row in actions))
+
+    def test_scrap_twenty_and_dump_ten_are_separate(self):
+        now = 10_000.0 - 100.0
+        market = _market(dn_bid=0.04, dn_ask=0.06, up_bid=0.70, up_ask=0.72)
+        intent = _dumped_up()
+        scrap = [
+            row for row in plan_sister_bids(
+                markets=[market], intents={"cid": intent}, open_orders={},
+                now_s=now, enabled=True,
+            )
+            if row["op"] == "place"
+        ]
+        dump = [
+            row for row in plan_dump_hedges(
+                markets=[market], intents={"cid": intent}, open_orders={},
+                now_s=now, enabled=True,
+            )
+            if row["op"] == "place"
+        ]
+        self.assertEqual([(row["leg"], row["shares"]) for row in scrap], [("dn", 20.0)])
+        self.assertEqual([(row["leg"], row["shares"]) for row in dump], [("dn", 10.0)])
+        self.assertNotEqual(scrap[0].get("book"), "dump")
+        self.assertEqual(dump[0]["book"], "dump")
+
+    def test_filled_dump_clip_does_not_buy_again(self):
+        now = 10_000.0 - 100.0
+        actions = plan_dump_hedges(
+            markets=[_market(dn_ask=0.08)],
+            intents={"cid": _dumped_up()},
+            open_orders={},
+            now_s=now,
+            enabled=True,
+            filled_shares={"cid": {"dn": 10}},
+        )
+        self.assertTrue(any(row["reason"] == "filled" for row in actions))
+        self.assertFalse(any(row["op"] == "place" for row in actions))
+
+    def test_disabled_places_nothing(self):
+        now = 10_000.0 - 100.0
+        actions = plan_dump_hedges(
+            markets=[_market(dn_ask=0.08)],
+            intents={"cid": _dumped_up()},
+            open_orders={},
+            now_s=now,
+            enabled=False,
+        )
+        self.assertFalse(any(row["op"] == "place" for row in actions))
+        self.assertTrue(any(row["reason"] == "disabled" for row in actions))
 
 
 if __name__ == "__main__":
