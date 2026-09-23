@@ -1414,6 +1414,25 @@ class ScrapSpeedTests(unittest.TestCase):
         tif, exp = resting_tif(now_s=1_000.0, expire_ts=1_030.0, min_ahead_s=60.0)
         self.assertEqual((tif, exp), ("GTC", 0))
 
+    def test_resting_tif_default_is_gtc_inside_180s_and_gtd_farther(self):
+        # btc-updown-15m-1790180100: ~90s left posted GTD and the exchange
+        # rejected it. Polymarket's GTD floor is ~180s.
+        tif, exp = resting_tif(now_s=1_000.0, expire_ts=1_090.0)
+        self.assertEqual((tif, exp), ("GTC", 0))
+        tif, exp = resting_tif(now_s=1_000.0, expire_ts=1_179.0)
+        self.assertEqual((tif, exp), ("GTC", 0))
+        tif, exp = resting_tif(now_s=1_000.0, expire_ts=1_240.0)
+        self.assertEqual((tif, exp), ("GTD", 1240))
+        self.assertEqual(DEFAULT_SELL_KNOBS["sell_scrap_rest_min_ahead_s"], 180.0)
+
+    def test_scrap_rest_px_caps_to_live_bid(self):
+        from buy.mint_sell import scrap_rest_px
+
+        self.assertEqual(scrap_rest_px(0.02, 0.01), 0.01)
+        self.assertEqual(scrap_rest_px(0.02, None), 0.02)
+        self.assertEqual(scrap_rest_px(0.02, 0.05), 0.02)
+        self.assertEqual(scrap_rest_px(0.02, 0), 0.02)
+
     def test_thin_oracle_still_blocks_when_persist_is_skipped(self):
         ok, why, _detail = late_oracle_scrap_ok(
             ttm_s=42.0,

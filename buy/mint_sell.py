@@ -11,7 +11,10 @@ in-range at fire and FAK ``sell_fak_px`` (~2¢). That rung equals
 live bid is below the floor, FAK at that live bid. Empty FAK, or a vanished
 loser book after arm, keeps ``armed_ts``. On an empty keep, fire a blind
 1¢ FAK (backoff ``sell_scrap_blind_backoff_s``). After a FAK miss, rest a
-GTD/GTC sell at ``sell_scrap_rest_px`` (~2¢, the print) for the remainder.
+GTD/GTC sell. The price is ``sell_scrap_rest_px`` (~2¢, the print) capped
+at the live or last-seen loser bid, so a 1¢ book is not posted at 2¢.
+GTD only when expiration is at least ``sell_scrap_rest_min_ahead_s``
+(~180s, Polymarket's floor) ahead; otherwise GTC.
 Keep the winner for redeem unless its sized bid reaches ``sell_winner_min``
 (~99¢).
 
@@ -51,10 +54,12 @@ DEFAULT_SELL_KNOBS = {
     "sell_scrap_blind_px": 0.01,
     "sell_scrap_blind_backoff_s": 3.0,
     "sell_scrap_rest_enabled": True,
-    # Post-miss resting sell. Default is the ~2¢ print.
+    # Post-miss resting sell ceiling. The posted rest is this, or the
+    # live/last-seen bid when that bid is lower.
     "sell_scrap_rest_px": 0.02,
     # GTD expiration must be at least this far ahead; otherwise rest GTC.
-    "sell_scrap_rest_min_ahead_s": 60.0,
+    # Polymarket rejects a GTD inside ~180s.
+    "sell_scrap_rest_min_ahead_s": 180.0,
     "sell_cooldown_s": 3.0,
     "sell_winner_min": 0.999,
     "sell_winner_cheap_if_loser_le": 0.03,
@@ -872,12 +877,37 @@ def scrap_rest_action(
     return "place", "fak_miss"
 
 
+def scrap_rest_px(configured_px: float, best_bid: Optional[float]) -> float:
+    """Post-miss rest price: never above the live loser bid.
+
+    ``configured_px`` is ``sell_scrap_rest_px`` (the ~2¢ print, kept as the
+    ceiling). A positive ``best_bid`` caps the rest at that bid so a 1¢
+    book can still be hit. A missing or non-positive bid keeps the
+    configured price.
+    """
+    try:
+        cfg = float(configured_px)
+    except (TypeError, ValueError):
+        return 0.0
+    if not math.isfinite(cfg):
+        return 0.0
+    if best_bid is None:
+        return cfg
+    try:
+        bid = float(best_bid)
+    except (TypeError, ValueError):
+        return cfg
+    if not math.isfinite(bid) or bid <= 0:
+        return cfg
+    return min(cfg, bid)
+
+
 def resting_tif(
-    *, now_s: float, expire_ts: float, min_ahead_s: float = 60.0
+    *, now_s: float, expire_ts: float, min_ahead_s: float = 180.0
 ) -> Tuple[str, int]:
     """``(GTD, unix_exp)`` when expiration is far enough ahead, else ``(GTC, 0)``.
 
-    Polymarket rejects a GTD that expires inside the ~60s security threshold.
+    Polymarket rejects a GTD that expires inside the ~180s security threshold.
     Callers still cancel GTC rests at window end or T−cancel.
     """
     try:

@@ -45,8 +45,11 @@ or the live bid when the book is thinner. Do not post above 2¢ on the
 loser FAK. Empty FAK or a vanished loser book after arm keeps `armed_ts`.
 On `empty_keep_arm` / `empty_fak_keep_arm`, fire a blind 1¢ FAK
 (`sell_scrap_blind_px`, backoff `sell_scrap_blind_backoff_s` ~3s). After
-the first FAK miss while still armed, rest a GTD/GTC sell at
-`sell_scrap_rest_px` (0.02, the print). Cancel that rest on fill, window
+the first FAK miss while still armed, rest a GTD/GTC sell. The posted
+price is `min(sell_scrap_rest_px, live or last-seen loser bid)` so a 1¢
+book is not left at the 2¢ print. `sell_scrap_rest_px` stays 0.02.
+GTD only when expiration is at least `sell_scrap_rest_min_ahead_s`
+(~180s, Polymarket's floor) ahead; otherwise GTC. Cancel that rest on fill, window
 end, loser no longer qualifies, or a hard late-window oracle block when
 that veto is on. An empty book alone does not pull a rest that still has
 edge. Out of range at fire logs `sell_cancel_out_of_range` and does not
@@ -74,7 +77,8 @@ work cannot steal a dump tick. Do not re-serialize them into one
 defaults are 5/2/60 (dump persist stays 2s); `sell_armed_poll_s` is
 sell-loop cadence only. Live `strategy_mint.json` still wins for keys it
 already sets. Code defaults arm at `sell_threshold` 0.02, print
-`sell_fak_px` / `sell_scrap_rest_px` 0.02, persist 5 / 2, sized-skip off,
+`sell_fak_px` / `sell_scrap_rest_px` 0.02, `sell_scrap_rest_min_ahead_s`
+180, persist 5 / 2, sized-skip off,
 `sell_late_window_s` 0, floor / per-TTM / stale edge knobs 0, and
 `sell_oracle_edge_persist_s` 3.
 `oracle_log_enabled` stays true. New keys absent from the live file take these
