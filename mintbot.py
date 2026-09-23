@@ -73,7 +73,13 @@ from buy.book import best_bid_with_min_size, bid_fill_depth
 from buy.chain import ChainReader
 from buy.contracts import ContractCall, build_atomic_mint_calls
 from buy.market import MarketGateway, MintMarket
-from buy.mint_loops import IntentStore, run_job_loop, start_mint_sell_loops
+from buy.mint_loops import (
+    IntentStore,
+    held_forward_floor,
+    run_job_loop,
+    select_mint_candidate,
+    start_mint_sell_loops,
+)
 from buy.oracle_log import OracleBagView, OracleLogService, snapshot_intents
 from buy.mint_sell import (
     classify_loser,
@@ -124,8 +130,10 @@ DEFAULTS = {
     "dry_run": True,
     "shares": 50.0,
     "enter_min_ttm_min": 0.0,
-    "enter_max_ttm_min": 30.0,
-    "mint_fail_cooldown_s": 90.0,
+    # 45m keeps the window after a bag booked near 30m out visible
+    # (two 15m steps past a market that is about to open).
+    "enter_max_ttm_min": 45.0,
+    "mint_fail_cooldown_s": 30.0,
     "mint_submitting_timeout_s": 90.0,
     "mint_max_attempts": 3,
     "series_slugs": [
@@ -486,11 +494,12 @@ def already_minted(
     cfg: dict,
     now: float | None = None,
 ) -> bool:
-    """True if this market must not be minted again this cycle.
+    """True if this condition must not be minted.
 
     Confirmed / completed / in-flight intents stay blocked. A ``failed``
-    intent is also blocked during ``mint_fail_cooldown_s`` and after
-    ``mint_max_attempts`` tries, then becomes eligible for remint.
+    intent is blocked during ``mint_fail_cooldown_s``. Once
+    ``mint_attempts`` reaches ``mint_max_attempts`` it stays blocked for
+    the rest of that condition. Below the cap it can remint after cooldown.
     """
     if not cfg.get("one_entry_per_market", True):
         return False
@@ -515,9 +524,9 @@ def already_minted(
     if attempts >= max_attempts:
         return True
     try:
-        cooldown = float(cfg.get("mint_fail_cooldown_s") or 90.0)
+        cooldown = float(cfg.get("mint_fail_cooldown_s") or 30.0)
     except (TypeError, ValueError):
-        cooldown = 90.0
+        cooldown = 30.0
     now_ts = time.time() if now is None else float(now)
     try:
         last_fail = float(intent.get("last_fail_ts") or intent.get("updated_at") or 0)
@@ -2573,25 +2582,31 @@ def run_mint_cycle(
             log_event("positions_fetch_fail", error=str(exc)[:160])
 
     tol = float(cfg["position_tolerance"])
-    pick: Optional[MintMarket] = None
     with STATE_LOCK:
-        for market in candidates:
-            if already_minted(state, market.condition_id, cfg, now):
-                continue
-            if float(data_positions.get(market.up_token, 0)) > tol:
-                continue
-            if float(data_positions.get(market.dn_token, 0)) > tol:
-                continue
-            pick = market
-            break
+        def _fail_attempts(condition_id: str) -> int:
+            intent = (state.get("intents") or {}).get(condition_id) or {}
+            if not isinstance(intent, dict) or intent.get("status") != "failed":
+                return 0
+            try:
+                return int(intent.get("mint_attempts") or 0)
+            except (TypeError, ValueError):
+                return 0
 
-        if pick is None:
-            write_loop_heartbeat(
-                "mint", "idle", markets=len(markets), eligible=len(candidates), reason="owned"
-            )
-            return "idle_owned"
+        pick, status = select_mint_candidate(
+            candidates,
+            is_blocked=lambda condition_id: already_minted(state, condition_id, cfg, now),
+            is_owned=lambda market: (
+                float(data_positions.get(market.up_token, 0)) > tol
+                or float(data_positions.get(market.dn_token, 0)) > tol
+            ),
+            slots_full=lambda market: mint_slots_full(
+                state, cfg, now, float(market.start_ts)
+            ),
+            min_start_ts=held_forward_floor(state, now, ACTIVE_STATUSES),
+            fail_attempts=_fail_attempts,
+        )
 
-        if mint_slots_full(state, cfg, now, float(pick.start_ts)):
+        if status == "capped" and pick is not None:
             write_loop_heartbeat(
                 "mint",
                 "capped_open",
@@ -2599,6 +2614,12 @@ def run_mint_cycle(
                 next_start=float(pick.start_ts),
             )
             return "capped_open"
+
+        if status != "pick" or pick is None:
+            write_loop_heartbeat(
+                "mint", "idle", markets=len(markets), eligible=len(candidates), reason="owned"
+            )
+            return "idle_owned"
 
     shares = float(cfg["shares"])
     mts = pick.minutes_to_start(now)

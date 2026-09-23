@@ -6,9 +6,12 @@ import threading
 import time
 import unittest
 
+from types import SimpleNamespace
+
 from buy.mint_loops import (
     IntentStore,
     interruptible_sleep,
+    select_mint_candidate,
     start_mint_sell_loops,
 )
 from buy.mint_sell import persist_ready
@@ -213,6 +216,135 @@ class ConcurrentLoopTests(unittest.TestCase):
         sell_t.join(timeout=2)
         mint_t.join(timeout=2)
         self.assertTrue(mint_errors)
+
+
+def _market(condition_id: str, start_ts: float):
+    return SimpleNamespace(
+        condition_id=condition_id,
+        start_ts=start_ts,
+        slug=f"btc-updown-15m-{int(start_ts)}",
+    )
+
+
+class SelectMintCandidateTests(unittest.TestCase):
+    def test_cooldown_on_nearest_picks_next_future_same_cycle(self):
+        nearest = _market("near", 100.0)
+        later = _market("later", 200.0)
+        pick, status = select_mint_candidate(
+            [nearest, later],
+            is_blocked=lambda cid: cid == "near",
+        )
+        self.assertEqual(status, "pick")
+        self.assertIs(pick, later)
+
+    def test_exhausted_condition_is_not_reminted(self):
+        poisoned = _market("poison", 100.0)
+        later = _market("later", 200.0)
+        pick, status = select_mint_candidate(
+            [poisoned, later],
+            is_blocked=lambda cid: cid == "poison",
+        )
+        self.assertEqual(status, "pick")
+        self.assertEqual(pick.condition_id, "later")
+
+    def test_only_blocked_candidates_idle(self):
+        pick, status = select_mint_candidate(
+            [_market("near", 100.0)],
+            is_blocked=lambda cid: True,
+        )
+        self.assertIsNone(pick)
+        self.assertEqual(status, "idle")
+
+    def test_after_cooldown_retries_nearest_when_no_virgin_remains(self):
+        nearest = _market("near", 100.0)
+        later = _market("later", 200.0)
+        pick, status = select_mint_candidate(
+            [nearest, later],
+            is_blocked=lambda cid: False,
+            fail_attempts=lambda cid: 1,
+        )
+        self.assertEqual(status, "pick")
+        self.assertIs(pick, nearest)
+
+    def test_virgin_beats_failed_retry_while_a_slot_is_free(self):
+        failed = _market("failed", 100.0)
+        virgin = _market("virgin", 1_000.0)
+        pick, status = select_mint_candidate(
+            [failed, virgin],
+            is_blocked=lambda cid: False,
+            fail_attempts=lambda cid: 2 if cid == "failed" else 0,
+        )
+        self.assertEqual(status, "pick")
+        self.assertIs(pick, virgin)
+
+    def test_held_bag_floor_skips_every_earlier_start(self):
+        earlier = _market("earlier", 1_000.0)
+        held = _market("held", 1_900.0)
+        nxt = _market("next", 2_800.0)
+        pick, status = select_mint_candidate(
+            [earlier, held, nxt],
+            is_blocked=lambda cid: cid == "held",
+            min_start_ts=1_900.0 + 900.0,
+        )
+        self.assertEqual(status, "pick")
+        self.assertIs(pick, nxt)
+
+    def test_capacity_blocked_nearest_does_not_hide_adjacent_window(self):
+        nearer = _market("near", 100.0)
+        adjacent = _market("next", 1_000.0)
+        too_far = _market("far", 2_000.0)
+        pick, status = select_mint_candidate(
+            [nearer, adjacent, too_far],
+            is_blocked=lambda cid: False,
+            slots_full=lambda market: market.condition_id != "next",
+        )
+        self.assertEqual(status, "pick")
+        self.assertIs(pick, adjacent)
+
+    def test_all_over_cap_reports_capped(self):
+        first = _market("a", 100.0)
+        second = _market("b", 200.0)
+        pick, status = select_mint_candidate(
+            [first, second],
+            is_blocked=lambda cid: False,
+            slots_full=lambda market: True,
+        )
+        self.assertEqual(status, "capped")
+        self.assertIs(pick, first)
+
+    def test_owned_tokens_are_skipped(self):
+        held = _market("held", 100.0)
+        fresh = _market("fresh", 200.0)
+        pick, status = select_mint_candidate(
+            [held, fresh],
+            is_blocked=lambda cid: False,
+            is_owned=lambda market: market.condition_id == "held",
+        )
+        self.assertEqual(status, "pick")
+        self.assertIs(pick, fresh)
+
+
+class HeldForwardFloorTests(unittest.TestCase):
+    def test_floor_is_one_window_after_the_latest_active_bag(self):
+        from buy.mint_loops import held_forward_floor
+
+        state = {
+            "intents": {
+                "early": {"status": "confirmed", "start_ts": 1_000.0, "end_ts": 1_900.0},
+                "late": {"status": "confirmed", "start_ts": 1_900.0, "end_ts": 2_800.0},
+                "dead": {"status": "failed", "start_ts": 2_800.0, "end_ts": 3_700.0},
+            }
+        }
+        floor = held_forward_floor(state, now=1_500.0, active_statuses={"confirmed"})
+        self.assertEqual(floor, 1_900.0 + 900.0)
+
+    def test_no_floor_without_an_active_bag(self):
+        from buy.mint_loops import held_forward_floor
+
+        state = {"intents": {"x": {"status": "failed", "start_ts": 1_000.0, "end_ts": 1_900.0}}}
+        self.assertIsNone(
+            held_forward_floor(state, now=1_100.0, active_statuses={"confirmed"})
+        )
 
 
 class InterruptibleSleepTests(unittest.TestCase):

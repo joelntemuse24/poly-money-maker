@@ -67,6 +67,134 @@ class IntentStore:
             return True
 
 
+def _market_condition_id(market: Any) -> str:
+    condition_id = getattr(market, "condition_id", None)
+    if condition_id is None and isinstance(market, dict):
+        condition_id = market.get("condition_id")
+    return str(condition_id or "")
+
+
+def _market_start_ts(market: Any) -> float:
+    start_ts = getattr(market, "start_ts", None)
+    if start_ts is None and isinstance(market, dict):
+        start_ts = market.get("start_ts")
+    try:
+        return float(start_ts or 0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def held_forward_floor(
+    state: dict,
+    now: float,
+    active_statuses: Any,
+) -> Optional[float]:
+    """One 15m step after the latest active bag, or None when nothing is held.
+
+    A confirmed (or other active) bag at ``start_ts=T`` forbids every
+    candidate with ``start_ts < T+900``. Failed intents do not set the floor.
+    """
+    latest: Optional[float] = None
+    try:
+        now_ts = float(now)
+    except (TypeError, ValueError):
+        now_ts = 0.0
+    for intent in (state.get("intents") or {}).values():
+        if not isinstance(intent, dict):
+            continue
+        if intent.get("status") not in active_statuses:
+            continue
+        try:
+            end_ts = float(intent.get("end_ts") or 0)
+        except (TypeError, ValueError):
+            end_ts = 0.0
+        if end_ts and now_ts > end_ts + 120.0:
+            continue
+        try:
+            start_ts = float(intent.get("start_ts") or 0)
+        except (TypeError, ValueError):
+            start_ts = 0.0
+        if start_ts <= 0:
+            continue
+        if latest is None or start_ts > latest:
+            latest = start_ts
+    if latest is None:
+        return None
+    return latest + 900.0
+
+
+def select_mint_candidate(
+    candidates: list,
+    is_blocked: Callable[[str], bool],
+    is_owned: Optional[Callable[[Any], bool]] = None,
+    slots_full: Optional[Callable[[Any], bool]] = None,
+    *,
+    min_start_ts: Optional[float] = None,
+    fail_attempts: Optional[Callable[[str], int]] = None,
+) -> tuple[Any, str]:
+    """Soonest forward candidate. Virgin windows beat a failed retry.
+
+    ``is_blocked`` covers a confirmed or in-flight mint, fail cooldown,
+    and ``mint_attempts >= mint_max_attempts``. Those are skipped in this
+    pass. Attempts at the cap stay blocked for that condition.
+
+    ``min_start_ts`` is the forward floor (latest held bag start + 900s).
+    Candidates that start earlier are never picked.
+
+    When a free candidate has zero failures, a condition that already
+    failed is left for a later pass. A retry is used only when no virgin
+    candidate fits. ``slots_full`` still skips a candidate that does not
+    fit ``max_open_sets`` without hiding a later one that does.
+
+    Status ``capped`` means every otherwise-free candidate was over
+    capacity. Status ``idle`` means nothing was free.
+    """
+    floor: Optional[float] = None
+    if min_start_ts is not None:
+        try:
+            floor = float(min_start_ts)
+        except (TypeError, ValueError):
+            floor = None
+
+    def fail_count(condition_id: str) -> int:
+        if fail_attempts is None:
+            return 0
+        try:
+            return int(fail_attempts(condition_id) or 0)
+        except (TypeError, ValueError):
+            return 0
+
+    capped: Any = None
+
+    def walk(allow_retry: bool) -> Any:
+        nonlocal capped
+        for market in candidates:
+            condition_id = _market_condition_id(market)
+            if not condition_id or is_blocked(condition_id):
+                continue
+            if is_owned is not None and is_owned(market):
+                continue
+            if floor is not None and _market_start_ts(market) + 1e-9 < floor:
+                continue
+            if not allow_retry and fail_count(condition_id) > 0:
+                continue
+            if slots_full is not None and slots_full(market):
+                if capped is None:
+                    capped = market
+                continue
+            return market
+        return None
+
+    picked = walk(False)
+    if picked is None:
+        picked = walk(True)
+    if picked is not None:
+        return picked, "pick"
+    if capped is not None:
+        return capped, "capped"
+    return None, "idle"
+
+
 def interruptible_sleep(
     seconds: float,
     should_stop: StopFn,
