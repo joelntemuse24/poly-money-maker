@@ -35,29 +35,31 @@ work.
 template: dry_run=true, entry_enabled=false, sell_enabled=false). Optional
 sell stays off until live `strategy_mint.json` sets `sell_enabled=true`.
 Loser scrap: sized opposite bid ≥ `sell_opposite_min` (~0.90), loser ≤
-`sell_threshold` (0.03) **arms**. Persist `sell_persist_s` (~5s), or
-`sell_persist_last_min_s` (~2s) when time-to-end is within
+`sell_threshold` (0.02) **arms**. Persist `sell_persist_s` (5s), or
+`sell_persist_last_min_s` (2s) when time-to-end is within
 `sell_persist_last_min_window_s` (~60s). Skip that wait when TTM ≤
 `sell_persist_skip_ttm_s` (~90s). `sell_persist_skip_when_sized` defaults
 false, so a sized book still waits the full persist. Then re-check in-range
-at fire and
-FAK `sell_fak_px` (0.03) → `sell_floor` (0.02), or the live bid when the
-book is thinner than the print. Do not post a 5¢ sell. Empty FAK or a
-vanished loser book after arm keeps `armed_ts`. On
-`empty_keep_arm` / `empty_fak_keep_arm`, fire a blind 1¢ FAK
+at fire and FAK `sell_fak_px` (0.02). That rung equals `sell_floor` (0.02),
+or the live bid when the book is thinner. Do not post above 2¢ on the
+loser FAK. Empty FAK or a vanished loser book after arm keeps `armed_ts`.
+On `empty_keep_arm` / `empty_fak_keep_arm`, fire a blind 1¢ FAK
 (`sell_scrap_blind_px`, backoff `sell_scrap_blind_backoff_s` ~3s). After
 the first FAK miss while still armed, rest a GTD/GTC sell at
-`sell_scrap_rest_px` (0.03, the print). Cancel that rest on fill, window
-end, loser no longer qualifies, or a hard late-window oracle block. An
-empty book alone does not pull a rest that still has edge. Out of range
-at fire logs `sell_cancel_out_of_range` and does not POST. **Late-window
-oracle veto:** when TTM ≤ `sell_late_window_s` (~120), also require
-side-aware Chainlink TWAP edge ≥
+`sell_scrap_rest_px` (0.02, the print). Cancel that rest on fill, window
+end, loser no longer qualifies, or a hard late-window oracle block when
+that veto is on. An empty book alone does not pull a rest that still has
+edge. Out of range at fire logs `sell_cancel_out_of_range` and does not
+POST. **Late-window oracle veto is off by default:** `sell_late_window_s`
+= 0 skips the whole block (`in_late` requires the window > 0, and
+`late_oracle_scrap_ok` returns `outside_late_window`). A positive value
+is the TTM, in seconds, where a new loser post (FAK, blind, or rest) also
+requires side-aware Chainlink TWAP edge ≥
 `max(sell_oracle_edge_floor_usd, sell_oracle_edge_per_ttm × TTM)` for
-`sell_oracle_edge_persist_s` (~3s) before any new loser post (FAK, blind,
-or rest), fail-closed on missing/stale tape (`sell_oracle_stale_s` ~5);
-log `sell_loser_oracle_block` / `sell_loser_oracle_ok`. Skip-persist does
-not bypass that veto. Outside that window, CLOB gates only.
+`sell_oracle_edge_persist_s` (~3s), fail-closed on missing/stale tape
+(`sell_oracle_stale_s` ~5). The edge knobs stay at 1.5 / 25 / 3 so setting
+the window back to 120 restores the old veto. Skip-persist does not bypass
+that veto when the window is on. With the default 0, CLOB gates only.
 Winner cash-out is a separate path at `sell_winner_min` (~0.999).
 Live-bid FAK the winner, then clamp `limit = min(live_sized_bid,
 sell_clob_max_price=0.99)` (floor `sell_clob_min_price=0.01`) so rich
@@ -73,10 +75,11 @@ work cannot steal a dump tick. Do not re-serialize them into one
 `manage_sells → discover → sleep` cycle. Persist / last-min / window
 defaults are 5/2/60 (dump persist stays 2s); `sell_armed_poll_s` is
 sell-loop cadence only. Live `strategy_mint.json` still wins for keys it
-already sets. Code defaults match the pre-2026-09-22 scrap rules
-(`sell_threshold` 0.03, persist 5 / 2, sized-skip off). New keys absent
-from the live file take these defaults after the operator pulls and
-restarts. Do not edit live JSON from this repo.
+already sets. Code defaults arm at `sell_threshold` 0.02, print
+`sell_fak_px` / `sell_scrap_rest_px` 0.02, persist 5 / 2, sized-skip off,
+and `sell_late_window_s` 0. New keys absent from the live file take these
+defaults after the operator pulls and restarts. Do not edit live JSON
+from this repo.
 
 Wallet A (mintbot) never posts a bid. There is no same-wallet buyback.
 `scrapbidder.py` is a separate process for wallet B. Cap is 20 shares
@@ -125,9 +128,9 @@ Shared `buy/` helpers exist for mint, pathlog, and the recording-only oracle tap
 - `buy/chain.py` — Polygon eth_call prechecks (`mintbot`)
 - `buy/contracts.py` — atomic mint calldata (`mintbot`) and the pUSD transfer used by the A→B top-up
 - `buy/oracle_log.py` — Chainlink BTC/USD 60s TWAP tape
-  (`logs/oracle_twap.jsonl`) plus read-only `bag_view` for the late
-  loser-scrap veto. Not an input to mint, winner, dump, or sell outside
-  `sell_late_window_s`.
+  (`logs/oracle_twap.jsonl`) plus read-only `bag_view`. The loser-scrap
+  veto reads it only when `sell_late_window_s` > 0 (default 0, so the
+  tape is audit-only). Not an input to mint, winner, or dump.
 - `buy/sister_bid.py` — wallet B buy policy. Post-scrap FAK at the
   live ask, limit clipped into [`bid_fak_min_notional/shares`,
   `bid_fak_max_notional/shares`] (5¢–7.5¢ at 20 shares, $1.00–$1.50).
