@@ -6,22 +6,21 @@ No CLOB buys. No hedges. Discovers **btc-up-or-down-15m** only, mints
 and open within enter_max_ttm_min, if collateral is available.
 
 Optional sell (``sell_enabled``, default off): arm a loser scrap when the
-sized loser bid is ≤ ``sell_threshold`` (~5¢) and the opposite bid is ≥ ~90¢.
-5¢ is the arm ceiling, not the print. Persist ``sell_persist_s`` (~2.5s), or
-``sell_persist_last_min_s`` (~1s) in the last
-``sell_persist_last_min_window_s`` (~60s). Skip that wait when TTM ≤
-``sell_persist_skip_ttm_s`` (~90s) or when depth at the FAK rung covers our
-size. At fire, FAK ``sell_fak_px`` (~3¢) → ``sell_floor`` (~2¢), or the live
-bid when the book is thinner. Never post the 5¢ arm. Empty keep fires a
-blind 1¢ FAK (backoff ~3s). A FAK miss rests a GTD/GTC sell at
-``sell_scrap_rest_px`` (~3¢). Wallet A never posts a bid. Keep the winner
-for redeem unless its bid reaches ~99.9¢. Off unless live
+sized loser bid is ≤ ``sell_threshold`` (~3¢) and the opposite bid is ≥ ~90¢.
+Persist ``sell_persist_s`` (~5s), or ``sell_persist_last_min_s`` (~2s) in
+the last ``sell_persist_last_min_window_s`` (~60s). Skip that wait when
+TTM ≤ ``sell_persist_skip_ttm_s`` (~90s). Sized depth does not skip
+(``sell_persist_skip_when_sized`` default false). At fire, FAK
+``sell_fak_px`` (~3¢) → ``sell_floor`` (~2¢), or the live bid when the book
+is thinner. Empty keep fires a blind 1¢ FAK (backoff ~3s). A FAK miss rests
+a GTD/GTC sell at ``sell_scrap_rest_px`` (~3¢). Wallet A never posts a bid.
+Keep the winner for redeem unless its bid reaches ~99.9¢. Off unless live
 ``strategy_mint.json`` turns it on. Sell and mint run as independent loops
 so Gamma/relayer work cannot steal a dump tick (bag
 ``btc-updown-15m-1789905600``). The sell loop sleeps ``sell_armed_poll_s``
 (~2s, allowed below the ``poll_s >= 2`` floor) while a bag is sell-hot
 (loser armed, or loser sold and dump/winner not done). Mint keeps
-``poll_s``. Persist defaults are 2.5/1/60. Live JSON keys that already
+``poll_s``. Persist defaults are 5/2/60. Live JSON keys that already
 exist (threshold, persist) override these defaults until the operator
 edits them.
 
@@ -99,13 +98,11 @@ from buy.mint_sell import (
     scrap_rest_action,
     sell_fire_decision,
     sell_window_open,
-    sister_hedge_dump_due,
     skip_mint_discovery_for_sell,
     winner_cashout_leg,
     winner_cheap_decision,
     winner_sell_limit,
 )
-from buy.sister_bid import sister_leg_filled
 
 load_dotenv()
 
@@ -114,7 +111,6 @@ REPO = Path(__file__).resolve().parent
 
 STRATEGY_FILE = REPO / "strategy_mint.json"
 STATE_FILE = REPO / "positions_mint.json"
-SCRAP_STATE_FILE = REPO / "positions_scrapbid.json"
 LOG_FILE = REPO / "mintbot.log"
 ORACLE_LOG_FILE = REPO / "logs" / "oracle_twap.jsonl"
 LOCK_FILE = REPO / ".mintbot.lock"
@@ -142,15 +138,15 @@ DEFAULTS = {
     "position_tolerance": 0.01,
     "require_accepting_orders": True,
     "sell_enabled": False,
-    "sell_threshold": 0.05,
+    "sell_threshold": 0.03,
     "sell_fak_px": 0.03,
     "sell_floor": 0.02,
     "sell_opposite_min": 0.90,
-    "sell_persist_s": 2.5,
-    "sell_persist_last_min_s": 1.0,
+    "sell_persist_s": 5.0,
+    "sell_persist_last_min_s": 2.0,
     "sell_persist_last_min_window_s": 60.0,
     "sell_persist_skip_ttm_s": 90.0,
-    "sell_persist_skip_when_sized": True,
+    "sell_persist_skip_when_sized": False,
     "sell_scrap_blind_enabled": True,
     "sell_scrap_blind_px": 0.01,
     "sell_scrap_blind_backoff_s": 3.0,
@@ -172,8 +168,6 @@ DEFAULTS = {
     "sell_dump_fak_retries": 2,
     "sell_dump_ladder_step": 0.04,
     "sell_dump_ladder_rungs": 4,
-    # Dump the held leg this long after sold_loser if B matched 0 shares. 0 disables.
-    "sell_dump_if_sister_miss_s": 10.0,
     "sell_min_bid_size": 1.0,
     # Late-window oracle veto on full loser scrap (TTM ≤ window only).
     "sell_late_window_s": 120.0,
@@ -373,8 +367,6 @@ def validate_strategy(cfg: dict) -> None:
         raise ValueError("sell_dump_ladder_step must be > 0")
     if int(cfg.get("sell_dump_ladder_rungs") or 0) < 1:
         raise ValueError("sell_dump_ladder_rungs must be >= 1")
-    if float(cfg.get("sell_dump_if_sister_miss_s") or 0) < 0:
-        raise ValueError("sell_dump_if_sister_miss_s must be >= 0")
     if float(cfg.get("sell_min_bid_size") or 0) < 0:
         raise ValueError("sell_min_bid_size must be >= 0")
 
@@ -1609,7 +1601,7 @@ def _mark_loser_sold(intent: dict, leg: str, *, note: str = "") -> None:
 
 
 def manage_sells(cfg: dict, state: dict, chain: ChainReader) -> None:
-    """Loser scrap: arm ≤5¢, FAK ~3¢→2¢ or live bid; winner; held dump."""
+    """Loser scrap: arm ≤3¢, FAK ~3¢→2¢ or live bid; winner; held dump."""
     if not cfg.get("sell_enabled"):
         return
     STATE_LOCK.acquire()
@@ -1619,29 +1611,16 @@ def manage_sells(cfg: dict, state: dict, chain: ChainReader) -> None:
         STATE_LOCK.release()
 
 
-def _sister_filled_map() -> dict:
-    """Wallet B matched shares from positions_scrapbid.json. Missing file is zero."""
-    if not SCRAP_STATE_FILE.exists():
-        return {}
-    try:
-        payload = json.loads(SCRAP_STATE_FILE.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return {}
-    filled = payload.get("filled") if isinstance(payload, dict) else None
-    return filled if isinstance(filled, dict) else {}
-
-
 def _manage_sells_locked(cfg: dict, state: dict, chain: ChainReader) -> None:
     now = time.time()
-    sister_fills = _sister_filled_map()
-    thr = float(cfg.get("sell_threshold") or 0.05)
+    thr = float(cfg.get("sell_threshold") or 0.03)
     floor = float(cfg.get("sell_floor") or 0.02)
     opp_min = float(cfg.get("sell_opposite_min") or 0.90)
     persist_s = float(cfg.get("sell_persist_s") or 0.0)
-    last_min_s = float(cfg.get("sell_persist_last_min_s", 1.0))
+    last_min_s = float(cfg.get("sell_persist_last_min_s", 2.0))
     last_min_window_s = float(cfg.get("sell_persist_last_min_window_s", 60.0))
     skip_ttm_s = float(cfg.get("sell_persist_skip_ttm_s", 90.0) or 0.0)
-    skip_when_sized = bool(cfg.get("sell_persist_skip_when_sized", True))
+    skip_when_sized = bool(cfg.get("sell_persist_skip_when_sized", False))
     fak_px = float(cfg.get("sell_fak_px", 0.03) or 0.03)
     blind_enabled = bool(cfg.get("sell_scrap_blind_enabled", True))
     blind_px = float(cfg.get("sell_scrap_blind_px", 0.01) or 0.01)
@@ -1882,39 +1861,6 @@ def _manage_sells_locked(cfg: dict, state: dict, chain: ChainReader) -> None:
         elif sold_leg == "dn":
             held = "up"
         dump_bid = bids.get(held) if held else None
-        miss_s = float(cfg.get("sell_dump_if_sister_miss_s") or 0)
-        sister_filled = (
-            sister_leg_filled(sister_fills, cid, str(sold_leg))
-            if sold_leg in ("up", "dn")
-            else 0.0
-        )
-        sister_due, _sister_why, sister_age = sister_hedge_dump_due(
-            sold_loser=sold_loser,
-            sold_dump=sold_dump,
-            sold_at=intent.get("sold_loser_at"),
-            now_s=now,
-            sister_filled=sister_filled,
-            miss_s=miss_s,
-        )
-        sister_force = bool(
-            dump_enabled
-            and sister_due
-            and held is not None
-            and dump_bid is not None
-            and not cooling
-        )
-        if sister_due and held is not None and dump_bid is None:
-            log_event(
-                "sell_dump_sister_miss",
-                condition_id=cid,
-                slug=intent.get("slug"),
-                leg=held,
-                scrap_leg=sold_leg,
-                age_s=sister_age,
-                sister_filled=sister_filled,
-                miss_s=miss_s,
-                status="empty_book",
-            )
         dump_armed = (
             dump_enabled
             and sold_loser
@@ -1940,25 +1886,10 @@ def _manage_sells_locked(cfg: dict, state: dict, chain: ChainReader) -> None:
                 bid=dump_bid,
                 below=dump_below,
             )
-        if (fire_d or sister_force) and held and not cooling:
-            if sister_force:
-                log_event(
-                    "sell_dump_sister_miss",
-                    condition_id=cid,
-                    slug=intent.get("slug"),
-                    leg=held,
-                    scrap_leg=sold_leg,
-                    age_s=sister_age,
-                    sister_filled=sister_filled,
-                    miss_s=miss_s,
-                    bid=dump_bid,
-                    status="fire",
-                )
-                fire_action, fire_reason = "fire", "sister_miss"
-            else:
-                fire_action, fire_reason = sell_fire_decision(
-                    "dump", bid=dump_bid, dump_below=dump_below,
-                )
+        if fire_d and held and not cooling:
+            fire_action, fire_reason = sell_fire_decision(
+                "dump", bid=dump_bid, dump_below=dump_below,
+            )
             if fire_action != "fire":
                 _apply_sell_fire_cancel(
                     intent,
@@ -2015,6 +1946,10 @@ def _manage_sells_locked(cfg: dict, state: dict, chain: ChainReader) -> None:
                     if dry_run or sold_total >= size - tol:
                         intent["sold_dump"] = True
                         intent["sold_winner"] = True
+                        # Normal held dump only. Sister B buys the other leg.
+                        intent["sell_dump_leg"] = held
+                        if not intent.get("sold_dump_at"):
+                            intent["sold_dump_at"] = now
                         intent["sell_dump_filled"] = float(
                             intent.get("sell_dump_filled") or 0
                         ) + sold_total
@@ -2026,12 +1961,10 @@ def _manage_sells_locked(cfg: dict, state: dict, chain: ChainReader) -> None:
                             condition_id=cid,
                             slug=intent.get("slug"),
                             leg=held,
+                            hedge_leg="dn" if held == "up" else "up",
                             sold=sold_total,
                             bid=dump_bid,
                             status=last_status,
-                            sister_miss=bool(sister_force),
-                            age_s=sister_age if sister_force else None,
-                            sister_filled=sister_filled if sister_force else None,
                         )
                         notify(
                             "Mint held dump",

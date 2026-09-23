@@ -30,8 +30,10 @@ strategy_mint.json
 positions_mint.json
 strategy_scrapbid.json
 positions_scrapbid.json
+positions_topup.json
 STOP_SCRAPBID
 .scrapbid.lock
+.topup.lock
 positions_complement.json
 positions_complement.dryrun.json
 pnl_complement.json

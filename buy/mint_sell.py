@@ -1,18 +1,18 @@
 """Pure mint-sell policy helpers (no CLOB posts, no mintbot import).
 
-Loser dump: arm when a sized loser bid is at/under ``sell_threshold`` (~5¢)
+Loser dump: arm when a sized loser bid is at/under ``sell_threshold`` (~3¢)
 and the opposite sized bid is at/over ``sell_opposite_min`` (~90¢). Persist
-that book for ``sell_persist_s`` (~2.5s), or ``sell_persist_last_min_s`` (~1s)
+that book for ``sell_persist_s`` (~5s), or ``sell_persist_last_min_s`` (~2s)
 when time-to-end is within ``sell_persist_last_min_window_s`` (~60s). Skip
-that wait when TTM ≤ ``sell_persist_skip_ttm_s`` (~90s) or when bid depth at
-the FAK limit covers our size. Then re-check in-range at fire and FAK
-``sell_fak_px`` (~3¢) → ``sell_floor`` (~2¢) when the live sized bid is at/over the floor;
-if the live bid is below the floor, FAK at that live bid. Empty FAK, or a
-vanished loser book after arm, keeps ``armed_ts``. On an empty keep, fire a
-blind 1¢ FAK (backoff ``sell_scrap_blind_backoff_s``). After a FAK miss,
-rest a GTD/GTC sell at ``sell_scrap_rest_px`` (~3¢, the print, not the 5¢
-arm) for the remainder. Keep
-the winner for redeem unless its sized bid reaches ``sell_winner_min`` (~99¢).
+that wait when TTM ≤ ``sell_persist_skip_ttm_s`` (~90s). Sized depth does
+not skip (``sell_persist_skip_when_sized`` default false). Then re-check
+in-range at fire and FAK ``sell_fak_px`` (~3¢) → ``sell_floor`` (~2¢) when
+the live sized bid is at/over the floor; if the live bid is below the floor,
+FAK at that live bid. Empty FAK, or a vanished loser book after arm, keeps
+``armed_ts``. On an empty keep, fire a blind 1¢ FAK (backoff
+``sell_scrap_blind_backoff_s``). After a FAK miss, rest a GTD/GTC sell at
+``sell_scrap_rest_px`` (~3¢, the print) for the remainder. Keep the winner
+for redeem unless its sized bid reaches ``sell_winner_min`` (~99¢).
 
 In the last ``sell_late_window_s`` (~120s), also require a side-aware
 Chainlink TWAP edge vs window open (≥ ``max(floor, per_ttm × TTM)`` for
@@ -22,10 +22,8 @@ edge still blocks; skip-persist does not bypass the veto.
 
 After the loser is sold, optional held-leg dump: if the remaining leg's sized
 bid stays under ``sell_dump_below`` (~80¢) for ``sell_dump_persist_s`` (~2s),
-live-bid FAK the held leg. Also dump that held leg when wallet B has not
-matched any hedge shares within ``sell_dump_if_sister_miss_s`` (~10s) of the
-confirmed scrap (0 disables). A sister fill of any size skips that timeout;
-the 80¢ dump still applies later.
+live-bid FAK the held leg. A sister miss does not dump that leg. Wallet B
+reads ``sell_dump_leg`` after this fill and buys the other side.
 """
 
 from __future__ import annotations
@@ -35,24 +33,24 @@ from typing import Any, Optional, Sequence, Tuple
 
 DEFAULT_SELL_KNOBS = {
     "sell_enabled": False,
-    "sell_threshold": 0.05,
+    "sell_threshold": 0.03,
     # Arm ceiling is sell_threshold. The scrap print is this rung (~3¢),
     # then the floor, or the live bid when the book is thinner.
     "sell_fak_px": 0.03,
     "sell_floor": 0.02,
     "sell_opposite_min": 0.90,
-    "sell_persist_s": 2.5,
-    "sell_persist_last_min_s": 1.0,
+    "sell_persist_s": 5.0,
+    "sell_persist_last_min_s": 2.0,
     "sell_persist_last_min_window_s": 60.0,
     # Immediate FAK once armed when TTM is inside this window (0 disables).
     "sell_persist_skip_ttm_s": 90.0,
-    # Immediate FAK when cumulative bid size at the limit covers our shares.
-    "sell_persist_skip_when_sized": True,
+    # Off: full persist always. On: skip when depth at the FAK rung covers us.
+    "sell_persist_skip_when_sized": False,
     "sell_scrap_blind_enabled": True,
     "sell_scrap_blind_px": 0.01,
     "sell_scrap_blind_backoff_s": 3.0,
     "sell_scrap_rest_enabled": True,
-    # Post-miss resting sell. Default is the ~3¢ print, not the 5¢ arm.
+    # Post-miss resting sell. Default is the ~3¢ print.
     "sell_scrap_rest_px": 0.03,
     # GTD expiration must be at least this far ahead; otherwise rest GTC.
     "sell_scrap_rest_min_ahead_s": 60.0,
@@ -70,9 +68,6 @@ DEFAULT_SELL_KNOBS = {
     # Dump retry ladder: top bid, then step down toward floor (short burst).
     "sell_dump_ladder_step": 0.04,
     "sell_dump_ladder_rungs": 4,
-    # Dump the held leg this long after a confirmed scrap if B matched 0.
-    # 0 disables. The 80¢ persist dump is unchanged.
-    "sell_dump_if_sister_miss_s": 10.0,
     "sell_min_bid_size": 1.0,
     # Cycle sleep while a loser persist arm is live. Does not change persist_s.
     "sell_armed_poll_s": 2.0,
@@ -545,46 +540,6 @@ def loser_ladder_limits(
     return limits
 
 
-def sister_hedge_dump_due(
-    *,
-    sold_loser: bool,
-    sold_dump: bool,
-    sold_at: Any,
-    now_s: float,
-    sister_filled: float,
-    miss_s: float,
-) -> Tuple[bool, str, Optional[float]]:
-    """Held-leg dump when wallet B has not bought the scrap leg in time.
-
-    Returns ``(due, why, age_s)``. ``miss_s`` <= 0 disables the timeout.
-    Any sister fill above zero is not a miss. The clock is the confirmed
-    scrap time. The 80¢ persist dump is a separate gate.
-    """
-    window = float(miss_s or 0)
-    if window <= 0:
-        return False, "disabled", None
-    if not sold_loser:
-        return False, "not_sold", None
-    if sold_dump:
-        return False, "already_dumped", None
-    try:
-        filled = float(sister_filled or 0)
-    except (TypeError, ValueError):
-        filled = 0.0
-    if filled > 1e-9:
-        return False, "sister_filled", None
-    try:
-        started = float(sold_at)
-    except (TypeError, ValueError):
-        return False, "no_clock", None
-    if not math.isfinite(started):
-        return False, "no_clock", None
-    age = float(now_s) - started
-    if age + 1e-9 < window:
-        return False, "waiting", age
-    return True, "sister_miss", age
-
-
 def sell_fire_decision(
     path: str,
     *,
@@ -804,8 +759,9 @@ def loser_scrap_persist_s(
     """Loser persist seconds for this tick, plus a reason.
 
     ``None`` / ``ended`` when the window is over. ``late_skip`` (0s) when
-    ``0 < TTM <= skip_ttm_s``. ``sized_skip`` (0s) when depth at the limit
-    covers ``our_size``. Otherwise the 2.5s / last-minute clock from
+    ``0 < TTM <= skip_ttm_s``. ``sized_skip`` (0s) only when
+    ``skip_when_sized`` is true and depth at the limit covers ``our_size``.
+    Otherwise the normal / last-minute clock from
     ``effective_loser_persist_s``. Does not consult the oracle.
     """
     base = effective_loser_persist_s(

@@ -381,17 +381,17 @@ Then eth_call CTF balances. When Up and Down each reach `before + shares` within
 A cooldown (`sell_cooldown_s`, live 3s) gates attempts after any sell try.
 
 <a id="section-17"></a>
-## Loser scrap: arm at 5¢, print ~3¢ → 2¢
+## Loser scrap: arm at 3¢, print ~3¢ → 2¢
 
 Policy (`classify_loser`):
 
-- Sized loser bid ≤ `sell_threshold` (code default **0.05**). That number arms the hunt. It is not the sell print.
+- Sized loser bid ≤ `sell_threshold` (code default **0.03**). That number arms the hunt. It is not a higher print.
 - Sized opposite bid ≥ `sell_opposite_min` (0.90)
 - Not both cheap (ambiguous)
-- Persist that condition for `sell_persist_s` (code default **2.5s**) via `loser_scrap_persist_s`. In the last `sell_persist_last_min_window_s` (60s) before `end_ts`, use `sell_persist_last_min_s` (code default **1s**). Effective persist is re-evaluated each tick; an arm started on the longer clock is not reset when the shorter clock begins.
-- Skip the wait (persist 0 / immediate on the first qualifying tick) when `0 < TTM ≤ sell_persist_skip_ttm_s` (90s), or when cumulative bid size at the first FAK rung covers our remaining shares. The skip does not consult the oracle.
+- Persist that condition for `sell_persist_s` (code default **5s**) via `loser_scrap_persist_s`. In the last `sell_persist_last_min_window_s` (60s) before `end_ts`, use `sell_persist_last_min_s` (code default **2s**). Effective persist is re-evaluated each tick; an arm started on the longer clock is not reset when the shorter clock begins.
+- Skip the wait (persist 0 / immediate on the first qualifying tick) when `0 < TTM ≤ sell_persist_skip_ttm_s` (90s). `sell_persist_skip_when_sized` defaults **false**, so displayed depth does not skip. The skip does not consult the oracle.
 - At fire, `sell_fire_decision` re-checks the path is still in range (loser ≤ threshold and opposite ≥ min; dump still `< sell_dump_below`; winner still ≥ effective min). Out of range logs `sell_cancel_out_of_range` and does **not** POST; empty loser book keeps `armed_ts`, a visible bid that left range resets the arm.
-- FAK ladder is `sell_fak_px` (**0.03**) → `sell_floor` (**0.02**), each rung clamped to the live sized bid. A 5¢ book posts 3¢ then 2¢. A thinner book posts the live bid. A bid below the floor is the only rung. The ladder does not post 0.05. If displayed depth at the rung is positive and shorter than our size, the FAK clips to that depth (`loser_partial_fak_shares`). Empty depth does not clip.
+- FAK ladder is `sell_fak_px` (**0.03**) → `sell_floor` (**0.02**), each rung clamped to the live sized bid. A thinner book posts the live bid. A bid below the floor is the only rung. The ladder does not post above the fak rung. If displayed depth at the rung is positive and shorter than our size, the FAK clips to that depth (`loser_partial_fak_shares`). Empty depth does not clip.
 - After a FAK miss (`no orders found`) while still armed, rest a GTD sell at `sell_scrap_rest_px` (**0.03**, the print, not the arm). If time-to-expiry is inside `sell_scrap_rest_min_ahead_s` (60s), rest GTC instead. Cancel on fill, window end, loser no longer qualifies, or a hard late-window oracle block. An empty book does not cancel a rest whose edge is still ok. Lower `sell_scrap_rest_px` to 0.01 or 0.02 when the goal is to catch a phantom 1–2¢ book rather than print ~3¢.
 - On `empty_keep_arm` / `empty_fak_keep_arm`, fire a blind FAK at `sell_scrap_blind_px` (0.01) no more often than `sell_scrap_blind_backoff_s` (3s). A live rest suppresses it.
 - **Late-window oracle veto (TTM ≤ `sell_late_window_s` = 120 only):** side-aware TWAP edge vs window open must stay ≥ `max(sell_oracle_edge_floor_usd=25, sell_oracle_edge_per_ttm=1.5 × TTM_s)` for `sell_oracle_edge_persist_s=3` continuous seconds before any **new** loser post (visible FAK, blind FAK, or rest). Scraping Down (keeping Up) needs `twap − open ≥ need`; scraping Up needs `open − twap ≥ need`. Fail closed on missing/stale tape (`sell_oracle_stale_s=5`). Logs `sell_loser_oracle_block` / `sell_loser_oracle_ok`. Combat for true reverse `btc-updown-15m-1790078400` (TTM≈42 → need ≳$63, edge ~+$20 → block). Skip-persist does not bypass this gate. Outside 120s this gate is off.
@@ -436,14 +436,14 @@ Action:
 Defaults: `sell_dump_fak_retries=2`, `sell_dump_ladder_step=0.04`, `sell_dump_ladder_rungs=4`.
 These are **dump-only**; loser and winner paths keep their current logic.
 
-**Scope:** only the remaining leg after a loser fill. Full sets with neither leg sold never arm dump. After `end_ts`, manage_sells skips the intent (same as other sells).
+**Scope:** only the remaining leg after a loser fill. Full sets with neither leg sold never arm dump. After `end_ts`, manage_sells skips the intent (same as other sells). A sister miss does not dump the held leg. A completed dump (dry-run or full fill) sets `sell_dump_leg` to the leg that was sold so wallet B can buy the other leg. `already_flat` sets `sold_dump` without `sell_dump_leg`.
 
 <a id="section-20"></a>
 ## Live-bid FAK vs fixed-limit FAK
 
 | Path | Limit choice | Why |
 |---|---|---|
-| Loser | Arm ≤ 0.05. Ladder `sell_fak_px` 0.03 → 0.02, or live bid when thinner (below floor: that bid only). Rest after a miss at `sell_scrap_rest_px` 0.03. Blind empty FAK at 0.01 | 5¢ starts the hunt. The print stays ~3¢ so a thinner book can still fill. Do not post the arm price |
+| Loser | Arm ≤ 0.03. Ladder `sell_fak_px` 0.03 → 0.02, or live bid when thinner (below floor: that bid only). Rest after a miss at `sell_scrap_rest_px` 0.03. Blind empty FAK at 0.01 | 3¢ starts the hunt. The print stays ~3¢ so a thinner book can still fill. |
 | Winner (allowed) | `min(live sized bid, 0.99)` | Resting books quote 0.995–0.999; posting those limits is rejected (`max: 0.99`). A 0.99 FAK still fills the rich book. |
 | Held dump | Current sized bid | Same rejection class; dump fires precisely when bid is *weak* |
 
@@ -532,7 +532,7 @@ Separate systemd unit. `SERIES = ["btc-up-or-down-15m"]` only. Polls CLOB books,
 
 `deploy/polypathlog.service` runs `pathlog.py` (no env file required for public books).
 
-`deploy/polyscrapbid.service` is opt-in and stays disabled. It runs `scrapbidder.py` with `EnvironmentFile=.env.complement` only (not mintbot `.env`). Wallet B buys 20 shares. After A `sold_loser` on leg L it FAK-buys at the live ask when the ask is ≤ `bid_fak_max_notional / shares` (7.5¢) and the limit (the ask, or 5¢ when the ask would print under $1) × shares is in [$1.00, $1.50]. If the FAK cannot fire, it rests at `bid_rest_px` 0.05 only when that rest does not cross the ask. No escalate ladder. GTD when expiration is ≥ ~180s ahead, else GTC, still cancelled by T−20s. Markets A never held are not bid (`bid_absent_enabled` defaults false). If B has matched 0 shares for `sell_dump_if_sister_miss_s` (10s) after the scrap, mintbot dumps the held leg. It does not mint and does not FAK-sell. `bid_enabled` defaults false and `dry_run` defaults true. Do not commit `.env.complement`. Same-wallet buyback is not implemented. Do not enable this unit unless the operator asks.
+`deploy/polyscrapbid.service` is opt-in and stays disabled. It runs `scrapbidder.py` with `EnvironmentFile=.env.complement` only (not mintbot `.env`). Wallet B buys 20 shares of a scrapped leg, and 10 shares of the other leg after A sets `sell_dump_leg`. Both use the FAK/rest notional band ($1.00–$1.50 by default). Markets A never held are not bid (`bid_absent_enabled` defaults false). There is no sister-miss dump. When B cannot fund a hedge, scrapbidder spawns `sister_topup.py`, which reads `.env` itself and transfers $5 of pUSD from A's proxy to B's deposit wallet, once per broke episode. It does not mint and does not FAK-sell. `bid_enabled` defaults false and `dry_run` defaults true. Do not commit `.env.complement`. Do not add `.env` to this unit. Same-wallet buyback is not implemented. Do not enable this unit unless the operator asks.
 
 Never enable retired buy units (`polycomplement`, buybots, DangerZone) from memory of old docs. `polyscrapbid` is not a restore of `complementbot.py`.
 
@@ -577,7 +577,7 @@ From VM `strategy_mint.json`:
 | `sell_oracle_stale_s` | 5 | Fail closed if latest TWAP older than this |
 | `sell_oracle_edge_floor_usd` | 25 | `need = max(floor, per_ttm × TTM)` |
 
-Repo code defaults changed 2026-09-22 (`mintbot` `DEFAULTS` / `strategy_mint.example.json`). Live JSON still overrides every key it already sets, including `sell_threshold` 0.03 and persist 5 / 2 in this table. After the operator pulls and restarts, keys missing from the live file pick up: arm `sell_threshold` 0.05, print `sell_fak_px` 0.03 then floor 0.02 (or the live bid), persist 2.5 / 1, skip when TTM ≤ 90 or sized depth covers the clip, blind 1¢ FAK on an empty arm, rest GTD at `sell_scrap_rest_px` 0.03 after a FAK miss, and `sell_dump_if_sister_miss_s` 10. Do not edit live JSON from this repo. Sister bids are a separate opt-in process (`strategy_scrapbid.example.json`): 20 shares, FAK at the live ask with the limit clipped into [0.05, 0.075] so notional stays in [$1, $1.50], else a non-crossing rest at 0.05. GTD when expiration is ≥ ~180s ahead, else GTC. Not a sell.
+Repo code defaults as of 2026-09-23 (`mintbot` `DEFAULTS` / `strategy_mint.example.json`) are the pre-22 Sep scrap rules: arm `sell_threshold` 0.03, persist 5 / 2, `sell_persist_skip_when_sized` false. Print stays `sell_fak_px` 0.03 then floor 0.02. Live JSON still overrides every key it already sets. A `sell_dump_if_sister_miss_s` key left in the live file is ignored. Do not edit live JSON from this repo. Sister bids stay a separate opt-in process. After a normal held dump, B buys 10 shares of the other leg. `sister_topup.py` can move $5 of pUSD from A to B once per broke episode. Not a sell.
 
 <a id="section-30"></a>
 ## Deploy boundary (VM is source of truth)

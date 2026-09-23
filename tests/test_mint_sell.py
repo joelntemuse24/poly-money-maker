@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import unittest
+from pathlib import Path
 
 from buy.book import best_bid_with_min_size
 from buy.mint_sell import (
@@ -32,7 +33,6 @@ from buy.mint_sell import (
     resting_tif,
     scrap_rest_action,
     sell_fire_decision,
-    sister_hedge_dump_due,
     sell_intent_hot,
     sell_window_open,
     side_aware_oracle_edge_usd,
@@ -199,16 +199,16 @@ class PersistReadyTests(unittest.TestCase):
 class PersistLagFoldTests(unittest.TestCase):
     """Persist waits fold ~4s sell-tick/FAK lag so wall-clock stays ~9s / last-min ~5-6s."""
 
-    def test_default_persist_ready_at_2_5s(self):
+    def test_default_persist_ready_at_5s(self):
         persist = DEFAULT_SELL_KNOBS["sell_persist_s"]
-        self.assertEqual(persist, 2.5)
+        self.assertEqual(persist, 5.0)
         fire, _, why = persist_ready(
-            True, now_s=12.4, armed_ts=10.0, persist_s=persist,
+            True, now_s=14.9, armed_ts=10.0, persist_s=persist,
         )
         self.assertFalse(fire)
         self.assertEqual(why, "waiting")
         fire, _, why = persist_ready(
-            True, now_s=12.5, armed_ts=10.0, persist_s=persist,
+            True, now_s=15.0, armed_ts=10.0, persist_s=persist,
         )
         self.assertTrue(fire)
         self.assertEqual(why, "ready")
@@ -218,16 +218,16 @@ class PersistLagFoldTests(unittest.TestCase):
         self.assertFalse(still_waiting)
         self.assertEqual(why_9, "waiting")
 
-    def test_default_last_min_persist_ready_at_1s(self):
+    def test_default_last_min_persist_ready_at_2s(self):
         last = DEFAULT_SELL_KNOBS["sell_persist_last_min_s"]
-        self.assertEqual(last, 1.0)
+        self.assertEqual(last, 2.0)
         fire, _, why = persist_ready(
-            True, now_s=10.9, armed_ts=10.0, persist_s=last,
+            True, now_s=11.9, armed_ts=10.0, persist_s=last,
         )
         self.assertFalse(fire)
         self.assertEqual(why, "waiting")
         fire, _, why = persist_ready(
-            True, now_s=11.0, armed_ts=10.0, persist_s=last,
+            True, now_s=12.0, armed_ts=10.0, persist_s=last,
         )
         self.assertTrue(fire)
         self.assertEqual(why, "ready")
@@ -1046,18 +1046,21 @@ class SellFireDecisionTests(unittest.TestCase):
 class LateOracleScrapGateTests(unittest.TestCase):
     """Combat for true reverse btc-updown-15m-1790078400."""
 
-    def test_default_threshold_is_five_cents(self):
-        self.assertEqual(DEFAULT_SELL_KNOBS["sell_threshold"], 0.05)
+    def test_default_threshold_is_three_cents(self):
+        self.assertEqual(DEFAULT_SELL_KNOBS["sell_threshold"], 0.03)
+        self.assertEqual(DEFAULT_SELL_KNOBS["sell_persist_s"], 5.0)
+        self.assertEqual(DEFAULT_SELL_KNOBS["sell_persist_last_min_s"], 2.0)
+        self.assertIs(DEFAULT_SELL_KNOBS["sell_persist_skip_when_sized"], False)
+        self.assertNotIn("sell_dump_if_sister_miss_s", DEFAULT_SELL_KNOBS)
         self.assertEqual(DEFAULT_SELL_KNOBS["sell_floor"], 0.02)
-        self.assertEqual(DEFAULT_SELL_KNOBS["sell_dump_if_sister_miss_s"], 10.0)
         leg, why = classify_loser(
-            up_bid=0.05, dn_bid=0.95,
+            up_bid=0.03, dn_bid=0.95,
             threshold=DEFAULT_SELL_KNOBS["sell_threshold"],
             opposite_min=DEFAULT_SELL_KNOBS["sell_opposite_min"],
         )
         self.assertEqual((leg, why), ("up", "loser"))
         leg, why = classify_loser(
-            up_bid=0.06, dn_bid=0.95,
+            up_bid=0.04, dn_bid=0.95,
             threshold=DEFAULT_SELL_KNOBS["sell_threshold"],
             opposite_min=DEFAULT_SELL_KNOBS["sell_opposite_min"],
         )
@@ -1269,6 +1272,19 @@ class ScrapSpeedTests(unittest.TestCase):
         self.assertEqual((persist, why), (0.0, "sized_skip"))
         persist, why = self._persist(now_s=self._END - 240.0, depth=10.0, size=50.0)
         self.assertEqual((persist, why), (2.5, "normal"))
+        # Default knob is off: a fat book still waits the full persist.
+        persist, why = loser_scrap_persist_s(
+            now_s=self._END - 240.0,
+            end_ts=self._END,
+            persist_s=5.0,
+            last_min_s=2.0,
+            last_min_window_s=60.0,
+            skip_ttm_s=90.0,
+            depth_at_limit=394.0,
+            our_size=50.0,
+            skip_when_sized=False,
+        )
+        self.assertEqual((persist, why), (5.0, "normal"))
 
     def test_partial_fak_clips_to_short_depth(self):
         self.assertEqual(
@@ -1434,73 +1450,11 @@ class ScrapSpeedTests(unittest.TestCase):
         self.assertEqual((action, rest_why), ("cancel", "oracle_block"))
 
 
-class SisterMissDumpTests(unittest.TestCase):
-    def test_dumps_held_leg_when_sister_has_not_filled_in_ten_seconds(self):
-        due, why, age = sister_hedge_dump_due(
-            sold_loser=True,
-            sold_dump=False,
-            sold_at=1_000.0,
-            now_s=1_010.0,
-            sister_filled=0.0,
-            miss_s=10.0,
-        )
-        self.assertTrue(due)
-        self.assertEqual(why, "sister_miss")
-        self.assertAlmostEqual(age, 10.0)
-        waiting, why, age = sister_hedge_dump_due(
-            sold_loser=True,
-            sold_dump=False,
-            sold_at=1_000.0,
-            now_s=1_009.0,
-            sister_filled=0.0,
-            miss_s=10.0,
-        )
-        self.assertFalse(waiting)
-        self.assertEqual(why, "waiting")
-
-    def test_any_sister_fill_skips_the_timeout(self):
-        due, why, _age = sister_hedge_dump_due(
-            sold_loser=True,
-            sold_dump=False,
-            sold_at=1_000.0,
-            now_s=1_030.0,
-            sister_filled=1.0,
-            miss_s=10.0,
-        )
-        self.assertFalse(due)
-        self.assertEqual(why, "sister_filled")
-
-    def test_zero_disables_and_missing_clock_does_not_fire(self):
-        due, why, _age = sister_hedge_dump_due(
-            sold_loser=True,
-            sold_dump=False,
-            sold_at=1_000.0,
-            now_s=1_100.0,
-            sister_filled=0.0,
-            miss_s=0,
-        )
-        self.assertFalse(due)
-        self.assertEqual(why, "disabled")
-        due, why, _age = sister_hedge_dump_due(
-            sold_loser=True,
-            sold_dump=False,
-            sold_at=None,
-            now_s=1_100.0,
-            sister_filled=0.0,
-            miss_s=10.0,
-        )
-        self.assertFalse(due)
-        self.assertEqual(why, "no_clock")
-        due, why, _age = sister_hedge_dump_due(
-            sold_loser=True,
-            sold_dump=True,
-            sold_at=1_000.0,
-            now_s=1_100.0,
-            sister_filled=0.0,
-            miss_s=10.0,
-        )
-        self.assertFalse(due)
-        self.assertEqual(why, "already_dumped")
+class SisterMissDumpRemovedTests(unittest.TestCase):
+    def test_policy_module_has_no_sister_miss_dump(self):
+        src = Path(__file__).resolve().parents[1].joinpath("buy", "mint_sell.py").read_text()
+        self.assertNotIn("def sister_hedge_dump_due", src)
+        self.assertNotIn("sell_dump_if_sister_miss_s", src)
 
 
 if __name__ == "__main__":

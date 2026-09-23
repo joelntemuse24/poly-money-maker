@@ -23,6 +23,39 @@ def _condition_bytes(condition_id: str) -> bytes:
         raise ValueError("condition_id must be bytes32 hex") from exc
 
 
+def encode_erc20_transfer(to: str, amount: int) -> str:
+    """ERC-20 ``transfer(address,uint256)`` calldata. ``amount`` is raw units."""
+    if amount <= 0:
+        raise ValueError("transfer amount must be positive")
+    selector = keccak(b"transfer(address,uint256)")[:4]
+    payload = selector + encode(
+        ["address", "uint256"],
+        [to_checksum_address(to), amount],
+    )
+    return "0x" + payload.hex()
+
+
+def pusd_units(usd: float) -> int:
+    """Six-decimal pUSD units. Rejects values that are not an exact unit count."""
+    units = int(round(float(usd) * 1_000_000))
+    if units <= 0 or abs(units / 1_000_000 - float(usd)) > 1e-9:
+        raise ValueError("usd must map exactly to six-decimal pUSD units")
+    return units
+
+
+def build_pusd_transfer_call(
+    *,
+    pUSD_address: str,
+    recipient: str,
+    usd: float,
+) -> ContractCall:
+    """One pUSD ``transfer`` from the signing wallet to ``recipient``."""
+    return ContractCall(
+        to=to_checksum_address(pUSD_address),
+        data=encode_erc20_transfer(recipient, pusd_units(usd)),
+    )
+
+
 def encode_approve(spender: str, amount: int) -> str:
     if amount <= 0:
         raise ValueError("approval amount must be positive")
