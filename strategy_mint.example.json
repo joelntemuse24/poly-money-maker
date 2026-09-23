@@ -3,8 +3,8 @@
   "dry_run": true,
   "shares": 50.0,
   "enter_min_ttm_min": 0.0,
-  "enter_max_ttm_min": 30.0,
-  "mint_fail_cooldown_s": 90.0,
+  "enter_max_ttm_min": 45.0,
+  "mint_fail_cooldown_s": 30.0,
   "mint_submitting_timeout_s": 90.0,
   "mint_max_attempts": 3,
   "series_slugs": [

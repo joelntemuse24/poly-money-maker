@@ -15,9 +15,9 @@ pathlog are **stopped / retired**. Do not start them.
 - Series: `btc-up-or-down-15m` only
 - `shares`: 5 ($5 trial complete set)
 - `entry_enabled`: true · `dry_run`: false
-- Enter when window opens within 30 minutes and is **not yet open**
-- `max_open_sets`: 1 with **adjacent-window lookahead**; `sold_loser` frees the slot
-- `already_minted` blocks confirmed/in-flight; `failed` remints after `mint_fail_cooldown_s` (90s) up to `mint_max_attempts` (3)
+- Enter when window opens within 45 minutes and is **not yet open** (operator set `enter_max_ttm_min=45` on 23 Sep 2026)
+- `max_open_sets`: 2 live (code default 1) with **adjacent-window lookahead**; `sold_loser` frees the slot
+- `already_minted` blocks confirmed/in-flight; `failed` remints after `mint_fail_cooldown_s` (30s live and code default) up to `mint_max_attempts` (3), then that condition is skipped for the rest of its life. A cooling or exhausted nearer window does not idle the cycle: the next eligible future is minted in the same pass.
 - `submitting` intents without a relayer `transaction_id` auto-fail after `mint_submitting_timeout_s` (90s by default, 0 disables) so restart ghosts cannot pin `wait_submit`
 - Sells on:
   - Loser: opposite ≥ 0.90, loser ≤ 0.03 persist **5s wait** (2s in last 60s before end_ts) so wait + typical ~4s tick/FAK ≈ 9s wall (last-min ~5–6s). At fire, re-check in-range; out of range logs `sell_cancel_out_of_range` and does not POST. FAK 0.03 → 0.02. **Late-window oracle veto (≤120s TTM):** side-aware Chainlink TWAP edge vs window open must stay ≥ `max(25, 1.5 × TTM_s)` for 3s continuous (fail-closed if tape missing/stale); logs `sell_loser_oracle_block` / `sell_loser_oracle_ok`. Combat for true reverse `btc-updown-15m-1790078400` (TTM≈42 needed ≳$63, edge ~+$20 → block). Outside 120s, CLOB gates only.
@@ -29,6 +29,7 @@ pathlog are **stopped / retired**. Do not start them.
 
 `strategy_mint.example.json` and `mintbot` `DEFAULTS`:
 
+- `enter_max_ttm_min` **45**. A bag booked about 30m out still leaves the following 15m window inside the lookahead. `mint_max_attempts` **3**. `mint_fail_cooldown_s` **30**.
 - `sell_threshold` **0.02**. Print is FAK `sell_fak_px` **0.02**, equal to `sell_floor` **0.02**, or the live bid when the book is thinner. Post-miss rest `sell_scrap_rest_px` is **0.02** (the print). `validate_strategy` requires `sell_floor` ≤ `sell_fak_px` ≤ `sell_threshold`.
 - `sell_persist_s` **5**, `sell_persist_last_min_s` **2** (window still 60s). Dump persist stays 2s.
 - `sell_persist_skip_when_sized` **false**. A sized book waits the full persist. TTM ≤ `sell_persist_skip_ttm_s` (90s) still skips.

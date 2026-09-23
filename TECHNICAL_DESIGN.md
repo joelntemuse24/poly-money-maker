@@ -81,7 +81,7 @@ With a $5 trial (`shares=5`), you pay about $5 to mint 5 Up + 5 Down. If you sel
 
 **What this bot is not:** it is not the old hourly FAK entry bot. It does not chase 90–95¢ asks on one side with an oracle. It does not “hedge” by buying the opposite leg after entry. The post-loser exit under 80¢ is deliberately named a **held dump / sell-side pass**, not a hedge.
 
-**Risk concentration:** `max_open_sets=1` means at most one full unsold bag blocks capacity (with a special adjacent-window exception described below). A failed relayer mint is blocked for `mint_fail_cooldown_s` (~90s) and gives up after `mint_max_attempts` (3) tries so a hot remint loop cannot run. A restart ghost intent stuck at `submitting` with no `transaction_id` is auto-failed after `mint_submitting_timeout_s` (default 90s, `0` disables) so `wait_submit` cannot wedge the desk forever. A single toxic loser fill or a missed dump still matters at small size; scaling share count scales both edge and left-tail together.
+**Risk concentration:** `max_open_sets=1` means at most one full unsold bag blocks capacity (with a special adjacent-window exception described below). A failed relayer mint is blocked for `mint_fail_cooldown_s` (30s) and gives up after `mint_max_attempts` (3) tries so a hot remint loop cannot run. A nearer window in that cooldown, or already at the attempt cap, does not idle the cycle: the next eligible future is selected in the same pass. A restart ghost intent stuck at `submitting` with no `transaction_id` is auto-failed after `mint_submitting_timeout_s` (default 90s, `0` disables) so `wait_submit` cannot wedge the desk forever. A single toxic loser fill or a missed dump still matters at small size; scaling share count scales both edge and left-tail together.
 
 <a id="section-2"></a>
 ## Processes, wallet identities and files
@@ -293,7 +293,7 @@ The thread wakes every second while a bag is open. Stored rows are 15s mid-windo
 `eligible_markets` keeps markets that:
 
 - have **not** started (`start_ts > now`),
-- open within `(enter_min_ttm_min, enter_max_ttm_min]` minutes (default 0–30 so N+1 can mint mid-N),
+- open within `(enter_min_ttm_min, enter_max_ttm_min]` minutes (default 0–45 so the window after a bag booked near 30m out stays visible — two 15m steps past a market that is about to open),
 - are active, not closed, not neg-risk,
 - optionally `accepting_orders`.
 
@@ -310,16 +310,17 @@ The thread wakes every second while a bag is open. Stored rows are 15s mid-windo
 - Else allow **only** the adjacent next window: `soonest_full_end ≤ candidate_start < soonest_full_end + 900`.
 - If we already hold that next window, or the candidate is further out → full.
 
-Live: `max_open_sets=1`. Holding 1:30–1:45 still permits minting 1:45–2:00 beforehand; it does **not** permit minting 2:00–2:15 while 1:30 is still a full bag.
+Code default: `max_open_sets=1`. The 23 Sep 2026 live file is `2`. Holding 1:30–1:45 still permits minting 1:45–2:00 beforehand; it does **not** permit minting 2:00–2:15 while 1:30 is still a full bag. A nearer candidate that does not fit the cap is skipped in the same pass so that adjacent window is still selected.
 
 <a id="section-13"></a>
 ## already_minted: failed remint after cooldown
 
 ```text
 confirmed / completed / ACTIVE_STATUSES → always blocked
-failed → blocked while now < last_fail_ts + mint_fail_cooldown_s (~90s)
-failed → blocked if mint_attempts >= mint_max_attempts (3)
+failed → blocked while now < last_fail_ts + mint_fail_cooldown_s (30s)
+failed → blocked for the rest of that condition if mint_attempts >= mint_max_attempts (3)
 failed → eligible again after cooldown if attempts remain
+selection → a blocked nearer candidate is skipped; the next future in the same list is minted
 ```
 
 A relayer `STATE_FAILED` marks the intent `failed` and persists `errorMsg` / tx hash when the API returns them. Without counting `failed` at all, the bot reminted the same `condition_id` in a hot loop (seen on the 2:15 window). Incident `btc-updown-15m-1789805700` then showed the opposite bug: `failed` blocked forever, so after `STATE_FAILED` the desk sat idle for the rest of the 15m window. Cooldown + max attempts is the middle path.
@@ -340,7 +341,7 @@ Trial shape (order of magnitude, not a SLA claim):
 
 - ~19 exact matches of that `errorMsg` over ~26h ≈ **6 windows × 3 retries** (+ one singleton), not nineteen independent daily sprays.
 - Overall mint confirm rate ~**74%** (85/115); this typed fail ~**17%** of attempts in that window.
-- Bot response: mark `failed`, persist `errorMsg`, wait `mint_fail_cooldown_s` (~90s), remint up to `mint_max_attempts` (3), then move on. Pre-mint with `enter_max_ttm_min=30` reduces mid-window timing pressure when a flake burns attempts.
+- Bot response: mark `failed`, persist `errorMsg`, wait `mint_fail_cooldown_s` (30s), remint up to `mint_max_attempts` (3), then skip that condition for the rest of its life. While it is cooling or exhausted, the same cycle mints the next eligible future instead of idling. `enter_max_ttm_min=45` keeps that next window visible after a bag booked about 30m out.
 
 Operational stance: **manageable**. Do not redesign the mint path solely for this message unless the rate worsens or a reproducible gas/batch fix appears.
 
@@ -546,10 +547,10 @@ From VM `strategy_mint.json`:
 | `entry_enabled` | true | Allow new mints |
 | `dry_run` | false | Real mint/sell |
 | `shares` | 5 | Complete set size ($5 trial) |
-| `enter_max_ttm_min` | 30 | Mint when window opens within 30m (N+1 mid-N) |
+| `enter_max_ttm_min` | 45 | Mint when window opens within 45m (code default; two 15m steps past a market about to open) |
 | `series_slugs` | `[btc-up-or-down-15m]` | 15m only |
 | `max_open_sets` | 1 | Capacity (see adjacent rule) |
-| `mint_fail_cooldown_s` | 90 | Wait after `failed` before remint |
+| `mint_fail_cooldown_s` | 30 | Wait after `failed` before remint (code default) |
 | `mint_submitting_timeout_s` | 90 | Auto-fail tx-less stale `submitting` intents (`0` disables) |
 | `mint_max_attempts` | 3 | Total mint tries per market |
 | `max_daily_notional` | 100 | Daily mint spend cap |
@@ -648,11 +649,12 @@ mint loop (always poll_s):
   if not cfg.entry_enabled: return "disabled"
   markets = gateway.discover(cfg.series_slugs)
   candidates = eligible_markets(markets, cfg, now)   # NOT YET OPEN, within TTM band
-  pick = first candidate where:
-           not already_minted(condition_id, now)     # failed remints after cooldown
+  pick = first candidate in start order where:
+           not already_minted(condition_id, now)     # cooldown, or attempts >= max
            and wallet does not already hold tokens
-  if no pick: return "idle"
-  if mint_slots_full(state, cfg, now, pick.start_ts): return "capped_open"
+           and not mint_slots_full for that start    # adjacent window still allowed
+  if every free candidate is over capacity: return "capped_open"
+  if nothing free: return "idle"
   precheck balances / contracts          # no lock
   claim submitting under STATE_LOCK      # already_minted + slots + same-slug
   tx_id, err = submit_mint_batch(calls)  # no lock
@@ -772,10 +774,11 @@ operator/systemd          mintbot               Gamma/CLOB         Relayer      
       |                      | discover series      |                  |                   |
       |                      |--------------------->|                  |                   |
       |                      | eligible: not open,  |                  |                   |
-      |                      |   TTM in (0,30] min  |                  |                   |
+      |                      |   TTM in (0,45] min  |                  |                   |
       |                      | skip already_minted  |                  |                   |
-      |                      |   (failed remints    |                  |                   |
-      |                      |    after 90s, max 3) |                  |                   |
+      |                      |   (cooldown 30s, or  |                  |                   |
+      |                      |    attempts >= 3)    |                  |                   |
+      |                      | next future same pass|                  |                   |
       |                      | mint_slots_full?     |                  |                   |
       |                      |   allow adjacent     |                  |                   |
       |                      |   next window only   |                  |                   |
@@ -796,7 +799,7 @@ Notes:
 
 1. **Sells run before mint** each cycle. A mid-window loser fill can free `max_open_sets` so the adjacent mint is allowed sooner.
 2. **Never mints an already-open window.** If adjacent lookahead fails, that quarter-hour is skipped forever for this bot.
-3. Relayer `STATE_FAILED` → intent `failed` + `errorMsg` → cooldown 90s, then remint until `mint_max_attempts`. The common typed message is `relay hub: internal transaction failure` (see [§13b](#section-13b)).
+3. Relayer `STATE_FAILED` → intent `failed` + `errorMsg` → cooldown 30s, then remint until `mint_max_attempts`. At the cap that condition is skipped for the rest of its life, and a later future is tried in the same cycle. The common typed message is `relay hub: internal transaction failure` (see [§13b](#section-13b)).
 
 <a id="section-36"></a>
 ## Sell-side sequence (loser → winner / held dump)

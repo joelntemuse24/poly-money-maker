@@ -67,6 +67,43 @@ class IntentStore:
             return True
 
 
+def select_mint_candidate(
+    candidates: list,
+    is_blocked: Callable[[str], bool],
+    is_owned: Optional[Callable[[Any], bool]] = None,
+    slots_full: Optional[Callable[[Any], bool]] = None,
+) -> tuple[Any, str]:
+    """Soonest mintable candidate, skipping a blocked nearer window.
+
+    ``is_blocked`` covers a confirmed or in-flight mint, fail cooldown,
+    and ``mint_attempts >= mint_max_attempts``. Those are skipped in this
+    pass so a later future is chosen instead of idling until cooldown
+    ends. Attempts at the cap stay blocked for that condition.
+
+    ``slots_full`` skips a candidate that does not fit ``max_open_sets``
+    without hiding a later candidate that does. Status ``capped`` means
+    every otherwise-free candidate was over capacity; the returned market
+    is the soonest of those. Status ``idle`` means nothing was free.
+    """
+    capped: Any = None
+    for market in candidates:
+        condition_id = getattr(market, "condition_id", None)
+        if condition_id is None and isinstance(market, dict):
+            condition_id = market.get("condition_id")
+        if not condition_id or is_blocked(str(condition_id)):
+            continue
+        if is_owned is not None and is_owned(market):
+            continue
+        if slots_full is not None and slots_full(market):
+            if capped is None:
+                capped = market
+            continue
+        return market, "pick"
+    if capped is not None:
+        return capped, "capped"
+    return None, "idle"
+
+
 def interruptible_sleep(
     seconds: float,
     should_stop: StopFn,

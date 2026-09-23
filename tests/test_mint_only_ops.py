@@ -69,12 +69,12 @@ class MintDefaultsTests(unittest.TestCase):
             self.assertIs(blob["dry_run"], True, label)
             self.assertIs(blob["sell_enabled"], False, label)
         self.assertEqual(defaults["shares"], example["shares"])
-        self.assertEqual(defaults["enter_max_ttm_min"], 30.0)
-        self.assertEqual(example["enter_max_ttm_min"], 30.0)
+        self.assertEqual(defaults["enter_max_ttm_min"], 45.0)
+        self.assertEqual(example["enter_max_ttm_min"], 45.0)
         self.assertEqual(defaults["enter_max_ttm_min"], example["enter_max_ttm_min"])
         self.assertEqual(defaults["enter_min_ttm_min"], 0.0)
-        self.assertEqual(defaults["mint_fail_cooldown_s"], 90.0)
-        self.assertEqual(example["mint_fail_cooldown_s"], 90.0)
+        self.assertEqual(defaults["mint_fail_cooldown_s"], 30.0)
+        self.assertEqual(example["mint_fail_cooldown_s"], 30.0)
         self.assertEqual(defaults["mint_max_attempts"], 3)
         self.assertEqual(example["mint_max_attempts"], 3)
         self.assertEqual(defaults["max_open_sets"], example["max_open_sets"])
@@ -241,20 +241,20 @@ class MintSlotChainTests(unittest.TestCase):
         self.assertTrue(slots(state, {"max_open_sets": 1}, _NOW, _START_C))
         self.assertFalse(capped(state, {"max_open_sets": 1}, _NOW))
 
-    def test_run_cycle_picks_then_gates_and_records_start_ts(self):
+    def test_run_cycle_skips_blocked_candidate_in_same_pass(self):
         src = MINT.read_text()
         cycle = src[src.find("def run_mint_cycle") : src.find("\ndef _reload_cfg")]
-        self.assertLess(cycle.find("pick = market"), cycle.find("if mint_slots_full"))
-        self.assertIn(
-            "if mint_slots_full(state, cfg, now, float(pick.start_ts)):",
-            cycle,
+        self.assertIn("select_mint_candidate(", cycle)
+        self.assertLess(
+            cycle.find("select_mint_candidate("),
+            cycle.find("mint_slots_full("),
         )
         self.assertNotIn(
             'if open_intent_count(state) >= int(cfg["max_open_sets"]):',
             cycle,
         )
         self.assertGreaterEqual(cycle.count('"start_ts": pick.start_ts'), 2)
-        self.assertIn("already_minted(state, market.condition_id, cfg, now)", cycle)
+        self.assertIn("already_minted(state, condition_id, cfg, now)", cycle)
         self.assertIn("mint_attempts", cycle)
         self.assertIn("last_fail_ts", cycle)
         self.assertIn("_claim_mint_intent", cycle)
@@ -287,8 +287,15 @@ _REMINT_CFG = {
 _INCIDENT_CID = "btc-updown-15m-1789805700"
 
 
+# 16:16 diagnosis: 16:45 bag is 29m out, 16:30 is 14m, 17:00 is 44m.
+_DIAG_NOW = 1_790_176_560.0
+_WIN_1630 = 1_790_177_400.0
+_WIN_1645 = 1_790_178_300.0
+_WIN_1700 = 1_790_179_200.0
+
+
 class MintEligibilityLeadTests(unittest.TestCase):
-    def test_eligible_when_opens_in_25m_and_max_is_30(self):
+    def test_eligible_when_opens_in_25m(self):
         defaults = _assign("DEFAULTS")
         fn = _fn("eligible_markets")
         now = 1_000_000.0
@@ -296,11 +303,36 @@ class MintEligibilityLeadTests(unittest.TestCase):
         out = fn([market], defaults, now)
         self.assertEqual([item.condition_id for item in out], [_INCIDENT_CID])
 
+    def test_44m_window_after_held_bag_stays_visible(self):
+        """45m lookahead keeps the next empty window after a ~29m bag."""
+        defaults = _assign("DEFAULTS")
+        fn = _fn("eligible_markets")
+        poison = _mint_market(start_ts=_WIN_1630, condition_id="btc-updown-15m-1790177400")
+        held = _mint_market(start_ts=_WIN_1645, condition_id="btc-updown-15m-1790178300")
+        nxt = _mint_market(start_ts=_WIN_1700, condition_id="btc-updown-15m-1790179200")
+        opened = _mint_market(start_ts=_DIAG_NOW - 60.0, condition_id="already-open")
+        out = fn([nxt, opened, held, poison], defaults, _DIAG_NOW)
+        self.assertEqual(
+            [item.condition_id for item in out],
+            [
+                "btc-updown-15m-1790177400",
+                "btc-updown-15m-1790178300",
+                "btc-updown-15m-1790179200",
+            ],
+        )
+
     def test_not_eligible_when_opens_beyond_enter_max(self):
         defaults = _assign("DEFAULTS")
         fn = _fn("eligible_markets")
         now = 1_000_000.0
-        market = _mint_market(start_ts=now + 30.1 * 60.0, condition_id=_INCIDENT_CID)
+        market = _mint_market(start_ts=now + 45.1 * 60.0, condition_id=_INCIDENT_CID)
+        self.assertEqual(fn([market], defaults, now), [])
+
+    def test_already_open_market_stays_ineligible(self):
+        defaults = _assign("DEFAULTS")
+        fn = _fn("eligible_markets")
+        now = 1_000_000.0
+        market = _mint_market(start_ts=now - 1.0, condition_id=_INCIDENT_CID)
         self.assertEqual(fn([market], defaults, now), [])
 
 
@@ -383,6 +415,102 @@ class MintRemintTests(unittest.TestCase):
                 now=9_999_999.0,
             )
         )
+
+    def test_default_cooldown_is_30s_and_exhaustion_stays_blocked(self):
+        fn = self._already()
+        defaults = _assign("DEFAULTS")
+        t0 = 2_000_000.0
+        cooling = {
+            "intents": {
+                _INCIDENT_CID: {
+                    "status": "failed",
+                    "mint_attempts": 1,
+                    "last_fail_ts": t0,
+                }
+            }
+        }
+        self.assertTrue(fn(cooling, _INCIDENT_CID, defaults, now=t0 + 29.0))
+        self.assertFalse(fn(cooling, _INCIDENT_CID, defaults, now=t0 + 30.0))
+        exhausted = {
+            "intents": {
+                _INCIDENT_CID: {
+                    "status": "failed",
+                    "mint_attempts": 3,
+                    "last_fail_ts": t0,
+                }
+            }
+        }
+        self.assertTrue(fn(exhausted, _INCIDENT_CID, defaults, now=t0 + 10_000.0))
+
+
+class MintPipelineSelectTests(unittest.TestCase):
+    def test_cooling_nearest_advances_to_the_window_after_the_bag(self):
+        from buy.mint_loops import select_mint_candidate
+
+        already = _fn("already_minted", {"ACTIVE_STATUSES": _ACTIVE})
+        poison = "btc-updown-15m-1790177400"
+        held = "btc-updown-15m-1790178300"
+        nxt = "btc-updown-15m-1790179200"
+        state = {
+            "intents": {
+                poison: {
+                    "status": "failed",
+                    "mint_attempts": 2,
+                    "last_fail_ts": _DIAG_NOW - 10.0,
+                },
+                held: {"status": "confirmed", "mint_attempts": 1},
+            }
+        }
+        cfg = {
+            "one_entry_per_market": True,
+            "mint_fail_cooldown_s": 30.0,
+            "mint_max_attempts": 3,
+            "max_open_sets": 2,
+        }
+        markets = [
+            _mint_market(start_ts=_WIN_1630, condition_id=poison),
+            _mint_market(start_ts=_WIN_1645, condition_id=held),
+            _mint_market(start_ts=_WIN_1700, condition_id=nxt),
+        ]
+        pick, status = select_mint_candidate(
+            markets,
+            is_blocked=lambda cid: already(state, cid, cfg, _DIAG_NOW),
+            slots_full=lambda market: False,
+        )
+        self.assertEqual(status, "pick")
+        self.assertEqual(pick.condition_id, nxt)
+
+    def test_exhausted_poison_is_skipped_for_the_rest_of_its_life(self):
+        from buy.mint_loops import select_mint_candidate
+
+        already = _fn("already_minted", {"ACTIVE_STATUSES": _ACTIVE})
+        poison = "btc-updown-15m-1790177400"
+        nxt = "btc-updown-15m-1790179200"
+        state = {
+            "intents": {
+                poison: {
+                    "status": "failed",
+                    "mint_attempts": 3,
+                    "last_fail_ts": _DIAG_NOW - 10_000.0,
+                }
+            }
+        }
+        cfg = {
+            "one_entry_per_market": True,
+            "mint_fail_cooldown_s": 30.0,
+            "mint_max_attempts": 3,
+        }
+        markets = [
+            _mint_market(start_ts=_WIN_1630, condition_id=poison),
+            _mint_market(start_ts=_WIN_1700, condition_id=nxt),
+        ]
+        self.assertTrue(already(state, poison, cfg, _DIAG_NOW))
+        pick, status = select_mint_candidate(
+            markets,
+            is_blocked=lambda cid: already(state, cid, cfg, _DIAG_NOW),
+        )
+        self.assertEqual(status, "pick")
+        self.assertEqual(pick.condition_id, nxt)
 
 
 class MintFailErrorMsgTests(unittest.TestCase):

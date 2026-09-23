@@ -6,9 +6,12 @@ import threading
 import time
 import unittest
 
+from types import SimpleNamespace
+
 from buy.mint_loops import (
     IntentStore,
     interruptible_sleep,
+    select_mint_candidate,
     start_mint_sell_loops,
 )
 from buy.mint_sell import persist_ready
@@ -213,6 +216,88 @@ class ConcurrentLoopTests(unittest.TestCase):
         sell_t.join(timeout=2)
         mint_t.join(timeout=2)
         self.assertTrue(mint_errors)
+
+
+def _market(condition_id: str, start_ts: float):
+    return SimpleNamespace(
+        condition_id=condition_id,
+        start_ts=start_ts,
+        slug=f"btc-updown-15m-{int(start_ts)}",
+    )
+
+
+class SelectMintCandidateTests(unittest.TestCase):
+    def test_cooldown_on_nearest_picks_next_future_same_cycle(self):
+        nearest = _market("near", 100.0)
+        later = _market("later", 200.0)
+        pick, status = select_mint_candidate(
+            [nearest, later],
+            is_blocked=lambda cid: cid == "near",
+        )
+        self.assertEqual(status, "pick")
+        self.assertIs(pick, later)
+
+    def test_exhausted_condition_is_not_reminted(self):
+        poisoned = _market("poison", 100.0)
+        later = _market("later", 200.0)
+        pick, status = select_mint_candidate(
+            [poisoned, later],
+            is_blocked=lambda cid: cid == "poison",
+        )
+        self.assertEqual(status, "pick")
+        self.assertEqual(pick.condition_id, "later")
+
+    def test_only_blocked_candidates_idle(self):
+        pick, status = select_mint_candidate(
+            [_market("near", 100.0)],
+            is_blocked=lambda cid: True,
+        )
+        self.assertIsNone(pick)
+        self.assertEqual(status, "idle")
+
+    def test_after_cooldown_retries_nearest_while_attempts_remain(self):
+        nearest = _market("near", 100.0)
+        later = _market("later", 200.0)
+        pick, status = select_mint_candidate(
+            [nearest, later],
+            is_blocked=lambda cid: False,
+        )
+        self.assertEqual(status, "pick")
+        self.assertIs(pick, nearest)
+
+    def test_capacity_blocked_nearest_does_not_hide_adjacent_window(self):
+        nearer = _market("near", 100.0)
+        adjacent = _market("next", 1_000.0)
+        too_far = _market("far", 2_000.0)
+        pick, status = select_mint_candidate(
+            [nearer, adjacent, too_far],
+            is_blocked=lambda cid: False,
+            slots_full=lambda market: market.condition_id != "next",
+        )
+        self.assertEqual(status, "pick")
+        self.assertIs(pick, adjacent)
+
+    def test_all_over_cap_reports_capped(self):
+        first = _market("a", 100.0)
+        second = _market("b", 200.0)
+        pick, status = select_mint_candidate(
+            [first, second],
+            is_blocked=lambda cid: False,
+            slots_full=lambda market: True,
+        )
+        self.assertEqual(status, "capped")
+        self.assertIs(pick, first)
+
+    def test_owned_tokens_are_skipped(self):
+        held = _market("held", 100.0)
+        fresh = _market("fresh", 200.0)
+        pick, status = select_mint_candidate(
+            [held, fresh],
+            is_blocked=lambda cid: False,
+            is_owned=lambda market: market.condition_id == "held",
+        )
+        self.assertEqual(status, "pick")
+        self.assertIs(pick, fresh)
 
 
 class InterruptibleSleepTests(unittest.TestCase):
