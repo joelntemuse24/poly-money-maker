@@ -606,6 +606,11 @@ class DecisionIsolationTests(unittest.TestCase):
     def test_manage_sells_wires_late_oracle_veto_only(self):
         manage = _fn_source(MINT, "_manage_sells_locked")
         self.assertIn("late_oracle_scrap_ok", manage)
+        self.assertIn("advance_oracle_edge_arm", manage)
+        self.assertNotIn(
+            "edge_qualify = bool(edge_ok) and loser is not None",
+            manage,
+        )
         self.assertIn("sell_loser_oracle_block", manage)
         self.assertIn("sell_loser_oracle_ok", manage)
         self.assertIn("_oracle_bag_view", manage)
