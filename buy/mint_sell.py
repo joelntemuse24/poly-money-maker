@@ -531,20 +531,30 @@ def loser_ladder_limits(
     """FAK limits. The arm ceiling is not the print.
 
     Top rung is ``fak_px`` when given, otherwise ``threshold`` for older
-    callers. Each rung is clamped to the live bid, then the floor. A live
-    bid below the floor is the only rung. Defaults post a single 2¢ rung
-    (``fak_px`` equals ``sell_floor``). A thinner book posts the live bid.
+    callers. One fire walks every 1¢ from ``min(top, live bid)`` down to
+    the floor, inclusive. Each rung is clamped to the live bid; duplicates
+    are skipped. A live bid below the floor is the only rung. Defaults post
+    a single 2¢ rung (``fak_px`` equals ``sell_floor``). A thinner book
+    starts at the live bid.
     """
+    tick = 0.01
     top = round(float(threshold if fak_px is None else fak_px), 4)
     fl = round(float(floor), 4)
     bid = round(float(loser_bid), 4)
     if bid + 1e-12 < fl:
         return [bid] if bid > 1e-12 else []
     limits: list[float] = []
-    for limit in sorted({top, fl}, reverse=True):
-        use_px = round(max(fl, min(limit, bid)), 4)
+    px = round(min(top, bid), 4)
+    while True:
+        use_px = round(max(fl, min(px, bid)), 4)
         if not limits or abs(use_px - limits[-1]) > 1e-12:
             limits.append(use_px)
+        if use_px <= fl + 1e-12:
+            break
+        nxt = round(px - tick, 4)
+        if nxt + 1e-12 >= px:
+            break
+        px = fl if nxt + 1e-12 < fl else nxt
     return limits
 
 
