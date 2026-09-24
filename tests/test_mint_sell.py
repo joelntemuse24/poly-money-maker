@@ -512,6 +512,37 @@ class LoserLadderTests(unittest.TestCase):
             [0.03, 0.02],
         )
 
+    def test_fak_to_floor_includes_every_cent(self):
+        """Joel: one fire walks 3¢ → 2¢ → 1¢, not only the endpoints."""
+        self.assertEqual(
+            loser_ladder_limits(
+                threshold=0.03, floor=0.01, loser_bid=0.03, fak_px=0.03,
+            ),
+            [0.03, 0.02, 0.01],
+        )
+
+    def test_thinner_bid_starts_the_cent_ladder(self):
+        self.assertEqual(
+            loser_ladder_limits(
+                threshold=0.03, floor=0.01, loser_bid=0.02, fak_px=0.03,
+            ),
+            [0.02, 0.01],
+        )
+        self.assertEqual(
+            loser_ladder_limits(
+                threshold=0.03, floor=0.01, loser_bid=0.01, fak_px=0.03,
+            ),
+            [0.01],
+        )
+
+    def test_bid_below_one_cent_floor_stays_the_live_bid(self):
+        self.assertEqual(
+            loser_ladder_limits(
+                threshold=0.03, floor=0.01, loser_bid=0.005, fak_px=0.03,
+            ),
+            [0.005],
+        )
+
 
 class EmptyFakArmTests(unittest.TestCase):
     def test_empty_fak_status_matches_clob_miss(self):
