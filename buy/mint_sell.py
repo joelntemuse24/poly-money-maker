@@ -728,6 +728,40 @@ def late_oracle_edge_persist(
     )
 
 
+def advance_oracle_edge_arm(
+    *,
+    edge_ok: bool,
+    sold_loser: bool,
+    scrap_leg: Optional[str],
+    now_s: float,
+    armed_ts: Optional[float],
+    armed_leg: Optional[str],
+    persist_s: float,
+    in_late: bool,
+) -> Tuple[bool, Optional[float], str, Optional[str]]:
+    """Advance the late-oracle persist clock for one sell tick.
+
+    A missing loser bid does not reset an arm that already started: pass
+    the kept scrap leg (``sell_loser_leg``) while the book is empty.
+    The clock still resets when the edge fails, the bag is sold, the
+    market leaves the late window, the scrap leg is unknown, or the
+    scrap leg changes (opposite side).
+
+    Returns ``(fire, armed_ts, why, armed_leg)``.
+    """
+    if not in_late or sold_loser or scrap_leg not in ("up", "dn"):
+        return False, None, "reset", None
+    if armed_leg in ("up", "dn") and armed_leg != scrap_leg:
+        armed_ts = None
+    fire, armed, why = late_oracle_edge_persist(
+        bool(edge_ok),
+        now_s=now_s,
+        armed_ts=armed_ts,
+        persist_s=persist_s,
+    )
+    return fire, armed, why, (scrap_leg if armed is not None else None)
+
+
 def depth_covers_size(depth_at_limit: Optional[float], our_size: float) -> bool:
     """True when displayed bid depth at the FAK limit covers our shares."""
     try:

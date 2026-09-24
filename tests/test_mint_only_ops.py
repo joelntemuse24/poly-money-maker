@@ -748,6 +748,7 @@ class DeployUnitsTests(unittest.TestCase):
         self.assertIn("def sell_fire_decision", mint_sell_src)
         self.assertIn("def late_oracle_scrap_ok", mint_sell_src)
         self.assertIn("def late_oracle_edge_persist", mint_sell_src)
+        self.assertIn("def advance_oracle_edge_arm", mint_sell_src)
         self.assertIn("def winner_sell_limit", mint_sell_src)
         self.assertIn("def dump_fast_retry_eligible", mint_sell_src)
         self.assertIn("def dump_retry_ladder_limits", mint_sell_src)

@@ -17,6 +17,7 @@ from buy.mint_sell import (
     effective_loser_persist_s,
     empty_fak_status,
     inventory_latch,
+    advance_oracle_edge_arm,
     late_oracle_edge_persist,
     late_oracle_need_usd,
     late_oracle_scrap_ok,
@@ -1155,6 +1156,115 @@ class LateOracleScrapGateTests(unittest.TestCase):
         )
         self.assertTrue(fire)
         self.assertEqual(why_p, "ready")
+
+    def test_empty_loser_book_does_not_reset_oracle_arm(self):
+        # Bag btc-updown-15m-1790210700: edge already OK, then the ≤2¢ bid
+        # flickered off. Persist must keep counting on the kept leg.
+        fire, armed, why, leg = advance_oracle_edge_arm(
+            edge_ok=True,
+            sold_loser=False,
+            scrap_leg="up",
+            now_s=100.0,
+            armed_ts=None,
+            armed_leg=None,
+            persist_s=3.0,
+            in_late=True,
+        )
+        self.assertFalse(fire)
+        self.assertEqual(why, "armed")
+        self.assertEqual(leg, "up")
+        fire, armed, why, leg = advance_oracle_edge_arm(
+            edge_ok=True,
+            sold_loser=False,
+            scrap_leg="up",
+            now_s=102.0,
+            armed_ts=armed,
+            armed_leg=leg,
+            persist_s=3.0,
+            in_late=True,
+        )
+        self.assertFalse(fire)
+        self.assertEqual(why, "waiting")
+        self.assertEqual(armed, 100.0)
+        fire, armed, why, leg = advance_oracle_edge_arm(
+            edge_ok=True,
+            sold_loser=False,
+            scrap_leg="up",
+            now_s=103.0,
+            armed_ts=armed,
+            armed_leg=leg,
+            persist_s=3.0,
+            in_late=True,
+        )
+        self.assertTrue(fire)
+        self.assertEqual(why, "ready")
+        self.assertEqual(leg, "up")
+
+    def test_oracle_arm_still_resets_on_thin_edge_sold_window_and_leg_flip(self):
+        fire, armed, why, leg = advance_oracle_edge_arm(
+            edge_ok=False,
+            sold_loser=False,
+            scrap_leg="up",
+            now_s=103.0,
+            armed_ts=100.0,
+            armed_leg="up",
+            persist_s=3.0,
+            in_late=True,
+        )
+        self.assertFalse(fire)
+        self.assertIsNone(armed)
+        self.assertEqual(why, "reset")
+        self.assertIsNone(leg)
+        fire, armed, why, leg = advance_oracle_edge_arm(
+            edge_ok=True,
+            sold_loser=True,
+            scrap_leg="up",
+            now_s=103.0,
+            armed_ts=100.0,
+            armed_leg="up",
+            persist_s=3.0,
+            in_late=True,
+        )
+        self.assertIsNone(armed)
+        self.assertEqual(why, "reset")
+        fire, armed, why, leg = advance_oracle_edge_arm(
+            edge_ok=True,
+            sold_loser=False,
+            scrap_leg="up",
+            now_s=103.0,
+            armed_ts=100.0,
+            armed_leg="up",
+            persist_s=3.0,
+            in_late=False,
+        )
+        self.assertIsNone(armed)
+        self.assertEqual(why, "reset")
+        fire, armed, why, leg = advance_oracle_edge_arm(
+            edge_ok=True,
+            sold_loser=False,
+            scrap_leg=None,
+            now_s=103.0,
+            armed_ts=100.0,
+            armed_leg="up",
+            persist_s=3.0,
+            in_late=True,
+        )
+        self.assertIsNone(armed)
+        self.assertEqual(why, "reset")
+        fire, armed, why, leg = advance_oracle_edge_arm(
+            edge_ok=True,
+            sold_loser=False,
+            scrap_leg="dn",
+            now_s=101.0,
+            armed_ts=100.0,
+            armed_leg="up",
+            persist_s=3.0,
+            in_late=True,
+        )
+        self.assertFalse(fire)
+        self.assertEqual(why, "armed")
+        self.assertEqual(armed, 101.0)
+        self.assertEqual(leg, "dn")
 
     def test_zero_late_window_skips_gate_even_with_missing_tape(self):
         ok, why, detail = late_oracle_scrap_ok(

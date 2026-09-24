@@ -94,7 +94,7 @@ from buy.mint_sell import (
     effective_loser_persist_s,
     empty_fak_status,
     inventory_latch,
-    late_oracle_edge_persist,
+    advance_oracle_edge_arm,
     late_oracle_scrap_ok,
     loser_blind_fak_due,
     loser_empty_keep_qualify,
@@ -2124,8 +2124,9 @@ def _manage_sells_locked(cfg: dict, state: dict, chain: ChainReader) -> None:
         )
         intent["sell_loser_armed_at"] = armed_l
         if why_l == "reset":
+            # CLOB disarm only. An empty loser book must not wipe the
+            # oracle persist clock; advance_oracle_edge_arm owns that.
             intent["sell_loser_leg"] = None
-            intent["sell_oracle_edge_armed_at"] = None
         else:
             intent["sell_loser_leg"] = loser or keep_leg or prev_leg
         persist_leg = loser or intent.get("sell_loser_leg")
@@ -2149,6 +2150,7 @@ def _manage_sells_locked(cfg: dict, state: dict, chain: ChainReader) -> None:
         oracle_block_why = "outside_late_window"
         if not in_late or sold_loser or persist_leg not in ("up", "dn"):
             intent["sell_oracle_edge_armed_at"] = None
+            intent["sell_oracle_edge_leg"] = None
         elif in_late:
             view = _oracle_bag_view(cid)
             age_s = (
@@ -2156,7 +2158,7 @@ def _manage_sells_locked(cfg: dict, state: dict, chain: ChainReader) -> None:
                 if view.obs_ts is None
                 else max(0.0, float(now) - float(view.obs_ts))
             )
-            # Gate qualifies on the scrap leg even while CLOB arm waits.
+            # Kept leg still counts while the loser bid has flickered off.
             scrap_for_edge = loser or persist_leg
             edge_ok, edge_why, edge_detail = late_oracle_scrap_ok(
                 ttm_s=ttm_for_oracle,
@@ -2169,16 +2171,20 @@ def _manage_sells_locked(cfg: dict, state: dict, chain: ChainReader) -> None:
                 floor_usd=floor_usd,
                 stale_s=stale_s,
             )
-            # Only accumulate edge persist while CLOB also still sees a loser.
-            edge_qualify = bool(edge_ok) and loser is not None and not sold_loser
-            oracle_fire, armed_o, why_o = late_oracle_edge_persist(
-                edge_qualify,
+            oracle_fire, armed_o, why_o, armed_leg = advance_oracle_edge_arm(
+                edge_ok=bool(edge_ok),
+                sold_loser=sold_loser,
+                scrap_leg=scrap_for_edge,
                 now_s=now,
                 armed_ts=intent.get("sell_oracle_edge_armed_at"),
+                armed_leg=intent.get("sell_oracle_edge_leg"),
                 persist_s=edge_persist_s,
+                in_late=True,
             )
             intent["sell_oracle_edge_armed_at"] = armed_o
+            intent["sell_oracle_edge_leg"] = armed_leg
             oracle_block_why = edge_why if not edge_ok else why_o
+            edge_qualify = bool(edge_ok) and not sold_loser
             if edge_qualify and why_o in {"armed", "waiting"}:
                 log_event(
                     "sell_loser_oracle_persist",
