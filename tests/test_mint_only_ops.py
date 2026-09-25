@@ -89,7 +89,7 @@ class MintDefaultsTests(unittest.TestCase):
             self.assertEqual(blob["sell_persist_s"], 5.0, label)
             self.assertEqual(blob["sell_persist_last_min_s"], 2.0, label)
             self.assertEqual(blob["sell_persist_last_min_window_s"], 60.0, label)
-            self.assertEqual(blob["sell_persist_skip_ttm_s"], 90.0, label)
+            self.assertNotIn("sell_persist_skip_ttm_s", blob, label)
             self.assertIs(blob["sell_persist_skip_when_sized"], False, label)
             self.assertIs(blob["sell_scrap_blind_enabled"], True, label)
             self.assertEqual(blob["sell_scrap_blind_px"], 0.01, label)
@@ -112,6 +112,50 @@ class MintDefaultsTests(unittest.TestCase):
         defaults = _assign("DEFAULTS")
         validate(example)
         validate(defaults)
+
+    def test_legacy_sell_persist_skip_ttm_s_is_ignored(self):
+        """A live file that still lists the removed skip key loads and does not skip."""
+        import tempfile
+
+        from buy.mint_sell import loser_scrap_persist_s
+
+        defaults = _assign("DEFAULTS")
+        validate = _fn("validate_strategy")
+        raw = json.loads(MINT_EXAMPLE.read_text())
+        raw["sell_persist_skip_ttm_s"] = 90.0
+        with tempfile.NamedTemporaryFile(
+            "w", suffix=".json", delete=False, encoding="utf-8"
+        ) as handle:
+            json.dump(raw, handle)
+            path = Path(handle.name)
+        try:
+            load = _fn(
+                "load_strategy",
+                {
+                    "json": json,
+                    "DEFAULTS": defaults,
+                    "validate_strategy": validate,
+                    "STRATEGY_FILE": path,
+                },
+            )
+            cfg = load()
+        finally:
+            path.unlink(missing_ok=True)
+        self.assertNotIn("sell_persist_skip_ttm_s", cfg)
+        self.assertEqual(cfg["sell_persist_s"], 5.0)
+        self.assertEqual(cfg["sell_persist_last_min_s"], 2.0)
+        self.assertEqual(cfg["sell_persist_last_min_window_s"], 60.0)
+        end = 1_790_101_800.0
+        for ttm, expect in ((30.0, (2.0, "last_min")), (75.0, (5.0, "normal"))):
+            persist, why = loser_scrap_persist_s(
+                now_s=end - ttm,
+                end_ts=end,
+                persist_s=cfg["sell_persist_s"],
+                last_min_s=cfg["sell_persist_last_min_s"],
+                last_min_window_s=cfg["sell_persist_last_min_window_s"],
+                skip_when_sized=bool(cfg["sell_persist_skip_when_sized"]),
+            )
+            self.assertEqual((persist, why), expect, ttm)
 
     def test_open_intent_count_ignores_expired_redeem_holds(self):
         statuses = frozenset(
@@ -744,6 +788,12 @@ class DeployUnitsTests(unittest.TestCase):
         self.assertIn("def loser_empty_keep_qualify", mint_sell_src)
         self.assertIn("def effective_loser_persist_s", mint_sell_src)
         self.assertIn("def loser_scrap_persist_s", mint_sell_src)
+        self.assertNotIn("late_skip", mint_sell_src)
+        self.assertNotIn("skip_ttm_s", mint_sell_src)
+        self.assertNotIn("sell_persist_skip_ttm_s", mint_sell_src)
+        self.assertNotIn("late_skip", src)
+        self.assertNotIn("skip_ttm_s", src)
+        self.assertNotIn("sell_persist_skip_ttm_s", src)
         self.assertIn("def loser_blind_fak_due", mint_sell_src)
         self.assertIn("def scrap_rest_action", mint_sell_src)
         self.assertIn("def sell_fire_decision", mint_sell_src)

@@ -37,8 +37,8 @@ sell stays off until live `strategy_mint.json` sets `sell_enabled=true`.
 Loser scrap: sized opposite bid ≥ `sell_opposite_min` (~0.90), loser ≤
 `sell_threshold` (0.02) **arms**. Persist `sell_persist_s` (5s), or
 `sell_persist_last_min_s` (2s) when time-to-end is within
-`sell_persist_last_min_window_s` (~60s). Skip that wait when TTM ≤
-`sell_persist_skip_ttm_s` (~90s). `sell_persist_skip_when_sized` defaults
+`sell_persist_last_min_window_s` (~60s). That 2s last-minute persist
+applies through market close. `sell_persist_skip_when_sized` defaults
 false, so a sized book still waits the full persist. Then re-check in-range
 at fire, `sell_scrap_sweep_enabled` (default true) posts one FAK at
 `sell_floor` for the full remaining loser size. The book still fills

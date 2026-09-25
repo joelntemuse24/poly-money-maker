@@ -1147,6 +1147,7 @@ class LateOracleScrapGateTests(unittest.TestCase):
         self.assertEqual(DEFAULT_SELL_KNOBS["sell_persist_s"], 5.0)
         self.assertEqual(DEFAULT_SELL_KNOBS["sell_persist_last_min_s"], 2.0)
         self.assertIs(DEFAULT_SELL_KNOBS["sell_persist_skip_when_sized"], False)
+        self.assertNotIn("sell_persist_skip_ttm_s", DEFAULT_SELL_KNOBS)
         self.assertNotIn("sell_dump_if_sister_miss_s", DEFAULT_SELL_KNOBS)
         self.assertEqual(floor, 0.02)
         self.assertEqual(fak, 0.02)
@@ -1454,27 +1455,43 @@ class ScrapSpeedTests(unittest.TestCase):
 
     _END = 1_790_101_800.0  # btc-updown-15m-1790100900 closes 900s after slug
 
-    def _persist(self, *, now_s, depth=0.0, size=50.0, skip_ttm=90.0, sized=True):
+    def _persist(self, *, now_s, depth=0.0, size=50.0, sized=True):
         return loser_scrap_persist_s(
             now_s=now_s,
             end_ts=self._END,
             persist_s=2.5,
             last_min_s=1.0,
             last_min_window_s=60.0,
-            skip_ttm_s=skip_ttm,
             depth_at_limit=depth,
             our_size=size,
             skip_when_sized=sized,
         )
 
-    def test_last_90s_skips_persist(self):
-        persist, why = self._persist(now_s=self._END - 70.0, depth=0.0)
-        self.assertEqual(persist, 0.0)
-        self.assertEqual(why, "late_skip")
-        persist, why = self._persist(now_s=self._END - 90.0, depth=0.0)
-        self.assertEqual((persist, why), (0.0, "late_skip"))
-        persist, why = self._persist(now_s=self._END - 100.0, depth=0.0)
-        self.assertEqual((persist, why), (2.5, "normal"))
+    def test_last_min_persist_holds_through_close(self):
+        end = self._END
+        for ttm in (30.0, 8.0):
+            persist, why = loser_scrap_persist_s(
+                now_s=end - ttm,
+                end_ts=end,
+                persist_s=5.0,
+                last_min_s=2.0,
+                last_min_window_s=60.0,
+                depth_at_limit=400.0,
+                our_size=50.0,
+                skip_when_sized=False,
+            )
+            self.assertEqual((persist, why), (2.0, "last_min"), ttm)
+        persist, why = loser_scrap_persist_s(
+            now_s=end - 75.0,
+            end_ts=end,
+            persist_s=5.0,
+            last_min_s=2.0,
+            last_min_window_s=60.0,
+            depth_at_limit=400.0,
+            our_size=50.0,
+            skip_when_sized=False,
+        )
+        self.assertEqual((persist, why), (5.0, "normal"))
 
     def test_sized_depth_skips_persist(self):
         self.assertTrue(depth_covers_size(394.0, 50.0))
@@ -1493,12 +1510,20 @@ class ScrapSpeedTests(unittest.TestCase):
             persist_s=5.0,
             last_min_s=2.0,
             last_min_window_s=60.0,
-            skip_ttm_s=90.0,
             depth_at_limit=394.0,
             our_size=50.0,
             skip_when_sized=False,
         )
         self.assertEqual((persist, why), (5.0, "normal"))
+        # Enabled sized skip still fires inside the last minute.
+        persist, why = self._persist(
+            now_s=self._END - 30.0, depth=394.0, size=50.0, sized=True,
+        )
+        self.assertEqual((persist, why), (0.0, "sized_skip"))
+        persist, why = self._persist(
+            now_s=self._END - 8.0, depth=394.0, size=50.0, sized=False,
+        )
+        self.assertEqual((persist, why), (1.0, "last_min"))
 
     def test_partial_fak_clips_to_short_depth(self):
         self.assertEqual(
@@ -1646,7 +1671,7 @@ class ScrapSpeedTests(unittest.TestCase):
         self.assertFalse(ok)
         self.assertEqual(why, "edge_thin")
         persist, skip_why = self._persist(now_s=self._END - 42.0, depth=400.0)
-        self.assertEqual((persist, skip_why), (0.0, "late_skip"))
+        self.assertEqual((persist, skip_why), (0.0, "sized_skip"))
         fire, blind_why = loser_blind_fak_due(
             why="empty_keep_arm",
             now_s=self._END - 42.0,
