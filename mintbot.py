@@ -74,17 +74,20 @@ from rich.console import Console
 from rich.panel import Panel
 
 from buy.book import best_bid_with_min_size, bid_fill_depth
-from buy.chain import ChainReader
+from buy.chain import ChainReader, thread_session
 from buy.contracts import ContractCall, build_atomic_mint_calls
 from buy.market import MarketGateway, MintMarket
 from buy.mint_loops import (
     IntentStore,
     held_forward_floor,
     mint_cash_block,
+    chain_reconcile_action,
     pending_mint_reserve,
     run_job_loop,
     select_mint_candidate,
+    snapshot_persist_intents,
     start_mint_sell_loops,
+    state_persist_changed,
 )
 from buy.oracle_log import OracleBagView, OracleLogService, snapshot_intents
 from buy.mint_sell import (
@@ -290,7 +293,7 @@ def notify(title: str, message: str, priority: str = "default") -> None:
 
 def atomic_save(path: Path, payload: dict) -> None:
     temporary = path.with_suffix(path.suffix + ".tmp")
-    data = json.dumps(payload, indent=2, sort_keys=True)
+    data = json.dumps(payload, separators=(",", ":"), sort_keys=True)
     with open(temporary, "w", encoding="utf-8") as handle:
         handle.write(data)
         handle.flush()
@@ -755,7 +758,7 @@ def submit_mint_batch(calls: List[ContractCall], metadata: str) -> Tuple[Optiona
 
 def get_relayer_transaction(relayer_url: str, transaction_id: str) -> Optional[dict]:
     try:
-        response = requests.get(
+        response = thread_session("relayer").get(
             f"{relayer_url.rstrip('/')}/transaction",
             params={"id": transaction_id},
             timeout=15,
@@ -837,10 +840,19 @@ def reconcile_intents(
             status = str(intent.get("status") or "")
             if status not in ("confirmed_waiting_inventory", "confirmed", "mined"):
                 continue
-            if skip_confirmed_inventory and status == "confirmed":
+            # Ended confirmed bags are not polled. One read after the grace
+            # can still flip an empty bag to completed, then chain_reconcile_done
+            # stops further eth_calls. In-flight statuses keep querying so
+            # pending cash can release. Live confirmed stays on the old path,
+            # including skip_confirmed_inventory while a sell is hot.
+            action = chain_reconcile_action(intent, now)
+            if action == "skip":
+                continue
+            if action != "final" and skip_confirmed_inventory and status == "confirmed":
                 continue
             up_tok = str(intent.get("up_token") or up_tok)
             dn_tok = str(intent.get("dn_token") or dn_tok)
+            final_read = action == "final"
         try:
             up = chain.position_balance(ctf, funder, up_tok)
             dn = chain.position_balance(ctf, funder, dn_tok)
@@ -854,6 +866,8 @@ def reconcile_intents(
             intent["observed_up"] = up
             intent["observed_dn"] = dn
             intent["updated_at"] = now
+            if final_read:
+                intent["chain_reconcile_done"] = True
             expected = float(intent.get("before_up") or 0) + float(intent["shares"])
             expected_dn = float(intent.get("before_dn") or 0) + float(intent["shares"])
             if up + tol >= expected and dn + tol >= expected_dn:
@@ -937,7 +951,7 @@ _book_pool = ThreadPoolExecutor(max_workers=2)
 def _fetch_book(token_id: str, min_size: float):
     """REST `/book` → sized best bid plus raw bid levels for depth logs."""
     try:
-        response = requests.get(
+        response = thread_session("clob_book").get(
             "https://clob.polymarket.com/book",
             params={"token_id": str(token_id)},
             timeout=5,
@@ -1767,6 +1781,7 @@ def _manage_sells_locked(cfg: dict, state: dict, chain: ChainReader) -> None:
     funder = os.getenv("FUNDER_ADDRESS") or ""
     funder_cs = to_checksum_address(funder) if funder else None
     dirty = False
+    before_intents = snapshot_persist_intents(state)
     ctf = str(cfg.get("ctf_address") or "")
 
     def _observed_loser_bid(leg: Optional[str], live: dict, seen: dict) -> Optional[float]:
@@ -1817,12 +1832,13 @@ def _manage_sells_locked(cfg: dict, state: dict, chain: ChainReader) -> None:
             "up": intent.get("last_up_bid"),
             "dn": intent.get("last_dn_bid"),
         }
+        # In-memory fallback for scrap_rest_px after a missed FAK.
+        # These prints alone must not rewrite positions_mint.json.
         intent["last_up_bid"] = up_bid
         intent["last_dn_bid"] = dn_bid
         intent["last_up_bid_size"] = up_sz
         intent["last_dn_bid_size"] = dn_sz
         intent["updated_at"] = now
-        dirty = True
 
         last = float(intent.get("last_sell_attempt_at") or 0)
         cooling = bool(last and now - last < cooldown)
@@ -2628,6 +2644,8 @@ def _manage_sells_locked(cfg: dict, state: dict, chain: ChainReader) -> None:
                 fak_miss=True,
             )
 
+    if state_persist_changed(before_intents, state.get("intents") or {}):
+        dirty = True
     if dirty:
         atomic_save(STATE_FILE, state)
 
@@ -2697,6 +2715,8 @@ def run_mint_cycle(
     if funder:
         with STATE_LOCK:
             sell_armed = skip_mint_discovery_for_sell(state, now)
+        with STATE_LOCK:
+            before_intents = snapshot_persist_intents(state)
         reconcile_intents(
             state,
             cfg,
@@ -2706,7 +2726,8 @@ def run_mint_cycle(
             skip_confirmed_inventory=sell_armed,
         )
         with STATE_LOCK:
-            atomic_save(STATE_FILE, state)
+            if state_persist_changed(before_intents, state.get("intents") or {}):
+                atomic_save(STATE_FILE, state)
 
     with STATE_LOCK:
         submitting = any(

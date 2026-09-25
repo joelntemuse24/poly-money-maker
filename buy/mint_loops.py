@@ -330,6 +330,110 @@ def pending_mint_reserve(state: Any) -> float:
     return total
 
 
+# One chain read this long after end_ts, then never again. Inside the
+# grace, ended confirmed bags are not queried. In-flight mint statuses
+# stay on the every-cycle path so pending cash can still release.
+ENDED_CHAIN_GRACE_S = 180.0
+
+_INFLIGHT_CHAIN_STATUSES = frozenset(
+    {
+        "submitting",
+        "pending",
+        "executed",
+        "mined",
+        "confirmed_waiting_inventory",
+    }
+)
+
+# Cached book prints and the touch timestamp. Losing them on crash is
+# acceptable; they must not force a positions rewrite.
+PERSIST_IGNORE_KEYS = frozenset(
+    {
+        "last_up_bid",
+        "last_dn_bid",
+        "last_up_bid_size",
+        "last_dn_bid_size",
+        "updated_at",
+    }
+)
+
+
+def chain_reconcile_action(
+    intent: Any,
+    now: float,
+    *,
+    grace_s: float = ENDED_CHAIN_GRACE_S,
+) -> str:
+    """Whether reconcile should eth_call this bag.
+
+    ``query`` — live window, or an in-flight mint that has not settled.
+    ``final`` — ended ``confirmed`` bag, once, after ``grace_s``.
+    ``skip`` — do not chain-query.
+
+    ``chain_reconcile_done`` on the intent means the final read already
+    happened. In-flight statuses ignore that flag and the market end:
+    their pUSD is still in ``pending_mint_reserve`` until they leave
+    the set.
+    """
+    if not isinstance(intent, dict):
+        return "skip"
+    status = str(intent.get("status") or "")
+    if status in _INFLIGHT_CHAIN_STATUSES:
+        return "query"
+    if status != "confirmed":
+        return "skip"
+    if intent.get("chain_reconcile_done"):
+        return "skip"
+    try:
+        end_ts = float(intent.get("end_ts") or 0)
+    except (TypeError, ValueError):
+        end_ts = 0.0
+    try:
+        now_ts = float(now)
+    except (TypeError, ValueError):
+        now_ts = 0.0
+    if end_ts <= 0 or now_ts <= end_ts:
+        return "query"
+    try:
+        grace = float(grace_s)
+    except (TypeError, ValueError):
+        grace = ENDED_CHAIN_GRACE_S
+    if grace < 0:
+        grace = 0.0
+    if now_ts + 1e-9 < end_ts + grace:
+        return "skip"
+    return "final"
+
+
+def snapshot_persist_intents(state: Any) -> dict:
+    """Shallow copy of intents for a later persist compare."""
+    intents = state.get("intents") if isinstance(state, dict) else None
+    if not isinstance(intents, dict):
+        return {}
+    return {
+        str(key): dict(intent) if isinstance(intent, dict) else intent
+        for key, intent in intents.items()
+    }
+
+
+def _persist_view(intent: Any) -> Any:
+    if not isinstance(intent, dict):
+        return intent
+    return {key: value for key, value in intent.items() if key not in PERSIST_IGNORE_KEYS}
+
+
+def state_persist_changed(before: Any, after: Any) -> bool:
+    """True when an intent changed aside from cached bids and updated_at."""
+    before_map = before if isinstance(before, dict) else {}
+    after_map = after if isinstance(after, dict) else {}
+    if set(before_map) != set(after_map):
+        return True
+    for key, old in before_map.items():
+        if _persist_view(old) != _persist_view(after_map.get(key)):
+            return True
+    return False
+
+
 def mint_cash_block(balance: float, need: float, reserved: float) -> Optional[dict]:
     """None when ``balance - reserved`` covers ``need``.
 
