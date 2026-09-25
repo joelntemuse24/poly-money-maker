@@ -40,10 +40,11 @@ Loser scrap: sized opposite bid ≥ `sell_opposite_min` (~0.90), loser ≤
 `sell_persist_last_min_window_s` (~60s). Skip that wait when TTM ≤
 `sell_persist_skip_ttm_s` (~90s). `sell_persist_skip_when_sized` defaults
 false, so a sized book still waits the full persist. Then re-check in-range
-at fire and FAK `sell_fak_px` (0.02). That rung equals `sell_floor` (0.02),
-or the live bid when the book is thinner. When the print is above the
-floor, the same fire walks every 1¢ rung down to the floor (live 3¢ → 2¢
-→ 1¢). Do not post above the fak print on the loser FAK. Empty FAK or a vanished loser book after arm keeps `armed_ts`.
+at fire, `sell_scrap_sweep_enabled` (default true) posts one FAK at
+`sell_floor` for the full remaining loser size. The book still fills
+higher bids first. Set the flag false to restore the 1¢ ladder from
+`sell_fak_px` down to the floor, clipped to top-rung depth. The flag is
+read on each sell tick. Do not post the sweep above the floor. Empty FAK or a vanished loser book after arm keeps `armed_ts`.
 On `empty_keep_arm` / `empty_fak_keep_arm`, fire a blind 1¢ FAK
 (`sell_scrap_blind_px`, backoff `sell_scrap_blind_backoff_s` ~3s). After
 the first FAK miss while still armed, rest a GTD/GTC sell. The posted

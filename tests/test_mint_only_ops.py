@@ -82,6 +82,7 @@ class MintDefaultsTests(unittest.TestCase):
             self.assertEqual(blob["sell_threshold"], 0.02, label)
             self.assertEqual(blob["sell_fak_px"], 0.02, label)
             self.assertEqual(blob["sell_floor"], 0.02, label)
+            self.assertIs(blob["sell_scrap_sweep_enabled"], True, label)
             self.assertLessEqual(blob["sell_floor"], blob["sell_fak_px"], label)
             self.assertLessEqual(blob["sell_fak_px"], blob["sell_threshold"], label)
             self.assertAlmostEqual(blob["sell_opposite_min"], 0.90, msg=label)
@@ -769,7 +770,12 @@ class DeployUnitsTests(unittest.TestCase):
         self.assertIn("empty_keep_arm", manage)
         self.assertIn("sell_loser_leg", manage)
         self.assertNotIn("book_empty=up_bid is None or dn_bid is None", manage)
-        self.assertIn('depth_path="loser"', manage)
+        self.assertIn("_fire_loser_scrap", manage)
+        self.assertIn("sell_scrap_sweep_enabled", manage)
+        fire = src[src.find("def _fire_loser_scrap") : src.find("\ndef _run_dump_fak_with_refire")]
+        self.assertIn('depth_path="loser"', fire)
+        self.assertIn('path="loser"', fire)
+        self.assertIn("sell_scrap_sweep", fire)
         self.assertIn('depth_path="winner_cheap" if cheap_on else None', manage)
         self.assertIn("_run_dump_fak_with_refire", manage)
         self.assertIn('phase="ready"', manage)
@@ -1103,6 +1109,186 @@ class DeployUnitsTests(unittest.TestCase):
         validate = src[src.find("def validate_strategy") : src.find("def eligible_markets")]
         self.assertIn("sell_armed_poll_s", validate)
         self.assertIn("poll_s must be >= 2", validate)
+
+    def test_loser_sweep_posts_one_full_floor_fak_and_leaves_a_remainder(self):
+        from buy.mint_sell import loser_scrap_post, sell_fill_vwap
+
+        events: list = []
+        fak_calls: list = []
+        ladder_calls: list = []
+        balances = {"n": 0}
+
+        def _fak(token_id, size, price, dry_run, capture=None):
+            fak_calls.append((size, price))
+            result = {
+                "status": "matched",
+                "makingAmount": "20.0",
+                "takingAmount": "0.40",
+            }
+            if capture is not None:
+                capture.append(result)
+            return 20.0, "matched"
+
+        def _inventory(*_args, **_kwargs):
+            balances["n"] += 1
+            return 30.0, "has_inventory"
+
+        fn = _fn(
+            "_fire_loser_scrap",
+            {
+                "loser_scrap_post": loser_scrap_post,
+                "sell_fill_vwap": sell_fill_vwap,
+                "log_event": lambda event, **kwargs: events.append((event, kwargs)),
+                "console": type("C", (), {"print": staticmethod(lambda *_a, **_k: None)})(),
+                "_log_sell_book_depth": lambda **kwargs: events.append(
+                    ("sell_book_depth", kwargs)
+                ),
+                "_fak_sell": _fak,
+                "_run_fak_ladder": lambda *a, **k: ladder_calls.append((a, k)) or (0, "no", None),
+                "_sell_inventory": _inventory,
+            },
+        )
+        intent: dict = {}
+        sold, status, px, flat = fn(
+            token_id="tok",
+            size=50.0,
+            floor=0.01,
+            threshold=0.03,
+            loser_bid=0.03,
+            fak_px=0.03,
+            depth_at_limit=8.0,
+            sweep=True,
+            dry_run=False,
+            tol=0.01,
+            bids=[{"price": "0.03", "size": "8"}],
+            slug="btc",
+            leg="up",
+            ttm_s=40.0,
+            condition_id="cid",
+            chain=object(),
+            ctf="ctf",
+            funder_cs="0x",
+            intent=intent,
+            shares=50.0,
+        )
+        self.assertEqual(fak_calls, [(50.0, 0.01)])
+        self.assertEqual(ladder_calls, [])
+        self.assertEqual(sold, 20.0)
+        self.assertEqual(status, "matched")
+        self.assertEqual(px, 0.01)
+        self.assertFalse(flat)
+        self.assertEqual(balances["n"], 1)
+        depth = [payload for name, payload in events if name == "sell_book_depth"]
+        self.assertEqual(len(depth), 1)
+        self.assertEqual(depth[0]["limit"], 0.01)
+        self.assertEqual(depth[0]["our_size"], 50.0)
+        self.assertEqual(depth[0]["path"], "loser")
+        self.assertEqual(depth[0]["phase"], "fak")
+        sweep = [payload for name, payload in events if name == "sell_scrap_sweep"]
+        self.assertEqual(len(sweep), 1)
+        self.assertEqual(sweep[0]["size"], 20.0)
+        self.assertEqual(sweep[0]["avg_px"], 0.02)
+        self.assertEqual(sweep[0]["offered"], 50.0)
+
+        def _fak_full(token_id, size, price, dry_run, capture=None):
+            fak_calls.append((size, price))
+            result = {"status": "matched", "makingAmount": str(size), "takingAmount": "0.30"}
+            if capture is not None:
+                capture.append(result)
+            return size, "matched"
+
+        def _flat(*_args, **_kwargs):
+            return 0.0, "already_flat"
+
+        fn2 = _fn(
+            "_fire_loser_scrap",
+            {
+                "loser_scrap_post": loser_scrap_post,
+                "sell_fill_vwap": sell_fill_vwap,
+                "log_event": lambda event, **kwargs: events.append((event, kwargs)),
+                "console": type("C", (), {"print": staticmethod(lambda *_a, **_k: None)})(),
+                "_log_sell_book_depth": lambda **kwargs: events.append(
+                    ("sell_book_depth", kwargs)
+                ),
+                "_fak_sell": _fak_full,
+                "_run_fak_ladder": lambda *a, **k: ladder_calls.append((a, k)) or (0, "no", None),
+                "_sell_inventory": _flat,
+            },
+        )
+        sold, status, px, flat = fn2(
+            token_id="tok",
+            size=30.0,
+            floor=0.01,
+            threshold=0.03,
+            loser_bid=0.02,
+            fak_px=0.03,
+            depth_at_limit=4.0,
+            sweep=True,
+            dry_run=False,
+            tol=0.01,
+            bids=[],
+            slug="btc",
+            leg="up",
+            ttm_s=20.0,
+            condition_id="cid",
+            chain=object(),
+            ctf="ctf",
+            funder_cs="0x",
+            intent=intent,
+            shares=50.0,
+        )
+        self.assertEqual(fak_calls[-1], (30.0, 0.01))
+        self.assertTrue(flat)
+        self.assertEqual(sold, 30.0)
+        self.assertEqual(ladder_calls, [])
+
+    def test_sweep_flag_off_uses_the_clipped_ladder(self):
+        from buy.mint_sell import loser_scrap_post, sell_fill_vwap
+
+        ladder_calls: list = []
+        fn = _fn(
+            "_fire_loser_scrap",
+            {
+                "loser_scrap_post": loser_scrap_post,
+                "sell_fill_vwap": sell_fill_vwap,
+                "log_event": lambda event, **kwargs: None,
+                "console": type("C", (), {"print": staticmethod(lambda *_a, **_k: None)})(),
+                "_log_sell_book_depth": lambda **kwargs: None,
+                "_fak_sell": lambda *a, **k: (_ for _ in ()).throw(AssertionError("direct fak")),
+                "_run_fak_ladder": lambda *a, **k: ladder_calls.append((a, k)) or (8.0, "matched", 0.03),
+                "_sell_inventory": lambda *a, **k: (_ for _ in ()).throw(AssertionError("refresh")),
+            },
+        )
+        sold, status, px, flat = fn(
+            token_id="tok",
+            size=50.0,
+            floor=0.01,
+            threshold=0.03,
+            loser_bid=0.03,
+            fak_px=0.03,
+            depth_at_limit=8.0,
+            sweep=False,
+            dry_run=False,
+            tol=0.01,
+            bids=[],
+            slug="btc",
+            leg="dn",
+            ttm_s=10.0,
+            condition_id="cid",
+            chain=object(),
+            ctf="ctf",
+            funder_cs=None,
+            intent={},
+            shares=50.0,
+        )
+        self.assertEqual(sold, 8.0)
+        self.assertEqual(px, 0.03)
+        self.assertFalse(flat)
+        self.assertEqual(status, "matched")
+        args, kwargs = ladder_calls[0]
+        self.assertEqual(args[1], 8.0)
+        self.assertEqual(kwargs["depth_path"], "loser")
+        self.assertEqual(list(args[2]), [0.03, 0.02, 0.01])
 
     def test_sell_book_depth_log_shape_is_observability_only(self):
         from buy.book import bid_fill_depth

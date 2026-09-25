@@ -42,6 +42,8 @@ DEFAULT_SELL_KNOBS = {
     # equal to the floor, or the live bid when the book is thinner.
     "sell_fak_px": 0.02,
     "sell_floor": 0.02,
+    # One FAK at sell_floor for the full remainder. False restores the cent ladder.
+    "sell_scrap_sweep_enabled": True,
     "sell_opposite_min": 0.90,
     "sell_persist_s": 5.0,
     "sell_persist_last_min_s": 2.0,
@@ -800,6 +802,63 @@ def loser_partial_fak_shares(
     if not math.isfinite(depth) or depth <= 1e-12:
         return rem
     return min(rem, depth)
+
+
+def loser_scrap_post(
+    *,
+    sweep: bool,
+    remaining: float,
+    floor: float,
+    threshold: float,
+    loser_bid: float,
+    fak_px: Optional[float] = None,
+    depth_at_limit: Optional[float] = None,
+) -> dict:
+    """Loser scrap order for this fire.
+
+    Sweep posts one FAK at ``floor`` for the full remainder. The book still
+    fills best bids first. Flag off keeps the 1¢ ladder and the top-rung
+    depth clip.
+    """
+    rem = max(0.0, float(remaining or 0.0))
+    if sweep:
+        return {
+            "mode": "sweep",
+            "limits": [round(float(floor), 4)],
+            "size": rem,
+        }
+    limits = list(
+        loser_ladder_limits(threshold, floor, loser_bid, fak_px=fak_px)
+    )
+    return {
+        "mode": "ladder",
+        "limits": limits,
+        "size": loser_partial_fak_shares(
+            remaining=rem, depth_at_limit=depth_at_limit
+        ),
+    }
+
+
+def sell_fill_vwap(result: Any, sold_shares: float) -> Optional[float]:
+    """USDC per share from a SELL fill. ``takingAmount`` is collateral."""
+    try:
+        sold = float(sold_shares or 0.0)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(sold) or sold <= 1e-12 or not isinstance(result, dict):
+        return None
+    usdc = None
+    for key in ("takingAmount", "taking_amount"):
+        parsed = _decode_amount(result.get(key), 0.0)
+        if parsed is not None and parsed > 0:
+            usdc = parsed
+            break
+    if usdc is None:
+        return None
+    px = usdc / sold
+    if not math.isfinite(px) or px <= 0 or px >= 1:
+        return None
+    return round(px, 4)
 
 
 def loser_scrap_persist_s(
