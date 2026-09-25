@@ -83,11 +83,10 @@ from buy.mint_loops import (
     mint_cash_block,
     chain_reconcile_action,
     pending_mint_reserve,
+    persist_form,
     run_job_loop,
     select_mint_candidate,
-    snapshot_persist_intents,
     start_mint_sell_loops,
-    state_persist_changed,
 )
 from buy.oracle_log import OracleBagView, OracleLogService, snapshot_intents
 from buy.mint_sell import (
@@ -225,6 +224,10 @@ ACTIVE_STATUSES = frozenset(
 
 _shutdown = False
 STATE_LOCK = threading.RLock()
+# Persist form of the last atomic_save that finished. None until load or
+# the first successful save. Ticks compare against this, so a mutation
+# that raised before the save is still written on the next tick.
+_saved_persist_form: Any = None
 _intent_store: Optional[IntentStore] = None
 _heartbeat_lock = threading.Lock()
 _heartbeat_parts: Dict[str, dict] = {}
@@ -307,15 +310,45 @@ def atomic_save(path: Path, payload: dict) -> None:
             os.close(dir_fd)
     except OSError:
         pass
+    remember_persisted_state(payload)
+
+
+def remember_persisted_state(payload: dict) -> None:
+    """Record the persist form of a state that is now on disk."""
+    global _saved_persist_form
+    intents = payload.get("intents") if isinstance(payload, dict) else None
+    _saved_persist_form = persist_form(intents)
+
+
+def persist_dirty(state: dict) -> bool:
+    """True when ``state`` differs from the last successful save."""
+    intents = state.get("intents") if isinstance(state, dict) else None
+    return persist_form(intents) != _saved_persist_form
+
+
+def commit_state(state: dict, *, dirty: bool = False) -> bool:
+    """Write positions when something persist-relevant is unsaved.
+
+    ``dirty`` covers callers that already know they mutated state. The
+    compare is against the last successful ``atomic_save``, not a copy
+    taken at the start of this tick.
+    """
+    if not dirty and not persist_dirty(state):
+        return False
+    atomic_save(STATE_FILE, state)
+    return True
 
 def load_state() -> dict:
     if not STATE_FILE.exists():
-        return {"intents": {}}
+        payload = {"intents": {}}
+        remember_persisted_state(payload)
+        return payload
     with open(STATE_FILE, encoding="utf-8") as handle:
         payload = json.load(handle)
     if not isinstance(payload, dict):
         raise ValueError("positions_mint.json must be an object")
     payload.setdefault("intents", {})
+    remember_persisted_state(payload)
     return payload
 
 def load_strategy() -> dict:
@@ -1781,7 +1814,6 @@ def _manage_sells_locked(cfg: dict, state: dict, chain: ChainReader) -> None:
     funder = os.getenv("FUNDER_ADDRESS") or ""
     funder_cs = to_checksum_address(funder) if funder else None
     dirty = False
-    before_intents = snapshot_persist_intents(state)
     ctf = str(cfg.get("ctf_address") or "")
 
     def _observed_loser_bid(leg: Optional[str], live: dict, seen: dict) -> Optional[float]:
@@ -2644,10 +2676,7 @@ def _manage_sells_locked(cfg: dict, state: dict, chain: ChainReader) -> None:
                 fak_miss=True,
             )
 
-    if state_persist_changed(before_intents, state.get("intents") or {}):
-        dirty = True
-    if dirty:
-        atomic_save(STATE_FILE, state)
+    commit_state(state, dirty=dirty)
 
 def _claim_mint_intent(
     state: dict,
@@ -2715,8 +2744,6 @@ def run_mint_cycle(
     if funder:
         with STATE_LOCK:
             sell_armed = skip_mint_discovery_for_sell(state, now)
-        with STATE_LOCK:
-            before_intents = snapshot_persist_intents(state)
         reconcile_intents(
             state,
             cfg,
@@ -2726,8 +2753,7 @@ def run_mint_cycle(
             skip_confirmed_inventory=sell_armed,
         )
         with STATE_LOCK:
-            if state_persist_changed(before_intents, state.get("intents") or {}):
-                atomic_save(STATE_FILE, state)
+            commit_state(state)
 
     with STATE_LOCK:
         submitting = any(

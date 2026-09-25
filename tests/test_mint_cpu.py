@@ -3,12 +3,15 @@
 from __future__ import annotations
 
 import ast
+import json
 import threading
 import time
 import unittest
+from contextlib import contextmanager
 from pathlib import Path
 from types import SimpleNamespace
 
+from buy.book import bid_fill_depth
 from buy.chain import ChainReader, thread_session
 from buy.mint_loops import (
     ENDED_CHAIN_GRACE_S,
@@ -17,6 +20,7 @@ from buy.mint_loops import (
     state_persist_changed,
 )
 from buy.oracle_log import fetch_crypto_price
+import buy.mint_sell as mint_sell
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -39,20 +43,65 @@ _NOW_FINAL = _END + ENDED_CHAIN_GRACE_S + 5.0
 _NOW_CAP = _END + 121.0
 
 
-def _fn(name: str, extras: dict | None = None):
+def _load(*names: str, extras: dict | None = None) -> dict:
     tree = ast.parse(MINT.read_text(), filename=str(MINT))
-    want = None
-    for node in tree.body:
-        if isinstance(node, ast.FunctionDef) and node.name == name:
-            want = node
-            break
-    if want is None:
-        raise AssertionError(f"{name} not found")
-    ns: dict = {"time": time}
+    if names:
+        want = [node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name in names]
+        found = {node.name for node in want}
+        missing = set(names) - found
+        if missing:
+            raise AssertionError(f"missing {sorted(missing)}")
+    else:
+        want = [node for node in tree.body if isinstance(node, ast.FunctionDef)]
+    ns: dict = {
+        "time": time,
+        "json": json,
+        "os": __import__("os"),
+        "Path": Path,
+        "threading": threading,
+        "persist_form": __import__("buy.mint_loops", fromlist=["persist_form"]).persist_form,
+        "contextmanager": contextmanager,
+    }
     if extras:
         ns.update(extras)
-    exec(compile(ast.Module(body=[want], type_ignores=[]), str(MINT), "exec"), ns)
+    exec(compile(ast.Module(body=want, type_ignores=[]), str(MINT), "exec"), ns)
+    return ns
+
+
+def _fn(name: str, extras: dict | None = None):
+    ns = _load(name, extras=extras)
     return ns[name]
+
+
+def _sell_runtime(saves: list) -> dict:
+    """Namespace that can run ``_manage_sells_locked`` without mintbot import."""
+    ns = _load()
+    for name in dir(mint_sell):
+        if name.startswith("_"):
+            continue
+        ns.setdefault(name, getattr(mint_sell, name))
+    ns["bid_fill_depth"] = bid_fill_depth
+    ns["log_event"] = lambda *_a, **_k: None
+    ns["notify"] = lambda *_a, **_k: None
+    ns["console"] = SimpleNamespace(print=lambda *_a, **_k: None)
+    ns["STATE_LOCK"] = threading.RLock()
+    ns["STATE_FILE"] = Path("/tmp/positions_mint_cpu_test.json")
+
+    @contextmanager
+    def _io_unlocked():
+        yield
+
+    ns["_io_unlocked"] = _io_unlocked
+    ns["_oracle_bag_view"] = lambda _cid: SimpleNamespace(twap=None, open_usd=None, obs_ts=None)
+    real_remember = ns["remember_persisted_state"]
+
+    def atomic_save(path, payload):
+        saves.append(json.loads(json.dumps(payload)))
+        real_remember(payload)
+
+    ns["atomic_save"] = atomic_save
+    # commit_state closed over the name atomic_save at runtime via global lookup.
+    return ns
 
 
 def _bag(**extra) -> dict:
@@ -273,16 +322,155 @@ class SaveOnChangeTests(unittest.TestCase):
         self.assertTrue(state_persist_changed(before, changed))
         self.assertTrue(state_persist_changed(before, {}))
 
-    def test_sell_and_mint_loops_save_only_when_persist_view_changes(self):
+    def test_sell_loop_skips_bid_only_and_saves_real_changes(self):
+        saves: list = []
+        ns = _sell_runtime(saves)
+        now = 1_700_000_100.0
+        ns["time"] = SimpleNamespace(time=lambda: now)
+        books = {"px": (0.40, 10.0, [])}
+
+        def fetch_books(_up, _dn, _min_size):
+            px, sz, levels = books["px"]
+            return (px, sz, levels), (0.60, sz, levels)
+
+        ns["_fetch_books"] = fetch_books
+        intent = {
+            "status": "confirmed",
+            "end_ts": now + 400.0,
+            "start_ts": now - 500.0,
+            "up_token": "up",
+            "dn_token": "dn",
+            "shares": 50.0,
+            "slug": "btc-updown-15m-test",
+        }
+        state = {"intents": {"cid": intent}}
+        cfg = {
+            "sell_threshold": 0.02,
+            "sell_floor": 0.02,
+            "sell_opposite_min": 0.90,
+            "sell_persist_s": 5.0,
+            "sell_persist_last_min_s": 2.0,
+            "sell_persist_last_min_window_s": 60.0,
+            "sell_persist_skip_ttm_s": 90.0,
+            "sell_persist_skip_when_sized": False,
+            "sell_fak_px": 0.02,
+            "sell_scrap_blind_enabled": False,
+            "sell_scrap_blind_px": 0.01,
+            "sell_scrap_blind_backoff_s": 3.0,
+            "sell_scrap_rest_enabled": False,
+            "sell_scrap_rest_px": 0.02,
+            "sell_scrap_rest_min_ahead_s": 180.0,
+            "sell_cooldown_s": 3.0,
+            "sell_winner_min": 0.999,
+            "sell_clob_max_price": 0.99,
+            "sell_clob_min_price": 0.01,
+            "sell_min_bid_size": 1.0,
+            "position_tolerance": 0.01,
+            "dry_run": True,
+            "shares": 50.0,
+            "sell_dump_enabled": False,
+            "sell_late_window_s": 0.0,
+            "ctf_address": "0xctf",
+        }
+        ns["remember_persisted_state"](state)
+        ns["_manage_sells_locked"](cfg, state, object())
+        self.assertEqual(len(saves), 1)
+        saves.clear()
+        books["px"] = (0.41, 12.0, [])
+        ns["_manage_sells_locked"](cfg, state, object())
+        self.assertEqual(saves, [])
+        books["px"] = (0.42, 8.0, [])
+
+        def fetch_and_fill(_up, _dn, _min_size):
+            intent["sell_limit"] = 0.02
+            intent["sold_loser"] = True
+            return (0.42, 8.0, []), (0.58, 8.0, [])
+
+        ns["_fetch_books"] = fetch_and_fill
+        ns["_manage_sells_locked"](cfg, state, object())
+        self.assertEqual(len(saves), 1)
+        self.assertTrue(saves[-1]["intents"]["cid"]["sold_loser"])
+        self.assertEqual(saves[-1]["intents"]["cid"]["sell_limit"], 0.02)
+
+    def test_raised_tick_is_saved_on_the_next_tick(self):
+        saves: list = []
+        ns = _sell_runtime(saves)
+        now = 1_700_000_100.0
+        ns["time"] = SimpleNamespace(time=lambda: now)
+        intent = {
+            "status": "confirmed",
+            "end_ts": now + 400.0,
+            "start_ts": now - 500.0,
+            "up_token": "up",
+            "dn_token": "dn",
+            "shares": 50.0,
+            "slug": "btc-updown-15m-test",
+        }
+        state = {"intents": {"cid": intent}}
+        cfg = {
+            "sell_threshold": 0.02,
+            "sell_floor": 0.02,
+            "sell_opposite_min": 0.90,
+            "sell_persist_s": 5.0,
+            "sell_persist_last_min_s": 2.0,
+            "sell_persist_last_min_window_s": 60.0,
+            "sell_persist_skip_ttm_s": 90.0,
+            "sell_persist_skip_when_sized": False,
+            "sell_fak_px": 0.02,
+            "sell_scrap_blind_enabled": False,
+            "sell_scrap_blind_px": 0.01,
+            "sell_scrap_blind_backoff_s": 3.0,
+            "sell_scrap_rest_enabled": False,
+            "sell_scrap_rest_px": 0.02,
+            "sell_scrap_rest_min_ahead_s": 180.0,
+            "sell_cooldown_s": 3.0,
+            "sell_winner_min": 0.999,
+            "sell_clob_max_price": 0.99,
+            "sell_clob_min_price": 0.01,
+            "sell_min_bid_size": 1.0,
+            "position_tolerance": 0.01,
+            "dry_run": True,
+            "shares": 50.0,
+            "sell_dump_enabled": False,
+            "sell_late_window_s": 0.0,
+            "ctf_address": "0xctf",
+        }
+
+        def quiet(_up, _dn, _min_size):
+            return (0.40, 10.0, []), (0.60, 10.0, [])
+
+        ns["_fetch_books"] = quiet
+        ns["remember_persisted_state"](state)
+        ns["_manage_sells_locked"](cfg, state, object())
+        saves.clear()
+
+        def mutate_then_raise(_up, _dn, _min_size):
+            intent["sell_limit"] = 0.02
+            intent["sell_filled"] = 50.0
+            raise RuntimeError("tick blew up after the fill")
+
+        ns["_fetch_books"] = mutate_then_raise
+        with self.assertRaises(RuntimeError):
+            ns["_manage_sells_locked"](cfg, state, object())
+        self.assertEqual(saves, [])
+        self.assertEqual(intent["sell_limit"], 0.02)
+        ns["_fetch_books"] = quiet
+        ns["_manage_sells_locked"](cfg, state, object())
+        self.assertEqual(len(saves), 1)
+        saved = saves[-1]["intents"]["cid"]
+        self.assertEqual(saved["sell_limit"], 0.02)
+        self.assertEqual(saved["sell_filled"], 50.0)
+
+    def test_sell_and_mint_loops_save_against_the_last_success(self):
         src = MINT.read_text()
         manage = src[src.find("def _manage_sells_locked") : src.find("\ndef _claim_mint_intent")]
         mint = src[src.find("def run_mint_cycle") : src.find("\ndef _reload_cfg")]
-        self.assertIn("snapshot_persist_intents", manage)
-        self.assertIn("state_persist_changed", manage)
-        self.assertNotIn('updated_at"] = now\n        dirty = True', manage)
-        self.assertIn("state_persist_changed", mint)
-        self.assertIn("atomic_save(STATE_FILE, state)", mint)
-        save = src[src.find("def atomic_save") : src.find("def load_state")]
+        save = src[src.find("def atomic_save") : src.find("def remember_persisted_state")]
+        self.assertIn("commit_state(state, dirty=dirty)", manage)
+        self.assertNotIn("snapshot_persist_intents", manage)
+        self.assertIn("commit_state(state)", mint)
+        self.assertNotIn("snapshot_persist_intents", mint)
+        self.assertIn("remember_persisted_state(payload)", save)
         self.assertNotIn("indent=2", save)
         self.assertIn('separators=(",", ":")', save)
         self.assertIn("sort_keys=True", save)

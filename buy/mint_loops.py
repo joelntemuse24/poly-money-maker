@@ -405,33 +405,30 @@ def chain_reconcile_action(
     return "final"
 
 
-def snapshot_persist_intents(state: Any) -> dict:
-    """Shallow copy of intents for a later persist compare."""
-    intents = state.get("intents") if isinstance(state, dict) else None
-    if not isinstance(intents, dict):
-        return {}
-    return {
-        str(key): dict(intent) if isinstance(intent, dict) else intent
-        for key, intent in intents.items()
-    }
-
-
 def _persist_view(intent: Any) -> Any:
     if not isinstance(intent, dict):
         return intent
     return {key: value for key, value in intent.items() if key not in PERSIST_IGNORE_KEYS}
 
 
+def persist_form(intents: Any) -> dict:
+    """Intent map with cached bids and ``updated_at`` removed.
+
+    The result is a new dict. Callers store it as the last successful save
+    and compare later ticks against that copy, not against a snapshot taken
+    at the start of the tick.
+    """
+    if not isinstance(intents, dict):
+        return {}
+    return {
+        str(key): _persist_view(intent) if isinstance(intent, dict) else intent
+        for key, intent in intents.items()
+    }
+
+
 def state_persist_changed(before: Any, after: Any) -> bool:
     """True when an intent changed aside from cached bids and updated_at."""
-    before_map = before if isinstance(before, dict) else {}
-    after_map = after if isinstance(after, dict) else {}
-    if set(before_map) != set(after_map):
-        return True
-    for key, old in before_map.items():
-        if _persist_view(old) != _persist_view(after_map.get(key)):
-            return True
-    return False
+    return persist_form(before) != persist_form(after)
 
 
 def mint_cash_block(balance: float, need: float, reserved: float) -> Optional[dict]:
