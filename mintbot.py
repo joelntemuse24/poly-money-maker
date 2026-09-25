@@ -10,9 +10,10 @@ sized loser bid is ≤ ``sell_threshold`` (~2¢) and the opposite bid is ≥ ~90
 Persist ``sell_persist_s`` (~5s), or ``sell_persist_last_min_s`` (~2s) in
 the last ``sell_persist_last_min_window_s`` (~60s). Skip that wait when
 TTM ≤ ``sell_persist_skip_ttm_s`` (~90s). Sized depth does not skip
-(``sell_persist_skip_when_sized`` default false). At fire, FAK
-``sell_fak_px`` (~2¢), which equals ``sell_floor`` (~2¢), or the live bid
-when the book is thinner. Empty keep fires a blind 1¢ FAK (backoff ~3s).
+(``sell_persist_skip_when_sized`` default false). At fire,
+``sell_scrap_sweep_enabled`` (default true) posts one FAK at ``sell_floor``
+for the full remainder. False restores the 1¢ ladder from ``sell_fak_px``.
+Empty keep fires a blind 1¢ FAK (backoff ~3s).
 A FAK miss rests a GTD/GTC sell at ``min(sell_scrap_rest_px, live or
 last-seen loser bid)`` so a 1¢ book is not posted at the 2¢ print.
 ``sell_scrap_rest_px`` stays ~2¢. GTD only when expiration is at least
@@ -100,6 +101,8 @@ from buy.mint_sell import (
     loser_empty_keep_qualify,
     loser_ladder_limits,
     loser_partial_fak_shares,
+    loser_scrap_post,
+    sell_fill_vwap,
     loser_persist_ready,
     loser_scrap_persist_s,
     mint_cycle_sleep_s,
@@ -158,6 +161,8 @@ DEFAULTS = {
     "sell_threshold": 0.02,
     "sell_fak_px": 0.02,
     "sell_floor": 0.02,
+    # One floor FAK for the full remainder. False restores the cent ladder.
+    "sell_scrap_sweep_enabled": True,
     "sell_opposite_min": 0.90,
     "sell_persist_s": 5.0,
     "sell_persist_last_min_s": 2.0,
@@ -1043,7 +1048,13 @@ def _get_clob_client():
         log_event("clob_client_init_fail", error=_clob_init_error)
         return None
 
-def _fak_sell(token_id: str, size: float, price: float, dry_run: bool):
+def _fak_sell(
+    token_id: str,
+    size: float,
+    price: float,
+    dry_run: bool,
+    capture: Optional[list] = None,
+):
     size = float(size)
     price = float(price)
     if size < 0.01 or price <= 0:
@@ -1085,6 +1096,8 @@ def _fak_sell(token_id: str, size: float, price: float, dry_run: bool):
         if isinstance(result, dict):
             status = str(result.get("status") or "posted")
             sold = parse_sell_fill_shares(result, size)
+            if capture is not None:
+                capture.append(result)
         log_event(
             "sell_fak_result",
             token_id=str(token_id),
@@ -1172,6 +1185,102 @@ def _run_fak_ladder(
             break
         time.sleep(0.35)
     return sold_total, last_status, last_px
+
+
+def _fire_loser_scrap(
+    *,
+    token_id: str,
+    size: float,
+    floor: float,
+    threshold: float,
+    loser_bid: float,
+    fak_px: float,
+    depth_at_limit: Optional[float],
+    sweep: bool,
+    dry_run: bool,
+    tol: float,
+    bids: Any,
+    slug: Any,
+    leg: Any,
+    ttm_s: Optional[float],
+    condition_id: Any,
+    chain: ChainReader,
+    ctf: str,
+    funder_cs: Optional[str],
+    intent: dict,
+    shares: float,
+) -> Tuple[float, str, Optional[float], bool]:
+    """One floor sweep, or the clipped cent ladder when sweep is off.
+
+    Returns sold shares, status, last limit, and whether the refreshed
+    balance is already flat. A partial sweep does not post another rung.
+    """
+    plan = loser_scrap_post(
+        sweep=sweep,
+        remaining=size,
+        floor=floor,
+        threshold=threshold,
+        loser_bid=loser_bid,
+        fak_px=fak_px,
+        depth_at_limit=depth_at_limit,
+    )
+    if plan["mode"] == "sweep":
+        limit = float(plan["limits"][0]) if plan["limits"] else round(float(floor), 4)
+        post_size = float(plan["size"])
+        _log_sell_book_depth(
+            slug=slug,
+            leg=leg,
+            limit=limit,
+            our_size=post_size,
+            bids=bids or [],
+            ttm_s=ttm_s,
+            path="loser",
+            phase="fak",
+            condition_id=condition_id,
+        )
+        console.print(
+            f"  [bold bright_yellow][SELL {str(leg).upper()}][/] {slug}  "
+            f"bid={loser_bid:.3f}  limit>={limit:.3f}  size={post_size:.2f}"
+        )
+        captured: list = []
+        sold, status = _fak_sell(
+            token_id, post_size, limit, dry_run, capture=captured,
+        )
+        raw = captured[0] if captured else None
+        avg = sell_fill_vwap(raw, sold)
+        log_event(
+            "sell_scrap_sweep",
+            condition_id=condition_id,
+            slug=slug,
+            leg=leg,
+            limit=round(limit, 4),
+            size=round(float(sold or 0), 4),
+            avg_px=avg,
+            offered=round(post_size, 4),
+            status=status,
+        )
+        _refreshed, latch = _sell_inventory(
+            chain, ctf, funder_cs, token_id, shares, tol,
+            "seen_loser_inventory", intent,
+        )
+        flat = latch == "already_flat"
+        return float(sold or 0), status, limit, flat
+    sold, status, last_px = _run_fak_ladder(
+        token_id,
+        float(plan["size"]),
+        plan["limits"],
+        dry_run=dry_run,
+        bid=loser_bid,
+        label=str(leg),
+        slug=slug,
+        tol=tol,
+        depth_bids=bids,
+        depth_path="loser",
+        depth_leg=leg,
+        ttm_s=ttm_s,
+        condition_id=condition_id,
+    )
+    return float(sold or 0), status, last_px, False
 
 
 def _run_dump_fak_with_refire(
@@ -2336,30 +2445,36 @@ def _manage_sells_locked(cfg: dict, state: dict, chain: ChainReader) -> None:
                 elif latch == "already_flat":
                     _note_loser_sold(intent, loser, note="already_flat")
                 else:
-                    limits = loser_ladder_limits(
-                        thr, floor, loser_bid, fak_px=fak_px,
-                    )
-                    post_size = loser_partial_fak_shares(
-                        remaining=size, depth_at_limit=depth_at_limit,
-                    )
+                    sweep_on = bool(cfg.get("sell_scrap_sweep_enabled", True))
                     intent["last_sell_attempt_at"] = now
                     with _io_unlocked():
-                        sold_total, last_status, last_px = _run_fak_ladder(
-                            l_tok, post_size, limits,
-                            dry_run=dry_run,
-                            bid=loser_bid,
-                            label=loser,
-                            slug=intent.get("slug"),
-                            tol=tol,
-                            depth_bids=books.get(loser),
-                            depth_path="loser",
-                            depth_leg=loser,
-                            ttm_s=ttm_s,
-                            condition_id=cid,
+                        sold_total, last_status, last_px, balance_flat = (
+                            _fire_loser_scrap(
+                                token_id=l_tok,
+                                size=size,
+                                floor=floor,
+                                threshold=thr,
+                                loser_bid=loser_bid,
+                                fak_px=fak_px,
+                                depth_at_limit=depth_at_limit,
+                                sweep=sweep_on,
+                                dry_run=dry_run,
+                                tol=tol,
+                                bids=books.get(loser),
+                                slug=intent.get("slug"),
+                                leg=loser,
+                                ttm_s=ttm_s,
+                                condition_id=cid,
+                                chain=chain,
+                                ctf=ctf,
+                                funder_cs=funder_cs,
+                                intent=intent,
+                                shares=shares,
+                            )
                         )
                     intent["sell_attempts"] = int(intent.get("sell_attempts") or 0) + 1
                     intent["sell_last_status"] = last_status
-                    done = dry_run or sold_total >= size - tol
+                    done = dry_run or balance_flat or sold_total >= size - tol
                     if sold_total >= tol or dry_run:
                         intent["sell_filled"] = float(
                             intent.get("sell_filled") or 0

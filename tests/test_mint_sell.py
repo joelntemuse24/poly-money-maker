@@ -25,6 +25,8 @@ from buy.mint_sell import (
     loser_empty_keep_qualify,
     loser_ladder_limits,
     loser_partial_fak_shares,
+    loser_scrap_post,
+    sell_fill_vwap,
     loser_persist_ready,
     loser_scrap_persist_s,
     parse_sell_fill_shares,
@@ -542,6 +544,65 @@ class LoserLadderTests(unittest.TestCase):
             ),
             [0.005],
         )
+
+
+class LoserScrapSweepTests(unittest.TestCase):
+    """One floor FAK for the full remainder; flag off keeps the cent ladder."""
+
+    def test_sweep_is_one_floor_order_for_the_full_size(self):
+        post = loser_scrap_post(
+            sweep=True,
+            remaining=50.0,
+            floor=0.01,
+            threshold=0.03,
+            loser_bid=0.03,
+            fak_px=0.03,
+            depth_at_limit=10.0,
+        )
+        self.assertEqual(post["mode"], "sweep")
+        self.assertEqual(post["limits"], [0.01])
+        self.assertEqual(post["size"], 50.0)
+
+    def test_sweep_does_not_clip_to_top_rung_depth(self):
+        post = loser_scrap_post(
+            sweep=True,
+            remaining=50.0,
+            floor=0.01,
+            threshold=0.03,
+            loser_bid=0.03,
+            fak_px=0.03,
+            depth_at_limit=8.0,
+        )
+        clipped = loser_partial_fak_shares(remaining=50.0, depth_at_limit=8.0)
+        self.assertEqual(clipped, 8.0)
+        self.assertEqual(post["size"], 50.0)
+        self.assertEqual(len(post["limits"]), 1)
+
+    def test_flag_off_reverts_to_clipped_cent_ladder(self):
+        post = loser_scrap_post(
+            sweep=False,
+            remaining=50.0,
+            floor=0.01,
+            threshold=0.03,
+            loser_bid=0.03,
+            fak_px=0.03,
+            depth_at_limit=8.0,
+        )
+        self.assertEqual(post["mode"], "ladder")
+        self.assertEqual(post["limits"], [0.03, 0.02, 0.01])
+        self.assertEqual(post["size"], 8.0)
+
+    def test_sweep_fill_logs_size_and_average_price(self):
+        avg = sell_fill_vwap(
+            {"makingAmount": "50.0", "takingAmount": "1.0"},
+            sold_shares=50.0,
+        )
+        self.assertEqual(avg, 0.02)
+        partial = sell_fill_vwap(
+            {"makingAmount": "20000000", "takingAmount": "400000"},
+            sold_shares=20.0,
+        )
+        self.assertEqual(partial, 0.02)
 
 
 class EmptyFakArmTests(unittest.TestCase):

@@ -29,6 +29,7 @@
   "sell_threshold": 0.02,
   "sell_fak_px": 0.02,
   "sell_floor": 0.02,
+  "sell_scrap_sweep_enabled": true,
   "sell_opposite_min": 0.9,
   "sell_persist_s": 5.0,
   "sell_persist_last_min_s": 2.0,
