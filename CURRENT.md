@@ -32,12 +32,12 @@ pathlog are **stopped / retired**. Do not start them.
 - `enter_max_ttm_min` **45**. A bag booked about 30m out still leaves the following 15m window inside the lookahead. `mint_max_attempts` **3**. `mint_fail_cooldown_s` **30**.
 - `sell_threshold` **0.02**. Print is FAK `sell_fak_px` **0.02**, equal to `sell_floor` **0.02**, or the live bid when the book is thinner. Post-miss rest ceiling `sell_scrap_rest_px` stays **0.02**. The posted rest is `min(sell_scrap_rest_px, live or last-seen loser bid)` so a 1¢ book is not left at 2¢. GTD only when expiration is at least `sell_scrap_rest_min_ahead_s` (**180s**) ahead; otherwise GTC. `validate_strategy` requires `sell_floor` ≤ `sell_fak_px` ≤ `sell_threshold`.
 - `sell_persist_s` **5**, `sell_persist_last_min_s` **2** (window still 60s). Dump persist stays 2s.
-- `sell_persist_skip_when_sized` **false**. A sized book waits the full persist. TTM ≤ `sell_persist_skip_ttm_s` (90s) still skips.
+- `sell_persist_skip_when_sized` **false**. A sized book waits the full persist. The 2s last-minute persist applies through market close. There is no late TTM skip.
 - `sell_late_window_s` **0** skips the late Chainlink scrap veto. `sell_oracle_edge_floor_usd`, `sell_oracle_edge_per_ttm`, and `sell_oracle_stale_s` are **0**, so raising only the window does not restore the old $25 / 1.5×TTM / 5s-stale veto. `sell_oracle_edge_persist_s` stays **3**. `oracle_log_enabled` stays true (audit tape).
 - The sister-miss held dump is gone. No `sell_dump_if_sister_miss_s`. The bid-under-`sell_dump_below` (0.80) persist dump is unchanged. A filled normal dump sets `sell_dump_leg` (the leg A sold). Inventory already flat does not.
 - Wallet A never posts a bid. Same-wallet buyback is not implemented.
 
-`load_strategy` overlays only keys already present in live `strategy_mint.json`. Keys that file already sets (`sell_threshold`, `sell_fak_px`, `sell_scrap_rest_px`, `sell_late_window_s`, persist) stay until the operator edits them. A leftover `sell_dump_if_sister_miss_s` key is ignored because it is no longer in `DEFAULTS`. Do not edit the live file from git.
+`load_strategy` overlays only keys already present in live `strategy_mint.json`. Keys that file already sets (`sell_threshold`, `sell_fak_px`, `sell_scrap_rest_px`, `sell_late_window_s`, persist) stay until the operator edits them. A leftover `sell_dump_if_sister_miss_s` or `sell_persist_skip_ttm_s` key is ignored because it is no longer in `DEFAULTS`. Do not edit the live file from git.
 
 ## Sister scrap bidder (wallet B, opt-in, off)
 

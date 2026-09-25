@@ -3,9 +3,9 @@
 Loser dump: arm when a sized loser bid is at/under ``sell_threshold`` (~2¢)
 and the opposite sized bid is at/over ``sell_opposite_min`` (~90¢). Persist
 that book for ``sell_persist_s`` (~5s), or ``sell_persist_last_min_s`` (~2s)
-when time-to-end is within ``sell_persist_last_min_window_s`` (~60s). Skip
-that wait when TTM ≤ ``sell_persist_skip_ttm_s`` (~90s). Sized depth does
-not skip (``sell_persist_skip_when_sized`` default false). Then re-check
+when time-to-end is within ``sell_persist_last_min_window_s`` (~60s). That
+last-minute wait applies through market close. Sized depth does not skip
+(``sell_persist_skip_when_sized`` default false). Then re-check
 in-range at fire and FAK ``sell_fak_px`` (~2¢). That rung equals
 ``sell_floor`` (~2¢) when the live sized bid is at/over the floor; if the
 live bid is below the floor, FAK at that live bid. Empty FAK, or a vanished
@@ -48,8 +48,6 @@ DEFAULT_SELL_KNOBS = {
     "sell_persist_s": 5.0,
     "sell_persist_last_min_s": 2.0,
     "sell_persist_last_min_window_s": 60.0,
-    # Immediate FAK once armed when TTM is inside this window (0 disables).
-    "sell_persist_skip_ttm_s": 90.0,
     # Off: full persist always. On: skip when depth at the FAK rung covers us.
     "sell_persist_skip_when_sized": False,
     "sell_scrap_blind_enabled": True,
@@ -868,18 +866,17 @@ def loser_scrap_persist_s(
     persist_s: float,
     last_min_s: float,
     last_min_window_s: float,
-    skip_ttm_s: float = 0.0,
     depth_at_limit: Optional[float] = None,
     our_size: float = 0.0,
     skip_when_sized: bool = False,
 ) -> Tuple[Optional[float], str]:
     """Loser persist seconds for this tick, plus a reason.
 
-    ``None`` / ``ended`` when the window is over. ``late_skip`` (0s) when
-    ``0 < TTM <= skip_ttm_s``. ``sized_skip`` (0s) only when
-    ``skip_when_sized`` is true and depth at the limit covers ``our_size``.
-    Otherwise the normal / last-minute clock from
-    ``effective_loser_persist_s``. Does not consult the oracle.
+    ``None`` / ``ended`` when the window is over. ``sized_skip`` (0s) only
+    when ``skip_when_sized`` is true and depth at the limit covers
+    ``our_size``. Otherwise the normal / last-minute clock from
+    ``effective_loser_persist_s``. The last-minute clock applies through
+    market close. Does not consult the oracle.
     """
     base = effective_loser_persist_s(
         now_s=now_s,
@@ -890,10 +887,6 @@ def loser_scrap_persist_s(
     )
     if base is None:
         return None, "ended"
-    if end_ts:
-        ttm = float(end_ts) - float(now_s)
-        if float(skip_ttm_s or 0) > 0 and 0 < ttm <= float(skip_ttm_s) + 1e-12:
-            return 0.0, "late_skip"
     if skip_when_sized and depth_covers_size(depth_at_limit, our_size):
         return 0.0, "sized_skip"
     if end_ts:

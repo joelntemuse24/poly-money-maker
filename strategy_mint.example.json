@@ -34,7 +34,6 @@
   "sell_persist_s": 5.0,
   "sell_persist_last_min_s": 2.0,
   "sell_persist_last_min_window_s": 60.0,
-  "sell_persist_skip_ttm_s": 90.0,
   "sell_persist_skip_when_sized": false,
   "sell_scrap_blind_enabled": true,
   "sell_scrap_blind_px": 0.01,

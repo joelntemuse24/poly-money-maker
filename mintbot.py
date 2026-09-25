@@ -8,8 +8,8 @@ and open within enter_max_ttm_min, if collateral is available.
 Optional sell (``sell_enabled``, default off): arm a loser scrap when the
 sized loser bid is ≤ ``sell_threshold`` (~2¢) and the opposite bid is ≥ ~90¢.
 Persist ``sell_persist_s`` (~5s), or ``sell_persist_last_min_s`` (~2s) in
-the last ``sell_persist_last_min_window_s`` (~60s). Skip that wait when
-TTM ≤ ``sell_persist_skip_ttm_s`` (~90s). Sized depth does not skip
+the last ``sell_persist_last_min_window_s`` (~60s). That last-minute wait
+applies through market close. Sized depth does not skip
 (``sell_persist_skip_when_sized`` default false). At fire,
 ``sell_scrap_sweep_enabled`` (default true) posts one FAK at ``sell_floor``
 for the full remainder. False restores the 1¢ ladder from ``sell_fak_px``.
@@ -169,7 +169,6 @@ DEFAULTS = {
     "sell_persist_s": 5.0,
     "sell_persist_last_min_s": 2.0,
     "sell_persist_last_min_window_s": 60.0,
-    "sell_persist_skip_ttm_s": 90.0,
     "sell_persist_skip_when_sized": False,
     "sell_scrap_blind_enabled": True,
     "sell_scrap_blind_px": 0.01,
@@ -415,8 +414,6 @@ def validate_strategy(cfg: dict) -> None:
     fak_px = float(cfg.get("sell_fak_px", 0.02) or 0)
     if not (floor <= fak_px <= threshold):
         raise ValueError("sell_floor <= sell_fak_px <= sell_threshold must hold")
-    if float(cfg.get("sell_persist_skip_ttm_s") or 0) < 0:
-        raise ValueError("sell_persist_skip_ttm_s must be >= 0")
     if float(cfg.get("sell_scrap_blind_px") or 0) <= 0:
         raise ValueError("sell_scrap_blind_px must be > 0")
     if float(cfg.get("sell_scrap_rest_px") or 0) <= 0:
@@ -1797,7 +1794,6 @@ def _manage_sells_locked(cfg: dict, state: dict, chain: ChainReader) -> None:
     persist_s = float(cfg.get("sell_persist_s") or 0.0)
     last_min_s = float(cfg.get("sell_persist_last_min_s", 2.0))
     last_min_window_s = float(cfg.get("sell_persist_last_min_window_s", 60.0))
-    skip_ttm_s = float(cfg.get("sell_persist_skip_ttm_s", 90.0) or 0.0)
     skip_when_sized = bool(cfg.get("sell_persist_skip_when_sized", False))
     fak_px = float(cfg.get("sell_fak_px", 0.02) or 0.02)
     blind_enabled = bool(cfg.get("sell_scrap_blind_enabled", True))
@@ -2223,7 +2219,6 @@ def _manage_sells_locked(cfg: dict, state: dict, chain: ChainReader) -> None:
             persist_s=persist_s,
             last_min_s=last_min_s,
             last_min_window_s=last_min_window_s,
-            skip_ttm_s=skip_ttm_s,
             depth_at_limit=depth_at_limit,
             our_size=remaining_shares,
             skip_when_sized=skip_when_sized,
@@ -2244,7 +2239,7 @@ def _manage_sells_locked(cfg: dict, state: dict, chain: ChainReader) -> None:
                 why=persist_why,
             )
         intent["sell_persist_effective_s"] = loser_persist_s
-        if persist_why in {"late_skip", "sized_skip"} and (
+        if persist_why == "sized_skip" and (
             intent.get("sell_persist_skip_why") != persist_why
         ):
             log_event(
