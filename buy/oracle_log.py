@@ -27,8 +27,7 @@ from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
 from typing import Any, Callable, Optional
 
-import requests
-
+from buy.chain import thread_session
 from buy.market import slug_start_ts
 
 
@@ -279,7 +278,7 @@ def parse_crypto_price_body(text: str) -> WindowPrice:
 
 
 def fetch_crypto_price(start_ts: int, *, timeout: float = 3.0) -> WindowPrice:
-    response = requests.get(
+    response = thread_session("crypto_price").get(
         CRYPTO_PRICE_URL,
         params=crypto_price_params(start_ts),
         timeout=timeout,

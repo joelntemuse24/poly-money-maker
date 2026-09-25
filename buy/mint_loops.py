@@ -330,6 +330,150 @@ def pending_mint_reserve(state: Any) -> float:
     return total
 
 
+# One chain read this long after end_ts, then never again. Inside the
+# grace, ended confirmed bags are not queried. In-flight mint statuses
+# stay on the every-cycle path so pending cash can still release.
+ENDED_CHAIN_GRACE_S = 180.0
+
+_INFLIGHT_CHAIN_STATUSES = frozenset(
+    {
+        "submitting",
+        "pending",
+        "executed",
+        "mined",
+        "confirmed_waiting_inventory",
+    }
+)
+
+# Cached book prints and the touch timestamp. Losing them on crash is
+# acceptable; they must not force a positions rewrite.
+PERSIST_IGNORE_KEYS = frozenset(
+    {
+        "last_up_bid",
+        "last_dn_bid",
+        "last_up_bid_size",
+        "last_dn_bid_size",
+        "updated_at",
+    }
+)
+
+
+def chain_reconcile_action(
+    intent: Any,
+    now: float,
+    *,
+    grace_s: float = ENDED_CHAIN_GRACE_S,
+) -> str:
+    """Whether reconcile should eth_call this bag.
+
+    ``query`` — live window, or an in-flight mint that has not settled.
+    ``final`` — ended ``confirmed`` bag, once, after ``grace_s``.
+    ``skip`` — do not chain-query.
+
+    ``chain_reconcile_done`` on the intent means the final read already
+    happened. In-flight statuses ignore that flag and the market end:
+    their pUSD is still in ``pending_mint_reserve`` until they leave
+    the set.
+    """
+    if not isinstance(intent, dict):
+        return "skip"
+    status = str(intent.get("status") or "")
+    if status in _INFLIGHT_CHAIN_STATUSES:
+        return "query"
+    if status != "confirmed":
+        return "skip"
+    if intent.get("chain_reconcile_done"):
+        return "skip"
+    try:
+        end_ts = float(intent.get("end_ts") or 0)
+    except (TypeError, ValueError):
+        end_ts = 0.0
+    try:
+        now_ts = float(now)
+    except (TypeError, ValueError):
+        now_ts = 0.0
+    if end_ts <= 0 or now_ts <= end_ts:
+        return "query"
+    try:
+        grace = float(grace_s)
+    except (TypeError, ValueError):
+        grace = ENDED_CHAIN_GRACE_S
+    if grace < 0:
+        grace = 0.0
+    if now_ts + 1e-9 < end_ts + grace:
+        return "skip"
+    return "final"
+
+
+def _persist_view(intent: Any) -> Any:
+    if not isinstance(intent, dict):
+        return intent
+    return {key: value for key, value in intent.items() if key not in PERSIST_IGNORE_KEYS}
+
+
+# History stays in the file. These statuses are not edited in place after
+# the tick that sets them: sell skips them, reconcile skips them, and a
+# re-mint replaces the whole entry (status leaves ``failed``).
+TERMINAL_PERSIST_STATUSES = frozenset({"completed", "failed"})
+
+
+def _intent_status(intent: Any) -> str:
+    if not isinstance(intent, dict):
+        return ""
+    return str(intent.get("status") or "")
+
+
+def persist_form(intents: Any) -> dict:
+    """Intent map with cached bids and ``updated_at`` removed.
+
+    Full copy of every intent. The hot path uses ``persist_digest`` instead.
+    """
+    if not isinstance(intents, dict):
+        return {}
+    return {
+        str(key): _persist_view(intent) if isinstance(intent, dict) else intent
+        for key, intent in intents.items()
+    }
+
+
+def persist_digest(state: Any) -> tuple:
+    """Cheap fingerprint of what a save would need to notice.
+
+    Terminal intents contribute only ``(id, status)``. Every other intent
+    contributes its persist view. Top-level keys other than ``intents`` are
+    included whole. Adding, removing, or replacing an intent, or changing
+    any status, changes the id summary.
+    """
+    if not isinstance(state, dict):
+        return ((), (), ())
+    top = tuple(
+        sorted(
+            (str(key), state[key])
+            for key in state
+            if key != "intents"
+        )
+    )
+    intents = state.get("intents")
+    if not isinstance(intents, dict):
+        return (top, (), ())
+    index = []
+    live = []
+    for key, intent in intents.items():
+        cid = str(key)
+        status = _intent_status(intent)
+        index.append((cid, status))
+        if status not in TERMINAL_PERSIST_STATUSES:
+            live.append((cid, _persist_view(intent)))
+    index.sort()
+    live.sort(key=lambda item: item[0])
+    return (top, tuple(index), tuple(live))
+
+
+def state_persist_changed(before: Any, after: Any) -> bool:
+    """True when an intent changed aside from cached bids and updated_at."""
+    return persist_form(before) != persist_form(after)
+
+
 def mint_cash_block(balance: float, need: float, reserved: float) -> Optional[dict]:
     """None when ``balance - reserved`` covers ``need``.
 

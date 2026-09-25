@@ -74,14 +74,16 @@ from rich.console import Console
 from rich.panel import Panel
 
 from buy.book import best_bid_with_min_size, bid_fill_depth
-from buy.chain import ChainReader
+from buy.chain import ChainReader, thread_session
 from buy.contracts import ContractCall, build_atomic_mint_calls
 from buy.market import MarketGateway, MintMarket
 from buy.mint_loops import (
     IntentStore,
     held_forward_floor,
     mint_cash_block,
+    chain_reconcile_action,
     pending_mint_reserve,
+    persist_digest,
     run_job_loop,
     select_mint_candidate,
     start_mint_sell_loops,
@@ -222,6 +224,10 @@ ACTIVE_STATUSES = frozenset(
 
 _shutdown = False
 STATE_LOCK = threading.RLock()
+# Persist form of the last atomic_save that finished. None until load or
+# the first successful save. Ticks compare against this, so a mutation
+# that raised before the save is still written on the next tick.
+_saved_persist_form: Any = None
 _intent_store: Optional[IntentStore] = None
 _heartbeat_lock = threading.Lock()
 _heartbeat_parts: Dict[str, dict] = {}
@@ -290,7 +296,7 @@ def notify(title: str, message: str, priority: str = "default") -> None:
 
 def atomic_save(path: Path, payload: dict) -> None:
     temporary = path.with_suffix(path.suffix + ".tmp")
-    data = json.dumps(payload, indent=2, sort_keys=True)
+    data = json.dumps(payload, separators=(",", ":"), sort_keys=True)
     with open(temporary, "w", encoding="utf-8") as handle:
         handle.write(data)
         handle.flush()
@@ -304,15 +310,47 @@ def atomic_save(path: Path, payload: dict) -> None:
             os.close(dir_fd)
     except OSError:
         pass
+    remember_persisted_state(payload)
+
+
+def remember_persisted_state(payload: dict) -> None:
+    """Record the digest of a state that is now on disk."""
+    global _saved_persist_form
+    _saved_persist_form = persist_digest(payload if isinstance(payload, dict) else {})
+
+
+def persist_dirty(state: dict) -> bool:
+    """True when ``state`` differs from the last successful save.
+
+    Compares the digest: live intents in full, terminal intents as id plus
+    status, and any top-level keys other than ``intents``.
+    """
+    return persist_digest(state if isinstance(state, dict) else {}) != _saved_persist_form
+
+
+def commit_state(state: dict, *, dirty: bool = False) -> bool:
+    """Write positions when something persist-relevant is unsaved.
+
+    ``dirty`` covers callers that already know they mutated state. The
+    compare is against the last successful ``atomic_save``, not a copy
+    taken at the start of this tick.
+    """
+    if not dirty and not persist_dirty(state):
+        return False
+    atomic_save(STATE_FILE, state)
+    return True
 
 def load_state() -> dict:
     if not STATE_FILE.exists():
-        return {"intents": {}}
+        payload = {"intents": {}}
+        remember_persisted_state(payload)
+        return payload
     with open(STATE_FILE, encoding="utf-8") as handle:
         payload = json.load(handle)
     if not isinstance(payload, dict):
         raise ValueError("positions_mint.json must be an object")
     payload.setdefault("intents", {})
+    remember_persisted_state(payload)
     return payload
 
 def load_strategy() -> dict:
@@ -755,7 +793,7 @@ def submit_mint_batch(calls: List[ContractCall], metadata: str) -> Tuple[Optiona
 
 def get_relayer_transaction(relayer_url: str, transaction_id: str) -> Optional[dict]:
     try:
-        response = requests.get(
+        response = thread_session("relayer").get(
             f"{relayer_url.rstrip('/')}/transaction",
             params={"id": transaction_id},
             timeout=15,
@@ -837,10 +875,19 @@ def reconcile_intents(
             status = str(intent.get("status") or "")
             if status not in ("confirmed_waiting_inventory", "confirmed", "mined"):
                 continue
-            if skip_confirmed_inventory and status == "confirmed":
+            # Ended confirmed bags are not polled. One read after the grace
+            # can still flip an empty bag to completed, then chain_reconcile_done
+            # stops further eth_calls. In-flight statuses keep querying so
+            # pending cash can release. Live confirmed stays on the old path,
+            # including skip_confirmed_inventory while a sell is hot.
+            action = chain_reconcile_action(intent, now)
+            if action == "skip":
+                continue
+            if action != "final" and skip_confirmed_inventory and status == "confirmed":
                 continue
             up_tok = str(intent.get("up_token") or up_tok)
             dn_tok = str(intent.get("dn_token") or dn_tok)
+            final_read = action == "final"
         try:
             up = chain.position_balance(ctf, funder, up_tok)
             dn = chain.position_balance(ctf, funder, dn_tok)
@@ -854,6 +901,8 @@ def reconcile_intents(
             intent["observed_up"] = up
             intent["observed_dn"] = dn
             intent["updated_at"] = now
+            if final_read:
+                intent["chain_reconcile_done"] = True
             expected = float(intent.get("before_up") or 0) + float(intent["shares"])
             expected_dn = float(intent.get("before_dn") or 0) + float(intent["shares"])
             if up + tol >= expected and dn + tol >= expected_dn:
@@ -937,7 +986,7 @@ _book_pool = ThreadPoolExecutor(max_workers=2)
 def _fetch_book(token_id: str, min_size: float):
     """REST `/book` → sized best bid plus raw bid levels for depth logs."""
     try:
-        response = requests.get(
+        response = thread_session("clob_book").get(
             "https://clob.polymarket.com/book",
             params={"token_id": str(token_id)},
             timeout=5,
@@ -1817,12 +1866,13 @@ def _manage_sells_locked(cfg: dict, state: dict, chain: ChainReader) -> None:
             "up": intent.get("last_up_bid"),
             "dn": intent.get("last_dn_bid"),
         }
+        # In-memory fallback for scrap_rest_px after a missed FAK.
+        # These prints alone must not rewrite positions_mint.json.
         intent["last_up_bid"] = up_bid
         intent["last_dn_bid"] = dn_bid
         intent["last_up_bid_size"] = up_sz
         intent["last_dn_bid_size"] = dn_sz
         intent["updated_at"] = now
-        dirty = True
 
         last = float(intent.get("last_sell_attempt_at") or 0)
         cooling = bool(last and now - last < cooldown)
@@ -2628,8 +2678,7 @@ def _manage_sells_locked(cfg: dict, state: dict, chain: ChainReader) -> None:
                 fak_miss=True,
             )
 
-    if dirty:
-        atomic_save(STATE_FILE, state)
+    commit_state(state, dirty=dirty)
 
 def _claim_mint_intent(
     state: dict,
@@ -2706,7 +2755,7 @@ def run_mint_cycle(
             skip_confirmed_inventory=sell_armed,
         )
         with STATE_LOCK:
-            atomic_save(STATE_FILE, state)
+            commit_state(state)
 
     with STATE_LOCK:
         submitting = any(

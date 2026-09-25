@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import itertools
+import threading
 from typing import Any
 
 import requests
@@ -8,16 +9,44 @@ from eth_abi import encode
 from eth_utils import keccak, to_checksum_address
 
 
+_thread_sessions = threading.local()
+
+
+def thread_session(slot: str = "default") -> requests.Session:
+    """One keep-alive ``requests.Session`` per calling thread and slot.
+
+    ``requests.Session`` is not safe to share across threads. Book fetches
+    run on a 2-thread pool, so each worker keeps its own session. A stale
+    pooled connection raises on the next call; callers already skip or
+    retry that error and this helper does not add a retry.
+    """
+    sessions = getattr(_thread_sessions, "sessions", None)
+    if sessions is None:
+        sessions = {}
+        _thread_sessions.sessions = sessions
+    key = str(slot or "default")
+    session = sessions.get(key)
+    if session is None:
+        session = requests.Session()
+        sessions[key] = session
+    return session
+
+
 class ChainReader:
-    """Minimal Polygon eth_call helper for mint prechecks."""
+    """Minimal Polygon eth_call helper for mint prechecks.
+
+    One Session per reader. Mint and sell each construct their own reader
+    and call it from that loop's thread only.
+    """
 
     def __init__(self, rpc_url: str, timeout: float = 15.0):
         self.rpc_url = rpc_url
         self.timeout = timeout
         self._ids = itertools.count(1)
+        self.session = requests.Session()
 
     def _rpc(self, method: str, params: list) -> Any:
-        response = requests.post(
+        response = self.session.post(
             self.rpc_url,
             json={
                 "jsonrpc": "2.0",
