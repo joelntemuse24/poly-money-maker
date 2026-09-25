@@ -411,12 +411,22 @@ def _persist_view(intent: Any) -> Any:
     return {key: value for key, value in intent.items() if key not in PERSIST_IGNORE_KEYS}
 
 
+# History stays in the file. These statuses are not edited in place after
+# the tick that sets them: sell skips them, reconcile skips them, and a
+# re-mint replaces the whole entry (status leaves ``failed``).
+TERMINAL_PERSIST_STATUSES = frozenset({"completed", "failed"})
+
+
+def _intent_status(intent: Any) -> str:
+    if not isinstance(intent, dict):
+        return ""
+    return str(intent.get("status") or "")
+
+
 def persist_form(intents: Any) -> dict:
     """Intent map with cached bids and ``updated_at`` removed.
 
-    The result is a new dict. Callers store it as the last successful save
-    and compare later ticks against that copy, not against a snapshot taken
-    at the start of the tick.
+    Full copy of every intent. The hot path uses ``persist_digest`` instead.
     """
     if not isinstance(intents, dict):
         return {}
@@ -424,6 +434,39 @@ def persist_form(intents: Any) -> dict:
         str(key): _persist_view(intent) if isinstance(intent, dict) else intent
         for key, intent in intents.items()
     }
+
+
+def persist_digest(state: Any) -> tuple:
+    """Cheap fingerprint of what a save would need to notice.
+
+    Terminal intents contribute only ``(id, status)``. Every other intent
+    contributes its persist view. Top-level keys other than ``intents`` are
+    included whole. Adding, removing, or replacing an intent, or changing
+    any status, changes the id summary.
+    """
+    if not isinstance(state, dict):
+        return ((), (), ())
+    top = tuple(
+        sorted(
+            (str(key), state[key])
+            for key in state
+            if key != "intents"
+        )
+    )
+    intents = state.get("intents")
+    if not isinstance(intents, dict):
+        return (top, (), ())
+    index = []
+    live = []
+    for key, intent in intents.items():
+        cid = str(key)
+        status = _intent_status(intent)
+        index.append((cid, status))
+        if status not in TERMINAL_PERSIST_STATUSES:
+            live.append((cid, _persist_view(intent)))
+    index.sort()
+    live.sort(key=lambda item: item[0])
+    return (top, tuple(index), tuple(live))
 
 
 def state_persist_changed(before: Any, after: Any) -> bool:

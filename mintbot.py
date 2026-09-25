@@ -83,7 +83,7 @@ from buy.mint_loops import (
     mint_cash_block,
     chain_reconcile_action,
     pending_mint_reserve,
-    persist_form,
+    persist_digest,
     run_job_loop,
     select_mint_candidate,
     start_mint_sell_loops,
@@ -314,16 +314,18 @@ def atomic_save(path: Path, payload: dict) -> None:
 
 
 def remember_persisted_state(payload: dict) -> None:
-    """Record the persist form of a state that is now on disk."""
+    """Record the digest of a state that is now on disk."""
     global _saved_persist_form
-    intents = payload.get("intents") if isinstance(payload, dict) else None
-    _saved_persist_form = persist_form(intents)
+    _saved_persist_form = persist_digest(payload if isinstance(payload, dict) else {})
 
 
 def persist_dirty(state: dict) -> bool:
-    """True when ``state`` differs from the last successful save."""
-    intents = state.get("intents") if isinstance(state, dict) else None
-    return persist_form(intents) != _saved_persist_form
+    """True when ``state`` differs from the last successful save.
+
+    Compares the digest: live intents in full, terminal intents as id plus
+    status, and any top-level keys other than ``intents``.
+    """
+    return persist_digest(state if isinstance(state, dict) else {}) != _saved_persist_form
 
 
 def commit_state(state: dict, *, dirty: bool = False) -> bool:

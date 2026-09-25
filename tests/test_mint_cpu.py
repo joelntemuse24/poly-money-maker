@@ -17,6 +17,7 @@ from buy.mint_loops import (
     ENDED_CHAIN_GRACE_S,
     chain_reconcile_action,
     pending_mint_reserve,
+    persist_digest,
     state_persist_changed,
 )
 from buy.oracle_log import fetch_crypto_price
@@ -59,7 +60,7 @@ def _load(*names: str, extras: dict | None = None) -> dict:
         "os": __import__("os"),
         "Path": Path,
         "threading": threading,
-        "persist_form": __import__("buy.mint_loops", fromlist=["persist_form"]).persist_form,
+        "persist_digest": __import__("buy.mint_loops", fromlist=["persist_digest"]).persist_digest,
         "contextmanager": contextmanager,
     }
     if extras:
@@ -321,6 +322,72 @@ class SaveOnChangeTests(unittest.TestCase):
         }
         self.assertTrue(state_persist_changed(before, changed))
         self.assertTrue(state_persist_changed(before, {}))
+
+    def test_digest_tracks_live_changes_and_skips_terminal_fields(self):
+        live = {
+            "status": "confirmed",
+            "shares": 50.0,
+            "sell_limit": 0.02,
+            "last_up_bid": 0.01,
+            "updated_at": 1.0,
+        }
+        done = {"status": "completed", "shares": 50.0, "slug": "old", "note": "audit"}
+        state = {"intents": {"live": dict(live), "done": dict(done)}, "note": "desk"}
+        base = persist_digest(state)
+
+        state["intents"]["live"]["last_up_bid"] = 0.4
+        state["intents"]["live"]["updated_at"] = 9.0
+        self.assertEqual(persist_digest(state), base)
+
+        state["intents"]["live"]["sell_limit"] = 0.01
+        self.assertNotEqual(persist_digest(state), base)
+        state["intents"]["live"]["sell_limit"] = 0.02
+        self.assertEqual(persist_digest(state), base)
+
+        state["intents"]["fresh"] = {"status": "submitting", "shares": 50.0}
+        self.assertNotEqual(persist_digest(state), base)
+        del state["intents"]["fresh"]
+        self.assertEqual(persist_digest(state), base)
+
+        state["intents"]["live"]["status"] = "completed"
+        self.assertNotEqual(persist_digest(state), base)
+        state["intents"]["live"]["status"] = "confirmed"
+        self.assertEqual(persist_digest(state), base)
+
+        state["extra"] = 1
+        self.assertNotEqual(persist_digest(state), base)
+
+    def test_digest_does_not_read_terminal_intent_fields(self):
+        class Guard(dict):
+            def __getitem__(self, key):
+                if key != "status":
+                    raise AssertionError(key)
+                return super().__getitem__(key)
+
+            def get(self, key, default=None):
+                if key != "status":
+                    raise AssertionError(key)
+                return super().get(key, default)
+
+            def items(self):
+                raise AssertionError("items")
+
+            def __iter__(self):
+                raise AssertionError("iter")
+
+        intents = {}
+        for i in range(3000):
+            intents[f"c{i}"] = Guard(status="completed", shares=50.0, blob="x" * 80)
+        intents["live"] = {"status": "confirmed", "shares": 50.0, "sell_limit": 0.02}
+        state = {"intents": intents}
+        started = time.perf_counter()
+        first = persist_digest(state)
+        second = persist_digest(state)
+        elapsed = time.perf_counter() - started
+        self.assertEqual(first, second)
+        self.assertLess(elapsed, 0.05)
+        intents["live"]["sell_filled"] = 1.0
+        self.assertNotEqual(persist_digest(state), first)
 
     def test_sell_loop_skips_bid_only_and_saves_real_changes(self):
         saves: list = []
