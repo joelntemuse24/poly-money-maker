@@ -93,6 +93,7 @@ from buy.mint_sell import (
     cycle_sleep_s,
     dump_fast_retry_eligible,
     dump_retry_ladder_limits,
+    dump_time_gate_open,
     effective_loser_persist_s,
     empty_fak_status,
     inventory_latch,
@@ -190,6 +191,9 @@ DEFAULTS = {
     "sell_dump_fak_retries": 2,
     "sell_dump_ladder_step": 0.04,
     "sell_dump_ladder_rungs": 4,
+    # 0 disables the time-left gate (old behavior). The example sets 240:
+    # arm and fire the held dump only when seconds-to-close is at or under this.
+    "sell_dump_max_ttm_s": 0.0,
     "sell_min_bid_size": 1.0,
     # 0 skips the late-window Chainlink veto on loser scrap.
     # Floor, per-TTM, and stale are 0 so a positive window does not
@@ -429,6 +433,8 @@ def validate_strategy(cfg: dict) -> None:
         raise ValueError("sell_dump_ladder_step must be > 0")
     if int(cfg.get("sell_dump_ladder_rungs") or 0) < 1:
         raise ValueError("sell_dump_ladder_rungs must be >= 1")
+    if float(cfg.get("sell_dump_max_ttm_s") or 0) < 0:
+        raise ValueError("sell_dump_max_ttm_s must be >= 0")
     if float(cfg.get("sell_min_bid_size") or 0) < 0:
         raise ValueError("sell_min_bid_size must be >= 0")
 
@@ -1778,6 +1784,42 @@ def _mark_loser_sold(intent: dict, leg: str, *, note: str = "") -> None:
     _note_loser_sold(intent, leg, note=note)
 
 
+def _log_sell_dump_time_gated(
+    *,
+    condition_id: str,
+    slug: Any,
+    leg: Any,
+    bid: Any,
+    ttm: Optional[float],
+    cutoff: float,
+    now_s: float,
+    interval_s: float = 15.0,
+) -> bool:
+    """Log ``sell_dump_time_gated`` at most once per bag per ``interval_s``.
+
+    Returns True when an event was emitted. The stamp is in-process only.
+    """
+    stamps = getattr(_log_sell_dump_time_gated, "_last_at", None)
+    if not isinstance(stamps, dict):
+        stamps = {}
+        setattr(_log_sell_dump_time_gated, "_last_at", stamps)
+    key = str(condition_id)
+    prev = stamps.get(key)
+    if prev is not None and float(now_s) + 1e-12 < float(prev) + float(interval_s):
+        return False
+    stamps[key] = float(now_s)
+    log_event(
+        "sell_dump_time_gated",
+        condition_id=condition_id,
+        slug=slug,
+        leg=leg,
+        bid=bid,
+        ttm=None if ttm is None else round(float(ttm), 3),
+        cutoff=float(cutoff),
+    )
+    return True
+
+
 def manage_sells(cfg: dict, state: dict, chain: ChainReader) -> None:
     """Loser scrap: arm ≤2¢, FAK at 2¢ or the live bid; winner; held dump."""
     if not cfg.get("sell_enabled"):
@@ -2051,6 +2093,10 @@ def _manage_sells_locked(cfg: dict, state: dict, chain: ChainReader) -> None:
         dump_retries = int(cfg.get("sell_dump_fak_retries", 2))
         dump_ladder_step = float(cfg.get("sell_dump_ladder_step") or 0.04)
         dump_ladder_rungs = int(cfg.get("sell_dump_ladder_rungs", 4))
+        # 0 or missing: no time gate (old behavior). Ladder rungs after the
+        # first submitted order stay inside _run_dump_fak_with_refire and
+        # are not re-checked against this cutoff.
+        dump_max_ttm_s = float(cfg.get("sell_dump_max_ttm_s") or 0.0)
         sold_leg = intent.get("sold_leg")
         held = None
         if sold_leg == "up":
@@ -2058,7 +2104,7 @@ def _manage_sells_locked(cfg: dict, state: dict, chain: ChainReader) -> None:
         elif sold_leg == "dn":
             held = "up"
         dump_bid = bids.get(held) if held else None
-        dump_armed = (
+        dump_price_ok = (
             dump_enabled
             and sold_loser
             and not sold_dump
@@ -2066,6 +2112,18 @@ def _manage_sells_locked(cfg: dict, state: dict, chain: ChainReader) -> None:
             and dump_bid is not None
             and float(dump_bid) < dump_below - 1e-12
         )
+        dump_ttm_ok = dump_time_gate_open(ttm_s, dump_max_ttm_s)
+        if dump_price_ok and not dump_ttm_ok:
+            _log_sell_dump_time_gated(
+                condition_id=cid,
+                slug=intent.get("slug"),
+                leg=held,
+                bid=dump_bid,
+                ttm=ttm_s,
+                cutoff=dump_max_ttm_s,
+                now_s=now,
+            )
+        dump_armed = dump_price_ok and dump_ttm_ok
         fire_d, armed_d, why_d = persist_ready(
             dump_armed,
             now_s=now,

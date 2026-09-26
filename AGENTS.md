@@ -81,8 +81,8 @@ sell-loop cadence only. Live `strategy_mint.json` still wins for keys it
 already sets. Code defaults arm at `sell_threshold` 0.02, print
 `sell_fak_px` / `sell_scrap_rest_px` 0.02, `sell_scrap_rest_min_ahead_s`
 180, persist 5 / 2, sized-skip off,
-`sell_late_window_s` 0, floor / per-TTM / stale edge knobs 0, and
-`sell_oracle_edge_persist_s` 3.
+`sell_late_window_s` 0, floor / per-TTM / stale edge knobs 0,
+`sell_oracle_edge_persist_s` 3, and `sell_dump_max_ttm_s` 0 (example 240).
 `oracle_log_enabled` stays true. New keys absent from the live file take these
 defaults after the operator pulls and restarts. Do not edit live JSON
 from this repo.
@@ -106,6 +106,11 @@ to that post-scrap hedge. Still cancel by T−`cancel_ttm_s` (~20s). The
 winner leg A still holds stays blocked. Markets A never held are not
 bid (`bid_absent_enabled` defaults false). There is no sister-miss held
 dump. The normal held dump under `sell_dump_below` still applies. When
+`sell_dump_max_ttm_s` > 0 it arms and fires only if seconds-to-close is
+at or under that cutoff (example 240; code default 0 leaves the gate
+off and keeps the old dump). A dip that starts before the cutoff must
+still persist the full `sell_dump_persist_s` after entering it. Ladder
+retries after the dump has fired are not re-checked. When
 that dump fills, mintbot sets `sell_dump_leg` and B FAK-buys
 `dump_hedge_shares` (10) of the other leg, with its own
 `dump_hedge_fak_min_notional` / `dump_hedge_fak_max_notional` (default

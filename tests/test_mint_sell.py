@@ -13,6 +13,7 @@ from buy.mint_sell import (
     depth_covers_size,
     dump_fast_retry_eligible,
     dump_retry_ladder_limits,
+    dump_time_gate_open,
     mint_cycle_sleep_s,
     effective_loser_persist_s,
     empty_fak_status,
@@ -1149,6 +1150,7 @@ class LateOracleScrapGateTests(unittest.TestCase):
         self.assertIs(DEFAULT_SELL_KNOBS["sell_persist_skip_when_sized"], False)
         self.assertNotIn("sell_persist_skip_ttm_s", DEFAULT_SELL_KNOBS)
         self.assertNotIn("sell_dump_if_sister_miss_s", DEFAULT_SELL_KNOBS)
+        self.assertEqual(DEFAULT_SELL_KNOBS["sell_dump_max_ttm_s"], 0.0)
         self.assertEqual(floor, 0.02)
         self.assertEqual(fak, 0.02)
         self.assertEqual(DEFAULT_SELL_KNOBS["sell_scrap_rest_px"], 0.02)
@@ -1706,6 +1708,25 @@ class ScrapSpeedTests(unittest.TestCase):
             armed=True,
         )
         self.assertEqual((action, rest_why), ("cancel", "oracle_block"))
+
+
+class DumpTimeGateTests(unittest.TestCase):
+    def test_open_at_or_under_cutoff_only(self):
+        self.assertFalse(dump_time_gate_open(427.0, 240.0))
+        self.assertFalse(dump_time_gate_open(240.0001, 240.0))
+        self.assertTrue(dump_time_gate_open(240.0, 240.0))
+        self.assertTrue(dump_time_gate_open(200.0, 240.0))
+        self.assertTrue(dump_time_gate_open(0.1, 240.0))
+
+    def test_zero_or_missing_cutoff_is_open(self):
+        self.assertTrue(dump_time_gate_open(427.0, 0.0))
+        self.assertTrue(dump_time_gate_open(427.0, None))
+        self.assertTrue(dump_time_gate_open(None, 0.0))
+        self.assertTrue(dump_time_gate_open(None, None))
+
+    def test_gate_on_without_a_clock_stays_closed(self):
+        self.assertFalse(dump_time_gate_open(None, 240.0))
+        self.assertFalse(dump_time_gate_open(float("nan"), 240.0))
 
 
 class SisterMissDumpRemovedTests(unittest.TestCase):
