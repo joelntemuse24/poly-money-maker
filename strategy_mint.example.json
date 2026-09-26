@@ -52,6 +52,7 @@
   "sell_dump_fak_retries": 2,
   "sell_dump_ladder_step": 0.04,
   "sell_dump_ladder_rungs": 4,
+  "sell_dump_max_ttm_s": 240.0,
   "sell_late_window_s": 0.0,
   "sell_oracle_edge_per_ttm": 0.0,
   "sell_oracle_edge_persist_s": 3.0,

@@ -26,7 +26,9 @@ thresholds. ``sell_oracle_edge_persist_s`` stays 3s. The tape stays on.
 
 After the loser is sold, optional held-leg dump: if the remaining leg's sized
 bid stays under ``sell_dump_below`` (~80¢) for ``sell_dump_persist_s`` (~2s),
-live-bid FAK the held leg. A sister miss does not dump that leg. Wallet B
+live-bid FAK the held leg. ``sell_dump_max_ttm_s`` (code default 0, off)
+blocks that arm and fire while seconds-to-close is above the cutoff; the
+example sets 240. A sister miss does not dump that leg. Wallet B
 reads ``sell_dump_leg`` after this fill and buys the other side.
 """
 
@@ -74,6 +76,8 @@ DEFAULT_SELL_KNOBS = {
     # Dump retry ladder: top bid, then step down toward floor (short burst).
     "sell_dump_ladder_step": 0.04,
     "sell_dump_ladder_rungs": 4,
+    # 0 disables the time-left gate (old behavior). The example sets 240.
+    "sell_dump_max_ttm_s": 0.0,
     "sell_min_bid_size": 1.0,
     # Cycle sleep while a loser persist arm is live. Does not change persist_s.
     "sell_armed_poll_s": 2.0,
@@ -449,6 +453,34 @@ def dump_retry_ladder_limits(
         if abs(cur - out[-1]) > 1e-12:
             out.append(cur)
     return out
+
+
+def dump_time_gate_open(
+    ttm_s: Optional[float],
+    max_ttm_s: Optional[float],
+) -> bool:
+    """True when the held dump may arm or fire.
+
+    ``max_ttm_s`` <= 0, missing, or non-finite leaves the gate off, so the
+    dump ignores time-to-close. Otherwise seconds-to-close must be finite
+    and at or under the cutoff. Ladder rungs after a dump has already
+    fired are not this function's job.
+    """
+    try:
+        cutoff = 0.0 if max_ttm_s is None else float(max_ttm_s)
+    except (TypeError, ValueError):
+        return True
+    if not math.isfinite(cutoff) or cutoff <= 0:
+        return True
+    if ttm_s is None:
+        return False
+    try:
+        ttm = float(ttm_s)
+    except (TypeError, ValueError):
+        return False
+    if not math.isfinite(ttm):
+        return False
+    return ttm <= cutoff + 1e-12
 
 
 def loser_empty_keep_qualify(

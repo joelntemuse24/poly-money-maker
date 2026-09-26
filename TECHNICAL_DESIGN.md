@@ -425,6 +425,7 @@ Preconditions (all required):
 - `sold_leg` is `"up"` or `"dn"` so the held leg is well-defined
 - sized held bid is not `None` and `< sell_dump_below` (0.80)
 - that condition persists `sell_dump_persist_s` (2.0 wait; lag-folded from 5s)
+- when `sell_dump_max_ttm_s` > 0, seconds-to-close is also ≤ that cutoff (example 240; code default 0 leaves the gate off). Above the cutoff the dump does not start `sell_dump_armed_at`, and a persist that already started is cleared, so the full `sell_dump_persist_s` must elapse again once inside the window. A missing key is the same as 0. Follow-up ladder rungs after orders are submitted are not blocked. A blocked arm logs `sell_dump_time_gated` (`condition_id`, `slug`, `leg`, `bid`, `ttm`, `cutoff`) at most once per bag per 15s.
 - at fire, still `< sell_dump_below` or cancel (`sell_cancel_out_of_range`)
 - not in sell cooldown
 
@@ -572,13 +573,14 @@ From VM `strategy_mint.json`:
 | `sell_dump_fak_retries` | 2 | Fast dump re-check/re-fire attempts after first zero-fill miss |
 | `sell_dump_ladder_step` | 0.04 | Dump retry ladder decrement toward floor |
 | `sell_dump_ladder_rungs` | 4 | Max limits per dump retry ladder |
+| `sell_dump_max_ttm_s` | **0 code default** / 240 example | Held dump arms and fires only when seconds-to-close ≤ this. 0 or missing disables |
 | `sell_late_window_s` | **0 code default** | 0 skips the oracle veto |
 | `sell_oracle_edge_per_ttm` | **0 code default** | Was 1.5. Zero does not restore that slope |
 | `sell_oracle_edge_persist_s` | **3 code default** | Edge must hold this long when the veto is on |
 | `sell_oracle_stale_s` | **0 code default** | Was 5s |
 | `sell_oracle_edge_floor_usd` | **0 code default** | Was $25. `need = max(floor, per_ttm × TTM)` |
 
-Repo code defaults (`mintbot` `DEFAULTS` / `strategy_mint.example.json`): arm `sell_threshold` 0.02, print `sell_fak_px` 0.02 equal to floor 0.02, rest ceiling `sell_scrap_rest_px` 0.02 capped at the live or last-seen bid, `sell_scrap_rest_min_ahead_s` 180, persist 5 / 2, `sell_persist_skip_when_sized` false, `sell_late_window_s` 0, oracle edge knobs `sell_oracle_edge_floor_usd` / `sell_oracle_edge_per_ttm` / `sell_oracle_stale_s` 0, and `sell_oracle_edge_persist_s` 3. `oracle_log_enabled` stays true. Live JSON still overrides every key it already sets. A `sell_dump_if_sister_miss_s` or `sell_persist_skip_ttm_s` key left in the live file is ignored. Do not edit live JSON from this repo. Sister bids stay a separate opt-in process. After a normal held dump, B buys 10 shares of the other leg. `sister_topup.py` can move $5 of pUSD from A to B once per broke episode. Not a sell.
+Repo code defaults (`mintbot` `DEFAULTS` / `strategy_mint.example.json`): arm `sell_threshold` 0.02, print `sell_fak_px` 0.02 equal to floor 0.02, rest ceiling `sell_scrap_rest_px` 0.02 capped at the live or last-seen bid, `sell_scrap_rest_min_ahead_s` 180, persist 5 / 2, `sell_persist_skip_when_sized` false, `sell_late_window_s` 0, oracle edge knobs `sell_oracle_edge_floor_usd` / `sell_oracle_edge_per_ttm` / `sell_oracle_stale_s` 0, and `sell_oracle_edge_persist_s` 3. `sell_dump_max_ttm_s` is 0 in code (gate off) and 240 in the example. `oracle_log_enabled` stays true. Live JSON still overrides every key it already sets. A `sell_dump_if_sister_miss_s` or `sell_persist_skip_ttm_s` key left in the live file is ignored. Do not edit live JSON from this repo. Sister bids stay a separate opt-in process. After a normal held dump, B buys 10 shares of the other leg. `sister_topup.py` can move $5 of pUSD from A to B once per broke episode. Not a sell.
 
 <a id="section-30"></a>
 ## Deploy boundary (VM is source of truth)

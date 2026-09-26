@@ -562,5 +562,251 @@ class OpenBagAndReserveTests(unittest.TestCase):
         self.assertEqual(pending_mint_reserve({"intents": {"old": _bag(status="completed")}}), 0.0)
 
 
+def _dump_cfg(**extra) -> dict:
+    cfg = {
+        "sell_threshold": 0.02,
+        "sell_floor": 0.02,
+        "sell_opposite_min": 0.90,
+        "sell_persist_s": 5.0,
+        "sell_persist_last_min_s": 2.0,
+        "sell_persist_last_min_window_s": 60.0,
+        "sell_persist_skip_when_sized": False,
+        "sell_fak_px": 0.02,
+        "sell_scrap_blind_enabled": False,
+        "sell_scrap_blind_px": 0.01,
+        "sell_scrap_blind_backoff_s": 3.0,
+        "sell_scrap_rest_enabled": False,
+        "sell_scrap_rest_px": 0.02,
+        "sell_scrap_rest_min_ahead_s": 180.0,
+        "sell_cooldown_s": 3.0,
+        "sell_winner_min": 0.999,
+        "sell_clob_max_price": 0.99,
+        "sell_clob_min_price": 0.01,
+        "sell_min_bid_size": 1.0,
+        "position_tolerance": 0.01,
+        "dry_run": False,
+        "shares": 50.0,
+        "sell_dump_enabled": True,
+        "sell_dump_below": 0.60,
+        "sell_dump_persist_s": 2.0,
+        "sell_dump_fak_retries": 2,
+        "sell_dump_ladder_step": 0.04,
+        "sell_dump_ladder_rungs": 4,
+        "sell_dump_max_ttm_s": 240.0,
+        "sell_late_window_s": 0.0,
+        "ctf_address": "",
+    }
+    cfg.update(extra)
+    return cfg
+
+
+def _dump_harness(fak_sell):
+    """Sell loop with a fixed 0.51/0.49 book and a stub FAK."""
+    events: list = []
+    fak_calls: list = []
+    clock = {"now": 1_700_000_000.0}
+    saves: list = []
+    ns = _sell_runtime(saves)
+    ns["time"] = SimpleNamespace(
+        time=lambda: clock["now"],
+        sleep=lambda *_a, **_k: None,
+    )
+    ns["log_event"] = lambda event, **kwargs: events.append({"event": event, **kwargs})
+    book = {
+        "up": (0.51, 50.0, [{"price": "0.51", "size": "80"}]),
+        "dn": (0.49, 50.0, [{"price": "0.49", "size": "80"}]),
+    }
+
+    def fetch_books(_up, _dn, _min_size):
+        return book["up"], book["dn"]
+
+    def wrapped_fak(token_id, size, price, dry_run, capture=None):
+        fak_calls.append(
+            {
+                "token_id": token_id,
+                "size": float(size),
+                "price": float(price),
+                "dry_run": dry_run,
+            }
+        )
+        return fak_sell(token_id, size, price, dry_run)
+
+    ns["_fetch_books"] = fetch_books
+    ns["_fak_sell"] = wrapped_fak
+    ns["_fetch_book"] = lambda *_a, **_k: (
+        0.48,
+        50.0,
+        [{"price": "0.48", "size": "80"}],
+    )
+    return ns, events, fak_calls, clock
+
+
+def _held_after_scrap(end_ts: float, **extra) -> dict:
+    row = {
+        "status": "confirmed",
+        "end_ts": end_ts,
+        "start_ts": end_ts - 900.0,
+        "up_token": "up-tok",
+        "dn_token": "dn-tok",
+        "shares": 50.0,
+        "slug": "btc-updown-15m-test",
+        "sold_loser": True,
+        "sold_leg": "dn",
+        "sold_loser_at": end_ts - 500.0,
+    }
+    row.update(extra)
+    return row
+
+
+def _fill_fak(_token, size, _price, _dry):
+    return float(size), "matched"
+
+
+class DumpMaxTtmGateTests(unittest.TestCase):
+    def _tick(self, ns, cfg, intent):
+        state = {"intents": {"cid-dump": intent}}
+        ns["remember_persisted_state"](state)
+        ns["_manage_sells_locked"](cfg, state, object())
+        return intent
+
+    def test_dump_blocked_at_ttm_427_with_bid_0_51(self):
+        ns, events, fak_calls, clock = _dump_harness(_fill_fak)
+        end = clock["now"] + 427.0
+        intent = _held_after_scrap(
+            end, sell_dump_armed_at=clock["now"] - 5.0,
+        )
+        self._tick(ns, _dump_cfg(), intent)
+        self.assertEqual(fak_calls, [])
+        self.assertIsNone(intent.get("sell_dump_armed_at"))
+        self.assertFalse(intent.get("sold_dump"))
+        gated = [row for row in events if row["event"] == "sell_dump_time_gated"]
+        self.assertEqual(len(gated), 1)
+        self.assertEqual(gated[0]["condition_id"], "cid-dump")
+        self.assertEqual(gated[0]["slug"], "btc-updown-15m-test")
+        self.assertEqual(gated[0]["leg"], "up")
+        self.assertAlmostEqual(gated[0]["bid"], 0.51)
+        self.assertAlmostEqual(gated[0]["ttm"], 427.0)
+        self.assertAlmostEqual(gated[0]["cutoff"], 240.0)
+        self.assertFalse(any(row["event"] == "sell_dump_persist" for row in events))
+
+        clock["now"] += 1.0
+        self._tick(ns, _dump_cfg(), intent)
+        gated = [row for row in events if row["event"] == "sell_dump_time_gated"]
+        self.assertEqual(len(gated), 1)
+        self.assertEqual(fak_calls, [])
+
+        clock["now"] += 14.0
+        self._tick(ns, _dump_cfg(), intent)
+        gated = [row for row in events if row["event"] == "sell_dump_time_gated"]
+        self.assertEqual(len(gated), 2)
+        self.assertAlmostEqual(gated[1]["ttm"], 412.0)
+        self.assertEqual(fak_calls, [])
+
+    def test_dump_fires_at_ttm_200_after_2s_persist(self):
+        ns, events, fak_calls, clock = _dump_harness(_fill_fak)
+        end = clock["now"] + 200.0
+        intent = _held_after_scrap(end)
+        cfg = _dump_cfg()
+        self._tick(ns, cfg, intent)
+        self.assertEqual(fak_calls, [])
+        self.assertEqual(intent.get("sell_dump_armed_at"), clock["now"])
+        self.assertFalse(intent.get("sold_dump"))
+        self.assertFalse(any(row["event"] == "sell_dump_time_gated" for row in events))
+
+        clock["now"] += 2.0
+        self._tick(ns, cfg, intent)
+        self.assertEqual(len(fak_calls), 1)
+        self.assertAlmostEqual(fak_calls[0]["price"], 0.51)
+        self.assertEqual(fak_calls[0]["token_id"], "up-tok")
+        self.assertAlmostEqual(fak_calls[0]["size"], 50.0)
+        self.assertTrue(intent.get("sold_dump"))
+        self.assertEqual(intent.get("sell_dump_leg"), "up")
+
+    def test_persist_started_outside_240_resets_and_waits_inside(self):
+        ns, _events, fak_calls, clock = _dump_harness(_fill_fak)
+        end = 1_700_000_242.0
+        clock["now"] = end - 242.0
+        stale_arm = clock["now"] - 30.0
+        intent = _held_after_scrap(end, sell_dump_armed_at=stale_arm)
+        cfg = _dump_cfg()
+        self._tick(ns, cfg, intent)
+        self.assertIsNone(intent.get("sell_dump_armed_at"))
+        self.assertEqual(fak_calls, [])
+
+        clock["now"] = end - 240.0
+        self._tick(ns, cfg, intent)
+        self.assertEqual(intent.get("sell_dump_armed_at"), clock["now"])
+        self.assertNotEqual(intent.get("sell_dump_armed_at"), stale_arm)
+        self.assertEqual(fak_calls, [])
+
+        armed = intent["sell_dump_armed_at"]
+        clock["now"] = armed + 1.9
+        self._tick(ns, cfg, intent)
+        self.assertEqual(intent.get("sell_dump_armed_at"), armed)
+        self.assertEqual(fak_calls, [])
+
+        clock["now"] = armed + 2.0
+        self._tick(ns, cfg, intent)
+        self.assertEqual(len(fak_calls), 1)
+        self.assertAlmostEqual(fak_calls[0]["price"], 0.51)
+        self.assertTrue(intent.get("sold_dump"))
+        self.assertAlmostEqual(end - (armed + 2.0), 238.0)
+
+    def test_gate_zero_keeps_the_old_dump_at_ttm_427(self):
+        ns, events, fak_calls, clock = _dump_harness(_fill_fak)
+        end = clock["now"] + 427.0
+        intent = _held_after_scrap(end)
+        cfg = _dump_cfg(sell_dump_max_ttm_s=0)
+        self._tick(ns, cfg, intent)
+        self.assertEqual(fak_calls, [])
+        self.assertEqual(intent.get("sell_dump_armed_at"), clock["now"])
+        self.assertFalse(any(row["event"] == "sell_dump_time_gated" for row in events))
+
+        clock["now"] += 2.0
+        self._tick(ns, cfg, intent)
+        self.assertEqual(len(fak_calls), 1)
+        self.assertAlmostEqual(fak_calls[0]["price"], 0.51)
+        self.assertTrue(intent.get("sold_dump"))
+
+    def test_missing_gate_key_keeps_the_old_dump(self):
+        ns, events, fak_calls, clock = _dump_harness(_fill_fak)
+        end = clock["now"] + 427.0
+        intent = _held_after_scrap(end)
+        cfg = _dump_cfg()
+        del cfg["sell_dump_max_ttm_s"]
+        self._tick(ns, cfg, intent)
+        self.assertEqual(intent.get("sell_dump_armed_at"), clock["now"])
+        clock["now"] += 2.0
+        self._tick(ns, cfg, intent)
+        self.assertEqual(len(fak_calls), 1)
+        self.assertTrue(intent.get("sold_dump"))
+        self.assertFalse(any(row["event"] == "sell_dump_time_gated" for row in events))
+
+    def test_ladder_retries_after_fire_are_not_time_gated(self):
+        misses = {"n": 0}
+
+        def fak_sell(_token, size, _price, _dry):
+            misses["n"] += 1
+            if misses["n"] == 1:
+                return 0.0, "error:no orders found to match with FAK order"
+            return float(size), "matched"
+
+        ns, events, fak_calls, clock = _dump_harness(fak_sell)
+        end = clock["now"] + 200.0
+        intent = _held_after_scrap(end, sell_dump_armed_at=clock["now"] - 2.0)
+        self._tick(ns, _dump_cfg(), intent)
+        self.assertEqual([row["price"] for row in fak_calls], [0.51, 0.48])
+        self.assertTrue(intent.get("sold_dump"))
+        self.assertFalse(any(row["event"] == "sell_dump_time_gated" for row in events))
+        src = MINT.read_text()
+        refire = src[
+            src.find("def _run_dump_fak_with_refire") : src.find(
+                "\ndef _apply_sell_fire_cancel"
+            )
+        ]
+        self.assertNotIn("sell_dump_max_ttm_s", refire)
+        self.assertNotIn("dump_time_gate_open", refire)
+
+
 if __name__ == "__main__":
     unittest.main()
