@@ -734,6 +734,7 @@ class DeployUnitsTests(unittest.TestCase):
                 "book.py",
                 "chain.py",
                 "contracts.py",
+                "log_archive.py",
                 "market.py",
                 "mint_sell.py",
                 "mint_loops.py",
