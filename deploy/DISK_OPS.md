@@ -32,7 +32,17 @@ bot data matters.
 
 3. **Prefer a larger boot disk** (20–30GB) if running the bots long-term.
 
-4. **Pathlog ticks are capped in-app** (`pathlog.py`: 14 days / **400 MB**, oldest
+4. **Keep mintbot log history.** `mintbot.log` still rotates at 2 MB
+   (`maxBytes=2_000_000`). Each rotation is renamed to
+   `logs/archive/mintbot.log.<UTC YYYYmmddTHHMMSSZ>` and gzipped in the
+   background to `mintbot.log.<stamp>.gz`. Nothing in `logs/archive/` is
+   pruned. Do not delete that directory when freeing disk; it is the
+   backtest tape (about 1.4 MB/day before gzip). A same-second collision
+   gets a numeric suffix. If compression fails, the uncompressed archive
+   is kept. `logs/oracle_twap.jsonl` is a separate append-only tape and
+   is not rotated.
+
+5. **Pathlog ticks are capped in-app** (`pathlog.py`: 14 days / **400 MB**, oldest
    JSONL first). Recorder `SERIES` is **15m only**. Journal cap ≠ pathlog cap.
    **Export before prune:**
 

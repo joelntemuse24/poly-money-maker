@@ -61,7 +61,6 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from datetime import datetime, timezone
-from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
@@ -257,11 +256,15 @@ def _signal_handler(signum, frame):
 def log_setup() -> None:
     import logging
 
+    from buy.log_archive import ArchiveRotatingFileHandler
+
     logger = logging.getLogger("mintbot")
     logger.setLevel(logging.INFO)
     logger.handlers.clear()
     fmt = logging.Formatter("%(message)s")
-    fh = RotatingFileHandler(LOG_FILE, maxBytes=2_000_000, backupCount=3)
+    # Live file still rolls at 2 MB. Rotated bytes move to logs/archive
+    # and are gzipped off the trading loop. Nothing in the archive is pruned.
+    fh = ArchiveRotatingFileHandler(LOG_FILE, maxBytes=2_000_000)
     fh.setFormatter(fmt)
     logger.addHandler(fh)
     sh = logging.StreamHandler(sys.stdout)
