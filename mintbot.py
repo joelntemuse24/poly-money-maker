@@ -75,6 +75,7 @@ from rich.panel import Panel
 from buy.book import best_bid_with_min_size, bid_fill_depth
 from buy.chain import ChainReader, thread_session
 from buy.contracts import ContractCall, build_atomic_mint_calls
+from buy.mint_gas import mint_gas_settings, validate_mint_gas
 from buy.market import MarketGateway, MintMarket
 from buy.mint_loops import (
     IntentStore,
@@ -147,6 +148,11 @@ DEFAULTS = {
     "mint_fail_cooldown_s": 30.0,
     "mint_submitting_timeout_s": 90.0,
     "mint_max_attempts": 3,
+    # Signed relay gasLimit. eth_estimateGas of the factory batch plus
+    # margin, else fallback. Both clamp to min(cap, relay-hub 650k).
+    "mint_gas_margin": 0.15,
+    "mint_gas_fallback": 650_000,
+    "mint_gas_cap": 650_000,
     "series_slugs": [
         "btc-up-or-down-15m",
     ],
@@ -395,6 +401,7 @@ def validate_strategy(cfg: dict) -> None:
         raise ValueError("mint_submitting_timeout_s must be >= 0")
     if int(cfg.get("mint_max_attempts") or 0) < 1:
         raise ValueError("mint_max_attempts must be >= 1")
+    validate_mint_gas(cfg)
     if not cfg["series_slugs"]:
         raise ValueError("series_slugs must not be empty")
     if int(cfg["max_open_sets"]) < 1:
@@ -710,12 +717,27 @@ def get_relayer_headers(body: dict) -> Optional[dict]:
     headers["Content-Type"] = "application/json"
     return headers
 
-def submit_mint_batch(calls: List[ContractCall], metadata: str) -> Tuple[Optional[str], Optional[str]]:
-    """Submit approve+split as one PROXY batch via Polymarket relayer."""
+def submit_mint_batch(
+    calls: List[ContractCall],
+    metadata: str,
+    *,
+    rpc=None,
+    gas_margin: float = 0.15,
+    gas_fallback: int = 650_000,
+    gas_cap: int = 650_000,
+) -> Tuple[Optional[str], Optional[str], dict]:
+    """Submit approve+split as one PROXY batch via Polymarket relayer.
+
+    ``rpc`` is ``(method, params) -> result`` and is used once, here, for
+    ``eth_estimateGas`` of the encoded batch. The sell loop does not call
+    this function. The third return value is the gas log fields.
+    """
+    from buy.mint_gas import choose_mint_relay_gas
+
     private_key = os.getenv("PRIVATE_KEY") or ""
     funder = os.getenv("FUNDER_ADDRESS") or ""
     if not private_key or not funder:
-        return None, "missing PRIVATE_KEY or FUNDER_ADDRESS"
+        return None, "missing PRIVATE_KEY or FUNDER_ADDRESS", {}
 
     from py_builder_relayer_client.builder.proxy import build_proxy_transaction_request
     from py_builder_relayer_client.config import get_contract_config as get_relayer_contract_config
@@ -734,7 +756,7 @@ def submit_mint_batch(calls: List[ContractCall], metadata: str) -> Tuple[Optiona
         eoa = signer.address()
         relayer_addr = os.getenv("RELAYER_API_KEY_ADDRESS")
         if relayer_addr and str(relayer_addr).lower() != str(eoa).lower():
-            return None, "RELAYER_API_KEY_ADDRESS does not match PRIVATE_KEY signer"
+            return None, "RELAYER_API_KEY_ADDRESS does not match PRIVATE_KEY signer", {}
 
         nonce_r = requests.get(
             f"{relayer_url}/relay-payload",
@@ -742,14 +764,14 @@ def submit_mint_batch(calls: List[ContractCall], metadata: str) -> Tuple[Optiona
             timeout=15,
         )
         if nonce_r.status_code != 200:
-            return None, f"relay payload fetch fail HTTP {nonce_r.status_code}"
+            return None, f"relay payload fetch fail HTTP {nonce_r.status_code}", {}
         relay_payload = nonce_r.json()
         if not isinstance(relay_payload, dict):
-            return None, "invalid relay payload"
+            return None, "invalid relay payload", {}
         nonce = relay_payload.get("nonce")
         relay = relay_payload.get("address")
         if nonce is None or not relay:
-            return None, "relay payload missing nonce/address"
+            return None, "relay payload missing nonce/address", {}
 
         encoded_data = encode_proxy_transaction_data(
             [
@@ -763,6 +785,16 @@ def submit_mint_batch(calls: List[ContractCall], metadata: str) -> Tuple[Optiona
             ]
         )
         config = get_relayer_contract_config(chain_id)
+        gas_plan = choose_mint_relay_gas(
+            rpc,
+            from_address=eoa,
+            to=config.proxy_factory,
+            data=encoded_data,
+            margin=gas_margin,
+            fallback=gas_fallback,
+            cap=gas_cap,
+        )
+        gas_log = gas_plan.as_log()
         request = build_proxy_transaction_request(
             signer=signer,
             args=ProxyTransactionArgs(
@@ -771,16 +803,17 @@ def submit_mint_batch(calls: List[ContractCall], metadata: str) -> Tuple[Optiona
                 gas_price="0",
                 data=encoded_data,
                 relay=str(relay),
+                gas_limit=gas_plan.relay_arg(),
             ),
             config=config,
             metadata=metadata,
         )
         body = request.to_dict()
         if str(body.get("proxyWallet") or "").lower() != str(funder).lower():
-            return None, "derived proxyWallet does not match FUNDER_ADDRESS"
+            return None, "derived proxyWallet does not match FUNDER_ADDRESS", gas_log
         headers = get_relayer_headers(body)
         if headers is None:
-            return None, "could not generate relayer authentication headers"
+            return None, "could not generate relayer authentication headers", gas_log
         submit_r = requests.post(
             f"{relayer_url}/submit",
             json=body,
@@ -791,11 +824,11 @@ def submit_mint_batch(calls: List[ContractCall], metadata: str) -> Tuple[Optiona
             payload = submit_r.json()
             tx_id = payload.get("transactionID") if isinstance(payload, dict) else None
             if tx_id:
-                return str(tx_id), None
-            return None, "relayer response missing transactionID"
-        return None, f"HTTP {submit_r.status_code} · {submit_r.text[:120]}"
+                return str(tx_id), None, gas_log
+            return None, "relayer response missing transactionID", gas_log
+        return None, f"HTTP {submit_r.status_code} · {submit_r.text[:120]}", gas_log
     except Exception as exc:
-        return None, f"relayer request failed: {str(exc)[:200]}"
+        return None, f"relayer request failed: {str(exc)[:200]}", {}
 
 def get_relayer_transaction(relayer_url: str, transaction_id: str) -> Optional[dict]:
     try:
@@ -3047,7 +3080,15 @@ def run_mint_cycle(
         mint_attempts=intent.get("mint_attempts"),
     )
 
-    tx_id, err = submit_mint_batch(calls, metadata=f"mintbot:split:{pick.condition_id}:{int(now)}")
+    gas_margin, gas_fallback, gas_cap = mint_gas_settings(cfg)
+    tx_id, err, gas = submit_mint_batch(
+        calls,
+        metadata=f"mintbot:split:{pick.condition_id}:{int(now)}",
+        rpc=chain._rpc,
+        gas_margin=gas_margin,
+        gas_fallback=gas_fallback,
+        gas_cap=gas_cap,
+    )
     with STATE_LOCK:
         intent = state["intents"][pick.condition_id]
         intent["updated_at"] = time.time()
@@ -3063,18 +3104,32 @@ def run_mint_cycle(
             fail_msg = None
     if not tx_id:
         console.print(f"  [dim red][MINT FAIL][/] {err}")
-        log_event(
-            "mint_submit_fail",
+        log_event("mint_submit_fail",
             condition_id=pick.condition_id,
             error=err,
             errorMsg=fail_msg,
+            gas_limit=gas.get("gas_limit"),
+            gas_estimate=gas.get("gas_estimate"),
+            gas_clamped=gas.get("gas_clamped"),
+            gas_source=gas.get("gas_source"),
+            gas_cap=gas.get("gas_cap"),
+            gas_hub_max=gas.get("gas_hub_max"),
         )
         notify("Mint submit failed", f"{pick.slug}\n{err}", priority="high")
         write_loop_heartbeat("mint", "submit_fail")
         return "submit_fail"
 
     console.print(f"  [bold bright_green][MINT ▶][/] tx={tx_id[:18]}…")
-    log_event("mint_submitted", condition_id=pick.condition_id, transaction_id=tx_id)
+    log_event("mint_submitted",
+        condition_id=pick.condition_id,
+        transaction_id=tx_id,
+        gas_limit=gas.get("gas_limit"),
+        gas_estimate=gas.get("gas_estimate"),
+        gas_clamped=gas.get("gas_clamped"),
+        gas_source=gas.get("gas_source"),
+        gas_cap=gas.get("gas_cap"),
+        gas_hub_max=gas.get("gas_hub_max"),
+    )
     notify("Mint submitted", f"{pick.slug}\n{shares:.0f} sets · {tx_id[:18]}…", priority="default")
     write_loop_heartbeat("mint", "submitted", slug=pick.slug)
     return "submitted"

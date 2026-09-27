@@ -7,6 +7,9 @@
   "mint_fail_cooldown_s": 30.0,
   "mint_submitting_timeout_s": 90.0,
   "mint_max_attempts": 3,
+  "mint_gas_margin": 0.15,
+  "mint_gas_fallback": 650000,
+  "mint_gas_cap": 650000,
   "series_slugs": [
     "btc-up-or-down-15m"
   ],

@@ -109,7 +109,9 @@ class MintDefaultsTests(unittest.TestCase):
         self.assertEqual(example["sell_dump_max_ttm_s"], 240)
 
     def test_example_and_defaults_pass_validate_strategy(self):
-        validate = _fn("validate_strategy")
+        from buy.mint_gas import validate_mint_gas
+
+        validate = _fn("validate_strategy", {"validate_mint_gas": validate_mint_gas})
         example = json.loads(MINT_EXAMPLE.read_text())
         defaults = _assign("DEFAULTS")
         validate(example)
@@ -132,8 +134,10 @@ class MintDefaultsTests(unittest.TestCase):
 
         from buy.mint_sell import loser_scrap_persist_s
 
+        from buy.mint_gas import validate_mint_gas
+
         defaults = _assign("DEFAULTS")
-        validate = _fn("validate_strategy")
+        validate = _fn("validate_strategy", {"validate_mint_gas": validate_mint_gas})
         raw = json.loads(MINT_EXAMPLE.read_text())
         raw["sell_persist_skip_ttm_s"] = 90.0
         with tempfile.NamedTemporaryFile(
@@ -750,6 +754,7 @@ class DeployUnitsTests(unittest.TestCase):
                 "log_archive.py",
                 "market.py",
                 "mint_sell.py",
+                "mint_gas.py",
                 "mint_loops.py",
                 "oracle_log.py",
                 "sister_bid.py",
