@@ -39,7 +39,14 @@ Loser scrap: sized opposite bid ≥ `sell_opposite_min` (~0.90), loser ≤
 `sell_persist_last_min_s` (2s) when time-to-end is within
 `sell_persist_last_min_window_s` (~60s). That 2s last-minute persist
 applies through market close. `sell_persist_skip_when_sized` defaults
-false, so a sized book still waits the full persist. Then re-check in-range
+false, so a sized book still waits the full persist.
+`sell_scrap_max_ttm_s` (code default 0, example 600) blocks arm, persist,
+and every loser-scrap fire (sweep FAK, blind FAK, post-miss rest) while
+seconds-to-close is above the cutoff. Unknown ttm leaves that gate open.
+Persist starts only once ttm is at or under the cutoff, so a cheap bid
+from earlier still waits the full persist. While gated, log
+`sell_scrap_time_gated` (`condition_id`, `slug`, `leg`, `bid`, `ttm`,
+`cutoff`) at most once per 15s per condition/leg. Then re-check in-range
 at fire, `sell_scrap_sweep_enabled` (default true) posts one FAK at
 `sell_floor` for the full remaining loser size. The book still fills
 higher bids first. Set the flag false to restore the 1¢ ladder from
@@ -93,7 +100,8 @@ already sets. Code defaults arm at `sell_threshold` 0.02, print
 `sell_fak_px` / `sell_scrap_rest_px` 0.02, `sell_scrap_rest_min_ahead_s`
 180, persist 5 / 2, sized-skip off,
 `sell_late_window_s` 0, floor / per-TTM / stale edge knobs 0,
-`sell_oracle_edge_persist_s` 3, and `sell_dump_max_ttm_s` 0 (example 240).
+`sell_oracle_edge_persist_s` 3, `sell_dump_max_ttm_s` 0 (example 240),
+and `sell_scrap_max_ttm_s` 0 (example 600).
 `oracle_log_enabled` stays true. New keys absent from the live file take these
 defaults after the operator pulls and restarts. Do not edit live JSON
 from this repo.
@@ -144,7 +152,12 @@ in git. `deploy/polyscrapbid.service` stays off until the operator asks.
 Shared `buy/` helpers exist for mint, pathlog, and the recording-only oracle tape:
 
 - `buy/book.py` — CLOB top-of-book parsing (`pathlog`, mint sized bids)
-- `buy/mint_sell.py` — sell fill parse, inventory latch, arm/persist
+- `buy/mint_sell.py` — sell fill parse, inventory latch, arm/persist.
+  Also the log-only `bag_risk` counters (held-bid min, seconds below
+  0.80/0.65/0.50, time-weighted `1 - bid` after scrap, scrap ttm / avg
+  fill / loser best-bid size, dump ttm and price). `mintbot` emits one
+  `bag_risk` line when the sell window closes. A failure there is
+  swallowed. It does not change orders.
 - `buy/mint_gas.py` — mint relay `gas_limit` (estimate + margin, 650k fallback, clamp to the ~650k hub budget). Mint submit only.
 - `buy/mint_loops.py` — concurrent sell vs mint job runner + intent claim
 - `buy/market.py` — Gamma/CLOB discovery (`mintbot`, `pathlog`)

@@ -10,7 +10,10 @@ sized loser bid is ≤ ``sell_threshold`` (~2¢) and the opposite bid is ≥ ~90
 Persist ``sell_persist_s`` (~5s), or ``sell_persist_last_min_s`` (~2s) in
 the last ``sell_persist_last_min_window_s`` (~60s). That last-minute wait
 applies through market close. Sized depth does not skip
-(``sell_persist_skip_when_sized`` default false). At fire,
+(``sell_persist_skip_when_sized`` default false). ``sell_scrap_max_ttm_s``
+(code default 0, off; example 600) blocks arm, persist, and every scrap
+fire while seconds-to-close is above the cutoff. Unknown time-to-end
+leaves that gate open. Persist starts only once the gate is open. At fire,
 ``sell_scrap_sweep_enabled`` (default true) posts one FAK at ``sell_floor``
 for the full remainder. False restores the 1¢ ladder from ``sell_fak_px``.
 Empty keep fires a blind 1¢ FAK (backoff ~3s).
@@ -53,6 +56,7 @@ from __future__ import annotations
 
 import fcntl
 import json
+import math
 import os
 import signal
 import sys
@@ -94,8 +98,12 @@ from buy.mint_sell import (
     cycle_sleep_s,
     dump_fast_retry_eligible,
     dump_retry_ladder_limits,
+    bag_risk_flush,
+    bag_risk_observe,
+    bag_risk_payload,
     dump_time_gate_open,
     effective_loser_persist_s,
+    fresh_bag_risk,
     empty_fak_status,
     inventory_latch,
     advance_oracle_edge_arm,
@@ -116,6 +124,7 @@ from buy.mint_sell import (
     resting_tif,
     scrap_rest_action,
     scrap_rest_px,
+    scrap_time_gate_open,
     sell_fire_decision,
     sell_window_open,
     skip_mint_discovery_for_sell,
@@ -182,6 +191,10 @@ DEFAULTS = {
     "sell_scrap_rest_enabled": True,
     "sell_scrap_rest_px": 0.02,
     "sell_scrap_rest_min_ahead_s": 180.0,
+    # 0 disables the scrap time-left gate (old behavior). The example sets 600:
+    # arm, persist, and fire the loser scrap only when seconds-to-close is
+    # at or under this. Unknown ttm (no end_ts) leaves the gate open.
+    "sell_scrap_max_ttm_s": 0.0,
     "sell_cooldown_s": 3.0,
     "sell_winner_min": 0.999,
     # Cheap 0.99 winner only if loser ≤ this AND loser+cheap_min > 1.0 (else redeem).
@@ -442,6 +455,8 @@ def validate_strategy(cfg: dict) -> None:
         raise ValueError("sell_dump_ladder_rungs must be >= 1")
     if float(cfg.get("sell_dump_max_ttm_s") or 0) < 0:
         raise ValueError("sell_dump_max_ttm_s must be >= 0")
+    if float(cfg.get("sell_scrap_max_ttm_s") or 0) < 0:
+        raise ValueError("sell_scrap_max_ttm_s must be >= 0")
     if float(cfg.get("sell_min_bid_size") or 0) < 0:
         raise ValueError("sell_min_bid_size must be >= 0")
 
@@ -1347,6 +1362,15 @@ def _fire_loser_scrap(
             offered=round(post_size, 4),
             status=status,
         )
+        try:
+            if float(sold or 0) > 0 or dry_run:
+                _remember_scrap_fill(
+                    condition_id,
+                    avg_px=avg if avg is not None else limit,
+                    best_bid_size=_scrap_best_bid_size(bids),
+                )
+        except Exception:
+            pass
         _refreshed, latch = _sell_inventory(
             chain, ctf, funder_cs, token_id, shares, tol,
             "seen_loser_inventory", intent,
@@ -1368,6 +1392,15 @@ def _fire_loser_scrap(
         ttm_s=ttm_s,
         condition_id=condition_id,
     )
+    try:
+        if float(sold or 0) > 0 or dry_run:
+            _remember_scrap_fill(
+                condition_id,
+                avg_px=last_px,
+                best_bid_size=_scrap_best_bid_size(bids),
+            )
+    except Exception:
+        pass
     return float(sold or 0), status, last_px, False
 
 
@@ -1853,6 +1886,223 @@ def _log_sell_dump_time_gated(
     return True
 
 
+def _log_sell_scrap_time_gated(
+    *,
+    condition_id: str,
+    slug: Any,
+    leg: Any,
+    bid: Any,
+    ttm: Optional[float],
+    cutoff: float,
+    now_s: float,
+    interval_s: float = 15.0,
+) -> bool:
+    """Log ``sell_scrap_time_gated`` at most once per leg per ``interval_s``.
+
+    Returns True when an event was emitted. The stamp is in-process only.
+    """
+    stamps = getattr(_log_sell_scrap_time_gated, "_last_at", None)
+    if not isinstance(stamps, dict):
+        stamps = {}
+        setattr(_log_sell_scrap_time_gated, "_last_at", stamps)
+    key = f"{condition_id}:{leg}"
+    prev = stamps.get(key)
+    if prev is not None and float(now_s) + 1e-12 < float(prev) + float(interval_s):
+        return False
+    stamps[key] = float(now_s)
+    log_event(
+        "sell_scrap_time_gated",
+        condition_id=condition_id,
+        slug=slug,
+        leg=leg,
+        bid=bid,
+        ttm=None if ttm is None else round(float(ttm), 3),
+        cutoff=float(cutoff),
+    )
+    return True
+
+
+def _bag_risk_rows() -> dict:
+    rows = getattr(_bag_risk_rows, "_rows", None)
+    if not isinstance(rows, dict):
+        rows = {}
+        setattr(_bag_risk_rows, "_rows", rows)
+    return rows
+
+
+def _bag_risk_emitted() -> set:
+    done = getattr(_bag_risk_emitted, "_done", None)
+    if not isinstance(done, set):
+        done = set()
+        setattr(_bag_risk_emitted, "_done", done)
+    return done
+
+
+def _remember_scrap_fill(
+    condition_id: Any,
+    *,
+    avg_px: Any,
+    best_bid_size: Any,
+) -> None:
+    """Stash this tick's scrap fill for the log-only bag_risk line."""
+    try:
+        slot = getattr(_remember_scrap_fill, "_fills", None)
+        if not isinstance(slot, dict):
+            slot = {}
+            setattr(_remember_scrap_fill, "_fills", slot)
+        slot[str(condition_id)] = {
+            "avg_px": avg_px,
+            "best_bid_size": best_bid_size,
+        }
+    except Exception:
+        return
+
+
+def _take_scrap_fill(condition_id: Any) -> dict:
+    try:
+        slot = getattr(_remember_scrap_fill, "_fills", None)
+        if not isinstance(slot, dict):
+            return {}
+        got = slot.pop(str(condition_id), None)
+        return got if isinstance(got, dict) else {}
+    except Exception:
+        return {}
+
+
+def _scrap_best_bid_size(bids: Any) -> Optional[float]:
+    try:
+        snap = bid_fill_depth(bids or [], None)
+    except Exception:
+        return None
+    if snap.get("best_bid") is None:
+        return None
+    try:
+        size = float(snap.get("best_bid_size") or 0.0)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(size):
+        return None
+    return size
+
+
+def _ttm_at(end_ts: Any, at_ts: Any) -> Optional[float]:
+    try:
+        end = float(end_ts or 0)
+        at = float(at_ts)
+    except (TypeError, ValueError):
+        return None
+    if end <= 0 or not math.isfinite(end) or not math.isfinite(at):
+        return None
+    return end - at
+
+
+def _bag_risk_ensure(condition_id: str, *, sold_at_start: bool) -> None:
+    """Open an in-memory risk row the first tick this process sees the bag."""
+    try:
+        rows = _bag_risk_rows()
+        if condition_id in rows:
+            return
+        rec = fresh_bag_risk()
+        if sold_at_start:
+            rec["partial"] = True
+        rows[condition_id] = rec
+    except Exception:
+        return
+
+
+def _note_bag_risk(
+    condition_id: str,
+    intent: dict,
+    *,
+    now: float,
+    end_ts: float,
+    ttm_s: Optional[float],
+    bids: dict,
+    books: dict,
+) -> None:
+    """Update bag_risk from bids this tick already fetched. Never trades."""
+    try:
+        rows = _bag_risk_rows()
+        rec = rows.get(condition_id)
+        if not isinstance(rec, dict):
+            return
+        sold_leg = intent.get("sold_leg")
+        sold = bool(intent.get("sold_loser") or sold_leg)
+        held = None
+        if sold_leg == "up":
+            held = "dn"
+        elif sold_leg == "dn":
+            held = "up"
+        held_bid = bids.get(held) if held else None
+        scrap_px = None
+        scrap_ttm = None
+        loser_size = None
+        if sold and not rec.get("scrap_seen"):
+            if rec.get("partial"):
+                scrap_px = intent.get("sell_limit")
+                scrap_ttm = _ttm_at(end_ts, intent.get("sold_loser_at"))
+            else:
+                fill = _take_scrap_fill(condition_id)
+                scrap_px = fill.get("avg_px")
+                if scrap_px is None:
+                    scrap_px = intent.get("sell_limit")
+                scrap_ttm = ttm_s
+                loser_size = fill.get("best_bid_size")
+                if loser_size is None and sold_leg in ("up", "dn"):
+                    loser_size = _scrap_best_bid_size(books.get(sold_leg))
+        dump_fired = bool(intent.get("sold_dump"))
+        dump_px = None
+        dump_ttm = None
+        if dump_fired and not rec.get("dump_seen"):
+            dump_px = intent.get("sell_dump_limit")
+            if rec.get("partial") and intent.get("sold_dump_at"):
+                dump_ttm = _ttm_at(end_ts, intent.get("sold_dump_at"))
+            else:
+                dump_ttm = ttm_s
+        bag_risk_observe(
+            rec,
+            now_s=now,
+            ttm_s=ttm_s,
+            sold_loser=sold,
+            sold_leg=sold_leg if sold_leg in ("up", "dn") else None,
+            scrap_avg_px=scrap_px,
+            loser_best_bid_size=loser_size,
+            scrap_ttm=scrap_ttm,
+            held_bid=held_bid,
+            dump_fired=dump_fired,
+            dump_px=dump_px,
+            dump_ttm=dump_ttm,
+        )
+    except Exception:
+        return
+
+
+def _close_bag_risk(condition_id: str, intent: dict, *, now: float) -> None:
+    """Emit one ``bag_risk`` line when the sell window closes. Log only."""
+    try:
+        done = _bag_risk_emitted()
+        if condition_id in done:
+            return
+        rec = _bag_risk_rows().get(condition_id)
+        if not isinstance(rec, dict):
+            return
+        bag_risk_flush(rec, now_s=now)
+        shares = intent.get("shares")
+        log_event(
+            "bag_risk",
+            **bag_risk_payload(
+                rec,
+                condition_id=condition_id,
+                slug=intent.get("slug"),
+                shares=shares,
+            ),
+        )
+        done.add(condition_id)
+        _bag_risk_rows().pop(condition_id, None)
+    except Exception:
+        return
+
+
 def manage_sells(cfg: dict, state: dict, chain: ChainReader) -> None:
     """Loser scrap: arm ≤2¢, FAK at 2¢ or the live bid; winner; held dump."""
     if not cfg.get("sell_enabled"):
@@ -1918,6 +2168,7 @@ def _manage_sells_locked(cfg: dict, state: dict, chain: ChainReader) -> None:
             if intent.get("sell_scrap_rest_id"):
                 _drop_scrap_rest(intent, cid, reason="window_end")
                 dirty = True
+            _close_bag_risk(cid, intent, now=now)
             continue
 
         up_tok = str(intent.get("up_token") or "")
@@ -1954,6 +2205,7 @@ def _manage_sells_locked(cfg: dict, state: dict, chain: ChainReader) -> None:
         bids = {"up": up_bid, "dn": dn_bid}
         shares = float(intent.get("shares") or cfg["shares"])
         sold_loser = bool(intent.get("sold_loser") or intent.get("sold_leg"))
+        _bag_risk_ensure(cid, sold_at_start=sold_loser)
         if sold_loser and not intent.get("sold_loser_at"):
             prior = intent.get("last_sell_attempt_at")
             try:
@@ -2318,6 +2570,10 @@ def _manage_sells_locked(cfg: dict, state: dict, chain: ChainReader) -> None:
             skip_when_sized=skip_when_sized,
         )
         if loser_persist_s is None:
+            _note_bag_risk(
+                cid, intent, now=now, end_ts=end_ts, ttm_s=ttm_s,
+                bids=bids, books=books,
+            )
             continue
         prev_persist = intent.get("sell_persist_effective_s")
         if (
@@ -2362,13 +2618,38 @@ def _manage_sells_locked(cfg: dict, state: dict, chain: ChainReader) -> None:
             and empty_fak_status(intent.get("sell_last_status"))
             and (up_bid is None or dn_bid is None)
         )
+        # 0 or missing: no scrap time gate (old behavior). Unknown ttm
+        # stays open. Blind, sweep, and post-miss rest only run after this
+        # arm, so a closed gate blocks those fires too. Dump keeps its own
+        # cutoff. A cheap bid from before the gate still waits full persist.
+        scrap_max_ttm_s = float(cfg.get("sell_scrap_max_ttm_s") or 0.0)
+        scrap_ttm_ok = scrap_time_gate_open(ttm_s, scrap_max_ttm_s)
+        if not scrap_ttm_ok and not sold_loser:
+            for leg_name in ("up", "dn"):
+                leg_bid = bids.get(leg_name)
+                try:
+                    cheap = (
+                        leg_bid is not None and float(leg_bid) <= thr + 1e-12
+                    )
+                except (TypeError, ValueError):
+                    cheap = False
+                if cheap:
+                    _log_sell_scrap_time_gated(
+                        condition_id=cid,
+                        slug=intent.get("slug"),
+                        leg=leg_name,
+                        bid=leg_bid,
+                        ttm=ttm_s,
+                        cutoff=scrap_max_ttm_s,
+                        now_s=now,
+                    )
         fire_l, armed_l, why_l = loser_persist_ready(
-            loser is not None and not sold_loser,
+            loser is not None and not sold_loser and scrap_ttm_ok,
             now_s=now,
             armed_ts=intent.get("sell_loser_armed_at"),
             persist_s=loser_persist_s,
             last_status=intent.get("sell_last_status"),
-            book_empty=keep_empty or fak_rearm,
+            book_empty=(keep_empty or fak_rearm) and scrap_ttm_ok,
         )
         intent["sell_loser_armed_at"] = armed_l
         if why_l == "reset":
@@ -2514,6 +2795,7 @@ def _manage_sells_locked(cfg: dict, state: dict, chain: ChainReader) -> None:
 
         if (
             fire_l
+            and scrap_ttm_ok
             and loser
             and not cooling
             and not intent.get("sold_loser")
@@ -2663,7 +2945,8 @@ def _manage_sells_locked(cfg: dict, state: dict, chain: ChainReader) -> None:
                         )
 
         if (
-            not intent.get("sold_loser")
+            scrap_ttm_ok
+            and not intent.get("sold_loser")
             and not intent.get("sell_scrap_rest_id")
             and persist_leg in ("up", "dn")
             and why_l in {"empty_keep_arm", "empty_fak_keep_arm"}
@@ -2742,7 +3025,8 @@ def _manage_sells_locked(cfg: dict, state: dict, chain: ChainReader) -> None:
                             fak_miss=True,
                         )
         elif (
-            why_l in {"empty_fak_keep_arm", "empty_fak_rearm"}
+            scrap_ttm_ok
+            and why_l in {"empty_fak_keep_arm", "empty_fak_rearm"}
             and not intent.get("sell_scrap_rest_id")
             and not intent.get("sold_loser")
             and persist_leg in ("up", "dn")
@@ -2766,6 +3050,11 @@ def _manage_sells_locked(cfg: dict, state: dict, chain: ChainReader) -> None:
                 armed=intent.get("sell_loser_armed_at") is not None,
                 fak_miss=True,
             )
+
+        _note_bag_risk(
+            cid, intent, now=now, end_ts=end_ts, ttm_s=ttm_s,
+            bids=bids, books=books,
+        )
 
     commit_state(state, dirty=dirty)
 

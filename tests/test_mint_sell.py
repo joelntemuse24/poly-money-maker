@@ -13,7 +13,11 @@ from buy.mint_sell import (
     depth_covers_size,
     dump_fast_retry_eligible,
     dump_retry_ladder_limits,
+    bag_risk_flush,
+    bag_risk_observe,
+    bag_risk_payload,
     dump_time_gate_open,
+    fresh_bag_risk,
     mint_cycle_sleep_s,
     effective_loser_persist_s,
     empty_fak_status,
@@ -36,6 +40,7 @@ from buy.mint_sell import (
     rest_order_matched_shares,
     resting_tif,
     scrap_rest_action,
+    scrap_time_gate_open,
     sell_fire_decision,
     sell_intent_hot,
     sell_window_open,
@@ -1151,6 +1156,7 @@ class LateOracleScrapGateTests(unittest.TestCase):
         self.assertNotIn("sell_persist_skip_ttm_s", DEFAULT_SELL_KNOBS)
         self.assertNotIn("sell_dump_if_sister_miss_s", DEFAULT_SELL_KNOBS)
         self.assertEqual(DEFAULT_SELL_KNOBS["sell_dump_max_ttm_s"], 0.0)
+        self.assertEqual(DEFAULT_SELL_KNOBS["sell_scrap_max_ttm_s"], 0.0)
         self.assertEqual(floor, 0.02)
         self.assertEqual(fak, 0.02)
         self.assertEqual(DEFAULT_SELL_KNOBS["sell_scrap_rest_px"], 0.02)
@@ -1708,6 +1714,156 @@ class ScrapSpeedTests(unittest.TestCase):
             armed=True,
         )
         self.assertEqual((action, rest_why), ("cancel", "oracle_block"))
+
+
+class ScrapTimeGateTests(unittest.TestCase):
+    def test_closed_above_cutoff_and_open_at_or_under(self):
+        self.assertFalse(scrap_time_gate_open(601.0, 600.0))
+        self.assertFalse(scrap_time_gate_open(600.0001, 600.0))
+        self.assertTrue(scrap_time_gate_open(600.0, 600.0))
+        self.assertTrue(scrap_time_gate_open(200.0, 600.0))
+        self.assertTrue(scrap_time_gate_open(0.1, 600.0))
+
+    def test_zero_or_missing_cutoff_is_open(self):
+        self.assertTrue(scrap_time_gate_open(800.0, 0.0))
+        self.assertTrue(scrap_time_gate_open(800.0, None))
+        self.assertTrue(scrap_time_gate_open(None, 0.0))
+        self.assertTrue(scrap_time_gate_open(None, None))
+
+    def test_unknown_ttm_stays_open(self):
+        self.assertTrue(scrap_time_gate_open(None, 600.0))
+        self.assertTrue(scrap_time_gate_open(float("nan"), 600.0))
+
+
+class BagRiskAccumulationTests(unittest.TestCase):
+    def test_held_bid_stats_start_only_after_scrap(self):
+        rec = fresh_bag_risk()
+        bag_risk_observe(
+            rec, now_s=0.0, ttm_s=100.0, sold_loser=False, sold_leg=None,
+            held_bid=0.40,
+        )
+        self.assertFalse(rec["scrap_seen"])
+        self.assertEqual(rec["sec_below_50"], 0.0)
+        bag_risk_observe(
+            rec,
+            now_s=10.0,
+            ttm_s=90.0,
+            sold_loser=True,
+            sold_leg="up",
+            scrap_avg_px=0.015,
+            loser_best_bid_size=40.0,
+            scrap_ttm=90.0,
+            held_bid=0.97,
+        )
+        self.assertEqual(rec["scrapped_leg"], "up")
+        self.assertEqual(rec["ttm_at_scrap"], 90.0)
+        self.assertEqual(rec["scrap_avg_px"], 0.015)
+        self.assertEqual(rec["loser_best_bid_size"], 40.0)
+        self.assertEqual(rec["min_held_bid"], 0.97)
+        self.assertEqual(rec["min_held_ttm"], 90.0)
+        self.assertEqual(rec["sec_below_80"], 0.0)
+        bag_risk_observe(
+            rec, now_s=12.0, ttm_s=88.0, sold_loser=True, sold_leg="up",
+            held_bid=0.70,
+        )
+        self.assertEqual(rec["sec_below_80"], 0.0)
+        self.assertAlmostEqual(rec["shortfall_weighted"], 0.06)
+        bag_risk_observe(
+            rec, now_s=15.0, ttm_s=85.0, sold_loser=True, sold_leg="up",
+            held_bid=0.40,
+        )
+        self.assertAlmostEqual(rec["sec_below_80"], 3.0)
+        self.assertAlmostEqual(rec["sec_below_65"], 0.0)
+        self.assertAlmostEqual(rec["sec_below_50"], 0.0)
+        self.assertEqual(rec["min_held_bid"], 0.40)
+        self.assertEqual(rec["min_held_ttm"], 85.0)
+        bag_risk_observe(
+            rec, now_s=17.0, ttm_s=83.0, sold_loser=True, sold_leg="up",
+            held_bid=0.40,
+        )
+        self.assertAlmostEqual(rec["sec_below_80"], 5.0)
+        self.assertAlmostEqual(rec["sec_below_65"], 2.0)
+        self.assertAlmostEqual(rec["sec_below_50"], 2.0)
+        bag_risk_flush(rec, now_s=19.0)
+        self.assertAlmostEqual(rec["sec_below_50"], 4.0)
+        bag_risk_flush(rec, now_s=25.0)
+        self.assertAlmostEqual(rec["sec_below_50"], 4.0)
+        payload = bag_risk_payload(
+            rec, condition_id="cid", slug="slug", shares=50,
+        )
+        self.assertEqual(payload["condition_id"], "cid")
+        self.assertEqual(payload["slug"], "slug")
+        self.assertEqual(payload["shares"], 50.0)
+        self.assertEqual(payload["scrapped_leg"], "up")
+        self.assertEqual(payload["ttm_at_scrap"], 90.0)
+        self.assertEqual(payload["scrap_avg_px"], 0.015)
+        self.assertEqual(payload["loser_best_bid_size"], 40.0)
+        self.assertEqual(payload["min_held_bid"], 0.40)
+        self.assertEqual(payload["min_held_ttm"], 85.0)
+        self.assertAlmostEqual(payload["sec_below_80"], 7.0)
+        self.assertAlmostEqual(payload["sec_below_65"], 4.0)
+        self.assertAlmostEqual(payload["sec_below_50"], 4.0)
+        self.assertAlmostEqual(payload["mean_shortfall"], round(3.36 / 9.0, 4))
+        self.assertFalse(payload["dump_fired"])
+        self.assertIsNone(payload["dump_ttm"])
+        self.assertIsNone(payload["dump_px"])
+        self.assertFalse(payload["partial"])
+
+    def test_never_scrapped_fields_are_null(self):
+        rec = fresh_bag_risk()
+        bag_risk_observe(
+            rec, now_s=1.0, ttm_s=10.0, sold_loser=False, sold_leg=None,
+            held_bid=0.40,
+        )
+        payload = bag_risk_payload(
+            rec, condition_id="cid", slug="slug", shares=5,
+        )
+        self.assertIsNone(payload["scrapped_leg"])
+        self.assertIsNone(payload["ttm_at_scrap"])
+        self.assertIsNone(payload["scrap_avg_px"])
+        self.assertIsNone(payload["loser_best_bid_size"])
+        self.assertIsNone(payload["min_held_bid"])
+        self.assertIsNone(payload["sec_below_80"])
+        self.assertIsNone(payload["mean_shortfall"])
+        self.assertFalse(payload["dump_fired"])
+        self.assertFalse(payload["partial"])
+
+    def test_dump_fields_stick_on_the_first_fire(self):
+        rec = fresh_bag_risk()
+        bag_risk_observe(
+            rec,
+            now_s=1.0,
+            ttm_s=20.0,
+            sold_loser=True,
+            sold_leg="dn",
+            scrap_avg_px=0.02,
+            scrap_ttm=40.0,
+            loser_best_bid_size=12.0,
+            held_bid=0.51,
+            dump_fired=True,
+            dump_px=0.51,
+            dump_ttm=20.0,
+        )
+        bag_risk_observe(
+            rec,
+            now_s=3.0,
+            ttm_s=18.0,
+            sold_loser=True,
+            sold_leg="dn",
+            held_bid=0.40,
+            dump_fired=True,
+            dump_px=0.10,
+            dump_ttm=5.0,
+        )
+        self.assertEqual(rec["dump_px"], 0.51)
+        self.assertEqual(rec["dump_ttm"], 20.0)
+        self.assertEqual(rec["scrap_avg_px"], 0.02)
+        payload = bag_risk_payload(
+            rec, condition_id="cid", slug="slug", shares=10,
+        )
+        self.assertTrue(payload["dump_fired"])
+        self.assertEqual(payload["dump_ttm"], 20.0)
+        self.assertEqual(payload["dump_px"], 0.51)
 
 
 class DumpTimeGateTests(unittest.TestCase):

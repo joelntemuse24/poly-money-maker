@@ -107,6 +107,8 @@ class MintDefaultsTests(unittest.TestCase):
             self.assertEqual(blob["sell_armed_poll_s"], 2.0, label)
         self.assertEqual(defaults["sell_dump_max_ttm_s"], 0.0)
         self.assertEqual(example["sell_dump_max_ttm_s"], 240)
+        self.assertEqual(defaults["sell_scrap_max_ttm_s"], 0.0)
+        self.assertEqual(example["sell_scrap_max_ttm_s"], 600)
 
     def test_example_and_defaults_pass_validate_strategy(self):
         from buy.mint_gas import validate_mint_gas
@@ -127,6 +129,17 @@ class MintDefaultsTests(unittest.TestCase):
         gated = dict(example)
         gated["sell_dump_max_ttm_s"] = 240
         validate(gated)
+        negative_scrap = dict(defaults)
+        negative_scrap["sell_scrap_max_ttm_s"] = -1
+        with self.assertRaises(ValueError) as scrap_caught:
+            validate(negative_scrap)
+        self.assertIn("sell_scrap_max_ttm_s", str(scrap_caught.exception))
+        scrap_off = dict(defaults)
+        scrap_off["sell_scrap_max_ttm_s"] = 0
+        validate(scrap_off)
+        scrap_on = dict(example)
+        scrap_on["sell_scrap_max_ttm_s"] = 600
+        validate(scrap_on)
 
     def test_legacy_sell_persist_skip_ttm_s_is_ignored(self):
         """A live file that still lists the removed skip key loads and does not skip."""
@@ -1135,6 +1148,8 @@ class DeployUnitsTests(unittest.TestCase):
         self.assertEqual(example["sell_dump_ladder_rungs"], 4)
         self.assertEqual(defaults["sell_dump_max_ttm_s"], 0.0)
         self.assertEqual(example["sell_dump_max_ttm_s"], 240)
+        self.assertEqual(defaults["sell_scrap_max_ttm_s"], 0.0)
+        self.assertEqual(example["sell_scrap_max_ttm_s"], 600)
         self.assertNotIn("sell_dump_if_sister_miss_s", defaults)
         self.assertNotIn("sell_dump_if_sister_miss_s", example)
         self.assertNotIn("sell_dump_sister_miss", src)
