@@ -808,5 +808,290 @@ class DumpMaxTtmGateTests(unittest.TestCase):
         self.assertNotIn("dump_time_gate_open", refire)
 
 
+def _scrap_cfg(**extra) -> dict:
+    cfg = _dump_cfg(
+        sell_dump_enabled=False,
+        sell_scrap_max_ttm_s=600.0,
+        sell_scrap_sweep_enabled=True,
+        sell_scrap_blind_enabled=True,
+    )
+    cfg.update(extra)
+    return cfg
+
+
+def _scrap_harness(fak_sell=None):
+    """Sell loop with a 0.01/0.98 book so Up is the loser scrap."""
+    if fak_sell is None:
+        fak_sell = _fill_fak
+    events: list = []
+    fak_calls: list = []
+    clock = {"now": 1_700_000_000.0}
+    saves: list = []
+    ns = _sell_runtime(saves)
+    ns["time"] = SimpleNamespace(
+        time=lambda: clock["now"],
+        sleep=lambda *_a, **_k: None,
+    )
+    ns["log_event"] = lambda event, **kwargs: events.append({"event": event, **kwargs})
+    book = {
+        "up": (0.01, 40.0, [{"price": "0.01", "size": "40"}]),
+        "dn": (0.98, 80.0, [{"price": "0.98", "size": "80"}]),
+    }
+
+    def fetch_books(_up, _dn, _min_size):
+        return book["up"], book["dn"]
+
+    def wrapped_fak(token_id, size, price, dry_run, capture=None):
+        fak_calls.append(
+            {
+                "token_id": token_id,
+                "size": float(size),
+                "price": float(price),
+                "dry_run": dry_run,
+            }
+        )
+        if capture is not None:
+            capture.append(
+                {
+                    "status": "matched",
+                    "makingAmount": str(size),
+                    "takingAmount": str(round(float(size) * 0.015, 4)),
+                }
+            )
+        return fak_sell(token_id, size, price, dry_run)
+
+    ns["_fetch_books"] = fetch_books
+    ns["_fak_sell"] = wrapped_fak
+    ns["_limit_sell"] = lambda *_a, **_k: ("", "not_called")
+    return ns, events, fak_calls, clock, book
+
+
+def _open_scrap_bag(end_ts: float, **extra) -> dict:
+    row = {
+        "status": "confirmed",
+        "end_ts": end_ts,
+        "start_ts": end_ts - 900.0 if end_ts else 0.0,
+        "up_token": "up-tok",
+        "dn_token": "dn-tok",
+        "shares": 50.0,
+        "slug": "btc-updown-15m-test",
+    }
+    row.update(extra)
+    return row
+
+
+class ScrapMaxTtmGateTests(unittest.TestCase):
+    def _tick(self, ns, cfg, intent, cid="cid-scrap"):
+        state = {"intents": {cid: intent}}
+        ns["remember_persisted_state"](state)
+        ns["_manage_sells_locked"](cfg, state, object())
+        return intent
+
+    def test_gated_above_cutoff_then_opens_and_waits_full_persist(self):
+        ns, events, fak_calls, clock, _book = _scrap_harness()
+        end = clock["now"] + 700.0
+        intent = _open_scrap_bag(end, sell_loser_armed_at=clock["now"] - 30.0)
+        cfg = _scrap_cfg()
+        self._tick(ns, cfg, intent)
+        self.assertEqual(fak_calls, [])
+        self.assertIsNone(intent.get("sell_loser_armed_at"))
+        self.assertFalse(intent.get("sold_loser"))
+        gated = [row for row in events if row["event"] == "sell_scrap_time_gated"]
+        self.assertEqual(len(gated), 1)
+        self.assertEqual(gated[0]["condition_id"], "cid-scrap")
+        self.assertEqual(gated[0]["slug"], "btc-updown-15m-test")
+        self.assertEqual(gated[0]["leg"], "up")
+        self.assertAlmostEqual(gated[0]["bid"], 0.01)
+        self.assertAlmostEqual(gated[0]["ttm"], 700.0)
+        self.assertAlmostEqual(gated[0]["cutoff"], 600.0)
+        self.assertFalse(any(row["event"] == "sell_loser_persist" for row in events))
+
+        clock["now"] += 1.0
+        self._tick(ns, cfg, intent)
+        gated = [row for row in events if row["event"] == "sell_scrap_time_gated"]
+        self.assertEqual(len(gated), 1)
+
+        clock["now"] += 14.0
+        self._tick(ns, cfg, intent)
+        gated = [row for row in events if row["event"] == "sell_scrap_time_gated"]
+        self.assertEqual(len(gated), 2)
+        self.assertEqual(fak_calls, [])
+
+        clock["now"] = end - 600.0
+        self._tick(ns, cfg, intent)
+        self.assertEqual(intent.get("sell_loser_armed_at"), clock["now"])
+        self.assertEqual(fak_calls, [])
+        armed = intent["sell_loser_armed_at"]
+        clock["now"] = armed + 4.9
+        self._tick(ns, cfg, intent)
+        self.assertEqual(fak_calls, [])
+        self.assertEqual(intent.get("sell_loser_armed_at"), armed)
+        clock["now"] = armed + 5.0
+        self._tick(ns, cfg, intent)
+        self.assertEqual(len(fak_calls), 1)
+        self.assertAlmostEqual(fak_calls[0]["price"], 0.02)
+        self.assertEqual(fak_calls[0]["token_id"], "up-tok")
+        self.assertTrue(intent.get("sold_loser"))
+        self.assertEqual(intent.get("sold_leg"), "up")
+
+    def test_last_minute_persist_starts_at_gate_open(self):
+        ns, _events, fak_calls, clock, _book = _scrap_harness()
+        end = clock["now"] + 80.0
+        intent = _open_scrap_bag(end, sell_loser_armed_at=clock["now"] - 20.0)
+        cfg = _scrap_cfg(sell_scrap_max_ttm_s=50.0)
+        self._tick(ns, cfg, intent)
+        self.assertIsNone(intent.get("sell_loser_armed_at"))
+        self.assertEqual(fak_calls, [])
+
+        clock["now"] = end - 50.0
+        self._tick(ns, cfg, intent)
+        self.assertEqual(intent.get("sell_loser_armed_at"), clock["now"])
+        self.assertEqual(fak_calls, [])
+        armed = intent["sell_loser_armed_at"]
+        clock["now"] = armed + 1.9
+        self._tick(ns, cfg, intent)
+        self.assertEqual(fak_calls, [])
+        clock["now"] = armed + 2.0
+        self._tick(ns, cfg, intent)
+        self.assertEqual(len(fak_calls), 1)
+        self.assertTrue(intent.get("sold_loser"))
+
+    def test_gate_zero_and_missing_key_keep_the_old_scrap(self):
+        ns, events, fak_calls, clock, _book = _scrap_harness()
+        end = clock["now"] + 800.0
+        intent = _open_scrap_bag(end)
+        cfg = _scrap_cfg(sell_scrap_max_ttm_s=0)
+        self._tick(ns, cfg, intent)
+        self.assertEqual(intent.get("sell_loser_armed_at"), clock["now"])
+        self.assertFalse(any(row["event"] == "sell_scrap_time_gated" for row in events))
+        clock["now"] += 5.0
+        self._tick(ns, cfg, intent)
+        self.assertEqual(len(fak_calls), 1)
+        self.assertTrue(intent.get("sold_loser"))
+
+        ns2, events2, fak2, clock2, _book2 = _scrap_harness()
+        end2 = clock2["now"] + 800.0
+        intent2 = _open_scrap_bag(end2)
+        cfg2 = _scrap_cfg()
+        del cfg2["sell_scrap_max_ttm_s"]
+        self._tick(ns2, cfg2, intent2)
+        self.assertEqual(intent2.get("sell_loser_armed_at"), clock2["now"])
+        self.assertFalse(any(row["event"] == "sell_scrap_time_gated" for row in events2))
+        self.assertEqual(fak2, [])
+
+    def test_unknown_ttm_stays_open(self):
+        ns, events, fak_calls, clock, _book = _scrap_harness()
+        intent = _open_scrap_bag(0.0)
+        cfg = _scrap_cfg(sell_scrap_max_ttm_s=600.0)
+        self._tick(ns, cfg, intent)
+        self.assertEqual(intent.get("sell_loser_armed_at"), clock["now"])
+        self.assertFalse(any(row["event"] == "sell_scrap_time_gated" for row in events))
+        clock["now"] += 5.0
+        self._tick(ns, cfg, intent)
+        self.assertEqual(len(fak_calls), 1)
+        self.assertTrue(intent.get("sold_loser"))
+
+    def test_dump_gate_is_independent_of_the_scrap_cutoff(self):
+        ns, events, fak_calls, clock = _dump_harness(_fill_fak)
+        end = clock["now"] + 500.0
+        intent = _held_after_scrap(end)
+        cfg = _dump_cfg(sell_dump_max_ttm_s=0, sell_scrap_max_ttm_s=100.0)
+        self._tick(ns, cfg, intent, cid="cid-dump")
+        self.assertEqual(intent.get("sell_dump_armed_at"), clock["now"])
+        self.assertFalse(any(row["event"] == "sell_scrap_time_gated" for row in events))
+        self.assertFalse(any(row["event"] == "sell_dump_time_gated" for row in events))
+        clock["now"] += 2.0
+        self._tick(ns, cfg, intent, cid="cid-dump")
+        self.assertEqual(len(fak_calls), 1)
+        self.assertTrue(intent.get("sold_dump"))
+
+
+class BagRiskLoopTests(unittest.TestCase):
+    def test_one_bag_risk_line_at_window_end(self):
+        ns, events, fak_calls, clock, book = _scrap_harness()
+        end = clock["now"] + 30.0
+        intent = _open_scrap_bag(end)
+        cfg = _scrap_cfg(sell_scrap_max_ttm_s=0, sell_persist_s=5.0)
+        state = {"intents": {"cid-risk": intent}}
+        ns["remember_persisted_state"](state)
+
+        def tick():
+            ns["_manage_sells_locked"](cfg, state, object())
+
+        tick()
+        self.assertEqual(fak_calls, [])
+        clock["now"] += 5.0
+        tick()
+        self.assertTrue(intent.get("sold_loser"))
+        self.assertEqual(len(fak_calls), 1)
+        book["dn"] = (0.70, 80.0, [{"price": "0.70", "size": "80"}])
+        clock["now"] += 2.0
+        tick()
+        book["dn"] = (0.40, 80.0, [{"price": "0.40", "size": "80"}])
+        clock["now"] += 3.0
+        tick()
+        clock["now"] = end + 1.0
+        tick()
+        risks = [row for row in events if row["event"] == "bag_risk"]
+        self.assertEqual(len(risks), 1)
+        row = risks[0]
+        self.assertEqual(row["condition_id"], "cid-risk")
+        self.assertEqual(row["slug"], "btc-updown-15m-test")
+        self.assertEqual(row["shares"], 50.0)
+        self.assertEqual(row["scrapped_leg"], "up")
+        self.assertAlmostEqual(row["ttm_at_scrap"], 25.0)
+        self.assertAlmostEqual(row["scrap_avg_px"], 0.015)
+        self.assertAlmostEqual(row["loser_best_bid_size"], 40.0)
+        self.assertAlmostEqual(row["min_held_bid"], 0.40)
+        self.assertGreater(row["sec_below_80"], 0.0)
+        self.assertGreater(row["sec_below_50"], 0.0)
+        self.assertIsNotNone(row["mean_shortfall"])
+        self.assertFalse(row["dump_fired"])
+        self.assertIsNone(row["dump_ttm"])
+        self.assertFalse(row["partial"])
+        self.assertNotIn("bag_risk", intent)
+        tick()
+        risks = [row for row in events if row["event"] == "bag_risk"]
+        self.assertEqual(len(risks), 1)
+
+    def test_restart_mid_bag_emits_partial_and_a_log_error_does_not_raise(self):
+        ns, events, _fak, clock, _book = _scrap_harness()
+        end = clock["now"] + 40.0
+        intent = _open_scrap_bag(
+            end,
+            sold_loser=True,
+            sold_leg="dn",
+            sold_loser_at=end - 40.0,
+            sell_limit=0.012,
+        )
+        cfg = _scrap_cfg(sell_scrap_max_ttm_s=600.0)
+        state = {"intents": {"cid-partial": intent}}
+        ns["remember_persisted_state"](state)
+        ns["_manage_sells_locked"](cfg, state, object())
+        clock["now"] = end + 1.0
+
+        def boom(event, **kwargs):
+            if event == "bag_risk":
+                raise RuntimeError("log broke")
+            events.append({"event": event, **kwargs})
+
+        ns["log_event"] = boom
+        ns["_manage_sells_locked"](cfg, state, object())
+        self.assertFalse(any(row["event"] == "bag_risk" for row in events))
+        ns["log_event"] = lambda event, **kwargs: events.append(
+            {"event": event, **kwargs}
+        )
+        ns["_manage_sells_locked"](cfg, state, object())
+        risks = [row for row in events if row["event"] == "bag_risk"]
+        self.assertEqual(len(risks), 1)
+        row = risks[0]
+        self.assertTrue(row["partial"])
+        self.assertEqual(row["scrapped_leg"], "dn")
+        self.assertAlmostEqual(row["scrap_avg_px"], 0.012)
+        self.assertAlmostEqual(row["ttm_at_scrap"], 40.0)
+        self.assertIsNone(row["loser_best_bid_size"])
+        self.assertAlmostEqual(row["min_held_bid"], 0.01)
+
+
 if __name__ == "__main__":
     unittest.main()

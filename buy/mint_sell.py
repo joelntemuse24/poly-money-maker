@@ -5,7 +5,11 @@ and the opposite sized bid is at/over ``sell_opposite_min`` (~90¢). Persist
 that book for ``sell_persist_s`` (~5s), or ``sell_persist_last_min_s`` (~2s)
 when time-to-end is within ``sell_persist_last_min_window_s`` (~60s). That
 last-minute wait applies through market close. Sized depth does not skip
-(``sell_persist_skip_when_sized`` default false). Then re-check
+(``sell_persist_skip_when_sized`` default false). ``sell_scrap_max_ttm_s``
+(code default 0, off) blocks arm, persist, and fire while seconds-to-close
+is above the cutoff; the example sets 600. Unknown time-to-end leaves
+that gate open. A bid that was already cheap still waits the full persist
+once the gate opens. Then re-check
 in-range at fire and FAK ``sell_fak_px`` (~2¢). That rung equals
 ``sell_floor`` (~2¢) when the live sized bid is at/over the floor; if the
 live bid is below the floor, FAK at that live bid. Empty FAK, or a vanished
@@ -62,6 +66,9 @@ DEFAULT_SELL_KNOBS = {
     # GTD expiration must be at least this far ahead; otherwise rest GTC.
     # Polymarket rejects a GTD inside ~180s.
     "sell_scrap_rest_min_ahead_s": 180.0,
+    # 0 disables the scrap time-left gate (old behavior). The example sets 600.
+    # Unknown ttm leaves the gate open. Dump uses sell_dump_max_ttm_s instead.
+    "sell_scrap_max_ttm_s": 0.0,
     "sell_cooldown_s": 3.0,
     "sell_winner_min": 0.999,
     "sell_winner_cheap_if_loser_le": 0.03,
@@ -481,6 +488,198 @@ def dump_time_gate_open(
     if not math.isfinite(ttm):
         return False
     return ttm <= cutoff + 1e-12
+
+
+def scrap_time_gate_open(
+    ttm_s: Optional[float],
+    max_ttm_s: Optional[float],
+) -> bool:
+    """True when loser scrap may arm, persist, or fire.
+
+    ``max_ttm_s`` <= 0, missing, or non-finite leaves the gate off, so scrap
+    ignores time-to-close. Unknown time-to-end (``None`` or non-finite)
+    stays open: a missing clock does not block the scrap. Otherwise
+    seconds-to-close must be at or under the cutoff. Same shape as
+    ``dump_time_gate_open``, except that function treats a missing clock
+    as closed.
+    """
+    try:
+        cutoff = 0.0 if max_ttm_s is None else float(max_ttm_s)
+    except (TypeError, ValueError):
+        return True
+    if not math.isfinite(cutoff) or cutoff <= 0:
+        return True
+    if ttm_s is None:
+        return True
+    try:
+        ttm = float(ttm_s)
+    except (TypeError, ValueError):
+        return True
+    if not math.isfinite(ttm):
+        return True
+    return ttm <= cutoff + 1e-12
+
+
+def fresh_bag_risk() -> dict:
+    """In-memory per-bag risk counters. Not persisted and not a trade input."""
+    return {
+        "partial": False,
+        "scrap_seen": False,
+        "scrapped_leg": None,
+        "ttm_at_scrap": None,
+        "scrap_avg_px": None,
+        "loser_best_bid_size": None,
+        "min_held_bid": None,
+        "min_held_ttm": None,
+        "sec_below_80": 0.0,
+        "sec_below_65": 0.0,
+        "sec_below_50": 0.0,
+        "shortfall_weighted": 0.0,
+        "shortfall_seconds": 0.0,
+        "last_sample_ts": None,
+        "last_held_bid": None,
+        "dump_seen": False,
+        "dump_fired": False,
+        "dump_ttm": None,
+        "dump_px": None,
+    }
+
+
+def _risk_num(value: Any) -> Optional[float]:
+    try:
+        num = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(num):
+        return None
+    return num
+
+
+def bag_risk_add_span(rec: dict, *, now_s: float) -> None:
+    """Add the open sample's tick delta, using the bid already on ``rec``."""
+    last_ts = _risk_num(rec.get("last_sample_ts"))
+    last_bid = _risk_num(rec.get("last_held_bid"))
+    now = _risk_num(now_s)
+    if last_ts is None or last_bid is None or now is None:
+        return
+    dt = now - last_ts
+    if dt <= 0 or not math.isfinite(dt):
+        return
+    if last_bid < 0.80:
+        rec["sec_below_80"] = float(rec.get("sec_below_80") or 0) + dt
+    if last_bid < 0.65:
+        rec["sec_below_65"] = float(rec.get("sec_below_65") or 0) + dt
+    if last_bid < 0.50:
+        rec["sec_below_50"] = float(rec.get("sec_below_50") or 0) + dt
+    rec["shortfall_weighted"] = float(rec.get("shortfall_weighted") or 0) + (
+        (1.0 - last_bid) * dt
+    )
+    rec["shortfall_seconds"] = float(rec.get("shortfall_seconds") or 0) + dt
+
+
+def bag_risk_observe(
+    rec: dict,
+    *,
+    now_s: float,
+    ttm_s: Optional[float],
+    sold_loser: bool,
+    sold_leg: Optional[str],
+    scrap_avg_px: Any = None,
+    loser_best_bid_size: Any = None,
+    scrap_ttm: Any = None,
+    held_bid: Any = None,
+    dump_fired: bool = False,
+    dump_px: Any = None,
+    dump_ttm: Any = None,
+) -> None:
+    """Update post-scrap held-bid stats. No orders, no intent writes."""
+    if sold_loser and not rec.get("scrap_seen"):
+        rec["scrap_seen"] = True
+        rec["scrapped_leg"] = sold_leg if sold_leg in ("up", "dn") else None
+        use_ttm = scrap_ttm if scrap_ttm is not None else ttm_s
+        rec["ttm_at_scrap"] = _risk_num(use_ttm)
+        rec["scrap_avg_px"] = _risk_num(scrap_avg_px)
+        rec["loser_best_bid_size"] = _risk_num(loser_best_bid_size)
+    if dump_fired and not rec.get("dump_seen"):
+        rec["dump_seen"] = True
+        rec["dump_fired"] = True
+        use_dump_ttm = dump_ttm if dump_ttm is not None else ttm_s
+        rec["dump_ttm"] = _risk_num(use_dump_ttm)
+        rec["dump_px"] = _risk_num(dump_px)
+    if not rec.get("scrap_seen"):
+        return
+    bid = _risk_num(held_bid)
+    if bid is None:
+        return
+    bag_risk_add_span(rec, now_s=now_s)
+    prev_min = _risk_num(rec.get("min_held_bid"))
+    if prev_min is None or bid < prev_min - 1e-12:
+        rec["min_held_bid"] = bid
+        rec["min_held_ttm"] = _risk_num(ttm_s)
+    rec["last_sample_ts"] = float(now_s)
+    rec["last_held_bid"] = bid
+
+
+def bag_risk_flush(rec: dict, *, now_s: float) -> None:
+    """Fold the last held-bid sample through ``now_s`` once.
+
+    Clears the open sample so a retried close does not add the span again.
+    """
+    if _risk_num(rec.get("last_held_bid")) is None:
+        return
+    bag_risk_add_span(rec, now_s=now_s)
+    rec["last_sample_ts"] = None
+    rec["last_held_bid"] = None
+
+
+def bag_risk_payload(
+    rec: dict,
+    *,
+    condition_id: str,
+    slug: Any,
+    shares: Any,
+) -> dict:
+    """One ``bag_risk`` log body. Nulls where the bag never reached that fact."""
+    scrapped = bool(rec.get("scrap_seen"))
+    seconds = float(rec.get("shortfall_seconds") or 0)
+    mean = None
+    if scrapped and seconds > 1e-12:
+        mean = float(rec.get("shortfall_weighted") or 0) / seconds
+
+    def rounded(value: Any, ndigits: int) -> Optional[float]:
+        num = _risk_num(value)
+        if num is None:
+            return None
+        return round(num, ndigits)
+
+    dump_fired = bool(rec.get("dump_fired"))
+    return {
+        "condition_id": condition_id,
+        "slug": slug,
+        "shares": rounded(shares, 4),
+        "scrapped_leg": rec.get("scrapped_leg") if scrapped else None,
+        "ttm_at_scrap": rounded(rec.get("ttm_at_scrap"), 3) if scrapped else None,
+        "scrap_avg_px": rounded(rec.get("scrap_avg_px"), 4) if scrapped else None,
+        "loser_best_bid_size": (
+            rounded(rec.get("loser_best_bid_size"), 4) if scrapped else None
+        ),
+        "min_held_bid": rounded(rec.get("min_held_bid"), 4) if scrapped else None,
+        "min_held_ttm": rounded(rec.get("min_held_ttm"), 3) if scrapped else None,
+        "sec_below_80": (
+            round(float(rec.get("sec_below_80") or 0), 3) if scrapped else None
+        ),
+        "sec_below_65": (
+            round(float(rec.get("sec_below_65") or 0), 3) if scrapped else None
+        ),
+        "sec_below_50": (
+            round(float(rec.get("sec_below_50") or 0), 3) if scrapped else None
+        ),
+        "mean_shortfall": rounded(mean, 4),
+        "dump_fired": dump_fired,
+        "dump_ttm": rounded(rec.get("dump_ttm"), 3) if dump_fired else None,
+        "dump_px": rounded(rec.get("dump_px"), 4) if dump_fired else None,
+        "partial": bool(rec.get("partial")),
+    }
 
 
 def loser_empty_keep_qualify(
