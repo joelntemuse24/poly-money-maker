@@ -335,7 +335,7 @@ What it is (and is not):
 - **Not** a declared Polymarket status-page outage (green while we saw it).
 - Often the **outer** Polygon tx into RelayHub **succeeds**, while the **inner** relayed call reverts (`RelayedCallFailed`) — so no CTF inventory lands.
 - In our cases it was **not** explained by low balance, market-not-ready, or duplicate submits (distinct tx hashes).
-- Community notes frequently blame RelayHub `gasleft` / proxy gas budget / batching. Treat as an intermittent hub/exec flake until Polymarket documents otherwise.
+- Confirmed cause (Sep 2026 traces): the inner CTF ERC-1155 transfer runs out of gas. `submit_mint_batch` omitted `gas_limit`, so `build_proxy_transaction_request` signed the library default `DEFAULT_GAS_LIMIT` of 500_000. Position-id derivation loops ~15k gas per iteration; markets at 7+ iterations exceed that stipend. Retrying the same market fails the same way because the iteration count is a function of `conditionId`. `py_builder_relayer_client.gas` documents a relay-hub budget of ~650k total. The mint path now estimates the factory call and signs `gas_limit` with a 15% margin, falling back to 650k and clamping to `min(mint_gas_cap, 650000)`.
 
 Trial shape (order of magnitude, not a SLA claim):
 
@@ -343,7 +343,7 @@ Trial shape (order of magnitude, not a SLA claim):
 - Overall mint confirm rate ~**74%** (85/115); this typed fail ~**17%** of attempts in that window.
 - Bot response: mark `failed`, persist `errorMsg`, wait `mint_fail_cooldown_s` (30s), remint up to `mint_max_attempts` (3), then skip that condition for the rest of its life. While it is cooling or exhausted, the same cycle mints the next eligible future instead of idling. `enter_max_ttm_min=45` keeps that next window visible after a bag booked about 30m out.
 
-Operational stance: **manageable**. Do not redesign the mint path solely for this message unless the rate worsens or a reproducible gas/batch fix appears.
+Operational stance: the reproducible fix is the explicit mint `gas_limit` above. Sister top-up stays on the library default; a single pUSD transfer is far under 500k. Do not estimate gas on the sell loop.
 
 <a id="section-14"></a>
 ## Relayer submit: approve + split as one PROXY batch
@@ -353,9 +353,10 @@ Operational stance: **manageable**. Do not redesign the mint path solely for thi
 1. Load `PRIVATE_KEY` / `FUNDER_ADDRESS`.
 2. Fetch relay payload (nonce + relay address) for PROXY type.
 3. Encode proxy calls (approve/allowance as needed + split).
-4. Build signed proxy request; require derived `proxyWallet` == funder.
-5. POST `/submit` with relayer auth headers.
-6. Return `transactionID` or error string.
+4. `eth_estimateGas` that calldata from the signer to the proxy factory (mint submit only). Sign `gas_limit` = estimate × (1 + `mint_gas_margin`), or `mint_gas_fallback` if estimation fails, clamped to `min(mint_gas_cap, 650000)`.
+5. Build signed proxy request; require derived `proxyWallet` == funder.
+6. POST `/submit` with relayer auth headers.
+7. Return `transactionID` or error string. `mint_submitted` / `mint_submit_fail` include `gas_limit` and `gas_estimate`.
 
 On success the intent is stored with tokens, shares, `start_ts`/`end_ts`, and `transaction_id`.
 
@@ -663,7 +664,7 @@ mint loop (always poll_s):
   log mint_attempt for pick.slug                       # same cycle
   precheck balances / contracts          # no lock
   claim submitting under STATE_LOCK      # already_minted + slots + same-slug
-  tx_id, err = submit_mint_batch(calls)  # no lock
+  tx_id, err, gas = submit_mint_batch(calls, rpc=chain)  # no lock; one eth_estimateGas
   persist pending / failed
 ```
 

@@ -69,6 +69,17 @@ sell_clob_max_price=0.99)` (floor `sell_clob_min_price=0.01`) so rich
 0.995–0.999 books fill; log `sell_winner_limit_clamped` when live >
 posted. Do not import `mintbot.py` in tests.
 
+Mint relay gas: `submit_mint_batch` sets `ProxyTransactionArgs.gas_limit`
+from one `eth_estimateGas` of the encoded batch (signer → proxy factory)
+plus `mint_gas_margin` (default 0.15). If estimation fails, use
+`mint_gas_fallback` (650000). Clamp to `min(mint_gas_cap, 650000)`.
+`py_builder_relayer_client.gas` documents a ~650k relay-hub budget;
+omitting `gas_limit` signs the library default 500000, and high-iteration
+splits out-of-gas inside that stipend. Log `gas_limit` and `gas_estimate`
+on `mint_submitted` and `mint_submit_fail`. The estimate runs only on the
+mint submit path. Keys absent from live `strategy_mint.json` keep these
+defaults. Do not add the estimate to the sell loop.
+
 `pathlog.py` records public CLOB books for **btc-up-or-down-15m** only.
 Keep `deploy/polypathlog.service`. Do not start `pathlog_hourly_dense.py`
 or add 5m/hourly back to `SERIES`.
@@ -134,6 +145,7 @@ Shared `buy/` helpers exist for mint, pathlog, and the recording-only oracle tap
 
 - `buy/book.py` — CLOB top-of-book parsing (`pathlog`, mint sized bids)
 - `buy/mint_sell.py` — sell fill parse, inventory latch, arm/persist
+- `buy/mint_gas.py` — mint relay `gas_limit` (estimate + margin, 650k fallback, clamp to the ~650k hub budget). Mint submit only.
 - `buy/mint_loops.py` — concurrent sell vs mint job runner + intent claim
 - `buy/market.py` — Gamma/CLOB discovery (`mintbot`, `pathlog`)
 - `buy/chain.py` — Polygon eth_call prechecks (`mintbot`)
