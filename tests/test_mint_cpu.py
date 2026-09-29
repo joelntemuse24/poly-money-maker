@@ -1254,7 +1254,7 @@ class ScrapFractionLoopTests(unittest.TestCase):
         book["up"] = (None, 0.0, [])
         book["dn"] = (0.98, 80.0, [{"price": "0.98", "size": "80"}])
         end = clock["now"] + 200.0
-        intent = self._arm(clock, end, shares=100.0, sell_loser_armed_at=clock["now"] - 10.0)
+        intent = self._arm(clock, end, shares=100.0)
 
         class Chain:
             def position_balance(self, _ctf, _funder, token):
