@@ -12,7 +12,10 @@ that gate open. A bid that was already cheap still waits the full persist
 once the gate opens. Then re-check
 in-range at fire and FAK ``sell_fak_px`` (~2¢). That rung equals
 ``sell_floor`` (~2¢) when the live sized bid is at/over the floor; if the
-live bid is below the floor, FAK at that live bid. Empty FAK, or a vanished
+live bid is below the floor, FAK at that live bid. ``sell_scrap_fraction``
+defaults to 1 and scraps the whole loser. Below 1, the first fire locks
+``floor(held × fraction)`` as the scrap target and leaves the remainder
+unsold. Empty FAK, or a vanished
 loser book after arm, keeps ``armed_ts``. On an empty keep, fire a blind
 1¢ FAK (backoff ``sell_scrap_blind_backoff_s``). After a FAK miss, rest a
 GTD/GTC sell. The price is ``sell_scrap_rest_px`` (~2¢, the print) capped
@@ -69,6 +72,9 @@ DEFAULT_SELL_KNOBS = {
     # 0 disables the scrap time-left gate (old behavior). The example sets 600.
     # Unknown ttm leaves the gate open. Dump uses sell_dump_max_ttm_s instead.
     "sell_scrap_max_ttm_s": 0.0,
+    # 1 scraps the whole loser. Below 1, floor(held × fraction) is the
+    # scrap target and the remainder is held to resolution.
+    "sell_scrap_fraction": 1.0,
     "sell_cooldown_s": 3.0,
     "sell_winner_min": 0.999,
     "sell_winner_cheap_if_loser_le": 0.03,
@@ -1013,6 +1019,159 @@ def depth_covers_size(depth_at_limit: Optional[float], our_size: float) -> bool:
     if not math.isfinite(depth) or not math.isfinite(need) or need <= 1e-12:
         return False
     return depth + 1e-9 >= need
+
+
+def normalize_scrap_fraction(value: Any) -> float:
+    """Strategy fraction in ``(0, 1]``. Missing or unusable values are 1."""
+    try:
+        fraction = float(value)
+    except (TypeError, ValueError):
+        return 1.0
+    if not math.isfinite(fraction) or fraction <= 0.0 or fraction > 1.0:
+        return 1.0
+    return fraction
+
+
+def scrap_share_plan(held: float, fraction: float) -> Tuple[float, float]:
+    """``(target, keep)`` shares for one loser scrap.
+
+    Fraction 1 (the default) returns ``(held, 0)`` with no floor, so a
+    full scrap still posts a fractional balance. Below 1, ``target`` is
+    ``floor(held × fraction)`` whole shares and ``keep`` is the rest.
+    """
+    try:
+        held_f = float(held)
+    except (TypeError, ValueError):
+        held_f = 0.0
+    if not math.isfinite(held_f) or held_f < 0:
+        held_f = 0.0
+    frac = normalize_scrap_fraction(fraction)
+    if frac >= 1.0 - 1e-12:
+        return held_f, 0.0
+    # 1e-9 keeps a binary value that is a hair under an integer from
+    # flooring to the next share down. 100 × 0.5 stays 50.
+    target = float(math.floor(held_f * frac + 1e-9))
+    if target > held_f:
+        target = held_f
+    if target < 0:
+        target = 0.0
+    return target, held_f - target
+
+
+def scrap_order_shares(
+    *,
+    target: float,
+    keep: float,
+    filled: float,
+    inventory: float,
+) -> float:
+    """Next loser-scrap size.
+
+    A zero keep (fraction 1) returns ``inventory`` unchanged. Otherwise
+    the size is ``target - filled``, and never more than ``inventory - keep``.
+    """
+    try:
+        inv = float(inventory)
+    except (TypeError, ValueError):
+        inv = 0.0
+    if not math.isfinite(inv) or inv < 0:
+        inv = 0.0
+    try:
+        keep_f = float(keep)
+    except (TypeError, ValueError):
+        keep_f = 0.0
+    if not math.isfinite(keep_f) or keep_f <= 1e-12:
+        return inv
+    try:
+        target_f = float(target)
+        filled_f = float(filled or 0.0)
+    except (TypeError, ValueError):
+        return 0.0
+    if not math.isfinite(target_f):
+        target_f = 0.0
+    if not math.isfinite(filled_f):
+        filled_f = 0.0
+    remaining = max(0.0, target_f - filled_f)
+    room = max(0.0, inv - keep_f)
+    return min(remaining, room)
+
+
+def scrap_target_met(
+    *,
+    filled: float,
+    target: float,
+    keep: float,
+    tol: float,
+    balance: Optional[float] = None,
+) -> Tuple[bool, str]:
+    """Whether the scrap target is done and the keep must stay put.
+
+    Met when filled shares are within ``tol`` of ``target``, or a known
+    balance is at or under ``keep + tol``.
+    """
+    try:
+        tol_f = float(tol or 0.0)
+        filled_f = float(filled or 0.0)
+        target_f = float(target or 0.0)
+        keep_f = float(keep or 0.0)
+    except (TypeError, ValueError):
+        return False, ""
+    if not math.isfinite(tol_f) or tol_f < 0:
+        tol_f = 0.0
+    if not math.isfinite(filled_f):
+        filled_f = 0.0
+    if not math.isfinite(target_f):
+        target_f = 0.0
+    if not math.isfinite(keep_f) or keep_f < 0:
+        keep_f = 0.0
+    if filled_f + 1e-12 >= target_f - tol_f:
+        return True, "target_filled"
+    bal: Optional[float]
+    if balance is None:
+        bal = None
+    else:
+        try:
+            bal = float(balance)
+        except (TypeError, ValueError):
+            bal = None
+        if bal is not None and not math.isfinite(bal):
+            bal = None
+    if bal is not None and bal <= keep_f + tol_f + 1e-12:
+        return True, "balance_at_keep" if keep_f > 1e-12 else "flat"
+    return False, ""
+
+
+def kept_leg_below_winner_min(
+    leg: Optional[str],
+    bid: Optional[float],
+    *,
+    sold_leg: Optional[str],
+    keep: float,
+    winner_min: float,
+) -> bool:
+    """True when ``leg`` is the kept loser and its bid is under ``winner_min``.
+
+    The cheap 0.99 winner path stays on the other leg. Kept shares cash
+    out only at the base winner minimum.
+    """
+    try:
+        keep_f = float(keep or 0.0)
+    except (TypeError, ValueError):
+        return False
+    if not math.isfinite(keep_f) or keep_f <= 1e-12:
+        return False
+    if leg not in ("up", "dn") or sold_leg != leg:
+        return False
+    if bid is None:
+        return True
+    try:
+        px = float(bid)
+        floor = float(winner_min)
+    except (TypeError, ValueError):
+        return True
+    if not math.isfinite(px) or not math.isfinite(floor):
+        return True
+    return px + 1e-12 < floor
 
 
 def loser_partial_fak_shares(

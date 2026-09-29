@@ -15,7 +15,9 @@ applies through market close. Sized depth does not skip
 fire while seconds-to-close is above the cutoff. Unknown time-to-end
 leaves that gate open. Persist starts only once the gate is open. At fire,
 ``sell_scrap_sweep_enabled`` (default true) posts one FAK at ``sell_floor``
-for the full remainder. False restores the 1¢ ladder from ``sell_fak_px``.
+for the scrap remainder. ``sell_scrap_fraction`` defaults to 1 (the whole
+loser). Below 1, the first fire locks ``floor(held × fraction)`` and does
+not sell the rest. False restores the 1¢ ladder from ``sell_fak_px``.
 Empty keep fires a blind 1¢ FAK (backoff ~3s).
 A FAK miss rests a GTD/GTC sell at ``min(sell_scrap_rest_px, live or
 last-seen loser bid)`` so a 1¢ book is not posted at the 2¢ print.
@@ -111,8 +113,13 @@ from buy.mint_sell import (
     loser_blind_fak_due,
     loser_empty_keep_qualify,
     loser_ladder_limits,
+    kept_leg_below_winner_min,
     loser_partial_fak_shares,
     loser_scrap_post,
+    normalize_scrap_fraction,
+    scrap_order_shares,
+    scrap_share_plan,
+    scrap_target_met,
     sell_fill_vwap,
     loser_persist_ready,
     loser_scrap_persist_s,
@@ -195,6 +202,9 @@ DEFAULTS = {
     # arm, persist, and fire the loser scrap only when seconds-to-close is
     # at or under this. Unknown ttm (no end_ts) leaves the gate open.
     "sell_scrap_max_ttm_s": 0.0,
+    # 1 scraps the whole loser. Below 1, the first fire locks
+    # floor(held * fraction) and holds the remainder to resolution.
+    "sell_scrap_fraction": 1.0,
     "sell_cooldown_s": 3.0,
     "sell_winner_min": 0.999,
     # Cheap 0.99 winner only if loser ≤ this AND loser+cheap_min > 1.0 (else redeem).
@@ -457,6 +467,13 @@ def validate_strategy(cfg: dict) -> None:
         raise ValueError("sell_dump_max_ttm_s must be >= 0")
     if float(cfg.get("sell_scrap_max_ttm_s") or 0) < 0:
         raise ValueError("sell_scrap_max_ttm_s must be >= 0")
+    try:
+        scrap_fraction = float(cfg.get("sell_scrap_fraction", 1.0))
+    except (TypeError, ValueError):
+        raise ValueError("sell_scrap_fraction must be > 0 and <= 1")
+    # NaN fails the ordered compare. Inf is > 1.
+    if not (0 < scrap_fraction <= 1) or scrap_fraction != scrap_fraction:
+        raise ValueError("sell_scrap_fraction must be > 0 and <= 1")
     if float(cfg.get("sell_min_bid_size") or 0) < 0:
         raise ValueError("sell_min_bid_size must be >= 0")
 
@@ -1796,10 +1813,23 @@ def _sync_scrap_rest(
             intent["sell_scrap_rest_matched"] = float(matched)
             if intent.get("sell_scrap_rest_px") is not None:
                 intent["sell_limit"] = intent.get("sell_scrap_rest_px")
-    filled = shares > 0 and float(intent.get("sell_filled") or 0) >= shares - tol
-    if status == "filled" or filled:
+    stored_target = intent.get("sell_scrap_target")
+    if stored_target is not None:
+        try:
+            goal = float(stored_target)
+        except (TypeError, ValueError):
+            goal = float(shares or 0)
+        goal_met = float(intent.get("sell_filled") or 0) + 1e-12 >= goal - float(tol)
+    else:
+        goal_met = shares > 0 and float(intent.get("sell_filled") or 0) >= shares - tol
+    if status == "filled" or goal_met:
         leg = intent.get("sell_loser_leg")
-        _note_loser_sold(intent, leg if leg in ("up", "dn") else None)
+        _finish_scrap(
+            intent,
+            cid,
+            leg if leg in ("up", "dn") else None,
+            outcome="rest_filled" if status == "filled" else "target_filled",
+        )
         log_event(
             "sell_scrap_rest_fill",
             condition_id=cid,
@@ -1848,6 +1878,105 @@ def _note_loser_sold(intent: dict, leg: Optional[str] = None, *, note: str = "")
 
 def _mark_loser_sold(intent: dict, leg: str, *, note: str = "") -> None:
     _note_loser_sold(intent, leg, note=note)
+
+
+def _uses_scrap_plan(intent: dict, fraction: float) -> bool:
+    """True when this bag scraps a locked target instead of the full balance."""
+    if intent.get("sell_scrap_target") is not None:
+        return True
+    return float(fraction) < 1.0 - 1e-12
+
+
+def _lock_scrap_plan(
+    intent: dict,
+    *,
+    held: float,
+    fraction: float,
+    cid: str,
+    leg: Optional[str],
+) -> Tuple[float, float]:
+    """Fix ``(target, keep)`` on the first scrap post. Later fires reuse it."""
+    existing = intent.get("sell_scrap_target")
+    if existing is not None:
+        try:
+            return float(existing), float(intent.get("sell_scrap_keep") or 0.0)
+        except (TypeError, ValueError):
+            pass
+    target, keep = scrap_share_plan(held, fraction)
+    intent["sell_scrap_target"] = float(target)
+    intent["sell_scrap_keep"] = float(keep)
+    intent["sell_scrap_held"] = float(held)
+    intent["sell_scrap_fraction"] = float(fraction)
+    log_event(
+        "sell_scrap_plan",
+        condition_id=cid,
+        slug=intent.get("slug"),
+        leg=leg,
+        held=round(float(held), 6),
+        fraction=float(fraction),
+        target=float(target),
+        keep=round(float(keep), 6),
+    )
+    return float(target), float(keep)
+
+
+def _scrap_post_shares(
+    intent: dict,
+    inventory: float,
+    fraction: float,
+    cid: str,
+    leg: Optional[str],
+) -> float:
+    """Shares to offer. Fraction 1 with no plan returns ``inventory``."""
+    if not _uses_scrap_plan(intent, fraction):
+        return float(inventory)
+    _lock_scrap_plan(
+        intent, held=float(inventory), fraction=fraction, cid=cid, leg=leg,
+    )
+    return scrap_order_shares(
+        target=float(intent.get("sell_scrap_target") or 0.0),
+        keep=float(intent.get("sell_scrap_keep") or 0.0),
+        filled=float(intent.get("sell_filled") or 0.0),
+        inventory=float(inventory),
+    )
+
+
+def _log_scrap_outcome(
+    intent: dict,
+    cid: str,
+    outcome: str,
+    leg: Optional[str] = None,
+) -> None:
+    """One audit line per bag once a partial scrap plan exists."""
+    if intent.get("sell_scrap_outcome"):
+        return
+    if intent.get("sell_scrap_target") is None:
+        return
+    intent["sell_scrap_outcome"] = str(outcome or "")
+    log_event(
+        "sell_scrap_outcome",
+        condition_id=cid,
+        slug=intent.get("slug"),
+        leg=leg or intent.get("sold_leg") or intent.get("sell_loser_leg"),
+        held=intent.get("sell_scrap_held"),
+        fraction=intent.get("sell_scrap_fraction"),
+        target=intent.get("sell_scrap_target"),
+        keep=intent.get("sell_scrap_keep"),
+        filled=float(intent.get("sell_filled") or 0.0),
+        outcome=intent["sell_scrap_outcome"],
+    )
+
+
+def _finish_scrap(
+    intent: dict,
+    cid: str,
+    leg: Optional[str],
+    *,
+    note: str = "",
+    outcome: str = "sold",
+) -> None:
+    _note_loser_sold(intent, leg if leg in ("up", "dn") else None, note=note)
+    _log_scrap_outcome(intent, cid, outcome, leg=leg)
 
 
 def _log_sell_dump_time_gated(
@@ -2136,6 +2265,7 @@ def _manage_sells_locked(cfg: dict, state: dict, chain: ChainReader) -> None:
     clob_min = float(cfg.get("sell_clob_min_price") or 0.01)
     min_bid_size = float(cfg.get("sell_min_bid_size") or 1.0)
     tol = float(cfg.get("position_tolerance") or 0.01)
+    scrap_fraction = normalize_scrap_fraction(cfg.get("sell_scrap_fraction", 1.0))
     dry_run = bool(cfg.get("dry_run"))
     funder = os.getenv("FUNDER_ADDRESS") or ""
     funder_cs = to_checksum_address(funder) if funder else None
@@ -2168,6 +2298,7 @@ def _manage_sells_locked(cfg: dict, state: dict, chain: ChainReader) -> None:
             if intent.get("sell_scrap_rest_id"):
                 _drop_scrap_rest(intent, cid, reason="window_end")
                 dirty = True
+            _log_scrap_outcome(intent, cid, "window_end")
             _close_bag_risk(cid, intent, now=now)
             continue
 
@@ -2254,6 +2385,26 @@ def _manage_sells_locked(cfg: dict, state: dict, chain: ChainReader) -> None:
         intent["sell_winner_cheap_reason"] = cheap_why
 
         winner = winner_cashout_leg(up_bid, dn_bid, effective_winner_min)
+        if kept_leg_below_winner_min(
+            winner,
+            bids.get(winner) if winner else None,
+            sold_leg=intent.get("sold_leg"),
+            keep=float(intent.get("sell_scrap_keep") or 0.0),
+            winner_min=winner_min,
+        ):
+            if not intent.get("sell_keep_winner_blocked"):
+                intent["sell_keep_winner_blocked"] = True
+                log_event(
+                    "sell_keep_winner_blocked",
+                    condition_id=cid,
+                    slug=intent.get("slug"),
+                    leg=winner,
+                    bid=bids.get(winner) if winner else None,
+                    winner_min=winner_min,
+                    effective_winner_min=effective_winner_min,
+                    keep=intent.get("sell_scrap_keep"),
+                )
+            winner = None
         fire_w, armed_w, why_w = persist_ready(
             winner is not None and not sold_winner,
             now_s=now,
@@ -2295,6 +2446,9 @@ def _manage_sells_locked(cfg: dict, state: dict, chain: ChainReader) -> None:
                     chain, ctf, funder_cs, w_tok, shares, tol,
                     "seen_winner_inventory", intent,
                 )
+                keep_cap = float(intent.get("sell_scrap_keep") or 0.0)
+                if keep_cap > 1e-12 and winner == intent.get("sold_leg"):
+                    size = min(float(size), keep_cap)
                 if latch == "await_inventory":
                     log_event(
                         "sell_skip_await_inventory",
@@ -2556,9 +2710,18 @@ def _manage_sells_locked(cfg: dict, state: dict, chain: ChainReader) -> None:
                     ).get("depth_at_limit")
                     or 0
                 )
-        remaining_shares = max(
-            0.0, shares - float(intent.get("sell_filled") or 0)
-        )
+        filled_scrap = float(intent.get("sell_filled") or 0)
+        stored_target = intent.get("sell_scrap_target")
+        if stored_target is not None:
+            try:
+                remaining_shares = max(0.0, float(stored_target) - filled_scrap)
+            except (TypeError, ValueError):
+                remaining_shares = max(0.0, shares - filled_scrap)
+        elif scrap_fraction < 1.0 - 1e-12:
+            planned_target, _planned_keep = scrap_share_plan(shares, scrap_fraction)
+            remaining_shares = max(0.0, planned_target - filled_scrap)
+        else:
+            remaining_shares = max(0.0, shares - filled_scrap)
         loser_persist_s, persist_why = loser_scrap_persist_s(
             now_s=now,
             end_ts=end_ts,
@@ -2767,7 +2930,11 @@ def _manage_sells_locked(cfg: dict, state: dict, chain: ChainReader) -> None:
                 slug=intent.get("slug"),
                 leg=loser,
                 limit=first_limit,
-                our_size=shares,
+                our_size=(
+                    remaining_shares
+                    if _uses_scrap_plan(intent, scrap_fraction)
+                    else shares
+                ),
                 bids=books.get(loser) or [],
                 ttm_s=ttm_s,
                 path="loser",
@@ -2864,85 +3031,124 @@ def _manage_sells_locked(cfg: dict, state: dict, chain: ChainReader) -> None:
                         path="loser",
                     )
                 elif latch == "already_flat":
-                    _note_loser_sold(intent, loser, note="already_flat")
+                    _finish_scrap(
+                        intent, cid, loser, note="already_flat", outcome="flat",
+                    )
                 else:
                     sweep_on = bool(cfg.get("sell_scrap_sweep_enabled", True))
                     intent["last_sell_attempt_at"] = now
-                    with _io_unlocked():
-                        sold_total, last_status, last_px, balance_flat = (
-                            _fire_loser_scrap(
-                                token_id=l_tok,
-                                size=size,
-                                floor=floor,
-                                threshold=thr,
-                                loser_bid=loser_bid,
-                                fak_px=fak_px,
-                                depth_at_limit=depth_at_limit,
-                                sweep=sweep_on,
-                                dry_run=dry_run,
-                                tol=tol,
-                                bids=books.get(loser),
-                                slug=intent.get("slug"),
-                                leg=loser,
-                                ttm_s=ttm_s,
-                                condition_id=cid,
-                                chain=chain,
-                                ctf=ctf,
-                                funder_cs=funder_cs,
-                                intent=intent,
-                                shares=shares,
-                            )
+                    post_size = float(size)
+                    if _uses_scrap_plan(intent, scrap_fraction):
+                        post_size = _scrap_post_shares(
+                            intent, size, scrap_fraction, cid, loser,
                         )
-                    intent["sell_attempts"] = int(intent.get("sell_attempts") or 0) + 1
-                    intent["sell_last_status"] = last_status
-                    done = dry_run or balance_flat or sold_total >= size - tol
-                    if sold_total >= tol or dry_run:
-                        intent["sell_filled"] = float(
-                            intent.get("sell_filled") or 0
-                        ) + sold_total
-                        intent["sell_limit"] = last_px
-                    if done:
-                        _note_loser_sold(intent, loser)
-                        if dry_run:
-                            intent["sell_dry"] = True
-                        log_event(
-                            "sell_loser_done",
-                            condition_id=cid,
-                            slug=intent.get("slug"),
-                            leg=loser,
-                            sold=sold_total,
-                            bid=loser_bid,
-                            status=last_status,
+                    if (
+                        _uses_scrap_plan(intent, scrap_fraction)
+                        and post_size < 0.01
+                    ):
+                        _met, why = scrap_target_met(
+                            filled=float(intent.get("sell_filled") or 0),
+                            target=float(intent.get("sell_scrap_target") or 0),
+                            keep=float(intent.get("sell_scrap_keep") or 0),
+                            tol=tol,
+                            balance=float(size),
                         )
-                        notify(
-                            "Mint loser sold",
-                            f"{intent.get('slug')}\n{loser} x{sold_total:.1f} "
-                            f"@<={thr:.2f}/{floor:.2f}",
-                            priority="default",
-                        )
-                        console.print(
-                            f"  [bold bright_green][SELL OK][/] {loser} {sold_total:.2f}  "
-                            f"kept opposite for redeem"
-                        )
-                    elif empty_fak_status(last_status):
-                        _place_scrap_rest(
+                        _finish_scrap(
                             intent,
                             cid,
-                            l_tok,
-                            max(0.0, size - sold_total),
-                            now=now,
-                            end_ts=end_ts,
-                            rest_px=scrap_rest_px(
-                                rest_px, _observed_loser_bid(loser, bids, seen_bids)
-                            ),
-                            rest_ahead=rest_ahead,
-                            rest_enabled=rest_enabled,
-                            dry_run=dry_run,
-                            oracle_blocks=oracle_blocks_new,
-                            loser_qualifies=True,
-                            armed=intent.get("sell_loser_armed_at") is not None,
-                            fak_miss=True,
+                            loser,
+                            note=why or "scrap_keep",
+                            outcome=why or "target_filled",
                         )
+                    else:
+                        with _io_unlocked():
+                            sold_total, last_status, last_px, balance_flat = (
+                                _fire_loser_scrap(
+                                    token_id=l_tok,
+                                    size=post_size,
+                                    floor=floor,
+                                    threshold=thr,
+                                    loser_bid=loser_bid,
+                                    fak_px=fak_px,
+                                    depth_at_limit=depth_at_limit,
+                                    sweep=sweep_on,
+                                    dry_run=dry_run,
+                                    tol=tol,
+                                    bids=books.get(loser),
+                                    slug=intent.get("slug"),
+                                    leg=loser,
+                                    ttm_s=ttm_s,
+                                    condition_id=cid,
+                                    chain=chain,
+                                    ctf=ctf,
+                                    funder_cs=funder_cs,
+                                    intent=intent,
+                                    shares=shares,
+                                )
+                            )
+                        intent["sell_attempts"] = int(intent.get("sell_attempts") or 0) + 1
+                        intent["sell_last_status"] = last_status
+                        done = dry_run or balance_flat or sold_total >= post_size - tol
+                        if sold_total >= tol or dry_run:
+                            intent["sell_filled"] = float(
+                                intent.get("sell_filled") or 0
+                            ) + sold_total
+                            intent["sell_limit"] = last_px
+                        if done:
+                            outcome = (
+                                "dry_run" if dry_run
+                                else "flat" if balance_flat
+                                else "target_filled"
+                            )
+                            _finish_scrap(intent, cid, loser, outcome=outcome)
+                            if dry_run:
+                                intent["sell_dry"] = True
+                            done_extra = {}
+                            if intent.get("sell_scrap_target") is not None:
+                                done_extra = {
+                                    "target": intent.get("sell_scrap_target"),
+                                    "keep": intent.get("sell_scrap_keep"),
+                                    "filled": float(intent.get("sell_filled") or 0),
+                                }
+                            log_event(
+                                "sell_loser_done",
+                                condition_id=cid,
+                                slug=intent.get("slug"),
+                                leg=loser,
+                                sold=sold_total,
+                                bid=loser_bid,
+                                status=last_status,
+                                **done_extra,
+                            )
+                            notify(
+                                "Mint loser sold",
+                                f"{intent.get('slug')}\n{loser} x{sold_total:.1f} "
+                                f"@<={thr:.2f}/{floor:.2f}",
+                                priority="default",
+                            )
+                            console.print(
+                                f"  [bold bright_green][SELL OK][/] {loser} {sold_total:.2f}  "
+                                f"kept opposite for redeem"
+                            )
+                        elif empty_fak_status(last_status):
+                            _place_scrap_rest(
+                                intent,
+                                cid,
+                                l_tok,
+                                max(0.0, post_size - sold_total),
+                                now=now,
+                                end_ts=end_ts,
+                                rest_px=scrap_rest_px(
+                                    rest_px, _observed_loser_bid(loser, bids, seen_bids)
+                                ),
+                                rest_ahead=rest_ahead,
+                                rest_enabled=rest_enabled,
+                                dry_run=dry_run,
+                                oracle_blocks=oracle_blocks_new,
+                                loser_qualifies=True,
+                                armed=intent.get("sell_loser_armed_at") is not None,
+                                fak_miss=True,
+                            )
 
         if (
             scrap_ttm_ok
@@ -2956,8 +3162,35 @@ def _manage_sells_locked(cfg: dict, state: dict, chain: ChainReader) -> None:
                 chain, ctf, funder_cs, b_tok, shares, tol,
                 "seen_loser_inventory", intent,
             )
+            scrap_kept = False
+            if b_latch != "already_flat" and _uses_scrap_plan(intent, scrap_fraction):
+                clipped = _scrap_post_shares(
+                    intent, b_size, scrap_fraction, cid, persist_leg,
+                )
+                if clipped < 0.01:
+                    _met, why = scrap_target_met(
+                        filled=float(intent.get("sell_filled") or 0),
+                        target=float(intent.get("sell_scrap_target") or 0),
+                        keep=float(intent.get("sell_scrap_keep") or 0),
+                        tol=tol,
+                        balance=float(b_size),
+                    )
+                    _finish_scrap(
+                        intent,
+                        cid,
+                        persist_leg,
+                        note=why or "scrap_keep",
+                        outcome=why or "target_filled",
+                    )
+                    scrap_kept = True
+                else:
+                    b_size = clipped
             if b_latch == "already_flat":
-                _mark_loser_sold(intent, persist_leg, note="already_flat")
+                _finish_scrap(
+                    intent, cid, persist_leg, note="already_flat", outcome="flat",
+                )
+            elif scrap_kept:
+                pass
             else:
                 blind_fire, blind_why = loser_blind_fak_due(
                     why=why_l,
@@ -2995,7 +3228,9 @@ def _manage_sells_locked(cfg: dict, state: dict, chain: ChainReader) -> None:
                         ) + float(blind_sold)
                         intent["sell_limit"] = blind_px
                     if float(blind_sold or 0) >= b_size - tol and not dry_run:
-                        _mark_loser_sold(intent, persist_leg)
+                        _finish_scrap(
+                            intent, cid, persist_leg, outcome="target_filled",
+                        )
                         log_event(
                             "sell_loser_done",
                             condition_id=cid,
@@ -3032,11 +3267,26 @@ def _manage_sells_locked(cfg: dict, state: dict, chain: ChainReader) -> None:
             and persist_leg in ("up", "dn")
             and empty_fak_status(intent.get("sell_last_status"))
         ):
+            rest_size = remaining_shares
+            if _uses_scrap_plan(intent, scrap_fraction):
+                if intent.get("sell_scrap_target") is None:
+                    _lock_scrap_plan(
+                        intent,
+                        held=shares,
+                        fraction=scrap_fraction,
+                        cid=cid,
+                        leg=persist_leg,
+                    )
+                rest_size = max(
+                    0.0,
+                    float(intent.get("sell_scrap_target") or 0)
+                    - float(intent.get("sell_filled") or 0),
+                )
             _place_scrap_rest(
                 intent,
                 cid,
                 tokens.get(persist_leg) or "",
-                remaining_shares,
+                rest_size,
                 now=now,
                 end_ts=end_ts,
                 rest_px=scrap_rest_px(

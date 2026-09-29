@@ -95,6 +95,7 @@ class MintDefaultsTests(unittest.TestCase):
             self.assertEqual(blob["sell_scrap_blind_px"], 0.01, label)
             self.assertEqual(blob["sell_scrap_rest_px"], 0.02, label)
             self.assertEqual(blob["sell_scrap_rest_min_ahead_s"], 180.0, label)
+            self.assertEqual(blob["sell_scrap_fraction"], 1.0, label)
             self.assertIs(blob["sell_scrap_rest_enabled"], True, label)
             self.assertEqual(blob["sell_dump_persist_s"], 2.0, label)
             self.assertEqual(blob["sell_dump_fak_retries"], 2, label)
@@ -140,6 +141,18 @@ class MintDefaultsTests(unittest.TestCase):
         scrap_on = dict(example)
         scrap_on["sell_scrap_max_ttm_s"] = 600
         validate(scrap_on)
+        half = dict(defaults)
+        half["sell_scrap_fraction"] = 0.5
+        validate(half)
+        missing_fraction = dict(defaults)
+        del missing_fraction["sell_scrap_fraction"]
+        validate(missing_fraction)
+        for bad in (0, -0.1, 1.01, "nope"):
+            broken = dict(defaults)
+            broken["sell_scrap_fraction"] = bad
+            with self.assertRaises(ValueError) as frac_caught:
+                validate(broken)
+            self.assertIn("sell_scrap_fraction", str(frac_caught.exception))
 
     def test_legacy_sell_persist_skip_ttm_s_is_ignored(self):
         """A live file that still lists the removed skip key loads and does not skip."""
@@ -186,6 +199,39 @@ class MintDefaultsTests(unittest.TestCase):
                 skip_when_sized=bool(cfg["sell_persist_skip_when_sized"]),
             )
             self.assertEqual((persist, why), expect, ttm)
+
+    def test_load_strategy_keeps_sell_scrap_fraction(self):
+        """Unknown keys are dropped. This knob is registered, so 0.5 survives."""
+        import tempfile
+
+        from buy.mint_gas import validate_mint_gas
+
+        defaults = _assign("DEFAULTS")
+        validate = _fn("validate_strategy", {"validate_mint_gas": validate_mint_gas})
+        raw = json.loads(MINT_EXAMPLE.read_text())
+        raw["sell_scrap_fraction"] = 0.5
+        raw["not_a_knob"] = 1
+        with tempfile.NamedTemporaryFile(
+            "w", suffix=".json", delete=False, encoding="utf-8"
+        ) as handle:
+            json.dump(raw, handle)
+            path = Path(handle.name)
+        try:
+            load = _fn(
+                "load_strategy",
+                {
+                    "json": json,
+                    "DEFAULTS": defaults,
+                    "validate_strategy": validate,
+                    "STRATEGY_FILE": path,
+                },
+            )
+            cfg = load()
+        finally:
+            path.unlink(missing_ok=True)
+        self.assertEqual(cfg["sell_scrap_fraction"], 0.5)
+        self.assertNotIn("not_a_knob", cfg)
+        self.assertEqual(defaults["sell_scrap_fraction"], 1.0)
 
     def test_open_intent_count_ignores_expired_redeem_holds(self):
         statuses = frozenset(

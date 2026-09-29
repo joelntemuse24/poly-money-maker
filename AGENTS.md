@@ -48,7 +48,16 @@ from earlier still waits the full persist. While gated, log
 `sell_scrap_time_gated` (`condition_id`, `slug`, `leg`, `bid`, `ttm`,
 `cutoff`) at most once per 15s per condition/leg. Then re-check in-range
 at fire, `sell_scrap_sweep_enabled` (default true) posts one FAK at
-`sell_floor` for the full remaining loser size. The book still fills
+`sell_floor` for the scrap remainder. `sell_scrap_fraction` defaults to
+1.0 (the whole loser, same posts as before). Below 1, the first scrap
+fire locks `target = floor(held loser shares × fraction)` and
+`keep = held - target` on the bag. Sweep, ladder, blind, and resting
+scrap orders post `target - filled` only. The loser is sold once that
+target fills within tolerance, or the balance is at or under
+`keep + tolerance`. Kept shares are not scrapped or dumped. They cash
+out only at `sell_winner_min` (the cheap 0.99 winner path does not
+apply to the kept leg) or stay until resolution. This repo does not
+redeem resolved positions. The book still fills
 higher bids first. Set the flag false to restore the 1¢ ladder from
 `sell_fak_px` down to the floor, clipped to top-rung depth. The flag is
 read on each sell tick. Do not post the sweep above the floor. Empty FAK or a vanished loser book after arm keeps `armed_ts`.
