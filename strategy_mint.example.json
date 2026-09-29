@@ -45,6 +45,7 @@
   "sell_scrap_rest_px": 0.02,
   "sell_scrap_rest_min_ahead_s": 180.0,
   "sell_scrap_max_ttm_s": 600.0,
+  "sell_scrap_fraction": 1.0,
   "sell_cooldown_s": 3.0,
   "sell_winner_min": 0.999,
   "sell_min_bid_size": 1.0,

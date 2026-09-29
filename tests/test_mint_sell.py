@@ -47,6 +47,11 @@ from buy.mint_sell import (
     side_aware_oracle_edge_usd,
     skip_mint_discovery_for_sell,
     skip_mint_discovery_when_armed_and_capped,
+    kept_leg_below_winner_min,
+    normalize_scrap_fraction,
+    scrap_order_shares,
+    scrap_share_plan,
+    scrap_target_met,
     winner_cashout_leg,
     winner_cheap_decision,
     winner_sell_limit,
@@ -1157,6 +1162,7 @@ class LateOracleScrapGateTests(unittest.TestCase):
         self.assertNotIn("sell_dump_if_sister_miss_s", DEFAULT_SELL_KNOBS)
         self.assertEqual(DEFAULT_SELL_KNOBS["sell_dump_max_ttm_s"], 0.0)
         self.assertEqual(DEFAULT_SELL_KNOBS["sell_scrap_max_ttm_s"], 0.0)
+        self.assertEqual(DEFAULT_SELL_KNOBS["sell_scrap_fraction"], 1.0)
         self.assertEqual(floor, 0.02)
         self.assertEqual(fak, 0.02)
         self.assertEqual(DEFAULT_SELL_KNOBS["sell_scrap_rest_px"], 0.02)
@@ -1890,6 +1896,84 @@ class SisterMissDumpRemovedTests(unittest.TestCase):
         src = Path(__file__).resolve().parents[1].joinpath("buy", "mint_sell.py").read_text()
         self.assertNotIn("def sister_hedge_dump_due", src)
         self.assertNotIn("sell_dump_if_sister_miss_s", src)
+
+
+class ScrapFractionTests(unittest.TestCase):
+    def test_fraction_one_keeps_the_full_balance_including_fractions(self):
+        self.assertEqual(normalize_scrap_fraction(None), 1.0)
+        self.assertEqual(normalize_scrap_fraction("bad"), 1.0)
+        self.assertEqual(scrap_share_plan(100, 1), (100.0, 0.0))
+        self.assertEqual(scrap_share_plan(50.5, 1.0), (50.5, 0.0))
+        self.assertEqual(
+            scrap_order_shares(target=100, keep=0, filled=40, inventory=60),
+            60.0,
+        )
+
+    def test_half_of_100_and_odd_counts_floor_the_target(self):
+        self.assertEqual(scrap_share_plan(100, 0.5), (50.0, 50.0))
+        self.assertEqual(scrap_share_plan(101, 0.5), (50.0, 51.0))
+        self.assertEqual(scrap_share_plan(3, 0.5), (1.0, 2.0))
+        self.assertEqual(
+            scrap_order_shares(target=50, keep=50, filled=0, inventory=100),
+            50.0,
+        )
+        self.assertEqual(
+            scrap_order_shares(target=50, keep=50, filled=20, inventory=100),
+            30.0,
+        )
+        self.assertEqual(
+            scrap_order_shares(target=50, keep=50, filled=20, inventory=70),
+            20.0,
+        )
+        self.assertEqual(
+            scrap_order_shares(target=50, keep=50, filled=0, inventory=50),
+            0.0,
+        )
+
+    def test_target_met_by_fills_or_balance_at_keep(self):
+        met, why = scrap_target_met(
+            filled=50, target=50, keep=50, tol=0.01,
+        )
+        self.assertEqual((met, why), (True, "target_filled"))
+        met, why = scrap_target_met(
+            filled=49.995, target=50, keep=50, tol=0.01,
+        )
+        self.assertTrue(met)
+        met, why = scrap_target_met(
+            filled=20, target=50, keep=50, tol=0.01, balance=50.0,
+        )
+        self.assertEqual((met, why), (True, "balance_at_keep"))
+        met, why = scrap_target_met(
+            filled=20, target=50, keep=50, tol=0.01, balance=60.0,
+        )
+        self.assertFalse(met)
+
+    def test_kept_leg_ignores_the_cheap_winner_threshold(self):
+        self.assertTrue(
+            kept_leg_below_winner_min(
+                "up", 0.995, sold_leg="up", keep=50, winner_min=0.999,
+            )
+        )
+        self.assertTrue(
+            kept_leg_below_winner_min(
+                "up", 0.99, sold_leg="up", keep=50, winner_min=0.999,
+            )
+        )
+        self.assertFalse(
+            kept_leg_below_winner_min(
+                "up", 0.999, sold_leg="up", keep=50, winner_min=0.999,
+            )
+        )
+        self.assertFalse(
+            kept_leg_below_winner_min(
+                "dn", 0.995, sold_leg="up", keep=50, winner_min=0.999,
+            )
+        )
+        self.assertFalse(
+            kept_leg_below_winner_min(
+                "up", 0.995, sold_leg="up", keep=0, winner_min=0.999,
+            )
+        )
 
 
 if __name__ == "__main__":
