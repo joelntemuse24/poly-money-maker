@@ -4,7 +4,8 @@ The live file still rolls at ``maxBytes``. Each roll is a rename into
 ``logs/archive/`` (or next to the live log if that directory cannot be
 created). Gzip runs on one background worker so the trading loop does
 not wait. Archives are never pruned. ``logs/oracle_twap.jsonl`` is not
-this handler's file and is left alone.
+this handler's file; its writer calls ``roll_if_over`` before each append
+and lands in the same ``logs/archive/`` directory.
 
 Warnings go to stderr. Logging them would re-enter this handler's lock.
 """
@@ -186,40 +187,84 @@ class ArchiveRotatingFileHandler(RotatingFileHandler):
             warn_archive(f"reopen after rotation failed: {exc}")
 
     def _archive_current(self) -> None:
-        src = self.baseFilename
-        if not os.path.isfile(src):
-            return
-        when = self._clock()
-        directory, gzip_later = self._destination_dir()
-        log_name = os.path.basename(src)
-        dest: Path | None = None
-        for _ in range(100):
-            dest = unique_archive_path(directory, log_name, when)
-            try:
-                rename_no_clobber(src, dest)
-            except FileExistsError:
-                continue
-            else:
-                break
+        archive_log_file(self.baseFilename, self.archive_dir, self._clock())
+
+
+def archive_log_file(src: str | Path, archive_dir: str | Path, when: datetime) -> Optional[Path]:
+    """Rename ``src`` to ``archive_dir/<name>.<UTC stamp>`` and gzip it later.
+
+    If ``archive_dir`` cannot be created the file is renamed next to
+    ``src`` and left uncompressed. Returns the renamed path, or ``None``
+    when there was nothing to move or no free name.
+    """
+    src = str(src)
+    if not os.path.isfile(src):
+        return None
+    directory, gzip_later = _destination_dir(Path(archive_dir), Path(src).parent)
+    log_name = os.path.basename(src)
+    dest: Path | None = None
+    for _ in range(100):
+        dest = unique_archive_path(directory, log_name, when)
+        try:
+            rename_no_clobber(src, dest)
+        except FileExistsError:
+            continue
         else:
-            warn_archive(f"rotation could not find a free name for {src}")
-            return
-        if gzip_later and dest is not None:
-            self._schedule_gzip(dest)
+            break
+    else:
+        warn_archive(f"rotation could not find a free name for {src}")
+        return None
+    if gzip_later and dest is not None:
+        _schedule_gzip(dest)
+    return dest
 
-    def _destination_dir(self) -> tuple[Path, bool]:
-        try:
-            self.archive_dir.mkdir(parents=True, exist_ok=True)
-        except OSError as exc:
-            warn_archive(
-                f"cannot create archive directory {self.archive_dir} ({exc}); "
-                "renamed uncompressed next to the live log"
-            )
-            return Path(self.baseFilename).parent, False
-        return self.archive_dir, True
 
-    def _schedule_gzip(self, dest: Path) -> None:
-        try:
-            _archive_executor().submit(compress_archived_log, dest)
-        except Exception as exc:
-            warn_archive(f"could not schedule compression of {dest}: {exc}")
+def _destination_dir(archive_dir: Path, fallback: Path) -> tuple[Path, bool]:
+    try:
+        archive_dir.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        warn_archive(
+            f"cannot create archive directory {archive_dir} ({exc}); "
+            "renamed uncompressed next to the live log"
+        )
+        return fallback, False
+    return archive_dir, True
+
+
+def _schedule_gzip(dest: Path) -> None:
+    try:
+        _archive_executor().submit(compress_archived_log, dest)
+    except Exception as exc:
+        warn_archive(f"could not schedule compression of {dest}: {exc}")
+
+
+def roll_if_over(
+    path: str | Path,
+    incoming_bytes: int,
+    max_bytes: int,
+    *,
+    archive_dir: str | Path | None = None,
+    clock: Callable[[], datetime] | None = None,
+) -> Optional[Path]:
+    """Archive ``path`` first if appending ``incoming_bytes`` would pass ``max_bytes``.
+
+    Same trigger as ``RotatingFileHandler``: a non-empty file whose size
+    plus the next write reaches the cap. ``max_bytes <= 0`` never rolls.
+    Never raises; a failed roll leaves the file in place to keep appending.
+    """
+    if max_bytes <= 0:
+        return None
+    target = Path(path)
+    try:
+        size = target.stat().st_size
+    except OSError:
+        return None
+    if size <= 0 or size + int(incoming_bytes) < max_bytes:
+        return None
+    if archive_dir is None:
+        archive_dir = target.parent / "archive"
+    try:
+        return archive_log_file(target, archive_dir, (clock or _utc_now)())
+    except Exception as exc:
+        warn_archive(f"rotation failed for {target}: {exc}")
+        return None

@@ -276,7 +276,7 @@ def cycle_sleep_s(cfg: Any, state: Any, now_s: float) -> float:
 
     Missing/invalid ``sell_armed_poll_s`` keeps ``poll_s`` so persist math is
     never replaced by the armed interval. Armed poll may be below the
-    ``poll_s >= 2`` floor (live default 2.0). Mint uses
+    ``poll_s >= 1`` floor (code default 2.0). Mint uses
     ``mint_cycle_sleep_s`` and is not gated by this.
     """
     poll = float((cfg or {}).get("poll_s") or 10)
@@ -1247,6 +1247,132 @@ def sell_fill_vwap(result: Any, sold_shares: float) -> Optional[float]:
     if not math.isfinite(px) or px <= 0 or px >= 1:
         return None
     return round(px, 4)
+
+
+def record_fill_px(intent: dict, key: str, fills: Any) -> Optional[float]:
+    """Fold ``(shares, px)`` fills into a running share-weighted average.
+
+    ``intent[key]`` is the average price over every priced fill so far and
+    ``intent[key + "_shares"]`` the shares it covers. Fills with no price
+    (no ``takingAmount`` in the reply) are skipped rather than guessed, so
+    readers fall back to the posted limit only when nothing was priced.
+    """
+    try:
+        prev_px = intent.get(key)
+        prev_sh = float(intent.get(key + "_shares") or 0.0)
+        usd = float(prev_px) * prev_sh if prev_px is not None and prev_sh > 0 else 0.0
+    except (TypeError, ValueError):
+        prev_sh, usd = 0.0, 0.0
+    total = prev_sh if usd > 0 else 0.0
+    added = False
+    for item in fills or ():
+        try:
+            shares, px = float(item[0]), item[1]
+            if px is None:
+                continue
+            px = float(px)
+        except (TypeError, ValueError, IndexError):
+            continue
+        if not (math.isfinite(shares) and math.isfinite(px)) or shares <= 1e-12 or px <= 0:
+            continue
+        usd += shares * px
+        total += shares
+        added = True
+    if not added:
+        return intent.get(key)
+    avg = round(usd / total, 4)
+    intent[key] = avg
+    intent[key + "_shares"] = round(total, 6)
+    return avg
+
+
+def kept_loser_open(intent: Any) -> bool:
+    """True while a partial scrap still holds kept loser shares.
+
+    Kept shares leave only through the winner path when the kept leg wins
+    (``sell_winner_leg == sold_leg``) or at resolution. A held-leg dump
+    does not sell them.
+    """
+    if not isinstance(intent, dict):
+        return False
+    try:
+        keep = float(intent.get("sell_scrap_keep") or 0.0)
+    except (TypeError, ValueError):
+        return False
+    if not math.isfinite(keep) or keep <= 1e-12:
+        return False
+    sold_leg = intent.get("sold_leg")
+    if intent.get("sold_winner") and sold_leg and intent.get("sell_winner_leg") == sold_leg:
+        return False
+    return True
+
+
+def recorded_fill_px(intent: dict, fill_key: str, limit_key: str) -> Optional[float]:
+    """Average fill if one was priced, else the posted limit (older state)."""
+    for key in (fill_key, limit_key):
+        raw = intent.get(key)
+        if raw is None:
+            continue
+        try:
+            px = float(raw)
+        except (TypeError, ValueError):
+            continue
+        if math.isfinite(px):
+            return px
+    return None
+
+
+def cfg_seconds(cfg: dict, key: str, default: float) -> float:
+    """Seconds knob where an explicit 0 means 0.
+
+    Missing, ``null``, empty, non-numeric, non-finite, or negative values
+    fall back to ``default``. ``float(cfg.get(key) or default)`` turned a
+    0 into the default.
+    """
+    raw = cfg.get(key) if isinstance(cfg, dict) else None
+    if raw is None or raw == "" or isinstance(raw, bool):
+        return float(default)
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return float(default)
+    if not math.isfinite(value) or value < 0:
+        return float(default)
+    return value
+
+
+def _cents(px: Any) -> str:
+    return f"{float(px) * 100:g}c"
+
+
+def sell_plan_banner(cfg: dict) -> str:
+    """One-line description of the loaded sell plan for the startup panel."""
+    if not cfg.get("sell_enabled"):
+        return "sell off (sell_enabled=false) · keep both legs"
+    thr = float(cfg.get("sell_threshold") or DEFAULT_SELL_KNOBS["sell_threshold"])
+    floor = float(cfg.get("sell_floor") or DEFAULT_SELL_KNOBS["sell_floor"])
+    fak_px = float(cfg.get("sell_fak_px") or thr)
+    if bool(cfg.get("sell_scrap_sweep_enabled", True)):
+        scrap = f"loser <={_cents(thr)} -> one FAK @ floor {_cents(floor)}"
+    else:
+        rungs = loser_ladder_limits(thr, floor, thr, fak_px=fak_px)
+        scrap = f"loser <={_cents(thr)} -> ladder " + "->".join(_cents(p) for p in rungs)
+    parts = [scrap]
+    frac = float(cfg.get("sell_scrap_fraction", 1.0) or 1.0)
+    if frac < 1.0 - 1e-12:
+        parts.append(f"scrap {frac * 100:g}% keep rest")
+    scrap_ttm = float(cfg.get("sell_scrap_max_ttm_s") or 0.0)
+    if scrap_ttm > 0:
+        parts.append(f"scrap ttm<={scrap_ttm:g}s")
+    if bool(cfg.get("sell_dump_enabled", True)):
+        dump = f"dump held <{_cents(cfg.get('sell_dump_below') or DEFAULT_SELL_KNOBS['sell_dump_below'])}"
+        dump_ttm = float(cfg.get("sell_dump_max_ttm_s") or 0.0)
+        if dump_ttm > 0:
+            dump += f" ttm<={dump_ttm:g}s"
+        parts.append(dump)
+    winner = cfg.get("sell_winner_min") or DEFAULT_SELL_KNOBS["sell_winner_min"]
+    parts.append(f"keep winner (cash >={float(winner):g})")
+    return " · ".join(parts)
 
 
 def loser_scrap_persist_s(

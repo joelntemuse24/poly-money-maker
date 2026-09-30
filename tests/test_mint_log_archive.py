@@ -274,8 +274,8 @@ class MintLogArchiveTests(unittest.TestCase):
 
     def test_log_setup_uses_two_megabyte_archive_handler(self) -> None:
         source = MINT.read_text(encoding="utf-8")
-        self.assertIn('if float(cfg["poll_s"]) < 2:', source)
-        self.assertIn('raise ValueError("poll_s must be >= 2")', source)
+        self.assertIn('if float(cfg["poll_s"]) < 1:', source)
+        self.assertIn('raise ValueError("poll_s must be >= 1")', source)
         tree = ast.parse(source, filename=str(MINT))
         fn = next(
             node

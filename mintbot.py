@@ -28,7 +28,7 @@ never posts a bid. Keep the winner for redeem unless its bid reaches
 ``strategy_mint.json`` turns it on. Sell and mint run as independent loops
 so Gamma/relayer work cannot steal a dump tick (bag
 ``btc-updown-15m-1789905600``). The sell loop sleeps ``sell_armed_poll_s``
-(~2s, allowed below the ``poll_s >= 2`` floor) while a bag is sell-hot
+(~2s, allowed below the ``poll_s >= 1`` floor) while a bag is sell-hot
 (loser armed, or loser sold and dump/winner not done). Mint keeps
 ``poll_s``. Persist defaults are 5/2/60. Live JSON keys that already
 exist (threshold, persist) override these defaults until the operator
@@ -121,6 +121,10 @@ from buy.mint_sell import (
     scrap_share_plan,
     scrap_target_met,
     sell_fill_vwap,
+    record_fill_px,
+    recorded_fill_px,
+    cfg_seconds,
+    sell_plan_banner,
     loser_persist_ready,
     loser_scrap_persist_s,
     mint_cycle_sleep_s,
@@ -138,6 +142,7 @@ from buy.mint_sell import (
     winner_cashout_leg,
     winner_cheap_decision,
     winner_sell_limit,
+    kept_loser_open,
 )
 
 load_dotenv()
@@ -174,6 +179,10 @@ DEFAULTS = {
     ],
     "one_entry_per_market": True,
     "max_open_sets": 1,
+    # False: a sold loser frees its mint slot even when a partial scrap
+    # kept some loser shares. True: those kept shares hold the slot until
+    # the window's grace ends (fewer mints, capped open exposure).
+    "count_kept_loser_as_open": False,
     "poll_s": 5.0,
     "sell_armed_poll_s": 2.0,
     # Chainlink 60s TWAP tape. The scrap veto is off unless
@@ -429,8 +438,8 @@ def validate_strategy(cfg: dict) -> None:
         raise ValueError("series_slugs must not be empty")
     if int(cfg["max_open_sets"]) < 1:
         raise ValueError("max_open_sets must be >= 1")
-    if float(cfg["poll_s"]) < 2:
-        raise ValueError("poll_s must be >= 2")
+    if float(cfg["poll_s"]) < 1:
+        raise ValueError("poll_s must be >= 1")
     if float(cfg.get("sell_armed_poll_s") or 0) < 0.2:
         raise ValueError("sell_armed_poll_s must be >= 0.2")
     floor = float(cfg.get("sell_floor") or 0)
@@ -457,6 +466,10 @@ def validate_strategy(cfg: dict) -> None:
         raise ValueError("sell_scrap_rest_px must be > 0")
     if float(cfg.get("sell_scrap_blind_backoff_s") or 0) < 0:
         raise ValueError("sell_scrap_blind_backoff_s must be >= 0")
+    for key in ("sell_dump_persist_s", "sell_cooldown_s", "sell_scrap_rest_min_ahead_s"):
+        raw = cfg.get(key)
+        if raw is not None and float(raw) < 0:
+            raise ValueError(f"{key} must be >= 0")
     if int(cfg.get("sell_dump_fak_retries") or 0) < 0:
         raise ValueError("sell_dump_fak_retries must be >= 0")
     if float(cfg.get("sell_dump_ladder_step") or 0) <= 0:
@@ -499,13 +512,18 @@ def eligible_markets(markets: List[MintMarket], cfg: dict, now: float) -> List[M
         out.append(market)
     return sorted(out, key=lambda m: m.start_ts)
 
-def open_intent_count(state: dict, now: float | None = None) -> int:
+def open_intent_count(
+    state: dict, now: float | None = None, cfg: dict | None = None,
+) -> int:
     """Count bags that still block a new mint (unsold loser).
 
     Post-expiry redeem holds do not block. After the loser is sold we only
     hold the winner for redeem — that must not skip the next 15m window.
+    ``count_kept_loser_as_open`` (default false) keeps a bag with kept
+    partial-scrap loser shares counted until the window's grace ends.
     """
     now = time.time() if now is None else float(now)
+    keep_blocks = bool((cfg or {}).get("count_kept_loser_as_open", False))
     n = 0
     for intent in state.get("intents", {}).values():
         if intent.get("status") not in ACTIVE_STATUSES:
@@ -514,7 +532,8 @@ def open_intent_count(state: dict, now: float | None = None) -> int:
         if end_ts and now > end_ts + 120:
             continue
         if intent.get("sold_loser") or intent.get("sold_leg"):
-            continue
+            if not (keep_blocks and kept_loser_open(intent)):
+                continue
         n += 1
     return n
 
@@ -527,6 +546,7 @@ def mint_slots_full(state: dict, cfg: dict, now: float, candidate_start_ts: floa
     A later (non-adjacent) window stays blocked at the cap.
     """
     max_open = int(cfg["max_open_sets"])
+    keep_blocks = bool(cfg.get("count_kept_loser_as_open", False))
     full = []
     for intent in state.get("intents", {}).values():
         if intent.get("status") not in ACTIVE_STATUSES:
@@ -535,7 +555,8 @@ def mint_slots_full(state: dict, cfg: dict, now: float, candidate_start_ts: floa
         if end_ts and now > end_ts + 120:
             continue
         if intent.get("sold_loser") or intent.get("sold_leg"):
-            continue
+            if not (keep_blocks and kept_loser_open(intent)):
+                continue
         full.append(intent)
     if len(full) < max_open:
         return False
@@ -561,6 +582,7 @@ def mint_discovery_capped(state: dict, cfg: dict, now: float) -> bool:
     slot is gone, so an armed loser does not starve N+1 mint.
     """
     max_open = int(cfg["max_open_sets"])
+    keep_blocks = bool(cfg.get("count_kept_loser_as_open", False))
     full = []
     for intent in state.get("intents", {}).values():
         if intent.get("status") not in ACTIVE_STATUSES:
@@ -569,7 +591,8 @@ def mint_discovery_capped(state: dict, cfg: dict, now: float) -> bool:
         if end_ts and now > end_ts + 120:
             continue
         if intent.get("sold_loser") or intent.get("sold_leg"):
-            continue
+            if not (keep_blocks and kept_loser_open(intent)):
+                continue
         full.append(intent)
     if len(full) < max_open:
         return False
@@ -1274,7 +1297,9 @@ def _run_fak_ladder(
     depth_leg: Any = None,
     ttm_s: Optional[float] = None,
     condition_id: Any = None,
+    fills: Optional[list] = None,
 ) -> Tuple[float, str, Optional[float]]:
+    """FAK each limit in turn. ``fills`` collects ``(shares, avg_px)`` per post."""
     sold_total = 0.0
     last_status = "none"
     last_px: Optional[float] = None
@@ -1298,9 +1323,16 @@ def _run_fak_ladder(
             f"  [bold bright_yellow][SELL {label.upper()}][/] {slug}  "
             f"bid={bid:.3f}  limit>={use_px:.3f}  size={remaining:.2f}"
         )
-        sold, last_status = _fak_sell(token_id, remaining, use_px, dry_run=dry_run)
+        captured: list = []
+        sold, last_status = _fak_sell(
+            token_id, remaining, use_px, dry_run=dry_run, capture=captured,
+        )
         sold_total += float(sold or 0)
         last_px = float(use_px)
+        if fills is not None and float(sold or 0) > 0:
+            fills.append(
+                (float(sold), sell_fill_vwap(captured[0] if captured else None, sold))
+            )
         if dry_run or sold_total >= size - tol:
             break
         time.sleep(0.35)
@@ -1329,11 +1361,13 @@ def _fire_loser_scrap(
     funder_cs: Optional[str],
     intent: dict,
     shares: float,
+    fills: Optional[list] = None,
 ) -> Tuple[float, str, Optional[float], bool]:
     """One floor sweep, or the clipped cent ladder when sweep is off.
 
     Returns sold shares, status, last limit, and whether the refreshed
     balance is already flat. A partial sweep does not post another rung.
+    ``fills`` collects ``(shares, avg_px)``; the limit is not the fill price.
     """
     plan = loser_scrap_post(
         sweep=sweep,
@@ -1368,6 +1402,8 @@ def _fire_loser_scrap(
         )
         raw = captured[0] if captured else None
         avg = sell_fill_vwap(raw, sold)
+        if fills is not None and float(sold or 0) > 0:
+            fills.append((float(sold), avg))
         log_event(
             "sell_scrap_sweep",
             condition_id=condition_id,
@@ -1394,6 +1430,7 @@ def _fire_loser_scrap(
         )
         flat = latch == "already_flat"
         return float(sold or 0), status, limit, flat
+    ladder_fills: list = []
     sold, status, last_px = _run_fak_ladder(
         token_id,
         float(plan["size"]),
@@ -1408,12 +1445,16 @@ def _fire_loser_scrap(
         depth_leg=leg,
         ttm_s=ttm_s,
         condition_id=condition_id,
+        fills=ladder_fills,
     )
+    if fills is not None:
+        fills.extend(ladder_fills)
     try:
         if float(sold or 0) > 0 or dry_run:
+            ladder_avg = record_fill_px({}, "px", ladder_fills)
             _remember_scrap_fill(
                 condition_id,
-                avg_px=last_px,
+                avg_px=ladder_avg if ladder_avg is not None else last_px,
                 best_bid_size=_scrap_best_bid_size(bids),
             )
     except Exception:
@@ -1438,8 +1479,12 @@ def _run_dump_fak_with_refire(
     ladder_rungs: int,
     dry_run: bool,
     tol: float,
+    fills: Optional[list] = None,
 ) -> Tuple[float, str, Optional[float], int, float]:
-    """Held-dump path: first live-bid FAK, then fast refire ladders on miss."""
+    """Held-dump path: first live-bid FAK, then fast refire ladders on miss.
+
+    ``fills`` collects ``(shares, avg_px)`` across every post.
+    """
     live_bid = float(initial_bid or 0.0)
     initial_limits = [round(live_bid, 4)] if live_bid > 0 else []
     sold_total = 0.0
@@ -1464,6 +1509,7 @@ def _run_dump_fak_with_refire(
             depth_leg=held,
             ttm_s=ttm_s,
             condition_id=condition_id,
+            fills=fills,
         )
     attempts += 1
     sold_total += float(sold or 0.0)
@@ -1530,6 +1576,7 @@ def _run_dump_fak_with_refire(
                 depth_leg=held,
                 ttm_s=ttm_s,
                 condition_id=condition_id,
+                fills=fills,
             )
         attempts += 1
         sold_total += float(sold or 0.0)
@@ -1813,6 +1860,11 @@ def _sync_scrap_rest(
             intent["sell_scrap_rest_matched"] = float(matched)
             if intent.get("sell_scrap_rest_px") is not None:
                 intent["sell_limit"] = intent.get("sell_scrap_rest_px")
+                # The order poll reports matched size, not price; the rest's
+                # own limit is the best available (lower-bound) fill price.
+                record_fill_px(
+                    intent, "sell_fill_px", [(delta, intent.get("sell_scrap_rest_px"))],
+                )
     stored_target = intent.get("sell_scrap_target")
     if stored_target is not None:
         try:
@@ -2168,11 +2220,14 @@ def _note_bag_risk(
         loser_size = None
         if sold and not rec.get("scrap_seen"):
             if rec.get("partial"):
-                scrap_px = intent.get("sell_limit")
+                scrap_px = recorded_fill_px(intent, "sell_fill_px", "sell_limit")
                 scrap_ttm = _ttm_at(end_ts, intent.get("sold_loser_at"))
             else:
                 fill = _take_scrap_fill(condition_id)
-                scrap_px = fill.get("avg_px")
+                # Whole-bag average first; the stash only holds the last tick.
+                scrap_px = intent.get("sell_fill_px")
+                if scrap_px is None:
+                    scrap_px = fill.get("avg_px")
                 if scrap_px is None:
                     scrap_px = intent.get("sell_limit")
                 scrap_ttm = ttm_s
@@ -2183,7 +2238,7 @@ def _note_bag_risk(
         dump_px = None
         dump_ttm = None
         if dump_fired and not rec.get("dump_seen"):
-            dump_px = intent.get("sell_dump_limit")
+            dump_px = recorded_fill_px(intent, "sell_dump_fill_px", "sell_dump_limit")
             if rec.get("partial") and intent.get("sold_dump_at"):
                 dump_ttm = _ttm_at(end_ts, intent.get("sold_dump_at"))
             else:
@@ -2258,8 +2313,8 @@ def _manage_sells_locked(cfg: dict, state: dict, chain: ChainReader) -> None:
     blind_backoff = float(cfg.get("sell_scrap_blind_backoff_s", 3.0) or 0.0)
     rest_enabled = bool(cfg.get("sell_scrap_rest_enabled", True))
     rest_px = float(cfg.get("sell_scrap_rest_px", 0.02) or 0.02)
-    rest_ahead = float(cfg.get("sell_scrap_rest_min_ahead_s", 180.0) or 180.0)
-    cooldown = float(cfg.get("sell_cooldown_s") or 3.0)
+    rest_ahead = cfg_seconds(cfg, "sell_scrap_rest_min_ahead_s", 180.0)
+    cooldown = cfg_seconds(cfg, "sell_cooldown_s", 3.0)
     winner_min = float(cfg.get("sell_winner_min") or 0.999)
     clob_max = float(cfg.get("sell_clob_max_price") or 0.99)
     clob_min = float(cfg.get("sell_clob_min_price") or 0.01)
@@ -2347,11 +2402,7 @@ def _manage_sells_locked(cfg: dict, state: dict, chain: ChainReader) -> None:
 
         # Prefer redeem at ~$1. Cheap 0.99 only if loser sold ≤ cheap_gate AND
         # loser_fill + cheap_min > 1.0 (beats mint). Flat 1¢+99¢ waits for redeem.
-        loser_px = intent.get("sell_limit")
-        try:
-            loser_px_f = float(loser_px) if loser_px is not None else None
-        except (TypeError, ValueError):
-            loser_px_f = None
+        loser_px_f = recorded_fill_px(intent, "sell_fill_px", "sell_limit")
         cheap_gate = float(cfg.get("sell_winner_cheap_if_loser_le") or 0.03)
         cheap_min = float(cfg.get("sell_winner_min_cheap") or 0.99)
         effective_winner_min, cheap_on, cheap_why = winner_cheap_decision(
@@ -2458,6 +2509,7 @@ def _manage_sells_locked(cfg: dict, state: dict, chain: ChainReader) -> None:
                     )
                 elif latch == "already_flat":
                     intent["sold_winner"] = True
+                    intent["sell_winner_leg"] = winner
                     intent["sell_winner_note"] = "already_flat"
                 else:
                     intent["last_sell_attempt_at"] = now
@@ -2498,6 +2550,7 @@ def _manage_sells_locked(cfg: dict, state: dict, chain: ChainReader) -> None:
                     intent["sell_winner_last_status"] = last_status
                     if dry_run or sold_total >= size - tol:
                         intent["sold_winner"] = True
+                        intent["sell_winner_leg"] = winner
                         intent["sell_winner_filled"] = float(
                             intent.get("sell_winner_filled") or 0
                         ) + sold_total
@@ -2528,7 +2581,7 @@ def _manage_sells_locked(cfg: dict, state: dict, chain: ChainReader) -> None:
         sold_dump = bool(intent.get("sold_dump") or intent.get("sold_winner"))
         dump_enabled = bool(cfg.get("sell_dump_enabled", True))
         dump_below = float(cfg.get("sell_dump_below") or 0.80)
-        dump_persist_s = float(cfg.get("sell_dump_persist_s") or 2.0)
+        dump_persist_s = cfg_seconds(cfg, "sell_dump_persist_s", 2.0)
         dump_retries = int(cfg.get("sell_dump_fak_retries", 2))
         dump_ladder_step = float(cfg.get("sell_dump_ladder_step") or 0.04)
         dump_ladder_rungs = int(cfg.get("sell_dump_ladder_rungs", 4))
@@ -2614,6 +2667,7 @@ def _manage_sells_locked(cfg: dict, state: dict, chain: ChainReader) -> None:
                 else:
                     live_px = float(dump_bid or 0)
                     intent["last_sell_attempt_at"] = now
+                    dump_fills: list = []
                     sold_total, last_status, last_px, used_attempts, live_px = (
                         _run_dump_fak_with_refire(
                             token_id=d_tok,
@@ -2631,8 +2685,10 @@ def _manage_sells_locked(cfg: dict, state: dict, chain: ChainReader) -> None:
                             ladder_rungs=dump_ladder_rungs,
                             dry_run=dry_run,
                             tol=tol,
+                            fills=dump_fills,
                         )
                     )
+                    record_fill_px(intent, "sell_dump_fill_px", dump_fills)
                     intent["sell_dump_attempts"] = int(
                         intent.get("sell_dump_attempts") or 0
                     ) + int(used_attempts)
@@ -2657,6 +2713,7 @@ def _manage_sells_locked(cfg: dict, state: dict, chain: ChainReader) -> None:
                             leg=held,
                             hedge_leg="dn" if held == "up" else "up",
                             sold=sold_total,
+                            avg_px=intent.get("sell_dump_fill_px"),
                             bid=dump_bid,
                             status=last_status,
                         )
@@ -3061,6 +3118,7 @@ def _manage_sells_locked(cfg: dict, state: dict, chain: ChainReader) -> None:
                             outcome=why or "target_filled",
                         )
                     else:
+                        scrap_fills: list = []
                         with _io_unlocked():
                             sold_total, last_status, last_px, balance_flat = (
                                 _fire_loser_scrap(
@@ -3084,8 +3142,10 @@ def _manage_sells_locked(cfg: dict, state: dict, chain: ChainReader) -> None:
                                     funder_cs=funder_cs,
                                     intent=intent,
                                     shares=shares,
+                                    fills=scrap_fills,
                                 )
                             )
+                        record_fill_px(intent, "sell_fill_px", scrap_fills)
                         intent["sell_attempts"] = int(intent.get("sell_attempts") or 0) + 1
                         intent["sell_last_status"] = last_status
                         done = dry_run or balance_flat or sold_total >= post_size - tol
@@ -3116,6 +3176,7 @@ def _manage_sells_locked(cfg: dict, state: dict, chain: ChainReader) -> None:
                                 slug=intent.get("slug"),
                                 leg=loser,
                                 sold=sold_total,
+                                avg_px=intent.get("sell_fill_px"),
                                 bid=loser_bid,
                                 status=last_status,
                                 **done_extra,
@@ -3205,9 +3266,11 @@ def _manage_sells_locked(cfg: dict, state: dict, chain: ChainReader) -> None:
                 )
                 if blind_fire and b_tok:
                     intent["sell_blind_last_at"] = now
+                    blind_raw: list = []
                     with _io_unlocked():
                         blind_sold, blind_status = _fak_sell(
                             b_tok, b_size, blind_px, dry_run=dry_run,
+                            capture=blind_raw,
                         )
                     log_event(
                         "sell_scrap_blind",
@@ -3227,6 +3290,16 @@ def _manage_sells_locked(cfg: dict, state: dict, chain: ChainReader) -> None:
                             intent.get("sell_filled") or 0
                         ) + float(blind_sold)
                         intent["sell_limit"] = blind_px
+                        record_fill_px(
+                            intent,
+                            "sell_fill_px",
+                            [(
+                                float(blind_sold),
+                                sell_fill_vwap(
+                                    blind_raw[0] if blind_raw else None, blind_sold,
+                                ),
+                            )],
+                        )
                     if float(blind_sold or 0) >= b_size - tol and not dry_run:
                         _finish_scrap(
                             intent, cid, persist_leg, outcome="target_filled",
@@ -3440,7 +3513,7 @@ def run_mint_cycle(
             write_loop_heartbeat(
                 "mint",
                 "capped_open",
-                open=open_intent_count(state),
+                open=open_intent_count(state, now, cfg),
                 next_start=float(pick.start_ts),
             )
             return "capped_open"
@@ -3716,7 +3789,7 @@ def main() -> int:
                 f"[dim]shares={cfg['shares']} · not-yet-open · opens within "
                 f"{cfg['enter_max_ttm_min']}m · "
                 f"dry_run={cfg['dry_run']} · entry_enabled={cfg['entry_enabled']}[/]\n"
-                "[dim]atomic mint · loser sell ladder 3c->2c · keep winner[/]\n"
+                f"[dim]atomic mint · {sell_plan_banner(cfg)}[/]\n"
                 "[dim]sell loop ⊥ mint/discover loop[/]",
                 vertical="middle",
             ),
@@ -3739,6 +3812,7 @@ def main() -> int:
         series=cfg["series_slugs"],
         loops=("sell", "mint", "oracle"),
         oracle_log_enabled=bool(cfg.get("oracle_log_enabled", True)),
+        sell_plan=sell_plan_banner(cfg),
     )
     if cfg.get("oracle_log_enabled", True):
         late_s = float(cfg.get("sell_late_window_s") or 0.0)

@@ -1,6 +1,6 @@
 # Poly Money Maker: technical design of the live 15m mint system
 
-This document explains the system as it runs on **30 September 2026**. It follows `mintbot.py`, the live atomic-mint trader, from discovering the next BTC 15m Up/Down window through a confirmed complete-set mint, the loser scrap (whole or partial), the held-leg dump, winner cash-out or redeem, and the local state that survives a restart. Python excerpts are from `main` at `1a3916d` (#223). The live VM runs the same code plus one local `poll_s` patch ([§32](#section-32)). Hypothetical trades illustrate arithmetic; they are not performance claims.
+This document explains the system as it runs on **30 September 2026**. It follows `mintbot.py`, the live atomic-mint trader, from discovering the next BTC 15m Up/Down window through a confirmed complete-set mint, the loser scrap (whole or partial), the held-leg dump, winner cash-out or redeem, and the local state that survives a restart. Python excerpts are from `main` after the 30 Sep follow-up fixes (recorded fill prices, oracle tape rotation, startup banner, `count_kept_loser_as_open`, explicit-zero seconds knobs, `poll_s ≥ 1`). Until the operator pulls and restarts, the live VM still runs `1a3916d` (#223) plus a local `poll_s` patch that `main` now carries ([§32](#section-32)). Hypothetical trades illustrate arithmetic; they are not performance claims.
 
 Where a knob matters, the text gives the **code default** (`DEFAULTS` in `mintbot.py`) and the **live value** from the VM's gitignored `strategy_mint.json` as read on 30 Sep 2026. Live JSON wins for every key it sets. The repo never commits a live JSON.
 
@@ -94,7 +94,7 @@ Live tree: `/home/ntemusejoel/poly-money-maker` on Google Cloud VM `poly-vm`.
 | Unit | Program | Role | Observed 30 Sep 2026 (read-only `systemctl`) |
 |---|---|---|---|
 | `polymintbot.service` | `mintbot.py` + gitignored `strategy_mint.json` | Atomic mint + sells | **active / enabled** |
-| `polypathlog.service` | `pathlog.py` | Public CLOB path recorder (no orders) | **enabled but inactive** since 22 Sep 2026 20:00 UTC (clean exit, status 0) |
+| `polypathlog.service` | `pathlog.py` | Public CLOB path recorder (no orders) | **retired**: inactive since 22 Sep 2026 20:00 UTC (clean exit). Still `enabled`, so it would start on reboot; the operator should `systemctl disable polypathlog` |
 | `polyscrapbid.service` | `scrapbidder.py` (wallet B) | Opt-in sister bids | **inactive / disabled** — stays off |
 | Retired buy / danger / shadow / dense pathlog units | — | — | **stopped / must stay off** |
 
@@ -116,7 +116,7 @@ Durable local files (gitignored where noted):
 | `STOP_MINT` | If present, both mintbot loops exit and the process stops |
 | `mintbot.log` / `pathlog.log` | Append logs; `mintbot.log` rolls at 2 MB into `logs/archive/` |
 | `logs/archive/mintbot.log.<UTC stamp>.gz` | Rotated mintbot history, gzipped, never pruned (#219) |
-| `logs/oracle_twap.jsonl` | Chainlink TWAP tape; append-only, not rotated (116 MB on 30 Sep) |
+| `logs/oracle_twap.jsonl` | Chainlink TWAP tape; rolls at 20 MB into `logs/archive/oracle_twap.jsonl.<UTC stamp>.gz`, never pruned (was 116 MB unrotated on 30 Sep; the first write after a restart on new code archives it) |
 | `.env` | Secrets — never read into chat or commit |
 
 <a id="section-3"></a>
@@ -124,7 +124,7 @@ Durable local files (gitignored where noted):
 
 ```
 mintbot.py              # live entry: discover → mint → reconcile → sell
-pathlog.py              # 15m-only book recorder
+pathlog.py              # 15m-only book recorder (service retired; research use only)
 strategy_mint.json      # LIVE knobs (gitignored)
 strategy_mint.example.json
 positions_mint.json     # LIVE state (gitignored)
@@ -137,13 +137,13 @@ buy/
   chain.py              # eth_call balances / prechecks, per-thread keep-alive sessions
   contracts.py          # approve + split calldata; pUSD transfer for the A→B top-up
   oracle_log.py         # Chainlink 60s TWAP tape + bag_view for the (off) late scrap veto
-  log_archive.py        # rotate mintbot.log into logs/archive and gzip off-thread
+  log_archive.py        # rotate mintbot.log and the oracle tape into logs/archive, gzip off-thread
   sister_bid.py         # wallet B bid policy (scrapbidder only)
   sister_topup.py       # A→B pUSD top-up policy (scrapbidder only)
 scrapbidder.py / sister_topup.py   # opt-in wallet B process + top-up script (off)
 deploy/
   polymintbot.service
-  polypathlog.service
+  polypathlog.service   # retired; kept for reference, keep disabled
   polyscrapbid.service  # opt-in, disabled
   DISK_OPS.md
 tests/                  # unit tests; do not import mintbot.py wholesale
@@ -194,7 +194,7 @@ Four Python habits recur in the money paths. Each is a one-paragraph aside.
 
 > **Aside — keyword-only arguments.** Many helpers put a bare `*` in the signature: `persist_ready(qualify, *, now_s, armed_ts, persist_s)` or `_fire_loser_scrap(*, token_id, size, floor, ...)`. Everything after `*` must be passed by name (`now_s=now`). The money helpers take several floats in a row (`now_s`, `armed_ts`, `persist_s`; or `floor`, `threshold`, `loser_bid`, `fak_px`). Positional calls would let a swapped pair type-check and run. Keyword-only makes the call site say which number is which.
 
-> **Aside — `Optional` and `None`.** `Optional[float]` means "a float or `None`", and here `None` carries meaning. `up_bid=None` is "no sized bid" (empty book), which is not the same as a 0.0 bid: `classify_loser` treats a missing opposite bid as `wick_unconfirmed`. `sell_loser_armed_at=None` is "not armed". `sell_scrap_target is None` is "no partial plan locked yet". Watch the `float(cfg.get(k) or default)` idiom: `or` also replaces a **zero**, so `sell_dump_persist_s: 0` becomes 2.0, `sell_cooldown_s: 0` becomes 3.0 and `sell_scrap_rest_min_ahead_s: 0` becomes 180. Keys read as `or 0.0` (the TTM gates, the oracle window) are safe at zero.
+> **Aside — `Optional` and `None`.** `Optional[float]` means "a float or `None`", and here `None` carries meaning. `up_bid=None` is "no sized bid" (empty book), which is not the same as a 0.0 bid: `classify_loser` treats a missing opposite bid as `wick_unconfirmed`. `sell_loser_armed_at=None` is "not armed". `sell_scrap_target is None` is "no partial plan locked yet". Watch the `float(cfg.get(k) or default)` idiom: `or` also replaces a **zero**. `sell_dump_persist_s`, `sell_cooldown_s` and `sell_scrap_rest_min_ahead_s` used to lose an explicit 0 that way; they now go through `cfg_seconds`, where only a missing, `null`, non-numeric or negative value falls back (negatives also fail validation). Keys read as `or 0.0` (the TTM gates, the oracle window) were always safe at zero.
 
 > **Aside — `Decimal` vs `float`.** Trading math is plain `float` with small epsilons (`+ 1e-12` in comparisons, `round(x, 4)` on prices). CLOB prices sit on a 0.01 / 0.001 grid, so that is enough. Where exactness is a correctness property, the code converts to integers instead: `build_atomic_mint_calls` turns shares into six-decimal pUSD units with `int(round(shares * 1_000_000))` and refuses a value that does not map exactly. `scrap_share_plan` adds `1e-9` before `math.floor` so `100 × 0.5` cannot floor to 49 on a binary rounding hair. Only `buy/oracle_log.py` uses `Decimal` (`json.loads(..., parse_float=Decimal)`), so the audit tape stores oracle prints digit-for-digit.
 
@@ -241,6 +241,8 @@ Top-level `positions_mint.json` shape (one live 100-share bag after a partial sc
       "sold_loser_at": 1790755042.8,
       "sell_filled": 50.0,
       "sell_limit": 0.01,
+      "sell_fill_px": 0.03,
+      "sell_fill_px_shares": 50.0,
       "sell_scrap_held": 100.0,
       "sell_scrap_fraction": 0.5,
       "sell_scrap_target": 50.0,
@@ -271,7 +273,7 @@ Saves are cheap and rare: `commit_state` compares a **digest** (`persist_digest`
 
 `main()` installs signal handlers, acquires `.mintbot.lock`, loads `strategy_mint.json` merged over `DEFAULTS`, validates knobs, builds the market gateway and **two** `ChainReader`s (one per loop, one keep-alive session each), then starts three daemon threads: sell (`run_sell_cycle`), mint (`run_mint_cycle`) and the oracle tape.
 
-`load_strategy` copies only keys that exist in `DEFAULTS`; anything else in the live file (for example the leftover `sell_persist_skip_ttm_s`) is ignored. `validate_strategy` enforces `sell_floor ≤ sell_threshold < sell_opposite_min < sell_winner_min < 1`, `sell_floor ≤ sell_fak_px ≤ sell_threshold`, `0 < sell_scrap_fraction ≤ 1`, mint gas bounds, and `poll_s ≥ 2` on `main` (the VM is patched to `≥ 1`, [§32](#section-32)).
+`load_strategy` copies only keys that exist in `DEFAULTS`; anything else in the live file (for example the leftover `sell_persist_skip_ttm_s`) is ignored. `validate_strategy` enforces `sell_floor ≤ sell_threshold < sell_opposite_min < sell_winner_min < 1`, `sell_floor ≤ sell_fak_px ≤ sell_threshold`, `0 < sell_scrap_fraction ≤ 1`, mint gas bounds, `sell_dump_persist_s` / `sell_cooldown_s` / `sell_scrap_rest_min_ahead_s` ≥ 0, and `poll_s ≥ 1` (it was 2 until 30 Sep; the VM carried a local patch for live `poll_s: 1`, [§32](#section-32)).
 
 Every tick of both loops re-reads the strategy file (`_reload_cfg`), so a knob edit takes effect within a second or two without a restart. If the reload fails validation, the loop logs `strategy_reload_fail` and keeps the **previous** config with `entry_enabled` forced false: sells continue, new mints stop.
 
@@ -299,7 +301,7 @@ Sell and mint are independent jobs (`buy/mint_loops.py`). They share `positions_
 4. Discover series markets; filter eligible; `select_mint_candidate` skips `already_minted`, owned tokens, and backwards windows; `mint_slots_full` → capped.
 5. Prechecks (no lock), including the **pending-cash reserve** ([§14](#section-14)); then claim `submitting` under the lock; `submit_mint_batch`; record pending/failed.
 
-`sold_loser` still frees the `max_open_sets` slot, even when half the loser is kept. The mint loop can claim the adjacent window **while** the sell loop runs dump persist on the previous bag. Do not skip Gamma because a bag is hot.
+`sold_loser` still frees the `max_open_sets` slot, even when half the loser is kept. That is the code default and live behaviour. `count_kept_loser_as_open: true` (opt-in, default false) keeps a bag with kept loser shares counted until `end_ts + 120s`, or until the kept leg itself is cashed as the winner: fewer mints, capped open exposure ([§12](#section-12)). The mint loop can claim the adjacent window **while** the sell loop runs dump persist on the previous bag. Do not skip Gamma because a bag is hot.
 
 <a id="section-10c"></a>
 ## Chainlink TWAP tape (recording only)
@@ -308,7 +310,7 @@ Sell and mint are independent jobs (`buy/mint_loops.py`). They share `positions_
 
 The live value is Polymarket's public RTDS relay of Chainlink's BTC/USD **60s TWAP** (`wss://ws-live-data.polymarket.com`, topic `crypto_prices_twap_sixty`). Direct Chainlink Data Streams would need credentials this bot does not use. The window price-to-beat and the completed close are read from Polymarket's crypto-price endpoint with `variant=fifteen` (the 15m series). Rows land in `logs/oracle_twap.jsonl` with `ts`, slug, `condition_id`, window start/end, `source`, `twap`, optional `open_ref`, and `notes`.
 
-The thread wakes every second while a bag is open. Stored rows are 15s mid-window, 2s near the open and in the last three minutes, and 1s in the last minute and just after the end, so a cold gap cannot skip the open print or the last minute. The file is append-only and nothing rotates it ([§32](#section-32)).
+The thread wakes every second while a bag is open. Stored rows are 15s mid-window, 2s near the open and in the last three minutes, and 1s in the last minute and just after the end, so a cold gap cannot skip the open print or the last minute. Before each append, `append_jsonl` calls `log_archive.roll_if_over`: once the file would reach `TAPE_MAX_BYTES` (20 MB) it is renamed to `logs/archive/oracle_twap.jsonl.<UTC stamp>` and gzipped on the same background worker as `mintbot.log`. Archives are never pruned. Only the oracle thread writes this file, so the roll needs no lock. Anything tailing the tape must follow the rename.
 
 `oracle_log_enabled` defaults true (live true). When the feed is down the thread writes `oracle_log_fail` and keeps going. Mint eligibility, winner cash-out, and held dump do not read the tape. Loser scrap does not read it while `sell_late_window_s` is **0** (code default and live). `sell_oracle_edge_floor_usd`, `sell_oracle_edge_per_ttm`, and `sell_oracle_stale_s` also default to **0** (live 0), so raising only the window does not restore the old $25 / 1.5×TTM / 5s-stale veto. `sell_oracle_edge_persist_s` is **3** in code and **0** in the live file; it only matters when the window is positive. If the veto is ever turned back on, #214 keeps its edge-persist clock running on the kept scrap leg while the loser book is momentarily empty, instead of resetting it. The tape stays on for audit.
 
@@ -350,7 +352,9 @@ The thread wakes every second while a bag is open. Stored rows are 15s mid-windo
 <a id="section-12"></a>
 ## Capacity: max_open_sets and adjacent lookahead
 
-`open_intent_count` counts intents in `ACTIVE_STATUSES` whose market has not been expired for >120s, **excluding** intents with `sold_loser` / `sold_leg`. Winner-only redeem holds, including a bag that kept half its loser, must not consume the mint slot.
+`open_intent_count` counts intents in `ACTIVE_STATUSES` whose market has not been expired for >120s, **excluding** intents with `sold_loser` / `sold_leg`. Winner-only redeem holds, including a bag that kept half its loser, must not consume the mint slot. That is the default.
+
+`count_kept_loser_as_open` (code default **false**, example false, not in the live file) changes one thing: with it true, a sold-loser bag whose partial scrap kept shares (`kept_loser_open`: `sell_scrap_keep > 0`, and the kept leg has not been cashed as the winner) still counts toward `max_open_sets` in `open_intent_count`, `mint_slots_full` and `mint_discovery_capped` until the usual `end_ts + 120s` cutoff. A held-leg dump does not release it; the kept shares are still open. The trade-off: at `max_open_sets=2` and fraction 0.5, each scrapped bag keeps holding a slot, so fewer windows get minted (less scrap income), in exchange for never carrying more than `max_open_sets` bags with live loser exposure at once. The adjacent-window lookahead still applies.
 
 `mint_slots_full(state, cfg, now, candidate_start_ts)`:
 
@@ -495,7 +499,7 @@ size, latch = _sell_inventory(chain, ctf, funder_cs, l_tok, shares, tol,
 
 **The order: one floor sweep (#216).** `sell_scrap_sweep_enabled` (true / true: the live file does not set it). `loser_scrap_post(sweep=True, …)` returns `{"mode": "sweep", "limits": [sell_floor], "size": remaining}`: one FAK at `sell_floor` (0.02 / **0.01**) for the whole remaining scrap size, not clipped to top-of-book depth. Because a sell FAK matches the best bids first, the live 1¢ sweep takes the 3¢ level, then 2¢, then 1¢ in one round trip. That is how the live "3¢ → 2¢ → 1¢" scrap happens: it is one order, not three. The fill is logged as `sell_scrap_sweep` (`limit`, `size`, `avg_px` from `takingAmount / size`, `offered`, `status`), preceded by one `sell_book_depth` line for the fire. After the POST the balance is re-read; a remainder waits for the next fire. With the flag false, `loser_ladder_limits` walks every 1¢ from `min(sell_fak_px, live bid)` down to the floor (#215), each rung clipped to displayed top-rung depth (`loser_partial_fak_shares`); live that would be 3¢, 2¢, 1¢ as separate FAKs. The flag is read every tick.
 
-**Done.** `done = dry_run or balance_flat or sold_total >= post_size - tol`. On done, `_finish_scrap` sets `sold_loser=True`, `sold_leg`, `sold_loser_at` once, resets the oracle arm, and (if a plan exists) logs `sell_scrap_outcome`. `sell_filled` accumulates shares. `sell_limit` stores the **last limit posted** (the floor, under sweep), not the average fill; the average is only in `sell_scrap_sweep.avg_px` and `bag_risk`. Then `sell_loser_done` and ntfy.
+**Done.** `done = dry_run or balance_flat or sold_total >= post_size - tol`. On done, `_finish_scrap` sets `sold_loser=True`, `sold_leg`, `sold_loser_at` once, resets the oracle arm, and (if a plan exists) logs `sell_scrap_outcome`. `sell_filled` accumulates shares. `sell_limit` still stores the **last limit posted** (the floor, under sweep). The real price goes to `sell_fill_px`: `record_fill_px` folds each fill's `takingAmount / size` into a share-weighted average across sweep, ladder, blind and rest fills, with `sell_fill_px_shares` counting the priced shares. A reply with no `takingAmount` is skipped rather than guessed, and a rest fill (the order poll reports size, not price) is recorded at the rest's own limit. `recorded_fill_px(intent, "sell_fill_px", "sell_limit")` is what the cheap-winner gate and `bag_risk` read; it falls back to `sell_limit` only for state written before this field existed. Then `sell_loser_done` (now with `avg_px`) and ntfy.
 
 **Misses.**
 
@@ -545,7 +549,7 @@ Two caps: never more than what is left of the target, and never so much that the
 
 `sell_winner_min` is 0.999 in code and **0.9995** live. Unconditional 0.99 cash-out was rejected: it cuts margin versus redeeming at $1.
 
-**Cheap-loser gate.** If `sold_loser`, the recorded `sell_limit` ≤ `sell_winner_cheap_if_loser_le` (0.03 code) **and** `sell_limit + sell_winner_min_cheap > 1.0`, then `effective_winner_min = min(winner_min, sell_winner_min_cheap)`. Live sets `sell_winner_cheap_if_loser_le = -1.0` (and `sell_winner_min_cheap = 0.999`), so `winner_cheap_decision` always returns `loser_above_cheap_gate`: the cheap path is off. Note that under the sweep `sell_limit` is the floor, not the average fill ([§17](#section-17)); the gate compares the floor.
+**Cheap-loser gate.** If `sold_loser`, the recorded loser fill (`sell_fill_px`, else `sell_limit` for old state) ≤ `sell_winner_cheap_if_loser_le` (0.03 code) **and** that fill + `sell_winner_min_cheap` > 1.0, then `effective_winner_min = min(winner_min, sell_winner_min_cheap)`. Live sets `sell_winner_cheap_if_loser_le = -1.0` (and `sell_winner_min_cheap = 0.999`), so `winner_cheap_decision` always returns `loser_above_cheap_gate`: the cheap path is off whatever the fill. Before 30 Sep the gate compared the 1¢ floor limit rather than the real 2–3¢ fill ([§17](#section-17)); with the code defaults that made a 2¢ scrap look like 1¢ + 99¢ = flat and kept the cheap path shut.
 
 **Fire.** `winner_cashout_leg` picks the unique leg whose sized bid is ≥ `effective_winner_min`. If that leg is the kept loser leg, the kept-leg block above applies. The same `persist_ready` clock (`sell_persist_s`) must hold, then `sell_fire_decision("winner")` re-checks. `_sell_inventory` gives the size (capped at `sell_scrap_keep` on the kept leg). The limit is the live bid clamped into the CLOB range:
 
@@ -581,7 +585,7 @@ Action (`_run_dump_fak_with_refire`):
 1. `_sell_inventory` on the held token → size (100). `already_flat` sets `sold_dump` / `sold_winner` with note `already_flat` and no `sell_dump_leg`.
 2. First shot: one **live-bid FAK** at the fire-time sized bid.
 3. If that returns zero fill with `no orders found` or a kill/cancel status (`dump_fast_retry_eligible`), re-fetch the held book and fire `dump_retry_ladder_limits(fresh_bid, floor=sell_floor, step=0.04, max_rungs=4)` — for example 0.31, 0.27, 0.23, 0.19 — up to `sell_dump_fak_retries` (2) times in the same tick. Stop on an empty book (`sell_dump_fast_refire_stop reason=empty_book`), a non-retryable status, or exhausted retries. These refires are not re-checked against the TTM gate.
-4. Full fill (or dry run): `sold_dump=True`, `sold_winner=True`, `sell_dump_leg = held`, `sold_dump_at`, `sell_dump_filled`, `sell_dump_limit = last limit`; log `sell_dump_done` (with `hedge_leg`), ntfy.
+4. Full fill (or dry run): `sold_dump=True`, `sold_winner=True`, `sell_dump_leg = held`, `sold_dump_at`, `sell_dump_filled`, `sell_dump_limit = last limit`, and `sell_dump_fill_px` = share-weighted average of every priced dump fill (first shot and refire rungs); log `sell_dump_done` (with `hedge_leg` and `avg_px`), ntfy. `bag_risk.dump_px` reads the average, falling back to the limit.
 
 **Scope:** only the held leg after a loser fill. The kept part of a partial scrap is **not** dumped. Full sets with neither leg sold never arm the dump. After `end_ts`, `manage_sells` skips the intent. A sister miss does not dump the held leg. `sell_dump_leg` exists so wallet B could buy the other leg; B is disabled live.
 
@@ -606,7 +610,7 @@ Live knobs throughout. Fees ignored.
 3. **T−6m (TTM 360).** The gate opens. `classify_loser` → `up`. `sell_loser_armed_at = now`, `sell_loser_persist why=armed`.
 4. **5s later**, still 0.03 / 0.96 → `ready`. `sell_fire_decision` → `fire`. `_sell_inventory` → 100 held, `has_inventory`.
 5. **Plan lock.** `scrap_share_plan(100, 0.5)` → target 50, keep 50. `sell_scrap_plan` logged. `scrap_order_shares(target=50, keep=50, filled=0, inventory=100)` → 50.
-6. **Sweep.** One FAK SELL 50 Up @ limit 0.01. Bids at 3¢ absorb it: `sell_scrap_sweep size=50 avg_px=0.03`: **+$1.50**. `sell_filled=50`, `sell_limit=0.01`, done → `sold_loser`, `sold_leg="up"`, `sell_scrap_outcome target_filled`, `sell_loser_done`. The mint slot frees.
+6. **Sweep.** One FAK SELL 50 Up @ limit 0.01. Bids at 3¢ absorb it: `sell_scrap_sweep size=50 avg_px=0.03`: **+$1.50**. `sell_filled=50`, `sell_limit=0.01`, `sell_fill_px=0.03`, done → `sold_loser`, `sold_leg="up"`, `sell_scrap_outcome target_filled`, `sell_loser_done`. The mint slot frees.
 7. **Rest of the window.** Down (held 100) stays 0.95–0.99. The dump needs < 0.40 inside the last 240s: never. Winner needs ≥ 0.9995: never. Kept Up 50 is blocked from any sale.
 8. **`end_ts`.** Sell window closes. `bag_risk` logs `scrap_avg_px 0.03`, `min_held_bid ≈ 0.95`, all `sec_below_*` 0, `dump_fired false`.
 9. **≈ end + 68s.** Down 100 redeems: **+$100.00**. Up 50: $0.
@@ -706,12 +710,12 @@ The dump turned +$1.50 into −$67.50: it cost **$69.00** (100 × (1 − 0.31)).
 <a id="section-26"></a>
 ## buy/market.py, book.py, chain.py, contracts.py, mint_gas.py, log_archive.py
 
-Discovery builds `MintMarket` with `condition_id`, `up_token`, `dn_token`, `start_ts`, `end_ts`, `slug`, flags. Book helper returns best bid with minimum size and `bid_fill_depth` (cumulative bids at/through a FAK limit; mint logs `sell_book_depth`, does not gate on it). Chain helper reads ERC-1155 positions and pUSD balance and exposes `_rpc` for the one gas estimate. Contracts helper encodes the atomic mint path used by the relayer batch, plus the pUSD transfer the sister top-up uses. `mint_gas.py` turns an estimate into a clamped `MintGasPlan` ([§14](#section-14)). `log_archive.py` supplies `ArchiveRotatingFileHandler`: `mintbot.log` still rolls at 2 MB, but each roll is renamed to `logs/archive/mintbot.log.<UTC stamp>` (never clobbering) and gzipped on one background worker. Nothing there is pruned (#219). `logs/oracle_twap.jsonl` is not handled by it.
+Discovery builds `MintMarket` with `condition_id`, `up_token`, `dn_token`, `start_ts`, `end_ts`, `slug`, flags. Book helper returns best bid with minimum size and `bid_fill_depth` (cumulative bids at/through a FAK limit; mint logs `sell_book_depth`, does not gate on it). Chain helper reads ERC-1155 positions and pUSD balance and exposes `_rpc` for the one gas estimate. Contracts helper encodes the atomic mint path used by the relayer batch, plus the pUSD transfer the sister top-up uses. `mint_gas.py` turns an estimate into a clamped `MintGasPlan` ([§14](#section-14)). `log_archive.py` supplies `ArchiveRotatingFileHandler`: `mintbot.log` still rolls at 2 MB, but each roll is renamed to `logs/archive/mintbot.log.<UTC stamp>` (never clobbering) and gzipped on one background worker. Nothing there is pruned (#219). The same module exposes `roll_if_over`, which `buy/oracle_log.py` calls before each append so `logs/oracle_twap.jsonl` rolls into the same archive at 20 MB ([§10c](#section-10c)).
 
 <a id="section-27"></a>
 ## pathlog.py: public book recorder
 
-Separate systemd unit. `SERIES = ["btc-up-or-down-15m"]` only. Polls CLOB books, appends JSONL ticks under `pathlog/`, prunes by age/size (14 days / 400 MB), optionally records resolution. **No orders.** Used for research/backtests (`check_path_backtest.py`). Pathlog is not a trading input. On 30 Sep 2026 the unit is enabled but not running (exited cleanly 22 Sep 20:00 UTC), so no new ticks are being recorded until the operator restarts it.
+Separate systemd unit. `SERIES = ["btc-up-or-down-15m"]` only. Polls CLOB books, appends JSONL ticks under `pathlog/`, prunes by age/size (14 days / 400 MB), optionally records resolution. **No orders.** Used for research/backtests (`check_path_backtest.py`). Pathlog is not a trading input. **The recorder is intentionally retired.** It exited cleanly on 22 Sep 20:00 UTC and is not coming back. On 30 Sep 2026 the unit was still `enabled`, so the operator should run `sudo systemctl disable polypathlog` to keep a reboot from reviving it. The code and unit file stay in the repo unchanged, for old tick files and backtests.
 
 <a id="part-v"></a>
 # Part V — Operations, verification and sharp edges
@@ -721,7 +725,7 @@ Separate systemd unit. `SERIES = ["btc-up-or-down-15m"]` only. Polls CLOB books,
 
 `deploy/polymintbot.service` runs `.venv/bin/python mintbot.py` with `EnvironmentFile=.env`, `Restart=always`.
 
-`deploy/polypathlog.service` runs `pathlog.py` (no env file required for public books).
+`deploy/polypathlog.service` runs `pathlog.py` (no env file required for public books). Retired: keep it stopped and disabled ([§27](#section-27)).
 
 `deploy/polyscrapbid.service` is opt-in and stays disabled. It runs `scrapbidder.py` with `EnvironmentFile=.env.complement` only (not mintbot `.env`). Since #212, even with `bid_enabled` on, wallet B's 20-share post-scrap buy needs `scrap_hedge_enabled` (default **false**); the 10-share dump hedge after A sets `sell_dump_leg` needs `dump_hedge_enabled` (default true). Both use the FAK/rest notional band ($1.00–$1.50 by default). Markets A never held are not bid (`bid_absent_enabled` defaults false). There is no sister-miss dump. The A→B top-up (`sister_topup.py`, $5 of pUSD once per broke episode, reads `.env` itself) needs `topup_enabled` (default **false**). Scrapbidder re-reads mint intents after quoting books so a scrap during the pass is not planned from a stale snapshot (#203). It does not mint and does not FAK-sell. `bid_enabled` defaults false and `dry_run` defaults true. Do not commit `.env.complement`. Do not add `.env` to this unit. Same-wallet buyback is not implemented. Do not enable this unit unless the operator asks.
 
@@ -738,10 +742,11 @@ Never enable retired buy units (`polycomplement`, buybots, DangerZone, shadow) f
 | `shares` | 50 | 50 | **100** | Complete-set size ($ per mint) |
 | `enter_min_ttm_min` / `enter_max_ttm_min` | 0 / 45 | | 0 / 45 | Mint only windows opening within 45m |
 | `max_open_sets` | 1 | 1 | **2** | Capacity (plus adjacent rule) |
+| `count_kept_loser_as_open` | false | false | — (false) | Kept loser shares hold the slot until resolution |
 | `mint_fail_cooldown_s` / `mint_max_attempts` | 30 / 3 | | 30 / 3 | Remint policy |
 | `mint_submitting_timeout_s` | 90 | | 90 | Auto-fail tx-less `submitting` |
 | `mint_gas_margin` / `_fallback` / `_cap` | 0.15 / 650000 / 650000 | same | — | Relay gas plan |
-| `poll_s` | 5 (floor 2) | 5 | **1** (needs VM patch) | Mint sleep; sell sleep when idle |
+| `poll_s` | 5 (floor 1) | 5 | **1** | Mint sleep; sell sleep when idle |
 | `sell_armed_poll_s` | 2 | 2 | **1** | Sell sleep while hot |
 | `sell_enabled` | false | false | **true** | Run `manage_sells` |
 | `sell_threshold` | 0.02 | 0.02 | **0.03** | Loser arm ceiling |
@@ -781,7 +786,7 @@ Operational rule: **VM files win**. GitHub is backup/history. Live `strategy_min
 
 The `Deploy to GCP` workflow runs on pushes to `main` that touch `mintbot.py`, `pathlog.py`, `check_path_backtest.py`, `buy/**` or `requirements.txt`. It does `git pull` + `pip install` on the VM and never restarts a service. Docs-only changes (including this file) do not trigger it and are not synced anywhere.
 
-After code pull: restart **only** `polymintbot` / `polypathlog` when the operator asks, and **re-apply the local `poll_s` patch first** ([§32](#section-32) item 10). Leave `polyscrapbid` stopped until the operator asks to start it.
+After code pull: restart **only** `polymintbot` when the operator asks. The `poll_s >= 1` floor is now on `main`, so the VM's old local `mintbot.py` patch must be dropped (`git checkout -- mintbot.py`) before the pull, or `git pull` refuses to merge over it ([§32](#section-32) item 10). `polypathlog` is retired. Leave `polyscrapbid` stopped until the operator asks to start it.
 
 <a id="section-31"></a>
 ## Testing without constructing a live bot
@@ -800,12 +805,12 @@ Do not import `mintbot.py` in unit tests (credentials, lock, clients). Test `buy
 7. **Importing mintbot in tests** — can take the flock or load `.env`.
 8. **Confusing mint with buybot docs** — old hourly TDD describes a different money path.
 9. **Re-serializing sell and mint** — do not fold them back into one `manage_sells → discover → sleep` cycle. That is the 1789905600 hole. Draft PR #193 skip-mint is not the fix.
-10. **Local `poll_s` patch on the VM.** Live `strategy_mint.json` sets `poll_s: 1`, but `validate_strategy` on `main` requires `poll_s >= 2`. The VM's `mintbot.py` carries an uncommitted edit lowering that floor to 1 (the `if float(cfg["poll_s"]) < 1` check and its message, plus the module docstring). A `git pull` that touches `mintbot.py` either refuses to merge over the edit or, after a reset, removes it, so the operator re-applies it after every deploy. If it is missing: a **restart** fails `load_strategy` and `main()` exits 1, so systemd restart-loops and nothing trades. A running process with the patch still in memory keeps working until then. Either commit the floor change or raise live `poll_s` to 2 to retire this step.
-11. **`or` swallows zero knobs** — `sell_dump_persist_s`, `sell_cooldown_s` and `sell_scrap_rest_min_ahead_s` fall back to their default when set to 0 ([§6](#section-6) aside).
-12. **`sell_limit` is the floor under sweep** — not the average fill. Anything that reads it as "loser price" (the cheap-winner gate, `bag_risk` after a restart) sees 0.01 live.
-13. **Oracle tape grows forever** — `logs/oracle_twap.jsonl` is append-only and not rotated (116 MB on 30 Sep). Watch disk (`deploy/DISK_OPS.md`).
-14. **Pathlog silently down** — `polypathlog` has been inactive since 22 Sep; `systemctl is-enabled` alone says `enabled`.
-15. **Startup banner is stale** — `main()` still prints "loser sell ladder 3c->2c"; the actual order is the floor sweep.
+10. **Stale local `poll_s` patch on the VM.** Live `strategy_mint.json` sets `poll_s: 1`. `main` now validates `poll_s >= 1`, so the VM's uncommitted `mintbot.py` edit is redundant. It still blocks the deploy workflow's `git pull`, so drop it (`git checkout -- mintbot.py`) before the first pull that carries this change. If live `poll_s` ever drops below 1, a restart fails `load_strategy` and systemd restart-loops.
+11. **Zero seconds knobs** — resolved. `sell_dump_persist_s`, `sell_cooldown_s` and `sell_scrap_rest_min_ahead_s` go through `cfg_seconds`, so an explicit 0 is respected; `validate_strategy` rejects negatives. Live sets 2 / 3 / 180, so nothing changes today ([§6](#section-6) aside).
+12. **`sell_limit` is the floor under sweep** — still true, and kept for compatibility. The loser price that matters is `sell_fill_px` (share-weighted average fill). The cheap-winner gate and `bag_risk` read it first, and fall back to `sell_limit` only for intents written before the field existed. The dump has `sell_dump_fill_px` alongside `sell_dump_limit`.
+13. **Oracle tape size** — resolved. `logs/oracle_twap.jsonl` rolls into `logs/archive/` at 20 MB and is gzipped in the background ([§10c](#section-10c)). The 116 MB live file is archived on the first append after the next restart; a `tail -f` must follow the rename (`tail -F`).
+14. **Pathlog retired but enabled** — `polypathlog` has been inactive since 22 Sep and is not coming back, but `systemctl is-enabled` still said `enabled` on 30 Sep. Disable it so a reboot does not revive it ([§27](#section-27)).
+15. **Startup banner** — resolved. `main()` prints `sell_plan_banner(cfg)` from the loaded strategy (sweep vs ladder, scrap fraction, TTM gates, dump threshold, winner floor), and the `startup` event carries the same `sell_plan` string.
 
 <a id="section-33"></a>
 ## Glossary
@@ -831,8 +836,8 @@ Do not import `mintbot.py` in unit tests (credentials, lock, clients). Test `buy
 ## Source snapshot
 
 - Host: Google VM `poly-vm` (`/home/ntemusejoel/poly-money-maker`)
-- Services (30 Sep): `polymintbot` active; `polypathlog` enabled but inactive; `polyscrapbid` disabled
-- Code: `main` at `1a3916d` (#223). VM `buy/` modules match `main`; VM `mintbot.py` differs only by the `poll_s` floor patch
+- Services (30 Sep): `polymintbot` active; `polypathlog` retired (inactive, still enabled; should be disabled); `polyscrapbid` disabled
+- Code: VM at `1a3916d` (#223); VM `buy/` modules match that commit and VM `mintbot.py` differs only by the `poll_s` floor patch, which `main` now carries. This revision also describes the 30 Sep follow-up fixes on `main`
 - Primary sources: `mintbot.py` (~3843 lines), `buy/mint_sell.py` (~1444), `buy/mint_loops.py` (~506), `pathlog.py` (~527)
 - Strategy: gitignored `strategy_mint.json` as tabulated in §29
 - Document date: 30 September 2026 (rev: partial scrap, 100-share live bag, floor sweep, TTM gates, relay gas, pending reserve, bag_risk)
@@ -895,8 +900,9 @@ Values are code default / live.
 
 ```
 effective = sell_winner_min                           # 0.999 code, 0.9995 live
-if sold_loser and sell_limit <= sell_winner_cheap_if_loser_le    # -1.0 live: never
-   and sell_limit + sell_winner_min_cheap > 1.0:
+loser_px = sell_fill_px, else sell_limit             # recorded average fill first
+if sold_loser and loser_px <= sell_winner_cheap_if_loser_le      # -1.0 live: never
+   and loser_px + sell_winner_min_cheap > 1.0:
     effective = min(effective, sell_winner_min_cheap)
 ```
 
@@ -958,12 +964,12 @@ Assume `shares=100`, `sell_scrap_fraction=0.5`, scrap average 3¢, fees ignored.
 <a id="appendix-f"></a>
 # Appendix F — Operator checklist
 
-1. `systemctl is-active polymintbot polypathlog` → mintbot active; pathlog is currently inactive (restart only when asked).
+1. `systemctl is-active polymintbot` → active. `systemctl is-enabled polypathlog` → should be `disabled` (retired).
 2. `jq . strategy_mint.json` → confirm shares, sell_*, dump_*, `sell_scrap_fraction` (never commit this file).
-3. `grep -n 'poll_s must be' mintbot.py` → must say `>= 1` while live `poll_s` is 1.
+3. `git status --short mintbot.py` → empty (the old local `poll_s` patch is upstream now; drop it before a pull).
 4. Tail `mintbot.log` for `mint_confirmed`, `mint_submitted` (gas fields), `mint_skip_pending_reserve`, `sell_scrap_plan`, `sell_scrap_sweep`, `sell_scrap_outcome`, `sell_dump_done`, `bag_risk`, `mint_failed`.
 5. After a `mint_failed`, expect a remint after 30s up to 3 attempts, then that slug is skipped.
-6. Code change on VM → restart **only** `polymintbot` when you ask, after re-applying the `poll_s` patch.
+6. Code change on VM → restart **only** `polymintbot` when you ask. No local patch to re-apply.
 7. GitHub sync is backup; VM remains SoT.
 
 
@@ -972,7 +978,7 @@ Assume `shares=100`, `sell_scrap_fraction=0.5`, scrap average 3¢, fees ignored.
 <a id="part-vi"></a>
 # Part VI — Sequences and redeem
 
-ASCII diagrams below are the PDF-safe form of sequence charts. They match `mintbot.py` on `main` at `1a3916d`.
+ASCII diagrams below are the PDF-safe form of sequence charts. They match `mintbot.py` on `main` (control flow unchanged since `1a3916d`).
 
 <a id="section-35"></a>
 ## End-to-end mint sequence
