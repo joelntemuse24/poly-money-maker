@@ -28,6 +28,7 @@ from decimal import Decimal, InvalidOperation
 from typing import Any, Callable, Optional
 
 from buy.chain import thread_session
+from buy.log_archive import roll_if_over
 from buy.market import slug_start_ts
 
 
@@ -50,6 +51,8 @@ GRACE_AFTER_S = 120.0
 INTERVAL_LAST_MIN_S = 1.0
 INTERVAL_HOT_S = 2.0
 INTERVAL_COLD_S = 15.0
+# The tape rolls into logs/archive at this size, gzipped, never pruned.
+TAPE_MAX_BYTES = 20_000_000
 STALE_AFTER_S = 20.0
 FAIL_REPEAT_S = 30.0
 HTTP_RETRY_S = 20.0
@@ -410,13 +413,18 @@ def build_oracle_row(
     return row
 
 
-def append_jsonl(path: Any, row: dict) -> None:
+def append_jsonl(path: Any, row: dict, *, max_bytes: int = 0) -> None:
+    """Append one row. With ``max_bytes`` > 0 the tape rolls into
+    ``<dir>/archive/<name>.<UTC stamp>.gz`` first, like ``mintbot.log``."""
     from pathlib import Path
 
     target = Path(path)
     target.parent.mkdir(parents=True, exist_ok=True)
-    with open(target, "a", encoding="utf-8") as handle:
-        handle.write(json.dumps(row, separators=(",", ":"), sort_keys=True) + "\n")
+    data = (json.dumps(row, separators=(",", ":"), sort_keys=True) + "\n").encode("utf-8")
+    if max_bytes > 0:
+        roll_if_over(target, len(data), max_bytes)
+    with open(target, "ab") as handle:
+        handle.write(data)
         handle.flush()
 
 
@@ -574,8 +582,10 @@ class OracleLogService:
         *,
         feed: Any = None,
         fetch_price: Optional[Callable[[int], WindowPrice]] = None,
+        max_bytes: int = TAPE_MAX_BYTES,
     ) -> None:
         self.path = path
+        self.max_bytes = int(max_bytes)
         self._feed = feed if feed is not None else RtdsTwapFeed()
         self._fetch_price = fetch_price if fetch_price is not None else fetch_crypto_price
         self.sleep_s = 5.0
@@ -813,7 +823,7 @@ class OracleLogService:
 
     def _append(self, row: dict) -> None:
         try:
-            append_jsonl(self.path, row)
+            append_jsonl(self.path, row, max_bytes=self.max_bytes)
         except Exception as exc:
             if self._on_fail is not None:
                 try:
@@ -830,7 +840,8 @@ class OracleLogService:
         try:
             append_jsonl(
                 self.path,
-                build_oracle_row(
+                max_bytes=self.max_bytes,
+                row=build_oracle_row(
                     now=now,
                     window=window,
                     source=RTDS_SOURCE,
