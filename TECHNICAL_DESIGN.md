@@ -1,6 +1,8 @@
 # Poly Money Maker: technical design of the live 15m mint system
 
-This document explains the system as it runs on **19 September 2026**. It follows `mintbot.py`, the live atomic-mint trader, from discovering the next BTC 15m Up/Down window through a confirmed complete-set mint, optional loser/winner/held-leg sells, and the local state that survives a restart. Python examples are taken from the live VM tree `/home/ntemusejoel/poly-money-maker`. Hypothetical trades illustrate arithmetic; they are not performance claims.
+This document explains the system as it runs on **30 September 2026**. It follows `mintbot.py`, the live atomic-mint trader, from discovering the next BTC 15m Up/Down window through a confirmed complete-set mint, the loser scrap (whole or partial), the held-leg dump, winner cash-out or redeem, and the local state that survives a restart. Python excerpts are from `main` at `1a3916d` (#223). The live VM runs the same code plus one local `poll_s` patch ([§32](#section-32)). Hypothetical trades illustrate arithmetic; they are not performance claims.
+
+Where a knob matters, the text gives the **code default** (`DEFAULTS` in `mintbot.py`) and the **live value** from the VM's gitignored `strategy_mint.json` as read on 30 Sep 2026. Live JSON wins for every key it sets. The repo never commits a live JSON.
 
 Three documents have different jobs:
 
@@ -10,7 +12,7 @@ Three documents have different jobs:
 | `AGENTS.md` | What must a coding agent know before changing anything? |
 | `TECHNICAL_DESIGN.md` | How is the system built, and why do its money paths work this way? |
 
-This file replaces the earlier guided tour of `buybothourly.py` (hourly FAK entry / hedge / TP). That strategy is **retired**. Buybots, complement, DangerZone, shadow bots, and hourly-dense pathlog stay off. Do not start them from this document.
+This file replaces the earlier guided tour of `buybothourly.py` (hourly FAK entry / hedge / TP). That strategy is **retired**. Buybots, complement, DangerZone, shadow bots, and hourly-dense pathlog stay off. Do not start them from this document. This file lives on GitHub only; no deploy or VM sync step copies it anywhere.
 
 Read Parts I and II straight through. Part III walks mint and sell. Part IV covers helpers. Part V covers operations and sharp edges.
 
@@ -32,27 +34,28 @@ Read Parts I and II straight through. Part III walks mint and sell. Part IV cove
   - [Chainlink TWAP tape (recording only)](#section-10c)
   - [Sync-loop audit](#section-10b)
   - [Eligibility: not-yet-open 15m windows](#section-11)
-  - [Capacity: max_open_sets=1 and adjacent lookahead](#section-12)
+  - [Capacity: max_open_sets and adjacent lookahead](#section-12)
   - [already_minted: failed remint after cooldown](#section-13)
   - [Relay hub: internal transaction failure](#section-13b)
-  - [Relayer submit: approve + split as one PROXY batch](#section-14)
+  - [Mint, line by line: precheck, reserve, claim, submit](#section-14)
   - [Reconcile: relayer state → inventory confirm](#section-15)
   - [Sell path overview](#section-16)
-  - [Loser dump: arm and print at 2¢ after opposite ≥ 90¢](#section-17)
-  - [Winner cash-out: prefer 0.999 / redeem; 0.99 only after cheap loser](#section-18)
-  - [Held-leg dump: under 80¢ for 2s after loser sold](#section-19)
-  - [Live-bid FAK vs fixed-limit FAK](#section-20)
-  - [Hypothetical lifecycle: $5 mint, loser @2¢, redeem winner](#section-21)
-  - [Hypothetical lifecycle: held dump after a flip](#section-22)
+  - [Loser scrap: arm, persist, time gate, floor sweep](#section-17)
+  - [Partial loser scrap: sell_scrap_fraction](#section-17b)
+  - [Winner cash-out: held for redeem in practice](#section-18)
+  - [Held-leg dump: under sell_dump_below (80¢ code, 40¢ live)](#section-19)
+  - [Live-bid FAK vs floor FAK](#section-20)
+  - [Hypothetical lifecycle: 100-share bag, scrap 50 @ ~3¢, winner redeems](#section-21)
+  - [Hypothetical lifecycle: false dump at ~31¢](#section-22)
   - [What this code does not prove](#section-23)
 - [Part IV — The buy/ helpers and pathlog](#part-iv)
   - [Ownership map](#section-24)
   - [buy/mint_sell.py policy helpers](#section-25)
-  - [buy/market.py, book.py, chain.py, contracts.py](#section-26)
+  - [buy/market.py, book.py, chain.py, contracts.py, mint_gas.py, log_archive.py](#section-26)
   - [pathlog.py: public book recorder](#section-27)
 - [Part V — Operations, verification and sharp edges](#part-v)
   - [systemd units](#section-28)
-  - [Live knobs (19 Sep 2026)](#section-29)
+  - [Knobs: code default vs live (30 Sep 2026)](#section-29)
   - [Deploy boundary (VM is source of truth)](#section-30)
   - [Testing without constructing a live bot](#section-31)
   - [Landmines](#section-32)
@@ -60,7 +63,7 @@ Read Parts I and II straight through. Part III walks mint and sell. Part IV cove
   - [Source snapshot](#section-34)
 - [Part VI — Sequences & redeem](#part-vi)
   - [End-to-end mint sequence](#section-35)
-  - [Sell-side sequence (loser → winner/dump)](#section-36)
+  - [Sell-side sequence (winner / dump / loser)](#section-36)
   - [Redeem path (what exists vs what does not)](#section-37)
   - [State after expiry](#section-38)
 
@@ -74,25 +77,26 @@ Polymarket’s **BTC Up or Down 15m** markets are binary windows. Each window as
 
 A **complete set** is one Up share plus one Down share for the same condition. On-chain Conditional Token Framework (CTF) mechanics let you **split** $N of collateral into N Up + N Down. That is a **mint**, not a directional buy. After the split you hold both legs. Economic edge then comes from:
 
-1. Selling the **loser** cheaply once the book clearly prices it near zero (and the opposite near one), and
-2. Preferring to **redeem** the winner at $1 after resolution (or, only in narrow cases, cashing the winner out on the CLOB near $1).
+1. Selling some or all of the **loser** cheaply once the book clearly prices it near zero (and the opposite near one), and
+2. **Redeeming** the winner at $1 after resolution (the live `sell_winner_min` of 0.9995 means the CLOB cash-out path practically never fires; [§18](#section-18)).
 
-With a $5 trial (`shares=5`), you pay about $5 to mint 5 Up + 5 Down. If you sell the loser for $0.10 total (5 × 2¢) and redeem the winner for $5, gross is about $5.10 before fees/gas abstraction — a thin edge that only works if loser fills are reliable and winner redeem is not accidentally sold too early at a worse price.
+Live size is `shares=100`: about $100 mints 100 Up + 100 Down. With `sell_scrap_fraction=0.5` the bot scraps 50 loser shares (a floor FAK that typically fills at 2–3¢, so about $1.50) and **keeps** the other 50 to resolution. If the favourite wins, the bag nets about +$1.50 before fees ($100 redeem + $1.50 scrap − $100 mint); the kept 50 expire worthless. If the "loser" flips and wins, the kept 50 pay $50. That keep is paid-for insurance: it halves the scrap income in exchange for a floor under the flip case ([§17b](#section-17b)).
 
-**What this bot is not:** it is not the old hourly FAK entry bot. It does not chase 90–95¢ asks on one side with an oracle. It does not “hedge” by buying the opposite leg after entry. The post-loser exit under 80¢ is deliberately named a **held dump / sell-side pass**, not a hedge.
+**What this bot is not:** it is not the old hourly FAK entry bot. It does not chase 90–95¢ asks on one side with an oracle. It does not “hedge” by buying the opposite leg after entry. The post-loser exit under `sell_dump_below` (code 80¢, live **40¢**) is deliberately named a **held dump / sell-side pass**, not a hedge.
 
-**Risk concentration:** `max_open_sets=1` means at most one full unsold bag blocks capacity (with a special adjacent-window exception described below). A failed relayer mint is blocked for `mint_fail_cooldown_s` (30s) and gives up after `mint_max_attempts` (3) tries so a hot remint loop cannot run. A nearer window in that cooldown, or already at the attempt cap, does not idle the cycle: the next eligible future is selected in the same pass and `mint_attempt` is logged for that slug. After an active bag at start `T`, selection never goes backwards (`start_ts < T+900`). A zero-fail window is preferred over retrying a failed condition while a slot is free. A restart ghost intent stuck at `submitting` with no `transaction_id` is auto-failed after `mint_submitting_timeout_s` (default 90s, `0` disables) so `wait_submit` cannot wedge the desk forever. A single toxic loser fill or a missed dump still matters at small size; scaling share count scales both edge and left-tail together.
+**Risk concentration:** code default `max_open_sets=1`, live **2**, plus one adjacent-window exception ([§12](#section-12)). A failed relayer mint is blocked for `mint_fail_cooldown_s` (30s) and gives up after `mint_max_attempts` (3) tries so a hot remint loop cannot run. A nearer window in that cooldown, or already at the attempt cap, does not idle the cycle: the next eligible future is selected in the same pass and `mint_attempt` is logged for that slug. After an active bag at start `T`, selection never goes backwards (`start_ts < T+900`). A zero-fail window is preferred over retrying a failed condition while a slot is free. A restart ghost intent stuck at `submitting` with no `transaction_id` is auto-failed after `mint_submitting_timeout_s` (default 90s, `0` disables) so `wait_submit` cannot wedge the desk forever. At 100 shares a single false dump costs tens of dollars ([§22](#section-22)); scaling share count scales edge and left tail together.
 
 <a id="section-2"></a>
 ## Processes, wallet identities and files
 
 Live tree: `/home/ntemusejoel/poly-money-maker` on Google Cloud VM `poly-vm`.
 
-| Unit | Program | Role | Observed policy |
+| Unit | Program | Role | Observed 30 Sep 2026 (read-only `systemctl`) |
 |---|---|---|---|
-| `polymintbot.service` | `mintbot.py` + gitignored `strategy_mint.json` | Atomic mint + optional sells | **active / enabled** |
-| `polypathlog.service` | `pathlog.py` | Public CLOB path recorder (no orders) | **active / enabled** |
-| Retired buy / danger / dense pathlog units | — | — | **stopped / must stay off** |
+| `polymintbot.service` | `mintbot.py` + gitignored `strategy_mint.json` | Atomic mint + sells | **active / enabled** |
+| `polypathlog.service` | `pathlog.py` | Public CLOB path recorder (no orders) | **enabled but inactive** since 22 Sep 2026 20:00 UTC (clean exit, status 0) |
+| `polyscrapbid.service` | `scrapbidder.py` (wallet B) | Opt-in sister bids | **inactive / disabled** — stays off |
+| Retired buy / danger / shadow / dense pathlog units | — | — | **stopped / must stay off** |
 
 Wallet roles (do not put secrets in this doc):
 
@@ -104,12 +108,15 @@ Durable local files (gitignored where noted):
 
 | Path | Purpose |
 |---|---|
-| `strategy_mint.json` | Live knobs (gitignored) |
-| `strategy_mint.example.json` | Committed template |
-| `positions_mint.json` | Intent state machine + sell flags |
-| `.heartbeat_mint` / `.heartbeat_pathlog` | Liveness stamps |
+| `strategy_mint.json` | Live knobs (gitignored), re-read every loop tick |
+| `strategy_mint.example.json` | Committed template (dry_run, entry and sell off) |
+| `positions_mint.json` | Intent state machine + sell flags (compact JSON, rewritten only on real change) |
+| `.heartbeat_mint` / `.heartbeat_pathlog` | Liveness stamps (mint file carries `sell` and `mint` parts) |
 | `.mintbot.lock` / `.pathlog.lock` | Single-instance flock |
-| `mintbot.log` / `pathlog.log` | Append logs |
+| `STOP_MINT` | If present, both mintbot loops exit and the process stops |
+| `mintbot.log` / `pathlog.log` | Append logs; `mintbot.log` rolls at 2 MB into `logs/archive/` |
+| `logs/archive/mintbot.log.<UTC stamp>.gz` | Rotated mintbot history, gzipped, never pruned (#219) |
+| `logs/oracle_twap.jsonl` | Chainlink TWAP tape; append-only, not rotated (116 MB on 30 Sep) |
 | `.env` | Secrets — never read into chat or commit |
 
 <a id="section-3"></a>
@@ -122,16 +129,23 @@ strategy_mint.json      # LIVE knobs (gitignored)
 strategy_mint.example.json
 positions_mint.json     # LIVE state (gitignored)
 buy/
-  mint_sell.py          # pure sell policy (persist, classify, ladders)
-  mint_loops.py         # concurrent sell vs mint jobs + intent claim
+  mint_sell.py          # pure sell policy (persist, classify, scrap plan, gates, bag_risk)
+  mint_loops.py         # concurrent sell vs mint jobs, intent claim, pending-cash reserve, persist digest
+  mint_gas.py           # mint relay gas_limit (estimate + margin, fallback, 650k clamp)
   market.py             # Gamma/CLOB discovery → MintMarket
   book.py               # sized top-of-book
-  chain.py              # eth_call balances / prechecks
-  contracts.py          # approve + split calldata
-  oracle_log.py         # Chainlink 60s TWAP tape + bag_view for late scrap veto
+  chain.py              # eth_call balances / prechecks, per-thread keep-alive sessions
+  contracts.py          # approve + split calldata; pUSD transfer for the A→B top-up
+  oracle_log.py         # Chainlink 60s TWAP tape + bag_view for the (off) late scrap veto
+  log_archive.py        # rotate mintbot.log into logs/archive and gzip off-thread
+  sister_bid.py         # wallet B bid policy (scrapbidder only)
+  sister_topup.py       # A→B pUSD top-up policy (scrapbidder only)
+scrapbidder.py / sister_topup.py   # opt-in wallet B process + top-up script (off)
 deploy/
   polymintbot.service
   polypathlog.service
+  polyscrapbid.service  # opt-in, disabled
+  DISK_OPS.md
 tests/                  # unit tests; do not import mintbot.py wholesale
 CURRENT.md / AGENTS.md / TECHNICAL_DESIGN.md
 ```
@@ -146,35 +160,45 @@ Reading order for a new engineer: this file Parts I–II, then `buy/mint_sell.py
 
 On Polymarket (Polygon), collateral (pUSD) can be split through the CTF / adapter into a pair of outcome ERC-1155 positions for a `condition_id`. **Minting** creates both legs atomically relative to your inventory: after confirmation you should observe roughly `before + shares` on Up and Down.
 
-Buying one outcome on the CLOB is a different trade: you pay the ask for one token and never receive the other. The mint bot’s edge thesis is “pay ~$1 for the pair, sell trash, redeem (or carefully cash) the rest,” not “pick a side at 97¢.”
+Buying one outcome on the CLOB is a different trade: you pay the ask for one token and never receive the other. The mint bot’s edge thesis is “pay ~$1 for the pair, sell (part of) the trash, redeem the rest,” not “pick a side at 97¢.”
 
-Gas and batching are abstracted by Polymarket’s **relayer**: the bot builds a PROXY transaction that typically includes allowance/approve plus split, submits it once, then polls relayer state until inventory shows up on-chain.
+Gas and batching are abstracted by Polymarket’s **relayer**: the bot builds a PROXY transaction that includes approve plus split, submits it once with an explicit `gas_limit` ([§13b](#section-13b)), then polls relayer state until inventory shows up on-chain.
 
 <a id="section-5"></a>
 ## Books, FAK, sized bids, and three prices
 
 The CLOB is a central limit order book. A **bid** is what buyers will pay; an **ask** is what sellers want.
 
-A **sized bid** in this codebase is the best bid that still has at least `sell_min_bid_size` (live 1.0) size. Thin one-lot prints are ignored so a 1-share tease at 2¢ does not arm a 5-share dump.
+A **sized bid** in this codebase is the best bid that still has at least `sell_min_bid_size` (1.0 code and live) size. Thin sub-share prints are ignored so dust at 2¢ does not arm a 100-share scrap. Depth beyond the top level is only logged (`sell_book_depth`), not gated on.
 
-**FAK** (Fill And Kill) / marketable limit sell: take liquidity down to your limit; cancel the rest. The bot uses FAK for loser ladders and for winner/held dumps.
+**FAK** (Fill And Kill) / marketable limit sell: take liquidity down to your limit; cancel the rest. A sell FAK matches the **best** bids first, so a FAK with a 1¢ limit against a book of 3¢ / 2¢ / 1¢ fills the 3¢ level first. The loser sweep relies on that ([§17](#section-17)).
 
 Three prices that must not be conflated:
 
-1. **Arm threshold** — e.g. loser ≤ 2¢ with opposite ≥ 90¢, or held bid < 80¢.
-2. **Limit posted** — what the order is allowed to cross (2¢ loser FAK, or live bid for winner/dump).
-3. **Average fill** — what actually cleared (may be better than limit).
+1. **Arm threshold** — loser ≤ `sell_threshold` (code 2¢, live **3¢**) with opposite ≥ 90¢, or held bid < `sell_dump_below` (code 80¢, live **40¢**).
+2. **Limit posted** — `sell_floor` for the loser sweep (code 2¢, live **1¢**); live sized bid for winner/dump.
+3. **Average fill** — what actually cleared (usually better than the limit). Live sweeps post 1¢ and log `avg_px` 0.02–0.03 in `sell_scrap_sweep`.
 
-**Live-bid FAK:** once a winner/dump path is allowed to fire, the limit is the current sized bid (e.g. 0.99), not a stale fixed 0.999 that Polymarket rejects when the book max is 0.99.
+**Live-bid FAK:** once a winner/dump path is allowed to fire, the limit is the current sized bid (winner clamped to 0.99), not a stale fixed 0.999 that Polymarket rejects when the book max is 0.99.
 
 <a id="section-6"></a>
 ## Python shape: values, state and side effects
 
-`buy/mint_sell.py` is intentionally pure-ish: given bids and knobs, return legs, persist decisions, ladder limits. No network.
+`buy/mint_sell.py` is intentionally pure-ish: given bids and knobs, return legs, persist decisions, scrap plans and ladder limits. No network. `buy/mint_loops.py` and `buy/mint_gas.py` follow the same rule.
 
 `mintbot.py` owns side effects: HTTP to Gamma/CLOB/relayer, eth_calls, file IO, notifications, systemd process lifetime.
 
-`positions_mint.json` is the durable state machine. Restart must not remint a market already `failed`/`confirmed`/`completed`, and must not forget `sold_loser` / `sold_leg`.
+`positions_mint.json` is the durable state machine. Restart must not remint a market already `failed`/`confirmed`/`completed`, and must not forget `sold_loser` / `sold_leg` or a locked scrap target.
+
+Four Python habits recur in the money paths. Each is a one-paragraph aside.
+
+> **Aside — keyword-only arguments.** Many helpers put a bare `*` in the signature: `persist_ready(qualify, *, now_s, armed_ts, persist_s)` or `_fire_loser_scrap(*, token_id, size, floor, ...)`. Everything after `*` must be passed by name (`now_s=now`). The money helpers take several floats in a row (`now_s`, `armed_ts`, `persist_s`; or `floor`, `threshold`, `loser_bid`, `fak_px`). Positional calls would let a swapped pair type-check and run. Keyword-only makes the call site say which number is which.
+
+> **Aside — `Optional` and `None`.** `Optional[float]` means "a float or `None`", and here `None` carries meaning. `up_bid=None` is "no sized bid" (empty book), which is not the same as a 0.0 bid: `classify_loser` treats a missing opposite bid as `wick_unconfirmed`. `sell_loser_armed_at=None` is "not armed". `sell_scrap_target is None` is "no partial plan locked yet". Watch the `float(cfg.get(k) or default)` idiom: `or` also replaces a **zero**, so `sell_dump_persist_s: 0` becomes 2.0, `sell_cooldown_s: 0` becomes 3.0 and `sell_scrap_rest_min_ahead_s: 0` becomes 180. Keys read as `or 0.0` (the TTM gates, the oracle window) are safe at zero.
+
+> **Aside — `Decimal` vs `float`.** Trading math is plain `float` with small epsilons (`+ 1e-12` in comparisons, `round(x, 4)` on prices). CLOB prices sit on a 0.01 / 0.001 grid, so that is enough. Where exactness is a correctness property, the code converts to integers instead: `build_atomic_mint_calls` turns shares into six-decimal pUSD units with `int(round(shares * 1_000_000))` and refuses a value that does not map exactly. `scrap_share_plan` adds `1e-9` before `math.floor` so `100 × 0.5` cannot floor to 49 on a binary rounding hair. Only `buy/oracle_log.py` uses `Decimal` (`json.loads(..., parse_float=Decimal)`), so the audit tape stores oracle prints digit-for-digit.
+
+> **Aside — dataclasses vs dicts.** Immutable value objects are `@dataclass(frozen=True)`: `MintMarket` (discovery), `ContractCall` (calldata), `MintGasPlan` (gas decision, with `relay_arg()` and `as_log()` methods), `OracleBagView`. Frozen means a market snapshot cannot be edited halfway through a tick. The **intent** is a plain `dict` on purpose: it round-trips to `positions_mint.json` as-is, and new keys (`sell_scrap_target`, `sold_dump_at`) appear without a schema migration. The cost is typo-prone `intent.get("...")` access.
 
 <a id="section-7"></a>
 ## External systems
@@ -182,46 +206,62 @@ Three prices that must not be conflated:
 | System | Use |
 |---|---|
 | Gamma API | Discover 15m markets / tokens / times |
-| CLOB API | Sized bids; FAK sells |
+| CLOB API | Sized bids; FAK sells; resting scrap sells (off live) |
 | Data API | Optional position checks |
 | Relayer v2 | Submit PROXY mint batch; poll `STATE_*` |
-| Polygon RPC | CTF balances / inventory confirm |
+| Polygon RPC | CTF balances / inventory confirm; one `eth_estimateGas` per mint submit |
 | Polymarket RTDS | Recording-only Chainlink BTC/USD 60s TWAP (`crypto_prices_twap_sixty`) |
-| ntfy (optional) | Operator push on mint/sell |
+| ntfy (optional) | Operator push on mint/sell (thread pool, off the tick) |
+
+HTTP goes through per-thread keep-alive `requests.Session` objects (`buy/chain.thread_session`; each `ChainReader` owns one). That was part of the CPU cut in #217.
 
 <a id="section-8"></a>
 ## JSON as durable memory
 
-Top-level `positions_mint.json` shape:
+Top-level `positions_mint.json` shape (one live 100-share bag after a partial scrap):
 
 ```json
 {
-  "daily": { "2026-09-19": 15.0 },
   "intents": {
     "<condition_id>": {
       "status": "confirmed",
       "slug": "btc-updown-15m-…",
-      "shares": 5.0,
-      "start_ts": 1789798500.0,
-      "end_ts": 1789799400.0,
+      "shares": 100.0,
+      "start_ts": 1790754300.0,
+      "end_ts": 1790755200.0,
       "up_token": "…",
       "dn_token": "…",
+      "before_up": 0.0,
+      "before_dn": 0.0,
       "transaction_id": "…",
       "relayer_state": "STATE_CONFIRMED",
+      "mint_attempts": 1,
       "sold_loser": true,
       "sold_leg": "up",
-      "sell_limit": 0.03,
+      "sold_loser_at": 1790755042.8,
+      "sell_filled": 50.0,
+      "sell_limit": 0.01,
+      "sell_scrap_held": 100.0,
+      "sell_scrap_fraction": 0.5,
+      "sell_scrap_target": 50.0,
+      "sell_scrap_keep": 50.0,
+      "sell_scrap_outcome": "target_filled",
       "sold_winner": false,
       "sold_dump": false,
-      "sell_loser_armed_at": 0.0,
-      "sell_winner_armed_at": 0.0,
-      "sell_dump_armed_at": null
+      "sell_dump_leg": null,
+      "sell_loser_armed_at": 1790755037.1,
+      "sell_winner_armed_at": null,
+      "sell_dump_armed_at": null,
+      "sell_scrap_rest_id": null,
+      "chain_reconcile_done": false
     }
   }
 }
 ```
 
-Statuses move roughly: `submitting` → `pending`/`executed`/`mined` → `confirmed_waiting_inventory` → `confirmed` → (sells) → `completed`, or `failed` on relayer failure.
+Statuses move roughly: `submitting` → `pending`/`executed`/`mined` → `confirmed_waiting_inventory` → `confirmed` → `completed` (flat after the end), or `failed` on relayer failure. There is no daily-notional key any more; the cap was removed.
+
+Saves are cheap and rare: `commit_state` compares a **digest** (`persist_digest` in `mint_loops.py`) against the last successful `atomic_save`. Cached bids (`last_up_bid`, …) and `updated_at` are ignored, and terminal intents contribute only id + status. A bid-only tick does not rewrite the file. A tick that mutated state and then raised is still saved next tick, because the compare is against the last write, not a per-tick snapshot (#217).
 
 <a id="part-iii"></a>
 # Part III — Walking mintbot.py
@@ -229,9 +269,15 @@ Statuses move roughly: `submitting` → `pending`/`executed`/`mined` → `confir
 <a id="section-9"></a>
 ## Startup, lock, strategy load
 
-`main()` installs signal handlers, acquires `.mintbot.lock`, loads `strategy_mint.json` merged over `DEFAULTS`, validates knobs, constructs market gateway + two chain readers, then starts **two threads**: `run_sell_cycle` and `run_mint_cycle`. Sell sleeps `poll_s` (live 5s), or `sell_armed_poll_s` (2s, allowed below the `poll_s >= 2` floor) while a bag is sell-hot (loser armed, or loser sold and dump/winner not done). Mint always sleeps `poll_s`. Armed poll does **not** replace persist math. Persist waits are shortened so typical ~4s tick/FAK lag is folded in: code defaults `sell_persist_s=5` / `sell_persist_last_min_s=2` (wall-clock ~9s / last-min ~5–6s). Shared intent writes take `STATE_LOCK`; book / FAK / Gamma / relayer / RPC stay outside that lock.
+`main()` installs signal handlers, acquires `.mintbot.lock`, loads `strategy_mint.json` merged over `DEFAULTS`, validates knobs, builds the market gateway and **two** `ChainReader`s (one per loop, one keep-alive session each), then starts three daemon threads: sell (`run_sell_cycle`), mint (`run_mint_cycle`) and the oracle tape.
 
-Incident `btc-updown-15m-1789905600`: after `loser_done`, next-window mint ran on the same thread and delayed the first dump look ~16s while UP cliffed 97→31. A skip-Gamma bandage (draft PR #193) is unnecessary once the loops are independent. Live bag `btc-updown-15m-1789880400`: sell ticks were ≈8.6–10.5s (`poll_s` plus manage_sells/reconcile/discover) on the old serial cycle; persist-ready FAK uses the same tick's book (no extra refetch).
+`load_strategy` copies only keys that exist in `DEFAULTS`; anything else in the live file (for example the leftover `sell_persist_skip_ttm_s`) is ignored. `validate_strategy` enforces `sell_floor ≤ sell_threshold < sell_opposite_min < sell_winner_min < 1`, `sell_floor ≤ sell_fak_px ≤ sell_threshold`, `0 < sell_scrap_fraction ≤ 1`, mint gas bounds, and `poll_s ≥ 2` on `main` (the VM is patched to `≥ 1`, [§32](#section-32)).
+
+Every tick of both loops re-reads the strategy file (`_reload_cfg`), so a knob edit takes effect within a second or two without a restart. If the reload fails validation, the loop logs `strategy_reload_fail` and keeps the **previous** config with `entry_enabled` forced false: sells continue, new mints stop.
+
+Sleep cadence: the sell loop sleeps `poll_s`, or `min(poll_s, sell_armed_poll_s)` while any bag is sell-hot (loser armed, or loser sold and dump/winner not done). Code defaults 5s / 2s; live **1s / 1s**. Mint always sleeps `poll_s`. Armed poll does **not** replace persist math. Shared intent writes take `STATE_LOCK`; book / FAK / Gamma / relayer / RPC stay outside that lock (`_io_unlocked`).
+
+Incident `btc-updown-15m-1789905600`: after `loser_done`, next-window mint ran on the same thread and delayed the first dump look ~16s while UP cliffed 97→31. A skip-Gamma bandage (draft PR #193) is unnecessary once the loops are independent.
 
 `dry_run=true` must not submit mints or live sells. Live VM has `dry_run=false`, `entry_enabled=true`, `sell_enabled=true`.
 
@@ -243,17 +289,17 @@ Sell and mint are independent jobs (`buy/mint_loops.py`). They share `positions_
 **Sell loop** (`run_sell_cycle`):
 
 1. `manage_sells` if `sell_enabled` — books, persist, FAK. Releases the state lock around book GET / inventory RPC / FAK POST.
-2. Heartbeat `hot` or `idle`. Sleep `cycle_sleep_s` (2s while sell-hot).
+2. Heartbeat `hot` or `idle`. Sleep `cycle_sleep_s`.
 
 **Mint loop** (`run_mint_cycle`):
 
-1. Reconcile open relayer intents / inventory (RPC outside the lock; skip confirmed inventory RPC while a bag is sell-hot to save RPC, not to unblock sell).
-2. Auto-fail stale `submitting` intents that still have no `transaction_id` after `mint_submitting_timeout_s`, then if any `submitting` remains → wait; if entry disabled → return.
-3. Discover series markets; filter eligible; skip `already_minted`; skip owned tokens.
-4. Pick earliest eligible; if `mint_slots_full(..., pick.start_ts)` → capped.
-5. Balance precheck (no lock); then claim `submitting` under the lock (`already_minted` + slots + same-slug claim); `submit_mint_batch`; record pending/failed.
+1. Auto-fail stale `submitting` intents that still have no `transaction_id` after `mint_submitting_timeout_s`.
+2. Reconcile open relayer intents / inventory (RPC outside the lock). `chain_reconcile_action` decides per bag: in-flight statuses always query; a live `confirmed` bag queries (skipped while a sell is hot, to save RPC); an **ended** `confirmed` bag is not queried until `end_ts + 180s`, gets one final read, then `chain_reconcile_done` stops further calls (#217).
+3. If any `submitting` remains → wait; if entry disabled → return.
+4. Discover series markets; filter eligible; `select_mint_candidate` skips `already_minted`, owned tokens, and backwards windows; `mint_slots_full` → capped.
+5. Prechecks (no lock), including the **pending-cash reserve** ([§14](#section-14)); then claim `submitting` under the lock; `submit_mint_batch`; record pending/failed.
 
-`sold_loser` still frees the `max_open_sets` slot. The mint loop can claim the adjacent window **while** the sell loop starts dump persist on the previous bag. Do not skip Gamma because a bag is hot.
+`sold_loser` still frees the `max_open_sets` slot, even when half the loser is kept. The mint loop can claim the adjacent window **while** the sell loop runs dump persist on the previous bag. Do not skip Gamma because a bag is hot.
 
 <a id="section-10c"></a>
 ## Chainlink TWAP tape (recording only)
@@ -262,9 +308,9 @@ Sell and mint are independent jobs (`buy/mint_loops.py`). They share `positions_
 
 The live value is Polymarket's public RTDS relay of Chainlink's BTC/USD **60s TWAP** (`wss://ws-live-data.polymarket.com`, topic `crypto_prices_twap_sixty`). Direct Chainlink Data Streams would need credentials this bot does not use. The window price-to-beat and the completed close are read from Polymarket's crypto-price endpoint with `variant=fifteen` (the 15m series). Rows land in `logs/oracle_twap.jsonl` with `ts`, slug, `condition_id`, window start/end, `source`, `twap`, optional `open_ref`, and `notes`.
 
-The thread wakes every second while a bag is open. Stored rows are 15s mid-window, 2s near the open and in the last three minutes, and 1s in the last minute and just after the end, so a cold gap cannot skip the open print or the last minute.
+The thread wakes every second while a bag is open. Stored rows are 15s mid-window, 2s near the open and in the last three minutes, and 1s in the last minute and just after the end, so a cold gap cannot skip the open print or the last minute. The file is append-only and nothing rotates it ([§32](#section-32)).
 
-`oracle_log_enabled` defaults true. When the feed is down the thread writes `oracle_log_fail` and keeps going. Mint eligibility, winner cash-out, and held dump do not read the tape. Loser scrap does not read it while `sell_late_window_s` is **0** (the code default). `sell_oracle_edge_floor_usd`, `sell_oracle_edge_per_ttm`, and `sell_oracle_stale_s` also default to **0**, so raising only the window does not restore the old $25 / 1.5×TTM / 5s-stale veto. `sell_oracle_edge_persist_s` stays **3**. The tape stays on for audit. Turn `oracle_log_enabled` off to stop the recorder.
+`oracle_log_enabled` defaults true (live true). When the feed is down the thread writes `oracle_log_fail` and keeps going. Mint eligibility, winner cash-out, and held dump do not read the tape. Loser scrap does not read it while `sell_late_window_s` is **0** (code default and live). `sell_oracle_edge_floor_usd`, `sell_oracle_edge_per_ttm`, and `sell_oracle_stale_s` also default to **0** (live 0), so raising only the window does not restore the old $25 / 1.5×TTM / 5s-stale veto. `sell_oracle_edge_persist_s` is **3** in code and **0** in the live file; it only matters when the window is positive. If the veto is ever turned back on, #214 keeps its edge-persist clock running on the kept scrap leg while the loser book is momentarily empty, instead of resetting it. The tape stays on for audit.
 
 <a id="section-10b"></a>
 ## Sync-loop audit (same class as mint stealing the dump cycle)
@@ -276,15 +322,17 @@ The thread wakes every second while a bag is open. Stored rows are 15s mid-windo
 | Shared sleep after `loser_done` (dump went cold, `poll_s=5`) | High | **Fixed** — sell stays hot through dump/winner exit |
 | Skip-mint-while-hot (draft PR #193) | Architecture reject | **Not used** — mint proceeds concurrently |
 | `notify()` sync 5s ntfy POST on the tick | Medium | **Fixed** — thread pool |
+| New TCP/TLS per HTTP call | Medium | **Fixed** (#217) — per-thread keep-alive sessions |
+| `atomic_save` + fsync on every dirty sell tick | Low | **Fixed** (#217) — digest compare, bid-only ticks skip the write |
+| Chain polls for ended bags every cycle | Low | **Fixed** (#217) — one final read at `end_ts + 180s` |
 | Multi-intent serial in `manage_sells` (N dump FAK then N+1 books) | Medium | Leftover — one intent's FAK can delay the other's look |
 | Sequential chain prechecks (5+ RPCs) | Low-Med | Leftover — mint-only latency |
 | Relayer submit/poll timeouts 15–20s | Low-Med | Leftover — mint-only; sell continues |
 | CLOB `update_balance_allowance` on every FAK | Low | Leftover — extra ~100ms on fire |
-| `atomic_save` fsync every dirty sell tick | Low | Leftover — disk sync |
 | Data API `positions` after Gamma | Low | Leftover — mint-only |
 | Sequential reconcile per pending intent | Low | Leftover — mint-only |
 | pathlog JSONL / Gamma I/O | n/a | Separate process; does not block mintbot |
-| Redeem vs sell | n/a | No automated redeem; sells stop at `end_ts` |
+| Redeem vs sell | n/a | No automated redeem in this repo; sells stop at `end_ts` |
 | Sequential UP/DN `/book` | Already fixed | Parallel `ThreadPoolExecutor` |
 
 <a id="section-11"></a>
@@ -300,9 +348,9 @@ The thread wakes every second while a bag is open. Stored rows are 15s mid-windo
 **The bot never mints a live (already open) window.** That is why missing the adjacent lookahead used to skip an entire quarter-hour: by the time the prior bag expired, the next market was already open and ineligible.
 
 <a id="section-12"></a>
-## Capacity: max_open_sets=1 and adjacent lookahead
+## Capacity: max_open_sets and adjacent lookahead
 
-`open_intent_count` counts intents in `ACTIVE_STATUSES` whose market has not been expired for >120s, **excluding** intents with `sold_loser` / `sold_leg`. Winner-only redeem holds must not consume the mint slot.
+`open_intent_count` counts intents in `ACTIVE_STATUSES` whose market has not been expired for >120s, **excluding** intents with `sold_loser` / `sold_leg`. Winner-only redeem holds, including a bag that kept half its loser, must not consume the mint slot.
 
 `mint_slots_full(state, cfg, now, candidate_start_ts)`:
 
@@ -310,7 +358,7 @@ The thread wakes every second while a bag is open. Stored rows are 15s mid-windo
 - Else allow **only** the adjacent next window: `soonest_full_end ≤ candidate_start < soonest_full_end + 900`.
 - If we already hold that next window, or the candidate is further out → full.
 
-Code default: `max_open_sets=1`. The 23 Sep 2026 live file is `2`. Holding 1:30–1:45 still permits minting 1:45–2:00 beforehand; it does **not** permit minting 2:00–2:15 while 1:30 is still a full bag. A nearer candidate that does not fit the cap is skipped in the same pass so that adjacent window is still selected.
+Code default: `max_open_sets=1`. Live: **2** (since 23 Sep 2026). With `1`, holding 1:30–1:45 still permits minting 1:45–2:00 beforehand; it does **not** permit minting 2:00–2:15 while 1:30 is still a full bag. A nearer candidate that does not fit the cap is skipped in the same pass so that adjacent window is still selected.
 
 <a id="section-13"></a>
 ## already_minted: failed remint after cooldown
@@ -335,7 +383,7 @@ What it is (and is not):
 - **Not** a declared Polymarket status-page outage (green while we saw it).
 - Often the **outer** Polygon tx into RelayHub **succeeds**, while the **inner** relayed call reverts (`RelayedCallFailed`) — so no CTF inventory lands.
 - In our cases it was **not** explained by low balance, market-not-ready, or duplicate submits (distinct tx hashes).
-- Confirmed cause (Sep 2026 traces): the inner CTF ERC-1155 transfer runs out of gas. `submit_mint_batch` omitted `gas_limit`, so `build_proxy_transaction_request` signed the library default `DEFAULT_GAS_LIMIT` of 500_000. Position-id derivation loops ~15k gas per iteration; markets at 7+ iterations exceed that stipend. Retrying the same market fails the same way because the iteration count is a function of `conditionId`. `py_builder_relayer_client.gas` documents a relay-hub budget of ~650k total. The mint path now estimates the factory call and signs `gas_limit` with a 15% margin, falling back to 650k and clamping to `min(mint_gas_cap, 650000)`.
+- Confirmed cause (Sep 2026 traces): the inner CTF ERC-1155 transfer runs out of gas. `submit_mint_batch` omitted `gas_limit`, so `build_proxy_transaction_request` signed the library default `DEFAULT_GAS_LIMIT` of 500_000. Position-id derivation loops ~15k gas per iteration; markets at 7+ iterations exceed that stipend. Retrying the same market fails the same way because the iteration count is a function of `conditionId`. `py_builder_relayer_client.gas` documents a relay-hub budget of ~650k total. The mint path now estimates the factory call and signs `gas_limit` with a 15% margin, falling back to 650k and clamping to `min(mint_gas_cap, 650000)` (#221).
 
 Trial shape (order of magnitude, not a SLA claim):
 
@@ -343,22 +391,52 @@ Trial shape (order of magnitude, not a SLA claim):
 - Overall mint confirm rate ~**74%** (85/115); this typed fail ~**17%** of attempts in that window.
 - Bot response: mark `failed`, persist `errorMsg`, wait `mint_fail_cooldown_s` (30s), remint up to `mint_max_attempts` (3), then skip that condition for the rest of its life. While it is cooling or exhausted, the same cycle mints the next eligible future instead of idling. `enter_max_ttm_min=45` keeps that next window visible after a bag booked about 30m out.
 
-Operational stance: the reproducible fix is the explicit mint `gas_limit` above. Sister top-up stays on the library default; a single pUSD transfer is far under 500k. Do not estimate gas on the sell loop.
+Operational stance: the reproducible fix is the explicit mint `gas_limit` above. Sister top-up stays on the library default; a single pUSD transfer is far under 500k. Do not estimate gas on the sell loop. The live JSON sets no `mint_gas_*` key, so code defaults apply.
 
 <a id="section-14"></a>
-## Relayer submit: approve + split as one PROXY batch
+## Mint, line by line: precheck, reserve, claim, submit
 
-`submit_mint_batch`:
+This is the money path from "a candidate was picked" to "an intent is `pending`". Excerpts are trimmed from `run_mint_cycle`.
 
-1. Load `PRIVATE_KEY` / `FUNDER_ADDRESS`.
-2. Fetch relay payload (nonce + relay address) for PROXY type.
-3. Encode proxy calls (approve/allowance as needed + split).
-4. `eth_estimateGas` that calldata from the signer to the proxy factory (mint submit only). Sign `gas_limit` = estimate × (1 + `mint_gas_margin`), or `mint_gas_fallback` if estimation fails, clamped to `min(mint_gas_cap, 650000)`.
-5. Build signed proxy request; require derived `proxyWallet` == funder.
-6. POST `/submit` with relayer auth headers.
-7. Return `transactionID` or error string. `mint_submitted` / `mint_submit_fail` include `gas_limit` and `gas_estimate`.
+**1. Prechecks, no lock held.**
 
-On success the intent is stored with tokens, shares, `start_ts`/`end_ts`, and `transaction_id`.
+```python
+if not chain.has_contract(str(cfg["pUSD_address"])): return "no_pusd_contract"
+if not chain.has_contract(str(cfg["standard_adapter_address"])): return "no_adapter"
+if chain.outcome_slot_count(str(cfg["ctf_address"]), pick.condition_id) != 2:
+    return "not_binary"
+balance = chain.pUSD_balance(str(cfg["pUSD_address"]), funder_cs)
+```
+
+Four eth_calls. They run without `STATE_LOCK`, so a slow RPC cannot stall the sell loop.
+
+**2. Reserve cash already promised to in-flight mints (#212).**
+
+```python
+with STATE_LOCK:
+    reserved = pending_mint_reserve(state)          # sum of shares for submitting/pending/executed/mined/confirmed_waiting_inventory
+block = mint_cash_block(balance, shares, reserved)  # None when balance - reserved >= shares
+```
+
+The on-chain pUSD balance still shows cash that a submitted split has not consumed yet. With `max_open_sets=2` and 100-share bags, two mints can be in flight within seconds of each other. Without the reserve, both see $150 and both submit $100; one fails on-chain. `mint_cash_block` returns `reason="pending_reserve"` (log `mint_skip_pending_reserve`, heartbeat `pending_reserve`) when the shortfall is only the reservation, or `no_balance` when the wallet is simply short. A confirm, failure or stale-submit timeout drops the intent out of the reserved set.
+
+**3. Existing inventory guard.** `before_up` / `before_dn` are read from chain; any balance above `position_tolerance` returns `existing_position`. Those two numbers are also stored on the intent: reconcile later confirms `observed ≥ before + shares`.
+
+**4. Calldata.** `build_atomic_mint_calls(pUSD_address=…, adapter_address=…, condition_id=…, shares=100.0)` returns two frozen `ContractCall`s: `approve(adapter, 100_000_000)` and `splitPosition(pUSD, 0x0, conditionId, [1, 2], 100_000_000)`. `100.0 × 1_000_000` is checked to be an exact integer ([§6](#section-6) aside).
+
+**5. Claim under the lock.** A fresh intent dict with `status="submitting"`, `mint_attempts = prev + 1`, `transaction_id=None` goes through `_claim_mint_intent`: re-check `already_minted`, re-check `mint_slots_full`, then `IntentStore.try_claim_condition`. The re-checks matter because the lock was released during prechecks. `atomic_save` persists the claim **before** any network submit, so a crash mid-submit leaves a `submitting` ghost that the 90s timeout later fails.
+
+**6. Submit.** `submit_mint_batch(calls, metadata=…, rpc=chain._rpc, gas_margin=…, gas_fallback=…, gas_cap=…)`:
+
+1. Load `PRIVATE_KEY` / `FUNDER_ADDRESS`; refuse a relayer key address that does not match the signer.
+2. `GET /relay-payload?type=PROXY` → nonce + relay address.
+3. Encode the proxy calls.
+4. `choose_mint_relay_gas`: one `eth_estimateGas` (signer → proxy factory). `plan_mint_gas` returns a frozen `MintGasPlan`: `ceil(estimate × 1.15)`, or `mint_gas_fallback` (650k) if the estimate failed, clamped to `min(mint_gas_cap, 650_000)`. `plan.relay_arg()` is the decimal string the relayer library wants; `plan.as_log()` is the log payload.
+5. Build and sign the proxy request with `gas_limit=plan.relay_arg()`; require derived `proxyWallet == FUNDER_ADDRESS`.
+6. `POST /submit` with relayer auth headers.
+7. Return `(transactionID or None, error or None, gas_log)`.
+
+**7. Record.** Success: `transaction_id`, `submitted_at`, `status="pending"`, save, log `mint_submitted` with `gas_limit`, `gas_estimate`, `gas_clamped`, `gas_source`. Failure: `mark_intent_failed` (sets `last_fail_ts`, `errorMsg`), save, log `mint_submit_fail` with the same gas fields, ntfy high priority.
 
 <a id="section-15"></a>
 ## Reconcile: relayer state → inventory confirm
@@ -366,117 +444,212 @@ On success the intent is stored with tokens, shares, `start_ts`/`end_ts`, and `t
 While status is submitting/pending/executed/mined, poll relayer:
 
 - `STATE_FAILED` / `STATE_INVALID` → `failed` (persist `errorMsg` and tx hash; set `last_fail_ts`)
-- `STATE_CONFIRMED` → `confirmed_waiting_inventory` (naming may vary slightly in logs)
+- `STATE_CONFIRMED` → `confirmed_waiting_inventory`
 - mined/executed intermediate states update accordingly
 
-Then eth_call CTF balances. When Up and Down each reach `before + shares` within tolerance → `confirmed` and notify. If the market ended and balances are flat, mark `completed`.
+Then eth_call CTF balances (subject to `chain_reconcile_action`, [§10](#section-10)). When Up and Down each reach `before + shares` within tolerance → `confirmed`, log `mint_confirmed`, notify. More than 120s after the end, a read that finds both legs flat marks `completed`. For ended `confirmed` bags that read happens once, at `end_ts + 180s`.
 
 <a id="section-16"></a>
 ## Sell path overview
 
-`manage_sells` runs only for intents still inside their window (`now ≤ end_ts`) and in confirmed-like statuses. For each intent it fetches sized Up/Down bids, then evaluates three exits in order:
+`manage_sells` runs only for intents in `confirmed`, `confirmed_waiting_inventory`, `mined` or `executed`, and only while `sell_window_open` (strictly before `end_ts`). For each intent it fetches sized Up/Down bids in parallel, caches them, then evaluates three exits **in this order**:
 
-1. **Winner cash-out** (rich bid path)
-2. **Held-leg dump** (only after loser sold; poor bid path)
-3. **Loser dump** (cheap bid + rich opposite)
+1. **Winner cash-out** (rich bid path, [§18](#section-18))
+2. **Held-leg dump** (only after loser sold; weak bid path, [§19](#section-19))
+3. **Loser scrap** (cheap bid + rich opposite, [§17](#section-17) / [§17b](#section-17b))
 
-A cooldown (`sell_cooldown_s`, live 3s) gates attempts after any sell try.
+`sell_cooldown_s` (3s code and live) suppresses the next FAK after any attempt on that bag.
+
+The first tick after the window closes does three things for that bag: cancel a live scrap rest (`window_end`), emit `sell_scrap_outcome window_end` if a partial plan never finished, and emit one **`bag_risk`** line. `bag_risk` is log-only (#222). It carries the scrapped leg, `ttm_at_scrap`, scrap average price, loser best-bid size at scrap, the held leg's minimum bid (and when), seconds the held bid spent below 0.80 / 0.65 / 0.50, the time-weighted mean `1 − held_bid` after scrap, and dump TTM / price if a dump fired. Its `partial` field means "this process first saw the bag already scrapped" (a restart mid-bag), **not** a partial scrap. The counters live in memory; a failure there is swallowed and never touches orders.
 
 <a id="section-17"></a>
-## Loser scrap: arm and print at 2¢
+## Loser scrap: arm, persist, time gate, floor sweep
 
-Policy (`classify_loser`):
+Values below are **code default / live**.
 
-- Sized loser bid ≤ `sell_threshold` (code default **0.02**). That number arms the hunt. The print is the same 2¢.
-- Sized opposite bid ≥ `sell_opposite_min` (0.90)
-- Not both cheap (ambiguous)
-- Persist that condition for `sell_persist_s` (code default **5s**) via `loser_scrap_persist_s`. In the last `sell_persist_last_min_window_s` (60s) before `end_ts`, use `sell_persist_last_min_s` (code default **2s**). Effective persist is re-evaluated each tick; an arm started on the longer clock is not reset when the shorter clock begins.
-- The last-minute clock (`sell_persist_last_min_s`, 2s) applies for the whole `sell_persist_last_min_window_s` (60s), through market close. There is no late TTM skip. `sell_persist_skip_when_sized` defaults **false**, so displayed depth does not skip. A leftover `sell_persist_skip_ttm_s` in live JSON is ignored (`load_strategy` copies only keys still in `DEFAULTS`). Sized skip does not consult the oracle.
-- `sell_scrap_max_ttm_s` (code default **0**, example **600**) blocks arm, persist, and every loser-scrap fire while seconds-to-close is above the cutoff. Unknown ttm leaves the gate open. A cheap bid from before the cutoff still waits the full persist (5s, or 2s inside the last minute) after the gate opens. Sweep, blind FAK, and a new post-miss rest are included. The held dump keeps `sell_dump_max_ttm_s`. While gated and a leg bid is at or under `sell_threshold`, log `sell_scrap_time_gated` at most once per 15s per condition/leg. A missing key is the same as 0.
-- At fire, `sell_fire_decision` re-checks the path is still in range (loser ≤ threshold and opposite ≥ min; dump still `< sell_dump_below`; winner still ≥ effective min). Out of range logs `sell_cancel_out_of_range` and does **not** POST; empty loser book keeps `armed_ts`, a visible bid that left range resets the arm.
-- With `sell_scrap_sweep_enabled` (default **true**), one fire is a single FAK at `sell_floor` for the full remaining loser size. It is not clipped to top-rung depth. A sell FAK at the floor matches best bids first. After it returns, the held balance is refreshed; a remainder waits for the next fire. `sell_book_depth` is logged once for that fire (`limit` = floor, `our_size` = full remainder). The fill size and average price are logged as `sell_scrap_sweep`. Setting the flag false restores the 1¢ ladder from `sell_fak_px` down to `sell_floor`, clipped by `loser_partial_fak_shares` when displayed depth is short but present. The flag is hot-reloaded with the rest of `strategy_mint.json`.
-- After a FAK miss (`no orders found`) while still armed, rest a GTD/GTC sell. The ceiling is `sell_scrap_rest_px` (**0.02**, the print). The posted price is `min(sell_scrap_rest_px, live or last-seen loser bid)` so a 1¢ book can still be hit. GTD only when expiration is at least `sell_scrap_rest_min_ahead_s` (**180s**, Polymarket's floor) ahead; inside that, rest GTC. Cancel on fill, window end, loser no longer qualifies, or a hard late-window oracle block when that veto is on. An empty book does not cancel a rest whose edge is still ok. `validate_strategy` only requires the rest price to be positive; the configured ceiling stays at the print so it stays inside `sell_floor` ≤ `sell_fak_px` ≤ `sell_threshold`.
-- On `empty_keep_arm` / `empty_fak_keep_arm`, fire a blind FAK at `sell_scrap_blind_px` (0.01) no more often than `sell_scrap_blind_backoff_s` (3s). A live rest suppresses it.
-- **Late-window oracle veto is off.** `sell_late_window_s` is **0**. `sell_oracle_edge_floor_usd`, `sell_oracle_edge_per_ttm`, and `sell_oracle_stale_s` are **0**. `sell_oracle_edge_persist_s` stays **3**. Zero window skips the block: `manage_sells` only enters it when the window is positive and TTM is inside it. The zero floor / slope / stale knobs are what shipped so a later window edit does not bring back the old $25 / 1.5×TTM / 5s-stale rule. The helper still implements that rule when those arguments are passed explicitly. With these defaults, CLOB gates only. `oracle_log_enabled` stays on.
+**Arm (`classify_loser`).** One leg's sized bid ≤ `sell_threshold` (0.02 / **0.03**) and the other leg's sized bid ≥ `sell_opposite_min` (0.90 / 0.90). Both cheap → `both_cheap`, no arm. Cheap leg with a weak or missing opposite → `wick_unconfirmed`, no arm.
 
-On full fill: set `sold_loser=true`, `sold_leg="up"|"dn"`, store `sell_limit` (fill/limit evidence). Inventory latch distinguishes “await mint settlement” zeros from true flat. Wallet A never posts a bid.
+**Time gate (#222).** `sell_scrap_max_ttm_s` (0 / **360**; example 600). While seconds-to-close is above the cutoff, `scrap_time_gate_open` is false and the arm, the persist clock, and every scrap fire (sweep, blind, new rest) are blocked. A cheap leg seen while gated logs `sell_scrap_time_gated` (`condition_id`, `slug`, `leg`, `bid`, `ttm`, `cutoff`) at most once per 15s per condition/leg. Unknown TTM (no `end_ts`) leaves the gate **open**, the opposite of the dump gate. Because the arm itself is blocked, persist starts only once TTM ≤ cutoff: a bid that was cheap at T−8m still waits the full persist after T−6m. Live, no loser is sold before the last six minutes.
 
-Live `strategy_mint.json` still overrides any key it already contains. On the 19 Sep snapshot those include `sell_threshold` 0.03 and persist 5 / 2. New keys that file does not list take the code defaults above only after the operator pulls this code and restarts `polymintbot`. The live table in [§29](#section-29) is that snapshot.
+**Persist.** `loser_scrap_persist_s`: `sell_persist_s` (5 / 5) normally, `sell_persist_last_min_s` (2 / 2) when `0 < TTM ≤ sell_persist_last_min_window_s` (60 / 60). That 2s clock applies right through close; the old late-TTM skip is gone (#218) and a leftover `sell_persist_skip_ttm_s` in the live file is ignored. `sell_persist_skip_when_sized` (false / false) would skip persist when depth at the first rung covers the order; it is off, so a sized book waits too. The effective value is recomputed each tick, so an arm started on the 5s clock can fire on the 2s clock without resetting `sell_loser_armed_at`.
+
+**Empty book keeps the arm.** `loser_persist_ready` wraps `persist_ready`. If the loser book vanishes after arm (opposite still ≥ min or also empty), or the last FAK came back `no orders found`, the arm survives as `empty_keep_arm` / `empty_fak_keep_arm` instead of resetting.
+
+**Fire (only when `why_l` is `ready`/`immediate`, gate open, not cooling, not already sold, no live rest).**
+
+```python
+fire_action, fire_reason = sell_fire_decision(
+    "loser", bid=bids.get(loser), opposite_bid=bids.get(opp_leg),
+    threshold=thr, floor=floor, opposite_min=opp_min,
+)
+```
+
+Persist-ready is not enough; the book is re-checked on the same tick's snapshot. Out of range logs `sell_cancel_out_of_range` and does not POST (empty loser book keeps the arm; a visible bid that left range resets it). In range:
+
+```python
+size, latch = _sell_inventory(chain, ctf, funder_cs, l_tok, shares, tol,
+                              "seen_loser_inventory", intent)
+```
+
+`_sell_inventory` reads the on-chain balance (lock released) and returns `(min(shares, balance), latch)`. `inventory_latch` distinguishes `await_inventory` (zero before any inventory was ever seen: the split may still be settling, so skip) from `already_flat` (zero after inventory was seen: finish without a POST) from `has_inventory`. Then the size is clipped by the partial plan ([§17b](#section-17b)) and `_fire_loser_scrap` posts.
+
+**The order: one floor sweep (#216).** `sell_scrap_sweep_enabled` (true / true: the live file does not set it). `loser_scrap_post(sweep=True, …)` returns `{"mode": "sweep", "limits": [sell_floor], "size": remaining}`: one FAK at `sell_floor` (0.02 / **0.01**) for the whole remaining scrap size, not clipped to top-of-book depth. Because a sell FAK matches the best bids first, the live 1¢ sweep takes the 3¢ level, then 2¢, then 1¢ in one round trip. That is how the live "3¢ → 2¢ → 1¢" scrap happens: it is one order, not three. The fill is logged as `sell_scrap_sweep` (`limit`, `size`, `avg_px` from `takingAmount / size`, `offered`, `status`), preceded by one `sell_book_depth` line for the fire. After the POST the balance is re-read; a remainder waits for the next fire. With the flag false, `loser_ladder_limits` walks every 1¢ from `min(sell_fak_px, live bid)` down to the floor (#215), each rung clipped to displayed top-rung depth (`loser_partial_fak_shares`); live that would be 3¢, 2¢, 1¢ as separate FAKs. The flag is read every tick.
+
+**Done.** `done = dry_run or balance_flat or sold_total >= post_size - tol`. On done, `_finish_scrap` sets `sold_loser=True`, `sold_leg`, `sold_loser_at` once, resets the oracle arm, and (if a plan exists) logs `sell_scrap_outcome`. `sell_filled` accumulates shares. `sell_limit` stores the **last limit posted** (the floor, under sweep), not the average fill; the average is only in `sell_scrap_sweep.avg_px` and `bag_risk`. Then `sell_loser_done` and ntfy.
+
+**Misses.**
+
+- Blind FAK: on `empty_keep_arm` / `empty_fak_keep_arm`, `loser_blind_fak_due` fires a FAK at `sell_scrap_blind_px` (0.01 / 0.01 default) no more often than `sell_scrap_blind_backoff_s` (3s), if inventory is present and no rest is live. Logs `sell_scrap_blind`. Same time gate and same partial size clip.
+- Post-miss rest: after a FAK returns `no orders found` while still armed, `_place_scrap_rest` posts a resting SELL at `scrap_rest_px(sell_scrap_rest_px, live or last-seen loser bid)` = the lower of the two, GTD when expiry is ≥ `sell_scrap_rest_min_ahead_s` (180s) ahead, else GTC (`resting_tif`). It is cancelled on fill, window end, loser no longer qualifying, or a hard oracle block when that veto is on. An empty book alone does not pull it. **Live has `sell_scrap_rest_enabled=false`**, so no rest is ever placed; code default is true (rest px 0.02 code / 0.01 live).
+
+**Late-window oracle veto: off.** `sell_late_window_s` is 0 in code and live, so `in_late` is always false and `late_oracle_scrap_ok` would return `outside_late_window`. The floor / per-TTM / stale knobs are 0 as well, so re-enabling only the window does not bring back the old $25 / 1.5×TTM / 5s-stale rule. The helper still implements that rule when the arguments are passed explicitly. With these values, CLOB gates only.
+
+Wallet A never posts a bid.
+
+<a id="section-17b"></a>
+## Partial loser scrap: sell_scrap_fraction
+
+`sell_scrap_fraction` (1.0 / **0.5**), #223. At 1.0 nothing below applies and the whole loser is scrapped, same posts as before. Below 1.0 the bag scraps a locked share count and keeps the rest to resolution.
+
+**Plan lock at the first fire.**
+
+```python
+def scrap_share_plan(held, fraction):
+    if frac >= 1.0 - 1e-12:
+        return held_f, 0.0
+    target = float(math.floor(held_f * frac + 1e-9))   # whole shares
+    return target, held_f - target
+```
+
+`_scrap_post_shares` calls `_lock_scrap_plan` the first time a scrap would post (sweep, ladder, blind, or rest). `held` is the on-chain loser balance from `_sell_inventory` at that moment (100 live). The lock writes `sell_scrap_target` (50), `sell_scrap_keep` (50), `sell_scrap_held` (100), `sell_scrap_fraction` (0.5) onto the intent and logs **`sell_scrap_plan`** once. Later fires reuse the stored numbers even if the fraction knob changes mid-bag.
+
+**Order size on every fire.**
+
+```python
+def scrap_order_shares(*, target, keep, filled, inventory):
+    remaining = max(0.0, target - filled)
+    room = max(0.0, inventory - keep)
+    return min(remaining, room)
+```
+
+Two caps: never more than what is left of the target, and never so much that the balance would dip into the keep. `filled` is `sell_filled`, updated by sweep, ladder, blind and rest fills.
+
+**When the scrap counts as done.** `scrap_target_met` returns true when `filled ≥ target − tol` (`target_filled`) or a known balance is ≤ `keep + tol` (`balance_at_keep`, or `flat` when keep is 0). If a fire computes an order size under 0.01, the bag is finished without a POST using that reason. Either way `_finish_scrap` sets `sold_loser` / `sold_leg` exactly as a full scrap does, so the mint slot frees and the held dump becomes eligible.
+
+**Outcome line.** `_log_scrap_outcome` writes **`sell_scrap_outcome`** once per bag that has a plan: `held`, `fraction`, `target`, `keep`, `filled`, `outcome` ∈ `target_filled`, `balance_at_keep`, `flat`, `rest_filled`, `dry_run`, or `window_end` (the window closed before the target filled). The live log on 30 Sep shows the expected triple each bag: `sell_scrap_plan` (100 → 50/50), `sell_scrap_sweep` (limit 0.01, size 50, avg 0.02–0.03, `matched`), `sell_scrap_outcome target_filled`.
+
+**What happens to the kept shares.** Nothing sells them on the scrap, blind, rest or dump paths. The held dump sells only the *other* leg. The winner path can sell them only if that leg's sized bid reaches the base `sell_winner_min` (0.999 / **0.9995**); the cheap 0.99 winner gate never applies to them. `kept_leg_below_winner_min` enforces that and logs **`sell_keep_winner_blocked`** once per bag. Even at the base minimum, the winner FAK size on the kept leg is capped at `sell_scrap_keep`. In practice the kept 50 sit to resolution: $0 if the favourite wins, $50 if the scrapped leg flips and wins. This repo does not redeem them.
 
 <a id="section-18"></a>
-## Winner cash-out: prefer 0.999 / redeem; 0.99 only after cheap loser
+## Winner cash-out: held for redeem in practice
 
-Default `sell_winner_min=0.999`. Unconditional 0.99 cash-out was rejected: it cuts margin versus redeeming at $1.
+`sell_winner_min` is 0.999 in code and **0.9995** live. Unconditional 0.99 cash-out was rejected: it cuts margin versus redeeming at $1.
 
-**Cheap-loser gate:** if `sold_loser` and recorded loser price ≤ `sell_winner_cheap_if_loser_le` (0.03) **and** `loser_fill + sell_winner_min_cheap > 1.0`, then `effective_winner_min = min(0.999, sell_winner_min_cheap=0.99)`. Flat 1¢+99¢ stays at 0.999 and waits for redeem.
+**Cheap-loser gate.** If `sold_loser`, the recorded `sell_limit` ≤ `sell_winner_cheap_if_loser_le` (0.03 code) **and** `sell_limit + sell_winner_min_cheap > 1.0`, then `effective_winner_min = min(winner_min, sell_winner_min_cheap)`. Live sets `sell_winner_cheap_if_loser_le = -1.0` (and `sell_winner_min_cheap = 0.999`), so `winner_cheap_decision` always returns `loser_above_cheap_gate`: the cheap path is off. Note that under the sweep `sell_limit` is the floor, not the average fill ([§17](#section-17)); the gate compares the floor.
 
-When the sized winner bid meets `effective_winner_min` for `sell_persist_s`, **live-bid FAK** the winner after the same in-range re-check, then clamp `limit = min(live_sized_bid, sell_clob_max_price=0.99)` (and floor `sell_clob_min_price=0.01`). A 0.99 sell FAK still fills resting 0.995–0.999 bids. Log `sell_winner_limit_clamped` when live > posted (`reason=clob_max`). Mark `sold_winner`.
+**Fire.** `winner_cashout_leg` picks the unique leg whose sized bid is ≥ `effective_winner_min`. If that leg is the kept loser leg, the kept-leg block above applies. The same `persist_ready` clock (`sell_persist_s`) must hold, then `sell_fire_decision("winner")` re-checks. `_sell_inventory` gives the size (capped at `sell_scrap_keep` on the kept leg). The limit is the live bid clamped into the CLOB range:
 
-If the book never reaches 0.999 and the cheap gate is closed, the bot holds for redeem after expiry (sells stop at `end_ts`).
+```python
+posted, clamped, why = winner_sell_limit(live_px, clob_max=0.99, clob_min=0.01)
+```
+
+A 0.99 sell FAK still fills resting 0.995–0.999 bids; `sell_winner_limit_clamped` is logged when live > posted. Full fill sets `sold_winner`.
+
+**Live reality.** Books near resolution quote on a 0.001 tick, so the highest possible sized bid is 0.999, which is under 0.9995. With the cheap gate closed, the winner path does not fire and the winner is held. After `end_ts` the sell loop stops. The operator observes the winning leg's pUSD back in wallet A about **68s after the window ends**. Nothing in this repo submits that redeem ([§37](#section-37)).
 
 <a id="section-19"></a>
-## Held-leg dump: under 80¢ for 2s after loser sold
+## Held-leg dump: under sell_dump_below (80¢ code, 40¢ live)
 
-This is the sell-side pass added 19 Sep 2026. It is **not** a hedge.
+A sell-side circuit breaker added 19 Sep 2026. It is **not** a hedge.
 
-Preconditions (all required):
+Preconditions (all required), code default / live:
 
-- `sell_dump_enabled` (live true)
-- `sold_loser` (or truthy `sold_leg`)
+- `sell_dump_enabled` (true / true)
+- `sold_loser` (or truthy `sold_leg`); a partial scrap counts once its target is met
 - not already `sold_dump` / `sold_winner`
-- `sold_leg` is `"up"` or `"dn"` so the held leg is well-defined
-- sized held bid is not `None` and `< sell_dump_below` (0.80)
-- that condition persists `sell_dump_persist_s` (2.0 wait; lag-folded from 5s)
-- when `sell_dump_max_ttm_s` > 0, seconds-to-close is also ≤ that cutoff (example 240; code default 0 leaves the gate off). Above the cutoff the dump does not start `sell_dump_armed_at`, and a persist that already started is cleared, so the full `sell_dump_persist_s` must elapse again once inside the window. A missing key is the same as 0. Follow-up ladder rungs after orders are submitted are not blocked. A blocked arm logs `sell_dump_time_gated` (`condition_id`, `slug`, `leg`, `bid`, `ttm`, `cutoff`) at most once per bag per 15s.
-- at fire, still `< sell_dump_below` or cancel (`sell_cancel_out_of_range`)
+- `sold_leg` is `"up"` or `"dn"`, so the held leg is the other one
+- sized held bid is not `None` and `< sell_dump_below` (0.80 / **0.40**)
+- `dump_time_gate_open(ttm, sell_dump_max_ttm_s)` (0 / **240**; example 240; #220). With a positive cutoff, the dump arms and fires only when seconds-to-close ≤ cutoff. Above it, `sell_dump_armed_at` is not started and an in-progress persist is cleared, so the full persist must elapse again inside the window. Unknown TTM counts as **closed** here. A blocked arm logs `sell_dump_time_gated` at most once per bag per 15s.
+- the condition persists `sell_dump_persist_s` (2 / 2)
+- at fire, `sell_fire_decision("dump")` still sees bid `< sell_dump_below`, else `sell_cancel_out_of_range`
 - not in sell cooldown
 
-Action:
+Live, that reads: in the last four minutes, if the leg we still hold 100 of has a sized bid under 40¢ for 2s, sell all 100.
 
-1. First shot is unchanged: one **live-bid FAK** at fire time.
-2. If that first shot returns **no-match / kill with zero fill**, the bot immediately re-checks the held-leg book and fast re-fires in the same sell tick (bounded retries), using a short descending ladder from the fresh top bid toward `sell_floor`.
-3. Stop fast retries if the re-check book is empty, a retry status is non-retryable, or retry count is exhausted.
+Action (`_run_dump_fak_with_refire`):
 
-Defaults: `sell_dump_fak_retries=2`, `sell_dump_ladder_step=0.04`, `sell_dump_ladder_rungs=4`.
-These are **dump-only**; loser and winner paths keep their current logic.
+1. `_sell_inventory` on the held token → size (100). `already_flat` sets `sold_dump` / `sold_winner` with note `already_flat` and no `sell_dump_leg`.
+2. First shot: one **live-bid FAK** at the fire-time sized bid.
+3. If that returns zero fill with `no orders found` or a kill/cancel status (`dump_fast_retry_eligible`), re-fetch the held book and fire `dump_retry_ladder_limits(fresh_bid, floor=sell_floor, step=0.04, max_rungs=4)` — for example 0.31, 0.27, 0.23, 0.19 — up to `sell_dump_fak_retries` (2) times in the same tick. Stop on an empty book (`sell_dump_fast_refire_stop reason=empty_book`), a non-retryable status, or exhausted retries. These refires are not re-checked against the TTM gate.
+4. Full fill (or dry run): `sold_dump=True`, `sold_winner=True`, `sell_dump_leg = held`, `sold_dump_at`, `sell_dump_filled`, `sell_dump_limit = last limit`; log `sell_dump_done` (with `hedge_leg`), ntfy.
 
-**Scope:** only the remaining leg after a loser fill. Full sets with neither leg sold never arm dump. After `end_ts`, manage_sells skips the intent (same as other sells). A sister miss does not dump the held leg. A completed dump (dry-run or full fill) sets `sell_dump_leg` to the leg that was sold so wallet B can buy the other leg. `already_flat` sets `sold_dump` without `sell_dump_leg`.
+**Scope:** only the held leg after a loser fill. The kept part of a partial scrap is **not** dumped. Full sets with neither leg sold never arm the dump. After `end_ts`, `manage_sells` skips the intent. A sister miss does not dump the held leg. `sell_dump_leg` exists so wallet B could buy the other leg; B is disabled live.
 
 <a id="section-20"></a>
-## Live-bid FAK vs fixed-limit FAK
+## Live-bid FAK vs floor FAK
 
 | Path | Limit choice | Why |
 |---|---|---|
-| Loser | Arm ≤ 0.02. Default sweep is one FAK at `sell_floor` for the full remainder (not clipped). Flag off walks every 1¢ from `sell_fak_px` down to the floor, clipped to top-rung depth. Rest after a miss at `min(sell_scrap_rest_px, live or last-seen bid)`. Blind empty FAK at 0.01 | A floor FAK still takes 3¢/2¢ bids first, in one round trip. The flag hot-reloads. A thinner book, including the post-miss rest, posts the live bid. GTD only when expiry is ≥ ~180s ahead. |
-| Winner (allowed) | `min(live sized bid, 0.99)` | Resting books quote 0.995–0.999; posting those limits is rejected (`max: 0.99`). A 0.99 FAK still fills the rich book. |
-| Held dump | Current sized bid | Same rejection class; dump fires precisely when bid is *weak* |
+| Loser | One FAK at `sell_floor` (0.02 code / 0.01 live) for the scrap remainder. Flag off: 1¢ ladder from `sell_fak_px` to the floor, clipped to top-rung depth. Blind FAK at 0.01. Post-miss rest at `min(sell_scrap_rest_px, live or last-seen bid)` (rest off live) | A floor FAK still takes 3¢ then 2¢ bids first, in one round trip, without clipping to top-of-book depth |
+| Winner (allowed) | `min(live sized bid, 0.99)` | Resting books quote 0.995–0.999; posting those limits is rejected (`max: 0.99`). A 0.99 FAK still fills the rich book |
+| Held dump | Current sized bid, then a 4¢-step retry ladder toward the floor on a zero-fill miss | Same rejection class; dump fires precisely when bid is *weak* and moving |
 
 Observed failure modes: (1) winner armed at bid 0.99 but FAK posted 0.999 → `invalid price … max: 0.99`. (2) bag `btc-updown-15m-1789810200`: cheap gate open, Down sized 0.995–0.999, live-bid FAK without clamp → 12× same rejection, winner never sold.
 
 <a id="section-21"></a>
-## Hypothetical lifecycle: $5 mint, loser @2¢, redeem winner
+## Hypothetical lifecycle: 100-share bag, scrap 50 @ ~3¢, winner redeems
 
-1. T−12m: mint 5/5 for next window; intent `confirmed`.
-2. Mid-window: Up sized bid 0.02, Down 0.97 for 5s → FAK sell Up @2¢; `sold_leg=up`, `sold_loser=true`, `sell_limit≈0.02`.
-3. Down never reaches 0.999; cheap gate would allow 0.99 but bid stalls at 0.97 → no winner cash-out.
-4. Held dump requires bid `<0.80`; 0.97 does not qualify.
-5. After end: sell loop stops; redeem Down for ~$5. Gross ≈ $5 + loser proceeds − fees.
+Live knobs throughout. Fees ignored.
+
+1. **T−30m.** The window is not yet open and within 45m. Prechecks pass; reserve is fine. Mint 100 Up + 100 Down: **−$100.00**. Relayer confirms, reconcile sees 100/100 → `confirmed`.
+2. **Window opens.** Up drifts down. At T−8m Up's sized bid is 0.03 and Down's 0.96. Up is a loser by price, but TTM 480 > 360: no arm, `sell_scrap_time_gated` every 15s.
+3. **T−6m (TTM 360).** The gate opens. `classify_loser` → `up`. `sell_loser_armed_at = now`, `sell_loser_persist why=armed`.
+4. **5s later**, still 0.03 / 0.96 → `ready`. `sell_fire_decision` → `fire`. `_sell_inventory` → 100 held, `has_inventory`.
+5. **Plan lock.** `scrap_share_plan(100, 0.5)` → target 50, keep 50. `sell_scrap_plan` logged. `scrap_order_shares(target=50, keep=50, filled=0, inventory=100)` → 50.
+6. **Sweep.** One FAK SELL 50 Up @ limit 0.01. Bids at 3¢ absorb it: `sell_scrap_sweep size=50 avg_px=0.03`: **+$1.50**. `sell_filled=50`, `sell_limit=0.01`, done → `sold_loser`, `sold_leg="up"`, `sell_scrap_outcome target_filled`, `sell_loser_done`. The mint slot frees.
+7. **Rest of the window.** Down (held 100) stays 0.95–0.99. The dump needs < 0.40 inside the last 240s: never. Winner needs ≥ 0.9995: never. Kept Up 50 is blocked from any sale.
+8. **`end_ts`.** Sell window closes. `bag_risk` logs `scrap_avg_px 0.03`, `min_held_bid ≈ 0.95`, all `sec_below_*` 0, `dump_fired false`.
+9. **≈ end + 68s.** Down 100 redeems: **+$100.00**. Up 50: $0.
+
+| Line | Cash |
+|---|---:|
+| Mint 100 sets | −100.00 |
+| Scrap 50 Up @ 0.03 | +1.50 |
+| Redeem 100 Down | +100.00 |
+| Kept 50 Up | 0.00 |
+| **Net** | **+1.50** |
+
+With `sell_scrap_fraction=1.0` the same bag would scrap 100 × 0.03 = $3.00 and net +$3.00. The keep costs $1.50 on a normal win.
 
 <a id="section-22"></a>
-## Hypothetical lifecycle: held dump after a flip
+## Hypothetical lifecycle: false dump at ~31¢
 
-1. Loser sold as above; holding Down.
-2. Tape flips: Down sized bid falls to 0.74 and stays ≤2s under 0.80.
-3. Dump arms → live-bid FAK Down @~0.74; `sold_dump=true`.
-4. Result is a realized loss versus redeem, accepted as left-tail control after the loser already paid a scrap.
+Steps 1–6 as above: −$100.00 mint, +$1.50 scrap, holding 100 Down and 50 Up.
+
+1. **T−3m20s (TTM 200, inside the 240s dump gate).** BTC spikes; Down's sized bid falls 0.60 → 0.38 → 0.33. At < 0.40 the dump arms (`sell_dump_persist why=armed`).
+2. **2s later**, bid 0.33 → `ready`, `sell_fire_decision` → `fire`. `_sell_inventory` → 100.
+3. First live-bid FAK at 0.33 returns `no orders found` (the 0.33 bid was pulled). Retry: fresh bid 0.31 → ladder `[0.31, 0.27, 0.23, 0.19]`. The first rung fills all 100 at 0.31: **+$31.00**. `sold_dump`, `sell_dump_leg="dn"`, `sell_dump_done`.
+4. BTC reverts; Down finishes up. Down wins.
+5. Redeem: Down 0 held → $0. Kept Up 50 → $0.
+
+| Line | With the dump | Without the dump |
+|---|---:|---:|
+| Mint | −100.00 | −100.00 |
+| Scrap 50 Up @ 0.03 | +1.50 | +1.50 |
+| Dump 100 Down @ 0.31 | +31.00 | — |
+| Redeem 100 Down | — | +100.00 |
+| **Net** | **−67.50** | **+1.50** |
+
+The dump turned +$1.50 into −$67.50: it cost **$69.00** (100 × (1 − 0.31)). That is the price of the circuit breaker on a false alarm. On a **true** flip (Up wins after the same dump), the kept 50 Up pay $50: −100 + 1.50 + 31 + 50 = **−$17.50**, against −$66.00 with `fraction=1.0` (−100 + 3 + 31). The 40¢ / 2s / last-240s shape is the operator's trade-off between those two cases. `bag_risk` records `dump_px`, `dump_ttm` and how long the held bid sat below 0.80 / 0.65 / 0.50, which is the data for re-tuning it.
 
 <a id="section-23"></a>
 ## What this code does not prove
 
-- That 2¢ loser fills always exist when opposite is 90¢.
-- That redeem will be claimed automatically (operator/process may still need a redeem path outside this doc’s sell loop).
+- That 2–3¢ loser bids with depth always exist when the opposite is ≥ 90¢ inside the last six minutes.
+- That the winner will be redeemed; redemption happens outside this repo ([§37](#section-37)).
 - That adjacent minting always beats skipping (relayer can still `STATE_FAILED`).
-- That dump at 80¢ is optimal; it is an operator-chosen circuit breaker.
+- That dumping at 40¢ (or 80¢) is optimal; it is an operator-chosen circuit breaker ([§22](#section-22)).
+- That keeping 50% of the loser is optimal; `bag_risk` and `sell_scrap_outcome` exist to measure it.
 
 <a id="part-iv"></a>
 # Part IV — The buy/ helpers and pathlog
@@ -487,44 +660,58 @@ Observed failure modes: (1) winner armed at bid 0.99 but FAK posted 0.999 → `i
 | Module | Owner of |
 |---|---|
 | `mintbot.py` | Process, knobs merge, relayer, CLOB sells, state file |
-| `buy/mint_loops.py` | Concurrent sell/mint job runner + same-slug claim |
-| `buy/mint_sell.py` | Pure sell policy |
+| `buy/mint_loops.py` | Concurrent sell/mint job runner, same-slug claim, candidate selection, pending-cash reserve, ended-bag chain policy, persist digest |
+| `buy/mint_sell.py` | Pure sell policy, scrap plan, TTM gates, `bag_risk` counters |
+| `buy/mint_gas.py` | Mint relay `gas_limit` plan |
 | `buy/market.py` | Discovery / `MintMarket` |
-| `buy/book.py` | Sized BBO parse |
-| `buy/chain.py` | RPC reads |
-| `buy/contracts.py` | Calldata for mint batch |
-| `buy/oracle_log.py` | Chainlink 60s TWAP tape + `bag_view` for late scrap veto |
+| `buy/book.py` | Sized BBO parse, depth snapshot |
+| `buy/chain.py` | RPC reads, per-thread sessions |
+| `buy/contracts.py` | Calldata for mint batch and the pUSD top-up transfer |
+| `buy/oracle_log.py` | Chainlink 60s TWAP tape + `bag_view` for the (off) late scrap veto |
+| `buy/log_archive.py` | `mintbot.log` rotation into `logs/archive/` |
+| `buy/sister_bid.py` / `buy/sister_topup.py` | Wallet B policy (scrapbidder only; off) |
 | `pathlog.py` | Separate process; read-only books |
 
 <a id="section-25"></a>
 ## buy/mint_sell.py policy helpers
 
 - `parse_sell_fill_shares` — share leg from CLOB response (not USDC `takingAmount`).
+- `sell_fill_vwap` — average price from `takingAmount / shares` for `sell_scrap_sweep.avg_px`.
 - `inventory_latch` — await vs already_flat vs has_inventory.
 - `classify_loser` — which leg is loser / both_cheap / wick_unconfirmed.
 - `persist_ready` — arm → waiting → ready over `persist_s` (resets when qualify drops).
-- `effective_loser_persist_s` — 5s normally, 2s when `0 < TTM ≤ 60`; `None` at/after `end_ts`.
+- `effective_loser_persist_s` / `loser_scrap_persist_s` — 5s normally, 2s when `0 < TTM ≤ 60`; `None` at/after `end_ts`; `sized_skip` only if that flag is on.
 - `sell_window_open` — CLOB sells only while TTM is strictly positive.
+- `scrap_time_gate_open` / `dump_time_gate_open` — TTM cutoffs; ≤ 0 disables; unknown TTM open for scrap, closed for dump.
 - `loser_empty_keep_qualify` — armed + empty loser book (opposite still ok or also empty) should keep the arm.
 - `loser_persist_ready` — persist_ready plus empty-book / empty-FAK keep/re-arm (`empty_keep_arm`).
 - `sell_fire_decision` — last in-range check before FAK (`fire` / `cancel_reset` / `cancel_keep_arm`).
-- `late_oracle_scrap_ok` / `late_oracle_edge_persist` / `side_aware_oracle_edge_usd` — late-window loser-scrap veto. Off unless `sell_late_window_s` > 0.
+- `loser_scrap_post` — sweep plan (one limit at the floor, full remainder) or ladder plan (cent rungs, depth-clipped).
+- `loser_ladder_limits` — every 1¢ from min(fak or threshold, bid) down to floor; the live bid alone when it is below the floor. Also used for the `depth_at_limit` preview and the `phase=ready` depth log, even in sweep mode.
+- `loser_partial_fak_shares` — ladder-mode clip to displayed depth.
+- `normalize_scrap_fraction` / `scrap_share_plan` / `scrap_order_shares` / `scrap_target_met` — partial scrap ([§17b](#section-17b)).
+- `kept_leg_below_winner_min` — blocks the winner path on the kept leg below base `sell_winner_min`.
+- `loser_blind_fak_due` — blind 1¢ FAK eligibility and backoff.
+- `scrap_rest_action` / `scrap_rest_px` / `resting_tif` / `rest_order_matched_shares` / `posted_order_id` — post-miss rest lifecycle.
+- `late_oracle_scrap_ok` / `advance_oracle_edge_arm` / `side_aware_oracle_edge_usd` — late-window loser-scrap veto. Off unless `sell_late_window_s` > 0.
 - `winner_cashout_leg` — unique leg whose sized bid ≥ winner_min.
-- `winner_cheap_decision` — 0.99 only if sold_loser, loser ≤ gate, and loser+cheap > $1.
-- `winner_sell_limit` — clamp live-bid FAK into CLOB [0.01, 0.99]; 0.99 still fills 0.995–0.999 books.
-- `loser_ladder_limits` — every 1¢ from min(fak or threshold, bid) down to floor; the live bid alone when it is below the floor.
+- `winner_cheap_decision` — cheap min only if sold_loser, loser ≤ gate, and loser + cheap > $1.
+- `winner_sell_limit` — clamp live-bid FAK into CLOB [0.01, 0.99].
+- `dump_fast_retry_eligible` / `dump_retry_ladder_limits` — held-dump refire.
+- `fresh_bag_risk` / `bag_risk_observe` / `bag_risk_flush` / `bag_risk_payload` — log-only `bag_risk`.
+- `cycle_sleep_s` / `mint_cycle_sleep_s` / `sell_intent_hot` — loop cadence.
 
-Defaults mirror mintbot sell knobs including dump keys.
+`DEFAULT_SELL_KNOBS` mirrors mintbot sell knobs including dump keys.
 
 <a id="section-26"></a>
-## buy/market.py, book.py, chain.py, contracts.py
+## buy/market.py, book.py, chain.py, contracts.py, mint_gas.py, log_archive.py
 
-Discovery builds `MintMarket` with `condition_id`, `up_token`, `dn_token`, `start_ts`, `end_ts`, `slug`, flags. Book helper returns best bid with minimum size and `bid_fill_depth` (cumulative bids at/through a FAK limit; mint logs `sell_book_depth`, does not gate on it). Chain helper reads ERC-1155 positions. Contracts helper encodes the atomic mint path used by the relayer batch.
+Discovery builds `MintMarket` with `condition_id`, `up_token`, `dn_token`, `start_ts`, `end_ts`, `slug`, flags. Book helper returns best bid with minimum size and `bid_fill_depth` (cumulative bids at/through a FAK limit; mint logs `sell_book_depth`, does not gate on it). Chain helper reads ERC-1155 positions and pUSD balance and exposes `_rpc` for the one gas estimate. Contracts helper encodes the atomic mint path used by the relayer batch, plus the pUSD transfer the sister top-up uses. `mint_gas.py` turns an estimate into a clamped `MintGasPlan` ([§14](#section-14)). `log_archive.py` supplies `ArchiveRotatingFileHandler`: `mintbot.log` still rolls at 2 MB, but each roll is renamed to `logs/archive/mintbot.log.<UTC stamp>` (never clobbering) and gzipped on one background worker. Nothing there is pruned (#219). `logs/oracle_twap.jsonl` is not handled by it.
 
 <a id="section-27"></a>
 ## pathlog.py: public book recorder
 
-Separate systemd unit. `SERIES = ["btc-up-or-down-15m"]` only. Polls CLOB books, appends JSONL ticks under `pathlog/`, prunes by age/size, optionally records resolution. **No orders.** Used for research/backtests (`check_path_backtest.py`). Mint loser scrap uses the Chainlink TWAP tape only when `sell_late_window_s` > 0 (default 0, so the tape is audit-only). Pathlog itself is not a trading input.
+Separate systemd unit. `SERIES = ["btc-up-or-down-15m"]` only. Polls CLOB books, appends JSONL ticks under `pathlog/`, prunes by age/size (14 days / 400 MB), optionally records resolution. **No orders.** Used for research/backtests (`check_path_backtest.py`). Pathlog is not a trading input. On 30 Sep 2026 the unit is enabled but not running (exited cleanly 22 Sep 20:00 UTC), so no new ticks are being recorded until the operator restarts it.
 
 <a id="part-v"></a>
 # Part V — Operations, verification and sharp edges
@@ -536,72 +723,76 @@ Separate systemd unit. `SERIES = ["btc-up-or-down-15m"]` only. Polls CLOB books,
 
 `deploy/polypathlog.service` runs `pathlog.py` (no env file required for public books).
 
-`deploy/polyscrapbid.service` is opt-in and stays disabled. It runs `scrapbidder.py` with `EnvironmentFile=.env.complement` only (not mintbot `.env`). Wallet B buys 20 shares of a scrapped leg, and 10 shares of the other leg after A sets `sell_dump_leg`. Both use the FAK/rest notional band ($1.00–$1.50 by default). Markets A never held are not bid (`bid_absent_enabled` defaults false). There is no sister-miss dump. When B cannot fund a hedge, scrapbidder spawns `sister_topup.py`, which reads `.env` itself and transfers $5 of pUSD from A's proxy to B's deposit wallet, once per broke episode. It does not mint and does not FAK-sell. `bid_enabled` defaults false and `dry_run` defaults true. Do not commit `.env.complement`. Do not add `.env` to this unit. Same-wallet buyback is not implemented. Do not enable this unit unless the operator asks.
+`deploy/polyscrapbid.service` is opt-in and stays disabled. It runs `scrapbidder.py` with `EnvironmentFile=.env.complement` only (not mintbot `.env`). Since #212, even with `bid_enabled` on, wallet B's 20-share post-scrap buy needs `scrap_hedge_enabled` (default **false**); the 10-share dump hedge after A sets `sell_dump_leg` needs `dump_hedge_enabled` (default true). Both use the FAK/rest notional band ($1.00–$1.50 by default). Markets A never held are not bid (`bid_absent_enabled` defaults false). There is no sister-miss dump. The A→B top-up (`sister_topup.py`, $5 of pUSD once per broke episode, reads `.env` itself) needs `topup_enabled` (default **false**). Scrapbidder re-reads mint intents after quoting books so a scrap during the pass is not planned from a stale snapshot (#203). It does not mint and does not FAK-sell. `bid_enabled` defaults false and `dry_run` defaults true. Do not commit `.env.complement`. Do not add `.env` to this unit. Same-wallet buyback is not implemented. Do not enable this unit unless the operator asks.
 
-Never enable retired buy units (`polycomplement`, buybots, DangerZone) from memory of old docs. `polyscrapbid` is not a restore of `complementbot.py`.
+Never enable retired buy units (`polycomplement`, buybots, DangerZone, shadow) from memory of old docs. `polyscrapbid` is not a restore of `complementbot.py`.
 
 <a id="section-29"></a>
-## Live knobs (19 Sep 2026)
+## Knobs: code default vs live (30 Sep 2026)
 
-From VM `strategy_mint.json`:
+"Code" is `DEFAULTS` in `mintbot.py` on `main`. "Example" is `strategy_mint.example.json` where it differs. "Live" is the VM's gitignored `strategy_mint.json` read on 30 Sep 2026; "—" means the key is absent and the code default applies.
 
-| Knob | Live value | Meaning |
-|---|---:|---|
-| `entry_enabled` | true | Allow new mints |
-| `dry_run` | false | Real mint/sell |
-| `shares` | 5 | Complete set size ($5 trial) |
-| `enter_max_ttm_min` | 45 | Mint when window opens within 45m (code default; two 15m steps past a market about to open) |
-| `series_slugs` | `[btc-up-or-down-15m]` | 15m only |
-| `max_open_sets` | 1 | Capacity (see adjacent rule) |
-| `mint_fail_cooldown_s` | 30 | Wait after `failed` before remint (code default) |
-| `mint_submitting_timeout_s` | 90 | Auto-fail tx-less stale `submitting` intents (`0` disables) |
-| `mint_max_attempts` | 3 | Total mint tries per market |
-| `max_daily_notional` | 100 | Daily mint spend cap |
-| `poll_s` | 5 | Mint-loop sleep; sell-loop sleep when not hot |
-| `sell_armed_poll_s` | 2 | Sell-loop sleep while sell-hot (not persist; code default, not yet in live JSON) |
-| `sell_enabled` | true | Enable manage_sells |
-| `sell_threshold` / `sell_floor` | 0.03 / 0.02 | Loser ladder |
-| `sell_opposite_min` | 0.90 | Opposite must be rich |
-| `sell_persist_s` | 9 live / **5 code default** | Loser/winner persist wait (normal). Fold ~4s lag so wall ≈ 9s. Operator must merge live JSON. |
-| `sell_persist_last_min_s` | 5 live / **2 code default** | Loser persist wait when TTM ≤ last-min window. Wall ≈ 5–6s. |
-| `sell_persist_last_min_window_s` | 60 | Seconds-to-end that select the short persist |
-| `sell_cooldown_s` | 3 | Between attempts |
-| `sell_winner_min` | 0.999 | Prefer redeem-quality bid |
-| `sell_winner_cheap_if_loser_le` | 0.03 | Cheap-loser price cap (still needs edge > $1) |
-| `sell_winner_min_cheap` | 0.99 | Winner limit if gated *and* loser+cheap > $1 |
-| `sell_dump_enabled` | true | Held-leg dump on |
-| `sell_dump_below` | 0.80 | Dump arm threshold |
-| `sell_dump_persist_s` | 5 live / **2 code default** | Dump persist wait (lag-folded from 5s) |
-| `sell_dump_fak_retries` | 2 | Fast dump re-check/re-fire attempts after first zero-fill miss |
-| `sell_dump_ladder_step` | 0.04 | Dump retry ladder decrement toward floor |
-| `sell_dump_ladder_rungs` | 4 | Max limits per dump retry ladder |
-| `sell_dump_max_ttm_s` | **0 code default** / 240 example | Held dump arms and fires only when seconds-to-close ≤ this. 0 or missing disables |
-| `sell_scrap_max_ttm_s` | **0 code default** / 600 example | Loser scrap arms, persists, and fires only when seconds-to-close ≤ this. 0 or missing disables. Unknown ttm stays open |
-| `sell_late_window_s` | **0 code default** | 0 skips the oracle veto |
-| `sell_oracle_edge_per_ttm` | **0 code default** | Was 1.5. Zero does not restore that slope |
-| `sell_oracle_edge_persist_s` | **3 code default** | Edge must hold this long when the veto is on |
-| `sell_oracle_stale_s` | **0 code default** | Was 5s |
-| `sell_oracle_edge_floor_usd` | **0 code default** | Was $25. `need = max(floor, per_ttm × TTM)` |
+| Knob | Code | Example | Live | Meaning |
+|---|---:|---:|---:|---|
+| `entry_enabled` / `dry_run` | false / true | false / true | **true / false** | Mint for real |
+| `shares` | 50 | 50 | **100** | Complete-set size ($ per mint) |
+| `enter_min_ttm_min` / `enter_max_ttm_min` | 0 / 45 | | 0 / 45 | Mint only windows opening within 45m |
+| `max_open_sets` | 1 | 1 | **2** | Capacity (plus adjacent rule) |
+| `mint_fail_cooldown_s` / `mint_max_attempts` | 30 / 3 | | 30 / 3 | Remint policy |
+| `mint_submitting_timeout_s` | 90 | | 90 | Auto-fail tx-less `submitting` |
+| `mint_gas_margin` / `_fallback` / `_cap` | 0.15 / 650000 / 650000 | same | — | Relay gas plan |
+| `poll_s` | 5 (floor 2) | 5 | **1** (needs VM patch) | Mint sleep; sell sleep when idle |
+| `sell_armed_poll_s` | 2 | 2 | **1** | Sell sleep while hot |
+| `sell_enabled` | false | false | **true** | Run `manage_sells` |
+| `sell_threshold` | 0.02 | 0.02 | **0.03** | Loser arm ceiling |
+| `sell_fak_px` | 0.02 | 0.02 | **0.03** | Top ladder rung (ladder mode only) |
+| `sell_floor` | 0.02 | 0.02 | **0.01** | Sweep limit; ladder bottom; dump ladder floor |
+| `sell_scrap_sweep_enabled` | true | true | — (true) | One floor FAK vs cent ladder |
+| `sell_opposite_min` | 0.90 | | 0.90 | Opposite must be rich |
+| `sell_persist_s` / `_last_min_s` / `_last_min_window_s` | 5 / 2 / 60 | | 5 / 2 / 60 | Loser (and winner) persist |
+| `sell_persist_skip_when_sized` | false | | false | Sized skip off |
+| `sell_scrap_max_ttm_s` | 0 (off) | 600 | **360** | Scrap only in the last N seconds |
+| `sell_scrap_fraction` | 1.0 | 1.0 | **0.5** | Scrap `floor(held × f)`, keep the rest |
+| `sell_scrap_blind_enabled` / `_px` / `_backoff_s` | true / 0.01 / 3 | | true / — / — | Blind FAK on empty keep |
+| `sell_scrap_rest_enabled` | true | true | **false** | Post-miss resting sell |
+| `sell_scrap_rest_px` / `_min_ahead_s` | 0.02 / 180 | | 0.01 / 180 | Rest ceiling; GTD vs GTC |
+| `sell_cooldown_s` | 3 | | 3 | Between FAK attempts |
+| `sell_winner_min` | 0.999 | | **0.9995** | Winner cash-out floor (unreachable on a 0.001 tick) |
+| `sell_winner_cheap_if_loser_le` / `sell_winner_min_cheap` | 0.03 / 0.99 | | **−1.0 / 0.999** | Cheap winner gate (closed live) |
+| `sell_clob_max_price` / `_min_price` | 0.99 / 0.01 | | — | Winner limit clamp |
+| `sell_dump_enabled` | true | | true | Held dump on |
+| `sell_dump_below` | 0.80 | 0.80 | **0.40** | Dump arm threshold |
+| `sell_dump_persist_s` | 2 | | 2 | Dump persist |
+| `sell_dump_max_ttm_s` | 0 (off) | 240 | **240** | Dump only in the last N seconds |
+| `sell_dump_fak_retries` / `_ladder_step` / `_ladder_rungs` | 2 / 0.04 / 4 | | 2 / 0.04 / 4 | Refire after a zero-fill miss |
+| `sell_min_bid_size` | 1.0 | | 1.0 | Sized-bid minimum |
+| `sell_late_window_s` | 0 | 0 | 0 | Oracle veto off |
+| `sell_oracle_edge_floor_usd` / `_per_ttm` / `_stale_s` | 0 / 0 / 0 | | 0 / 0 / 0 | Old veto knobs zeroed |
+| `sell_oracle_edge_persist_s` | 3 | 3 | **0** | Only used when the veto is on |
+| `oracle_log_enabled` | true | true | true | Audit tape |
+| `sell_persist_skip_ttm_s` | — | — | 0 | Leftover; ignored (not in `DEFAULTS`) |
 
-Repo code defaults (`mintbot` `DEFAULTS` / `strategy_mint.example.json`): arm `sell_threshold` 0.02, print `sell_fak_px` 0.02 equal to floor 0.02, rest ceiling `sell_scrap_rest_px` 0.02 capped at the live or last-seen bid, `sell_scrap_rest_min_ahead_s` 180, persist 5 / 2, `sell_persist_skip_when_sized` false, `sell_late_window_s` 0, oracle edge knobs `sell_oracle_edge_floor_usd` / `sell_oracle_edge_per_ttm` / `sell_oracle_stale_s` 0, and `sell_oracle_edge_persist_s` 3. `sell_dump_max_ttm_s` is 0 in code (gate off) and 240 in the example. `sell_scrap_max_ttm_s` is 0 in code (gate off) and 600 in the example. One log-only `bag_risk` line is emitted when the sell window closes (held-bid path after scrap). It does not place or cancel orders. `oracle_log_enabled` stays true. Live JSON still overrides every key it already sets. A `sell_dump_if_sister_miss_s` or `sell_persist_skip_ttm_s` key left in the live file is ignored. Do not edit live JSON from this repo. Sister bids stay a separate opt-in process. After a normal held dump, B buys 10 shares of the other leg. `sister_topup.py` can move $5 of pUSD from A to B once per broke episode. Not a sell.
+Live JSON still overrides every key it sets; keys it omits take the code default after a pull and restart. Do not edit live JSON from this repo. The sister process is off; its knobs are in `strategy_scrapbid.example.json`.
 
 <a id="section-30"></a>
 ## Deploy boundary (VM is source of truth)
 
-Operational rule: **VM files win**. GitHub is backup/history. Copy VM → GitHub; do not blindly merge GitHub onto the VM. Live `strategy_mint.json` and `positions_mint.json` stay gitignored. Example knobs are not authorization to trade.
+Operational rule: **VM files win**. GitHub is backup/history. Live `strategy_mint.json` and `positions_mint.json` stay gitignored. Example knobs are not authorization to trade.
 
-After code pull: restart **only** `polymintbot` / `polypathlog` when the operator asks. Leave `polyscrapbid` stopped until the operator asks to start it.
+The `Deploy to GCP` workflow runs on pushes to `main` that touch `mintbot.py`, `pathlog.py`, `check_path_backtest.py`, `buy/**` or `requirements.txt`. It does `git pull` + `pip install` on the VM and never restarts a service. Docs-only changes (including this file) do not trigger it and are not synced anywhere.
+
+After code pull: restart **only** `polymintbot` / `polypathlog` when the operator asks, and **re-apply the local `poll_s` patch first** ([§32](#section-32) item 10). Leave `polyscrapbid` stopped until the operator asks to start it.
 
 <a id="section-31"></a>
 ## Testing without constructing a live bot
 
-Do not import `mintbot.py` in unit tests (credentials, lock, clients). Test `buy/mint_sell.py` and AST-extracted pure functions. `python -m unittest` in a disposable sandbox.
+Do not import `mintbot.py` in unit tests (credentials, lock, clients). Test `buy/` helpers directly and AST-extract `mintbot.py` functions with stubs (`tests/test_mint_only_ops.py`, `tests/test_mint_cpu.py`). Run `python -m unittest discover -s tests -p 'test_*.py' -v` in a disposable sandbox.
 
 <a id="section-32"></a>
 ## Landmines
 
 1. **Failed remint storm** — `failed` stays in `already_minted` during cooldown and after `mint_max_attempts`.
-2. **`relay hub: internal transaction failure`** — opaque inner RelayHub revert; outer tx may still succeed. Retries absorb clusters; not a status-page outage. See [§13b](#section-13b).
+2. **`relay hub: internal transaction failure`** — inner CTF split out of gas under the 500k library default. Fixed by the explicit `gas_limit`; watch `gas_source=fallback` or `gas_clamped=true` in `mint_submitted`. See [§13b](#section-13b).
 3. **Skipping the next window** — without adjacent lookahead, `max_open_sets=1` + “never mint open markets” skips a quarter-hour.
 4. **Winner at 0.999 on a 0.99 book** — live-bid FAK once allowed, then clamp to CLOB max 0.99 (do not POST 0.995–0.999).
 5. **Dump without `sold_leg`** — held leg cannot be inferred; loser path must set `sold_leg`.
@@ -609,6 +800,12 @@ Do not import `mintbot.py` in unit tests (credentials, lock, clients). Test `buy
 7. **Importing mintbot in tests** — can take the flock or load `.env`.
 8. **Confusing mint with buybot docs** — old hourly TDD describes a different money path.
 9. **Re-serializing sell and mint** — do not fold them back into one `manage_sells → discover → sleep` cycle. That is the 1789905600 hole. Draft PR #193 skip-mint is not the fix.
+10. **Local `poll_s` patch on the VM.** Live `strategy_mint.json` sets `poll_s: 1`, but `validate_strategy` on `main` requires `poll_s >= 2`. The VM's `mintbot.py` carries an uncommitted edit lowering that floor to 1 (the `if float(cfg["poll_s"]) < 1` check and its message, plus the module docstring). A `git pull` that touches `mintbot.py` either refuses to merge over the edit or, after a reset, removes it, so the operator re-applies it after every deploy. If it is missing: a **restart** fails `load_strategy` and `main()` exits 1, so systemd restart-loops and nothing trades. A running process with the patch still in memory keeps working until then. Either commit the floor change or raise live `poll_s` to 2 to retire this step.
+11. **`or` swallows zero knobs** — `sell_dump_persist_s`, `sell_cooldown_s` and `sell_scrap_rest_min_ahead_s` fall back to their default when set to 0 ([§6](#section-6) aside).
+12. **`sell_limit` is the floor under sweep** — not the average fill. Anything that reads it as "loser price" (the cheap-winner gate, `bag_risk` after a restart) sees 0.01 live.
+13. **Oracle tape grows forever** — `logs/oracle_twap.jsonl` is append-only and not rotated (116 MB on 30 Sep). Watch disk (`deploy/DISK_OPS.md`).
+14. **Pathlog silently down** — `polypathlog` has been inactive since 22 Sep; `systemctl is-enabled` alone says `enabled`.
+15. **Startup banner is stale** — `main()` still prints "loser sell ladder 3c->2c"; the actual order is the floor sweep.
 
 <a id="section-33"></a>
 ## Glossary
@@ -617,40 +814,48 @@ Do not import `mintbot.py` in unit tests (credentials, lock, clients). Test `buy
 |---|---|
 | Complete set | 1 Up + 1 Down for one condition |
 | Mint / split | Collateral → both outcome tokens |
-| Loser dump | Sell cheap leg after opposite is rich |
-| Winner cash-out | Sell rich leg near $1 (gated) |
-| Held dump | After loser sold, sell held leg if weak (<80¢) |
-| Redeem | Exchange winning tokens for $1 collateral after resolution |
+| Loser scrap | Sell the cheap leg (all, or a locked fraction) after the opposite is rich |
+| Partial scrap / keep | `sell_scrap_fraction < 1`: scrap `floor(held × f)`, hold the rest to resolution |
+| Floor sweep | One loser FAK at `sell_floor` for the scrap remainder |
+| Winner cash-out | Sell rich leg near $1 (gated; unreachable live) |
+| Held dump | After loser sold, sell the held leg if weak (< 80¢ code, < 40¢ live) |
+| Redeem | Exchange winning tokens for $1 collateral after resolution (outside this repo) |
 | FAK | Fill-and-kill marketable limit |
 | Sized bid | Best bid with minimum size |
 | Adjacent lookahead | Mint next 15m while still holding current full bag |
 | Relayer PROXY | Polymarket-submitted batched tx from proxy wallet |
+| Pending reserve | pUSD already committed to in-flight mints, subtracted before a new mint |
+| `bag_risk` | One log line per bag at window close; audit only |
 
 <a id="section-34"></a>
 ## Source snapshot
 
 - Host: Google VM `poly-vm` (`/home/ntemusejoel/poly-money-maker`)
-- Services: `polymintbot.service`, `polypathlog.service` active
-- Primary sources: `mintbot.py` (~1426 lines), `buy/mint_sell.py` (~166), `pathlog.py` (~527)
+- Services (30 Sep): `polymintbot` active; `polypathlog` enabled but inactive; `polyscrapbid` disabled
+- Code: `main` at `1a3916d` (#223). VM `buy/` modules match `main`; VM `mintbot.py` differs only by the `poll_s` floor patch
+- Primary sources: `mintbot.py` (~3843 lines), `buy/mint_sell.py` (~1444), `buy/mint_loops.py` (~506), `pathlog.py` (~527)
 - Strategy: gitignored `strategy_mint.json` as tabulated in §29
-- Document date: 19 September 2026 (rev: sequences + redeem)
+- Document date: 30 September 2026 (rev: partial scrap, 100-share live bag, floor sweep, TTM gates, relay gas, pending reserve, bag_risk)
+- Prior revision: 19 September 2026 (sequences + redeem)
 - Prior document replaced: hourly `buybothourly.py` guided tour (9 Sep 2026 era)
 
 ---
-
 
 
 <a id="appendix-a"></a>
 # Appendix A — Cycle pseudocode (faithful to live control flow)
 
 ```
-sell loop (cycle_sleep_s: poll_s, or sell_armed_poll_s while sell-hot):
-  cfg = load_strategy()
+sell loop (cycle_sleep_s: poll_s, or min(poll_s, sell_armed_poll_s) while sell-hot):
+  cfg = load_strategy()                  # every tick; failure keeps old cfg, entry off
   manage_sells(cfg, state, chain)        # lock around intent writes; I/O unlocked
+  commit_state if persist digest changed
 
 mint loop (always poll_s):
   cfg = load_strategy()
-  reconcile_intents(...)                 # relayer/RPC outside lock
+  fail_stale_submitting_intents(...)
+  reconcile_intents(...)                 # relayer/RPC outside lock; ended bags: one read at end+180s
+  if any submitting: return "wait_submit"
   if not cfg.entry_enabled: return "disabled"
   markets = gateway.discover(cfg.series_slugs)
   candidates = eligible_markets(markets, cfg, now)   # NOT YET OPEN, within TTM band
@@ -663,32 +868,36 @@ mint loop (always poll_s):
   if none: repeat, allowing a failed condition under the attempt cap
   if every free candidate is over capacity: return "capped_open"
   if nothing free: return "idle"
-  log mint_attempt for pick.slug                       # same cycle
-  precheck balances / contracts          # no lock
-  claim submitting under STATE_LOCK      # already_minted + slots + same-slug
-  tx_id, err, gas = submit_mint_batch(calls, rpc=chain)  # no lock; one eth_estimateGas
+  precheck contracts / binary / pUSD balance            # no lock
+  if balance - pending_mint_reserve < shares: return "pending_reserve" or "no_balance"
+  claim submitting under STATE_LOCK      # already_minted + slots + same-slug; saved before submit
+  log mint_attempt for pick.slug
+  tx_id, err, gas = submit_mint_batch(calls, rpc=chain._rpc)  # no lock; one eth_estimateGas
   persist pending / failed
 ```
 
 <a id="appendix-b"></a>
 # Appendix B — Sell decision table
 
+Values are code default / live.
+
 | Precondition | Persist | Action | Flags set |
 |---|---|---|---|
-| Loser sized bid ≤ 0.02 AND opposite ≥ 0.90 AND not both cheap | 5s wait (~9s wall) | FAK at 0.02, or live bid if below floor; cancel if out of range at fire | `sold_loser`, `sold_leg` |
-| Same, TTM ≤ 60s | 2s wait (~5–6s wall) | Same loser FAK / cancel-at-fire | `sold_loser`, `sold_leg` |
-| Winner sized bid ≥ effective_winner_min (0.999, or 0.99 if loser ≤0.03 *and* loser+0.99 > $1) | 5s wait | Live-bid FAK winner, clamped to CLOB max 0.99; cancel if bid dropped below min | `sold_winner` |
-| `sold_loser` AND held sized bid < 0.80 | 2s wait | First live-bid FAK held; on first zero-fill no-match/kill, immediate re-check + short descending ladder retries; cancel if bid ≥ 0.80 | `sold_dump`, `sold_winner` |
-| `now > end_ts` | — | No CLOB sells | (redeem outside this loop) |
+| Loser sized bid ≤ `sell_threshold` (0.02 / 0.03) AND opposite ≥ 0.90 AND not both cheap AND TTM ≤ `sell_scrap_max_ttm_s` (off / 360) | 5s | Lock plan if fraction < 1; one FAK at `sell_floor` (0.02 / 0.01) for `target − filled`; cancel if out of range at fire | `sold_loser`, `sold_leg`, `sell_filled`, `sell_scrap_*` |
+| Same, TTM ≤ 60s | 2s | Same | Same |
+| Loser armed, book or FAK empty | kept | Blind FAK at 0.01 every ≥ 3s; rest after a miss (off live) | Same on fill |
+| Winner sized bid ≥ effective_winner_min (0.999 / 0.9995; cheap 0.99 gate closed live) | 5s | Live-bid FAK clamped to 0.99; kept leg capped at keep; cancel if bid dropped | `sold_winner` |
+| `sold_loser` AND held sized bid < `sell_dump_below` (0.80 / 0.40) AND TTM ≤ `sell_dump_max_ttm_s` (off / 240) | 2s | Live-bid FAK; on zero-fill miss, re-check + 4¢-step ladder retries; cancel if bid ≥ below | `sold_dump`, `sold_winner`, `sell_dump_leg` |
+| `now ≥ end_ts` | — | No CLOB sells; cancel rest; `sell_scrap_outcome window_end` if unfinished; one `bag_risk` | (redeem outside this loop) |
 | Within `sell_cooldown_s` of last attempt | — | Skip fire | — |
 
 `effective_winner_min` formula:
 
 ```
-effective = sell_winner_min                           # 0.999
-if sold_loser and sell_limit <= sell_winner_cheap_if_loser_le
+effective = sell_winner_min                           # 0.999 code, 0.9995 live
+if sold_loser and sell_limit <= sell_winner_cheap_if_loser_le    # -1.0 live: never
    and sell_limit + sell_winner_min_cheap > 1.0:
-    effective = min(effective, sell_winner_min_cheap) # 0.99
+    effective = min(effective, sell_winner_min_cheap)
 ```
 
 <a id="appendix-c"></a>
@@ -697,11 +906,12 @@ if sold_loser and sell_limit <= sell_winner_cheap_if_loser_le
 ```
 submitting → pending → executed/mined → confirmed_waiting_inventory → confirmed
                                                                   ↘ completed (flat after end)
-                 ↘ failed   (STATE_FAILED / STATE_INVALID; remint after cooldown, max 3)
+                 ↘ failed   (STATE_FAILED / STATE_INVALID / stale submitting; remint after cooldown, max 3)
 ```
 
 `ACTIVE_STATUSES` (count toward open bags unless loser sold / expired+120s):
 `submitting`, `pending`, `executed`, `mined`, `confirmed_waiting_inventory`, `confirmed`.
+`PENDING_CASH_STATUSES` (reserve pUSD): the same set minus `confirmed`.
 
 <a id="appendix-d"></a>
 # Appendix D — Why adjacent lookahead exists
@@ -715,43 +925,46 @@ Timeline bug without lookahead (`max_open_sets=1`):
 
 Fix: while holding a full bag ending at `end_ts`, allow minting the candidate whose `start_ts` is exactly that adjacent boundary. Still forbid a second lookahead.
 
-Combined with `sold_loser` freeing the slot mid-window, the bot can mint the next set after the loser dump without waiting for expiry.
+Combined with `sold_loser` freeing the slot mid-window, the bot can mint the next set after the loser scrap without waiting for expiry.
 
 <a id="appendix-e"></a>
 # Appendix E — Economic sketch (not a promise)
 
-Assume shares=5, lossless fees for arithmetic only.
+Assume `shares=100`, `sell_scrap_fraction=0.5`, scrap average 3¢, fees ignored.
 
 | Path | Cash out | Comment |
 |---|---:|---|
-| Mint | −5.00 | Split collateral |
-| Loser @ 0.02 | +0.10 | 5 × 2¢ |
-| Redeem winner | +5.00 | Post-resolution |
-| **Net** | **+0.10** | Thin; fees can erase it |
+| Mint | −100.00 | Split collateral |
+| Scrap 50 loser @ 0.03 | +1.50 | Floor sweep, avg fill |
+| Redeem winner 100 | +100.00 | Post-resolution |
+| Kept 50 loser | 0.00 | Expires worthless |
+| **Net** | **+1.50** | Thin; fees can erase it |
 
 | Path | Cash out | Comment |
 |---|---:|---|
-| Mint | −5.00 | |
-| Loser @ 0.02 | +0.10 | |
-| Held dump @ 0.74 | +3.70 | Circuit breaker |
-| **Net** | **−1.20** | Paid to cut left tail |
+| Mint | −100.00 | |
+| Scrap 50 @ 0.03 | +1.50 | |
+| False dump 100 held @ 0.31 | +31.00 | Held leg then wins |
+| **Net** | **−67.50** | vs +1.50 without the dump |
 
 | Path | Cash out | Comment |
 |---|---:|---|
-| Mint | −5.00 | |
-| Loser @ 0.03 | +0.15 | |
-| Winner live FAK @ 0.99 | +4.95 | Only if cheap-loser gate open |
-| **Net** | **+0.10** | Same ballpark as redeem; redeems avoid CLOB fee/slip |
+| Mint | −100.00 | |
+| Scrap 50 @ 0.03 | +1.50 | |
+| True-flip dump 100 held @ 0.31 | +31.00 | Scrapped leg wins |
+| Redeem kept 50 | +50.00 | The keep pays |
+| **Net** | **−17.50** | −66.00 with fraction 1.0 |
 
 <a id="appendix-f"></a>
 # Appendix F — Operator checklist
 
-1. `systemctl is-active polymintbot polypathlog` → both active.
-2. `jq . strategy_mint.json` → confirm shares, sell_*, dump_* (never commit this file).
-3. Tail `mintbot.log` for `mint_confirmed`, `sell_loser_done`, `sell_dump_done`, `mint_failed`.
-4. After a `mint_failed`, expect **no** remint of that slug; wait for next window.
-5. Code change on VM → restart **only** `polymintbot` when you ask.
-6. GitHub sync is backup; VM remains SoT.
+1. `systemctl is-active polymintbot polypathlog` → mintbot active; pathlog is currently inactive (restart only when asked).
+2. `jq . strategy_mint.json` → confirm shares, sell_*, dump_*, `sell_scrap_fraction` (never commit this file).
+3. `grep -n 'poll_s must be' mintbot.py` → must say `>= 1` while live `poll_s` is 1.
+4. Tail `mintbot.log` for `mint_confirmed`, `mint_submitted` (gas fields), `mint_skip_pending_reserve`, `sell_scrap_plan`, `sell_scrap_sweep`, `sell_scrap_outcome`, `sell_dump_done`, `bag_risk`, `mint_failed`.
+5. After a `mint_failed`, expect a remint after 30s up to 3 attempts, then that slug is skipped.
+6. Code change on VM → restart **only** `polymintbot` when you ask, after re-applying the `poll_s` patch.
+7. GitHub sync is backup; VM remains SoT.
 
 
 
@@ -759,7 +972,7 @@ Assume shares=5, lossless fees for arithmetic only.
 <a id="part-vi"></a>
 # Part VI — Sequences and redeem
 
-ASCII diagrams below are the PDF-safe form of sequence charts. They match the live `mintbot.py` control flow on 19 September 2026.
+ASCII diagrams below are the PDF-safe form of sequence charts. They match `mintbot.py` on `main` at `1a3916d`.
 
 <a id="section-35"></a>
 ## End-to-end mint sequence
@@ -791,10 +1004,13 @@ operator/systemd          mintbot               Gamma/CLOB         Relayer      
       |                      | mint_slots_full?     |                  |                   |
       |                      |   allow adjacent     |                  |                   |
       |                      |   next window only   |                  |                   |
+      |                      | balance - reserve    |                  |                   |
+      |                      |   >= shares?         |                  |                   |
       |                      |                      |                  |                   |
       |                      | build approve+split  |                  |                   |
+      |                      | eth_estimateGas ---------------------------------------------->|
       |                      |---------------------------------------->| PROXY submit      |
-      |                      |                      |                  |------------------>| 
+      |                      |   gas_limit=est×1.15 |                  |------------------>| 
       |                      | persist intent       |                  |                   |
       |                      |   status=pending     |                  |                   |
       |                      | poll until inventory |                  |                   |
@@ -806,31 +1022,32 @@ operator/systemd          mintbot               Gamma/CLOB         Relayer      
 
 Notes:
 
-1. **Sells run before mint** each cycle. A mid-window loser fill can free `max_open_sets` so the adjacent mint is allowed sooner.
+1. **Sell and mint run concurrently**; neither waits for the other. A mid-window loser fill (full or partial target) frees `max_open_sets` so the adjacent mint is allowed sooner.
 2. **Never mints an already-open window.** If adjacent lookahead fails, that quarter-hour is skipped forever for this bot.
-3. Relayer `STATE_FAILED` → intent `failed` + `errorMsg` → cooldown 30s, then remint until `mint_max_attempts`. At the cap that condition is skipped for the rest of its life, and a later future is tried in the same cycle. The common typed message is `relay hub: internal transaction failure` (see [§13b](#section-13b)).
+3. Relayer `STATE_FAILED` → intent `failed` + `errorMsg` → cooldown 30s, then remint until `mint_max_attempts`. At the cap that condition is skipped for the rest of its life, and a later future is tried in the same cycle. The historical typed message is `relay hub: internal transaction failure` (see [§13b](#section-13b)).
 
 <a id="section-36"></a>
-## Sell-side sequence (loser → winner / held dump)
+## Sell-side sequence (winner / held dump / loser)
 
 ```
 mintbot                 CLOB book              inventory latch           flags on intent
    |                        |                        |                        |
    | for each confirmed     |                        |                        |
-   | intent with now<=end   |                        |                        |
+   | intent with now<end    |                        |                        |
    |---- sized Up/Dn bids ->|                        |                        |
    |<-----------------------|                        |                        |
    |                        |                        |                        |
    | [A] winner path        |                        |                        |
-   | effective_min = 0.999  |                        |                        |
-   | if sold_loser and      |                        |                        |
-   |   sell_limit<=0.03 and |                        |                        |
-   |   sell_limit+0.99>$1:  |                        |                        |
-   |   effective_min=0.99   |                        |                        |
+   | effective_min =        |                        |                        |
+   |   sell_winner_min      |                        |                        |
+   |   (0.9995 live; cheap  |                        |                        |
+   |    gate closed live)   |                        |                        |
+   | kept leg < base min:   |                        |                        |
+   |   blocked              |                        |                        |
    | if sized winner bid    |                        |                        |
    |   >= effective_min     |                        |                        |
    |   for persist_s:       |                        |                        |
-   |---- live-bid FAK ----->|                        |                        |
+   |---- FAK min(bid,.99) ->|                        |                        |
    |                        |                        |---- has shares? ------>|
    |                        |                        |                        | sold_winner
    |                        |                        |                        |
@@ -838,19 +1055,24 @@ mintbot                 CLOB book              inventory latch           flags o
    | requires sold_loser    |                        |                        |
    | held = opposite of     |                        |                        |
    |   sold_leg             |                        |                        |
-   | if sized held bid      |                        |                        |
-   |   < 0.80 for 5s:       |                        |                        |
+   | if ttm <= dump cutoff  |                        |                        |
+   |   and held bid <       |                        |                        |
+   |   dump_below for 2s:   |                        |                        |
    |---- live-bid FAK ----->|                        |                        |
-   |                        |                        |                        | sold_dump
+   |   (+ refire ladder)    |                        |                        | sold_dump
    |                        |                        |                        | + sold_winner
+   |                        |                        |                        | sell_dump_leg
    |                        |                        |                        |
    | [C] loser path         |                        |                        |
-   | loser<=0.02 and        |                        |                        |
+   | ttm <= scrap cutoff,   |                        |                        |
+   | loser<=threshold and   |                        |                        |
    | opposite>=0.90 for 5s  |                        |                        |
-   |---- FAK 0.02 --------->|                        |                        |
-   |                        |                        |                        | sold_loser
+   |   (2s in last 60s)     |                        |                        |
+   | lock target/keep once  |                        |                        |
+   |---- FAK @ floor ------>|                        |                        |
+   |   size target-filled   |                        |                        | sold_loser
    |                        |                        |                        | sold_leg=up|dn
-   |                        |                        |                        | sell_limit≈fill
+   |                        |                        |                        | sell_filled
 ```
 
 Ordering in code is **A → B → C** inside one intent iteration. That matters: a bag that already sold the loser can cash out or dump the held leg before another loser attempt (loser already flagged off).
@@ -866,7 +1088,7 @@ After a 15m window resolves, the winning outcome token can be **redeemed** throu
 
 Economically the mint thesis prefers:
 
-1. Sell loser for scraps (2¢),
+1. Sell (part of) the loser for scraps (2–3¢),
 2. **Redeem** winner at $1,
 
 rather than selling the winner at 0.99 on the CLOB (which donates ~1¢ × shares plus fees versus redeem).
@@ -875,19 +1097,14 @@ rather than selling the winner at 0.99 on the CLOB (which donates ~1¢ × shares
 
 | Step | Implemented? | Where |
 |---|---|---|
-| Stop CLOB sells after `end_ts` | **Yes** | `manage_sells` skips intents with `now > end_ts` |
-| Keep winner inventory unmarked if never cashed out | **Yes** | no forced sell at expiry |
+| Stop CLOB sells after `end_ts` | **Yes** | `manage_sells` skips intents once `sell_window_open` is false |
+| Keep winner (and kept loser) inventory unsold | **Yes** | no forced sell at expiry; live winner min is unreachable |
 | Free mint slot while winner sits for redeem | **Yes** | `sold_loser` excluded from open-slot count; also expiry+120s |
-| Call CTF `redeemPositions` / merge automatically | **No** | not in `mintbot.py` |
+| Call CTF `redeemPositions` / merge automatically | **No** | not in `mintbot.py` or anywhere in this repo |
 | Relayer batch for redeem | **No** | mint-only submit path |
-| Mark intent `redeemed` after payout | **No** | status may become `completed` when flat post-expiry |
+| Mark intent `redeemed` after payout | **No** | status may become `completed` when flat at the final read |
 
-So “kept opposite for redeem” in logs is an **inventory policy**, not an automated redeem worker. Today, redemption is expected via:
-
-- Polymarket portfolio UI / built-in redeem, or
-- a future/manual script the operator runs,
-
-not via the mint loop itself.
+Live observation (30 Sep 2026): the winning leg's pUSD is back in wallet A about **68s after `end_ts`**. That happens outside this repository; mintbot neither triggers nor waits for it. Kept loser shares from a partial scrap are worthless on a normal win and pay $1 each on a flip.
 
 ### Why the design stops at “hold for redeem”
 
@@ -897,29 +1114,32 @@ not via the mint loop itself.
 
 ### Honest gap / future work
 
-If you want the bot to close the cash loop without the UI, a follow-on would look like:
+If this repo should close the cash loop itself, a follow-on would look like:
 
 1. After `end_ts` + short delay, read resolution (Gamma or CTF payout vector),
 2. If winner tokens remain and payout is live, submit redeem via relayer PROXY,
 3. Confirm collateral increase; set `redeemed_at` / status `completed`,
-4. Never redeem while CLOB dump/cash-out still eligible (`now <= end_ts`).
+4. Never redeem while CLOB dump/cash-out still eligible (`now < end_ts`).
 
-Until that exists, treat redeem as **operator-owned**, and treat mintbot as **mint + intra-window sell policy**.
+Until that exists, treat redeem as **outside this repo**, and treat mintbot as **mint + intra-window sell policy**.
 
 <a id="section-38"></a>
 ## State after expiry
 
 ```
-now <= end_ts
-  └─ manage_sells active (loser / winner / dump)
+now < end_ts
+  └─ manage_sells active (winner / dump / loser)
 
-now > end_ts
-  ├─ manage_sells: skip this intent
+now >= end_ts
+  ├─ manage_sells: cancel rest, sell_scrap_outcome window_end (if unfinished),
+  │     one bag_risk line, then skip this intent
   ├─ open_intent_count: still counts full bag until end_ts+120
   │     unless sold_loser already cleared the slot
   ├─ after end_ts+120: intent no longer blocks mint capacity
-  └─ if balances flat → reconcile may mark completed
-        else tokens sit until human/UI/future redeem
+  ├─ end_ts .. end_ts+180: reconcile does not chain-query a confirmed bag
+  └─ at end_ts+180: one final balance read (chain_reconcile_done)
+        if both legs flat → completed
+        else stays confirmed; no further reads
 ```
 
 Adjacent mint may already have been submitted **before** expiry (lookahead). That is intentional and is the main fix for the “skipped 15m” bug.
