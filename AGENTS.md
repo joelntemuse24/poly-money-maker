@@ -117,7 +117,8 @@ from this repo.
 
 Wallet A (mintbot) never posts a bid. There is no same-wallet buyback.
 `scrapbidder.py` is a separate process for wallet B. Cap is 20 shares
-and `bid_max_px` 0.05 (`bid_rest_px` 0.05). After A `sold_loser` on leg L,
+and `bid_max_px` 0.05 (`bid_rest_px` 0.05). With `scrap_hedge_enabled`
+(default false), after A `sold_loser` on leg L,
 B immediately FAK-buys 20 shares at the live ask, as long as the ask is
 ≤ `bid_fak_max_notional / shares` (1.50/20 = 7.5¢). If `shares * ask` is
 under `bid_fak_min_notional` ($1), the FAK limit is raised to
@@ -144,7 +145,8 @@ that dump fills, mintbot sets `sell_dump_leg` and B FAK-buys
 `dump_hedge_fak_min_notional` / `dump_hedge_fak_max_notional` (default
 $1.00–$1.50, so 10 shares price in 10¢–15¢, or a non-crossing rest at
 `dump_hedge_rest_px` 10¢). That clip is separate from the 20-share scrap
-bid. If B's pUSD is under `topup_need_usd` (~$1.50) or a place fails
+bid. With `topup_enabled` (default false), if B's pUSD is under
+`topup_need_usd` (~$1.50) or a place fails
 balance/allowance, `sister_topup.py` moves `topup_usd` ($5) of pUSD from
 A's proxy to B's deposit wallet once per broke episode. If sold_loser on L
 has no B bid or fill and the window is still open past cancel, log
@@ -178,7 +180,8 @@ Shared `buy/` helpers exist for mint, pathlog, and the recording-only oracle tap
   per-TTM / stale edge keys 0). `sell_oracle_edge_persist_s` stays 3.
   The tape is audit-only.
   Not an input to mint, winner, or dump.
-- `buy/sister_bid.py` — wallet B buy policy. Post-scrap FAK at the
+- `buy/sister_bid.py` — wallet B buy policy. Post-scrap hedge (only
+  with `scrap_hedge_enabled`, default false): FAK at the
   live ask, limit clipped into [`bid_fak_min_notional/shares`,
   `bid_fak_max_notional/shares`] (5¢–7.5¢ at 20 shares, $1.00–$1.50).
   Otherwise rest at `bid_rest_px` (5¢) only if that rest does not cross
