@@ -6,9 +6,10 @@ The live VM is the source of truth. This repository snapshot was aligned
 to the VM on 2026-09-19. Historical buy/hedge documents are gone from
 this tree; they are not current operational instructions.
 
-**Live services:** `polymintbot` (`mintbot.py` + `strategy_mint.json`) and
-`polypathlog` (`pathlog.py`, **15m only**). Atomic mint on
-`btc-up-or-down-15m`. Buybots, complementbot, hedge, DangerZone, shadow
+**Live service:** `polymintbot` (`mintbot.py` + `strategy_mint.json`).
+Atomic mint on `btc-up-or-down-15m`. `polypathlog` (`pathlog.py`, 15m
+only) is intentionally retired: keep it stopped and disabled, and do not
+revive it. Buybots, complementbot, hedge, DangerZone, shadow
 bots, and hourly-dense pathlog stay **off**. Do not start them, and do
 not add those sources back. `scrapbidder.py` /
 `deploy/polyscrapbid.service` is an opt-in bids-only sister process
@@ -97,8 +98,18 @@ mint submit path. Keys absent from live `strategy_mint.json` keep these
 defaults. Do not add the estimate to the sell loop.
 
 `pathlog.py` records public CLOB books for **btc-up-or-down-15m** only.
-Keep `deploy/polypathlog.service`. Do not start `pathlog_hourly_dense.py`
-or add 5m/hourly back to `SERIES`.
+It is retired: keep `deploy/polypathlog.service` in the repo but stopped
+and disabled on the VM. Do not start it or `pathlog_hourly_dense.py`, and
+do not add 5m/hourly back to `SERIES`.
+
+Loser and dump fills record the real share-weighted average fill in
+`sell_fill_px` / `sell_dump_fill_px`; `sell_limit` / `sell_dump_limit`
+stay the last posted limit (the floor under sweep). The cheap-winner gate
+and `bag_risk` read the fill first. `count_kept_loser_as_open` (default
+false) keeps a bag with kept loser shares counted toward `max_open_sets`
+until resolution. `sell_dump_persist_s`, `sell_cooldown_s` and
+`sell_scrap_rest_min_ahead_s` respect an explicit 0. `poll_s` must be
+≥ 1.
 
 `mintbot.py` runs sell and mint as independent loops so Gamma/relayer
 work cannot steal a dump tick. Do not re-serialize them into one
@@ -179,7 +190,8 @@ Shared `buy/` helpers exist for mint, pathlog, and the recording-only oracle tap
   loser-scrap veto stays off (`sell_late_window_s` 0, and the floor /
   per-TTM / stale edge keys 0). `sell_oracle_edge_persist_s` stays 3.
   The tape is audit-only.
-  Not an input to mint, winner, or dump.
+  Not an input to mint, winner, or dump. It rolls at 20 MB into
+  `logs/archive/` (gzipped) via `buy/log_archive.roll_if_over`.
 - `buy/sister_bid.py` — wallet B buy policy. Post-scrap hedge (only
   with `scrap_hedge_enabled`, default false): FAK at the
   live ask, limit clipped into [`bid_fak_min_notional/shares`,
@@ -211,6 +223,6 @@ knob files stay gitignored.
 The existing main-branch deployment workflow pulls code and installs
 dependencies on the VM after merge. It does not restart services.
 Creating a PR is not authorization to merge or deploy it. After a pull,
-only `polymintbot` and `polypathlog` may be restarted, and only when the
-operator asks. `polyscrapbid` stays stopped until the operator asks to
+only `polymintbot` may be restarted, and only when the operator asks.
+`polypathlog` is retired. `polyscrapbid` stays stopped until the operator asks to
 start it.

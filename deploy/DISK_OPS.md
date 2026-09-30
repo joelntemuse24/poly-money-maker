@@ -1,8 +1,9 @@
 # GCP disk ops (poly-money-maker VM)
 
-Live processes are **polymintbot** and **polypathlog** (15m). Do not start
-retired buy/complement/DangerZone units, or the opt-in `polyscrapbid`
-unit, while recovering disk.
+The live process is **polymintbot**. `polypathlog` (15m) is retired and
+should stay stopped and disabled. Do not start it, retired
+buy/complement/DangerZone units, or the opt-in `polyscrapbid` unit while
+recovering disk.
 
 ## Why the disk filled (2026-07 incident)
 
@@ -39,11 +40,14 @@ bot data matters.
    pruned. Do not delete that directory when freeing disk; it is the
    backtest tape (about 1.4 MB/day before gzip). A same-second collision
    gets a numeric suffix. If compression fails, the uncompressed archive
-   is kept. `logs/oracle_twap.jsonl` is a separate append-only tape and
-   is not rotated.
+   is kept. `logs/oracle_twap.jsonl` (the Chainlink TWAP audit tape) rolls
+   the same way at 20 MB into `logs/archive/oracle_twap.jsonl.<stamp>.gz`.
+   The first append after a restart archives a tape that is already over
+   20 MB. Use `tail -F` (not `-f`) to follow it across a roll.
 
 5. **Pathlog ticks are capped in-app** (`pathlog.py`: 14 days / **400 MB**, oldest
-   JSONL first). Recorder `SERIES` is **15m only**. Journal cap ≠ pathlog cap.
+   JSONL first). The recorder is retired, so no new ticks arrive; existing
+   files are the backtest set. Journal cap ≠ pathlog cap.
    **Export before prune:**
 
    ```bash
@@ -59,7 +63,7 @@ bot data matters.
 ## Recovery if 100% full
 
 ```bash
-sudo systemctl stop polymintbot polypathlog
+sudo systemctl stop polymintbot
 sudo du -xh / --max-depth=1 2>/dev/null | sort -h
 sudo du -xh /var/log --max-depth=2 2>/dev/null | sort -h | tail -20
 sudo journalctl --vacuum-size=20M
@@ -70,6 +74,7 @@ df -h /
 # Export pathlog ticks BEFORE any manual delete — prune already caps them at 400 MB
 # scp -r ~/poly-money-maker/pathlog/ticks ./pathlog-export-$(date -u +%Y%m%d)
 cd ~/poly-money-maker && git pull
-# Restart live units only. Do not start polybuybot* / polycomplement / DangerZone.
-sudo systemctl start polymintbot polypathlog
+# Restart the live unit only. Do not start polypathlog (retired), polybuybot*,
+# polycomplement or DangerZone.
+sudo systemctl start polymintbot
 ```

@@ -4,8 +4,10 @@ Source: live Google VM (`/home/ntemusejoel/poly-money-maker`). VM is the
 source of truth.
 
 **Live money path:** atomic mint on **15m only** (`polymintbot` /
-`mintbot.py` + gitignored `strategy_mint.json`). **Live recorder:**
-`polypathlog` / `pathlog.py` with series `btc-up-or-down-15m` only.
+`mintbot.py` + gitignored `strategy_mint.json`). **Recorder retired:**
+`polypathlog` / `pathlog.py` (15m only) stopped on 22 Sep 2026 and is
+intentionally not restarted. The unit was still `enabled` on 30 Sep; the
+operator should `sudo systemctl disable polypathlog`.
 
 Buybots, complement, hedge, DangerZone, shadow bots, and hourly-dense
 pathlog are **stopped / retired**. Do not start them.
@@ -16,14 +18,14 @@ pathlog are **stopped / retired**. Do not start them.
 - `shares`: 100 ($100 complete set)
 - `entry_enabled`: true · `dry_run`: false
 - Enter when window opens within 45 minutes and is **not yet open** (operator set `enter_max_ttm_min=45` on 23 Sep 2026)
-- `max_open_sets`: 2 live (code default 1) with **adjacent-window lookahead**; `sold_loser` frees the slot
+- `max_open_sets`: 2 live (code default 1) with **adjacent-window lookahead**; `sold_loser` frees the slot. Opt-in `count_kept_loser_as_open` (default **false**, absent live) keeps a bag with kept loser shares counted until resolution: fewer mints, but open exposure stays capped at `max_open_sets` bags
 - `already_minted` blocks confirmed/in-flight; `failed` remints after `mint_fail_cooldown_s` (30s live and code default) up to `mint_max_attempts` (3), then that condition is skipped for the rest of its life. The same cycle then mints the next eligible slug (`mint_attempt` logs that slug). After an active bag at start `T`, nothing with `start_ts < T+900` is picked (no backwards mint). A zero-fail window beats a retry while a slot is free.
 - `submitting` intents without a relayer `transaction_id` auto-fail after `mint_submitting_timeout_s` (90s by default, 0 disables) so restart ghosts cannot pin `wait_submit`
 - Sells on:
   - Loser: opposite ≥ 0.90, loser ≤ 0.03, only when seconds-to-close ≤ `sell_scrap_max_ttm_s` **360**, persist **5s wait** (2s in last 60s before end_ts). At fire, re-check in-range; out of range logs `sell_cancel_out_of_range` and does not POST. One FAK at `sell_floor` **0.01** (sweep default; the book fills 3¢, then 2¢, then 1¢ bids). `sell_scrap_fraction` **0.5**: the first fire locks target 50 / keep 50 of the 100 held (`sell_scrap_plan`, `sell_scrap_outcome`); the kept 50 ride to resolution. Post-miss rest is off (`sell_scrap_rest_enabled` false). **Late-window oracle veto is off** (`sell_late_window_s` 0); CLOB gates only.
   - Winner: `sell_winner_min` **0.9995** and cheap gate closed (`sell_winner_cheap_if_loser_le` −1), so the winner is held; its pUSD comes back about 68s after the window ends (redeem happens outside this repo)
   - Held dump: after loser sold, if held sized bid < **0.40** for **2s** (live `sell_dump_below`; code default 0.80) → first shot is live-bid FAK. If that first shot returns no-match / kill with zero fill, immediately re-check and fast re-fire with a short descending ladder from fresh top bid toward `sell_floor` (`sell_dump_fak_retries=2`, `sell_dump_ladder_step=0.04`, `sell_dump_ladder_rungs=4` by default), stopping if the book is empty. `sell_dump_max_ttm_s` (live and example **240**, code default **0** = off) blocks arm and fire while seconds-to-close is above the cutoff, and clears an in-progress dump persist so the full 2s must elapse again inside the window. Ladder retries after a dump has fired are not gated. A blocked arm logs `sell_dump_time_gated` at most once per bag per 15s.
-- Two loops: sell (`manage_sells`) and mint/discover run concurrently. Live `poll_s` and `sell_armed_poll_s` are both **1**; `poll_s` 1 only validates because the VM's `mintbot.py` carries a local patch lowering the `poll_s >= 2` floor to 1, which must be re-applied after every deploy. Mint does not skip Gamma because a bag is hot. **That live JSON is untouched** until the operator edits it.
+- Two loops: sell (`manage_sells`) and mint/discover run concurrently. Live `poll_s` and `sell_armed_poll_s` are both **1**; `main` now validates `poll_s >= 1`, so the VM's old local `mintbot.py` floor patch is redundant; drop it (`git checkout -- mintbot.py`) before the next pull so `git pull` does not refuse. Mint does not skip Gamma because a bag is hot. **That live JSON is untouched** until the operator edits it.
 
 ## Repo code defaults (23 September 2026)
 
@@ -60,11 +62,11 @@ See `TECHNICAL_DESIGN.md` for the full guided tour.
 
 The live path is Polymarket RTDS topic `crypto_prices_twap_sixty` for `btc/usd` (Chainlink's 60s TWAP, no Data Streams credentials). Window price-to-beat and the completed close come from `GET /api/crypto/crypto-price?symbol=btc&variant=fifteen&eventStartTime=<window start>`. `variant=fifteen` is the 15m Chainlink series; other variant strings fall back to hourly Binance and are not used.
 
-Stored samples are 15s through the middle of the window, 2s around the open and in the last 3 minutes, and 1s in the last 60s and just after the end. The recorder wakes every second while a bag is open so that tighter cadence is not stuck behind a cold sleep. A dead feed appends `oracle_log_fail` and logs the same event.
+Stored samples are 15s through the middle of the window, 2s around the open and in the last 3 minutes, and 1s in the last 60s and just after the end. The recorder wakes every second while a bag is open so that tighter cadence is not stuck behind a cold sleep. A dead feed appends `oracle_log_fail` and logs the same event. The tape rolls at 20 MB into `logs/archive/oracle_twap.jsonl.<UTC stamp>` and is gzipped in the background, like `mintbot.log` (#219). Nothing is pruned.
 
 **The tape is audit-only.** `oracle_log_enabled` stays on. `sell_late_window_s` is 0, and `sell_oracle_edge_floor_usd`, `sell_oracle_edge_per_ttm`, and `sell_oracle_stale_s` are 0, so loser scrap does not consult the TWAP and those zeros do not re-arm the old dollar or stale veto. `sell_oracle_edge_persist_s` stays 3. Mint eligibility, winner cash-out, and held dump do not read the tape.
 
 ## Deploy boundary
 
 Copy VM → GitHub for backup. Do not blindly merge GitHub onto the VM.
-Restart **only** `polymintbot` and `polypathlog` when the operator asks.
+Restart **only** `polymintbot` when the operator asks. `polypathlog` is retired.
