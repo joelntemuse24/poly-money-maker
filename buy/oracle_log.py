@@ -15,15 +15,22 @@ Source, chosen because it needs no Chainlink Data Streams credentials:
 * Window open and completed close: ``GET /api/crypto/crypto-price`` with
   ``variant=fifteen``. That variant is the 15m Chainlink series. Other
   variant strings fall back to hourly Binance and are not used.
+
+Feed health: protocol ping/pong plus a silence watchdog reconnect the
+socket when no sample arrives for ``FEED_SILENT_RECONNECT_S``. A stall is
+logged once when it starts (``oracle_feed_stall``), at most once a minute
+while it lasts, and once when it ends (``oracle_feed_recovered``).
+crypto-price errors are logged once per window per kind; a 429 backs off.
 """
 
 from __future__ import annotations
 
 import json
+import random
 import threading
 import time
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from decimal import Decimal, InvalidOperation
 from typing import Any, Callable, Optional
 
@@ -57,6 +64,23 @@ STALE_AFTER_S = 20.0
 FAIL_REPEAT_S = 30.0
 HTTP_RETRY_S = 20.0
 IDLE_STOP_S = 30.0
+# crypto-price close fetch. The close usually shows ``completed`` 60-100s
+# after the end; until then the reply is ``incomplete`` (a normal wait).
+# Only the close fetch uses the longer grace; sampling still stops at
+# GRACE_AFTER_S.
+CLOSE_GRACE_S = 300.0
+HTTP_BACKOFF_CAP_S = 120.0
+HTTP_JITTER_S = 3.0
+# RTDS feed health. The socket can stay connected but silent, so a
+# watchdog closes it after this long without a sample while a bag is
+# tracked. Forced reconnects back off 45s -> 90s -> 120s cap.
+FEED_SILENT_RECONNECT_S = 45.0
+FEED_WATCHDOG_CAP_S = 120.0
+FEED_PING_INTERVAL_S = 20.0
+FEED_PING_TIMEOUT_S = 10.0
+FEED_BACKOFF_MAX_S = 30.0
+STALL_REMIND_S = 60.0
+FEED_EVENT_REPEAT_S = 60.0
 
 BAG_STATUSES = frozenset(
     {
@@ -82,6 +106,7 @@ SUBSCRIBE_FRAME = {
 }
 
 FailFn = Callable[[str], None]
+EventFn = Callable[[str, dict], None]
 
 
 @dataclass(frozen=True)
@@ -280,6 +305,36 @@ def parse_crypto_price_body(text: str) -> WindowPrice:
     )
 
 
+class CryptoPriceHTTPError(RuntimeError):
+    """Non-2xx crypto-price reply. ``retry_after`` is seconds, if sent."""
+
+    def __init__(self, status: int, retry_after: Optional[float] = None, body: str = "") -> None:
+        self.status = int(status)
+        self.retry_after = retry_after
+        super().__init__(f"HTTP {self.status}" + (f" {body[:120]}" if body else ""))
+
+
+def parse_retry_after(value: Any) -> Optional[float]:
+    """Seconds from a Retry-After header (delta-seconds or HTTP date)."""
+    if value is None:
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+    seconds = _as_float(text)
+    if seconds is None:
+        from email.utils import parsedate_to_datetime
+
+        try:
+            when = parsedate_to_datetime(text)
+        except (TypeError, ValueError, IndexError):
+            return None
+        if when is None:
+            return None
+        seconds = when.timestamp() - time.time()
+    return max(0.0, seconds)
+
+
 def fetch_crypto_price(start_ts: int, *, timeout: float = 3.0) -> WindowPrice:
     response = thread_session("crypto_price").get(
         CRYPTO_PRICE_URL,
@@ -287,8 +342,47 @@ def fetch_crypto_price(start_ts: int, *, timeout: float = 3.0) -> WindowPrice:
         timeout=timeout,
         headers={"User-Agent": "poly-money-maker-oracle-log/1.0"},
     )
-    response.raise_for_status()
+    status = int(getattr(response, "status_code", 200) or 200)
+    if status >= 400:
+        headers = getattr(response, "headers", None) or {}
+        raise CryptoPriceHTTPError(
+            status,
+            parse_retry_after(headers.get("Retry-After")),
+            str(getattr(response, "text", "") or "").strip(),
+        )
     return parse_crypto_price_body(response.text)
+
+
+def classify_http_error(exc: BaseException) -> tuple[str, Optional[float]]:
+    """``(kind, retry_after)``: ``http_429``, ``http_400``, ..., or ``error``."""
+    status = getattr(exc, "status", None)
+    retry_after = getattr(exc, "retry_after", None)
+    response = getattr(exc, "response", None)
+    if status is None and response is not None:
+        status = getattr(response, "status_code", None)
+        headers = getattr(response, "headers", None) or {}
+        try:
+            retry_after = parse_retry_after(headers.get("Retry-After"))
+        except Exception:
+            retry_after = None
+    try:
+        code = int(status) if status is not None else None
+    except (TypeError, ValueError):
+        code = None
+    if code is None:
+        return "error", None
+    return f"http_{code}", retry_after if code == 429 else None
+
+
+def http_retry_delay_s(kind: str, n429: int, retry_after: Optional[float]) -> float:
+    """20s normally. The n-th consecutive 429 waits 20, 40, 80, then 120s,
+    or longer if the server sent Retry-After."""
+    if kind != "http_429":
+        return HTTP_RETRY_S
+    delay = min(HTTP_BACKOFF_CAP_S, HTTP_RETRY_S * (2 ** max(0, n429 - 1)))
+    if retry_after is not None:
+        delay = max(delay, float(retry_after))
+    return delay
 
 
 def sample_interval_s(now: float, start_ts: float, end_ts: float) -> float:
@@ -326,21 +420,25 @@ def snapshot_intents(state: Any) -> dict:
     return {"intents": copied}
 
 
-def windows_from_intents(state: Any, now: float) -> list[OracleWindow]:
+def windows_from_intents(
+    state: Any, now: float, *, grace_s: float = GRACE_AFTER_S
+) -> list[OracleWindow]:
     """15m bags we hold or are about to hold, through a short post-end grace."""
     intents = state.get("intents") if isinstance(state, dict) else None
     if not isinstance(intents, dict):
         return []
     windows: list[OracleWindow] = []
     for key, intent in intents.items():
-        window = _window_from_intent(key, intent, now)
+        window = _window_from_intent(key, intent, now, grace_s)
         if window is not None:
             windows.append(window)
     windows.sort(key=lambda item: (item.start_ts, item.condition_id))
     return windows
 
 
-def _window_from_intent(key: Any, intent: Any, now: float) -> Optional[OracleWindow]:
+def _window_from_intent(
+    key: Any, intent: Any, now: float, grace_s: float = GRACE_AFTER_S
+) -> Optional[OracleWindow]:
     if not isinstance(intent, dict):
         return None
     if str(intent.get("status") or "") not in BAG_STATUSES:
@@ -364,7 +462,7 @@ def _window_from_intent(key: Any, intent: Any, now: float) -> Optional[OracleWin
             end = start + FIFTEEN_S
         if abs((end - start) - FIFTEEN_S) > 5:
             return None
-    if now > end + GRACE_AFTER_S:
+    if now > end + grace_s:
         return None
     condition_id = str(intent.get("condition_id") or key or "").strip()
     if not condition_id:
@@ -392,6 +490,7 @@ def build_oracle_row(
     open_ref: Optional[str],
     notes: str,
     error: Optional[str] = None,
+    extra: Optional[dict] = None,
 ) -> dict[str, Any]:
     row: dict[str, Any] = {
         "ts": now,
@@ -410,6 +509,9 @@ def build_oracle_row(
     }
     if error:
         row["error"] = error[:240]
+    if extra:
+        for key, value in extra.items():
+            row.setdefault(key, value)
     return row
 
 
@@ -440,6 +542,10 @@ class RtdsTwapFeed:
         self._stop = threading.Event()
         self._thread: Optional[threading.Thread] = None
         self._ws: Any = None
+        self._events: deque[dict] = deque(maxlen=50)
+        self._force_reason = ""
+        self._conn_samples = 0
+        self._reconnects = 0
 
     def start(self) -> None:
         if self._thread is not None and self._thread.is_alive():
@@ -461,6 +567,20 @@ class RtdsTwapFeed:
             except Exception:
                 return
 
+    def reconnect(self, reason: str) -> bool:
+        """Close the live socket so ``_run`` reconnects. False if none is open."""
+        ws = self._ws
+        if ws is None:
+            return False
+        with self._lock:
+            self._force_reason = str(reason)[:120]
+        try:
+            ws.close()
+        except Exception as exc:
+            self._set_error(str(exc)[:240])
+            return False
+        return True
+
     def latest(self) -> Optional[TwapSample]:
         with self._lock:
             return self._latest
@@ -474,6 +594,12 @@ class RtdsTwapFeed:
     def last_error(self) -> str:
         with self._lock:
             return self._last_error
+
+    def pop_events(self) -> list[dict]:
+        with self._lock:
+            items = list(self._events)
+            self._events.clear()
+            return items
 
     def handle_message(self, raw: Any) -> None:
         text = raw.decode("utf-8", "replace") if isinstance(raw, (bytes, bytearray)) else str(raw)
@@ -491,6 +617,7 @@ class RtdsTwapFeed:
                 if self._latest is None or newest.obs_ts >= self._latest.obs_ts:
                     self._latest = newest
                 self._last_error = ""
+                self._conn_samples += len(samples)
             return
         stripped = text.strip()
         if not stripped or stripped.upper() in {"PING", "PONG"}:
@@ -508,15 +635,46 @@ class RtdsTwapFeed:
 
         backoff = 1.0
         while not self._stop.is_set():
+            with self._lock:
+                self._conn_samples = 0
+                self._force_reason = ""
             try:
                 self._run_once(websocket)
-                backoff = 1.0
             except Exception as exc:
                 self._set_error(str(exc)[:240])
             if self._stop.is_set():
                 return
-            self._stop.wait(backoff)
-            backoff = min(30.0, backoff * 2.0)
+            wait, backoff = self._after_disconnect(backoff)
+            self._stop.wait(wait)
+
+    def _after_disconnect(self, backoff: float) -> tuple[float, float]:
+        """Queue one reconnect event. Returns ``(wait_s, next_backoff)``.
+
+        A connection that delivered samples reconnects after 1s and resets
+        the backoff. One that delivered nothing (silent, refused or closed
+        early) waits the current backoff, which doubles up to
+        ``FEED_BACKOFF_MAX_S``."""
+        with self._lock:
+            delivered = self._conn_samples > 0
+            reason = self._force_reason or ("closed" if delivered else "no_samples")
+            if delivered:
+                self._reconnects = 0
+                wait, next_backoff = 1.0, 2.0
+            else:
+                self._reconnects += 1
+                wait = min(FEED_BACKOFF_MAX_S, max(1.0, backoff))
+                next_backoff = min(FEED_BACKOFF_MAX_S, wait * 2.0)
+            self._events.append(
+                {
+                    "kind": "reconnect",
+                    "reason": reason,
+                    "last_error": self._last_error,
+                    "attempt": self._reconnects,
+                    "backoff_s": wait,
+                    "samples": self._conn_samples,
+                }
+            )
+        return wait, next_backoff
 
     def _run_once(self, websocket: Any) -> None:
         ping_stop = threading.Event()
@@ -547,6 +705,7 @@ class RtdsTwapFeed:
         )
         self._ws = app
 
+        # RTDS also wants an application-level text PING every few seconds.
         def ping() -> None:
             while not ping_stop.is_set() and not self._stop.is_set():
                 if ping_stop.wait(5.0):
@@ -558,7 +717,10 @@ class RtdsTwapFeed:
 
         threading.Thread(target=ping, name="oracle-rtds-ping", daemon=True).start()
         try:
-            app.run_forever(ping_interval=0)
+            app.run_forever(
+                ping_interval=FEED_PING_INTERVAL_S,
+                ping_timeout=FEED_PING_TIMEOUT_S,
+            )
         finally:
             ping_stop.set()
             self._ws = None
@@ -571,6 +733,16 @@ class _WindowMemory:
     open_logged: bool = False
     end_logged: bool = False
     last_http: float = 0.0
+    window: Optional[OracleWindow] = None
+    next_http: float = 0.0
+    open_armed: bool = False
+    end_armed: bool = False
+    inflight: bool = False
+    n429: int = 0
+    http_attempts: int = 0
+    http_counts: dict = field(default_factory=dict)
+    http_logged: set = field(default_factory=set)
+    end_final: bool = False
 
 
 class OracleLogService:
@@ -583,20 +755,30 @@ class OracleLogService:
         feed: Any = None,
         fetch_price: Optional[Callable[[int], WindowPrice]] = None,
         max_bytes: int = TAPE_MAX_BYTES,
+        jitter: Optional[Callable[[], float]] = None,
     ) -> None:
         self.path = path
         self.max_bytes = int(max_bytes)
         self._feed = feed if feed is not None else RtdsTwapFeed()
         self._fetch_price = fetch_price if fetch_price is not None else fetch_crypto_price
+        self._jitter = jitter if jitter is not None else (lambda: random.uniform(0.0, HTTP_JITTER_S))
         self.sleep_s = 5.0
         self._memory: dict[str, _WindowMemory] = {}
         self._seen: set[tuple[Any, ...]] = set()
         self._seen_order: deque[tuple[Any, ...]] = deque()
-        self._last_fail_wall = 0.0
-        self._last_fail_text = ""
+        self._fail_wall: dict[str, float] = {}
         self._idle_since: Optional[float] = None
         self._awaiting_since: Optional[float] = None
         self._on_fail: Optional[FailFn] = None
+        self._on_event: Optional[EventFn] = None
+        self._last_arrival: Optional[float] = None
+        self._watchdog_at: Optional[float] = None
+        self._watchdog_gap = FEED_SILENT_RECONNECT_S
+        self._stall_origin: Optional[float] = None
+        self._stall_noted = 0.0
+        self._stall_reminders = 0
+        self._event_wall: dict[str, float] = {}
+        self._event_suppressed: dict[str, int] = {}
 
     def bag_view(self, condition_id: str) -> OracleBagView:
         """Latest TWAP + open_ref for one bag. Reuses the live feed (no second WS)."""
@@ -626,12 +808,14 @@ class OracleLogService:
         *,
         enabled: bool = True,
         on_fail: Optional[FailFn] = None,
+        on_event: Optional[EventFn] = None,
     ) -> None:
         self._on_fail = on_fail
+        self._on_event = on_event
         try:
             self._tick(state, now, enabled=enabled)
         except Exception as exc:
-            self._fail(f"tick: {exc}", now=now, window=None)
+            self._fail(f"tick: {exc}", now=now, window=None, kind="tick")
             self.sleep_s = 5.0
 
     def _tick(self, state: Any, now: float, *, enabled: bool) -> None:
@@ -640,11 +824,27 @@ class OracleLogService:
             self.sleep_s = 5.0
             self._idle_since = None
             self._awaiting_since = None
+            self._end_stall(now, None, reason="disabled")
+            self._reset_feed_watch()
             return
         windows = windows_from_intents(state, now)
+        tracked = {window.condition_id for window in windows}
+        closing = [
+            window
+            for window in windows_from_intents(state, now, grace_s=CLOSE_GRACE_S)
+            if window.condition_id not in tracked
+        ]
         if not windows:
-            self.sleep_s = 5.0
+            self._end_stall(now, None, reason="no_windows")
+            self._reset_feed_watch()
             self._awaiting_since = None
+            for window in closing:
+                self._maybe_http(window, self._window_memory(window), now)
+            self._finish_http(now)
+            pending = any(
+                not self._window_memory(window).end_logged for window in closing
+            )
+            self.sleep_s = INTERVAL_LAST_MIN_S if pending else 5.0
             self._note_idle(now)
             return
         self._idle_since = None
@@ -657,12 +857,28 @@ class OracleLogService:
             samples = list(self._feed.drain())
             latest = self._feed.latest()
         except Exception as exc:
-            self._fail(f"feed: {exc}", now=now, window=windows[0])
+            self._fail(f"feed: {exc}", now=now, window=windows[0], kind="feed")
             samples = []
             latest = None
+        if samples or self._last_arrival is None:
+            self._last_arrival = now
+        if samples:
+            self._watchdog_at = None
+            self._watchdog_gap = FEED_SILENT_RECONNECT_S
         for window in windows:
             self._record_window(window, samples, latest, now)
+        for window in closing:
+            self._maybe_http(window, self._window_memory(window), now)
+        self._finish_http(now)
+        self._log_feed_events(now, windows[0])
+        self._watch_feed(now, windows[0])
         self._note_silence(windows[0], latest, samples, now)
+
+    def _window_memory(self, window: OracleWindow) -> _WindowMemory:
+        memory = self._memory.setdefault(window.condition_id, _WindowMemory())
+        if memory.window is None:
+            memory.window = window
+        return memory
 
     def _stop_feed(self) -> None:
         stop = getattr(self._feed, "stop", None)
@@ -676,6 +892,76 @@ class OracleLogService:
         if now - self._idle_since >= IDLE_STOP_S:
             self._stop_feed()
 
+    def _feed_error(self) -> str:
+        last_error = getattr(self._feed, "last_error", None)
+        if last_error is None:
+            return ""
+        try:
+            return str(last_error() or "")[:240]
+        except Exception as exc:
+            return str(exc)[:240]
+
+    def _reset_feed_watch(self) -> None:
+        self._last_arrival = None
+        self._watchdog_at = None
+        self._watchdog_gap = FEED_SILENT_RECONNECT_S
+
+    def _watch_feed(self, now: float, window: OracleWindow) -> None:
+        """Force a reconnect when a tracked bag gets no sample for too long."""
+        if self._last_arrival is None:
+            return
+        silent = now - self._last_arrival
+        since = self._watchdog_at if self._watchdog_at is not None else self._last_arrival
+        if silent < FEED_SILENT_RECONNECT_S or now - since < self._watchdog_gap:
+            return
+        reconnect = getattr(self._feed, "reconnect", None)
+        if reconnect is None:
+            return
+        try:
+            closed = bool(reconnect(f"watchdog: silent {silent:.0f}s"))
+        except Exception as exc:
+            closed = False
+            self._fail(f"feed: reconnect {exc}", now=now, window=window, kind="feed")
+        self._watchdog_gap = min(FEED_WATCHDOG_CAP_S, self._watchdog_gap * 2.0)
+        self._watchdog_at = now
+        self._event(
+            "oracle_feed_watchdog",
+            now=now,
+            window=window,
+            fields={
+                "silent_s": round(silent, 1),
+                "closed": closed,
+                "next_check_s": self._watchdog_gap,
+                "last_error": self._feed_error(),
+            },
+            throttle="watchdog",
+        )
+
+    def _log_feed_events(self, now: float, window: OracleWindow) -> None:
+        pop = getattr(self._feed, "pop_events", None)
+        if pop is None:
+            return
+        try:
+            events = list(pop())
+        except Exception:
+            return
+        for item in events:
+            if not isinstance(item, dict) or item.get("kind") != "reconnect":
+                continue
+            self._event(
+                "oracle_feed_reconnect",
+                now=now,
+                window=window,
+                fields={
+                    "reason": str(item.get("reason") or "")[:120],
+                    "last_error": str(item.get("last_error") or "")[:240],
+                    "attempt": item.get("attempt"),
+                    "backoff_s": item.get("backoff_s"),
+                    "samples": item.get("samples"),
+                },
+                throttle="reconnect",
+            )
+
     def _note_silence(
         self,
         window: OracleWindow,
@@ -683,28 +969,63 @@ class OracleLogService:
         samples: list[TwapSample],
         now: float,
     ) -> None:
-        if latest is not None or samples:
+        """One ``oracle_feed_stall`` when the TWAP goes stale, a reminder at
+        most every ``STALL_REMIND_S``, and one ``oracle_feed_recovered``."""
+        if latest is not None:
             self._awaiting_since = None
-            if latest is not None and now - latest.obs_ts > STALE_AFTER_S:
-                self._fail(
-                    f"stale twap age={now - latest.obs_ts:.0f}s",
-                    now=now,
-                    window=window,
-                )
+            origin = float(latest.obs_ts)
+        else:
+            if self._awaiting_since is None:
+                self._awaiting_since = now
+            origin = self._awaiting_since
+        del samples
+        age = now - origin
+        if age <= STALE_AFTER_S:
+            self._end_stall(now, window, reason="fresh")
             return
-        if self._awaiting_since is None:
-            self._awaiting_since = now
+        if self._stall_origin is None:
+            self._stall_origin = origin
+            self._stall_noted = now
+            self._stall_reminders = 0
+            self._event(
+                "oracle_feed_stall",
+                now=now,
+                window=window,
+                fields={
+                    "age_s": round(age, 1),
+                    "reminder": 0,
+                    "no_sample_yet": latest is None,
+                    "last_error": self._feed_error(),
+                },
+            )
             return
-        if now - self._awaiting_since < STALE_AFTER_S:
+        if now - self._stall_noted >= STALL_REMIND_S:
+            self._stall_noted = now
+            self._stall_reminders += 1
+            self._event(
+                "oracle_feed_stall",
+                now=now,
+                window=window,
+                fields={
+                    "age_s": round(age, 1),
+                    "reminder": self._stall_reminders,
+                    "no_sample_yet": latest is None,
+                    "last_error": self._feed_error(),
+                },
+            )
+
+    def _end_stall(self, now: float, window: Optional[OracleWindow], *, reason: str) -> None:
+        if self._stall_origin is None:
             return
-        error = ""
-        last_error = getattr(self._feed, "last_error", None)
-        if last_error is not None:
-            try:
-                error = str(last_error() or "")
-            except Exception as exc:
-                error = str(exc)
-        self._fail(error or "no twap sample", now=now, window=window)
+        duration = now - self._stall_origin
+        self._stall_origin = None
+        self._stall_reminders = 0
+        self._event(
+            "oracle_feed_recovered",
+            now=now,
+            window=window,
+            fields={"duration_s": round(duration, 1), "reason": reason},
+        )
 
     def _record_window(
         self,
@@ -713,7 +1034,7 @@ class OracleLogService:
         latest: Optional[TwapSample],
         now: float,
     ) -> None:
-        memory = self._memory.setdefault(window.condition_id, _WindowMemory())
+        memory = self._window_memory(window)
         self._maybe_http(window, memory, now)
         interval = sample_interval_s(now, window.start_ts, window.end_ts)
         dense = interval <= INTERVAL_HOT_S
@@ -762,21 +1083,79 @@ class OracleLogService:
         return True
 
     def _maybe_http(self, window: OracleWindow, memory: _WindowMemory, now: float) -> None:
+        """At most one crypto-price request in flight per window.
+
+        The first request waits for the open (or the end) plus 0-3s jitter.
+        ``incomplete`` is a normal 20s wait. A 429 backs off 20/40/80/120s
+        (or Retry-After). The close is fetched until ``CLOSE_GRACE_S``."""
+        if memory.inflight:
+            return
         need_open = memory.open_ref is None and now >= window.start_ts
-        need_end = (not memory.end_logged) and now >= window.end_ts
+        need_end = (
+            not memory.end_logged
+            and window.end_ts <= now <= window.end_ts + CLOSE_GRACE_S
+        )
         if not need_open and not need_end:
             return
-        if memory.last_http and now - memory.last_http < HTTP_RETRY_S:
+        if need_open and not memory.open_armed:
+            memory.open_armed = True
+            memory.next_http = max(memory.next_http, window.start_ts + self._jitter_s())
+        if need_end and not memory.end_armed:
+            memory.end_armed = True
+            memory.next_http = max(memory.next_http, window.end_ts + self._jitter_s())
+        if now < memory.next_http:
             return
+        memory.inflight = True
         memory.last_http = now
+        memory.http_attempts += 1
         try:
-            price = self._fetch_price(int(window.start_ts))
-        except Exception as exc:
-            self._fail(f"crypto-price: {exc}", now=now, window=window)
+            try:
+                price = self._fetch_price(int(window.start_ts))
+            except Exception as exc:
+                self._http_failed(window, memory, now, exc)
+                return
+            if not isinstance(price, WindowPrice):
+                self._http_failed(window, memory, now, ValueError("bad payload"))
+                return
+            memory.n429 = 0
+            self._http_ok(window, memory, now, price, need_end)
+        finally:
+            memory.inflight = False
+
+    def _jitter_s(self) -> float:
+        try:
+            value = float(self._jitter())
+        except Exception:
+            return 0.0
+        return min(HTTP_JITTER_S, max(0.0, value))
+
+    def _http_failed(
+        self, window: OracleWindow, memory: _WindowMemory, now: float, exc: BaseException
+    ) -> None:
+        kind, retry_after = classify_http_error(exc)
+        memory.http_counts[kind] = int(memory.http_counts.get(kind, 0)) + 1
+        memory.n429 = memory.n429 + 1 if kind == "http_429" else 0
+        delay = http_retry_delay_s(kind, memory.n429, retry_after)
+        memory.next_http = now + delay + self._jitter_s()
+        if kind in memory.http_logged:
             return
-        if not isinstance(price, WindowPrice):
-            self._fail("crypto-price: bad payload", now=now, window=window)
-            return
+        memory.http_logged.add(kind)
+        hint = f"; retry_after={retry_after:.0f}s" if retry_after is not None else ""
+        self._fail(
+            f"crypto-price {kind}: {exc} (retry in {delay:.0f}s{hint}; once per window)",
+            now=now,
+            window=window,
+            kind=f"http:{window.condition_id}:{kind}",
+        )
+
+    def _http_ok(
+        self,
+        window: OracleWindow,
+        memory: _WindowMemory,
+        now: float,
+        price: WindowPrice,
+        need_end: bool,
+    ) -> None:
         if price.open_ref and not memory.open_logged:
             memory.open_ref = price.open_ref
             memory.open_logged = True
@@ -810,6 +1189,47 @@ class OracleLogService:
                     notes="window_end",
                 )
             )
+            self._close_summary(window, memory, now, outcome="ok")
+            return
+        if need_end:
+            # Not published yet: a normal wait, not an error.
+            memory.http_counts["incomplete"] = int(memory.http_counts.get("incomplete", 0)) + 1
+        if need_end or memory.open_ref is None:
+            memory.next_http = now + HTTP_RETRY_S + self._jitter_s()
+
+    def _finish_http(self, now: float) -> None:
+        for cid in list(self._memory):
+            memory = self._memory[cid]
+            window = memory.window
+            if window is None:
+                continue
+            past = now - (window.end_ts + CLOSE_GRACE_S)
+            if past <= 0:
+                continue
+            if memory.end_armed and not memory.end_logged and not memory.end_final:
+                self._close_summary(window, memory, now, outcome="gave_up")
+            if past > 60.0:
+                del self._memory[cid]
+
+    def _close_summary(
+        self, window: OracleWindow, memory: _WindowMemory, now: float, *, outcome: str
+    ) -> None:
+        """One line per window: always on give-up, on success only after errors."""
+        memory.end_final = True
+        errors = {k: v for k, v in memory.http_counts.items() if k != "incomplete"}
+        if outcome == "ok" and not errors:
+            return
+        self._event(
+            "oracle_close_fetch" if outcome == "ok" else "oracle_window_end_missed",
+            now=now,
+            window=window,
+            fields={
+                "outcome": outcome,
+                "attempts": memory.http_attempts,
+                "counts": dict(sorted(memory.http_counts.items())),
+                "after_end_s": round(now - window.end_ts, 1),
+            },
+        )
 
     def _remember(self, key: tuple[Any, ...]) -> bool:
         if key in self._seen:
@@ -825,18 +1245,86 @@ class OracleLogService:
         try:
             append_jsonl(self.path, row, max_bytes=self.max_bytes)
         except Exception as exc:
-            if self._on_fail is not None:
-                try:
-                    self._on_fail(f"write: {exc}"[:240])
-                except Exception:
-                    return
+            if self._on_fail is None:
+                return
+            if not self._throttle_ok(self._fail_wall, "write", float(row.get("ts") or 0.0), FAIL_REPEAT_S):
+                return
+            try:
+                self._on_fail(f"write: {exc}"[:240])
+            except Exception:
+                return
 
-    def _fail(self, message: str, *, now: float, window: Optional[OracleWindow]) -> None:
-        text = " ".join(str(message).split())[:240] or "oracle_log_fail"
-        if text == self._last_fail_text and now - self._last_fail_wall < FAIL_REPEAT_S:
+    @staticmethod
+    def _throttle_ok(book: dict, key: str, now: float, every: float) -> bool:
+        last = book.get(key)
+        if last is not None and 0.0 <= now - last < every:
+            return False
+        book[key] = now
+        return True
+
+    def _event(
+        self,
+        name: str,
+        *,
+        now: float,
+        window: Optional[OracleWindow],
+        fields: dict,
+        throttle: Optional[str] = None,
+    ) -> None:
+        """Tape row + ``on_event`` (``on_fail`` text if no event hook).
+        ``throttle`` keys allow one line per ``FEED_EVENT_REPEAT_S``."""
+        payload = dict(fields)
+        if throttle is not None:
+            if not self._throttle_ok(self._event_wall, throttle, now, FEED_EVENT_REPEAT_S):
+                self._event_suppressed[throttle] = self._event_suppressed.get(throttle, 0) + 1
+                return
+            payload["suppressed"] = self._event_suppressed.pop(throttle, 0)
+        if window is not None:
+            payload.setdefault("slug", window.slug)
+            payload.setdefault("condition_id", window.condition_id)
+        try:
+            append_jsonl(
+                self.path,
+                max_bytes=self.max_bytes,
+                row=build_oracle_row(
+                    now=now,
+                    window=window,
+                    source=RTDS_SOURCE,
+                    event=name,
+                    twap=None,
+                    twap_ts=None,
+                    open_ref=None,
+                    notes=name,
+                    extra={k: v for k, v in payload.items() if k not in ("slug", "condition_id")},
+                ),
+            )
+        except Exception:
+            pass
+        if self._on_event is not None:
+            try:
+                self._on_event(name, payload)
+            except Exception:
+                return
             return
-        self._last_fail_wall = now
-        self._last_fail_text = text
+        if self._on_fail is not None:
+            detail = " ".join(f"{k}={v}" for k, v in payload.items() if v not in ("", None))
+            try:
+                self._on_fail(f"{name} {detail}"[:240])
+            except Exception:
+                return
+
+    def _fail(
+        self,
+        message: str,
+        *,
+        now: float,
+        window: Optional[OracleWindow],
+        kind: str,
+    ) -> None:
+        """Throttled per ``kind`` (not exact text) to one per ``FAIL_REPEAT_S``."""
+        text = " ".join(str(message).split())[:240] or "oracle_log_fail"
+        if not self._throttle_ok(self._fail_wall, kind, now, FAIL_REPEAT_S):
+            return
         try:
             append_jsonl(
                 self.path,

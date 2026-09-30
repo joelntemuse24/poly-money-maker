@@ -378,7 +378,7 @@ class WriterTests(unittest.TestCase):
     def _service(self, feed: FakeFeed, fetch):
         folder = Path(tempfile.mkdtemp(prefix="oracle-log-"))
         path = folder / "oracle_twap.jsonl"
-        return OracleLogService(path, feed=feed, fetch_price=fetch), path
+        return OracleLogService(path, feed=feed, fetch_price=fetch, jitter=lambda: 0.0), path
 
     def test_bag_view_reuses_feed_and_open_ref(self):
         feed = FakeFeed()
