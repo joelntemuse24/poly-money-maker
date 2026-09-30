@@ -15,6 +15,7 @@
   ],
   "one_entry_per_market": true,
   "max_open_sets": 1,
+  "count_kept_loser_as_open": false,
   "poll_s": 5.0,
   "sell_armed_poll_s": 2.0,
   "oracle_log_enabled": true,

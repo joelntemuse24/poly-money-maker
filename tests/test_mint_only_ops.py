@@ -1240,7 +1240,7 @@ class DeployUnitsTests(unittest.TestCase):
         self.assertNotIn("def run_cycle", src)
         validate = src[src.find("def validate_strategy") : src.find("def eligible_markets")]
         self.assertIn("sell_armed_poll_s", validate)
-        self.assertIn("poll_s must be >= 2", validate)
+        self.assertIn("poll_s must be >= 1", validate)
 
     def test_loser_sweep_posts_one_full_floor_fak_and_leaves_a_remainder(self):
         from buy.mint_sell import loser_scrap_post, sell_fill_vwap
