@@ -1,4 +1,10 @@
-"""WhatsApp alerts via CallMeBot when a loser scrap (or, opt-in, a held dump) fills.
+"""WhatsApp alerts via CallMeBot.
+
+* Danger zone (default on): after the loser scrap has filled, the held
+  (winner) leg's sized bid stays under ``notify_danger_px`` for
+  ``notify_danger_hold_s``. One alert per bag, and a ``danger_zone`` log line
+  even when WhatsApp is off.
+* Scrap fill and held dump fill (both default off).
 
 Alerts only. Nothing here reads or writes intent state, and nothing here can
 block the sell loop: ``send`` is a non-blocking put on a bounded queue, and
@@ -31,6 +37,8 @@ BAG_TZ = "Europe/Dublin"
 # restart does not re-announce old bags still sitting in state.
 WINDOW_END_NOTIFY_S = 60.0
 MIN_SOLD = 0.01
+DANGER_PX = 0.70
+DANGER_HOLD_S = 5.0
 
 LogFn = Callable[..., None]
 HttpGet = Callable[..., Any]
@@ -348,6 +356,60 @@ def dump_message(
     return "Mintbot DUMP: " + " | ".join(parts)
 
 
+def _shares_held(intent: Mapping[str, Any]) -> tuple[float, float]:
+    """``(held winner shares, kept loser shares)`` from the intent's own counters."""
+    shares = _num(intent.get("shares")) or 0.0
+    sold_held = (_num(intent.get("sell_dump_filled")) or 0.0) + (
+        _num(intent.get("sell_winner_filled")) or 0.0
+    )
+    keep = _num(intent.get("sell_scrap_keep"))
+    if keep is None:
+        keep = shares - (_num(intent.get("sell_filled")) or 0.0)
+    return max(0.0, shares - sold_held), max(0.0, keep)
+
+
+def danger_message(
+    intent: Mapping[str, Any],
+    *,
+    now: float,
+    held: str,
+    bid: float,
+    danger_px: float,
+    hold_s: float,
+    dump_below: Optional[float],
+    dump_max_ttm_s: float = 0.0,
+) -> str:
+    """``Mintbot DANGER: 11:30 bag | UP bid 0.66 <70c for 5s | 3m12s left |
+    holding 125 UP + 63 DN | dump arms <40c``."""
+    held_sh, kept_sh = _shares_held(intent)
+    loser = _other(held)
+    parts = [
+        f"{bag_start_label(_start_ts(intent))} bag",
+        f"{_leg_name(held)} bid {_px_txt(bid)} <{danger_px * 100:.0f}c for {hold_s:.0f}s",
+    ]
+    end = _num(intent.get("end_ts"))
+    parts.append(_left_txt(None if end is None else end - now))
+    holding = f"holding {_shares_txt(held_sh)} {_leg_name(held)}"
+    if kept_sh >= MIN_SOLD:
+        holding += f" + {_shares_txt(kept_sh)} {_leg_name(loser)}"
+    parts.append(holding)
+    if dump_below is None:
+        parts.append("dump off")
+    else:
+        arm = f"dump arms <{dump_below * 100:.0f}c"
+        if dump_max_ttm_s > 0:
+            arm += f" in last {dump_max_ttm_s:.0f}s"
+        parts.append(arm)
+    return "Mintbot DANGER: " + " | ".join(parts)
+
+
+def _cfg_float(cfg: Mapping[str, Any], key: str, default: float, *, lo: float, hi: float) -> float:
+    value = _num(cfg.get(key))
+    if value is None or isinstance(cfg.get(key), bool) or not lo <= value <= hi:
+        return default
+    return value
+
+
 def _truthy(value: Any, default: bool) -> bool:
     if value is None:
         return default
@@ -370,19 +432,35 @@ class BagAlerts:
         self._log = log
         self.scrap = False
         self.dump = False
+        self.danger = False
+        self.danger_px = DANGER_PX
+        self.danger_hold_s = DANGER_HOLD_S
+        self.dump_below: Optional[float] = None
+        self.dump_max_ttm_s = 0.0
         self.dry_run = True
         self._bids: dict[str, dict] = {}
         self._sent: set[tuple[str, str]] = set()
+        self._below_since: dict[str, float] = {}
+        self._danger_fired: dict[str, float] = {}
 
     def configure(self, cfg: Mapping[str, Any]) -> None:
         """Re-read knobs each sell tick so strategy hot-reload applies."""
         try:
             on = self.notifier.enabled
-            self.scrap = on and _truthy(cfg.get("notify_scrap_whatsapp"), True)
+            self.scrap = on and _truthy(cfg.get("notify_scrap_whatsapp"), False)
             self.dump = on and _truthy(cfg.get("notify_dump_whatsapp"), False)
+            self.danger = on and _truthy(cfg.get("notify_danger_whatsapp"), True)
+            self.danger_px = _cfg_float(cfg, "notify_danger_px", DANGER_PX, lo=0.0, hi=1.0)
+            self.danger_hold_s = _cfg_float(
+                cfg, "notify_danger_hold_s", DANGER_HOLD_S, lo=0.0, hi=3600.0
+            )
+            dump_on = _truthy(cfg.get("sell_dump_enabled"), True)
+            below = _num(cfg.get("sell_dump_below"))
+            self.dump_below = (below if below else 0.80) if dump_on else None
+            self.dump_max_ttm_s = _cfg_float(cfg, "sell_dump_max_ttm_s", 0.0, lo=0.0, hi=1e9)
             self.dry_run = _truthy(cfg.get("dry_run"), True)
         except Exception:
-            self.scrap = self.dump = False
+            self.scrap = self.dump = self.danger = False
 
     def startup(self, cfg: Mapping[str, Any]) -> None:
         """Exactly one startup line; never includes the key or full phone."""
@@ -398,6 +476,9 @@ class BagAlerts:
             self._emit(
                 "notify_whatsapp_on",
                 phone=self.notifier.phone_hint(),
+                danger=self.danger,
+                danger_px=self.danger_px,
+                danger_hold_s=self.danger_hold_s,
                 scrap=self.scrap,
                 dump=self.dump,
                 dry_run=self.dry_run,
@@ -444,6 +525,92 @@ class BagAlerts:
             )
         except Exception:
             return False
+
+    def danger_tick(
+        self,
+        intent: Mapping[str, Any],
+        cid: str,
+        *,
+        now: float,
+        held: Any,
+        bid: Any,
+    ) -> bool:
+        """Run once per sell tick per bag with the dump's own held bid.
+
+        Watches only after the loser scrap has filled (``sold_loser``) and
+        before any dump / winner sale, inside the window. The held bid must
+        stay under ``danger_px`` for ``danger_hold_s``; a bid at or above the
+        line, or no sized bid, resets the timer. Fires once per bag: a
+        ``danger_zone`` log line always, a WhatsApp only when enabled and not
+        dry run. Returns True on the tick it fires."""
+        try:
+            key = str(cid)
+            end = _num(intent.get("end_ts"))
+            if end is not None and now >= end:
+                self._below_since.pop(key, None)
+                return False
+            if key in self._danger_fired:
+                return False
+            watching = (
+                held in ("up", "dn")
+                and bool(intent.get("sold_loser") or intent.get("sold_leg"))
+                and not intent.get("sold_dump")
+                and not intent.get("sold_winner")
+            )
+            px = _num(bid)
+            if not watching or px is None or px <= 0 or px >= self.danger_px - 1e-12:
+                self._below_since.pop(key, None)
+                return False
+            since = self._below_since.setdefault(key, now)
+            below_s = now - since
+            if below_s + 1e-9 < self.danger_hold_s:
+                return False
+            self._below_since.pop(key, None)
+            self._danger_fired[key] = end if end is not None else now
+            self._prune_danger(now)
+            held_sh, kept_sh = _shares_held(intent)
+            send = self.danger and not self.dry_run
+            self._emit(
+                "danger_zone",
+                condition_id=key,
+                slug=intent.get("slug"),
+                leg=held,
+                bid=px,
+                threshold=self.danger_px,
+                hold_s=self.danger_hold_s,
+                below_s=round(below_s, 3),
+                ttm=None if end is None else round(end - now, 3),
+                held_shares=held_sh,
+                kept_shares=kept_sh,
+                dump_below=self.dump_below,
+                whatsapp=send,
+                dry_run=self.dry_run,
+            )
+            if not send:
+                return True
+            text = danger_message(
+                intent,
+                now=now,
+                held=str(held),
+                bid=px,
+                danger_px=self.danger_px,
+                hold_s=self.danger_hold_s,
+                dump_below=self.dump_below,
+                dump_max_ttm_s=self.dump_max_ttm_s,
+            )
+            self.notifier.send(
+                text, kind="danger", meta={"condition_id": key, "slug": intent.get("slug")},
+            )
+            return True
+        except Exception:
+            return False
+
+    def _prune_danger(self, now: float) -> None:
+        if len(self._danger_fired) <= 200:
+            return
+        for key, end in list(self._danger_fired.items()):
+            if end < now - 3600.0:
+                self._danger_fired.pop(key, None)
 
     def dump_filled(
         self, intent: Mapping[str, Any], cid: str, *, now: float, leg: Any = None

@@ -182,8 +182,13 @@ DEFAULTS = {
     "max_open_sets": 1,
     # WhatsApp alerts (CallMeBot). No-op unless CALLMEBOT_PHONE and
     # CALLMEBOT_APIKEY are set in the environment.
-    "notify_scrap_whatsapp": True,
+    "notify_scrap_whatsapp": False,
     "notify_dump_whatsapp": False,
+    # Danger: after the loser scrap, the held winner's sized bid stays
+    # under notify_danger_px for notify_danger_hold_s. One alert per bag.
+    "notify_danger_whatsapp": True,
+    "notify_danger_px": 0.70,
+    "notify_danger_hold_s": 5.0,
     # False: a sold loser frees its mint slot even when a partial scrap
     # kept some loser shares. True: those kept shares hold the slot until
     # the window's grace ends (fewer mints, capped open exposure).
@@ -2416,6 +2421,15 @@ def _manage_sells_locked(cfg: dict, state: dict, chain: ChainReader) -> None:
         bids = {"up": up_bid, "dn": dn_bid}
         shares = float(intent.get("shares") or cfg["shares"])
         sold_loser = bool(intent.get("sold_loser") or intent.get("sold_leg"))
+        danger_held = {"up": "dn", "dn": "up"}.get(str(intent.get("sold_leg") or ""))
+        _whatsapp(
+            "danger_tick",
+            intent,
+            cid,
+            now=now,
+            held=danger_held,
+            bid=bids.get(danger_held) if danger_held else None,
+        )
         _bag_risk_ensure(cid, sold_at_start=sold_loser)
         if sold_loser and not intent.get("sold_loser_at"):
             prior = intent.get("last_sell_attempt_at")

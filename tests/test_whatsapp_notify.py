@@ -18,6 +18,7 @@ from buy.whatsapp_notify import (
     BagAlerts,
     WhatsAppNotifier,
     bag_start_label,
+    danger_message,
     dump_message,
     redact,
     scrap_message,
@@ -166,7 +167,8 @@ class NoEnvTests(unittest.TestCase):
         alerts.startup({"dry_run": False})
         self.assertEqual(
             log.rows,
-            [{"event": "notify_whatsapp_on", "phone": "...7820", "scrap": True, "dump": False, "dry_run": False}],
+            [{"event": "notify_whatsapp_on", "phone": "...7820", "danger": True, "danger_px": 0.70,
+              "danger_hold_s": 5.0, "scrap": False, "dump": False, "dry_run": False}],
         )
         self.assertNotIn(KEY, log.dump())
         self.assertNotIn(PHONE, log.dump())
@@ -177,13 +179,15 @@ class KnobTests(unittest.TestCase):
         sent: list = []
         alerts = BagAlerts(_notifier(lambda *a, **k: sent.append(k) or Resp(200)))
         alerts.configure({"dry_run": False})
-        self.assertEqual((alerts.scrap, alerts.dump), (True, False))
+        self.assertEqual((alerts.danger, alerts.scrap, alerts.dump), (True, False, False))
+        self.assertEqual((alerts.danger_px, alerts.danger_hold_s), (0.70, 5.0))
+        self.assertFalse(alerts.scrap_filled(_scrap_intent(), "c1", now=END - 10))
         alerts.configure({"dry_run": False, "notify_scrap_whatsapp": False, "notify_dump_whatsapp": "true"})
         self.assertEqual((alerts.scrap, alerts.dump), (False, True))
         self.assertFalse(alerts.scrap_filled(_scrap_intent(), "c1", now=END - 10))
-        alerts.configure({"dry_run": True})
+        alerts.configure({"dry_run": True, "notify_scrap_whatsapp": True})
         self.assertFalse(alerts.scrap_filled(_scrap_intent(), "c1", now=END - 10))
-        alerts.configure({"dry_run": False})
+        alerts.configure({"dry_run": False, "notify_scrap_whatsapp": True})
         self.assertTrue(alerts.scrap_filled(_scrap_intent(), "c1", now=END - 10))
         self.assertFalse(alerts.scrap_filled(_scrap_intent(), "c1", now=END - 9))
         alerts.notifier.flush()
@@ -191,8 +195,10 @@ class KnobTests(unittest.TestCase):
 
     def test_window_end_partial_only_just_after_the_end(self):
         alerts = BagAlerts(_notifier(lambda *a, **k: Resp(200)))
-        alerts.configure({"dry_run": False})
         partial = _scrap_intent(sold_loser=False, sell_filled=20.0)
+        alerts.configure({"dry_run": False})
+        self.assertFalse(alerts.scrap_filled(partial, "default-off", now=END + 5, window_end=True))
+        alerts.configure({"dry_run": False, "notify_scrap_whatsapp": True})
         self.assertFalse(alerts.scrap_filled(partial, "old", now=END + 3600, window_end=True))
         self.assertFalse(alerts.scrap_filled(_scrap_intent(), "done", now=END + 5, window_end=True))
         self.assertTrue(alerts.scrap_filled(partial, "fresh", now=END + 5, window_end=True))
@@ -205,8 +211,10 @@ class KnobTests(unittest.TestCase):
                 isinstance(t, ast.Name) and t.id == "DEFAULTS" for t in node.targets
             ):
                 defaults = ast.literal_eval(node.value)
-        self.assertIs(defaults["notify_scrap_whatsapp"], True)
+        self.assertIs(defaults["notify_scrap_whatsapp"], False)
         self.assertIs(defaults["notify_dump_whatsapp"], False)
+        self.assertIs(defaults["notify_danger_whatsapp"], True)
+        self.assertEqual((defaults["notify_danger_px"], defaults["notify_danger_hold_s"]), (0.70, 5.0))
         example = json.loads((ROOT / "strategy_mint.example.json").read_text(encoding="utf-8"))
         folder = Path(tempfile.mkdtemp(prefix="strategy-"))
         for extra in ({}, {"notify_whatsapp_typo": 1}, {"notify_dump_whatsapp": True}):
@@ -216,7 +224,9 @@ class KnobTests(unittest.TestCase):
             path.write_text(json.dumps(raw), encoding="utf-8")
             ns = _load("load_strategy", "validate_strategy", extras={"STRATEGY_FILE": path, "DEFAULTS": defaults, "validate_mint_gas": validate_mint_gas})
             cfg = ns["load_strategy"]()
-            self.assertIs(cfg["notify_scrap_whatsapp"], True)
+            self.assertIs(cfg["notify_scrap_whatsapp"], False)
+            self.assertIs(cfg["notify_danger_whatsapp"], True)
+            self.assertEqual(cfg["notify_danger_px"], 0.70)
             self.assertIs(cfg["notify_dump_whatsapp"], bool(extra.get("notify_dump_whatsapp")))
             self.assertNotIn("notify_whatsapp_typo", cfg)
 
@@ -381,7 +391,7 @@ class SellLoopIntegrationTests(unittest.TestCase):
         ns["_BAG_ALERTS"] = alerts
         end = clock["now"] + 200.0
         intent = _open_scrap_bag(end, sell_loser_armed_at=clock["now"] - 10.0)
-        cfg = _scrap_cfg(sell_floor=0.01, sell_scrap_max_ttm_s=0)
+        cfg = _scrap_cfg(sell_floor=0.01, sell_scrap_max_ttm_s=0, notify_scrap_whatsapp=True)
         for _ in range(3):
             state = {"intents": {"cid-wa": intent}}
             ns["remember_persisted_state"](state)
@@ -395,7 +405,11 @@ class SellLoopIntegrationTests(unittest.TestCase):
         )
 
     def test_dry_run_and_disabled_knob_send_nothing(self):
-        for cfg_extra in ({"dry_run": True}, {"notify_scrap_whatsapp": False}):
+        for cfg_extra in (
+            {"dry_run": True, "notify_scrap_whatsapp": True},
+            {"notify_scrap_whatsapp": False},
+            {},
+        ):
             ns, _events, _fak, clock, _book = _scrap_harness()
             alerts, sent = self._alerts()
             ns["_BAG_ALERTS"] = alerts
@@ -439,12 +453,257 @@ class SellLoopIntegrationTests(unittest.TestCase):
         state = {"intents": {"cid-wa": intent}}
         ns["remember_persisted_state"](state)
         t0 = time.monotonic()
-        ns["_manage_sells_locked"](_scrap_cfg(sell_floor=0.01, sell_scrap_max_ttm_s=0), state, object())
+        ns["_manage_sells_locked"](
+            _scrap_cfg(sell_floor=0.01, sell_scrap_max_ttm_s=0, notify_scrap_whatsapp=True),
+            state,
+            object(),
+        )
         self.assertLess(time.monotonic() - t0, 1.0)
         self.assertTrue(intent.get("sold_loser"))
         self.assertEqual(len(fak_calls), 1)
         release.set()
         self.assertTrue(notifier.flush())
+
+
+def _danger_bag(**extra) -> dict:
+    return _scrap_intent(shares=125.0, **extra)
+
+
+class DangerUnitTests(unittest.TestCase):
+    """``BagAlerts.danger_tick`` on its own; ``held`` is UP (the scrap sold DN)."""
+
+    def _alerts(self, cfg=None, env=True):
+        sent: list = []
+        log = Log()
+        get = lambda url, *, params, timeout: sent.append(params["text"]) or Resp(200)  # noqa: E731
+        if env:
+            notifier = _notifier(get, log)
+        else:
+            notifier = WhatsAppNotifier.from_env({}, log=log, http_get=get)
+        alerts = BagAlerts(notifier, log=log)
+        alerts.configure({"dry_run": False, "sell_dump_below": 0.40, **(cfg or {})})
+        return alerts, sent, log
+
+    def _run(self, alerts, intent, ticks, *, cid="cid-d", t0=None):
+        """``ticks`` is ``[(seconds_from_t0, bid), ...]``; returns the fire times."""
+        t0 = END - 192.0 if t0 is None else t0
+        return [
+            s for s, bid in ticks
+            if alerts.danger_tick(intent, cid, now=t0 + s, held="up", bid=bid)
+        ]
+
+    def test_message_matches_the_spec_example(self):
+        text = danger_message(
+            _danger_bag(), now=END - 192.0, held="up", bid=0.66,
+            danger_px=0.70, hold_s=5.0, dump_below=0.40,
+        )
+        self.assertEqual(
+            text,
+            "Mintbot DANGER: 11:30 bag | UP bid 0.66 <70c for 5s | 3m12s left"
+            " | holding 125 UP + 63 DN | dump arms <40c",
+        )
+        gated = danger_message(
+            _danger_bag(sell_scrap_keep=0.0), now=END - 30.0, held="up", bid=0.5,
+            danger_px=0.70, hold_s=5.0, dump_below=0.40, dump_max_ttm_s=240.0,
+        )
+        self.assertTrue(gated.endswith("30s left | holding 125 UP | dump arms <40c in last 240s"))
+        off = danger_message(
+            _danger_bag(), now=END - 30.0, held="up", bid=0.5,
+            danger_px=0.70, hold_s=5.0, dump_below=None,
+        )
+        self.assertTrue(off.endswith("| dump off"))
+
+    def test_fires_after_five_seconds_continuously_below(self):
+        alerts, sent, log = self._alerts()
+        fired = self._run(alerts, _danger_bag(), [(s, 0.66) for s in range(0, 9)])
+        self.assertEqual(fired, [5])
+        alerts.notifier.flush()
+        self.assertEqual(
+            sent,
+            ["Mintbot DANGER: 11:30 bag | UP bid 0.66 <70c for 5s | 3m07s left"
+             " | holding 125 UP + 63 DN | dump arms <40c"],
+        )
+        rows = log.named("danger_zone")
+        self.assertEqual(len(rows), 1)
+        row = rows[0]
+        self.assertEqual(
+            {k: row[k] for k in ("condition_id", "leg", "bid", "threshold", "hold_s", "below_s",
+                                 "ttm", "held_shares", "kept_shares", "dump_below", "whatsapp")},
+            {"condition_id": "cid-d", "leg": "up", "bid": 0.66, "threshold": 0.70, "hold_s": 5.0,
+             "below_s": 5.0, "ttm": 187.0, "held_shares": 125.0, "kept_shares": 63.0,
+             "dump_below": 0.40, "whatsapp": True},
+        )
+        self.assertEqual(len(log.named("notify_sent")), 1)
+        self.assertEqual(log.named("notify_sent")[0]["kind"], "danger")
+
+    def test_recovery_at_four_seconds_resets_the_timer(self):
+        alerts, sent, log = self._alerts()
+        ticks = [(0, 0.66), (1, 0.60), (2, 0.66), (3, 0.69), (4, 0.70)]
+        ticks += [(s, 0.66) for s in range(5, 10)]
+        self.assertEqual(self._run(alerts, _danger_bag(), ticks), [])
+        self.assertEqual(log.named("danger_zone"), [])
+        self.assertEqual(self._run(alerts, _danger_bag(), [(10, 0.66)]), [10])
+        for gap in (None, 0.0, 0.85):
+            alerts, _sent, _log = self._alerts()
+            ticks = [(s, 0.5) for s in range(0, 4)] + [(4, gap)] + [(s, 0.5) for s in range(5, 9)]
+            self.assertEqual(self._run(alerts, _danger_bag(), ticks), [], gap)
+
+    def test_no_fire_before_the_scrap_fills_and_no_carry_over(self):
+        alerts, sent, log = self._alerts()
+        pre = _danger_bag(sold_loser=False, sold_leg=None, sell_filled=20.0)
+        self.assertEqual(self._run(alerts, pre, [(s, 0.40) for s in range(0, 30)]), [])
+        post = _danger_bag()
+        self.assertEqual(self._run(alerts, post, [(s, 0.40) for s in range(30, 40)]), [35])
+        self.assertEqual(len(log.named("danger_zone")), 1)
+
+    def test_fires_once_per_bag(self):
+        alerts, sent, log = self._alerts()
+        ticks = [(s, 0.66) for s in range(0, 10)] + [(10, 0.9)] + [(s, 0.3) for s in range(11, 30)]
+        self.assertEqual(self._run(alerts, _danger_bag(), ticks), [5])
+        self.assertEqual(self._run(alerts, _danger_bag(), [(s, 0.66) for s in range(0, 10)], cid="other"), [5])
+        alerts.configure({"dry_run": False})
+        self.assertEqual(self._run(alerts, _danger_bag(), [(s, 0.3) for s in range(40, 50)]), [])
+        alerts.notifier.flush()
+        self.assertEqual(len(sent), 2)
+        self.assertEqual(len(log.named("danger_zone")), 2)
+
+    def test_no_fire_after_dump_winner_sale_or_window_end(self):
+        for extra in ({"sold_dump": True}, {"sold_winner": True}):
+            alerts, sent, log = self._alerts()
+            self.assertEqual(self._run(alerts, _danger_bag(**extra), [(s, 0.3) for s in range(0, 10)]), [])
+            self.assertEqual(log.named("danger_zone"), [], extra)
+        alerts, sent, log = self._alerts()
+        bag = _danger_bag()
+        self.assertEqual(self._run(alerts, bag, [(s, 0.3) for s in range(-3, 10)], t0=END), [])
+        alerts, sent, log = self._alerts()
+        mid_dump = _danger_bag()
+        self.assertEqual(self._run(alerts, mid_dump, [(0, 0.3), (2, 0.3)]), [])
+        mid_dump["sold_dump"] = True
+        self.assertEqual(self._run(alerts, mid_dump, [(s, 0.3) for s in range(3, 10)]), [])
+        self.assertEqual(log.named("danger_zone"), [])
+        alerts.notifier.flush()
+        self.assertEqual(sent, [])
+
+    def test_logs_danger_zone_even_when_whatsapp_is_off(self):
+        cases = (
+            ({"notify_danger_whatsapp": False}, True),
+            ({"dry_run": True}, True),
+            ({}, False),
+        )
+        for cfg, env in cases:
+            alerts, sent, log = self._alerts(cfg, env=env)
+            self.assertEqual(self._run(alerts, _danger_bag(), [(s, 0.5) for s in range(0, 6)]), [5])
+            alerts.notifier.flush()
+            self.assertEqual(sent, [], cfg)
+            rows = log.named("danger_zone")
+            self.assertEqual(len(rows), 1, cfg)
+            self.assertIs(rows[0]["whatsapp"], False)
+            self.assertEqual(log.named("notify_sent"), [])
+
+    def test_knobs_hot_reload_and_bad_values_fall_back(self):
+        alerts, sent, log = self._alerts({"notify_danger_px": 0.55, "notify_danger_hold_s": 2})
+        self.assertEqual(self._run(alerts, _danger_bag(), [(0, 0.6), (1, 0.54), (2, 0.54), (3, 0.54)]), [3])
+        alerts.configure({"dry_run": False, "notify_danger_px": "junk", "notify_danger_hold_s": -1})
+        self.assertEqual((alerts.danger_px, alerts.danger_hold_s), (0.70, 5.0))
+        alerts.configure({"dry_run": False, "notify_danger_px": True, "notify_danger_hold_s": None})
+        self.assertEqual((alerts.danger_px, alerts.danger_hold_s), (0.70, 5.0))
+        alerts.configure({"dry_run": False, "sell_dump_enabled": False})
+        self.assertIsNone(alerts.dump_below)
+
+    def test_bad_inputs_never_raise(self):
+        alerts, _sent, _log = self._alerts()
+        self.assertFalse(alerts.danger_tick(None, "c", now=0.0, held="up", bid=0.1))
+        self.assertFalse(alerts.danger_tick({}, "c", now=0.0, held=None, bid=0.1))
+        self.assertFalse(alerts.danger_tick(_danger_bag(), "c", now=END - 60, held="up", bid="x"))
+        self.assertFalse(alerts.danger_tick({"sold_leg": "dn", "end_ts": "?"}, "c", now=0.0, held="up", bid=0.1))
+
+
+class DangerSellLoopTests(unittest.TestCase):
+    """The real ``_manage_sells_locked`` feeds the dump's held bid to the alert."""
+
+    def _loop(self, book, *, notifier=None, **cfg_extra):
+        ns, events, fak_calls, clock = _dump_harness(_fill_fak)
+        ns["_fetch_books"] = lambda *_a: (book["up"], book["dn"])
+        sent: list = []
+        log = Log()
+        if notifier is None:
+            notifier = _notifier(lambda url, *, params, timeout: sent.append(params["text"]) or Resp(200), log)
+        alerts = BagAlerts(notifier, log=log)
+        ns["_BAG_ALERTS"] = alerts
+        cfg = _dump_cfg(**cfg_extra)
+        return ns, clock, fak_calls, alerts, sent, log, cfg
+
+    @staticmethod
+    def _side(px):
+        return (px, 80.0, [{"price": str(px), "size": "80"}])
+
+    def _tick(self, ns, clock, cfg, intent, n, step=1.0):
+        for _ in range(n):
+            state = {"intents": {"cid-danger": intent}}
+            ns["remember_persisted_state"](state)
+            ns["_manage_sells_locked"](cfg, state, object())
+            clock["now"] += step
+
+    def test_held_bid_under_70c_for_5s_fires_once(self):
+        book = {"up": self._side(0.66), "dn": self._side(0.01)}
+        ns, clock, fak_calls, alerts, sent, log, cfg = self._loop(book, sell_dump_below=0.40)
+        end = clock["now"] + 200.0
+        intent = _held_after_scrap(end, shares=125.0, sell_filled=62.0, sell_scrap_keep=63.0)
+        self._tick(ns, clock, cfg, intent, 5)
+        self.assertEqual(log.named("danger_zone"), [])
+        self._tick(ns, clock, cfg, intent, 10)
+        self.assertEqual(fak_calls, [])
+        alerts.notifier.flush()
+        rows = log.named("danger_zone")
+        self.assertEqual(len(rows), 1)
+        self.assertEqual((rows[0]["leg"], rows[0]["bid"], rows[0]["below_s"]), ("up", 0.66, 5.0))
+        label = bag_start_label(end - 900.0)
+        self.assertEqual(
+            sent,
+            [f"Mintbot DANGER: {label} bag | UP bid 0.66 <70c for 5s | 3m15s left"
+             " | holding 125 UP + 63 DN | dump arms <40c in last 240s"],
+        )
+
+    def test_recovery_pre_scrap_and_dump_paths_stay_quiet(self):
+        book = {"up": self._side(0.66), "dn": self._side(0.01)}
+        ns, clock, _fak, alerts, sent, log, cfg = self._loop(book, sell_dump_below=0.40)
+        intent = _held_after_scrap(clock["now"] + 200.0)
+        self._tick(ns, clock, cfg, intent, 4)
+        book["up"] = self._side(0.75)
+        self._tick(ns, clock, cfg, intent, 1)
+        book["up"] = self._side(0.66)
+        self._tick(ns, clock, cfg, intent, 4)
+        self.assertEqual(log.named("danger_zone"), [])
+
+        book = {"up": self._side(0.51), "dn": self._side(0.49)}
+        ns, clock, _fak, alerts, sent, log, cfg = self._loop(book, sell_dump_below=0.40)
+        pre = _held_after_scrap(clock["now"] + 200.0, sold_loser=False, sold_leg=None)
+        pre.pop("sold_loser_at")
+        self._tick(ns, clock, cfg, pre, 10)
+        self.assertEqual(log.named("danger_zone"), [])
+
+        book = {"up": self._side(0.51), "dn": self._side(0.49)}
+        ns, clock, fak_calls, alerts, sent, log, cfg = self._loop(book)
+        dumped = _held_after_scrap(clock["now"] + 200.0)
+        self._tick(ns, clock, cfg, dumped, 10)
+        self.assertTrue(dumped.get("sold_dump"))
+        self.assertTrue(fak_calls)
+        self.assertEqual(log.named("danger_zone"), [])
+        alerts.notifier.flush()
+        self.assertEqual(sent, [])
+
+    def test_hung_http_does_not_block_the_sell_tick(self):
+        release = threading.Event()
+        hung = _notifier(lambda url, *, params, timeout: release.wait(10) or Resp(200))
+        book = {"up": self._side(0.5), "dn": self._side(0.01)}
+        ns, clock, _fak, alerts, _sent, log, cfg = self._loop(book, notifier=hung, sell_dump_below=0.40)
+        intent = _held_after_scrap(clock["now"] + 200.0)
+        t0 = time.monotonic()
+        self._tick(ns, clock, cfg, intent, 12)
+        self.assertLess(time.monotonic() - t0, 1.0)
+        self.assertEqual(len(log.named("danger_zone")), 1)
+        release.set()
+        self.assertTrue(hung.flush())
 
 
 if __name__ == "__main__":
