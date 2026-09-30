@@ -204,6 +204,11 @@ Shared `buy/` helpers exist for mint, pathlog, and the recording-only oracle tap
   ladder. A's rest and the 180s window do not block that leg; cancel
   near expiry. After A sets `sell_dump_leg`, B buys 10 shares of the
   other leg (`plan_dump_hedges`). `scrapbidder.py` posts both.
+- `buy/whatsapp_notify.py` — CallMeBot WhatsApp alert when a loser scrap
+  (and, with `notify_dump_whatsapp`, a held dump) fills. `CALLMEBOT_PHONE` /
+  `CALLMEBOT_APIKEY` come from the mintbot `.env`; missing vars mean a
+  no-op with one startup line. Bounded queue + one worker thread; never
+  blocks the sell loop; never logs the key or the URL. Alerts only.
 - `buy/sister_topup.py` — one $5 pUSD top-up from A to B per broke episode.
   `sister_topup.py` submits the PROXY batch. Scrapbidder spawns it.
 

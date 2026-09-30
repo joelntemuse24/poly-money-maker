@@ -212,6 +212,12 @@ Four Python habits recur in the money paths. Each is a one-paragraph aside.
 | Polygon RPC | CTF balances / inventory confirm; one `eth_estimateGas` per mint submit |
 | Polymarket RTDS | Recording-only Chainlink BTC/USD 60s TWAP (`crypto_prices_twap_sixty`) |
 | ntfy (optional) | Operator push on mint/sell (thread pool, off the tick) |
+| CallMeBot (optional) | WhatsApp alert when a loser scrap fills (and, opt-in, a held dump); see below |
+
+**WhatsApp alerts (`buy/whatsapp_notify.py`).** When `CALLMEBOT_PHONE` (with country code, e.g. `+353…`) and `CALLMEBOT_APIKEY` are in the process environment, mintbot sends one WhatsApp message per bag when its loser scrap completes (every `_finish_scrap` path: sweep, ladder, blind, rest fill), or, if the window ends after a partial scrap, one "partial, window ended" message within 60s of the end. Example: `Mintbot scrap: 11:30 bag | sold 62 DN @ 0.02 ($1.24) | 3m12s left | kept 63 | UP bid 0.98`. The price is `sell_fill_px` (falling back to `sell_limit`), the time is the window start in Europe/Dublin, and the bid is the opposite leg's last sized bid. `notify_dump_whatsapp` adds a `Mintbot DUMP: …` line when a held dump fills.
+- Knobs (hot-reloaded each sell tick): `notify_scrap_whatsapp` (default **true**; effective only with both env vars) and `notify_dump_whatsapp` (default **false**). Dry run sends nothing. Missing env vars make it a no-op with one startup line, `notify_whatsapp_off` (`missing`); otherwise one `notify_whatsapp_on` (last 4 phone digits only).
+- It never blocks trading. The sell loop only formats the text and does a non-blocking put onto a bounded queue (50, drop-oldest with `notify_dropped`). One daemon worker does `GET api.callmebot.com/whatsapp.php` with an 8s timeout and retries once after 5s on 429/5xx/no reply. It logs `notify_sent` or `notify_failed` (`status`, `attempts`; redacted error). A bad key comes back as HTTP 203 "APIKey is invalid" and is counted as failed. The API key, the phone and any URL are never logged. All hook code swallows its own exceptions.
+- It only reads intent fields already in memory, writes nothing to intents, and dedupes per bag in process memory (a restart can re-send only for a partial scrap that ended in the last 60s).
 
 HTTP goes through per-thread keep-alive `requests.Session` objects (`buy/chain.thread_session`; each `ChainReader` owns one). That was part of the CPU cut in #217.
 
@@ -731,7 +737,7 @@ Separate systemd unit. `SERIES = ["btc-up-or-down-15m"]` only. Polls CLOB books,
 <a id="section-28"></a>
 ## systemd units
 
-`deploy/polymintbot.service` runs `.venv/bin/python mintbot.py` with `EnvironmentFile=.env`, `Restart=always`.
+`deploy/polymintbot.service` runs `.venv/bin/python mintbot.py` with `EnvironmentFile=.env`, `Restart=always`. That `.env` (`/home/ntemusejoel/poly-money-maker/.env` on the VM, gitignored) also carries the optional `CALLMEBOT_PHONE` / `CALLMEBOT_APIKEY`; env changes need a restart.
 
 `deploy/polypathlog.service` runs `pathlog.py` (no env file required for public books). Retired: keep it stopped and disabled ([§27](#section-27)).
 
@@ -751,6 +757,7 @@ Never enable retired buy units (`polycomplement`, buybots, DangerZone, shadow) f
 | `enter_min_ttm_min` / `enter_max_ttm_min` | 0 / 45 | | 0 / 45 | Mint only windows opening within 45m |
 | `max_open_sets` | 1 | 1 | **2** | Capacity (plus adjacent rule) |
 | `count_kept_loser_as_open` | false | false | — (false) | Kept loser shares hold the slot until resolution |
+| `notify_scrap_whatsapp` / `notify_dump_whatsapp` | true / false | true / false | — | WhatsApp alert on scrap / dump fill (needs `CALLMEBOT_*` env) |
 | `mint_fail_cooldown_s` / `mint_max_attempts` | 30 / 3 | | 30 / 3 | Remint policy |
 | `mint_submitting_timeout_s` | 90 | | 90 | Auto-fail tx-less `submitting` |
 | `mint_gas_margin` / `_fallback` / `_cap` | 0.15 / 650000 / 650000 | same | — | Relay gas plan |
