@@ -57,7 +57,22 @@ scrap orders post `target - filled` only. The loser is sold once that
 target fills within tolerance, or the balance is at or under
 `keep + tolerance`. Kept shares are not scrapped or dumped. They cash
 out only at `sell_winner_min` (the cheap 0.99 winner path does not
-apply to the kept leg) or stay until resolution. This repo does not
+apply to the kept leg) or stay until resolution. There is one exception,
+the **post-dump kept-loser stop** (`post_dump_kept_stop`, default
+**false**). It applies only after a held dump has filled (`sold_dump`
+with `sell_dump_leg` opposite `sold_leg`). If the kept leg's sized bid
+stays under `post_dump_kept_stop_px` (0.40) for
+`post_dump_kept_stop_hold_s` (3s), it sells the remaining kept shares
+through the dump's own path (`_run_dump_fak_with_refire`, live-bid FAK
+plus the zero-fill refire ladder, `path="post_dump_stop"`). A bid at or
+above the line, or no sized bid, resets the timer. A partial fill
+keeps the arm and retries `keep - post_dump_stop_filled` after the sell
+cooldown. `post_dump_stop_done` ends it once per bag. It never fires
+before a dump fill or after window end. Optional
+`post_dump_kept_stop_max_ttm_s` (0 = no gate). Logs
+`post_dump_stop_armed` / `post_dump_stop_fill` / `post_dump_stop_miss`.
+Dry run only logs. The WhatsApp line rides on `notify_dump_whatsapp`.
+This repo does not
 redeem resolved positions. The book still fills
 higher bids first. Set the flag false to restore the 1¢ ladder from
 `sell_fak_px` down to the floor, clipped to top-rung depth. The flag is
@@ -211,7 +226,8 @@ Shared `buy/` helpers exist for mint, pathlog, and the recording-only oracle tap
   resets the timer. It sends one message per bag, never after a
   dump/winner sale or window end. It always logs `danger_zone`.
   Default off: `notify_scrap_whatsapp` (scrap fill / partial window end)
-  and `notify_dump_whatsapp` (dump fill). `CALLMEBOT_PHONE` /
+  and `notify_dump_whatsapp` (dump fill, and the post-dump kept-loser
+  stop fill). `CALLMEBOT_PHONE` /
   `CALLMEBOT_APIKEY` come from the mintbot `.env`; missing vars mean a
   no-op with one startup line. Bounded queue + one worker thread; never
   blocks the sell loop; never logs the key or the URL. Alerts only.

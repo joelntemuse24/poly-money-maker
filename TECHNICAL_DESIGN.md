@@ -225,7 +225,7 @@ Four Python habits recur in the money paths. Each is a one-paragraph aside.
   - One message per bag when its loser scrap completes (every `_finish_scrap` path: sweep, ladder, blind, rest fill). If the window ends after a partial scrap, one "partial, window ended" message is sent within 60s of the end instead.
   - Example: `Mintbot scrap: 11:30 bag | sold 62 DN @ 0.02 ($1.24) | 3m12s left | kept 63 | UP bid 0.98`.
   - The price is `sell_fill_px` (falling back to `sell_limit`), the time is the window start in Europe/Dublin, and the bid is the opposite leg's last sized bid.
-- **Dump fill (`notify_dump_whatsapp`, default off).** A `Mintbot DUMP: …` line when a held dump fills; the natural follow-up to a danger alert.
+- **Dump fill (`notify_dump_whatsapp`, default off).** A `Mintbot DUMP: …` line when a held dump fills; the natural follow-up to a danger alert. The same knob sends `Mintbot KEPT STOP: 11:30 bag | sold 63 DN @ 0.35 ($22.05) | 1m40s left | UP bid 0.64` once when the post-dump kept-loser stop completes.
 - Knobs are hot-reloaded each sell tick. A bad `notify_danger_px` (outside 0–1) or `notify_danger_hold_s` (outside 0–3600) falls back to 0.70 / 5. Dry run sends nothing. Missing env vars make it a no-op with one startup line, `notify_whatsapp_off` (`missing`); otherwise one `notify_whatsapp_on` (last 4 phone digits only).
 - It never blocks trading. The sell loop only formats the text and does a non-blocking put onto a bounded queue (50, drop-oldest with `notify_dropped`). One daemon worker does `GET api.callmebot.com/whatsapp.php` with an 8s timeout and retries once after 5s on 429/5xx/no reply. It logs `notify_sent` or `notify_failed` (`status`, `attempts`; redacted error). A bad key comes back as HTTP 203 "APIKey is invalid" and is counted as failed. The API key, the phone and any URL are never logged. All hook code swallows its own exceptions.
 - It only reads intent fields already in memory, writes nothing to intents, and dedupes per bag in process memory (a restart can re-send only for a partial scrap that ended in the last 60s).
@@ -614,6 +614,25 @@ Action (`_run_dump_fak_with_refire`):
 
 **Scope:** only the held leg after a loser fill. The kept part of a partial scrap is **not** dumped. Full sets with neither leg sold never arm the dump. After `end_ts`, `manage_sells` skips the intent. A sister miss does not dump the held leg. `sell_dump_leg` exists so wallet B could buy the other leg; B is disabled live.
 
+**Post-dump kept-loser stop (`_post_dump_kept_stop`, `post_dump_kept_stop`, default off).** After a dump, the bag's only exposure is the kept loser shares (63 of 125 at fraction 0.5). A real reversal makes them the favourite. In a false dump the original winner recovers and they go to ~0. The stop cuts that tail. It runs every sell tick right after the dump block, and only when all of these hold:
+
+- the knob is true;
+- the dump **filled**: `sold_dump` with `sell_dump_leg` opposite `sold_leg`, so `already_flat` without `sell_dump_leg` does not count;
+- `sell_scrap_keep − post_dump_stop_filled` > tolerance;
+- `post_dump_stop_done` is not set;
+- the optional `post_dump_kept_stop_max_ttm_s` gate is open (0 = off; same `dump_time_gate_open` rule, so unknown TTM is closed when a cutoff is set);
+- the kept leg's **sized** bid is `< post_dump_kept_stop_px` (0.40).
+
+That condition must persist `post_dump_kept_stop_hold_s` (3s; `persist_ready`, stamp `post_dump_stop_armed_at`). A bid at or above the line, or no sized bid, resets it. Each new arm logs `post_dump_stop_armed` (`leg`, `bid`, `below`, `hold_s`, `ttm`, `kept`, `dump_leg`, `dump_px`). Fire respects the sell cooldown, so a stop never posts in the same cooldown as the dump.
+
+At fire, `_sell_inventory` on the kept token (latch `seen_loser_inventory`) caps the size at the on-chain balance. A seen-then-flat balance sets `post_dump_stop_done` with `post_dump_stop_flat`. It then calls `_run_dump_fak_with_refire(..., path="post_dump_stop")`: a live-bid FAK, then the same zero-fill refire ladder (`sell_dump_fak_retries`, `sell_dump_ladder_step`, `sell_dump_ladder_rungs`, `sell_floor`), with depth logs tagged `post_dump_stop` / `post_dump_stop_refire`. Fills fold into `post_dump_stop_fill_px` (share-weighted, like `sell_dump_fill_px`), `post_dump_stop_filled`, `post_dump_stop_attempts` and `post_dump_stop_last_status`.
+
+- **Full fill (or dry run):** `post_dump_stop_done`, `post_dump_stop_at`, `post_dump_stop_limit`. It logs `post_dump_stop_fill` (`sold`, `avg_px`, `limit`, `bid`, `below`, `status`, `attempts`, `remaining`, `done`, `ttm`, `dry_run`), sends ntfy, and sends the `Mintbot KEPT STOP` WhatsApp when `notify_dump_whatsapp` is on.
+- **Partial fill:** logs `post_dump_stop_fill` with `done=false` and keeps the arm. The next ready tick after the cooldown sells the remainder.
+- **Zero fill:** logs `post_dump_stop_miss` and keeps the arm.
+
+`kept_loser_open` turns false once the stop is done. In dry run `_fak_sell` only logs `dry_sell`, so the stop logs and marks itself done (`post_dump_stop_dry`) without posting. The winner path still skips the bag after a dump (`sold_winner` is set), so without this stop the kept shares ride to resolution.
+
 <a id="section-20"></a>
 ## Live-bid FAK vs floor FAK
 
@@ -796,6 +815,8 @@ Never enable retired buy units (`polycomplement`, buybots, DangerZone, shadow) f
 | `sell_dump_below` | 0.80 | 0.80 | **0.40** | Dump arm threshold |
 | `sell_dump_persist_s` | 2 | | 2 | Dump persist |
 | `sell_dump_max_ttm_s` | 0 (off) | 240 | **240** | Dump only in the last N seconds |
+| `post_dump_kept_stop` | false | false | — (false) | After a dump fill, stop out kept loser shares |
+| `post_dump_kept_stop_px` / `_hold_s` / `_max_ttm_s` | 0.40 / 3 / 0 | 0.40 / 3 / 0 | — | Kept-leg sized bid line, persist, optional TTM gate (0 = off) |
 | `sell_dump_fak_retries` / `_ladder_step` / `_ladder_rungs` | 2 / 0.04 / 4 | | 2 / 0.04 / 4 | Refire after a zero-fill miss |
 | `sell_min_bid_size` | 1.0 | | 1.0 | Sized-bid minimum |
 | `sell_late_window_s` | 0 | 0 | 0 | Oracle veto off |
@@ -921,6 +942,7 @@ Values are code default / live.
 | Loser armed, book or FAK empty | kept | Blind FAK at 0.01 every ≥ 3s; rest after a miss (off live) | Same on fill |
 | Winner sized bid ≥ effective_winner_min (0.999 / 0.9995; cheap 0.99 gate closed live) | 5s | Live-bid FAK clamped to 0.99; kept leg capped at keep; cancel if bid dropped | `sold_winner` |
 | `sold_loser` AND held sized bid < `sell_dump_below` (0.80 / 0.40) AND TTM ≤ `sell_dump_max_ttm_s` (off / 240) | 2s | Live-bid FAK; on zero-fill miss, re-check + 4¢-step ladder retries; cancel if bid ≥ below | `sold_dump`, `sold_winner`, `sell_dump_leg` |
+| `post_dump_kept_stop` (off / off) AND dump filled (`sell_dump_leg` opposite `sold_leg`) AND kept sized bid < `post_dump_kept_stop_px` (0.40) AND TTM ≤ `post_dump_kept_stop_max_ttm_s` (0 = off) | 3s | Same dump FAK + refire path for `keep − post_dump_stop_filled`; partial keeps the arm | `post_dump_stop_filled`, `post_dump_stop_fill_px`, `post_dump_stop_done` |
 | `now ≥ end_ts` | — | No CLOB sells; cancel rest; `sell_scrap_outcome window_end` if unfinished; one `bag_risk` | (redeem outside this loop) |
 | Within `sell_cooldown_s` of last attempt | — | Skip fire | — |
 
