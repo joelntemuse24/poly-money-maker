@@ -1304,7 +1304,89 @@ def kept_loser_open(intent: Any) -> bool:
     sold_leg = intent.get("sold_leg")
     if intent.get("sold_winner") and sold_leg and intent.get("sell_winner_leg") == sold_leg:
         return False
+    if intent.get("post_dump_stop_done"):
+        return False
     return True
+
+
+POST_DUMP_STOP_PX = 0.40
+POST_DUMP_STOP_HOLD_S = 3.0
+
+
+def post_dump_kept_stop_knobs(cfg: Any) -> Tuple[bool, float, float, float]:
+    """``(enabled, stop_px, hold_s, max_ttm_s)``; bad values take the defaults.
+
+    Off unless ``post_dump_kept_stop`` is literally true (or a true-ish
+    string). ``stop_px`` must be in (0, 1); ``max_ttm_s`` 0 leaves the time
+    gate off.
+    """
+    cfg = cfg if isinstance(cfg, dict) else {}
+    raw = cfg.get("post_dump_kept_stop")
+    if isinstance(raw, str):
+        enabled = raw.strip().lower() in {"1", "true", "yes", "on"}
+    else:
+        enabled = raw is True or (isinstance(raw, (int, float)) and not isinstance(raw, bool) and raw == 1)
+    px_raw = cfg.get("post_dump_kept_stop_px")
+    try:
+        stop_px = float(px_raw) if px_raw is not None and not isinstance(px_raw, bool) else POST_DUMP_STOP_PX
+    except (TypeError, ValueError):
+        stop_px = POST_DUMP_STOP_PX
+    if not math.isfinite(stop_px) or not 0.0 < stop_px < 1.0:
+        stop_px = POST_DUMP_STOP_PX
+    hold_s = cfg_seconds(cfg, "post_dump_kept_stop_hold_s", POST_DUMP_STOP_HOLD_S)
+    max_ttm_s = cfg_seconds(cfg, "post_dump_kept_stop_max_ttm_s", 0.0)
+    return enabled, stop_px, hold_s, max_ttm_s
+
+
+def post_dump_kept_stop_plan(
+    intent: Any,
+    *,
+    bid: Optional[float],
+    stop_px: float,
+    ttm_s: Optional[float],
+    max_ttm_s: float,
+    tol: float,
+) -> Tuple[Optional[str], float, bool, str]:
+    """Kept-loser stop after a held dump has filled.
+
+    Returns ``(kept_leg, kept shares left, qualify, reason)``. Qualifies only
+    when the dump filled on the other leg (``sold_dump`` with
+    ``sell_dump_leg`` opposite ``sold_leg``), kept shares remain, the stop has
+    not completed, the optional time gate is open, and the kept leg's sized
+    bid is under ``stop_px``. No sized bid does not qualify, which resets
+    the persist timer.
+    """
+    if not isinstance(intent, dict):
+        return None, 0.0, False, "no_intent"
+    kept = intent.get("sold_leg")
+    if kept not in ("up", "dn"):
+        return None, 0.0, False, "no_kept_leg"
+    other = "dn" if kept == "up" else "up"
+    if not intent.get("sold_dump") or intent.get("sell_dump_leg") != other:
+        return kept, 0.0, False, "no_dump_fill"
+    if intent.get("post_dump_stop_done"):
+        return kept, 0.0, False, "done"
+    try:
+        keep = float(intent.get("sell_scrap_keep") or 0.0)
+        stopped = float(intent.get("post_dump_stop_filled") or 0.0)
+    except (TypeError, ValueError):
+        return kept, 0.0, False, "bad_keep"
+    if not (math.isfinite(keep) and math.isfinite(stopped)):
+        return kept, 0.0, False, "bad_keep"
+    left = max(0.0, keep - stopped)
+    if left <= float(tol):
+        return kept, 0.0, False, "no_kept_shares"
+    if not dump_time_gate_open(ttm_s, max_ttm_s):
+        return kept, left, False, "time_gated"
+    try:
+        px = None if bid is None else float(bid)
+    except (TypeError, ValueError):
+        px = None
+    if px is None or not math.isfinite(px) or px <= 0:
+        return kept, left, False, "no_bid"
+    if px >= float(stop_px) - 1e-12:
+        return kept, left, False, "at_or_above_stop"
+    return kept, left, True, "below_stop"
 
 
 def recorded_fill_px(intent: dict, fill_key: str, limit_key: str) -> Optional[float]:

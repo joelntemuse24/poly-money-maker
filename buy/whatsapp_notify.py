@@ -4,7 +4,8 @@
   (winner) leg's sized bid stays under ``notify_danger_px`` for
   ``notify_danger_hold_s``. One alert per bag, and a ``danger_zone`` log line
   even when WhatsApp is off.
-* Scrap fill and held dump fill (both default off).
+* Scrap fill and held dump fill (both default off). The post-dump kept-loser
+  stop fill rides on the dump knob.
 
 Alerts only. Nothing here reads or writes intent state, and nothing here can
 block the sell loop: ``send`` is a non-blocking put on a bounded queue, and
@@ -356,6 +357,34 @@ def dump_message(
     return "Mintbot DUMP: " + " | ".join(parts)
 
 
+def kept_stop_message(
+    intent: Mapping[str, Any],
+    *,
+    now: float,
+    leg: Any = None,
+    bids: Optional[Mapping[str, Any]] = None,
+) -> Optional[str]:
+    """``Mintbot KEPT STOP: 11:30 bag | sold 63 DN @ 0.35 ($22.05) | 1m40s left | UP bid 0.64``."""
+    sold = _num(intent.get("post_dump_stop_filled")) or 0.0
+    if sold < MIN_SOLD:
+        return None
+    leg = leg or intent.get("sold_leg")
+    px = _num(intent.get("post_dump_stop_fill_px"))
+    if px is None:
+        px = _num(intent.get("post_dump_stop_limit"))
+    parts = [f"{bag_start_label(_start_ts(intent))} bag"]
+    if px is not None:
+        parts.append(f"sold {_shares_txt(sold)} {_leg_name(leg)} @ {_px_txt(px)} (${sold * px:.2f})")
+    else:
+        parts.append(f"sold {_shares_txt(sold)} {_leg_name(leg)}")
+    end = _num(intent.get("end_ts"))
+    parts.append(_left_txt(None if end is None else end - now))
+    bid = _bid_part(_other(leg), bids)
+    if bid:
+        parts.append(bid)
+    return "Mintbot KEPT STOP: " + " | ".join(parts)
+
+
 def _shares_held(intent: Mapping[str, Any]) -> tuple[float, float]:
     """``(held winner shares, kept loser shares)`` from the intent's own counters."""
     shares = _num(intent.get("shares")) or 0.0
@@ -627,6 +656,26 @@ class BagAlerts:
             self._sent.add(key)
             return self.notifier.send(
                 text, kind="dump", meta={"condition_id": str(cid), "slug": intent.get("slug")},
+            )
+        except Exception:
+            return False
+
+    def kept_stop_filled(
+        self, intent: Mapping[str, Any], cid: str, *, now: float, leg: Any = None
+    ) -> bool:
+        """Post-dump kept-loser stop; rides on ``notify_dump_whatsapp``."""
+        try:
+            if not self.dump or self.dry_run or intent.get("post_dump_stop_dry"):
+                return False
+            key = ("kept_stop", str(cid))
+            if key in self._sent:
+                return False
+            text = kept_stop_message(intent, now=now, leg=leg, bids=self._bids.get(str(cid)))
+            if text is None:
+                return False
+            self._sent.add(key)
+            return self.notifier.send(
+                text, kind="kept_stop", meta={"condition_id": str(cid), "slug": intent.get("slug")},
             )
         except Exception:
             return False

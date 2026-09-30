@@ -908,8 +908,11 @@ class DeployUnitsTests(unittest.TestCase):
         self.assertIn('depth_path="winner_cheap" if cheap_on else None', manage)
         self.assertIn("_run_dump_fak_with_refire", manage)
         self.assertIn('phase="ready"', manage)
-        self.assertIn('depth_path="dump"', src)
-        self.assertIn('depth_path="dump_refire"', src)
+        dump_run = src[src.find("def _run_dump_fak_with_refire") : src.find("\ndef _post_dump_kept_stop")]
+        self.assertIn('path: str = "dump"', dump_run)
+        self.assertIn("depth_path=path", dump_run)
+        self.assertIn('depth_path=f"{path}_refire"', dump_run)
+        self.assertIn('path="post_dump_stop"', src)
         self.assertNotIn("depth_at_limit >", src)
         self.assertNotIn("depth_at_limit <", src)
         self.assertNotIn("persist_s=persist_s", manage.split("loser_persist_ready")[1][:400])

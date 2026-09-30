@@ -131,6 +131,8 @@ from buy.mint_sell import (
     mint_cycle_sleep_s,
     parse_sell_fill_shares,
     persist_ready,
+    post_dump_kept_stop_knobs,
+    post_dump_kept_stop_plan,
     posted_order_id,
     rest_order_matched_shares,
     resting_tif,
@@ -242,6 +244,13 @@ DEFAULTS = {
     # 0 disables the time-left gate (old behavior). The example sets 240:
     # arm and fire the held dump only when seconds-to-close is at or under this.
     "sell_dump_max_ttm_s": 0.0,
+    # After a held dump fills: if the kept loser's sized bid stays under
+    # post_dump_kept_stop_px for post_dump_kept_stop_hold_s, sell the kept
+    # shares the same way the dump sells. max_ttm_s 0 = no time gate.
+    "post_dump_kept_stop": False,
+    "post_dump_kept_stop_px": 0.40,
+    "post_dump_kept_stop_hold_s": 3.0,
+    "post_dump_kept_stop_max_ttm_s": 0.0,
     "sell_min_bid_size": 1.0,
     # 0 skips the late-window Chainlink veto on loser scrap.
     # Floor, per-TTM, and stale are 0 so a positive window does not
@@ -1506,10 +1515,12 @@ def _run_dump_fak_with_refire(
     dry_run: bool,
     tol: float,
     fills: Optional[list] = None,
+    path: str = "dump",
 ) -> Tuple[float, str, Optional[float], int, float]:
     """Held-dump path: first live-bid FAK, then fast refire ladders on miss.
 
-    ``fills`` collects ``(shares, avg_px)`` across every post.
+    ``fills`` collects ``(shares, avg_px)`` across every post. ``path`` tags
+    labels, depth logs and refire lines (``post_dump_stop`` reuses this).
     """
     live_bid = float(initial_bid or 0.0)
     initial_limits = [round(live_bid, 4)] if live_bid > 0 else []
@@ -1527,11 +1538,11 @@ def _run_dump_fak_with_refire(
             initial_limits,
             dry_run=dry_run,
             bid=live_bid,
-            label=f"dump {held}",
+            label=f"{path} {held}",
             slug=slug,
             tol=tol,
             depth_bids=initial_bids,
-            depth_path="dump",
+            depth_path=path,
             depth_leg=held,
             ttm_s=ttm_s,
             condition_id=condition_id,
@@ -1553,6 +1564,7 @@ def _run_dump_fak_with_refire(
                 condition_id=condition_id,
                 slug=slug,
                 leg=held,
+                path=path,
                 retry=retry_idx + 1,
                 attempts=attempts,
                 reason="empty_book",
@@ -1571,6 +1583,7 @@ def _run_dump_fak_with_refire(
                 condition_id=condition_id,
                 slug=slug,
                 leg=held,
+                path=path,
                 retry=retry_idx + 1,
                 attempts=attempts,
                 reason="no_ladder_limits",
@@ -1582,6 +1595,7 @@ def _run_dump_fak_with_refire(
             condition_id=condition_id,
             slug=slug,
             leg=held,
+            path=path,
             retry=retry_idx + 1,
             attempts=attempts + 1,
             bid=live_bid,
@@ -1594,11 +1608,11 @@ def _run_dump_fak_with_refire(
                 limits,
                 dry_run=dry_run,
                 bid=live_bid,
-                label=f"dump {held}",
+                label=f"{path} {held}",
                 slug=slug,
                 tol=tol,
                 depth_bids=retry_bids,
-                depth_path="dump_refire",
+                depth_path=f"{path}_refire",
                 depth_leg=held,
                 ttm_s=ttm_s,
                 condition_id=condition_id,
@@ -1614,6 +1628,7 @@ def _run_dump_fak_with_refire(
                 condition_id=condition_id,
                 slug=slug,
                 leg=held,
+                path=path,
                 retry=retry_idx + 1,
                 attempts=attempts,
                 reason="non_retryable_status",
@@ -1622,6 +1637,177 @@ def _run_dump_fak_with_refire(
             )
             break
     return sold_total, last_status, last_px, attempts, live_bid
+
+
+def _post_dump_kept_stop(
+    cfg: dict,
+    intent: dict,
+    cid: str,
+    *,
+    now: float,
+    ttm_s: Optional[float],
+    bids: dict,
+    books: dict,
+    tokens: dict,
+    cooldown: float,
+    dry_run: bool,
+    tol: float,
+    floor: float,
+    min_bid_size: float,
+    chain: ChainReader,
+    ctf: str,
+    funder_cs: Optional[str],
+) -> None:
+    """After a held dump filled, stop out the kept loser shares.
+
+    Arms while the kept leg's sized bid is under ``post_dump_kept_stop_px``
+    and fires after ``post_dump_kept_stop_hold_s``, through the dump's own
+    live-bid FAK + refire ladder. A partial fill keeps the arm and retries
+    the remainder after the sell cooldown; ``post_dump_stop_done`` ends it.
+    """
+    enabled, stop_px, hold_s, max_ttm_s = post_dump_kept_stop_knobs(cfg)
+    kept_raw = intent.get("sold_leg")
+    kept_bid = bids.get(kept_raw) if kept_raw in ("up", "dn") else None
+    kept, left, qualify, _why = post_dump_kept_stop_plan(
+        intent, bid=kept_bid, stop_px=stop_px, ttm_s=ttm_s,
+        max_ttm_s=max_ttm_s, tol=tol,
+    )
+    qualify = enabled and qualify
+    prev_armed = intent.get("post_dump_stop_armed_at")
+    if not qualify and prev_armed is None:
+        return
+    fire, armed_ts, _why = persist_ready(
+        qualify,
+        now_s=now,
+        armed_ts=prev_armed,
+        persist_s=hold_s,
+    )
+    intent["post_dump_stop_armed_at"] = armed_ts
+    if qualify and prev_armed is None:
+        log_event(
+            "post_dump_stop_armed",
+            condition_id=cid,
+            slug=intent.get("slug"),
+            leg=kept,
+            bid=kept_bid,
+            below=stop_px,
+            hold_s=hold_s,
+            ttm=None if ttm_s is None else round(ttm_s, 3),
+            kept=left,
+            dump_leg=intent.get("sell_dump_leg"),
+            dump_px=recorded_fill_px(intent, "sell_dump_fill_px", "sell_dump_limit"),
+        )
+    if not fire or kept is None:
+        return
+    last = float(intent.get("last_sell_attempt_at") or 0)
+    if last and now - last < cooldown:
+        return
+    k_tok = tokens[kept]
+    size, latch = _sell_inventory(
+        chain, ctf, funder_cs, k_tok, left, tol,
+        "seen_loser_inventory", intent,
+    )
+    if latch == "await_inventory":
+        log_event(
+            "sell_skip_await_inventory",
+            condition_id=cid,
+            leg=kept,
+            path="post_dump_stop",
+        )
+        return
+    if latch == "already_flat":
+        intent["post_dump_stop_done"] = True
+        intent["post_dump_stop_note"] = "already_flat"
+        intent["post_dump_stop_armed_at"] = None
+        log_event(
+            "post_dump_stop_flat",
+            condition_id=cid,
+            slug=intent.get("slug"),
+            leg=kept,
+        )
+        return
+    intent["last_sell_attempt_at"] = now
+    stop_fills: list = []
+    sold_total, last_status, last_px, used_attempts, live_px = (
+        _run_dump_fak_with_refire(
+            token_id=k_tok,
+            size=size,
+            initial_bid=float(kept_bid or 0),
+            initial_bids=books.get(kept),
+            held=kept,
+            slug=intent.get("slug"),
+            condition_id=cid,
+            ttm_s=ttm_s,
+            floor=floor,
+            min_bid_size=min_bid_size,
+            retries=int(cfg.get("sell_dump_fak_retries", 2)),
+            ladder_step=float(cfg.get("sell_dump_ladder_step") or 0.04),
+            ladder_rungs=int(cfg.get("sell_dump_ladder_rungs", 4)),
+            dry_run=dry_run,
+            tol=tol,
+            fills=stop_fills,
+            path="post_dump_stop",
+        )
+    )
+    record_fill_px(intent, "post_dump_stop_fill_px", stop_fills)
+    intent["post_dump_stop_attempts"] = int(
+        intent.get("post_dump_stop_attempts") or 0
+    ) + int(used_attempts)
+    intent["post_dump_stop_last_status"] = last_status
+    intent["post_dump_stop_filled"] = float(
+        intent.get("post_dump_stop_filled") or 0
+    ) + float(sold_total)
+    done = dry_run or sold_total >= size - tol
+    if done:
+        intent["post_dump_stop_done"] = True
+        intent["post_dump_stop_at"] = now
+        intent["post_dump_stop_limit"] = last_px
+        intent["post_dump_stop_armed_at"] = None
+        if dry_run:
+            intent["post_dump_stop_dry"] = True
+    if not done and sold_total < tol:
+        log_event(
+            "post_dump_stop_miss",
+            condition_id=cid,
+            slug=intent.get("slug"),
+            leg=kept,
+            bid=kept_bid,
+            status=last_status,
+            attempts=used_attempts,
+            remaining=round(left, 6),
+        )
+        return
+    log_event(
+        "post_dump_stop_fill",
+        condition_id=cid,
+        slug=intent.get("slug"),
+        leg=kept,
+        sold=sold_total,
+        avg_px=intent.get("post_dump_stop_fill_px"),
+        limit=last_px,
+        bid=kept_bid,
+        below=stop_px,
+        status=last_status,
+        attempts=used_attempts,
+        remaining=round(max(0.0, size - sold_total), 6) if not done else 0.0,
+        done=done,
+        ttm=None if ttm_s is None else round(ttm_s, 3),
+        dry_run=dry_run,
+    )
+    if not done:
+        return
+    _whatsapp("kept_stop_filled", intent, cid, now=now, leg=kept)
+    notify(
+        "Mint kept-loser stop",
+        f"{intent.get('slug')}\n{kept} x{float(intent.get('post_dump_stop_filled') or 0):.1f} "
+        f"@<{stop_px:.2f} (live {live_px:.3f})",
+        priority="default",
+    )
+    console.print(
+        f"  [bold bright_yellow][KEPT STOP][/] {kept} "
+        f"{float(intent.get('post_dump_stop_filled') or 0):.2f}  "
+        f"bid={live_px:.3f} (<{stop_px:.2f})"
+    )
 
 
 def _apply_sell_fire_cancel(
@@ -2771,6 +2957,13 @@ def _manage_sells_locked(cfg: dict, state: dict, chain: ChainReader) -> None:
                         intent["sell_dump_filled"] = float(
                             intent.get("sell_dump_filled") or 0
                         ) + sold_total
+
+        _post_dump_kept_stop(
+            cfg, intent, cid,
+            now=now, ttm_s=ttm_s, bids=bids, books=books, tokens=tokens,
+            cooldown=cooldown, dry_run=dry_run, tol=tol, floor=floor,
+            min_bid_size=min_bid_size, chain=chain, ctf=ctf, funder_cs=funder_cs,
+        )
 
         prev_leg = intent.get("sell_loser_leg")
         if prev_leg not in ("up", "dn"):
