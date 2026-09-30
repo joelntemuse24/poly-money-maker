@@ -3861,6 +3861,7 @@ def main() -> int:
             time.time(),
             enabled=enabled,
             on_fail=lambda msg: log_event("oracle_log_fail", error=str(msg)[:240]),
+            on_event=lambda name, fields: log_event(name, **fields),
         )
 
     def oracle_sleep() -> float:

@@ -191,7 +191,10 @@ Shared `buy/` helpers exist for mint, pathlog, and the recording-only oracle tap
   per-TTM / stale edge keys 0). `sell_oracle_edge_persist_s` stays 3.
   The tape is audit-only.
   Not an input to mint, winner, or dump. It rolls at 20 MB into
-  `logs/archive/` (gzipped) via `buy/log_archive.roll_if_over`.
+  `logs/archive/` (gzipped) via `buy/log_archive.roll_if_over`. A feed
+  silent for 45s is reconnected (ping/pong on); stalls log once, a
+  reminder a minute, and on recovery. crypto-price 429s back off and the
+  close is fetched until 5 minutes after the end. Logging only.
 - `buy/sister_bid.py` — wallet B buy policy. Post-scrap hedge (only
   with `scrap_hedge_enabled`, default false): FAK at the
   live ask, limit clipped into [`bid_fak_min_notional/shares`,
