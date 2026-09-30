@@ -95,6 +95,7 @@ from buy.mint_loops import (
     start_mint_sell_loops,
 )
 from buy.oracle_log import OracleBagView, OracleLogService, snapshot_intents
+from buy.whatsapp_notify import BagAlerts, WhatsAppNotifier
 from buy.mint_sell import (
     classify_loser,
     cycle_sleep_s,
@@ -179,6 +180,15 @@ DEFAULTS = {
     ],
     "one_entry_per_market": True,
     "max_open_sets": 1,
+    # WhatsApp alerts (CallMeBot). No-op unless CALLMEBOT_PHONE and
+    # CALLMEBOT_APIKEY are set in the environment.
+    "notify_scrap_whatsapp": False,
+    "notify_dump_whatsapp": False,
+    # Danger: after the loser scrap, the held winner's sized bid stays
+    # under notify_danger_px for notify_danger_hold_s. One alert per bag.
+    "notify_danger_whatsapp": True,
+    "notify_danger_px": 0.70,
+    "notify_danger_hold_s": 5.0,
     # False: a sold loser frees its mint slot even when a partial scrap
     # kept some loser shares. True: those kept shares hold the slot until
     # the window's grace ends (fewer mints, capped open exposure).
@@ -290,6 +300,22 @@ def _oracle_bag_view(condition_id: str) -> OracleBagView:
 
 
 _notify_pool = ThreadPoolExecutor(max_workers=2, thread_name_prefix="ntfy")
+# CALLMEBOT_PHONE / CALLMEBOT_APIKEY come from systemd EnvironmentFile=.env.
+_BAG_ALERTS = BagAlerts(
+    WhatsAppNotifier.from_env(os.environ, log=lambda event, **kw: log_event(event, **kw)),
+    log=lambda event, **kw: log_event(event, **kw),
+)
+
+
+def _whatsapp(action: str, *args: Any, **kwargs: Any) -> None:
+    """Scrap/dump WhatsApp alert hook. Non-blocking; never raises."""
+    alerts = globals().get("_BAG_ALERTS")
+    if alerts is None:
+        return
+    try:
+        getattr(alerts, action)(*args, **kwargs)
+    except Exception:
+        return
 
 def _signal_handler(signum, frame):
     global _shutdown
@@ -2029,6 +2055,7 @@ def _finish_scrap(
 ) -> None:
     _note_loser_sold(intent, leg if leg in ("up", "dn") else None, note=note)
     _log_scrap_outcome(intent, cid, outcome, leg=leg)
+    _whatsapp("scrap_filled", intent, cid, now=time.time(), leg=leg)
 
 
 def _log_sell_dump_time_gated(
@@ -2300,6 +2327,7 @@ def manage_sells(cfg: dict, state: dict, chain: ChainReader) -> None:
 
 def _manage_sells_locked(cfg: dict, state: dict, chain: ChainReader) -> None:
     now = time.time()
+    _whatsapp("configure", cfg)
     thr = float(cfg.get("sell_threshold") or 0.02)
     floor = float(cfg.get("sell_floor") or 0.02)
     opp_min = float(cfg.get("sell_opposite_min") or 0.90)
@@ -2354,6 +2382,7 @@ def _manage_sells_locked(cfg: dict, state: dict, chain: ChainReader) -> None:
                 _drop_scrap_rest(intent, cid, reason="window_end")
                 dirty = True
             _log_scrap_outcome(intent, cid, "window_end")
+            _whatsapp("scrap_filled", intent, cid, now=now, window_end=True)
             _close_bag_risk(cid, intent, now=now)
             continue
 
@@ -2369,6 +2398,7 @@ def _manage_sells_locked(cfg: dict, state: dict, chain: ChainReader) -> None:
             (up_bid, up_sz, up_bids), (dn_bid, dn_sz, dn_bids) = _fetch_books(
                 up_tok, dn_tok, min_bid_size
             )
+        _whatsapp("note_bids", cid, up_bid, dn_bid)
         books = {"up": up_bids, "dn": dn_bids}
         ttm_s = (end_ts - now) if end_ts else None
         # Keep the previous positive print so an empty book after a FAK
@@ -2391,6 +2421,15 @@ def _manage_sells_locked(cfg: dict, state: dict, chain: ChainReader) -> None:
         bids = {"up": up_bid, "dn": dn_bid}
         shares = float(intent.get("shares") or cfg["shares"])
         sold_loser = bool(intent.get("sold_loser") or intent.get("sold_leg"))
+        danger_held = {"up": "dn", "dn": "up"}.get(str(intent.get("sold_leg") or ""))
+        _whatsapp(
+            "danger_tick",
+            intent,
+            cid,
+            now=now,
+            held=danger_held,
+            bid=bids.get(danger_held) if danger_held else None,
+        )
         _bag_risk_ensure(cid, sold_at_start=sold_loser)
         if sold_loser and not intent.get("sold_loser_at"):
             prior = intent.get("last_sell_attempt_at")
@@ -2717,6 +2756,7 @@ def _manage_sells_locked(cfg: dict, state: dict, chain: ChainReader) -> None:
                             bid=dump_bid,
                             status=last_status,
                         )
+                        _whatsapp("dump_filled", intent, cid, now=now, leg=held)
                         notify(
                             "Mint held dump",
                             f"{intent.get('slug')}\n{held} x{sold_total:.1f} "
@@ -3814,6 +3854,7 @@ def main() -> int:
         oracle_log_enabled=bool(cfg.get("oracle_log_enabled", True)),
         sell_plan=sell_plan_banner(cfg),
     )
+    _whatsapp("startup", cfg)
     if cfg.get("oracle_log_enabled", True):
         late_s = float(cfg.get("sell_late_window_s") or 0.0)
         if late_s > 0:

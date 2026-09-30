@@ -818,6 +818,7 @@ class DeployUnitsTests(unittest.TestCase):
                 "oracle_log.py",
                 "sister_bid.py",
                 "sister_topup.py",
+                "whatsapp_notify.py",
             },
         )
         market_src = (BUY / "market.py").read_text()
