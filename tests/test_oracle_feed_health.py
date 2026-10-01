@@ -1,4 +1,4 @@
-"""Oracle tape hardening: feed watchdog, stall logging, crypto-price retries."""
+"""Oracle tape hardening: feed watchdog, stall logging, crypto-price / Gamma retries."""
 
 from __future__ import annotations
 
@@ -15,9 +15,13 @@ from buy.oracle_log import (
     FEED_PING_INTERVAL_S,
     FEED_PING_TIMEOUT_S,
     FEED_SILENT_RECONNECT_S,
+    GAMMA_FIRST_S,
+    GAMMA_GIVE_UP_S,
+    GAMMA_RETRY_S,
     GRACE_AFTER_S,
     HTTP_RETRY_S,
     CryptoPriceHTTPError,
+    GammaStrike,
     OracleLogService,
     RtdsTwapFeed,
     WindowPrice,
@@ -39,9 +43,15 @@ class ReconnectFeed(FakeFeed):
         return True
 
 
+def _no_gamma(slug: str) -> GammaStrike:
+    del slug
+    return GammaStrike(price_to_beat=None, final_price=None)
+
+
 def _service(feed, fetch, **kw):
     folder = Path(tempfile.mkdtemp(prefix="oracle-health-"))
     path = folder / "oracle_twap.jsonl"
+    kw.setdefault("fetch_gamma", _no_gamma)
     service = OracleLogService(path, feed=feed, fetch_price=fetch, jitter=lambda: 0.0, **kw)
     return service, path
 
@@ -303,188 +313,184 @@ class HttpRetryTests(unittest.TestCase):
             price = fetch_crypto_price(int(START))
         self.assertEqual(price, WindowPrice(open_ref="100.5", close_twap=None, completed=False))
 
-    def _drive(self, fetch, *, start: float, stop: float, jitter=None):
+    def _checked_service(self, fetch_gamma, **memory_kw):
         feed = FakeFeed()
-        service, path = _service(feed, fetch)
-        if jitter is not None:
-            service._jitter = jitter
-        rec = Recorder()
-        for now in range(int(start), int(stop) + 1):
-            feed.latest_sample = _sample(float(now))
-            service.tick(_bag(), float(now), enabled=True, **rec.kwargs())
-        return service, path, rec
+        service, path = _service(feed, _open_only, fetch_gamma=fetch_gamma)
+        window = oracle_log.OracleWindow(
+            condition_id="cid-15m", slug=f"btc-updown-15m-{int(START)}", start_ts=START, end_ts=END,
+        )
+        memory = oracle_log._WindowMemory(window=window, **memory_kw)
+        service._memory["cid-15m"] = memory
+        return service, path, memory
 
-    def test_429_backs_off_and_gives_up_after_close_grace(self):
+    def _run(self, service, clock, start, stop, rec=None):
+        for now in range(int(start), int(stop)):
+            clock["now"] = float(now)
+            kwargs = rec.kwargs() if rec is not None else {}
+            service.tick({"intents": {}}, float(now), enabled=True, **kwargs)
+
+    def test_gamma_429_backs_off_and_gives_up_after_an_hour(self):
         calls: list[float] = []
         clock = {"now": 0.0}
 
-        def fetch(start_ts: int) -> WindowPrice:
-            del start_ts
+        def gamma(slug: str) -> GammaStrike:
+            self.assertEqual(slug, f"btc-updown-15m-{int(START)}")
             calls.append(clock["now"] - END)
             raise CryptoPriceHTTPError(429)
 
-        feed = FakeFeed()
-        service, path = _service(feed, fetch)
+        service, path, _memory = self._checked_service(
+            gamma, open_ref="100", open_source=oracle_log.STRIKE_RTDS,
+        )
         rec = Recorder()
-        service._memory["cid-15m"] = oracle_log._WindowMemory(open_ref="100", open_logged=True)
-        for now in range(int(END), int(END + CLOSE_GRACE_S + 5)):
-            clock["now"] = float(now)
-            service.tick(_bag(), float(now), enabled=True, **rec.kwargs())
-        self.assertEqual(calls, [0.0, 20.0, 60.0, 140.0, 260.0])
-        http_fails = [f for f in rec.fails if "crypto-price" in f]
+        self._run(service, clock, END, END + GAMMA_GIVE_UP_S + 5, rec)
+        self.assertEqual(calls, [600.0, 720.0, 960.0, 1440.0, 2040.0, 2640.0, 3240.0])
+        http_fails = [f for f in rec.fails if f.startswith("gamma")]
         self.assertEqual(len(http_fails), 1)
         self.assertIn("http_429", http_fails[0])
-        missed = rec.named("oracle_window_end_missed")
+        missed = rec.named("oracle_check_missed")
         self.assertEqual(len(missed), 1)
-        self.assertEqual(missed[0]["counts"], {"http_429": 5})
-        self.assertEqual(missed[0]["attempts"], 5)
-        self.assertFalse(any(row["event"] == "oracle_window_end" for row in _rows(path)))
+        self.assertEqual(missed[0]["missing"], ["price_to_beat", "final_price"])
+        self.assertEqual(missed[0]["counts"], {"http_429": 7})
+        self.assertEqual(missed[0]["attempts"], 7)
+        self.assertEqual(missed[0]["strike_source"], "rtds_twap_at_start")
+        self.assertFalse(any(row["event"] == "oracle_strike_check" for row in _rows(path)))
+        self._run(service, clock, END + GAMMA_GIVE_UP_S + 5, END + GAMMA_GIVE_UP_S + 200, rec)
+        self.assertEqual(len(calls), 7)
+        self.assertEqual(service._memory, {})
 
-    def test_retry_after_is_honoured(self):
+    def test_gamma_is_never_polled_per_second(self):
         calls: list[float] = []
         clock = {"now": 0.0}
 
-        def fetch(start_ts: int) -> WindowPrice:
-            del start_ts
+        def gamma(slug: str) -> GammaStrike:
+            del slug
+            calls.append(clock["now"] - END)
+            return GammaStrike(price_to_beat=None, final_price=None)
+
+        service, _path, memory = self._checked_service(gamma, open_ref="100")
+        self._run(service, clock, START, END + GAMMA_GIVE_UP_S + 5)
+        self.assertEqual(calls[0], 600.0)
+        gaps = [b - a for a, b in zip(calls, calls[1:])]
+        self.assertTrue(gaps and min(gaps) >= GAMMA_RETRY_S)
+        self.assertLessEqual(len(calls), int((GAMMA_GIVE_UP_S - 600) / GAMMA_RETRY_S) + 1)
+        self.assertEqual(memory.check_http.counts, {"unpublished": len(calls)})
+
+    def test_gamma_retry_after_is_honoured(self):
+        calls: list[float] = []
+        clock = {"now": 0.0}
+
+        def gamma(slug: str) -> GammaStrike:
+            del slug
             calls.append(clock["now"] - END)
             if len(calls) == 1:
-                raise CryptoPriceHTTPError(429, retry_after=95.0)
-            return WindowPrice(open_ref="100", close_twap="101", completed=True)
+                raise CryptoPriceHTTPError(429, retry_after=900.0)
+            return GammaStrike(price_to_beat="100", final_price="101")
 
-        feed = FakeFeed()
-        service, _path = _service(feed, fetch)
-        service._memory["cid-15m"] = oracle_log._WindowMemory(open_ref="100", open_logged=True)
+        service, _path, _memory = self._checked_service(
+            gamma, open_ref="100", open_source=oracle_log.STRIKE_RTDS,
+            close_twap="101", close_source=oracle_log.CLOSE_RTDS, end_logged=True,
+        )
         rec = Recorder()
-        for now in range(int(END), int(END + 120)):
-            clock["now"] = float(now)
-            service.tick(_bag(), float(now), enabled=True, **rec.kwargs())
-        self.assertEqual(calls, [0.0, 95.0])
-        summary = rec.named("oracle_close_fetch")
-        self.assertEqual(len(summary), 1)
-        self.assertEqual(summary[0]["counts"], {"http_429": 1})
+        self._run(service, clock, END, END + 1600, rec)
+        self.assertEqual(calls, [600.0, 1500.0])
+        self.assertEqual(rec.named("oracle_strike_check")[0]["match"], True)
+        self.assertEqual(rec.named("oracle_close_check")[0]["match"], True)
 
-    def test_incomplete_is_a_normal_wait_not_an_error(self):
+    def test_unpublished_metadata_is_a_normal_wait_not_an_error(self):
         calls: list[float] = []
         clock = {"now": 0.0}
 
-        def fetch(start_ts: int) -> WindowPrice:
-            del start_ts
+        def gamma(slug: str) -> GammaStrike:
+            del slug
             calls.append(clock["now"] - END)
-            if clock["now"] < END + 80:
-                return WindowPrice(open_ref="100", close_twap=None, completed=False)
-            return WindowPrice(open_ref="100", close_twap="101.5", completed=True)
+            if clock["now"] < END + 900:
+                return GammaStrike(price_to_beat=None, final_price=None)
+            if clock["now"] < END + 1100:
+                return GammaStrike(price_to_beat="100", final_price=None)
+            return GammaStrike(price_to_beat="100", final_price="101.5")
 
-        feed = FakeFeed()
-        service, path = _service(feed, fetch)
-        service._memory["cid-15m"] = oracle_log._WindowMemory(open_ref="100", open_logged=True)
+        service, path, memory = self._checked_service(
+            gamma, open_ref="100", open_source=oracle_log.STRIKE_RTDS,
+            close_twap="101.5", close_source=oracle_log.CLOSE_RTDS, end_logged=True,
+        )
         rec = Recorder()
-        for now in range(int(END), int(END + 200)):
-            clock["now"] = float(now)
-            feed.latest_sample = _sample(float(now))
-            service.tick(_bag(), float(now), enabled=True, **rec.kwargs())
-        self.assertEqual(calls, [0.0, 20.0, 40.0, 60.0, 80.0])
+        self._run(service, clock, END, END + 1500, rec)
+        self.assertEqual(calls, [600.0, 720.0, 840.0, 960.0, 1080.0, 1200.0])
         self.assertEqual(rec.fails, [])
-        self.assertEqual(rec.named("oracle_close_fetch"), [])
-        rows = _rows(path)
-        self.assertFalse(any(row["event"] == "oracle_log_fail" for row in rows))
-        ends = [row for row in rows if row["event"] == "oracle_window_end"]
-        self.assertEqual(len(ends), 1)
-        self.assertEqual(ends[0]["twap"], "101.5")
-        self.assertEqual(service._memory["cid-15m"].http_counts, {"incomplete": 4})
+        self.assertEqual(len(rec.named("oracle_strike_check")), 1)
+        self.assertEqual(len(rec.named("oracle_close_check")), 1)
+        self.assertEqual(memory.check_http.counts, {"unpublished": 3})
+        self.assertFalse(any(row["event"] == "oracle_log_fail" for row in _rows(path)))
 
-    def test_extended_grace_catches_a_late_close_without_longer_sampling(self):
-        calls: list[float] = []
-        clock = {"now": 0.0}
-
-        def fetch(start_ts: int) -> WindowPrice:
-            del start_ts
-            calls.append(clock["now"] - END)
-            if clock["now"] < END + 200:
-                return WindowPrice(open_ref="100", close_twap=None, completed=False)
-            return WindowPrice(open_ref="100", close_twap="99.25", completed=True)
-
-        feed = FakeFeed()
-        service, path = _service(feed, fetch)
-        service._memory["cid-15m"] = oracle_log._WindowMemory(open_ref="100", open_logged=True)
-        sleeps: dict[float, float] = {}
-        for now in range(int(END), int(END + CLOSE_GRACE_S + 30)):
-            clock["now"] = float(now)
-            feed.latest_sample = _sample(float(now))
-            feed.samples = [feed.latest_sample]
-            service.tick(_bag(), float(now), enabled=True)
-            sleeps[now - END] = service.sleep_s
-        rows = _rows(path)
-        ends = [row for row in rows if row["event"] == "oracle_window_end"]
-        self.assertEqual(len(ends), 1)
-        self.assertEqual(ends[0]["twap"], "99.25")
-        self.assertGreater(ends[0]["ts"], END + GRACE_AFTER_S)
-        self.assertEqual(calls[-1], 200.0)
-        twap_ts = [row["twap_ts"] for row in rows if row["event"] == "oracle_twap"]
-        self.assertLessEqual(max(twap_ts), END + GRACE_AFTER_S)
-        self.assertEqual(sleeps[250], 5.0)
-        self.assertEqual(feed.started, int(GRACE_AFTER_S) + 1)
-
-    def test_restart_inside_close_grace_still_fetches_the_close(self):
-        fetched: list[float] = []
-
-        def fetch(start_ts: int) -> WindowPrice:
-            del start_ts
-            fetched.append(1.0)
-            return WindowPrice(open_ref="100", close_twap="101", completed=True)
-
-        feed = FakeFeed()
-        service, path = _service(feed, fetch)
-        service.tick(_bag(), END + 200, enabled=True)
-        self.assertEqual(len(fetched), 1)
-        self.assertEqual(sum(row["event"] == "oracle_window_end" for row in _rows(path)), 1)
-        service.tick(_bag(), END + CLOSE_GRACE_S + 1, enabled=True)
-        self.assertEqual(len(fetched), 1)
-        self.assertEqual(feed.started, 0)
-
-    def test_errors_log_once_per_window_per_kind(self):
+    def test_gamma_errors_log_once_per_window_per_kind(self):
         script = ["400", "400", "429", "400", "ok"]
         clock = {"now": 0.0}
 
-        def fetch(start_ts: int) -> WindowPrice:
-            del start_ts
+        def gamma(slug: str) -> GammaStrike:
+            del slug
             step = script.pop(0) if script else "ok"
             if step == "ok":
-                return WindowPrice(open_ref="100", close_twap="101", completed=True)
+                return GammaStrike(price_to_beat="100", final_price="101")
             raise CryptoPriceHTTPError(int(step))
 
-        feed = FakeFeed()
-        service, _path = _service(feed, fetch)
-        service._memory["cid-15m"] = oracle_log._WindowMemory(open_ref="100", open_logged=True)
+        service, _path, memory = self._checked_service(gamma, open_ref="100", close_twap="101")
         rec = Recorder()
-        for now in range(int(END), int(END + CLOSE_GRACE_S)):
-            clock["now"] = float(now)
-            service.tick(_bag(), float(now), enabled=True, **rec.kwargs())
-        http_fails = [f for f in rec.fails if "crypto-price" in f]
+        self._run(service, clock, END, END + 1400, rec)
+        http_fails = [f for f in rec.fails if f.startswith("gamma")]
         self.assertEqual(len(http_fails), 2)
         self.assertIn("http_400", http_fails[0])
         self.assertIn("http_429", http_fails[1])
-        summary = rec.named("oracle_close_fetch")
-        self.assertEqual(len(summary), 1)
-        self.assertEqual(summary[0]["counts"], {"http_400": 3, "http_429": 1})
-        self.assertEqual(summary[0]["attempts"], 5)
+        self.assertEqual(memory.check_http.counts, {"http_400": 3, "http_429": 1})
+        self.assertEqual(memory.check_http.attempts, 5)
+        self.assertTrue(memory.check_done)
 
-        # The next window logs its own first 400.
-        nxt = START + 900
-        state = {
-            "intents": {
-                "cid-next": {
-                    "status": "confirmed",
-                    "slug": f"btc-updown-15m-{int(nxt)}",
-                    "condition_id": "cid-next",
-                    "series_slug": "btc-up-or-down-15m",
-                }
-            }
-        }
-        script[:] = ["400", "400", "ok"]
-        for now in range(int(nxt + 900), int(nxt + 960)):
-            service.tick(state, float(now), enabled=True, **rec.kwargs())
-        http_fails = [f for f in rec.fails if "crypto-price" in f]
-        self.assertEqual(len(http_fails), 3)
+    def test_one_gamma_request_per_tick_across_windows(self):
+        calls: list[str] = []
+
+        def gamma(slug: str) -> GammaStrike:
+            calls.append(slug)
+            return GammaStrike(price_to_beat="100", final_price="101")
+
+        feed = FakeFeed()
+        service, _path = _service(feed, _open_only, fetch_gamma=gamma)
+        for offset in (0.0, 900.0, 1800.0):
+            window = oracle_log.OracleWindow(
+                condition_id=f"cid-{int(offset)}", slug=f"btc-updown-15m-{int(START + offset)}",
+                start_ts=START + offset, end_ts=END + offset,
+            )
+            service._memory[window.condition_id] = oracle_log._WindowMemory(
+                window=window, open_ref="100", close_twap="101",
+            )
+        now = END + 1800 + GAMMA_FIRST_S
+        service.tick({"intents": {}}, now, enabled=True)
+        self.assertEqual(len(calls), 1)
+        service.tick({"intents": {}}, now + 1, enabled=True)
+        service.tick({"intents": {}}, now + 2, enabled=True)
+        self.assertEqual(len(calls), 3)
+        self.assertEqual(len(set(calls)), 3)
+
+    def test_fallback_429_backs_off_and_stops_at_window_end(self):
+        calls: list[float] = []
+        clock = {"now": 0.0}
+
+        def fetch(start_ts: int) -> WindowPrice:
+            del start_ts
+            calls.append(clock["now"] - START)
+            raise CryptoPriceHTTPError(429)
+
+        feed = FakeFeed()
+        service, _path = _service(feed, fetch)
+        rec = Recorder()
+        for now in range(int(START), int(END + 60)):
+            clock["now"] = float(now)
+            feed.latest_sample = _sample(float(now) - 0.5)
+            service.tick(_bag(), float(now), enabled=True, **rec.kwargs())
+        self.assertEqual(calls[:5], [75.0, 95.0, 135.0, 215.0, 335.0])
+        self.assertLess(max(calls), END - START)
+        http_fails = [f for f in rec.fails if f.startswith("crypto-price")]
+        self.assertEqual(len(http_fails), 1)
+        self.assertIn("http_429", http_fails[0])
+        self.assertEqual(len(rec.named("oracle_strike_late")), 1)
 
     def test_jitter_delays_the_first_request_and_stays_in_range(self):
         calls: list[float] = []
@@ -498,10 +504,10 @@ class HttpRetryTests(unittest.TestCase):
         feed = FakeFeed()
         service, _path = _service(feed, fetch)
         service._jitter = lambda: 2.4
-        for now in range(int(START - 5), int(START + 10)):
+        for now in range(int(START - 5), int(START + 90)):
             clock["now"] = float(now)
             service.tick(_bag(), float(now), enabled=True)
-        self.assertEqual(calls, [3.0])
+        self.assertEqual(calls, [78.0])
         service._jitter = lambda: 99.0
         self.assertEqual(service._jitter_s(), 3.0)
         service._jitter = lambda: -1.0
@@ -516,15 +522,33 @@ class HttpRetryTests(unittest.TestCase):
             calls.append(start_ts)
             svc = holder["svc"]
             memory = svc._memory["cid-15m"]
-            memory.next_http = 0.0
-            svc._maybe_http(memory.window, memory, END + 50)
-            return WindowPrice(open_ref="100", close_twap=None, completed=False)
+            memory.open_http.next_at = 0.0
+            svc._maybe_open_fallback(memory.window, memory, START + 200)
+            return WindowPrice(open_ref=None, close_twap=None, completed=False)
 
         service, _path = _service(feed, fetch)
         holder["svc"] = service
-        service.tick(_bag(), END + 10, enabled=True)
+        service.tick(_bag(), START + 100, enabled=True)
         self.assertEqual(len(calls), 1)
-        self.assertFalse(service._memory["cid-15m"].inflight)
+        self.assertFalse(service._memory["cid-15m"].open_http.inflight)
+
+    def test_sampling_still_stops_at_grace_after_the_end(self):
+        feed = FakeFeed()
+        service, path = _service(feed, _open_only)
+        sleeps: dict[float, float] = {}
+        for now in range(int(END), int(END + CLOSE_GRACE_S + 30)):
+            feed.latest_sample = _sample(float(now))
+            feed.samples = [feed.latest_sample]
+            service.tick(_bag(), float(now), enabled=True)
+            sleeps[now - END] = service.sleep_s
+        rows = _rows(path)
+        ends = [row for row in rows if row["event"] == "oracle_window_end"]
+        self.assertEqual(len(ends), 1)
+        self.assertEqual(ends[0]["twap_ts"], END)
+        twap_ts = [row["twap_ts"] for row in rows if row["event"] == "oracle_twap"]
+        self.assertLessEqual(max(twap_ts), END + GRACE_AFTER_S)
+        self.assertEqual(sleeps[250], 5.0)
+        self.assertEqual(feed.started, int(GRACE_AFTER_S) + 1)
 
 
 if __name__ == "__main__":

@@ -2960,6 +2960,7 @@ def _manage_sells_locked(cfg: dict, state: dict, chain: ChainReader) -> None:
                 floor_usd=floor_usd,
                 stale_s=stale_s,
             )
+            edge_detail["open_source"] = getattr(view, "open_source", None)
             oracle_fire, armed_o, why_o, armed_leg = advance_oracle_edge_arm(
                 edge_ok=bool(edge_ok),
                 sold_loser=sold_loser,
@@ -2985,6 +2986,7 @@ def _manage_sells_locked(cfg: dict, state: dict, chain: ChainReader) -> None:
                     edge=edge_detail.get("edge"),
                     need=edge_detail.get("need"),
                     open_ref=edge_detail.get("open_usd"),
+                    open_source=edge_detail.get("open_source"),
                     twap=edge_detail.get("twap"),
                     age_s=edge_detail.get("age_s"),
                 )
@@ -2999,6 +3001,7 @@ def _manage_sells_locked(cfg: dict, state: dict, chain: ChainReader) -> None:
                     edge=edge_detail.get("edge"),
                     need=edge_detail.get("need"),
                     open_ref=edge_detail.get("open_usd"),
+                    open_source=edge_detail.get("open_source"),
                     twap=edge_detail.get("twap"),
                     age_s=edge_detail.get("age_s"),
                 )
@@ -3095,6 +3098,7 @@ def _manage_sells_locked(cfg: dict, state: dict, chain: ChainReader) -> None:
                     edge=edge_detail.get("edge"),
                     need=edge_detail.get("need"),
                     open_ref=edge_detail.get("open_usd"),
+                    open_source=edge_detail.get("open_source"),
                     twap=edge_detail.get("twap"),
                     age_s=edge_detail.get("age_s"),
                     clob_ready=True,
@@ -3111,6 +3115,7 @@ def _manage_sells_locked(cfg: dict, state: dict, chain: ChainReader) -> None:
                         edge=edge_detail.get("edge"),
                         need=edge_detail.get("need"),
                         open_ref=edge_detail.get("open_usd"),
+                        open_source=edge_detail.get("open_source"),
                         twap=edge_detail.get("twap"),
                         age_s=edge_detail.get("age_s"),
                     )
