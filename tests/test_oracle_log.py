@@ -16,6 +16,7 @@ from buy.mint_sell import (
 )
 from buy.oracle_log import (
     CRYPTO_PRICE_VARIANT,
+    GammaStrike,
     OracleBagView,
     OracleLogService,
     RtdsTwapFeed,
@@ -143,6 +144,11 @@ class FakeFeed:
 
     def last_error(self) -> str:
         return self.error
+
+
+def _no_gamma(slug: str) -> GammaStrike:
+    del slug
+    return GammaStrike(price_to_beat=None, final_price=None)
 
 
 def _sample(obs: float, twap: str = "85260.062350763205066752") -> TwapSample:
@@ -378,15 +384,19 @@ class WriterTests(unittest.TestCase):
     def _service(self, feed: FakeFeed, fetch):
         folder = Path(tempfile.mkdtemp(prefix="oracle-log-"))
         path = folder / "oracle_twap.jsonl"
-        return OracleLogService(path, feed=feed, fetch_price=fetch, jitter=lambda: 0.0), path
+        service = OracleLogService(
+            path, feed=feed, fetch_price=fetch, fetch_gamma=_no_gamma, jitter=lambda: 0.0,
+        )
+        return service, path
 
     def test_bag_view_reuses_feed_and_open_ref(self):
         feed = FakeFeed()
-        now = START + 100
-        feed.latest_sample = _sample(now - 1.0, "85260.5")
+        now = START + 2
+        feed.samples = [_sample(START, "85224.5"), _sample(now - 1.0, "85260.5")]
+        feed.latest_sample = feed.samples[-1]
 
         def fetch(start_ts: int) -> WindowPrice:
-            return WindowPrice(open_ref="85224.5", close_twap=None, completed=False)
+            raise AssertionError("crypto-price is a fallback only")
 
         svc, _path = self._service(feed, fetch)
         svc.tick(_bag(), now, enabled=True)
@@ -394,36 +404,44 @@ class WriterTests(unittest.TestCase):
         self.assertIsInstance(view, OracleBagView)
         self.assertEqual(view.twap, "85260.5")
         self.assertEqual(view.open_usd, "85224.5")
+        self.assertEqual(view.open_source, "rtds_twap_at_start")
         self.assertAlmostEqual(view.obs_ts, now - 1.0)
         missing = svc.bag_view("unknown-cid")
         self.assertEqual(missing.twap, "85260.5")
         self.assertIsNone(missing.open_usd)
+        self.assertIsNone(missing.open_source)
 
     def test_hot_path_records_samples_without_touching_intents(self):
         feed = FakeFeed()
-        now = END - 10
-        feed.samples = [_sample(now - 2, "85260.1"), _sample(now - 1, "85260.2")]
-        feed.latest_sample = feed.samples[-1]
         calls = []
 
         def fetch(start_ts: int) -> WindowPrice:
             calls.append(start_ts)
-            return WindowPrice(open_ref="85224.5", close_twap=None, completed=False)
+            return WindowPrice(open_ref="1", close_twap=None, completed=False)
 
         service, path = self._service(feed, fetch)
         state = _bag(oracle_twap="nope", open_ref="nope")
         before = json.dumps(state, sort_keys=True)
         fails: list[str] = []
+        feed.samples = [_sample(START, "85224.5")]
+        feed.latest_sample = feed.samples[-1]
+        service.tick(state, START + 1.5, enabled=True, on_fail=fails.append)
+        now = END - 10
+        feed.samples = [_sample(now - 2, "85260.1"), _sample(now - 1, "85260.2")]
+        feed.latest_sample = feed.samples[-1]
         service.tick(state, now, enabled=True, on_fail=fails.append)
         self.assertEqual(json.dumps(state, sort_keys=True), before)
         self.assertEqual(fails, [])
-        self.assertEqual(calls, [int(START)])
-        self.assertEqual(feed.started, 1)
+        self.assertEqual(calls, [])
+        self.assertEqual(feed.started, 2)
         rows = _rows(path)
         self.assertEqual(rows[0]["event"], "oracle_open_ref")
-        self.assertEqual(rows[0]["source"], "polymarket_crypto_price")
+        self.assertEqual(rows[0]["source"], "polymarket_rtds")
+        self.assertEqual(rows[0]["strike_source"], "rtds_twap_at_start")
         self.assertEqual(rows[0]["open_ref"], "85224.5")
-        twaps = [row for row in rows if row["event"] == "oracle_twap"]
+        self.assertEqual(rows[0]["twap_ts"], START)
+        self.assertEqual(rows[0]["capture_delay_s"], 1.5)
+        twaps = [row for row in rows if row["event"] == "oracle_twap" and row["twap_ts"] > START]
         self.assertEqual([row["twap"] for row in twaps], ["85260.1", "85260.2"])
         self.assertEqual(twaps[0]["notes"], "last_min")
         self.assertEqual(twaps[0]["slug"], f"btc-updown-15m-{int(START)}")
@@ -457,9 +475,6 @@ class WriterTests(unittest.TestCase):
 
     def test_window_end_row_and_http_failure_does_not_drop_the_tape(self):
         feed = FakeFeed()
-        now = END + 5
-        feed.latest_sample = _sample(now, "85200")
-        feed.samples = [feed.latest_sample]
         fails: list[str] = []
 
         def fetch(start_ts: int) -> WindowPrice:
@@ -469,29 +484,25 @@ class WriterTests(unittest.TestCase):
         service, path = self._service(feed, fetch)
         state = _bag()
         before = json.dumps(state, sort_keys=True)
+        now = START + 80
+        feed.latest_sample = _sample(now, "85230")
+        feed.samples = [feed.latest_sample]
         service.tick(state, now, enabled=True, on_fail=fails.append)
-        self.assertEqual(json.dumps(state, sort_keys=True), before)
         self.assertTrue(any("oracle down" in item for item in fails))
         rows = _rows(path)
-        self.assertTrue(any(row["event"] == "oracle_twap" and row["notes"] == "end" for row in rows))
+        self.assertTrue(any(row["event"] == "oracle_twap" for row in rows))
         self.assertTrue(any(row["event"] == "oracle_log_fail" for row in rows))
-        self.assertFalse(any(row["event"] == "oracle_window_end" for row in rows))
+        self.assertFalse(any(row["event"] == "oracle_open_ref" for row in rows))
 
-        def fetch_done(start_ts: int) -> WindowPrice:
-            del start_ts
-            return WindowPrice(
-                open_ref="85224.5",
-                close_twap="85200.25",
-                completed=True,
-            )
-
-        service._fetch_price = fetch_done
-        service.tick(state, now + 20, enabled=True, on_fail=fails.append)
+        feed.samples = [_sample(END, "85200.25"), _sample(END + 1, "85200.3")]
+        feed.latest_sample = feed.samples[-1]
+        service.tick(state, END + 2, enabled=True, on_fail=fails.append)
         end_rows = [row for row in _rows(path) if row["event"] == "oracle_window_end"]
         self.assertEqual(len(end_rows), 1)
         self.assertEqual(end_rows[0]["twap"], "85200.25")
-        self.assertEqual(end_rows[0]["open_ref"], "85224.5")
-        self.assertEqual(end_rows[0]["source"], "polymarket_crypto_price")
+        self.assertEqual(end_rows[0]["twap_ts"], END)
+        self.assertEqual(end_rows[0]["source"], "polymarket_rtds")
+        self.assertEqual(end_rows[0]["close_source"], "rtds_twap_at_end")
         self.assertEqual(json.dumps(state, sort_keys=True), before)
 
     def test_disabled_flag_does_not_connect_or_write(self):

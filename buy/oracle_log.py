@@ -12,15 +12,29 @@ Source, chosen because it needs no Chainlink Data Streams credentials:
   ``crypto_prices_twap_sixty`` (symbol ``btc/usd``). The subscribe burst
   carries the recent 1Hz path; updates then arrive about once a second.
   ``full_accuracy_value`` is the signed 1e18 Chainlink price.
-* Window open and completed close: ``GET /api/crypto/crypto-price`` with
-  ``variant=fifteen``. That variant is the 15m Chainlink series. Other
-  variant strings fall back to hourly Binance and are not used.
+* Strike and close: the 60s TWAP sample stamped exactly at the window's
+  start (``priceToBeat``) and end (``finalPrice``). Gamma's
+  ``eventMetadata.priceToBeat`` for window N equals its ``finalPrice`` for
+  N-1, and both equal that boundary sample. The subscribe burst replays
+  about the last minute, so a reconnect shortly after the boundary still
+  recovers it. A later sample for the same second with a different value
+  supersedes the first (``oracle_strike_revised``).
+* Strike fallback only: ``GET /api/crypto/crypto-price`` (``variant=fifteen``)
+  ``openPrice``, when no boundary sample arrived by ``STRIKE_WAIT_S``. That
+  endpoint publishes a different boundary price series (its open/close
+  differ from priceToBeat/finalPrice by up to ~$40), so its rows are
+  labelled ``strike_source=crypto_price_open`` and its close is not used.
+* Reconciliation: ``GET gamma-api /events?slug=`` once ``eventMetadata`` is
+  published (``priceToBeat`` ~10 min after the end, ``finalPrice`` later).
+  Logs ``oracle_strike_check`` / ``oracle_close_check`` and corrects the
+  tape if ours differs. It runs after the window, so it cannot reach a
+  live decision.
 
 Feed health: protocol ping/pong plus a silence watchdog reconnect the
 socket when no sample arrives for ``FEED_SILENT_RECONNECT_S``. A stall is
 logged once when it starts (``oracle_feed_stall``), at most once a minute
 while it lasts, and once when it ends (``oracle_feed_recovered``).
-crypto-price errors are logged once per window per kind; a 429 backs off.
+HTTP errors are logged once per window per kind and source; a 429 backs off.
 """
 
 from __future__ import annotations
@@ -64,10 +78,8 @@ STALE_AFTER_S = 20.0
 FAIL_REPEAT_S = 30.0
 HTTP_RETRY_S = 20.0
 IDLE_STOP_S = 30.0
-# crypto-price close fetch. The close usually shows ``completed`` 60-100s
-# after the end; until then the reply is ``incomplete`` (a normal wait).
-# Only the close fetch uses the longer grace; sampling still stops at
-# GRACE_AFTER_S.
+# A window with no end-boundary sample by this long after the end logs
+# ``oracle_window_end_missed``. Sampling still stops at GRACE_AFTER_S.
 CLOSE_GRACE_S = 300.0
 HTTP_BACKOFF_CAP_S = 120.0
 HTTP_JITTER_S = 3.0
@@ -81,6 +93,25 @@ FEED_PING_TIMEOUT_S = 10.0
 FEED_BACKOFF_MAX_S = 30.0
 STALL_REMIND_S = 60.0
 FEED_EVENT_REPEAT_S = 60.0
+# Strike capture. The subscribe replay covers ~57s, so past this no
+# reconnect can still deliver the boundary sample; fall back to crypto-price.
+STRIKE_WAIT_S = 75.0
+STRIKE_RTDS = "rtds_twap_at_start"
+STRIKE_CRYPTO = "crypto_price_open"
+STRIKE_GAMMA = "gamma_price_to_beat"
+CLOSE_RTDS = "rtds_twap_at_end"
+CLOSE_GAMMA = "gamma_final_price"
+GAMMA_SOURCE = "gamma_event_metadata"
+GAMMA_EVENTS_URL = "https://gamma-api.polymarket.com/events"
+GAMMA_SLUG_PREFIX = "btc-updown-15m-"
+# Gamma publishes priceToBeat ~10 min after the window ends and finalPrice
+# later still. Checks start then, retry every 2 min, and stop after an hour.
+GAMMA_FIRST_S = 600.0
+GAMMA_RETRY_S = 120.0
+GAMMA_BACKOFF_CAP_S = 600.0
+GAMMA_GIVE_UP_S = 3600.0
+STRIKE_MATCH_USD = Decimal("0.01")
+BOUNDARY_KEEP = 32
 
 BAG_STATUSES = frozenset(
     {
@@ -126,6 +157,12 @@ class WindowPrice:
 
 
 @dataclass(frozen=True)
+class GammaStrike:
+    price_to_beat: Optional[str]
+    final_price: Optional[str]
+
+
+@dataclass(frozen=True)
 class OracleBagView:
     """Read-only TWAP + window-open snapshot for the late loser-scrap gate."""
 
@@ -133,6 +170,7 @@ class OracleBagView:
     open_usd: Optional[str]
     obs_ts: Optional[float]
     source: str = RTDS_SOURCE
+    open_source: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -305,13 +343,93 @@ def parse_crypto_price_body(text: str) -> WindowPrice:
     )
 
 
-class CryptoPriceHTTPError(RuntimeError):
-    """Non-2xx crypto-price reply. ``retry_after`` is seconds, if sent."""
+class OracleHTTPError(RuntimeError):
+    """Non-2xx crypto-price or Gamma reply. ``retry_after`` is seconds, if sent."""
 
     def __init__(self, status: int, retry_after: Optional[float] = None, body: str = "") -> None:
         self.status = int(status)
         self.retry_after = retry_after
         super().__init__(f"HTTP {self.status}" + (f" {body[:120]}" if body else ""))
+
+
+CryptoPriceHTTPError = OracleHTTPError
+
+
+def boundary_second(obs_ts: Any) -> Optional[int]:
+    """The 15m boundary (unix seconds) when ``obs_ts`` is exactly one."""
+    obs = _as_float(obs_ts)
+    if obs is None:
+        return None
+    sec = round(obs)
+    if abs(obs - sec) > 0.0005 or sec % int(FIFTEEN_S):
+        return None
+    return int(sec)
+
+
+def gamma_event_slug(start_ts: Any) -> str:
+    return f"{GAMMA_SLUG_PREFIX}{int(float(start_ts))}"
+
+
+def parse_gamma_event_body(text: str) -> GammaStrike:
+    """``eventMetadata.priceToBeat`` / ``finalPrice`` from ``/events?slug=``.
+
+    Missing metadata (not yet published) gives ``None`` fields."""
+    data = json.loads(text, parse_float=Decimal, parse_int=Decimal)
+    if isinstance(data, list):
+        data = data[0] if data else {}
+    if not isinstance(data, dict):
+        raise ValueError("gamma event payload was not an object")
+    meta = data.get("eventMetadata")
+    if isinstance(meta, str):
+        try:
+            meta = json.loads(meta, parse_float=Decimal, parse_int=Decimal)
+        except json.JSONDecodeError:
+            meta = None
+    if not isinstance(meta, dict):
+        return GammaStrike(price_to_beat=None, final_price=None)
+
+    def pick(key: str) -> Optional[str]:
+        value = meta.get(key)
+        if value is None or isinstance(value, bool):
+            return None
+        if isinstance(value, Decimal):
+            return _format_decimal(value) if value.is_finite() and value > 0 else None
+        text_value = _loose_decimal_str(value)
+        if text_value is None or Decimal(text_value) <= 0:
+            return None
+        return text_value
+
+    return GammaStrike(price_to_beat=pick("priceToBeat"), final_price=pick("finalPrice"))
+
+
+def fetch_gamma_strike(slug: str, *, timeout: float = 5.0) -> GammaStrike:
+    response = thread_session("gamma_strike").get(
+        GAMMA_EVENTS_URL,
+        params={"slug": slug},
+        timeout=timeout,
+        headers={"User-Agent": "poly-money-maker-oracle-log/1.0"},
+    )
+    status = int(getattr(response, "status_code", 200) or 200)
+    if status >= 400:
+        headers = getattr(response, "headers", None) or {}
+        raise OracleHTTPError(
+            status,
+            parse_retry_after(headers.get("Retry-After")),
+            str(getattr(response, "text", "") or "").strip(),
+        )
+    return parse_gamma_event_body(response.text)
+
+
+def usd_diff(ours: Any, official: Any) -> Optional[Decimal]:
+    """``ours - official`` exactly, or None when either is unusable."""
+    try:
+        a = Decimal(str(ours))
+        b = Decimal(str(official))
+    except (InvalidOperation, ValueError, TypeError):
+        return None
+    if ours is None or official is None or not (a.is_finite() and b.is_finite()):
+        return None
+    return a - b
 
 
 def parse_retry_after(value: Any) -> Optional[float]:
@@ -374,12 +492,20 @@ def classify_http_error(exc: BaseException) -> tuple[str, Optional[float]]:
     return f"http_{code}", retry_after if code == 429 else None
 
 
-def http_retry_delay_s(kind: str, n429: int, retry_after: Optional[float]) -> float:
-    """20s normally. The n-th consecutive 429 waits 20, 40, 80, then 120s,
-    or longer if the server sent Retry-After."""
+def http_retry_delay_s(
+    kind: str,
+    n429: int,
+    retry_after: Optional[float],
+    *,
+    base_s: float = HTTP_RETRY_S,
+    cap_s: float = HTTP_BACKOFF_CAP_S,
+) -> float:
+    """``base_s`` normally (20s crypto-price, 120s Gamma). The n-th consecutive
+    429 waits base, 2x, 4x, ... up to ``cap_s``, or longer if the server
+    sent Retry-After."""
     if kind != "http_429":
-        return HTTP_RETRY_S
-    delay = min(HTTP_BACKOFF_CAP_S, HTTP_RETRY_S * (2 ** max(0, n429 - 1)))
+        return base_s
+    delay = min(cap_s, base_s * (2 ** max(0, n429 - 1)))
     if retry_after is not None:
         delay = max(delay, float(retry_after))
     return delay
@@ -727,22 +853,36 @@ class RtdsTwapFeed:
 
 
 @dataclass
-class _WindowMemory:
-    last_sample_wall: float = 0.0
-    open_ref: Optional[str] = None
-    open_logged: bool = False
-    end_logged: bool = False
-    last_http: float = 0.0
-    window: Optional[OracleWindow] = None
-    next_http: float = 0.0
-    open_armed: bool = False
-    end_armed: bool = False
+class _HttpSlot:
+    """One HTTP purpose per window (strike fallback or Gamma check)."""
+
+    armed: bool = False
+    next_at: float = 0.0
     inflight: bool = False
     n429: int = 0
-    http_attempts: int = 0
-    http_counts: dict = field(default_factory=dict)
-    http_logged: set = field(default_factory=set)
+    attempts: int = 0
+    counts: dict = field(default_factory=dict)
+    logged: set = field(default_factory=set)
+    done: bool = False
+
+
+@dataclass
+class _WindowMemory:
+    last_sample_wall: float = 0.0
+    window: Optional[OracleWindow] = None
+    open_ref: Optional[str] = None
+    open_source: Optional[str] = None
+    open_delay_s: Optional[float] = None
+    strike_late_logged: bool = False
+    close_twap: Optional[str] = None
+    close_source: Optional[str] = None
+    end_logged: bool = False
     end_final: bool = False
+    strike_checked: bool = False
+    close_checked: bool = False
+    check_done: bool = False
+    open_http: _HttpSlot = field(default_factory=_HttpSlot)
+    check_http: _HttpSlot = field(default_factory=_HttpSlot)
 
 
 class OracleLogService:
@@ -754,6 +894,7 @@ class OracleLogService:
         *,
         feed: Any = None,
         fetch_price: Optional[Callable[[int], WindowPrice]] = None,
+        fetch_gamma: Optional[Callable[[str], GammaStrike]] = None,
         max_bytes: int = TAPE_MAX_BYTES,
         jitter: Optional[Callable[[], float]] = None,
     ) -> None:
@@ -761,9 +902,11 @@ class OracleLogService:
         self.max_bytes = int(max_bytes)
         self._feed = feed if feed is not None else RtdsTwapFeed()
         self._fetch_price = fetch_price if fetch_price is not None else fetch_crypto_price
+        self._fetch_gamma = fetch_gamma if fetch_gamma is not None else fetch_gamma_strike
         self._jitter = jitter if jitter is not None else (lambda: random.uniform(0.0, HTTP_JITTER_S))
         self.sleep_s = 5.0
         self._memory: dict[str, _WindowMemory] = {}
+        self._boundary: dict[int, str] = {}
         self._seen: set[tuple[Any, ...]] = set()
         self._seen_order: deque[tuple[Any, ...]] = deque()
         self._fail_wall: dict[str, float] = {}
@@ -781,10 +924,11 @@ class OracleLogService:
         self._event_suppressed: dict[str, int] = {}
 
     def bag_view(self, condition_id: str) -> OracleBagView:
-        """Latest TWAP + open_ref for one bag. Reuses the live feed (no second WS)."""
+        """Latest TWAP + strike for one bag. Reuses the live feed (no second WS)."""
         cid = str(condition_id or "")
         memory = self._memory.get(cid)
         open_usd = memory.open_ref if memory is not None else None
+        open_source = memory.open_source if memory is not None else None
         latest: Optional[TwapSample] = None
         try:
             latest = self._feed.latest()
@@ -792,13 +936,15 @@ class OracleLogService:
             latest = None
         if latest is None:
             return OracleBagView(
-                twap=None, open_usd=open_usd, obs_ts=None, source=RTDS_SOURCE
+                twap=None, open_usd=open_usd, obs_ts=None, source=RTDS_SOURCE,
+                open_source=open_source,
             )
         return OracleBagView(
             twap=latest.twap,
             open_usd=open_usd,
             obs_ts=float(latest.obs_ts),
             source=str(latest.source or RTDS_SOURCE),
+            open_source=open_source,
         )
 
     def tick(
@@ -839,12 +985,10 @@ class OracleLogService:
             self._reset_feed_watch()
             self._awaiting_since = None
             for window in closing:
-                self._maybe_http(window, self._window_memory(window), now)
-            self._finish_http(now)
-            pending = any(
-                not self._window_memory(window).end_logged for window in closing
-            )
-            self.sleep_s = INTERVAL_LAST_MIN_S if pending else 5.0
+                self._resolve_boundaries(window, self._window_memory(window), now)
+            self._finish_windows(now)
+            self._maybe_check(now)
+            self.sleep_s = 5.0
             self._note_idle(now)
             return
         self._idle_since = None
@@ -865,11 +1009,13 @@ class OracleLogService:
         if samples:
             self._watchdog_at = None
             self._watchdog_gap = FEED_SILENT_RECONNECT_S
+        self._note_boundaries(samples, latest)
         for window in windows:
             self._record_window(window, samples, latest, now)
         for window in closing:
-            self._maybe_http(window, self._window_memory(window), now)
-        self._finish_http(now)
+            self._resolve_boundaries(window, self._window_memory(window), now)
+        self._finish_windows(now)
+        self._maybe_check(now)
         self._log_feed_events(now, windows[0])
         self._watch_feed(now, windows[0])
         self._note_silence(windows[0], latest, samples, now)
@@ -1027,6 +1173,136 @@ class OracleLogService:
             fields={"duration_s": round(duration, 1), "reason": reason},
         )
 
+    def _note_boundaries(self, samples: list[TwapSample], latest: Optional[TwapSample]) -> None:
+        """Remember the value at each 15m boundary second, last arrival wins.
+
+        ``latest`` first, then the drained samples in arrival order, so a
+        replayed or corrected sample for the same second supersedes."""
+        ordered: list[TwapSample] = []
+        if latest is not None:
+            ordered.append(latest)
+        ordered.extend(samples)
+        for sample in ordered:
+            key = boundary_second(getattr(sample, "obs_ts", None))
+            if key is None or not getattr(sample, "twap", None):
+                continue
+            self._boundary.pop(key, None)
+            self._boundary[key] = str(sample.twap)
+        while len(self._boundary) > BOUNDARY_KEEP:
+            self._boundary.pop(min(self._boundary))
+
+    def _resolve_boundaries(self, window: OracleWindow, memory: _WindowMemory, now: float) -> None:
+        start_value = self._boundary.get(int(round(window.start_ts)))
+        if start_value is not None and memory.open_source != STRIKE_GAMMA:
+            if memory.open_source != STRIKE_RTDS or memory.open_ref != start_value:
+                self._set_strike(window, memory, now, start_value, STRIKE_RTDS, source=RTDS_SOURCE)
+        end_value = self._boundary.get(int(round(window.end_ts)))
+        if end_value is not None and memory.close_source != CLOSE_GAMMA:
+            if memory.close_source != CLOSE_RTDS or memory.close_twap != end_value:
+                self._set_close(window, memory, now, end_value, CLOSE_RTDS, source=RTDS_SOURCE)
+        if (
+            memory.open_source in (None, STRIKE_CRYPTO)
+            and not memory.strike_late_logged
+            and window.start_ts + STRIKE_WAIT_S <= now < window.end_ts
+        ):
+            memory.strike_late_logged = True
+            self._event(
+                "oracle_strike_late",
+                now=now,
+                window=window,
+                fields={
+                    "reason": "no_boundary_sample",
+                    "wait_s": STRIKE_WAIT_S,
+                    "fallback": STRIKE_CRYPTO,
+                },
+            )
+
+    def _set_strike(
+        self,
+        window: OracleWindow,
+        memory: _WindowMemory,
+        now: float,
+        value: str,
+        strike_source: str,
+        *,
+        source: str,
+        announce: bool = True,
+    ) -> None:
+        previous, previous_source = memory.open_ref, memory.open_source
+        memory.open_ref = value
+        memory.open_source = strike_source
+        memory.open_delay_s = round(now - window.start_ts, 3)
+        extra: dict[str, Any] = {
+            "strike_source": strike_source,
+            "capture_delay_s": memory.open_delay_s,
+        }
+        if previous is not None:
+            extra["previous"] = previous
+            extra["previous_source"] = previous_source
+        self._append(
+            build_oracle_row(
+                now=now,
+                window=window,
+                source=source,
+                event="oracle_open_ref",
+                twap=value,
+                twap_ts=window.start_ts,
+                open_ref=value,
+                notes="open_ref",
+                extra=extra,
+            )
+        )
+        if previous is None or not announce:
+            return
+        diff = usd_diff(value, previous)
+        self._event(
+            "oracle_strike_revised",
+            now=now,
+            window=window,
+            fields={
+                "strike": value,
+                "strike_source": strike_source,
+                "previous": previous,
+                "previous_source": previous_source,
+                "delta": None if diff is None else float(diff),
+            },
+        )
+
+    def _set_close(
+        self,
+        window: OracleWindow,
+        memory: _WindowMemory,
+        now: float,
+        value: str,
+        close_source: str,
+        *,
+        source: str,
+    ) -> None:
+        previous, previous_source = memory.close_twap, memory.close_source
+        memory.close_twap = value
+        memory.close_source = close_source
+        memory.end_logged = True
+        extra: dict[str, Any] = {
+            "close_source": close_source,
+            "capture_delay_s": round(now - window.end_ts, 3),
+        }
+        if previous is not None:
+            extra["previous"] = previous
+            extra["previous_source"] = previous_source
+        self._append(
+            build_oracle_row(
+                now=now,
+                window=window,
+                source=source,
+                event="oracle_window_end",
+                twap=value,
+                twap_ts=window.end_ts,
+                open_ref=memory.open_ref,
+                notes="window_end",
+                extra=extra,
+            )
+        )
+
     def _record_window(
         self,
         window: OracleWindow,
@@ -1035,7 +1311,8 @@ class OracleLogService:
         now: float,
     ) -> None:
         memory = self._window_memory(window)
-        self._maybe_http(window, memory, now)
+        self._resolve_boundaries(window, memory, now)
+        self._maybe_open_fallback(window, memory, now)
         interval = sample_interval_s(now, window.start_ts, window.end_ts)
         dense = interval <= INTERVAL_HOT_S
         if dense:
@@ -1062,7 +1339,7 @@ class OracleLogService:
         *,
         stale: bool,
     ) -> bool:
-        key = (window.condition_id, "rtds", int(round(sample.obs_ts * 1000.0)))
+        key = (window.condition_id, "rtds", int(round(sample.obs_ts * 1000.0)), str(sample.twap))
         if not self._remember(key):
             return False
         notes = notes_for(sample.obs_ts, window.start_ts, window.end_ts)
@@ -1082,45 +1359,164 @@ class OracleLogService:
         )
         return True
 
-    def _maybe_http(self, window: OracleWindow, memory: _WindowMemory, now: float) -> None:
-        """At most one crypto-price request in flight per window.
-
-        The first request waits for the open (or the end) plus 0-3s jitter.
-        ``incomplete`` is a normal 20s wait. A 429 backs off 20/40/80/120s
-        (or Retry-After). The close is fetched until ``CLOSE_GRACE_S``."""
-        if memory.inflight:
+    def _maybe_open_fallback(self, window: OracleWindow, memory: _WindowMemory, now: float) -> None:
+        """crypto-price ``openPrice`` only when no boundary sample came by
+        ``STRIKE_WAIT_S`` and the window is still live. One request in flight."""
+        slot = memory.open_http
+        if memory.open_ref is not None or slot.inflight or slot.done:
             return
-        need_open = memory.open_ref is None and now >= window.start_ts
-        need_end = (
-            not memory.end_logged
-            and window.end_ts <= now <= window.end_ts + CLOSE_GRACE_S
+        first = window.start_ts + STRIKE_WAIT_S
+        if now < first or now >= window.end_ts:
+            return
+        if not slot.armed:
+            slot.armed = True
+            slot.next_at = max(slot.next_at, first + self._jitter_s())
+        if now < slot.next_at:
+            return
+        price = self._http_call(
+            slot, window, now,
+            lambda: self._fetch_price(int(window.start_ts)),
+            label="crypto-price", expect=WindowPrice, base_s=HTTP_RETRY_S,
+            cap_s=HTTP_BACKOFF_CAP_S,
         )
-        if not need_open and not need_end:
+        if price is None:
             return
-        if need_open and not memory.open_armed:
-            memory.open_armed = True
-            memory.next_http = max(memory.next_http, window.start_ts + self._jitter_s())
-        if need_end and not memory.end_armed:
-            memory.end_armed = True
-            memory.next_http = max(memory.next_http, window.end_ts + self._jitter_s())
-        if now < memory.next_http:
+        if price.open_ref and memory.open_ref is None:
+            slot.done = True
+            self._set_strike(window, memory, now, price.open_ref, STRIKE_CRYPTO, source=HTTP_SOURCE)
             return
-        memory.inflight = True
-        memory.last_http = now
-        memory.http_attempts += 1
+        slot.next_at = now + HTTP_RETRY_S + self._jitter_s()
+
+    def _maybe_check(self, now: float) -> None:
+        """Gamma reconciliation after the window. At most one request per tick."""
+        for memory in list(self._memory.values()):
+            window = memory.window
+            if window is None or memory.check_done:
+                continue
+            slot = memory.check_http
+            first = window.end_ts + GAMMA_FIRST_S
+            if slot.inflight or now < first:
+                continue
+            if now > window.end_ts + GAMMA_GIVE_UP_S:
+                self._check_gave_up(window, memory, now)
+                continue
+            if not slot.armed:
+                slot.armed = True
+                slot.next_at = max(slot.next_at, first + self._jitter_s())
+            if now < slot.next_at:
+                continue
+            result = self._http_call(
+                slot, window, now,
+                lambda: self._fetch_gamma(gamma_event_slug(window.start_ts)),
+                label="gamma", expect=GammaStrike, base_s=GAMMA_RETRY_S,
+                cap_s=GAMMA_BACKOFF_CAP_S,
+            )
+            if result is not None:
+                self._check_ok(window, memory, now, result)
+            return
+
+    def _check_ok(
+        self, window: OracleWindow, memory: _WindowMemory, now: float, result: GammaStrike
+    ) -> None:
+        slot = memory.check_http
+        ptb, final = result.price_to_beat, result.final_price
+        if ptb is not None and not memory.strike_checked:
+            memory.strike_checked = True
+            ours, ours_source = memory.open_ref, memory.open_source
+            diff = usd_diff(ours, ptb)
+            match = diff is not None and abs(diff) < STRIKE_MATCH_USD
+            self._event(
+                "oracle_strike_check",
+                now=now,
+                window=window,
+                fields={
+                    "strike": ours,
+                    "strike_source": ours_source,
+                    "price_to_beat": ptb,
+                    "diff": None if diff is None else float(diff),
+                    "match": match,
+                    "capture_delay_s": memory.open_delay_s,
+                },
+            )
+            if not match:
+                self._set_strike(
+                    window, memory, now, ptb, STRIKE_GAMMA, source=GAMMA_SOURCE, announce=False,
+                )
+        if final is not None and not memory.close_checked:
+            memory.close_checked = True
+            ours, ours_source = memory.close_twap, memory.close_source
+            diff = usd_diff(ours, final)
+            match = diff is not None and abs(diff) < STRIKE_MATCH_USD
+            self._event(
+                "oracle_close_check",
+                now=now,
+                window=window,
+                fields={
+                    "close": ours,
+                    "close_source": ours_source,
+                    "final_price": final,
+                    "diff": None if diff is None else float(diff),
+                    "match": match,
+                },
+            )
+            if not match:
+                self._set_close(window, memory, now, final, CLOSE_GAMMA, source=GAMMA_SOURCE)
+        if memory.strike_checked and memory.close_checked:
+            memory.check_done = True
+            slot.done = True
+            return
+        if ptb is None and final is None:
+            slot.counts["unpublished"] = int(slot.counts.get("unpublished", 0)) + 1
+        slot.next_at = now + GAMMA_RETRY_S + self._jitter_s()
+
+    def _check_gave_up(self, window: OracleWindow, memory: _WindowMemory, now: float) -> None:
+        memory.check_done = True
+        slot = memory.check_http
+        missing = [
+            name
+            for name, done in (("price_to_beat", memory.strike_checked), ("final_price", memory.close_checked))
+            if not done
+        ]
+        self._event(
+            "oracle_check_missed",
+            now=now,
+            window=window,
+            fields={
+                "missing": missing,
+                "strike": memory.open_ref,
+                "strike_source": memory.open_source,
+                "attempts": slot.attempts,
+                "counts": dict(sorted(slot.counts.items())),
+            },
+        )
+
+    def _http_call(
+        self,
+        slot: _HttpSlot,
+        window: OracleWindow,
+        now: float,
+        call: Callable[[], Any],
+        *,
+        label: str,
+        expect: type,
+        base_s: float,
+        cap_s: float,
+    ) -> Any:
+        """Run one request for ``slot``; failures back off and log once per kind."""
+        slot.inflight = True
+        slot.attempts += 1
         try:
             try:
-                price = self._fetch_price(int(window.start_ts))
+                result = call()
+                if not isinstance(result, expect):
+                    raise ValueError("bad payload")
             except Exception as exc:
-                self._http_failed(window, memory, now, exc)
-                return
-            if not isinstance(price, WindowPrice):
-                self._http_failed(window, memory, now, ValueError("bad payload"))
-                return
-            memory.n429 = 0
-            self._http_ok(window, memory, now, price, need_end)
+                self._slot_failed(slot, window, now, exc, label=label, base_s=base_s, cap_s=cap_s)
+                return None
+            slot.n429 = 0
+            return result
         finally:
-            memory.inflight = False
+            slot.inflight = False
 
     def _jitter_s(self) -> float:
         try:
@@ -1129,107 +1525,54 @@ class OracleLogService:
             return 0.0
         return min(HTTP_JITTER_S, max(0.0, value))
 
-    def _http_failed(
-        self, window: OracleWindow, memory: _WindowMemory, now: float, exc: BaseException
+    def _slot_failed(
+        self,
+        slot: _HttpSlot,
+        window: OracleWindow,
+        now: float,
+        exc: BaseException,
+        *,
+        label: str,
+        base_s: float,
+        cap_s: float,
     ) -> None:
         kind, retry_after = classify_http_error(exc)
-        memory.http_counts[kind] = int(memory.http_counts.get(kind, 0)) + 1
-        memory.n429 = memory.n429 + 1 if kind == "http_429" else 0
-        delay = http_retry_delay_s(kind, memory.n429, retry_after)
-        memory.next_http = now + delay + self._jitter_s()
-        if kind in memory.http_logged:
+        slot.counts[kind] = int(slot.counts.get(kind, 0)) + 1
+        slot.n429 = slot.n429 + 1 if kind == "http_429" else 0
+        delay = http_retry_delay_s(kind, slot.n429, retry_after, base_s=base_s, cap_s=cap_s)
+        slot.next_at = now + delay + self._jitter_s()
+        if kind in slot.logged:
             return
-        memory.http_logged.add(kind)
+        slot.logged.add(kind)
         hint = f"; retry_after={retry_after:.0f}s" if retry_after is not None else ""
         self._fail(
-            f"crypto-price {kind}: {exc} (retry in {delay:.0f}s{hint}; once per window)",
+            f"{label} {kind}: {exc} (retry in {delay:.0f}s{hint}; once per window)",
             now=now,
             window=window,
-            kind=f"http:{window.condition_id}:{kind}",
+            kind=f"http:{label}:{window.condition_id}:{kind}",
         )
 
-    def _http_ok(
-        self,
-        window: OracleWindow,
-        memory: _WindowMemory,
-        now: float,
-        price: WindowPrice,
-        need_end: bool,
-    ) -> None:
-        if price.open_ref and not memory.open_logged:
-            memory.open_ref = price.open_ref
-            memory.open_logged = True
-            self._append(
-                build_oracle_row(
-                    now=now,
-                    window=window,
-                    source=HTTP_SOURCE,
-                    event="oracle_open_ref",
-                    twap=price.open_ref,
-                    twap_ts=window.start_ts,
-                    open_ref=price.open_ref,
-                    notes="open_ref",
-                )
-            )
-        elif price.open_ref and memory.open_ref is None:
-            memory.open_ref = price.open_ref
-        if need_end and price.completed and price.close_twap and not memory.end_logged:
-            memory.end_logged = True
-            if memory.open_ref is None and price.open_ref:
-                memory.open_ref = price.open_ref
-            self._append(
-                build_oracle_row(
-                    now=now,
-                    window=window,
-                    source=HTTP_SOURCE,
-                    event="oracle_window_end",
-                    twap=price.close_twap,
-                    twap_ts=window.end_ts,
-                    open_ref=memory.open_ref,
-                    notes="window_end",
-                )
-            )
-            self._close_summary(window, memory, now, outcome="ok")
-            return
-        if need_end:
-            # Not published yet: a normal wait, not an error.
-            memory.http_counts["incomplete"] = int(memory.http_counts.get("incomplete", 0)) + 1
-        if need_end or memory.open_ref is None:
-            memory.next_http = now + HTTP_RETRY_S + self._jitter_s()
-
-    def _finish_http(self, now: float) -> None:
+    def _finish_windows(self, now: float) -> None:
         for cid in list(self._memory):
             memory = self._memory[cid]
             window = memory.window
             if window is None:
                 continue
-            past = now - (window.end_ts + CLOSE_GRACE_S)
-            if past <= 0:
-                continue
-            if memory.end_armed and not memory.end_logged and not memory.end_final:
-                self._close_summary(window, memory, now, outcome="gave_up")
-            if past > 60.0:
+            past_close = now - (window.end_ts + CLOSE_GRACE_S)
+            if past_close > 0 and not memory.end_logged and not memory.end_final:
+                memory.end_final = True
+                self._event(
+                    "oracle_window_end_missed",
+                    now=now,
+                    window=window,
+                    fields={
+                        "outcome": "no_boundary_sample",
+                        "after_end_s": round(now - window.end_ts, 1),
+                    },
+                )
+            past_check = now - (window.end_ts + GAMMA_GIVE_UP_S)
+            if past_check > 60.0 or (memory.check_done and past_close > 60.0):
                 del self._memory[cid]
-
-    def _close_summary(
-        self, window: OracleWindow, memory: _WindowMemory, now: float, *, outcome: str
-    ) -> None:
-        """One line per window: always on give-up, on success only after errors."""
-        memory.end_final = True
-        errors = {k: v for k, v in memory.http_counts.items() if k != "incomplete"}
-        if outcome == "ok" and not errors:
-            return
-        self._event(
-            "oracle_close_fetch" if outcome == "ok" else "oracle_window_end_missed",
-            now=now,
-            window=window,
-            fields={
-                "outcome": outcome,
-                "attempts": memory.http_attempts,
-                "counts": dict(sorted(memory.http_counts.items())),
-                "after_end_s": round(now - window.end_ts, 1),
-            },
-        )
 
     def _remember(self, key: tuple[Any, ...]) -> bool:
         if key in self._seen:
