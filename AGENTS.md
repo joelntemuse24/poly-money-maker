@@ -193,8 +193,14 @@ Shared `buy/` helpers exist for mint, pathlog, and the recording-only oracle tap
   Not an input to mint, winner, or dump. It rolls at 20 MB into
   `logs/archive/` (gzipped) via `buy/log_archive.roll_if_over`. A feed
   silent for 45s is reconnected (ping/pong on); stalls log once, a
-  reminder a minute, and on recovery. crypto-price 429s back off and the
-  close is fetched until 5 minutes after the end. Logging only.
+  reminder a minute, and on recovery. The strike (`open_ref`) and close
+  are the TWAP samples stamped exactly at window start / end (Gamma
+  `priceToBeat` / `finalPrice`), labelled `strike_source` /
+  `close_source`. crypto-price `openPrice` is only a labelled fallback
+  after 75s with no boundary sample (a different series, up to ~$40 off).
+  From ~10 min after the end, one Gamma `/events?slug=` request per tick
+  (retry 2 min, stop at 1h) checks and corrects the tape. Never poll
+  Gamma per second. Logging only.
 - `buy/sister_bid.py` — wallet B buy policy. Post-scrap hedge (only
   with `scrap_hedge_enabled`, default false): FAK at the
   live ask, limit clipped into [`bid_fak_min_notional/shares`,
