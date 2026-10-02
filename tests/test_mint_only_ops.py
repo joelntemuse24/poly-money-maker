@@ -8,6 +8,9 @@ import unittest
 from contextlib import nullcontext
 from pathlib import Path
 
+from buy.mint_redeem import validate_redeem
+from buy.mint_sequence import validate_seq
+
 import pathlog
 
 
@@ -114,7 +117,7 @@ class MintDefaultsTests(unittest.TestCase):
     def test_example_and_defaults_pass_validate_strategy(self):
         from buy.mint_gas import validate_mint_gas
 
-        validate = _fn("validate_strategy", {"validate_mint_gas": validate_mint_gas})
+        validate = _fn("validate_strategy", {"validate_mint_gas": validate_mint_gas, "validate_seq": validate_seq, "validate_redeem": validate_redeem})
         example = json.loads(MINT_EXAMPLE.read_text())
         defaults = _assign("DEFAULTS")
         validate(example)
@@ -163,7 +166,7 @@ class MintDefaultsTests(unittest.TestCase):
         from buy.mint_gas import validate_mint_gas
 
         defaults = _assign("DEFAULTS")
-        validate = _fn("validate_strategy", {"validate_mint_gas": validate_mint_gas})
+        validate = _fn("validate_strategy", {"validate_mint_gas": validate_mint_gas, "validate_seq": validate_seq, "validate_redeem": validate_redeem})
         raw = json.loads(MINT_EXAMPLE.read_text())
         raw["sell_persist_skip_ttm_s"] = 90.0
         with tempfile.NamedTemporaryFile(
@@ -207,7 +210,7 @@ class MintDefaultsTests(unittest.TestCase):
         from buy.mint_gas import validate_mint_gas
 
         defaults = _assign("DEFAULTS")
-        validate = _fn("validate_strategy", {"validate_mint_gas": validate_mint_gas})
+        validate = _fn("validate_strategy", {"validate_mint_gas": validate_mint_gas, "validate_seq": validate_seq, "validate_redeem": validate_redeem})
         raw = json.loads(MINT_EXAMPLE.read_text())
         raw["sell_scrap_fraction"] = 0.5
         raw["not_a_knob"] = 1
@@ -815,6 +818,8 @@ class DeployUnitsTests(unittest.TestCase):
                 "mint_sell.py",
                 "mint_gas.py",
                 "mint_loops.py",
+                "mint_redeem.py",
+                "mint_sequence.py",
                 "oracle_log.py",
                 "sister_bid.py",
                 "sister_topup.py",

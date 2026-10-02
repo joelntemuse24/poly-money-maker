@@ -8,6 +8,8 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
+from buy.mint_redeem import validate_redeem
+from buy.mint_sequence import validate_seq
 from buy.contracts import ContractCall, build_atomic_mint_calls
 from buy.mint_gas import (
     RELAY_HUB_GAS_MAX,
@@ -414,7 +416,7 @@ class MintGasConfigTests(unittest.TestCase):
         legacy.pop("mint_gas_fallback")
         legacy.pop("mint_gas_cap")
         validate_mint_gas(legacy)
-        validate = _fn("validate_strategy", {"validate_mint_gas": validate_mint_gas})
+        validate = _fn("validate_strategy", {"validate_mint_gas": validate_mint_gas, "validate_seq": validate_seq, "validate_redeem": validate_redeem})
         validate(legacy)
         validate(defaults)
 

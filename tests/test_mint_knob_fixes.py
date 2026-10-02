@@ -6,6 +6,8 @@ import json
 import unittest
 from pathlib import Path
 
+from buy.mint_redeem import validate_redeem
+from buy.mint_sequence import validate_seq
 from buy.mint_gas import validate_mint_gas
 from buy.mint_sell import cfg_seconds, kept_loser_open, sell_plan_banner
 from test_mint_cpu import _dump_cfg, _dump_harness, _fill_fak, _held_after_scrap
@@ -189,7 +191,7 @@ class ExplicitZeroSecondsTests(unittest.TestCase):
         self.assertEqual(fak2, [])
 
     def test_validation_rejects_negatives_and_accepts_zero(self):
-        validate = _fn("validate_strategy", {"validate_mint_gas": validate_mint_gas})
+        validate = _fn("validate_strategy", {"validate_mint_gas": validate_mint_gas, "validate_seq": validate_seq, "validate_redeem": validate_redeem})
         base = _assign("DEFAULTS")
         for key, _default in self.KEYS:
             ok = dict(base, **{key: 0})
@@ -202,7 +204,7 @@ class ExplicitZeroSecondsTests(unittest.TestCase):
 
 class PollFloorTests(unittest.TestCase):
     def test_poll_s_floor_is_one_second(self):
-        validate = _fn("validate_strategy", {"validate_mint_gas": validate_mint_gas})
+        validate = _fn("validate_strategy", {"validate_mint_gas": validate_mint_gas, "validate_seq": validate_seq, "validate_redeem": validate_redeem})
         base = _assign("DEFAULTS")
         validate(dict(base, poll_s=1.0, sell_armed_poll_s=1.0))
         with self.assertRaises(ValueError) as caught:

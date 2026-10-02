@@ -261,3 +261,16 @@ class MarketGateway:
             balances[str(token_id)] = float(position.get("size") or 0)
         return balances
 
+    def redeemable_positions(self, funder_address: str) -> list[dict]:
+        """Raw Data API rows the API marks redeemable (resolved markets)."""
+        response = self.session.get(
+            f"{self.data_api_url}/positions",
+            params={"user": funder_address, "redeemable": "true", "limit": 500},
+            timeout=self.timeout,
+        )
+        response.raise_for_status()
+        payload = response.json()
+        if not isinstance(payload, list):
+            raise ValueError("positions response was not a list")
+        return [row for row in payload if isinstance(row, dict)]
+

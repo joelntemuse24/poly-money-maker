@@ -12,6 +12,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
 
+from buy.mint_redeem import validate_redeem
+from buy.mint_sequence import validate_seq
 from buy.mint_gas import validate_mint_gas
 from buy.whatsapp_notify import (
     CALLMEBOT_URL,
@@ -222,7 +224,7 @@ class KnobTests(unittest.TestCase):
             raw.update(extra)
             path = folder / "strategy_mint.json"
             path.write_text(json.dumps(raw), encoding="utf-8")
-            ns = _load("load_strategy", "validate_strategy", extras={"STRATEGY_FILE": path, "DEFAULTS": defaults, "validate_mint_gas": validate_mint_gas})
+            ns = _load("load_strategy", "validate_strategy", extras={"STRATEGY_FILE": path, "DEFAULTS": defaults, "validate_mint_gas": validate_mint_gas, "validate_seq": validate_seq, "validate_redeem": validate_redeem})
             cfg = ns["load_strategy"]()
             self.assertIs(cfg["notify_scrap_whatsapp"], False)
             self.assertIs(cfg["notify_danger_whatsapp"], True)
