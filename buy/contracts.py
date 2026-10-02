@@ -91,6 +91,66 @@ def encode_split_position(
     return "0x" + payload.hex()
 
 
+def encode_redeem_positions(*, collateral: str, condition_id: str) -> str:
+    """``redeemPositions(collateral, 0x0, conditionId, [1, 2])``.
+
+    Sent to the collateral adapter, which burns both outcome balances of
+    the caller and pays the winning side out in ``collateral`` (pUSD).
+    """
+    selector = keccak(b"redeemPositions(address,bytes32,bytes32,uint256[])")[:4]
+    payload = selector + encode(
+        ["address", "bytes32", "bytes32", "uint256[]"],
+        [
+            to_checksum_address(collateral),
+            bytes(32),
+            _condition_bytes(condition_id),
+            [1, 2],
+        ],
+    )
+    return "0x" + payload.hex()
+
+
+def encode_set_approval_for_all(operator: str, approved: bool = True) -> str:
+    selector = keccak(b"setApprovalForAll(address,bool)")[:4]
+    payload = selector + encode(
+        ["address", "bool"],
+        [to_checksum_address(operator), bool(approved)],
+    )
+    return "0x" + payload.hex()
+
+
+def build_redeem_calls(
+    *,
+    pUSD_address: str,
+    adapter_address: str,
+    ctf_address: str,
+    condition_id: str,
+    approve_adapter: bool,
+) -> list[ContractCall]:
+    """Redeem a resolved binary market through the collateral adapter.
+
+    Same target and arguments as the Polymarket SDK's ``redeem_positions``
+    for a non-neg-risk CTF market. ``approve_adapter`` prepends the CTF
+    ``setApprovalForAll(adapter)`` the adapter needs to pull the outcome
+    tokens, for a wallet that has not granted it yet.
+    """
+    calls: list[ContractCall] = []
+    if approve_adapter:
+        calls.append(
+            ContractCall(
+                to=to_checksum_address(ctf_address),
+                data=encode_set_approval_for_all(adapter_address, True),
+            )
+        )
+    calls.append(
+        ContractCall(
+            to=to_checksum_address(adapter_address),
+            data=encode_redeem_positions(collateral=pUSD_address, condition_id=condition_id),
+        )
+    )
+    return calls
+
+
 def build_atomic_mint_calls(
     *,
     pUSD_address: str,

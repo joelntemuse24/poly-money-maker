@@ -80,8 +80,17 @@ from rich.panel import Panel
 
 from buy.book import best_bid_with_min_size, bid_fill_depth
 from buy.chain import ChainReader, thread_session
-from buy.contracts import ContractCall, build_atomic_mint_calls
+from buy.contracts import ContractCall, build_atomic_mint_calls, build_redeem_calls
 from buy.mint_gas import mint_gas_settings, validate_mint_gas
+from buy.mint_redeem import RedeemDesk, RedeemIO, redeem_settings, validate_redeem
+from buy.mint_sequence import (
+    SeqWaits,
+    seq_busy_bag,
+    seq_eligible_markets,
+    seq_late_markets,
+    seq_settings,
+    validate_seq,
+)
 from buy.market import MarketGateway, MintMarket
 from buy.mint_loops import (
     IntentStore,
@@ -180,6 +189,23 @@ DEFAULTS = {
     ],
     "one_entry_per_market": True,
     "max_open_sets": 1,
+    # Sequential bags (one bag of capital). Mint the next window only in
+    # [start - lead, start + cutoff] and only once the previous bag's
+    # winner is cashed or its window ended. Short cash waits; past the
+    # cutoff the window is skipped (mint_seq_skip).
+    "mint_sequential": False,
+    "mint_seq_lead_s": 30.0,
+    "mint_seq_cutoff_s": 240.0,
+    # Auto-redeem resolved positions via the collateral adapter (relayer
+    # PROXY batch, same signing as mint). Off unless set true.
+    "redeem_enabled": False,
+    "redeem_poll_s": 15.0,
+    "redeem_min_after_end_s": 60.0,
+    "redeem_retry_s": 60.0,
+    "redeem_max_attempts": 6,
+    "redeem_tx_timeout_s": 300.0,
+    "redeem_startup_sweep": True,
+    "redeem_min_payout_usd": 0.01,
     # WhatsApp alerts (CallMeBot). No-op unless CALLMEBOT_PHONE and
     # CALLMEBOT_APIKEY are set in the environment.
     "notify_scrap_whatsapp": False,
@@ -274,6 +300,10 @@ ACTIVE_STATUSES = frozenset(
 
 _shutdown = False
 STATE_LOCK = threading.RLock()
+# Mint and redeem share the signer's relayer nonce (/relay-payload then
+# /submit). One submit at a time.
+RELAY_SUBMIT_LOCK = threading.Lock()
+_SEQ_WAITS = SeqWaits()
 # Persist form of the last atomic_save that finished. None until load or
 # the first successful save. Ticks compare against this, so a mutation
 # that raised before the save is still written on the next tick.
@@ -460,6 +490,8 @@ def validate_strategy(cfg: dict) -> None:
     if int(cfg.get("mint_max_attempts") or 0) < 1:
         raise ValueError("mint_max_attempts must be >= 1")
     validate_mint_gas(cfg)
+    validate_seq(cfg)
+    validate_redeem(cfg)
     if not cfg["series_slugs"]:
         raise ValueError("series_slugs must not be empty")
     if int(cfg["max_open_sets"]) < 1:
@@ -3437,7 +3469,10 @@ def _claim_mint_intent(
     """Under STATE_LOCK: refuse if already minted or slots full; else write intent."""
     if already_minted(state, condition_id, cfg, now):
         return "already_minted"
-    if mint_slots_full(state, cfg, now, float(candidate_start_ts)):
+    if seq_settings(cfg)[0]:
+        if seq_busy_bag(state, now, ACTIVE_STATUSES, exclude=condition_id) is not None:
+            return "seq_wait_prev"
+    elif mint_slots_full(state, cfg, now, float(candidate_start_ts)):
         return "capped_open"
     store = _intent_store
     if store is not None:
@@ -3456,6 +3491,31 @@ def _claim_mint_intent(
         return None
     state.setdefault("intents", {})[condition_id] = intent
     return None
+
+
+def _log_seq_skips(markets: List[MintMarket], state: dict, cfg: dict, now: float) -> None:
+    """One ``mint_seq_skip`` per live window that passed its cutoff unminted."""
+    for market in seq_late_markets(markets, cfg, now):
+        with STATE_LOCK:
+            intent = (state.get("intents") or {}).get(market.condition_id) or {}
+            held = isinstance(intent, dict) and intent.get("status") in (
+                ACTIVE_STATUSES | {"completed"}
+            )
+        if held:
+            continue
+        wait = _SEQ_WAITS.take_skip(market.condition_id)
+        if wait is None:
+            continue
+        log_event(
+            "mint_seq_skip",
+            condition_id=market.condition_id,
+            slug=market.slug,
+            start_ts=market.start_ts,
+            since_start_s=round(now - float(market.start_ts), 1),
+            cutoff_s=seq_settings(cfg)[2],
+            last_wait=wait.get("reason") or "none",
+            waited_s=round(now - float(wait["first"]), 1) if wait.get("first") else 0.0,
+        )
 
 
 def run_sell_cycle(cfg: dict, state: dict, chain: ChainReader) -> str:
@@ -3517,7 +3577,12 @@ def run_mint_cycle(
         return "disabled"
 
     markets = gateway.discover(list(cfg["series_slugs"]))
-    candidates = eligible_markets(markets, cfg, now)
+    seq_on = seq_settings(cfg)[0]
+    if seq_on:
+        _log_seq_skips(markets, state, cfg, now)
+        candidates = seq_eligible_markets(markets, cfg, now)
+    else:
+        candidates = eligible_markets(markets, cfg, now)
     if not candidates:
         write_loop_heartbeat("mint", "idle", markets=len(markets), eligible=0)
         return "idle"
@@ -3547,12 +3612,31 @@ def run_mint_cycle(
                 float(data_positions.get(market.up_token, 0)) > tol
                 or float(data_positions.get(market.dn_token, 0)) > tol
             ),
-            slots_full=lambda market: mint_slots_full(
-                state, cfg, now, float(market.start_ts)
+            slots_full=lambda market: (
+                seq_busy_bag(state, now, ACTIVE_STATUSES, exclude=market.condition_id) is not None
+                if seq_on
+                else mint_slots_full(state, cfg, now, float(market.start_ts))
             ),
             min_start_ts=held_forward_floor(state, now, ACTIVE_STATUSES),
             fail_attempts=_fail_attempts,
         )
+
+        if seq_on and status == "capped" and pick is not None:
+            busy = seq_busy_bag(state, now, ACTIVE_STATUSES, exclude=pick.condition_id)
+            busy_cid, busy_intent = busy if busy is not None else ("", {})
+            if _SEQ_WAITS.note_wait(pick.condition_id, "prev_bag", now):
+                log_event(
+                    "mint_seq_wait_prev",
+                    condition_id=pick.condition_id,
+                    slug=pick.slug,
+                    start_ts=pick.start_ts,
+                    since_start_s=round(now - float(pick.start_ts), 1),
+                    prev_condition_id=busy_cid,
+                    prev_slug=busy_intent.get("slug"),
+                    prev_end_ts=busy_intent.get("end_ts"),
+                )
+            write_loop_heartbeat("mint", "seq_wait_prev", next_start=float(pick.start_ts))
+            return "seq_wait_prev"
 
         if status == "capped" and pick is not None:
             write_loop_heartbeat(
@@ -3628,6 +3712,24 @@ def run_mint_cycle(
         with STATE_LOCK:
             reserved = pending_mint_reserve(state)
         block = mint_cash_block(balance, shares, reserved)
+        if seq_on and block is not None:
+            if _SEQ_WAITS.note_wait(pick.condition_id, "cash", now):
+                log_event(
+                    "mint_seq_wait_cash",
+                    condition_id=pick.condition_id,
+                    slug=pick.slug,
+                    cash_reason=block["reason"],
+                    balance=block["balance"],
+                    reserved=block["reserved"],
+                    free=block["free"],
+                    need=block["need"],
+                    since_start_s=round(now - float(pick.start_ts), 1),
+                    waited_s=round(_SEQ_WAITS.waited_s(pick.condition_id, now), 1),
+                )
+            write_loop_heartbeat(
+                "mint", "seq_wait_cash", balance=block["balance"], need=block["need"]
+            )
+            return "seq_wait_cash"
         if block is not None and block["reason"] == "pending_reserve":
             console.print(
                 "  [dim red][SKIP][/] pending reserve  "
@@ -3735,17 +3837,21 @@ def run_mint_cycle(
         start_ts=pick.start_ts,
         balance=balance,
         mint_attempts=intent.get("mint_attempts"),
+        sequential=seq_on,
+        seq_waited_s=round(_SEQ_WAITS.waited_s(pick.condition_id, now), 1) if seq_on else None,
     )
+    _SEQ_WAITS.minted(pick.condition_id)
 
     gas_margin, gas_fallback, gas_cap = mint_gas_settings(cfg)
-    tx_id, err, gas = submit_mint_batch(
-        calls,
-        metadata=f"mintbot:split:{pick.condition_id}:{int(now)}",
-        rpc=chain._rpc,
-        gas_margin=gas_margin,
-        gas_fallback=gas_fallback,
-        gas_cap=gas_cap,
-    )
+    with RELAY_SUBMIT_LOCK:
+        tx_id, err, gas = submit_mint_batch(
+            calls,
+            metadata=f"mintbot:split:{pick.condition_id}:{int(now)}",
+            rpc=chain._rpc,
+            gas_margin=gas_margin,
+            gas_fallback=gas_fallback,
+            gas_cap=gas_cap,
+        )
     with STATE_LOCK:
         intent = state["intents"][pick.condition_id]
         intent["updated_at"] = time.time()
@@ -3803,6 +3909,68 @@ def _reload_cfg(cfg_box: Dict[str, Any]) -> dict:
     return loaded
 
 
+def submit_redeem(cfg: dict, chain: ChainReader, condition_id: str, approve_adapter: bool):
+    """Relayer PROXY batch: optional CTF approval, then adapter.redeemPositions."""
+    calls = build_redeem_calls(
+        pUSD_address=str(cfg["pUSD_address"]),
+        adapter_address=str(cfg["standard_adapter_address"]),
+        ctf_address=str(cfg["ctf_address"]),
+        condition_id=condition_id,
+        approve_adapter=approve_adapter,
+    )
+    gas_margin, gas_fallback, gas_cap = mint_gas_settings(cfg)
+    with RELAY_SUBMIT_LOCK:
+        return submit_mint_batch(
+            calls,
+            metadata=f"mintbot:redeem:{condition_id}:{int(time.time())}",
+            rpc=chain._rpc,
+            gas_margin=gas_margin,
+            gas_fallback=gas_fallback,
+            gas_cap=gas_cap,
+        )
+
+
+def build_redeem_desk(
+    cfg_box: Dict[str, Any],
+    chain: ChainReader,
+    gateway: MarketGateway,
+    funder: str,
+) -> RedeemDesk:
+    def cfg() -> dict:
+        return cfg_box.get("cfg") or {}
+
+    def ctf() -> str:
+        return str(cfg()["ctf_address"])
+
+    io = RedeemIO(
+        payout_denominator=lambda cid: chain.payout_denominator(ctf(), cid),
+        payout_numerator=lambda cid, index: chain.payout_numerator(ctf(), cid, index),
+        balance=lambda token: chain.position_balance(ctf(), funder, token),
+        is_approved=lambda: chain.is_approved_for_all(
+            ctf(), funder, str(cfg()["standard_adapter_address"])
+        ),
+        submit=lambda cid, approve: submit_redeem(cfg(), chain, cid, approve),
+        relayer_status=lambda tx_id: get_relayer_transaction(str(cfg()["relayer_url"]), tx_id),
+        log=log_event,
+        notify=lambda title, message: notify(title, message, priority="high"),
+        positions=lambda: gateway.redeemable_positions(funder),
+    )
+    return RedeemDesk(io, lock=STATE_LOCK, save=lambda s: commit_state(s, dirty=True))
+
+
+def run_redeem_cycle(cfg: dict, state: dict, desk: Optional[RedeemDesk]) -> str:
+    """Redeem tick on its own thread. Never touches the sell or mint loop.
+
+    No heartbeat write: the heartbeat ``ts`` must keep tracking sell/mint.
+    """
+    if STOP_FILE.exists():
+        return "stopped"
+    if desk is None:
+        return "no_funder"
+    result = desk.tick(state, cfg, time.time())
+    return str(result.get("status") or "ok")
+
+
 def main() -> int:
     global _intent_store
     signal.signal(signal.SIGINT, _signal_handler)
@@ -3855,9 +4023,13 @@ def main() -> int:
         shares=cfg["shares"],
         max_ttm=cfg["enter_max_ttm_min"],
         series=cfg["series_slugs"],
-        loops=("sell", "mint", "oracle"),
+        loops=("sell", "mint", "oracle", "redeem"),
         oracle_log_enabled=bool(cfg.get("oracle_log_enabled", True)),
         sell_plan=sell_plan_banner(cfg),
+        mint_sequential=seq_settings(cfg)[0],
+        mint_seq_lead_s=seq_settings(cfg)[1],
+        mint_seq_cutoff_s=seq_settings(cfg)[2],
+        redeem_enabled=redeem_settings(cfg).enabled,
     )
     _whatsapp("startup", cfg)
     if cfg.get("oracle_log_enabled", True):
@@ -3947,11 +4119,52 @@ def main() -> int:
         daemon=True,
     )
     oracle_thread.start()
+
+    funder_env = os.getenv("FUNDER_ADDRESS") or ""
+    redeem_desk = (
+        build_redeem_desk(
+            cfg_box,
+            ChainReader(str(cfg["rpc_url"])),
+            MarketGateway(
+                gamma_url=str(cfg["gamma_url"]),
+                data_api_url=str(cfg["data_api_url"]),
+            ),
+            to_checksum_address(funder_env),
+        )
+        if funder_env
+        else None
+    )
+
+    def redeem_tick() -> None:
+        current = cfg_box.get("cfg") or cfg
+        status = run_redeem_cycle(current, state, redeem_desk)
+        if status not in ("ok", "disabled", "stopped", "no_funder"):
+            log_event("redeem_cycle", status=status)
+
+    def redeem_sleep() -> float:
+        current = cfg_box.get("cfg") or cfg
+        settings = redeem_settings(current)
+        return settings.poll_s if settings.enabled else 30.0
+
+    redeem_thread = threading.Thread(
+        target=run_job_loop,
+        kwargs={
+            "name": "redeem",
+            "tick": redeem_tick,
+            "sleep_s": redeem_sleep,
+            "should_stop": should_stop,
+            "on_error": lambda exc: log_event("redeem_cycle_error", error=str(exc)[:300]),
+        },
+        name="mintbot-redeem",
+        daemon=True,
+    )
+    redeem_thread.start()
     while not should_stop():
         time.sleep(0.25)
     sell_thread.join(timeout=5)
     mint_thread.join(timeout=5)
     oracle_thread.join(timeout=5)
+    redeem_thread.join(timeout=5)
 
     console.print("[dim]mintbot stopped[/]")
     try:

@@ -32,6 +32,13 @@ def thread_session(slot: str = "default") -> requests.Session:
     return session
 
 
+def _condition_id_bytes(condition_id: str) -> bytes:
+    raw_id = str(condition_id).lower().removeprefix("0x")
+    if len(raw_id) != 64:
+        raise ValueError("condition_id must be bytes32 hex")
+    return bytes.fromhex(raw_id)
+
+
 class ChainReader:
     """Minimal Polygon eth_call helper for mint prechecks.
 
@@ -95,6 +102,26 @@ class ChainReader:
         )
         raw = self._eth_call(ctf, data)
         return int.from_bytes(raw, "big")
+
+    def payout_denominator(self, ctf: str, condition_id: str) -> int:
+        """CTF ``payoutDenominator``. Zero until the condition is resolved."""
+        data = keccak(b"payoutDenominator(bytes32)")[:4] + encode(
+            ["bytes32"], [_condition_id_bytes(condition_id)]
+        )
+        return int.from_bytes(self._eth_call(ctf, data), "big")
+
+    def payout_numerator(self, ctf: str, condition_id: str, index: int) -> int:
+        data = keccak(b"payoutNumerators(bytes32,uint256)")[:4] + encode(
+            ["bytes32", "uint256"], [_condition_id_bytes(condition_id), int(index)]
+        )
+        return int.from_bytes(self._eth_call(ctf, data), "big")
+
+    def is_approved_for_all(self, ctf: str, owner: str, operator: str) -> bool:
+        data = keccak(b"isApprovedForAll(address,address)")[:4] + encode(
+            ["address", "address"],
+            [to_checksum_address(owner), to_checksum_address(operator)],
+        )
+        return int.from_bytes(self._eth_call(ctf, data), "big") != 0
 
     def has_contract(self, address: str) -> bool:
         code = self._rpc("eth_getCode", [to_checksum_address(address), "latest"])

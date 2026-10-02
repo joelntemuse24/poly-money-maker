@@ -132,6 +132,8 @@ buy/
   mint_sell.py          # pure sell policy (persist, classify, scrap plan, gates, bag_risk)
   mint_loops.py         # concurrent sell vs mint jobs, intent claim, pending-cash reserve, persist digest
   mint_gas.py           # mint relay gas_limit (estimate + margin, fallback, 650k clamp)
+  mint_sequence.py      # opt-in sequential bags: mint range, busy-bag gate, wait/skip bookkeeping
+  mint_redeem.py        # opt-in auto-redeem job runner (resolution poll, relayer redeem, retries)
   market.py             # Gamma/CLOB discovery → MintMarket
   book.py               # sized top-of-book
   chain.py              # eth_call balances / prechecks, per-thread keep-alive sessions
@@ -207,9 +209,9 @@ Four Python habits recur in the money paths. Each is a one-paragraph aside.
 |---|---|
 | Gamma API | Discover 15m markets / tokens / times |
 | CLOB API | Sized bids; FAK sells; resting scrap sells (off live) |
-| Data API | Optional position checks |
-| Relayer v2 | Submit PROXY mint batch; poll `STATE_*` |
-| Polygon RPC | CTF balances / inventory confirm; one `eth_estimateGas` per mint submit |
+| Data API | Optional position checks; `redeemable=true` startup sweep (opt-in redeem) |
+| Relayer v2 | Submit PROXY mint batch (and opt-in redeem batch); poll `STATE_*` |
+| Polygon RPC | CTF balances / inventory confirm; one `eth_estimateGas` per mint or redeem submit; `payoutDenominator` / `payoutNumerators` / `isApprovedForAll` for redeem |
 | Polymarket RTDS | Recording-only Chainlink BTC/USD 60s TWAP (`crypto_prices_twap_sixty`) |
 | Gamma `/events?slug=` (oracle tape) | Recording-only post-window check of `eventMetadata.priceToBeat` / `finalPrice` against the tape |
 | ntfy (optional) | Operator push on mint/sell (thread pool, off the tick) |
@@ -367,7 +369,7 @@ These rows go to the tape, and `mintbot` logs them through an `on_event` hook. N
 | Data API `positions` after Gamma | Low | Leftover — mint-only |
 | Sequential reconcile per pending intent | Low | Leftover — mint-only |
 | pathlog JSONL / Gamma I/O | n/a | Separate process; does not block mintbot |
-| Redeem vs sell | n/a | No automated redeem in this repo; sells stop at `end_ts` |
+| Redeem vs sell | Separate thread | Opt-in `redeem_enabled` runs on `mintbot-redeem`; sells stop at `end_ts` and never wait on it |
 | Sequential UP/DN `/book` | Already fixed | Parallel `ThreadPoolExecutor` |
 
 <a id="section-11"></a>
@@ -380,7 +382,15 @@ These rows go to the tape, and `mintbot` logs them through an `on_event` hook. N
 - are active, not closed, not neg-risk,
 - optionally `accepting_orders`.
 
-**The bot never mints a live (already open) window.** That is why missing the adjacent lookahead used to skip an entire quarter-hour: by the time the prior bag expired, the next market was already open and ineligible.
+**The bot never mints a live (already open) window** in the default mode. That is why missing the adjacent lookahead used to skip an entire quarter-hour: by the time the prior bag expired, the next market was already open and ineligible.
+
+**Sequential mode (`mint_sequential`, opt-in, `buy/mint_sequence.py`).** `seq_eligible_markets` replaces `eligible_markets`:
+
+- A market is eligible only in `[start - mint_seq_lead_s, start + mint_seq_cutoff_s]` (30s / 240s). A window that is already open is allowed up to the cutoff.
+- It must also be active, not closed, not neg-risk, optionally `accepting_orders`, and not ended.
+- `enter_*_ttm_min` is not read.
+
+A split is price neutral, so minting at the open costs the same as 14 minutes earlier. The sell path keys off `end_ts` and the books, not the mint time.
 
 <a id="section-12"></a>
 ## Capacity: max_open_sets and adjacent lookahead
@@ -396,6 +406,21 @@ These rows go to the tape, and `mintbot` logs them through an `on_event` hook. N
 - If we already hold that next window, or the candidate is further out → full.
 
 Code default: `max_open_sets=1`. Live: **2** (since 23 Sep 2026). With `1`, holding 1:30–1:45 still permits minting 1:45–2:00 beforehand; it does **not** permit minting 2:00–2:15 while 1:30 is still a full bag. A nearer candidate that does not fit the cap is skipped in the same pass so that adjacent window is still selected.
+
+Because the adjacent lookahead mints about 14 minutes before the open, two bags overlap and tie up two bags of pUSD, even at `max_open_sets=1`.
+
+**Sequential capacity.** With `mint_sequential` on, `seq_busy_bag` replaces `mint_slots_full` in `select_mint_candidate` and in `_claim_mint_intent`.
+
+- **Busy bag.** A busy bag is any other active, non-dry intent whose window has not ended and whose `sold_winner` is not set. The held dump also sets `sold_winner`. A sold loser alone does not free the gate, because the winner's capital is still in tokens.
+- **Previous bag busy.** A busy bag gives `seq_wait_prev` and logs `mint_seq_wait_prev` (throttled to 30s per window).
+- **Cash short.** Short cash (`mint_cash_block`, including `pending_reserve`) gives `seq_wait_cash` and logs `mint_seq_wait_cash`. It is retried every `poll_s`.
+- **Skip.** After the cutoff, `_log_seq_skips` logs one `mint_seq_skip` per unminted live window, with the last wait reason and how long it waited.
+- **Timeline.** A winner cashed before the end lets the next bag mint at start − 30s. An unsold winner releases the gate at `end_ts`, and the cash comes back by redeem.
+  - On-chain resolution measured 53–87s after the end.
+  - The relayer redeem adds about 30–60s.
+  - The 240s cutoff covers that with margin.
+
+In-memory wait records live in `_SEQ_WAITS`, so a restart can log one extra skip line.
 
 <a id="section-13"></a>
 ## already_minted: failed remint after cooldown
@@ -700,6 +725,8 @@ The dump turned +$1.50 into −$67.50: it cost **$69.00** (100 × (1 − 0.31)).
 | `buy/mint_loops.py` | Concurrent sell/mint job runner, same-slug claim, candidate selection, pending-cash reserve, ended-bag chain policy, persist digest |
 | `buy/mint_sell.py` | Pure sell policy, scrap plan, TTM gates, `bag_risk` counters |
 | `buy/mint_gas.py` | Mint relay `gas_limit` plan |
+| `buy/mint_sequence.py` | Sequential mint range, busy-bag gate, wait / skip bookkeeping (opt-in) |
+| `buy/mint_redeem.py` | Redeem jobs: resolution poll, relayer redeem, retry / give-up, startup sweep (opt-in) |
 | `buy/market.py` | Discovery / `MintMarket` |
 | `buy/book.py` | Sized BBO parse, depth snapshot |
 | `buy/chain.py` | RPC reads, per-thread sessions |
@@ -743,7 +770,7 @@ The dump turned +$1.50 into −$67.50: it cost **$69.00** (100 × (1 − 0.31)).
 <a id="section-26"></a>
 ## buy/market.py, book.py, chain.py, contracts.py, mint_gas.py, log_archive.py
 
-Discovery builds `MintMarket` with `condition_id`, `up_token`, `dn_token`, `start_ts`, `end_ts`, `slug`, flags. Book helper returns best bid with minimum size and `bid_fill_depth` (cumulative bids at/through a FAK limit; mint logs `sell_book_depth`, does not gate on it). Chain helper reads ERC-1155 positions and pUSD balance and exposes `_rpc` for the one gas estimate. Contracts helper encodes the atomic mint path used by the relayer batch, plus the pUSD transfer the sister top-up uses. `mint_gas.py` turns an estimate into a clamped `MintGasPlan` ([§14](#section-14)). `log_archive.py` supplies `ArchiveRotatingFileHandler`: `mintbot.log` still rolls at 2 MB, but each roll is renamed to `logs/archive/mintbot.log.<UTC stamp>` (never clobbering) and gzipped on one background worker. Nothing there is pruned (#219). The same module exposes `roll_if_over`, which `buy/oracle_log.py` calls before each append so `logs/oracle_twap.jsonl` rolls into the same archive at 20 MB ([§10c](#section-10c)).
+Discovery builds `MintMarket` with `condition_id`, `up_token`, `dn_token`, `start_ts`, `end_ts`, `slug`, flags. Book helper returns best bid with minimum size and `bid_fill_depth` (cumulative bids at/through a FAK limit; mint logs `sell_book_depth`, does not gate on it). Chain helper reads ERC-1155 positions and pUSD balance and exposes `_rpc` for the one gas estimate. Contracts helper encodes the atomic mint path used by the relayer batch, the pUSD transfer the sister top-up uses, and the opt-in redeem batch (`setApprovalForAll` + adapter `redeemPositions`). Chain also reads the CTF payout vector and adapter approval for redeem. `mint_gas.py` turns an estimate into a clamped `MintGasPlan` ([§14](#section-14)). `log_archive.py` supplies `ArchiveRotatingFileHandler`: `mintbot.log` still rolls at 2 MB, but each roll is renamed to `logs/archive/mintbot.log.<UTC stamp>` (never clobbering) and gzipped on one background worker. Nothing there is pruned (#219). The same module exposes `roll_if_over`, which `buy/oracle_log.py` calls before each append so `logs/oracle_twap.jsonl` rolls into the same archive at 20 MB ([§10c](#section-10c)).
 
 <a id="section-27"></a>
 ## pathlog.py: public book recorder
@@ -776,6 +803,10 @@ Never enable retired buy units (`polycomplement`, buybots, DangerZone, shadow) f
 | `enter_min_ttm_min` / `enter_max_ttm_min` | 0 / 45 | | 0 / 45 | Mint only windows opening within 45m |
 | `max_open_sets` | 1 | 1 | **2** | Capacity (plus adjacent rule) |
 | `count_kept_loser_as_open` | false | false | — (false) | Kept loser shares hold the slot until resolution |
+| `mint_sequential` / `mint_seq_lead_s` / `mint_seq_cutoff_s` | false / 30 / 240 | false / 30 / 240 | — (off) | One bag of capital: mint in [start − lead, start + cutoff] once the previous bag is cashed or ended; wait on cash, skip past cutoff |
+| `redeem_enabled` | false | false | — (off) | Auto-redeem resolved positions on the `mintbot-redeem` thread |
+| `redeem_poll_s` / `redeem_min_after_end_s` / `redeem_retry_s` / `redeem_max_attempts` / `redeem_tx_timeout_s` | 15 / 60 / 60 / 6 / 300 | same | — | Redeem cadence, start delay after `end_ts`, backoff base (doubling, cap 900s), give-up count, relayer timeout |
+| `redeem_startup_sweep` / `redeem_min_payout_usd` | true / 0.01 | same | — | One Data API redeemable sweep per start; skip worthless conditions |
 | `notify_danger_whatsapp` / `notify_danger_px` / `notify_danger_hold_s` | true / 0.70 / 5 | true / 0.70 / 5 | — | WhatsApp danger alert: held winner bid under the line for the hold, after the scrap (needs `CALLMEBOT_*` env) |
 | `notify_scrap_whatsapp` / `notify_dump_whatsapp` | false / false | false / false | — | WhatsApp alert on scrap / dump fill |
 | `mint_fail_cooldown_s` / `mint_max_attempts` | 30 / 3 | | 30 / 3 | Remint policy |
@@ -1142,11 +1173,53 @@ rather than selling the winner at 0.99 on the CLOB (which donates ~1¢ × shares
 | Stop CLOB sells after `end_ts` | **Yes** | `manage_sells` skips intents once `sell_window_open` is false |
 | Keep winner (and kept loser) inventory unsold | **Yes** | no forced sell at expiry; live winner min is unreachable |
 | Free mint slot while winner sits for redeem | **Yes** | `sold_loser` excluded from open-slot count; also expiry+120s |
-| Call CTF `redeemPositions` / merge automatically | **No** | not in `mintbot.py` or anywhere in this repo |
-| Relayer batch for redeem | **No** | mint-only submit path |
-| Mark intent `redeemed` after payout | **No** | status may become `completed` when flat at the final read |
+| Redeem resolved positions automatically | **Opt-in** (`redeem_enabled`, default false) | `buy/mint_redeem.py` `RedeemDesk`, thread `mintbot-redeem` |
+| Relayer batch for redeem | **Opt-in** | `submit_redeem` → `submit_mint_batch` (same PROXY signer, gas plan, relayer auth) |
+| Mark intent `redeemed` after payout | **Opt-in** | `redeemed: true`, `redeem_status`, status `completed` |
+| Merge (Up + Down → pUSD before resolution) | **No** | not needed; complete sets are sold or redeemed |
 
-Live observation (30 Sep 2026): the winning leg's pUSD is back in wallet A about **68s after `end_ts`**. That happens outside this repository; mintbot neither triggers nor waits for it. Kept loser shares from a partial scrap are worthless on a normal win and pay $1 each on a flip.
+Live observation (30 Sep 2026): the winning leg's pUSD is back in wallet A about **68s after `end_ts`**, with the redeem knob off. Kept loser shares from a partial scrap are worthless on a normal win and pay $1 each on a flip.
+
+### Auto-redeem (opt-in)
+
+**Call.** The desk sends `redeemPositions(pUSD, bytes32(0), conditionId, [1, 2])` to the collateral adapter `standard_adapter_address`. This is the same target the mint splits through, and it is what the Polymarket SDK does for a non-neg-risk market. The adapter burns both outcome balances of the proxy wallet and pays the winning side in pUSD. If CTF `isApprovedForAll(proxy, adapter)` is false, the batch prepends `setApprovalForAll(adapter, true)`. Both calls go through `submit_mint_batch` as one PROXY transaction signed by the mint EOA.
+
+**Gas.** The gas limit is one `eth_estimateGas` plus 15%, falling back to and capped at 650k. On-chain relay-hub redeems measured 365k–453k gas. Gas price is 0 for the signer, so the relayer pays; at ~330 gwei that is about 0.12–0.15 POL.
+
+**Job lifecycle.** Each job lives in `positions_mint.json` → `redeems[condition_id]`.
+
+```text
+waiting ── legs flat on 2 reads ───────────────► done (nothing_held)
+   │──── payoutDenominator == 0 ─► wait (poll_s; 5 min after 1h)
+   │──── payout < min_payout ──────────────────► no_winner (no tx)
+   │──── dry_run ─► log once, re-check every 5 min (no tx)
+   └──── persist submitting ─► submit ─► submitted
+                                    │ no tx id ─► retry (backoff)
+submitted ── STATE_CONFIRMED and legs flat ────► done (redeemed)
+   │──── STATE_FAILED / STATE_INVALID ─► retry (backoff)
+   └──── no answer after tx_timeout ─► legs flat? done : retry
+retry: next_at = now + retry_s * 2^(attempts-1), cap 900s;
+       attempts >= redeem_max_attempts ─► gave_up (ntfy, manual redeem)
+submitting found on restart: after tx_timeout ─► waiting (re-check, resubmit)
+```
+
+**Job sources.**
+- **Bags.** Intents with status `mined` / `confirmed_waiting_inventory` / `confirmed`, not dry and not already redeemed or given up, from `end_ts + redeem_min_after_end_s`.
+- **Startup sweep.** One Data API `/positions?redeemable=true` pass for the funder. Rows are grouped per condition, and Up is outcome index 0. Neg-risk rows are counted and skipped. A failed sweep retries every 5 minutes.
+
+**Idempotency.**
+- Each tick re-reads both CTF balances before any submit.
+- A job never submits twice in a row without a failure or timeout first.
+- A repeated `redeemPositions` burns a zero balance and pays zero, so an uncertain retry cannot double-pay.
+- Final jobs (`done`, `no_winner`, `gave_up`) are pruned after two days. The intent flags stop them from being created again.
+
+**Concurrency.**
+- All I/O runs outside `STATE_LOCK`. Every job write saves state with `commit_state(dirty=True)`.
+- `RELAY_SUBMIT_LOCK` serializes mint and redeem relayer submits, which share the EOA nonce from `/relay-payload`.
+- The redeem thread does not write the heartbeat file, so its `ts` still tracks sell and mint.
+- The sell loop never calls redeem code.
+
+**Payout mapping.** The payout estimate assumes Up is CTF slot 0 (`clobTokenIds[0]`, indexSet 1), which is Polymarket's standard binary layout. The redeem call itself passes both index sets, so a wrong mapping would only affect the `no_winner` skip and the logged estimate.
 
 ### Why the design stops at “hold for redeem”
 
@@ -1154,16 +1227,7 @@ Live observation (30 Sep 2026): the winning leg's pUSD is back in wallet A about
 2. **Window boundary:** once `end_ts` passes, CLOB prices for that market become resolution-driven and the bot refuses further FAK risk.
 3. **Scope control:** mint + sell-side pass is already enough surface area; auto-redeem adds another relayer/CTF path and failure mode (wrong condition index, partial redeem, gas/relayer auth).
 
-### Honest gap / future work
-
-If this repo should close the cash loop itself, a follow-on would look like:
-
-1. After `end_ts` + short delay, read resolution (Gamma or CTF payout vector),
-2. If winner tokens remain and payout is live, submit redeem via relayer PROXY,
-3. Confirm collateral increase; set `redeemed_at` / status `completed`,
-4. Never redeem while CLOB dump/cash-out still eligible (`now < end_ts`).
-
-Until that exists, treat redeem as **outside this repo**, and treat mintbot as **mint + intra-window sell policy**.
+With `redeem_enabled` false (code default, and absent live), redeem stays **outside this repo**, and mintbot is **mint + intra-window sell policy**.
 
 <a id="section-38"></a>
 ## State after expiry
@@ -1182,6 +1246,11 @@ now >= end_ts
   └─ at end_ts+180: one final balance read (chain_reconcile_done)
         if both legs flat → completed
         else stays confirmed; no further reads
+
+redeem_enabled (opt-in), separate thread:
+  end_ts+60: redeem job created; legs flat (2 reads) → completed
+  resolved (~end_ts+53..87s) and value held → relayer redeem
+  confirmed and legs flat → completed, redeemed: true
 ```
 
 Adjacent mint may already have been submitted **before** expiry (lookahead). That is intentional and is the main fix for the “skipped 15m” bug.
