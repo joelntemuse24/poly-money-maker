@@ -57,8 +57,8 @@ scrap orders post `target - filled` only. The loser is sold once that
 target fills within tolerance, or the balance is at or under
 `keep + tolerance`. Kept shares are not scrapped or dumped. They cash
 out only at `sell_winner_min` (the cheap 0.99 winner path does not
-apply to the kept leg) or stay until resolution. This repo does not
-redeem resolved positions. The book still fills
+apply to the kept leg) or stay until resolution. Resolved positions are
+redeemed only when the opt-in `redeem_enabled` is on (see below). The book still fills
 higher bids first. Set the flag false to restore the 1¢ ladder from
 `sell_fak_px` down to the floor, clipped to top-rung depth. The flag is
 read on each sell tick. Do not post the sweep above the floor. Empty FAK or a vanished loser book after arm keeps `armed_ts`.
@@ -94,8 +94,56 @@ plus `mint_gas_margin` (default 0.15). If estimation fails, use
 omitting `gas_limit` signs the library default 500000, and high-iteration
 splits out-of-gas inside that stipend. Log `gas_limit` and `gas_estimate`
 on `mint_submitted` and `mint_submit_fail`. The estimate runs only on the
-mint submit path. Keys absent from live `strategy_mint.json` keep these
+mint and redeem submit paths. Keys absent from live `strategy_mint.json` keep these
 defaults. Do not add the estimate to the sell loop.
+
+Sequential bags (`buy/mint_sequence.py`) are opt-in: `mint_sequential`
+defaults false, with `mint_seq_lead_s` 30 and `mint_seq_cutoff_s` 240.
+When on:
+
+- The next window mints only in `[start - lead, start + cutoff]`. The
+  14-minute lookahead and `max_open_sets` are not used.
+- It mints only when no other live, non-dry, active bag still lacks
+  `sold_winner`. The held dump also sets `sold_winner`. A bag whose
+  window has ended no longer blocks.
+- `seq_busy_bag` is checked both in `select_mint_candidate` and again in
+  `_claim_mint_intent`.
+- Short pUSD (`mint_cash_block`, including `pending_reserve`) is a wait:
+  `mint_seq_wait_cash`, throttled to 30s, retried every mint tick. A
+  previous bag still live logs `mint_seq_wait_prev`. Past the cutoff the
+  window is skipped once with `mint_seq_skip`.
+- Sell, scrap, and dump do not read mint time.
+
+With the flag off, eligibility and capacity are byte-for-byte the old
+path.
+
+Auto-redeem (`buy/mint_redeem.py`) is also opt-in: `redeem_enabled`
+defaults false.
+
+- **Thread.** It runs on its own `mintbot-redeem` thread, never on the
+  sell loop, and writes no heartbeat. Jobs live in `positions_mint.json`
+  → `redeems`. They come from landed bags at `end_ts +
+  redeem_min_after_end_s` (60) and from one Data API `redeemable` sweep
+  per start (`redeem_startup_sweep`, default true; neg-risk skipped).
+- **Per job:**
+  - Both legs flat on two reads → `nothing_held`. One zero read is not
+    proof.
+  - `payoutDenominator` 0 → wait.
+  - Held value under `redeem_min_payout_usd` → `no_winner`, no transaction.
+  - Otherwise persist `submitting`, then submit one relayer PROXY batch:
+    optional CTF `setApprovalForAll(adapter)`, then adapter
+    `redeemPositions(pUSD, 0, conditionId, [1,2])`. It goes through
+    `submit_mint_batch` under `RELAY_SUBMIT_LOCK`, the same lock the mint
+    submit holds, because both share the signer nonce.
+  - Confirmed with legs flat → `done`. The intent becomes `completed` with
+    `redeemed: true`.
+- **Failure handling.** Failed, invalid, or timed-out
+  (`redeem_tx_timeout_s` 300) submits back off from `redeem_retry_s` (60),
+  doubling to a 900s cap. After `redeem_max_attempts` (6) the job is
+  `gave_up`, with an ntfy alert. A crash in `submitting` is re-checked
+  after the timeout.
+- **Dry run.** `dry_run` logs `redeem_dry_run` and sends nothing.
+- **No merge.**
 
 `pathlog.py` records public CLOB books for **btc-up-or-down-15m** only.
 It is retired: keep `deploy/polypathlog.service` in the repo but stopped
@@ -182,9 +230,11 @@ Shared `buy/` helpers exist for mint, pathlog, and the recording-only oracle tap
   swallowed. It does not change orders.
 - `buy/mint_gas.py` — mint relay `gas_limit` (estimate + margin, 650k fallback, clamp to the ~650k hub budget). Mint submit only.
 - `buy/mint_loops.py` — concurrent sell vs mint job runner + intent claim
+- `buy/mint_sequence.py` — opt-in sequential mint range, busy-bag gate, wait/skip bookkeeping
+- `buy/mint_redeem.py` — opt-in redeem job runner (`RedeemDesk`) with injected chain/relayer I/O
 - `buy/market.py` — Gamma/CLOB discovery (`mintbot`, `pathlog`)
 - `buy/chain.py` — Polygon eth_call prechecks (`mintbot`)
-- `buy/contracts.py` — atomic mint calldata (`mintbot`) and the pUSD transfer used by the A→B top-up
+- `buy/contracts.py` — atomic mint calldata (`mintbot`), the opt-in redeem batch, and the pUSD transfer used by the A→B top-up
 - `buy/oracle_log.py` — Chainlink BTC/USD 60s TWAP tape
   (`logs/oracle_twap.jsonl`). `oracle_log_enabled` stays on. The
   loser-scrap veto stays off (`sell_late_window_s` 0, and the floor /

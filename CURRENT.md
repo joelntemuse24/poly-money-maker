@@ -23,7 +23,7 @@ pathlog are **stopped / retired**. Do not start them.
 - `submitting` intents without a relayer `transaction_id` auto-fail after `mint_submitting_timeout_s` (90s by default, 0 disables) so restart ghosts cannot pin `wait_submit`
 - Sells on:
   - Loser: opposite ≥ 0.90, loser ≤ 0.03, only when seconds-to-close ≤ `sell_scrap_max_ttm_s` **360**, persist **5s wait** (2s in last 60s before end_ts). At fire, re-check in-range; out of range logs `sell_cancel_out_of_range` and does not POST. One FAK at `sell_floor` **0.01** (sweep default; the book fills 3¢, then 2¢, then 1¢ bids). `sell_scrap_fraction` **0.5**: the first fire locks target 50 / keep 50 of the 100 held (`sell_scrap_plan`, `sell_scrap_outcome`); the kept 50 ride to resolution. Post-miss rest is off (`sell_scrap_rest_enabled` false). **Late-window oracle veto is off** (`sell_late_window_s` 0); CLOB gates only.
-  - Winner: `sell_winner_min` **0.9995** and cheap gate closed (`sell_winner_cheap_if_loser_le` −1), so the winner is held; its pUSD comes back about 68s after the window ends (redeem happens outside this repo)
+  - Winner: `sell_winner_min` **0.9995** and cheap gate closed (`sell_winner_cheap_if_loser_le` −1), so the winner is held; its pUSD comes back about 68s after the window ends (redeem happens outside this repo unless the opt-in `redeem_enabled` below is turned on)
   - Held dump: after loser sold, if held sized bid < **0.40** for **2s** (live `sell_dump_below`; code default 0.80) → first shot is live-bid FAK. If that first shot returns no-match / kill with zero fill, immediately re-check and fast re-fire with a short descending ladder from fresh top bid toward `sell_floor` (`sell_dump_fak_retries=2`, `sell_dump_ladder_step=0.04`, `sell_dump_ladder_rungs=4` by default), stopping if the book is empty. `sell_dump_max_ttm_s` (live and example **240**, code default **0** = off) blocks arm and fire while seconds-to-close is above the cutoff, and clears an in-progress dump persist so the full 2s must elapse again inside the window. Ladder retries after a dump has fired are not gated. A blocked arm logs `sell_dump_time_gated` at most once per bag per 15s.
 - WhatsApp alerts (CallMeBot): the danger-zone alert is on by default (`notify_danger_whatsapp`). After the loser scrap fills, if the held winner's bid stays under `notify_danger_px` (0.70) for `notify_danger_hold_s` (5s), it sends one message per bag. It never fires after a dump or winner sale, or after the window ends, and it always logs `danger_zone`. The scrap-fill alert (`notify_scrap_whatsapp`) and the held-dump alert (`notify_dump_whatsapp`) are both off by default. `CALLMEBOT_PHONE` / `CALLMEBOT_APIKEY` live in the VM's `.env` (systemd `EnvironmentFile`). Background worker only; logs `notify_sent` / `notify_failed` without the key.
 - Two loops: sell (`manage_sells`) and mint/discover run concurrently. Live `poll_s` and `sell_armed_poll_s` are both **1**; `main` now validates `poll_s >= 1`, so the VM's old local `mintbot.py` floor patch is redundant; drop it (`git checkout -- mintbot.py`) before the next pull so `git pull` does not refuse. Mint does not skip Gamma because a bag is hot. **That live JSON is untouched** until the operator edits it.
@@ -42,6 +42,70 @@ pathlog are **stopped / retired**. Do not start them.
 - Wallet A never posts a bid. Same-wallet buyback is not implemented.
 
 `load_strategy` overlays only keys already present in live `strategy_mint.json`. Keys that file already sets (`sell_threshold`, `sell_fak_px`, `sell_scrap_rest_px`, `sell_late_window_s`, persist) stay until the operator edits them. The live file now sets `sell_dump_max_ttm_s` 240 and `sell_scrap_max_ttm_s` 360; a key it omits stays at the code default. A leftover `sell_dump_if_sister_miss_s` or `sell_persist_skip_ttm_s` key is ignored because it is no longer in `DEFAULTS`. Do not edit the live file from git.
+
+## Sequential bags and auto-redeem (opt-in, off)
+
+Both are off in code and in the example, and absent from the live file, so
+nothing changes until the operator adds them to `strategy_mint.json` and
+restarts `polymintbot`.
+
+**`mint_sequential`** (default false) keeps one bag of capital in play
+instead of two:
+
+- The next window is minted only from `mint_seq_lead_s` (30s) before its
+  start to `mint_seq_cutoff_s` (240s) after it. There is no 14-minute
+  lookahead.
+- It is minted only once no other bag is still live and uncashed. A bag
+  stops blocking when its winner is sold (`sold_winner`, which the held
+  dump also sets) or its window ends.
+  - A winner cashed at 0.9995 before the end lets the next bag mint at
+    start − 30s.
+  - An unsold winner frees the gate at the end. Its cash comes back from
+    redeem.
+- If pUSD is short inside that range, it waits and retries every mint tick
+  (`mint_seq_wait_cash`, throttled to one line per 30s). Past the cutoff
+  the window is skipped once (`mint_seq_skip` with `last_wait` and
+  `waited_s`). A blocked previous bag logs `mint_seq_wait_prev`.
+- Minting is price neutral, so a mint at the open costs the same.
+  Sell, scrap and dump key off `end_ts` and the books, so a bag minted at
+  the open sells exactly like one minted early.
+- `max_open_sets`, `enter_*_ttm_min` and the adjacent lookahead are ignored
+  while sequential is on.
+
+**`redeem_enabled`** (default false) runs a fourth thread, `mintbot-redeem`:
+
+- **Jobs.** From `end_ts + redeem_min_after_end_s` (60s), each landed bag
+  gets a job in `positions_mint.json` → `redeems`. Once per start, a
+  Data API sweep adds any other `redeemable` non-neg-risk positions
+  (`redeem_startup_sweep`, default true).
+- **Each tick** (`redeem_poll_s`, 15s):
+  - Both legs flat on two reads → `nothing_held`. This covers bags that
+    were fully sold or redeemed elsewhere.
+  - Not resolved yet → wait. On-chain resolution lands about 1–1.5 min
+    after the end.
+  - Resolved but the held legs pay under `redeem_min_payout_usd` → no
+    transaction (`redeem_no_winner`). This is the case for a kept loser
+    half that lost.
+  - Otherwise it submits `adapter.redeemPositions(pUSD, 0, conditionId,
+    [1,2])` through the same relayer PROXY path and signer as the mint.
+    `setApprovalForAll(adapter)` is prepended once if missing.
+- **Retries.** Failures back off 60s, doubling to a 15-minute cap, up to
+  `redeem_max_attempts` (6). After that it logs `redeem_gave_up` and sends
+  an ntfy alert. A submit with no answer is re-checked after
+  `redeem_tx_timeout_s` (300s).
+- **Logs.** `redeem_wait_resolution`, `redeem_submitted`,
+  `redeem_confirmed`, `redeem_submit_fail`, `redeem_nothing_held`,
+  `redeem_sweep`.
+- **State.** A redeemed bag becomes `completed` with `redeemed: true`.
+- **Safety.** It never runs on the sell loop. Mint and redeem share one
+  relayer submit lock (same nonce). Under `dry_run` it logs
+  `redeem_dry_run` and sends nothing.
+- **Cost.** Gas is about 365k–453k per redeem (estimated + 15%, capped at
+  650k), paid by the Polymarket relayer. Each redeem uses one relayer
+  transaction from the builder quota.
+
+Suggested live keys for one $200 bag: `"shares": 200`, `"mint_sequential": true`,
+`"redeem_enabled": true`. Leave lead 30 / cutoff 240 at the defaults.
 
 ## Sister scrap bidder (wallet B, opt-in, off)
 
