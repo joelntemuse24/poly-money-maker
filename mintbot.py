@@ -268,6 +268,8 @@ DEFAULTS = {
     # 0 disables the time-left gate (old behavior). The example sets 240:
     # arm and fire the held dump only when seconds-to-close is at or under this.
     "sell_dump_max_ttm_s": 0.0,
+    # When the held dump fills, also sell the kept scrap half (1c floor sweep).
+    "sell_dump_also_kept": False,
     "sell_min_bid_size": 1.0,
     # 0 skips the late-window Chainlink veto on loser scrap.
     # Floor, per-TTM, and stale are 0 so a positive window does not
@@ -1656,6 +1658,152 @@ def _run_dump_fak_with_refire(
     return sold_total, last_status, last_px, attempts, live_bid
 
 
+def _sell_kept_after_dump(
+    *,
+    cfg: dict,
+    intent: dict,
+    cid: str,
+    kept: str,
+    tokens: dict,
+    bids: dict,
+    books: dict,
+    ttm_s: Optional[float],
+    min_bid_size: float,
+    retries: int,
+    ladder_step: float,
+    ladder_rungs: int,
+    dry_run: bool,
+    tol: float,
+    chain: ChainReader,
+    ctf: str,
+    funder_cs: Optional[str],
+) -> None:
+    """``sell_dump_also_kept``: exit the kept scrap half in the dump event.
+
+    Same live-bid FAK + fast refire as the held dump, then one FAK at the
+    1c floor for any remainder. Runs once per bag (``sell_dump_kept_done``).
+    """
+    intent["sell_dump_kept_done"] = True
+    slug = intent.get("slug")
+    floor = max(0.01, float(cfg.get("sell_clob_min_price") or 0.01))
+    try:
+        keep = float(intent.get("sell_scrap_keep") or 0.0)
+    except (TypeError, ValueError):
+        keep = 0.0
+    if not math.isfinite(keep) or keep < 0:
+        keep = 0.0
+    token = tokens.get(kept)
+    size = 0.0
+    latch = "no_keep"
+    if keep >= tol and token:
+        size, latch = _sell_inventory(
+            chain, ctf, funder_cs, token, keep, tol,
+            "seen_kept_inventory", intent,
+        )
+        if latch in {"already_flat", "await_inventory"}:
+            size = 0.0
+    planned = round(float(size), 4)
+    intent["sell_dump_kept_planned"] = planned
+    if size < tol:
+        intent["sell_dump_kept_outcome"] = "nothing_kept"
+        log_event(
+            "sell_dump_kept",
+            condition_id=cid,
+            slug=slug,
+            leg=kept,
+            planned=planned,
+            keep=keep,
+            sold=0.0,
+            avg_px=None,
+            status=latch,
+            outcome="nothing_kept",
+            remaining=0.0,
+        )
+        return
+
+    kept_fills: list = []
+    sold_total, last_status, last_px, attempts, live_bid = _run_dump_fak_with_refire(
+        token_id=token,
+        size=size,
+        initial_bid=float(bids.get(kept) or 0.0),
+        initial_bids=books.get(kept),
+        held=kept,
+        slug=slug,
+        condition_id=cid,
+        ttm_s=ttm_s,
+        floor=floor,
+        min_bid_size=min_bid_size,
+        retries=retries,
+        ladder_step=ladder_step,
+        ladder_rungs=ladder_rungs,
+        dry_run=dry_run,
+        tol=tol,
+        fills=kept_fills,
+    )
+    sold_total = float(sold_total or 0.0)
+    swept = 0.0
+    if not dry_run and size - sold_total >= tol:
+        with _io_unlocked():
+            swept, sweep_status, sweep_px = _run_fak_ladder(
+                token,
+                size - sold_total,
+                [round(floor, 4)],
+                dry_run=dry_run,
+                bid=live_bid,
+                label=f"dump kept {kept}",
+                slug=slug,
+                tol=tol,
+                depth_bids=books.get(kept),
+                depth_path="dump_kept",
+                depth_leg=kept,
+                ttm_s=ttm_s,
+                condition_id=cid,
+                fills=kept_fills,
+            )
+        attempts += 1
+        sold_total += float(swept or 0.0)
+        last_status, last_px = sweep_status, sweep_px
+    remaining = max(0.0, size - sold_total)
+    if dry_run:
+        outcome = "dry_run"
+    elif remaining < tol:
+        outcome = "filled"
+    elif sold_total >= tol:
+        outcome = "partial"
+    else:
+        outcome = "no_fill"
+    avg_px = record_fill_px(intent, "sell_dump_kept_fill_px", kept_fills)
+    intent["sell_dump_kept_leg"] = kept
+    intent["sell_dump_kept_filled"] = round(sold_total, 6)
+    intent["sell_dump_kept_limit"] = last_px
+    intent["sell_dump_kept_attempts"] = int(attempts)
+    intent["sell_dump_kept_outcome"] = outcome
+    if outcome in {"filled", "dry_run"}:
+        intent["sell_dump_kept_sold"] = True
+    log_event(
+        "sell_dump_kept",
+        condition_id=cid,
+        slug=slug,
+        leg=kept,
+        planned=planned,
+        keep=keep,
+        sold=round(sold_total, 4),
+        swept=round(float(swept or 0.0), 4),
+        fills=len(kept_fills),
+        avg_px=avg_px,
+        bid=live_bid,
+        limit=last_px,
+        attempts=int(attempts),
+        status=last_status,
+        outcome=outcome,
+        remaining=round(remaining, 4),
+    )
+    console.print(
+        f"  [bold bright_yellow][DUMP KEPT {outcome.upper()}][/] {kept} "
+        f"{sold_total:.2f}/{size:.2f}  avg={avg_px}"
+    )
+
+
 def _apply_sell_fire_cancel(
     intent: dict,
     *,
@@ -2799,6 +2947,29 @@ def _manage_sells_locked(cfg: dict, state: dict, chain: ChainReader) -> None:
                             f"  [bold bright_yellow][DUMP OK][/] {held} {sold_total:.2f}  "
                             f"bid={live_px:.3f} (<{dump_below:.2f})"
                         )
+                        if (
+                            bool(cfg.get("sell_dump_also_kept", False))
+                            and not intent.get("sell_dump_kept_done")
+                        ):
+                            _sell_kept_after_dump(
+                                cfg=cfg,
+                                intent=intent,
+                                cid=cid,
+                                kept=sold_leg,
+                                tokens=tokens,
+                                bids=bids,
+                                books=books,
+                                ttm_s=ttm_s,
+                                min_bid_size=min_bid_size,
+                                retries=dump_retries,
+                                ladder_step=dump_ladder_step,
+                                ladder_rungs=dump_ladder_rungs,
+                                dry_run=dry_run,
+                                tol=tol,
+                                chain=chain,
+                                ctf=ctf,
+                                funder_cs=funder_cs,
+                            )
                     elif sold_total >= tol:
                         intent["sell_dump_filled"] = float(
                             intent.get("sell_dump_filled") or 0

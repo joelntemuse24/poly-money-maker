@@ -644,8 +644,9 @@ Action (`_run_dump_fak_with_refire`):
 2. First shot: one **live-bid FAK** at the fire-time sized bid.
 3. If that returns zero fill with `no orders found` or a kill/cancel status (`dump_fast_retry_eligible`), re-fetch the held book and fire `dump_retry_ladder_limits(fresh_bid, floor=sell_floor, step=0.04, max_rungs=4)` — for example 0.31, 0.27, 0.23, 0.19 — up to `sell_dump_fak_retries` (2) times in the same tick. Stop on an empty book (`sell_dump_fast_refire_stop reason=empty_book`), a non-retryable status, or exhausted retries. These refires are not re-checked against the TTM gate.
 4. Full fill (or dry run): `sold_dump=True`, `sold_winner=True`, `sell_dump_leg = held`, `sold_dump_at`, `sell_dump_filled`, `sell_dump_limit = last limit`, and `sell_dump_fill_px` = share-weighted average of every priced dump fill (first shot and refire rungs); log `sell_dump_done` (with `hedge_leg` and `avg_px`), ntfy. `bag_risk.dump_px` reads the average, falling back to the limit.
+5. `sell_dump_also_kept` (false / not set live; read from cfg each tick): in that same full-fill branch, `_sell_kept_after_dump` sells the kept scrap half once per bag. The size is `min(sell_scrap_keep, on-chain balance of sold_leg)`. Without a funder or CTF, it uses `sell_scrap_keep`. Flat or zero is a no-op (`outcome=nothing_kept`). The sale is the same `_run_dump_fak_with_refire` on the kept token with the ladder floored at `max(0.01, sell_clob_min_price)`, then one FAK at that 1¢ floor for any remainder. It records `sell_dump_kept_done`, `_planned`, `_filled`, `_fill_px`, `_limit`, `_attempts` and `_outcome` (`filled` / `partial` / `no_fill` / `dry_run` / `nothing_kept`), and `sell_dump_kept_sold` when fully sold. That last flag closes `kept_loser_open`. It logs `sell_dump_kept`. A partial remainder is not retried on later ticks, and enabling the flag after the dump does nothing.
 
-**Scope:** only the held leg after a loser fill. The kept part of a partial scrap is **not** dumped. Full sets with neither leg sold never arm the dump. After `end_ts`, `manage_sells` skips the intent. A sister miss does not dump the held leg. `sell_dump_leg` exists so wallet B could buy the other leg; B is disabled live.
+**Scope:** only the held leg after a loser fill. The kept part of a partial scrap is **not** dumped unless `sell_dump_also_kept` is on. Full sets with neither leg sold never arm the dump. After `end_ts`, `manage_sells` skips the intent. A sister miss does not dump the held leg. `sell_dump_leg` exists so wallet B could buy the other leg; B is disabled live.
 
 <a id="section-20"></a>
 ## Live-bid FAK vs floor FAK
@@ -835,6 +836,7 @@ Never enable retired buy units (`polycomplement`, buybots, DangerZone, shadow) f
 | `sell_dump_below` | 0.80 | 0.80 | **0.40** | Dump arm threshold |
 | `sell_dump_persist_s` | 2 | | 2 | Dump persist |
 | `sell_dump_max_ttm_s` | 0 (off) | 240 | **240** | Dump only in the last N seconds |
+| `sell_dump_also_kept` | false | false | — | Dump also sells the kept scrap half (1¢ floor) |
 | `sell_dump_fak_retries` / `_ladder_step` / `_ladder_rungs` | 2 / 0.04 / 4 | | 2 / 0.04 / 4 | Refire after a zero-fill miss |
 | `sell_min_bid_size` | 1.0 | | 1.0 | Sized-bid minimum |
 | `sell_late_window_s` | 0 | 0 | 0 | Oracle veto off |

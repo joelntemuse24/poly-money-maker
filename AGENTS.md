@@ -198,7 +198,14 @@ dump. The normal held dump under `sell_dump_below` still applies. When
 at or under that cutoff (example 240; code default 0 leaves the gate
 off and keeps the old dump). A dip that starts before the cutoff must
 still persist the full `sell_dump_persist_s` after entering it. Ladder
-retries after the dump has fired are not re-checked. When
+retries after the dump has fired are not re-checked.
+`sell_dump_also_kept` (default false; the example and live leave it off)
+also exits the kept scrap half in the same dump event. Once the held dump
+fills, mintbot sells `min(sell_scrap_keep, on-chain balance)` of the
+scrapped leg with the dump's live-bid FAK and refire. It then sends one
+FAK at the 1¢ floor for any remainder and logs `sell_dump_kept`
+(planned, sold, avg_px, outcome). This runs once per bag. Kept 0 is a
+logged no-op. Turning the flag on after a dump does not sell later. When
 that dump fills, mintbot sets `sell_dump_leg` and B FAK-buys
 `dump_hedge_shares` (10) of the other leg, with its own
 `dump_hedge_fak_min_notional` / `dump_hedge_fak_max_notional` (default
