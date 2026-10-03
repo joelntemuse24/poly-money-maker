@@ -114,6 +114,9 @@ from buy.mint_sell import (
     bag_risk_observe,
     bag_risk_payload,
     dump_time_gate_open,
+    dump_tiers,
+    advance_dump_tiers,
+    validate_dump_tiers,
     effective_loser_persist_s,
     fresh_bag_risk,
     empty_fak_status,
@@ -262,6 +265,9 @@ DEFAULTS = {
     "sell_dump_enabled": True,
     "sell_dump_below": 0.80,
     "sell_dump_persist_s": 2.0,
+    # [[price_below, persist_s], ...]. Each tier has its own timer; the dump
+    # fires when any one is satisfied. Empty keeps the single timer above.
+    "sell_dump_tiers": [],
     "sell_dump_fak_retries": 2,
     "sell_dump_ladder_step": 0.04,
     "sell_dump_ladder_rungs": 4,
@@ -492,6 +498,7 @@ def validate_strategy(cfg: dict) -> None:
     validate_mint_gas(cfg)
     validate_seq(cfg)
     validate_redeem(cfg)
+    validate_dump_tiers(cfg)
     if not cfg["series_slugs"]:
         raise ValueError("series_slugs must not be empty")
     if int(cfg["max_open_sets"]) < 1:
@@ -1685,6 +1692,7 @@ def _apply_sell_fire_cancel(
         intent["sell_loser_leg"] = None
     elif path == "dump":
         intent["sell_dump_armed_at"] = None
+        intent.pop("sell_dump_tier_armed", None)
     elif path == "winner":
         intent["sell_winner_armed_at"] = None
 
@@ -2653,6 +2661,10 @@ def _manage_sells_locked(cfg: dict, state: dict, chain: ChainReader) -> None:
         dump_enabled = bool(cfg.get("sell_dump_enabled", True))
         dump_below = float(cfg.get("sell_dump_below") or 0.80)
         dump_persist_s = cfg_seconds(cfg, "sell_dump_persist_s", 2.0)
+        tiers = dump_tiers(cfg)
+        if tiers:
+            # The highest tier is the outer price gate; each tier keeps its own timer.
+            dump_below = tiers[0][0]
         dump_retries = int(cfg.get("sell_dump_fak_retries", 2))
         dump_ladder_step = float(cfg.get("sell_dump_ladder_step") or 0.04)
         dump_ladder_rungs = int(cfg.get("sell_dump_ladder_rungs", 4))
@@ -2687,24 +2699,69 @@ def _manage_sells_locked(cfg: dict, state: dict, chain: ChainReader) -> None:
                 now_s=now,
             )
         dump_armed = dump_price_ok and dump_ttm_ok
-        fire_d, armed_d, why_d = persist_ready(
-            dump_armed,
-            now_s=now,
-            armed_ts=intent.get("sell_dump_armed_at"),
-            persist_s=dump_persist_s,
-        )
-        intent["sell_dump_armed_at"] = armed_d
-        if dump_armed and why_d in {"armed", "waiting"}:
-            log_event(
-                "sell_dump_persist",
-                condition_id=cid,
-                slug=intent.get("slug"),
-                leg=held,
-                why=why_d,
-                bid=dump_bid,
-                below=dump_below,
+        fired_tier = None
+        if tiers:
+            fired_tier, tier_armed, tier_changes = advance_dump_tiers(
+                dump_armed,
+                dump_bid,
+                tiers,
+                now_s=now,
+                armed=intent.get("sell_dump_tier_armed"),
             )
+            if tier_armed:
+                intent["sell_dump_tier_armed"] = tier_armed
+            else:
+                intent.pop("sell_dump_tier_armed", None)
+            intent["sell_dump_armed_at"] = min(tier_armed.values()) if tier_armed else None
+            for change in tier_changes:
+                log_event(
+                    "sell_dump_persist",
+                    condition_id=cid,
+                    slug=intent.get("slug"),
+                    leg=held,
+                    why=change["why"],
+                    bid=dump_bid,
+                    below=change["below"],
+                    persist_s=change["persist_s"],
+                    below_s=change.get("below_s"),
+                    reason=change.get("reason"),
+                    tiered=True,
+                )
+            fire_d = fired_tier is not None
+            if fired_tier is not None:
+                dump_below = fired_tier["below"]
+        else:
+            fire_d, armed_d, why_d = persist_ready(
+                dump_armed,
+                now_s=now,
+                armed_ts=intent.get("sell_dump_armed_at"),
+                persist_s=dump_persist_s,
+            )
+            intent["sell_dump_armed_at"] = armed_d
+            if dump_armed and why_d in {"armed", "waiting"}:
+                log_event(
+                    "sell_dump_persist",
+                    condition_id=cid,
+                    slug=intent.get("slug"),
+                    leg=held,
+                    why=why_d,
+                    bid=dump_bid,
+                    below=dump_below,
+                )
         if fire_d and held and not cooling:
+            if fired_tier is not None:
+                log_event(
+                    "sell_dump_persist",
+                    condition_id=cid,
+                    slug=intent.get("slug"),
+                    leg=held,
+                    why="fire",
+                    bid=dump_bid,
+                    below=fired_tier["below"],
+                    persist_s=fired_tier["persist_s"],
+                    below_s=fired_tier["below_s"],
+                    tiered=True,
+                )
             fire_action, fire_reason = sell_fire_decision(
                 "dump", bid=dump_bid, dump_below=dump_below,
             )

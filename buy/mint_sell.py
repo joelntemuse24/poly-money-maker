@@ -42,7 +42,7 @@ reads ``sell_dump_leg`` after this fill and buys the other side.
 from __future__ import annotations
 
 import math
-from typing import Any, Optional, Sequence, Tuple
+from typing import Any, List, Optional, Sequence, Tuple
 
 DEFAULT_SELL_KNOBS = {
     "sell_enabled": False,
@@ -341,6 +341,102 @@ def persist_ready(
     if float(now_s) + 1e-12 < float(armed_ts) + persist:
         return False, float(armed_ts), "waiting"
     return True, float(armed_ts), "ready"
+
+
+def dump_tiers(cfg: Any) -> List[Tuple[float, float]]:
+    """``sell_dump_tiers`` as ``[(price_below, persist_s), ...]``, highest price first.
+
+    Absent, empty, or malformed returns ``[]``: the caller keeps the single
+    ``sell_dump_below`` / ``sell_dump_persist_s`` timer.
+    """
+    raw = (cfg or {}).get("sell_dump_tiers")
+    if not isinstance(raw, (list, tuple)) or not raw:
+        return []
+    out: List[Tuple[float, float]] = []
+    for row in raw:
+        if not isinstance(row, (list, tuple)) or len(row) != 2:
+            return []
+        try:
+            price, persist = float(row[0]), float(row[1])
+        except (TypeError, ValueError):
+            return []
+        if not (math.isfinite(price) and math.isfinite(persist)):
+            return []
+        if not (0 < price < 1) or persist < 0:
+            return []
+        out.append((price, persist))
+    return sorted(out, key=lambda tier: -tier[0])
+
+
+def validate_dump_tiers(cfg: Any) -> None:
+    raw = (cfg or {}).get("sell_dump_tiers")
+    if raw is None or raw == [] or raw == ():
+        return
+    if not dump_tiers(cfg):
+        raise ValueError(
+            "sell_dump_tiers must be a list of [price_below, persist_s] "
+            "with 0 < price_below < 1 and persist_s >= 0"
+        )
+    prices = [price for price, _persist in dump_tiers(cfg)]
+    if len(set(prices)) != len(prices):
+        raise ValueError("sell_dump_tiers prices must be distinct")
+
+
+def dump_tier_key(price: float) -> str:
+    return f"{float(price):.4f}"
+
+
+def advance_dump_tiers(
+    qualify: bool,
+    bid: Optional[float],
+    tiers: List[Tuple[float, float]],
+    *,
+    now_s: float,
+    armed: Any,
+) -> Tuple[Optional[dict], dict, List[dict]]:
+    """Advance one independent persist timer per tier.
+
+    A tier's timer runs while ``qualify`` holds and ``bid`` is strictly
+    under that tier's price. It resets when the bid is back at or above
+    the price, or ``qualify`` drops. Returns ``(fired, armed, changes)``:
+    ``fired`` is the first ready tier (highest price) as ``{"below",
+    "persist_s", "below_s", "armed_at"}``, ``armed`` is the new
+    ``{key: armed_ts}`` map, and ``changes`` lists per-tier ``armed`` /
+    ``reset`` transitions for logging.
+    """
+    prev = armed if isinstance(armed, dict) else {}
+    out: dict = {}
+    changes: List[dict] = []
+    fired: Optional[dict] = None
+    for price, persist in tiers:
+        key = dump_tier_key(price)
+        tier_ok = bool(qualify) and bid is not None and float(bid) < price - 1e-12
+        was = prev.get(key)
+        fire, armed_ts, why = persist_ready(
+            tier_ok, now_s=now_s, armed_ts=was, persist_s=persist
+        )
+        if armed_ts is not None:
+            out[key] = armed_ts
+        if why in ("armed", "immediate") and was is None:
+            changes.append({"why": "armed", "below": price, "persist_s": persist})
+        elif why == "reset" and was is not None:
+            changes.append(
+                {
+                    "why": "reset",
+                    "below": price,
+                    "persist_s": persist,
+                    "below_s": round(float(now_s) - float(was), 3),
+                    "reason": "bid_above" if qualify else "gate_closed",
+                }
+            )
+        if fire and fired is None:
+            fired = {
+                "below": price,
+                "persist_s": persist,
+                "below_s": round(float(now_s) - float(armed_ts), 3),
+                "armed_at": armed_ts,
+            }
+    return fired, out, changes
 
 
 def winner_cashout_leg(
@@ -1365,7 +1461,13 @@ def sell_plan_banner(cfg: dict) -> str:
     if scrap_ttm > 0:
         parts.append(f"scrap ttm<={scrap_ttm:g}s")
     if bool(cfg.get("sell_dump_enabled", True)):
-        dump = f"dump held <{_cents(cfg.get('sell_dump_below') or DEFAULT_SELL_KNOBS['sell_dump_below'])}"
+        tiers = dump_tiers(cfg)
+        if tiers:
+            dump = "dump held " + ",".join(
+                f"<{_cents(price)}/{persist:g}s" for price, persist in tiers
+            )
+        else:
+            dump = f"dump held <{_cents(cfg.get('sell_dump_below') or DEFAULT_SELL_KNOBS['sell_dump_below'])}"
         dump_ttm = float(cfg.get("sell_dump_max_ttm_s") or 0.0)
         if dump_ttm > 0:
             dump += f" ttm<={dump_ttm:g}s"
