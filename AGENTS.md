@@ -100,15 +100,19 @@ above 0 does not restore the old $25 / 1.5×TTM / 5s-stale veto.
 tape is audit-only. With these defaults the late veto adds nothing.
 **Scrap oracle veto (#234) is separate and on by default:**
 `scrap_oracle_veto_enabled` true, `scrap_oracle_veto_usd` 5.0,
-`scrap_oracle_veto_stale_s` 3.0 (hot-reloaded). With `margin = twap −
-strike` (in-memory RTDS 60s sample and the bag's `open_ref`, read through
-`bag_view` with no I/O), scrapping Up is blocked while margin > −5 and
-scrapping Down while margin < +5. It is ANDed into the scrap time gate, so
+`scrap_oracle_veto_stale_s` 3.0, `scrap_oracle_veto_use_live` true
+(hot-reloaded). With `margin = twap − strike` and `live_margin =
+live_price − strike` (in-memory RTDS 60s sample, the live
+`crypto_prices_chainlink` print from the same websocket, and the bag's
+`open_ref`, read through `bag_view` with no I/O), scrapping Up is blocked
+while either margin > −5 and scrapping Down while either < +5. It is ANDed into the scrap time gate, so
 it covers arm, persist, sweep, blind, and rest, and it cancels a resting
 scrap. It is re-checked right before the FAK, and a block resets the arm.
-A sample older than 3s by `recv_ts`, or a missing strike, means no veto
-(log `scrap_oracle_stale`). Blocks log `scrap_oracle_veto` at most once
-per 5s per bag. Scrap fills carry `oracle_margin`. Never apply it to the
+A live price older than 3s by `recv_ts` leaves the average alone; both
+stale, or a missing strike, means no veto (log `scrap_oracle_stale`).
+Blocks log `scrap_oracle_veto` (with `live_price` / `live_margin`) at
+most once per 5s per bag. Scrap fills carry `oracle_margin` and
+`oracle_live_margin`. Never apply it to the
 dump, `sell_dump_also_kept`, winner, or mint.
 Winner cash-out is a separate path at `sell_winner_min` (~0.999).
 Live-bid FAK the winner, then clamp `limit = min(live_sized_bid,

@@ -584,16 +584,18 @@ size, latch = _sell_inventory(chain, ctf, funder_cs, l_tok, shares, tol,
 **Scrap oracle veto (#234, on in code; takes effect live after a pull and restart).** A separate, any-time check that blocks a loser scrap while the oracle still favours that leg. It was added after `btc-updown-15m-1791039600` (3 Oct, 16:00–16:15 IST): 100 Up were scrapped at 2–3¢ with 31s left while the 60s TWAP sat $0.42 above the strike. Up won, and the bag lost about $97.
 
 - `margin = twap − strike`. The TWAP is the latest RTDS 60s sample, and the strike is the bag's `open_ref` (`OracleLogService.bag_view`). Scrapping Up is blocked while `margin > −scrap_oracle_veto_usd`. Scrapping Down is blocked while `margin < +scrap_oracle_veto_usd`. Exactly $5 against goes ahead.
-- Knobs: `scrap_oracle_veto_enabled` (true), `scrap_oracle_veto_usd` (5.0) and `scrap_oracle_veto_stale_s` (3.0). They are hot-reloaded, and a bad or negative value falls back to the default.
+- Live price: with `scrap_oracle_veto_use_live` (true), the same rule also runs on `live_margin = live_price − strike`. `live_price` is the latest Chainlink BTC/USD print from the `crypto_prices_chainlink` topic on the same RTDS websocket (about one a second). A scrap is blocked if either margin says the leg is winning or within $5, so it only goes ahead when both are more than $5 against it.
+- Knobs: `scrap_oracle_veto_enabled` (true), `scrap_oracle_veto_usd` (5.0), `scrap_oracle_veto_stale_s` (3.0) and `scrap_oracle_veto_use_live` (true). They are hot-reloaded, and a bad or negative value falls back to the default.
 - It is ANDed into the scrap time gate (`scrap_ok = scrap_ttm_ok and not veto`). It therefore blocks the arm, the persist, the sweep or ladder fire, the blind FAK and a new post-miss rest. It also cancels a resting scrap sell (`oracle_blocks`).
 - A block resets `sell_loser_armed_at`, so once the TWAP is more than $5 against the leg the scrap still waits its full persist, inside the 360s cutoff and the 3¢ trigger.
 - `_scrap_oracle_gate` runs again on its own right before `_fire_loser_scrap` and before the blind `_fak_sell`.
-- No I/O: it reads the sample the `oracle-rtds` websocket thread holds in memory. Measured cost is about 4µs per call (p99 about 5µs).
-- Fallback: if the sample is older than `scrap_oracle_veto_stale_s` by local receive time (`recv_ts`), its Chainlink stamp is more than 10s old, or the TWAP or strike is missing, there is no veto and the scrap runs as before.
+- No I/O: it reads the TWAP sample and the live print the `oracle-rtds` websocket thread holds in memory. Measured cost with both is about 7µs per call (p99 about 9µs), against about 6µs for the average alone.
+- Fallback: a reading is stale if it is older than `scrap_oracle_veto_stale_s` by local receive time (`recv_ts`), its Chainlink stamp is more than 10s old, or it is missing. A stale live price leaves the average to decide alone (`fallback` `twap_only`); a stale average leaves the live price alone (`live_only`). If both are stale, or the strike is missing, there is no veto and the scrap runs as before (`fallback` `none`).
 - Logs:
-  - `scrap_oracle_veto` on a block (`slug`, `side`, `bid`, `ttm`, `twap`, `strike`, `margin`, `threshold`, `why`, `phase` arm/fire/blind, `age_s`). At most once per 5s per bag.
-  - `scrap_oracle_stale` (`level` WARNING, `reason`, `age_s`, `obs_age_s`) on a fallback, with the same throttle.
-  - A scrap that goes through carries `oracle_margin` / `oracle_twap` / `oracle_strike` / `oracle_why` on `sell_scrap_sweep`, `sell_scrap_blind` and `sell_loser_done`, plus `intent.sell_scrap_oracle_margin`.
+  - `scrap_oracle_veto` on a block (`slug`, `side`, `bid`, `ttm`, `twap`, `strike`, `margin`, `live_price`, `live_margin`, `threshold`, `why`, `basis`, `phase` arm/fire/blind, `age_s`, `live_age_s`). `why` is `oracle_favors_leg` / `within_threshold` for the average, or `live_favors_leg` / `live_within_threshold` for the live price. At most once per 5s per bag.
+  - `scrap_oracle_stale` (`level` WARNING, `reason`, `fallback`, `age_s`, `live_age_s`) whenever a reading drops out, with the same throttle.
+  - A scrap that goes through carries `oracle_margin` / `oracle_twap` / `oracle_live_price` / `oracle_live_margin` / `oracle_strike` / `oracle_why` / `oracle_basis` on `sell_scrap_sweep`, `sell_scrap_blind` and `sell_loser_done`, plus `intent.sell_scrap_oracle_margin` and `intent.sell_scrap_oracle_live_margin`.
+  - Each `oracle_twap` tape row also carries the live print held at write time (`live_price`, `live_ts`).
 - Dump, `sell_dump_also_kept`, winner and mint never call it. The late-window veto above stays off.
 
 Wallet A never posts a bid.
@@ -811,7 +813,7 @@ That is the operator's trade: a false alarm costs more than a perfect dump would
 - `loser_blind_fak_due` — blind 1¢ FAK eligibility and backoff.
 - `scrap_rest_action` / `scrap_rest_px` / `resting_tif` / `rest_order_matched_shares` / `posted_order_id` — post-miss rest lifecycle.
 - `late_oracle_scrap_ok` / `advance_oracle_edge_arm` / `side_aware_oracle_edge_usd` — late-window loser-scrap veto. Off unless `sell_late_window_s` > 0.
-- `scrap_oracle_settings` / `scrap_oracle_veto` — any-time scrap oracle veto (#234). Pure: `(block, why, detail)` from TWAP, strike, receive age and threshold.
+- `scrap_oracle_settings` / `scrap_oracle_veto` — any-time scrap oracle veto (#234). Pure: `(block, why, detail)` from TWAP, optional live price, strike, receive ages and threshold.
 - `winner_cashout_leg` — unique leg whose sized bid ≥ winner_min.
 - `winner_cheap_decision` — cheap min only if sold_loser, loser ≤ gate, and loser + cheap > $1.
 - `winner_sell_limit` — clamp live-bid FAK into CLOB [0.01, 0.99].
@@ -896,7 +898,7 @@ Never enable retired buy units (`polycomplement`, buybots, DangerZone, shadow) f
 | `sell_late_window_s` | 0 | 0 | 0 † | Oracle veto off |
 | `sell_oracle_edge_floor_usd` / `_per_ttm` / `_stale_s` | 0 / 0 / 0 | | 0 / 0 / 0 | Old veto knobs zeroed |
 | `sell_oracle_edge_persist_s` | 3 | 3 | **0** | Only used when the veto is on |
-| `scrap_oracle_veto_enabled` / `_usd` / `_stale_s` | true / 5.0 / 3.0 | true / 5.0 / 3.0 | — (code default after pull + restart) | Scrap oracle veto (#234): no scrap while the TWAP is within $5 of the strike or on the scrapped leg's side |
+| `scrap_oracle_veto_enabled` / `_usd` / `_stale_s` / `_use_live` | true / 5.0 / 3.0 / true | true / 5.0 / 3.0 / true | — (code default after pull + restart) | Scrap oracle veto (#234): no scrap while the TWAP or the live Chainlink price is within $5 of the strike or on the scrapped leg's side |
 | `oracle_log_enabled` | true | true | true | Audit tape |
 | `sell_persist_skip_ttm_s` | — | — | 0 | Leftover; ignored (not in `DEFAULTS`) |
 
@@ -1323,8 +1325,8 @@ Adjacent mint may already have been submitted **before** expiry (lookahead). Tha
 # Changelog
 
 - **2026-10-03 (PR #234, not live until pull + restart)** — Scrap oracle veto.
-  - No loser scrap while the in-memory 60s TWAP is within $5 of the strike or on the scrapped leg's side (`scrap_oracle_veto_enabled` true, `scrap_oracle_veto_usd` 5.0, `scrap_oracle_veto_stale_s` 3.0). It is re-checked every tick and right before the order is sent.
-  - A stale or missing feed falls back to the old scrap and logs `scrap_oracle_stale`.
+  - No loser scrap while the in-memory 60s TWAP or the live Chainlink price is within $5 of the strike or on the scrapped leg's side (`scrap_oracle_veto_enabled` true, `scrap_oracle_veto_usd` 5.0, `scrap_oracle_veto_stale_s` 3.0, `scrap_oracle_veto_use_live` true). It is re-checked every tick and right before the order is sent.
+  - A stale live price leaves the average alone; both stale falls back to the old scrap. Either logs `scrap_oracle_stale`.
   - The RTDS feed gains `recv_ts` and a hot mode for the last 360s: a 5s watchdog, a 2s redial and the Gamma audit deferred. Dump is unchanged.
 - **2026-10-03 13:25 IST** — Aligned to the live VM.
   - **Size and capital.** 200 shares a side (was 100). `mint_sequential` on: one bag at a time, minted in [start − 30s, start + 240s] once the previous winner is sold or its window has ended. Two-bag `max_open_sets` / lookahead is no longer the live mode.

@@ -35,10 +35,10 @@ pathlog are **stopped / retired**. Do not start them.
     - **Fire:** at fire it re-checks the range; out of range logs `sell_cancel_out_of_range` and does not POST. One FAK at `sell_floor` **0.01** (sweep default); the book fills 3¢, then 2¢, then 1¢ bids.
     - **Partial scrap:** `sell_scrap_fraction` **0.5**. The first fire locks target **100** / keep **100** of the 200 held (`sell_scrap_plan`, `sell_scrap_outcome`). The kept 100 ride to resolution unless the held dump fires (see `sell_dump_also_kept`).
     - Post-miss rest is off (`sell_scrap_rest_enabled` false). **The late-window oracle veto is off** (`sell_late_window_s` 0).
-    - **Scrap oracle veto (PR #234, not live until the operator pulls and restarts).** The live file does not set these keys, so after a restart the code defaults apply: `scrap_oracle_veto_enabled` **true**, `scrap_oracle_veto_usd` **5.0** and `scrap_oracle_veto_stale_s` **3.0**.
-      - No scrap while the in-memory 60s TWAP is within $5 of the strike or on the scrapped leg's side. Up is blocked while `twap − strike > −5`, and Down while it is `< +5`.
+    - **Scrap oracle veto (PR #234, not live until the operator pulls and restarts).** The live file does not set these keys, so after a restart the code defaults apply: `scrap_oracle_veto_enabled` **true**, `scrap_oracle_veto_usd` **5.0**, `scrap_oracle_veto_stale_s` **3.0** and `scrap_oracle_veto_use_live` **true**.
+      - No scrap while the in-memory 60s TWAP or the live Chainlink price (same websocket) is within $5 of the strike or on the scrapped leg's side. Up is blocked while either `price − strike > −5`, and Down while either is `< +5`. The scrap only goes ahead when both are more than $5 against the leg.
       - It is re-checked every tick and right before the order goes out. A block resets the persist and logs `scrap_oracle_veto` (at most once per 5s per bag).
-      - A sample older than 3s by receive time, or a missing strike, falls back to today's scrap and logs `scrap_oracle_stale`.
+      - A live price older than 3s by receive time leaves the average to decide alone. If both are stale, or the strike is missing, it falls back to today's scrap. Both cases log `scrap_oracle_stale`.
       - Dump is untouched.
   - **Winner:** `sell_winner_min` **0.9995** and the cheap gate is closed (`sell_winner_cheap_if_loser_le` −1). The winner is held and redeemed by mintbot's own redeem thread.
   - **Held dump:**
@@ -55,7 +55,7 @@ pathlog are **stopped / retired**. Do not start them.
   - It never fires after a dump or winner sale, or after the window ends. It always logs `danger_zone`.
   - The scrap-fill alert (`notify_scrap_whatsapp`) and the held-dump alert (`notify_dump_whatsapp`) are both off by default.
   - `CALLMEBOT_PHONE` / `CALLMEBOT_APIKEY` live in the VM's `.env` (systemd `EnvironmentFile`). The alert runs on a background worker only, and logs `notify_sent` / `notify_failed` without the key.
-- **Strike and settlement.** The strike is the Chainlink BTC/USD 60s average (TWAP) sample at the window open, self-checked against Polymarket's published `priceToBeat` (PR #229). Polymarket settles each 15m window on that same 60s Chainlink average at the close. The tape file is audit-only. After PR #234 is pulled, the scrap oracle veto reads the same feed's in-memory sample, not the file.
+- **Strike and settlement.** The strike is the Chainlink BTC/USD 60s average (TWAP) sample at the window open, self-checked against Polymarket's published `priceToBeat` (PR #229). Polymarket settles each 15m window on that same 60s Chainlink average at the close. The tape file is audit-only. After PR #234 is pulled, the scrap oracle veto reads the same feed's in-memory average and live price, not the file.
 - **Loops.** The sell loop (`manage_sells`) and the mint/discover loop run concurrently. Live `poll_s` and `sell_armed_poll_s` are both **1** (30 Sep read). `main` validates `poll_s >= 1`, so the VM's old local `mintbot.py` floor patch is redundant; if it is still present, drop it (`git checkout -- mintbot.py`) before a pull. **The live JSON is untouched** by this repo; only the operator edits it.
 
 ## Repo code defaults (23 September 2026)
@@ -67,7 +67,7 @@ pathlog are **stopped / retired**. Do not start them.
 - `sell_persist_s` **5**, `sell_persist_last_min_s` **2**, window **60s** (code defaults; live is 3 / 2 / 90). Dump persist stays 2s.
 - `sell_persist_skip_when_sized` **false**. A sized book waits the full persist. The 2s last-minute persist applies through market close. There is no late TTM skip.
 - `sell_late_window_s` **0** skips the late Chainlink scrap veto. `sell_oracle_edge_floor_usd`, `sell_oracle_edge_per_ttm`, and `sell_oracle_stale_s` are **0**, so raising only the window does not restore the old $25 / 1.5×TTM / 5s-stale veto. `sell_oracle_edge_persist_s` stays **3**. `oracle_log_enabled` stays true (audit tape).
-- `scrap_oracle_veto_enabled` **true**, `scrap_oracle_veto_usd` **5.0** and `scrap_oracle_veto_stale_s` **3.0** (#234). These are the any-time loser-scrap oracle veto described in the live section. It is separate from the late-window veto and is never applied to the dump.
+- `scrap_oracle_veto_enabled` **true**, `scrap_oracle_veto_usd` **5.0**, `scrap_oracle_veto_stale_s` **3.0** and `scrap_oracle_veto_use_live` **true** (#234). These are the any-time loser-scrap oracle veto described in the live section. It is separate from the late-window veto and is never applied to the dump.
 - The sister-miss held dump is gone. No `sell_dump_if_sister_miss_s`. The bid-under-`sell_dump_below` (code 0.80, live 0.40) persist dump is unchanged when `sell_dump_max_ttm_s` is 0 (code default). The example sets **240**: arm and fire only with that many seconds left or fewer. A filled normal dump sets `sell_dump_leg` (the leg A sold). Inventory already flat does not.
 - `sell_scrap_max_ttm_s` is **0** in code (gate off) and **600** in the example. Above that cutoff the loser scrap does not arm, persist, or fire (sweep, blind, or a new rest). Unknown ttm leaves the gate open. Persist starts only after the gate opens. A blocked cheap bid logs `sell_scrap_time_gated` at most once per 15s per leg. The dump cutoff is separate. `bag_risk` is one log line at window close and does not trade.
 - Wallet A never posts a bid. Same-wallet buyback is not implemented.
