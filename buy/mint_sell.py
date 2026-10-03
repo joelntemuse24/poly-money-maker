@@ -104,6 +104,13 @@ DEFAULT_SELL_KNOBS = {
     "sell_oracle_edge_persist_s": 3.0,
     "sell_oracle_stale_s": 0.0,
     "sell_oracle_edge_floor_usd": 0.0,
+    # Any-time scrap veto: no loser scrap while the 60s TWAP or (use_live)
+    # the live Chainlink price is within $usd of the strike or on the
+    # scrapped leg's side. A stale reading drops out; both stale: no veto.
+    "scrap_oracle_veto_enabled": True,
+    "scrap_oracle_veto_usd": 5.0,
+    "scrap_oracle_veto_stale_s": 3.0,
+    "scrap_oracle_veto_use_live": True,
 }
 
 
@@ -962,6 +969,165 @@ def late_oracle_scrap_ok(
     if edge + 1e-12 < need:
         return False, "edge_thin", detail
     return True, "edge_ok", detail
+
+
+def scrap_oracle_settings(cfg: Any) -> Tuple[bool, float, float, bool]:
+    """``(enabled, threshold_usd, stale_s, use_live)`` for the scrap oracle veto.
+
+    A missing, non-numeric, non-finite or negative value takes the default
+    (on, $5, 3s, live on), so a bad hot-reload edit cannot silently widen
+    the veto.
+    """
+    get = cfg.get if isinstance(cfg, dict) else (lambda _k, d=None: d)
+
+    def _flag(key: str) -> bool:
+        raw = get(key, True)
+        if isinstance(raw, str):
+            return raw.strip().lower() not in ("0", "false", "no", "off", "")
+        return bool(raw)
+
+    def _num(key: str, default: float) -> float:
+        val = _finite_usd(get(key, default))
+        if val is None or val < 0:
+            return default
+        return val
+
+    return (
+        _flag("scrap_oracle_veto_enabled"),
+        _num("scrap_oracle_veto_usd", 5.0),
+        _num("scrap_oracle_veto_stale_s", 3.0),
+        _flag("scrap_oracle_veto_use_live"),
+    )
+
+
+# Chainlink obs stamps reach us ~1.5-2.5s late; past stale_s + this the
+# reading is old even if the frame itself just arrived.
+SCRAP_ORACLE_OBS_LAG_S = 7.0
+
+
+def _scrap_source_check(
+    value: Optional[float],
+    age_s: Optional[float],
+    obs_age_s: Optional[float],
+    stale_s: float,
+    name: str,
+) -> Optional[str]:
+    """None when the reading is usable, else why not (``missing_twap`` ...)."""
+    if value is None:
+        return f"missing_{name}"
+    if age_s is None:
+        return f"missing_{name}_age"
+    if float(age_s) > float(stale_s) + 1e-12:
+        return f"stale_{name}"
+    if obs_age_s is not None and float(obs_age_s) > float(stale_s) + SCRAP_ORACLE_OBS_LAG_S:
+        return "stale_obs" if name == "twap" else f"stale_{name}_obs"
+    return None
+
+
+def _scrap_side_verdict(leg: str, margin: float, thr: float) -> Optional[str]:
+    """``favors`` / ``within`` when this margin vetoes scrapping ``leg``."""
+    if leg == "up":
+        if margin > -thr:
+            return "favors" if margin > 0 else "within"
+    elif margin < thr:
+        return "favors" if margin < 0 else "within"
+    return None
+
+
+def _round_age(age: Optional[float]) -> Optional[float]:
+    return None if age is None else round(float(age), 3)
+
+
+def scrap_oracle_veto(
+    *,
+    scrap_leg: Optional[str],
+    twap_usd: Any,
+    strike_usd: Any,
+    twap_age_s: Optional[float],
+    threshold_usd: float,
+    stale_s: float,
+    enabled: bool = True,
+    obs_age_s: Optional[float] = None,
+    live_usd: Any = None,
+    live_age_s: Optional[float] = None,
+    live_obs_age_s: Optional[float] = None,
+    use_live: bool = False,
+) -> Tuple[bool, str, dict]:
+    """``(block, why, detail)``: veto a loser scrap the oracle still favours.
+
+    ``margin = twap - strike`` and, with ``use_live``, ``live_margin =
+    live - strike``. Scrapping Up is blocked while either margin is
+    ``> -threshold``; scrapping Down while either is ``< +threshold``. So
+    the scrap only goes ahead when every fresh reading is more than
+    ``threshold`` against the leg. Ages are local receive ages;
+    ``*obs_age_s`` (optional) are the Chainlink stamp ages.
+
+    A stale or missing reading drops out (``detail["fallback"]`` is
+    ``twap_only`` / ``live_only``). With neither usable, or no strike,
+    ``block=False`` with the reason, so the scrap runs as before the veto.
+    """
+    thr = float(threshold_usd)
+    detail: dict = {
+        "leg": scrap_leg,
+        "twap": None,
+        "strike": None,
+        "margin": None,
+        "live_price": None,
+        "live_margin": None,
+        "threshold": thr,
+        "age_s": _round_age(twap_age_s),
+        "obs_age_s": _round_age(obs_age_s),
+        "live_age_s": _round_age(live_age_s),
+        "live_obs_age_s": _round_age(live_obs_age_s),
+        "twap_why": None,
+        "live_why": None if use_live else "live_off",
+        "basis": None,
+        "fallback": None,
+    }
+    if not enabled:
+        return False, "disabled", detail
+    if scrap_leg not in ("up", "dn"):
+        return False, "bad_leg", detail
+    strike = _finite_usd(strike_usd)
+    twap = _finite_usd(twap_usd)
+    live = _finite_usd(live_usd) if use_live else None
+    detail["strike"] = strike
+    detail["twap"] = twap
+    detail["live_price"] = live
+    if strike is None:
+        detail["fallback"] = "none"
+        return False, "missing_strike", detail
+    twap_bad = _scrap_source_check(twap, twap_age_s, obs_age_s, stale_s, "twap")
+    twap_verdict = None
+    if twap_bad is None:
+        detail["margin"] = round(twap - strike, 4)
+        twap_verdict = _scrap_side_verdict(scrap_leg, detail["margin"], thr)
+    detail["twap_why"] = twap_bad or (twap_verdict or "clear_against")
+    live_bad: Optional[str] = "live_off"
+    live_verdict = None
+    if use_live:
+        live_bad = _scrap_source_check(live, live_age_s, live_obs_age_s, stale_s, "live")
+        if live_bad is None:
+            detail["live_margin"] = round(live - strike, 4)
+            live_verdict = _scrap_side_verdict(scrap_leg, detail["live_margin"], thr)
+        detail["live_why"] = live_bad or (live_verdict or "clear_against")
+    if twap_bad is not None and live_bad is not None:
+        detail["fallback"] = "none"
+        return False, twap_bad, detail
+    if twap_bad is None and live_bad is None:
+        detail["basis"] = "twap+live"
+    elif twap_bad is None:
+        detail["basis"] = "twap"
+        if use_live:
+            detail["fallback"] = "twap_only"
+    else:
+        detail["basis"] = "live"
+        detail["fallback"] = "live_only"
+    if twap_verdict is not None:
+        return True, ("oracle_favors_leg" if twap_verdict == "favors" else "within_threshold"), detail
+    if live_verdict is not None:
+        return True, ("live_favors_leg" if live_verdict == "favors" else "live_within_threshold"), detail
+    return False, "clear_against", detail
 
 
 def late_oracle_edge_persist(

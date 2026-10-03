@@ -120,6 +120,8 @@ from buy.mint_sell import (
     inventory_latch,
     advance_oracle_edge_arm,
     late_oracle_scrap_ok,
+    scrap_oracle_settings,
+    scrap_oracle_veto,
     loser_blind_fak_due,
     loser_empty_keep_qualify,
     loser_ladder_limits,
@@ -279,6 +281,16 @@ DEFAULTS = {
     "sell_oracle_edge_persist_s": 3.0,
     "sell_oracle_stale_s": 0.0,
     "sell_oracle_edge_floor_usd": 0.0,
+    # Any-time loser-scrap veto (not the late window above, not the dump):
+    # block a scrap while the 60s TWAP or (scrap_oracle_veto_use_live) the
+    # live Chainlink price, minus the strike, is not at least
+    # scrap_oracle_veto_usd against the scrapped leg. A reading older than
+    # scrap_oracle_veto_stale_s drops out; both stale, or no strike, falls
+    # back to no veto.
+    "scrap_oracle_veto_enabled": True,
+    "scrap_oracle_veto_usd": 5.0,
+    "scrap_oracle_veto_stale_s": 3.0,
+    "scrap_oracle_veto_use_live": True,
     "rpc_url": "https://polygon.drpc.org",
     "gamma_url": "https://gamma-api.polymarket.com",
     "data_api_url": "https://data-api.polymarket.com",
@@ -1422,6 +1434,7 @@ def _fire_loser_scrap(
     intent: dict,
     shares: float,
     fills: Optional[list] = None,
+    log_extra: Optional[dict] = None,
 ) -> Tuple[float, str, Optional[float], bool]:
     """One floor sweep, or the clipped cent ladder when sweep is off.
 
@@ -1474,6 +1487,7 @@ def _fire_loser_scrap(
             avg_px=avg,
             offered=round(post_size, 4),
             status=status,
+            **(log_extra or {}),
         )
         try:
             if float(sold or 0) > 0 or dry_run:
@@ -2310,6 +2324,147 @@ def _log_sell_scrap_time_gated(
     return True
 
 
+def _scrap_oracle_log_due(kind: str, condition_id: str, now_s: float, interval_s: float) -> bool:
+    stamps = getattr(_scrap_oracle_log_due, "_last_at", None)
+    if not isinstance(stamps, dict):
+        stamps = {}
+        setattr(_scrap_oracle_log_due, "_last_at", stamps)
+    key = f"{kind}:{condition_id}"
+    prev = stamps.get(key)
+    if prev is not None and float(now_s) + 1e-12 < float(prev) + float(interval_s):
+        return False
+    stamps[key] = float(now_s)
+    return True
+
+
+def _scrap_oracle_gate(
+    cfg: dict,
+    condition_id: str,
+    leg: Any,
+    *,
+    now_s: float,
+    slug: Any,
+    bid: Any,
+    ttm: Optional[float],
+    phase: str,
+    log_interval_s: float = 5.0,
+) -> Tuple[bool, str, dict]:
+    """In-memory scrap oracle veto. No I/O: reads the RTDS 60s TWAP and live
+    Chainlink price the feed thread already holds. Logs ``scrap_oracle_veto``
+    on a block and ``scrap_oracle_stale`` when a reading drops out, each at
+    most once per bag per ``log_interval_s``."""
+    enabled, threshold, stale_s, use_live = scrap_oracle_settings(cfg)
+    if not enabled:
+        return False, "disabled", {}
+    if leg not in ("up", "dn"):
+        return False, "bad_leg", {}
+    view = _oracle_bag_view(condition_id)
+    now_f = float(now_s)
+
+    def _ages(recv: Any, obs: Any) -> Tuple[Optional[float], Optional[float]]:
+        ref = recv if recv is not None else obs
+        age = None if ref is None else max(0.0, now_f - float(ref))
+        obs_age = None if obs is None else max(0.0, now_f - float(obs))
+        return age, obs_age
+
+    age, obs_age = _ages(getattr(view, "recv_ts", None), getattr(view, "obs_ts", None))
+    live_age, live_obs_age = _ages(
+        getattr(view, "live_recv_ts", None), getattr(view, "live_obs_ts", None),
+    )
+    block, why, detail = scrap_oracle_veto(
+        scrap_leg=leg,
+        twap_usd=getattr(view, "twap", None),
+        strike_usd=getattr(view, "open_usd", None),
+        twap_age_s=age,
+        threshold_usd=threshold,
+        stale_s=stale_s,
+        obs_age_s=obs_age,
+        live_usd=getattr(view, "live_price", None),
+        live_age_s=live_age,
+        live_obs_age_s=live_obs_age,
+        use_live=use_live,
+    )
+    detail["why"] = why
+    detail["open_source"] = getattr(view, "open_source", None)
+    common = {
+        "condition_id": condition_id,
+        "slug": slug,
+        "side": leg,
+        "bid": bid,
+        "ttm": None if ttm is None else round(float(ttm), 3),
+        "phase": phase,
+    }
+    if block:
+        if _scrap_oracle_log_due("veto", condition_id, now_s, log_interval_s):
+            log_event(
+                "scrap_oracle_veto",
+                **common,
+                twap=detail.get("twap"),
+                strike=detail.get("strike"),
+                margin=detail.get("margin"),
+                live_price=detail.get("live_price"),
+                live_margin=detail.get("live_margin"),
+                threshold=detail.get("threshold"),
+                why=why,
+                basis=detail.get("basis"),
+                age_s=detail.get("age_s"),
+                live_age_s=detail.get("live_age_s"),
+                obs_age_s=detail.get("obs_age_s"),
+                open_source=detail.get("open_source"),
+            )
+    fallback = detail.get("fallback")
+    if fallback:
+        if fallback == "twap_only":
+            reason = detail.get("live_why")
+        elif fallback == "live_only":
+            reason = detail.get("twap_why")
+        else:
+            reason = why
+        if _scrap_oracle_log_due("stale", condition_id, now_s, log_interval_s):
+            log_event(
+                "scrap_oracle_stale",
+                **common,
+                level="WARNING",
+                reason=reason,
+                fallback=fallback,
+                age_s=detail.get("age_s"),
+                obs_age_s=detail.get("obs_age_s"),
+                live_age_s=detail.get("live_age_s"),
+                live_obs_age_s=detail.get("live_obs_age_s"),
+                stale_s=stale_s,
+                twap=detail.get("twap"),
+                live_price=detail.get("live_price"),
+                strike=detail.get("strike"),
+                open_source=detail.get("open_source"),
+            )
+            what = (
+                "scrap not vetoed" if fallback == "none"
+                else f"veto on {fallback.replace('_only', '')} only"
+            )
+            console.print(
+                f"  [bold red][ORACLE STALE][/] {slug} {leg} {what}: {reason} "
+                f"twap_age={detail.get('age_s')}s live_age={detail.get('live_age_s')}s"
+            )
+    return block, why, detail
+
+
+def _scrap_oracle_fields(detail: Optional[dict]) -> dict:
+    """Margin fields for scrap fill events (empty when the veto did not run)."""
+    if not detail:
+        return {}
+    return {
+        "oracle_margin": detail.get("margin"),
+        "oracle_twap": detail.get("twap"),
+        "oracle_live_price": detail.get("live_price"),
+        "oracle_live_margin": detail.get("live_margin"),
+        "oracle_strike": detail.get("strike"),
+        "oracle_why": detail.get("why"),
+        "oracle_basis": detail.get("basis"),
+        "oracle_age_s": detail.get("age_s"),
+        "oracle_live_age_s": detail.get("live_age_s"),
+    }
+
+
 def _bag_risk_rows() -> dict:
     rows = getattr(_bag_risk_rows, "_rows", None)
     if not isinstance(rows, dict):
@@ -3106,13 +3261,41 @@ def _manage_sells_locked(cfg: dict, state: dict, chain: ChainReader) -> None:
                         cutoff=scrap_max_ttm_s,
                         now_s=now,
                     )
+        # Scrap oracle veto: re-read every tick from memory. A block resets
+        # the arm like the time gate, so once the TWAP is clearly against
+        # the leg the scrap still waits its full persist.
+        veto_leg = loser or keep_leg or prev_leg
+        scrap_veto = False
+        scrap_oracle: dict = {}
+        if (
+            scrap_ttm_ok
+            and not sold_loser
+            and veto_leg in ("up", "dn")
+            and (
+                loser is not None
+                or keep_empty
+                or fak_rearm
+                or intent.get("sell_scrap_rest_id")
+            )
+        ):
+            scrap_veto, _veto_why, scrap_oracle = _scrap_oracle_gate(
+                cfg,
+                cid,
+                veto_leg,
+                now_s=now,
+                slug=intent.get("slug"),
+                bid=bids.get(veto_leg),
+                ttm=ttm_s,
+                phase="arm",
+            )
+        scrap_ok = scrap_ttm_ok and not scrap_veto
         fire_l, armed_l, why_l = loser_persist_ready(
-            loser is not None and not sold_loser and scrap_ttm_ok,
+            loser is not None and not sold_loser and scrap_ok,
             now_s=now,
             armed_ts=intent.get("sell_loser_armed_at"),
             persist_s=loser_persist_s,
             last_status=intent.get("sell_last_status"),
-            book_empty=(keep_empty or fak_rearm) and scrap_ttm_ok,
+            book_empty=(keep_empty or fak_rearm) and scrap_ok,
         )
         intent["sell_loser_armed_at"] = armed_l
         if why_l == "reset":
@@ -3219,7 +3402,7 @@ def _manage_sells_locked(cfg: dict, state: dict, chain: ChainReader) -> None:
             cid,
             shares=shares,
             tol=tol,
-            oracle_blocks=oracle_hard_block,
+            oracle_blocks=oracle_hard_block or scrap_veto,
             loser_qualifies=loser_qualifies,
             window_open=True,
         )
@@ -3265,7 +3448,7 @@ def _manage_sells_locked(cfg: dict, state: dict, chain: ChainReader) -> None:
 
         if (
             fire_l
-            and scrap_ttm_ok
+            and scrap_ok
             and loser
             and not cooling
             and not intent.get("sold_loser")
@@ -3347,10 +3530,24 @@ def _manage_sells_locked(cfg: dict, state: dict, chain: ChainReader) -> None:
                         post_size = _scrap_post_shares(
                             intent, size, scrap_fraction, cid, loser,
                         )
-                    if (
+                    plan_done = (
                         _uses_scrap_plan(intent, scrap_fraction)
                         and post_size < 0.01
-                    ):
+                    )
+                    fire_veto = False
+                    fire_oracle = scrap_oracle
+                    if not plan_done:
+                        fire_veto, _fire_why, fire_oracle = _scrap_oracle_gate(
+                            cfg,
+                            cid,
+                            loser,
+                            now_s=time.time(),
+                            slug=intent.get("slug"),
+                            bid=loser_bid,
+                            ttm=ttm_s,
+                            phase="fire",
+                        )
+                    if plan_done:
                         _met, why = scrap_target_met(
                             filled=float(intent.get("sell_filled") or 0),
                             target=float(intent.get("sell_scrap_target") or 0),
@@ -3365,7 +3562,13 @@ def _manage_sells_locked(cfg: dict, state: dict, chain: ChainReader) -> None:
                             note=why or "scrap_keep",
                             outcome=why or "target_filled",
                         )
+                    elif fire_veto:
+                        intent["sell_loser_armed_at"] = None
                     else:
+                        oracle_fields = _scrap_oracle_fields(fire_oracle)
+                        if oracle_fields:
+                            intent["sell_scrap_oracle_margin"] = oracle_fields["oracle_margin"]
+                            intent["sell_scrap_oracle_live_margin"] = oracle_fields["oracle_live_margin"]
                         scrap_fills: list = []
                         with _io_unlocked():
                             sold_total, last_status, last_px, balance_flat = (
@@ -3391,6 +3594,7 @@ def _manage_sells_locked(cfg: dict, state: dict, chain: ChainReader) -> None:
                                     intent=intent,
                                     shares=shares,
                                     fills=scrap_fills,
+                                    log_extra=oracle_fields,
                                 )
                             )
                         record_fill_px(intent, "sell_fill_px", scrap_fills)
@@ -3428,6 +3632,7 @@ def _manage_sells_locked(cfg: dict, state: dict, chain: ChainReader) -> None:
                                 bid=loser_bid,
                                 status=last_status,
                                 **done_extra,
+                                **oracle_fields,
                             )
                             notify(
                                 "Mint loser sold",
@@ -3460,7 +3665,7 @@ def _manage_sells_locked(cfg: dict, state: dict, chain: ChainReader) -> None:
                             )
 
         if (
-            scrap_ttm_ok
+            scrap_ok
             and not intent.get("sold_loser")
             and not intent.get("sell_scrap_rest_id")
             and persist_leg in ("up", "dn")
@@ -3512,8 +3717,27 @@ def _manage_sells_locked(cfg: dict, state: dict, chain: ChainReader) -> None:
                     oracle_blocks=oracle_blocks_new,
                     enabled=blind_enabled,
                 )
+                blind_oracle = scrap_oracle
+                if blind_fire and b_tok:
+                    blind_veto, _blind_vwhy, blind_oracle = _scrap_oracle_gate(
+                        cfg,
+                        cid,
+                        persist_leg,
+                        now_s=time.time(),
+                        slug=intent.get("slug"),
+                        bid=bids.get(persist_leg),
+                        ttm=ttm_s,
+                        phase="blind",
+                    )
+                    if blind_veto:
+                        blind_fire = False
+                        intent["sell_loser_armed_at"] = None
                 if blind_fire and b_tok:
                     intent["sell_blind_last_at"] = now
+                    blind_fields = _scrap_oracle_fields(blind_oracle)
+                    if blind_fields:
+                        intent["sell_scrap_oracle_margin"] = blind_fields["oracle_margin"]
+                        intent["sell_scrap_oracle_live_margin"] = blind_fields["oracle_live_margin"]
                     blind_raw: list = []
                     with _io_unlocked():
                         blind_sold, blind_status = _fak_sell(
@@ -3530,6 +3754,7 @@ def _manage_sells_locked(cfg: dict, state: dict, chain: ChainReader) -> None:
                         sold=blind_sold,
                         status=blind_status,
                         why=blind_why,
+                        **blind_fields,
                     )
                     intent["sell_attempts"] = int(intent.get("sell_attempts") or 0) + 1
                     intent["sell_last_status"] = blind_status
@@ -3559,6 +3784,7 @@ def _manage_sells_locked(cfg: dict, state: dict, chain: ChainReader) -> None:
                             leg=persist_leg,
                             sold=blind_sold,
                             status=blind_status,
+                            **blind_fields,
                         )
                     elif empty_fak_status(blind_status):
                         _place_scrap_rest(
@@ -3581,7 +3807,7 @@ def _manage_sells_locked(cfg: dict, state: dict, chain: ChainReader) -> None:
                             fak_miss=True,
                         )
         elif (
-            scrap_ttm_ok
+            scrap_ok
             and why_l in {"empty_fak_keep_arm", "empty_fak_rearm"}
             and not intent.get("sell_scrap_rest_id")
             and not intent.get("sold_loser")
