@@ -9,8 +9,10 @@ in-memory value fresh through the last 6 minutes.
 from __future__ import annotations
 
 import json
+import tempfile
 import timeit
 import unittest
+from pathlib import Path
 from types import SimpleNamespace
 
 from buy.mint_sell import (
@@ -25,12 +27,15 @@ from buy.oracle_log import (
     FEED_SILENT_HOT_S,
     FEED_SILENT_RECONNECT_S,
     GAMMA_FIRST_S,
+    RTDS_LIVE_TOPIC,
+    SUBSCRIBE_FRAME,
     GammaStrike,
     OracleLogService,
     OracleWindow,
     RtdsTwapFeed,
     TwapSample,
     _WindowMemory,
+    parse_rtds_live,
 )
 from test_mint_cpu import (
     MINT,
@@ -43,7 +48,7 @@ from test_mint_cpu import (
     _scrap_harness,
 )
 from test_oracle_feed_health import ReconnectFeed, Recorder, _open_only, _service
-from test_oracle_log import END, START, _bag, _sample
+from test_oracle_log import END, START, _bag, _rows, _sample
 
 # btc-updown-15m-1791039600 (3 Oct 2026, 16:00-16:15 IST): 100 Up scrapped at
 # 2-3c with 31s left while the TWAP sat $0.42 above the strike. Up won.
@@ -120,37 +125,129 @@ class VetoHelperTests(unittest.TestCase):
         self.assertEqual(_veto(None, TWAP_UP_WINNING)[:2], (False, "bad_leg"))
 
     def test_settings_defaults_and_bad_values(self):
-        self.assertEqual(scrap_oracle_settings({}), (True, 5.0, 3.0))
-        self.assertEqual(scrap_oracle_settings(None), (True, 5.0, 3.0))
+        self.assertEqual(scrap_oracle_settings({}), (True, 5.0, 3.0, True))
+        self.assertEqual(scrap_oracle_settings(None), (True, 5.0, 3.0, True))
         self.assertEqual(
             scrap_oracle_settings(
                 {"scrap_oracle_veto_enabled": False, "scrap_oracle_veto_usd": 7.5,
-                 "scrap_oracle_veto_stale_s": 2.0}
+                 "scrap_oracle_veto_stale_s": 2.0, "scrap_oracle_veto_use_live": False}
             ),
-            (False, 7.5, 2.0),
+            (False, 7.5, 2.0, False),
         )
         self.assertEqual(
             scrap_oracle_settings(
                 {"scrap_oracle_veto_usd": "abc", "scrap_oracle_veto_stale_s": -1}
             ),
-            (True, 5.0, 3.0),
+            (True, 5.0, 3.0, True),
         )
         self.assertFalse(scrap_oracle_settings({"scrap_oracle_veto_enabled": "false"})[0])
         self.assertTrue(scrap_oracle_settings({"scrap_oracle_veto_enabled": "true"})[0])
+        self.assertFalse(scrap_oracle_settings({"scrap_oracle_veto_use_live": "off"})[3])
         self.assertTrue(DEFAULT_SELL_KNOBS["scrap_oracle_veto_enabled"])
         self.assertEqual(DEFAULT_SELL_KNOBS["scrap_oracle_veto_usd"], 5.0)
         self.assertEqual(DEFAULT_SELL_KNOBS["scrap_oracle_veto_stale_s"], 3.0)
+        self.assertTrue(DEFAULT_SELL_KNOBS["scrap_oracle_veto_use_live"])
+
+
+def _veto_live(leg, twap, live, *, age=0.5, live_age=0.5, use_live=True, **kw):
+    return _veto(
+        leg, twap, age=age, live_usd=live, live_age_s=live_age, use_live=use_live, **kw,
+    )
+
+
+class LiveVetoHelperTests(unittest.TestCase):
+    def test_live_favours_side_while_average_is_against_blocks(self):
+        block, why, d = _veto_live("up", STRIKE - 9.0, STRIKE + 1.25)
+        self.assertTrue(block)
+        self.assertEqual(why, "live_favors_leg")
+        self.assertAlmostEqual(d["margin"], -9.0)
+        self.assertAlmostEqual(d["live_margin"], 1.25)
+        self.assertEqual(d["twap_why"], "clear_against")
+        self.assertEqual(d["live_why"], "favors")
+        self.assertEqual(d["basis"], "twap+live")
+        self.assertIsNone(d["fallback"])
+        block, why, _ = _veto_live("dn", STRIKE + 9.0, STRIKE - 0.5)
+        self.assertEqual((block, why), (True, "live_favors_leg"))
+
+    def test_live_within_threshold_blocks(self):
+        block, why, d = _veto_live("up", STRIKE - 9.0, STRIKE - 4.0)
+        self.assertEqual((block, why), (True, "live_within_threshold"))
+        self.assertAlmostEqual(d["live_margin"], -4.0)
+
+    def test_average_still_blocks_when_live_is_clear(self):
+        block, why, _ = _veto_live("up", TWAP_UP_WINNING, STRIKE - 20.0)
+        self.assertEqual((block, why), (True, "oracle_favors_leg"))
+
+    def test_both_against_by_more_than_threshold_allows(self):
+        block, why, d = _veto_live("up", STRIKE - 6.0, STRIKE - 5.01)
+        self.assertEqual((block, why), (False, "clear_against"))
+        self.assertEqual(d["basis"], "twap+live")
+        block, why, _ = _veto_live("dn", STRIKE + 6.0, STRIKE + 7.0)
+        self.assertEqual((block, why), (False, "clear_against"))
+        # Exactly $5 against on the live print goes ahead too.
+        self.assertFalse(_veto_live("up", STRIKE - 6.0, STRIKE - 5.0)[0])
+
+    def test_live_stale_means_average_alone(self):
+        block, why, d = _veto_live("up", STRIKE - 6.0, STRIKE + 3.0, live_age=3.5)
+        self.assertEqual((block, why), (False, "clear_against"))
+        self.assertEqual(d["basis"], "twap")
+        self.assertEqual(d["fallback"], "twap_only")
+        self.assertEqual(d["live_why"], "stale_live")
+        self.assertIsNone(d["live_margin"])
+        block, why, d = _veto_live("up", TWAP_UP_WINNING, STRIKE - 20.0, live_age=None)
+        self.assertEqual((block, why), (True, "oracle_favors_leg"))
+        self.assertEqual(d["live_why"], "missing_live_age")
+        block, _why, d = _veto_live("up", STRIKE - 6.0, None)
+        self.assertFalse(block)
+        self.assertEqual(d["live_why"], "missing_live")
+        _b, _w, d = _veto_live("up", STRIKE - 6.0, STRIKE + 3, live_obs_age_s=10.5)
+        self.assertEqual(d["live_why"], "stale_live_obs")
+        self.assertFalse(_b)
+
+    def test_average_stale_means_live_alone(self):
+        block, why, d = _veto_live("up", STRIKE - 9.0, STRIKE + 1.0, age=4.0)
+        self.assertEqual((block, why), (True, "live_favors_leg"))
+        self.assertEqual(d["fallback"], "live_only")
+        self.assertEqual(d["twap_why"], "stale_twap")
+        block, _why, d = _veto_live("up", TWAP_UP_WINNING, STRIKE - 9.0, age=4.0)
+        self.assertFalse(block)
+        self.assertEqual(d["basis"], "live")
+
+    def test_both_stale_falls_back_to_scrap(self):
+        block, why, d = _veto_live("up", TWAP_UP_WINNING, STRIKE + 1, age=4.0, live_age=4.0)
+        self.assertEqual((block, why), (False, "stale_twap"))
+        self.assertEqual(d["fallback"], "none")
+        self.assertEqual(d["live_why"], "stale_live")
+
+    def test_use_live_false_ignores_the_live_print(self):
+        block, why, d = _veto_live("up", STRIKE - 9.0, STRIKE + 5.0, use_live=False)
+        self.assertEqual((block, why), (False, "clear_against"))
+        self.assertIsNone(d["live_price"])
+        self.assertEqual(d["live_why"], "live_off")
+        self.assertIsNone(d["fallback"])
+        block, why, d = _veto_live("up", TWAP_UP_WINNING, STRIKE + 5.0, age=4.0, use_live=False)
+        self.assertEqual((block, why, d["fallback"]), (False, "stale_twap", "none"))
+
+
+_SAME = object()
 
 
 class _View:
-    """Mutable stand-in for ``_oracle_bag_view`` (an in-memory read)."""
+    """Mutable stand-in for ``_oracle_bag_view`` (an in-memory read).
 
-    def __init__(self, clock, *, twap=TWAP_UP_WINNING, strike=STRIKE, age=0.8, lag=2.0):
+    ``live`` / ``live_age`` default to following the TWAP and its age."""
+
+    def __init__(
+        self, clock, *, twap=TWAP_UP_WINNING, strike=STRIKE, age=0.8, lag=2.0,
+        live=_SAME, live_age=_SAME,
+    ):
         self.clock = clock
         self.twap = twap
         self.strike = strike
         self.age = age
         self.lag = lag
+        self.live = live
+        self.live_age = live_age
         self.calls = 0
         self.script: list = []
 
@@ -160,6 +257,9 @@ class _View:
             self.twap = self.script.pop(0)
         now = self.clock["now"]
         recv = None if self.age is None else now - self.age
+        live = self.twap if self.live is _SAME else self.live
+        live_age = self.age if self.live_age is _SAME else self.live_age
+        live_recv = None if live_age is None else now - live_age
         return SimpleNamespace(
             twap=None if self.twap is None else str(self.twap),
             open_usd=None if self.strike is None else str(self.strike),
@@ -167,6 +267,9 @@ class _View:
             recv_ts=recv,
             open_source="rtds_twap_at_start",
             source="polymarket_rtds",
+            live_price=None if live is None else str(live),
+            live_obs_ts=None if live_recv is None else live_recv - 1.2,
+            live_recv_ts=live_recv,
         )
 
 
@@ -401,6 +504,123 @@ class SellLoopVetoTests(unittest.TestCase):
         self.assertFalse(_named(events, "scrap_oracle_veto"))
         self.assertFalse(_named(events, "scrap_oracle_stale"))
 
+    def test_live_price_favouring_the_side_blocks_while_average_is_against(self):
+        ns, events, fak_calls, clock, intent, _view, _end = self._setup(
+            twap=STRIKE - 9.0, live=STRIKE + 0.8,
+        )
+        cfg = _scrap_cfg()
+        for _ in range(12):
+            self._tick(ns, cfg, intent)
+            clock["now"] += 0.5
+        self.assertEqual(fak_calls, [])
+        self.assertIsNone(intent.get("sell_loser_armed_at"))
+        row = _named(events, "scrap_oracle_veto")[0]
+        self.assertEqual(row["why"], "live_favors_leg")
+        self.assertAlmostEqual(row["margin"], -9.0)
+        self.assertAlmostEqual(row["live_price"], STRIKE + 0.8)
+        self.assertAlmostEqual(row["live_margin"], 0.8)
+        self.assertEqual(row["basis"], "twap+live")
+        self.assertFalse(_named(events, "scrap_oracle_stale"))
+
+    def test_both_against_by_more_than_5_scraps_with_live_fields(self):
+        ns, events, fak_calls, clock, intent, _view, _end = self._setup(
+            twap=STRIKE - 6.0, live=STRIKE - 7.5,
+        )
+        cfg = _scrap_cfg()
+        self._tick(ns, cfg, intent)
+        armed = intent["sell_loser_armed_at"]
+        clock["now"] = armed + 2.0
+        self._tick(ns, cfg, intent)
+        self.assertEqual(len(fak_calls), 1)
+        for name in ("sell_scrap_sweep", "sell_loser_done"):
+            row = _named(events, name)[0]
+            self.assertAlmostEqual(row["oracle_margin"], -6.0)
+            self.assertAlmostEqual(row["oracle_live_price"], STRIKE - 7.5)
+            self.assertAlmostEqual(row["oracle_live_margin"], -7.5)
+            self.assertEqual(row["oracle_basis"], "twap+live")
+        self.assertAlmostEqual(intent["sell_scrap_oracle_live_margin"], -7.5)
+
+    def test_live_turning_at_fire_time_blocks_the_post(self):
+        ns, events, fak_calls, clock, intent, view, _end = self._setup(
+            twap=STRIKE - 9.0, live=STRIKE - 9.0,
+        )
+        cfg = _scrap_cfg()
+        self._tick(ns, cfg, intent)
+        armed = intent["sell_loser_armed_at"]
+        clock["now"] = armed + 2.0
+        calls = {"n": 0}
+        base = view.__call__
+
+        def flip(cid):
+            calls["n"] += 1
+            if calls["n"] == 2:
+                view.live = STRIKE + 0.3
+            return base(cid)
+
+        ns["_oracle_bag_view"] = flip
+        self._tick(ns, cfg, intent)
+        self.assertEqual(fak_calls, [])
+        vetoes = _named(events, "scrap_oracle_veto")
+        self.assertEqual([(r["phase"], r["why"]) for r in vetoes], [("fire", "live_favors_leg")])
+
+    def test_live_stale_uses_the_average_alone_and_logs(self):
+        ns, events, fak_calls, clock, intent, _view, _end = self._setup(
+            twap=STRIKE - 6.0, live=STRIKE + 2.0, live_age=4.0,
+        )
+        cfg = _scrap_cfg()
+        self._tick(ns, cfg, intent)
+        armed = intent["sell_loser_armed_at"]
+        clock["now"] = armed + 2.0
+        self._tick(ns, cfg, intent)
+        self.assertEqual(len(fak_calls), 1)
+        stale = _named(events, "scrap_oracle_stale")
+        self.assertEqual(stale[0]["reason"], "stale_live")
+        self.assertEqual(stale[0]["fallback"], "twap_only")
+        self.assertAlmostEqual(stale[0]["live_age_s"], 4.0)
+        self.assertEqual(stale[0]["level"], "WARNING")
+        done = _named(events, "sell_loser_done")[0]
+        self.assertEqual(done["oracle_basis"], "twap")
+        self.assertIsNone(done["oracle_live_margin"])
+
+    def test_live_stale_average_favouring_still_blocks(self):
+        ns, events, fak_calls, clock, intent, _view, _end = self._setup(
+            live=STRIKE - 20.0, live_age=None,
+        )
+        for _ in range(6):
+            self._tick(ns, _scrap_cfg(), intent)
+            clock["now"] += 0.5
+        self.assertEqual(fak_calls, [])
+        self.assertEqual(_named(events, "scrap_oracle_veto")[0]["why"], "oracle_favors_leg")
+        self.assertEqual(_named(events, "scrap_oracle_stale")[0]["reason"], "missing_live_age")
+
+    def test_both_stale_scraps_as_today(self):
+        ns, events, fak_calls, clock, intent, _view, _end = self._setup(
+            live=STRIKE + 2.0, age=4.0, live_age=5.0,
+        )
+        cfg = _scrap_cfg()
+        self._tick(ns, cfg, intent)
+        clock["now"] += 2.0
+        self._tick(ns, cfg, intent)
+        self.assertEqual(len(fak_calls), 1)
+        stale = _named(events, "scrap_oracle_stale")[0]
+        self.assertEqual((stale["reason"], stale["fallback"]), ("stale_twap", "none"))
+        self.assertAlmostEqual(stale["live_age_s"], 5.0)
+
+    def test_use_live_hot_reload_off_ignores_live(self):
+        ns, events, fak_calls, clock, intent, _view, _end = self._setup(
+            twap=STRIKE - 9.0, live=STRIKE + 1.0,
+        )
+        cfg = _scrap_cfg()
+        self._tick(ns, cfg, intent)
+        self.assertIsNone(intent.get("sell_loser_armed_at"))
+        cfg["scrap_oracle_veto_use_live"] = False
+        clock["now"] += 0.5
+        self._tick(ns, cfg, intent)
+        armed = intent["sell_loser_armed_at"]
+        clock["now"] = armed + 2.0
+        self._tick(ns, cfg, intent)
+        self.assertEqual(len(fak_calls), 1)
+
     def test_scrap_time_gate_still_applies_first(self):
         ns, events, fak_calls, clock, intent, view, _end = self._setup(ttm=700.0, twap=STRIKE - 9.0)
         self._tick(ns, _scrap_cfg(), intent)
@@ -506,6 +726,75 @@ class FeedFreshnessTests(unittest.TestCase):
         self.assertEqual(view.obs_ts, START + 867.0)
         self.assertEqual(view.open_usd, str(STRIKE))
         self.assertEqual(float(view.twap), 84829.0)
+
+    @staticmethod
+    def _live_frame(obs_ms: int, value: str = "84841164260323815000000", topic=RTDS_LIVE_TOPIC):
+        # Shape captured from wss://ws-live-data.polymarket.com on 3 Oct 2026.
+        return json.dumps(
+            {
+                "topic": topic,
+                "type": "update",
+                "timestamp": obs_ms + 1049,
+                "payload": {
+                    "full_accuracy_value": value,
+                    "symbol": "btc/usd",
+                    "timestamp": obs_ms,
+                    "value": 84841.16426032381,
+                },
+            }
+        )
+
+    def test_live_chainlink_print_is_held_in_memory(self):
+        clock = {"now": 1_791_042_659.05}
+        feed = RtdsTwapFeed(clock=lambda: clock["now"])
+        feed.handle_message(self._live_frame(1_791_042_658_000))
+        live = feed.latest_live()
+        self.assertEqual(live.price, "84841.164260323815")
+        self.assertEqual(live.obs_ts, 1_791_042_658.0)
+        self.assertEqual(live.recv_ts, clock["now"])
+        # Live prints are not TWAP samples: no tape backlog, no TWAP change.
+        self.assertEqual(feed.drain(), [])
+        self.assertIsNone(feed.latest())
+        self.assertEqual(feed.last_error(), "")
+        clock["now"] += 0.9
+        feed.handle_message(self._live_frame(1_791_042_658_000, "84841000000000000000000"))
+        self.assertEqual(feed.latest_live().recv_ts, 1_791_042_659.05)
+        feed.handle_message(self._live_frame(1_791_042_659_000))
+        self.assertEqual(feed.latest_live().recv_ts, clock["now"])
+        feed.handle_message(self._live_frame(1_791_042_600_000))
+        self.assertEqual(feed.latest_live().obs_ts, 1_791_042_659.0)
+
+    def test_live_parser_ignores_snapshot_and_other_symbols(self):
+        self.assertIsNone(parse_rtds_live(self._live_frame(1, topic="crypto_prices")))
+        eth = json.loads(self._live_frame(1_791_042_658_000))
+        eth["payload"]["symbol"] = "eth/usd"
+        self.assertIsNone(parse_rtds_live(json.dumps(eth)))
+        self.assertIsNone(parse_rtds_live("PONG"))
+        self.assertIsNone(parse_rtds_live(self._frame(1_791_040_467_000)))
+        topics = [sub["topic"] for sub in SUBSCRIBE_FRAME["subscriptions"]]
+        self.assertEqual(topics, ["crypto_prices_twap_sixty", RTDS_LIVE_TOPIC])
+
+    def test_bag_view_and_tape_carry_the_live_print(self):
+        clock = {"now": START + 869.0}
+        feed = RtdsTwapFeed(clock=lambda: clock["now"])
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "oracle_twap.jsonl"
+            service = OracleLogService(path, feed=feed, fetch_price=_open_only, jitter=lambda: 0.0)
+            window = OracleWindow(condition_id="cid-15m", slug="s", start_ts=START, end_ts=END)
+            service._memory["cid-15m"] = _WindowMemory(window=window, open_ref=str(STRIKE))
+            feed.handle_message(self._frame(int((START + 867.0) * 1000)))
+            clock["now"] += 0.2
+            feed.handle_message(self._live_frame(int((START + 868.0) * 1000)))
+            view = service.bag_view("cid-15m")
+            self.assertEqual(view.live_price, "84841.164260323815")
+            self.assertEqual(view.live_obs_ts, START + 868.0)
+            self.assertEqual(view.live_recv_ts, START + 869.2)
+            self.assertEqual(view.recv_ts, START + 869.0)
+            service.tick(_bag(), START + 869.5, enabled=True)
+            rows = [r for r in _rows(path) if r["event"] == "oracle_twap"]
+            self.assertTrue(rows)
+            self.assertEqual(rows[-1]["live_price"], "84841.164260323815")
+            self.assertEqual(rows[-1]["live_ts"], START + 868.0)
 
     def test_hot_span_watchdog_reconnects_after_5s_silence(self):
         feed = ReconnectFeed()
@@ -615,6 +904,8 @@ class LatencyTests(unittest.TestCase):
             )
         )
 
+        feed.handle_message(FeedFreshnessTests._live_frame(int((START + 868.0) * 1000)))
+
         def check():
             view = service.bag_view("cid-15m")
             now = clock["now"]
@@ -626,6 +917,10 @@ class LatencyTests(unittest.TestCase):
                 threshold_usd=5.0,
                 stale_s=3.0,
                 obs_age_s=max(0.0, now - view.obs_ts),
+                live_usd=view.live_price,
+                live_age_s=max(0.0, now - view.live_recv_ts),
+                live_obs_age_s=max(0.0, now - view.live_obs_ts),
+                use_live=True,
             )
 
         self.assertTrue(check()[0])
