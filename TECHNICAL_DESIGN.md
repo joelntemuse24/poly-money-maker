@@ -347,12 +347,22 @@ The thread wakes every second while a bag is open. Stored rows are 15s mid-windo
 **Feed health (30 Sep hardening).** On 29–30 Sep the RTDS socket twice stayed connected but silent (22 min and 100 min) and only recovered on its own, while `_note_silence` logged `stale twap age=Ns` every second. Now:
 
 - **Ping/pong and watchdog.** `run_forever` uses protocol ping/pong (`FEED_PING_INTERVAL_S` 20s, `FEED_PING_TIMEOUT_S` 10s) alongside RTDS's text `PING`. While a bag is tracked, no new sample for `FEED_SILENT_RECONNECT_S` (45s) closes the socket (`oracle_feed_watchdog`). Repeated forced closes back off 45 → 90 → 120s (`FEED_WATCHDOG_CAP_S`); a sample resets that. The feed's own reconnect wait is 1s after a connection that delivered samples, else doubling to `FEED_BACKOFF_MAX_S` (30s). Each reconnect logs `oracle_feed_reconnect` (reason, `last_error`, attempt, backoff), throttled to one a minute with a `suppressed` count.
+- **Hot span (#234).** The scrap oracle veto reads this feed, so while any tracked bag is within `FEED_HOT_TTM_S` (360s) of its end the feed runs in hot mode:
+  - The watchdog fires after `FEED_SILENT_HOT_S` (5s) of silence and backs off 5 → 10s (`FEED_HOT_WATCHDOG_CAP_S`). `oracle_feed_watchdog` carries `hot`.
+  - A connection that delivers nothing redials within `FEED_HOT_BACKOFF_S` (2s), not up to 30s.
+  - The post-window Gamma audit, which is blocking HTTP on this thread, waits until no bag is hot.
+
+  Every sample also carries `recv_ts`, the local wall time its frame arrived. `bag_view` exposes it and tape rows log it. The Chainlink `twap_ts` stamp trails arrival by about 1.5–2.5s, so receive time, not `twap_ts`, is the freshness clock.
+- **Measured staleness before the hot span (280 windows, 30 Sep–3 Oct).** The stream ticks every second, and 1.07% of gaps are longer.
+  - In the last 180s (tape write times), the in-memory value was more than 2s old 0.92% of the time, more than 3s old 0.50% and more than 10s old 0.09%.
+  - Silent-socket episodes inside the last 6 minutes (`1791036000`, `1790829000`, `1790762400`) lasted 45–57s, because only the 45s watchdog ended them. The reconnect replay back-filled the missed seconds, so they are invisible in `twap_ts` cadence.
+  - Hot mode cuts such an outage to about 6–8s, and the veto falls back (logged) for those seconds.
 - **Stall lines.** A stale TWAP (> `STALE_AFTER_S` 20s) logs one `oracle_feed_stall` (`age_s`, `last_error`), a reminder at most every `STALL_REMIND_S` (60s), and one `oracle_feed_recovered` (`duration_s`). `oracle_log_fail` is now deduped per kind, not exact text.
 - **HTTP.** crypto-price (strike fallback) and Gamma (reconciliation) each keep one request at a time per window, with 0–3s jitter (`HTTP_JITTER_S`) on the first. crypto-price retries every 20s; a 429 backs off 20 → 40 → 80 → 120s (`HTTP_BACKOFF_CAP_S`). Gamma retries every 120s; a 429 backs off 120 → 240 → 480 → 600s. Both honour a longer Retry-After. Each error kind (`http_400`, `http_429`, ...) is logged once per window per source via `oracle_log_fail`.
 
 These rows go to the tape, and `mintbot` logs them through an `on_event` hook. None of this is read by mint, sell, winner or dump.
 
-`oracle_log_enabled` defaults true (live true). When the feed is down the thread logs the stall and keeps going. Mint eligibility, winner cash-out, and held dump do not read the tape. Loser scrap does not read it while `sell_late_window_s` is **0** (code default and live). `sell_oracle_edge_floor_usd`, `sell_oracle_edge_per_ttm`, and `sell_oracle_stale_s` also default to **0** (live 0), so raising only the window does not restore the old $25 / 1.5×TTM / 5s-stale veto. `sell_oracle_edge_persist_s` is **3** in code and **0** in the live file; it only matters when the window is positive. If the veto is ever turned back on, #214 keeps its edge-persist clock running on the kept scrap leg while the loser book is momentarily empty, instead of resetting it. The tape stays on for audit.
+`oracle_log_enabled` defaults true (live true). When the feed is down the thread logs the stall and keeps going. Mint eligibility, winner cash-out, and held dump do not read the tape. Loser scrap reads only the in-memory feed sample, for the scrap oracle veto (#234, §17). It never reads the tape file. The late-window veto stays off while `sell_late_window_s` is **0** (code default and live). `sell_oracle_edge_floor_usd`, `sell_oracle_edge_per_ttm`, and `sell_oracle_stale_s` also default to **0** (live 0), so raising only the window does not restore the old $25 / 1.5×TTM / 5s-stale veto. `sell_oracle_edge_persist_s` is **3** in code and **0** in the live file; it only matters when the window is positive. If the veto is ever turned back on, #214 keeps its edge-persist clock running on the kept scrap leg while the loser book is momentarily empty, instead of resetting it. The tape stays on for audit.
 
 <a id="section-10b"></a>
 ## Sync-loop audit (same class as mint stealing the dump cycle)
@@ -571,6 +581,21 @@ size, latch = _sell_inventory(chain, ctf, funder_cs, l_tok, shares, tol,
 
 **Late-window oracle veto: off.** `sell_late_window_s` is 0 in code and live, so `in_late` is always false and `late_oracle_scrap_ok` would return `outside_late_window`. The floor / per-TTM / stale knobs are 0 as well, so re-enabling only the window does not bring back the old $25 / 1.5×TTM / 5s-stale rule. The helper still implements that rule when the arguments are passed explicitly. With these values, CLOB gates only.
 
+**Scrap oracle veto (#234, on in code; takes effect live after a pull and restart).** A separate, any-time check that blocks a loser scrap while the oracle still favours that leg. It was added after `btc-updown-15m-1791039600` (3 Oct, 16:00–16:15 IST): 100 Up were scrapped at 2–3¢ with 31s left while the 60s TWAP sat $0.42 above the strike. Up won, and the bag lost about $97.
+
+- `margin = twap − strike`. The TWAP is the latest RTDS 60s sample, and the strike is the bag's `open_ref` (`OracleLogService.bag_view`). Scrapping Up is blocked while `margin > −scrap_oracle_veto_usd`. Scrapping Down is blocked while `margin < +scrap_oracle_veto_usd`. Exactly $5 against goes ahead.
+- Knobs: `scrap_oracle_veto_enabled` (true), `scrap_oracle_veto_usd` (5.0) and `scrap_oracle_veto_stale_s` (3.0). They are hot-reloaded, and a bad or negative value falls back to the default.
+- It is ANDed into the scrap time gate (`scrap_ok = scrap_ttm_ok and not veto`). It therefore blocks the arm, the persist, the sweep or ladder fire, the blind FAK and a new post-miss rest. It also cancels a resting scrap sell (`oracle_blocks`).
+- A block resets `sell_loser_armed_at`, so once the TWAP is more than $5 against the leg the scrap still waits its full persist, inside the 360s cutoff and the 3¢ trigger.
+- `_scrap_oracle_gate` runs again on its own right before `_fire_loser_scrap` and before the blind `_fak_sell`.
+- No I/O: it reads the sample the `oracle-rtds` websocket thread holds in memory. Measured cost is about 4µs per call (p99 about 5µs).
+- Fallback: if the sample is older than `scrap_oracle_veto_stale_s` by local receive time (`recv_ts`), its Chainlink stamp is more than 10s old, or the TWAP or strike is missing, there is no veto and the scrap runs as before.
+- Logs:
+  - `scrap_oracle_veto` on a block (`slug`, `side`, `bid`, `ttm`, `twap`, `strike`, `margin`, `threshold`, `why`, `phase` arm/fire/blind, `age_s`). At most once per 5s per bag.
+  - `scrap_oracle_stale` (`level` WARNING, `reason`, `age_s`, `obs_age_s`) on a fallback, with the same throttle.
+  - A scrap that goes through carries `oracle_margin` / `oracle_twap` / `oracle_strike` / `oracle_why` on `sell_scrap_sweep`, `sell_scrap_blind` and `sell_loser_done`, plus `intent.sell_scrap_oracle_margin`.
+- Dump, `sell_dump_also_kept`, winner and mint never call it. The late-window veto above stays off.
+
 Wallet A never posts a bid.
 
 <a id="section-17b"></a>
@@ -786,6 +811,7 @@ That is the operator's trade: a false alarm costs more than a perfect dump would
 - `loser_blind_fak_due` — blind 1¢ FAK eligibility and backoff.
 - `scrap_rest_action` / `scrap_rest_px` / `resting_tif` / `rest_order_matched_shares` / `posted_order_id` — post-miss rest lifecycle.
 - `late_oracle_scrap_ok` / `advance_oracle_edge_arm` / `side_aware_oracle_edge_usd` — late-window loser-scrap veto. Off unless `sell_late_window_s` > 0.
+- `scrap_oracle_settings` / `scrap_oracle_veto` — any-time scrap oracle veto (#234). Pure: `(block, why, detail)` from TWAP, strike, receive age and threshold.
 - `winner_cashout_leg` — unique leg whose sized bid ≥ winner_min.
 - `winner_cheap_decision` — cheap min only if sold_loser, loser ≤ gate, and loser + cheap > $1.
 - `winner_sell_limit` — clamp live-bid FAK into CLOB [0.01, 0.99].
@@ -870,6 +896,7 @@ Never enable retired buy units (`polycomplement`, buybots, DangerZone, shadow) f
 | `sell_late_window_s` | 0 | 0 | 0 † | Oracle veto off |
 | `sell_oracle_edge_floor_usd` / `_per_ttm` / `_stale_s` | 0 / 0 / 0 | | 0 / 0 / 0 | Old veto knobs zeroed |
 | `sell_oracle_edge_persist_s` | 3 | 3 | **0** | Only used when the veto is on |
+| `scrap_oracle_veto_enabled` / `_usd` / `_stale_s` | true / 5.0 / 3.0 | true / 5.0 / 3.0 | — (code default after pull + restart) | Scrap oracle veto (#234): no scrap while the TWAP is within $5 of the strike or on the scrapped leg's side |
 | `oracle_log_enabled` | true | true | true | Audit tape |
 | `sell_persist_skip_ttm_s` | — | — | 0 | Leftover; ignored (not in `DEFAULTS`) |
 
@@ -907,7 +934,7 @@ Do not import `mintbot.py` in unit tests (credentials, lock, clients). Test `buy
 13. **Oracle tape size** — resolved. `logs/oracle_twap.jsonl` rolls into `logs/archive/` at 20 MB and is gzipped in the background ([§10c](#section-10c)). The 116 MB live file is archived on the first append after the next restart; a `tail -f` must follow the rename (`tail -F`).
 14. **Pathlog retired but enabled** — `polypathlog` has been inactive since 22 Sep and is not coming back, but `systemctl is-enabled` still said `enabled` on 30 Sep. Disable it so a reboot does not revive it ([§27](#section-27)).
 15. **Startup banner** — resolved. `main()` prints `sell_plan_banner(cfg)` from the loaded strategy (sweep vs ladder, scrap fraction, TTM gates, dump threshold, winner floor), and the `startup` event carries the same `sell_plan` string.
-16. **Silent RTDS socket** — resolved in code. A connected-but-silent feed is closed by the 45s watchdog and protocol ping/pong, and the stall logs once plus a reminder a minute instead of every second ([§10c](#section-10c)). The close now comes from the end-boundary RTDS sample, not crypto-price, so crypto-price 429s no longer drop `oracle_window_end` rows (8 of 226 on 29–30 Sep).
+16. **Silent RTDS socket** — resolved in code. A connected-but-silent feed is closed by the 45s watchdog (5s in a bag's last 360s since #234; three 45–57s silences fell inside that span on 30 Sep–3 Oct) and protocol ping/pong, and the stall logs once plus a reminder a minute instead of every second ([§10c](#section-10c)). The close now comes from the end-boundary RTDS sample, not crypto-price, so crypto-price 429s no longer drop `oracle_window_end` rows (8 of 226 on 29–30 Sep).
 17. **A dump now exits both legs.** With `sell_dump_also_kept` true (live), a dumped bag is flat, and its redeem job ends `nothing_held`. Reading `sell_dump_done` alone undercounts the dump event; add `sell_dump_kept` (`sold`, `avg_px`, `outcome`). A `partial` or `no_fill` outcome leaves kept shares to resolution and is not retried.
 18. **Unmerged dump PRs.** `sell_dump_tiers` (PR #231) and the post-dump kept stop (PR #228) are not on `main`. Setting `sell_dump_tiers` in the live file does nothing, because `load_strategy` drops keys missing from `DEFAULTS`.
 
@@ -1295,6 +1322,10 @@ Adjacent mint may already have been submitted **before** expiry (lookahead). Tha
 <a id="changelog"></a>
 # Changelog
 
+- **2026-10-03 (PR #234, not live until pull + restart)** — Scrap oracle veto.
+  - No loser scrap while the in-memory 60s TWAP is within $5 of the strike or on the scrapped leg's side (`scrap_oracle_veto_enabled` true, `scrap_oracle_veto_usd` 5.0, `scrap_oracle_veto_stale_s` 3.0). It is re-checked every tick and right before the order is sent.
+  - A stale or missing feed falls back to the old scrap and logs `scrap_oracle_stale`.
+  - The RTDS feed gains `recv_ts` and a hot mode for the last 360s: a 5s watchdog, a 2s redial and the Gamma audit deferred. Dump is unchanged.
 - **2026-10-03 13:25 IST** — Aligned to the live VM.
   - **Size and capital.** 200 shares a side (was 100). `mint_sequential` on: one bag at a time, minted in [start − 30s, start + 240s] once the previous winner is sold or its window has ended. Two-bag `max_open_sets` / lookahead is no longer the live mode.
   - **Redeem.** `redeem_enabled` on, `redeem_startup_sweep` off.
