@@ -31,7 +31,9 @@ Source, chosen because it needs no Chainlink Data Streams credentials:
   live decision.
 
 Feed health: protocol ping/pong plus a silence watchdog reconnect the
-socket when no sample arrives for ``FEED_SILENT_RECONNECT_S``. A stall is
+socket when no sample arrives for ``FEED_SILENT_RECONNECT_S`` (``FEED_SILENT_HOT_S``
+while a bag is in its last ``FEED_HOT_TTM_S``, where mintbot's scrap oracle
+veto reads ``bag_view``; samples carry a local ``recv_ts``). A stall is
 logged once when it starts (``oracle_feed_stall``), at most once a minute
 while it lasts, and once when it ends (``oracle_feed_recovered``).
 HTTP errors are logged once per window per kind and source; a 429 backs off.
@@ -44,7 +46,7 @@ import random
 import threading
 import time
 from collections import deque
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from decimal import Decimal, InvalidOperation
 from typing import Any, Callable, Optional
 
@@ -88,6 +90,15 @@ HTTP_JITTER_S = 3.0
 # tracked. Forced reconnects back off 45s -> 90s -> 120s cap.
 FEED_SILENT_RECONNECT_S = 45.0
 FEED_WATCHDOG_CAP_S = 120.0
+# While any tracked bag is within FEED_HOT_TTM_S of its end (the loser-scrap
+# span, where the scrap oracle veto reads this feed) the watchdog fires after
+# FEED_SILENT_HOT_S of silence (5s -> 10s cap), a dead socket redials within
+# FEED_HOT_BACKOFF_S, and the post-window Gamma audit (blocking HTTP on this
+# thread) waits until no bag is hot.
+FEED_HOT_TTM_S = 360.0
+FEED_SILENT_HOT_S = 5.0
+FEED_HOT_WATCHDOG_CAP_S = 10.0
+FEED_HOT_BACKOFF_S = 2.0
 FEED_PING_INTERVAL_S = 20.0
 FEED_PING_TIMEOUT_S = 10.0
 FEED_BACKOFF_MAX_S = 30.0
@@ -147,6 +158,9 @@ class TwapSample:
     twap: str
     obs_ts: float
     source: str = RTDS_SOURCE
+    # Local wall time the feed first held this observation. ``obs_ts`` is
+    # the Chainlink stamp and trails arrival by ~1.5-2.5s.
+    recv_ts: Optional[float] = field(default=None, compare=False)
 
 
 @dataclass(frozen=True)
@@ -164,13 +178,14 @@ class GammaStrike:
 
 @dataclass(frozen=True)
 class OracleBagView:
-    """Read-only TWAP + window-open snapshot for the late loser-scrap gate."""
+    """Read-only TWAP + window-open snapshot for the loser-scrap oracle gates."""
 
     twap: Optional[str]
     open_usd: Optional[str]
     obs_ts: Optional[float]
     source: str = RTDS_SOURCE
     open_source: Optional[str] = None
+    recv_ts: Optional[float] = None
 
 
 @dataclass(frozen=True)
@@ -659,8 +674,10 @@ def append_jsonl(path: Any, row: dict, *, max_bytes: int = 0) -> None:
 class RtdsTwapFeed:
     """Background RTDS subscription. ``handle_message`` is the test seam."""
 
-    def __init__(self, url: str = RTDS_URL) -> None:
+    def __init__(self, url: str = RTDS_URL, *, clock: Callable[[], float] = time.time) -> None:
         self.url = url
+        self._clock = clock
+        self._hot = False
         self._lock = threading.Lock()
         self._latest: Optional[TwapSample] = None
         self._backlog: list[TwapSample] = []
@@ -711,6 +728,11 @@ class RtdsTwapFeed:
         with self._lock:
             return self._latest
 
+    def set_hot(self, hot: bool) -> None:
+        """Hot = a bag is in its scrap span; caps the redial backoff."""
+        with self._lock:
+            self._hot = bool(hot)
+
     def drain(self) -> list[TwapSample]:
         with self._lock:
             items = self._backlog
@@ -735,13 +757,20 @@ class RtdsTwapFeed:
             self._set_error(str(exc)[:240])
             return
         if samples:
+            recv = float(self._clock())
+            samples = [replace(sample, recv_ts=recv) for sample in samples]
             with self._lock:
                 self._backlog.extend(samples)
                 if len(self._backlog) > 500:
                     self._backlog = self._backlog[-500:]
                 newest = max(samples, key=lambda sample: sample.obs_ts)
-                if self._latest is None or newest.obs_ts >= self._latest.obs_ts:
+                prev = self._latest
+                if prev is None or newest.obs_ts > prev.obs_ts:
                     self._latest = newest
+                elif newest.obs_ts == prev.obs_ts:
+                    # Same second re-sent (or revised): not a newer reading,
+                    # so it keeps the first arrival time.
+                    self._latest = replace(newest, recv_ts=prev.recv_ts)
                 self._last_error = ""
                 self._conn_samples += len(samples)
             return
@@ -788,7 +817,8 @@ class RtdsTwapFeed:
                 wait, next_backoff = 1.0, 2.0
             else:
                 self._reconnects += 1
-                wait = min(FEED_BACKOFF_MAX_S, max(1.0, backoff))
+                cap = FEED_HOT_BACKOFF_S if self._hot else FEED_BACKOFF_MAX_S
+                wait = min(cap, max(1.0, backoff))
                 next_backoff = min(FEED_BACKOFF_MAX_S, wait * 2.0)
             self._events.append(
                 {
@@ -917,6 +947,8 @@ class OracleLogService:
         self._last_arrival: Optional[float] = None
         self._watchdog_at: Optional[float] = None
         self._watchdog_gap = FEED_SILENT_RECONNECT_S
+        self._hot_gap = FEED_SILENT_HOT_S
+        self._hot = False
         self._stall_origin: Optional[float] = None
         self._stall_noted = 0.0
         self._stall_reminders = 0
@@ -939,12 +971,14 @@ class OracleLogService:
                 twap=None, open_usd=open_usd, obs_ts=None, source=RTDS_SOURCE,
                 open_source=open_source,
             )
+        recv = getattr(latest, "recv_ts", None)
         return OracleBagView(
             twap=latest.twap,
             open_usd=open_usd,
             obs_ts=float(latest.obs_ts),
             source=str(latest.source or RTDS_SOURCE),
             open_source=open_source,
+            recv_ts=None if recv is None else float(recv),
         )
 
     def tick(
@@ -993,6 +1027,7 @@ class OracleLogService:
             return
         self._idle_since = None
         self._feed.start()
+        self._set_hot(any(window.end_ts - now <= FEED_HOT_TTM_S for window in windows))
         # Wake every second while a bag is open so a cold 15s gap cannot
         # skip the open or the last minute. Stored rows stay on the slower
         # cadence until the window is hot.
@@ -1009,13 +1044,15 @@ class OracleLogService:
         if samples:
             self._watchdog_at = None
             self._watchdog_gap = FEED_SILENT_RECONNECT_S
+            self._hot_gap = FEED_SILENT_HOT_S
         self._note_boundaries(samples, latest)
         for window in windows:
             self._record_window(window, samples, latest, now)
         for window in closing:
             self._resolve_boundaries(window, self._window_memory(window), now)
         self._finish_windows(now)
-        self._maybe_check(now)
+        if not self._hot:
+            self._maybe_check(now)
         self._log_feed_events(now, windows[0])
         self._watch_feed(now, windows[0])
         self._note_silence(windows[0], latest, samples, now)
@@ -1025,6 +1062,15 @@ class OracleLogService:
         if memory.window is None:
             memory.window = window
         return memory
+
+    def _set_hot(self, hot: bool) -> None:
+        self._hot = bool(hot)
+        set_hot = getattr(self._feed, "set_hot", None)
+        if set_hot is not None:
+            try:
+                set_hot(self._hot)
+            except Exception:
+                pass
 
     def _stop_feed(self) -> None:
         stop = getattr(self._feed, "stop", None)
@@ -1051,6 +1097,8 @@ class OracleLogService:
         self._last_arrival = None
         self._watchdog_at = None
         self._watchdog_gap = FEED_SILENT_RECONNECT_S
+        self._hot_gap = FEED_SILENT_HOT_S
+        self._set_hot(False)
 
     def _watch_feed(self, now: float, window: OracleWindow) -> None:
         """Force a reconnect when a tracked bag gets no sample for too long."""
@@ -1058,7 +1106,11 @@ class OracleLogService:
             return
         silent = now - self._last_arrival
         since = self._watchdog_at if self._watchdog_at is not None else self._last_arrival
-        if silent < FEED_SILENT_RECONNECT_S or now - since < self._watchdog_gap:
+        if self._hot:
+            limit, gap = FEED_SILENT_HOT_S, self._hot_gap
+        else:
+            limit, gap = FEED_SILENT_RECONNECT_S, self._watchdog_gap
+        if silent < limit or now - since < gap:
             return
         reconnect = getattr(self._feed, "reconnect", None)
         if reconnect is None:
@@ -1068,7 +1120,12 @@ class OracleLogService:
         except Exception as exc:
             closed = False
             self._fail(f"feed: reconnect {exc}", now=now, window=window, kind="feed")
-        self._watchdog_gap = min(FEED_WATCHDOG_CAP_S, self._watchdog_gap * 2.0)
+        if self._hot:
+            self._hot_gap = min(FEED_HOT_WATCHDOG_CAP_S, self._hot_gap * 2.0)
+            next_check = self._hot_gap
+        else:
+            self._watchdog_gap = min(FEED_WATCHDOG_CAP_S, self._watchdog_gap * 2.0)
+            next_check = self._watchdog_gap
         self._watchdog_at = now
         self._event(
             "oracle_feed_watchdog",
@@ -1077,7 +1134,8 @@ class OracleLogService:
             fields={
                 "silent_s": round(silent, 1),
                 "closed": closed,
-                "next_check_s": self._watchdog_gap,
+                "hot": self._hot,
+                "next_check_s": next_check,
                 "last_error": self._feed_error(),
             },
             throttle="watchdog",
@@ -1355,6 +1413,11 @@ class OracleLogService:
                 twap_ts=sample.obs_ts,
                 open_ref=memory.open_ref,
                 notes=notes,
+                extra=(
+                    {"recv_ts": round(float(sample.recv_ts), 3)}
+                    if sample.recv_ts is not None
+                    else None
+                ),
             )
         )
         return True
