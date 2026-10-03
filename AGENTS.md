@@ -20,6 +20,23 @@ Never infer service state from filenames or old documentation. Read
 current configuration and read-only service status before operational
 work.
 
+**Live knobs (operator-confirmed 2026-10-03 13:25 IST; details in
+`CURRENT.md`).** The numbers in "Code and validation" below are **code
+defaults** unless they say live. Live `strategy_mint.json` runs:
+
+- **Bags:** 200 shares a side, with `mint_sequential` true (one bag at a
+  time, minted 30s before to 240s after the open).
+- **Redeem:** `redeem_enabled` true, `redeem_startup_sweep` false.
+- **Loser scrap:** arms at ≤ 3¢, `sell_scrap_fraction` 0.5 (sell 100 /
+  keep 100), one 1¢-floor FAK, only with ≤ 360s left. Persist 3s, or 2s
+  within the last 90s.
+- **Dump:** under 0.40 for 2s with ≤ 240s left, and
+  `sell_dump_also_kept` true (#232).
+- **Unchanged:** `sell_winner_min` 0.9995, oracle veto off, WhatsApp
+  danger alert on (70¢ for 5s).
+- **Not live:** `sell_dump_tiers` (#231) and the post-dump kept stop
+  (#228) are unmerged.
+
 ## Safety boundaries
 
 - Never read or commit .env files, credentials, private keys, or API secrets.
@@ -55,7 +72,8 @@ fire locks `target = floor(held loser shares × fraction)` and
 `keep = held - target` on the bag. Sweep, ladder, blind, and resting
 scrap orders post `target - filled` only. The loser is sold once that
 target fills within tolerance, or the balance is at or under
-`keep + tolerance`. Kept shares are not scrapped or dumped. They cash
+`keep + tolerance`. Kept shares are not scrapped. They are dumped only
+when `sell_dump_also_kept` is on (on live). Otherwise they cash
 out only at `sell_winner_min` (the cheap 0.99 winner path does not
 apply to the kept leg) or stay until resolution. Resolved positions are
 redeemed only when the opt-in `redeem_enabled` is on (see below). The book still fills
@@ -97,8 +115,8 @@ on `mint_submitted` and `mint_submit_fail`. The estimate runs only on the
 mint and redeem submit paths. Keys absent from live `strategy_mint.json` keep these
 defaults. Do not add the estimate to the sell loop.
 
-Sequential bags (`buy/mint_sequence.py`) are opt-in: `mint_sequential`
-defaults false, with `mint_seq_lead_s` 30 and `mint_seq_cutoff_s` 240.
+Sequential bags (`buy/mint_sequence.py`) are opt-in (on live as of
+2026-10-03): `mint_sequential` defaults false, with `mint_seq_lead_s` 30 and `mint_seq_cutoff_s` 240.
 When on:
 
 - The next window mints only in `[start - lead, start + cutoff]`. The
@@ -118,7 +136,7 @@ With the flag off, eligibility and capacity are byte-for-byte the old
 path.
 
 Auto-redeem (`buy/mint_redeem.py`) is also opt-in: `redeem_enabled`
-defaults false.
+defaults false (live: true, with `redeem_startup_sweep` false).
 
 - **Thread.** It runs on its own `mintbot-redeem` thread, never on the
   sell loop, and writes no heartbeat. Jobs live in `positions_mint.json`
@@ -199,7 +217,8 @@ at or under that cutoff (example 240; code default 0 leaves the gate
 off and keeps the old dump). A dip that starts before the cutoff must
 still persist the full `sell_dump_persist_s` after entering it. Ladder
 retries after the dump has fired are not re-checked.
-`sell_dump_also_kept` (default false; the example and live leave it off)
+`sell_dump_also_kept` (default false and false in the example; **true
+live** since 10:31 IST on 2026-10-03)
 also exits the kept scrap half in the same dump event. Once the held dump
 fills, mintbot sells `min(sell_scrap_keep, on-chain balance)` of the
 scrapped leg with the dump's live-bid FAK and refire. It then sends one
