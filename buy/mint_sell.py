@@ -104,6 +104,11 @@ DEFAULT_SELL_KNOBS = {
     "sell_oracle_edge_persist_s": 3.0,
     "sell_oracle_stale_s": 0.0,
     "sell_oracle_edge_floor_usd": 0.0,
+    # Any-time scrap veto: no loser scrap while the 60s TWAP is within
+    # $usd of the strike or on the scrapped leg's side. Stale feed: no veto.
+    "scrap_oracle_veto_enabled": True,
+    "scrap_oracle_veto_usd": 5.0,
+    "scrap_oracle_veto_stale_s": 3.0,
 }
 
 
@@ -962,6 +967,95 @@ def late_oracle_scrap_ok(
     if edge + 1e-12 < need:
         return False, "edge_thin", detail
     return True, "edge_ok", detail
+
+
+def scrap_oracle_settings(cfg: Any) -> Tuple[bool, float, float]:
+    """``(enabled, threshold_usd, stale_s)`` for the scrap oracle veto.
+
+    A missing, non-numeric, non-finite or negative value takes the default
+    (on, $5, 3s), so a bad hot-reload edit cannot silently widen the veto.
+    """
+    get = cfg.get if isinstance(cfg, dict) else (lambda _k, d=None: d)
+    raw_on = get("scrap_oracle_veto_enabled", True)
+    if isinstance(raw_on, str):
+        enabled = raw_on.strip().lower() not in ("0", "false", "no", "off", "")
+    else:
+        enabled = bool(raw_on)
+
+    def _num(key: str, default: float) -> float:
+        val = _finite_usd(get(key, default))
+        if val is None or val < 0:
+            return default
+        return val
+
+    return (
+        enabled,
+        _num("scrap_oracle_veto_usd", 5.0),
+        _num("scrap_oracle_veto_stale_s", 3.0),
+    )
+
+
+# Chainlink obs stamps reach us ~1.5-2.5s late; past stale_s + this the
+# reading is old even if the frame itself just arrived.
+SCRAP_ORACLE_OBS_LAG_S = 7.0
+
+
+def scrap_oracle_veto(
+    *,
+    scrap_leg: Optional[str],
+    twap_usd: Any,
+    strike_usd: Any,
+    twap_age_s: Optional[float],
+    threshold_usd: float,
+    stale_s: float,
+    enabled: bool = True,
+    obs_age_s: Optional[float] = None,
+) -> Tuple[bool, str, dict]:
+    """``(block, why, detail)``: veto a loser scrap the oracle still favours.
+
+    ``margin = twap - strike``. Scrapping Up is blocked while
+    ``margin > -threshold``; scrapping Down while ``margin < +threshold``.
+    ``twap_age_s`` is the local receive age of the latest sample;
+    ``obs_age_s`` (optional) is the age of its Chainlink stamp.
+    Missing / stale TWAP or an unknown strike returns ``block=False`` with
+    the reason, so the scrap runs as it did before the veto existed.
+    """
+    thr = float(threshold_usd)
+    detail: dict = {
+        "leg": scrap_leg,
+        "twap": None,
+        "strike": None,
+        "margin": None,
+        "threshold": thr,
+        "age_s": None if twap_age_s is None else round(float(twap_age_s), 3),
+        "obs_age_s": None if obs_age_s is None else round(float(obs_age_s), 3),
+    }
+    if not enabled:
+        return False, "disabled", detail
+    if scrap_leg not in ("up", "dn"):
+        return False, "bad_leg", detail
+    strike = _finite_usd(strike_usd)
+    twap = _finite_usd(twap_usd)
+    detail["strike"] = strike
+    detail["twap"] = twap
+    if strike is None:
+        return False, "missing_strike", detail
+    if twap is None:
+        return False, "missing_twap", detail
+    if twap_age_s is None:
+        return False, "missing_twap_age", detail
+    if float(twap_age_s) > float(stale_s) + 1e-12:
+        return False, "stale_twap", detail
+    if obs_age_s is not None and float(obs_age_s) > float(stale_s) + SCRAP_ORACLE_OBS_LAG_S:
+        return False, "stale_obs", detail
+    margin = round(twap - strike, 4)
+    detail["margin"] = margin
+    if scrap_leg == "up":
+        if margin > -thr:
+            return True, ("oracle_favors_leg" if margin > 0 else "within_threshold"), detail
+    elif margin < thr:
+        return True, ("oracle_favors_leg" if margin < 0 else "within_threshold"), detail
+    return False, "clear_against", detail
 
 
 def late_oracle_edge_persist(
