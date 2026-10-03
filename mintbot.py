@@ -282,12 +282,15 @@ DEFAULTS = {
     "sell_oracle_stale_s": 0.0,
     "sell_oracle_edge_floor_usd": 0.0,
     # Any-time loser-scrap veto (not the late window above, not the dump):
-    # block a scrap while the 60s TWAP minus the strike is not at least
-    # scrap_oracle_veto_usd against the scrapped leg. A TWAP older than
-    # scrap_oracle_veto_stale_s, or no strike, falls back to no veto.
+    # block a scrap while the 60s TWAP or (scrap_oracle_veto_use_live) the
+    # live Chainlink price, minus the strike, is not at least
+    # scrap_oracle_veto_usd against the scrapped leg. A reading older than
+    # scrap_oracle_veto_stale_s drops out; both stale, or no strike, falls
+    # back to no veto.
     "scrap_oracle_veto_enabled": True,
     "scrap_oracle_veto_usd": 5.0,
     "scrap_oracle_veto_stale_s": 3.0,
+    "scrap_oracle_veto_use_live": True,
     "rpc_url": "https://polygon.drpc.org",
     "gamma_url": "https://gamma-api.polymarket.com",
     "data_api_url": "https://data-api.polymarket.com",
@@ -2346,21 +2349,28 @@ def _scrap_oracle_gate(
     phase: str,
     log_interval_s: float = 5.0,
 ) -> Tuple[bool, str, dict]:
-    """In-memory scrap oracle veto. No I/O: reads the RTDS sample the feed
-    thread already holds. Logs ``scrap_oracle_veto`` on a block and
-    ``scrap_oracle_stale`` on a missing/stale fallback, each at most once
-    per bag per ``log_interval_s``."""
-    enabled, threshold, stale_s = scrap_oracle_settings(cfg)
+    """In-memory scrap oracle veto. No I/O: reads the RTDS 60s TWAP and live
+    Chainlink price the feed thread already holds. Logs ``scrap_oracle_veto``
+    on a block and ``scrap_oracle_stale`` when a reading drops out, each at
+    most once per bag per ``log_interval_s``."""
+    enabled, threshold, stale_s, use_live = scrap_oracle_settings(cfg)
     if not enabled:
         return False, "disabled", {}
     if leg not in ("up", "dn"):
         return False, "bad_leg", {}
     view = _oracle_bag_view(condition_id)
-    obs = getattr(view, "obs_ts", None)
-    recv = getattr(view, "recv_ts", None)
-    ref = recv if recv is not None else obs
-    age = None if ref is None else max(0.0, float(now_s) - float(ref))
-    obs_age = None if obs is None else max(0.0, float(now_s) - float(obs))
+    now_f = float(now_s)
+
+    def _ages(recv: Any, obs: Any) -> Tuple[Optional[float], Optional[float]]:
+        ref = recv if recv is not None else obs
+        age = None if ref is None else max(0.0, now_f - float(ref))
+        obs_age = None if obs is None else max(0.0, now_f - float(obs))
+        return age, obs_age
+
+    age, obs_age = _ages(getattr(view, "recv_ts", None), getattr(view, "obs_ts", None))
+    live_age, live_obs_age = _ages(
+        getattr(view, "live_recv_ts", None), getattr(view, "live_obs_ts", None),
+    )
     block, why, detail = scrap_oracle_veto(
         scrap_leg=leg,
         twap_usd=getattr(view, "twap", None),
@@ -2369,6 +2379,10 @@ def _scrap_oracle_gate(
         threshold_usd=threshold,
         stale_s=stale_s,
         obs_age_s=obs_age,
+        live_usd=getattr(view, "live_price", None),
+        live_age_s=live_age,
+        live_obs_age_s=live_obs_age,
+        use_live=use_live,
     )
     detail["why"] = why
     detail["open_source"] = getattr(view, "open_source", None)
@@ -2388,31 +2402,48 @@ def _scrap_oracle_gate(
                 twap=detail.get("twap"),
                 strike=detail.get("strike"),
                 margin=detail.get("margin"),
+                live_price=detail.get("live_price"),
+                live_margin=detail.get("live_margin"),
                 threshold=detail.get("threshold"),
                 why=why,
+                basis=detail.get("basis"),
                 age_s=detail.get("age_s"),
+                live_age_s=detail.get("live_age_s"),
                 obs_age_s=detail.get("obs_age_s"),
                 open_source=detail.get("open_source"),
             )
-    elif why in (
-        "missing_strike", "missing_twap", "missing_twap_age", "stale_twap", "stale_obs",
-    ):
+    fallback = detail.get("fallback")
+    if fallback:
+        if fallback == "twap_only":
+            reason = detail.get("live_why")
+        elif fallback == "live_only":
+            reason = detail.get("twap_why")
+        else:
+            reason = why
         if _scrap_oracle_log_due("stale", condition_id, now_s, log_interval_s):
             log_event(
                 "scrap_oracle_stale",
                 **common,
                 level="WARNING",
-                reason=why,
+                reason=reason,
+                fallback=fallback,
                 age_s=detail.get("age_s"),
                 obs_age_s=detail.get("obs_age_s"),
+                live_age_s=detail.get("live_age_s"),
+                live_obs_age_s=detail.get("live_obs_age_s"),
                 stale_s=stale_s,
                 twap=detail.get("twap"),
+                live_price=detail.get("live_price"),
                 strike=detail.get("strike"),
                 open_source=detail.get("open_source"),
             )
+            what = (
+                "scrap not vetoed" if fallback == "none"
+                else f"veto on {fallback.replace('_only', '')} only"
+            )
             console.print(
-                f"  [bold red][ORACLE STALE][/] {slug} {leg} scrap not vetoed: "
-                f"{why} age={detail.get('age_s')}s"
+                f"  [bold red][ORACLE STALE][/] {slug} {leg} {what}: {reason} "
+                f"twap_age={detail.get('age_s')}s live_age={detail.get('live_age_s')}s"
             )
     return block, why, detail
 
@@ -2424,9 +2455,13 @@ def _scrap_oracle_fields(detail: Optional[dict]) -> dict:
     return {
         "oracle_margin": detail.get("margin"),
         "oracle_twap": detail.get("twap"),
+        "oracle_live_price": detail.get("live_price"),
+        "oracle_live_margin": detail.get("live_margin"),
         "oracle_strike": detail.get("strike"),
         "oracle_why": detail.get("why"),
+        "oracle_basis": detail.get("basis"),
         "oracle_age_s": detail.get("age_s"),
+        "oracle_live_age_s": detail.get("live_age_s"),
     }
 
 
@@ -3533,6 +3568,7 @@ def _manage_sells_locked(cfg: dict, state: dict, chain: ChainReader) -> None:
                         oracle_fields = _scrap_oracle_fields(fire_oracle)
                         if oracle_fields:
                             intent["sell_scrap_oracle_margin"] = oracle_fields["oracle_margin"]
+                            intent["sell_scrap_oracle_live_margin"] = oracle_fields["oracle_live_margin"]
                         scrap_fills: list = []
                         with _io_unlocked():
                             sold_total, last_status, last_px, balance_flat = (
@@ -3701,6 +3737,7 @@ def _manage_sells_locked(cfg: dict, state: dict, chain: ChainReader) -> None:
                     blind_fields = _scrap_oracle_fields(blind_oracle)
                     if blind_fields:
                         intent["sell_scrap_oracle_margin"] = blind_fields["oracle_margin"]
+                        intent["sell_scrap_oracle_live_margin"] = blind_fields["oracle_live_margin"]
                     blind_raw: list = []
                     with _io_unlocked():
                         blind_sold, blind_status = _fak_sell(

@@ -83,5 +83,6 @@
   "sell_oracle_edge_floor_usd": 0.0,
   "scrap_oracle_veto_enabled": true,
   "scrap_oracle_veto_usd": 5.0,
-  "scrap_oracle_veto_stale_s": 3.0
+  "scrap_oracle_veto_stale_s": 3.0,
+  "scrap_oracle_veto_use_live": true
 }

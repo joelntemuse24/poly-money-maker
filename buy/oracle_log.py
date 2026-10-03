@@ -57,6 +57,9 @@ from buy.market import slug_start_ts
 
 RTDS_URL = "wss://ws-live-data.polymarket.com"
 RTDS_TOPIC = "crypto_prices_twap_sixty"
+# Live Chainlink BTC/USD price on the same socket (~1 update/s). Held in
+# memory for the scrap oracle veto only; never written as a tape sample.
+RTDS_LIVE_TOPIC = "crypto_prices_chainlink"
 RTDS_SYMBOL = "btc/usd"
 RTDS_SOURCE = "polymarket_rtds"
 HTTP_SOURCE = "polymarket_crypto_price"
@@ -143,7 +146,12 @@ SUBSCRIBE_FRAME = {
             "topic": RTDS_TOPIC,
             "type": "update",
             "filters": "{\"symbol\":\"btc/usd\"}",
-        }
+        },
+        {
+            "topic": RTDS_LIVE_TOPIC,
+            "type": "*",
+            "filters": "{\"symbol\":\"btc/usd\"}",
+        },
     ],
 }
 
@@ -161,6 +169,15 @@ class TwapSample:
     # Local wall time the feed first held this observation. ``obs_ts`` is
     # the Chainlink stamp and trails arrival by ~1.5-2.5s.
     recv_ts: Optional[float] = field(default=None, compare=False)
+
+
+@dataclass(frozen=True)
+class LivePrice:
+    """Latest live Chainlink BTC/USD print (``crypto_prices_chainlink``)."""
+
+    price: str
+    obs_ts: float
+    recv_ts: Optional[float] = None
 
 
 @dataclass(frozen=True)
@@ -186,6 +203,9 @@ class OracleBagView:
     source: str = RTDS_SOURCE
     open_source: Optional[str] = None
     recv_ts: Optional[float] = None
+    live_price: Optional[str] = None
+    live_obs_ts: Optional[float] = None
+    live_recv_ts: Optional[float] = None
 
 
 @dataclass(frozen=True)
@@ -325,6 +345,40 @@ def parse_rtds_message(raw: Any) -> list[TwapSample]:
         return samples
     sample = _point_to_sample(body, symbol)
     return [sample] if sample is not None else []
+
+
+def parse_rtds_live(raw: Any) -> Optional[LivePrice]:
+    """One ``crypto_prices_chainlink`` btc/usd update, or None.
+
+    The subscribe snapshot (topic ``crypto_prices``) and other symbols are
+    ignored, so a reconnect only trusts prints that arrive live."""
+    if isinstance(raw, (bytes, bytearray)):
+        raw = raw.decode("utf-8", "replace")
+    if isinstance(raw, str):
+        try:
+            payload = json.loads(raw)
+        except json.JSONDecodeError:
+            return None
+    elif isinstance(raw, dict):
+        payload = raw
+    else:
+        return None
+    if not isinstance(payload, dict) or payload.get("topic") != RTDS_LIVE_TOPIC:
+        return None
+    body = payload.get("payload")
+    if not isinstance(body, dict):
+        return None
+    if str(body.get("symbol") or "").strip().lower() != RTDS_SYMBOL:
+        return None
+    price = None
+    if body.get("full_accuracy_value") is not None:
+        price = e18_to_decimal_str(body.get("full_accuracy_value"))
+    if price is None and body.get("value") is not None:
+        price = _loose_decimal_str(body.get("value"))
+    obs = _obs_seconds(body.get("timestamp"))
+    if price is None or obs is None:
+        return None
+    return LivePrice(price=price, obs_ts=obs)
 
 
 def crypto_price_params(start_ts: int) -> dict[str, Any]:
@@ -680,6 +734,7 @@ class RtdsTwapFeed:
         self._hot = False
         self._lock = threading.Lock()
         self._latest: Optional[TwapSample] = None
+        self._live: Optional[LivePrice] = None
         self._backlog: list[TwapSample] = []
         self._last_error = ""
         self._stop = threading.Event()
@@ -728,6 +783,10 @@ class RtdsTwapFeed:
         with self._lock:
             return self._latest
 
+    def latest_live(self) -> Optional[LivePrice]:
+        with self._lock:
+            return self._live
+
     def set_hot(self, hot: bool) -> None:
         """Hot = a bag is in its scrap span; caps the redial backoff."""
         with self._lock:
@@ -751,6 +810,21 @@ class RtdsTwapFeed:
 
     def handle_message(self, raw: Any) -> None:
         text = raw.decode("utf-8", "replace") if isinstance(raw, (bytes, bytearray)) else str(raw)
+        if RTDS_LIVE_TOPIC in text:
+            try:
+                live = parse_rtds_live(text)
+            except Exception as exc:
+                self._set_error(str(exc)[:240])
+                return
+            if live is not None:
+                recv = float(self._clock())
+                with self._lock:
+                    prev = self._live
+                    if prev is None or live.obs_ts > prev.obs_ts:
+                        self._live = replace(live, recv_ts=recv)
+                    elif live.obs_ts == prev.obs_ts:
+                        self._live = replace(live, recv_ts=prev.recv_ts)
+                return
         try:
             samples = parse_rtds_message(text)
         except Exception as exc:
@@ -966,10 +1040,24 @@ class OracleLogService:
             latest = self._feed.latest()
         except Exception:
             latest = None
+        live: Optional[LivePrice] = None
+        latest_live = getattr(self._feed, "latest_live", None)
+        if latest_live is not None:
+            try:
+                live = latest_live()
+            except Exception:
+                live = None
+        live_kw = {}
+        if live is not None:
+            live_kw = {
+                "live_price": live.price,
+                "live_obs_ts": float(live.obs_ts),
+                "live_recv_ts": None if live.recv_ts is None else float(live.recv_ts),
+            }
         if latest is None:
             return OracleBagView(
                 twap=None, open_usd=open_usd, obs_ts=None, source=RTDS_SOURCE,
-                open_source=open_source,
+                open_source=open_source, **live_kw,
             )
         recv = getattr(latest, "recv_ts", None)
         return OracleBagView(
@@ -979,6 +1067,7 @@ class OracleLogService:
             source=str(latest.source or RTDS_SOURCE),
             open_source=open_source,
             recv_ts=None if recv is None else float(recv),
+            **live_kw,
         )
 
     def tick(
@@ -1413,14 +1502,25 @@ class OracleLogService:
                 twap_ts=sample.obs_ts,
                 open_ref=memory.open_ref,
                 notes=notes,
-                extra=(
-                    {"recv_ts": round(float(sample.recv_ts), 3)}
-                    if sample.recv_ts is not None
-                    else None
-                ),
+                extra=self._row_extra(sample),
             )
         )
         return True
+
+    def _row_extra(self, sample: TwapSample) -> Optional[dict]:
+        extra: dict = {}
+        if sample.recv_ts is not None:
+            extra["recv_ts"] = round(float(sample.recv_ts), 3)
+        latest_live = getattr(self._feed, "latest_live", None)
+        if latest_live is not None:
+            try:
+                live = latest_live()
+            except Exception:
+                live = None
+            if live is not None:
+                extra["live_price"] = live.price
+                extra["live_ts"] = live.obs_ts
+        return extra or None
 
     def _maybe_open_fallback(self, window: OracleWindow, memory: _WindowMemory, now: float) -> None:
         """crypto-price ``openPrice`` only when no boundary sample came by
