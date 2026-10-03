@@ -197,8 +197,25 @@ dump. The normal held dump under `sell_dump_below` still applies. When
 `sell_dump_max_ttm_s` > 0 it arms and fires only if seconds-to-close is
 at or under that cutoff (example 240; code default 0 leaves the gate
 off and keeps the old dump). A dip that starts before the cutoff must
-still persist the full `sell_dump_persist_s` after entering it. Ladder
-retries after the dump has fired are not re-checked. When
+still persist the full `sell_dump_persist_s` after entering it.
+
+`sell_dump_tiers` (code and example `[]`) replaces that single timer
+when set. It is a list of `[price_below, persist_s]` pairs; the intended
+live value is `[[0.40, 6], [0.30, 4], [0.20, 2]]`.
+
+- **Timers.** Each tier has its own timer (`sell_dump_tier_armed`). A
+  timer starts when the bid first goes under the tier's price, and resets
+  when the bid is back at or above it or the TTM gate closes.
+- **Fire.** The dump fires when any one tier is satisfied. The highest
+  price wins a tie.
+- **Logs.** `sell_dump_persist` rows with `tiered: true` and `why`
+  `armed` / `reset` / `fire`, carrying `below`, `persist_s` and
+  `below_s`.
+- **Fallback.** Empty or absent tiers keep the single
+  `sell_dump_below` / `sell_dump_persist_s` timer unchanged. Tiers are
+  read from cfg every sell tick.
+
+Ladder retries after the dump has fired are not re-checked. When
 that dump fills, mintbot sets `sell_dump_leg` and B FAK-buys
 `dump_hedge_shares` (10) of the other leg, with its own
 `dump_hedge_fak_min_notional` / `dump_hedge_fak_max_notional` (default

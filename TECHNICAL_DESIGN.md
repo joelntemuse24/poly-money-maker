@@ -638,6 +638,20 @@ Preconditions (all required), code default / live:
 
 Live, that reads: in the last four minutes, if the leg we still hold 100 of has a sized bid under 40¢ for 2s, sell all 100.
 
+**Tiered persistence (`sell_dump_tiers`, code and example `[]`).** A list of `[price_below, persist_s]` pairs, for example `[[0.40, 6], [0.30, 4], [0.20, 2]]`, replaces the single timer:
+
+- **Timers.** Each tier has its own timer in `intent["sell_dump_tier_armed"]`, keyed by price (`advance_dump_tiers` in `buy/mint_sell.py`). A tier's timer starts when the bid first goes strictly under its price. It resets when the bid is back at or above that price, or when the outer gate drops.
+- **Gates.** The outer gates are unchanged: the sold loser, the 240s TTM gate, and `bid < highest tier price`.
+- **Fire.** The dump fires as soon as any tier is satisfied. If two are ready on the same tick, the highest price wins. `sell_fire_decision` and the fire-time log use that tier's price.
+- **Example.** A 15¢ → 37¢ → 29¢ bounce resets the 30¢ and 20¢ timers, and the 40¢ timer keeps running.
+- **Logs.** Each change is a `sell_dump_persist` row with `tiered: true`:
+  - `why=armed`, with `below` and `persist_s`;
+  - `why=reset`, with `below_s` and `reason` (`bid_above` / `gate_closed`);
+  - `why=fire`, with `below`, `persist_s` and `below_s`.
+- **Unchanged.** The sale, fast refire, ladder and cooldown are the same as before.
+- **Reload.** Tiers are read from `cfg` every sell tick, so a strategy reload applies them live.
+- **Fallback.** Empty or absent tiers use the single `sell_dump_below` / `sell_dump_persist_s` timer exactly as before (`sell_dump_armed_at`, `why=armed|waiting` rows).
+
 Action (`_run_dump_fak_with_refire`):
 
 1. `_sell_inventory` on the held token → size (100). `already_flat` sets `sold_dump` / `sold_winner` with note `already_flat` and no `sell_dump_leg`.
@@ -834,6 +848,7 @@ Never enable retired buy units (`polycomplement`, buybots, DangerZone, shadow) f
 | `sell_dump_enabled` | true | | true | Held dump on |
 | `sell_dump_below` | 0.80 | 0.80 | **0.40** | Dump arm threshold |
 | `sell_dump_persist_s` | 2 | | 2 | Dump persist |
+| `sell_dump_tiers` | [] | [] | — (intended `[[0.40, 6], [0.30, 4], [0.20, 2]]`) | Per-tier dump timers; any tier fires. Empty keeps the single timer |
 | `sell_dump_max_ttm_s` | 0 (off) | 240 | **240** | Dump only in the last N seconds |
 | `sell_dump_fak_retries` / `_ladder_step` / `_ladder_rungs` | 2 / 0.04 / 4 | | 2 / 0.04 / 4 | Refire after a zero-fill miss |
 | `sell_min_bid_size` | 1.0 | | 1.0 | Sized-bid minimum |
