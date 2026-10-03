@@ -91,6 +91,8 @@ DEFAULT_SELL_KNOBS = {
     "sell_dump_ladder_rungs": 4,
     # 0 disables the time-left gate (old behavior). The example sets 240.
     "sell_dump_max_ttm_s": 0.0,
+    # When the held dump fills, also sell the kept scrap half (1c floor sweep).
+    "sell_dump_also_kept": False,
     "sell_min_bid_size": 1.0,
     # Cycle sleep while a loser persist arm is live. Does not change persist_s.
     "sell_armed_poll_s": 2.0,
@@ -1289,9 +1291,9 @@ def record_fill_px(intent: dict, key: str, fills: Any) -> Optional[float]:
 def kept_loser_open(intent: Any) -> bool:
     """True while a partial scrap still holds kept loser shares.
 
-    Kept shares leave only through the winner path when the kept leg wins
-    (``sell_winner_leg == sold_leg``) or at resolution. A held-leg dump
-    does not sell them.
+    Kept shares leave through the winner path when the kept leg wins
+    (``sell_winner_leg == sold_leg``), at resolution, or with the held
+    dump when ``sell_dump_also_kept`` is on (``sell_dump_kept_sold``).
     """
     if not isinstance(intent, dict):
         return False
@@ -1300,6 +1302,8 @@ def kept_loser_open(intent: Any) -> bool:
     except (TypeError, ValueError):
         return False
     if not math.isfinite(keep) or keep <= 1e-12:
+        return False
+    if intent.get("sell_dump_kept_sold"):
         return False
     sold_leg = intent.get("sold_leg")
     if intent.get("sold_winner") and sold_leg and intent.get("sell_winner_leg") == sold_leg:
