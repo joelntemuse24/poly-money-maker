@@ -204,6 +204,7 @@ class LockBot:
         self._warmed: set[str] = set()
         self.slow_at = 0.0
         self._status_at = 0.0
+        self._lock = threading.RLock()
 
     def reload(self) -> None:
         try:
@@ -257,8 +258,9 @@ class LockBot:
                     continue
                 if market is None:
                     continue
-                self.markets[slug] = market
-                self.market_at[slug] = now
+                with self._lock:
+                    self.markets[slug] = market
+                    self.market_at[slug] = now
                 if not market.resolution_ok and slug not in self._logged_resolution:
                     self._logged_resolution.add(slug)
                     log_event(
@@ -351,7 +353,8 @@ class LockBot:
             price = boundary_price(hist, market.start_ts, tol_s=tol)
             if price is None:
                 continue
-            self.latched[market.slug] = float(price)
+            with self._lock:
+                self.latched[market.slug] = float(price)
             if market.slug not in self._latched_logged:
                 self._latched_logged.add(market.slug)
                 log_event(
@@ -412,6 +415,10 @@ class LockBot:
         return None
 
     def _account(self, market: LockMarket, now: float) -> dict:
+        with self._lock:
+            return self._account_locked(market, now)
+
+    def _account_locked(self, market: LockMarket, now: float) -> dict:
         spent_s1 = self._strategy_spent(market.slug, "s1")
         spent_s2 = self._strategy_spent(market.slug, "s2")
         exposure = open_exposure_usd(self.state["positions"].values()) + self._pending_usd()
@@ -453,19 +460,10 @@ class LockBot:
         return False
 
     def tick(self, now: Optional[float] = None) -> int:
+        """Decision only. Gamma and strike HTTP run on ``lockbot-slow``."""
         now = time.time() if now is None else float(now)
-        # Decide before any Gamma or strike HTTP. A slow refresh must not
-        # sit in front of a Binance tick.
-        if not self.markets:
-            self._slow(now)
-            self.slow_at = now
         self._flush_paper(now)
-        buys = self._fast(now)
-        slow_every = float(self.cfg.get("poll_s") or 1.0)
-        if now - self.slow_at >= slow_every:
-            self._slow(now)
-            self.slow_at = now
-        return buys
+        return self._fast(now)
 
     def _slow(self, now: float) -> None:
         self.reload()
@@ -503,13 +501,15 @@ class LockBot:
 
     def _fast(self, now: float) -> int:
         buys = 0
+        with self._lock:
+            markets = list(self.markets.values())
         s1_max = float(self.cfg.get("s1_tau_max") or 58)
         s1_min = float(self.cfg.get("s1_tau_min") or 1)
         s2_max = float(self.cfg.get("s2_tau_max") or 300)
         s2_min = float(self.cfg.get("s2_tau_min") or 5)
         s2_keys = {str(item) for item in (self.cfg.get("strategy2_markets") or ["btc_5m"])}
         enabled = set(enabled_keys(self.cfg))
-        for market in list(self.markets.values()):
+        for market in markets:
             if market.key not in enabled:
                 continue
             ttm = market.end_ts - now
@@ -704,6 +704,10 @@ class LockBot:
         )
 
     def _add_fill(self, market: LockMarket, decision: dict, fill: dict, now: float) -> None:
+        with self._lock:
+            self._add_fill_locked(market, decision, fill, now)
+
+    def _add_fill_locked(self, market: LockMarket, decision: dict, fill: dict, now: float) -> None:
         strategy = str(decision.get("strategy") or "s1")
         side = str(decision.get("side") or "")
         key = f"{market.slug}|{strategy}|{side}"
@@ -790,6 +794,10 @@ class LockBot:
             log_event("notify_fail", error=str(exc)[:160])
 
     def _settle(self, market: LockMarket, now: float) -> None:
+        with self._lock:
+            self._settle_locked(market, now)
+
+    def _settle_locked(self, market: LockMarket, now: float) -> None:
         if now < market.end_ts:
             return
         rows = self._positions_for(market.slug)
@@ -912,6 +920,16 @@ def _sleep_s(bot: LockBot, now: float) -> float:
     return max(0.2, min(1.0, wait))
 
 
+def _slow_loop(bot: LockBot) -> None:
+    """Gamma, strike latch, and settlement. Never on the decision tick."""
+    while not _stop.is_set() and not STOP_FILE.exists():
+        try:
+            bot._slow(time.time())
+        except Exception as exc:
+            log_event("slow_fail", error=str(exc)[:200])
+        _stop.wait(float(bot.cfg.get("poll_s") or 1))
+
+
 def _redeem_loop(bot: LockBot) -> None:
     """Live redeem on its own thread. Dry-run settlements are logged in-tick."""
     if bot.cfg.get("dry_run", True) or not bot.cfg.get("redeem_enabled", True):
@@ -1029,6 +1047,8 @@ def main(argv: Optional[list[str]] = None) -> int:
         config=str(path),
     )
     try:
+        bot._slow(time.time())
+        threading.Thread(target=_slow_loop, args=(bot,), name="lockbot-slow", daemon=True).start()
         while not _stop.is_set() and not STOP_FILE.exists():
             started = time.time()
             try:
