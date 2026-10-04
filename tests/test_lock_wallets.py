@@ -174,6 +174,13 @@ class CompareTests(unittest.TestCase):
         self.assertEqual(near["our_decision_ts"], 103.0)
         self.assertAlmostEqual(near["us_minus_them_s"], 3.0)
         self.assertTrue(near["trigger_fired"])
+        quiet = compare_fills(
+            [{"slug": SLUG, "strategy": "s2", "side": "down", "decision_ts": 101.0, "ask": 0.4, "limit": 0.4}],
+            [{"wallet": DVAS, "name": "dvasdkasodk", "slug": SLUG, "outcome": "Down", "trade_side": "BUY", "price": 0.31, "size": 5, "their_ts": 100.0, "tx": "0xsmall", "s2_market": True, "binance_move": -0.12, "move_min": 2.0}],
+            window_s=10,
+        )[0]
+        self.assertTrue(quiet["paired"])
+        self.assertFalse(quiet["trigger_fired"])
         outside = compare_fills(
             [{"slug": SLUG, "strategy": "s2", "side": "up", "decision_ts": 111.0, "ask": 0.5, "limit": 0.5}],
             [{"wallet": ASDA, "name": "asdaefef", "slug": SLUG, "outcome": "Up", "trade_side": "BUY", "price": 0.4, "size": 1, "their_ts": 100.0, "tx": "0xfar"}],

@@ -352,7 +352,8 @@ def compare_fills(attempts: list[dict], fills: list[dict], *, window_s: float = 
         if move_min is None:
             move_min = 2.0
         s2 = _s2_market(fill)
-        fired = _trigger_fired(attempts, fill, move, window) if s2 else False
+        qualifying = move is not None and abs(move) + 1e-12 >= move_min
+        fired = _trigger_fired(attempts, fill, move, window) if s2 and qualifying else False
         paired = attempt is not None
         if not s2:
             move_class = "other" if not paired else "paired"
