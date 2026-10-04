@@ -37,6 +37,14 @@ defaults** unless they say live. Live `strategy_mint.json` runs:
 - **Not live:** `sell_dump_tiers` (#231) and the post-dump kept stop
   (#228) are unmerged.
 
+**Lockbot is a separate service and is not live.** `lockbot.py` plus
+`lockbot.example.json` (`dry_run` true) runs two BTC takers: a NIULAI4
+TWAP ladder (15m and 5m) and a Binance-move sniper (5m). ETH/SOL/XRP
+stay off. It does not import `mintbot.py`, does not take the mint lock,
+and does not read `strategy_mint.json`. `deploy/polylockbot.service` is
+in the repo only. Do not install, enable, or start it until the operator
+asks. Do not restart `polymintbot` for a lockbot change.
+
 ## Safety boundaries
 
 - Never read or commit .env files, credentials, private keys, or API secrets.
@@ -318,6 +326,36 @@ Shared `buy/` helpers exist for mint, pathlog, and the recording-only oracle tap
 - `buy/sister_topup.py` — one $5 pUSD top-up from A to B per broke episode.
   `sister_topup.py` submits the PROXY batch. Scrapbidder spawns it.
 
+`lockbot.py` is its own process. Strategy 1 (`strategy1_enabled`) is the
+NIULAI4 ladder on BTC 15m and BTC 5m: from tau 58 to tau 1, buy the
+Chainlink favourite when `z_side >= Z`, `ask <= Pmax`, and
+`q - ask - fee >= edge_min`. Defaults are Z=0 / Pmax=0.97 on 15m and
+Z=0.25 / Pmax=0.90 on 5m, `edge_min` 0, `ask_min` 0.02, `max_pay` 0.97.
+Clips are `clip_usd` (5) up to `strategy1_market_usd` (20). The first
+fill locks that side. Strategy 2 (`strategy2_enabled`) is the R2e
+Binance 3-second move sniper on BTC 5m only (`|move| >= 2` sigma, ask
+0.02–0.98, no q filter). ETH/SOL/XRP 15m and 5m stay off.
+`strategy1_market_usd` and `strategy2_market_usd` are 20 each.
+`combined_per_market_usd` is 40, so in BTC 5m one strategy cannot spend
+the other's budget.
+`max_open_exposure_usd` is 60. The daily loss stop stays 60. Books come
+from the CLOB market websocket; Binance trades are in memory. Dry-run
+walks the book after `dry_run_latency_s` (0.20) and logs receive,
+decision, post, and ack times. A separate RTDS `activity/trades`
+socket records fills by NIULAI4, asdaefef, and dvasdkasodk on BTC 5m
+and 15m. Each of their fills pairs with our nearest same-outcome
+signal inside `h2h_window_s` (10s). Farther signals stay unpaired.
+On BTC 5m the row also stores the Binance 3-second move at their fill
+and whether our strategy-2 trigger fired on that same direction inside
+the window. It does not place or change orders. It holds to settlement
+and never sells. Every threshold is in `lockbot.example.json`. A
+gitignored `lockbot.json` overrides it. `logs/lockbot.jsonl` and
+`positions_lockbot.json` stay gitignored. `python lockbot_summary.py`
+prints P&L, paper fills, latency by strategy, and the wallet
+head-to-head: the share of their fills we also signalled, the median
+and p90 of the signed gap, the price difference, and how many unpaired
+fills had a qualifying move (`missed`) versus none (`no_move`).
+
 Do not restore retired buybot modules (`entry_skip`, `hedge_gate`,
 `btc_price`, `clob_book_ws`, `depth_ladder`, `strategy_coherence`,
 `entry_rest_gtd`, complementbot, probe/journal helpers).
@@ -339,4 +377,4 @@ dependencies on the VM after merge. It does not restart services.
 Creating a PR is not authorization to merge or deploy it. After a pull,
 only `polymintbot` may be restarted, and only when the operator asks.
 `polypathlog` is retired. `polyscrapbid` stays stopped until the operator asks to
-start it.
+start it. `polylockbot` stays uninstalled until the operator asks.

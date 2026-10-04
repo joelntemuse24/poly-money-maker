@@ -39,6 +39,10 @@ positions_complement.dryrun.json
 pnl_complement.json
 STOP_MINT
 .mintbot.lock
+lockbot.json
+positions_lockbot.json
+STOP_LOCKBOT
+.lockbot.lock
 STOP_PATHLOG
 .pathlog.lock
 pathlog/

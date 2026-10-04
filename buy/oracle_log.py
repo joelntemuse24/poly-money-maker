@@ -42,6 +42,7 @@ HTTP errors are logged once per window per kind and source; a 429 backs off.
 from __future__ import annotations
 
 import json
+import math
 import random
 import threading
 import time
@@ -62,6 +63,22 @@ RTDS_TOPIC = "crypto_prices_twap_sixty"
 RTDS_LIVE_TOPIC = "crypto_prices_chainlink"
 RTDS_SYMBOL = "btc/usd"
 RTDS_SOURCE = "polymarket_rtds"
+
+
+def _allowed_symbols(symbols: Any) -> frozenset[str]:
+    """Default is btc/usd only, so mintbot's parser stays single-asset.
+
+    Lockbot passes the symbols it subscribed to. An empty list does not
+    mean "every symbol".
+    """
+    if symbols is None:
+        return frozenset({RTDS_SYMBOL})
+    allowed = []
+    for item in symbols:
+        text = str(item or "").strip().lower()
+        if text and text not in allowed:
+            allowed.append(text)
+    return frozenset(allowed)
 HTTP_SOURCE = "polymarket_crypto_price"
 CRYPTO_PRICE_URL = "https://polymarket.com/api/crypto/crypto-price"
 CRYPTO_PRICE_VARIANT = "fifteen"
@@ -293,12 +310,13 @@ def _point_to_sample(point: Any, symbol: str) -> Optional[TwapSample]:
     return TwapSample(symbol=symbol, window_s=60, twap=twap, obs_ts=obs)
 
 
-def parse_rtds_message(raw: Any) -> list[TwapSample]:
-    """Parse one RTDS text frame into 60s btc/usd TWAP samples.
+def parse_rtds_message(raw: Any, *, symbols: Any = None) -> list[TwapSample]:
+    """Parse one RTDS text frame into 60s TWAP samples.
 
-    Blank frames, PING/PONG, other symbols, and the 30s topic are ignored.
-    A subscribe payload's ``data`` array is the recent path; an update
-    payload is one observation.
+    Blank frames, PING/PONG, symbols outside ``symbols``, and the 30s
+    topic are ignored. ``symbols`` defaults to btc/usd. A subscribe
+    payload's ``data`` array is the recent path; an update payload is
+    one observation.
     """
     if isinstance(raw, (bytes, bytearray)):
         raw = raw.decode("utf-8", "replace")
@@ -322,8 +340,8 @@ def parse_rtds_message(raw: Any) -> list[TwapSample]:
     body = payload.get("payload")
     if not isinstance(body, dict):
         return []
-    symbol = str(body.get("symbol") or RTDS_SYMBOL).strip().lower()
-    if symbol != RTDS_SYMBOL:
+    symbol = str(body.get("symbol") or "").strip().lower()
+    if symbol not in _allowed_symbols(symbols):
         return []
     window_s = body.get("window_s", body.get("window_seconds"))
     if window_s is not None:
@@ -347,11 +365,12 @@ def parse_rtds_message(raw: Any) -> list[TwapSample]:
     return [sample] if sample is not None else []
 
 
-def parse_rtds_live(raw: Any) -> Optional[LivePrice]:
-    """One ``crypto_prices_chainlink`` btc/usd update, or None.
+def parse_rtds_live(raw: Any, *, symbols: Any = None) -> Optional[LivePrice]:
+    """One ``crypto_prices_chainlink`` update, or None.
 
-    The subscribe snapshot (topic ``crypto_prices``) and other symbols are
-    ignored, so a reconnect only trusts prints that arrive live."""
+    The subscribe snapshot (topic ``crypto_prices``) is ignored here, so a
+    reconnect only trusts prints that arrive live. Symbols outside
+    ``symbols`` are ignored. ``symbols`` defaults to btc/usd."""
     if isinstance(raw, (bytes, bytearray)):
         raw = raw.decode("utf-8", "replace")
     if isinstance(raw, str):
@@ -368,7 +387,8 @@ def parse_rtds_live(raw: Any) -> Optional[LivePrice]:
     body = payload.get("payload")
     if not isinstance(body, dict):
         return None
-    if str(body.get("symbol") or "").strip().lower() != RTDS_SYMBOL:
+    symbol = str(body.get("symbol") or "").strip().lower()
+    if symbol not in _allowed_symbols(symbols):
         return None
     price = None
     if body.get("full_accuracy_value") is not None:
@@ -379,6 +399,55 @@ def parse_rtds_live(raw: Any) -> Optional[LivePrice]:
     if price is None or obs is None:
         return None
     return LivePrice(price=price, obs_ts=obs)
+
+
+def _json_payload(raw: Any) -> Optional[dict]:
+    if isinstance(raw, (bytes, bytearray)):
+        raw = raw.decode("utf-8", "replace")
+    if isinstance(raw, str):
+        text = raw.strip()
+        if not text or text.upper() in {"PING", "PONG"}:
+            return None
+        try:
+            payload = json.loads(text)
+        except json.JSONDecodeError:
+            return None
+    elif isinstance(raw, dict):
+        payload = raw
+    else:
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def parse_rtds_price_snapshot(raw: Any, *, symbols: Any = None) -> list[LivePrice]:
+    """Recent live path from a ``crypto_prices`` subscribe snapshot.
+
+    Chainlink *updates* stay on ``parse_rtds_live``. This is the ~60s
+    backlog the socket sends on connect (``timestamp`` + ``value``).
+    Symbols outside ``symbols`` are dropped. Default is btc/usd.
+    """
+    payload = _json_payload(raw)
+    if payload is None or payload.get("topic") != "crypto_prices":
+        return []
+    body = payload.get("payload")
+    if not isinstance(body, dict):
+        return []
+    symbol = str(body.get("symbol") or "").strip().lower()
+    if symbol not in _allowed_symbols(symbols):
+        return []
+    points = body.get("data")
+    if not isinstance(points, list):
+        points = [body]
+    out: list[LivePrice] = []
+    for point in points:
+        if not isinstance(point, dict):
+            continue
+        price = _loose_decimal_str(point.get("value"))
+        obs = _obs_seconds(point.get("timestamp"))
+        if price is None or obs is None:
+            continue
+        out.append(LivePrice(price=price, obs_ts=obs))
+    return out
 
 
 def crypto_price_params(start_ts: int) -> dict[str, Any]:
@@ -728,7 +797,14 @@ def append_jsonl(path: Any, row: dict, *, max_bytes: int = 0) -> None:
 class RtdsTwapFeed:
     """Background RTDS subscription. ``handle_message`` is the test seam."""
 
-    def __init__(self, url: str = RTDS_URL, *, clock: Callable[[], float] = time.time) -> None:
+    def __init__(
+        self,
+        url: str = RTDS_URL,
+        *,
+        clock: Callable[[], float] = time.time,
+        symbols: Any = None,
+        history_s: float = 0.0,
+    ) -> None:
         self.url = url
         self._clock = clock
         self._hot = False
@@ -744,6 +820,42 @@ class RtdsTwapFeed:
         self._force_reason = ""
         self._conn_samples = 0
         self._reconnects = 0
+        # Default stays the single btc/usd subscription mintbot already uses.
+        # Lockbot passes one symbol per socket: a shared socket only streamed
+        # live updates for one symbol (checked 2026-10-04).
+        if symbols is None:
+            self.symbols: tuple[str, ...] = (RTDS_SYMBOL,)
+        else:
+            cleaned: list[str] = []
+            for item in symbols:
+                text = str(item or "").strip().lower()
+                if text and text not in cleaned:
+                    cleaned.append(text)
+            self.symbols = tuple(cleaned) or (RTDS_SYMBOL,)
+        self._symbol_set = frozenset(self.symbols)
+        self.history_s = max(0.0, float(history_s or 0.0))
+        # (obs_ts, recv_ts, price). Empty unless history_s > 0.
+        self._live_hist: deque = deque()
+        self._twap_hist: deque = deque()
+        self._live_by: dict[str, LivePrice] = {}
+        self._twap_by: dict[str, TwapSample] = {}
+
+    def subscribe_frame(self) -> dict:
+        """RTDS subscribe payload. The default btc/usd frame is the constant."""
+        if self.symbols == (RTDS_SYMBOL,):
+            return SUBSCRIBE_FRAME
+        subs = []
+        for symbol in self.symbols:
+            filters = json.dumps({"symbol": symbol}, separators=(",", ":"))
+            subs.append({"topic": RTDS_TOPIC, "type": "update", "filters": filters})
+            subs.append({"topic": RTDS_LIVE_TOPIC, "type": "*", "filters": filters})
+        return {"action": "subscribe", "subscriptions": subs}
+
+    def _is_default_symbol(self, symbol: str) -> bool:
+        """``latest()`` / ``latest_live()`` stay on btc when btc is subscribed."""
+        if RTDS_SYMBOL in self._symbol_set:
+            return symbol == RTDS_SYMBOL
+        return True
 
     def start(self) -> None:
         if self._thread is not None and self._thread.is_alive():
@@ -779,13 +891,46 @@ class RtdsTwapFeed:
             return False
         return True
 
-    def latest(self) -> Optional[TwapSample]:
+    def latest(self, symbol: Optional[str] = None) -> Optional[TwapSample]:
         with self._lock:
-            return self._latest
+            if symbol is None:
+                return self._latest
+            return self._twap_by.get(str(symbol).strip().lower())
 
-    def latest_live(self) -> Optional[LivePrice]:
+    def latest_live(self, symbol: Optional[str] = None) -> Optional[LivePrice]:
         with self._lock:
-            return self._live
+            if symbol is None:
+                return self._live
+            return self._live_by.get(str(symbol).strip().lower())
+
+    def live_history(self) -> list[tuple[float, float, float]]:
+        """``(obs_ts, recv_ts, price)`` for the retained live path. Copy."""
+        with self._lock:
+            return list(self._live_hist)
+
+    def twap_history(self) -> list[tuple[float, float, float]]:
+        """``(obs_ts, recv_ts, twap)`` for the retained 60s TWAP path. Copy."""
+        with self._lock:
+            return list(self._twap_hist)
+
+    def _merge_hist(self, bucket: deque, rows: list[tuple[float, float, float]]) -> None:
+        if self.history_s <= 0 or not rows:
+            return
+        merged: dict[float, tuple[float, float]] = {obs: (recv, price) for obs, recv, price in bucket}
+        for obs, recv, price in rows:
+            prev = merged.get(obs)
+            if prev is None:
+                merged[obs] = (recv, price)
+            else:
+                merged[obs] = (prev[0], price)
+        items = sorted((obs, recv, price) for obs, (recv, price) in merged.items())
+        if items:
+            cutoff = items[-1][0] - self.history_s
+            items = [row for row in items if row[0] >= cutoff]
+        if len(items) > 4000:
+            items = items[-4000:]
+        bucket.clear()
+        bucket.extend(items)
 
     def set_hot(self, hot: bool) -> None:
         """Hot = a bag is in its scrap span; caps the redial backoff."""
@@ -808,25 +953,81 @@ class RtdsTwapFeed:
             self._events.clear()
             return items
 
+    def _remember_live(self, live: LivePrice, recv: float, symbol: str) -> None:
+        """Store one live print. Same-second repeats keep the first recv_ts."""
+        stamped = live
+        prev = self._live_by.get(symbol)
+        if prev is None or live.obs_ts > prev.obs_ts:
+            stamped = replace(live, recv_ts=recv)
+        elif live.obs_ts == prev.obs_ts:
+            stamped = replace(live, recv_ts=prev.recv_ts)
+        else:
+            return
+        self._live_by[symbol] = stamped
+        if self._is_default_symbol(symbol):
+            self._live = stamped
+        if self.history_s > 0:
+            try:
+                price = float(stamped.price)
+            except (TypeError, ValueError):
+                return
+            if math.isfinite(price):
+                self._merge_hist(self._live_hist, [(float(stamped.obs_ts), float(stamped.recv_ts or recv), price)])
+
     def handle_message(self, raw: Any) -> None:
         text = raw.decode("utf-8", "replace") if isinstance(raw, (bytes, bytearray)) else str(raw)
+        if self.history_s > 0 and "crypto_prices" in text and RTDS_LIVE_TOPIC not in text and RTDS_TOPIC not in text:
+            try:
+                snapped = parse_rtds_price_snapshot(text, symbols=self._symbol_set)
+            except Exception as exc:
+                self._set_error(str(exc)[:240])
+                return
+            if snapped:
+                recv = float(self._clock())
+                symbol = self.symbols[0] if len(self.symbols) == 1 else ""
+                # The snapshot payload carries its own symbol; recover it
+                # from the frame so a multi-symbol feed files the path.
+                payload = _json_payload(text)
+                body = payload.get("payload") if isinstance(payload, dict) else None
+                if isinstance(body, dict):
+                    symbol = str(body.get("symbol") or symbol).strip().lower()
+                if symbol not in self._symbol_set:
+                    return
+                with self._lock:
+                    rows = []
+                    newest = None
+                    for point in snapped:
+                        try:
+                            price = float(point.price)
+                        except (TypeError, ValueError):
+                            continue
+                        if not math.isfinite(price):
+                            continue
+                        rows.append((float(point.obs_ts), recv, price))
+                        if newest is None or point.obs_ts >= newest.obs_ts:
+                            newest = point
+                    self._merge_hist(self._live_hist, rows)
+                    if newest is not None:
+                        self._remember_live(newest, recv, symbol)
+                return
         if RTDS_LIVE_TOPIC in text:
             try:
-                live = parse_rtds_live(text)
+                live = parse_rtds_live(text, symbols=self._symbol_set)
             except Exception as exc:
                 self._set_error(str(exc)[:240])
                 return
             if live is not None:
                 recv = float(self._clock())
+                symbol = self.symbols[0] if len(self.symbols) == 1 else RTDS_SYMBOL
+                payload = _json_payload(text)
+                body = payload.get("payload") if isinstance(payload, dict) else None
+                if isinstance(body, dict):
+                    symbol = str(body.get("symbol") or symbol).strip().lower()
                 with self._lock:
-                    prev = self._live
-                    if prev is None or live.obs_ts > prev.obs_ts:
-                        self._live = replace(live, recv_ts=recv)
-                    elif live.obs_ts == prev.obs_ts:
-                        self._live = replace(live, recv_ts=prev.recv_ts)
+                    self._remember_live(live, recv, symbol)
                 return
         try:
-            samples = parse_rtds_message(text)
+            samples = parse_rtds_message(text, symbols=self._symbol_set)
         except Exception as exc:
             self._set_error(str(exc)[:240])
             return
@@ -837,14 +1038,29 @@ class RtdsTwapFeed:
                 self._backlog.extend(samples)
                 if len(self._backlog) > 500:
                     self._backlog = self._backlog[-500:]
-                newest = max(samples, key=lambda sample: sample.obs_ts)
-                prev = self._latest
-                if prev is None or newest.obs_ts > prev.obs_ts:
-                    self._latest = newest
-                elif newest.obs_ts == prev.obs_ts:
-                    # Same second re-sent (or revised): not a newer reading,
-                    # so it keeps the first arrival time.
-                    self._latest = replace(newest, recv_ts=prev.recv_ts)
+                rows: list[tuple[float, float, float]] = []
+                for sample in sorted(samples, key=lambda item: item.obs_ts):
+                    prev = self._twap_by.get(sample.symbol)
+                    if prev is None or sample.obs_ts > prev.obs_ts:
+                        stored = sample
+                    elif sample.obs_ts == prev.obs_ts:
+                        # Same second re-sent (or revised): not a newer
+                        # reading, so it keeps the first arrival time.
+                        stored = replace(sample, recv_ts=prev.recv_ts)
+                    else:
+                        stored = None
+                    if stored is not None:
+                        self._twap_by[sample.symbol] = stored
+                        if self._is_default_symbol(sample.symbol):
+                            self._latest = stored
+                    try:
+                        price = float(sample.twap)
+                    except (TypeError, ValueError):
+                        price = None
+                    if price is not None and math.isfinite(price):
+                        rows.append((float(sample.obs_ts), recv, price))
+                if self.history_s > 0:
+                    self._merge_hist(self._twap_hist, rows)
                 self._last_error = ""
                 self._conn_samples += len(samples)
             return
@@ -912,7 +1128,7 @@ class RtdsTwapFeed:
         def on_open(ws: Any) -> None:
             self._ws = ws
             self._set_error("")
-            ws.send(json.dumps(SUBSCRIBE_FRAME))
+            ws.send(json.dumps(self.subscribe_frame()))
 
         def on_message(ws: Any, message: Any) -> None:
             del ws

@@ -783,8 +783,13 @@ class DeployUnitsTests(unittest.TestCase):
                 "polymintbot.service",
                 "polypathlog.service",
                 "polyscrapbid.service",
+                "polylockbot.service",
             },
         )
+        lock = (DEPLOY / "polylockbot.service").read_text(encoding="utf-8")
+        self.assertIn("lockbot.py", lock)
+        self.assertNotIn("mintbot.py", lock)
+        self.assertIn("do not enable", lock)
         scrap = (DEPLOY / "polyscrapbid.service").read_text(encoding="utf-8")
         self.assertIn(".env.complement", scrap)
         self.assertNotIn("EnvironmentFile=/home/ntemusejoel/poly-money-maker/.env\n", scrap)
@@ -824,6 +829,18 @@ class DeployUnitsTests(unittest.TestCase):
                 "sister_bid.py",
                 "sister_topup.py",
                 "whatsapp_notify.py",
+                "lock_binance.py",
+                "lock_bookws.py",
+                "lock_config.py",
+                "lock_engine.py",
+                "lock_fair.py",
+                "lock_gates.py",
+                "lock_markets.py",
+                "lock_orders.py",
+                "lock_paper.py",
+                "lock_report.py",
+                "lock_wallets.py",
+                "relay_batch.py",
             },
         )
         market_src = (BUY / "market.py").read_text()
