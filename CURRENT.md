@@ -165,13 +165,35 @@ Stored samples are 15s through the middle of the window, 2s around the open and 
 
 **The tape is audit-only.** `oracle_log_enabled` stays on. `sell_late_window_s` is 0, and `sell_oracle_edge_floor_usd`, `sell_oracle_edge_per_ttm`, and `sell_oracle_stale_s` are 0, so the late veto stays off and those zeros do not re-arm the old dollar or stale veto. The scrap oracle veto (#234) reads the feed's in-memory sample, never this file. `sell_oracle_edge_persist_s` stays 3. Mint eligibility, winner cash-out, and held dump do not read the tape.
 
+## Lockbot (repo only, not on the VM)
+
+`lockbot.py` is a separate TWAP-lock taker. It is not installed and not
+enabled. `deploy/polylockbot.service` is a unit file only. `dry_run`
+defaults to true in `lockbot.example.json`. Copy that file to the
+gitignored `lockbot.json` before any run. Do not start it, and do not
+restart `polymintbot`, until the operator asks.
+
+It buys the side whose model probability clears `p_min` in the last
+`entry_window_s`, holds to settlement, and redeems. v1 never sells.
+Strategy 1 is `btc-updown-15m-<start>`. Strategy 2 is the same engine on
+`eth` / `sol` / `xrp` 15m and `btc` 5m. Confirmed on Gamma 2026-10-04:
+those five, plus the alt 5m books, resolve on
+`https://data.chain.link/streams/{asset}-usd-twap-60s-streams` against
+`priceToBeat`. Alt 5m stays off by flag. One RTDS socket per symbol
+(`btc/usd`, `eth/usd`, `sol/usd`, `xrp/usd`) on
+`crypto_prices_twap_sixty` and `crypto_prices_chainlink`.
+
+`python lockbot_summary.py` reads `logs/lockbot.jsonl`.
+
 ## Deploy boundary
 
 Copy VM → GitHub for backup. Do not blindly merge GitHub onto the VM.
 Restart **only** `polymintbot` when the operator asks. `polypathlog` is retired.
+`polylockbot` stays uninstalled until the operator asks.
 
 ## Changelog
 
+- **2026-10-04** — Lockbot added as a separate dry-run service. Mintbot knobs unchanged. Not deployed.
 - **2026-10-03 13:25 IST** — Docs aligned to the live VM.
   - 200 shares a side, with `mint_sequential` and `redeem_enabled` on (`redeem_startup_sweep` off).
   - `sell_persist_s` cut from 5 to 3 today; the last-minute window is 90s.

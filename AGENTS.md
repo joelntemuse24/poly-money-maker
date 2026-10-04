@@ -37,6 +37,13 @@ defaults** unless they say live. Live `strategy_mint.json` runs:
 - **Not live:** `sell_dump_tiers` (#231) and the post-dump kept stop
   (#228) are unmerged.
 
+**Lockbot is a separate service and is not live.** `lockbot.py` plus
+`lockbot.example.json` (`dry_run` true) is a TWAP-lock taker. It does not
+import `mintbot.py`, does not take the mint lock, and does not read
+`strategy_mint.json`. `deploy/polylockbot.service` is in the repo only.
+Do not install, enable, or start it until the operator asks. Do not
+restart `polymintbot` for a lockbot change.
+
 ## Safety boundaries
 
 - Never read or commit .env files, credentials, private keys, or API secrets.
@@ -318,6 +325,18 @@ Shared `buy/` helpers exist for mint, pathlog, and the recording-only oracle tap
 - `buy/sister_topup.py` — one $5 pUSD top-up from A to B per broke episode.
   `sister_topup.py` submits the PROXY batch. Scrapbidder spawns it.
 
+`lockbot.py` is its own process. Strategy 1 is the BTC 15m TWAP-lock
+taker; strategy 2 is the same engine on ETH/SOL/XRP 15m and BTC 5m.
+ETH/SOL/XRP 5m resolve on the same Chainlink 60s TWAP stream and stay
+off (`eth_5m` / `sol_5m` / `xrp_5m` false) until a flag is turned on.
+The decision tick is in-memory (`buy/lock_fair.py`, `buy/lock_engine.py`,
+`buy/lock_gates.py`). It reuses `RtdsTwapFeed` (one socket per symbol),
+the CLOB FAK client, `RedeemDesk` via `buy/relay_batch.py` (live only),
+and the WhatsApp helper. v1 holds to settlement and never sells. Every
+threshold is in `lockbot.example.json`. A gitignored `lockbot.json`
+overrides it. `logs/lockbot.jsonl` and `positions_lockbot.json` stay
+gitignored. `python lockbot_summary.py` prints P&L by strategy and asset.
+
 Do not restore retired buybot modules (`entry_skip`, `hedge_gate`,
 `btc_price`, `clob_book_ws`, `depth_ladder`, `strategy_coherence`,
 `entry_rest_gtd`, complementbot, probe/journal helpers).
@@ -339,4 +358,4 @@ dependencies on the VM after merge. It does not restart services.
 Creating a PR is not authorization to merge or deploy it. After a pull,
 only `polymintbot` may be restarted, and only when the operator asks.
 `polypathlog` is retired. `polyscrapbid` stays stopped until the operator asks to
-start it.
+start it. `polylockbot` stays uninstalled until the operator asks.

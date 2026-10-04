@@ -66,6 +66,8 @@ Read Parts I and II straight through. Part III walks mint and sell. Part IV cove
   - [Sell-side sequence (winner / dump / loser)](#section-36)
   - [Redeem path (what exists vs what does not)](#section-37)
   - [State after expiry](#section-38)
+- [Part VII — Lockbot](#part-vii)
+  - [TWAP-lock taker](#section-39)
 - [Changelog](#changelog)
 
 <a id="part-i"></a>
@@ -843,6 +845,8 @@ Separate systemd unit. `SERIES = ["btc-up-or-down-15m"]` only. Polls CLOB books,
 
 `deploy/polypathlog.service` runs `pathlog.py` (no env file required for public books). Retired: keep it stopped and disabled ([§27](#section-27)).
 
+`deploy/polylockbot.service` runs `lockbot.py` with the mintbot `.env`. It is not installed and not enabled. See [§39](#section-39).
+
 `deploy/polyscrapbid.service` is opt-in and stays disabled. It runs `scrapbidder.py` with `EnvironmentFile=.env.complement` only (not mintbot `.env`). Since #212, even with `bid_enabled` on, wallet B's 20-share post-scrap buy needs `scrap_hedge_enabled` (default **false**); the 10-share dump hedge after A sets `sell_dump_leg` needs `dump_hedge_enabled` (default true). Both use the FAK/rest notional band ($1.00–$1.50 by default). Markets A never held are not bid (`bid_absent_enabled` defaults false). There is no sister-miss dump. The A→B top-up (`sister_topup.py`, $5 of pUSD once per broke episode, reads `.env` itself) needs `topup_enabled` (default **false**). Scrapbidder re-reads mint intents after quoting books so a scrap during the pass is not planned from a stale snapshot (#203). It does not mint and does not FAK-sell. `bid_enabled` defaults false and `dry_run` defaults true. Do not commit `.env.complement`. Do not add `.env` to this unit. Same-wallet buyback is not implemented. Do not enable this unit unless the operator asks.
 
 Never enable retired buy units (`polycomplement`, buybots, DangerZone, shadow) from memory of old docs. `polyscrapbid` is not a restore of `complementbot.py`.
@@ -1321,9 +1325,32 @@ redeem_enabled (opt-in), separate thread:
 
 Adjacent mint may already have been submitted **before** expiry (lookahead). That is intentional and is the main fix for the “skipped 15m” bug.
 
+<a id="part-vii"></a>
+# Part VII — Lockbot
+
+<a id="section-39"></a>
+## TWAP-lock taker
+
+`lockbot.py` is a separate process from `mintbot.py`. It does not import mintbot, does not take `.mintbot.lock`, and does not read `strategy_mint.json`. v1 buys and holds. It never sells.
+
+**Settlement.** Polymarket crypto up/down windows resolve on the Chainlink 60-second TWAP at the window end, against the strike (the same TWAP at the open, Gamma `priceToBeat`). In the last 60 seconds part of that average is already fixed. `buy/lock_fair.py` follows `q1e_lock_chainlink`: the known seconds stay, the remaining `tau - 1` seconds are filled with the live Chainlink print, and
+
+`E[F] = (known_sum + S * (tau - 1)) / 60`, `Var = sigma^2 * tau^3 / 10800`.
+
+`sigma` is the max of the 5-minute and 15-minute standard deviation of 1-second live returns, floored at `1e-9`. Up's win probability is the normal CDF of `(E[F] - K) / sqrt(Var + (0.00002 K)^2)`. The path is already Chainlink, so the Binance basis in the research script is 0. Before the last minute the expectation is the live price and the variance scale is `tau - 40`, matching q1e, but entries default to the last 60 seconds.
+
+**Entry.** With `ttm <= entry_window_s` (60), the side with `p >= p_min` (0.80), best ask in `[ask_min, ask_max]` (0.30–0.95), and `edge = p - ask - 0.07*ask*(1-ask) >= edge_min` (0.03), buys a FAK at the ask (plus `limit_tick_improve` ticks, never above `max_pay` 0.97). Notional is at most `per_market_usd` (20), including earlier partial fills, and at most `max_entries_per_market` (1) orders. Also clipped by `max_open_exposure_usd` (100) and cash above `min_cash_buffer_usd` (5).
+
+**Risk.** `enabled` false stops new entries. `dry_run` true (the example) walks the live book and posts nothing. A Dublin-day loss of `daily_loss_stop_usd` (60), realized plus mark-to-bid, latches until the next Europe/Dublin day. Live price, TWAP, and book must be newer than 2 seconds by local receive time. A missing strike, or an RTDS boundary sample that disagrees with Gamma `priceToBeat`, skips the market.
+
+**Books.** Confirmed on Gamma 2026-10-04. Event slug `{asset}-updown-{5m|15m}-{start_ts}`, series `{asset}-up-or-down-{5m|15m}`. BTC/ETH/SOL/XRP 15m and BTC 5m are on. ETH/SOL/XRP 5m use the same `twap-60s` resolution source and stay off until their flags are set. A `resolutionSource` without `twap-60s` is skipped even if the flag is on. One `RtdsTwapFeed` per symbol; a shared socket streamed live updates for only one symbol.
+
+**State.** `logs/lockbot.jsonl` (eval, entry, fill, settlement, redeem) and `positions_lockbot.json` are gitignored. `lockbot_summary.py` prints P&L, win rate, and the worst market by strategy lane and by asset. Decision-to-order latency is `decision_to_order_ms`. Live redeem reuses `RedeemDesk` through `buy/relay_batch.py` on a `lockbot-redeem` thread. Dry-run logs `redeem_dry_run` and sends nothing.
+
 <a id="changelog"></a>
 # Changelog
 
+- **2026-10-04** — Lockbot. Separate TWAP-lock taker (`lockbot.py`), dry-run by default, not deployed. Mintbot is unchanged.
 - **2026-10-03 (PR #234, not live until pull + restart)** — Scrap oracle veto.
   - No loser scrap while the in-memory 60s TWAP or the live Chainlink price is within $5 of the strike or on the scrapped leg's side (`scrap_oracle_veto_enabled` true, `scrap_oracle_veto_usd` 5.0, `scrap_oracle_veto_stale_s` 3.0, `scrap_oracle_veto_use_live` true). It is re-checked every tick and right before the order is sent.
   - A stale live price leaves the average alone; both stale falls back to the old scrap. Either logs `scrap_oracle_stale`.
