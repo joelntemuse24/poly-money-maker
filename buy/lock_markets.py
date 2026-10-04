@@ -9,8 +9,9 @@ Confirmed against Gamma on 2026-10-04 (User-Agent required):
   The rules text settles Up when that Chainlink TWAP over the window
   is greater than or equal to the price at the start (``priceToBeat``,
   the 60s TWAP stamped at the open).
-* ETH/SOL/XRP 5m markets use the same ``twap-60s`` stream. They stay
-  off until the config flag is turned on.
+* ETH/SOL/XRP 15m and 5m use the same ``twap-60s`` stream. They stay
+  off: after fees the wallet study has them near break-even. The
+  flags can turn a book back on.
 * A market whose ``resolutionSource`` does not contain ``twap-60s`` is
   not the same contract and is skipped even when its flag is on.
 """
@@ -35,13 +36,13 @@ RTDS_SYMBOL = {
     "xrp": "xrp/usd",
 }
 
-# lane "btc_15m" is strategy 1. Everything else is strategy 2.
+# Both BTC books are on. Alt books stay off until a flag is set.
 SPECS: dict[str, dict[str, Any]] = {
     "btc_15m": {"asset": "btc", "duration": "15m", "lane": "btc_15m", "default": True},
-    "eth_15m": {"asset": "eth", "duration": "15m", "lane": "ext", "default": True},
-    "sol_15m": {"asset": "sol", "duration": "15m", "lane": "ext", "default": True},
-    "xrp_15m": {"asset": "xrp", "duration": "15m", "lane": "ext", "default": True},
-    "btc_5m": {"asset": "btc", "duration": "5m", "lane": "ext", "default": True},
+    "eth_15m": {"asset": "eth", "duration": "15m", "lane": "ext", "default": False},
+    "sol_15m": {"asset": "sol", "duration": "15m", "lane": "ext", "default": False},
+    "xrp_15m": {"asset": "xrp", "duration": "15m", "lane": "ext", "default": False},
+    "btc_5m": {"asset": "btc", "duration": "5m", "lane": "btc_5m", "default": True},
     "eth_5m": {"asset": "eth", "duration": "5m", "lane": "ext", "default": False},
     "sol_5m": {"asset": "sol", "duration": "5m", "lane": "ext", "default": False},
     "xrp_5m": {"asset": "xrp", "duration": "5m", "lane": "ext", "default": False},

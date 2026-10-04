@@ -38,11 +38,12 @@ defaults** unless they say live. Live `strategy_mint.json` runs:
   (#228) are unmerged.
 
 **Lockbot is a separate service and is not live.** `lockbot.py` plus
-`lockbot.example.json` (`dry_run` true) is a TWAP-lock taker. It does not
-import `mintbot.py`, does not take the mint lock, and does not read
-`strategy_mint.json`. `deploy/polylockbot.service` is in the repo only.
-Do not install, enable, or start it until the operator asks. Do not
-restart `polymintbot` for a lockbot change.
+`lockbot.example.json` (`dry_run` true) runs two BTC takers: a NIULAI4
+TWAP ladder (15m and 5m) and a Binance-move sniper (5m). ETH/SOL/XRP
+stay off. It does not import `mintbot.py`, does not take the mint lock,
+and does not read `strategy_mint.json`. `deploy/polylockbot.service` is
+in the repo only. Do not install, enable, or start it until the operator
+asks. Do not restart `polymintbot` for a lockbot change.
 
 ## Safety boundaries
 
@@ -325,17 +326,24 @@ Shared `buy/` helpers exist for mint, pathlog, and the recording-only oracle tap
 - `buy/sister_topup.py` — one $5 pUSD top-up from A to B per broke episode.
   `sister_topup.py` submits the PROXY batch. Scrapbidder spawns it.
 
-`lockbot.py` is its own process. Strategy 1 is the BTC 15m TWAP-lock
-taker; strategy 2 is the same engine on ETH/SOL/XRP 15m and BTC 5m.
-ETH/SOL/XRP 5m resolve on the same Chainlink 60s TWAP stream and stay
-off (`eth_5m` / `sol_5m` / `xrp_5m` false) until a flag is turned on.
-The decision tick is in-memory (`buy/lock_fair.py`, `buy/lock_engine.py`,
-`buy/lock_gates.py`). It reuses `RtdsTwapFeed` (one socket per symbol),
-the CLOB FAK client, `RedeemDesk` via `buy/relay_batch.py` (live only),
-and the WhatsApp helper. v1 holds to settlement and never sells. Every
-threshold is in `lockbot.example.json`. A gitignored `lockbot.json`
+`lockbot.py` is its own process. Strategy 1 (`strategy1_enabled`) is the
+NIULAI4 ladder on BTC 15m and BTC 5m: from tau 58 to tau 1, buy the
+Chainlink favourite when `z_side >= Z`, `ask <= Pmax`, and
+`q - ask - fee >= edge_min`. Defaults are Z=0 / Pmax=0.97 on 15m and
+Z=0.25 / Pmax=0.90 on 5m, `edge_min` 0, `ask_min` 0.02, `max_pay` 0.97.
+Clips are `clip_usd` (5) up to `strategy1_market_usd` (20). The first
+fill locks that side. Strategy 2 (`strategy2_enabled`) is the R2e
+Binance 3-second move sniper on BTC 5m only (`|move| >= 2` sigma, ask
+0.02–0.98, no q filter). ETH/SOL/XRP 15m and 5m stay off. A combined
+`combined_per_market_usd` (20) caps both strategies in one market.
+`max_open_exposure_usd` is 60. The daily loss stop stays 60. Books come
+from the CLOB market websocket; Binance trades are in memory. Dry-run
+walks the book after `dry_run_latency_s` (0.20) and logs receive,
+decision, post, and ack times. It holds to settlement and never sells.
+Every threshold is in `lockbot.example.json`. A gitignored `lockbot.json`
 overrides it. `logs/lockbot.jsonl` and `positions_lockbot.json` stay
-gitignored. `python lockbot_summary.py` prints P&L by strategy and asset.
+gitignored. `python lockbot_summary.py` prints P&L, paper fills, and
+latency by strategy.
 
 Do not restore retired buybot modules (`entry_skip`, `hedge_gate`,
 `btc_price`, `clob_book_ws`, `depth_ladder`, `strategy_coherence`,

@@ -33,14 +33,39 @@ def load_jsonl(path: Any) -> list[dict]:
 
 
 def summarize(rows: Iterable[dict]) -> dict:
-    """Group settled markets by lane (strategy 1 vs 2) and by asset.
+    """Settled P&L by strategy (s1 / s2), lane, and asset.
 
-    One settlement row per market. Win rate uses the ``won`` flag.
-    Worst market is the lowest ``pnl``.
+    One settlement can share a slug across strategies and sides, so the
+    key is slug + strategy + side. Win rate uses the ``won`` flag.
+    Signal and paper-fill counts are included so a dry-run day can be
+    read before every window has settled. Latency percentiles come from
+    decision/post/ack stamps on those attempts.
     """
-    by_slug: dict[str, dict] = {}
-    for row in rows or []:
-        if not isinstance(row, dict) or row.get("event") != "settlement":
+    from buy.lock_paper import latency_summary
+
+    stored = list(rows or [])
+    by_key: dict[str, dict] = {}
+    signals = {"s1": 0, "s2": 0}
+    fills = {
+        "s1": {"n": 0, "cost": 0.0, "shares": 0.0},
+        "s2": {"n": 0, "cost": 0.0, "shares": 0.0},
+    }
+    for row in stored:
+        if not isinstance(row, dict):
+            continue
+        event = row.get("event")
+        strategy = str(row.get("strategy") or "")
+        if strategy not in {"s1", "s2"}:
+            strategy = ""
+        if event == "signal" and strategy:
+            signals[strategy] += 1
+        if event in {"paper_fill", "entry"} and strategy:
+            shares = _num(row.get("shares")) or 0.0
+            if shares > 0:
+                fills[strategy]["n"] += 1
+                fills[strategy]["cost"] += _num(row.get("cost")) or 0.0
+                fills[strategy]["shares"] += shares
+        if event != "settlement":
             continue
         slug = str(row.get("slug") or "")
         if not slug:
@@ -48,13 +73,15 @@ def summarize(rows: Iterable[dict]) -> dict:
         pnl = _num(row.get("pnl"))
         if pnl is None:
             continue
-        by_slug[slug] = row
+        key = f"{slug}|{row.get('strategy') or ''}|{row.get('side') or ''}"
+        by_key[key] = row
 
     def bucket() -> dict:
         return {"markets": 0, "wins": 0, "pnl": 0.0, "worst": None, "worst_slug": None}
 
     lanes: dict[str, dict] = {}
     assets: dict[str, dict] = {}
+    strategies: dict[str, dict] = {}
     overall = bucket()
 
     def add(into: dict, row: dict) -> None:
@@ -67,14 +94,16 @@ def summarize(rows: Iterable[dict]) -> dict:
             into["worst"] = pnl
             into["worst_slug"] = row.get("slug")
 
-    for row in by_slug.values():
+    for row in by_key.values():
         lane = str(row.get("lane") or "ext")
         asset = str(row.get("asset") or "?")
         duration = str(row.get("duration") or "")
         asset_key = f"{asset}_{duration}" if duration else asset
+        strategy = str(row.get("strategy") or "unset")
         add(overall, row)
         add(lanes.setdefault(lane, bucket()), row)
         add(assets.setdefault(asset_key, bucket()), row)
+        add(strategies.setdefault(strategy, bucket()), row)
 
     def finish(raw: dict) -> dict:
         n = int(raw["markets"])
@@ -93,6 +122,13 @@ def summarize(rows: Iterable[dict]) -> dict:
         "worst_slug": overall["worst_slug"],
         "lanes": {key: finish(value) for key, value in sorted(lanes.items())},
         "assets": {key: finish(value) for key, value in sorted(assets.items())},
+        "strategies": {key: finish(value) for key, value in sorted(strategies.items())},
+        "signals": signals,
+        "fills": {
+            key: {"n": row["n"], "cost": round(row["cost"], 4), "shares": round(row["shares"], 4)}
+            for key, row in fills.items()
+        },
+        "latency": latency_summary(stored),
     }
 
 
@@ -105,15 +141,40 @@ def format_summary(summary: dict) -> str:
         else f"markets {summary.get('markets', 0)}  pnl ${float(summary.get('pnl') or 0):.2f}"
     ]
     lines.append("by strategy")
+    strategies = summary.get("strategies") or {}
+    signals = summary.get("signals") or {}
+    fills = summary.get("fills") or {}
+    names = sorted(set(strategies) | set(signals) | set(fills))
+    if not names:
+        lines.append("  (none)")
+    for name in names:
+        row = strategies.get(name) or {"markets": 0, "pnl": 0.0, "win_rate": None, "worst": None}
+        label = {"s1": "strategy 1", "s2": "strategy 2"}.get(name, name)
+        sig = (signals.get(name) or {}).get("n", signals.get(name, 0)) if isinstance(signals.get(name), dict) else signals.get(name, 0)
+        fill = fills.get(name) or {}
+        lines.append(
+            f"  {label}: signals {sig}  fills {fill.get('n', 0)}  "
+            f"bought ${float(fill.get('cost') or 0):.2f}  "
+            f"settled {row.get('markets', 0)}  pnl ${float(row.get('pnl') or 0):.2f}  "
+            f"win_rate {_pct(row.get('win_rate'))}  worst {_usd(row.get('worst'))}"
+        )
+    lines.append("by market")
     lanes = summary.get("lanes") or {}
     if not lanes:
         lines.append("  (none)")
     for name, row in lanes.items():
-        label = "strategy 1 btc 15m" if name == "btc_15m" else "strategy 2 other"
         lines.append(
-            f"  {label}: markets {row['markets']}  pnl ${row['pnl']:.2f}  "
+            f"  {name}: markets {row['markets']}  pnl ${row['pnl']:.2f}  "
             f"win_rate {_pct(row.get('win_rate'))}  worst {_usd(row.get('worst'))}"
         )
+    latency = summary.get("latency") or {}
+    lines.append("latency ms")
+    for key in ("decision_to_post_ms", "recv_to_post_ms"):
+        pack = latency.get(key)
+        if not pack:
+            lines.append(f"  {key}: n/a")
+            continue
+        lines.append(f"  {key}: n {pack['n']}  p50 {pack['p50']}  p95 {pack['p95']}  max {pack['max']}")
     lines.append("by asset")
     assets = summary.get("assets") or {}
     if not assets:

@@ -170,6 +170,7 @@ def build_view(
         "asset": market.asset,
         "duration": market.duration,
         "lane": market.lane,
+        "key": market.key,
         "condition_id": market.condition_id,
         "start_ts": market.start_ts,
         "end_ts": market.end_ts,

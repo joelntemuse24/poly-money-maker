@@ -10,6 +10,8 @@ from buy.lock_gates import (
     day_pnl,
     dublin_day,
     evaluate_entry,
+    evaluate_strategy1,
+    evaluate_strategy2,
     execute_buy,
     is_stale,
     loss_stop_active,
@@ -30,6 +32,8 @@ def _view(**over):
         "strike_reason": "match",
         "coverage_ok": True,
         "vol_samples": 120,
+        "key": "btc_15m",
+        "expected": 110.0,
         "p_up": 0.90,
         "live_recv_ts": 999.5,
         "twap_recv_ts": 999.5,
@@ -55,6 +59,19 @@ def _account(**over):
     return base
 
 
+def _s2_view(**over):
+    base = _view(
+        key="btc_5m",
+        end_ts=1_200.0,
+        binance_recv_ts=999.5,
+        binance_move=2.5,
+        sigma1s=1.0,
+        sigma_source="pre_window",
+    )
+    base.update(over)
+    return base
+
+
 class GateTests(unittest.TestCase):
     def setUp(self):
         self.cfg = apply_defaults({})
@@ -63,13 +80,48 @@ class GateTests(unittest.TestCase):
         edge = taker_edge(0.90, 0.80, self.cfg)
         self.assertAlmostEqual(edge, 0.90 - 0.80 - 0.07 * 0.80 * 0.20, places=9)
 
-    def test_qualifying_ask_buys_at_most_twenty_dollars(self):
+    def test_qualifying_ask_buys_one_clip(self):
         decision = evaluate_entry(_view(), _account(), self.cfg)
         self.assertEqual(decision["action"], "buy")
         self.assertEqual(decision["side"], "up")
-        self.assertAlmostEqual(decision["notional"], 20.0)
+        self.assertEqual(decision["strategy"], "s1")
+        self.assertAlmostEqual(decision["notional"], 5.0)
         self.assertAlmostEqual(decision["limit"], 0.80)
-        self.assertGreater(decision["edge"], 0.03)
+        self.assertGreater(decision["edge"], 0.0)
+        self.assertGreaterEqual(decision["z_side"], 0.0)
+
+    def test_btc_15m_buys_the_mid_price_bucket(self):
+        decision = evaluate_strategy1(
+            _view(up={"asks": [(0.55, 100.0)], "bids": [], "recv_ts": 999.5}),
+            _account(),
+            self.cfg,
+        )
+        self.assertEqual(decision["action"], "buy")
+        self.assertAlmostEqual(decision["ask"], 0.55)
+
+    def test_btc_5m_requires_z_and_a_tighter_pmax(self):
+        view = _view(key="btc_5m", expected=100.05)
+        small = evaluate_strategy1(view, _account(), self.cfg)
+        self.assertEqual(small["reason"], "z_below")
+        rich = evaluate_strategy1(
+            _view(
+                key="btc_5m",
+                up={"asks": [(0.92, 100.0)], "bids": [], "recv_ts": 999.5},
+            ),
+            _account(),
+            self.cfg,
+        )
+        self.assertEqual(rich["reason"], "ask_above")
+        ok = evaluate_strategy1(
+            _view(
+                key="btc_5m",
+                up={"asks": [(0.80, 100.0)], "bids": [], "recv_ts": 999.5},
+            ),
+            _account(),
+            self.cfg,
+        )
+        self.assertEqual(ok["action"], "buy")
+        self.assertGreaterEqual(ok["z_side"], 0.25)
 
     def test_stale_live_and_book_skip(self):
         stale_live = evaluate_entry(_view(live_recv_ts=990.0), _account(), self.cfg)
@@ -90,7 +142,7 @@ class GateTests(unittest.TestCase):
 
     def test_price_caps(self):
         rich = evaluate_entry(
-            _view(up={"asks": [(0.96, 100.0)], "bids": [], "recv_ts": 999.5}),
+            _view(key="btc_5m", up={"asks": [(0.92, 100.0)], "bids": [], "recv_ts": 999.5}),
             _account(),
             self.cfg,
         )
@@ -98,47 +150,81 @@ class GateTests(unittest.TestCase):
         insane = evaluate_entry(
             _view(up={"asks": [(0.98, 100.0)], "bids": [], "recv_ts": 999.5}),
             _account(),
-            apply_defaults({"ask_max": 0.99}),
+            self.cfg,
         )
         self.assertEqual(insane["reason"], "max_pay")
         thin = evaluate_entry(
-            _view(p_up=0.99, up={"asks": [(0.20, 100.0)], "bids": [], "recv_ts": 999.5}),
+            _view(up={"asks": [(0.01, 100.0)], "bids": [], "recv_ts": 999.5}),
             _account(),
             self.cfg,
         )
         self.assertEqual(thin["reason"], "ask_below")
 
     def test_edge_below_min_skips(self):
-        # 0.82 - 0.80 - fee ≈ 0.0088 < 0.03
         decision = evaluate_entry(
-            _view(p_up=0.82),
+            _view(expected=100.0),
             _account(),
             self.cfg,
         )
         self.assertEqual(decision["reason"], "edge_below")
 
-    def test_partial_fills_share_the_twenty_dollar_cap(self):
-        cfg = apply_defaults({"max_entries_per_market": 2, "min_shares": 1})
-        first = evaluate_entry(_view(), _account(), cfg)
-        self.assertAlmostEqual(first["notional"], 20.0)
-        account = note_fill(_account(), cost=12.5, shares=15.0)
-        second = evaluate_entry(_view(), account, cfg)
-        self.assertEqual(second["action"], "buy")
-        self.assertAlmostEqual(second["notional"], 7.5)
-        self.assertLessEqual(12.5 + second["notional"], 20.0 + 1e-9)
+    def test_ladder_clips_five_until_twenty(self):
+        account = _account()
+        for _ in range(4):
+            decision = evaluate_entry(_view(), account, self.cfg)
+            self.assertEqual(decision["action"], "buy")
+            self.assertAlmostEqual(decision["notional"], 5.0)
+            account = note_fill(account, cost=5.0, shares=6.0, strategy="s1", side="up", now=1.0)
+        fresh = {"asks": [(0.80, 200.0)], "bids": [(0.79, 40.0)], "recv_ts": 1_001.5}
+        blocked = evaluate_entry(
+            _view(
+                now=1_002.0,
+                end_ts=1_032.0,
+                live_recv_ts=1_001.5,
+                twap_recv_ts=1_001.5,
+                up=fresh,
+                down=fresh,
+            ),
+            account,
+            self.cfg,
+        )
+        self.assertEqual(blocked["reason"], "strategy_cap")
+        self.assertAlmostEqual(account["spent_s1"], 20.0)
 
-    def test_one_entry_blocks_a_second_even_with_room(self):
-        account = note_fill(_account(), cost=12.5, shares=15.0)
+    def test_partial_fill_leaves_room_for_another_clip(self):
+        account = note_fill(_account(), cost=17.5, shares=20.0, strategy="s1", side="up", now=900.0)
         decision = evaluate_entry(_view(), account, self.cfg)
-        self.assertEqual(decision["reason"], "max_entries")
+        self.assertEqual(decision["action"], "buy")
+        self.assertAlmostEqual(decision["notional"], 2.5)
+        self.assertLessEqual(17.5 + decision["notional"], 20.0 + 1e-9)
+
+    def test_first_fill_locks_the_side(self):
+        account = note_fill(_account(), cost=5.0, shares=6.0, strategy="s1", side="up", now=900.0)
+        flipped = evaluate_entry(_view(expected=90.0), account, self.cfg)
+        self.assertEqual(flipped["side"], "down")
+        self.assertEqual(flipped["reason"], "side_locked")
+        same = evaluate_entry(_view(), account, self.cfg)
+        self.assertEqual(same["action"], "buy")
+        self.assertEqual(same["side"], "up")
+        unlocked = note_fill(_account(), cost=5.0, shares=0.0, strategy="s1", side="up")
+        self.assertIsNone(unlocked.get("locked_side"))
+
+    def test_combined_cap_blocks_the_other_strategy(self):
+        account = note_fill(_account(), cost=20.0, shares=25.0, strategy="s1", side="up", now=900.0)
+        decision = evaluate_strategy2(_s2_view(), account, self.cfg)
+        self.assertEqual(decision["reason"], "combined_cap")
+        roomy = note_fill(_account(), cost=10.0, shares=12.0, strategy="s1", side="up", now=900.0)
+        second = evaluate_strategy2(_s2_view(), roomy, self.cfg)
+        self.assertEqual(second["action"], "buy")
+        self.assertAlmostEqual(second["notional"], 5.0)
 
     def test_exposure_cap_clips_the_order(self):
-        decision = evaluate_entry(_view(), _account(open_cost=90.0), self.cfg)
+        decision = evaluate_entry(_view(), _account(open_cost=56.0), self.cfg)
         self.assertEqual(decision["action"], "buy")
-        self.assertAlmostEqual(decision["notional"], 10.0)
+        self.assertAlmostEqual(decision["notional"], 4.0)
 
     def test_exposure_block_when_the_room_cannot_pay_the_minimum(self):
-        decision = evaluate_entry(_view(), _account(open_cost=99.5), self.cfg)
+        decision = evaluate_entry(_view(), _account(open_cost=59.5), self.cfg)
         self.assertEqual(decision["reason"], "exposure")
 
     def test_cash_buffer_blocks(self):

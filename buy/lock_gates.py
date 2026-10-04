@@ -225,59 +225,177 @@ def _book(view: dict, side: str) -> dict:
     return book if isinstance(book, dict) else {}
 
 
-def evaluate_entry(view: dict, account: dict, cfg: dict) -> dict:
-    """One market, one decision. ``action`` is ``buy`` or ``skip``.
+def market_rule(cfg: dict, key: str) -> dict:
+    """Per-market ``Z``, ``Pmax`` and ``edge_min``. Missing keys fall back."""
+    rules = (cfg or {}).get("market_rules") or {}
+    row = rules.get(key) or {}
+    if not isinstance(row, dict):
+        row = {}
+    fallback = {"btc_15m": (0.0, 0.97, 0.0), "btc_5m": (0.25, 0.90, 0.0)}.get(key, (0.0, 0.97, 0.0))
+    return {
+        "Z": _num(row.get("Z"), fallback[0]),
+        "Pmax": _num(row.get("Pmax"), fallback[1]),
+        "edge_min": _num(row.get("edge_min"), fallback[2]),
+    }
 
-    Risk blocks are applied after a qualifying price, so a disabled bot
-    or a daily stop still records the edge it refused.
-    """
-    cfg = cfg or {}
-    account = account or {}
-    view = view or {}
-    now = _num(view.get("now"), _num(account.get("now"), 0.0))
+
+def _decision_base(view: dict, strategy: str) -> dict:
+    now = _num(view.get("now"), 0.0)
     end_ts = _num(view.get("end_ts"), 0.0)
-    ttm = end_ts - now
-    base = {
+    return {
         "action": "skip",
         "reason": "no_view",
-        "ttm_s": ttm,
+        "ttm_s": end_ts - now,
         "slug": view.get("slug"),
         "asset": view.get("asset"),
         "duration": view.get("duration"),
         "lane": view.get("lane"),
-        "strategy": "twap_lock",
+        "market_key": view.get("key") or view.get("market_key"),
+        "strategy": strategy,
         "condition_id": view.get("condition_id"),
         "p": None,
+        "q": None,
+        "z": None,
+        "z_side": None,
         "ask": None,
         "edge": None,
         "side": None,
         "limit": None,
         "notional": 0.0,
         "shares": 0.0,
+        "strike": view.get("strike"),
+        "live": view.get("live"),
+        "twap": view.get("twap"),
+        "sigma": view.get("sigma"),
+        "expected": view.get("expected"),
+        "binance_recv_ts": view.get("binance_recv_ts"),
     }
+
+
+def _side_book(view: dict, side: str, now: float, stale_s: float) -> dict:
+    book = _book(view, side)
+    asks = book.get("asks") or []
+    if asks and isinstance(asks[0], (tuple, list)):
+        ask, ask_sz = best_level(asks)
+    else:
+        ask = finite_float(book.get("ask"))
+        ask_sz = _num(book.get("ask_size"), 0.0)
+        asks = [(ask, ask_sz)] if ask is not None else []
+    return {
+        "side": side,
+        "ask": ask,
+        "ask_size": ask_sz,
+        "asks": asks,
+        "bids": book.get("bids") or [],
+        "stale": is_stale(book.get("recv_ts"), now, stale_s),
+        "token_id": view.get("up_token") if side == "up" else view.get("dn_token"),
+        "recv_ts": book.get("recv_ts"),
+    }
+
+
+def _clip_room(account: dict, cfg: dict, *, strategy: str) -> tuple[float, str]:
+    """Dollars this clip may spend, and a reason when the room is under the minimum."""
+    clip = _num(cfg.get("clip_usd"), 5.0)
+    combined = _num(cfg.get("combined_per_market_usd"), _num(cfg.get("per_market_usd"), 20.0))
+    if strategy == "s1":
+        cap = _num(cfg.get("strategy1_market_usd"), 20.0)
+        spent_strategy = _num(account.get("spent_s1"), _num(account.get("spent"), 0.0))
+    else:
+        cap = _num(cfg.get("strategy2_market_usd"), 20.0)
+        spent_strategy = _num(account.get("spent_s2"), 0.0)
+    spent_total = _num(account.get("spent_total"), _num(account.get("spent_s1"), 0.0) + _num(account.get("spent_s2"), 0.0))
+    exposure = _num(account.get("open_cost"), 0.0)
+    max_exposure = _num(cfg.get("max_open_exposure_usd"), 60.0)
+    cash = _num(account.get("cash"), 0.0)
+    buffer = _num(cfg.get("min_cash_buffer_usd"), 5.0)
+    room_strategy = cap - spent_strategy
+    room_combined = combined - spent_total
+    room_exposure = max_exposure - exposure
+    room_cash = cash - buffer
+    room = min(clip, room_strategy, room_combined, room_exposure, room_cash)
+    min_usd = _num(cfg.get("min_order_usd"), 1.0)
+    if room + 1e-9 >= min_usd:
+        return room, ""
+    if room_strategy <= room_combined and room_strategy <= room_exposure and room_strategy <= room_cash:
+        return max(0.0, room), "strategy_cap"
+    if room_combined <= room_exposure and room_combined <= room_cash:
+        return max(0.0, room), "combined_cap"
+    if room_exposure <= room_cash:
+        return max(0.0, room), "exposure"
+    return max(0.0, room), "cash"
+
+
+def _finish_buy(base: dict, account: dict, cfg: dict, *, strategy: str, limit: float, now: float, cooldown_s: float, last_ts: Any) -> dict:
+    if not bool(cfg.get("enabled", True)):
+        base["reason"] = "disabled"
+        return base
+    if account.get("loss_stopped"):
+        base["reason"] = "daily_loss"
+        return base
+    if last_ts is not None and now - float(last_ts) < float(cooldown_s):
+        base["reason"] = "cooldown"
+        return base
+    room, reason = _clip_room(account, cfg, strategy=strategy)
+    if reason:
+        base["reason"] = reason
+        base["notional"] = room
+        return base
+    shares = room / float(limit)
+    min_shares = _num(cfg.get("min_shares"), 1.0)
+    if shares + 1e-9 < min_shares:
+        base["reason"] = "min_shares"
+        base["notional"] = room
+        base["shares"] = shares
+        return base
+    base["action"] = "buy"
+    base["reason"] = "signal"
+    base["limit"] = float(limit)
+    base["notional"] = room
+    base["shares"] = shares
+    return base
+
+
+def _common_skip(view: dict, cfg: dict) -> Optional[str]:
+    if not view.get("market_enabled", True):
+        return "market_disabled"
+    if view.get("resolution_ok") is not True:
+        return "resolution_unsupported" if view.get("resolution_source") else "resolution_unknown"
+    return None
+
+
+def evaluate_strategy1(view: dict, account: dict, cfg: dict) -> dict:
+    """NIULAI4 ladder. One clip, the Chainlink favourite only.
+
+    After the first fill the side is locked: the other side is never bought
+    in this market. Risk blocks still record the z and the ask they refused.
+    """
+    from buy.lock_fair import side_z
+
+    cfg = cfg or {}
+    account = account or {}
+    view = view or {}
+    base = _decision_base(view, "s1")
+    now = _num(view.get("now"), 0.0)
+    ttm = base["ttm_s"]
 
     def skip(reason: str, **extra: Any) -> dict:
         base["reason"] = reason
         base.update(extra)
         return base
 
-    if not view.get("market_enabled", True):
-        return skip("market_disabled")
-    if view.get("resolution_ok") is not True:
-        return skip("resolution_unsupported" if view.get("resolution_source") else "resolution_unknown")
-
-    entry_window = _num(cfg.get("entry_window_s"), 60.0)
-    entry_min = _num(cfg.get("entry_min_ttm_s"), 1.0)
-    if ttm > entry_window:
+    if not bool(cfg.get("strategy1_enabled", True)):
+        return skip("strategy_off")
+    common = _common_skip(view, cfg)
+    if common:
+        return skip(common)
+    if ttm > _num(cfg.get("s1_tau_max"), 58.0):
         return skip("too_early")
-    if ttm < entry_min:
+    if ttm < _num(cfg.get("s1_tau_min"), 1.0):
         return skip("too_late")
-
     if is_stale(view.get("live_recv_ts"), now, _num(cfg.get("stale_price_s"), 2.0)):
         return skip("stale_live")
     if is_stale(view.get("twap_recv_ts"), now, _num(cfg.get("stale_price_s"), 2.0)):
         return skip("stale_twap")
-
     strike_reason = str(view.get("strike_reason") or "")
     if strike_reason in {"strike_unknown", "strike_mismatch"} or view.get("strike") is None:
         return skip(strike_reason or "strike_unknown")
@@ -286,146 +404,208 @@ def evaluate_entry(view: dict, account: dict, cfg: dict) -> dict:
     vol_n = int(_num(view.get("vol_samples"), 0))
     if vol_n < int(_num(cfg.get("vol_min_samples"), 60)):
         return skip("vol_short", vol_samples=vol_n)
-
-    p_up = finite_float(view.get("p_up"))
-    if p_up is None:
+    expected = finite_float(view.get("expected"))
+    strike = finite_float(view.get("strike"))
+    sigma = finite_float(view.get("sigma"))
+    if expected is None or strike is None or sigma is None:
         return skip("model_unavailable")
-
-    p_min = _num(cfg.get("p_min"), 0.80)
-    ask_min = _num(cfg.get("ask_min"), 0.30)
-    ask_max = _num(cfg.get("ask_max"), 0.95)
-    max_pay = _num(cfg.get("max_pay"), 0.97)
-    edge_min = _num(cfg.get("edge_min"), 0.03)
-    stale_book = _num(cfg.get("stale_book_s"), 2.0)
-
-    candidates = []
-    for side, p_win in (("up", p_up), ("down", 1.0 - p_up)):
-        book = _book(view, side)
-        asks = book.get("asks") or []
-        if asks and isinstance(asks[0], (tuple, list)):
-            ask, ask_sz = best_level(asks)
-        else:
-            ask = finite_float(book.get("ask"))
-            ask_sz = _num(book.get("ask_size"), 0.0)
-            asks = [(ask, ask_sz)] if ask is not None else []
-        edge = None if ask is None else taker_edge(p_win, ask, cfg)
-        candidates.append(
-            {
-                "side": side,
-                "p": p_win,
-                "ask": ask,
-                "ask_size": ask_sz,
-                "asks": asks,
-                "bids": book.get("bids") or [],
-                "edge": edge,
-                "stale": is_stale(book.get("recv_ts"), now, stale_book),
-                "token_id": view.get("up_token") if side == "up" else view.get("dn_token"),
-            }
-        )
-    candidates.sort(key=lambda row: (row["p"], row["edge"] if row["edge"] is not None else -9), reverse=True)
-
-    def consider(side_row: dict) -> tuple[str, Optional[float]]:
-        if side_row["p"] + 1e-12 < p_min:
-            return "p_below", None
-        if side_row["stale"] or side_row["ask"] is None:
-            return ("stale_book" if side_row["stale"] else "no_ask"), None
-        ask = float(side_row["ask"])
-        if ask - 1e-12 > max_pay:
-            return "max_pay", None
-        if ask - 1e-12 > ask_max:
-            return "ask_above", None
-        if ask + 1e-12 < ask_min:
-            return "ask_below", None
-        if side_row["edge"] is None or side_row["edge"] + 1e-12 < edge_min:
-            return "edge_below", None
-        limit = limit_price(ask, cfg)
-        if limit is None:
-            return "max_pay", None
-        if limit > ask + 1e-9 and taker_edge(side_row["p"], limit, cfg) + 1e-12 < edge_min:
-            return "edge_below", limit
-        return "edge", limit
-
-    chosen = None
-    chosen_limit = None
-    fallback_reason = "p_below"
-    for side_row in candidates:
-        reason, limit = consider(side_row)
-        if reason == "edge":
-            chosen = side_row
-            chosen_limit = limit
-            break
-        if side_row is candidates[0]:
-            fallback_reason = reason
-            chosen = side_row
-            chosen_limit = limit
-    best = chosen or candidates[0]
+    scored = side_z(
+        strike=strike,
+        expected=expected,
+        sigma=sigma,
+        tau_s=max(ttm, 0.0),
+        noise_frac=_num(cfg.get("noise_frac"), 0.00002),
+    )
+    side = scored["side"]
+    book = _side_book(view, side, now, _num(cfg.get("stale_book_s"), 2.0))
+    rule = market_rule(cfg, str(view.get("key") or view.get("market_key") or ""))
+    ask = book["ask"]
+    q = scored["q"]
+    edge = None if ask is None else (q - float(ask) - taker_fee(float(ask), _num(cfg.get("taker_fee_rate"), 0.07), _num(cfg.get("taker_fee_exponent"), 1.0)))
     base.update(
         {
-            "side": best["side"],
-            "p": best["p"],
-            "ask": best["ask"],
-            "edge": best["edge"],
-            "token_id": best["token_id"],
-            "asks": best["asks"],
-            "bids": best["bids"],
-            "strike": view.get("strike"),
-            "gamma_strike": view.get("gamma_strike"),
-            "live": view.get("live"),
-            "twap": view.get("twap"),
-            "sigma": view.get("sigma"),
-            "expected": view.get("expected"),
+            "side": side,
+            "p": q,
+            "q": q,
+            "z": scored["z"],
+            "z_side": scored["z_side"],
+            "sd": scored["sd"],
+            "ask": ask,
+            "edge": edge,
+            "token_id": book["token_id"],
+            "asks": book["asks"],
+            "bids": book["bids"],
+            "book_recv_ts": book["recv_ts"],
+            "Z": rule["Z"],
+            "Pmax": rule["Pmax"],
         }
     )
-    if chosen_limit is not None and chosen is not None and consider(chosen)[0] == "edge":
-        base["limit"] = chosen_limit
-    else:
-        return skip(fallback_reason)
-
-    if not bool(cfg.get("enabled", True)):
-        return skip("disabled")
-    if account.get("loss_stopped"):
-        return skip("daily_loss")
-
-    entries = int(_num(account.get("entries"), 0))
-    max_entries = int(_num(cfg.get("max_entries_per_market"), 1))
-    if entries >= max_entries:
-        return skip("max_entries")
-
-    per_market = _num(cfg.get("per_market_usd"), 20.0)
-    spent = _num(account.get("spent"), 0.0)
-    exposure = _num(account.get("open_cost"), 0.0)
-    max_exposure = _num(cfg.get("max_open_exposure_usd"), 100.0)
-    cash = _num(account.get("cash"), 0.0)
-    buffer = _num(cfg.get("min_cash_buffer_usd"), 5.0)
-    room_market = per_market - spent
-    room_exposure = max_exposure - exposure
-    room_cash = cash - buffer
-    room = min(room_market, room_exposure, room_cash, per_market)
-    min_usd = _num(cfg.get("min_order_usd"), 1.0)
-    if room + 1e-9 < min_usd:
-        if room_market <= room_exposure and room_market <= room_cash:
-            return skip("per_market_cap", notional=max(0.0, room))
-        if room_exposure <= room_cash:
-            return skip("exposure", notional=max(0.0, room))
-        return skip("cash", notional=max(0.0, room))
-
-    shares = room / limit
-    min_shares = _num(cfg.get("min_shares"), 5.0)
-    if shares + 1e-9 < min_shares:
-        return skip("min_shares", notional=room, shares=shares)
-
-    base["action"] = "buy"
-    base["reason"] = "edge"
-    base["notional"] = room
-    base["shares"] = shares
-    return base
+    locked = account.get("locked_side")
+    if locked and str(locked) != side:
+        return skip("side_locked")
+    if scored["z_side"] + 1e-12 < rule["Z"]:
+        return skip("z_below")
+    if book["stale"]:
+        return skip("stale_book")
+    if ask is None:
+        return skip("no_ask")
+    ask_f = float(ask)
+    ask_min = _num(cfg.get("ask_min"), 0.02)
+    max_pay = _num(cfg.get("max_pay"), 0.97)
+    if ask_f + 1e-12 < ask_min:
+        return skip("ask_below")
+    if ask_f - 1e-12 > max_pay:
+        return skip("max_pay")
+    if ask_f - 1e-12 > rule["Pmax"]:
+        return skip("ask_above")
+    if edge is None or edge + 1e-12 < rule["edge_min"]:
+        return skip("edge_below")
+    limit = limit_price(ask_f, cfg)
+    if limit is None or limit - 1e-12 > max_pay:
+        return skip("max_pay")
+    return _finish_buy(
+        base,
+        account,
+        cfg,
+        strategy="s1",
+        limit=limit,
+        now=now,
+        cooldown_s=_num(cfg.get("s1_clip_cooldown_s"), 1.0),
+        last_ts=account.get("last_s1_ts"),
+    )
 
 
-def note_fill(account: dict, *, cost: float, shares: float, count_entry: bool = True) -> dict:
-    """Add a fill toward the per-market cap and the open exposure."""
+def evaluate_strategy2(view: dict, account: dict, cfg: dict) -> dict:
+    """R2e Binance-move sniper. The side is the move, not the Chainlink favourite.
+
+    ``s2_q_edge_min`` null disables the optional ``q - ask`` filter. This
+    path does not lock a side: the wallets buy both sides of one window.
+    """
+    cfg = cfg or {}
+    account = account or {}
+    view = view or {}
+    base = _decision_base(view, "s2")
+    now = _num(view.get("now"), 0.0)
+    ttm = base["ttm_s"]
+
+    def skip(reason: str, **extra: Any) -> dict:
+        base["reason"] = reason
+        base.update(extra)
+        return base
+
+    if not bool(cfg.get("strategy2_enabled", True)):
+        return skip("strategy_off")
+    allowed = cfg.get("strategy2_markets") or ["btc_5m"]
+    key = str(view.get("key") or view.get("market_key") or "")
+    if key not in {str(item) for item in allowed}:
+        return skip("strategy_market_off")
+    common = _common_skip(view, cfg)
+    if common:
+        return skip(common)
+    if ttm > _num(cfg.get("s2_tau_max"), 300.0):
+        return skip("too_early")
+    if ttm < _num(cfg.get("s2_tau_min"), 5.0):
+        return skip("too_late")
+    if is_stale(view.get("binance_recv_ts"), now, _num(cfg.get("stale_binance_s"), 2.0)):
+        return skip("stale_binance")
+    move = finite_float(view.get("binance_move"))
+    if move is None:
+        return skip("move_unavailable")
+    base["move"] = move
+    base["sigma1s"] = view.get("sigma1s")
+    base["sigma_source"] = view.get("sigma_source")
+    threshold = _num(cfg.get("s2_move_sigma"), 2.0)
+    if abs(move) + 1e-12 < threshold:
+        return skip("move_below")
+    side = "up" if move > 0 else "down"
+    book = _side_book(view, side, now, _num(cfg.get("stale_book_s"), 2.0))
+    q_up = finite_float(view.get("q_up"))
+    q = None if q_up is None else (q_up if side == "up" else 1.0 - q_up)
+    ask = book["ask"]
+    base.update(
+        {
+            "side": side,
+            "p": q,
+            "q": q,
+            "ask": ask,
+            "token_id": book["token_id"],
+            "asks": book["asks"],
+            "bids": book["bids"],
+            "book_recv_ts": book["recv_ts"],
+        }
+    )
+    if book["stale"]:
+        return skip("stale_book")
+    if ask is None:
+        return skip("no_ask")
+    ask_f = float(ask)
+    ask_min = _num(cfg.get("ask_min"), 0.02)
+    ask_max = _num(cfg.get("s2_ask_max"), 0.98)
+    max_pay = _num(cfg.get("max_pay"), 0.97)
+    if ask_f + 1e-12 < ask_min:
+        return skip("ask_below")
+    if ask_f - 1e-12 > max_pay:
+        return skip("max_pay")
+    if ask_f - 1e-12 > ask_max:
+        return skip("ask_above")
+    q_edge = cfg.get("s2_q_edge_min")
+    if q_edge is not None and q_edge != "":
+        if q is None:
+            return skip("model_unavailable")
+        edge = float(q) - ask_f
+        base["edge"] = edge
+        if edge + 1e-12 < float(q_edge):
+            return skip("q_edge_below")
+    limit = limit_price(ask_f, cfg)
+    if limit is None or limit - 1e-12 > max_pay:
+        return skip("max_pay")
+    return _finish_buy(
+        base,
+        account,
+        cfg,
+        strategy="s2",
+        limit=limit,
+        now=now,
+        cooldown_s=_num(cfg.get("s2_clip_cooldown_s"), 1.0),
+        last_ts=account.get("last_s2_ts"),
+    )
+
+
+def evaluate_entry(view: dict, account: dict, cfg: dict) -> dict:
+    """Strategy 1. Kept so older callers still hit the NIULAI4 rule."""
+    return evaluate_strategy1(view, account, cfg)
+
+
+def note_fill(
+    account: dict,
+    *,
+    cost: float,
+    shares: float,
+    count_entry: bool = True,
+    strategy: str = "s1",
+    side: Optional[str] = None,
+    now: Optional[float] = None,
+) -> dict:
+    """Add a fill toward the strategy cap, the combined cap, and open exposure.
+
+    A strategy-1 fill with shares locks ``locked_side``. Later clips on the
+    other side are refused. Strategy 2 does not lock.
+    """
     account = dict(account or {})
-    account["spent"] = _num(account.get("spent"), 0.0) + max(0.0, float(cost))
-    account["open_cost"] = _num(account.get("open_cost"), 0.0) + max(0.0, float(cost))
+    paid = max(0.0, float(cost))
+    account["open_cost"] = _num(account.get("open_cost"), 0.0) + paid
+    if strategy == "s2":
+        account["spent_s2"] = _num(account.get("spent_s2"), 0.0) + paid
+        if now is not None:
+            account["last_s2_ts"] = float(now)
+    else:
+        account["spent_s1"] = _num(account.get("spent_s1"), 0.0) + paid
+        if now is not None:
+            account["last_s1_ts"] = float(now)
+        if side and float(shares) > 0:
+            account["locked_side"] = str(side)
+    account["spent_total"] = _num(account.get("spent_s1"), 0.0) + _num(account.get("spent_s2"), 0.0)
+    account["spent"] = account["spent_total"]
     if count_entry:
         account["entries"] = int(_num(account.get("entries"), 0)) + 1
     account["last_shares"] = float(shares)

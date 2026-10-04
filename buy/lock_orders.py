@@ -15,7 +15,7 @@ def post_fak_buy(client: Any, plan: dict) -> dict:
     from py_clob_client_v2 import MarketOrderArgs, OrderType
     from py_clob_client_v2.order_builder.constants import BUY
 
-    started = time.perf_counter()
+    post_ts = time.time()
     signed = client.create_market_order(
         MarketOrderArgs(
             token_id=str(plan["token_id"]),
@@ -28,7 +28,11 @@ def post_fak_buy(client: Any, plan: dict) -> dict:
     result = client.post_order(signed, order_type=OrderType.FAK)
     if not isinstance(result, dict):
         result = {"raw": str(result)[:500]}
-    result["decision_to_order_ms"] = (time.perf_counter() - started) * 1000.0
+    ack_ts = time.time()
+    result["post_ts"] = post_ts
+    result["ack_ts"] = ack_ts
+    result["post_to_ack_ms"] = (ack_ts - post_ts) * 1000.0
+    result["decision_to_order_ms"] = result["post_to_ack_ms"]
     result["posted"] = True
     return result
 
@@ -65,7 +69,7 @@ def normalize_fill(fill: dict, plan: dict, cfg: dict) -> dict:
         float(cfg.get("taker_fee_rate") or 0.07),
         float(cfg.get("taker_fee_exponent") or 1.0),
     ) * shares
-    return {
+    out = {
         "shares": shares,
         "cost": cost,
         "vwap": vwap,
@@ -75,6 +79,21 @@ def normalize_fill(fill: dict, plan: dict, cfg: dict) -> dict:
         "decision_to_order_ms": fill.get("decision_to_order_ms"),
         "raw_status": fill.get("status") or fill.get("errorMsg") or fill.get("error"),
     }
+    for key in (
+        "decision_ts",
+        "post_ts",
+        "ack_ts",
+        "binance_recv_ts",
+        "book_recv_ts",
+        "decision_to_post_ms",
+        "post_to_ack_ms",
+        "recv_to_decision_ms",
+        "recv_to_post_ms",
+        "reason",
+    ):
+        if key in fill and fill.get(key) is not None:
+            out[key] = fill.get(key)
+    return out
 
 
 def build_clob_client() -> Optional[Any]:
@@ -104,3 +123,25 @@ def build_clob_client() -> Optional[Any]:
         signature_type=1,
         funder=funder,
     )
+
+
+def warm_market(client: Any, condition_id: str) -> None:
+    """Cache tick size, neg-risk, and fee so the hot path does not HTTP.
+
+    ``create_market_order`` calls ``__ensure_market_info_cached``, which
+    fetches those three unless ``get_clob_market_info`` already ran for
+    this condition. Price and size still change every clip, so the order
+    itself is signed at decision time.
+    """
+    if client is None or not condition_id:
+        return
+    getter = getattr(client, "get_version", None)
+    if callable(getter):
+        try:
+            getter()
+        except Exception:
+            pass
+    info = getattr(client, "get_clob_market_info", None)
+    if not callable(info):
+        return
+    info(str(condition_id))

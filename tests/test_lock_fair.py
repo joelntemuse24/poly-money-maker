@@ -10,7 +10,10 @@ from buy.lock_fair import (
     fair_up,
     normal_cdf,
     resample_1s,
+    side_z,
+    sigma_1s,
     sigma_from_prices,
+    signed_move,
     taker_fee,
 )
 
@@ -76,6 +79,25 @@ class FairTests(unittest.TestCase):
         self.assertGreater(sigma, 0.1)
         flat, _n = sigma_from_prices([5.0] * 50, short_n=10, long_n=20)
         self.assertAlmostEqual(flat, 1e-9, places=12)
+
+    def test_side_z_uses_the_last_minute_variance(self):
+        scored = side_z(strike=100.0, expected=100.0, sigma=1.0, tau_s=30.0, noise_frac=0.0)
+        self.assertEqual(scored["side"], "up")
+        self.assertAlmostEqual(scored["z_side"], 0.0, places=9)
+        self.assertAlmostEqual(scored["variance"], (30.0 ** 3) / 10800.0, places=12)
+        favourite = side_z(strike=100.0, expected=90.0, sigma=1.0, tau_s=30.0, noise_frac=0.0)
+        self.assertEqual(favourite["side"], "down")
+        self.assertGreater(favourite["z_side"], 0.0)
+        self.assertAlmostEqual(favourite["z_side"], -favourite["z"], places=9)
+        tiny = side_z(strike=100.0, expected=100.0, sigma=1.0, tau_s=0.2, noise_frac=0.0)
+        self.assertAlmostEqual(tiny["variance"], (0.5 ** 3) / 10800.0, places=12)
+
+    def test_sigma_1s_is_the_population_std_with_a_price_floor(self):
+        sigma, n = sigma_1s([100.0, 101.0, 99.0, 100.0])
+        self.assertEqual(n, 3)
+        self.assertGreater(sigma, 1e-6 * 100.0)
+        move = signed_move(102.0, 100.0, sigma=1.0)
+        self.assertAlmostEqual(move, 2.0, places=9)
 
     def test_resample_keeps_one_price_per_second(self):
         samples = [(1000.2, 10.0), (1001.4, 12.0), (1001.8, 13.0), (1003.0, 14.0)]

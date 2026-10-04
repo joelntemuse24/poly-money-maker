@@ -161,6 +161,76 @@ def fair_up(
     }
 
 
+def side_z(
+    *,
+    strike: float,
+    expected: float,
+    sigma: float,
+    tau_s: float,
+    noise_frac: float = 0.00002,
+) -> dict:
+    """Favourite side, ``z_side`` and ``q`` for the NIULAI4 rule.
+
+    The projected close is the caller's (the same elapsed-TWAP expectation
+    the bot already uses). Inside the last minute the study's variance is
+    ``sigma^2 * max(tau, 0.5)^3 / 10800``, plus ``(noise_frac * strike)^2``.
+    ``z`` is for Up. The traded side is the sign of ``expected - strike``
+    (a tie stays Up, which is how settlement treats a tie). ``z_side`` is
+    that side's z, so it is ``>= 0`` whenever a side is chosen.
+    """
+    k = float(strike)
+    if not math.isfinite(k) or k <= 0:
+        raise ValueError("strike must be positive")
+    exp = float(expected)
+    tau = float(tau_s)
+    if not math.isfinite(exp) or not math.isfinite(tau):
+        raise ValueError("expected and tau must be finite")
+    scale = (max(tau, 0.5) ** 3) / VARIANCE_DENOM
+    sig = max(float(sigma), 0.0)
+    variance = (sig ** 2) * scale
+    noise = (float(noise_frac) * k) ** 2
+    sd = math.sqrt(max(variance + noise, 0.0))
+    if sd <= 0.0:
+        z = 0.0 if exp == k else (12.0 if exp > k else -12.0)
+    else:
+        z = (exp - k) / sd
+    side = "up" if exp >= k else "down"
+    z_side = z if side == "up" else -z
+    return {
+        "side": side,
+        "z": z,
+        "z_side": z_side,
+        "q": normal_cdf(z_side),
+        "q_up": normal_cdf(z),
+        "sd": sd,
+        "variance": variance,
+        "tau_s": tau,
+    }
+
+
+def sigma_1s(prices_1s: Sequence[float], *, floor_frac: float = 1e-6) -> tuple[float, int]:
+    """``$/second`` from 1-second levels. NumPy's N-divisor, study floor ``1e-6 * px``."""
+    levels = [float(p) for p in prices_1s if p is not None and math.isfinite(float(p))]
+    rets = [levels[i] - levels[i - 1] for i in range(1, len(levels))]
+    last = abs(levels[-1]) if levels else 1.0
+    floor = max(float(floor_frac) * last, SIGMA_FLOOR)
+    if len(rets) < 2:
+        return floor, len(rets)
+    return max(population_std(rets), floor), len(rets)
+
+
+def signed_move(now_px: float, then_px: float, sigma: float) -> Optional[float]:
+    """Binance change over the lookback, in units of ``sigma`` (1-second)."""
+    sig = float(sigma)
+    if not math.isfinite(sig) or sig <= 0:
+        return None
+    now = float(now_px)
+    then = float(then_px)
+    if not math.isfinite(now) or not math.isfinite(then):
+        return None
+    return (now - then) / sig
+
+
 def resample_1s(samples: Sequence[tuple[float, float]]) -> list[float]:
     """Last price in each whole second, from ``(obs_ts, price)`` pairs."""
     rows = [(float(ts), float(px)) for ts, px in samples if math.isfinite(float(ts)) and math.isfinite(float(px))]

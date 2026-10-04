@@ -167,23 +167,27 @@ Stored samples are 15s through the middle of the window, 2s around the open and 
 
 ## Lockbot (repo only, not on the VM)
 
-`lockbot.py` is a separate TWAP-lock taker. It is not installed and not
-enabled. `deploy/polylockbot.service` is a unit file only. `dry_run`
+`lockbot.py` is a separate two-strategy taker. It is not installed and
+not enabled. `deploy/polylockbot.service` is a unit file only. `dry_run`
 defaults to true in `lockbot.example.json`. Copy that file to the
 gitignored `lockbot.json` before any run. Do not start it, and do not
 restart `polymintbot`, until the operator asks.
 
-It buys the side whose model probability clears `p_min` in the last
-`entry_window_s`, holds to settlement, and redeems. v1 never sells.
-Strategy 1 is `btc-updown-15m-<start>`. Strategy 2 is the same engine on
-`eth` / `sol` / `xrp` 15m and `btc` 5m. Confirmed on Gamma 2026-10-04:
-those five, plus the alt 5m books, resolve on
-`https://data.chain.link/streams/{asset}-usd-twap-60s-streams` against
-`priceToBeat`. Alt 5m stays off by flag. One RTDS socket per symbol
-(`btc/usd`, `eth/usd`, `sol/usd`, `xrp/usd`) on
-`crypto_prices_twap_sixty` and `crypto_prices_chainlink`.
+Strategy 1 mirrors NIULAI4 on BTC 15m and BTC 5m. From tau 58 down to
+tau 1 it buys the Chainlink favourite in $5 clips, up to $20 a market,
+and locks that side after the first fill. 15m uses Z=0 and Pmax=0.97.
+5m uses Z=0.25 and Pmax=0.90. `edge_min` is 0, so asks from a couple of
+cents through Pmax qualify when the model still clears the fee. Strategy
+2 mirrors the Binance 3-second move rule on BTC 5m only (2 sigma, ask
+up to 0.98, no fair-value filter), also $5 clips inside the same $20
+combined market cap. ETH, SOL, and XRP stay off. Exposure cap is $60.
+The daily loss stop stays $60. Both hold to settlement and never sell.
+BTC 5m uses the same `btc/usd` Chainlink 60s TWAP as 15m, latched at
+the 5m open. Books are the CLOB market websocket. Binance is an
+in-memory BTCUSDT trade stream.
 
-`python lockbot_summary.py` reads `logs/lockbot.jsonl`.
+`python lockbot_summary.py` reads `logs/lockbot.jsonl` and prints
+simulated P&L, fill counts, and latency per strategy.
 
 ## Deploy boundary
 

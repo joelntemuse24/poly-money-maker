@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """Print running lockbot P&L from logs/lockbot.jsonl.
 
-Groups settlement rows by strategy lane (btc 15m vs the other books)
-and by asset/duration. Win rate is the share of settled markets that
-won. Worst market is the lowest P&L.
+Groups settlement rows by strategy (s1 NIULAI4, s2 Binance sniper)
+and by asset/duration. Also prints signal and paper-fill counts plus
+decision-to-post latency, so a dry-run day can be read before settlement.
 """
 
 from __future__ import annotations

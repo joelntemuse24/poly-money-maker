@@ -13,27 +13,51 @@ from typing import Any
 DEFAULTS: dict[str, Any] = {
     "enabled": True,
     "dry_run": True,
+    "strategy1_enabled": True,
+    "strategy2_enabled": True,
+    # Combined dollars in one market, across both strategies.
     "per_market_usd": 20.0,
-    "max_open_exposure_usd": 100.0,
+    "combined_per_market_usd": 20.0,
+    # Each strategy's own cap inside that market. The combined cap still binds.
+    "strategy1_market_usd": 20.0,
+    "strategy2_market_usd": 20.0,
+    "clip_usd": 5.0,
+    "max_open_exposure_usd": 60.0,
     "daily_loss_stop_usd": 60.0,
     "min_cash_buffer_usd": 5.0,
     "dry_run_cash_usd": 500.0,
-    "entry_window_s": 60.0,
-    "entry_min_ttm_s": 1.0,
-    "p_min": 0.80,
-    "ask_min": 0.30,
-    "ask_max": 0.95,
-    "edge_min": 0.03,
+    # Strategy 1 (NIULAI4): once a second from tau 58 down to tau 1.
+    "s1_tau_max": 58.0,
+    "s1_tau_min": 1.0,
+    "s1_clip_cooldown_s": 1.0,
+    # Strategy 2 (R2e): Binance 3s move on BTC 5m, tau 5..300.
+    "s2_tau_max": 300.0,
+    "s2_tau_min": 5.0,
+    "s2_move_s": 3.0,
+    "s2_move_sigma": 2.0,
+    "s2_ask_max": 0.98,
+    "s2_q_edge_min": None,
+    "s2_clip_cooldown_s": 1.0,
+    "s2_sigma_window_s": 300.0,
+    "s2_sigma_min_samples": 60,
+    "strategy2_markets": ["btc_5m"],
+    "ask_min": 0.02,
     "taker_fee_rate": 0.07,
     "taker_fee_exponent": 1.0,
     "max_pay": 0.97,
     "limit_tick_improve": 0,
     "price_tick": 0.01,
-    "max_entries_per_market": 1,
-    "min_shares": 5.0,
+    "min_shares": 1.0,
     "min_order_usd": 1.0,
     "stale_price_s": 2.0,
     "stale_book_s": 2.0,
+    "stale_binance_s": 2.0,
+    "dry_run_latency_s": 0.20,
+    "fast_poll_s": 0.05,
+    "market_rules": {
+        "btc_15m": {"Z": 0.0, "Pmax": 0.97, "edge_min": 0.0},
+        "btc_5m": {"Z": 0.25, "Pmax": 0.90, "edge_min": 0.0},
+    },
     "elapsed_max_gap_s": 3.0,
     "strike_match_usd": 0.01,
     "strike_match_rel": 0.0001,
@@ -69,12 +93,12 @@ DEFAULTS: dict[str, Any] = {
     "ctf_address": "0x4D97DCd97eC945f40cF65F87097ACe5EA0476045",
     "standard_adapter_address": "0xAdA100Db00Ca00073811820692005400218FcE1f",
     "markets": {
+        # Strategy 1 trades both BTC books. Alts are break-even after fees.
         "btc_15m": True,
-        "eth_15m": True,
-        "sol_15m": True,
-        "xrp_15m": True,
         "btc_5m": True,
-        # Same Chainlink 60s TWAP, but not in the requested book.
+        "eth_15m": False,
+        "sol_15m": False,
+        "xrp_15m": False,
         "eth_5m": False,
         "sol_5m": False,
         "xrp_5m": False,
@@ -104,13 +128,24 @@ def apply_defaults(raw: Any) -> dict:
     if not isinstance(raw, dict):
         return cfg
     markets = dict(DEFAULTS["markets"])
+    rules = {name: dict(row) for name, row in DEFAULTS["market_rules"].items()}
     for key, value in raw.items():
         if key == "markets" and isinstance(value, dict):
             for name, flag in value.items():
                 markets[str(name)] = _bool(flag, False)
             continue
+        if key == "market_rules" and isinstance(value, dict):
+            for name, row in value.items():
+                base = dict(rules.get(str(name)) or {})
+                if isinstance(row, dict):
+                    base.update(row)
+                rules[str(name)] = base
+            continue
         cfg[key] = value
     cfg["markets"] = markets
+    cfg["market_rules"] = rules
+    if "combined_per_market_usd" not in raw and "per_market_usd" in raw:
+        cfg["combined_per_market_usd"] = cfg["per_market_usd"]
     return cfg
 
 
@@ -120,32 +155,37 @@ def validate_config(cfg: Any) -> None:
         raise ValueError("config must be an object")
     positive = (
         "per_market_usd",
+        "combined_per_market_usd",
+        "strategy1_market_usd",
+        "strategy2_market_usd",
+        "clip_usd",
         "max_open_exposure_usd",
-        "entry_window_s",
+        "s1_tau_max",
+        "s2_tau_max",
+        "s2_move_sigma",
         "stale_price_s",
         "stale_book_s",
+        "stale_binance_s",
         "poll_s",
+        "fast_poll_s",
         "price_tick",
         "settle_window_s",
         "max_pay",
+        "dry_run_latency_s",
     )
     for key in positive:
         if key in cfg and _num(cfg.get(key), -1.0) <= 0:
             raise ValueError(f"{key} must be > 0")
-    if _num(cfg.get("p_min"), -1) <= 0 or _num(cfg.get("p_min"), 2) > 1:
-        raise ValueError("p_min must be in (0, 1]")
     if _num(cfg.get("max_pay"), 0) >= 1:
         raise ValueError("max_pay must be < 1")
-    if _num(cfg.get("ask_max"), 0) > _num(cfg.get("max_pay"), 0.97) + 1e-9:
-        # ask_max above the sanity cap is allowed only when max_pay still
-        # clips the order. Reject a cap that could never bind below 1.
-        if _num(cfg.get("ask_max"), 0) >= 1:
-            raise ValueError("ask_max must be < 1")
-    try:
-        if int(cfg.get("max_entries_per_market", 1)) < 1:
-            raise ValueError
-    except (TypeError, ValueError):
-        raise ValueError("max_entries_per_market must be >= 1")
+    if _num(cfg.get("s2_ask_max"), 0) >= 1:
+        raise ValueError("s2_ask_max must be < 1")
+    if _num(cfg.get("ask_min"), 1) < 0 or _num(cfg.get("ask_min"), 0) >= 1:
+        raise ValueError("ask_min must be in [0, 1)")
+    q_edge = cfg.get("s2_q_edge_min")
+    if q_edge is not None and q_edge != "":
+        if not math.isfinite(_num(q_edge, float("nan"))):
+            raise ValueError("s2_q_edge_min must be a number or null")
     if _num(cfg.get("daily_loss_stop_usd"), -1) < 0:
         raise ValueError("daily_loss_stop_usd must be >= 0")
     if _num(cfg.get("min_cash_buffer_usd"), -1) < 0:
@@ -153,3 +193,6 @@ def validate_config(cfg: Any) -> None:
     markets = cfg.get("markets")
     if markets is not None and not isinstance(markets, dict):
         raise ValueError("markets must be an object")
+    rules = cfg.get("market_rules")
+    if rules is not None and not isinstance(rules, dict):
+        raise ValueError("market_rules must be an object")

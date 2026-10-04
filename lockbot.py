@@ -1,14 +1,15 @@
 #!/usr/bin/env python3
-"""TWAP-lock taker for Polymarket crypto up/down windows.
+"""Two-strategy taker for Polymarket BTC up/down windows.
 
 Separate from mintbot. It does not import mintbot, does not take the mint
 lock, and does not read ``strategy_mint.json``. Default config is
 ``lockbot.example.json`` (dry_run true). A gitignored ``lockbot.json``
-wins when it exists. Entries are hold-to-settlement; v1 never sells.
+wins when it exists. Entries are hold-to-settlement; this process never sells.
 
-The decision tick reads the in-memory Chainlink path and the cached book.
-Gamma, the CLOB book, and the order post are the only network calls, and
-the order post happens after the decision.
+Strategy 1 is the NIULAI4 ladder on BTC 15m and BTC 5m in the last minute.
+Strategy 2 is the Binance 3-second move sniper on BTC 5m. The decision tick
+reads the in-memory Chainlink path, the Binance trade, and the CLOB market
+websocket. Gamma and the order post stay off that tick.
 """
 
 from __future__ import annotations
@@ -26,17 +27,23 @@ from typing import Any, Optional
 
 import requests
 
+from buy.lock_binance import BinanceTradeFeed
+from buy.lock_bookws import ClobBookFeed
 from buy.lock_config import apply_defaults, validate_config
 from buy.lock_engine import build_view
+from buy.lock_fair import side_z, signed_move
 from buy.lock_gates import (
     day_pnl,
     dublin_day,
-    evaluate_entry,
+    evaluate_strategy1,
+    evaluate_strategy2,
     loss_stop_active,
     open_exposure_usd,
     parse_levels,
     settle_pnl,
 )
+from buy.lock_orders import build_clob_client, dispatch_buy, normalize_fill, warm_market
+from buy.lock_paper import enqueue_paper, take_due, walk_late_book
 from buy.lock_markets import (
     DURATION_S,
     SPECS,
@@ -47,7 +54,6 @@ from buy.lock_markets import (
     symbols_for,
     window_starts,
 )
-from buy.lock_orders import build_clob_client, dispatch_buy, normalize_fill
 from buy.mint_gas import mint_gas_settings
 from buy.oracle_log import RtdsTwapFeed, append_jsonl, fetch_gamma_strike
 
@@ -164,7 +170,7 @@ def _public_decision(decision: dict) -> dict:
     out = {key: value for key, value in decision.items() if key not in skip}
     out["ask_levels"] = _top(decision.get("asks"))
     out["bid_levels"] = _top(decision.get("bids"))
-    for key in ("p", "ask", "edge", "limit", "notional", "ttm_s", "sigma", "live", "twap", "strike", "expected"):
+    for key in ("p", "q", "z", "z_side", "ask", "edge", "move", "limit", "notional", "ttm_s", "sigma", "live", "twap", "strike", "expected"):
         if isinstance(out.get(key), float):
             out[key] = round(out[key], 6)
     return out
@@ -188,7 +194,16 @@ class LockBot:
         self.cash_at = 0.0
         self.client = None
         self._logged_resolution: set[str] = set()
-        self._pool = ThreadPoolExecutor(max_workers=8, thread_name_prefix="lockbot-io")
+        self._pool = ThreadPoolExecutor(max_workers=4, thread_name_prefix="lockbot-io")
+        self.book_feed = ClobBookFeed()
+        self.binance: Optional[BinanceTradeFeed] = None
+        self.paper: list[dict] = []
+        self.clip_at: dict[tuple[str, str], float] = {}
+        self.latched: dict[str, float] = {}
+        self._latched_logged: set[str] = set()
+        self._warmed: set[str] = set()
+        self.slow_at = 0.0
+        self._status_at = 0.0
 
     def reload(self) -> None:
         try:
@@ -216,6 +231,14 @@ class LockBot:
         for symbol in list(self.feeds):
             if symbol not in wanted:
                 self.feeds.pop(symbol).stop()
+        self.book_feed.start()
+        if self.cfg.get("strategy2_enabled", True):
+            if self.binance is None:
+                self.binance = BinanceTradeFeed(history_s=float(self.cfg.get("history_s") or 1200))
+                self.binance.start()
+                log_event("binance_subscribe", urls=list(self.binance.urls))
+        elif self.binance is not None:
+            self.binance.stop()
 
     def refresh_markets(self, now: float) -> None:
         gamma = str(self.cfg.get("gamma_url"))
@@ -266,38 +289,79 @@ class LockBot:
                     continue
 
     def _interesting(self, now: float) -> list[LockMarket]:
-        warm = float(self.cfg.get("entry_window_s") or 60) + float(self.cfg.get("book_warm_s") or 15)
+        """Current and next windows. Token ids are subscribed as soon as Gamma resolves them."""
         out = []
         for market in self.markets.values():
             if market.key not in enabled_keys(self.cfg):
                 continue
-            ttm = market.end_ts - now
-            if -30 <= ttm <= warm or 0 <= (market.start_ts - now) <= 30:
+            if market.end_ts + 30 >= now:
                 out.append(market)
         return out
 
-    def refresh_books(self, now: float) -> None:
-        clob = str(self.cfg.get("clob_url"))
-        jobs = []
+    def _book(self, token: str) -> dict:
+        row = self.book_feed.book(token)
+        if row is not None:
+            return row
+        return self.books.get(token) or {}
+
+    def subscribe_books(self, now: float) -> None:
+        tokens: list[str] = []
         for market in self._interesting(now):
-            ttm = market.end_ts - now
-            warm = float(self.cfg.get("entry_window_s") or 60) + float(self.cfg.get("book_warm_s") or 15)
-            if not (0 < ttm <= warm):
-                continue
-            for token in (market.up_token, market.dn_token):
-                jobs.append(token)
-        if not jobs:
+            tokens.append(market.up_token)
+            tokens.append(market.dn_token)
+        self.book_feed.set_tokens(tokens)
+        age = self.book_feed.age_s(now)
+        if age is not None and age > 5.0:
+            ws = self.book_feed._ws
+            if ws is not None:
+                try:
+                    ws.close()
+                except Exception:
+                    pass
+
+    def warm_clients(self, now: float) -> None:
+        if self.cfg.get("dry_run", True) or self.client is None:
             return
-
-        def one(token: str) -> tuple[str, Optional[dict]]:
+        for market in self._interesting(now):
+            if market.condition_id in self._warmed:
+                continue
             try:
-                return token, fetch_book(self.session, clob, token)
-            except Exception:
-                return token, None
+                warm_market(self.client, market.condition_id)
+                self._warmed.add(market.condition_id)
+                log_event("market_warmed", slug=market.slug, condition_id=market.condition_id)
+            except Exception as exc:
+                log_event("market_warm_fail", slug=market.slug, error=str(exc)[:160])
 
-        for token, book in self._pool.map(one, jobs):
-            if book is not None:
-                self.books[token] = book
+    def latch_strikes(self, now: float) -> None:
+        """Remember the TWAP print at each window open, including a 5m open.
+
+        The latch survives history rolloff. A sample within 1.25s of the
+        open counts, which covers a print stamped on the neighbouring second.
+        """
+        tol = max(float(self.cfg.get("strike_tol_s") or 0.75), 1.25)
+        from buy.lock_markets import boundary_price
+
+        for market in self._interesting(now):
+            if market.slug in self.latched or now + 1.0 < market.start_ts:
+                continue
+            feed = self.feeds.get(market.symbol)
+            if feed is None:
+                continue
+            hist = feed.twap_history()
+            price = boundary_price(hist, market.start_ts, tol_s=tol)
+            if price is None:
+                continue
+            self.latched[market.slug] = float(price)
+            if market.slug not in self._latched_logged:
+                self._latched_logged.add(market.slug)
+                log_event(
+                    "strike_latched",
+                    slug=market.slug,
+                    asset=market.asset,
+                    duration=market.duration,
+                    strike=price,
+                    start_ts=market.start_ts,
+                )
 
     def _marks(self) -> dict[str, float]:
         marks = {}
@@ -305,16 +369,52 @@ class LockBot:
             if not isinstance(pos, dict) or pos.get("settled_ts"):
                 continue
             token = str(pos.get("token_id") or "")
-            book = self.books.get(token) or {}
+            book = self._book(token)
             bids = book.get("bids") or []
             if bids:
                 marks[token] = float(bids[0][0])
                 pos["last_mark"] = marks[token]
         return marks
 
+    def _positions_for(self, slug: str) -> list[dict]:
+        out = []
+        for key, pos in self.state["positions"].items():
+            if not isinstance(pos, dict):
+                continue
+            if pos.get("slug") == slug or key == slug:
+                out.append(pos)
+        return out
+
+    def _strategy_spent(self, slug: str, strategy: str) -> float:
+        total = 0.0
+        for pos in self._positions_for(slug):
+            if pos.get("settled_ts"):
+                continue
+            if str(pos.get("strategy") or "s1") != strategy:
+                continue
+            total += float(pos.get("cost") or 0.0)
+        for item in self.paper:
+            if item.get("slug") == slug and item.get("strategy") == strategy:
+                total += float(item.get("notional") or 0.0)
+        return total
+
+    def _pending_usd(self) -> float:
+        return sum(float(item.get("notional") or 0.0) for item in self.paper)
+
+    def _locked_side(self, slug: str) -> Optional[str]:
+        for pos in self._positions_for(slug):
+            if pos.get("settled_ts"):
+                continue
+            if str(pos.get("strategy") or "") != "s1":
+                continue
+            if float(pos.get("shares") or 0.0) > 0 and pos.get("side"):
+                return str(pos["side"])
+        return None
+
     def _account(self, market: LockMarket, now: float) -> dict:
-        pos = self.state["positions"].get(market.slug) or {}
-        exposure = open_exposure_usd(self.state["positions"].values())
+        spent_s1 = self._strategy_spent(market.slug, "s1")
+        spent_s2 = self._strategy_spent(market.slug, "s2")
+        exposure = open_exposure_usd(self.state["positions"].values()) + self._pending_usd()
         pnl = day_pnl(self.state["positions"].values(), now, self._marks())
         today = dublin_day(now)
         stop = float(self.cfg.get("daily_loss_stop_usd") or 0)
@@ -329,10 +429,15 @@ class LockBot:
         else:
             cash = float(self.cash)
         return {
-            "spent": float(pos.get("cost") or 0),
-            "entries": int(pos.get("entries") or 0),
+            "spent": spent_s1 + spent_s2,
+            "spent_s1": spent_s1,
+            "spent_s2": spent_s2,
+            "spent_total": spent_s1 + spent_s2,
             "open_cost": exposure,
             "cash": float(cash),
+            "locked_side": self._locked_side(market.slug),
+            "last_s1_ts": self.clip_at.get((market.slug, "s1")),
+            "last_s2_ts": self.clip_at.get((market.slug, "s2")),
             "loss_stopped": loss_stop_active(pnl, stop, self.state.get("loss_stop_day"), today),
             "day_pnl": pnl,
             "cash_unknown": unknown,
@@ -349,110 +454,264 @@ class LockBot:
 
     def tick(self, now: Optional[float] = None) -> int:
         now = time.time() if now is None else float(now)
+        # Decide before any Gamma or strike HTTP. A slow refresh must not
+        # sit in front of a Binance tick.
+        if not self.markets:
+            self._slow(now)
+            self.slow_at = now
+        self._flush_paper(now)
+        buys = self._fast(now)
+        slow_every = float(self.cfg.get("poll_s") or 1.0)
+        if now - self.slow_at >= slow_every:
+            self._slow(now)
+            self.slow_at = now
+        return buys
+
+    def _slow(self, now: float) -> None:
         self.reload()
         self.ensure_feeds()
         self.refresh_markets(now)
         self.refresh_gamma_strikes(now)
-        self.refresh_books(now)
+        self.latch_strikes(now)
+        self.subscribe_books(now)
+        self.warm_clients(now)
         if not self.cfg.get("dry_run", True):
             self._refresh_cash(now)
-        buys = 0
         for market in list(self.markets.values()):
-            ttm = market.end_ts - now
             if market.key not in enabled_keys(self.cfg):
                 continue
-            if ttm <= 0:
+            if market.end_ts - now <= 0:
                 self._settle(market, now)
+        self._status(now)
+
+    def _status(self, now: float) -> None:
+        if now - self._status_at < 30:
+            return
+        self._status_at = now
+        latest = self.binance.latest() if self.binance is not None else None
+        age = None if latest is None else now - float(latest[1])
+        log_event(
+            "feed_status",
+            book_age_s=self.book_feed.age_s(now),
+            book_error=self.book_feed.last_error()[:160],
+            binance_age_s=age,
+            binance_px=None if latest is None else latest[2],
+            binance_error=(self.binance.last_error()[:160] if self.binance is not None else ""),
+            markets=len(self.markets),
+            paper=len(self.paper),
+        )
+
+    def _fast(self, now: float) -> int:
+        buys = 0
+        s1_max = float(self.cfg.get("s1_tau_max") or 58)
+        s1_min = float(self.cfg.get("s1_tau_min") or 1)
+        s2_max = float(self.cfg.get("s2_tau_max") or 300)
+        s2_min = float(self.cfg.get("s2_tau_min") or 5)
+        s2_keys = {str(item) for item in (self.cfg.get("strategy2_markets") or ["btc_5m"])}
+        enabled = set(enabled_keys(self.cfg))
+        for market in list(self.markets.values()):
+            if market.key not in enabled:
                 continue
-            window = float(self.cfg.get("entry_window_s") or 60)
-            if ttm > window:
+            ttm = market.end_ts - now
+            if ttm <= 0:
+                continue
+            want_s1 = bool(self.cfg.get("strategy1_enabled", True)) and s1_min <= ttm <= s1_max
+            want_s2 = bool(self.cfg.get("strategy2_enabled", True)) and market.key in s2_keys and s2_min <= ttm <= s2_max
+            if not want_s1 and not want_s2:
                 continue
             view = self._view(market, now)
-            account = self._account(market, now)
-            started = time.perf_counter()
-            decision = evaluate_entry(view, account, self.cfg)
-            decision["eval_ms"] = (time.perf_counter() - started) * 1000.0
-            if account.get("cash_unknown") and decision.get("action") == "buy":
-                decision["action"] = "skip"
-                decision["reason"] = "cash_unknown"
-            force = decision.get("action") == "buy"
-            if self._should_log(market.slug, str(decision.get("reason")), now, force):
-                self.eval_log[market.slug] = (now, str(decision.get("reason")))
-                log_event("eval", **_public_decision(decision))
-            if decision.get("action") == "buy":
-                self._enter(market, decision, now)
-                buys += 1
+            if want_s1:
+                buys += self._consider(market, view, self._account(market, now), now, "s1")
+            if want_s2:
+                buys += self._consider(market, view, self._account(market, now), now, "s2")
         return buys
+
+    def _consider(self, market: LockMarket, view: dict, account: dict, now: float, strategy: str) -> int:
+        started = time.perf_counter()
+        if strategy == "s1":
+            decision = evaluate_strategy1(view, account, self.cfg)
+        else:
+            decision = evaluate_strategy2(view, account, self.cfg)
+        decision["eval_ms"] = (time.perf_counter() - started) * 1000.0
+        if account.get("cash_unknown") and decision.get("action") == "buy":
+            decision["action"] = "skip"
+            decision["reason"] = "cash_unknown"
+        force = decision.get("action") == "buy"
+        log_key = f"{market.slug}|{strategy}"
+        if self._should_log(log_key, str(decision.get("reason")), now, force):
+            self.eval_log[log_key] = (now, str(decision.get("reason")))
+            log_event("eval", **_public_decision(decision))
+        if decision.get("action") != "buy":
+            return 0
+        self._act(market, decision, now)
+        return 1
 
     def _view(self, market: LockMarket, now: float) -> dict:
         feed = self.feeds.get(market.symbol)
-        live_hist = feed.live_history() if feed is not None else []
-        twap_hist = feed.twap_history() if feed is not None else []
-        return build_view(
+        live_hist = list(feed.live_history()) if feed is not None else []
+        twap_hist = list(feed.twap_history()) if feed is not None else []
+        latched = self.latched.get(market.slug)
+        if latched is not None:
+            twap_hist.append((market.start_ts, now, float(latched)))
+        view = build_view(
             market,
             now=now,
             live_hist=live_hist,
             twap_hist=twap_hist,
-            up_book=self.books.get(market.up_token),
-            dn_book=self.books.get(market.dn_token),
+            up_book=self._book(market.up_token),
+            dn_book=self._book(market.dn_token),
             gamma_strike=self.gamma_px.get(market.slug, market.price_to_beat),
             cfg=self.cfg,
             market_enabled=True,
         )
+        return self._attach_binance(view, market, now)
 
-    def _enter(self, market: LockMarket, decision: dict, now: float) -> None:
-        dry = bool(self.cfg.get("dry_run", True))
-        if not dry and self.client is None:
-            log_event("order_skip", slug=market.slug, reason="no_clob_client")
+    def _attach_binance(self, view: dict, market: LockMarket, now: float) -> dict:
+        feed = self.binance
+        if feed is not None:
+            latest = feed.latest()
+            if latest is not None:
+                obs, recv, px = latest
+                view["binance_recv_ts"] = recv
+                view["binance_px"] = px
+                then = feed.price_at(float(obs) - float(self.cfg.get("s2_move_s") or 3))
+                sigma, nrets, source = feed.sigma_before(
+                    market.start_ts,
+                    float(self.cfg.get("s2_sigma_window_s") or 300),
+                    min_n=int(self.cfg.get("s2_sigma_min_samples") or 60),
+                )
+                view["sigma1s"] = sigma
+                view["sigma1s_n"] = nrets
+                view["sigma_source"] = source
+                if then is not None and sigma is not None:
+                    view["binance_move"] = signed_move(px, then, sigma)
+        expected = view.get("expected")
+        strike = view.get("strike")
+        sigma = view.get("sigma")
+        if expected is not None and strike is not None and sigma is not None:
+            try:
+                scored = side_z(
+                    strike=float(strike),
+                    expected=float(expected),
+                    sigma=float(sigma),
+                    tau_s=max(market.end_ts - now, 0.0),
+                    noise_frac=float(self.cfg.get("noise_frac") or 0.00002),
+                )
+                view["q_up"] = scored["q_up"]
+            except (TypeError, ValueError):
+                pass
+        return view
+
+    def _act(self, market: LockMarket, decision: dict, now: float) -> None:
+        strategy = str(decision.get("strategy") or "s1")
+        decision_ts = time.time()
+        decision["decision_ts"] = decision_ts
+        self.clip_at[(market.slug, strategy)] = decision_ts
+        log_event("signal", **_public_decision(decision))
+        if self.cfg.get("dry_run", True):
+            enqueue_paper(self.paper, decision, now=decision_ts)
             return
+        if self.client is None:
+            log_event("order_skip", slug=market.slug, strategy=strategy, reason="no_clob_client")
+            return
+        post_ts = time.time()
         try:
-            raw = dispatch_buy(decision, dry_run=dry, client=None if dry else self.client)
+            raw = dispatch_buy(decision, dry_run=False, client=self.client)
         except Exception as exc:
-            log_event("order_fail", slug=market.slug, error=str(exc)[:200])
+            log_event(
+                "order_fail",
+                slug=market.slug,
+                strategy=strategy,
+                error=str(exc)[:200],
+                decision_ts=decision_ts,
+                post_ts=post_ts,
+                binance_recv_ts=decision.get("binance_recv_ts"),
+            )
             return
+        ack_ts = time.time()
+        raw["decision_ts"] = decision_ts
+        raw["post_ts"] = raw.get("post_ts") or post_ts
+        raw["ack_ts"] = raw.get("ack_ts") or ack_ts
+        raw["binance_recv_ts"] = decision.get("binance_recv_ts")
+        raw["book_recv_ts"] = decision.get("book_recv_ts")
+        raw["decision_to_post_ms"] = (float(raw["post_ts"]) - decision_ts) * 1000.0
+        if decision.get("binance_recv_ts") is not None:
+            raw["recv_to_decision_ms"] = (decision_ts - float(decision["binance_recv_ts"])) * 1000.0
+            raw["recv_to_post_ms"] = (float(raw["post_ts"]) - float(decision["binance_recv_ts"])) * 1000.0
         fill = normalize_fill(raw, decision, self.cfg)
+        self._log_attempt(market, decision, fill, event="entry")
+        if fill["shares"] > 0:
+            self._add_fill(market, decision, fill, now)
+
+    def _flush_paper(self, now: float) -> None:
+        latency = float(self.cfg.get("dry_run_latency_s") or 0.2)
+        due, keep = take_due(self.paper, now, latency)
+        self.paper = keep
+        for item in due:
+            token = str(item.get("token_id") or "")
+            book = self._book(token)
+            fill = walk_late_book(item, book.get("asks") or [], now=now)
+            decision = dict(item.get("decision") or {})
+            decision.setdefault("token_id", token)
+            decision.setdefault("strategy", item.get("strategy"))
+            decision.setdefault("side", item.get("side"))
+            decision.setdefault("slug", item.get("slug"))
+            norm = normalize_fill(fill, decision, self.cfg)
+            market = self.markets.get(str(item.get("slug") or ""))
+            self._log_attempt(market, decision, norm, event="paper_fill")
+            if market is not None and norm["shares"] > 0:
+                self._add_fill(market, decision, norm, now)
+
+    def _log_attempt(self, market: Optional[LockMarket], decision: dict, fill: dict, *, event: str) -> None:
         log_event(
-            "entry",
-            slug=market.slug,
-            asset=market.asset,
-            duration=market.duration,
-            lane=market.lane,
-            strategy="twap_lock",
-            condition_id=market.condition_id,
+            event,
+            slug=decision.get("slug") or (None if market is None else market.slug),
+            asset=None if market is None else market.asset,
+            duration=None if market is None else market.duration,
+            lane=None if market is None else market.lane,
+            strategy=decision.get("strategy"),
+            condition_id=None if market is None else market.condition_id,
             side=decision.get("side"),
             p=decision.get("p"),
+            q=decision.get("q"),
+            z_side=decision.get("z_side"),
             ask=decision.get("ask"),
             edge=decision.get("edge"),
+            move=decision.get("move"),
             limit=decision.get("limit"),
             ttm_s=decision.get("ttm_s"),
-            twap=decision.get("twap"),
-            live=decision.get("live"),
             strike=decision.get("strike"),
             sigma=decision.get("sigma"),
             expected=decision.get("expected"),
-            ask_levels=_top(decision.get("asks")),
-            bid_levels=_top(decision.get("bids")),
-            shares=fill["shares"],
-            cost=fill["cost"],
-            vwap=fill["vwap"],
-            fee=fill["fee"],
-            dry_run=fill["dry_run"],
-            posted=fill["posted"],
+            shares=fill.get("shares"),
+            cost=fill.get("cost"),
+            vwap=fill.get("vwap"),
+            fee=fill.get("fee"),
+            dry_run=fill.get("dry_run"),
+            posted=fill.get("posted"),
+            reason=fill.get("reason"),
+            decision_ts=fill.get("decision_ts") or decision.get("decision_ts"),
+            post_ts=fill.get("post_ts"),
+            ack_ts=fill.get("ack_ts"),
+            binance_recv_ts=fill.get("binance_recv_ts") or decision.get("binance_recv_ts"),
+            book_recv_ts=fill.get("book_recv_ts") or decision.get("book_recv_ts"),
+            decision_to_post_ms=fill.get("decision_to_post_ms"),
+            post_to_ack_ms=fill.get("post_to_ack_ms"),
+            recv_to_decision_ms=fill.get("recv_to_decision_ms"),
+            recv_to_post_ms=fill.get("recv_to_post_ms"),
             decision_to_order_ms=fill.get("decision_to_order_ms"),
             eval_ms=decision.get("eval_ms"),
-            status=fill.get("raw_status"),
         )
-        count = (fill["shares"] > 0) if dry else bool(fill["posted"])
-        if fill["shares"] <= 0 and not count:
-            return
-        self._add_fill(market, decision, fill, now, count_entry=count or fill["shares"] > 0)
 
-    def _add_fill(self, market: LockMarket, decision: dict, fill: dict, now: float, *, count_entry: bool) -> None:
-        pos = dict(self.state["positions"].get(market.slug) or {})
+    def _add_fill(self, market: LockMarket, decision: dict, fill: dict, now: float) -> None:
+        strategy = str(decision.get("strategy") or "s1")
+        side = str(decision.get("side") or "")
+        key = f"{market.slug}|{strategy}|{side}"
+        pos = dict(self.state["positions"].get(key) or {})
         shares = float(pos.get("shares") or 0) + float(fill["shares"])
         cost = float(pos.get("cost") or 0) + float(fill["cost"])
         fee = float(pos.get("fee") or 0) + float(fill["fee"])
-        entries = int(pos.get("entries") or 0) + (1 if count_entry else 0)
+        entries = int(pos.get("entries") or 0) + 1
         token = decision.get("token_id")
         pos.update(
             {
@@ -460,9 +719,9 @@ class LockBot:
                 "asset": market.asset,
                 "duration": market.duration,
                 "lane": market.lane,
-                "strategy": "twap_lock",
+                "strategy": strategy,
                 "condition_id": market.condition_id,
-                "side": decision.get("side") or pos.get("side"),
+                "side": side or pos.get("side"),
                 "token_id": token or pos.get("token_id"),
                 "up_token": market.up_token,
                 "dn_token": market.dn_token,
@@ -477,7 +736,7 @@ class LockBot:
                 "dry_run": bool(self.cfg.get("dry_run", True)),
             }
         )
-        self.state["positions"][market.slug] = pos
+        self.state["positions"][key] = pos
         if not pos["dry_run"]:
             self.state["intents"][market.condition_id] = {
                 "status": "confirmed",
@@ -496,6 +755,7 @@ class LockBot:
                 asset=market.asset,
                 duration=market.duration,
                 lane=market.lane,
+                strategy=strategy,
                 side=pos.get("side"),
                 shares=fill["shares"],
                 cost=fill["cost"],
@@ -503,7 +763,12 @@ class LockBot:
                 fee=fill["fee"],
                 spent=cost,
                 dry_run=pos["dry_run"],
-                decision_to_order_ms=fill.get("decision_to_order_ms"),
+                decision_to_post_ms=fill.get("decision_to_post_ms"),
+                recv_to_post_ms=fill.get("recv_to_post_ms"),
+                decision_ts=fill.get("decision_ts"),
+                post_ts=fill.get("post_ts"),
+                ack_ts=fill.get("ack_ts"),
+                binance_recv_ts=fill.get("binance_recv_ts"),
             )
             self._notify_fill(pos, fill)
 
@@ -525,63 +790,78 @@ class LockBot:
             log_event("notify_fail", error=str(exc)[:160])
 
     def _settle(self, market: LockMarket, now: float) -> None:
-        pos = self.state["positions"].get(market.slug)
-        if not isinstance(pos, dict) or pos.get("settled_ts") or float(pos.get("shares") or 0) <= 0:
-            return
         if now < market.end_ts:
+            return
+        rows = self._positions_for(market.slug)
+        if not rows:
             return
         feed = self.feeds.get(market.symbol)
         twap_hist = feed.twap_history() if feed is not None else []
         from buy.lock_markets import boundary_price
 
-        final = boundary_price(twap_hist, market.end_ts, tol_s=float(self.cfg.get("strike_tol_s") or 0.75))
-        strike = pos.get("strike")
-        if final is None or strike is None:
-            if now - market.end_ts > 600 and not pos.get("settle_miss_logged"):
-                pos["settle_miss_logged"] = True
-                log_event("settlement_unknown", slug=market.slug, have_final=final is not None, have_strike=strike is not None)
-                atomic_save(STATE_FILE, self.state)
-            return
-        result = settle_pnl(
-            side=str(pos.get("side") or ""),
-            shares=float(pos["shares"]),
-            cost=float(pos["cost"]),
-            fee=float(pos.get("fee") or 0),
-            final_twap=float(final),
-            strike=float(strike),
-        )
-        pos.update(result)
-        pos["final_twap"] = final
-        pos["settled_ts"] = now
-        self.state["positions"][market.slug] = pos
-        atomic_save(STATE_FILE, self.state)
-        log_event(
-            "settlement",
-            slug=market.slug,
-            asset=market.asset,
-            duration=market.duration,
-            lane=market.lane,
-            strategy="twap_lock",
-            condition_id=market.condition_id,
-            side=pos.get("side"),
-            won=result["won"],
-            pnl=round(result["pnl"], 6),
-            payout=round(result["payout"], 6),
-            cost=pos["cost"],
-            fee=pos.get("fee"),
-            shares=pos["shares"],
-            strike=strike,
-            final_twap=final,
-            dry_run=pos.get("dry_run"),
-        )
-        if pos.get("dry_run"):
-            log_event(
-                "redeem_dry_run",
-                slug=market.slug,
-                condition_id=market.condition_id,
-                payout_est=round(result["payout"], 6),
-                won=result["won"],
+        tol = max(float(self.cfg.get("strike_tol_s") or 0.75), 1.25)
+        final = boundary_price(twap_hist, market.end_ts, tol_s=tol)
+        changed = False
+        for pos in rows:
+            if pos.get("settled_ts") or float(pos.get("shares") or 0) <= 0:
+                continue
+            strike = pos.get("strike")
+            if final is None or strike is None:
+                if now - market.end_ts > 600 and not pos.get("settle_miss_logged"):
+                    pos["settle_miss_logged"] = True
+                    changed = True
+                    log_event(
+                        "settlement_unknown",
+                        slug=market.slug,
+                        strategy=pos.get("strategy"),
+                        side=pos.get("side"),
+                        have_final=final is not None,
+                        have_strike=strike is not None,
+                    )
+                continue
+            result = settle_pnl(
+                side=str(pos.get("side") or ""),
+                shares=float(pos["shares"]),
+                cost=float(pos["cost"]),
+                fee=float(pos.get("fee") or 0),
+                final_twap=float(final),
+                strike=float(strike),
             )
+            pos.update(result)
+            pos["final_twap"] = final
+            pos["settled_ts"] = now
+            changed = True
+            log_event(
+                "settlement",
+                slug=market.slug,
+                asset=market.asset,
+                duration=market.duration,
+                lane=market.lane,
+                strategy=pos.get("strategy"),
+                condition_id=market.condition_id,
+                side=pos.get("side"),
+                won=result["won"],
+                pnl=round(result["pnl"], 6),
+                payout=round(result["payout"], 6),
+                cost=pos["cost"],
+                fee=pos.get("fee"),
+                shares=pos["shares"],
+                strike=strike,
+                final_twap=final,
+                dry_run=pos.get("dry_run"),
+            )
+            if pos.get("dry_run"):
+                log_event(
+                    "redeem_dry_run",
+                    slug=market.slug,
+                    strategy=pos.get("strategy"),
+                    side=pos.get("side"),
+                    condition_id=market.condition_id,
+                    payout_est=round(result["payout"], 6),
+                    won=result["won"],
+                )
+        if changed:
+            atomic_save(STATE_FILE, self.state)
 
     def _refresh_cash(self, now: float) -> None:
         if now - self.cash_at < 15:
@@ -602,24 +882,34 @@ class LockBot:
     def close(self) -> None:
         for feed in self.feeds.values():
             feed.stop()
+        self.book_feed.stop()
+        if self.binance is not None:
+            self.binance.stop()
         self._pool.shutdown(wait=False, cancel_futures=True)
 
 
 def _sleep_s(bot: LockBot, now: float) -> float:
-    poll = float(bot.cfg.get("poll_s") or 1)
-    warm = float(bot.cfg.get("entry_window_s") or 60) + float(bot.cfg.get("book_warm_s") or 15)
+    """50ms while a strategy window is open, otherwise wait for the next one."""
+    fast = float(bot.cfg.get("fast_poll_s") or 0.05)
+    s1_max = float(bot.cfg.get("s1_tau_max") or 58)
+    s2_max = float(bot.cfg.get("s2_tau_max") or 300)
+    s2_keys = {str(item) for item in (bot.cfg.get("strategy2_markets") or ["btc_5m"])}
+    enabled = set(enabled_keys(bot.cfg))
     hot = False
     wait = 5.0
     for market in bot.markets.values():
+        if market.key not in enabled:
+            continue
         ttm = market.end_ts - now
-        if 0 < ttm <= warm:
+        horizon = s2_max if market.key in s2_keys and bot.cfg.get("strategy2_enabled", True) else s1_max
+        if 0 < ttm <= horizon:
             hot = True
-        until = ttm - warm
+        until = ttm - horizon
         if until > 0:
             wait = min(wait, until)
     if hot:
-        return max(0.2, poll)
-    return max(poll, min(5.0, wait))
+        return max(0.01, fast)
+    return max(0.2, min(1.0, wait))
 
 
 def _redeem_loop(bot: LockBot) -> None:
@@ -729,9 +1019,13 @@ def main(argv: Optional[list[str]] = None) -> int:
         "startup",
         dry_run=bool(cfg.get("dry_run", True)),
         enabled=bool(cfg.get("enabled", True)),
+        strategy1_enabled=bool(cfg.get("strategy1_enabled", True)),
+        strategy2_enabled=bool(cfg.get("strategy2_enabled", True)),
         markets=enabled_keys(cfg),
         symbols=symbols_for(cfg),
-        per_market_usd=cfg.get("per_market_usd"),
+        per_market_usd=cfg.get("combined_per_market_usd"),
+        clip_usd=cfg.get("clip_usd"),
+        max_open_exposure_usd=cfg.get("max_open_exposure_usd"),
         config=str(path),
     )
     try:

@@ -111,6 +111,7 @@ class DryRunTests(unittest.TestCase):
                 "event": "settlement",
                 "slug": "btc-updown-15m-1",
                 "lane": "btc_15m",
+                "strategy": "s1",
                 "asset": "btc",
                 "duration": "15m",
                 "pnl": 2.5,
@@ -128,7 +129,8 @@ class DryRunTests(unittest.TestCase):
             {
                 "event": "settlement",
                 "slug": "btc-updown-5m-1",
-                "lane": "ext",
+                "lane": "btc_5m",
+                "strategy": "s2",
                 "asset": "btc",
                 "duration": "5m",
                 "pnl": 0.4,
@@ -141,11 +143,14 @@ class DryRunTests(unittest.TestCase):
         self.assertAlmostEqual(summary["win_rate"], 2 / 3, places=4)
         self.assertEqual(summary["worst_slug"], "eth-updown-15m-1")
         self.assertEqual(summary["lanes"]["btc_15m"]["markets"], 1)
-        self.assertEqual(summary["lanes"]["ext"]["markets"], 2)
+        self.assertEqual(summary["strategies"]["s1"]["markets"], 1)
+        self.assertEqual(summary["strategies"]["s2"]["pnl"], 0.4)
         self.assertEqual(summary["assets"]["btc_5m"]["pnl"], 0.4)
         text = format_summary(summary)
-        self.assertIn("strategy 1 btc 15m", text)
+        self.assertIn("strategy 1", text)
+        self.assertIn("strategy 2", text)
         self.assertIn("eth_15m", text)
+        self.assertIn("latency ms", text)
 
 
 if __name__ == "__main__":
