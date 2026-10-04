@@ -293,16 +293,34 @@ def _side_book(view: dict, side: str, now: float, stale_s: float) -> dict:
     }
 
 
+def _bucket(account: dict, strategy: str) -> float:
+    """Dollars this strategy has spent.
+
+    A missing bucket is zero when the other strategy's bucket is present,
+    so an s2 fill does not count as s1 spend. An old account that only
+    has ``spent`` still counts that total as strategy 1.
+    """
+    key = "spent_s1" if strategy == "s1" else "spent_s2"
+    other = "spent_s2" if strategy == "s1" else "spent_s1"
+    if account.get(key) is not None:
+        return _num(account.get(key), 0.0)
+    if account.get(other) is not None:
+        return 0.0
+    if strategy == "s1":
+        return _num(account.get("spent"), 0.0)
+    return 0.0
+
+
 def _clip_room(account: dict, cfg: dict, *, strategy: str) -> tuple[float, str]:
     """Dollars this clip may spend, and a reason when the room is under the minimum."""
     clip = _num(cfg.get("clip_usd"), 5.0)
-    combined = _num(cfg.get("combined_per_market_usd"), _num(cfg.get("per_market_usd"), 20.0))
+    combined = _num(cfg.get("combined_per_market_usd"), _num(cfg.get("per_market_usd"), 40.0))
     if strategy == "s1":
         cap = _num(cfg.get("strategy1_market_usd"), 20.0)
-        spent_strategy = _num(account.get("spent_s1"), _num(account.get("spent"), 0.0))
+        spent_strategy = _bucket(account, "s1")
     else:
         cap = _num(cfg.get("strategy2_market_usd"), 20.0)
-        spent_strategy = _num(account.get("spent_s2"), 0.0)
+        spent_strategy = _bucket(account, "s2")
     spent_total = _num(account.get("spent_total"), _num(account.get("spent_s1"), 0.0) + _num(account.get("spent_s2"), 0.0))
     exposure = _num(account.get("open_cost"), 0.0)
     max_exposure = _num(cfg.get("max_open_exposure_usd"), 60.0)

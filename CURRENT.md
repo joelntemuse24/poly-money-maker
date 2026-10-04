@@ -180,7 +180,8 @@ and locks that side after the first fill. 15m uses Z=0 and Pmax=0.97.
 cents through Pmax qualify when the model still clears the fee. Strategy
 2 mirrors the Binance 3-second move rule on BTC 5m only (2 sigma, ask
 up to 0.98, no fair-value filter), also $5 clips inside the same $20
-combined market cap. ETH, SOL, and XRP stay off. Exposure cap is $60.
+market. The combined cap is $40, so strategy 2 cannot spend strategy
+1's $20. ETH, SOL, and XRP stay off. Exposure cap is $60.
 The daily loss stop stays $60. Both hold to settlement and never sell.
 BTC 5m uses the same `btc/usd` Chainlink 60s TWAP as 15m, latched at
 the 5m open. Books are the CLOB market websocket. Binance is an
@@ -190,14 +191,17 @@ A log-only RTDS `activity/trades` socket records fills by NIULAI4
 (`0x44832d0d2ec11187c1e77d786feb15f6a50254c6`), asdaefef
 (`0x75cc3b63a2f2423085e10706c78b494017b93ce1`), and dvasdkasodk
 (`0x5d4aba8ad45bb5eab3499a0294b42da5d1e455d3`) in the BTC 5m and 15m
-markets. Where both sides trade, the log keeps our signal, post, and
-ack times next to their fill price, size, and timestamp. Nothing in
-that tape is an order input.
+markets. A fill pairs with our nearest same-outcome signal inside
+`h2h_window_s` (10 seconds) and stays unpaired otherwise. BTC 5m rows
+also store the Binance 3-second move at their fill and whether our
+strategy-2 trigger fired on that same direction. Nothing in that tape
+is an order input.
 
 `python lockbot_summary.py` reads `logs/lockbot.jsonl` and prints
-simulated P&L, fill counts, and latency per strategy, plus the median
-and p90 of our signal time minus their fill time, the share of cases
-where our signal was first, and the price difference.
+simulated P&L, fill counts, and latency per strategy, plus the share
+of their fills we also signalled, the median and p90 of the signed
+gap, the price difference, and the unpaired split (`missed` when our
+rule saw a qualifying move, `no_move` when they traded without one).
 
 ## Deploy boundary
 
@@ -207,6 +211,7 @@ Restart **only** `polymintbot` when the operator asks. `polypathlog` is retired.
 
 ## Changelog
 
+- **2026-10-04** — Lockbot head-to-head uses the nearest signal inside 10s. Combined cap is $40 so each strategy keeps $20. Not deployed.
 - **2026-10-04** — Lockbot wallet tape: log-only comparison with NIULAI4, asdaefef, and dvasdkasodk. Not an order input. Not deployed.
 - **2026-10-04** — Lockbot added as a separate dry-run service. Mintbot knobs unchanged. Not deployed.
 - **2026-10-03 13:25 IST** — Docs aligned to the live VM.

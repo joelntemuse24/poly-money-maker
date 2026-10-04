@@ -260,86 +260,166 @@ def attempts_from_rows(rows: list[dict]) -> list[dict]:
     return list(by_key.values())
 
 
-def _pick_attempt(attempts: list[dict], outcome: str) -> Optional[dict]:
+DEFAULT_H2H_WINDOW_S = 10.0
+
+
+def _nearest_attempt(
+    attempts: list[dict],
+    *,
+    slug: str,
+    outcome: str,
+    their_ts: float,
+    window_s: float,
+) -> Optional[dict]:
+    """Closest same-outcome signal in this market inside the window."""
     side = str(outcome or "").strip().lower()
-    same = [row for row in attempts if row.get("side") == side and side]
-    pool = same or list(attempts)
-    if not pool:
+    if side not in {"up", "down"}:
         return None
-    return min(pool, key=lambda row: float(row.get("decision_ts") or 0.0))
+    best: Optional[dict] = None
+    best_abs = None
+    for row in attempts:
+        if str(row.get("slug") or "") != slug or str(row.get("side") or "") != side:
+            continue
+        decision = _num(row.get("decision_ts"))
+        if decision is None:
+            continue
+        gap = abs(decision - their_ts)
+        if gap > float(window_s) + 1e-9:
+            continue
+        if best is None or gap < best_abs - 1e-9 or (abs(gap - best_abs) <= 1e-9 and decision < float(best["decision_ts"])):
+            best = row
+            best_abs = gap
+    return best
 
 
-def compare_fills(attempts: list[dict], fills: list[dict]) -> list[dict]:
-    """One case per watched fill in a market we also signaled or ordered.
+def _trigger_fired(attempts: list[dict], fill: dict, move: Optional[float], window_s: float) -> bool:
+    """True when an s2 signal fired on this move's side inside the window."""
+    if move is None or move == 0:
+        return False
+    side = "up" if move > 0 else "down"
+    slug = str(fill.get("slug") or "")
+    their_ts = _num(fill.get("their_ts"))
+    if their_ts is None:
+        return False
+    for row in attempts:
+        if str(row.get("slug") or "") != slug:
+            continue
+        if str(row.get("strategy") or "") != "s2" or str(row.get("side") or "") != side:
+            continue
+        decision = _num(row.get("decision_ts"))
+        if decision is None:
+            continue
+        if abs(decision - their_ts) <= float(window_s) + 1e-9:
+            return True
+    return False
 
-    The attempt is our earliest signal on the same outcome. When we only
-    traded the other outcome, the earliest signal in the market is used
-    and ``same_side`` is false. ``us_minus_them_s`` is our signal time
-    minus their payload timestamp, so a negative value means we were first.
-    Price difference is our price minus their price, and only on the same
-    outcome. Our price is the fill VWAP when shares filled, else the ask.
+
+def _s2_market(fill: dict) -> bool:
+    if "s2_market" in fill:
+        return bool(fill.get("s2_market"))
+    return str(fill.get("slug") or "").lower().startswith("btc-updown-5m-")
+
+
+def compare_fills(attempts: list[dict], fills: list[dict], *, window_s: float = DEFAULT_H2H_WINDOW_S) -> list[dict]:
+    """One row per watched fill.
+
+    The match is our nearest same-outcome signal within ``window_s`` of
+    their payload timestamp. A fill outside that window stays unpaired.
+    ``us_minus_them_s`` is our signal time minus theirs, so a negative
+    value means we were first. On BTC 5m, ``binance_move`` is the 3-second
+    move at their fill and ``trigger_fired`` says an s2 signal took that
+    same direction inside the window. ``move_class`` on an unpaired 5m
+    fill is ``missed`` when that move clears the s2 threshold and
+    ``no_move`` when it does not.
     """
-    by_slug: dict[str, list[dict]] = {}
-    for attempt in attempts or []:
-        slug = str(attempt.get("slug") or "")
-        if slug:
-            by_slug.setdefault(slug, []).append(attempt)
+    window = float(window_s)
     cases: list[dict] = []
     seen: set[str] = set()
     for fill in fills or []:
         if not isinstance(fill, dict):
             continue
-        slug = str(fill.get("slug") or "")
-        pool = by_slug.get(slug) or []
-        if not pool:
-            continue
-        key = fill_key(fill)
+        key = str(fill.get("fill_id") or fill_key(fill))
         if key in seen:
             continue
         seen.add(key)
-        attempt = _pick_attempt(pool, str(fill.get("outcome") or ""))
-        if attempt is None:
-            continue
-        decision_ts = float(attempt["decision_ts"])
         their_ts = _num(fill.get("their_ts"))
         if their_ts is None:
             continue
-        our_px, source = _our_price(attempt)
+        slug = str(fill.get("slug") or "")
+        attempt = _nearest_attempt(attempts, slug=slug, outcome=str(fill.get("outcome") or ""), their_ts=their_ts, window_s=window)
+        move = _num(fill.get("binance_move"))
+        move_min = _num(fill.get("move_min"))
+        if move_min is None:
+            move_min = 2.0
+        s2 = _s2_market(fill)
+        fired = _trigger_fired(attempts, fill, move, window) if s2 else False
+        paired = attempt is not None
+        if not s2:
+            move_class = "other" if not paired else "paired"
+        elif move is None:
+            move_class = "unknown" if not paired else "paired"
+        elif abs(move) + 1e-12 >= move_min:
+            move_class = "missed" if not paired else "paired"
+        else:
+            move_class = "no_move" if not paired else "paired"
         their_px = _num(fill.get("price"))
-        same_side = str(attempt.get("side") or "") == str(fill.get("outcome") or "").strip().lower()
-        price_diff = None
-        if same_side and our_px is not None and their_px is not None:
-            price_diff = our_px - their_px
         recv = _num(fill.get("recv_ts"))
         their_name = str(fill.get("name") or WALLETS.get(str(fill.get("wallet") or ""), ""))
-        cases.append(
-            {
-                "key": f"{key}|{round(decision_ts, 3)}",
-                "slug": slug,
-                "duration": fill.get("duration") or window_kind(slug),
-                "wallet": fill.get("wallet"),
-                "name": their_name,
-                "outcome": fill.get("outcome"),
-                "trade_side": fill.get("trade_side"),
-                "their_price": their_px,
-                "their_size": _num(fill.get("size")),
-                "their_ts": their_ts,
-                "their_recv_ts": recv,
-                "tx": fill.get("tx") or "",
-                "our_strategy": attempt.get("strategy"),
-                "our_side": attempt.get("side"),
-                "our_decision_ts": decision_ts,
-                "our_post_ts": _num(attempt.get("post_ts")),
-                "our_ack_ts": _num(attempt.get("ack_ts")),
-                "our_price": our_px,
-                "our_price_source": source,
-                "same_side": same_side,
-                "us_minus_them_s": decision_ts - their_ts,
-                "us_minus_them_recv_s": None if recv is None else decision_ts - recv,
-                "we_first": decision_ts < their_ts,
-                "price_diff": price_diff,
-            }
-        )
+        row = {
+            "key": key,
+            "fill_id": key,
+            "paired": paired,
+            "slug": slug,
+            "duration": fill.get("duration") or window_kind(slug),
+            "s2_market": s2,
+            "wallet": fill.get("wallet"),
+            "name": their_name,
+            "outcome": fill.get("outcome"),
+            "trade_side": fill.get("trade_side"),
+            "their_price": their_px,
+            "their_size": _num(fill.get("size")),
+            "their_ts": their_ts,
+            "their_recv_ts": recv,
+            "tx": fill.get("tx") or "",
+            "asset": fill.get("asset") or "",
+            "binance_move": move,
+            "move_min": move_min if s2 else None,
+            "trigger_fired": fired,
+            "move_class": move_class,
+            "h2h_window_s": window,
+            "our_strategy": None,
+            "our_side": None,
+            "our_decision_ts": None,
+            "our_post_ts": None,
+            "our_ack_ts": None,
+            "our_price": None,
+            "our_price_source": "",
+            "us_minus_them_s": None,
+            "us_minus_them_recv_s": None,
+            "we_first": None,
+            "price_diff": None,
+            "same_side": False,
+        }
+        if attempt is not None:
+            decision_ts = float(attempt["decision_ts"])
+            our_px, source = _our_price(attempt)
+            row.update(
+                {
+                    "our_strategy": attempt.get("strategy"),
+                    "our_side": attempt.get("side"),
+                    "our_decision_ts": decision_ts,
+                    "our_post_ts": _num(attempt.get("post_ts")),
+                    "our_ack_ts": _num(attempt.get("ack_ts")),
+                    "our_price": our_px,
+                    "our_price_source": source,
+                    "us_minus_them_s": decision_ts - their_ts,
+                    "us_minus_them_recv_s": None if recv is None else decision_ts - recv,
+                    "we_first": decision_ts < their_ts,
+                    "price_diff": None if our_px is None or their_px is None else our_px - their_px,
+                    "same_side": True,
+                }
+            )
+        cases.append(row)
     return cases
 
 
@@ -364,24 +444,31 @@ def _pack_price(values: list[float]) -> Optional[dict]:
 
 
 def summarize_cases(cases: list[dict]) -> dict:
-    """Median and p90 of our signal time minus their fill time.
+    """Share of their fills we also signalled, and the gap on those pairs.
 
-    ``we_first`` is the share of cases whose signal was strictly earlier.
-    Price difference uses same-outcome pairs only.
+    The signed gap and the price difference use paired fills only. Unpaired
+    BTC 5m fills split into ``missed`` (the 3s move cleared the s2 bar and
+    we did not signal) and ``no_move`` (they traded without that move).
     """
 
     def pack(group: list[dict]) -> dict:
-        deltas = [float(row["us_minus_them_s"]) for row in group if _num(row.get("us_minus_them_s")) is not None]
-        recvs = [float(row["us_minus_them_recv_s"]) for row in group if _num(row.get("us_minus_them_recv_s")) is not None]
-        prices = [float(row["price_diff"]) for row in group if _num(row.get("price_diff")) is not None]
-        first = sum(1 for row in group if row.get("we_first"))
+        paired = [row for row in group if row.get("paired")]
+        deltas = [float(row["us_minus_them_s"]) for row in paired if _num(row.get("us_minus_them_s")) is not None]
+        prices = [float(row["price_diff"]) for row in paired if _num(row.get("price_diff")) is not None]
         n = len(group)
+        n_paired = len(paired)
         return {
-            "n": n,
-            "we_first": (first / n) if n else None,
+            "fills": n,
+            "paired": n_paired,
+            "signalled": (n_paired / n) if n else None,
             "us_minus_them_s": _pack_seconds(deltas),
-            "us_minus_them_recv_s": _pack_seconds(recvs),
             "price_diff": _pack_price(prices),
+            "unpaired": n - n_paired,
+            "missed": sum(1 for row in group if row.get("move_class") == "missed"),
+            "no_move": sum(1 for row in group if row.get("move_class") == "no_move"),
+            "move_unknown": sum(1 for row in group if row.get("move_class") == "unknown"),
+            "other": sum(1 for row in group if row.get("move_class") == "other"),
+            "same_move": sum(1 for row in group if row.get("trigger_fired")),
         }
 
     by_name: dict[str, list[dict]] = {}
@@ -393,23 +480,49 @@ def summarize_cases(cases: list[dict]) -> dict:
     }
 
 
-def head_to_head(rows: list[dict]) -> tuple[list[dict], dict]:
-    """Join ``wallet_fill`` rows to our signals. Returns cases and the summary."""
-    fills = []
-    n_fills = 0
-    seen: set[str] = set()
+def _window_from_rows(rows: list[dict]) -> float:
     for row in rows or []:
+        if isinstance(row, dict) and row.get("event") == "startup" and _num(row.get("h2h_window_s")) is not None:
+            return float(row["h2h_window_s"])
+    return DEFAULT_H2H_WINDOW_S
+
+
+def head_to_head(rows: list[dict], *, window_s: Optional[float] = None) -> tuple[list[dict], dict]:
+    """Join ``wallet_fill`` rows to our signals. Returns cases and the summary."""
+    stored = list(rows or [])
+    window = DEFAULT_H2H_WINDOW_S if window_s is None else float(window_s)
+    if window_s is None:
+        window = _window_from_rows(stored)
+    moves: dict[str, dict] = {}
+    for row in stored:
+        if not isinstance(row, dict) or row.get("event") not in {"wallet_fill", "wallet_compare"}:
+            continue
+        if _num(row.get("binance_move")) is None:
+            continue
+        key = str(row.get("fill_id") or fill_key(row))
+        moves[key] = row
+    fills = []
+    seen: set[str] = set()
+    for row in stored:
         if not isinstance(row, dict) or row.get("event") != "wallet_fill":
             continue
-        key = fill_key(row)
+        key = str(row.get("fill_id") or fill_key(row))
         if key in seen:
             continue
         seen.add(key)
-        n_fills += 1
-        fills.append(row)
-    cases = compare_fills(attempts_from_rows(rows), fills)
+        fill = dict(row)
+        extra = moves.get(key)
+        if extra is not None and _num(fill.get("binance_move")) is None:
+            fill["binance_move"] = extra.get("binance_move")
+            if extra.get("move_min") is not None:
+                fill["move_min"] = extra.get("move_min")
+            if "s2_market" in extra:
+                fill["s2_market"] = extra.get("s2_market")
+        fills.append(fill)
+    cases = compare_fills(attempts_from_rows(stored), fills, window_s=window)
     summary = summarize_cases(cases)
-    summary["fills"] = n_fills
+    summary["fills"] = len(fills)
+    summary["window_s"] = window
     return cases, summary
 
 

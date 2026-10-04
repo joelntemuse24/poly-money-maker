@@ -192,29 +192,29 @@ def format_summary(summary: dict) -> str:
 
 def _wallet_lines(wallets: dict) -> list[str]:
     lines = ["vs wallets"]
-    fills = int(wallets.get("fills") or 0)
     overall = wallets.get("all") or {}
-    lines.append(f"  fills {fills}  {_wallet_stats(overall)}")
+    lines.append(f"  {_wallet_stats(overall)}")
     for name, row in (wallets.get("by_wallet") or {}).items():
         lines.append(f"  {name}: {_wallet_stats(row)}")
     return lines
 
 
 def _wallet_stats(row: dict) -> str:
-    n = int(row.get("n") or 0)
-    if not n:
-        return "compared 0"
+    fills = int(row.get("fills") or 0)
+    if not fills:
+        return "fills 0"
     delta = row.get("us_minus_them_s") or {}
     price = row.get("price_diff") or {}
-    recv = row.get("us_minus_them_recv_s") or {}
-    text = (
-        f"compared {n}  us_minus_them_s median {delta.get('median')}  p90 {delta.get('p90')}  "
-        f"we_first {_pct(row.get('we_first'))}  "
-        f"price_diff median {price.get('median')}  p90 {price.get('p90')}"
+    gap = "n/a" if not delta else f"median {delta.get('median')}  p90 {delta.get('p90')}"
+    px = "n/a" if not price else f"median {price.get('median')}  p90 {price.get('p90')}"
+    return (
+        f"fills {fills}  signalled {_pct(row.get('signalled'))}  "
+        f"gap_s {gap}  price_diff {px}  "
+        f"no_signal {int(row.get('unpaired') or 0)} "
+        f"(missed {int(row.get('missed') or 0)}, no_move {int(row.get('no_move') or 0)}, "
+        f"move_unknown {int(row.get('move_unknown') or 0)}, other {int(row.get('other') or 0)})  "
+        f"same_move {int(row.get('same_move') or 0)}"
     )
-    if recv:
-        text += f"  recv median {recv.get('median')}  p90 {recv.get('p90')}"
-    return text
 
 
 def _pct(value: Any) -> str:

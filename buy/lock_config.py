@@ -15,10 +15,10 @@ DEFAULTS: dict[str, Any] = {
     "dry_run": True,
     "strategy1_enabled": True,
     "strategy2_enabled": True,
-    # Combined dollars in one market, across both strategies.
-    "per_market_usd": 20.0,
-    "combined_per_market_usd": 20.0,
-    # Each strategy's own cap inside that market. The combined cap still binds.
+    # Each strategy keeps its own budget. The combined cap is the sum, so
+    # strategy 2 cannot spend strategy 1's $20 in the same BTC 5m market.
+    "per_market_usd": 40.0,
+    "combined_per_market_usd": 40.0,
     "strategy1_market_usd": 20.0,
     "strategy2_market_usd": 20.0,
     "clip_usd": 5.0,
@@ -54,6 +54,9 @@ DEFAULTS: dict[str, Any] = {
     "stale_binance_s": 2.0,
     "dry_run_latency_s": 0.20,
     "fast_poll_s": 0.05,
+    # Pair a watched fill with our nearest same-outcome signal inside this
+    # many seconds. Farther signals stay unpaired.
+    "h2h_window_s": 10.0,
     "market_rules": {
         "btc_15m": {"Z": 0.0, "Pmax": 0.97, "edge_min": 0.0},
         "btc_5m": {"Z": 0.25, "Pmax": 0.90, "edge_min": 0.0},
@@ -172,6 +175,7 @@ def validate_config(cfg: Any) -> None:
         "settle_window_s",
         "max_pay",
         "dry_run_latency_s",
+        "h2h_window_s",
     )
     for key in positive:
         if key in cfg and _num(cfg.get(key), -1.0) <= 0:

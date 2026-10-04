@@ -47,7 +47,6 @@ from buy.lock_gates import (
 )
 from buy.lock_orders import build_clob_client, dispatch_buy, normalize_fill, warm_market
 from buy.lock_paper import enqueue_paper, take_due, walk_late_book
-from buy.lock_wallets import WALLETS, WalletTape, compare_fills
 from buy.lock_markets import (
     DURATION_S,
     SPECS,
@@ -55,9 +54,11 @@ from buy.lock_markets import (
     enabled_keys,
     event_slug,
     parse_lock_event,
+    parse_slug,
     symbols_for,
     window_starts,
 )
+from buy.lock_wallets import WALLETS, WalletTape, compare_fills
 from buy.mint_gas import mint_gas_settings
 from buy.oracle_log import RtdsTwapFeed, append_jsonl, fetch_gamma_strike
 
@@ -912,11 +913,46 @@ class LockBot:
 
     def _on_wallet_fill(self, fill: dict) -> None:
         """Record one watched fill. Does not read or write an order."""
+        self._stamp_binance_move(fill)
+        from buy.lock_wallets import fill_key
+
+        fill["fill_id"] = fill.get("fill_id") or fill_key(fill)
         with self._lock:
             self.wallet_fills.append(dict(fill))
             if len(self.wallet_fills) > 5000:
                 del self.wallet_fills[: len(self.wallet_fills) - 5000]
         log_event("wallet_fill", **fill)
+
+    def _stamp_binance_move(self, fill: dict) -> None:
+        """3-second Binance move at their fill time. Log only."""
+        parsed = parse_slug(str(fill.get("slug") or ""))
+        s2_keys = {str(item) for item in (self.cfg.get("strategy2_markets") or ["btc_5m"])}
+        s2 = False
+        start = None
+        if parsed is not None:
+            asset, duration, start = parsed
+            s2 = f"{asset}_{duration}" in s2_keys
+        fill["s2_market"] = s2
+        if not s2:
+            return
+        fill["move_min"] = float(self.cfg.get("s2_move_sigma") or 2.0)
+        feed = self.binance
+        their_ts = fill.get("their_ts")
+        if feed is None or start is None or their_ts is None:
+            fill["binance_move"] = None
+            return
+        lookback = float(self.cfg.get("s2_move_s") or 3.0)
+        now_px = feed.price_at(float(their_ts))
+        then_px = feed.price_at(float(their_ts) - lookback)
+        sigma, _nrets, _source = feed.sigma_before(
+            float(start),
+            float(self.cfg.get("s2_sigma_window_s") or 300),
+            min_n=int(self.cfg.get("s2_sigma_min_samples") or 60),
+        )
+        move = None
+        if now_px is not None and then_px is not None and sigma is not None:
+            move = signed_move(now_px, then_px, sigma)
+        fill["binance_move"] = None if move is None else round(float(move), 4)
 
     def _remember_attempt(self, decision: dict) -> None:
         decision_ts = decision.get("decision_ts")
@@ -962,25 +998,34 @@ class LockBot:
                 return
 
     def _emit_compares(self, now: float) -> None:
-        """Append one wallet_compare row once post/ack is known.
+        """Append one wallet_compare row after the pairing window has closed.
 
-        The summary recomputes the same join from the log, so a row that
-        lands before the paper walk is not required. This socket never
-        feeds the strategy gates.
+        A signal inside the window can still arrive, so an unpaired row
+        waits. The summary recomputes the join from the log. This tape
+        never feeds the strategy gates.
         """
+        window = float(self.cfg.get("h2h_window_s") or 10.0)
+        with self._lock:
+            pending = [fill for fill in self.wallet_fills if fill.get("s2_market") and fill.get("binance_move") is None]
+        for fill in pending:
+            self._stamp_binance_move(fill)
         with self._lock:
             attempts = [dict(row) for row in self.attempts]
             fills = [dict(row) for row in self.wallet_fills]
             done = set(self._compared)
         fresh = []
-        for case in compare_fills(attempts, fills):
+        for case in compare_fills(attempts, fills, window_s=window):
             key = str(case.get("key") or "")
             if not key or key in done:
                 continue
-            decision_ts = case.get("our_decision_ts")
-            if case.get("our_post_ts") is None and (
-                decision_ts is None or float(now) - float(decision_ts) < 2.0
-            ):
+            their_ts = case.get("their_ts")
+            recv = case.get("their_recv_ts")
+            if their_ts is None:
+                continue
+            anchor = float(their_ts)
+            if recv is not None:
+                anchor = max(anchor, float(recv))
+            if float(now) + 1e-9 < anchor + window:
                 continue
             fresh.append(case)
         for case in fresh:
@@ -1148,6 +1193,9 @@ def main(argv: Optional[list[str]] = None) -> int:
         markets=enabled_keys(cfg),
         symbols=symbols_for(cfg),
         per_market_usd=cfg.get("combined_per_market_usd"),
+        strategy1_market_usd=cfg.get("strategy1_market_usd"),
+        strategy2_market_usd=cfg.get("strategy2_market_usd"),
+        h2h_window_s=cfg.get("h2h_window_s"),
         clip_usd=cfg.get("clip_usd"),
         max_open_exposure_usd=cfg.get("max_open_exposure_usd"),
         config=str(path),

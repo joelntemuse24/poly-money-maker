@@ -210,13 +210,23 @@ class GateTests(unittest.TestCase):
         self.assertIsNone(unlocked.get("locked_side"))
 
     def test_combined_cap_blocks_the_other_strategy(self):
+        tight = apply_defaults({"combined_per_market_usd": 20.0, "per_market_usd": 20.0})
         account = note_fill(_account(), cost=20.0, shares=25.0, strategy="s1", side="up", now=900.0)
-        decision = evaluate_strategy2(_s2_view(), account, self.cfg)
+        decision = evaluate_strategy2(_s2_view(), account, tight)
         self.assertEqual(decision["reason"], "combined_cap")
         roomy = note_fill(_account(), cost=10.0, shares=12.0, strategy="s1", side="up", now=900.0)
-        second = evaluate_strategy2(_s2_view(), roomy, self.cfg)
+        second = evaluate_strategy2(_s2_view(), roomy, tight)
         self.assertEqual(second["action"], "buy")
         self.assertAlmostEqual(second["notional"], 5.0)
+
+    def test_each_strategy_keeps_its_own_budget(self):
+        spent = note_fill(_account(), cost=20.0, shares=25.0, strategy="s2", side="down", now=900.0)
+        decision = evaluate_entry(_view(), spent, self.cfg)
+        self.assertEqual(decision["action"], "buy")
+        self.assertAlmostEqual(decision["notional"], 5.0)
+        both = note_fill(spent, cost=20.0, shares=25.0, strategy="s1", side="up", now=901.0)
+        blocked = evaluate_strategy2(_s2_view(), both, self.cfg)
+        self.assertEqual(blocked["reason"], "strategy_cap")
 
     def test_exposure_cap_clips_the_order(self):
         decision = evaluate_entry(_view(), _account(open_cost=56.0), self.cfg)
