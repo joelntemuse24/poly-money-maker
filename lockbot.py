@@ -207,6 +207,7 @@ class LockBot:
         self.attempts: list[dict] = []
         self._compared: set[str] = set()
         self._compared_order: deque[str] = deque()
+        self._wallet_kick = 0.0
         self.paper: list[dict] = []
         self.clip_at: dict[tuple[str, str], float] = {}
         self.latched: dict[str, float] = {}
@@ -498,6 +499,7 @@ class LockBot:
                 continue
             if market.end_ts - now <= 0:
                 self._settle(market, now)
+        self._kick_wallet_tape(now)
         self._emit_compares(now)
         self._status(now)
 
@@ -996,6 +998,21 @@ class LockBot:
                 if row.get("limit") is None:
                     row["limit"] = decision.get("limit")
                 return
+
+    def _kick_wallet_tape(self, now: float) -> None:
+        """Redial the activity socket when the firehose goes quiet."""
+        age = self.wallets.age_s(now)
+        if age is None or age <= 15.0 or now - self._wallet_kick < 15.0:
+            return
+        ws = self.wallets._ws
+        if ws is None:
+            return
+        self._wallet_kick = now
+        log_event("wallet_reconnect", age_s=round(age, 1))
+        try:
+            ws.close()
+        except Exception:
+            return
 
     def _emit_compares(self, now: float) -> None:
         """Append one wallet_compare row after the pairing window has closed.
