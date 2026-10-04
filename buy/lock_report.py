@@ -42,6 +42,7 @@ def summarize(rows: Iterable[dict]) -> dict:
     decision/post/ack stamps on those attempts.
     """
     from buy.lock_paper import latency_summary
+    from buy.lock_wallets import head_to_head
 
     stored = list(rows or [])
     by_key: dict[str, dict] = {}
@@ -129,6 +130,7 @@ def summarize(rows: Iterable[dict]) -> dict:
             for key, row in fills.items()
         },
         "latency": latency_summary(stored),
+        "wallets": head_to_head(stored)[1],
     }
 
 
@@ -175,6 +177,7 @@ def format_summary(summary: dict) -> str:
             lines.append(f"  {key}: n/a")
             continue
         lines.append(f"  {key}: n {pack['n']}  p50 {pack['p50']}  p95 {pack['p95']}  max {pack['max']}")
+    lines.extend(_wallet_lines(summary.get("wallets") or {}))
     lines.append("by asset")
     assets = summary.get("assets") or {}
     if not assets:
@@ -185,6 +188,33 @@ def format_summary(summary: dict) -> str:
             f"win_rate {_pct(row.get('win_rate'))}  worst {_usd(row.get('worst'))} {row.get('worst_slug') or ''}"
         )
     return "\n".join(lines)
+
+
+def _wallet_lines(wallets: dict) -> list[str]:
+    lines = ["vs wallets"]
+    fills = int(wallets.get("fills") or 0)
+    overall = wallets.get("all") or {}
+    lines.append(f"  fills {fills}  {_wallet_stats(overall)}")
+    for name, row in (wallets.get("by_wallet") or {}).items():
+        lines.append(f"  {name}: {_wallet_stats(row)}")
+    return lines
+
+
+def _wallet_stats(row: dict) -> str:
+    n = int(row.get("n") or 0)
+    if not n:
+        return "compared 0"
+    delta = row.get("us_minus_them_s") or {}
+    price = row.get("price_diff") or {}
+    recv = row.get("us_minus_them_recv_s") or {}
+    text = (
+        f"compared {n}  us_minus_them_s median {delta.get('median')}  p90 {delta.get('p90')}  "
+        f"we_first {_pct(row.get('we_first'))}  "
+        f"price_diff median {price.get('median')}  p90 {price.get('p90')}"
+    )
+    if recv:
+        text += f"  recv median {recv.get('median')}  p90 {recv.get('p90')}"
+    return text
 
 
 def _pct(value: Any) -> str:

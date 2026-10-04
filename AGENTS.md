@@ -339,11 +339,15 @@ Binance 3-second move sniper on BTC 5m only (`|move| >= 2` sigma, ask
 `max_open_exposure_usd` is 60. The daily loss stop stays 60. Books come
 from the CLOB market websocket; Binance trades are in memory. Dry-run
 walks the book after `dry_run_latency_s` (0.20) and logs receive,
-decision, post, and ack times. It holds to settlement and never sells.
-Every threshold is in `lockbot.example.json`. A gitignored `lockbot.json`
-overrides it. `logs/lockbot.jsonl` and `positions_lockbot.json` stay
-gitignored. `python lockbot_summary.py` prints P&L, paper fills, and
-latency by strategy.
+decision, post, and ack times. A separate RTDS `activity/trades`
+socket records fills by NIULAI4, asdaefef, and dvasdkasodk on BTC 5m
+and 15m. It does not place or change orders. It holds to settlement
+and never sells. Every threshold is in `lockbot.example.json`. A
+gitignored `lockbot.json` overrides it. `logs/lockbot.jsonl` and
+`positions_lockbot.json` stay gitignored. `python lockbot_summary.py`
+prints P&L, paper fills, latency by strategy, and the wallet
+head-to-head (median and p90 of our signal time minus their fill time,
+the share of cases we were first, and the price difference).
 
 Do not restore retired buybot modules (`entry_skip`, `hedge_gate`,
 `btc_price`, `clob_book_ws`, `depth_ladder`, `strategy_coherence`,

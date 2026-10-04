@@ -186,8 +186,18 @@ BTC 5m uses the same `btc/usd` Chainlink 60s TWAP as 15m, latched at
 the 5m open. Books are the CLOB market websocket. Binance is an
 in-memory BTCUSDT trade stream.
 
+A log-only RTDS `activity/trades` socket records fills by NIULAI4
+(`0x44832d0d2ec11187c1e77d786feb15f6a50254c6`), asdaefef
+(`0x75cc3b63a2f2423085e10706c78b494017b93ce1`), and dvasdkasodk
+(`0x5d4aba8ad45bb5eab3499a0294b42da5d1e455d3`) in the BTC 5m and 15m
+markets. Where both sides trade, the log keeps our signal, post, and
+ack times next to their fill price, size, and timestamp. Nothing in
+that tape is an order input.
+
 `python lockbot_summary.py` reads `logs/lockbot.jsonl` and prints
-simulated P&L, fill counts, and latency per strategy.
+simulated P&L, fill counts, and latency per strategy, plus the median
+and p90 of our signal time minus their fill time, the share of cases
+where our signal was first, and the price difference.
 
 ## Deploy boundary
 
@@ -197,6 +207,7 @@ Restart **only** `polymintbot` when the operator asks. `polypathlog` is retired.
 
 ## Changelog
 
+- **2026-10-04** — Lockbot wallet tape: log-only comparison with NIULAI4, asdaefef, and dvasdkasodk. Not an order input. Not deployed.
 - **2026-10-04** — Lockbot added as a separate dry-run service. Mintbot knobs unchanged. Not deployed.
 - **2026-10-03 13:25 IST** — Docs aligned to the live VM.
   - 200 shares a side, with `mint_sequential` and `redeem_enabled` on (`redeem_startup_sweep` off).

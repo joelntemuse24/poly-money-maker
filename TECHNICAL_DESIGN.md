@@ -1349,11 +1349,14 @@ Adjacent mint may already have been submitted **before** expiry (lookahead). Tha
 
 **Books.** Confirmed on Gamma 2026-10-04. Event slug `{asset}-updown-{5m|15m}-{start_ts}`, series `{asset}-up-or-down-{5m|15m}`. BTC 15m and BTC 5m are on. ETH/SOL/XRP 15m and 5m use the same `twap-60s` source and stay off. A `resolutionSource` without `twap-60s` is skipped even if the flag is on. One `RtdsTwapFeed` per enabled symbol (btc/usd for the defaults). The CLOB market websocket keeps the ladders. Current and next window token ids are subscribed as soon as Gamma resolves them. Live mode warms `get_clob_market_info` off the decision tick. The Binance feed is `btcusdt@trade`.
 
-**State.** `logs/lockbot.jsonl` (eval, signal, paper_fill, entry, fill, settlement, redeem) and `positions_lockbot.json` are gitignored. Positions are keyed by slug, strategy, and side. `lockbot_summary.py` prints P&L, paper-fill counts, and latency percentiles per strategy. Live redeem reuses `RedeemDesk` through `buy/relay_batch.py` on a `lockbot-redeem` thread. Dry-run logs `redeem_dry_run` and sends nothing.
+**Wallet tape.** A second RTDS socket on `wss://ws-live-data.polymarket.com` subscribes to `activity/trades` and records fills by NIULAI4 (`0x44832d0d2ec11187c1e77d786feb15f6a50254c6`), asdaefef (`0x75cc3b63a2f2423085e10706c78b494017b93ce1`), and dvasdkasodk (`0x5d4aba8ad45bb5eab3499a0294b42da5d1e455d3`) in BTC 5m and 15m. For each of their fills in a market we also signaled or ordered, the log stores our signal time, post time, and ack time, their price, size, and timestamp, whether our signal was earlier, and our price minus their price. `lockbot_summary.py` prints the median and p90 of that time difference, the share of cases where we were first, and the price difference. The tape is log-only. The gates do not read it.
+
+**State.** `logs/lockbot.jsonl` (eval, signal, paper_fill, entry, fill, settlement, redeem, wallet_fill, wallet_compare) and `positions_lockbot.json` are gitignored. Positions are keyed by slug, strategy, and side. `lockbot_summary.py` prints P&L, paper-fill counts, latency percentiles per strategy, and the wallet comparison. Live redeem reuses `RedeemDesk` through `buy/relay_batch.py` on a `lockbot-redeem` thread. Dry-run logs `redeem_dry_run` and sends nothing.
 
 <a id="changelog"></a>
 # Changelog
 
+- **2026-10-04** — Lockbot wallet tape (PR #235, not merged). Log-only RTDS `activity/trades` comparison against NIULAI4, asdaefef, and dvasdkasodk on BTC 5m/15m. Summary adds median and p90 of our signal time minus their fill time, the share of cases we were first, and the price difference. No order uses the tape. Mintbot is unchanged.
 - **2026-10-04** — Lockbot strategy update (PR #235, not merged). Strategy 1 is the NIULAI4 BTC ladder (15m Z=0/Pmax=0.97, 5m Z=0.25/Pmax=0.90, $5 clips, side lock). Strategy 2 is the BTC 5m Binance-move sniper. Alts off. Combined cap $20, exposure $60, dry-run latency fill. Mintbot is unchanged.
 - **2026-10-04** — Lockbot. Separate taker (`lockbot.py`), dry-run by default, not deployed. Mintbot is unchanged.
 - **2026-10-03 (PR #234, not live until pull + restart)** — Scrap oracle veto.

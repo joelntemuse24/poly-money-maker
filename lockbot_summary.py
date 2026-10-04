@@ -2,8 +2,10 @@
 """Print running lockbot P&L from logs/lockbot.jsonl.
 
 Groups settlement rows by strategy (s1 NIULAI4, s2 Binance sniper)
-and by asset/duration. Also prints signal and paper-fill counts plus
-decision-to-post latency, so a dry-run day can be read before settlement.
+and by asset/duration. Also prints signal and paper-fill counts,
+decision-to-post latency, and the head-to-head wallet comparison
+(median and p90 of our signal time minus their fill time, the share
+of cases where our signal was first, and the price difference).
 """
 
 from __future__ import annotations

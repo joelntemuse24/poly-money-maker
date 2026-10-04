@@ -9,7 +9,9 @@ wins when it exists. Entries are hold-to-settlement; this process never sells.
 Strategy 1 is the NIULAI4 ladder on BTC 15m and BTC 5m in the last minute.
 Strategy 2 is the Binance 3-second move sniper on BTC 5m. The decision tick
 reads the in-memory Chainlink path, the Binance trade, and the CLOB market
-websocket. Gamma and the order post stay off that tick.
+websocket. Gamma and the order post stay off that tick. A separate RTDS
+activity/trades socket records three watched wallets for a latency
+comparison. That tape never places or changes an order.
 """
 
 from __future__ import annotations
@@ -21,6 +23,7 @@ import os
 import signal
 import threading
 import time
+from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any, Optional
@@ -44,6 +47,7 @@ from buy.lock_gates import (
 )
 from buy.lock_orders import build_clob_client, dispatch_buy, normalize_fill, warm_market
 from buy.lock_paper import enqueue_paper, take_due, walk_late_book
+from buy.lock_wallets import WALLETS, WalletTape, compare_fills
 from buy.lock_markets import (
     DURATION_S,
     SPECS,
@@ -197,6 +201,11 @@ class LockBot:
         self._pool = ThreadPoolExecutor(max_workers=4, thread_name_prefix="lockbot-io")
         self.book_feed = ClobBookFeed()
         self.binance: Optional[BinanceTradeFeed] = None
+        self.wallets = WalletTape(on_fill=self._on_wallet_fill)
+        self.wallet_fills: list[dict] = []
+        self.attempts: list[dict] = []
+        self._compared: set[str] = set()
+        self._compared_order: deque[str] = deque()
         self.paper: list[dict] = []
         self.clip_at: dict[tuple[str, str], float] = {}
         self.latched: dict[str, float] = {}
@@ -240,6 +249,14 @@ class LockBot:
                 log_event("binance_subscribe", urls=list(self.binance.urls))
         elif self.binance is not None:
             self.binance.stop()
+        if not self.wallets.running():
+            self.wallets.start()
+            log_event(
+                "wallet_subscribe",
+                topic="activity",
+                feed="trades",
+                wallets=sorted(WALLETS.values()),
+            )
 
     def refresh_markets(self, now: float) -> None:
         gamma = str(self.cfg.get("gamma_url"))
@@ -480,6 +497,7 @@ class LockBot:
                 continue
             if market.end_ts - now <= 0:
                 self._settle(market, now)
+        self._emit_compares(now)
         self._status(now)
 
     def _status(self, now: float) -> None:
@@ -495,6 +513,9 @@ class LockBot:
             binance_age_s=age,
             binance_px=None if latest is None else latest[2],
             binance_error=(self.binance.last_error()[:160] if self.binance is not None else ""),
+            wallet_age_s=self.wallets.age_s(now),
+            wallet_fills=self.wallets.fills,
+            wallet_error=self.wallets.last_error()[:160],
             markets=len(self.markets),
             paper=len(self.paper),
         )
@@ -608,6 +629,7 @@ class LockBot:
         decision["decision_ts"] = decision_ts
         self.clip_at[(market.slug, strategy)] = decision_ts
         log_event("signal", **_public_decision(decision))
+        self._remember_attempt(decision)
         if self.cfg.get("dry_run", True):
             enqueue_paper(self.paper, decision, now=decision_ts)
             return
@@ -702,6 +724,7 @@ class LockBot:
             decision_to_order_ms=fill.get("decision_to_order_ms"),
             eval_ms=decision.get("eval_ms"),
         )
+        self._stamp_attempt(decision, fill)
 
     def _add_fill(self, market: LockMarket, decision: dict, fill: dict, now: float) -> None:
         with self._lock:
@@ -887,10 +910,93 @@ class LockBot:
         except Exception as exc:
             log_event("cash_fail", error=str(exc)[:160])
 
+    def _on_wallet_fill(self, fill: dict) -> None:
+        """Record one watched fill. Does not read or write an order."""
+        with self._lock:
+            self.wallet_fills.append(dict(fill))
+            if len(self.wallet_fills) > 5000:
+                del self.wallet_fills[: len(self.wallet_fills) - 5000]
+        log_event("wallet_fill", **fill)
+
+    def _remember_attempt(self, decision: dict) -> None:
+        decision_ts = decision.get("decision_ts")
+        if decision_ts is None:
+            return
+        row = {
+            "slug": decision.get("slug"),
+            "strategy": decision.get("strategy"),
+            "side": str(decision.get("side") or "").lower(),
+            "decision_ts": float(decision_ts),
+            "ask": decision.get("ask"),
+            "limit": decision.get("limit"),
+            "post_ts": None,
+            "ack_ts": None,
+            "vwap": None,
+            "shares": None,
+        }
+        with self._lock:
+            self.attempts.append(row)
+            if len(self.attempts) > 2000:
+                del self.attempts[: len(self.attempts) - 2000]
+
+    def _stamp_attempt(self, decision: dict, fill: dict) -> None:
+        decision_ts = fill.get("decision_ts") or decision.get("decision_ts")
+        if decision_ts is None:
+            return
+        slug = decision.get("slug")
+        strategy = decision.get("strategy")
+        with self._lock:
+            for row in reversed(self.attempts):
+                if row.get("slug") != slug or row.get("strategy") != strategy:
+                    continue
+                if abs(float(row.get("decision_ts") or 0.0) - float(decision_ts)) > 1e-3:
+                    continue
+                row["post_ts"] = fill.get("post_ts")
+                row["ack_ts"] = fill.get("ack_ts")
+                row["vwap"] = fill.get("vwap")
+                row["shares"] = fill.get("shares")
+                if row.get("ask") is None:
+                    row["ask"] = decision.get("ask")
+                if row.get("limit") is None:
+                    row["limit"] = decision.get("limit")
+                return
+
+    def _emit_compares(self, now: float) -> None:
+        """Append one wallet_compare row once post/ack is known.
+
+        The summary recomputes the same join from the log, so a row that
+        lands before the paper walk is not required. This socket never
+        feeds the strategy gates.
+        """
+        with self._lock:
+            attempts = [dict(row) for row in self.attempts]
+            fills = [dict(row) for row in self.wallet_fills]
+            done = set(self._compared)
+        fresh = []
+        for case in compare_fills(attempts, fills):
+            key = str(case.get("key") or "")
+            if not key or key in done:
+                continue
+            decision_ts = case.get("our_decision_ts")
+            if case.get("our_post_ts") is None and (
+                decision_ts is None or float(now) - float(decision_ts) < 2.0
+            ):
+                continue
+            fresh.append(case)
+        for case in fresh:
+            key = str(case["key"])
+            self._compared.add(key)
+            self._compared_order.append(key)
+            while len(self._compared_order) > 10000:
+                self._compared.discard(self._compared_order.popleft())
+            payload = {field: value for field, value in case.items() if field != "key"}
+            log_event("wallet_compare", **payload)
+
     def close(self) -> None:
         for feed in self.feeds.values():
             feed.stop()
         self.book_feed.stop()
+        self.wallets.stop()
         if self.binance is not None:
             self.binance.stop()
         self._pool.shutdown(wait=False, cancel_futures=True)
