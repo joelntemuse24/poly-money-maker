@@ -92,7 +92,8 @@ def latency_summary(rows: list[dict]) -> dict:
     for row in rows or []:
         if not isinstance(row, dict):
             continue
-        if row.get("event") not in {"signal", "paper_fill", "entry", "fill"}:
+        # ``fill`` repeats the timestamps already on ``paper_fill`` / ``entry``.
+        if row.get("event") not in {"signal", "paper_fill", "entry"}:
             continue
         for key, bucket in (("decision_to_post_ms", decision), ("recv_to_post_ms", recv)):
             value = row.get(key)
