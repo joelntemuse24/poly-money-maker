@@ -281,10 +281,21 @@ class FeedCostTests(unittest.TestCase):
         decision = evaluate_strategy2(view, {"cash": 500.0, "open_cost": 0.0, "spent_s1": 0.0, "spent_s2": 0.0}, apply_defaults({}))
         self.assertEqual(decision["action"], "buy")
 
-    def test_h2h_flag_defaults_on_and_can_be_disabled(self):
-        self.assertIs(apply_defaults({})["h2h_enabled"], True)
-        self.assertIs(apply_defaults({"h2h_enabled": False})["h2h_enabled"], False)
+    def test_h2h_flag_defaults_off_and_can_be_enabled(self):
+        self.assertIs(apply_defaults({})["h2h_enabled"], False)
+        self.assertIs(apply_defaults({"h2h_enabled": True})["h2h_enabled"], True)
+        self.assertIs(apply_defaults({"h2h_enabled": "on"})["h2h_enabled"], True)
         self.assertIs(apply_defaults({"h2h_enabled": "off"})["h2h_enabled"], False)
+
+    def test_same_book_tokens_do_not_mark_the_socket_dirty(self):
+        feed = ClobBookFeed()
+        feed.set_tokens(["up", "dn"])
+        self.assertTrue(feed._subs_dirty.is_set())
+        feed._subs_dirty.clear()
+        feed.set_tokens(["up", "dn"])
+        self.assertFalse(feed._subs_dirty.is_set())
+        feed.set_tokens(["dn", "up"])
+        self.assertTrue(feed._subs_dirty.is_set())
 
 
 class WindowTests(unittest.TestCase):

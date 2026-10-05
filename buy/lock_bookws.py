@@ -252,6 +252,8 @@ class ClobBookFeed:
             if text and text not in cleaned:
                 cleaned.append(text)
         with self._lock:
+            if cleaned == self._wanted:
+                return
             self._wanted = cleaned
         # The reader thread is the only one that writes the socket.
         self._subs_dirty.set()

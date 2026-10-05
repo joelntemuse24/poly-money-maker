@@ -15,7 +15,8 @@ from buy.lock_ws import connect_kwargs
 
 # aggTrade is the same last price as the raw trade stream (field ``p``,
 # time ``T``). It collapses prints that share a price and a millisecond,
-# which is the 3-second move this feed is for.
+# which is the 3-second move this feed is for. bookTicker is a quote, not
+# that trade, and on BTC it is often busier, so it is not used.
 BINANCE_TRADE_URLS = (
     "wss://stream.binance.com:9443/ws/btcusdt@aggTrade",
     "wss://data-stream.binance.vision/ws/btcusdt@aggTrade",

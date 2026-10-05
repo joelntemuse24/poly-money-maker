@@ -57,8 +57,9 @@ DEFAULTS: dict[str, Any] = {
     # Pair a watched fill with our nearest same-outcome signal inside this
     # many seconds. Farther signals stay unpaired.
     "h2h_window_s": 10.0,
-    # Head-to-head wallet tape. False skips the RTDS activity socket.
-    "h2h_enabled": True,
+    # Head-to-head wallet tape. Off unless set: the RTDS activity socket
+    # stays closed and is not an input to either strategy.
+    "h2h_enabled": False,
     "market_rules": {
         "btc_15m": {"Z": 0.0, "Pmax": 0.97, "edge_min": 0.0},
         "btc_5m": {"Z": 0.25, "Pmax": 0.90, "edge_min": 0.0},
@@ -73,7 +74,7 @@ DEFAULTS: dict[str, Any] = {
     "noise_frac": 0.00002,
     "settle_window_s": 60.0,
     "poll_s": 1.0,
-    "eval_log_s": 5.0,
+    "eval_log_s": 30.0,
     "book_warm_s": 15.0,
     "gamma_refresh_s": 20.0,
     "market_refresh_s": 20.0,
@@ -149,7 +150,7 @@ def apply_defaults(raw: Any) -> dict:
         cfg[key] = value
     cfg["markets"] = markets
     cfg["market_rules"] = rules
-    cfg["h2h_enabled"] = _bool(cfg.get("h2h_enabled"), True)
+    cfg["h2h_enabled"] = _bool(cfg.get("h2h_enabled"), False)
     if "combined_per_market_usd" not in raw and "per_market_usd" in raw:
         cfg["combined_per_market_usd"] = cfg["per_market_usd"]
     return cfg

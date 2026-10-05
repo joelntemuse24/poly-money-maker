@@ -342,7 +342,7 @@ the other's budget.
 `max_open_exposure_usd` is 60. The daily loss stop stays 60. Books come
 from the CLOB market websocket; Binance `aggTrade` prices are in
 memory (the 3-second move uses that last price). `h2h_enabled` (default
-true) is the wallet tape; false leaves that socket closed. Latched
+false) is the wallet tape; false leaves that socket closed. Latched
 strikes persist in gitignored `lockbot_windows.json`. Dry-run
 walks the book after `dry_run_latency_s` (0.20) and logs receive,
 decision, post, and ack times. A separate RTDS `activity/trades`

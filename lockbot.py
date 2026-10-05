@@ -9,9 +9,8 @@ wins when it exists. Entries are hold-to-settlement; this process never sells.
 Strategy 1 is the NIULAI4 ladder on BTC 15m and BTC 5m in the last minute.
 Strategy 2 is the Binance 3-second move sniper on BTC 5m. The decision tick
 reads the in-memory Chainlink path, the Binance trade, and the CLOB market
-websocket. Gamma and the order post stay off that tick. A separate RTDS
-activity/trades socket records three watched wallets for a latency
-comparison. That tape never places or changes an order.
+websocket. Gamma and the order post stay off that tick. The wallet tape
+is off unless ``h2h_enabled`` is set. It never places or changes an order.
 """
 
 from __future__ import annotations
@@ -25,7 +24,6 @@ import sys
 import threading
 import time
 from collections import deque
-from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any, Optional
 
@@ -54,6 +52,7 @@ from buy.lock_markets import (
     LockMarket,
     enabled_keys,
     event_slug,
+    market_fetch_due,
     parse_lock_event,
     parse_slug,
     symbols_for,
@@ -72,7 +71,7 @@ from buy.lock_state import (
 from buy.lock_ws import wsaccel_available
 from buy.lock_wallets import WALLETS, WalletTape, compare_fills
 from buy.mint_gas import mint_gas_settings
-from buy.oracle_log import RtdsTwapFeed, append_jsonl, fetch_gamma_strike
+from buy.oracle_log import RtdsTwapFeed, append_jsonl
 
 
 ROOT = Path(__file__).resolve().parent
@@ -190,14 +189,12 @@ class LockBot:
         self.market_at: dict[str, float] = {}
         self.books: dict[str, dict] = {}
         self.gamma_px: dict[str, float] = {}
-        self.gamma_at: dict[str, float] = {}
         self.feeds: dict[str, RtdsTwapFeed] = {}
         self.eval_log: dict[str, tuple[float, str]] = {}
         self.cash: Optional[float] = None
         self.cash_at = 0.0
         self.client = None
         self._logged_resolution: set[str] = set()
-        self._pool = ThreadPoolExecutor(max_workers=4, thread_name_prefix="lockbot-io")
         self.book_feed = ClobBookFeed()
         self.binance: Optional[BinanceTradeFeed] = None
         self.wallets = WalletTape(on_fill=self._on_wallet_fill)
@@ -221,8 +218,11 @@ class LockBot:
         self._lock = threading.RLock()
         self._wake = threading.Event()
         self._poster = LivePoster(self._post_job)
-        self._poster.start()
+        if not dry:
+            self._poster.start()
         self._sigma_cache: dict[str, tuple] = {}
+        self._risk_at = 0.0
+        self._risk_marks: dict[str, float] = {}
         self._s1_at = 0.0
         self._s2_recv: Optional[float] = None
         self._redeem_started = False
@@ -274,6 +274,7 @@ class LockBot:
         and the process has to be restarted. Flipping the file back to
         dry_run does not delete the live ledger.
         """
+        self._poster.start()
         if self.client is None:
             client, err = open_live_client()
             if client is None:
@@ -316,7 +317,7 @@ class LockBot:
                 log_event("binance_subscribe", urls=list(self.binance.urls))
         elif self.binance is not None:
             self.binance.stop()
-        if self.cfg.get("h2h_enabled", True):
+        if self.cfg.get("h2h_enabled", False):
             if not self.wallets.running():
                 self.wallets.start()
                 log_event(
@@ -338,7 +339,20 @@ class LockBot:
             dur = DURATION_S[spec["duration"]]
             for start in window_starts(now, dur, ahead=1):
                 slug = event_slug(spec["asset"], spec["duration"], start)
-                if slug in self.markets and now - self.market_at.get(slug, 0) < refresh:
+                existing = self.markets.get(slug)
+                have_strike = (
+                    existing is not None and existing.price_to_beat is not None
+                ) or self.gamma_px.get(slug) is not None
+                # One /events fetch. While priceToBeat is missing, use the
+                # shorter gamma interval. There is no second strike request.
+                cadence = refresh if have_strike else float(self.cfg.get("gamma_refresh_s") or refresh)
+                if not market_fetch_due(
+                    now=now,
+                    fetched_at=self.market_at.get(slug, 0.0),
+                    have_market=existing is not None,
+                    have_strike=have_strike,
+                    refresh_s=cadence,
+                ):
                     continue
                 try:
                     market = fetch_market(self.session, gamma, slug)
@@ -361,23 +375,6 @@ class LockBot:
                     )
                 if market.price_to_beat is not None:
                     self.gamma_px[slug] = market.price_to_beat
-
-    def refresh_gamma_strikes(self, now: float) -> None:
-        interval = float(self.cfg.get("gamma_refresh_s") or 20)
-        for market in self._interesting(now):
-            if now - self.gamma_at.get(market.slug, 0) < interval:
-                continue
-            self.gamma_at[market.slug] = now
-            try:
-                strike = fetch_gamma_strike(market.slug)
-            except Exception as exc:
-                log_event("gamma_strike_fail", slug=market.slug, error=str(exc)[:160])
-                continue
-            if strike.price_to_beat:
-                try:
-                    self.gamma_px[market.slug] = float(strike.price_to_beat)
-                except (TypeError, ValueError):
-                    continue
 
     def _interesting(self, now: float) -> list[LockMarket]:
         """Current and next windows. Token ids are subscribed as soon as Gamma resolves them."""
@@ -524,6 +521,14 @@ class LockBot:
                     start_ts=market.start_ts,
                 )
 
+    def _marks_cached(self, now: float) -> dict[str, float]:
+        """Bid marks for the daily stop. Once a second, not once per aggTrade."""
+        if self._risk_at > 0 and now - self._risk_at < 1.0:
+            return self._risk_marks
+        self._risk_marks = self._marks()
+        self._risk_at = now
+        return self._risk_marks
+
     def _marks(self) -> dict[str, float]:
         marks = {}
         for pos in self.state["positions"].values():
@@ -580,7 +585,7 @@ class LockBot:
         spent_s1 = self._strategy_spent(market.slug, "s1")
         spent_s2 = self._strategy_spent(market.slug, "s2")
         exposure = open_exposure_usd(self.state["positions"].values()) + self._pending_usd()
-        pnl = day_pnl(self.state["positions"].values(), now, self._marks())
+        pnl = day_pnl(self.state["positions"].values(), now, self._marks_cached(now))
         today = dublin_day(now)
         stop = float(self.cfg.get("daily_loss_stop_usd") or 0)
         if pnl <= -abs(stop):
@@ -611,7 +616,7 @@ class LockBot:
     def _should_log(self, slug: str, reason: str, now: float, force: bool) -> bool:
         if force:
             return True
-        interval = float(self.cfg.get("eval_log_s") or 5)
+        interval = float(self.cfg.get("eval_log_s") or 30)
         prev = self.eval_log.get(slug)
         if prev is None or prev[1] != reason or now - prev[0] >= interval:
             return True
@@ -627,7 +632,6 @@ class LockBot:
         self.reload()
         self.ensure_feeds()
         self.refresh_markets(now)
-        self.refresh_gamma_strikes(now)
         self.latch_strikes(now)
         self.subscribe_books(now)
         self.warm_clients(now)
@@ -638,9 +642,31 @@ class LockBot:
                 continue
             if market.end_ts - now <= 0:
                 self._settle(market, now)
-        self._kick_wallet_tape(now)
-        self._emit_compares(now)
+        self._prune_markets(now)
+        if self.cfg.get("h2h_enabled", False):
+            self._kick_wallet_tape(now)
+            self._emit_compares(now)
         self._status(now)
+
+    def _prune_markets(self, now: float) -> None:
+        """Drop windows that ended and have nothing left to settle."""
+        with self._lock:
+            drop = []
+            for slug, market in self.markets.items():
+                if market.end_ts + 120.0 >= now:
+                    continue
+                pending = False
+                for pos in self._positions_for(slug):
+                    if pos.get("settled_ts"):
+                        continue
+                    if float(pos.get("shares") or 0) > 0:
+                        pending = True
+                        break
+                if not pending:
+                    drop.append(slug)
+            for slug in drop:
+                self.markets.pop(slug, None)
+                self.market_at.pop(slug, None)
 
     def _status(self, now: float) -> None:
         spot = time.time()
@@ -660,9 +686,10 @@ class LockBot:
             binance_age_s=age,
             binance_px=None if latest is None else latest[2],
             binance_error=(self.binance.last_error()[:160] if self.binance is not None else ""),
-            wallet_age_s=self.wallets.age_s(spot),
+            h2h_enabled=bool(self.cfg.get("h2h_enabled", False)),
+            wallet_age_s=self.wallets.age_s(spot) if self.wallets.running() else None,
             wallet_fills=self.wallets.fills,
-            wallet_error=self.wallets.last_error()[:160],
+            wallet_error=self.wallets.last_error()[:160] if self.wallets.running() else "",
             markets=len(self.markets),
             paper=len(self.paper),
         )
@@ -995,6 +1022,7 @@ class LockBot:
                 "slug": market.slug,
                 "condition_id": market.condition_id,
             }
+        self._risk_at = 0.0
         atomic_save(self.state_path, self.state)
         if fill["shares"] > 0:
             log_event(
@@ -1116,6 +1144,7 @@ class LockBot:
                     won=result["won"],
                 )
         if changed:
+            self._risk_at = 0.0
             atomic_save(self.state_path, self.state)
 
     def _refresh_cash(self, now: float, *, force: bool = False) -> None:
@@ -1283,7 +1312,6 @@ class LockBot:
         self.wallets.stop()
         if self.binance is not None:
             self.binance.stop()
-        self._pool.shutdown(wait=False, cancel_futures=True)
 
 
 def _wait_s(bot: LockBot, now: float) -> float:
@@ -1454,7 +1482,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         strategy1_market_usd=cfg.get("strategy1_market_usd"),
         strategy2_market_usd=cfg.get("strategy2_market_usd"),
         h2h_window_s=cfg.get("h2h_window_s"),
-        h2h_enabled=bool(cfg.get("h2h_enabled", True)),
+        h2h_enabled=bool(cfg.get("h2h_enabled", False)),
         switchinterval_s=sys.getswitchinterval(),
         wsaccel=wsaccel_available(),
         windows=len(bot.windows),

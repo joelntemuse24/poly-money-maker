@@ -1349,14 +1349,14 @@ Two loops share one process and one `RLock` for state. Neither loop does the oth
 | Thread | Name | Work |
 |---|---|---|
 | Decision | main | Blocks on a `threading.Event`. A Binance aggTrade sets it before the callback returns. Otherwise it wakes for the next strategy-1 second, the next paper fill, or `poll_s` (1s). It does not spin on `fast_poll_s`. `sys.setswitchinterval(0.001)` so a feed thread cannot hold the GIL for the default 5ms. |
-| Slow | `lockbot-slow` | Gamma discovery, strike latch (written to `lockbot_windows.json`), book subscribe, client warm, pUSD cash, settlement, wallet compare, `feed_status`. Cadence `poll_s`. |
+| Slow | `lockbot-slow` | One Gamma `/events` fetch per enabled BTC window (again at 60s once `priceToBeat` is known; no second strike request). Strike latch (written to `lockbot_windows.json`), book subscribe, client warm, pUSD cash, settlement, `feed_status` every 30s. Wallet compare only when `h2h_enabled` is true. Cadence `poll_s`. |
 | Book read | `lockbot-book` | CLOB market websocket. `recv` only queues the raw frame. Sends the text `PING` every 10s. |
 | Book apply | `lockbot-book-apply` | Parses with `orjson` when that module imports, otherwise the stdlib `json`. Applies deltas to price→size maps. Sorts only when `book()` is read. |
 | Book ping | `lockbot-book-ping` | Sets a flag every 10s. The reader sends `PING`. If `sock` is `None`, it does nothing. |
 | Binance | `lockbot-binance` | `btcusdt@aggTrade`. The callback sets the decision event and returns. No second-thread protocol ping. |
-| Orders | `lockbot-orders` | Live FAK posts. The decision thread enqueues and does not wait. |
-| Redeem | `lockbot-redeem` | Started when the process is live. Idle while `dry_run` is true. |
-| Wallets | `lockbot-wallets` | RTDS activity tape when `h2h_enabled` is true. Log only. Byte-filters before JSON. |
+| Orders | `lockbot-orders` | Live FAK posts. Started only when the process is live. The decision thread enqueues and does not wait. |
+| Redeem | `lockbot-redeem` | Started when the process is live. Not started while `dry_run` is true. |
+| Wallets | `lockbot-wallets` | Off unless `h2h_enabled` is true. The socket is not opened when it is false. Log only. Byte-filters before JSON. |
 
 `fast_poll_s` (0.05) remains in the config so an old file still validates. The decision wait does not use it.
 
@@ -1410,7 +1410,7 @@ Polymarket crypto up/down windows resolve on the Chainlink 60-second TWAP at the
 | `stale_price_s`, `stale_book_s`, `stale_binance_s` | 2 | Local receive time. |
 | `dry_run_latency_s` | 0.20 | Paper fill walks the book this long after the decision. |
 | `h2h_window_s` | 10 | Wallet pairing window. |
-| `h2h_enabled` | true | Wallet tape socket. False leaves it closed. |
+| `h2h_enabled` | false | Wallet tape socket. False leaves it closed. |
 
 The intended live overlay, not written into the example and not applied on the VM, is `clip_usd` 5, `strategy1_market_usd` 5, `strategy2_market_usd` 5, `market_rules.btc_5m.combined_usd` 10, `market_rules.btc_15m.combined_usd` 5, `daily_loss_stop_usd` 15, then `dry_run` false.
 
@@ -1429,7 +1429,7 @@ Positions are keyed `slug|strategy|side`. `python lockbot.py --reset-live` repla
 
 ### Wallet tape
 
-`h2h_enabled` (default true) opens a second RTDS socket on `wss://ws-live-data.polymarket.com` for `activity/trades`. Documented `market_slug` filters on that topic are not applied by the server, so the subscribe stays unfiltered and each frame is kept only when the raw bytes contain a watched wallet and `btc-updown-`. Set `h2h_enabled` false to skip the socket. The tape records fills by NIULAI4 (`0x44832d0d2ec11187c1e77d786feb15f6a50254c6`), asdaefef (`0x75cc3b63a2f2423085e10706c78b494017b93ce1`), and dvasdkasodk (`0x5d4aba8ad45bb5eab3499a0294b42da5d1e455d3`) in BTC 5m and 15m. Each fill pairs with our nearest same-outcome signal inside `h2h_window_s` (10s) and stays unpaired otherwise. The paired row stores our signal, post, and ack times, their price, size, and timestamp, the signed gap (`us_minus_them_s` = our decision time minus their payload timestamp; negative means we were first), and our price minus their price. On BTC 5m it also stores the Binance 3-second move at their fill. `trigger_fired` is true only when that move clears `s2_move_sigma` and an s2 signal on that side exists inside the window. `lockbot_summary.py` prints the share of their fills we also signalled, the median and p90 of the signed gap, the price difference, and the unpaired split: `missed` when the move cleared the bar, `no_move` when it did not. The tape is log-only. The gates do not read it.
+`h2h_enabled` (default false) is the only switch for a second RTDS socket on `wss://ws-live-data.polymarket.com` for `activity/trades`. While false, that socket is not opened and the compare loop does not run. Documented `market_slug` filters on that topic are not applied by the server, so when the flag is true the subscribe stays unfiltered and each frame is kept only when the raw bytes contain a watched wallet and `btc-updown-`. The tape records fills by NIULAI4 (`0x44832d0d2ec11187c1e77d786feb15f6a50254c6`), asdaefef (`0x75cc3b63a2f2423085e10706c78b494017b93ce1`), and dvasdkasodk (`0x5d4aba8ad45bb5eab3499a0294b42da5d1e455d3`) in BTC 5m and 15m. Each fill pairs with our nearest same-outcome signal inside `h2h_window_s` (10s) and stays unpaired otherwise. The paired row stores our signal, post, and ack times, their price, size, and timestamp, the signed gap (`us_minus_them_s` = our decision time minus their payload timestamp; negative means we were first), and our price minus their price. On BTC 5m it also stores the Binance 3-second move at their fill. `trigger_fired` is true only when that move clears `s2_move_sigma` and an s2 signal on that side exists inside the window. `lockbot_summary.py` prints the share of their fills we also signalled, the median and p90 of the signed gap, the price difference, and the unpaired split: `missed` when the move cleared the bar, `no_move` when it did not. The tape is log-only. The gates do not read it.
 
 ### Markets and feeds
 
@@ -1462,7 +1462,7 @@ Creating a pull request does not merge it and does not restart `polylockbot` or 
 <a id="changelog"></a>
 # Changelog
 
-- **2026-10-05** — Lockbot feed CPU, not merged. Websocket clients pass `skip_utf8_validation=True`. The book socket sends text `PING`. The wallet tape drops non-BTC frames before JSON and `h2h_enabled` can turn it off. Binance is `btcusdt@aggTrade`. Strategy 2 skips the Chainlink resample unless the q filter is on. The GIL switch interval is 1ms. Latched strikes persist in `lockbot_windows.json`. Not deployed. Lockbot on the VM stays dry-run at `9dabb08`.
+- **2026-10-05** — Lockbot feed CPU, not merged. Websocket clients pass `skip_utf8_validation=True`. The book socket sends text `PING`. Binance is `btcusdt@aggTrade` (not bookTicker). Strategy 2 skips the Chainlink resample unless the q filter is on. The GIL switch interval is 1ms. Latched strikes persist in `lockbot_windows.json`. `h2h_enabled` defaults false and the wallet socket stays closed. Skip evals log at 30s. Bid marks for the daily stop refresh once a second. ETH/SOL/XRP stay unsubscribed. Not deployed. Lockbot on the VM stays dry-run at `9dabb08`.
 - **2026-10-05** — Lockbot live blockers (PR #236, merged as `9dabb08`). Scoped CLOB books, event-driven strategy 2, separate paper and live ledgers, per-market combined caps, lazy live client, pUSD cash log. The VM dry-run after that merge still used about one core and strategy-2 receive-to-decision was a median of 241ms. No live orders.
 - **2026-10-04** — Lockbot head-to-head pairing (PR #235, merged as `ded7bf2`). A watched fill matches our nearest same-outcome signal inside `h2h_window_s` (10s). BTC 5m rows record the Binance 3s move and whether s2 fired on it. The summary reports the signalled share, the signed gap, the price difference, and missed versus no-move. Combined cap is $40 so each strategy keeps its $20. Mintbot is unchanged.
 - **2026-10-04** — Lockbot wallet tape (PR #235, not merged). Log-only RTDS `activity/trades` comparison against NIULAI4, asdaefef, and dvasdkasodk on BTC 5m/15m. No order uses the tape. Mintbot is unchanged.
