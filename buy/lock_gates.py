@@ -1,12 +1,13 @@
 """Entry gates, caps, staleness, and the Dublin-day loss stop.
 
-Pure: no network, no clock reads. The caller passes ``now`` and the
-in-memory book and oracle view.
+No network I/O. The caller passes ``now`` and the in-memory book and
+oracle view; exposure defaults to the current time for older callers.
 """
 
 from __future__ import annotations
 
 import math
+import time
 from datetime import datetime, timezone
 from typing import Any, Optional, Sequence
 from zoneinfo import ZoneInfo
@@ -203,10 +204,15 @@ def loss_stop_active(pnl: float, stop_usd: float, latched_day: Optional[str], to
     return float(pnl) <= -abs(float(stop_usd))
 
 
-def open_exposure_usd(positions: Sequence[dict]) -> float:
+def open_exposure_usd(positions: Sequence[dict], now: Optional[float] = None) -> float:
+    """Cost of unsettled positions whose windows are still open."""
+    now = time.time() if now is None else float(now)
     total = 0.0
     for pos in positions or []:
         if not isinstance(pos, dict) or pos.get("settled_ts"):
+            continue
+        end = finite_float(pos.get("end_ts"))
+        if end is not None and end <= now:
             continue
         total += max(0.0, _num(pos.get("cost"), 0.0))
     return total
