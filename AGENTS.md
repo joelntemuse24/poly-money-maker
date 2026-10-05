@@ -340,7 +340,10 @@ Binance 3-second move sniper on BTC 5m only (`|move| >= 2` sigma, ask
 `combined_per_market_usd` is 40, so in BTC 5m one strategy cannot spend
 the other's budget.
 `max_open_exposure_usd` is 60. The daily loss stop stays 60. Books come
-from the CLOB market websocket; Binance trades are in memory. Dry-run
+from the CLOB market websocket; Binance `aggTrade` prices are in
+memory (the 3-second move uses that last price). `h2h_enabled` (default
+true) is the wallet tape; false leaves that socket closed. Latched
+strikes persist in gitignored `lockbot_windows.json`. Dry-run
 walks the book after `dry_run_latency_s` (0.20) and logs receive,
 decision, post, and ack times. A separate RTDS `activity/trades`
 socket records fills by NIULAI4, asdaefef, and dvasdkasodk on BTC 5m
@@ -351,8 +354,8 @@ and whether our strategy-2 trigger fired on that same direction inside
 the window. It does not place or change orders. It holds to settlement
 and never sells. Every threshold is in `lockbot.example.json`. A
 gitignored `lockbot.json` overrides it. `logs/lockbot.jsonl`,
-`positions_lockbot.json` (paper), and `positions_lockbot_live.json`
-stay gitignored. `python lockbot_summary.py`
+`positions_lockbot.json` (paper), `positions_lockbot_live.json`,
+and `lockbot_windows.json` stay gitignored. `python lockbot_summary.py`
 prints P&L, paper fills, latency by strategy, and the wallet
 head-to-head: the share of their fills we also signalled, the median
 and p90 of the signed gap, the price difference, and how many unpaired
@@ -379,4 +382,5 @@ dependencies on the VM after merge. It does not restart services.
 Creating a PR is not authorization to merge or deploy it. After a pull,
 only `polymintbot` may be restarted, and only when the operator asks.
 `polypathlog` is retired. `polyscrapbid` stays stopped until the operator asks to
-start it. `polylockbot` stays uninstalled until the operator asks.
+start it. `polylockbot` is installed and stays dry-run until the operator
+asks to change `lockbot.json` and restart it.

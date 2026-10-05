@@ -180,7 +180,11 @@ class WatchdogTests(unittest.TestCase):
         feed._run_once(SimpleNamespace(WebSocketApp=FakeApp))
         self.assertEqual(
             seen["kwargs"],
-            {"ping_interval": FEED_PING_INTERVAL_S, "ping_timeout": FEED_PING_TIMEOUT_S},
+            {
+                "ping_interval": FEED_PING_INTERVAL_S,
+                "ping_timeout": FEED_PING_TIMEOUT_S,
+                "skip_utf8_validation": True,
+            },
         )
         self.assertGreater(FEED_PING_INTERVAL_S, FEED_PING_TIMEOUT_S)
 

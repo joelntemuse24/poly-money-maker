@@ -98,6 +98,7 @@ class MarketTests(unittest.TestCase):
         self.assertEqual(cfg["strategy1_market_usd"], 20.0)
         self.assertEqual(cfg["strategy2_market_usd"], 20.0)
         self.assertEqual(cfg["h2h_window_s"], 10.0)
+        self.assertIs(cfg["h2h_enabled"], True)
         self.assertEqual(cfg["clip_usd"], 5.0)
         self.assertEqual(cfg["max_open_exposure_usd"], 60.0)
         self.assertEqual(cfg["daily_loss_stop_usd"], 60.0)

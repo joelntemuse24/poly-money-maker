@@ -779,16 +779,44 @@ def build_oracle_row(
     return row
 
 
+_JSONL_DIRS: set[str] = set()
+_JSONL_SIZE: dict[str, int] = {}
+
+
 def append_jsonl(path: Any, row: dict, *, max_bytes: int = 0) -> None:
     """Append one row. With ``max_bytes`` > 0 the tape rolls into
-    ``<dir>/archive/<name>.<UTC stamp>.gz`` first, like ``mintbot.log``."""
+    ``<dir>/archive/<name>.<UTC stamp>.gz`` first, like ``mintbot.log``.
+
+    The parent directory is created once per process, and the size check
+    uses the bytes this process has written, so a hot log line does not
+    stat the file.
+    """
     from pathlib import Path
 
     target = Path(path)
-    target.parent.mkdir(parents=True, exist_ok=True)
+    parent = str(target.parent)
+    if parent not in _JSONL_DIRS:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        _JSONL_DIRS.add(parent)
     data = (json.dumps(row, separators=(",", ":"), sort_keys=True) + "\n").encode("utf-8")
+    key = str(target)
     if max_bytes > 0:
-        roll_if_over(target, len(data), max_bytes)
+        known = _JSONL_SIZE.get(key)
+        if known is None:
+            try:
+                known = target.stat().st_size
+            except OSError:
+                known = 0
+        if known > 0 and known + len(data) >= int(max_bytes):
+            rolled = roll_if_over(target, len(data), max_bytes)
+            if rolled is not None or not target.exists():
+                known = 0
+            else:
+                try:
+                    known = target.stat().st_size
+                except OSError:
+                    known = 0
+        _JSONL_SIZE[key] = int(known) + len(data)
     with open(target, "ab") as handle:
         handle.write(data)
         handle.flush()
@@ -1166,6 +1194,7 @@ class RtdsTwapFeed:
             app.run_forever(
                 ping_interval=FEED_PING_INTERVAL_S,
                 ping_timeout=FEED_PING_TIMEOUT_S,
+                skip_utf8_validation=True,
             )
         finally:
             ping_stop.set()

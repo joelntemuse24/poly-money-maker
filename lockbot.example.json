@@ -39,6 +39,7 @@
   "dry_run_latency_s": 0.2,
   "fast_poll_s": 0.05,
   "h2h_window_s": 10.0,
+  "h2h_enabled": true,
   "market_rules": {
     "btc_15m": {"Z": 0.0, "Pmax": 0.97, "edge_min": 0.0},
     "btc_5m": {"Z": 0.25, "Pmax": 0.90, "edge_min": 0.0}

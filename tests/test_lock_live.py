@@ -11,7 +11,21 @@ from buy.lock_config import apply_defaults, validate_config
 from buy.lock_gates import evaluate_strategy1, evaluate_strategy2
 from buy.lock_orders import open_live_client
 from buy.lock_paper import latency_summary
-from buy.lock_state import decision_wait_s, ledger_path, load_ledger, reset_live_ledger, save_ledger
+from buy.lock_binance import BINANCE_TRADE_URLS, parse_trade
+from buy.lock_engine import s2_quote_view
+from buy.lock_markets import LockMarket
+from buy.lock_state import (
+    decision_wait_s,
+    ledger_path,
+    load_ledger,
+    load_windows,
+    reset_live_ledger,
+    save_ledger,
+    save_windows,
+    strike_for_position,
+)
+from buy.lock_wallets import activity_worth_parsing
+from buy.lock_ws import connect_kwargs, heartbeat_kind
 
 
 def _view(**over):
@@ -205,6 +219,103 @@ class WaitTests(unittest.TestCase):
         self.assertEqual(summary["recv_to_handoff_ms"]["p50"], 5.0)
         self.assertEqual(summary["recv_to_post_ms"]["n"], 2)
         self.assertEqual(summary["decision_to_post_ms"]["n"], 2)
+
+
+class FeedCostTests(unittest.TestCase):
+    def test_sockets_skip_utf8_validation(self):
+        self.assertEqual(connect_kwargs(), {"skip_utf8_validation": True})
+        self.assertEqual(heartbeat_kind("PING"), "PING")
+        self.assertEqual(heartbeat_kind(b" pong "), "PONG")
+        self.assertEqual(heartbeat_kind("{"), "")
+
+    def test_binance_aggtrade_keeps_the_trade_price_and_time(self):
+        self.assertTrue(all(url.endswith("btcusdt@aggTrade") for url in BINANCE_TRADE_URLS))
+        parsed = parse_trade('{"e":"aggTrade","p":"64000.5","T":1700000003500}')
+        self.assertEqual(parsed, (1700000003.5, 64000.5))
+        self.assertIsNone(parse_trade('{"e":"depthUpdate","p":"1","T":1}'))
+
+    def test_wallet_precheck_is_a_byte_search(self):
+        watched = (
+            b'{"proxyWallet":"0x44832d0d2ec11187c1e77d786feb15f6a50254c6",'
+            b'"slug":"btc-updown-5m-1791153600"}'
+        )
+        self.assertTrue(activity_worth_parsing(watched))
+        eth = watched.replace(b"btc-updown-", b"eth-updown-")
+        self.assertFalse(activity_worth_parsing(eth))
+        stranger = watched.replace(b"0x44832d0d2ec11187c1e77d786feb15f6a50254c6", b"0x" + b"11" * 20)
+        self.assertFalse(activity_worth_parsing(stranger))
+        self.assertFalse(activity_worth_parsing(b"PING"))
+
+    def test_strategy2_quote_view_does_not_resample(self):
+        market = LockMarket(
+            asset="btc",
+            duration="5m",
+            lane="btc_5m",
+            key="btc_5m",
+            symbol="btc/usd",
+            slug="btc-updown-5m-1000",
+            series_slug="btc-up-or-down-5m",
+            condition_id="cid",
+            question="q",
+            start_ts=1000.0,
+            end_ts=1300.0,
+            up_token="UP",
+            dn_token="DN",
+            resolution_source="https://data.chain.link/streams/btc-usd-twap-60s-streams",
+            price_to_beat=None,
+            resolution_ok=True,
+            accepting_orders=True,
+        )
+        view = s2_quote_view(
+            market,
+            now=1100.0,
+            up_book={"asks": [(0.4, 10.0)], "bids": [], "recv_ts": 1099.0},
+            dn_book={"asks": [(0.6, 10.0)], "bids": [], "recv_ts": 1099.0},
+            strike=64000.0,
+        )
+        self.assertNotIn("sigma", view)
+        self.assertEqual(view["strike"], 64000.0)
+        self.assertEqual(view["up"]["asks"], [(0.4, 10.0)])
+        view["binance_recv_ts"] = 1099.9
+        view["binance_move"] = 2.5
+        decision = evaluate_strategy2(view, {"cash": 500.0, "open_cost": 0.0, "spent_s1": 0.0, "spent_s2": 0.0}, apply_defaults({}))
+        self.assertEqual(decision["action"], "buy")
+
+    def test_h2h_flag_defaults_on_and_can_be_disabled(self):
+        self.assertIs(apply_defaults({})["h2h_enabled"], True)
+        self.assertIs(apply_defaults({"h2h_enabled": False})["h2h_enabled"], False)
+        self.assertIs(apply_defaults({"h2h_enabled": "off"})["h2h_enabled"], False)
+
+
+class WindowTests(unittest.TestCase):
+    def test_strikes_reload_and_cover_a_position_that_missed_the_latch(self):
+        root = Path(tempfile.mkdtemp(prefix="lock-windows-"))
+        path = root / "lockbot_windows.json"
+        now = 1_000_000.0
+        save_windows(
+            path,
+            {
+                "btc-updown-5m-999700": {
+                    "strike": 64010.0,
+                    "start_ts": 999700.0,
+                    "end_ts": 1_000_000.0,
+                    "latched_at": 999700.0,
+                    "source": "rtds",
+                },
+                "btc-updown-5m-1": {
+                    "strike": 1.0,
+                    "start_ts": 1.0,
+                    "end_ts": 301.0,
+                    "latched_at": 1.0,
+                },
+            },
+            now,
+        )
+        loaded = load_windows(path, now)
+        self.assertEqual(set(loaded), {"btc-updown-5m-999700"})
+        self.assertEqual(strike_for_position({"slug": "btc-updown-5m-999700"}, {"btc-updown-5m-999700": 64010.0}), 64010.0)
+        self.assertEqual(strike_for_position({"slug": "btc-updown-5m-999700", "strike": 1.0}, {}), 1.0)
+        self.assertIsNone(strike_for_position({"slug": "missing"}, {}))
 
 
 if __name__ == "__main__":

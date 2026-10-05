@@ -21,6 +21,7 @@ import fcntl
 import json
 import os
 import signal
+import sys
 import threading
 import time
 from collections import deque
@@ -33,7 +34,7 @@ import requests
 from buy.lock_binance import BinanceTradeFeed
 from buy.lock_bookws import ClobBookFeed
 from buy.lock_config import apply_defaults, validate_config
-from buy.lock_engine import build_view
+from buy.lock_engine import build_view, s2_quote_view
 from buy.lock_fair import side_z, signed_move
 from buy.lock_gates import (
     day_pnl,
@@ -58,7 +59,17 @@ from buy.lock_markets import (
     symbols_for,
     window_starts,
 )
-from buy.lock_state import decision_wait_s, ledger_path, load_ledger, reset_live_ledger
+from buy.lock_state import (
+    decision_wait_s,
+    ledger_path,
+    load_ledger,
+    load_windows,
+    reset_live_ledger,
+    save_windows,
+    strike_for_position,
+    window_file,
+)
+from buy.lock_ws import wsaccel_available
 from buy.lock_wallets import WALLETS, WalletTape, compare_fills
 from buy.mint_gas import mint_gas_settings
 from buy.oracle_log import RtdsTwapFeed, append_jsonl, fetch_gamma_strike
@@ -197,8 +208,13 @@ class LockBot:
         self._wallet_kick = 0.0
         self.paper: list[dict] = []
         self.clip_at: dict[tuple[str, str], float] = {}
-        self.latched: dict[str, float] = {}
-        self._latched_logged: set[str] = set()
+        self.window_path = window_file(ROOT)
+        self.windows = load_windows(self.window_path, time.time())
+        self.latched: dict[str, float] = {
+            slug: float(row["strike"]) for slug, row in self.windows.items() if row.get("strike") is not None
+        }
+        self._latched_logged: set[str] = set(self.latched)
+        self._recover_strikes_from_positions()
         self._warmed: set[str] = set()
         self.slow_at = 0.0
         self._status_at = 0.0
@@ -300,14 +316,19 @@ class LockBot:
                 log_event("binance_subscribe", urls=list(self.binance.urls))
         elif self.binance is not None:
             self.binance.stop()
-        if not self.wallets.running():
-            self.wallets.start()
-            log_event(
-                "wallet_subscribe",
-                topic="activity",
-                feed="trades",
-                wallets=sorted(WALLETS.values()),
-            )
+        if self.cfg.get("h2h_enabled", True):
+            if not self.wallets.running():
+                self.wallets.start()
+                log_event(
+                    "wallet_subscribe",
+                    topic="activity",
+                    feed="trades",
+                    filter="client_bytes",
+                    wallets=sorted(WALLETS.values()),
+                )
+        elif self.wallets.running():
+            self.wallets.stop()
+            log_event("wallet_stopped", reason="h2h_disabled")
 
     def refresh_markets(self, now: float) -> None:
         gamma = str(self.cfg.get("gamma_url"))
@@ -409,6 +430,53 @@ class LockBot:
             except Exception as exc:
                 log_event("market_warm_fail", slug=market.slug, error=str(exc)[:160])
 
+    def _recover_strikes_from_positions(self) -> None:
+        """A fill that already stored a strike can rebuild the window file."""
+        changed = False
+        for pos in (self.state.get("positions") or {}).values():
+            if not isinstance(pos, dict):
+                continue
+            slug = str(pos.get("slug") or "")
+            if not slug or slug in self.latched:
+                continue
+            strike = strike_for_position(pos, {})
+            if strike is None:
+                continue
+            parsed = parse_slug(slug)
+            start = parsed[2] if parsed else None
+            duration = parsed[1] if parsed else str(pos.get("duration") or "")
+            end = None
+            if start is not None and duration in DURATION_S:
+                end = float(start) + float(DURATION_S[duration])
+            self.latched[slug] = strike
+            self.windows[slug] = {
+                "strike": strike,
+                "start_ts": start,
+                "end_ts": end,
+                "asset": parsed[0] if parsed else pos.get("asset"),
+                "duration": duration,
+                "key": pos.get("lane"),
+                "latched_at": time.time(),
+                "source": "position",
+            }
+            self._latched_logged.add(slug)
+            changed = True
+        if not changed:
+            return
+        try:
+            self.windows = save_windows(self.window_path, self.windows, time.time())
+        except OSError:
+            return
+
+    def _stamp_open_strikes(self, slug: str, strike: float) -> None:
+        """Write the latch onto open positions that were filled before it."""
+        for pos in (self.state.get("positions") or {}).values():
+            if not isinstance(pos, dict) or str(pos.get("slug") or "") != slug:
+                continue
+            if pos.get("settled_ts") or pos.get("strike") is not None:
+                continue
+            pos["strike"] = float(strike)
+
     def latch_strikes(self, now: float) -> None:
         """Remember the TWAP print at each window open, including a 5m open.
 
@@ -430,6 +498,21 @@ class LockBot:
                 continue
             with self._lock:
                 self.latched[market.slug] = float(price)
+                self.windows[market.slug] = {
+                    "strike": float(price),
+                    "start_ts": market.start_ts,
+                    "end_ts": market.end_ts,
+                    "asset": market.asset,
+                    "duration": market.duration,
+                    "key": market.key,
+                    "latched_at": now,
+                    "source": "rtds",
+                }
+                self._stamp_open_strikes(market.slug, float(price))
+            try:
+                self.windows = save_windows(self.window_path, self.windows, now)
+            except OSError as exc:
+                log_event("window_save_fail", slug=market.slug, error=str(exc)[:160])
             if market.slug not in self._latched_logged:
                 self._latched_logged.add(market.slug)
                 log_event(
@@ -618,7 +701,13 @@ class LockBot:
             want_s2 = new_trade and bool(self.cfg.get("strategy2_enabled", True)) and market.key in s2_keys and s2_min <= ttm <= s2_max
             if not want_s1 and not want_s2:
                 continue
-            view = self._view(market, now)
+            # The q filter is off by default. Strategy 2 then only needs the
+            # book and the Binance move, not a full Chainlink resample.
+            q_on = self.cfg.get("s2_q_edge_min") not in (None, "")
+            if want_s1 or (want_s2 and q_on):
+                view = self._view(market, now)
+            else:
+                view = self._s2_view(market, now)
             if want_s1:
                 buys += self._consider(market, view, self._account(market, now), now, "s1")
             if want_s2:
@@ -644,6 +733,16 @@ class LockBot:
             return 0
         self._act(market, decision, now)
         return 1
+
+    def _s2_view(self, market: LockMarket, now: float) -> dict:
+        view = s2_quote_view(
+            market,
+            now=now,
+            up_book=self._book(market.up_token),
+            dn_book=self._book(market.dn_token),
+            strike=self.latched.get(market.slug),
+        )
+        return self._attach_binance(view, market, now)
 
     def _view(self, market: LockMarket, now: float) -> dict:
         feed = self.feeds.get(market.symbol)
@@ -958,7 +1057,10 @@ class LockBot:
         for pos in rows:
             if pos.get("settled_ts") or float(pos.get("shares") or 0) <= 0:
                 continue
-            strike = pos.get("strike")
+            strike = strike_for_position(pos, self.latched)
+            if strike is not None and pos.get("strike") is None:
+                pos["strike"] = float(strike)
+                changed = True
             if final is None or strike is None:
                 if now - market.end_ts > 600 and not pos.get("settle_miss_logged"):
                     pos["settle_miss_logged"] = True
@@ -1126,15 +1228,11 @@ class LockBot:
         age = self.wallets.age_s(now)
         if age is None or age <= 15.0 or now - self._wallet_kick < 15.0:
             return
-        ws = self.wallets._ws
-        if ws is None:
+        if not self.wallets.running():
             return
         self._wallet_kick = now
         log_event("wallet_reconnect", age_s=round(age, 1))
-        try:
-            ws.close()
-        except Exception:
-            return
+        self.wallets.request_reconnect()
 
     def _emit_compares(self, now: float) -> None:
         """Append one wallet_compare row after the pairing window has closed.
@@ -1321,6 +1419,10 @@ def main(argv: Optional[list[str]] = None) -> int:
         print(json.dumps({"event": "live_ledger_reset", "path": str(path)}, separators=(",", ":")), flush=True)
         del hold
         return 0
+    # Default 5ms lets a busy websocket thread hold the GIL across a
+    # strategy-2 wake. 1ms is the longest the decision thread should wait
+    # behind one slice of feed parsing.
+    sys.setswitchinterval(0.001)
     signal.signal(signal.SIGINT, _handle_signal)
     signal.signal(signal.SIGTERM, _handle_signal)
     try:
@@ -1352,6 +1454,10 @@ def main(argv: Optional[list[str]] = None) -> int:
         strategy1_market_usd=cfg.get("strategy1_market_usd"),
         strategy2_market_usd=cfg.get("strategy2_market_usd"),
         h2h_window_s=cfg.get("h2h_window_s"),
+        h2h_enabled=bool(cfg.get("h2h_enabled", True)),
+        switchinterval_s=sys.getswitchinterval(),
+        wsaccel=wsaccel_available(),
+        windows=len(bot.windows),
         clip_usd=cfg.get("clip_usd"),
         max_open_exposure_usd=cfg.get("max_open_exposure_usd"),
         ledger=str(bot.state_path),

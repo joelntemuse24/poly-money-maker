@@ -198,3 +198,49 @@ def build_view(
         "up": book(up_book),
         "down": book(dn_book),
     }
+
+
+def _book_snapshot(raw: Optional[dict]) -> dict:
+    raw = raw or {}
+    return {
+        "asks": raw.get("asks") or [],
+        "bids": raw.get("bids") or [],
+        "recv_ts": raw.get("recv_ts"),
+    }
+
+
+def s2_quote_view(
+    market: LockMarket,
+    *,
+    now: float,
+    up_book: Optional[dict] = None,
+    dn_book: Optional[dict] = None,
+    strike: Optional[float] = None,
+) -> dict:
+    """Books and identity for a strategy-2 tick. No Chainlink resample.
+
+    Strategy 2's default rule is the Binance move and the ask. The full
+    ``build_view`` path (1-second resample and sigma) stays on the
+    once-a-second strategy-1 tick, and on strategy 2 only when the
+    optional q filter is on.
+    """
+    return {
+        "now": float(now),
+        "slug": market.slug,
+        "asset": market.asset,
+        "duration": market.duration,
+        "lane": market.lane,
+        "key": market.key,
+        "condition_id": market.condition_id,
+        "start_ts": market.start_ts,
+        "end_ts": market.end_ts,
+        "up_token": market.up_token,
+        "dn_token": market.dn_token,
+        "symbol": market.symbol,
+        "market_enabled": True,
+        "resolution_ok": market.resolution_ok,
+        "resolution_source": market.resolution_source,
+        "strike": strike,
+        "up": _book_snapshot(up_book),
+        "down": _book_snapshot(dn_book),
+    }

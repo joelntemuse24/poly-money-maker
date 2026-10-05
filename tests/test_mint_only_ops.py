@@ -841,6 +841,7 @@ class DeployUnitsTests(unittest.TestCase):
                 "lock_report.py",
                 "lock_state.py",
                 "lock_wallets.py",
+                "lock_ws.py",
                 "relay_batch.py",
             },
         )
