@@ -86,7 +86,7 @@ class GateTests(unittest.TestCase):
         self.assertEqual(decision["side"], "up")
         self.assertEqual(decision["strategy"], "s1")
         self.assertAlmostEqual(decision["notional"], 5.0)
-        self.assertAlmostEqual(decision["limit"], 0.80)
+        self.assertAlmostEqual(decision["limit"], 0.82)
         self.assertGreater(decision["edge"], 0.0)
         self.assertGreaterEqual(decision["z_side"], 0.0)
 
@@ -202,7 +202,7 @@ class GateTests(unittest.TestCase):
         account = note_fill(_account(), cost=5.0, shares=6.0, strategy="s1", side="up", now=900.0)
         flipped = evaluate_entry(_view(expected=90.0), account, self.cfg)
         self.assertEqual(flipped["side"], "down")
-        self.assertEqual(flipped["reason"], "side_locked")
+        self.assertEqual(flipped["reason"], "signal")
         same = evaluate_entry(_view(), account, self.cfg)
         self.assertEqual(same["action"], "buy")
         self.assertEqual(same["side"], "up")

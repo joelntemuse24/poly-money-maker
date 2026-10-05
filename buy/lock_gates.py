@@ -397,8 +397,8 @@ def _common_skip(view: dict, cfg: dict) -> Optional[str]:
 def evaluate_strategy1(view: dict, account: dict, cfg: dict) -> dict:
     """NIULAI4 ladder. One clip, the Chainlink favourite only.
 
-    After the first fill the side is locked: the other side is never bought
-    in this market. Risk blocks still record the z and the ask they refused.
+    Soft locking allows one qualifying opposite-side switch per market.
+    Risk blocks record the z and the ask they refused.
     """
     from buy.lock_fair import side_z
 
@@ -472,8 +472,13 @@ def evaluate_strategy1(view: dict, account: dict, cfg: dict) -> dict:
         }
     )
     locked = account.get("locked_side")
-    if locked and str(locked) != side:
-        return skip("side_locked")
+    mode = cfg.get("s1_side_lock_mode", "soft")
+    if locked and str(locked) != side and mode != "off":
+        if mode == "hard" or account.get("s1_switches", 0) >= 1:
+            return skip("side_locked")
+        if scored["z_side"] + 1e-12 < _num(cfg.get("s1_flip_z"), 0.5) or edge is None or edge < 0:
+            return skip("flip_below")
+        base["side_switch"] = True
     if scored["z_side"] + 1e-12 < rule["Z"]:
         return skip("z_below")
     if book["stale"]:
@@ -491,7 +496,7 @@ def evaluate_strategy1(view: dict, account: dict, cfg: dict) -> dict:
         return skip("ask_above")
     if edge is None or edge + 1e-12 < rule["edge_min"]:
         return skip("edge_below")
-    limit = limit_price(ask_f, cfg)
+    limit = limit_price(ask_f, {**cfg, "max_pay": min(max_pay, rule["Pmax"])})
     if limit is None or limit - 1e-12 > max_pay:
         return skip("max_pay")
     return _finish_buy(

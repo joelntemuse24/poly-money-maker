@@ -217,9 +217,11 @@ class LockBot:
         self._status_at = 0.0
         self._lock = threading.RLock()
         self._wake = threading.Event()
+        self.inflight: dict[str, dict] = dict(self.state.get("uncertain_orders", {}))
+        self._results = LivePoster(self._finish_job)
+        self._results.start()
         self._poster = LivePoster(self._post_job)
-        if not dry:
-            self._poster.start()
+        self._poster.start()
         self._sigma_cache: dict[str, tuple] = {}
         self._risk_at = 0.0
         self._risk_marks: dict[str, float] = {}
@@ -484,6 +486,17 @@ class LockBot:
         from buy.lock_markets import boundary_price
 
         for market in self._interesting(now):
+            official = self.gamma_px.get(market.slug, market.price_to_beat)
+            if official is not None and now >= market.start_ts and self.latched.get(market.slug) != official:
+                previous = self.latched.get(market.slug)
+                if previous is not None and abs(previous - official) > 0.50:
+                    log_event("strike_mismatch", slug=market.slug, latched=previous, official=official, delta=official - previous)
+                self.latched[market.slug] = float(official)
+                self.windows[market.slug] = {"strike": float(official), "start_ts": market.start_ts, "end_ts": market.end_ts, "latched_at": now, "source": "gamma"}
+                for pos in self._positions_for(market.slug):
+                    if not pos.get("settled_ts"):
+                        pos["strike"] = float(official)
+                save_windows(self.window_path, self.windows, now)
             if market.slug in self.latched or now + 1.0 < market.start_ts:
                 continue
             feed = self.feeds.get(market.symbol)
@@ -554,27 +567,24 @@ class LockBot:
     def _strategy_spent(self, slug: str, strategy: str) -> float:
         total = 0.0
         for pos in self._positions_for(slug):
-            if pos.get("settled_ts"):
-                continue
             if str(pos.get("strategy") or "s1") != strategy:
                 continue
             total += float(pos.get("cost") or 0.0)
-        for item in self.paper:
+        for item in self.paper + list(self.inflight.values()):
             if item.get("slug") == slug and item.get("strategy") == strategy:
                 total += float(item.get("notional") or 0.0)
         return total
 
     def _pending_usd(self) -> float:
-        return sum(float(item.get("notional") or 0.0) for item in self.paper)
+        return sum(float(item.get("notional") or 0.0) for item in self.paper + list(self.inflight.values()))
 
     def _locked_side(self, slug: str) -> Optional[str]:
-        for pos in self._positions_for(slug):
-            if pos.get("settled_ts"):
-                continue
-            if str(pos.get("strategy") or "") != "s1":
-                continue
-            if float(pos.get("shares") or 0.0) > 0 and pos.get("side"):
-                return str(pos["side"])
+        lock = self.state.get("s1_locks", {}).get(slug)
+        if lock:
+            return lock.get("side")
+        positions = [p for p in self._positions_for(slug) if p.get("strategy") == "s1" and float(p.get("shares") or 0) > 0]
+        if positions:
+            return str(max(positions, key=lambda p: p.get("last_fill_ts", p.get("opened_ts", 0))).get("side"))
         return None
 
     def _account(self, market: LockMarket, now: float) -> dict:
@@ -597,7 +607,7 @@ class LockBot:
             cash = 1e12
             unknown = True
         else:
-            cash = float(self.cash)
+            cash = float(self.cash) - self._pending_usd()
         return {
             "spent": spent_s1 + spent_s2,
             "spent_s1": spent_s1,
@@ -606,6 +616,7 @@ class LockBot:
             "open_cost": exposure,
             "cash": float(cash),
             "locked_side": self._locked_side(market.slug),
+            "s1_switches": self.state.get("s1_locks", {}).get(market.slug, {}).get("switches", max(0, len([p for p in self._positions_for(market.slug) if p.get("strategy") == "s1" and p.get("shares", 0) > 0]) - 1)),
             "last_s1_ts": self.clip_at.get((market.slug, "s1")),
             "last_s2_ts": self.clip_at.get((market.slug, "s2")),
             "loss_stopped": loss_stop_active(pnl, stop, self.state.get("loss_stop_day"), today),
@@ -753,12 +764,13 @@ class LockBot:
             decision["reason"] = "cash_unknown"
         force = decision.get("action") == "buy"
         log_key = f"{market.slug}|{strategy}"
+        if force:
+            self._act(market, decision, now)
         if self._should_log(log_key, str(decision.get("reason")), now, force):
             self.eval_log[log_key] = (now, str(decision.get("reason")))
             log_event("eval", **_public_decision(decision))
         if decision.get("action") != "buy":
             return 0
-        self._act(market, decision, now)
         return 1
 
     def _s2_view(self, market: LockMarket, now: float) -> dict:
@@ -853,6 +865,10 @@ class LockBot:
         elif self.client is None:
             self._skip_live(market, strategy)
         else:
+            reservation = f"{market.slug}|{strategy}|{time.monotonic_ns()}"
+            decision["reservation"] = reservation
+            with self._lock:
+                self.inflight[reservation] = dict(decision)
             self._poster.submit((market, dict(decision), decision_ts))
         handoff = time.time()
         decision["handoff_ts"] = handoff
@@ -884,20 +900,45 @@ class LockBot:
     def _post_job(self, job: tuple) -> None:
         """Order thread. ``post_ts`` is stamped inside ``post_fak_buy`` before the sign."""
         market, decision, decision_ts = job
-        post_ts = time.time()
+        reservation = decision["reservation"]
+        with self._lock:
+            self.inflight.pop(reservation, None)
+            account = self._account_locked(market, time.time())
+            from buy.lock_gates import _clip_room
+            room, reason = _clip_room(account, self.cfg, strategy=decision.get("strategy", "s1"), market_key=market.key)
+            if market.condition_id not in self._warmed or not self.cfg.get("enabled", True) or account["loss_stopped"] or account["cash_unknown"] or time.time() >= market.end_ts or reason or room + 1e-9 < decision["notional"]:
+                self._results.submit((job, None, "cap_recheck"))
+                return
+            self.inflight[reservation] = dict(decision)
         try:
             raw = dispatch_buy(decision, dry_run=False, client=self.client)
         except Exception as exc:
-            log_event(
-                "order_fail",
-                slug=market.slug,
-                strategy=decision.get("strategy"),
-                error=str(exc)[:200],
-                decision_ts=decision_ts,
-                post_ts=post_ts,
-                binance_recv_ts=decision.get("binance_recv_ts"),
-            )
+            self._results.submit((job, None, str(exc)[:200]))
             return
+        self._results.submit((job, raw, ""))
+
+    def _finish_job(self, result: tuple) -> None:
+        """Bookkeeping and retry scheduling run independently of the hot poster."""
+        job, raw, error = result
+        market, decision, decision_ts = job
+        reservation = decision["reservation"]
+        from buy.lock_orders import fak_no_match, kill_failure
+        miss = fak_no_match(error or raw)
+        if error:
+            fatal = kill_failure(error)
+            if miss or fatal or error == "cap_recheck":
+                with self._lock:
+                    self.inflight.pop(reservation, None)
+            else:
+                # Transport errors have an unknown execution outcome; retain the reserve.
+                with self._lock:
+                    self.state.setdefault("uncertain_orders", {})[reservation] = dict(decision)
+                    atomic_save(self.state_path, self.state)
+            log_event("order_miss" if miss else ("order_fail" if fatal else "order_uncertain"), slug=market.slug, strategy=decision.get("strategy"), error=error, kill_failure=fatal)
+            if miss:
+                self._retry_miss(market, decision)
+            return
+        post_ts = raw.get("post_ts") or decision_ts
         ack_ts = time.time()
         raw["decision_ts"] = decision_ts
         raw["post_ts"] = raw.get("post_ts") or post_ts
@@ -909,9 +950,43 @@ class LockBot:
             raw["recv_to_decision_ms"] = (decision_ts - float(decision["binance_recv_ts"])) * 1000.0
             raw["recv_to_post_ms"] = (float(raw["post_ts"]) - float(decision["binance_recv_ts"])) * 1000.0
         fill = normalize_fill(raw, decision, self.cfg)
-        self._log_attempt(market, decision, fill, event="entry")
+        if kill_failure(raw) and fill["shares"] <= 0:
+            with self._lock:
+                self.inflight.pop(reservation, None)
+            log_event("order_fail", slug=market.slug, strategy=decision.get("strategy"), kill_failure=True, error=str(fill.get("raw_status")))
+            return
+        with self._lock:
+            if fill["shares"] > 0:
+                self._add_fill_locked(market, decision, fill, time.time())
+                self.inflight.pop(reservation, None)
+                self.state.get("uncertain_orders", {}).pop(reservation, None)
+            elif miss:
+                self.inflight.pop(reservation, None)
+            else:
+                self.state.setdefault("uncertain_orders", {})[reservation] = dict(decision)
+                atomic_save(self.state_path, self.state)
         if fill["shares"] > 0:
-            self._add_fill(market, decision, fill, time.time())
+            atomic_save(self.state_path, self.state)
+        self._log_attempt(market, decision, fill, event="order_miss" if miss else "entry")
+        if miss:
+            self._retry_miss(market, decision)
+
+    def _retry_miss(self, market: LockMarket, decision: dict) -> None:
+        attempt = int(decision.get("retry", 0))
+        if decision.get("strategy") != "s1" or attempt >= int(self.cfg.get("s1_fak_retries", 2)):
+            return
+        self._poster.submit_at(time.monotonic() + 0.3, (market, attempt), handler=self._run_retry)
+
+    def _run_retry(self, job: tuple) -> None:
+        """Recheck the signal on the hot poster after the miss backoff."""
+        market, attempt = job
+        now = time.time()
+        account = self._account(market, now)
+        account["last_s1_ts"] = None
+        fresh = evaluate_strategy1(self._view(market, now), account, self.cfg)
+        if fresh.get("action") == "buy":
+            fresh["retry"] = attempt + 1
+            self._act(market, fresh, now)
 
     def _flush_paper(self, now: float) -> None:
         latency = float(self.cfg.get("dry_run_latency_s") or 0.2)
@@ -970,6 +1045,12 @@ class LockBot:
             recv_to_decision_ms=fill.get("recv_to_decision_ms"),
             recv_to_post_ms=fill.get("recv_to_post_ms"),
             decision_to_order_ms=fill.get("decision_to_order_ms"),
+            order_build_ts=fill.get("order_build_ts"),
+            sign_ts=fill.get("sign_ts"),
+            signed_ts=fill.get("signed_ts"),
+            http_send_ts=fill.get("http_send_ts"),
+            response_ts=fill.get("response_ts"),
+            confirm_ts=fill.get("confirm_ts"),
             eval_ms=decision.get("eval_ms"),
         )
         self._stamp_attempt(decision, fill)
@@ -977,10 +1058,16 @@ class LockBot:
     def _add_fill(self, market: LockMarket, decision: dict, fill: dict, now: float) -> None:
         with self._lock:
             self._add_fill_locked(market, decision, fill, now)
+        atomic_save(self.state_path, self.state)
 
     def _add_fill_locked(self, market: LockMarket, decision: dict, fill: dict, now: float) -> None:
         strategy = str(decision.get("strategy") or "s1")
         side = str(decision.get("side") or "")
+        if strategy == "s1":
+            locks = self.state.setdefault("s1_locks", {})
+            previous = self._locked_side(market.slug)
+            switches = locks.get(market.slug, {}).get("switches", 0)
+            locks[market.slug] = {"side": side, "switches": switches + int(bool(previous and previous != side))}
         key = f"{market.slug}|{strategy}|{side}"
         pos = dict(self.state["positions"].get(key) or {})
         shares = float(pos.get("shares") or 0) + float(fill["shares"])
@@ -1008,6 +1095,7 @@ class LockBot:
                 "end_ts": market.end_ts,
                 "start_ts": market.start_ts,
                 "opened_ts": pos.get("opened_ts") or now,
+                "last_fill_ts": now,
                 "dry_run": bool(self.cfg.get("dry_run", True)),
             }
         )
@@ -1023,7 +1111,6 @@ class LockBot:
                 "condition_id": market.condition_id,
             }
         self._risk_at = 0.0
-        atomic_save(self.state_path, self.state)
         if fill["shares"] > 0:
             log_event(
                 "fill",
@@ -1306,6 +1393,7 @@ class LockBot:
     def close(self) -> None:
         self._wake.set()
         self._poster.stop()
+        self._results.stop()
         for feed in self.feeds.values():
             feed.stop()
         self.book_feed.stop()

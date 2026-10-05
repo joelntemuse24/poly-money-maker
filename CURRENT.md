@@ -185,7 +185,7 @@ Do not restart `polylockbot` or `polymintbot` unless the operator asks.
 
 Strategy 1 mirrors NIULAI4 on BTC 15m and BTC 5m. From tau 58 down to
 tau 1 it buys the Chainlink favourite in $5 clips, up to $20 a market,
-and locks that side after the first fill. 15m uses Z=0 and Pmax=0.97.
+and uses soft side locking after the first fill. Soft locking permits one qualifying opposite-side switch per market at projected-TWAP |z| >= 0.5, nonnegative edge, and ask <= Pmax. Hard and off modes are configurable. 15m uses Z=0 and Pmax=0.97.
 5m uses Z=0.25 and Pmax=0.90. `edge_min` is 0, so asks from a couple of
 cents through Pmax qualify when the model still clears the fee. Strategy
 2 mirrors the Binance 3-second move rule on BTC 5m only (2 sigma, ask
@@ -265,3 +265,7 @@ restarts it. Creating a PR is not a merge and not a restart.
   - `sell_dump_also_kept` turned on at 10:31 IST (PR #232).
   - `sell_dump_tiers` (PR #231) and the post-dump kept stop (PR #228) are not live.
   - Replaced the stale 100-share, two-bag and 5s/60s persist text.
+
+### Lockbot (PR from main, 2026-10-05)
+
+The requested s1 fixes are implemented on `lockbot/s1-soft-unlock-fak-retry-speed`: soft one-switch side lock, two-tick FAK slack capped by Pmax/max_pay, bounded 300ms miss retries, in-flight cap reservations, durable uncertain-order state, official Gamma `priceToBeat` preference with >$0.50 mismatch logs, and per-order phase timestamps. Defaults remain dry-run. The order path pre-warms CLOB metadata and uses a dedicated post/result worker pair.

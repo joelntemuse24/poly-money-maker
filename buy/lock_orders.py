@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-import queue
+import heapq
+import itertools
 import threading
 import time
 from typing import Any, Callable, Optional
@@ -17,26 +18,43 @@ def post_fak_buy(client: Any, plan: dict) -> dict:
     from py_clob_client_v2 import MarketOrderArgs, OrderType
     from py_clob_client_v2.order_builder.constants import BUY
 
-    post_ts = time.time()
-    signed = client.create_market_order(
-        MarketOrderArgs(
+    build_ts = time.time()
+    args = MarketOrderArgs(
             token_id=str(plan["token_id"]),
             amount=float(plan["notional"]),
             side=BUY,
             price=float(plan["limit"]),
             order_type=OrderType.FAK,
         )
-    )
+    sign_ts = time.time()
+    signed = client.create_market_order(args)
+    signed_ts = time.time()
+    post_ts = time.time()
     result = client.post_order(signed, order_type=OrderType.FAK)
     if not isinstance(result, dict):
         result = {"raw": str(result)[:500]}
     ack_ts = time.time()
+    result.update(order_build_ts=build_ts, sign_ts=sign_ts, signed_ts=signed_ts, http_send_ts=post_ts, response_ts=ack_ts, confirm_ts=ack_ts)
     result["post_ts"] = post_ts
     result["ack_ts"] = ack_ts
     result["post_to_ack_ms"] = (ack_ts - post_ts) * 1000.0
     result["decision_to_order_ms"] = result["post_to_ack_ms"]
     result["posted"] = True
     return result
+
+
+def fak_no_match(value: Any) -> bool:
+    """Recognize an unfilled FAK without treating it as an execution failure."""
+    text = str(value).lower()
+    if isinstance(value, dict) and str(value.get("status", "")).lower() in {"unmatched", "canceled", "cancelled"}:
+        return float(value.get("takingAmount") or 0) == 0 and not value.get("orderID")
+    return any(token in text for token in ("no orders found", "no match", "unfilled", "not filled"))
+
+
+def kill_failure(value: Any) -> bool:
+    """Failures that may safely contribute to an external kill policy."""
+    text = str(value).lower()
+    return any(token in text for token in ("auth", "unauthorized", "invalid signature", "oversize", "cap_recheck"))
 
 
 def dispatch_buy(plan: dict, *, dry_run: bool, client: Any = None) -> dict:
@@ -82,6 +100,12 @@ def normalize_fill(fill: dict, plan: dict, cfg: dict) -> dict:
         "raw_status": fill.get("status") or fill.get("errorMsg") or fill.get("error"),
     }
     for key in (
+        "order_build_ts",
+        "sign_ts",
+        "signed_ts",
+        "http_send_ts",
+        "response_ts",
+        "confirm_ts",
         "decision_ts",
         "post_ts",
         "ack_ts",
@@ -116,11 +140,14 @@ def open_live_client(builder: Callable[[], Optional[Any]] | None = None) -> tupl
 
 
 class LivePoster:
-    """Posts live orders off the decision thread. The queue is the hand-off."""
+    """Run immediate and delayed jobs on one worker, using monotonic deadlines."""
 
-    def __init__(self, handler: Callable[[Any], None]) -> None:
+    def __init__(self, handler: Callable[[Any], None], *, clock: Callable[[], float] = time.monotonic) -> None:
         self._handler = handler
-        self._queue: queue.Queue = queue.Queue()
+        self._clock = clock
+        self._queue: list[tuple] = []
+        self._sequence = itertools.count()
+        self._condition = threading.Condition()
         self._stop = threading.Event()
         self._thread: Optional[threading.Thread] = None
 
@@ -132,21 +159,43 @@ class LivePoster:
         self._thread.start()
 
     def submit(self, job: Any) -> None:
-        self._queue.put(job)
+        self.submit_at(self._clock(), job)
+
+    def submit_at(self, due_ts: float, job: Any, *, handler: Callable[[Any], None] | None = None) -> None:
+        """Enqueue a job for a monotonic deadline, optionally with its own handler."""
+        with self._condition:
+            if self._stop.is_set():
+                return
+            heapq.heappush(self._queue, (due_ts, next(self._sequence), handler or self._handler, job))
+            self._condition.notify()
 
     def stop(self) -> None:
-        self._stop.set()
-        self._queue.put(None)
+        with self._condition:
+            self._stop.set()
+            self._queue.clear()
+            self._condition.notify_all()
+
+    def _run_once(self, *, block: bool = False) -> bool:
+        with self._condition:
+            while not self._stop.is_set():
+                delay = self._queue[0][0] - self._clock() if self._queue else None
+                if delay is not None and delay <= 0:
+                    _, _, handler, job = heapq.heappop(self._queue)
+                    break
+                if not block:
+                    return False
+                self._condition.wait(timeout=delay)
+            else:
+                return False
+        try:
+            handler(job)
+        except Exception:
+            pass
+        return True
 
     def _run(self) -> None:
-        while not self._stop.is_set():
-            job = self._queue.get()
-            if job is None:
-                return
-            try:
-                self._handler(job)
-            except Exception:
-                continue
+        while self._run_once(block=True):
+            pass
 
 
 def build_clob_client() -> Optional[Any]:

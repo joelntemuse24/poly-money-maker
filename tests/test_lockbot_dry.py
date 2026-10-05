@@ -99,7 +99,7 @@ class DryRunTests(unittest.TestCase):
             gamma_strike=100.0,
             cfg=apply_defaults({}),
         )
-        self.assertEqual(view["strike_reason"], "match")
+        self.assertEqual(view["strike_reason"], "gamma")
         self.assertGreater(view["p_up"], 0.8)
         self.assertGreater(view["vol_samples"], 60)
         self.assertTrue(view["coverage_ok"])

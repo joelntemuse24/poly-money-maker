@@ -111,6 +111,203 @@ class BookFeedTests(unittest.TestCase):
         self.assertEqual(books["UP"]["asks"], [(0.4, 10.0)])
 
 
+class S1RevisionTests(unittest.TestCase):
+    def test_soft_flip_requires_z_and_edge(self):
+        cfg = apply_defaults({})
+        account = {"locked_side": "up", "s1_switches": 0, "spent_s1": 0, "spent_s2": 0, "spent_total": 0, "open_cost": 0, "cash": 500}
+        view = _view(expected=90.0)
+        flipped = evaluate_strategy1(view, account, cfg)
+        self.assertEqual(flipped["action"], "buy")
+        self.assertTrue(flipped["side_switch"])
+        self.assertEqual(evaluate_strategy1(view, {**account, "s1_switches": 1}, cfg)["reason"], "side_locked")
+        self.assertEqual(evaluate_strategy1(view, account, {**cfg, "s1_side_lock_mode": "hard"})["reason"], "side_locked")
+        self.assertEqual(evaluate_strategy1(view, {**account, "s1_switches": 1}, {**cfg, "s1_side_lock_mode": "off"})["action"], "buy")
+        self.assertEqual(evaluate_strategy1(view, account, {**cfg, "s1_flip_z": 100})["reason"], "flip_below")
+
+    def test_slack_is_capped_by_pmax(self):
+        from buy.lock_gates import evaluate_strategy1
+        cfg = apply_defaults({"limit_tick_improve": 2})
+        decision = evaluate_strategy1(_view(), {"spent_s1": 0, "spent_s2": 0, "spent_total": 0, "open_cost": 0, "cash": 500}, cfg)
+        self.assertEqual(decision["limit"], 0.82)
+
+    def test_pmax_clamps_slack(self):
+        cfg = apply_defaults({"market_rules": {"btc_15m": {"Pmax": .81}}})
+        decision = evaluate_strategy1(_view(), {"cash": 500}, cfg)
+        self.assertEqual(decision["limit"], .81)
+
+    def test_inflight_counts_in_strategy_and_exposure_and_restart_spend(self):
+        import lockbot
+        bot = lockbot.LockBot.__new__(lockbot.LockBot)
+        bot.state = {"positions": {"a": {"slug": "market", "strategy": "s1", "cost": 5, "settled_ts": 1}}}
+        bot.paper = []
+        bot.inflight = {"live": {"slug": "market", "strategy": "s1", "notional": 5}}
+        self.assertEqual(bot._strategy_spent("market", "s1"), 10)
+        self.assertEqual(bot._strategy_spent("market", "s2"), 0)
+        self.assertEqual(bot._pending_usd(), 5)
+
+    def test_retry_is_bounded_and_rechecks_fresh_signal(self):
+        import lockbot
+        from unittest.mock import Mock, patch
+        bot = lockbot.LockBot.__new__(lockbot.LockBot)
+        bot.cfg = apply_defaults({})
+        bot._account = Mock(return_value={"cash": 500})
+        bot._view = Mock(return_value=_view())
+        bot._act = Mock()
+        from buy.lock_orders import LivePoster
+        clock = [10.0]
+        bot._poster = LivePoster(Mock(), clock=lambda: clock[0])
+        with patch("lockbot.time.monotonic", side_effect=lambda: clock[0]):
+            bot._retry_miss(object(), {"strategy": "s1", "retry": 0})
+            bot._account.assert_not_called()
+            bot._view.assert_not_called()
+            bot._act.assert_not_called()
+            self.assertFalse(bot._poster._run_once())
+            clock[0] = 10.3
+            with patch("lockbot.time.time", return_value=1000.0):
+                self.assertTrue(bot._poster._run_once())
+            self.assertEqual(bot._act.call_args.args[1]["retry"], 1)
+            bot._account.assert_called_once_with(bot._act.call_args.args[0], 1000.0)
+            bot._view.assert_called_once_with(bot._act.call_args.args[0], 1000.0)
+
+            bot._retry_miss(object(), {"strategy": "s1", "retry": 1})
+            clock[0] += .3
+            self.assertTrue(bot._poster._run_once())
+            self.assertEqual(bot._act.call_args.args[1]["retry"], 2)
+            bot._retry_miss(object(), {"strategy": "s1", "retry": 2})
+            bot._retry_miss(object(), {"strategy": "s2", "retry": 0})
+            self.assertEqual(len(bot._poster._queue), 0)
+
+            bot._retry_miss(object(), {"strategy": "s1", "retry": 0})
+            bot._account.return_value = {"cash": 500, "spent_s1": 20}
+            clock[0] += .3
+            self.assertTrue(bot._poster._run_once())
+            self.assertEqual(bot._act.call_count, 2)
+
+            bot._retry_miss(object(), {"strategy": "s1", "retry": 0})
+            bot._account.return_value = {"cash": 500, "last_s1_ts": 1000.0}
+            bot._view.return_value = _view(end_ts=999.0)
+            clock[0] += .3
+            self.assertTrue(bot._poster._run_once())
+            self.assertEqual(bot._act.call_count, 2)
+
+    def test_result_worker_returns_while_retry_is_pending(self):
+        import lockbot
+        import threading
+        import time
+        from types import SimpleNamespace
+        from unittest.mock import Mock, patch
+        from buy.lock_orders import LivePoster
+
+        bot = lockbot.LockBot.__new__(lockbot.LockBot)
+        bot.cfg = apply_defaults({})
+        bot._lock = threading.RLock()
+        bot.inflight = {"miss": {}, "other": {}}
+        bot._account = Mock(return_value={"cash": 500, "last_s1_ts": 1000.0})
+        bot._view = Mock(return_value=_view())
+        bot._act = Mock()
+        clock = [10.0]
+        bot._poster = LivePoster(Mock(), clock=lambda: clock[0])
+        market = SimpleNamespace(slug="market")
+        miss = (market, {"reservation": "miss", "strategy": "s1", "retry": 0}, 1000.0)
+        other = (market, {"reservation": "other", "strategy": "s2"}, 1000.0)
+        with patch("lockbot.time.monotonic", side_effect=lambda: clock[0]), patch("lockbot.log_event") as log, patch("lockbot.time.sleep", side_effect=AssertionError("result worker slept")):
+            started = time.perf_counter()
+            bot._finish_job((miss, None, "no orders found"))
+            bot._finish_job((other, None, "unauthorized"))
+            self.assertLess(time.perf_counter() - started, .1)
+            self.assertEqual(bot.inflight, {})
+            self.assertFalse(log.call_args_list[0].kwargs["kill_failure"])
+            self.assertTrue(log.call_args_list[1].kwargs["kill_failure"])
+            self.assertEqual(len(bot._poster._queue), 1)
+            bot._account.assert_not_called()
+            clock[0] = 10.299
+            self.assertFalse(bot._poster._run_once())
+            bot._act.assert_not_called()
+            clock[0] = 10.3
+            self.assertTrue(bot._poster._run_once())
+            self.assertEqual(bot._act.call_args.args[1]["retry"], 1)
+            self.assertIsNone(bot._account.return_value["last_s1_ts"])
+
+    def test_post_thread_rechecks_caps_before_dispatch(self):
+        import lockbot
+        import threading
+        from types import SimpleNamespace
+        from unittest.mock import Mock, patch
+        bot = lockbot.LockBot.__new__(lockbot.LockBot)
+        bot.cfg = apply_defaults({})
+        bot.inflight = {"r": {"notional": 5}}
+        bot._lock = threading.RLock()
+        bot._warmed = {"cid"}
+        bot._results = Mock()
+        bot._account_locked = Mock(return_value={"cash": 500, "spent_s1": 20, "loss_stopped": False, "cash_unknown": False})
+        market = SimpleNamespace(condition_id="cid", key="btc_15m", end_ts=1e20)
+        with patch("lockbot.dispatch_buy") as post:
+            bot._post_job((market, {"reservation": "r", "strategy": "s1", "notional": 5}, 1))
+            post.assert_not_called()
+        self.assertNotIn("r", bot.inflight)
+
+    def test_no_match_is_not_kill_failure(self):
+        from buy.lock_orders import fak_no_match, kill_failure
+        self.assertTrue(fak_no_match("no orders found"))
+        self.assertFalse(kill_failure("no orders found"))
+        self.assertTrue(kill_failure("unauthorized"))
+
+class LivePosterTests(unittest.TestCase):
+    def test_due_order_and_equal_deadlines(self):
+        from buy.lock_orders import LivePoster
+        seen = []
+        clock = [10.0]
+        poster = LivePoster(seen.append, clock=lambda: clock[0])
+        poster.submit_at(10.3, {"retry": 1})
+        poster.submit_at(10.3, {"retry": 2})
+        poster.submit("immediate")
+        self.assertTrue(poster._run_once())
+        self.assertEqual(seen, ["immediate"])
+        self.assertFalse(poster._run_once())
+        clock[0] = 10.3
+        self.assertTrue(poster._run_once())
+        self.assertTrue(poster._run_once())
+        self.assertEqual(seen, ["immediate", {"retry": 1}, {"retry": 2}])
+
+    def test_immediate_submit_wakes_worker_waiting_for_delay_and_stop(self):
+        import threading
+        import time
+        from buy.lock_orders import LivePoster
+        fired = threading.Event()
+        seen = []
+
+        def handle(job):
+            seen.append(job)
+            fired.set()
+
+        poster = LivePoster(handle)
+        poster.submit_at(time.monotonic() + 60.0, "delayed")
+        poster.start()
+        try:
+            poster.submit("immediate")
+            self.assertTrue(fired.wait(.5))
+            self.assertEqual(seen, ["immediate"])
+        finally:
+            poster.stop()
+            poster._thread.join(.5)
+        self.assertFalse(poster._thread.is_alive())
+        self.assertEqual(poster._queue, [])
+        poster.submit("after-stop")
+        self.assertFalse(poster._run_once())
+        self.assertEqual(seen, ["immediate"])
+
+    def test_handler_error_keeps_worker_running(self):
+        from unittest.mock import Mock
+        from buy.lock_orders import LivePoster
+        handler = Mock(side_effect=[RuntimeError("failed"), None])
+        poster = LivePoster(handler)
+        poster.submit("first")
+        poster.submit("second")
+        self.assertTrue(poster._run_once())
+        self.assertTrue(poster._run_once())
+        self.assertEqual(handler.call_count, 2)
+
+
 class CapTests(unittest.TestCase):
     def test_market_rule_combined_usd_overrides_the_global_cap(self):
         cfg = apply_defaults(
