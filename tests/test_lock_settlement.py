@@ -64,20 +64,6 @@ class ExposureTests(unittest.TestCase):
     def test_missing_or_invalid_expiry_still_counts(self):
         self.assertEqual(open_exposure_usd([position(end_ts=None), position(end_ts="bad")], END), 30)
 
-    def test_paper_and_live_account_share_expiry_helper(self):
-        for dry in (True, False):
-            with self.subTest(dry_run=dry):
-                obj = bot({"old": position(dry_run=dry), "open": position(end_ts=END + 10, cost=5)})
-                obj.cfg["dry_run"] = dry
-                obj.cash = 100
-                obj.paper = []
-                obj.inflight = {"pending": {"notional": 2}}
-                obj.clip_at = {}
-                obj._marks_cached = Mock(return_value={})
-                with patch("lockbot.open_exposure_usd", wraps=open_exposure_usd) as exposure:
-                    self.assertEqual(obj._account_locked(market(), END)["open_cost"], 7)
-                    exposure.assert_called_once()
-                    self.assertEqual(exposure.call_args.kwargs["now"], END)
 
 
 class GammaWinnerTests(unittest.TestCase):

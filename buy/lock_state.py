@@ -148,27 +148,3 @@ def strike_for_position(pos: dict, latched: dict) -> Optional[float]:
     if strike <= 0:
         return None
     return strike
-
-
-def decision_wait_s(
-    now: float,
-    *,
-    poll_s: float,
-    s1_next: Optional[float] = None,
-    paper_next: Optional[float] = None,
-    window_in: Optional[float] = None,
-) -> float:
-    """Seconds the decision thread may block. A trade event wakes it sooner.
-
-    ``fast_poll_s`` is not a spin interval. The wait is the next strategy-1
-    second, the next paper fill, the next window, or ``poll_s``, whichever
-    comes first.
-    """
-    wait = max(0.0, float(poll_s))
-    for stamp in (s1_next, paper_next):
-        if stamp is None:
-            continue
-        wait = min(wait, max(0.0, float(stamp) - float(now)))
-    if window_in is not None:
-        wait = min(wait, max(0.0, float(window_in)))
-    return wait
