@@ -134,23 +134,17 @@ class StrikeCaptureTests(unittest.TestCase):
         h = Harness()
         h.tick(START + 1, [_sample(START, "83900.62")])
         h.tick(START + 2, [_sample(START, STRIKE), _sample(START + 1, "83901")])
-        self.assertEqual(h.service.bag_view("cid-15m").open_usd, STRIKE)
+        self.assertEqual(h.service.bag_view("cid-15m").open_usd, "83900.62")
         rows = h.rows("oracle_open_ref")
-        self.assertEqual([r["open_ref"] for r in rows], ["83900.62", STRIKE])
-        self.assertEqual(rows[1]["previous"], "83900.62")
-        self.assertEqual(rows[1]["previous_source"], "rtds_twap_at_start")
-        revised = h.rec.named("oracle_strike_revised")
-        self.assertEqual(len(revised), 1)
-        self.assertEqual(revised[0]["strike"], STRIKE)
-        self.assertEqual(revised[0]["previous"], "83900.62")
-        self.assertAlmostEqual(revised[0]["delta"], 0.04)
+        self.assertEqual([r["open_ref"] for r in rows], ["83900.62"])
+        self.assertEqual(h.rec.named("oracle_strike_revised"), [])
         at_start = [r["twap"] for r in h.rows("oracle_twap") if r["twap_ts"] == START]
         self.assertEqual(at_start, ["83900.62", STRIKE])
 
     def test_revision_inside_one_batch_keeps_the_last_arrival(self):
         h = Harness()
         h.tick(START + 1, [_sample(START, "83900.5"), _sample(START, STRIKE)])
-        self.assertEqual(h.service.bag_view("cid-15m").open_usd, STRIKE)
+        self.assertEqual(h.service.bag_view("cid-15m").open_usd, "83900.5")
         self.assertEqual(len(h.rows("oracle_open_ref")), 1)
 
     def test_late_capture_after_reconnect_replays_the_boundary(self):

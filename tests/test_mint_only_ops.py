@@ -1218,8 +1218,8 @@ class DeployUnitsTests(unittest.TestCase):
         self.assertIn("sell_dump_leg", src)
         self.assertEqual(defaults["sell_late_window_s"], 0.0)
         self.assertEqual(example["sell_late_window_s"], 0.0)
-        self.assertIs(defaults["oracle_log_enabled"], True)
-        self.assertIs(example["oracle_log_enabled"], True)
+        self.assertIs(defaults["oracle_log_enabled"], False)
+        self.assertIs(example["oracle_log_enabled"], False)
         for blob in (defaults, example):
             self.assertEqual(blob["sell_oracle_edge_per_ttm"], 0.0)
             self.assertEqual(blob["sell_oracle_edge_persist_s"], 3.0)

@@ -1566,28 +1566,33 @@ class OracleLogService:
         )
 
     def _note_boundaries(self, samples: list[TwapSample], latest: Optional[TwapSample]) -> None:
-        """Remember the value at each 15m boundary second, last arrival wins.
+        """Remember the first value observed at each 15m boundary second.
 
-        ``latest`` first, then the drained samples in arrival order, so a
-        replayed or corrected sample for the same second supersedes."""
-        ordered: list[TwapSample] = []
+        The first RTDS TWAP boundary sample is the window open reference.
+        Later samples for that second are retained in the tape but cannot
+        mutate the open reference."""
+        ordered: list[TwapSample] = list(samples)
         if latest is not None:
             ordered.append(latest)
-        ordered.extend(samples)
         for sample in ordered:
             key = boundary_second(getattr(sample, "obs_ts", None))
             if key is None or not getattr(sample, "twap", None):
                 continue
-            self._boundary.pop(key, None)
-            self._boundary[key] = str(sample.twap)
+            if key not in self._boundary:
+                self._boundary[key] = str(sample.twap)
         while len(self._boundary) > BOUNDARY_KEEP:
             self._boundary.pop(min(self._boundary))
 
     def _resolve_boundaries(self, window: OracleWindow, memory: _WindowMemory, now: float) -> None:
         start_value = self._boundary.get(int(round(window.start_ts)))
-        if start_value is not None and memory.open_source != STRIKE_GAMMA:
-            if memory.open_source != STRIKE_RTDS or memory.open_ref != start_value:
-                self._set_strike(window, memory, now, start_value, STRIKE_RTDS, source=RTDS_SOURCE)
+        # First RTDS TWAP open_ref is sticky. Later boundary values must not
+        # mutate it (live/crypto spot overwrote strike in prod). Gamma may
+        # still correct via the dedicated check path.
+        if (
+            start_value is not None
+            and memory.open_source not in (STRIKE_GAMMA, STRIKE_RTDS)
+        ):
+            self._set_strike(window, memory, now, start_value, STRIKE_RTDS, source=RTDS_SOURCE)
         end_value = self._boundary.get(int(round(window.end_ts)))
         if end_value is not None and memory.close_source != CLOSE_GAMMA:
             if memory.close_source != CLOSE_RTDS or memory.close_twap != end_value:

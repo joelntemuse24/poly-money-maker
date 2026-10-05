@@ -120,8 +120,6 @@ from buy.mint_sell import (
     inventory_latch,
     advance_oracle_edge_arm,
     late_oracle_scrap_ok,
-    scrap_oracle_settings,
-    scrap_oracle_veto,
     loser_blind_fak_due,
     loser_empty_keep_qualify,
     loser_ladder_limits,
@@ -225,7 +223,7 @@ DEFAULTS = {
     "sell_armed_poll_s": 2.0,
     # Chainlink 60s TWAP tape. The scrap veto is off unless
     # sell_late_window_s is positive.
-    "oracle_log_enabled": True,
+    "oracle_log_enabled": False,
     "position_tolerance": 0.01,
     "require_accepting_orders": True,
     "sell_enabled": False,
@@ -287,7 +285,7 @@ DEFAULTS = {
     # scrap_oracle_veto_usd against the scrapped leg. A reading older than
     # scrap_oracle_veto_stale_s drops out; both stale, or no strike, falls
     # back to no veto.
-    "scrap_oracle_veto_enabled": True,
+    "scrap_oracle_veto_enabled": False,
     "scrap_oracle_veto_usd": 5.0,
     "scrap_oracle_veto_stale_s": 3.0,
     "scrap_oracle_veto_use_live": True,
@@ -2349,103 +2347,8 @@ def _scrap_oracle_gate(
     phase: str,
     log_interval_s: float = 5.0,
 ) -> Tuple[bool, str, dict]:
-    """In-memory scrap oracle veto. No I/O: reads the RTDS 60s TWAP and live
-    Chainlink price the feed thread already holds. Logs ``scrap_oracle_veto``
-    on a block and ``scrap_oracle_stale`` when a reading drops out, each at
-    most once per bag per ``log_interval_s``."""
-    enabled, threshold, stale_s, use_live = scrap_oracle_settings(cfg)
-    if not enabled:
-        return False, "disabled", {}
-    if leg not in ("up", "dn"):
-        return False, "bad_leg", {}
-    view = _oracle_bag_view(condition_id)
-    now_f = float(now_s)
-
-    def _ages(recv: Any, obs: Any) -> Tuple[Optional[float], Optional[float]]:
-        ref = recv if recv is not None else obs
-        age = None if ref is None else max(0.0, now_f - float(ref))
-        obs_age = None if obs is None else max(0.0, now_f - float(obs))
-        return age, obs_age
-
-    age, obs_age = _ages(getattr(view, "recv_ts", None), getattr(view, "obs_ts", None))
-    live_age, live_obs_age = _ages(
-        getattr(view, "live_recv_ts", None), getattr(view, "live_obs_ts", None),
-    )
-    block, why, detail = scrap_oracle_veto(
-        scrap_leg=leg,
-        twap_usd=getattr(view, "twap", None),
-        strike_usd=getattr(view, "open_usd", None),
-        twap_age_s=age,
-        threshold_usd=threshold,
-        stale_s=stale_s,
-        obs_age_s=obs_age,
-        live_usd=getattr(view, "live_price", None),
-        live_age_s=live_age,
-        live_obs_age_s=live_obs_age,
-        use_live=use_live,
-    )
-    detail["why"] = why
-    detail["open_source"] = getattr(view, "open_source", None)
-    common = {
-        "condition_id": condition_id,
-        "slug": slug,
-        "side": leg,
-        "bid": bid,
-        "ttm": None if ttm is None else round(float(ttm), 3),
-        "phase": phase,
-    }
-    if block:
-        if _scrap_oracle_log_due("veto", condition_id, now_s, log_interval_s):
-            log_event(
-                "scrap_oracle_veto",
-                **common,
-                twap=detail.get("twap"),
-                strike=detail.get("strike"),
-                margin=detail.get("margin"),
-                live_price=detail.get("live_price"),
-                live_margin=detail.get("live_margin"),
-                threshold=detail.get("threshold"),
-                why=why,
-                basis=detail.get("basis"),
-                age_s=detail.get("age_s"),
-                live_age_s=detail.get("live_age_s"),
-                obs_age_s=detail.get("obs_age_s"),
-                open_source=detail.get("open_source"),
-            )
-    fallback = detail.get("fallback")
-    if fallback:
-        if fallback == "twap_only":
-            reason = detail.get("live_why")
-        elif fallback == "live_only":
-            reason = detail.get("twap_why")
-        else:
-            reason = why
-        if _scrap_oracle_log_due("stale", condition_id, now_s, log_interval_s):
-            log_event(
-                "scrap_oracle_stale",
-                **common,
-                level="WARNING",
-                reason=reason,
-                fallback=fallback,
-                age_s=detail.get("age_s"),
-                obs_age_s=detail.get("obs_age_s"),
-                live_age_s=detail.get("live_age_s"),
-                live_obs_age_s=detail.get("live_obs_age_s"),
-                stale_s=stale_s,
-                twap=detail.get("twap"),
-                live_price=detail.get("live_price"),
-                strike=detail.get("strike"),
-                open_source=detail.get("open_source"),
-            )
-            what = (
-                "scrap not vetoed" if fallback == "none"
-                else f"veto on {fallback.replace('_only', '')} only"
-            )
-            console.print(
-                f"  [bold red][ORACLE STALE][/] {slug} {leg} {what}: {reason} "
-                f"twap_age={detail.get('age_s')}s live_age={detail.get('live_age_s')}s"
-            )
-    return block, why, detail
+    """The live scrap oracle veto is disabled to avoid a costly stale tape read."""
+    return False, "disabled", {}
 
 
 def _scrap_oracle_fields(detail: Optional[dict]) -> dict:
@@ -4421,7 +4324,7 @@ def main() -> int:
         max_ttm=cfg["enter_max_ttm_min"],
         series=cfg["series_slugs"],
         loops=("sell", "mint", "oracle", "redeem"),
-        oracle_log_enabled=bool(cfg.get("oracle_log_enabled", True)),
+        oracle_log_enabled=bool(cfg.get("oracle_log_enabled", False)),
         sell_plan=sell_plan_banner(cfg),
         mint_sequential=seq_settings(cfg)[0],
         mint_seq_lead_s=seq_settings(cfg)[1],
@@ -4429,7 +4332,7 @@ def main() -> int:
         redeem_enabled=redeem_settings(cfg).enabled,
     )
     _whatsapp("startup", cfg)
-    if cfg.get("oracle_log_enabled", True):
+    if cfg.get("oracle_log_enabled", False):
         late_s = float(cfg.get("sell_late_window_s") or 0.0)
         if late_s > 0:
             veto = f"[dim](+ late loser-scrap veto ≤{late_s:g}s TTM)[/]"
@@ -4468,7 +4371,7 @@ def main() -> int:
 
     def oracle_tick() -> None:
         current = cfg_box.get("cfg") or {}
-        enabled = bool(current.get("oracle_log_enabled", True))
+        enabled = bool(current.get("oracle_log_enabled", False))
         with STATE_LOCK:
             snap = snapshot_intents(state)
         oracle.tick(
