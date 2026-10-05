@@ -141,13 +141,13 @@ class MarketTests(unittest.TestCase):
         strike, reason = strike_status(None, None)
         self.assertEqual(reason, "strike_unknown")
         strike, reason = strike_status(100.0, 100.005, match_usd=0.01, match_rel=0.0001)
-        self.assertEqual(reason, "match")
+        self.assertEqual(reason, "gamma")
         strike, reason = strike_status(100.0, 101.0, match_usd=0.01, match_rel=0.0001)
-        self.assertEqual(reason, "strike_mismatch")
-        self.assertIsNone(strike)
+        self.assertEqual(reason, "gamma")
+        self.assertEqual(strike, 101.0)
         # XRP-sized relative tolerance: 1bp of 1.50 is $0.00015, absolute floor $0.01.
         strike, reason = strike_status(1.50, 1.505, match_usd=0.01, match_rel=0.0001)
-        self.assertEqual(reason, "match")
+        self.assertEqual(reason, "gamma")
 
     def test_default_parser_still_ignores_other_symbols(self):
         eth = {

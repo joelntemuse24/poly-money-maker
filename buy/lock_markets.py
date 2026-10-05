@@ -243,10 +243,8 @@ def strike_status(
 ) -> tuple[Optional[float], str]:
     """``(strike, reason)``.
 
-    A missing strike is ``strike_unknown``. When Gamma ``priceToBeat`` is
-    present it must sit within ``max(match_usd, match_rel * gamma)`` of
-    the RTDS boundary sample. Gamma alone is accepted: it is the official
-    strike. RTDS alone is accepted while Gamma has not published yet.
+    Gamma priceToBeat is authoritative when published. The boundary latch
+    supplies the strike while the official value is unavailable.
     """
     rtds = finite_float(rtds_strike)
     gamma = finite_float(gamma_strike)
@@ -260,10 +258,7 @@ def strike_status(
         return gamma, "gamma"
     if gamma is None:
         return rtds, "rtds"
-    tol = max(float(match_usd), float(match_rel) * gamma)
-    if abs(rtds - gamma) > tol:
-        return None, "strike_mismatch"
-    return rtds, "match"
+    return gamma, "gamma"
 
 
 def boundary_price(

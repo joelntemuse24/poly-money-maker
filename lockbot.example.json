@@ -24,12 +24,14 @@
   "s2_clip_cooldown_s": 1.0,
   "s2_sigma_window_s": 300.0,
   "s2_sigma_min_samples": 60,
-  "strategy2_markets": ["btc_5m"],
+  "strategy2_markets": [
+    "btc_5m"
+  ],
   "ask_min": 0.02,
   "taker_fee_rate": 0.07,
   "taker_fee_exponent": 1.0,
   "max_pay": 0.97,
-  "limit_tick_improve": 0,
+  "limit_tick_improve": 2,
   "price_tick": 0.01,
   "min_shares": 1.0,
   "min_order_usd": 1.0,
@@ -41,8 +43,16 @@
   "h2h_window_s": 10.0,
   "h2h_enabled": false,
   "market_rules": {
-    "btc_15m": {"Z": 0.0, "Pmax": 0.97, "edge_min": 0.0},
-    "btc_5m": {"Z": 0.25, "Pmax": 0.90, "edge_min": 0.0}
+    "btc_15m": {
+      "Z": 0.0,
+      "Pmax": 0.97,
+      "edge_min": 0.0
+    },
+    "btc_5m": {
+      "Z": 0.25,
+      "Pmax": 0.9,
+      "edge_min": 0.0
+    }
   },
   "elapsed_max_gap_s": 3.0,
   "strike_match_usd": 0.01,
@@ -51,7 +61,7 @@
   "vol_short_s": 300,
   "vol_long_s": 900,
   "vol_min_samples": 60,
-  "noise_frac": 0.00002,
+  "noise_frac": 2e-05,
   "settle_window_s": 60.0,
   "poll_s": 1.0,
   "eval_log_s": 30.0,
@@ -87,5 +97,8 @@
     "eth_5m": false,
     "sol_5m": false,
     "xrp_5m": false
-  }
+  },
+  "s1_side_lock_mode": "soft",
+  "s1_flip_z": 0.5,
+  "s1_fak_retries": 2
 }

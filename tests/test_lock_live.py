@@ -111,6 +111,83 @@ class BookFeedTests(unittest.TestCase):
         self.assertEqual(books["UP"]["asks"], [(0.4, 10.0)])
 
 
+class S1RevisionTests(unittest.TestCase):
+    def test_soft_flip_requires_z_and_edge(self):
+        cfg = apply_defaults({})
+        account = {"locked_side": "up", "s1_switches": 0, "spent_s1": 0, "spent_s2": 0, "spent_total": 0, "open_cost": 0, "cash": 500}
+        view = _view(expected=90.0)
+        flipped = evaluate_strategy1(view, account, cfg)
+        self.assertEqual(flipped["action"], "buy")
+        self.assertTrue(flipped["side_switch"])
+        self.assertEqual(evaluate_strategy1(view, {**account, "s1_switches": 1}, cfg)["reason"], "side_locked")
+        self.assertEqual(evaluate_strategy1(view, account, {**cfg, "s1_side_lock_mode": "hard"})["reason"], "side_locked")
+        self.assertEqual(evaluate_strategy1(view, {**account, "s1_switches": 1}, {**cfg, "s1_side_lock_mode": "off"})["action"], "buy")
+        self.assertEqual(evaluate_strategy1(view, account, {**cfg, "s1_flip_z": 100})["reason"], "flip_below")
+
+    def test_slack_is_capped_by_pmax(self):
+        from buy.lock_gates import evaluate_strategy1
+        cfg = apply_defaults({"limit_tick_improve": 2})
+        decision = evaluate_strategy1(_view(), {"spent_s1": 0, "spent_s2": 0, "spent_total": 0, "open_cost": 0, "cash": 500}, cfg)
+        self.assertEqual(decision["limit"], 0.82)
+
+    def test_pmax_clamps_slack(self):
+        cfg = apply_defaults({"market_rules": {"btc_15m": {"Pmax": .81}}})
+        decision = evaluate_strategy1(_view(), {"cash": 500}, cfg)
+        self.assertEqual(decision["limit"], .81)
+
+    def test_inflight_counts_in_strategy_and_exposure_and_restart_spend(self):
+        import lockbot
+        bot = lockbot.LockBot.__new__(lockbot.LockBot)
+        bot.state = {"positions": {"a": {"slug": "market", "strategy": "s1", "cost": 5, "settled_ts": 1}}}
+        bot.paper = []
+        bot.inflight = {"live": {"slug": "market", "strategy": "s1", "notional": 5}}
+        self.assertEqual(bot._strategy_spent("market", "s1"), 10)
+        self.assertEqual(bot._strategy_spent("market", "s2"), 0)
+        self.assertEqual(bot._pending_usd(), 5)
+
+    def test_retry_is_bounded_and_rechecks_fresh_signal(self):
+        import lockbot
+        from unittest.mock import Mock, patch
+        bot = lockbot.LockBot.__new__(lockbot.LockBot)
+        bot.cfg = apply_defaults({})
+        bot._account = Mock(return_value={"cash": 500})
+        bot._view = Mock(return_value=_view())
+        bot._act = Mock()
+        with patch("lockbot.time.sleep") as pause:
+            bot._retry_miss(object(), {"strategy": "s1", "retry": 0})
+            pause.assert_called_once_with(.3)
+        self.assertEqual(bot._act.call_args.args[1]["retry"], 1)
+        bot._retry_miss(object(), {"strategy": "s1", "retry": 2})
+        self.assertEqual(bot._act.call_count, 1)
+        bot._account.return_value = {"cash": 500, "spent_s1": 20}
+        with patch("lockbot.time.sleep"):
+            bot._retry_miss(object(), {"strategy": "s1", "retry": 0})
+        self.assertEqual(bot._act.call_count, 1)
+
+    def test_post_thread_rechecks_caps_before_dispatch(self):
+        import lockbot
+        import threading
+        from types import SimpleNamespace
+        from unittest.mock import Mock, patch
+        bot = lockbot.LockBot.__new__(lockbot.LockBot)
+        bot.cfg = apply_defaults({})
+        bot.inflight = {"r": {"notional": 5}}
+        bot._lock = threading.RLock()
+        bot._warmed = {"cid"}
+        bot._results = Mock()
+        bot._account_locked = Mock(return_value={"cash": 500, "spent_s1": 20, "loss_stopped": False, "cash_unknown": False})
+        market = SimpleNamespace(condition_id="cid", key="btc_15m", end_ts=1e20)
+        with patch("lockbot.dispatch_buy") as post:
+            bot._post_job((market, {"reservation": "r", "strategy": "s1", "notional": 5}, 1))
+            post.assert_not_called()
+        self.assertNotIn("r", bot.inflight)
+
+    def test_no_match_is_not_kill_failure(self):
+        from buy.lock_orders import fak_no_match, kill_failure
+        self.assertTrue(fak_no_match("no orders found"))
+        self.assertFalse(kill_failure("no orders found"))
+        self.assertTrue(kill_failure("unauthorized"))
+
 class CapTests(unittest.TestCase):
     def test_market_rule_combined_usd_overrides_the_global_cap(self):
         cfg = apply_defaults(

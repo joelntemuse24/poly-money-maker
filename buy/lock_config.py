@@ -30,6 +30,9 @@ DEFAULTS: dict[str, Any] = {
     "s1_tau_max": 58.0,
     "s1_tau_min": 1.0,
     "s1_clip_cooldown_s": 1.0,
+    "s1_side_lock_mode": "soft",
+    "s1_flip_z": 0.5,
+    "s1_fak_retries": 2,
     # Strategy 2 (R2e): Binance 3s move on BTC 5m, tau 5..300.
     "s2_tau_max": 300.0,
     "s2_tau_min": 5.0,
@@ -45,7 +48,7 @@ DEFAULTS: dict[str, Any] = {
     "taker_fee_rate": 0.07,
     "taker_fee_exponent": 1.0,
     "max_pay": 0.97,
-    "limit_tick_improve": 0,
+    "limit_tick_improve": 2,
     "price_tick": 0.01,
     "min_shares": 1.0,
     "min_order_usd": 1.0,
@@ -160,6 +163,12 @@ def validate_config(cfg: Any) -> None:
     """Raise ``ValueError`` on a knob that would make entries unsafe."""
     if not isinstance(cfg, dict):
         raise ValueError("config must be an object")
+    if cfg.get("s1_side_lock_mode", "soft") not in {"hard", "soft", "off"}:
+        raise ValueError("s1_side_lock_mode must be hard, soft, or off")
+    for key in ("s1_flip_z", "s1_fak_retries", "limit_tick_improve", "s1_clip_cooldown_s"):
+        value = _num(cfg.get(key, DEFAULTS[key]), -1)
+        if value < 0 or (key in {"s1_fak_retries", "limit_tick_improve"} and value != int(value)):
+            raise ValueError(f"{key} must be a nonnegative number (integer for counts)")
     positive = (
         "per_market_usd",
         "combined_per_market_usd",
