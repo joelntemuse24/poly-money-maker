@@ -107,7 +107,7 @@ DEFAULT_SELL_KNOBS = {
     # Any-time scrap veto: no loser scrap while the 60s TWAP or (use_live)
     # the live Chainlink price is within $usd of the strike or on the
     # scrapped leg's side. A stale reading drops out; both stale: no veto.
-    "scrap_oracle_veto_enabled": True,
+    "scrap_oracle_veto_enabled": False,
     "scrap_oracle_veto_usd": 5.0,
     "scrap_oracle_veto_stale_s": 3.0,
     "scrap_oracle_veto_use_live": True,
@@ -975,13 +975,12 @@ def scrap_oracle_settings(cfg: Any) -> Tuple[bool, float, float, bool]:
     """``(enabled, threshold_usd, stale_s, use_live)`` for the scrap oracle veto.
 
     A missing, non-numeric, non-finite or negative value takes the default
-    (on, $5, 3s, live on), so a bad hot-reload edit cannot silently widen
-    the veto.
+    (off, $5, 3s, live on).
     """
     get = cfg.get if isinstance(cfg, dict) else (lambda _k, d=None: d)
 
     def _flag(key: str) -> bool:
-        raw = get(key, True)
+        raw = get(key, False if key == "scrap_oracle_veto_enabled" else True)
         if isinstance(raw, str):
             return raw.strip().lower() not in ("0", "false", "no", "off", "")
         return bool(raw)

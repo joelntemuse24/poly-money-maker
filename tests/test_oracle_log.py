@@ -601,13 +601,13 @@ class DecisionIsolationTests(unittest.TestCase):
                 for target in node.targets:
                     if isinstance(target, ast.Name) and target.id == "DEFAULTS":
                         defaults_value = ast.literal_eval(node.value)
-        self.assertIs(defaults_value["oracle_log_enabled"], True)
+        self.assertIs(defaults_value["oracle_log_enabled"], False)
         self.assertEqual(defaults_value["sell_late_window_s"], 0.0)
         self.assertEqual(defaults_value["sell_oracle_edge_per_ttm"], 0.0)
         self.assertEqual(defaults_value["sell_oracle_edge_persist_s"], 3.0)
         self.assertEqual(defaults_value["sell_oracle_stale_s"], 0.0)
         self.assertEqual(defaults_value["sell_oracle_edge_floor_usd"], 0.0)
-        self.assertIs(example["oracle_log_enabled"], True)
+        self.assertIs(example["oracle_log_enabled"], False)
         self.assertEqual(example["sell_late_window_s"], 0.0)
         self.assertEqual(example["sell_oracle_edge_per_ttm"], 0.0)
         self.assertEqual(example["sell_oracle_edge_persist_s"], 3.0)

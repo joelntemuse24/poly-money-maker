@@ -102,10 +102,10 @@ POST. **Late-window oracle veto is off by default:** `sell_late_window_s`
 `sell_oracle_edge_floor_usd`, `sell_oracle_edge_per_ttm`, and
 `sell_oracle_stale_s` also default to 0, so setting only the window back
 above 0 does not restore the old $25 / 1.5×TTM / 5s-stale veto.
-`sell_oracle_edge_persist_s` stays 3. `oracle_log_enabled` stays true; the
+`sell_oracle_edge_persist_s` stays 3. `oracle_log_enabled` stays false; the
 tape is audit-only. With these defaults the late veto adds nothing.
-**Scrap oracle veto (#234) is separate and on by default:**
-`scrap_oracle_veto_enabled` true, `scrap_oracle_veto_usd` 5.0,
+**Scrap oracle veto is disabled in the live sell path:**
+`scrap_oracle_veto_enabled` false, `scrap_oracle_veto_usd` 5.0,
 `scrap_oracle_veto_stale_s` 3.0, `scrap_oracle_veto_use_live` true
 (hot-reloaded). With `margin = twap − strike` and `live_margin =
 live_price − strike` (in-memory RTDS 60s sample, the live
@@ -210,7 +210,7 @@ already sets. Code defaults arm at `sell_threshold` 0.02, print
 `sell_late_window_s` 0, floor / per-TTM / stale edge knobs 0,
 `sell_oracle_edge_persist_s` 3, `sell_dump_max_ttm_s` 0 (example 240),
 and `sell_scrap_max_ttm_s` 0 (example 600).
-`oracle_log_enabled` stays true. New keys absent from the live file take these
+`oracle_log_enabled` stays false. New keys absent from the live file take these
 defaults after the operator pulls and restarts. Do not edit live JSON
 from this repo.
 
@@ -284,7 +284,7 @@ Shared `buy/` helpers exist for mint, pathlog, and the recording-only oracle tap
 - `buy/chain.py` — Polygon eth_call prechecks (`mintbot`)
 - `buy/contracts.py` — atomic mint calldata (`mintbot`), the opt-in redeem batch, and the pUSD transfer used by the A→B top-up
 - `buy/oracle_log.py` — Chainlink BTC/USD 60s TWAP tape
-  (`logs/oracle_twap.jsonl`). `oracle_log_enabled` stays on. The
+  (`logs/oracle_twap.jsonl`). `oracle_log_enabled` stays off. The
   loser-scrap veto stays off (`sell_late_window_s` 0, and the floor /
   per-TTM / stale edge keys 0). `sell_oracle_edge_persist_s` stays 3.
  The tape file is audit-only.

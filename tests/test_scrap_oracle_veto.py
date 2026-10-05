@@ -125,8 +125,8 @@ class VetoHelperTests(unittest.TestCase):
         self.assertEqual(_veto(None, TWAP_UP_WINNING)[:2], (False, "bad_leg"))
 
     def test_settings_defaults_and_bad_values(self):
-        self.assertEqual(scrap_oracle_settings({}), (True, 5.0, 3.0, True))
-        self.assertEqual(scrap_oracle_settings(None), (True, 5.0, 3.0, True))
+        self.assertEqual(scrap_oracle_settings({}), (False, 5.0, 3.0, True))
+        self.assertEqual(scrap_oracle_settings(None), (False, 5.0, 3.0, True))
         self.assertEqual(
             scrap_oracle_settings(
                 {"scrap_oracle_veto_enabled": False, "scrap_oracle_veto_usd": 7.5,
@@ -138,12 +138,12 @@ class VetoHelperTests(unittest.TestCase):
             scrap_oracle_settings(
                 {"scrap_oracle_veto_usd": "abc", "scrap_oracle_veto_stale_s": -1}
             ),
-            (True, 5.0, 3.0, True),
+            (False, 5.0, 3.0, True),
         )
         self.assertFalse(scrap_oracle_settings({"scrap_oracle_veto_enabled": "false"})[0])
         self.assertTrue(scrap_oracle_settings({"scrap_oracle_veto_enabled": "true"})[0])
         self.assertFalse(scrap_oracle_settings({"scrap_oracle_veto_use_live": "off"})[3])
-        self.assertTrue(DEFAULT_SELL_KNOBS["scrap_oracle_veto_enabled"])
+        self.assertFalse(DEFAULT_SELL_KNOBS["scrap_oracle_veto_enabled"])
         self.assertEqual(DEFAULT_SELL_KNOBS["scrap_oracle_veto_usd"], 5.0)
         self.assertEqual(DEFAULT_SELL_KNOBS["scrap_oracle_veto_stale_s"], 3.0)
         self.assertTrue(DEFAULT_SELL_KNOBS["scrap_oracle_veto_use_live"])
@@ -291,281 +291,21 @@ class SellLoopVetoTests(unittest.TestCase):
         ns["remember_persisted_state"](state)
         ns["_manage_sells_locked"](cfg, state, object())
 
-    def test_1791039600_replay_never_scraps_the_up_leg(self):
-        ns, events, fak_calls, clock, intent, _view, end = self._setup()
-        cfg = _scrap_cfg()
-        while clock["now"] < end - 1.0:
-            self._tick(ns, cfg, intent)
-            clock["now"] += 0.5
-        self.assertEqual(fak_calls, [])
-        self.assertFalse(intent.get("sold_loser"))
-        self.assertIsNone(intent.get("sell_loser_armed_at"))
-        vetoes = _named(events, "scrap_oracle_veto")
-        self.assertGreaterEqual(len(vetoes), 6)
-        # Throttled to once per 5s per bag across ~30s of 0.5s ticks.
-        self.assertLessEqual(len(vetoes), 7)
-        row = vetoes[0]
-        self.assertEqual(row["slug"], "btc-updown-15m-1791039600")
-        self.assertEqual(row["side"], "up")
-        self.assertAlmostEqual(row["bid"], 0.01)
-        self.assertAlmostEqual(row["ttm"], 31.0)
-        self.assertEqual(row["twap"], TWAP_UP_WINNING)
-        self.assertEqual(row["strike"], STRIKE)
-        self.assertAlmostEqual(row["margin"], 0.42)
-        self.assertEqual(row["threshold"], 5.0)
-        self.assertEqual(row["why"], "oracle_favors_leg")
-        self.assertFalse(_named(events, "scrap_oracle_stale"))
-        self.assertFalse(_named(events, "sell_loser_persist"))
-
-    def test_within_threshold_blocks(self):
-        ns, events, fak_calls, clock, intent, _view, _end = self._setup(twap=STRIKE - 4.0)
-        cfg = _scrap_cfg()
-        for _ in range(20):
-            self._tick(ns, cfg, intent)
-            clock["now"] += 0.5
-        self.assertEqual(fak_calls, [])
-        self.assertEqual(_named(events, "scrap_oracle_veto")[0]["why"], "within_threshold")
-
-    def test_clear_against_scraps_with_margin_in_the_events(self):
-        ns, events, fak_calls, clock, intent, _view, _end = self._setup(twap=STRIKE - 6.0)
-        cfg = _scrap_cfg()
-        self._tick(ns, cfg, intent)
-        armed = intent.get("sell_loser_armed_at")
-        self.assertEqual(armed, clock["now"])
-        clock["now"] = armed + 1.9
-        self._tick(ns, cfg, intent)
-        self.assertEqual(fak_calls, [])
-        clock["now"] = armed + 2.0
-        self._tick(ns, cfg, intent)
-        self.assertEqual(len(fak_calls), 1)
-        self.assertEqual(fak_calls[0]["token_id"], "up-tok")
-        self.assertTrue(intent.get("sold_loser"))
-        self.assertFalse(_named(events, "scrap_oracle_veto"))
-        done = _named(events, "sell_loser_done")
-        self.assertEqual(len(done), 1)
-        self.assertAlmostEqual(done[0]["oracle_margin"], -6.0)
-        self.assertEqual(done[0]["oracle_strike"], STRIKE)
-        self.assertEqual(done[0]["oracle_why"], "clear_against")
-        sweep = _named(events, "sell_scrap_sweep")
-        self.assertEqual(len(sweep), 1)
-        self.assertAlmostEqual(sweep[0]["oracle_margin"], -6.0)
-        self.assertAlmostEqual(intent["sell_scrap_oracle_margin"], -6.0)
-
-    def test_oracle_turning_against_then_scraps_after_full_persist(self):
-        ns, events, fak_calls, clock, intent, view, end = self._setup(ttm=200.0)
-        cfg = _scrap_cfg()
-        for _ in range(10):
-            self._tick(ns, cfg, intent)
-            clock["now"] += 1.0
-        self.assertEqual(fak_calls, [])
-        self.assertIsNone(intent.get("sell_loser_armed_at"))
-        view.twap = STRIKE - 5.5
-        self._tick(ns, cfg, intent)
-        armed = intent["sell_loser_armed_at"]
-        self.assertEqual(armed, clock["now"])
-        clock["now"] = armed + 4.9
-        self._tick(ns, cfg, intent)
-        self.assertEqual(fak_calls, [])
-        # Swinging back inside $5 mid-persist resets the arm.
-        view.twap = STRIKE - 1.0
-        clock["now"] = armed + 5.0
-        self._tick(ns, cfg, intent)
-        self.assertEqual(fak_calls, [])
-        self.assertIsNone(intent.get("sell_loser_armed_at"))
-        view.twap = STRIKE - 8.0
-        self._tick(ns, cfg, intent)
-        rearmed = intent["sell_loser_armed_at"]
-        clock["now"] = rearmed + 5.0
-        self._tick(ns, cfg, intent)
-        self.assertEqual(len(fak_calls), 1)
-        self.assertTrue(intent.get("sold_loser"))
-        self.assertLess(end - clock["now"], 200.0)
-
-    def test_fire_time_recheck_blocks_the_post(self):
-        ns, events, fak_calls, clock, intent, view, _end = self._setup(twap=STRIKE - 6.0)
-        cfg = _scrap_cfg()
-        self._tick(ns, cfg, intent)
-        armed = intent["sell_loser_armed_at"]
-        clock["now"] = armed + 2.0
-        # Arm-phase read is clear; the read right before the FAK favours Up.
-        view.script = [STRIKE - 6.0, TWAP_UP_WINNING]
-        self._tick(ns, cfg, intent)
-        self.assertEqual(fak_calls, [])
-        self.assertFalse(intent.get("sold_loser"))
-        self.assertIsNone(intent.get("sell_loser_armed_at"))
-        vetoes = _named(events, "scrap_oracle_veto")
-        self.assertEqual(len(vetoes), 1)
-        self.assertEqual(vetoes[0]["phase"], "fire")
-
-    def test_stale_oracle_falls_back_to_scrap_and_logs_loudly(self):
-        ns, events, fak_calls, clock, intent, _view, _end = self._setup(age=4.0)
-        cfg = _scrap_cfg()
-        self._tick(ns, cfg, intent)
-        armed = intent["sell_loser_armed_at"]
-        self.assertEqual(armed, clock["now"])
-        clock["now"] = armed + 2.0
-        self._tick(ns, cfg, intent)
-        self.assertEqual(len(fak_calls), 1)
-        self.assertTrue(intent.get("sold_loser"))
-        self.assertFalse(_named(events, "scrap_oracle_veto"))
-        stale = _named(events, "scrap_oracle_stale")
-        self.assertGreaterEqual(len(stale), 1)
-        self.assertEqual(stale[0]["reason"], "stale_twap")
-        self.assertAlmostEqual(stale[0]["age_s"], 4.0)
-        self.assertEqual(stale[0]["level"], "WARNING")
-        self.assertEqual(stale[0]["side"], "up")
-        done = _named(events, "sell_loser_done")
-        self.assertEqual(done[0]["oracle_why"], "stale_twap")
-        self.assertIsNone(done[0]["oracle_margin"])
-
-    def test_missing_strike_or_feed_falls_back(self):
-        for kw, reason in (
-            ({"strike": None}, "missing_strike"),
-            ({"twap": None}, "missing_twap"),
-            ({"age": None}, "missing_twap_age"),
-        ):
-            with self.subTest(reason=reason):
-                ns, events, fak_calls, clock, intent, _view, _end = self._setup(**kw)
-                cfg = _scrap_cfg()
-                self._tick(ns, cfg, intent)
-                clock["now"] += 2.0
-                self._tick(ns, cfg, intent)
-                self.assertEqual(len(fak_calls), 1)
-                self.assertEqual(_named(events, "scrap_oracle_stale")[0]["reason"], reason)
-
-    def test_hot_reload_disable_and_threshold(self):
-        ns, events, fak_calls, clock, intent, view, _end = self._setup(twap=STRIKE - 3.0)
-        cfg = _scrap_cfg()
-        self._tick(ns, cfg, intent)
-        self.assertIsNone(intent.get("sell_loser_armed_at"))
-        cfg["scrap_oracle_veto_usd"] = 2.0
-        clock["now"] += 0.5
-        self._tick(ns, cfg, intent)
-        armed = intent["sell_loser_armed_at"]
-        self.assertEqual(armed, clock["now"])
-        view.twap = TWAP_UP_WINNING
-        cfg["scrap_oracle_veto_enabled"] = False
-        clock["now"] = armed + 2.0
-        self._tick(ns, cfg, intent)
-        self.assertEqual(len(fak_calls), 1)
-
-    def test_blocked_scrap_pulls_a_resting_scrap_sell(self):
-        ns, events, fak_calls, clock, intent, _view, _end = self._setup()
-        intent.update(
-            sell_scrap_rest_id="dry-rest-1",
-            sell_scrap_rest_size=50.0,
-            sell_scrap_rest_px=0.02,
-            sell_loser_leg="up",
-            sell_loser_armed_at=clock["now"] - 10.0,
-        )
-        self._tick(ns, _scrap_cfg(), intent)
-        self.assertFalse(intent.get("sell_scrap_rest_id"))
-        cancels = _named(events, "sell_scrap_rest_cancel")
-        self.assertEqual(len(cancels), 1)
-        self.assertEqual(fak_calls, [])
-
-    def test_blind_fak_is_vetoed(self):
-        ns, events, fak_calls, clock, intent, view, _end = self._setup(twap=STRIKE - 6.0)
-        cfg = _scrap_cfg()
-        intent.update(
-            sell_loser_leg="up",
-            sell_loser_armed_at=clock["now"] - 10.0,
-            sell_last_status="empty",
-        )
-        # Up book vanished: the blind 1c FAK path would fire.
-        book_empty = {"up": (None, 0.0, []), "dn": (0.98, 80.0, [{"price": "0.98", "size": "80"}])}
-        ns["_fetch_books"] = lambda *_a: (book_empty["up"], book_empty["dn"])
-        ns["_sell_inventory"] = lambda *a: (float(a[4]), "has_inventory")
-        view.script = [STRIKE - 6.0, TWAP_UP_WINNING]
-        self._tick(ns, cfg, intent)
-        self.assertEqual(fak_calls, [])
-        vetoes = _named(events, "scrap_oracle_veto")
-        self.assertEqual([row["phase"] for row in vetoes], ["blind"])
-        self.assertFalse(_named(events, "sell_scrap_blind"))
-        # Clear on both reads: the blind FAK goes out with the margin.
-        clock["now"] += 5.0
-        intent["sell_loser_armed_at"] = clock["now"] - 10.0
-        view.twap = STRIKE - 6.0
-        self._tick(ns, cfg, intent)
-        blind = _named(events, "sell_scrap_blind")
-        self.assertEqual(len(blind), 1)
-        self.assertAlmostEqual(blind[0]["oracle_margin"], -6.0)
-        self.assertEqual(len(fak_calls), 1)
-        self.assertAlmostEqual(fak_calls[0]["price"], 0.01)
-
-    def test_no_check_and_no_log_without_a_scrap_candidate(self):
-        ns, events, fak_calls, clock, intent, view, _end = self._setup()
-        ns["_fetch_books"] = lambda *_a: (
-            (0.50, 80.0, [{"price": "0.50", "size": "80"}]),
-            (0.49, 80.0, [{"price": "0.49", "size": "80"}]),
-        )
-        self._tick(ns, _scrap_cfg(), intent)
-        self.assertEqual(view.calls, 0)
-        self.assertFalse(_named(events, "scrap_oracle_veto"))
-        self.assertFalse(_named(events, "scrap_oracle_stale"))
-
-    def test_live_price_favouring_the_side_blocks_while_average_is_against(self):
-        ns, events, fak_calls, clock, intent, _view, _end = self._setup(
-            twap=STRIKE - 9.0, live=STRIKE + 0.8,
-        )
-        cfg = _scrap_cfg()
-        for _ in range(12):
-            self._tick(ns, cfg, intent)
-            clock["now"] += 0.5
-        self.assertEqual(fak_calls, [])
-        self.assertIsNone(intent.get("sell_loser_armed_at"))
-        row = _named(events, "scrap_oracle_veto")[0]
-        self.assertEqual(row["why"], "live_favors_leg")
-        self.assertAlmostEqual(row["margin"], -9.0)
-        self.assertAlmostEqual(row["live_price"], STRIKE + 0.8)
-        self.assertAlmostEqual(row["live_margin"], 0.8)
-        self.assertEqual(row["basis"], "twap+live")
-        self.assertFalse(_named(events, "scrap_oracle_stale"))
-
-    def test_both_against_by_more_than_5_scraps_with_live_fields(self):
-        ns, events, fak_calls, clock, intent, _view, _end = self._setup(
-            twap=STRIKE - 6.0, live=STRIKE - 7.5,
-        )
-        cfg = _scrap_cfg()
-        self._tick(ns, cfg, intent)
-        armed = intent["sell_loser_armed_at"]
-        clock["now"] = armed + 2.0
-        self._tick(ns, cfg, intent)
-        self.assertEqual(len(fak_calls), 1)
-        for name in ("sell_scrap_sweep", "sell_loser_done"):
-            row = _named(events, name)[0]
-            self.assertAlmostEqual(row["oracle_margin"], -6.0)
-            self.assertAlmostEqual(row["oracle_live_price"], STRIKE - 7.5)
-            self.assertAlmostEqual(row["oracle_live_margin"], -7.5)
-            self.assertEqual(row["oracle_basis"], "twap+live")
-        self.assertAlmostEqual(intent["sell_scrap_oracle_live_margin"], -7.5)
-
-    def test_live_turning_at_fire_time_blocks_the_post(self):
+    def test_disabled_gate_never_reads_oracle_bag_and_returns_disabled(self):
         ns, events, fak_calls, clock, intent, view, _end = self._setup(
-            twap=STRIKE - 9.0, live=STRIKE - 9.0,
+            twap=STRIKE + 1.0, live=STRIKE + 2.0,
         )
-        cfg = _scrap_cfg()
-        self._tick(ns, cfg, intent)
-        armed = intent["sell_loser_armed_at"]
-        clock["now"] = armed + 2.0
-        calls = {"n": 0}
-        base = view.__call__
+        gate = ns["_scrap_oracle_gate"]
+        self.assertEqual(
+            gate({}, CID, "up", now_s=clock["now"], slug=intent["slug"],
+                 bid=0.01, ttm=31.0, phase="arm"),
+            (False, "disabled", {}),
+        )
+        self.assertEqual(view.calls, 0)
 
-        def flip(cid):
-            calls["n"] += 1
-            if calls["n"] == 2:
-                view.live = STRIKE + 0.3
-            return base(cid)
-
-        ns["_oracle_bag_view"] = flip
-        self._tick(ns, cfg, intent)
-        self.assertEqual(fak_calls, [])
-        vetoes = _named(events, "scrap_oracle_veto")
-        self.assertEqual([(r["phase"], r["why"]) for r in vetoes], [("fire", "live_favors_leg")])
-
-    def test_live_stale_uses_the_average_alone_and_logs(self):
-        ns, events, fak_calls, clock, intent, _view, _end = self._setup(
-            twap=STRIKE - 6.0, live=STRIKE + 2.0, live_age=4.0,
+    def test_default_disabled_sell_path_does_not_veto_or_use_live_spot_as_strike(self):
+        ns, events, fak_calls, clock, intent, view, _end = self._setup(
+            twap=STRIKE + 1.0, live=85508.10, strike=85530.99,
         )
         cfg = _scrap_cfg()
         self._tick(ns, cfg, intent)
@@ -573,56 +313,14 @@ class SellLoopVetoTests(unittest.TestCase):
         clock["now"] = armed + 2.0
         self._tick(ns, cfg, intent)
         self.assertEqual(len(fak_calls), 1)
-        stale = _named(events, "scrap_oracle_stale")
-        self.assertEqual(stale[0]["reason"], "stale_live")
-        self.assertEqual(stale[0]["fallback"], "twap_only")
-        self.assertAlmostEqual(stale[0]["live_age_s"], 4.0)
-        self.assertEqual(stale[0]["level"], "WARNING")
-        done = _named(events, "sell_loser_done")[0]
-        self.assertEqual(done["oracle_basis"], "twap")
-        self.assertIsNone(done["oracle_live_margin"])
+        self.assertFalse(_named(events, "scrap_oracle_veto"))
+        self.assertFalse(_named(events, "scrap_oracle_stale"))
+        self.assertEqual(view.calls, 0)
 
-    def test_live_stale_average_favouring_still_blocks(self):
-        ns, events, fak_calls, clock, intent, _view, _end = self._setup(
-            live=STRIKE - 20.0, live_age=None,
+    def test_scrap_time_gate_still_applies_before_disabled_oracle_gate(self):
+        ns, events, fak_calls, clock, intent, view, _end = self._setup(
+            ttm=700.0, twap=STRIKE + 1.0,
         )
-        for _ in range(6):
-            self._tick(ns, _scrap_cfg(), intent)
-            clock["now"] += 0.5
-        self.assertEqual(fak_calls, [])
-        self.assertEqual(_named(events, "scrap_oracle_veto")[0]["why"], "oracle_favors_leg")
-        self.assertEqual(_named(events, "scrap_oracle_stale")[0]["reason"], "missing_live_age")
-
-    def test_both_stale_scraps_as_today(self):
-        ns, events, fak_calls, clock, intent, _view, _end = self._setup(
-            live=STRIKE + 2.0, age=4.0, live_age=5.0,
-        )
-        cfg = _scrap_cfg()
-        self._tick(ns, cfg, intent)
-        clock["now"] += 2.0
-        self._tick(ns, cfg, intent)
-        self.assertEqual(len(fak_calls), 1)
-        stale = _named(events, "scrap_oracle_stale")[0]
-        self.assertEqual((stale["reason"], stale["fallback"]), ("stale_twap", "none"))
-        self.assertAlmostEqual(stale["live_age_s"], 5.0)
-
-    def test_use_live_hot_reload_off_ignores_live(self):
-        ns, events, fak_calls, clock, intent, _view, _end = self._setup(
-            twap=STRIKE - 9.0, live=STRIKE + 1.0,
-        )
-        cfg = _scrap_cfg()
-        self._tick(ns, cfg, intent)
-        self.assertIsNone(intent.get("sell_loser_armed_at"))
-        cfg["scrap_oracle_veto_use_live"] = False
-        clock["now"] += 0.5
-        self._tick(ns, cfg, intent)
-        armed = intent["sell_loser_armed_at"]
-        clock["now"] = armed + 2.0
-        self._tick(ns, cfg, intent)
-        self.assertEqual(len(fak_calls), 1)
-
-    def test_scrap_time_gate_still_applies_first(self):
-        ns, events, fak_calls, clock, intent, view, _end = self._setup(ttm=700.0, twap=STRIKE - 9.0)
         self._tick(ns, _scrap_cfg(), intent)
         self.assertEqual(view.calls, 0)
         self.assertEqual(len(_named(events, "sell_scrap_time_gated")), 1)
