@@ -5,17 +5,14 @@ source of truth. Mint knobs below were confirmed by the operator on
 3 Oct 2026 at 13:25 IST (07:55 UTC). Rows marked "(30 Sep read)" were last
 read from the VM on 30 Sep 2026 and were not re-confirmed on 3 Oct.
 
-**polymintbot is stopped.** As of 2026-10-05 00:01 UTC the unit is
-**inactive** and still **enabled** at boot. `strategy_mint.json` was not
-changed. The mint code is still in the repo. Do not start `polymintbot`
-unless the operator asks.
+**polymintbot is live** for scrap (operator 2026-10-05). Do not stop it
+or change `strategy_mint.json` unless the operator asks. This doc's mint
+knob rows below remain the last confirmed snapshot.
 
-**Lockbot is the process under test.** `polylockbot.service` is installed
-and enabled. It is running **dry_run** at `9dabb08` (restarted 2026-10-05
-01:36 UTC). That dry-run failed the health check: about 103% of one core,
-strategy-2 receive-to-decision median 241ms, 12 book reconnects in 14
-minutes. It has not placed a live order. The example file stays
-`dry_run: true`.
+**Lockbot deleted (2026-10-05).** Entry point, lock modules, tests,
+example config, and `deploy/polylockbot.service` removed from the repo.
+On the VM: unit stopped, disabled, unit file removed; no `lockbot.py`
+process. Do not restore or start lockbot.
 
 **Recorder retired:** `polypathlog` / `pathlog.py` (15m only) stopped on
 22 Sep 2026 and is intentionally not restarted. The unit was still
@@ -174,52 +171,24 @@ Stored samples are 15s through the middle of the window, 2s around the open and 
 
 **The tape is audit-only.** `oracle_log_enabled` stays on. `sell_late_window_s` is 0, and `sell_oracle_edge_floor_usd`, `sell_oracle_edge_per_ttm`, and `sell_oracle_stale_s` are 0, so the late veto stays off and those zeros do not re-arm the old dollar or stale veto. The scrap oracle veto (#234) reads the feed's in-memory sample, never this file. `sell_oracle_edge_persist_s` stays 3. Mint eligibility, winner cash-out, and held dump do not read the tape.
 
-## Lockbot (idle settlement shell)
+## Lockbot — deleted
 
-Copy-trading strategies s1/s2/s3 removed by Joel 2026-10-05.
-Wallet-copy, NIULAI4-follow, Binance-move entry, late-oracle sniper,
-side locks, FAK retries, wallet tape, and head-to-head follow machinery
-have been deleted.
-
-`lockbot.py` is an idle settlement shell. `enabled` defaults false and
-`dry_run` defaults true. It has no order client, entry workers, paper
-entry simulation, or live activation path. Old strategy settings in a
-local config are ignored. Switching `dry_run` selects the corresponding
-legacy ledger for settlement and never enables orders.
-
-The shell hot-reloads supported config settings, retries settlement of
-expired ledger positions, and sleeps between ticks. Settlement uses the
-Chainlink time-weighted average price (TWAP) at expiry when a strike is
-available; Gamma resolved outcomes supply the fallback after restart or
-history loss. Up wins ties. Expired positions are excluded from
-`open_exposure_usd`. Paper state remains `positions_lockbot.json`; live
-state remains `positions_lockbot_live.json`. Existing uncertain-order
-records remain in the ledger without a submission or retry hook.
-Persisted `lockbot_windows.json` strikes remain readable for settlement.
-`python lockbot.py --reset-live` retains its isolated live-ledger reset.
-
-Oracle feeds are opened only for existing unsettled positions. The
-optional BTC 5m/15m book logger defaults false; enabling
-`book_log_enabled` opens market discovery and the CLOB book websocket.
-Its path, level count, throttle, and rotation settings hot-reload.
-`python lockbot_summary.py` reports legacy settlement P&L by stored
-strategy, market, and asset. Lockbot's automatic live redeem wiring has
-been removed; the independent mint redeem helpers remain available.
-
-This repository change is pending review. The VM has not been touched,
-and its previously recorded dry-run service state remains the last
-observation. Creating this PR does not merge, deploy, or restart a service.
+Removed 2026-10-05 by Joel: `lockbot.py`, `lockbot_summary.py`,
+`lockbot.example.json`, all `buy/lock_*.py`, `buy/relay_batch.py` (lockbot-only),
+lockbot tests, and `deploy/polylockbot.service`. Copy-trading strategies
+were already gone (#242). VM unit stopped/disabled and unit file removed.
+Mintbot and scrapbidder untouched.
 
 ## Deploy boundary
 
 Copy VM → GitHub for backup. Do not blindly merge GitHub onto the VM.
-`polymintbot` is stopped (inactive, still enabled at boot). Do not start
-it unless the operator asks. `polypathlog` is retired. `polylockbot` is
-installed; its last observed state is dry-run. This removal is pending review. Creating a PR is not a merge and not a restart.
+`polymintbot` is live for scrap; do not stop it or edit mint/scrap knobs
+unless the operator asks. `polypathlog` is retired. Lockbot/`polylockbot`
+is deleted. Creating a PR is not a merge and not a restart.
 
 ## Changelog
 
-- **2026-10-05** — Copy-trading strategies s1/s2/s3 removed by Joel. Idle settlement shell, dry-run by default; pending review and deployment.
+- **2026-10-05** — Lockbot deleted entirely (code + VM unit). Copy-trading strategies s1/s2/s3 already removed (#242). Mintbot left live for scrap.
 
 - **2026-10-03 13:25 IST** — Docs aligned to the live VM.
   - 200 shares a side, with `mint_sequential` and `redeem_enabled` on (`redeem_startup_sweep` off).

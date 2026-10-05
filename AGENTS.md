@@ -38,13 +38,10 @@ defaults** unless they say live. Live `strategy_mint.json` runs:
 - **Not live:** `sell_dump_tiers` (#231) and the post-dump kept stop
   (#228) are unmerged.
 
-**Lockbot is installed and dry-run.** `polylockbot` has been running
-`dry_run` true since 2026-10-05 00:01 UTC. `lockbot.example.json` stays
-`dry_run` true. It does not import `mintbot.py`, does not take the mint
-lock, and does not read `strategy_mint.json`. Do not restart it, and do
-not set `dry_run` false, unless the operator asks. Paper state is
-`positions_lockbot.json`. Live state is `positions_lockbot_live.json`.
-`python lockbot.py --reset-live` zeros only the live file.
+**Lockbot deleted.** `lockbot.py`, lock modules, tests, example config,
+and `deploy/polylockbot.service` are removed. On the VM the unit is
+stopped, disabled, and the unit file removed. Do not restore lockbot
+unless the operator asks. Mintbot/scrap config untouched.
 
 ## Safety boundaries
 
@@ -327,17 +324,9 @@ Shared `buy/` helpers exist for mint, pathlog, and the recording-only oracle tap
 - `buy/sister_topup.py` — one $5 pUSD top-up from A to B per broke episode.
   `sister_topup.py` submits the PROXY batch. Scrapbidder spawns it.
 
-`lockbot.py` is an idle settlement shell. Copy-trading strategies s1/s2/s3
-removed by Joel 2026-10-05. Wallet-copy and NIULAI4-follow machinery,
-entry evaluation, order clients, FAK retries, and paper entry simulation
-are deleted. Defaults are `enabled: false`, `dry_run: true`, and
-`book_log_enabled: false`. Hot reload can select the paper or live legacy
-ledger; every mode is entry-free. Settlement retains TWAP and Gamma
-fallbacks, persisted strikes, and expired exposure exclusion. Feeds run
-only for existing unsettled positions or optional BTC book logging.
-The independent mint redeem helpers remain; lockbot's live redeem
-activation is removed. `lockbot_summary.py` reports legacy settlements.
-This change is pending review; keep live services untouched.
+Lockbot is deleted (entrypoint, `buy/lock_*`, `buy/relay_batch.py`,
+summary script, example JSON, lockbot tests, and `polylockbot.service`).
+Do not restore it. Mintbot and scrapbidder stay untouched.
 
 Do not restore retired buybot modules (`entry_skip`, `hedge_gate`,
 `btc_price`, `clob_book_ws`, `depth_ladder`, `strategy_coherence`,
@@ -360,5 +349,4 @@ dependencies on the VM after merge. It does not restart services.
 Creating a PR is not authorization to merge or deploy it. After a pull,
 only `polymintbot` may be restarted, and only when the operator asks.
 `polypathlog` is retired. `polyscrapbid` stays stopped until the operator asks to
-start it. `polylockbot` is installed and stays dry-run until the operator
-asks to change `lockbot.json` and restart it.
+start it. Lockbot/`polylockbot` is deleted; do not reinstall or start it.

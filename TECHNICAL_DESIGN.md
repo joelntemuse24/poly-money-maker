@@ -66,8 +66,6 @@ Read Parts I and II straight through. Part III walks mint and sell. Part IV cove
   - [Sell-side sequence (winner / dump / loser)](#section-36)
   - [Redeem path (what exists vs what does not)](#section-37)
   - [State after expiry](#section-38)
-- [Part VII — Lockbot](#part-vii)
-  - [TWAP-lock taker](#section-39)
 - [Changelog](#changelog)
 
 <a id="part-i"></a>
@@ -100,8 +98,7 @@ Live tree: `/home/ntemusejoel/poly-money-maker` on Google Cloud VM `poly-vm`.
 
 | Unit | Program | Role | Observed |
 |---|---|---|---|
-| `polymintbot.service` | `mintbot.py` + gitignored `strategy_mint.json` | Atomic mint + sells | **stopped** as of 2026-10-05: inactive, still enabled at boot. Code and `strategy_mint.json` are unchanged. Do not start it unless the operator asks |
-| `polylockbot.service` | `lockbot.py` + gitignored `lockbot.json` | Repo: idle settlement shell with optional BTC book logging | **installed, enabled, dry_run** at `9dabb08` (restarted 2026-10-05 01:36 UTC). Health check failed (about 103% of one core, strategy-2 receive-to-decision median 241ms). No live orders |
+| `polymintbot.service` | `mintbot.py` + gitignored `strategy_mint.json` | Atomic mint + sells | **live** for scrap (operator 2026-10-05). Do not stop or change mint/scrap knobs unless the operator asks |
 | `polypathlog.service` | `pathlog.py` | Public CLOB path recorder (no orders) | **retired**: inactive since 22 Sep 2026 20:00 UTC (clean exit). Still `enabled`, so it would start on reboot; the operator should `systemctl disable polypathlog` |
 | `polyscrapbid.service` | `scrapbidder.py` (wallet B) | Opt-in sister bids | **inactive / disabled** — stays off |
 | Retired buy / danger / shadow / dense pathlog units | — | — | **stopped / must stay off** |
@@ -125,15 +122,6 @@ Durable local files (gitignored where noted):
 | `mintbot.log` / `pathlog.log` | Append logs; `mintbot.log` rolls at 2 MB into `logs/archive/` |
 | `logs/archive/mintbot.log.<UTC stamp>.gz` | Rotated mintbot history, gzipped, never pruned (#219) |
 | `logs/oracle_twap.jsonl` | Chainlink TWAP tape; rolls at 20 MB into `logs/archive/oracle_twap.jsonl.<UTC stamp>.gz`, never pruned (was 116 MB unrotated on 30 Sep; the first write after a restart on new code archives it) |
-| `lockbot.example.json` | Idle lockbot template. `enabled` false, `dry_run` true, book logging false |
-| `lockbot.json` | Lockbot knobs on the VM (gitignored). Hot-reloaded |
-| `positions_lockbot.json` | Paper ledger (gitignored) |
-| `positions_lockbot_live.json` | Legacy live ledger (gitignored). Selected for settlement when `dry_run` is false |
-| `lockbot_windows.json` | Latched strikes and window rows (gitignored). Reloaded on start |
-| `STOP_LOCKBOT` | If present, lockbot exits |
-| `.lockbot.lock` | Single-instance flock |
-| `logs/lockbot.jsonl` | Lockbot log, rolls at 20 MB |
-| `logs/books.jsonl` | Optional lockbot book tape. Off unless `book_log_enabled` is true. Rolls at `book_log_max_bytes` |
 | `.env` | Secrets — never read into chat or commit |
 
 <a id="section-3"></a>
@@ -855,7 +843,7 @@ Separate systemd unit. `SERIES = ["btc-up-or-down-15m"]` only. Polls CLOB books,
 
 `deploy/polypathlog.service` runs `pathlog.py` (no env file required for public books). Retired: keep it stopped and disabled ([§27](#section-27)).
 
-`deploy/polylockbot.service` runs `lockbot.py`. Its last observed VM state was installed, enabled, and dry-run. The repo now contains an idle settlement shell with no order activation path. Deployment and service changes require an operator request.
+Lockbot/`deploy/polylockbot.service` is deleted. Do not reinstall or start it.
 
 `deploy/polyscrapbid.service` is opt-in and stays disabled. It runs `scrapbidder.py` with `EnvironmentFile=.env.complement` only (not mintbot `.env`). Since #212, even with `bid_enabled` on, wallet B's 20-share post-scrap buy needs `scrap_hedge_enabled` (default **false**); the 10-share dump hedge after A sets `sell_dump_leg` needs `dump_hedge_enabled` (default true). Both use the FAK/rest notional band ($1.00–$1.50 by default). Markets A never held are not bid (`bid_absent_enabled` defaults false). There is no sister-miss dump. The A→B top-up (`sister_topup.py`, $5 of pUSD once per broke episode, reads `.env` itself) needs `topup_enabled` (default **false**). Scrapbidder re-reads mint intents after quoting books so a scrap during the pass is not planned from a stale snapshot (#203). It does not mint and does not FAK-sell. `bid_enabled` defaults false and `dry_run` defaults true. Do not commit `.env.complement`. Do not add `.env` to this unit. Same-wallet buyback is not implemented. Do not enable this unit unless the operator asks.
 
@@ -925,7 +913,7 @@ Operational rule: **VM files win**. GitHub is backup/history. Live `strategy_min
 
 The `Deploy to GCP` workflow runs on pushes to `main` that touch `mintbot.py`, `pathlog.py`, `check_path_backtest.py`, `buy/**` or `requirements.txt`. It does `git pull` + `pip install` on the VM and never restarts a service. Docs-only changes (including this file) do not trigger it and are not synced anywhere.
 
-After code pull: `polymintbot` is stopped (inactive, still enabled). Do not start it unless the operator asks. Restart `polylockbot` only when the operator asks; a pull does not restart it. The `poll_s >= 1` floor is now on `main`, so the VM's old local `mintbot.py` patch must be dropped (`git checkout -- mintbot.py`) before the pull, or `git pull` refuses to merge over it ([§32](#section-32) item 10). `polypathlog` is retired. Leave `polyscrapbid` stopped until the operator asks to start it.
+After code pull: `polymintbot` is live for scrap — do not stop it or change mint/scrap knobs unless the operator asks. A pull does not restart services. The `poll_s >= 1` floor is now on `main`, so the VM's old local `mintbot.py` patch must be dropped (`git checkout -- mintbot.py`) before the pull, or `git pull` refuses to merge over it ([§32](#section-32) item 10). `polypathlog` is retired. Leave `polyscrapbid` stopped until the operator asks to start it. Lockbot is deleted.
 
 <a id="section-31"></a>
 ## Testing without constructing a live bot
@@ -1112,7 +1100,7 @@ Assume the live `shares=200`, `sell_scrap_fraction=0.5`, scrap average 3¢, fees
 3. `git status --short mintbot.py` → empty (the old local `poll_s` patch is upstream now; drop it before a pull).
 4. Tail `mintbot.log` for `mint_confirmed`, `mint_submitted` (gas fields), `mint_skip_pending_reserve`, `sell_scrap_plan`, `sell_scrap_sweep`, `sell_scrap_outcome`, `sell_dump_done`, `sell_dump_kept`, `bag_risk`, `mint_failed`, `mint_seq_wait_cash` / `mint_seq_skip`, `redeem_confirmed` / `redeem_gave_up`.
 5. After a `mint_failed`, expect a remint after 30s up to 3 attempts, then that slug is skipped.
-6. Code change on VM → restart `polylockbot` only when the operator asks. `polymintbot` stays stopped unless the operator asks to start it. No local patch to re-apply.
+6. Code change on VM → restart `polymintbot` only when the operator asks. Do not touch mint/scrap knobs unless asked. Lockbot is deleted. No local patch to re-apply.
 7. GitHub sync is backup; VM remains SoT.
 
 
@@ -1335,46 +1323,9 @@ redeem_enabled (opt-in), separate thread:
 
 Adjacent mint may already have been submitted **before** expiry (lookahead). That is intentional and is the main fix for the “skipped 15m” bug.
 
-<a id="part-vii"></a>
-# Part VII — Lockbot
-
-Copy-trading strategies s1/s2/s3 removed by Joel 2026-10-05.
-Wallet-copy, NIULAI4-follow, Binance-move entry, late-oracle sniper,
-side locks, FAK retries, wallet tape, and head-to-head follow machinery
-have been deleted.
-
-`lockbot.py` is an idle settlement shell. `enabled` defaults false and
-`dry_run` defaults true. It has no order client, entry workers, paper
-entry simulation, or live activation path. Old strategy settings in a
-local config are ignored. Switching `dry_run` selects the corresponding
-legacy ledger for settlement and never enables orders.
-
-The shell hot-reloads supported config settings, retries settlement of
-expired ledger positions, and sleeps between ticks. Settlement uses the
-Chainlink time-weighted average price (TWAP) at expiry when a strike is
-available; Gamma resolved outcomes supply the fallback after restart or
-history loss. Up wins ties. Expired positions are excluded from
-`open_exposure_usd`. Paper state remains `positions_lockbot.json`; live
-state remains `positions_lockbot_live.json`. Existing uncertain-order
-records remain in the ledger without a submission or retry hook.
-Persisted `lockbot_windows.json` strikes remain readable for settlement.
-`python lockbot.py --reset-live` retains its isolated live-ledger reset.
-
-Oracle feeds are opened only for existing unsettled positions. The
-optional BTC 5m/15m book logger defaults false; enabling
-`book_log_enabled` opens market discovery and the CLOB book websocket.
-Its path, level count, throttle, and rotation settings hot-reload.
-`python lockbot_summary.py` reports legacy settlement P&L by stored
-strategy, market, and asset. Lockbot's automatic live redeem wiring has
-been removed; the independent mint redeem helpers remain available.
-
-This repository change is pending review. The VM has not been touched,
-and its previously recorded dry-run service state remains the last
-observation. Creating this PR does not merge, deploy, or restart a service.
-
 # Changelog
 
-- **2026-10-05** — Copy-trading strategies s1/s2/s3 removed by Joel. Retained legacy settlement and optional book logging; pending review and deployment.
+- **2026-10-05** — Lockbot deleted entirely (code, tests, unit file). Copy-trading strategies already removed (#242). Mintbot left live for scrap.
 
 - **2026-10-03 (PR #234, not live until pull + restart)** — Scrap oracle veto.
   - No loser scrap while the in-memory 60s TWAP or the live Chainlink price is within $5 of the strike or on the scrapped leg's side (`scrap_oracle_veto_enabled` true, `scrap_oracle_veto_usd` 5.0, `scrap_oracle_veto_stale_s` 3.0, `scrap_oracle_veto_use_live` true). It is re-checked every tick and right before the order is sent.
