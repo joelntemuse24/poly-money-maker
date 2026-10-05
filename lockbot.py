@@ -560,15 +560,16 @@ class LockBot:
         self._status(now)
 
     def _status(self, now: float) -> None:
-        if now - self._status_at < 30:
+        spot = time.time()
+        if spot - self._status_at < 30:
             return
-        self._status_at = now
+        self._status_at = spot
         latest = self.binance.latest() if self.binance is not None else None
-        age = None if latest is None else now - float(latest[1])
+        age = None if latest is None else spot - float(latest[1])
         book_stats = self.book_feed.stats()
         log_event(
             "feed_status",
-            book_age_s=self.book_feed.age_s(now),
+            book_age_s=self.book_feed.age_s(spot),
             book_error=self.book_feed.last_error()[:160],
             book_reconnects=book_stats.get("reconnects"),
             book_tokens=book_stats.get("tokens"),
@@ -576,7 +577,7 @@ class LockBot:
             binance_age_s=age,
             binance_px=None if latest is None else latest[2],
             binance_error=(self.binance.last_error()[:160] if self.binance is not None else ""),
-            wallet_age_s=self.wallets.age_s(now),
+            wallet_age_s=self.wallets.age_s(spot),
             wallet_fills=self.wallets.fills,
             wallet_error=self.wallets.last_error()[:160],
             markets=len(self.markets),
