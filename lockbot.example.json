@@ -42,6 +42,11 @@
   "fast_poll_s": 0.05,
   "h2h_window_s": 10.0,
   "h2h_enabled": false,
+  "book_log_enabled": false,
+  "book_log_levels": 5,
+  "book_log_min_interval_ms": 100,
+  "book_log_path": "logs/books.jsonl",
+  "book_log_max_bytes": 104857600,
   "market_rules": {
     "btc_15m": {
       "Z": 0.0,

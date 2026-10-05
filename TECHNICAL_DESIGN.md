@@ -133,6 +133,7 @@ Durable local files (gitignored where noted):
 | `STOP_LOCKBOT` | If present, lockbot exits |
 | `.lockbot.lock` | Single-instance flock |
 | `logs/lockbot.jsonl` | Lockbot log, rolls at 20 MB |
+| `logs/books.jsonl` | Optional lockbot book tape. Off unless `book_log_enabled` is true. Rolls at `book_log_max_bytes` |
 | `.env` | Secrets — never read into chat or commit |
 
 <a id="section-3"></a>
@@ -1456,6 +1457,8 @@ Going back to paper: set `dry_run` true and save. Posts stop, the paper ledger i
 `orjson` is optional. The VM was not given a new install. If `import orjson` fails, parsing uses the stdlib and `book_parser` in `feed_status` says `json`.
 
 State events in `logs/lockbot.jsonl`: eval, signal, paper_fill, entry, fill, settlement, redeem, wallet_fill, wallet_compare, feed_status, cash_balance, live_switch_fail, live_client_ready, ledger. `lockbot_summary.py` prints P&L, paper-fill counts, latency, and the wallet comparison. Live redeem reuses `RedeemDesk` through `buy/relay_batch.py`. Dry-run logs `redeem_dry_run` and sends nothing.
+
+**Book tape (`buy/lock_book_log.py`, off by default).** `book_log_enabled: true` writes `logs/books.jsonl` (path from `book_log_path`, relative to the repo root). Each row has `ts`, `recv_ts`, `token_id`, `slug`, `asset`, `duration`, `side`, `best_ask`, `best_bid`, and the top `book_log_levels` `ask_levels` and `bid_levels` as `[[px, sz], ...]`. Only the subscribed BTC 5m and 15m tokens are logged. The websocket apply thread calls one hook (`ClobBookFeed.touch_hook`). While the knob is off the hook is unset and the apply path does no extra work. While it is on the hook queues the token (one slot per token, bounded, drops are counted). A daemon thread `lockbot-book-log` reads the book, throttles, formats, and appends. A row is skipped when the best ask and best bid are unchanged and less than `book_log_min_interval_ms` has passed since that token's last row. `0` logs every change. The file rolls into `logs/archive/` at `book_log_max_bytes` (default 100 MB; `0` never rolls). All `book_log_*` knobs hot-reload. `feed_status` carries `book_log` (rows, drops, errors, queued) while it is on. No trading input reads this file.
 
 Creating a pull request does not merge it and does not restart `polylockbot` or `polymintbot`.
 
