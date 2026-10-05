@@ -14,6 +14,7 @@ import time
 from typing import Any, Callable, Optional
 
 from buy.lock_gates import parse_levels
+from buy.lock_ws import connect_kwargs, heartbeat_kind
 
 
 CLOB_MARKET_URL = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
@@ -218,8 +219,10 @@ class ClobBookFeed:
         self._threads: list[threading.Thread] = []
         self._ws: Any = None
         self._queue: queue.Queue = queue.Queue(maxsize=512)
+        self._dirty: set[str] = set()
         self._error = ""
         self._last_msg = 0.0
+        self._last_rx = 0.0
         self.connects = 0
         self.reconnects = 0
         self.messages = 0
@@ -249,6 +252,8 @@ class ClobBookFeed:
             if text and text not in cleaned:
                 cleaned.append(text)
         with self._lock:
+            if cleaned == self._wanted:
+                return
             self._wanted = cleaned
         # The reader thread is the only one that writes the socket.
         self._subs_dirty.set()
@@ -262,8 +267,14 @@ class ClobBookFeed:
             return set(self._subscribed)
 
     def book(self, token: str) -> Optional[dict]:
+        key = str(token)
         with self._lock:
-            cached = self._views.get(str(token))
+            if key in self._dirty:
+                row = self._books.get(key)
+                if row is not None:
+                    self._views[key] = materialize_book(row)
+                self._dirty.discard(key)
+            cached = self._views.get(key)
             if cached is None:
                 return None
             return {"asks": list(cached["asks"]), "bids": list(cached["bids"]), "recv_ts": cached["recv_ts"]}
@@ -305,14 +316,8 @@ class ClobBookFeed:
             self._last_msg = now
             self.messages += 1
             self._error = ""
-            seen: set[str] = set()
-            for token in touched:
-                if token in seen:
-                    continue
-                seen.add(token)
-                row = self._books.get(token)
-                if row is not None:
-                    self._views[token] = materialize_book(row)
+            # Sort when a reader asks. Doing it on every delta held the GIL.
+            self._dirty.update(touched)
 
     def _sync_subscriptions(self) -> None:
         self._subs_dirty.clear()
@@ -386,7 +391,7 @@ class ClobBookFeed:
                     self.reconnects += 1
             retries += 1
             try:
-                ws = websocket.create_connection(self.url, timeout=10)
+                ws = websocket.create_connection(self.url, timeout=10, **connect_kwargs())
                 with self._io_lock:
                     if self._stop.is_set():
                         try:
@@ -415,12 +420,20 @@ class ClobBookFeed:
                     try:
                         message = ws.recv()
                     except websocket.WebSocketTimeoutException:
-                        if self._last_msg > 0 and self._clock() - self._last_msg > 15.0:
+                        if self._last_rx > 0 and self._clock() - self._last_rx > 15.0:
                             break
                         continue
                     except Exception as exc:
                         self._note_error(exc)
                         break
+                    self._last_rx = self._clock()
+                    kind = heartbeat_kind(message)
+                    if kind == "PING":
+                        if not self._send_text("PONG"):
+                            break
+                        continue
+                    if kind == "PONG":
+                        continue
                     try:
                         self._queue.put_nowait(message)
                     except queue.Full:
@@ -448,15 +461,23 @@ class ClobBookFeed:
                 self._note_error(exc)
 
     def _ping_socket(self, ws: Any) -> bool:
-        """Ping from the reader thread. A failure drops the socket there."""
-        if not _sock_open(ws):
-            return False
-        try:
-            ws.ping()
-            return True
-        except Exception as exc:
-            self._note_error(exc)
-            return False
+        """Text ``PING`` from the reader thread. The market channel does not
+        treat a WebSocket protocol ping as a heartbeat."""
+        return self._send_text("PING")
+
+    def _send_text(self, text: str) -> bool:
+        with self._io_lock:
+            ws = self._ws
+            if not _sock_open(ws):
+                return False
+            try:
+                ws.settimeout(2.0)
+                ws.send(text)
+                ws.settimeout(1.0)
+                return True
+            except Exception as exc:
+                self._note_error(exc)
+                return False
 
     def _ping_loop(self) -> None:
         """Ask the reader to ping. This thread never touches the socket."""

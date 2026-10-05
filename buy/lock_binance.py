@@ -10,12 +10,32 @@ from collections import deque
 from typing import Any, Callable, Optional
 
 from buy.lock_fair import resample_1s, sigma_1s
+from buy.lock_ws import connect_kwargs
 
 
+# aggTrade is the same last price as the raw trade stream (field ``p``,
+# time ``T``). It collapses prints that share a price and a millisecond,
+# which is the 3-second move this feed is for. bookTicker is a quote, not
+# that trade, and on BTC it is often busier, so it is not used.
 BINANCE_TRADE_URLS = (
-    "wss://stream.binance.com:9443/ws/btcusdt@trade",
-    "wss://data-stream.binance.vision/ws/btcusdt@trade",
+    "wss://stream.binance.com:9443/ws/btcusdt@aggTrade",
+    "wss://data-stream.binance.vision/ws/btcusdt@aggTrade",
 )
+
+try:
+    import orjson
+
+    def _loads(raw: Any) -> Any:
+        if isinstance(raw, str):
+            raw = raw.encode("utf-8")
+        return orjson.loads(raw)
+
+except ImportError:  # pragma: no cover - depends on the environment
+
+    def _loads(raw: Any) -> Any:
+        if isinstance(raw, (bytes, bytearray)):
+            raw = raw.decode("utf-8", "replace")
+        return json.loads(raw)
 
 
 def parse_trade(raw: Any) -> Optional[tuple[float, float]]:
@@ -27,8 +47,8 @@ def parse_trade(raw: Any) -> Optional[tuple[float, float]]:
         if not text or text.upper() in {"PING", "PONG"}:
             return None
         try:
-            payload = json.loads(text)
-        except json.JSONDecodeError:
+            payload = _loads(text)
+        except (json.JSONDecodeError, ValueError, TypeError):
             return None
     elif isinstance(raw, dict):
         payload = raw
@@ -36,7 +56,7 @@ def parse_trade(raw: Any) -> Optional[tuple[float, float]]:
         return None
     if not isinstance(payload, dict):
         return None
-    if payload.get("e") not in (None, "trade"):
+    if payload.get("e") not in (None, "trade", "aggTrade"):
         return None
     price = payload.get("p")
     stamp = payload.get("T", payload.get("E"))
@@ -176,7 +196,10 @@ class BinanceTradeFeed:
                         on_message=lambda _ws, message: self.handle_message(message),
                         on_error=lambda _ws, err: self._set_error(str(err)[:200]),
                     )
-                    ws.run_forever(ping_interval=20, ping_timeout=10)
+                    # Binance sends protocol pings. A client ping thread would
+                    # write the socket from a second thread. skip_utf8 keeps
+                    # the receive path from holding the GIL in the validator.
+                    ws.run_forever(ping_interval=0, **connect_kwargs())
                 except Exception as exc:
                     self._set_error(str(exc)[:200])
                 if self._stop.is_set():

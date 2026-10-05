@@ -3,6 +3,11 @@
 Subscribes to ``activity/trades`` and keeps fills by NIULAI4, asdaefef, and
 dvasdkasodk in the BTC 5m and 15m markets. Comparison against our own
 signals is arithmetic on the log. Nothing here places or changes an order.
+
+RTDS documents ``market_slug`` / ``event_slug`` filters on this topic. The
+live server ignores them and still sends every trade, or sends nothing, so
+the socket stays unfiltered. Frames that do not contain a watched wallet
+and a BTC up/down slug are dropped with a byte search before JSON parse.
 """
 
 from __future__ import annotations
@@ -14,6 +19,8 @@ import threading
 import time
 from collections import deque
 from typing import Any, Callable, Optional
+
+from buy.lock_ws import connect_kwargs, heartbeat_kind
 
 
 ACTIVITY_URL = "wss://ws-live-data.polymarket.com"
@@ -31,6 +38,59 @@ WALLETS = {
 }
 
 BTC_SLUG_PREFIXES = ("btc-updown-5m-", "btc-updown-15m-")
+_BTC_NEEDLE = b"btc-updown-"
+_BTC_NEEDLE_UPPER = b"BTC-UPDOWN-"
+_WALLET_NEEDLES: Optional[tuple[bytes, ...]] = None
+
+
+def _wallet_needles() -> tuple[bytes, ...]:
+    """Lowercase and checksummed address bytes. Computed once."""
+    global _WALLET_NEEDLES
+    if _WALLET_NEEDLES is not None:
+        return _WALLET_NEEDLES
+    checksum = None
+    try:
+        from eth_utils import to_checksum_address
+
+        checksum = to_checksum_address
+    except Exception:
+        checksum = None
+    found: list[bytes] = []
+    seen: set[bytes] = set()
+    for addr in WALLETS:
+        texts = [addr]
+        if checksum is not None:
+            try:
+                texts.append(checksum(addr))
+            except Exception:
+                pass
+        for text in texts:
+            raw = str(text).encode("ascii")
+            if raw not in seen:
+                seen.add(raw)
+                found.append(raw)
+    _WALLET_NEEDLES = tuple(found)
+    return _WALLET_NEEDLES
+
+
+def activity_worth_parsing(raw: Any) -> bool:
+    """True when the raw frame might be a watched BTC up/down fill.
+
+    A substring search, before ``json.loads``. Heartbeats are not fills.
+    Dicts (the test seam) are left for the parser.
+    """
+    if isinstance(raw, str):
+        blob = raw.encode("utf-8", "replace")
+    elif isinstance(raw, (bytes, bytearray)):
+        blob = bytes(raw)
+    else:
+        return True
+    if _BTC_NEEDLE not in blob and _BTC_NEEDLE_UPPER not in blob:
+        return False
+    for needle in _wallet_needles():
+        if needle in blob:
+            return True
+    return False
 
 
 def is_btc_updown(slug: str) -> bool:
@@ -544,6 +604,7 @@ class WalletTape:
         self._seen: set[str] = set()
         self._seen_order: deque[str] = deque()
         self._stop = threading.Event()
+        self._reconnect = threading.Event()
         self._thread: Optional[threading.Thread] = None
         self._ws: Any = None
         self._error = ""
@@ -562,12 +623,27 @@ class WalletTape:
 
     def stop(self) -> None:
         self._stop.set()
+        self._reconnect.set()
+        self._close_socket()
+
+    def request_reconnect(self) -> None:
+        """Ask the reader to drop the socket. Callers do not close it."""
+        self._reconnect.set()
+
+    def _close_socket(self) -> None:
         ws = self._ws
-        if ws is not None:
-            try:
-                ws.close()
-            except Exception:
-                return
+        self._ws = None
+        if ws is None or getattr(ws, "sock", None) is None:
+            return
+        try:
+            ws.close()
+        except Exception:
+            return
+
+    def _touch(self, now: float) -> None:
+        with self._lock:
+            self._last_msg = float(now)
+            self._error = ""
 
     def last_error(self) -> str:
         with self._lock:
@@ -612,24 +688,59 @@ class WalletTape:
         return delivered
 
     def _run(self) -> None:
+        """One reader. It sends the RTDS text PING and never shares the socket."""
         import websocket
 
+        backoff = 1.0
         while not self._stop.is_set():
+            self._reconnect.clear()
             try:
-                ws = websocket.WebSocketApp(
-                    self.url,
-                    on_open=lambda sock: sock.send(json.dumps(SUBSCRIBE_FRAME)),
-                    on_message=lambda _sock, message: self.handle_message(message),
-                    on_error=lambda _sock, err: self._set_error(str(err)[:200]),
-                )
+                ws = websocket.create_connection(self.url, timeout=10, **connect_kwargs())
                 self._ws = ws
-                ws.run_forever(ping_interval=20, ping_timeout=10)
+                try:
+                    ws.settimeout(1.0)
+                    ws.send(json.dumps(SUBSCRIBE_FRAME))
+                except Exception as exc:
+                    self._set_error(str(exc)[:200])
+                    self._close_socket()
+                    self._stop.wait(backoff)
+                    backoff = min(backoff * 2.0, 15.0)
+                    continue
+                next_ping = time.monotonic() + 5.0
+                while not self._stop.is_set() and not self._reconnect.is_set():
+                    now_mono = time.monotonic()
+                    if now_mono >= next_ping:
+                        try:
+                            ws.send("PING")
+                        except Exception as exc:
+                            self._set_error(str(exc)[:200])
+                            break
+                        next_ping = now_mono + 5.0
+                    try:
+                        message = ws.recv()
+                    except websocket.WebSocketTimeoutException:
+                        continue
+                    except Exception as exc:
+                        self._set_error(str(exc)[:200])
+                        break
+                    self._touch(self._clock())
+                    kind = heartbeat_kind(message)
+                    if kind == "PING":
+                        try:
+                            ws.send("PONG")
+                        except Exception:
+                            break
+                        continue
+                    if kind == "PONG" or not activity_worth_parsing(message):
+                        continue
+                    self.handle_message(message)
             except Exception as exc:
                 self._set_error(str(exc)[:200])
-            self._ws = None
+            self._close_socket()
             if self._stop.is_set():
                 return
-            self._stop.wait(2.0)
+            self._stop.wait(backoff)
+            backoff = min(backoff * 2.0, 15.0)
 
     def _set_error(self, message: str) -> None:
         with self._lock:

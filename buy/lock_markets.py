@@ -129,6 +129,28 @@ def window_starts(now: float, duration_s: float, *, ahead: int = 1) -> list[floa
     return [start + i * dur for i in range(0, ahead + 1)]
 
 
+def market_fetch_due(
+    *,
+    now: float,
+    fetched_at: float,
+    have_market: bool,
+    have_strike: bool,
+    refresh_s: float,
+) -> bool:
+    """Whether Gamma ``/events`` should be fetched again.
+
+    A slug we have never seen is due immediately. Once it has token ids and
+    ``priceToBeat``, the next fetch waits at least 60s. Until the strike is
+    published the shorter ``refresh_s`` still applies.
+    """
+    if not have_market or fetched_at <= 0:
+        return True
+    interval = float(refresh_s)
+    if have_strike:
+        interval = max(interval, 60.0)
+    return float(now) - float(fetched_at) >= interval
+
+
 def _metadata(event: dict) -> dict:
     meta = event.get("eventMetadata")
     if isinstance(meta, str):

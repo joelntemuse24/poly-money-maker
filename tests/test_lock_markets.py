@@ -10,6 +10,7 @@ from buy.lock_config import DEFAULTS, apply_defaults
 from buy.lock_markets import (
     enabled_keys,
     event_slug,
+    market_fetch_due,
     parse_lock_event,
     resolution_is_chainlink_twap60,
     rtds_symbol,
@@ -98,6 +99,9 @@ class MarketTests(unittest.TestCase):
         self.assertEqual(cfg["strategy1_market_usd"], 20.0)
         self.assertEqual(cfg["strategy2_market_usd"], 20.0)
         self.assertEqual(cfg["h2h_window_s"], 10.0)
+        self.assertIs(cfg["h2h_enabled"], False)
+        self.assertEqual(cfg["eval_log_s"], 30.0)
+        self.assertEqual(symbols_for(cfg), ["btc/usd"])
         self.assertEqual(cfg["clip_usd"], 5.0)
         self.assertEqual(cfg["max_open_exposure_usd"], 60.0)
         self.assertEqual(cfg["daily_loss_stop_usd"], 60.0)
@@ -111,6 +115,23 @@ class MarketTests(unittest.TestCase):
         self.assertIsNone(cfg["s2_q_edge_min"])
         for name in ("eth_15m", "sol_15m", "xrp_15m", "eth_5m", "sol_5m", "xrp_5m"):
             self.assertFalse(cfg["markets"][name])
+
+    def test_gamma_poll_slows_down_once_the_strike_is_known(self):
+        self.assertTrue(
+            market_fetch_due(now=100.0, fetched_at=0.0, have_market=False, have_strike=False, refresh_s=20.0)
+        )
+        self.assertFalse(
+            market_fetch_due(now=30.0, fetched_at=20.0, have_market=True, have_strike=False, refresh_s=20.0)
+        )
+        self.assertTrue(
+            market_fetch_due(now=40.0, fetched_at=20.0, have_market=True, have_strike=False, refresh_s=20.0)
+        )
+        self.assertFalse(
+            market_fetch_due(now=70.0, fetched_at=20.0, have_market=True, have_strike=True, refresh_s=20.0)
+        )
+        self.assertTrue(
+            market_fetch_due(now=80.0, fetched_at=20.0, have_market=True, have_strike=True, refresh_s=20.0)
+        )
 
     def test_strike_must_match_gamma_when_both_exist(self):
         strike, reason = strike_status(100.0, None)

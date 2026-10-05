@@ -11,9 +11,11 @@ changed. The mint code is still in the repo. Do not start `polymintbot`
 unless the operator asks.
 
 **Lockbot is the process under test.** `polylockbot.service` is installed
-and enabled. It has been running **dry_run** since 2026-10-05 00:01:40 UTC
-(deploy of `ded7bf2`). It has not placed a live order. The example file
-stays `dry_run: true`.
+and enabled. It is running **dry_run** at `9dabb08` (restarted 2026-10-05
+01:36 UTC). That dry-run failed the health check: about 103% of one core,
+strategy-2 receive-to-decision median 241ms, 12 book reconnects in 14
+minutes. It has not placed a live order. The example file stays
+`dry_run: true`.
 
 **Recorder retired:** `polypathlog` / `pathlog.py` (15m only) stopped on
 22 Sep 2026 and is intentionally not restarted. The unit was still
@@ -192,10 +194,17 @@ market. The combined cap is $40, so strategy 2 cannot spend strategy
 1's $20. ETH, SOL, and XRP stay off. Exposure cap is $60.
 The daily loss stop stays $60. Both hold to settlement and never sell.
 BTC 5m uses the same `btc/usd` Chainlink 60s TWAP as 15m, latched at
-the 5m open. Books are the CLOB market websocket. Binance is an
-in-memory BTCUSDT trade stream.
+the 5m open. The latch is written to gitignored `lockbot_windows.json`
+and reloaded on start, so a mid-window restart keeps the strike.
+Books are the CLOB market websocket (text `PING` every 10s, current and
+next BTC windows only). Binance is an in-memory `btcusdt@aggTrade`
+stream. The 3-second move still uses the last price and its trade time.
 
-A log-only RTDS `activity/trades` socket records fills by NIULAI4
+`h2h_enabled` (default false) is the only switch for the log-only RTDS
+`activity/trades` socket. It stays closed until the flag is true. The
+server does not apply slug filters on that topic, so when the tape is
+on, frames are dropped with a byte search before JSON parse. The tape
+records fills by NIULAI4
 (`0x44832d0d2ec11187c1e77d786feb15f6a50254c6`), asdaefef
 (`0x75cc3b63a2f2423085e10706c78b494017b93ce1`), and dvasdkasodk
 (`0x5d4aba8ad45bb5eab3499a0294b42da5d1e455d3`) in the BTC 5m and 15m
@@ -245,7 +254,8 @@ restarts it. Creating a PR is not a merge and not a restart.
 
 ## Changelog
 
-- **2026-10-05** — Lockbot live blockers (not merged, not deployed). Scoped CLOB books, event-driven strategy 2, separate paper and live ledgers, per-market combined caps, lazy live client, pUSD cash log. `polymintbot` is stopped on the VM. Lockbot stays dry-run.
+- **2026-10-05** — Lockbot feed CPU (not merged, not deployed). Skip websocket UTF-8 validation, text book `PING`, wallet byte filter, Binance `aggTrade`, strategy-2 quote path, 1ms GIL switch, persisted strikes. `h2h_enabled` now defaults false so the wallet socket stays closed. The VM is still the `9dabb08` dry-run.
+- **2026-10-05** — Lockbot live blockers merged as `9dabb08` and restarted dry-run. Health check failed (CPU about 103% of a core, strategy-2 receive-to-decision median 241ms). No live orders.
 - **2026-10-04** — Lockbot head-to-head uses the nearest signal inside 10s. Combined cap is $40 so each strategy keeps $20. Not deployed.
 - **2026-10-04** — Lockbot wallet tape: log-only comparison with NIULAI4, asdaefef, and dvasdkasodk. Not an order input. Not deployed.
 - **2026-10-04** — Lockbot added as a separate dry-run service. Mintbot knobs unchanged. Not deployed.
