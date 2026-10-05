@@ -327,39 +327,17 @@ Shared `buy/` helpers exist for mint, pathlog, and the recording-only oracle tap
 - `buy/sister_topup.py` — one $5 pUSD top-up from A to B per broke episode.
   `sister_topup.py` submits the PROXY batch. Scrapbidder spawns it.
 
-`lockbot.py` is its own process. Strategy 1 (`strategy1_enabled`) is the
-NIULAI4 ladder on BTC 15m and BTC 5m: from tau 58 to tau 1, buy the
-Chainlink favourite when `z_side >= Z`, `ask <= Pmax`, and
-`q - ask - fee >= edge_min`. Defaults are Z=0 / Pmax=0.97 on 15m and
-Z=0.25 / Pmax=0.90 on 5m, `edge_min` 0, `ask_min` 0.02, `max_pay` 0.97.
-Clips are `clip_usd` (5) up to `strategy1_market_usd` (20). The first
-fill locks that side. Strategy 2 (`strategy2_enabled`) is the R2e
-Binance 3-second move sniper on BTC 5m only (`|move| >= 2` sigma, ask
-0.02–0.98, no q filter). ETH/SOL/XRP 15m and 5m stay off.
-`strategy1_market_usd` and `strategy2_market_usd` are 20 each.
-`combined_per_market_usd` is 40, so in BTC 5m one strategy cannot spend
-the other's budget.
-`max_open_exposure_usd` is 60. The daily loss stop stays 60. Books come
-from the CLOB market websocket; Binance `aggTrade` prices are in
-memory (the 3-second move uses that last price). `h2h_enabled` (default
-false) is the wallet tape; false leaves that socket closed. Latched
-strikes persist in gitignored `lockbot_windows.json`. Dry-run
-walks the book after `dry_run_latency_s` (0.20) and logs receive,
-decision, post, and ack times. A separate RTDS `activity/trades`
-socket records fills by NIULAI4, asdaefef, and dvasdkasodk on BTC 5m
-and 15m. Each of their fills pairs with our nearest same-outcome
-signal inside `h2h_window_s` (10s). Farther signals stay unpaired.
-On BTC 5m the row also stores the Binance 3-second move at their fill
-and whether our strategy-2 trigger fired on that same direction inside
-the window. It does not place or change orders. It holds to settlement
-and never sells. Every threshold is in `lockbot.example.json`. A
-gitignored `lockbot.json` overrides it. `logs/lockbot.jsonl`,
-`positions_lockbot.json` (paper), `positions_lockbot_live.json`,
-and `lockbot_windows.json` stay gitignored. `python lockbot_summary.py`
-prints P&L, paper fills, latency by strategy, and the wallet
-head-to-head: the share of their fills we also signalled, the median
-and p90 of the signed gap, the price difference, and how many unpaired
-fills had a qualifying move (`missed`) versus none (`no_move`).
+`lockbot.py` is an idle settlement shell. Copy-trading strategies s1/s2/s3
+removed by Joel 2026-10-05. Wallet-copy and NIULAI4-follow machinery,
+entry evaluation, order clients, FAK retries, and paper entry simulation
+are deleted. Defaults are `enabled: false`, `dry_run: true`, and
+`book_log_enabled: false`. Hot reload can select the paper or live legacy
+ledger; every mode is entry-free. Settlement retains TWAP and Gamma
+fallbacks, persisted strikes, and expired exposure exclusion. Feeds run
+only for existing unsettled positions or optional BTC book logging.
+The independent mint redeem helpers remain; lockbot's live redeem
+activation is removed. `lockbot_summary.py` reports legacy settlements.
+This change is pending review; keep live services untouched.
 
 Do not restore retired buybot modules (`entry_skip`, `hedge_gate`,
 `btc_price`, `clob_book_ws`, `depth_ladder`, `strategy_coherence`,

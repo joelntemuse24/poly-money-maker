@@ -16,12 +16,6 @@ This file replaces the earlier guided tour of `buybothourly.py` (hourly FAK entr
 
 Read Parts I and II straight through. Part III walks mint and sell. Part IV covers helpers. Part V covers operations and sharp edges.
 
-## Strategy 3: NIULAI4 Fast-Follow
-
-Strategy 3 (`s3`) is an opt-in copy-follow lane. It watches NIULAI4 (`0x44832d0d2ec11187c1e77d786feb15f6a50254c6`) BUY fills in BTC 5m and 15m up/down markets and buys the same token. It has no model, edge, price ceiling, or s3-specific daily-loss gate. Each detected fill creates one `$10` clip, with a `$20` per-market cap. Orders are marketable FAK buys at technical limit `0.99`; detections with under three seconds to market end, SELLs, unsupported markets, and duplicates are skipped. `strategy3_enabled` defaults to `false`, so s1 and s2 retain their existing behavior and the wallet socket remains off unless h2h or s3 needs it.
-
-The detector order is Polygon `OrderFilled` configuration first, data-api `/v2/trades?user=...` fallback, and the existing RTDS activity wallet tape as the current operational source. Polygon and data-api adapters expose a clear configured stub until endpoint schemas are confirmed. s3 rows include `detect_source`, `detect_lag_ms`, `his_price`, `his_tx`, `our_limit`, `our_fill_price`, and order timing fields.
-
 ## Contents
 
 - [Part I — Picture](#part-i)
@@ -107,7 +101,7 @@ Live tree: `/home/ntemusejoel/poly-money-maker` on Google Cloud VM `poly-vm`.
 | Unit | Program | Role | Observed |
 |---|---|---|---|
 | `polymintbot.service` | `mintbot.py` + gitignored `strategy_mint.json` | Atomic mint + sells | **stopped** as of 2026-10-05: inactive, still enabled at boot. Code and `strategy_mint.json` are unchanged. Do not start it unless the operator asks |
-| `polylockbot.service` | `lockbot.py` + gitignored `lockbot.json` | BTC 5m/15m taker, hold to settlement | **installed, enabled, dry_run** at `9dabb08` (restarted 2026-10-05 01:36 UTC). Health check failed (about 103% of one core, strategy-2 receive-to-decision median 241ms). No live orders |
+| `polylockbot.service` | `lockbot.py` + gitignored `lockbot.json` | Repo: idle settlement shell with optional BTC book logging | **installed, enabled, dry_run** at `9dabb08` (restarted 2026-10-05 01:36 UTC). Health check failed (about 103% of one core, strategy-2 receive-to-decision median 241ms). No live orders |
 | `polypathlog.service` | `pathlog.py` | Public CLOB path recorder (no orders) | **retired**: inactive since 22 Sep 2026 20:00 UTC (clean exit). Still `enabled`, so it would start on reboot; the operator should `systemctl disable polypathlog` |
 | `polyscrapbid.service` | `scrapbidder.py` (wallet B) | Opt-in sister bids | **inactive / disabled** — stays off |
 | Retired buy / danger / shadow / dense pathlog units | — | — | **stopped / must stay off** |
@@ -131,10 +125,10 @@ Durable local files (gitignored where noted):
 | `mintbot.log` / `pathlog.log` | Append logs; `mintbot.log` rolls at 2 MB into `logs/archive/` |
 | `logs/archive/mintbot.log.<UTC stamp>.gz` | Rotated mintbot history, gzipped, never pruned (#219) |
 | `logs/oracle_twap.jsonl` | Chainlink TWAP tape; rolls at 20 MB into `logs/archive/oracle_twap.jsonl.<UTC stamp>.gz`, never pruned (was 116 MB unrotated on 30 Sep; the first write after a restart on new code archives it) |
-| `lockbot.example.json` | Lockbot template. `dry_run` true. Not authorization to go live |
+| `lockbot.example.json` | Idle lockbot template. `enabled` false, `dry_run` true, book logging false |
 | `lockbot.json` | Lockbot knobs on the VM (gitignored). Hot-reloaded |
 | `positions_lockbot.json` | Paper ledger (gitignored) |
-| `positions_lockbot_live.json` | Live ledger (gitignored). Loss, exposure, and spend when `dry_run` is false |
+| `positions_lockbot_live.json` | Legacy live ledger (gitignored). Selected for settlement when `dry_run` is false |
 | `lockbot_windows.json` | Latched strikes and window rows (gitignored). Reloaded on start |
 | `STOP_LOCKBOT` | If present, lockbot exits |
 | `.lockbot.lock` | Single-instance flock |
@@ -861,7 +855,7 @@ Separate systemd unit. `SERIES = ["btc-up-or-down-15m"]` only. Polls CLOB books,
 
 `deploy/polypathlog.service` runs `pathlog.py` (no env file required for public books). Retired: keep it stopped and disabled ([§27](#section-27)).
 
-`deploy/polylockbot.service` runs `lockbot.py` with the same `.env`. It is installed and enabled on the VM and stays in dry-run until `lockbot.json` sets `dry_run` false and the process is reloaded or restarted. See [§39](#section-39).
+`deploy/polylockbot.service` runs `lockbot.py`. Its last observed VM state was installed, enabled, and dry-run. The repo now contains an idle settlement shell with no order activation path. Deployment and service changes require an operator request.
 
 `deploy/polyscrapbid.service` is opt-in and stays disabled. It runs `scrapbidder.py` with `EnvironmentFile=.env.complement` only (not mintbot `.env`). Since #212, even with `bid_enabled` on, wallet B's 20-share post-scrap buy needs `scrap_hedge_enabled` (default **false**); the 10-share dump hedge after A sets `sell_dump_leg` needs `dump_hedge_enabled` (default true). Both use the FAK/rest notional band ($1.00–$1.50 by default). Markets A never held are not bid (`bid_absent_enabled` defaults false). There is no sister-miss dump. The A→B top-up (`sister_topup.py`, $5 of pUSD once per broke episode, reads `.env` itself) needs `topup_enabled` (default **false**). Scrapbidder re-reads mint intents after quoting books so a scrap during the pass is not planned from a stale snapshot (#203). It does not mint and does not FAK-sell. `bid_enabled` defaults false and `dry_run` defaults true. Do not commit `.env.complement`. Do not add `.env` to this unit. Same-wallet buyback is not implemented. Do not enable this unit unless the operator asks.
 
@@ -1344,141 +1338,44 @@ Adjacent mint may already have been submitted **before** expiry (lookahead). Tha
 <a id="part-vii"></a>
 # Part VII — Lockbot
 
-<a id="section-39"></a>
-## TWAP-lock taker
+Copy-trading strategies s1/s2/s3 removed by Joel 2026-10-05.
+Wallet-copy, NIULAI4-follow, Binance-move entry, late-oracle sniper,
+side locks, FAK retries, wallet tape, and head-to-head follow machinery
+have been deleted.
 
-`polymintbot` is stopped (inactive, still enabled at boot, code still in the repo). `lockbot.py` is the process under test. It does not import mintbot, does not take `.mintbot.lock`, and does not read `strategy_mint.json`. It buys and holds. It never sells.
+`lockbot.py` is an idle settlement shell. `enabled` defaults false and
+`dry_run` defaults true. It has no order client, entry workers, paper
+entry simulation, or live activation path. Old strategy settings in a
+local config are ignored. Switching `dry_run` selects the corresponding
+legacy ledger for settlement and never enables orders.
 
-### Architecture
+The shell hot-reloads supported config settings, retries settlement of
+expired ledger positions, and sleeps between ticks. Settlement uses the
+Chainlink time-weighted average price (TWAP) at expiry when a strike is
+available; Gamma resolved outcomes supply the fallback after restart or
+history loss. Up wins ties. Expired positions are excluded from
+`open_exposure_usd`. Paper state remains `positions_lockbot.json`; live
+state remains `positions_lockbot_live.json`. Existing uncertain-order
+records remain in the ledger without a submission or retry hook.
+Persisted `lockbot_windows.json` strikes remain readable for settlement.
+`python lockbot.py --reset-live` retains its isolated live-ledger reset.
 
-Two loops share one process and one `RLock` for state. Neither loop does the other's HTTP.
+Oracle feeds are opened only for existing unsettled positions. The
+optional BTC 5m/15m book logger defaults false; enabling
+`book_log_enabled` opens market discovery and the CLOB book websocket.
+Its path, level count, throttle, and rotation settings hot-reload.
+`python lockbot_summary.py` reports legacy settlement P&L by stored
+strategy, market, and asset. Lockbot's automatic live redeem wiring has
+been removed; the independent mint redeem helpers remain available.
 
-| Thread | Name | Work |
-|---|---|---|
-| Decision | main | Blocks on a `threading.Event`. A Binance aggTrade sets it before the callback returns. Otherwise it wakes for the next strategy-1 second, the next paper fill, or `poll_s` (1s). It does not spin on `fast_poll_s`. `sys.setswitchinterval(0.001)` so a feed thread cannot hold the GIL for the default 5ms. |
-| Slow | `lockbot-slow` | One Gamma `/events` fetch per enabled BTC window (again at 60s once `priceToBeat` is known; no second strike request). Strike latch (written to `lockbot_windows.json`), book subscribe, client warm, pUSD cash, settlement, `feed_status` every 30s. Wallet compare only when `h2h_enabled` is true. Cadence `poll_s`. |
-| Book read | `lockbot-book` | CLOB market websocket. `recv` only queues the raw frame. Sends the text `PING` every 10s. |
-| Book apply | `lockbot-book-apply` | Parses with `orjson` when that module imports, otherwise the stdlib `json`. Applies deltas to price→size maps. Sorts only when `book()` is read. |
-| Book ping | `lockbot-book-ping` | Sets a flag every 10s. The reader sends `PING`. If `sock` is `None`, it does nothing. |
-| Binance | `lockbot-binance` | `btcusdt@aggTrade`. The callback sets the decision event and returns. No second-thread protocol ping. |
-| Orders | `lockbot-orders` | Live FAK posts. Started only when the process is live. The decision thread enqueues and does not wait. |
-| Redeem | `lockbot-redeem` | Started when the process is live. Not started while `dry_run` is true. |
-| Wallets | `lockbot-wallets` | Off unless `h2h_enabled` is true. The socket is not opened when it is false. Log only. Byte-filters before JSON. |
+This repository change is pending review. The VM has not been touched,
+and its previously recorded dry-run service state remains the last
+observation. Creating this PR does not merge, deploy, or restart a service.
 
-`fast_poll_s` (0.05) remains in the config so an old file still validates. The decision wait does not use it.
-
-Strategy 2 reads the latest aggTrade when the event fires, not once per queued print. A burst coalesces into one evaluation. With the q filter off (the default), that evaluation uses the book and the 3-second move and does not resample the Chainlink path. Sigma for a window is computed once it is a full pre-window sample, then cached. Until then it refreshes at most every 5s. The 3-second price is the last aggTrade at or before that time, scanned from the end of the history. aggTrade's `p` and `T` are the same last-price fields as a raw trade.
-
-Live orders are handed to `LivePoster`, which reserves the notional before enqueueing and re-checks enabled state, cash, exposure, strategy, combined, and market caps immediately before signing. Unconfirmed reservations remain in the per-market, per-strategy, combined, exposure, and cash calculations; uncertain transport outcomes persist in the ledger across restart. `warm_market` pre-caches tick size, neg-risk, and fee on the slow thread. Live posting fails closed if metadata is not warm. `post_fak_buy` records decision, order-build, sign, HTTP-send, response, and fill/confirm timestamps. A no-match FAK is retried up to `s1_fak_retries` times after 300ms with a fresh view and cap check. No-match misses do not count as kill failures; authentication, oversize, and cap failures do. The result worker owns ledger and log I/O so the hot post handoff has no logging or ledger wait.
-
-### Books
-
-The socket is `wss://ws-subscriptions-clob.polymarket.com/ws/market`. The first frame is `{"type":"market","assets_ids":[...]}`. Later adds are `{"operation":"subscribe","assets_ids":[...]}`. Ids that leave the set are `{"operation":"unsubscribe","assets_ids":[...]}`.
-
-The set is the token ids of the **current and next BTC 5m and BTC 15m windows** only (up to eight tokens). ETH, SOL, and XRP are not subscribed. When a window rolls, the expired ids are unsubscribed.
-
-A `book` event replaces that token's map. A `price_change` writes one level; size 0 deletes it. `BUY` is the bid and `SELL` is the ask. `book()` returns asks ascending and bids descending.
-
-Every lockbot websocket passes `skip_utf8_validation=True` (`create_connection` for the book and the wallet tape, `run_forever` for Binance and the Chainlink RTDS feed). `wsaccel` is listed in `requirements.txt` as an optional speedup; websocket-client uses it when the import works, and lockbot still runs without it.
-
-The market channel keepalive is the text frame `PING` every 10 seconds. The server answers `PONG`. A protocol ping is not that heartbeat. The reader sends `PING` and answers a server `PING` with `PONG`. Reconnects use backoff from 0.5s to 15s, then resubscribe the full wanted set. A socket with no frame for 15s drops itself on the reader thread. No other thread calls `close`. Every send and close checks that the websocket and its `sock` are not `None`. `feed_status` includes `book_age_s`, `book_reconnects`, `book_tokens`, and `book_parser`.
-
-### Strategy 1 (NIULAI4)
-
-Every second from tau 58 to tau 1 on BTC 15m and BTC 5m. The side is the sign of projected TWAP minus strike (the elapsed-TWAP expectation below; a tie stays Up). Inside the minute, `sd` is `sqrt(sigma^2 * max(tau, 0.5)^3 / 10800 + (0.00002 K)^2)` and `q = Phi(z_side)`. A FAK buys when `z_side >= Z`, `ask <= Pmax`, and `q - ask - fee >= edge_min`. Defaults: 15m Z=0, Pmax=0.97, edge_min=0; 5m Z=0.25, Pmax=0.90, edge_min=0. `ask_min` is 0.02 and `max_pay` is 0.97. Clips are `clip_usd` (5) until `strategy1_market_usd` (20), including partial fills. Side locking is controlled by `s1_side_lock_mode`: `hard` preserves one-side behavior, `soft` (default) permits one opposite-side switch per market only when opposite projected-TWAP `z` clears `s1_flip_z`, edge is nonnegative, and ask is within `Pmax`, and `off` permits switches. `limit_tick_improve` applies to s1 FAK limits and is capped by both `max_pay` and `Pmax`.
-
-### Strategy 2 (R2e)
-
-BTC 5m only, tau 5 to 300, on each Binance trade (or one evaluation for a burst). `move` is the Binance BTCUSDT change over `s2_move_s` (3) divided by `sigma1s`, the population std of 1-second returns in the 300 seconds before the open (else a rolling 300-second window). `|move| >= s2_move_sigma` (2) buys that side, the direction of the move, when the ask is in `[ask_min, s2_ask_max]` (0.02–0.98) and still at or under `max_pay`. `s2_q_edge_min` null disables the optional `q - ask` filter (no fee in that filter). Clips are $5 up to `strategy2_market_usd` (20), with `s2_clip_cooldown_s` (1). It does not lock a side. It holds to settlement and never sells.
-
-### Settlement model
-
-Polymarket crypto up/down windows resolve on the Chainlink 60-second TWAP at the window end, against the strike (the same TWAP at the open, Gamma `priceToBeat`). In the last 60 seconds part of that average is already fixed. `buy/lock_fair.py` follows `q1e_lock_chainlink`: the known seconds stay, the remaining `tau - 1` seconds are filled with the live Chainlink print, and
-
-`E[F] = (known_sum + S * (tau - 1)) / 60`, `Var = sigma^2 * tau^3 / 10800`.
-
-`sigma` is the max of the 5-minute and 15-minute standard deviation of 1-second live returns, floored at `1e-9`. Up's win probability is the normal CDF of `(E[F] - K) / sqrt(Var + (0.00002 K)^2)`. The path is already Chainlink, so the Binance basis in the research script is 0. Before the last minute the expectation is the live price and the variance scale is `tau - 40`, matching q1e, but strategy 1 entries are the last 58 seconds. BTC 5m uses the same `btc/usd` Chainlink stream. The strike is latched at that window's open, within 1.25s, and written to gitignored `lockbot_windows.json` (slug, strike, start, end, asset, duration). Startup reloads rows whose window ended less than six hours ago, and also rebuilds a row from a position that already stored a strike. Settlement uses the position strike, then the latched strike. Gamma official `priceToBeat` takes precedence when published; the persisted latch supplies the fallback. Differences above $0.50 log `strike_mismatch`. A missing strike blocks strategy 1. Up wins ties (`final TWAP >= strike`).
-
-Expired positions (`end_ts <= now`) are excluded from open exposure in both paper and live ledgers. Each slow tick retries all expired, unsettled ledger positions by slug, including windows absent after restart. Settlement first uses the end TWAP with a position/latch strike, backfilled from Gamma `priceToBeat`, persisted windows, or the open boundary. If either price is missing, a resolved or closed Gamma market with decisive Up/Down payout prices supplies the winner. Positions and settlement logs record `settlement_source` (`twap` or `gamma`); unresolved Gamma requests retry at most once per slug per market refresh interval (minimum 20s).
-
-### Risk
-
-| Knob | Example default | What it does |
-|---|---|---|
-| `enabled` | true | False stops new entries. Redeem and logs continue. Hot-reloaded. |
-| `dry_run` | true | True does not post. See going live below. |
-| `clip_usd` | 5 | One order's dollars, before the caps. |
-| `strategy1_market_usd` | 20 | Strategy 1 spend in one market. |
-| `strategy2_market_usd` | 20 | Strategy 2 spend in one market. |
-| `combined_per_market_usd` | 40 | Both strategies together, unless a market rule overrides it. |
-| `market_rules.<key>.combined_usd` | unset | Optional. `btc_5m` and `btc_15m` each replace the global combined cap. |
-| `max_open_exposure_usd` | 60 | Open cost plus reserved paper notional. |
-| `daily_loss_stop_usd` | 60 | Dublin-day realized plus mark-to-bid. Latches until the next Europe/Dublin day. |
-| `min_cash_buffer_usd` | 5 | Cash left after the order. |
-| `dry_run_cash_usd` | 500 | Paper cash. Live mode does not use it. |
-| `stale_price_s`, `stale_book_s`, `stale_binance_s` | 2 | Local receive time. |
-| `dry_run_latency_s` | 0.20 | Paper fill walks the book this long after the decision. |
-| `h2h_window_s` | 10 | Wallet pairing window. |
-| `h2h_enabled` | false | Wallet tape socket. False leaves it closed. |
-
-The intended live overlay, not written into the example and not applied on the VM, is `clip_usd` 5, `strategy1_market_usd` 5, `strategy2_market_usd` 5, `market_rules.btc_5m.combined_usd` 10, `market_rules.btc_15m.combined_usd` 5, `daily_loss_stop_usd` 15, then `dry_run` false.
-
-Live cash is `ChainReader.pUSD_balance` of `FUNDER_ADDRESS`. That is the proxy's pUSD collateral (about $233 at the 2026-10-05 deploy; native USDC and USDC.e were 0). It is logged as `cash_balance` when the client comes up and then about every 15s. Unknown cash skips buys (`cash_unknown`). Dry-run cash stays `dry_run_cash_usd` minus exposure.
-
-A zero paper fill (`book_moved`) does not lock a side and does not spend the live ledger. Paper notional is reserved until the delayed walk.
-
-### Ledgers
-
-| Mode | File | Counters |
-|---|---|---|
-| `dry_run` true | `positions_lockbot.json` | Paper loss, exposure, spend. |
-| `dry_run` false | `positions_lockbot_live.json` | Live loss, exposure, spend. The paper file is not read. |
-
-Positions are keyed `slug|strategy|side`. `python lockbot.py --reset-live` replaces the live file with an empty book and does not open the paper file. It takes `.lockbot.lock`, so it exits if lockbot is already running. Stop the service, reset, then start.
-
-### Wallet tape
-
-`h2h_enabled` (default false) is the only switch for a second RTDS socket on `wss://ws-live-data.polymarket.com` for `activity/trades`. While false, that socket is not opened and the compare loop does not run. Documented `market_slug` filters on that topic are not applied by the server, so when the flag is true the subscribe stays unfiltered and each frame is kept only when the raw bytes contain a watched wallet and `btc-updown-`. The tape records fills by NIULAI4 (`0x44832d0d2ec11187c1e77d786feb15f6a50254c6`), asdaefef (`0x75cc3b63a2f2423085e10706c78b494017b93ce1`), and dvasdkasodk (`0x5d4aba8ad45bb5eab3499a0294b42da5d1e455d3`) in BTC 5m and 15m. Each fill pairs with our nearest same-outcome signal inside `h2h_window_s` (10s) and stays unpaired otherwise. The paired row stores our signal, post, and ack times, their price, size, and timestamp, the signed gap (`us_minus_them_s` = our decision time minus their payload timestamp; negative means we were first), and our price minus their price. On BTC 5m it also stores the Binance 3-second move at their fill. `trigger_fired` is true only when that move clears `s2_move_sigma` and an s2 signal on that side exists inside the window. `lockbot_summary.py` prints the share of their fills we also signalled, the median and p90 of the signed gap, the price difference, and the unpaired split: `missed` when the move cleared the bar, `no_move` when it did not. The tape is log-only. The gates do not read it.
-
-### Markets and feeds
-
-Confirmed on Gamma 2026-10-04. Event slug `{asset}-updown-{5m|15m}-{start_ts}`, series `{asset}-up-or-down-{5m|15m}`. BTC 15m and BTC 5m are on. ETH/SOL/XRP 15m and 5m stay off. A `resolutionSource` without `twap-60s` is skipped even if the flag is on. One `RtdsTwapFeed` per enabled symbol (`btc/usd` for the defaults) subscribes to `crypto_prices_twap_sixty` and `crypto_prices_chainlink`. The Binance feed tries `stream.binance.com` then `data-stream.binance.vision`, stream `btcusdt@aggTrade`.
-
-### Deploy and operations
-
-Unit file: `deploy/polylockbot.service`. User `ntemusejoel`, working directory `/home/ntemusejoel/poly-money-maker`, `EnvironmentFile` the gitignored `.env`, `ExecStart` `.venv/bin/python lockbot.py`, `Restart=always`, `RestartSec=5`. The VM already has this unit installed and enabled. This repo does not restart it.
-
-Config: `lockbot.json` if it exists, otherwise `lockbot.example.json`. The example stays `dry_run: true`. The VM file is gitignored. Hot reload watches mtime.
-
-Kill switch: `enabled: false` stops new entries and is hot-reloaded. Creating `STOP_LOCKBOT` in the repo directory makes the loops exit. Deleting that file does not start the process; systemd restarts it because `Restart=always`, so remove the file before expecting a clean start, or stop the unit.
-
-Going live:
-
-1. Stop is optional if the hot reload succeeds. Prefer a restart so the operator can see `live_client_ready` and `cash_balance` in the startup log.
-2. In `lockbot.json` set the $5 / $15 overlay above and `dry_run` to false. Do not commit that file.
-3. On a running process, saving the file is enough: reload builds the CLOB client with `open_live_client()` from the environment systemd already injected, logs `live_client_ready`, logs pUSD, switches to `positions_lockbot_live.json`, and starts `lockbot-redeem`.
-4. If the build fails (`PRIVATE_KEY` or `FUNDER_ADDRESS` missing, or an exception), the log is `live_switch_fail` with `action` `restart_required`. No order is posted. The env is loaded only at process start, so a failed switch needs a restart after the environment is fixed. `order_skip` repeats that reason at most every 30s.
-5. Reset a live book that should not carry over: stop lockbot, `python lockbot.py --reset-live`, start it.
-
-Going back to paper: set `dry_run` true and save. Posts stop, the paper ledger is loaded again, and the live file is left on disk. Redeem ticks no-op while `dry_run` is true.
-
-`orjson` is optional. The VM was not given a new install. If `import orjson` fails, parsing uses the stdlib and `book_parser` in `feed_status` says `json`.
-
-State events in `logs/lockbot.jsonl`: eval, signal, paper_fill, entry, fill, settlement, redeem, wallet_fill, wallet_compare, feed_status, cash_balance, live_switch_fail, live_client_ready, ledger. `lockbot_summary.py` prints P&L, paper-fill counts, latency, and the wallet comparison. Live redeem reuses `RedeemDesk` through `buy/relay_batch.py`. Dry-run logs `redeem_dry_run` and sends nothing.
-
-**Book tape (`buy/lock_book_log.py`, off by default).** `book_log_enabled: true` writes `logs/books.jsonl` (path from `book_log_path`, relative to the repo root). Each row has `ts`, `recv_ts`, `token_id`, `slug`, `asset`, `duration`, `side`, `best_ask`, `best_bid`, and the top `book_log_levels` `ask_levels` and `bid_levels` as `[[px, sz], ...]`. Only the subscribed BTC 5m and 15m tokens are logged. The websocket apply thread calls one hook (`ClobBookFeed.touch_hook`). While the knob is off the hook is unset and the apply path does no extra work. While it is on the hook queues the token (one slot per token, bounded, drops are counted). A daemon thread `lockbot-book-log` reads the book, throttles, formats, and appends. A row is skipped when the best ask and best bid are unchanged and less than `book_log_min_interval_ms` has passed since that token's last row. `0` logs every change. The file rolls into `logs/archive/` at `book_log_max_bytes` (default 100 MB; `0` never rolls). All `book_log_*` knobs hot-reload. `feed_status` carries `book_log` (rows, drops, errors, queued) while it is on. No trading input reads this file.
-
-Creating a pull request does not merge it and does not restart `polylockbot` or `polymintbot`.
-
-<a id="changelog"></a>
 # Changelog
 
-- **2026-10-05** — Lockbot feed CPU, not merged. Websocket clients pass `skip_utf8_validation=True`. The book socket sends text `PING`. Binance is `btcusdt@aggTrade` (not bookTicker). Strategy 2 skips the Chainlink resample unless the q filter is on. The GIL switch interval is 1ms. Latched strikes persist in `lockbot_windows.json`. `h2h_enabled` defaults false and the wallet socket stays closed. Skip evals log at 30s. Bid marks for the daily stop refresh once a second. ETH/SOL/XRP stay unsubscribed. Not deployed. Lockbot on the VM stays dry-run at `9dabb08`.
-- **2026-10-05** — Lockbot live blockers (PR #236, merged as `9dabb08`). Scoped CLOB books, event-driven strategy 2, separate paper and live ledgers, per-market combined caps, lazy live client, pUSD cash log. The VM dry-run after that merge still used about one core and strategy-2 receive-to-decision was a median of 241ms. No live orders.
-- **2026-10-04** — Lockbot head-to-head pairing (PR #235, merged as `ded7bf2`). A watched fill matches our nearest same-outcome signal inside `h2h_window_s` (10s). BTC 5m rows record the Binance 3s move and whether s2 fired on it. The summary reports the signalled share, the signed gap, the price difference, and missed versus no-move. Combined cap is $40 so each strategy keeps its $20. Mintbot is unchanged.
-- **2026-10-04** — Lockbot wallet tape (PR #235, not merged). Log-only RTDS `activity/trades` comparison against NIULAI4, asdaefef, and dvasdkasodk on BTC 5m/15m. No order uses the tape. Mintbot is unchanged.
-- **2026-10-04** — Lockbot strategy update (PR #235, not merged). Strategy 1 is the NIULAI4 BTC ladder (15m Z=0/Pmax=0.97, 5m Z=0.25/Pmax=0.90, $5 clips, side lock). Strategy 2 is the BTC 5m Binance-move sniper. Alts off. Combined cap $20, exposure $60, dry-run latency fill. Mintbot is unchanged.
-- **2026-10-04** — Lockbot. Separate taker (`lockbot.py`), dry-run by default, not deployed. Mintbot is unchanged.
+- **2026-10-05** — Copy-trading strategies s1/s2/s3 removed by Joel. Retained legacy settlement and optional book logging; pending review and deployment.
+
 - **2026-10-03 (PR #234, not live until pull + restart)** — Scrap oracle veto.
   - No loser scrap while the in-memory 60s TWAP or the live Chainlink price is within $5 of the strike or on the scrapped leg's side (`scrap_oracle_veto_enabled` true, `scrap_oracle_veto_usd` 5.0, `scrap_oracle_veto_stale_s` 3.0, `scrap_oracle_veto_use_live` true). It is re-checked every tick and right before the order is sent.
   - A stale live price leaves the average alone; both stale falls back to the old scrap. Either logs `scrap_oracle_stale`.
