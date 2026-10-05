@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import queue
+import threading
 import time
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 from buy.lock_fair import taker_fee
 from buy.lock_gates import buy_spent_usd, execute_buy
@@ -94,6 +96,57 @@ def normalize_fill(fill: dict, plan: dict, cfg: dict) -> dict:
         if key in fill and fill.get(key) is not None:
             out[key] = fill.get(key)
     return out
+
+
+def open_live_client(builder: Callable[[], Optional[Any]] | None = None) -> tuple[Optional[Any], str]:
+    """Build the order client. A failure string means do not post.
+
+    The process env is loaded at startup. A hot reload can call this, but
+    it cannot see a ``.env`` that was not already in the environment. When
+    the string is set, the operator restarts the process.
+    """
+    build = build_clob_client if builder is None else builder
+    try:
+        client = build()
+    except Exception as exc:
+        return None, str(exc)[:200]
+    if client is None:
+        return None, "missing PRIVATE_KEY or FUNDER_ADDRESS; restart after the env is loaded"
+    return client, ""
+
+
+class LivePoster:
+    """Posts live orders off the decision thread. The queue is the hand-off."""
+
+    def __init__(self, handler: Callable[[Any], None]) -> None:
+        self._handler = handler
+        self._queue: queue.Queue = queue.Queue()
+        self._stop = threading.Event()
+        self._thread: Optional[threading.Thread] = None
+
+    def start(self) -> None:
+        if self._thread is not None and self._thread.is_alive():
+            return
+        self._stop.clear()
+        self._thread = threading.Thread(target=self._run, name="lockbot-orders", daemon=True)
+        self._thread.start()
+
+    def submit(self, job: Any) -> None:
+        self._queue.put(job)
+
+    def stop(self) -> None:
+        self._stop.set()
+        self._queue.put(None)
+
+    def _run(self) -> None:
+        while not self._stop.is_set():
+            job = self._queue.get()
+            if job is None:
+                return
+            try:
+                self._handler(job)
+            except Exception:
+                continue
 
 
 def build_clob_client() -> Optional[Any]:

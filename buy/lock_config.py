@@ -200,3 +200,7 @@ def validate_config(cfg: Any) -> None:
     rules = cfg.get("market_rules")
     if rules is not None and not isinstance(rules, dict):
         raise ValueError("market_rules must be an object")
+    for name, row in (rules or {}).items():
+        if isinstance(row, dict) and row.get("combined_usd") is not None:
+            if _num(row.get("combined_usd"), -1.0) <= 0:
+                raise ValueError(f"market_rules.{name}.combined_usd must be > 0")

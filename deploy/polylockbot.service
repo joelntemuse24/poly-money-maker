@@ -1,5 +1,5 @@
 [Unit]
-Description=Polymarket TWAP-lock taker (lockbot; do not enable until the operator asks)
+Description=Polymarket TWAP-lock taker (lockbot; do not enable until the operator asks; stays dry-run until lockbot.json says otherwise)
 After=network-online.target
 Wants=network-online.target
 

@@ -45,7 +45,7 @@ from buy.lock_gates import (
     parse_levels,
     settle_pnl,
 )
-from buy.lock_orders import build_clob_client, dispatch_buy, normalize_fill, warm_market
+from buy.lock_orders import LivePoster, dispatch_buy, normalize_fill, open_live_client, warm_market
 from buy.lock_paper import enqueue_paper, take_due, walk_late_book
 from buy.lock_markets import (
     DURATION_S,
@@ -58,6 +58,7 @@ from buy.lock_markets import (
     symbols_for,
     window_starts,
 )
+from buy.lock_state import decision_wait_s, ledger_path, load_ledger, reset_live_ledger
 from buy.lock_wallets import WALLETS, WalletTape, compare_fills
 from buy.mint_gas import mint_gas_settings
 from buy.oracle_log import RtdsTwapFeed, append_jsonl, fetch_gamma_strike
@@ -67,7 +68,6 @@ ROOT = Path(__file__).resolve().parent
 EXAMPLE_FILE = ROOT / "lockbot.example.json"
 CONFIG_FILE = ROOT / "lockbot.json"
 LOG_FILE = ROOT / "logs" / "lockbot.jsonl"
-STATE_FILE = ROOT / "positions_lockbot.json"
 LOCK_FILE = ROOT / ".lockbot.lock"
 STOP_FILE = ROOT / "STOP_LOCKBOT"
 USER_AGENT = "poly-money-maker-lockbot/1.0"
@@ -94,21 +94,6 @@ def atomic_save(path: Path, payload: dict) -> None:
     temporary = path.with_suffix(path.suffix + ".tmp")
     temporary.write_text(json.dumps(payload, separators=(",", ":"), sort_keys=True), encoding="utf-8")
     os.replace(temporary, path)
-
-
-def load_state() -> dict:
-    if not STATE_FILE.exists():
-        return {"positions": {}, "intents": {}, "redeems": {}}
-    try:
-        payload = json.loads(STATE_FILE.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return {"positions": {}, "intents": {}, "redeems": {}}
-    if not isinstance(payload, dict):
-        return {"positions": {}, "intents": {}, "redeems": {}}
-    payload.setdefault("positions", {})
-    payload.setdefault("intents", {})
-    payload.setdefault("redeems", {})
-    return payload
 
 
 def resolve_config_path(explicit: Optional[str] = None) -> Path:
@@ -186,7 +171,9 @@ class LockBot:
         self.cfg = cfg
         self.config_path = config_path
         self.config_mtime = config_path.stat().st_mtime if config_path.exists() else 0.0
-        self.state = load_state()
+        dry = bool(cfg.get("dry_run", True))
+        self.state_path = ledger_path(ROOT, dry)
+        self.state = load_ledger(self.state_path, "paper" if dry else "live")
         self.session = _session()
         self.markets: dict[str, LockMarket] = {}
         self.market_at: dict[str, float] = {}
@@ -216,6 +203,20 @@ class LockBot:
         self.slow_at = 0.0
         self._status_at = 0.0
         self._lock = threading.RLock()
+        self._wake = threading.Event()
+        self._poster = LivePoster(self._post_job)
+        self._poster.start()
+        self._sigma_cache: dict[str, tuple] = {}
+        self._s1_at = 0.0
+        self._s2_recv: Optional[float] = None
+        self._redeem_started = False
+        self._live_failed = False
+        self._skip_log_at = 0.0
+
+    def _on_trade(self, obs: float, recv: float, price: float) -> None:
+        """Binance callback. It only wakes the decision thread."""
+        del obs, recv, price
+        self._wake.set()
 
     def reload(self) -> None:
         try:
@@ -224,12 +225,57 @@ class LockBot:
             return
         if mtime == self.config_mtime:
             return
+        prev_dry = bool(self.cfg.get("dry_run", True))
         try:
             self.cfg = read_config(self.config_path)
             self.config_mtime = mtime
-            log_event("config_reloaded", path=str(self.config_path), dry_run=bool(self.cfg.get("dry_run")))
         except Exception as exc:
             log_event("config_reload_fail", error=str(exc)[:200])
+            return
+        now_dry = bool(self.cfg.get("dry_run", True))
+        log_event("config_reloaded", path=str(self.config_path), dry_run=now_dry)
+        if prev_dry != now_dry:
+            self._bind_ledger(now_dry)
+            if now_dry:
+                log_event("dry_run_on", detail="live posts stopped; paper ledger is active")
+            else:
+                self._activate_live()
+        elif not now_dry and self.client is None:
+            self._activate_live()
+
+    def _bind_ledger(self, dry_run: bool) -> None:
+        kind = "paper" if dry_run else "live"
+        self.state_path = ledger_path(ROOT, dry_run)
+        self.state = load_ledger(self.state_path, kind)
+        if not dry_run:
+            self.paper.clear()
+        log_event("ledger", ledger=kind, path=str(self.state_path), positions=len(self.state.get("positions") or {}))
+
+    def _activate_live(self) -> bool:
+        """Build the order client the first time dry_run is false.
+
+        Env is loaded at process start. If this fails, orders are skipped
+        and the process has to be restarted. Flipping the file back to
+        dry_run does not delete the live ledger.
+        """
+        if self.client is None:
+            client, err = open_live_client()
+            if client is None:
+                self._live_failed = True
+                log_event("live_switch_fail", error=err, action="restart_required")
+                return False
+            self.client = client
+            self._live_failed = False
+            log_event("live_client_ready")
+        self._refresh_cash(time.time(), force=True)
+        self._start_redeem()
+        return True
+
+    def _start_redeem(self) -> None:
+        if self._redeem_started or not self.cfg.get("redeem_enabled", True):
+            return
+        self._redeem_started = True
+        threading.Thread(target=_redeem_loop, args=(self,), name="lockbot-redeem", daemon=True).start()
 
     def ensure_feeds(self) -> None:
         wanted = symbols_for(self.cfg)
@@ -246,7 +292,10 @@ class LockBot:
         self.book_feed.start()
         if self.cfg.get("strategy2_enabled", True):
             if self.binance is None:
-                self.binance = BinanceTradeFeed(history_s=float(self.cfg.get("history_s") or 1200))
+                self.binance = BinanceTradeFeed(
+                    history_s=float(self.cfg.get("history_s") or 1200),
+                    on_trade=self._on_trade,
+                )
                 self.binance.start()
                 log_event("binance_subscribe", urls=list(self.binance.urls))
         elif self.binance is not None:
@@ -325,20 +374,27 @@ class LockBot:
             return row
         return self.books.get(token) or {}
 
+    def _book_markets(self, now: float) -> list[LockMarket]:
+        """Current and next BTC 5m and 15m windows only. Expired ids drop off."""
+        keys = {"btc_5m", "btc_15m"} & set(enabled_keys(self.cfg))
+        out: list[LockMarket] = []
+        seen: set[str] = set()
+        for key in sorted(keys):
+            spec = SPECS[key]
+            starts = set(window_starts(now, DURATION_S[spec["duration"]], ahead=1))
+            for market in self.markets.values():
+                if market.key != key or market.start_ts not in starts or market.slug in seen:
+                    continue
+                seen.add(market.slug)
+                out.append(market)
+        return out
+
     def subscribe_books(self, now: float) -> None:
         tokens: list[str] = []
-        for market in self._interesting(now):
+        for market in self._book_markets(now):
             tokens.append(market.up_token)
             tokens.append(market.dn_token)
         self.book_feed.set_tokens(tokens)
-        age = self.book_feed.age_s(now)
-        if age is not None and age > 5.0:
-            ws = self.book_feed._ws
-            if ws is not None:
-                try:
-                    ws.close()
-                except Exception:
-                    pass
 
     def warm_clients(self, now: float) -> None:
         if self.cfg.get("dry_run", True) or self.client is None:
@@ -504,19 +560,24 @@ class LockBot:
         self._status(now)
 
     def _status(self, now: float) -> None:
-        if now - self._status_at < 30:
+        spot = time.time()
+        if spot - self._status_at < 30:
             return
-        self._status_at = now
+        self._status_at = spot
         latest = self.binance.latest() if self.binance is not None else None
-        age = None if latest is None else now - float(latest[1])
+        age = None if latest is None else spot - float(latest[1])
+        book_stats = self.book_feed.stats()
         log_event(
             "feed_status",
-            book_age_s=self.book_feed.age_s(now),
+            book_age_s=self.book_feed.age_s(spot),
             book_error=self.book_feed.last_error()[:160],
+            book_reconnects=book_stats.get("reconnects"),
+            book_tokens=book_stats.get("tokens"),
+            book_parser=book_stats.get("parser"),
             binance_age_s=age,
             binance_px=None if latest is None else latest[2],
             binance_error=(self.binance.last_error()[:160] if self.binance is not None else ""),
-            wallet_age_s=self.wallets.age_s(now),
+            wallet_age_s=self.wallets.age_s(spot),
             wallet_fills=self.wallets.fills,
             wallet_error=self.wallets.last_error()[:160],
             markets=len(self.markets),
@@ -524,6 +585,7 @@ class LockBot:
         )
 
     def _fast(self, now: float) -> int:
+        """Strategy 2 runs when a new Binance trade is in. Strategy 1 runs once a second."""
         buys = 0
         with self._lock:
             markets = list(self.markets.values())
@@ -533,14 +595,27 @@ class LockBot:
         s2_min = float(self.cfg.get("s2_tau_min") or 5)
         s2_keys = {str(item) for item in (self.cfg.get("strategy2_markets") or ["btc_5m"])}
         enabled = set(enabled_keys(self.cfg))
+        latest_recv = None
+        if self.binance is not None:
+            latest = self.binance.latest()
+            if latest is not None:
+                latest_recv = float(latest[1])
+        new_trade = latest_recv is not None and latest_recv != self._s2_recv
+        s1_due = now - self._s1_at >= 1.0
+        if new_trade:
+            self._s2_recv = latest_recv
+        if s1_due:
+            self._s1_at = now
+        if not new_trade and not s1_due:
+            return 0
         for market in markets:
             if market.key not in enabled:
                 continue
             ttm = market.end_ts - now
             if ttm <= 0:
                 continue
-            want_s1 = bool(self.cfg.get("strategy1_enabled", True)) and s1_min <= ttm <= s1_max
-            want_s2 = bool(self.cfg.get("strategy2_enabled", True)) and market.key in s2_keys and s2_min <= ttm <= s2_max
+            want_s1 = s1_due and bool(self.cfg.get("strategy1_enabled", True)) and s1_min <= ttm <= s1_max
+            want_s2 = new_trade and bool(self.cfg.get("strategy2_enabled", True)) and market.key in s2_keys and s2_min <= ttm <= s2_max
             if not want_s1 and not want_s2:
                 continue
             view = self._view(market, now)
@@ -599,11 +674,7 @@ class LockBot:
                 view["binance_recv_ts"] = recv
                 view["binance_px"] = px
                 then = feed.price_at(float(obs) - float(self.cfg.get("s2_move_s") or 3))
-                sigma, nrets, source = feed.sigma_before(
-                    market.start_ts,
-                    float(self.cfg.get("s2_sigma_window_s") or 300),
-                    min_n=int(self.cfg.get("s2_sigma_min_samples") or 60),
-                )
+                sigma, nrets, source = self._sigma_cached(feed, market)
                 view["sigma1s"] = sigma
                 view["sigma1s_n"] = nrets
                 view["sigma_source"] = source
@@ -626,19 +697,67 @@ class LockBot:
                 pass
         return view
 
+    def _sigma_cached(self, feed: BinanceTradeFeed, market: LockMarket) -> tuple:
+        """Sigma is stable once the pre-window sample is in. Do not recompute it per trade."""
+        cached = self._sigma_cache.get(market.slug)
+        now = time.time()
+        if cached is not None:
+            sigma, nrets, source, at = cached
+            if source == "pre_window" or now - float(at) < 5.0:
+                return sigma, nrets, source
+        sigma, nrets, source = feed.sigma_before(
+            market.start_ts,
+            float(self.cfg.get("s2_sigma_window_s") or 300),
+            min_n=int(self.cfg.get("s2_sigma_min_samples") or 60),
+        )
+        self._sigma_cache[market.slug] = (sigma, nrets, source, now)
+        if len(self._sigma_cache) > 32:
+            oldest = sorted(self._sigma_cache, key=lambda slug: self._sigma_cache[slug][3])[:8]
+            for slug in oldest:
+                self._sigma_cache.pop(slug, None)
+        return sigma, nrets, source
+
     def _act(self, market: LockMarket, decision: dict, now: float) -> None:
         strategy = str(decision.get("strategy") or "s1")
         decision_ts = time.time()
         decision["decision_ts"] = decision_ts
         self.clip_at[(market.slug, strategy)] = decision_ts
-        log_event("signal", **_public_decision(decision))
-        self._remember_attempt(decision)
         if self.cfg.get("dry_run", True):
             enqueue_paper(self.paper, decision, now=decision_ts)
+        elif self.client is None:
+            self._skip_live(market, strategy)
+        else:
+            self._poster.submit((market, dict(decision), decision_ts))
+        handoff = time.time()
+        decision["handoff_ts"] = handoff
+        decision["decision_to_handoff_ms"] = (handoff - decision_ts) * 1000.0
+        recv = decision.get("binance_recv_ts")
+        if recv is not None:
+            try:
+                decision["recv_to_decision_ms"] = (decision_ts - float(recv)) * 1000.0
+                decision["recv_to_handoff_ms"] = (handoff - float(recv)) * 1000.0
+            except (TypeError, ValueError):
+                pass
+        log_event("signal", **_public_decision(decision))
+        self._remember_attempt(decision)
+
+    def _skip_live(self, market: LockMarket, strategy: str) -> None:
+        now = time.time()
+        if now - self._skip_log_at < 30.0:
             return
-        if self.client is None:
-            log_event("order_skip", slug=market.slug, strategy=strategy, reason="no_clob_client")
-            return
+        self._skip_log_at = now
+        reason = "live_switch_fail" if self._live_failed else "no_clob_client"
+        log_event(
+            "order_skip",
+            slug=market.slug,
+            strategy=strategy,
+            reason=reason,
+            action="restart_required",
+        )
+
+    def _post_job(self, job: tuple) -> None:
+        """Order thread. ``post_ts`` is stamped inside ``post_fak_buy`` before the sign."""
+        market, decision, decision_ts = job
         post_ts = time.time()
         try:
             raw = dispatch_buy(decision, dry_run=False, client=self.client)
@@ -646,7 +765,7 @@ class LockBot:
             log_event(
                 "order_fail",
                 slug=market.slug,
-                strategy=strategy,
+                strategy=decision.get("strategy"),
                 error=str(exc)[:200],
                 decision_ts=decision_ts,
                 post_ts=post_ts,
@@ -666,7 +785,7 @@ class LockBot:
         fill = normalize_fill(raw, decision, self.cfg)
         self._log_attempt(market, decision, fill, event="entry")
         if fill["shares"] > 0:
-            self._add_fill(market, decision, fill, now)
+            self._add_fill(market, decision, fill, time.time())
 
     def _flush_paper(self, now: float) -> None:
         latency = float(self.cfg.get("dry_run_latency_s") or 0.2)
@@ -777,7 +896,7 @@ class LockBot:
                 "slug": market.slug,
                 "condition_id": market.condition_id,
             }
-        atomic_save(STATE_FILE, self.state)
+        atomic_save(self.state_path, self.state)
         if fill["shares"] > 0:
             log_event(
                 "fill",
@@ -895,10 +1014,11 @@ class LockBot:
                     won=result["won"],
                 )
         if changed:
-            atomic_save(STATE_FILE, self.state)
+            atomic_save(self.state_path, self.state)
 
-    def _refresh_cash(self, now: float) -> None:
-        if now - self.cash_at < 15:
+    def _refresh_cash(self, now: float, *, force: bool = False) -> None:
+        """Live cash is the funder pUSD balance. Dry-run never calls this."""
+        if not force and now - self.cash_at < 15:
             return
         self.cash_at = now
         try:
@@ -907,9 +1027,11 @@ class LockBot:
             funder = os.getenv("FUNDER_ADDRESS") or ""
             if not funder:
                 self.cash = None
+                log_event("cash_balance", pusd=None, asset="pUSD", reason="no_funder")
                 return
             chain = ChainReader(str(self.cfg.get("rpc_url")))
             self.cash = chain.pUSD_balance(str(self.cfg.get("pUSD_address")), funder)
+            log_event("cash_balance", pusd=None if self.cash is None else round(float(self.cash), 4), asset="pUSD")
         except Exception as exc:
             log_event("cash_fail", error=str(exc)[:160])
 
@@ -1055,6 +1177,8 @@ class LockBot:
             log_event("wallet_compare", **payload)
 
     def close(self) -> None:
+        self._wake.set()
+        self._poster.stop()
         for feed in self.feeds.values():
             feed.stop()
         self.book_feed.stop()
@@ -1064,28 +1188,33 @@ class LockBot:
         self._pool.shutdown(wait=False, cancel_futures=True)
 
 
-def _sleep_s(bot: LockBot, now: float) -> float:
-    """50ms while a strategy window is open, otherwise wait for the next one."""
-    fast = float(bot.cfg.get("fast_poll_s") or 0.05)
+def _wait_s(bot: LockBot, now: float) -> float:
+    """How long the decision thread blocks. A Binance trade wakes it earlier.
+
+    Strategy 1 is checked once a second while its window is open. Strategy 2
+    does not poll. ``fast_poll_s`` is not used as a spin.
+    """
+    poll = float(bot.cfg.get("poll_s") or 1.0)
     s1_max = float(bot.cfg.get("s1_tau_max") or 58)
-    s2_max = float(bot.cfg.get("s2_tau_max") or 300)
-    s2_keys = {str(item) for item in (bot.cfg.get("strategy2_markets") or ["btc_5m"])}
+    s1_min = float(bot.cfg.get("s1_tau_min") or 1)
     enabled = set(enabled_keys(bot.cfg))
-    hot = False
-    wait = 5.0
+    s1_hot = False
+    window_in = None
     for market in bot.markets.values():
         if market.key not in enabled:
             continue
         ttm = market.end_ts - now
-        horizon = s2_max if market.key in s2_keys and bot.cfg.get("strategy2_enabled", True) else s1_max
-        if 0 < ttm <= horizon:
-            hot = True
-        until = ttm - horizon
+        if bot.cfg.get("strategy1_enabled", True) and s1_min <= ttm <= s1_max:
+            s1_hot = True
+        until = ttm - s1_max
         if until > 0:
-            wait = min(wait, until)
-    if hot:
-        return max(0.01, fast)
-    return max(0.2, min(1.0, wait))
+            window_in = until if window_in is None else min(window_in, until)
+    s1_next = (bot._s1_at + 1.0) if s1_hot else None
+    paper_next = None
+    if bot.paper:
+        latency = float(bot.cfg.get("dry_run_latency_s") or 0.2)
+        paper_next = min(float(item.get("decision_ts") or now) for item in bot.paper) + latency
+    return decision_wait_s(now, poll_s=poll, s1_next=s1_next, paper_next=paper_next, window_in=window_in)
 
 
 def _slow_loop(bot: LockBot) -> None:
@@ -1100,7 +1229,7 @@ def _slow_loop(bot: LockBot) -> None:
 
 def _redeem_loop(bot: LockBot) -> None:
     """Live redeem on its own thread. Dry-run settlements are logged in-tick."""
-    if bot.cfg.get("dry_run", True) or not bot.cfg.get("redeem_enabled", True):
+    if not bot.cfg.get("redeem_enabled", True):
         return
     from buy.chain import ChainReader
     from buy.contracts import build_redeem_calls
@@ -1151,9 +1280,12 @@ def _redeem_loop(bot: LockBot) -> None:
             positions=lambda: gateway.redeemable_positions(funder),
         ),
         lock=lock,
-        save=lambda state: atomic_save(STATE_FILE, state),
+        save=lambda state: atomic_save(bot.state_path, state),
     )
     while not _stop.is_set() and not STOP_FILE.exists():
+        if bot.cfg.get("dry_run", True):
+            _stop.wait(float(bot.cfg.get("redeem_poll_s") or 15))
+            continue
         try:
             desk.tick(bot.state, bot.cfg, time.time())
         except Exception as exc:
@@ -1177,7 +1309,18 @@ def acquire_lock():
 def main(argv: Optional[list[str]] = None) -> int:
     parser = argparse.ArgumentParser(description="TWAP-lock taker (dry-run by default)")
     parser.add_argument("--config", default="", help="knob file; default lockbot.json or the example")
+    parser.add_argument(
+        "--reset-live",
+        action="store_true",
+        help="zero positions_lockbot_live.json and exit; does not touch the paper ledger",
+    )
     args = parser.parse_args(argv)
+    if args.reset_live:
+        hold = acquire_lock()
+        path = reset_live_ledger(ROOT)
+        print(json.dumps({"event": "live_ledger_reset", "path": str(path)}, separators=(",", ":")), flush=True)
+        del hold
+        return 0
     signal.signal(signal.SIGINT, _handle_signal)
     signal.signal(signal.SIGTERM, _handle_signal)
     try:
@@ -1196,11 +1339,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     del hold
     bot = LockBot(cfg, config_path=path)
     if not cfg.get("dry_run", True):
-        try:
-            bot.client = build_clob_client()
-        except Exception as exc:
-            log_event("clob_client_fail", error=str(exc)[:200])
-        threading.Thread(target=_redeem_loop, args=(bot,), name="lockbot-redeem", daemon=True).start()
+        bot._activate_live()
     log_event(
         "startup",
         dry_run=bool(cfg.get("dry_run", True)),
@@ -1215,19 +1354,22 @@ def main(argv: Optional[list[str]] = None) -> int:
         h2h_window_s=cfg.get("h2h_window_s"),
         clip_usd=cfg.get("clip_usd"),
         max_open_exposure_usd=cfg.get("max_open_exposure_usd"),
+        ledger=str(bot.state_path),
         config=str(path),
     )
     try:
         bot._slow(time.time())
         threading.Thread(target=_slow_loop, args=(bot,), name="lockbot-slow", daemon=True).start()
         while not _stop.is_set() and not STOP_FILE.exists():
-            started = time.time()
+            delay = _wait_s(bot, time.time())
+            bot._wake.wait(delay)
+            bot._wake.clear()
+            if _stop.is_set() or STOP_FILE.exists():
+                break
             try:
-                bot.tick(started)
+                bot.tick(time.time())
             except Exception as exc:
                 log_event("tick_fail", error=str(exc)[:200])
-            delay = _sleep_s(bot, time.time())
-            _stop.wait(delay)
     finally:
         bot.close()
         log_event("shutdown")

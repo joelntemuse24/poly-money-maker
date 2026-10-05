@@ -61,10 +61,12 @@ class BinanceTradeFeed:
         *,
         history_s: float = 1200.0,
         clock: Callable[[], float] = time.time,
+        on_trade: Optional[Callable[[float, float, float], None]] = None,
     ) -> None:
         self.urls = urls
         self.history_s = float(history_s)
         self._clock = clock
+        self._on_trade = on_trade
         self._lock = threading.Lock()
         self._hist: deque[tuple[float, float, float]] = deque()
         self._last: Optional[tuple[float, float, float]] = None
@@ -101,15 +103,12 @@ class BinanceTradeFeed:
 
     def price_at(self, ts: float) -> Optional[float]:
         """Last trade at or before ``ts`` (observation time)."""
+        target = float(ts)
         with self._lock:
-            rows = self._hist
-            found = None
-            for obs, _recv, price in rows:
-                if obs <= float(ts):
-                    found = price
-                else:
-                    break
-            return found
+            for obs, _recv, price in reversed(self._hist):
+                if obs <= target:
+                    return price
+            return None
 
     def handle_message(self, raw: Any, *, recv_ts: Optional[float] = None) -> None:
         parsed = parse_trade(raw)
@@ -126,6 +125,12 @@ class BinanceTradeFeed:
             if len(self._hist) > 20000:
                 self._hist.popleft()
             self._error = ""
+        callback = self._on_trade
+        if callback is not None:
+            try:
+                callback(obs, recv, price)
+            except Exception:
+                return
 
     def sigma_before(
         self,

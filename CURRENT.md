@@ -1,13 +1,20 @@
-# Operational snapshot — live knobs as of 3 October 2026, 13:25 IST
+# Operational snapshot — live knobs as of 5 October 2026
 
 Source: live Google VM (`/home/ntemusejoel/poly-money-maker`). VM is the
-source of truth. The knobs named below were confirmed by the operator on
+source of truth. Mint knobs below were confirmed by the operator on
 3 Oct 2026 at 13:25 IST (07:55 UTC). Rows marked "(30 Sep read)" were last
 read from the VM on 30 Sep 2026 and were not re-confirmed on 3 Oct.
 
-**Live money path:** atomic mint on **15m only** (`polymintbot` /
-`mintbot.py` + gitignored `strategy_mint.json`). The VM runs `main`
-through #232 (`sell_dump_also_kept`, live since 10:31 IST on 3 Oct).
+**polymintbot is stopped.** As of 2026-10-05 00:01 UTC the unit is
+**inactive** and still **enabled** at boot. `strategy_mint.json` was not
+changed. The mint code is still in the repo. Do not start `polymintbot`
+unless the operator asks.
+
+**Lockbot is the process under test.** `polylockbot.service` is installed
+and enabled. It has been running **dry_run** since 2026-10-05 00:01:40 UTC
+(deploy of `ded7bf2`). It has not placed a live order. The example file
+stays `dry_run: true`.
+
 **Recorder retired:** `polypathlog` / `pathlog.py` (15m only) stopped on
 22 Sep 2026 and is intentionally not restarted. The unit was still
 `enabled` on 30 Sep; the operator should `sudo systemctl disable polypathlog`.
@@ -165,13 +172,14 @@ Stored samples are 15s through the middle of the window, 2s around the open and 
 
 **The tape is audit-only.** `oracle_log_enabled` stays on. `sell_late_window_s` is 0, and `sell_oracle_edge_floor_usd`, `sell_oracle_edge_per_ttm`, and `sell_oracle_stale_s` are 0, so the late veto stays off and those zeros do not re-arm the old dollar or stale veto. The scrap oracle veto (#234) reads the feed's in-memory sample, never this file. `sell_oracle_edge_persist_s` stays 3. Mint eligibility, winner cash-out, and held dump do not read the tape.
 
-## Lockbot (repo only, not on the VM)
+## Lockbot (dry-run on the VM)
 
-`lockbot.py` is a separate two-strategy taker. It is not installed and
-not enabled. `deploy/polylockbot.service` is a unit file only. `dry_run`
-defaults to true in `lockbot.example.json`. Copy that file to the
-gitignored `lockbot.json` before any run. Do not start it, and do not
-restart `polymintbot`, until the operator asks.
+`lockbot.py` is a separate two-strategy taker. `polylockbot.service` is
+installed and enabled on the VM and is running **dry_run**. `dry_run`
+stays true in `lockbot.example.json`. The live knobs are the gitignored
+`lockbot.json` on the VM (copied from the example at deploy: $20 per
+strategy, combined $40, clip $5). Do not edit that file from the repo.
+Do not restart `polylockbot` or `polymintbot` unless the operator asks.
 
 Strategy 1 mirrors NIULAI4 on BTC 15m and BTC 5m. From tau 58 down to
 tau 1 it buys the Chainlink favourite in $5 clips, up to $20 a market,
@@ -202,15 +210,42 @@ simulated P&L, fill counts, and latency per strategy, plus the share
 of their fills we also signalled, the median and p90 of the signed
 gap, the price difference, and the unpaired split (`missed` when our
 rule saw a qualifying move, `no_move` when they traded without one).
+Receive-to-decision and receive-to-handoff are the queue delay.
+Receive-to-post on a paper fill includes the 200ms book walk.
+Receive-to-post on a live entry is the time until `post_fak_buy` starts.
+
+Paper positions stay in `positions_lockbot.json`. Live positions and
+the live loss, exposure, and spend counters stay in
+`positions_lockbot_live.json`. A $15 live stop does not see the paper
+loss. `python lockbot.py --reset-live` zeros the live file only, and
+only when this process is not already holding `.lockbot.lock`.
+
+`market_rules.btc_5m.combined_usd` and `market_rules.btc_15m.combined_usd`
+override `combined_per_market_usd` for that market. The intended live
+overlay, still not applied on the VM, is clip $5, each strategy cap $5,
+btc_5m combined $10, btc_15m combined $5, `daily_loss_stop_usd` 15, then
+`dry_run` false. Live cash for the buffer is the funder's pUSD balance
+(about $233 at deploy), logged as `cash_balance` at startup.
+
+Going live is a restart with `dry_run` false, or a hot reload of that
+flag. The hot reload builds the order client from the environment the
+process already has. If that build fails it logs `live_switch_fail`
+with `action=restart_required` and does not post. Setting `dry_run`
+back to true stops posts and resumes the paper ledger. It does not
+delete the live one. `enabled: false` or a `STOP_LOCKBOT` file stops
+entries; `STOP_LOCKBOT` stops the process.
 
 ## Deploy boundary
 
 Copy VM → GitHub for backup. Do not blindly merge GitHub onto the VM.
-Restart **only** `polymintbot` when the operator asks. `polypathlog` is retired.
-`polylockbot` stays uninstalled until the operator asks.
+`polymintbot` is stopped (inactive, still enabled at boot). Do not start
+it unless the operator asks. `polypathlog` is retired. `polylockbot` is
+installed and is dry-run until the operator changes `lockbot.json` and
+restarts it. Creating a PR is not a merge and not a restart.
 
 ## Changelog
 
+- **2026-10-05** — Lockbot live blockers (not merged, not deployed). Scoped CLOB books, event-driven strategy 2, separate paper and live ledgers, per-market combined caps, lazy live client, pUSD cash log. `polymintbot` is stopped on the VM. Lockbot stays dry-run.
 - **2026-10-04** — Lockbot head-to-head uses the nearest signal inside 10s. Combined cap is $40 so each strategy keeps $20. Not deployed.
 - **2026-10-04** — Lockbot wallet tape: log-only comparison with NIULAI4, asdaefef, and dvasdkasodk. Not an order input. Not deployed.
 - **2026-10-04** — Lockbot added as a separate dry-run service. Mintbot knobs unchanged. Not deployed.
