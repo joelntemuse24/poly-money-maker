@@ -396,7 +396,8 @@ class LateMintedBagSellTests(unittest.TestCase):
         self.assertEqual(intent.get("sell_loser_armed_at"), clock["now"])
         clock["now"] += 5.0
         ns["_manage_sells_locked"](cfg, state, object())
-        self.assertEqual(fak_calls, [{"token_id": "up-tok", "size": 50.0, "price": 0.02, "dry_run": False}])
+        # Live-bid sweep: the 1c loser bid, not the 2c sell_floor.
+        self.assertEqual(fak_calls, [{"token_id": "up-tok", "size": 50.0, "price": 0.01, "dry_run": False}])
         self.assertTrue(intent.get("sold_loser"))
         names = [row["event"] for row in events]
         self.assertIn("sell_scrap_sweep", names)

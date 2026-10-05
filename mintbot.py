@@ -14,8 +14,10 @@ applies through market close. Sized depth does not skip
 (code default 0, off; example 600) blocks arm, persist, and every scrap
 fire while seconds-to-close is above the cutoff. Unknown time-to-end
 leaves that gate open. Persist starts only once the gate is open. At fire,
-``sell_scrap_sweep_enabled`` (default true) posts one FAK at ``sell_floor``
-for the scrap remainder. ``sell_scrap_fraction`` defaults to 1 (the whole
+``sell_scrap_sweep_enabled`` (default true) posts one FAK at the live loser
+bid (capped at ``sell_threshold``, floored at ``sell_clob_min_price`` 1¢,
+never clamped up to ``sell_floor``) for the scrap remainder and retries each
+tick at the new bid. ``sell_scrap_fraction`` defaults to 1 (the whole
 loser). Below 1, the first fire locks ``floor(held × fraction)`` and does
 not sell the rest. False restores the 1¢ ladder from ``sell_fak_px``.
 Empty keep fires a blind 1¢ FAK (backoff ~3s).
@@ -144,6 +146,7 @@ from buy.mint_sell import (
     rest_order_matched_shares,
     resting_tif,
     scrap_rest_action,
+    scrap_live_bid_limit,
     scrap_rest_px,
     scrap_time_gate_open,
     sell_fire_decision,
@@ -229,8 +232,13 @@ DEFAULTS = {
     "sell_enabled": False,
     "sell_threshold": 0.02,
     "sell_fak_px": 0.02,
+    # sell_floor is the cent-ladder / dump floor only. The loser sweep does
+    # NOT use it: once triggered (loser <= sell_threshold, favourite >=
+    # sell_opposite_min) the sweep FAK posts at the live loser bid, capped
+    # at sell_threshold and floored at sell_clob_min_price (1c), and retries
+    # each tick at the new bid until flat or the window closes.
     "sell_floor": 0.02,
-    # One floor FAK for the full remainder. False restores the cent ladder.
+    # One live-bid FAK for the full remainder. False restores the cent ladder.
     "sell_scrap_sweep_enabled": True,
     "sell_opposite_min": 0.90,
     "sell_persist_s": 5.0,
@@ -1433,8 +1441,12 @@ def _fire_loser_scrap(
     shares: float,
     fills: Optional[list] = None,
     log_extra: Optional[dict] = None,
+    min_px: float = 0.01,
 ) -> Tuple[float, str, Optional[float], bool]:
-    """One floor sweep, or the clipped cent ladder when sweep is off.
+    """One live-bid sweep FAK, or the clipped cent ladder when sweep is off.
+
+    The sweep limit is the live loser bid (capped at ``threshold``, floored
+    at ``min_px``), never clamped up to ``sell_floor``.
 
     Returns sold shares, status, last limit, and whether the refreshed
     balance is already flat. A partial sweep does not post another rung.
@@ -1448,9 +1460,10 @@ def _fire_loser_scrap(
         loser_bid=loser_bid,
         fak_px=fak_px,
         depth_at_limit=depth_at_limit,
+        min_px=min_px,
     )
     if plan["mode"] == "sweep":
-        limit = float(plan["limits"][0]) if plan["limits"] else round(float(floor), 4)
+        limit = float(plan["limits"][0]) if plan["limits"] else round(float(min_px), 4)
         post_size = float(plan["size"])
         _log_sell_book_depth(
             slug=slug,
@@ -3313,8 +3326,11 @@ def _manage_sells_locked(cfg: dict, state: dict, chain: ChainReader) -> None:
 
         if loser and why_l in {"ready", "immediate"}:
             loser_bid = float(bids[loser] or thr)
-            preview = loser_ladder_limits(thr, floor, loser_bid, fak_px=fak_px)
-            first_limit = preview[0] if preview else min(float(loser_bid), fak_px)
+            if bool(cfg.get("sell_scrap_sweep_enabled", True)):
+                first_limit = scrap_live_bid_limit(loser_bid, thr, min_px=clob_min)
+            else:
+                preview = loser_ladder_limits(thr, floor, loser_bid, fak_px=fak_px)
+                first_limit = preview[0] if preview else min(float(loser_bid), fak_px)
             _log_sell_book_depth(
                 slug=intent.get("slug"),
                 leg=loser,
@@ -3498,6 +3514,7 @@ def _manage_sells_locked(cfg: dict, state: dict, chain: ChainReader) -> None:
                                     shares=shares,
                                     fills=scrap_fills,
                                     log_extra=oracle_fields,
+                                    min_px=clob_min,
                                 )
                             )
                         record_fill_px(intent, "sell_fill_px", scrap_fills)
@@ -3540,7 +3557,7 @@ def _manage_sells_locked(cfg: dict, state: dict, chain: ChainReader) -> None:
                             notify(
                                 "Mint loser sold",
                                 f"{intent.get('slug')}\n{loser} x{sold_total:.1f} "
-                                f"@<={thr:.2f}/{floor:.2f}",
+                                f"@bid<={thr:.2f} avg={intent.get('sell_fill_px')}",
                                 priority="default",
                             )
                             console.print(

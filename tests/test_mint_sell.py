@@ -8,6 +8,7 @@ from pathlib import Path
 from buy.book import best_bid_with_min_size
 from buy.mint_sell import (
     DEFAULT_SELL_KNOBS,
+    scrap_live_bid_limit,
     classify_loser,
     cycle_sleep_s,
     depth_covers_size,
@@ -558,9 +559,9 @@ class LoserLadderTests(unittest.TestCase):
 
 
 class LoserScrapSweepTests(unittest.TestCase):
-    """One floor FAK for the full remainder; flag off keeps the cent ladder."""
+    """One live-bid FAK for the full remainder; flag off keeps the cent ladder."""
 
-    def test_sweep_is_one_floor_order_for_the_full_size(self):
+    def test_sweep_is_one_live_bid_order_for_the_full_size(self):
         post = loser_scrap_post(
             sweep=True,
             remaining=50.0,
@@ -571,8 +572,35 @@ class LoserScrapSweepTests(unittest.TestCase):
             depth_at_limit=10.0,
         )
         self.assertEqual(post["mode"], "sweep")
-        self.assertEqual(post["limits"], [0.01])
+        self.assertEqual(post["limits"], [0.03])
         self.assertEqual(post["size"], 50.0)
+
+    def test_sweep_follows_bid_below_sell_floor(self):
+        """Bag btc-updown-15m-1791215100: floor/threshold 9c, bid 8c->7c->1c.
+
+        The old sweep posted ``limit>=0.090`` every retry and never matched.
+        Each retry must post at the then-current live bid instead.
+        """
+        for bid in (0.09, 0.08, 0.07, 0.01):
+            post = loser_scrap_post(
+                sweep=True,
+                remaining=39.0,
+                floor=0.09,
+                threshold=0.09,
+                loser_bid=bid,
+                fak_px=0.09,
+                min_px=0.01,
+            )
+            self.assertEqual(post["limits"], [bid], bid)
+            self.assertEqual(post["size"], 39.0)
+
+    def test_live_bid_limit_caps_at_threshold_and_floors_at_clob_min(self):
+        self.assertEqual(scrap_live_bid_limit(0.12, 0.09), 0.09)
+        self.assertEqual(scrap_live_bid_limit(0.05, 0.09), 0.05)
+        self.assertEqual(scrap_live_bid_limit(0.005, 0.09, min_px=0.01), 0.01)
+        self.assertEqual(scrap_live_bid_limit(0.004, 0.09, min_px=0.001), 0.004)
+        self.assertEqual(scrap_live_bid_limit(None, 0.09), 0.01)
+        self.assertEqual(scrap_live_bid_limit(0.0, 0.09), 0.01)
 
     def test_sweep_does_not_clip_to_top_rung_depth(self):
         post = loser_scrap_post(

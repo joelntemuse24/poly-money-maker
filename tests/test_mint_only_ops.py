@@ -1256,7 +1256,7 @@ class DeployUnitsTests(unittest.TestCase):
         self.assertIn("sell_armed_poll_s", validate)
         self.assertIn("poll_s must be >= 1", validate)
 
-    def test_loser_sweep_posts_one_full_floor_fak_and_leaves_a_remainder(self):
+    def test_loser_sweep_posts_one_live_bid_fak_and_leaves_a_remainder(self):
         from buy.mint_sell import loser_scrap_post, sell_fill_vwap
 
         events: list = []
@@ -1317,16 +1317,16 @@ class DeployUnitsTests(unittest.TestCase):
             intent=intent,
             shares=50.0,
         )
-        self.assertEqual(fak_calls, [(50.0, 0.01)])
+        self.assertEqual(fak_calls, [(50.0, 0.03)])
         self.assertEqual(ladder_calls, [])
         self.assertEqual(sold, 20.0)
         self.assertEqual(status, "matched")
-        self.assertEqual(px, 0.01)
+        self.assertEqual(px, 0.03)
         self.assertFalse(flat)
         self.assertEqual(balances["n"], 1)
         depth = [payload for name, payload in events if name == "sell_book_depth"]
         self.assertEqual(len(depth), 1)
-        self.assertEqual(depth[0]["limit"], 0.01)
+        self.assertEqual(depth[0]["limit"], 0.03)
         self.assertEqual(depth[0]["our_size"], 50.0)
         self.assertEqual(depth[0]["path"], "loser")
         self.assertEqual(depth[0]["phase"], "fak")
@@ -1383,7 +1383,7 @@ class DeployUnitsTests(unittest.TestCase):
             intent=intent,
             shares=50.0,
         )
-        self.assertEqual(fak_calls[-1], (30.0, 0.01))
+        self.assertEqual(fak_calls[-1], (30.0, 0.02))
         self.assertTrue(flat)
         self.assertEqual(sold, 30.0)
         self.assertEqual(ladder_calls, [])
