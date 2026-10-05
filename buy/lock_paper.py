@@ -87,20 +87,34 @@ def walk_late_book(item: dict, asks: list, *, now: float) -> dict:
 
 def latency_summary(rows: list[dict]) -> dict:
     """Percentiles of decision-to-post and receive-to-post, in milliseconds."""
-    decision = []
-    recv = []
+    buckets = {
+        "recv_to_decision_ms": [],
+        "recv_to_handoff_ms": [],
+        "decision_to_handoff_ms": [],
+        "decision_to_post_ms": [],
+        "recv_to_post_ms": [],
+    }
+    schedule_keys = ("recv_to_decision_ms", "recv_to_handoff_ms", "decision_to_handoff_ms")
+    post_keys = ("decision_to_post_ms", "recv_to_post_ms")
     for row in rows or []:
         if not isinstance(row, dict):
             continue
-        # ``fill`` repeats the timestamps already on ``paper_fill`` / ``entry``.
-        if row.get("event") not in {"signal", "paper_fill", "entry"}:
+        event = row.get("event")
+        # Schedule stamps live on the signal. Post stamps live on the
+        # paper fill and the live entry, so the 200ms paper walk is not
+        # mixed into the hand-off and a signal is not counted twice.
+        if event == "signal":
+            keys = schedule_keys
+        elif event in {"paper_fill", "entry"}:
+            keys = post_keys
+        else:
             continue
-        for key, bucket in (("decision_to_post_ms", decision), ("recv_to_post_ms", recv)):
+        for key in keys:
             value = row.get(key)
             if value is None:
                 continue
             try:
-                bucket.append(float(value))
+                buckets[key].append(float(value))
             except (TypeError, ValueError):
                 continue
 
@@ -113,4 +127,4 @@ def latency_summary(rows: list[dict]) -> dict:
             return round(ordered[idx], 3)
         return {"n": len(ordered), "p50": pct(0.50), "p95": pct(0.95), "max": round(ordered[-1], 3)}
 
-    return {"decision_to_post_ms": pack(decision), "recv_to_post_ms": pack(recv)}
+    return {key: pack(values) for key, values in buckets.items()}

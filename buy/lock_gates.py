@@ -311,10 +311,23 @@ def _bucket(account: dict, strategy: str) -> float:
     return 0.0
 
 
-def _clip_room(account: dict, cfg: dict, *, strategy: str) -> tuple[float, str]:
+def combined_cap(cfg: dict, market_key: str) -> float:
+    """Per-market combined cap when ``market_rules.<key>.combined_usd`` is set.
+
+    Otherwise the global ``combined_per_market_usd`` applies.
+    """
+    rules = (cfg or {}).get("market_rules") or {}
+    row = rules.get(str(market_key or "")) or {}
+    if isinstance(row, dict) and row.get("combined_usd") is not None:
+        return _num(row.get("combined_usd"), _num(cfg.get("combined_per_market_usd"), 40.0))
+    return _num((cfg or {}).get("combined_per_market_usd"), _num((cfg or {}).get("per_market_usd"), 40.0))
+
+
+def _clip_room(account: dict, cfg: dict, *, strategy: str, market_key: str = "") -> tuple[float, str]:
     """Dollars this clip may spend, and a reason when the room is under the minimum."""
     clip = _num(cfg.get("clip_usd"), 5.0)
-    combined = _num(cfg.get("combined_per_market_usd"), _num(cfg.get("per_market_usd"), 40.0))
+    key = market_key or str(account.get("market_key") or "")
+    combined = combined_cap(cfg, key)
     if strategy == "s1":
         cap = _num(cfg.get("strategy1_market_usd"), 20.0)
         spent_strategy = _bucket(account, "s1")
@@ -343,7 +356,7 @@ def _clip_room(account: dict, cfg: dict, *, strategy: str) -> tuple[float, str]:
     return max(0.0, room), "cash"
 
 
-def _finish_buy(base: dict, account: dict, cfg: dict, *, strategy: str, limit: float, now: float, cooldown_s: float, last_ts: Any) -> dict:
+def _finish_buy(base: dict, account: dict, cfg: dict, *, strategy: str, limit: float, now: float, cooldown_s: float, last_ts: Any, market_key: str = "") -> dict:
     if not bool(cfg.get("enabled", True)):
         base["reason"] = "disabled"
         return base
@@ -353,7 +366,7 @@ def _finish_buy(base: dict, account: dict, cfg: dict, *, strategy: str, limit: f
     if last_ts is not None and now - float(last_ts) < float(cooldown_s):
         base["reason"] = "cooldown"
         return base
-    room, reason = _clip_room(account, cfg, strategy=strategy)
+    room, reason = _clip_room(account, cfg, strategy=strategy, market_key=market_key or str(base.get("market_key") or ""))
     if reason:
         base["reason"] = reason
         base["notional"] = room
@@ -490,6 +503,7 @@ def evaluate_strategy1(view: dict, account: dict, cfg: dict) -> dict:
         now=now,
         cooldown_s=_num(cfg.get("s1_clip_cooldown_s"), 1.0),
         last_ts=account.get("last_s1_ts"),
+        market_key=str(view.get("key") or view.get("market_key") or ""),
     )
 
 
@@ -586,6 +600,7 @@ def evaluate_strategy2(view: dict, account: dict, cfg: dict) -> dict:
         now=now,
         cooldown_s=_num(cfg.get("s2_clip_cooldown_s"), 1.0),
         last_ts=account.get("last_s2_ts"),
+        market_key=str(view.get("key") or view.get("market_key") or ""),
     )
 
 

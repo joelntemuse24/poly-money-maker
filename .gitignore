@@ -41,6 +41,7 @@ STOP_MINT
 .mintbot.lock
 lockbot.json
 positions_lockbot.json
+positions_lockbot_live.json
 STOP_LOCKBOT
 .lockbot.lock
 STOP_PATHLOG

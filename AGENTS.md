@@ -6,8 +6,9 @@ The live VM is the source of truth. This repository snapshot was aligned
 to the VM on 2026-09-19. Historical buy/hedge documents are gone from
 this tree; they are not current operational instructions.
 
-**Live service:** `polymintbot` (`mintbot.py` + `strategy_mint.json`).
-Atomic mint on `btc-up-or-down-15m`. `polypathlog` (`pathlog.py`, 15m
+**polymintbot is stopped** as of 2026-10-05 (inactive, still enabled at
+boot). `mintbot.py` and `strategy_mint.json` are unchanged. Do not start
+`polymintbot` unless the operator asks. `polypathlog` (`pathlog.py`, 15m
 only) is intentionally retired: keep it stopped and disabled, and do not
 revive it. Buybots, complementbot, hedge, DangerZone, shadow
 bots, and hourly-dense pathlog stay **off**. Do not start them, and do
@@ -37,13 +38,13 @@ defaults** unless they say live. Live `strategy_mint.json` runs:
 - **Not live:** `sell_dump_tiers` (#231) and the post-dump kept stop
   (#228) are unmerged.
 
-**Lockbot is a separate service and is not live.** `lockbot.py` plus
-`lockbot.example.json` (`dry_run` true) runs two BTC takers: a NIULAI4
-TWAP ladder (15m and 5m) and a Binance-move sniper (5m). ETH/SOL/XRP
-stay off. It does not import `mintbot.py`, does not take the mint lock,
-and does not read `strategy_mint.json`. `deploy/polylockbot.service` is
-in the repo only. Do not install, enable, or start it until the operator
-asks. Do not restart `polymintbot` for a lockbot change.
+**Lockbot is installed and dry-run.** `polylockbot` has been running
+`dry_run` true since 2026-10-05 00:01 UTC. `lockbot.example.json` stays
+`dry_run` true. It does not import `mintbot.py`, does not take the mint
+lock, and does not read `strategy_mint.json`. Do not restart it, and do
+not set `dry_run` false, unless the operator asks. Paper state is
+`positions_lockbot.json`. Live state is `positions_lockbot_live.json`.
+`python lockbot.py --reset-live` zeros only the live file.
 
 ## Safety boundaries
 
@@ -349,8 +350,9 @@ On BTC 5m the row also stores the Binance 3-second move at their fill
 and whether our strategy-2 trigger fired on that same direction inside
 the window. It does not place or change orders. It holds to settlement
 and never sells. Every threshold is in `lockbot.example.json`. A
-gitignored `lockbot.json` overrides it. `logs/lockbot.jsonl` and
-`positions_lockbot.json` stay gitignored. `python lockbot_summary.py`
+gitignored `lockbot.json` overrides it. `logs/lockbot.jsonl`,
+`positions_lockbot.json` (paper), and `positions_lockbot_live.json`
+stay gitignored. `python lockbot_summary.py`
 prints P&L, paper fills, latency by strategy, and the wallet
 head-to-head: the share of their fills we also signalled, the median
 and p90 of the signed gap, the price difference, and how many unpaired

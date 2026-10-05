@@ -171,7 +171,13 @@ def format_summary(summary: dict) -> str:
         )
     latency = summary.get("latency") or {}
     lines.append("latency ms")
-    for key in ("decision_to_post_ms", "recv_to_post_ms"):
+    for key in (
+        "recv_to_decision_ms",
+        "recv_to_handoff_ms",
+        "decision_to_handoff_ms",
+        "decision_to_post_ms",
+        "recv_to_post_ms",
+    ):
         pack = latency.get(key)
         if not pack:
             lines.append(f"  {key}: n/a")
