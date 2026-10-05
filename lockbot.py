@@ -188,6 +188,7 @@ class LockBot:
         self.session = _session()
         self.markets: dict[str, LockMarket] = {}
         self.market_at: dict[str, float] = {}
+        self._settlement_cache: dict[str, tuple[float, Optional[LockMarket]]] = {}
         self.books: dict[str, dict] = {}
         self.gamma_px: dict[str, float] = {}
         self.feeds: dict[str, RtdsTwapFeed] = {}
@@ -610,7 +611,7 @@ class LockBot:
     def _account_locked(self, market: LockMarket, now: float) -> dict:
         spent_s1 = self._strategy_spent(market.slug, "s1")
         spent_s2 = self._strategy_spent(market.slug, "s2")
-        exposure = open_exposure_usd(self.state["positions"].values()) + self._pending_usd()
+        exposure = open_exposure_usd(self.state["positions"].values(), now=now) + self._pending_usd()
         pnl = day_pnl(self.state["positions"].values(), now, self._marks_cached(now))
         today = dublin_day(now)
         stop = float(self.cfg.get("daily_loss_stop_usd") or 0)
@@ -664,11 +665,7 @@ class LockBot:
         self.warm_clients(now)
         if not self.cfg.get("dry_run", True):
             self._refresh_cash(now)
-        for market in list(self.markets.values()):
-            if market.key not in enabled_keys(self.cfg):
-                continue
-            if market.end_ts - now <= 0:
-                self._settle(market, now)
+        self._settle_pending(now)
         self._prune_markets(now)
         if self.cfg.get("h2h_enabled", False):
             self._kick_wallet_tape(now)
@@ -1169,6 +1166,82 @@ class LockBot:
         except Exception as exc:
             log_event("notify_fail", error=str(exc)[:160])
 
+    def _settle_pending(self, now: float) -> None:
+        """Retry expired ledger slugs; fetch Gamma outside the ledger lock."""
+        from buy.lock_markets import boundary_price
+
+        with self._lock:
+            pending = {}
+            for pos in self.state["positions"].values():
+                if not isinstance(pos, dict) or pos.get("settled_ts"):
+                    continue
+                if pos.get("end_ts") is None or float(pos["end_ts"]) > now:
+                    continue
+                if float(pos.get("shares") or 0) <= 0:
+                    continue
+                slug = str(pos.get("slug") or "")
+                if slug:
+                    pending.setdefault(slug, []).append(dict(pos))
+        for slug in list(self._settlement_cache):
+            if slug not in pending:
+                self._settlement_cache.pop(slug, None)
+        cadence = max(20.0, float(self.cfg.get("market_refresh_s") or 20))
+        tol = max(float(self.cfg.get("strike_tol_s") or 0.75), 1.25)
+        for slug, rows in pending.items():
+            fetched_at, cached = self._settlement_cache.get(slug, (None, None))
+            market = cached or self.markets.get(slug)
+            if market is None:
+                pos = rows[0]
+                parsed = parse_slug(slug)
+                asset, duration, start = parsed or (
+                    str(pos.get("asset") or "btc"),
+                    str(pos.get("duration") or "5m"),
+                    float(pos.get("start_ts") or 0),
+                )
+                key = f"{asset}_{duration}"
+                market = LockMarket(
+                    asset=asset, duration=duration, lane=str(pos.get("lane") or key),
+                    key=key, symbol=f"{asset}/usd", slug=slug, series_slug="",
+                    condition_id=str(pos.get("condition_id") or ""), question="",
+                    start_ts=start, end_ts=float(pos["end_ts"]),
+                    up_token=str(pos.get("up_token") or ""),
+                    dn_token=str(pos.get("dn_token") or ""),
+                    resolution_source="", price_to_beat=None,
+                    resolution_ok=False, accepting_orders=False,
+                )
+            feed = self.feeds.get(market.symbol)
+            hist = feed.twap_history() if feed is not None else []
+            final = boundary_price(hist, market.end_ts, tol_s=tol)
+            need_gamma = final is None or any(
+                self._settlement_strike(row, market, hist, tol) is None for row in rows
+            )
+            # A miss never stops retries. HTTP is limited per slug, even on failure.
+            if need_gamma and market.resolved_winner is None and (
+                fetched_at is None or now - fetched_at >= cadence
+            ):
+                fetched = None
+                try:
+                    fetched = fetch_market(self.session, str(self.cfg.get("gamma_url")), slug)
+                except Exception as exc:
+                    log_event("settlement_fetch_fail", slug=slug, error=str(exc)[:160])
+                self._settlement_cache[slug] = (now, fetched or cached)
+                if fetched is not None:
+                    market = fetched
+            self._settle(market, now)
+
+    def _settlement_strike(self, pos: dict, market: LockMarket, hist: list, tol: float) -> Optional[float]:
+        from buy.lock_markets import boundary_price
+
+        strike = strike_for_position(pos, self.latched)
+        if strike is not None:
+            return strike
+        row = self.windows.get(market.slug) or {}
+        for value in (market.price_to_beat, self.gamma_px.get(market.slug), row.get("strike")):
+            strike = strike_for_position({"strike": value}, {})
+            if strike is not None:
+                return strike
+        return boundary_price(hist, market.start_ts, tol_s=tol)
+
     def _settle(self, market: LockMarket, now: float) -> None:
         with self._lock:
             self._settle_locked(market, now)
@@ -1189,11 +1262,12 @@ class LockBot:
         for pos in rows:
             if pos.get("settled_ts") or float(pos.get("shares") or 0) <= 0:
                 continue
-            strike = strike_for_position(pos, self.latched)
+            strike = self._settlement_strike(pos, market, twap_hist, tol)
             if strike is not None and pos.get("strike") is None:
                 pos["strike"] = float(strike)
                 changed = True
-            if final is None or strike is None:
+            have_twap = final is not None and strike is not None
+            if not have_twap and market.resolved_winner is None:
                 if now - market.end_ts > 600 and not pos.get("settle_miss_logged"):
                     pos["settle_miss_logged"] = True
                     changed = True
@@ -1206,16 +1280,25 @@ class LockBot:
                         have_strike=strike is not None,
                     )
                 continue
-            result = settle_pnl(
-                side=str(pos.get("side") or ""),
-                shares=float(pos["shares"]),
-                cost=float(pos["cost"]),
-                fee=float(pos.get("fee") or 0),
-                final_twap=float(final),
-                strike=float(strike),
-            )
+            if have_twap:
+                result = settle_pnl(
+                    side=str(pos.get("side") or ""), shares=float(pos["shares"]),
+                    cost=float(pos["cost"]), fee=float(pos.get("fee") or 0),
+                    final_twap=float(final), strike=float(strike),
+                )
+                source = "twap"
+            else:
+                won = str(pos.get("side") or "") == market.resolved_winner
+                payout = float(pos["shares"]) if won else 0.0
+                result = {
+                    "won": won, "up_wins": market.resolved_winner == "up",
+                    "payout": payout,
+                    "pnl": payout - float(pos["cost"]) - float(pos.get("fee") or 0),
+                }
+                source = "gamma"
             pos.update(result)
             pos["final_twap"] = final
+            pos["settlement_source"] = source
             pos["settled_ts"] = now
             changed = True
             log_event(
@@ -1227,6 +1310,7 @@ class LockBot:
                 strategy=pos.get("strategy"),
                 condition_id=market.condition_id,
                 side=pos.get("side"),
+                settlement_source=source,
                 won=result["won"],
                 pnl=round(result["pnl"], 6),
                 payout=round(result["payout"], 6),

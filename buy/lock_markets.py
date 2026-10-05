@@ -68,6 +68,7 @@ class LockMarket:
     price_to_beat: Optional[float]
     resolution_ok: bool
     accepting_orders: bool
+    resolved_winner: Optional[str] = None
 
 
 def market_key(asset: str, duration: str) -> str:
@@ -181,6 +182,30 @@ def _outcomes(market: dict) -> dict[str, str]:
     return {str(name).lower(): str(token) for name, token in zip(raw_names, raw_tokens)}
 
 
+def gamma_winner(market: dict) -> Optional[str]:
+    """Final binary payout, gated by Gamma resolution or closed status."""
+    resolved = str(market.get("umaResolutionStatus") or "").lower() == "resolved"
+    closed = str(market.get("closed", False)).lower() in {"true", "1", "yes"}
+    if not (resolved or closed):
+        return None
+    names, prices = market.get("outcomes"), market.get("outcomePrices")
+    try:
+        names = json.loads(names) if isinstance(names, str) else names
+        prices = json.loads(prices) if isinstance(prices, str) else prices
+    except (ValueError, TypeError):
+        return None
+    if not isinstance(names, list) or not isinstance(prices, list) or len(names) != 2 or len(prices) != 2:
+        return None
+    payouts = {str(name).strip().lower(): finite_float(price) for name, price in zip(names, prices)}
+    if set(payouts) != {"up", "down"}:
+        return None
+    if payouts["up"] == 1.0 and payouts["down"] == 0.0:
+        return "up"
+    if payouts["down"] == 1.0 and payouts["up"] == 0.0:
+        return "down"
+    return None
+
+
 def parse_lock_event(event: Any) -> Optional[LockMarket]:
     """One Gamma ``/events?slug=`` object, or None when it is not our market."""
     if not isinstance(event, dict):
@@ -205,6 +230,8 @@ def parse_lock_event(event: Any) -> Optional[LockMarket]:
     if not meta:
         meta = _metadata(market)
     price = finite_float(meta.get("priceToBeat")) if meta else None
+    if price is None:
+        price = finite_float(market.get("priceToBeat", event.get("priceToBeat")))
     if price is not None and price <= 0:
         price = None
     key = market_key(asset, duration)
@@ -231,6 +258,7 @@ def parse_lock_event(event: Any) -> Optional[LockMarket]:
         price_to_beat=price,
         resolution_ok=resolution_is_chainlink_twap60(source),
         accepting_orders=bool(accepting) if isinstance(accepting, bool) else str(accepting).lower() in {"1", "true", "yes"},
+        resolved_winner=gamma_winner({**event, **market}),
     )
 
 
