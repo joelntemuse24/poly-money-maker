@@ -838,6 +838,7 @@ class DeployUnitsTests(unittest.TestCase):
                 "lock_gates.py",
                 "lock_markets.py",
                 "lock_orders.py",
+                "lock_s3.py",
                 "lock_paper.py",
                 "lock_report.py",
                 "lock_state.py",

@@ -15,6 +15,14 @@ DEFAULTS: dict[str, Any] = {
     "dry_run": True,
     "strategy1_enabled": True,
     "strategy2_enabled": True,
+    "strategy3_enabled": False,
+    "strategy3_market_usd": 20.0,
+    "strategy3_clip_usd": 10.0,
+    "strategy3_limit": 0.99,
+    "strategy3_min_ttm_s": 3.0,
+    "strategy3_wallet": "0x44832d0d2ec11187c1e77d786feb15f6a50254c6",
+    "strategy3_rpc_ws_url": "",
+    "strategy3_exchange_addresses": [],
     # Each strategy keeps its own budget. The combined cap is the sum, so
     # strategy 2 cannot spend strategy 1's $20 in the same BTC 5m market.
     "per_market_usd": 40.0,
@@ -162,6 +170,7 @@ def apply_defaults(raw: Any) -> dict:
     cfg["markets"] = markets
     cfg["market_rules"] = rules
     cfg["h2h_enabled"] = _bool(cfg.get("h2h_enabled"), False)
+    cfg["strategy3_enabled"] = _bool(cfg.get("strategy3_enabled"), False)
     cfg["book_log_enabled"] = _bool(cfg.get("book_log_enabled"), False)
     if "combined_per_market_usd" not in raw and "per_market_usd" in raw:
         cfg["combined_per_market_usd"] = cfg["per_market_usd"]
@@ -183,6 +192,10 @@ def validate_config(cfg: Any) -> None:
         "combined_per_market_usd",
         "strategy1_market_usd",
         "strategy2_market_usd",
+        "strategy3_market_usd",
+        "strategy3_clip_usd",
+        "strategy3_limit",
+        "strategy3_min_ttm_s",
         "clip_usd",
         "max_open_exposure_usd",
         "s1_tau_max",

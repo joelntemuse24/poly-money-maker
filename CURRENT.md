@@ -164,6 +164,8 @@ If that sold leg has no B bid or fill for ~10s while the window is open past can
 
 See `TECHNICAL_DESIGN.md` for the full guided tour.
 
+**Strategy 3 (s3) fast-follow:** off by default via `strategy3_enabled`. When enabled, NIULAI4 BUY fills in BTC 5m/15m windows trigger a same-token FAK at limit 0.99. It uses $10 clips, up to $20 per market, skips markets with under 3 seconds remaining, deduplicates fills, and reuses the RTDS wallet tape plus the existing warm order path. Polygon OrderFilled detection is configured as a future adapter seam; s3 logs its current RTDS detection source and lag.
+
 ## Chainlink TWAP tape (audit only)
 
 `oracle_log_enabled` defaults **on**. A missing key in live `strategy_mint.json` stays on; do not edit that file for this tape. While a 15m mint intent is open (including the pre-open bag and ~2 minutes after the end), mintbot appends `logs/oracle_twap.jsonl`.

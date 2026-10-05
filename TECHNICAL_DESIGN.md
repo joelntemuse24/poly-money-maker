@@ -16,6 +16,12 @@ This file replaces the earlier guided tour of `buybothourly.py` (hourly FAK entr
 
 Read Parts I and II straight through. Part III walks mint and sell. Part IV covers helpers. Part V covers operations and sharp edges.
 
+## Strategy 3: NIULAI4 Fast-Follow
+
+Strategy 3 (`s3`) is an opt-in copy-follow lane. It watches NIULAI4 (`0x44832d0d2ec11187c1e77d786feb15f6a50254c6`) BUY fills in BTC 5m and 15m up/down markets and buys the same token. It has no model, edge, price ceiling, or s3-specific daily-loss gate. Each detected fill creates one `$10` clip, with a `$20` per-market cap. Orders are marketable FAK buys at technical limit `0.99`; detections with under three seconds to market end, SELLs, unsupported markets, and duplicates are skipped. `strategy3_enabled` defaults to `false`, so s1 and s2 retain their existing behavior and the wallet socket remains off unless h2h or s3 needs it.
+
+The detector order is Polygon `OrderFilled` configuration first, data-api `/v2/trades?user=...` fallback, and the existing RTDS activity wallet tape as the current operational source. Polygon and data-api adapters expose a clear configured stub until endpoint schemas are confirmed. s3 rows include `detect_source`, `detect_lag_ms`, `his_price`, `his_tx`, `our_limit`, `our_fill_price`, and order timing fields.
+
 ## Contents
 
 - [Part I — Picture](#part-i)

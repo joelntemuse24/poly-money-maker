@@ -306,8 +306,8 @@ def _bucket(account: dict, strategy: str) -> float:
     so an s2 fill does not count as s1 spend. An old account that only
     has ``spent`` still counts that total as strategy 1.
     """
-    key = "spent_s1" if strategy == "s1" else "spent_s2"
-    other = "spent_s2" if strategy == "s1" else "spent_s1"
+    key = {"s1": "spent_s1", "s2": "spent_s2", "s3": "spent_s3"}.get(strategy, "spent_s2")
+    other = {"s1": "spent_s2", "s2": "spent_s1", "s3": "spent_total"}.get(strategy, "spent_s1")
     if account.get(key) is not None:
         return _num(account.get(key), 0.0)
     if account.get(other) is not None:
@@ -331,12 +331,16 @@ def combined_cap(cfg: dict, market_key: str) -> float:
 
 def _clip_room(account: dict, cfg: dict, *, strategy: str, market_key: str = "") -> tuple[float, str]:
     """Dollars this clip may spend, and a reason when the room is under the minimum."""
-    clip = _num(cfg.get("clip_usd"), 5.0)
+    clip_key = "strategy3_clip_usd" if strategy == "s3" else "clip_usd"
+    clip = _num(cfg.get(clip_key), 10.0 if strategy == "s3" else 5.0)
     key = market_key or str(account.get("market_key") or "")
     combined = combined_cap(cfg, key)
     if strategy == "s1":
         cap = _num(cfg.get("strategy1_market_usd"), 20.0)
         spent_strategy = _bucket(account, "s1")
+    elif strategy == "s3":
+        cap = _num(cfg.get("strategy3_market_usd"), 20.0)
+        spent_strategy = _bucket(account, "s3")
     else:
         cap = _num(cfg.get("strategy2_market_usd"), 20.0)
         spent_strategy = _bucket(account, "s2")
@@ -642,6 +646,10 @@ def note_fill(
         account["spent_s2"] = _num(account.get("spent_s2"), 0.0) + paid
         if now is not None:
             account["last_s2_ts"] = float(now)
+    elif strategy == "s3":
+        account["spent_s3"] = _num(account.get("spent_s3"), 0.0) + paid
+        if now is not None:
+            account["last_s3_ts"] = float(now)
     else:
         account["spent_s1"] = _num(account.get("spent_s1"), 0.0) + paid
         if now is not None:
