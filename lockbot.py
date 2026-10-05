@@ -46,6 +46,7 @@ from buy.lock_gates import (
     settle_pnl,
 )
 from buy.lock_orders import LivePoster, dispatch_buy, normalize_fill, open_live_client, warm_market
+from buy.lock_s3 import evaluate_strategy3, normalize_s3_fill
 from buy.lock_paper import enqueue_paper, take_due, walk_late_book
 from buy.lock_markets import (
     DURATION_S,
@@ -171,7 +172,7 @@ def _public_decision(decision: dict) -> dict:
     out = {key: value for key, value in decision.items() if key not in skip}
     out["ask_levels"] = _top(decision.get("asks"))
     out["bid_levels"] = _top(decision.get("bids"))
-    for key in ("p", "q", "z", "z_side", "ask", "edge", "move", "limit", "notional", "ttm_s", "sigma", "live", "twap", "strike", "expected"):
+    for key in ("p", "q", "z", "z_side", "ask", "edge", "move", "limit", "our_limit", "notional", "ttm_s", "sigma", "live", "twap", "strike", "expected", "his_price", "our_fill_price", "detect_lag_ms"):
         if isinstance(out.get(key), float):
             out[key] = round(out[key], 6)
     return out
@@ -203,6 +204,7 @@ class LockBot:
         self.binance: Optional[BinanceTradeFeed] = None
         self.wallets = WalletTape(on_fill=self._on_wallet_fill)
         self.wallet_fills: list[dict] = []
+        self.s3_seen: set[str] = set()
         self.attempts: list[dict] = []
         self._compared: set[str] = set()
         self._compared_order: deque[str] = deque()
@@ -324,7 +326,7 @@ class LockBot:
                 log_event("binance_subscribe", urls=list(self.binance.urls))
         elif self.binance is not None:
             self.binance.stop()
-        if self.cfg.get("h2h_enabled", False):
+        if self.cfg.get("h2h_enabled", False) or self.cfg.get("strategy3_enabled", False):
             if not self.wallets.running():
                 self.wallets.start()
                 log_event(
@@ -336,7 +338,7 @@ class LockBot:
                 )
         elif self.wallets.running():
             self.wallets.stop()
-            log_event("wallet_stopped", reason="h2h_disabled")
+            log_event("wallet_stopped", reason="h2h_and_strategy3_disabled")
 
     def refresh_markets(self, now: float) -> None:
         gamma = str(self.cfg.get("gamma_url"))
@@ -611,6 +613,7 @@ class LockBot:
     def _account_locked(self, market: LockMarket, now: float) -> dict:
         spent_s1 = self._strategy_spent(market.slug, "s1")
         spent_s2 = self._strategy_spent(market.slug, "s2")
+        spent_s3 = self._strategy_spent(market.slug, "s3")
         exposure = open_exposure_usd(self.state["positions"].values(), now=now) + self._pending_usd()
         pnl = day_pnl(self.state["positions"].values(), now, self._marks_cached(now))
         today = dublin_day(now)
@@ -626,10 +629,11 @@ class LockBot:
         else:
             cash = float(self.cash) - self._pending_usd()
         return {
-            "spent": spent_s1 + spent_s2,
+            "spent": spent_s1 + spent_s2 + spent_s3,
             "spent_s1": spent_s1,
             "spent_s2": spent_s2,
-            "spent_total": spent_s1 + spent_s2,
+            "spent_s3": spent_s3,
+            "spent_total": spent_s1 + spent_s2 + spent_s3,
             "open_cost": exposure,
             "cash": float(cash),
             "locked_side": self._locked_side(market.slug),
@@ -920,7 +924,9 @@ class LockBot:
             account = self._account_locked(market, time.time())
             from buy.lock_gates import _clip_room
             room, reason = _clip_room(account, self.cfg, strategy=decision.get("strategy", "s1"), market_key=market.key)
-            if market.condition_id not in self._warmed or not self.cfg.get("enabled", True) or account["loss_stopped"] or account["cash_unknown"] or time.time() >= market.end_ts or reason or room + 1e-9 < decision["notional"]:
+            strat = str(decision.get("strategy") or "")
+            loss_block = account["loss_stopped"] and strat != "s3"  # s3: no daily-loss gate (Joel)
+            if market.condition_id not in self._warmed or not self.cfg.get("enabled", True) or loss_block or account["cash_unknown"] or time.time() >= market.end_ts or reason or room + 1e-9 < decision["notional"]:
                 self._results.submit((job, None, "cap_recheck"))
                 return
             self.inflight[reservation] = dict(decision)
@@ -1042,6 +1048,12 @@ class LockBot:
             strike=decision.get("strike"),
             sigma=decision.get("sigma"),
             expected=decision.get("expected"),
+            his_price=decision.get("his_price"),
+            his_tx=decision.get("his_tx"),
+            our_limit=decision.get("our_limit"),
+            our_fill_price=fill.get("vwap"),
+            detect_source=decision.get("detect_source"),
+            detect_lag_ms=decision.get("detect_lag_ms"),
             shares=fill.get("shares"),
             cost=fill.get("cost"),
             vwap=fill.get("vwap"),
@@ -1355,7 +1367,12 @@ class LockBot:
             log_event("cash_fail", error=str(exc)[:160])
 
     def _on_wallet_fill(self, fill: dict) -> None:
-        """Record one watched fill. Does not read or write an order."""
+        """Record one watched fill and optionally feed the s3 copy-follow.
+
+        s3 runs before any h2h/Binance bookkeeping so detect→handoff stays thin.
+        """
+        if self.cfg.get("strategy3_enabled", False):
+            self._consider_s3_fill(fill)
         self._stamp_binance_move(fill)
         from buy.lock_wallets import fill_key
 
@@ -1365,6 +1382,61 @@ class LockBot:
             if len(self.wallet_fills) > 5000:
                 del self.wallet_fills[: len(self.wallet_fills) - 5000]
         log_event("wallet_fill", **fill)
+
+    def _consider_s3_fill(self, raw_fill: dict) -> None:
+        """Thin hot path: normalize → cap → FAK@$limit → poster. No model/book/edge."""
+        fill = normalize_s3_fill(raw_fill)
+        if fill is None:
+            return
+        fill_id = str(fill.get("fill_id") or "")
+        with self._lock:
+            if fill_id in self.s3_seen:
+                return
+            self.s3_seen.add(fill_id)
+            if len(self.s3_seen) > 10000:
+                self.s3_seen = set(list(self.s3_seen)[-5000:])
+            pending_s3 = sum(
+                float(item.get("notional") or 0.0)
+                for item in list(self.inflight.values()) + list(self.paper)
+                if item.get("strategy") == "s3" and item.get("slug") == fill.get("slug")
+            )
+        market = self.markets.get(str(fill.get("slug") or ""))
+        if market is None:
+            return
+        # Prefer market token map (always warm) over raw asset string.
+        side = str(fill.get("outcome") or "").strip().lower()
+        token = fill.get("asset") or (market.up_token if side == "up" else market.dn_token if side == "down" else "")
+        if token:
+            fill = dict(fill, asset=str(token))
+        now = time.time()
+        # Lightweight account: only s3 spend + pending (skip marks/cash for the gate).
+        spent_s3 = self._strategy_spent(market.slug, "s3")
+        account = {"spent_s3": spent_s3, "pending_s3": pending_s3, "loss_stopped": False}
+        detect_lag_ms = max(0.0, (float(fill.get("recv_ts") or now) - float(fill.get("their_ts") or now)) * 1000.0)
+        decision = evaluate_strategy3(
+            {
+                "his_fill": fill,
+                "slug": market.slug,
+                "market_key": market.key,
+                "ttm_s": market.end_ts - now,
+                "detect_source": "rtds_wallet_tape",
+                "detect_lag_ms": detect_lag_ms,
+                "seen_fill_ids": (),
+            },
+            account,
+            self.cfg,
+        )
+        decision.update(
+            decision_ts=now,
+            slug=market.slug,
+            condition_id=market.condition_id,
+            detect_source="rtds_wallet_tape",
+            detect_lag_ms=detect_lag_ms,
+            ask=decision.get("limit"),
+        )
+        if decision.get("action") == "buy":
+            self._act(market, decision, now)
+        log_event("eval", **_public_decision(decision))
 
     def _stamp_binance_move(self, fill: dict) -> None:
         """3-second Binance move at their fill time. Log only."""
