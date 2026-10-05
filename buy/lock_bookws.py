@@ -213,6 +213,8 @@ class ClobBookFeed:
         self._subscribed: set[str] = set()
         self._stop = threading.Event()
         self._reconnect = threading.Event()
+        self._subs_dirty = threading.Event()
+        self._ping_due = threading.Event()
         self._threads: list[threading.Thread] = []
         self._ws: Any = None
         self._queue: queue.Queue = queue.Queue(maxsize=512)
@@ -248,7 +250,8 @@ class ClobBookFeed:
                 cleaned.append(text)
         with self._lock:
             self._wanted = cleaned
-        self._sync_subscriptions()
+        # The reader thread is the only one that writes the socket.
+        self._subs_dirty.set()
 
     def wanted(self) -> list[str]:
         with self._lock:
@@ -312,6 +315,7 @@ class ClobBookFeed:
                     self._views[token] = materialize_book(row)
 
     def _sync_subscriptions(self) -> None:
+        self._subs_dirty.clear()
         with self._lock:
             wanted = list(self._wanted)
             subscribed = set(self._subscribed)
@@ -347,7 +351,9 @@ class ClobBookFeed:
             if not _sock_open(ws):
                 return False
             try:
+                ws.settimeout(2.0)
                 ws.send(text)
+                ws.settimeout(1.0)
                 return True
             except Exception as exc:
                 self._note_error(exc)
@@ -400,6 +406,12 @@ class ClobBookFeed:
                 self._sync_subscriptions()
                 backoff = 0.5
                 while not self._stop.is_set() and not self._reconnect.is_set():
+                    if self._subs_dirty.is_set():
+                        self._sync_subscriptions()
+                    if self._ping_due.is_set():
+                        self._ping_due.clear()
+                        if not self._ping_socket(ws):
+                            break
                     try:
                         message = ws.recv()
                     except websocket.WebSocketTimeoutException:
@@ -435,17 +447,21 @@ class ClobBookFeed:
             except Exception as exc:
                 self._note_error(exc)
 
+    def _ping_socket(self, ws: Any) -> bool:
+        """Ping from the reader thread. A failure drops the socket there."""
+        if not _sock_open(ws):
+            return False
+        try:
+            ws.ping()
+            return True
+        except Exception as exc:
+            self._note_error(exc)
+            return False
+
     def _ping_loop(self) -> None:
+        """Ask the reader to ping. This thread never touches the socket."""
         while not self._stop.wait(10.0):
-            with self._io_lock:
-                ws = self._ws
-                if not _sock_open(ws):
-                    continue
-                try:
-                    ws.ping()
-                except Exception as exc:
-                    self._note_error(exc)
-                    self._reconnect.set()
+            self._ping_due.set()
 
     def _run(self) -> None:
         """Kept so an older caller that starts ``_run`` still has a target."""
