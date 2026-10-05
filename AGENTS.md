@@ -2,46 +2,34 @@
 
 ## Operational truth
 
-The live VM is the source of truth. This repository snapshot was aligned
-to the VM on 2026-09-19. Historical buy/hedge documents are gone from
-this tree; they are not current operational instructions.
+The live VM is the source of truth. Read `CURRENT.md` for Joel's
+operator-confirmed snapshot on **5 October 2026**.
 
-**polymintbot is stopped** as of 2026-10-05 (inactive, still enabled at
-boot). `mintbot.py` and `strategy_mint.json` are unchanged. Do not start
-`polymintbot` unless the operator asks. `polypathlog` (`pathlog.py`, 15m
-only) is intentionally retired: keep it stopped and disabled, and do not
-revive it. Buybots, complementbot, hedge, DangerZone, shadow
-bots, and hourly-dense pathlog stay **off**. Do not start them, and do
-not add those sources back. `scrapbidder.py` /
-`deploy/polyscrapbid.service` is an opt-in bids-only sister process
-(wallet B). It is not a restore of `complementbot.py`. Leave it stopped
-until the operator asks.
+**polymintbot is LIVE.** `entry_enabled=true`, `dry_run=false`, with
+100 shares per side and `mint_sequential=true`. Its live path is mint →
+scrap loser near close → hold winner to redeem. Leave live services
+untouched unless the operator authorizes a service change.
 
-Never infer service state from filenames or old documentation. Read
-current configuration and read-only service status before operational
-work.
+- **Scrap:** opposite ≥ 90¢, only in the last 300s. The $5 scrap oracle
+  veto is on. Carried-forward settings (not re-confirmed 5 Oct) are
+  loser ≤ 3¢, fraction 0.5 (sell 50 / keep 50), 1¢ floor, persist 3s or
+  2s within the last 90s.
+- **Dump:** `sell_dump_enabled=false`; dump knobs are inert.
+- **WhatsApp:** scrap on; dump and danger off. `danger_zone` still logs.
+- **Redeem:** on, startup sweep off (not re-confirmed 5 Oct).
+  Winner floor 0.9995 is effectively unreachable; the cheap gate is closed.
+- **Wallet:** about $226 pUSD earlier on 5 Oct, a snapshot.
+- **Aim:** about 10–12 scraps/day aiming about $100. There is no daily
+  cap in code. Joel distrusts optimistic backtests; the aim is unproven.
 
-**Live knobs (operator-confirmed 2026-10-03 13:25 IST; details in
-`CURRENT.md`).** The numbers in "Code and validation" below are **code
-defaults** unless they say live. Live `strategy_mint.json` runs:
+**Lockbot deleted Oct 5 (#242 strategies gone, #243 full delete).** Copy-trading s1/s2/s3 and NIULAI4
+follow are deleted. `lockbot.py` is an removed entirely (Oct 5) only;
+the `polylockbot` unit is to be disabled by the operator.
 
-- **Bags:** 200 shares a side, with `mint_sequential` true (one bag at a
-  time, minted 30s before to 240s after the open).
-- **Redeem:** `redeem_enabled` true, `redeem_startup_sweep` false.
-- **Loser scrap:** arms at ≤ 3¢, `sell_scrap_fraction` 0.5 (sell 100 /
-  keep 100), one 1¢-floor FAK, only with ≤ 360s left. Persist 3s, or 2s
-  within the last 90s.
-- **Dump:** under 0.40 for 2s with ≤ 240s left, and
-  `sell_dump_also_kept` true (#232).
-- **Unchanged:** `sell_winner_min` 0.9995, oracle veto off, WhatsApp
-  danger alert on (70¢ for 5s).
-- **Not live:** `sell_dump_tiers` (#231) and the post-dump kept stop
-  (#228) are unmerged.
-
-**Lockbot deleted.** `lockbot.py`, lock modules, tests, example config,
-and `deploy/polylockbot.service` are removed. On the VM the unit is
-stopped, disabled, and the unit file removed. Do not restore lockbot
-unless the operator asks. Mintbot/scrap config untouched.
+**scrapbidder is OFF.** Leave `polyscrapbid` off until the operator asks.
+`polypathlog` is retired; keep it stopped and disabled. Buybots,
+complement, hedge, DangerZone, shadow bots, and hourly-dense pathlog
+remain retired. Never infer service state from filenames or old docs.
 
 ## Safety boundaries
 
@@ -59,7 +47,7 @@ unless the operator asks. Mintbot/scrap config untouched.
 template: dry_run=true, entry_enabled=false, sell_enabled=false). Optional
 sell stays off until live `strategy_mint.json` sets `sell_enabled=true`.
 Loser scrap: sized opposite bid ≥ `sell_opposite_min` (~0.90), loser ≤
-`sell_threshold` (0.02) **arms**. Persist `sell_persist_s` (5s), or
+`sell_threshold` (0.03 live †) **arms**. Persist `sell_persist_s` (3s live †), or
 `sell_persist_last_min_s` (2s) when time-to-end is within
 `sell_persist_last_min_window_s` (~60s). That 2s last-minute persist
 applies through market close. `sell_persist_skip_when_sized` defaults
@@ -79,7 +67,8 @@ fire locks `target = floor(held loser shares × fraction)` and
 scrap orders post `target - filled` only. The loser is sold once that
 target fills within tolerance, or the balance is at or under
 `keep + tolerance`. Kept shares are not scrapped. They are dumped only
-when `sell_dump_also_kept` is on (on live). Otherwise they cash
+when both `sell_dump_enabled` and `sell_dump_also_kept` are on
+(disabled live). Otherwise they cash
 out only at `sell_winner_min` (the cheap 0.99 winner path does not
 apply to the kept leg) or stay until resolution. Resolved positions are
 redeemed only when the opt-in `redeem_enabled` is on (see below). The book still fills
@@ -87,7 +76,7 @@ higher bids first. Set the flag false to restore the 1¢ ladder from
 `sell_fak_px` down to the floor, clipped to top-rung depth. The flag is
 read on each sell tick. Do not post the sweep above the floor. Empty FAK or a vanished loser book after arm keeps `armed_ts`.
 On `empty_keep_arm` / `empty_fak_keep_arm`, fire a blind 1¢ FAK
-(`sell_scrap_blind_px`, backoff `sell_scrap_blind_backoff_s` ~3s). After
+(`sell_scrap_blind_px`, backoff `sell_scrap_blind_backoff_s` ~3s). With `sell_scrap_rest_enabled` true (false live), after
 the first FAK miss while still armed, rest a GTD/GTC sell. The posted
 price is `min(sell_scrap_rest_px, live or last-seen loser bid)` so a 1¢
 book is not left at the 2¢ print. `sell_scrap_rest_px` stays 0.02.
@@ -233,14 +222,14 @@ block that leg, and the last-`active_ttm_s` (~180s) window does not apply
 to that post-scrap hedge. Still cancel by T−`cancel_ttm_s` (~20s). The
 winner leg A still holds stays blocked. Markets A never held are not
 bid (`bid_absent_enabled` defaults false). There is no sister-miss held
-dump. The normal held dump under `sell_dump_below` still applies. When
+dump. The held dump under `sell_dump_below` is code capability, disabled live. When
 `sell_dump_max_ttm_s` > 0 it arms and fires only if seconds-to-close is
 at or under that cutoff (example 240; code default 0 leaves the gate
 off and keeps the old dump). A dip that starts before the cutoff must
 still persist the full `sell_dump_persist_s` after entering it. Ladder
 retries after the dump has fired are not re-checked.
 `sell_dump_also_kept` (default false and false in the example; **true
-live** since 10:31 IST on 2026-10-03)
+in the carried-forward live file**, inert while `sell_dump_enabled` is false)
 also exits the kept scrap half in the same dump event. Once the held dump
 fills, mintbot sells `min(sell_scrap_keep, on-chain balance)` of the
 scrapped leg with the dump's live-bid FAK and refire. It then sends one
@@ -324,9 +313,18 @@ Shared `buy/` helpers exist for mint, pathlog, and the recording-only oracle tap
 - `buy/sister_topup.py` — one $5 pUSD top-up from A to B per broke episode.
   `sister_topup.py` submits the PROXY batch. Scrapbidder spawns it.
 
-Lockbot is deleted (entrypoint, `buy/lock_*`, `buy/relay_batch.py`,
-summary script, example JSON, lockbot tests, and `polylockbot.service`).
-Do not restore it. Mintbot and scrapbidder stay untouched.
+`lockbot.py` is an removed entirely (Oct 5). Copy-trading strategies s1/s2/s3
+removed by Joel 2026-10-05. Wallet-copy and NIULAI4-follow machinery,
+entry evaluation, order clients, FAK retries, and paper entry simulation
+are deleted. Defaults are `enabled: false`, `dry_run: true`, and
+`book_log_enabled: false`. Hot reload can select the paper or live legacy
+ledger; every mode is entry-free. Settlement retains TWAP and Gamma
+fallbacks, persisted strikes, and expired exposure exclusion. Feeds run
+only for existing unsettled positions or optional BTC book logging.
+The independent mint redeem helpers remain; lockbot's live redeem
+activation is removed. `lockbot_summary.py` reports legacy settlements.
+PR #242 is merged. The unit is to be disabled by the operator; keep
+live services untouched during repository work.
 
 Do not restore retired buybot modules (`entry_skip`, `hedge_gate`,
 `btc_price`, `clob_book_ws`, `depth_ladder`, `strategy_coherence`,
@@ -349,4 +347,5 @@ dependencies on the VM after merge. It does not restart services.
 Creating a PR is not authorization to merge or deploy it. After a pull,
 only `polymintbot` may be restarted, and only when the operator asks.
 `polypathlog` is retired. `polyscrapbid` stays stopped until the operator asks to
-start it. Lockbot/`polylockbot` is deleted; do not reinstall or start it.
+start it. `polylockbot` is an removed entirely (Oct 5); its unit is to be disabled
+by the operator. Lockbot trading was removed Oct 5.
