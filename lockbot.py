@@ -30,6 +30,7 @@ from typing import Any, Optional
 import requests
 
 from buy.lock_binance import BinanceTradeFeed
+from buy.lock_book_log import BookSnapshotLogger
 from buy.lock_bookws import ClobBookFeed
 from buy.lock_config import apply_defaults, validate_config
 from buy.lock_engine import build_view, s2_quote_view
@@ -196,6 +197,8 @@ class LockBot:
         self.client = None
         self._logged_resolution: set[str] = set()
         self.book_feed = ClobBookFeed()
+        self.book_log = BookSnapshotLogger(ROOT, self.book_feed.book)
+        self._apply_book_log(time.time())
         self.binance: Optional[BinanceTradeFeed] = None
         self.wallets = WalletTape(on_fill=self._on_wallet_fill)
         self.wallet_fills: list[dict] = []
@@ -252,6 +255,7 @@ class LockBot:
             return
         now_dry = bool(self.cfg.get("dry_run", True))
         log_event("config_reloaded", path=str(self.config_path), dry_run=now_dry)
+        self._apply_book_log(time.time())
         if prev_dry != now_dry:
             self._bind_ledger(now_dry)
             if now_dry:
@@ -409,12 +413,24 @@ class LockBot:
                 out.append(market)
         return out
 
+    def _apply_book_log(self, now: float) -> None:
+        """Hot-reload the ``book_log_*`` knobs. The feed hook stays unset while off."""
+        self.book_log.configure(self.cfg)
+        if self.book_log.enabled:
+            self.book_log.set_markets(self._book_markets(now))
+            self.book_feed.touch_hook = self.book_log.on_touch
+        else:
+            self.book_feed.touch_hook = None
+
     def subscribe_books(self, now: float) -> None:
         tokens: list[str] = []
-        for market in self._book_markets(now):
+        markets = self._book_markets(now)
+        for market in markets:
             tokens.append(market.up_token)
             tokens.append(market.dn_token)
         self.book_feed.set_tokens(tokens)
+        if self.book_log.enabled:
+            self.book_log.set_markets(markets)
 
     def warm_clients(self, now: float) -> None:
         if self.cfg.get("dry_run", True) or self.client is None:
@@ -694,6 +710,7 @@ class LockBot:
             book_reconnects=book_stats.get("reconnects"),
             book_tokens=book_stats.get("tokens"),
             book_parser=book_stats.get("parser"),
+            book_log=self.book_log.stats() if self.book_log.enabled else None,
             binance_age_s=age,
             binance_px=None if latest is None else latest[2],
             binance_error=(self.binance.last_error()[:160] if self.binance is not None else ""),
@@ -1397,6 +1414,7 @@ class LockBot:
         for feed in self.feeds.values():
             feed.stop()
         self.book_feed.stop()
+        self.book_log.close()
         self.wallets.stop()
         if self.binance is not None:
             self.binance.stop()

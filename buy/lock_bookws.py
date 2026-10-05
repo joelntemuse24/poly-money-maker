@@ -220,6 +220,9 @@ class ClobBookFeed:
         self._ws: Any = None
         self._queue: queue.Queue = queue.Queue(maxsize=512)
         self._dirty: set[str] = set()
+        # Optional ``fn(tokens, now)`` called after each applied frame. None
+        # keeps the apply path free of any extra work.
+        self.touch_hook: Optional[Callable[[list[str], float], None]] = None
         self._error = ""
         self._last_msg = 0.0
         self._last_rx = 0.0
@@ -318,6 +321,12 @@ class ClobBookFeed:
             self._error = ""
             # Sort when a reader asks. Doing it on every delta held the GIL.
             self._dirty.update(touched)
+        hook = self.touch_hook
+        if hook is not None and touched:
+            try:
+                hook(touched, now)
+            except Exception as exc:
+                self._note_error(exc)
 
     def _sync_subscriptions(self) -> None:
         self._subs_dirty.clear()

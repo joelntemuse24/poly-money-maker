@@ -214,6 +214,12 @@ also store the Binance 3-second move at their fill and whether our
 strategy-2 trigger fired on that same direction. Nothing in that tape
 is an order input.
 
+**Book tape (not merged, not deployed).** Off by default. For paper, set
+`"book_log_enabled": true` in `lockbot.json`; it hot-reloads and writes
+`logs/books.jsonl` (top 5 levels per BTC 5m/15m token, throttled to 100ms
+when the best ask and bid are unchanged, rolls at 100 MB). Set it back to
+false to stop. It does not change any trading input.
+
 `python lockbot_summary.py` reads `logs/lockbot.jsonl` and prints
 simulated P&L, fill counts, and latency per strategy, plus the share
 of their fills we also signalled, the median and p90 of the signed

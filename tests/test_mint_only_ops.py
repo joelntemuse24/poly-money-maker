@@ -830,6 +830,7 @@ class DeployUnitsTests(unittest.TestCase):
                 "sister_topup.py",
                 "whatsapp_notify.py",
                 "lock_binance.py",
+                "lock_book_log.py",
                 "lock_bookws.py",
                 "lock_config.py",
                 "lock_engine.py",

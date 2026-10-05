@@ -63,6 +63,14 @@ DEFAULTS: dict[str, Any] = {
     # Head-to-head wallet tape. Off unless set: the RTDS activity socket
     # stays closed and is not an input to either strategy.
     "h2h_enabled": False,
+    # Optional JSONL tape of BTC 5m/15m books at ``book_log_path`` (relative
+    # to the repo root). Off by default; the book hot path does no extra work
+    # while it is off. Interval 0 logs every change.
+    "book_log_enabled": False,
+    "book_log_levels": 5,
+    "book_log_min_interval_ms": 100,
+    "book_log_path": "logs/books.jsonl",
+    "book_log_max_bytes": 104857600,
     "market_rules": {
         "btc_15m": {"Z": 0.0, "Pmax": 0.97, "edge_min": 0.0},
         "btc_5m": {"Z": 0.25, "Pmax": 0.90, "edge_min": 0.0},
@@ -154,6 +162,7 @@ def apply_defaults(raw: Any) -> dict:
     cfg["markets"] = markets
     cfg["market_rules"] = rules
     cfg["h2h_enabled"] = _bool(cfg.get("h2h_enabled"), False)
+    cfg["book_log_enabled"] = _bool(cfg.get("book_log_enabled"), False)
     if "combined_per_market_usd" not in raw and "per_market_usd" in raw:
         cfg["combined_per_market_usd"] = cfg["per_market_usd"]
     return cfg
@@ -203,6 +212,15 @@ def validate_config(cfg: Any) -> None:
     if q_edge is not None and q_edge != "":
         if not math.isfinite(_num(q_edge, float("nan"))):
             raise ValueError("s2_q_edge_min must be a number or null")
+    levels = _num(cfg.get("book_log_levels", DEFAULTS["book_log_levels"]), -1)
+    if levels < 1 or levels != int(levels):
+        raise ValueError("book_log_levels must be a positive integer")
+    for key in ("book_log_min_interval_ms", "book_log_max_bytes"):
+        if _num(cfg.get(key, DEFAULTS[key]), -1) < 0:
+            raise ValueError(f"{key} must be >= 0")
+    path = cfg.get("book_log_path", DEFAULTS["book_log_path"])
+    if not isinstance(path, str) or not path.strip():
+        raise ValueError("book_log_path must be a non-empty string")
     if _num(cfg.get("daily_loss_stop_usd"), -1) < 0:
         raise ValueError("daily_loss_stop_usd must be >= 0")
     if _num(cfg.get("min_cash_buffer_usd"), -1) < 0:
