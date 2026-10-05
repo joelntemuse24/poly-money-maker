@@ -10,6 +10,5 @@ eth-account
 eth-abi
 eth-utils
 websocket-client
-# Optional C speedup. websocket-client uses it when installed. Lockbot also
-# passes skip_utf8_validation=True, so a missing wheel does not stop the bot.
+# Optional C speedup for websocket-client when installed.
 wsaccel

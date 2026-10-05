@@ -783,13 +783,9 @@ class DeployUnitsTests(unittest.TestCase):
                 "polymintbot.service",
                 "polypathlog.service",
                 "polyscrapbid.service",
-                "polylockbot.service",
             },
         )
-        lock = (DEPLOY / "polylockbot.service").read_text(encoding="utf-8")
-        self.assertIn("lockbot.py", lock)
-        self.assertNotIn("mintbot.py", lock)
-        self.assertIn("do not enable", lock)
+        self.assertFalse((DEPLOY / "polylockbot.service").exists())
         scrap = (DEPLOY / "polyscrapbid.service").read_text(encoding="utf-8")
         self.assertIn(".env.complement", scrap)
         self.assertNotIn("EnvironmentFile=/home/ntemusejoel/poly-money-maker/.env\n", scrap)
@@ -809,6 +805,13 @@ class DeployUnitsTests(unittest.TestCase):
         self.assertFalse((DEPLOY / "polybuybothourly.service").exists())
         self.assertFalse((DEPLOY / "polycomplement.service").exists())
         self.assertFalse((DEPLOY / "polydangerzone.service").exists())
+        self.assertFalse((DEPLOY / "polylockbot.service").exists())
+        for name in (
+            "lockbot.py",
+            "lockbot_summary.py",
+            "lockbot.example.json",
+        ):
+            self.assertFalse((ROOT / name).exists(), name)
 
     def test_buy_helpers_are_mint_and_pathlog_only(self):
         self.assertEqual(
@@ -829,15 +832,6 @@ class DeployUnitsTests(unittest.TestCase):
                 "sister_bid.py",
                 "sister_topup.py",
                 "whatsapp_notify.py",
-                "lock_book_log.py",
-                "lock_bookws.py",
-                "lock_config.py",
-                "lock_gates.py",
-                "lock_markets.py",
-                "lock_report.py",
-                "lock_state.py",
-                "lock_ws.py",
-                "relay_batch.py",
             },
         )
         market_src = (BUY / "market.py").read_text()

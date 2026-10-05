@@ -68,7 +68,7 @@ RTDS_SOURCE = "polymarket_rtds"
 def _allowed_symbols(symbols: Any) -> frozenset[str]:
     """Default is btc/usd only, so mintbot's parser stays single-asset.
 
-    Lockbot passes the symbols it subscribed to. An empty list does not
+    Callers pass the symbols they subscribed to. An empty list does not
     mean "every symbol".
     """
     if symbols is None:
@@ -849,7 +849,7 @@ class RtdsTwapFeed:
         self._conn_samples = 0
         self._reconnects = 0
         # Default stays the single btc/usd subscription mintbot already uses.
-        # Lockbot passes one symbol per socket: a shared socket only streamed
+        # One symbol per socket: a shared socket only streamed
         # live updates for one symbol (checked 2026-10-04).
         if symbols is None:
             self.symbols: tuple[str, ...] = (RTDS_SYMBOL,)
