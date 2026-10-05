@@ -1359,6 +1359,45 @@ def loser_partial_fak_shares(
     return min(rem, depth)
 
 
+def scrap_live_bid_limit(
+    loser_bid: Optional[float],
+    threshold: float,
+    *,
+    min_px: float = 0.01,
+) -> float:
+    """Sweep FAK limit once the loser scrap is triggered: the live bid.
+
+    The trigger (loser bid <= ``sell_threshold`` with the favourite >=
+    ``sell_opposite_min``) is the ceiling, not the print. Once triggered the
+    FAK posts at the current best bid so it chases the bid down tick by
+    tick. It is capped at ``threshold`` and floored only at the exchange
+    minimum ``min_px`` (``sell_clob_min_price``, 1¢). ``sell_floor`` is NOT
+    applied: live bag ``btc-updown-15m-1791215100`` had ``sell_floor`` 0.09,
+    so every retry posted ``limit>=0.090`` into an 8¢/7¢/1¢ book, missed
+    ~45 times and left 39 Up to resolve at $0.
+    """
+    try:
+        lo = float(min_px)
+    except (TypeError, ValueError):
+        lo = 0.01
+    if not math.isfinite(lo) or lo <= 0:
+        lo = 0.01
+    lo = round(lo, 4)
+    try:
+        bid = float(loser_bid) if loser_bid is not None else 0.0
+    except (TypeError, ValueError):
+        bid = 0.0
+    if not math.isfinite(bid) or bid <= 1e-12:
+        return lo
+    try:
+        top = float(threshold)
+    except (TypeError, ValueError):
+        top = bid
+    if math.isfinite(top) and top > 0:
+        bid = min(bid, top)
+    return round(max(lo, bid), 4)
+
+
 def loser_scrap_post(
     *,
     sweep: bool,
@@ -1368,18 +1407,21 @@ def loser_scrap_post(
     loser_bid: float,
     fak_px: Optional[float] = None,
     depth_at_limit: Optional[float] = None,
+    min_px: float = 0.01,
 ) -> dict:
     """Loser scrap order for this fire.
 
-    Sweep posts one FAK at ``floor`` for the full remainder. The book still
-    fills best bids first. Flag off keeps the 1¢ ladder and the top-rung
-    depth clip.
+    Sweep posts one FAK at the live loser bid (``scrap_live_bid_limit``:
+    capped at ``threshold``, floored at ``min_px``) for the full
+    remainder. Any shares left are retried next tick at the new live bid.
+    ``floor`` does not clamp the sweep up. Flag off keeps the 1¢ ladder and
+    the top-rung depth clip.
     """
     rem = max(0.0, float(remaining or 0.0))
     if sweep:
         return {
             "mode": "sweep",
-            "limits": [round(float(floor), 4)],
+            "limits": [scrap_live_bid_limit(loser_bid, threshold, min_px=min_px)],
             "size": rem,
         }
     limits = list(

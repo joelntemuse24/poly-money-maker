@@ -880,6 +880,45 @@ def _open_scrap_bag(end_ts: float, **extra) -> dict:
     return row
 
 
+class ScrapLiveBidChaseTests(unittest.TestCase):
+    """Bag btc-updown-15m-1791215100: 9c trigger, bid fell 8c -> 7c -> 1c.
+
+    The old sweep posted at ``sell_floor`` (0.09 live) on every retry, so
+    ~45 FAKs missed and 39 Up resolved at $0. Each retry must post at the
+    live bid seen on that tick.
+    """
+
+    def test_retries_post_at_the_falling_live_bid(self):
+        misses = {"left": 2}
+
+        def miss_then_fill(_tok, size, _price, _dry):
+            if misses["left"] > 0:
+                misses["left"] -= 1
+                return 0.0, "no orders found to match with FAK order"
+            return float(size), "matched"
+
+        ns, _events, fak_calls, clock, book = _scrap_harness(miss_then_fill)
+        end = clock["now"] + 300.0
+        intent = _open_scrap_bag(end, sell_loser_armed_at=clock["now"] - 10.0)
+        cfg = _scrap_cfg(
+            sell_threshold=0.09,
+            sell_floor=0.09,
+            sell_fak_px=0.09,
+            sell_scrap_max_ttm_s=0.0,
+            sell_scrap_blind_enabled=False,
+        )
+        state = {"intents": {"cid-chase": intent}}
+        ns["remember_persisted_state"](state)
+        for bid in (0.08, 0.07, 0.01):
+            book["up"] = (bid, 40.0, [{"price": str(bid), "size": "40"}])
+            book["dn"] = (0.95, 80.0, [{"price": "0.95", "size": "80"}])
+            ns["_manage_sells_locked"](cfg, state, object())
+            clock["now"] += 3.5
+        self.assertEqual([c["price"] for c in fak_calls], [0.08, 0.07, 0.01])
+        self.assertTrue(intent.get("sold_loser"))
+        self.assertEqual(intent.get("sold_leg"), "up")
+
+
 class ScrapMaxTtmGateTests(unittest.TestCase):
     def _tick(self, ns, cfg, intent, cid="cid-scrap"):
         state = {"intents": {cid: intent}}
@@ -929,7 +968,8 @@ class ScrapMaxTtmGateTests(unittest.TestCase):
         clock["now"] = armed + 5.0
         self._tick(ns, cfg, intent)
         self.assertEqual(len(fak_calls), 1)
-        self.assertAlmostEqual(fak_calls[0]["price"], 0.02)
+        # Sweep posts at the live 1c loser bid, not the 2c sell_floor.
+        self.assertAlmostEqual(fak_calls[0]["price"], 0.01)
         self.assertEqual(fak_calls[0]["token_id"], "up-tok")
         self.assertTrue(intent.get("sold_loser"))
         self.assertEqual(intent.get("sold_leg"), "up")

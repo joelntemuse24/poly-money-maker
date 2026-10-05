@@ -183,7 +183,7 @@ A **sized bid** in this codebase is the best bid that still has at least `sell_m
 Three prices that must not be conflated:
 
 1. **Arm threshold** — loser ≤ `sell_threshold` (code 2¢, live **3¢**) with opposite ≥ 90¢, or held bid < `sell_dump_below` (code 80¢, live **40¢**).
-2. **Limit posted** — `sell_floor` for the loser sweep (code 2¢, live **1¢**); live sized bid for winner/dump.
+2. **Limit posted** — live sized loser bid for the loser sweep (capped at `sell_threshold`, floored at `sell_clob_min_price` 1¢; not `sell_floor`); live sized bid for winner/dump.
 3. **Average fill** — what actually cleared (usually better than the limit). Live sweeps post 1¢ and log `avg_px` 0.02–0.03 in `sell_scrap_sweep`.
 
 **Live-bid FAK:** once a winner/dump path is allowed to fire, the limit is the current sized bid (winner clamped to 0.99), not a stale fixed 0.999 that Polymarket rejects when the book max is 0.99.
@@ -570,6 +570,8 @@ size, latch = _sell_inventory(chain, ctf, funder_cs, l_tok, shares, tol,
 
 `_sell_inventory` reads the on-chain balance (lock released) and returns `(min(shares, balance), latch)`. `inventory_latch` distinguishes `await_inventory` (zero before any inventory was ever seen: the split may still be settling, so skip) from `already_flat` (zero after inventory was seen: finish without a POST) from `has_inventory`. Then the size is clipped by the partial plan ([§17b](#section-17b)) and `_fire_loser_scrap` posts.
 
+**Update (5 Oct 2026, bag `btc-updown-15m-1791215100`):** the sweep limit is now the live loser bid (`scrap_live_bid_limit`), capped at `sell_threshold` and floored at `sell_clob_min_price`; `sell_floor` no longer clamps it. With live `sell_floor` 0.09 the old sweep posted `limit>=0.090` into an 8¢→7¢→1¢ book ~45 times and 39 Up resolved at $0. The history below describes the old floor sweep.
+
 **The order: one floor sweep (#216).** `sell_scrap_sweep_enabled` (true / true: the live file does not set it). `loser_scrap_post(sweep=True, …)` returns `{"mode": "sweep", "limits": [sell_floor], "size": remaining}`: one FAK at `sell_floor` (0.02 / **0.01**) for the whole remaining scrap size, not clipped to top-of-book depth. Because a sell FAK matches the best bids first, the live 1¢ sweep takes the 3¢ level, then 2¢, then 1¢ in one round trip. That is how the live "3¢ → 2¢ → 1¢" scrap happens: it is one order, not three. The fill is logged as `sell_scrap_sweep` (`limit`, `size`, `avg_px` from `takingAmount / size`, `offered`, `status`), preceded by one `sell_book_depth` line for the fire. After the POST the balance is re-read; a remainder waits for the next fire. With the flag false, `loser_ladder_limits` walks every 1¢ from `min(sell_fak_px, live bid)` down to the floor (#215), each rung clipped to displayed top-rung depth (`loser_partial_fak_shares`); live that would be 3¢, 2¢, 1¢ as separate FAKs. The flag is read every tick.
 
 **Done.** `done = dry_run or balance_flat or sold_total >= post_size - tol`. On done, `_finish_scrap` sets `sold_loser=True`, `sold_leg`, `sold_loser_at` once, resets the oracle arm, and (if a plan exists) logs `sell_scrap_outcome`. `sell_filled` accumulates shares. `sell_limit` still stores the **last limit posted** (the floor, under sweep). The real price goes to `sell_fill_px`: `record_fill_px` folds each fill's `takingAmount / size` into a share-weighted average across sweep, ladder, blind and rest fills, with `sell_fill_px_shares` counting the priced shares. A reply with no `takingAmount` is skipped rather than guessed, and a rest fill (the order poll reports size, not price) is recorded at the rest's own limit. `recorded_fill_px(intent, "sell_fill_px", "sell_limit")` is what the cheap-winner gate and `bag_risk` read; it falls back to `sell_limit` only for state written before this field existed. Then `sell_loser_done` (now with `avg_px`) and ntfy.
@@ -695,7 +697,7 @@ Action (`_run_dump_fak_with_refire`):
 
 | Path | Limit choice | Why |
 |---|---|---|
-| Loser | One FAK at `sell_floor` (0.02 code / 0.01 live) for the scrap remainder. Flag off: 1¢ ladder from `sell_fak_px` to the floor, clipped to top-rung depth. Blind FAK at 0.01. Post-miss rest at `min(sell_scrap_rest_px, live or last-seen bid)` (rest off live) | A floor FAK still takes 3¢ then 2¢ bids first, in one round trip, without clipping to top-of-book depth |
+| Loser | One FAK at the live loser bid (≤ `sell_threshold`, ≥ 1¢) for the scrap remainder, re-posted at the new bid each retry. Flag off: 1¢ ladder from `sell_fak_px` to the floor, clipped to top-rung depth. Blind FAK at 0.01. Post-miss rest at `min(sell_scrap_rest_px, live or last-seen bid)` (rest off live) | A floor FAK still takes 3¢ then 2¢ bids first, in one round trip, without clipping to top-of-book depth |
 | Winner (allowed) | `min(live sized bid, 0.99)` | Resting books quote 0.995–0.999; posting those limits is rejected (`max: 0.99`). A 0.99 FAK still fills the rich book |
 | Held dump | Current sized bid, then a 4¢-step retry ladder toward the floor on a zero-fill miss | Same rejection class; dump fires precisely when bid is *weak* and moving |
 
@@ -875,7 +877,7 @@ Never enable retired buy units (`polycomplement`, buybots, DangerZone, shadow) f
 | `sell_enabled` | false | false | **true** | Run `manage_sells` |
 | `sell_threshold` | 0.02 | 0.02 | **0.03** † | Loser arm ceiling |
 | `sell_fak_px` | 0.02 | 0.02 | **0.03** | Top ladder rung (ladder mode only) |
-| `sell_floor` | 0.02 | 0.02 | **0.01** † | Sweep limit; ladder bottom; dump ladder floor |
+| `sell_floor` | 0.02 | 0.02 | **0.01** † | Ladder bottom; dump ladder floor (no longer the sweep limit) |
 | `sell_scrap_sweep_enabled` | true | true | — (true) | One floor FAK vs cent ladder |
 | `sell_opposite_min` | 0.90 | | 0.90 | Opposite must be rich |
 | `sell_persist_s` / `_last_min_s` / `_last_min_window_s` | 5 / 2 / 60 | | **3** / 2 / **90** † | Loser (and winner) persist; live `sell_persist_s` was 5 until 3 Oct |
@@ -951,7 +953,7 @@ Do not import `mintbot.py` in unit tests (credentials, lock, clients). Test `buy
 | Mint / split | Collateral → both outcome tokens |
 | Loser scrap | Sell the cheap leg (all, or a locked fraction) after the opposite is rich |
 | Partial scrap / keep | `sell_scrap_fraction < 1`: scrap `floor(held × f)`, hold the rest to resolution |
-| Floor sweep | One loser FAK at `sell_floor` for the scrap remainder |
+| Live-bid sweep | One loser FAK at the live loser bid for the scrap remainder |
 | Winner cash-out | Sell rich leg near $1 (gated; unreachable live) |
 | Held dump | After loser sold, sell the held leg if weak (< 80¢ code, < 40¢ live) |
 | Redeem | Exchange winning tokens for $1 collateral after resolution (`mintbot-redeem` thread, on live) |
@@ -1021,7 +1023,7 @@ Values are code default / live.
 
 | Precondition | Persist | Action | Flags set |
 |---|---|---|---|
-| Loser sized bid ≤ `sell_threshold` (0.02 / 0.03) AND opposite ≥ 0.90 AND not both cheap AND TTM ≤ `sell_scrap_max_ttm_s` (off / 360) | 5s / 3s | Lock plan if fraction < 1; one FAK at `sell_floor` (0.02 / 0.01) for `target − filled`; cancel if out of range at fire | `sold_loser`, `sold_leg`, `sell_filled`, `sell_scrap_*` |
+| Loser sized bid ≤ `sell_threshold` (0.02 / 0.03) AND opposite ≥ 0.90 AND not both cheap AND TTM ≤ `sell_scrap_max_ttm_s` (off / 360) | 5s / 3s | Lock plan if fraction < 1; one FAK at the live loser bid for `target − filled`; cancel if out of range at fire | `sold_loser`, `sold_leg`, `sell_filled`, `sell_scrap_*` |
 | Same, TTM ≤ `sell_persist_last_min_window_s` (60 / 90) | 2s | Same | Same |
 | Loser armed, book or FAK empty | kept | Blind FAK at 0.01 every ≥ 3s; rest after a miss (off live) | Same on fill |
 | Winner sized bid ≥ effective_winner_min (0.999 / 0.9995; cheap 0.99 gate closed live) | 5s / 3s | Live-bid FAK clamped to 0.99; kept leg capped at keep; cancel if bid dropped | `sold_winner` |

@@ -38,7 +38,7 @@ pathlog are **stopped / retired**. Do not start them.
   - **Loser scrap.**
     - **Arm:** opposite ≥ 0.90 and loser ≤ **0.03** (`sell_threshold`), only when seconds-to-close ≤ `sell_scrap_max_ttm_s` **360**.
     - **Persist:** `sell_persist_s` **3.0** (was 5 until 3 Oct). Within `sell_persist_last_min_window_s` **90** of the end, the persist is `sell_persist_last_min_s` **2.0**.
-    - **Fire:** at fire it re-checks the range; out of range logs `sell_cancel_out_of_range` and does not POST. One FAK at `sell_floor` **0.01** (sweep default); the book fills 3¢, then 2¢, then 1¢ bids.
+    - **Fire:** at fire it re-checks the range; out of range logs `sell_cancel_out_of_range` and does not POST. One FAK at the **live loser bid** (capped at `sell_threshold`, floored at `sell_clob_min_price` 1¢; `sell_floor` no longer clamps the sweep). A remainder retries next tick at the new live bid, so the scrap chases a falling bid instead of freezing at a fixed limit (bag `btc-updown-15m-1791215100`).
     - **Partial scrap:** `sell_scrap_fraction` **0.5**. The first fire locks target **100** / keep **100** of the 200 held (`sell_scrap_plan`, `sell_scrap_outcome`). The kept 100 ride to resolution unless the held dump fires (see `sell_dump_also_kept`).
     - Post-miss rest is off (`sell_scrap_rest_enabled` false). **The late-window oracle veto is off** (`sell_late_window_s` 0).
     - **Scrap oracle veto is disabled in the live sell path.** The pure helper retains these settings for tests: `scrap_oracle_veto_enabled` **false**, `scrap_oracle_veto_usd` **5.0**, `scrap_oracle_veto_stale_s` **3.0** and `scrap_oracle_veto_use_live` **true**.

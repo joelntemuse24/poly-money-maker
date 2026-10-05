@@ -71,8 +71,13 @@ Persist starts only once ttm is at or under the cutoff, so a cheap bid
 from earlier still waits the full persist. While gated, log
 `sell_scrap_time_gated` (`condition_id`, `slug`, `leg`, `bid`, `ttm`,
 `cutoff`) at most once per 15s per condition/leg. Then re-check in-range
-at fire, `sell_scrap_sweep_enabled` (default true) posts one FAK at
-`sell_floor` for the scrap remainder. `sell_scrap_fraction` defaults to
+at fire, `sell_scrap_sweep_enabled` (default true) posts one FAK at the
+**live loser bid** (`scrap_live_bid_limit`: capped at `sell_threshold`,
+floored at `sell_clob_min_price` 1¢; `sell_floor` is NOT applied) for the
+scrap remainder, and each retry tick re-posts at the new live bid. The
+trigger (loser ≤ `sell_threshold`, favourite ≥ `sell_opposite_min`) is the
+ceiling, not the print (bag `btc-updown-15m-1791215100`: a 9¢ floor FAK
+missed ~45 times into an 8¢→1¢ book). `sell_scrap_fraction` defaults to
 1.0 (the whole loser, same posts as before). Below 1, the first scrap
 fire locks `target = floor(held loser shares × fraction)` and
 `keep = held - target` on the bag. Sweep, ladder, blind, and resting
@@ -85,7 +90,7 @@ apply to the kept leg) or stay until resolution. Resolved positions are
 redeemed only when the opt-in `redeem_enabled` is on (see below). The book still fills
 higher bids first. Set the flag false to restore the 1¢ ladder from
 `sell_fak_px` down to the floor, clipped to top-rung depth. The flag is
-read on each sell tick. Do not post the sweep above the floor. Empty FAK or a vanished loser book after arm keeps `armed_ts`.
+read on each sell tick. Never post the sweep above the live bid. Empty FAK or a vanished loser book after arm keeps `armed_ts`.
 On `empty_keep_arm` / `empty_fak_keep_arm`, fire a blind 1¢ FAK
 (`sell_scrap_blind_px`, backoff `sell_scrap_blind_backoff_s` ~3s). After
 the first FAK miss while still armed, rest a GTD/GTC sell. The posted
