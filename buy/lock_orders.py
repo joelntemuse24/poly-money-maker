@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-import queue
+import heapq
+import itertools
 import threading
 import time
 from typing import Any, Callable, Optional
@@ -139,11 +140,14 @@ def open_live_client(builder: Callable[[], Optional[Any]] | None = None) -> tupl
 
 
 class LivePoster:
-    """Posts live orders off the decision thread. The queue is the hand-off."""
+    """Run immediate and delayed jobs on one worker, using monotonic deadlines."""
 
-    def __init__(self, handler: Callable[[Any], None]) -> None:
+    def __init__(self, handler: Callable[[Any], None], *, clock: Callable[[], float] = time.monotonic) -> None:
         self._handler = handler
-        self._queue: queue.Queue = queue.Queue()
+        self._clock = clock
+        self._queue: list[tuple] = []
+        self._sequence = itertools.count()
+        self._condition = threading.Condition()
         self._stop = threading.Event()
         self._thread: Optional[threading.Thread] = None
 
@@ -155,21 +159,43 @@ class LivePoster:
         self._thread.start()
 
     def submit(self, job: Any) -> None:
-        self._queue.put(job)
+        self.submit_at(self._clock(), job)
+
+    def submit_at(self, due_ts: float, job: Any, *, handler: Callable[[Any], None] | None = None) -> None:
+        """Enqueue a job for a monotonic deadline, optionally with its own handler."""
+        with self._condition:
+            if self._stop.is_set():
+                return
+            heapq.heappush(self._queue, (due_ts, next(self._sequence), handler or self._handler, job))
+            self._condition.notify()
 
     def stop(self) -> None:
-        self._stop.set()
-        self._queue.put(None)
+        with self._condition:
+            self._stop.set()
+            self._queue.clear()
+            self._condition.notify_all()
+
+    def _run_once(self, *, block: bool = False) -> bool:
+        with self._condition:
+            while not self._stop.is_set():
+                delay = self._queue[0][0] - self._clock() if self._queue else None
+                if delay is not None and delay <= 0:
+                    _, _, handler, job = heapq.heappop(self._queue)
+                    break
+                if not block:
+                    return False
+                self._condition.wait(timeout=delay)
+            else:
+                return False
+        try:
+            handler(job)
+        except Exception:
+            pass
+        return True
 
     def _run(self) -> None:
-        while not self._stop.is_set():
-            job = self._queue.get()
-            if job is None:
-                return
-            try:
-                self._handler(job)
-            except Exception:
-                continue
+        while self._run_once(block=True):
+            pass
 
 
 def build_clob_client() -> Optional[Any]:

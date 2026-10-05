@@ -221,8 +221,7 @@ class LockBot:
         self._results = LivePoster(self._finish_job)
         self._results.start()
         self._poster = LivePoster(self._post_job)
-        if not dry:
-            self._poster.start()
+        self._poster.start()
         self._sigma_cache: dict[str, tuple] = {}
         self._risk_at = 0.0
         self._risk_marks: dict[str, float] = {}
@@ -976,7 +975,11 @@ class LockBot:
         attempt = int(decision.get("retry", 0))
         if decision.get("strategy") != "s1" or attempt >= int(self.cfg.get("s1_fak_retries", 2)):
             return
-        time.sleep(0.3)
+        self._poster.submit_at(time.monotonic() + 0.3, (market, attempt), handler=self._run_retry)
+
+    def _run_retry(self, job: tuple) -> None:
+        """Recheck the signal on the hot poster after the miss backoff."""
+        market, attempt = job
         now = time.time()
         account = self._account(market, now)
         account["last_s1_ts"] = None
@@ -1390,6 +1393,7 @@ class LockBot:
     def close(self) -> None:
         self._wake.set()
         self._poster.stop()
+        self._results.stop()
         for feed in self.feeds.values():
             feed.stop()
         self.book_feed.stop()
