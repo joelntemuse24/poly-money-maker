@@ -298,7 +298,7 @@ Saves are cheap and rare: `commit_state` compares a **digest** (`persist_digest`
 
 `main()` installs signal handlers, acquires `.mintbot.lock`, loads `strategy_mint.json` merged over `DEFAULTS`, validates knobs, builds the market gateway and **two** `ChainReader`s (one per loop, one keep-alive session each), then starts three daemon threads: sell (`run_sell_cycle`), mint (`run_mint_cycle`) and the oracle tape.
 
-`load_strategy` copies only keys that exist in `DEFAULTS`; anything else in the live file (for example the leftover `sell_persist_skip_ttm_s`) is ignored. `validate_strategy` enforces `sell_floor ≤ sell_threshold < sell_opposite_min < sell_winner_min < 1`, `sell_floor ≤ sell_fak_px ≤ sell_threshold`, `0 < sell_scrap_fraction ≤ 1`, mint gas bounds, `sell_dump_persist_s` / `sell_cooldown_s` / `sell_scrap_rest_min_ahead_s` ≥ 0, and `poll_s ≥ 1` (it was 2 until 30 Sep; the VM carried a local patch for live `poll_s: 1`, [§32](#section-32)).
+`load_strategy` copies only keys that exist in `DEFAULTS`; anything else in the live file (for example the leftover `sell_persist_skip_ttm_s`) is ignored. `validate_strategy` enforces `sell_floor ≤ sell_threshold < sell_opposite_min < sell_winner_min < 1`, `sell_floor ≤ sell_fak_px ≤ sell_threshold`, `0 < sell_scrap_fraction ≤ 1`, mint gas bounds, `sell_dump_persist_s` / `sell_dump_persist_last_min_s` / `sell_dump_persist_last_min_window_s` / `sell_cooldown_s` / `sell_scrap_rest_min_ahead_s` ≥ 0, and `poll_s ≥ 1` (it was 2 until 30 Sep; the VM carried a local patch for live `poll_s: 1`, [§32](#section-32)).
 
 Every tick of both loops re-reads the strategy file (`_reload_cfg`), so a knob edit takes effect within a second or two without a restart. If the reload fails validation, the loop logs `strategy_reload_fail` and keeps the **previous** config with `entry_enabled` forced false: sells continue, new mints stop.
 
@@ -669,7 +669,7 @@ Preconditions (all required), code default / live:
 - `sold_leg` is `"up"` or `"dn"`, so the held leg is the other one
 - sized held bid is not `None` and `< sell_dump_below` (0.80 / **0.40**)
 - `dump_time_gate_open(ttm, sell_dump_max_ttm_s)` (0 / **240**; example 240; #220). With a positive cutoff, the dump arms and fires only when seconds-to-close ≤ cutoff. Above it, `sell_dump_armed_at` is not started and an in-progress persist is cleared, so the full persist must elapse again inside the window. Unknown TTM counts as **closed** here. A blocked arm logs `sell_dump_time_gated` at most once per bag per 15s.
-- the condition persists `sell_dump_persist_s` (2 / 2)
+- the condition persists `sell_dump_persist_s` (2 / 2), or `sell_dump_persist_last_min_s` (null = same as `sell_dump_persist_s`) when `0 < ttm ≤ sell_dump_persist_last_min_window_s` (default 0 = off). The choice is re-evaluated every tick through `effective_dump_persist_s`, so an arm started on the 2s clock can fire on the 1s clock (`sell_dump_armed_at` is not reset). After market end it falls back to `sell_dump_persist_s`. Live will set `last_min_s=1.0`, `window=120` after merge.
 - at fire, `sell_fire_decision("dump")` still sees bid `< sell_dump_below`, else `sell_cancel_out_of_range`
 - not in sell cooldown
 
@@ -894,6 +894,8 @@ Never enable retired buy units (`polycomplement`, buybots, DangerZone, shadow) f
 | `sell_dump_enabled` | true | | true | Held dump on |
 | `sell_dump_below` | 0.80 | 0.80 | **0.40** † | Dump arm threshold |
 | `sell_dump_persist_s` | 2 | | 2 † | Dump persist |
+| `sell_dump_persist_last_min_s` | null (= `sell_dump_persist_s`) | 2 | not set yet (will be 1.0) | Dump persist inside the last-min window |
+| `sell_dump_persist_last_min_window_s` | 0 (off) | 0 | not set yet (will be 120) | Last-min window length for the dump persist |
 | `sell_dump_max_ttm_s` | 0 (off) | 240 | **240** † | Dump only in the last N seconds |
 | `sell_dump_also_kept` | false | false | **true** † (since 10:31 IST, #232) | Dump also sells the kept scrap half (1¢ floor), so the bag exits flat |
 | `sell_dump_tiers` | — | — | — | Not in `main`. Exists only in unmerged PR #231; not adopted |

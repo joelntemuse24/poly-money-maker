@@ -242,7 +242,12 @@ dump. The normal held dump under `sell_dump_below` still applies. When
 `sell_dump_max_ttm_s` > 0 it arms and fires only if seconds-to-close is
 at or under that cutoff (example 240; code default 0 leaves the gate
 off and keeps the old dump). A dip that starts before the cutoff must
-still persist the full `sell_dump_persist_s` after entering it. Ladder
+still persist the full `sell_dump_persist_s` after entering it. Optional
+`sell_dump_persist_last_min_s` (null = same as `sell_dump_persist_s`)
+replaces that persist when seconds-to-close is within
+`sell_dump_persist_last_min_window_s` (default 0 = off, no behaviour
+change); `armed_ts` is not reset on the switch. Live is meant to set
+`last_min_s` 1.0 and window 120 after merge. Ladder
 retries after the dump has fired are not re-checked.
 `sell_dump_also_kept` (default false and false in the example; **true
 live** since 10:31 IST on 2026-10-03)
