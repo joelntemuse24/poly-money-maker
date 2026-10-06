@@ -49,6 +49,7 @@ pathlog are **stopped / retired**. Do not start them.
   - **Winner:** `sell_winner_min` **0.9995** and the cheap gate is closed (`sell_winner_cheap_if_loser_le` −1). The winner is held and redeemed by mintbot's own redeem thread.
   - **Held dump:**
     - After the loser is sold, if the held sized bid is < **0.40** (`sell_dump_below`) for **2s** (`sell_dump_persist_s`) with ≤ **240s** left (`sell_dump_max_ttm_s`), it sells the whole held leg.
+    - Optional last-minute persist: `sell_dump_persist_last_min_s` (default = `sell_dump_persist_s`) applies when ≤ `sell_dump_persist_last_min_window_s` seconds remain (default 0 = off). The arm is not reset when the clock switches. Live will set `last_min_s=1.0`, `window=120` after merge; until then live stays at 2s.
     - The first shot is a live-bid FAK. If that returns no-match / kill with zero fill, it re-checks and fast re-fires a short descending ladder toward `sell_floor` (`sell_dump_fak_retries=2`, `sell_dump_ladder_step=0.04`, `sell_dump_ladder_rungs=4`).
     - Above 240s left the dump does not arm, and an in-progress persist is cleared. A blocked arm logs `sell_dump_time_gated` at most once per bag per 15s.
   - **`sell_dump_also_kept` true** (PR #232, live since 10:31 IST on 3 Oct):

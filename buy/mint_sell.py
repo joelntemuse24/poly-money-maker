@@ -33,7 +33,9 @@ thresholds. ``sell_oracle_edge_persist_s`` stays 3s. The tape stays on.
 
 After the loser is sold, optional held-leg dump: if the remaining leg's sized
 bid stays under ``sell_dump_below`` (~80¢) for ``sell_dump_persist_s`` (~2s),
-live-bid FAK the held leg. ``sell_dump_max_ttm_s`` (code default 0, off)
+live-bid FAK the held leg. Optional ``sell_dump_persist_last_min_s`` applies
+when time-to-end is within ``sell_dump_persist_last_min_window_s`` (default 0,
+off). ``sell_dump_max_ttm_s`` (code default 0, off)
 blocks that arm and fire while seconds-to-close is above the cutoff; the
 example sets 240. A sister miss does not dump that leg. Wallet B
 reads ``sell_dump_leg`` after this fill and buys the other side.
@@ -84,6 +86,10 @@ DEFAULT_SELL_KNOBS = {
     "sell_dump_enabled": True,
     "sell_dump_below": 0.80,
     "sell_dump_persist_s": 2.0,
+    # Dump persist inside the last window seconds. None = same as sell_dump_persist_s.
+    # Window 0 disables the last-minute clock.
+    "sell_dump_persist_last_min_s": None,
+    "sell_dump_persist_last_min_window_s": 0.0,
     # After first dump no-match/kill-0-fill, quickly refire this many times.
     "sell_dump_fak_retries": 2,
     # Dump retry ladder: top bid, then step down toward floor (short burst).
@@ -329,6 +335,30 @@ def effective_loser_persist_s(
     if window > 0 and ttm <= window + 1e-12:
         return float(last_min_s)
     return float(persist_s)
+
+
+def effective_dump_persist_s(
+    *,
+    now_s: float,
+    end_ts: float,
+    persist_s: float,
+    last_min_s: float,
+    last_min_window_s: float,
+) -> float:
+    """Held-leg dump persist for this tick.
+
+    Same clock switch as ``effective_loser_persist_s``. Falls back to
+    ``persist_s`` once the market has ended. Callers pass the result into
+    ``persist_ready`` each tick, so ``armed_ts`` is never reset on a switch.
+    """
+    effective = effective_loser_persist_s(
+        now_s=now_s,
+        end_ts=end_ts,
+        persist_s=persist_s,
+        last_min_s=last_min_s,
+        last_min_window_s=last_min_window_s,
+    )
+    return float(persist_s) if effective is None else effective
 
 
 def persist_ready(
@@ -1556,6 +1586,18 @@ def _cents(px: Any) -> str:
     return f"{float(px) * 100:g}c"
 
 
+def dump_persist_knobs(cfg: dict) -> Tuple[float, float, float]:
+    """``(persist_s, last_min_s, last_min_window_s)`` for the held-leg dump.
+
+    A missing or ``null`` ``sell_dump_persist_last_min_s`` follows
+    ``sell_dump_persist_s``. The window defaults to 0 (last-minute clock off).
+    """
+    persist = cfg_seconds(cfg, "sell_dump_persist_s", 2.0)
+    last_min = cfg_seconds(cfg, "sell_dump_persist_last_min_s", persist)
+    window = cfg_seconds(cfg, "sell_dump_persist_last_min_window_s", 0.0)
+    return persist, last_min, window
+
+
 def sell_plan_banner(cfg: dict) -> str:
     """One-line description of the loaded sell plan for the startup panel."""
     if not cfg.get("sell_enabled"):
@@ -1580,6 +1622,9 @@ def sell_plan_banner(cfg: dict) -> str:
         dump_ttm = float(cfg.get("sell_dump_max_ttm_s") or 0.0)
         if dump_ttm > 0:
             dump += f" ttm<={dump_ttm:g}s"
+        d_persist, d_last_min, d_window = dump_persist_knobs(cfg)
+        if d_window > 0:
+            dump += f" persist {d_persist:g}s ({d_last_min:g}s last {d_window:g}s)"
         parts.append(dump)
     winner = cfg.get("sell_winner_min") or DEFAULT_SELL_KNOBS["sell_winner_min"]
     parts.append(f"keep winner (cash >={float(winner):g})")

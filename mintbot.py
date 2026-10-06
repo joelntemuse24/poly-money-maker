@@ -116,6 +116,7 @@ from buy.mint_sell import (
     bag_risk_observe,
     bag_risk_payload,
     dump_time_gate_open,
+    effective_dump_persist_s,
     effective_loser_persist_s,
     fresh_bag_risk,
     empty_fak_status,
@@ -270,6 +271,10 @@ DEFAULTS = {
     "sell_dump_enabled": True,
     "sell_dump_below": 0.80,
     "sell_dump_persist_s": 2.0,
+    # Dump persist in the last window seconds; None follows sell_dump_persist_s.
+    # Window 0 = off.
+    "sell_dump_persist_last_min_s": None,
+    "sell_dump_persist_last_min_window_s": 0.0,
     "sell_dump_fak_retries": 2,
     "sell_dump_ladder_step": 0.04,
     "sell_dump_ladder_rungs": 4,
@@ -544,7 +549,13 @@ def validate_strategy(cfg: dict) -> None:
         raise ValueError("sell_scrap_rest_px must be > 0")
     if float(cfg.get("sell_scrap_blind_backoff_s") or 0) < 0:
         raise ValueError("sell_scrap_blind_backoff_s must be >= 0")
-    for key in ("sell_dump_persist_s", "sell_cooldown_s", "sell_scrap_rest_min_ahead_s"):
+    for key in (
+        "sell_dump_persist_s",
+        "sell_dump_persist_last_min_s",
+        "sell_dump_persist_last_min_window_s",
+        "sell_cooldown_s",
+        "sell_scrap_rest_min_ahead_s",
+    ):
         raw = cfg.get(key)
         if raw is not None and float(raw) < 0:
             raise ValueError(f"{key} must be >= 0")
@@ -2871,7 +2882,19 @@ def _manage_sells_locked(cfg: dict, state: dict, chain: ChainReader) -> None:
         sold_dump = bool(intent.get("sold_dump") or intent.get("sold_winner"))
         dump_enabled = bool(cfg.get("sell_dump_enabled", True))
         dump_below = float(cfg.get("sell_dump_below") or 0.80)
-        dump_persist_s = cfg_seconds(cfg, "sell_dump_persist_s", 2.0)
+        dump_persist_base = cfg_seconds(cfg, "sell_dump_persist_s", 2.0)
+        # Re-evaluated every tick; armed_ts is never reset when the clock switches.
+        dump_persist_s = effective_dump_persist_s(
+            now_s=now,
+            end_ts=end_ts,
+            persist_s=dump_persist_base,
+            last_min_s=cfg_seconds(
+                cfg, "sell_dump_persist_last_min_s", dump_persist_base
+            ),
+            last_min_window_s=cfg_seconds(
+                cfg, "sell_dump_persist_last_min_window_s", 0.0
+            ),
+        )
         dump_retries = int(cfg.get("sell_dump_fak_retries", 2))
         dump_ladder_step = float(cfg.get("sell_dump_ladder_step") or 0.04)
         dump_ladder_rungs = int(cfg.get("sell_dump_ladder_rungs", 4))
@@ -2922,6 +2945,7 @@ def _manage_sells_locked(cfg: dict, state: dict, chain: ChainReader) -> None:
                 why=why_d,
                 bid=dump_bid,
                 below=dump_below,
+                persist_s=dump_persist_s,
             )
         if fire_d and held and not cooling:
             fire_action, fire_reason = sell_fire_decision(
