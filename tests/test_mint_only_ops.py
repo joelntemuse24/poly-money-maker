@@ -865,7 +865,10 @@ class DeployUnitsTests(unittest.TestCase):
         self.assertIn("loser_scrap_persist_s", src)
         self.assertIn("loser_blind_fak_due", src)
         self.assertIn("scrap_rest_action", src)
-        self.assertNotIn("side=BUY", src)
+        buy_fn = src[src.find("def _fak_buy") : src.find("\ndef _sell_inventory")]
+        self.assertIn("side=BUY", buy_fn)
+        self.assertIn("OrderType.FAK", buy_fn)
+        self.assertNotIn("side=BUY", src.replace(buy_fn, "", 1))
         self.assertIn("sell_window_open", src)
         self.assertIn("sell_persist_effective", src)
         self.assertIn("sell_persist_last_min_s", src)
