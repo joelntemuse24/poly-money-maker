@@ -1752,9 +1752,14 @@ def _run_dump_fak_with_refire(
 
     for retry_idx in range(max(0, int(retries or 0))):
         with _io_unlocked():
-            retry_bid, _retry_sz, retry_bids, _a, _asz, _asks, _age = _book_quote(
-                _fetch_book(token_id, min_bid_size)
-            )
+            # Tolerate a 3-tuple stub. Ask fields are not used on this retry.
+            row = _fetch_book(token_id, min_bid_size)
+            if isinstance(row, (tuple, list)):
+                retry_bid = row[0] if len(row) > 0 else None
+                _retry_sz = row[1] if len(row) > 1 else 0.0
+                retry_bids = row[2] if len(row) > 2 else []
+            else:
+                retry_bid, _retry_sz, retry_bids = None, 0.0, []
         if retry_bid is None:
             log_event(
                 "sell_dump_fast_refire_stop",
