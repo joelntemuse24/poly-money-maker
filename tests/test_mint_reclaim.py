@@ -8,12 +8,17 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from buy.book import ask_fill_depth, best_ask_with_min_size, book_age_s
+from decimal import Decimal
+
 from buy.mint_sell import (
     cycle_sleep_s,
     reclaim_arm_block,
+    reclaim_buy_usdc,
     reclaim_candidate_order,
     reclaim_entry_decision,
     reclaim_entry_qualify,
+    reclaim_fak_status,
+    reclaim_market_buy_amounts,
     sell_intent_hot,
     sell_plan_banner,
 )
@@ -219,18 +224,22 @@ class GuardDecisionTests(unittest.TestCase):
             up_ask=0.94,
             dn_bid=0.06,
             dn_ask=0.07,
-            up_depth=500.0,
-            dn_depth=500.0,
             up_age=None,
             dn_age=None,
         )
         base.update(kwargs)
         return reclaim_entry_decision(**base)
 
-    def test_other_side_does_not_confirm(self):
-        out = self._decision(up_bid=0.90, dn_bid=0.07, dn_ask=0.08)
+    def test_other_ask_at_nine_cents_confirms_with_a_90_bid(self):
+        out = self._decision(up_bid=0.90, up_ask=0.94, dn_bid=0.08, dn_ask=0.09)
+        self.assertEqual(out["action"], "buy")
+        self.assertEqual(out["leg"], "up")
+        self.assertAlmostEqual(out["limit"], 0.94)
+
+    def test_other_ask_at_ten_cents_does_not_confirm(self):
+        out = self._decision(up_bid=0.93, up_ask=0.94, dn_bid=0.08, dn_ask=0.10)
         self.assertEqual(out["action"], "skip")
-        self.assertEqual(out["reason"], "wick_unconfirmed")
+        self.assertEqual(out["reason"], "sister_unconfirmed")
         self.assertIsNone(out["armed_ts"])
 
     def test_single_tick_does_not_fire(self):
@@ -251,7 +260,7 @@ class GuardDecisionTests(unittest.TestCase):
         self.assertAlmostEqual(out["shares"], 106.0)
         self.assertAlmostEqual(out["limit"], 0.94)
 
-    def test_stale_empty_crossed_locked_wide_and_thin(self):
+    def test_stale_empty_crossed_locked_and_wide(self):
         stale = self._decision(up_age=5.01)
         self.assertEqual((stale["action"], stale["reason"]), ("skip", "stale_book"))
         fresh = self._decision(up_age=5.0)
@@ -266,8 +275,6 @@ class GuardDecisionTests(unittest.TestCase):
         self.assertEqual(locked["reason"], "locked")
         wide = self._decision(up_bid=0.82, up_ask=0.94)
         self.assertEqual(wide["reason"], "wide_spread")
-        thin = self._decision(up_depth=10.0)
-        self.assertEqual(thin["reason"], "thin_depth")
 
     def test_quiet_book_is_no_entry_and_both_rich_skips(self):
         quiet = self._decision(
@@ -293,8 +300,8 @@ class GuardDecisionTests(unittest.TestCase):
         self.assertEqual(reclaim_candidate_order(0.95, 0.97, 0.91), ["dn", "up"])
 
     def test_dumped_leg_is_named_when_the_guard_fails(self):
-        out = self._decision(up_depth=1.0, dumped_legs=("up", "dn"))
-        self.assertEqual(out["reason"], "thin_depth")
+        out = self._decision(dn_ask=0.10, dn_bid=0.08, dumped_legs=("up", "dn"))
+        self.assertEqual(out["reason"], "sister_unconfirmed")
         self.assertTrue(out["dumped_leg"])
         ok = self._decision(dumped_legs=("up",))
         self.assertEqual(ok["action"], "buy")
@@ -336,14 +343,20 @@ class GuardDecisionTests(unittest.TestCase):
         self.assertEqual(gated["reason"], "time_gated")
         self.assertIsNone(gated["armed_ts"])
 
-    def test_qualify_matches_classify_loser_shape(self):
+    def test_qualify_uses_the_other_ask_and_ignores_depth(self):
         ok, reason, shares = reclaim_entry_qualify(
-            leg="up", bid=0.93, ask=0.94, other_bid=0.06, other_ask=0.07,
-            entry=0.91, usd=100.0, ask_depth=500.0,
+            leg="up", bid=0.90, ask=0.94, other_bid=0.08, other_ask=0.09,
+            entry=0.91, usd=100.0,
         )
         self.assertTrue(ok)
         self.assertEqual(reason, "ok")
         self.assertEqual(shares, 106.0)
+        bad, why, _shares = reclaim_entry_qualify(
+            leg="up", bid=0.93, ask=0.94, other_bid=0.08, other_ask=0.10,
+            entry=0.91, usd=100.0,
+        )
+        self.assertFalse(bad)
+        self.assertEqual(why, "sister_unconfirmed")
 
 
 class ArmTests(unittest.TestCase):
@@ -498,17 +511,28 @@ class LoopTests(unittest.TestCase):
             5.0,
         )
 
+    def test_ask_smaller_than_the_clip_still_buys(self):
+        loop = _Loop()
+        now = loop.clock["now"]
+        intent = _dumped(now + 200.0)
+        _arm_entry(intent, now)
+        loop.book = _qualifying(up=(0.90, 0.94, 10.0, None), dn=(0.08, 0.09, 500.0, None))
+        loop.tick(_reclaim_cfg(), intent)
+        self.assertEqual(len(loop.buys), 1)
+        self.assertAlmostEqual(loop.buys[0]["size"], 106.0)
+        self.assertAlmostEqual(loop.buys[0]["price"], 0.94)
+        self.assertFalse(any(row["reason"] == "thin_depth" for row in loop.events_named("reclaim_skip")))
+
     def test_guards_block_the_buy_until_every_check_holds(self):
         loop = _Loop()
         end = loop.clock["now"] + 200.0
         intent = _dumped(end)
         cfg = _reclaim_cfg()
         cases = [
-            ("wick", _qualifying(up=(0.90, 0.94, 500.0, None), dn=(0.07, 0.08, 500.0, None)), "wick_unconfirmed"),
+            ("sister", _qualifying(up=(0.93, 0.94, 1.0, None), dn=(0.08, 0.10, 500.0, None)), "sister_unconfirmed"),
             ("stale", _qualifying(up=(0.93, 0.94, 500.0, 6.0)), "stale_book"),
             ("empty", {"up": _row(None, None), "dn": _row(0.06, 0.07)}, "empty_book"),
             ("crossed", _qualifying(up=(0.95, 0.93, 500.0, None)), "crossed"),
-            ("thin", _qualifying(up=(0.93, 0.94, 10.0, None)), "thin_depth"),
         ]
         for _name, book, reason in cases:
             loop.book = book
@@ -519,8 +543,12 @@ class LoopTests(unittest.TestCase):
             loop.tick(cfg, intent)
             self.assertEqual(loop.buys, [], reason)
             self.assertEqual(loop.events_named("reclaim_skip")[-1]["reason"], reason)
-        thin = [row for row in loop.events_named("reclaim_skip") if row["reason"] == "thin_depth"]
-        self.assertTrue(thin[-1]["dumped_leg"])
+        sister = [
+            row for row in loop.events_named("reclaim_skip")
+            if row["reason"] == "sister_unconfirmed"
+        ]
+        self.assertTrue(sister[-1]["dumped_leg"])
+        self.assertAlmostEqual(sister[-1]["other_ask"], 0.10)
 
     def test_one_buy_after_persist_ignores_cooldown_and_does_not_rebuy(self):
         loop = _Loop()
@@ -793,6 +821,292 @@ class LoopTests(unittest.TestCase):
         self.assertNotIn("time.sleep", stop)
         self.assertIn("_sell_inventory", stop)
         self.assertIn("_run_dump_fak_with_refire", stop)
+        buy_fn = src[src.find("def _fak_buy"):src.find("\ndef _sell_inventory")]
+        self.assertIn("build_market_order", buy_fn)
+        self.assertIn("MarketOrderArgs", buy_fn)
+        self.assertNotIn("client.create_order", buy_fn)
+        self.assertNotIn("client.create_market_order", buy_fn)
+        self.assertNotIn("__ensure_market_info_cached", buy_fn)
+        self.assertNotIn("time.sleep", buy_fn)
+        self.assertNotIn("thin_depth", tick)
+        self.assertNotIn("_reclaim_ask_depth", src)
+        self.assertNotIn("classify_loser", tick)
+
+
+def _places(value: float) -> int:
+    return abs(Decimal(str(value)).as_tuple().exponent)
+
+
+class ReclaimAmountTests(unittest.TestCase):
+    def test_market_buy_usdc_has_two_decimals_on_both_ticks(self):
+        from py_clob_client_v2.order_builder.builder import (
+            ROUNDING_CONFIG,
+            OrderBuilder,
+        )
+        from py_clob_client_v2.order_builder.constants import BUY
+
+        sizes = [1, 5, 20, 26.37, 78.63, 100, 105, 106, 200.5]
+        prices = [0.01, 0.50, 0.91, 0.943, 0.95, 0.96, 0.986, 0.989, 0.99]
+        seen = 0
+        for tick in ("0.01", "0.001"):
+            digits = int(ROUNDING_CONFIG[tick].amount)
+            for size in sizes:
+                for price in prices:
+                    usdc = reclaim_buy_usdc(size, price)
+                    if usdc < 0.01:
+                        continue
+                    got = reclaim_market_buy_amounts(usdc, price, tick)
+                    seen += 1
+                    self.assertEqual(got["maker"] % 10_000, 0)
+                    self.assertLessEqual(_places(got["usdc"]), 2)
+                    self.assertAlmostEqual(got["usdc"], usdc)
+                    self.assertLessEqual(_places(got["shares"]), digits)
+                    self.assertGreater(got["taker"], 0)
+        self.assertGreater(seen, 100)
+        # The limit builder is what the live 400 rejected.
+        _side, maker, _taker = OrderBuilder(signer=None).get_order_amounts(
+            BUY, 26.37, 0.96, ROUNDING_CONFIG["0.01"],
+        )
+        self.assertNotEqual(int(maker) % 10_000, 0)
+
+    def test_live_0814_order_amounts(self):
+        self.assertEqual(reclaim_buy_usdc(105, 0.95), 99.75)
+        self.assertEqual(reclaim_buy_usdc(26.37, 0.96), 25.31)
+        first = reclaim_market_buy_amounts(99.75, 0.95, "0.001")
+        self.assertEqual(first["maker"], 99_750_000)
+        self.assertEqual(first["taker"], 105_000_000)
+        self.assertEqual(first["usdc"], 99.75)
+        self.assertEqual(first["shares"], 105.0)
+        top = reclaim_market_buy_amounts(25.31, 0.96, "0.001")
+        self.assertEqual(top["maker"], 25_310_000)
+        self.assertEqual(top["taker"], 26_364_580)
+        self.assertEqual(top["usdc"], 25.31)
+        self.assertEqual(top["shares"], 26.36458)
+        top_cent = reclaim_market_buy_amounts(25.31, 0.96, "0.01")
+        self.assertEqual(top_cent["maker"], 25_310_000)
+        self.assertEqual(top_cent["taker"], 26_364_500)
+        self.assertEqual(top_cent["shares"], 26.3645)
+
+    def test_fak_buy_signs_cents_without_a_market_info_fetch(self):
+        loop = _Loop(real_buy=True)
+        seen: dict = {}
+
+        class Builder:
+            def build_market_order(self, args, options, version=2, fee_rate_bps=None):
+                seen["amount"] = args.amount
+                seen["price"] = args.price
+                seen["side"] = args.side
+                seen["tick"] = options.tick_size
+                seen["version"] = version
+                return {"signed": True}
+
+        class Client:
+            builder = Builder()
+            builder_config = None
+
+            def get_tick_size(self, _token):
+                return "0.001"
+
+            def get_neg_risk(self, _token):
+                return False
+
+            def _ClobClient__resolve_version(self):
+                return 2
+
+            def update_balance_allowance(self, _params):
+                return None
+
+            def post_order(self, _signed, order_type=None):
+                seen["order_type"] = order_type
+                return {
+                    "status": "matched",
+                    "takingAmount": "26.36458",
+                    "makingAmount": "25.31",
+                }
+
+            def create_order(self, *_a, **_k):
+                raise AssertionError("limit create_order")
+
+            def create_market_order(self, *_a, **_k):
+                raise AssertionError("create_market_order prefetch")
+
+        loop.ns["_get_clob_client"] = lambda: Client()
+        bought, status = loop.ns["_fak_buy"]("tok", 26.37, 0.96, False)
+        self.assertEqual(seen["amount"], 25.31)
+        self.assertEqual(seen["price"], 0.96)
+        self.assertEqual(seen["side"], "BUY")
+        self.assertEqual(seen["tick"], "0.001")
+        self.assertEqual(seen["version"], 2)
+        self.assertEqual(str(seen["order_type"]), "FAK")
+        self.assertEqual(status, "matched")
+        self.assertAlmostEqual(bought, 26.36458)
+        bought0, _status0 = loop.ns["_fak_buy"]("tok", 105, 0.95, False)
+        self.assertEqual(seen["amount"], 99.75)
+        self.assertAlmostEqual(bought0, 26.36458)
+
+    def test_fak_status_splits_reject_from_uncertain(self):
+        class Boom(Exception):
+            def __init__(self, status, msg):
+                super().__init__(msg)
+                self.status_code = status
+
+        self.assertTrue(
+            reclaim_fak_status(Boom(400, "invalid amounts")).startswith("reject:400:")
+        )
+        self.assertIn(
+            "invalid amounts",
+            reclaim_fak_status(Boom(400, "PolyApiException invalid amounts")),
+        )
+        self.assertTrue(
+            reclaim_fak_status(Boom(400, "not enough balance")).startswith("reject:400:")
+        )
+        self.assertTrue(
+            reclaim_fak_status(Boom(502, "bad gateway")).startswith("error:502:")
+        )
+        self.assertTrue(
+            reclaim_fak_status(Boom(None, "timed out")).startswith("error:net:")
+        )
+        self.assertTrue(reclaim_fak_status(TimeoutError("timed out")).startswith("error:net:"))
+
+
+class ReclaimRejectTests(unittest.TestCase):
+    def test_partial_then_topup_is_accepted(self):
+        calls = {"n": 0}
+
+        def buy_result(shares, price):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                self.assertAlmostEqual(price, 0.95)
+                self.assertAlmostEqual(shares, 105.0)
+                self.assertEqual(reclaim_buy_usdc(shares, price), 99.75)
+                return 78.63, "matched"
+            self.assertAlmostEqual(price, 0.96)
+            self.assertAlmostEqual(shares, 26.37, places=4)
+            self.assertEqual(reclaim_buy_usdc(shares, price), 25.31)
+            return float(shares), "matched"
+
+        loop = _Loop(buy_result=buy_result)
+        now = loop.clock["now"]
+        intent = _dumped(now + 200.0)
+        _arm_entry(intent, now)
+        loop.book = _qualifying(up=(0.94, 0.95, 500.0, None), dn=(0.05, 0.06, 500.0, None))
+        cfg = _reclaim_cfg()
+        loop.tick(cfg, intent)
+        self.assertAlmostEqual(intent.get("reclaim_filled"), 78.63)
+        self.assertFalse(intent.get("reclaim_bought"))
+        self.assertFalse(intent.get("reclaim_buy_uncertain"))
+        loop.book = _qualifying(up=(0.95, 0.96, 500.0, None), dn=(0.04, 0.05, 500.0, None))
+        loop.clock["now"] = now + 0.2
+        loop.tick(cfg, intent)
+        self.assertEqual(len(loop.buys), 2)
+        self.assertTrue(intent.get("reclaim_bought"))
+        done = loop.events_named("reclaim_done")
+        self.assertEqual(len(done), 1)
+        self.assertEqual(done[0]["reason"], "filled")
+        self.assertAlmostEqual(done[0]["filled"], 105.0)
+        self.assertIsNotNone(done[0]["avg_px"])
+        self.assertAlmostEqual(done[0]["cost"], 105.0 * float(done[0]["avg_px"]), places=4)
+        self.assertFalse(intent.get("reclaim_buy_uncertain"))
+
+    def test_hard_400_is_not_uncertain_and_the_same_order_is_not_retried(self):
+        loop = _Loop(buy_result=lambda _s, _p: (0.0, "reject:400:invalid amounts"))
+        now = loop.clock["now"]
+        intent = _dumped(now + 200.0)
+        _arm_entry(intent, now)
+        loop.book = _qualifying()
+        cfg = _reclaim_cfg()
+        loop.tick(cfg, intent)
+        self.assertEqual(len(loop.buys), 1)
+        self.assertFalse(intent.get("reclaim_buy_uncertain"))
+        self.assertFalse(intent.get("reclaim_buy_inflight"))
+        self.assertEqual(loop.inventories, [])
+        rejected = loop.events_named("reclaim_fak_reject")
+        self.assertEqual(len(rejected), 1)
+        self.assertIn("invalid amounts", rejected[0]["error"])
+        self.assertIn("reject:400:", rejected[0]["status"])
+        loop.clock["now"] = now + 0.2
+        loop.tick(cfg, intent)
+        self.assertEqual(len(loop.buys), 1)
+        self.assertEqual(loop.inventories, [])
+        self.assertFalse(intent.get("reclaim_bought"))
+        self.assertEqual(loop.events_named("reclaim_skip")[-1]["reason"], "rejected")
+
+    def test_rejected_topup_ends_once_the_same_order_would_repeat(self):
+        calls = {"n": 0}
+
+        def buy_result(shares, price):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                return 78.63, "matched"
+            return 0.0, "reject:400:invalid amounts"
+
+        loop = _Loop(buy_result=buy_result)
+        now = loop.clock["now"]
+        intent = _dumped(now + 200.0)
+        _arm_entry(intent, now)
+        loop.book = _qualifying(up=(0.94, 0.95, 500.0, None), dn=(0.05, 0.06, 500.0, None))
+        cfg = _reclaim_cfg()
+        loop.tick(cfg, intent)
+        loop.book = _qualifying(up=(0.95, 0.96, 500.0, None), dn=(0.04, 0.05, 500.0, None))
+        loop.clock["now"] = now + 0.2
+        loop.tick(cfg, intent)
+        self.assertEqual(len(loop.buys), 2)
+        self.assertFalse(intent.get("reclaim_buy_uncertain"))
+        self.assertTrue(loop.events_named("reclaim_fak_reject"))
+        self.assertEqual(loop.inventories, [])
+        loop.clock["now"] = now + 0.4
+        loop.tick(cfg, intent)
+        self.assertEqual(len(loop.buys), 2)
+        self.assertTrue(intent.get("reclaim_bought"))
+        done = loop.events_named("reclaim_done")
+        self.assertEqual(done[-1]["reason"], "rejected")
+        self.assertAlmostEqual(done[-1]["filled"], 78.63)
+        self.assertIsNotNone(done[-1]["avg_px"])
+        self.assertIsNotNone(done[-1]["cost"])
+
+    def test_a_different_ask_may_still_top_up_after_a_reject(self):
+        calls = {"n": 0}
+
+        def buy_result(_shares, _price):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                return 0.0, "reject:400:invalid amounts"
+            return float(_shares), "matched"
+
+        loop = _Loop(buy_result=buy_result)
+        now = loop.clock["now"]
+        intent = _dumped(now + 200.0)
+        _arm_entry(intent, now)
+        loop.book = _qualifying(up=(0.94, 0.95, 500.0, None), dn=(0.05, 0.06, 500.0, None))
+        cfg = _reclaim_cfg()
+        loop.tick(cfg, intent)
+        loop.book = _qualifying(up=(0.95, 0.96, 500.0, None), dn=(0.04, 0.05, 500.0, None))
+        loop.clock["now"] = now + 0.2
+        loop.tick(cfg, intent)
+        self.assertEqual(len(loop.buys), 2)
+        self.assertTrue(intent.get("reclaim_bought"))
+        self.assertEqual(loop.events_named("reclaim_done")[-1]["reason"], "filled")
+
+    def test_partial_that_stops_qualifying_logs_reclaim_done(self):
+        loop = _Loop(buy_result=lambda _s, _p: (78.63, "matched"))
+        now = loop.clock["now"]
+        intent = _dumped(now + 200.0)
+        _arm_entry(intent, now)
+        loop.book = _qualifying(up=(0.94, 0.95, 500.0, None), dn=(0.05, 0.06, 500.0, None))
+        cfg = _reclaim_cfg()
+        loop.tick(cfg, intent)
+        self.assertFalse(intent.get("reclaim_bought"))
+        loop.book = _qualifying(up=(0.50, 0.80, 500.0, None), dn=(0.20, 0.21, 500.0, None))
+        loop.clock["now"] = now + 0.2
+        loop.tick(cfg, intent)
+        self.assertEqual(len(loop.buys), 1)
+        self.assertTrue(intent.get("reclaim_bought"))
+        done = loop.events_named("reclaim_done")
+        self.assertEqual(len(done), 1)
+        self.assertAlmostEqual(done[0]["filled"], 78.63)
+        self.assertNotEqual(done[0]["reason"], "inflight")
+        self.assertTrue(done[0]["reason"])
+        self.assertIsNotNone(done[0]["cost"])
 
 
 if __name__ == "__main__":

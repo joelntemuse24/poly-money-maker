@@ -250,8 +250,8 @@ def ask_fill_depth(
     """Cumulative ask size a buy FAK at ``limit`` can lift.
 
     A CLOB BUY FAK at ``limit`` matches resting asks with ``price <= limit``.
-    Same shape as ``bid_fill_depth``. Log and the reclaim size check both
-    read ``depth_at_limit``.
+    Same shape as ``bid_fill_depth``. Sell logging reads ``depth_at_limit``.
+    Reclaim does not gate on it.
     """
     parsed = _parsed_ask_levels(levels)
     best_ask: Optional[float] = parsed[0][0] if parsed else None

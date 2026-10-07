@@ -38,8 +38,10 @@ defaults until the operator edits them.
 
 Opt-in reclaim (``reclaim_enabled``, default false): after a both-sides
 dump, buy about ``reclaim_usd`` of the first side whose book holds at
-``reclaim_entry`` for ``reclaim_entry_persist_s``, using the same
-sister-book checks as the loser scrap. Stop-sell at ``reclaim_stop``
+``reclaim_entry`` for ``reclaim_entry_persist_s``. The other side confirms
+when its best ask is at or under ``1 - reclaim_entry``. There is no
+ask-depth gate. The FAK is a market buy in USDC
+truncated to cents. Stop-sell at ``reclaim_stop``
 (default on) or hold to redeem. The watch stays on ``sell_armed_poll_s``
 until that finishes. A position still held at resolution is redeemed by
 the existing redeem thread.
@@ -89,7 +91,6 @@ from rich.console import Console
 from rich.panel import Panel
 
 from buy.book import (
-    ask_fill_depth,
     best_ask_with_min_size,
     best_bid_with_min_size,
     bid_fill_depth,
@@ -151,7 +152,10 @@ from buy.mint_sell import (
     sell_fill_vwap,
     record_fill_px,
     reclaim_arm_block,
+    reclaim_buy_order_key,
+    reclaim_buy_usdc,
     reclaim_entry_decision,
+    reclaim_fak_status,
     reclaim_stop_decision,
     recorded_fill_px,
     cfg_seconds,
@@ -1422,17 +1426,24 @@ def _fak_buy(
     dry_run: bool,
     capture: Optional[list] = None,
 ):
-    """One FAK buy. ``shares`` is outcome size; ``price`` is the max (the ask).
+    """One FAK buy. ``shares`` sizes the clip; the post is a market BUY in USDC.
 
-    Dry-run returns before any client call. Live path matches the sell FAK:
-    one collateral allowance refresh, then a single post. No sleep.
+    The dollar amount is ``reclaim_buy_usdc`` (whole cents) and ``price`` is
+    the max. Signing uses the market-order builder, the same shape as a
+    sell FAK, so the maker amount has at most two USDC decimals. Tick size,
+    exchange version, and neg-risk are the lookups ``create_order`` already
+    does. ``create_market_order``'s market-info prefetch is not called.
+    Dry-run returns before any client call. No sleep.
     """
     shares = float(shares)
     price = float(price)
-    if shares < 0.01 or not (0 < price < 1):
+    usdc = reclaim_buy_usdc(shares, price)
+    if shares < 0.01 or usdc < 0.01 or not (0 < price < 1):
         return 0.0, "bad_args"
     if dry_run:
-        log_event("dry_buy", token_id=str(token_id), size=shares, price=price)
+        log_event(
+            "dry_buy", token_id=str(token_id), size=shares, price=price, usdc=usdc,
+        )
         return 0.0, "dry"
     client = _get_clob_client()
     if client is None:
@@ -1441,10 +1452,13 @@ def _fak_buy(
         from py_clob_client_v2 import (
             BalanceAllowanceParams,
             AssetType,
-            OrderArgs,
+            MarketOrderArgs,
             OrderType,
         )
+        from py_clob_client_v2.clob_types import CreateOrderOptions
+        from py_clob_client_v2.constants import BYTES32_ZERO
         from py_clob_client_v2.order_builder.constants import BUY
+        from py_clob_client_v2.utilities import price_valid
         from buy.sister_bid import buy_matched_shares
 
         try:
@@ -1453,13 +1467,29 @@ def _fak_buy(
             )
         except Exception as exc:
             log_event("reclaim_allowance_warn", error=str(exc)[:160])
-        signed = client.create_order(
-            OrderArgs(
-                token_id=str(token_id),
-                price=price,
-                size=shares,
-                side=BUY,
-            )
+        order_args = MarketOrderArgs(
+            token_id=str(token_id),
+            amount=usdc,
+            side=BUY,
+            price=price,
+            order_type=OrderType.FAK,
+        )
+        tick_size = client.get_tick_size(str(token_id))
+        if not price_valid(price, tick_size):
+            return 0.0, "bad_args"
+        resolve_version = getattr(client, "_ClobClient__resolve_version", None)
+        version = int(resolve_version() if resolve_version is not None else 2)
+        neg_risk = False if version == 3 else bool(client.get_neg_risk(str(token_id)))
+        builder_config = getattr(client, "builder_config", None)
+        if builder_config and getattr(builder_config, "builder_code", None):
+            code = builder_config.builder_code
+            current = getattr(order_args, "builder_code", None)
+            if not current or current == BYTES32_ZERO:
+                order_args.builder_code = code
+        signed = client.builder.build_market_order(
+            order_args,
+            CreateOrderOptions(tick_size=tick_size, neg_risk=neg_risk),
+            version=version,
         )
         result = client.post_order(signed, order_type=OrderType.FAK)
         bought = 0.0
@@ -1474,6 +1504,7 @@ def _fak_buy(
             token_id=str(token_id),
             size=shares,
             price=price,
+            usdc=usdc,
             bought=bought,
             status=status,
             raw=str(result)[:240] if result is not None else None,
@@ -1481,7 +1512,7 @@ def _fak_buy(
         return bought, status
     except Exception as exc:
         log_event("reclaim_fak_fail", token_id=str(token_id)[:18], error=str(exc)[:200])
-        return 0.0, f"error:{str(exc)[:80]}"
+        return 0.0, reclaim_fak_status(exc)
 
 
 def _sell_inventory(
@@ -2742,7 +2773,6 @@ def _reclaim_quote_fields(
     *,
     bids: dict,
     asks_px: dict,
-    depths: dict,
     ttm_s: Optional[float],
 ) -> dict:
     leg = decision.get("leg")
@@ -2753,25 +2783,9 @@ def _reclaim_quote_fields(
         "ask": asks_px.get(leg) if leg else None,
         "other_bid": bids.get(other) if other else None,
         "other_ask": asks_px.get(other) if other else None,
-        "depth": depths.get(leg) if leg else None,
         "ttm": ttm_s,
         "dumped_leg": bool(decision.get("dumped_leg")),
     }
-
-
-def _reclaim_ask_depth(ask_books: dict, asks_px: dict, leg: str) -> float:
-    """Depth at this tick's sized ask. No fetch."""
-    from buy.book import ask_fill_depth
-
-    ask = asks_px.get(leg)
-    if ask is None:
-        return 0.0
-    try:
-        return float(
-            ask_fill_depth(ask_books.get(leg) or [], ask).get("depth_at_limit") or 0.0
-        )
-    except Exception:
-        return 0.0
 
 
 def _reclaim_finish_hot(intent: dict, *, stop_enabled: bool) -> None:
@@ -2796,6 +2810,63 @@ def _reclaim_hold(intent: dict, cid: str) -> None:
         leg=intent.get("reclaim_leg"),
         filled=intent.get("reclaim_filled"),
     )
+
+
+def _reclaim_finish_buy(
+    intent: dict,
+    cid: str,
+    *,
+    reason: str,
+    cfg: dict,
+    now: float,
+    ttm_s: Optional[float],
+    bids: dict,
+    tokens: dict,
+    dry_run: bool,
+    tol: float,
+    chain: ChainReader,
+    ctf: str,
+    funder_cs: Optional[str],
+    min_bid_size: float,
+    clob_min: float,
+    stop_enabled: bool,
+) -> None:
+    """Buy phase is over. Log ``reclaim_done`` once, then the stop or the hold."""
+    intent["reclaim_bought"] = True
+    intent["reclaim_buy_inflight"] = False
+    intent["reclaim_buy_uncertain"] = False
+    if not intent.get("reclaim_done_logged"):
+        intent["reclaim_done_logged"] = True
+        filled = float(intent.get("reclaim_filled") or 0.0)
+        avg = intent.get("reclaim_buy_px")
+        cost = None
+        try:
+            if avg is not None and filled > 0:
+                cost = round(float(avg) * filled, 4)
+        except (TypeError, ValueError):
+            cost = None
+        log_event(
+            "reclaim_done",
+            condition_id=cid,
+            slug=intent.get("slug"),
+            leg=intent.get("reclaim_leg"),
+            filled=filled,
+            avg_px=avg,
+            cost=cost,
+            reason=str(reason),
+            target=intent.get("reclaim_target"),
+        )
+    _reclaim_finish_hot(intent, stop_enabled=stop_enabled)
+    if stop_enabled:
+        _reclaim_stop_tick(
+            cfg=cfg, intent=intent, cid=cid, now=now, ttm_s=ttm_s,
+            bids=bids, tokens=tokens, dry_run=dry_run, tol=tol,
+            chain=chain, ctf=ctf, funder_cs=funder_cs,
+            min_bid_size=min_bid_size, clob_min=clob_min,
+            stop_enabled=True,
+        )
+    else:
+        _reclaim_hold(intent, cid)
 
 
 def _reclaim_recover_buy(
@@ -3020,7 +3091,6 @@ def _reclaim_tick(
     ttm_s: Optional[float],
     bids: dict,
     asks_px: dict,
-    ask_books: dict,
     ages: dict,
     tokens: dict,
     dry_run: bool,
@@ -3085,10 +3155,6 @@ def _reclaim_tick(
             intent["reclaim_hot"] = False
         return
     intent["reclaim_hot"] = True
-    depths = {
-        "up": _reclaim_ask_depth(ask_books, asks_px, "up"),
-        "dn": _reclaim_ask_depth(ask_books, asks_px, "dn"),
-    }
     locked = intent.get("reclaim_leg") if intent.get("reclaim_buy_posted") else None
     decision = reclaim_entry_decision(
         now_s=now,
@@ -3107,8 +3173,6 @@ def _reclaim_tick(
         up_ask=asks_px.get("up"),
         dn_bid=bids.get("dn"),
         dn_ask=asks_px.get("dn"),
-        up_depth=depths["up"],
-        dn_depth=depths["dn"],
         up_age=ages.get("up"),
         dn_age=ages.get("dn"),
         inflight=bool(
@@ -3128,19 +3192,17 @@ def _reclaim_tick(
         _reclaim_skip(
             intent, cid, "inflight",
             **_reclaim_quote_fields(
-                decision, bids=bids, asks_px=asks_px, depths=depths, ttm_s=ttm_s,
+                decision, bids=bids, asks_px=asks_px, ttm_s=ttm_s,
             ),
         )
         if intent.get("reclaim_bought"):
-            _reclaim_finish_hot(intent, stop_enabled=stop_enabled)
-            if stop_enabled:
-                _reclaim_stop_tick(
-                    cfg=cfg, intent=intent, cid=cid, now=now, ttm_s=ttm_s,
-                    bids=bids, tokens=tokens, dry_run=dry_run, tol=tol,
-                    chain=chain, ctf=ctf, funder_cs=funder_cs,
-                    min_bid_size=min_bid_size, clob_min=clob_min,
-                    stop_enabled=True,
-                )
+            _reclaim_finish_buy(
+                intent, cid, reason="recovered",
+                cfg=cfg, now=now, ttm_s=ttm_s, bids=bids, tokens=tokens,
+                dry_run=dry_run, tol=tol, chain=chain, ctf=ctf,
+                funder_cs=funder_cs, min_bid_size=min_bid_size,
+                clob_min=clob_min, stop_enabled=stop_enabled,
+            )
         return
     if action == "wait":
         intent.pop("reclaim_skip_reason", None)
@@ -3160,25 +3222,19 @@ def _reclaim_tick(
         # A partial that no longer qualifies is a position: stop it, do not
         # switch sides or wait for the entry to come back.
         if decision.get("reason") == "filled" or held_now > 0:
-            intent["reclaim_bought"] = True
-            intent["reclaim_buy_inflight"] = False
-            intent["reclaim_buy_uncertain"] = False
-            _reclaim_finish_hot(intent, stop_enabled=stop_enabled)
-            if stop_enabled:
-                _reclaim_stop_tick(
-                    cfg=cfg, intent=intent, cid=cid, now=now, ttm_s=ttm_s,
-                    bids=bids, tokens=tokens, dry_run=dry_run, tol=tol,
-                    chain=chain, ctf=ctf, funder_cs=funder_cs,
-                    min_bid_size=min_bid_size, clob_min=clob_min,
-                    stop_enabled=True,
-                )
-            else:
-                _reclaim_hold(intent, cid)
+            _reclaim_finish_buy(
+                intent, cid,
+                reason=str(decision.get("reason") or "held"),
+                cfg=cfg, now=now, ttm_s=ttm_s, bids=bids, tokens=tokens,
+                dry_run=dry_run, tol=tol, chain=chain, ctf=ctf,
+                funder_cs=funder_cs, min_bid_size=min_bid_size,
+                clob_min=clob_min, stop_enabled=stop_enabled,
+            )
             return
         _reclaim_skip(
             intent, cid, str(decision.get("reason") or "skip"),
             **_reclaim_quote_fields(
-                decision, bids=bids, asks_px=asks_px, depths=depths, ttm_s=ttm_s,
+                decision, bids=bids, asks_px=asks_px, ttm_s=ttm_s,
             ),
         )
         return
@@ -3190,9 +3246,30 @@ def _reclaim_tick(
         _reclaim_skip(
             intent, cid, "no_token",
             **_reclaim_quote_fields(
-                decision, bids=bids, asks_px=asks_px, depths=depths, ttm_s=ttm_s,
+                decision, bids=bids, asks_px=asks_px, ttm_s=ttm_s,
             ),
         )
+        return
+    usdc = reclaim_buy_usdc(shares, float(limit))
+    order_key = reclaim_buy_order_key(shares, float(limit))
+    rejected = list(intent.get("reclaim_buy_rejects") or [])
+    if order_key in rejected:
+        # Same price and size already refused. Do not post it again.
+        if float(intent.get("reclaim_filled") or 0.0) > 0:
+            _reclaim_finish_buy(
+                intent, cid, reason="rejected",
+                cfg=cfg, now=now, ttm_s=ttm_s, bids=bids, tokens=tokens,
+                dry_run=dry_run, tol=tol, chain=chain, ctf=ctf,
+                funder_cs=funder_cs, min_bid_size=min_bid_size,
+                clob_min=clob_min, stop_enabled=stop_enabled,
+            )
+        else:
+            _reclaim_skip(
+                intent, cid, "rejected",
+                **_reclaim_quote_fields(
+                    decision, bids=bids, asks_px=asks_px, ttm_s=ttm_s,
+                ),
+            )
         return
     # In memory only. The FAK is the next call: no commit, sleep, book, or balance.
     if intent.get("reclaim_target") is None:
@@ -3214,6 +3291,7 @@ def _reclaim_tick(
         "leg": leg,
         "shares": shares,
         "price": float(limit),
+        "usdc": usdc,
         "bought": float(bought or 0.0),
         "status": status_s,
         "dry_run": dry_run,
@@ -3221,23 +3299,24 @@ def _reclaim_tick(
     }
     if dry_run or status_s == "dry":
         intent["reclaim_filled"] = float(intent.get("reclaim_target") or shares)
-        intent["reclaim_bought"] = True
         intent["reclaim_buy_px"] = float(limit)
-        intent["reclaim_buy_inflight"] = False
-        intent["reclaim_buy_uncertain"] = False
         intent["reclaim_buy_dry"] = True
         log_event("reclaim_buy", **post_fields)
-        _reclaim_finish_hot(intent, stop_enabled=stop_enabled)
-        if stop_enabled:
-            _reclaim_stop_tick(
-                cfg=cfg, intent=intent, cid=cid, now=now, ttm_s=ttm_s,
-                bids=bids, tokens=tokens, dry_run=dry_run, tol=tol,
-                chain=chain, ctf=ctf, funder_cs=funder_cs,
-                min_bid_size=min_bid_size, clob_min=clob_min,
-                stop_enabled=True,
-            )
-        else:
-            _reclaim_hold(intent, cid)
+        _reclaim_finish_buy(
+            intent, cid, reason="dry_run",
+            cfg=cfg, now=now, ttm_s=ttm_s, bids=bids, tokens=tokens,
+            dry_run=dry_run, tol=tol, chain=chain, ctf=ctf,
+            funder_cs=funder_cs, min_bid_size=min_bid_size,
+            clob_min=clob_min, stop_enabled=stop_enabled,
+        )
+        return
+    if status_s.startswith("reject"):
+        intent["reclaim_buy_inflight"] = False
+        intent["reclaim_buy_uncertain"] = False
+        if order_key not in rejected:
+            rejected.append(order_key)
+        intent["reclaim_buy_rejects"] = rejected[-8:]
+        log_event("reclaim_fak_reject", error=status_s, **post_fields)
         return
     if status_s.startswith("error"):
         intent["reclaim_buy_uncertain"] = True
@@ -3270,18 +3349,13 @@ def _reclaim_tick(
         log_event("reclaim_buy", **post_fields)
     target = float(intent.get("reclaim_target") or shares)
     if float(intent.get("reclaim_filled") or 0.0) + tol >= target:
-        intent["reclaim_bought"] = True
-        _reclaim_finish_hot(intent, stop_enabled=stop_enabled)
-        if stop_enabled:
-            _reclaim_stop_tick(
-                cfg=cfg, intent=intent, cid=cid, now=now, ttm_s=ttm_s,
-                bids=bids, tokens=tokens, dry_run=dry_run, tol=tol,
-                chain=chain, ctf=ctf, funder_cs=funder_cs,
-                min_bid_size=min_bid_size, clob_min=clob_min,
-                stop_enabled=True,
-            )
-        else:
-            _reclaim_hold(intent, cid)
+        _reclaim_finish_buy(
+            intent, cid, reason="filled",
+            cfg=cfg, now=now, ttm_s=ttm_s, bids=bids, tokens=tokens,
+            dry_run=dry_run, tol=tol, chain=chain, ctf=ctf,
+            funder_cs=funder_cs, min_bid_size=min_bid_size,
+            clob_min=clob_min, stop_enabled=stop_enabled,
+        )
 
 
 def manage_sells(cfg: dict, state: dict, chain: ChainReader) -> None:
@@ -3367,10 +3441,10 @@ def _manage_sells_locked(cfg: dict, state: dict, chain: ChainReader) -> None:
         with _io_unlocked():
             up_row, dn_row = _fetch_books(up_tok, dn_tok, min_bid_size)
         (
-            up_bid, up_sz, up_bids, up_ask, _up_ask_sz, up_asks, up_age,
+            up_bid, up_sz, up_bids, up_ask, _up_ask_sz, _up_asks, up_age,
         ) = _book_quote(up_row)
         (
-            dn_bid, dn_sz, dn_bids, dn_ask, _dn_ask_sz, dn_asks, dn_age,
+            dn_bid, dn_sz, dn_bids, dn_ask, _dn_ask_sz, _dn_asks, dn_age,
         ) = _book_quote(dn_row)
         _whatsapp("note_bids", cid, up_bid, dn_bid)
         books = {"up": up_bids, "dn": dn_bids}
@@ -4514,7 +4588,6 @@ def _manage_sells_locked(cfg: dict, state: dict, chain: ChainReader) -> None:
                 ttm_s=ttm_s,
                 bids=bids,
                 asks_px={"up": up_ask, "dn": dn_ask},
-                ask_books={"up": up_asks, "dn": dn_asks},
                 ages={"up": up_age, "dn": dn_age},
                 tokens=tokens,
                 dry_run=dry_run,
