@@ -101,6 +101,25 @@ def seq_late_markets(markets: Iterable[Any], cfg: Any, now: float) -> list:
     return out
 
 
+def seq_exit_open(intent: dict) -> bool:
+    """True while a dump, stop, or reclaim position is still in progress.
+
+    A bag whose window has ended does not use this: the caller skips it
+    first. ``sell_exit_inflight`` covers the synchronous dump/stop FAK.
+    ``reclaim_bought`` without ``reclaim_stopped`` covers the open position,
+    including the stop persist before the sell.
+    """
+    if not isinstance(intent, dict):
+        return False
+    if intent.get("sell_exit_inflight"):
+        return True
+    if intent.get("reclaim_bought") and not intent.get("reclaim_stopped"):
+        return True
+    if intent.get("reclaim_stop_latched") and not intent.get("reclaim_stopped"):
+        return True
+    return False
+
+
 def seq_busy_bag(
     state: Any,
     now: float,
@@ -127,7 +146,10 @@ def seq_busy_bag(
         end = _num(intent.get("end_ts"), 0.0)
         if end and float(now) >= end:
             continue
-        if intent.get("sold_winner"):
+        # sold_winner is set when the held dump fills. That used to free
+        # the next window while the reclaim position or its stop was still
+        # open, and the mint then stalled the sell loop.
+        if intent.get("sold_winner") and not seq_exit_open(intent):
             continue
         if busy is None or _num(intent.get("start_ts"), 0.0) < _num(busy[1].get("start_ts"), 0.0):
             busy = (str(cid), intent)

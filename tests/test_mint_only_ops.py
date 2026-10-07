@@ -1135,7 +1135,74 @@ class DeployUnitsTests(unittest.TestCase):
         self.assertEqual(attempts, 2)
         self.assertEqual(last_bid, 0.11)
         self.assertEqual(calls[0]["limits"], [0.22])
-        self.assertEqual(calls[1]["limits"], [0.11, 0.07, 0.03])
+        self.assertEqual(calls[1]["limits"], [0.11])
+        self.assertNotIn(0.07, calls[1]["limits"])
+        self.assertNotIn(0.03, calls[1]["limits"])
+
+    def test_dump_refire_prices_each_retry_off_a_fresh_book(self):
+        calls: list[dict] = []
+        books = iter(
+            [
+                (0.34, 8.0, [{"price": "0.34", "size": "8"}]),
+                (0.09, 8.0, [{"price": "0.09", "size": "8"}]),
+            ]
+        )
+        fn = _fn(
+            "_run_dump_fak_with_refire",
+            {
+                "_run_fak_ladder": lambda *_args, **kwargs: (
+                    calls.append(
+                        {
+                            "limits": list(_args[2]),
+                            "depth_path": kwargs.get("depth_path"),
+                            "depth_bids": kwargs.get("depth_bids"),
+                        }
+                    )
+                    or (0.0, "error:no orders found to match with FAK order", _args[2][0])
+                ),
+                "_fetch_book": lambda *_args, **_kwargs: next(books),
+                "_io_unlocked": nullcontext,
+                "dump_fast_retry_eligible": lambda **_kwargs: True,
+                "log_event": lambda *_args, **_kwargs: None,
+            },
+        )
+        sold, _status, px, attempts, last_bid = fn(
+            token_id="tok",
+            size=107.0,
+            initial_bid=0.38,
+            initial_bids=[],
+            held="up",
+            slug="btc-updown-15m-1791412200",
+            condition_id="cid",
+            ttm_s=24.975,
+            floor=0.01,
+            min_bid_size=1.0,
+            retries=2,
+            ladder_step=0.04,
+            ladder_rungs=4,
+            dry_run=False,
+            tol=0.01,
+        )
+        self.assertEqual(sold, 0.0)
+        self.assertEqual(attempts, 3)
+        self.assertEqual(last_bid, 0.09)
+        self.assertEqual(px, 0.09)
+        self.assertEqual(
+            [row["limits"] for row in calls],
+            [[0.38], [0.34], [0.09]],
+        )
+        posted = [limit for row in calls for limit in row["limits"]]
+        for stale in (0.30, 0.26, 0.22, 0.05, 0.01):
+            self.assertNotIn(stale, posted)
+        self.assertEqual(calls[1]["depth_path"], "dump_refire")
+        self.assertEqual(calls[1]["depth_bids"], [{"price": "0.34", "size": "8"}])
+        self.assertEqual(calls[2]["depth_bids"], [{"price": "0.09", "size": "8"}])
+        src = MINT.read_text()
+        refire = src[
+            src.find("def _run_dump_fak_with_refire") : src.find("\ndef _sell_kept_after_dump")
+        ]
+        self.assertNotIn("dump_retry_ladder_limits", refire)
+        self.assertNotIn("time.sleep", refire)
 
     def test_dump_refire_stops_when_book_turns_empty(self):
         calls: list[dict] = []

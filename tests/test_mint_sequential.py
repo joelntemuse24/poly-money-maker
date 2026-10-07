@@ -14,6 +14,7 @@ from buy.mint_gas import mint_gas_settings
 from buy.mint_sequence import (
     SeqWaits,
     seq_busy_bag,
+    seq_exit_open,
     seq_eligible_markets,
     seq_late_markets,
     seq_phase,
@@ -302,6 +303,40 @@ class SequentialMintCycleTests(unittest.TestCase):
         state = {"intents": {_cid(1): _prev_bag(sold_loser=True, sold_dump=True, sold_winner=True)}}
         h = MintHarness(_cfg(), state, [_market(S, 2)], balance=200.0)
         self.assertEqual(h.tick(S - 5.0), "submitted")
+
+    def test_open_reclaim_defers_the_next_mint_until_the_bag_ends(self):
+        open_bag = _prev_bag(
+            sold_loser=True, sold_dump=True, sold_winner=True, reclaim_bought=True,
+        )
+        state = {"intents": {_cid(1): open_bag}}
+        self.assertTrue(seq_exit_open(open_bag))
+        self.assertIsNotNone(seq_busy_bag(state, S - 30.0, ACTIVE))
+        h = MintHarness(_cfg(), state, [_market(S, 2)], balance=200.0)
+        self.assertEqual(h.tick(S - 30.0), "seq_wait_prev")
+        self.assertEqual(h.submits, [])
+        self.assertEqual(h.tick(S), "submitted")
+
+    def test_stopped_reclaim_and_inflight_dump(self):
+        stopped = _prev_bag(
+            sold_winner=True, reclaim_bought=True, reclaim_stopped=True,
+        )
+        self.assertFalse(seq_exit_open(stopped))
+        self.assertIsNone(
+            seq_busy_bag({"intents": {_cid(1): stopped}}, S - 30.0, ACTIVE)
+        )
+        h = MintHarness(
+            _cfg(), {"intents": {_cid(1): stopped}}, [_market(S, 2)], balance=200.0,
+        )
+        self.assertEqual(h.tick(S - 30.0), "submitted")
+        inflight = _prev_bag(sold_winner=True, sell_exit_inflight=True)
+        latched = _prev_bag(sold_winner=True, reclaim_stop_latched=True)
+        self.assertTrue(seq_exit_open(inflight))
+        self.assertTrue(seq_exit_open(latched))
+        self.assertIsNotNone(
+            seq_busy_bag({"intents": {_cid(1): inflight}}, S - 30.0, ACTIVE)
+        )
+        ended = {"intents": {_cid(1): _prev_bag(sold_winner=True, reclaim_bought=True)}}
+        self.assertIsNone(seq_busy_bag(ended, S, ACTIVE))
 
     def test_cash_short_waits_then_mints_when_redeem_lands(self):
         state = {"intents": {_cid(1): _prev_bag()}}
