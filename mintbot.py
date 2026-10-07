@@ -44,10 +44,18 @@ ask-depth gate. The FAK is a market buy at
 ``min(ask + reclaim_slippage, reclaim_max_price)`` (default 3¢ over the
 ask, hard cap 96¢), sized off that limit, with USDC truncated to cents.
 A top-up whose ask is already above the cap logs
-``reclaim_topup_skipped_cap`` and is not posted. Stop-sell at ``reclaim_stop``
-(default on) or hold to redeem. The watch stays on ``sell_armed_poll_s``
-until that finishes. A position still held at resolution is redeemed by
-the existing redeem thread.
+``reclaim_topup_skipped_cap`` and is not posted. Every send, first or
+retry, re-checks that tick's books (entry, sister ask, fresh uncrossed
+book, spread, and ask at or under the cap). A failed check does not send
+and starts the persist hold again. ``reclaim_min_ttm_s`` (default 0, off)
+skips entry with ``too_close`` when seconds-to-close is under it. Stop-sell
+at ``reclaim_stop`` (default on) or hold to redeem. A missing or stale bid
+does not clear the stop clock. Each dump or stop refire refetches that
+leg and sells at the live bid. While the reclaim is open, or a dump or
+stop sell is in progress, the next sequential mint waits until the
+position is closed or the bag's window has ended. The watch stays on
+``sell_armed_poll_s`` until that finishes. A position still held at
+resolution is redeemed by the existing redeem thread.
 
 A third loop records Chainlink BTC/USD 60s TWAP (Polymarket RTDS) to
 ``logs/oracle_twap.jsonl`` while a 15m bag is open. ``oracle_log_enabled``
@@ -130,7 +138,6 @@ from buy.mint_sell import (
     classify_loser,
     cycle_sleep_s,
     dump_fast_retry_eligible,
-    dump_retry_ladder_limits,
     bag_risk_flush,
     bag_risk_observe,
     bag_risk_payload,
@@ -322,6 +329,8 @@ DEFAULTS = {
     "reclaim_slippage": 0.03,
     "reclaim_max_price": 0.96,
     "reclaim_max_ttm_s": 0.0,
+    # 0 leaves the close gate off. No reclaim entry when ttm is under this.
+    "reclaim_min_ttm_s": 0.0,
     "sell_min_bid_size": 1.0,
     # 0 skips the late-window Chainlink veto on loser scrap.
     # Floor, per-TTM, and stale are 0 so a positive window does not
@@ -649,6 +658,7 @@ def validate_strategy(cfg: dict) -> None:
         "reclaim_entry_persist_s",
         "reclaim_stop_persist_s",
         "reclaim_max_ttm_s",
+        "reclaim_min_ttm_s",
     ):
         raw = cfg.get(key)
         if raw is not None and float(raw) < 0:
@@ -1751,6 +1761,23 @@ def _fire_loser_scrap(
     return float(sold or 0), status, last_px, False
 
 
+@contextmanager
+def _mark_sell_exit(intent: dict):
+    """Keep the next sequential mint waiting while this dump or stop posts.
+
+    Nested calls (kept half inside the held dump) leave the flag set until
+    the outermost sell returns. The sell thread drops ``STATE_LOCK`` inside
+    the FAK, so the flag has to be on before that release.
+    """
+    already = bool(intent.get("sell_exit_inflight"))
+    intent["sell_exit_inflight"] = True
+    try:
+        yield
+    finally:
+        if not already:
+            intent["sell_exit_inflight"] = False
+
+
 def _run_dump_fak_with_refire(
     *,
     token_id: str,
@@ -1770,9 +1797,11 @@ def _run_dump_fak_with_refire(
     tol: float,
     fills: Optional[list] = None,
 ) -> Tuple[float, str, Optional[float], int, float]:
-    """Held-dump path: first live-bid FAK, then fast refire ladders on miss.
+    """Held-dump path: first live-bid FAK, then one fresh-bid FAK per retry.
 
-    ``fills`` collects ``(shares, avg_px)`` across every post.
+    Each retry refetches that leg and posts a single FAK at the new best
+    bid. It does not walk a ladder off the first snapshot. ``fills``
+    collects ``(shares, avg_px)`` across every post.
     """
     live_bid = float(initial_bid or 0.0)
     initial_limits = [round(live_bid, 4)] if live_bid > 0 else []
@@ -1818,6 +1847,13 @@ def _run_dump_fak_with_refire(
             else:
                 retry_bid, _retry_sz, retry_bids = None, 0.0, []
         if retry_bid is None:
+            fresh_bid = None
+        else:
+            try:
+                fresh_bid = float(retry_bid)
+            except (TypeError, ValueError):
+                fresh_bid = 0.0
+        if fresh_bid is None or fresh_bid != fresh_bid or fresh_bid <= 0:
             log_event(
                 "sell_dump_fast_refire_stop",
                 condition_id=condition_id,
@@ -1826,27 +1862,12 @@ def _run_dump_fak_with_refire(
                 retry=retry_idx + 1,
                 attempts=attempts,
                 reason="empty_book",
+                bid=fresh_bid,
             )
             break
-        live_bid = float(retry_bid or 0.0)
-        limits = dump_retry_ladder_limits(
-            live_bid,
-            floor=floor,
-            step=ladder_step,
-            max_rungs=ladder_rungs,
-        )
-        if not limits:
-            log_event(
-                "sell_dump_fast_refire_stop",
-                condition_id=condition_id,
-                slug=slug,
-                leg=held,
-                retry=retry_idx + 1,
-                attempts=attempts,
-                reason="no_ladder_limits",
-                bid=live_bid,
-            )
-            break
+        # One FAK at the bid just fetched. The next retry fetches again.
+        live_bid = fresh_bid
+        limits = [round(live_bid, 4)]
         log_event(
             "sell_dump_fast_refire_attempt",
             condition_id=condition_id,
@@ -1919,29 +1940,107 @@ def _sell_kept_after_dump(
     Same live-bid FAK + fast refire as the held dump, then one FAK at the
     1c floor for any remainder. Runs once per bag (``sell_dump_kept_done``).
     """
-    intent["sell_dump_kept_done"] = True
-    slug = intent.get("slug")
-    floor = max(0.01, float(cfg.get("sell_clob_min_price") or 0.01))
+    already_exit = bool(intent.get("sell_exit_inflight"))
+    intent["sell_exit_inflight"] = True
     try:
-        keep = float(intent.get("sell_scrap_keep") or 0.0)
-    except (TypeError, ValueError):
-        keep = 0.0
-    if not math.isfinite(keep) or keep < 0:
-        keep = 0.0
-    token = tokens.get(kept)
-    size = 0.0
-    latch = "no_keep"
-    if keep >= tol and token:
-        size, latch = _sell_inventory(
-            chain, ctf, funder_cs, token, keep, tol,
-            "seen_kept_inventory", intent,
-        )
-        if latch in {"already_flat", "await_inventory"}:
-            size = 0.0
-    planned = round(float(size), 4)
-    intent["sell_dump_kept_planned"] = planned
-    if size < tol:
-        intent["sell_dump_kept_outcome"] = "nothing_kept"
+        intent["sell_dump_kept_done"] = True
+        slug = intent.get("slug")
+        floor = max(0.01, float(cfg.get("sell_clob_min_price") or 0.01))
+        try:
+            keep = float(intent.get("sell_scrap_keep") or 0.0)
+        except (TypeError, ValueError):
+            keep = 0.0
+        if not math.isfinite(keep) or keep < 0:
+            keep = 0.0
+        token = tokens.get(kept)
+        size = 0.0
+        latch = "no_keep"
+        if keep >= tol and token:
+            size, latch = _sell_inventory(
+                chain, ctf, funder_cs, token, keep, tol,
+                "seen_kept_inventory", intent,
+            )
+            if latch in {"already_flat", "await_inventory"}:
+                size = 0.0
+        planned = round(float(size), 4)
+        intent["sell_dump_kept_planned"] = planned
+        if size < tol:
+            intent["sell_dump_kept_outcome"] = "nothing_kept"
+            log_event(
+                "sell_dump_kept",
+                condition_id=cid,
+                slug=slug,
+                leg=kept,
+                planned=planned,
+                keep=keep,
+                sold=0.0,
+                avg_px=None,
+                status=latch,
+                outcome="nothing_kept",
+                remaining=0.0,
+            )
+            return
+
+        kept_fills: list = []
+        with _mark_sell_exit(intent):
+            sold_total, last_status, last_px, attempts, live_bid = _run_dump_fak_with_refire(
+                token_id=token,
+                size=size,
+                initial_bid=float(bids.get(kept) or 0.0),
+                initial_bids=books.get(kept),
+                held=kept,
+                slug=slug,
+                condition_id=cid,
+                ttm_s=ttm_s,
+                floor=floor,
+                min_bid_size=min_bid_size,
+                retries=retries,
+                ladder_step=ladder_step,
+                ladder_rungs=ladder_rungs,
+                dry_run=dry_run,
+                tol=tol,
+                fills=kept_fills,
+            )
+            sold_total = float(sold_total or 0.0)
+            swept = 0.0
+            if not dry_run and size - sold_total >= tol:
+                with _io_unlocked():
+                    swept, sweep_status, sweep_px = _run_fak_ladder(
+                        token,
+                        size - sold_total,
+                        [round(floor, 4)],
+                        dry_run=dry_run,
+                        bid=live_bid,
+                        label=f"dump kept {kept}",
+                        slug=slug,
+                        tol=tol,
+                        depth_bids=books.get(kept),
+                        depth_path="dump_kept",
+                        depth_leg=kept,
+                        ttm_s=ttm_s,
+                        condition_id=cid,
+                        fills=kept_fills,
+                    )
+                attempts += 1
+                sold_total += float(swept or 0.0)
+                last_status, last_px = sweep_status, sweep_px
+        remaining = max(0.0, size - sold_total)
+        if dry_run:
+            outcome = "dry_run"
+        elif remaining < tol:
+            outcome = "filled"
+        elif sold_total >= tol:
+            outcome = "partial"
+        else:
+            outcome = "no_fill"
+        avg_px = record_fill_px(intent, "sell_dump_kept_fill_px", kept_fills)
+        intent["sell_dump_kept_leg"] = kept
+        intent["sell_dump_kept_filled"] = round(sold_total, 6)
+        intent["sell_dump_kept_limit"] = last_px
+        intent["sell_dump_kept_attempts"] = int(attempts)
+        intent["sell_dump_kept_outcome"] = outcome
+        if outcome in {"filled", "dry_run"}:
+            intent["sell_dump_kept_sold"] = True
         log_event(
             "sell_dump_kept",
             condition_id=cid,
@@ -1949,95 +2048,24 @@ def _sell_kept_after_dump(
             leg=kept,
             planned=planned,
             keep=keep,
-            sold=0.0,
-            avg_px=None,
-            status=latch,
-            outcome="nothing_kept",
-            remaining=0.0,
+            sold=round(sold_total, 4),
+            swept=round(float(swept or 0.0), 4),
+            fills=len(kept_fills),
+            avg_px=avg_px,
+            bid=live_bid,
+            limit=last_px,
+            attempts=int(attempts),
+            status=last_status,
+            outcome=outcome,
+            remaining=round(remaining, 4),
         )
-        return
-
-    kept_fills: list = []
-    sold_total, last_status, last_px, attempts, live_bid = _run_dump_fak_with_refire(
-        token_id=token,
-        size=size,
-        initial_bid=float(bids.get(kept) or 0.0),
-        initial_bids=books.get(kept),
-        held=kept,
-        slug=slug,
-        condition_id=cid,
-        ttm_s=ttm_s,
-        floor=floor,
-        min_bid_size=min_bid_size,
-        retries=retries,
-        ladder_step=ladder_step,
-        ladder_rungs=ladder_rungs,
-        dry_run=dry_run,
-        tol=tol,
-        fills=kept_fills,
-    )
-    sold_total = float(sold_total or 0.0)
-    swept = 0.0
-    if not dry_run and size - sold_total >= tol:
-        with _io_unlocked():
-            swept, sweep_status, sweep_px = _run_fak_ladder(
-                token,
-                size - sold_total,
-                [round(floor, 4)],
-                dry_run=dry_run,
-                bid=live_bid,
-                label=f"dump kept {kept}",
-                slug=slug,
-                tol=tol,
-                depth_bids=books.get(kept),
-                depth_path="dump_kept",
-                depth_leg=kept,
-                ttm_s=ttm_s,
-                condition_id=cid,
-                fills=kept_fills,
-            )
-        attempts += 1
-        sold_total += float(swept or 0.0)
-        last_status, last_px = sweep_status, sweep_px
-    remaining = max(0.0, size - sold_total)
-    if dry_run:
-        outcome = "dry_run"
-    elif remaining < tol:
-        outcome = "filled"
-    elif sold_total >= tol:
-        outcome = "partial"
-    else:
-        outcome = "no_fill"
-    avg_px = record_fill_px(intent, "sell_dump_kept_fill_px", kept_fills)
-    intent["sell_dump_kept_leg"] = kept
-    intent["sell_dump_kept_filled"] = round(sold_total, 6)
-    intent["sell_dump_kept_limit"] = last_px
-    intent["sell_dump_kept_attempts"] = int(attempts)
-    intent["sell_dump_kept_outcome"] = outcome
-    if outcome in {"filled", "dry_run"}:
-        intent["sell_dump_kept_sold"] = True
-    log_event(
-        "sell_dump_kept",
-        condition_id=cid,
-        slug=slug,
-        leg=kept,
-        planned=planned,
-        keep=keep,
-        sold=round(sold_total, 4),
-        swept=round(float(swept or 0.0), 4),
-        fills=len(kept_fills),
-        avg_px=avg_px,
-        bid=live_bid,
-        limit=last_px,
-        attempts=int(attempts),
-        status=last_status,
-        outcome=outcome,
-        remaining=round(remaining, 4),
-    )
-    console.print(
-        f"  [bold bright_yellow][DUMP KEPT {outcome.upper()}][/] {kept} "
-        f"{sold_total:.2f}/{size:.2f}  avg={avg_px}"
-    )
+        console.print(
+            f"  [bold bright_yellow][DUMP KEPT {outcome.upper()}][/] {kept} "
+            f"{sold_total:.2f}/{size:.2f}  avg={avg_px}"
+        )
+    finally:
+        if not already_exit:
+            intent["sell_exit_inflight"] = False
 
 
 def _apply_sell_fire_cancel(
@@ -2852,6 +2880,7 @@ def _reclaim_finish_buy(
     min_bid_size: float,
     clob_min: float,
     stop_enabled: bool,
+    ages: Optional[dict] = None,
 ) -> None:
     """Buy phase is over. Log ``reclaim_done`` once, then the stop or the hold."""
     intent["reclaim_bought"] = True
@@ -2885,7 +2914,7 @@ def _reclaim_finish_buy(
             bids=bids, tokens=tokens, dry_run=dry_run, tol=tol,
             chain=chain, ctf=ctf, funder_cs=funder_cs,
             min_bid_size=min_bid_size, clob_min=clob_min,
-            stop_enabled=True,
+            stop_enabled=True, ages=ages,
         )
     else:
         _reclaim_hold(intent, cid)
@@ -2964,6 +2993,7 @@ def _reclaim_stop_tick(
     min_bid_size: float,
     clob_min: float,
     stop_enabled: bool,
+    ages: Optional[dict] = None,
 ) -> None:
     """Stop sell. Inventory read, then one live-bid FAK. No sleep before that post."""
     if not stop_enabled:
@@ -2974,6 +3004,7 @@ def _reclaim_stop_tick(
     if leg not in ("up", "dn"):
         return
     bid = bids.get(leg)
+    book_age = ages.get(leg) if isinstance(ages, dict) else None
     decision = reclaim_stop_decision(
         now_s=now,
         stop=float(cfg.get("reclaim_stop") or 0.75),
@@ -2982,6 +3013,7 @@ def _reclaim_stop_tick(
         bid=bid,
         latched=bool(intent.get("reclaim_stop_latched")),
         stop_enabled=True,
+        book_age_s=book_age,
     )
     intent["reclaim_stop_armed_at"] = decision.get("armed_ts")
     action = decision.get("action")
@@ -3042,29 +3074,30 @@ def _reclaim_stop_tick(
     if live > 0 and live < floor:
         live = floor
     fills: list = []
-    if live > 0:
-        sold, status, last_px, _attempts, live = _run_dump_fak_with_refire(
-            token_id=token,
-            size=size,
-            initial_bid=live,
-            initial_bids=[],
-            held=leg,
-            slug=intent.get("slug"),
-            condition_id=cid,
-            ttm_s=ttm_s,
-            floor=floor,
-            min_bid_size=min_bid_size,
-            retries=int(cfg.get("sell_dump_fak_retries") or 0),
-            ladder_step=float(cfg.get("sell_dump_ladder_step") or 0.04),
-            ladder_rungs=int(cfg.get("sell_dump_ladder_rungs") or 1),
-            dry_run=dry_run,
-            tol=tol,
-            fills=fills,
-        )
-    else:
-        sold, status = _fak_sell(token, size, floor, dry_run, capture=None)
-        last_px = floor
-        sold = float(sold or 0.0)
+    with _mark_sell_exit(intent):
+        if live > 0:
+            sold, status, last_px, _attempts, live = _run_dump_fak_with_refire(
+                token_id=token,
+                size=size,
+                initial_bid=live,
+                initial_bids=[],
+                held=leg,
+                slug=intent.get("slug"),
+                condition_id=cid,
+                ttm_s=ttm_s,
+                floor=floor,
+                min_bid_size=min_bid_size,
+                retries=int(cfg.get("sell_dump_fak_retries") or 0),
+                ladder_step=float(cfg.get("sell_dump_ladder_step") or 0.04),
+                ladder_rungs=int(cfg.get("sell_dump_ladder_rungs") or 1),
+                dry_run=dry_run,
+                tol=tol,
+                fills=fills,
+            )
+        else:
+            sold, status = _fak_sell(token, size, floor, dry_run, capture=None)
+            last_px = floor
+            sold = float(sold or 0.0)
     intent["reclaim_stop_limit"] = last_px
     intent["reclaim_stop_status"] = status
     if float(sold or 0.0) > 0:
@@ -3170,7 +3203,7 @@ def _reclaim_tick(
                 bids=bids, tokens=tokens, dry_run=dry_run, tol=tol,
                 chain=chain, ctf=ctf, funder_cs=funder_cs,
                 min_bid_size=min_bid_size, clob_min=clob_min,
-                stop_enabled=True,
+                stop_enabled=True, ages=ages,
             )
         else:
             _reclaim_hold(intent, cid)
@@ -3183,6 +3216,7 @@ def _reclaim_tick(
         end_ts=float(end_ts or 0),
         ttm_s=ttm_s,
         max_ttm_s=cfg_seconds(cfg, "reclaim_max_ttm_s", 0.0),
+        min_ttm_s=cfg_seconds(cfg, "reclaim_min_ttm_s", 0.0),
         entry=float(cfg.get("reclaim_entry") or 0.91),
         usd=float(cfg.get("reclaim_usd") or 100.0),
         persist_s=cfg_seconds(cfg, "reclaim_entry_persist_s", 0.5),
@@ -3229,7 +3263,7 @@ def _reclaim_tick(
                 cfg=cfg, now=now, ttm_s=ttm_s, bids=bids, tokens=tokens,
                 dry_run=dry_run, tol=tol, chain=chain, ctf=ctf,
                 funder_cs=funder_cs, min_bid_size=min_bid_size,
-                clob_min=clob_min, stop_enabled=stop_enabled,
+                clob_min=clob_min, stop_enabled=stop_enabled, ages=ages,
             )
         return
     if action == "wait":
@@ -3245,8 +3279,9 @@ def _reclaim_tick(
             persist_s=cfg_seconds(cfg, "reclaim_entry_persist_s", 0.5),
         )
         return
-    if decision.get("reason") == "above_cap":
-        # Stay in the buy. A later ask at or under the cap can still top up.
+    if decision.get("reason") == "above_cap" and intent.get("reclaim_buy_posted"):
+        # Stay in the buy. The persist clock was cleared, so a later ask
+        # at or under the cap has to hold again before the next send.
         if intent.get("reclaim_skip_reason") != "above_cap":
             intent["reclaim_skip_reason"] = "above_cap"
             cap = cfg.get("reclaim_max_price", 0.96)
@@ -3270,7 +3305,7 @@ def _reclaim_tick(
                 cfg=cfg, now=now, ttm_s=ttm_s, bids=bids, tokens=tokens,
                 dry_run=dry_run, tol=tol, chain=chain, ctf=ctf,
                 funder_cs=funder_cs, min_bid_size=min_bid_size,
-                clob_min=clob_min, stop_enabled=stop_enabled,
+                clob_min=clob_min, stop_enabled=stop_enabled, ages=ages,
             )
             return
         _reclaim_skip(
@@ -3303,7 +3338,7 @@ def _reclaim_tick(
                 cfg=cfg, now=now, ttm_s=ttm_s, bids=bids, tokens=tokens,
                 dry_run=dry_run, tol=tol, chain=chain, ctf=ctf,
                 funder_cs=funder_cs, min_bid_size=min_bid_size,
-                clob_min=clob_min, stop_enabled=stop_enabled,
+                clob_min=clob_min, stop_enabled=stop_enabled, ages=ages,
             )
         else:
             _reclaim_skip(
@@ -3349,7 +3384,7 @@ def _reclaim_tick(
             cfg=cfg, now=now, ttm_s=ttm_s, bids=bids, tokens=tokens,
             dry_run=dry_run, tol=tol, chain=chain, ctf=ctf,
             funder_cs=funder_cs, min_bid_size=min_bid_size,
-            clob_min=clob_min, stop_enabled=stop_enabled,
+            clob_min=clob_min, stop_enabled=stop_enabled, ages=ages,
         )
         return
     if status_s.startswith("reject"):
@@ -3396,7 +3431,7 @@ def _reclaim_tick(
             cfg=cfg, now=now, ttm_s=ttm_s, bids=bids, tokens=tokens,
             dry_run=dry_run, tol=tol, chain=chain, ctf=ctf,
             funder_cs=funder_cs, min_bid_size=min_bid_size,
-            clob_min=clob_min, stop_enabled=stop_enabled,
+            clob_min=clob_min, stop_enabled=stop_enabled, ages=ages,
         )
 
 
@@ -3810,26 +3845,27 @@ def _manage_sells_locked(cfg: dict, state: dict, chain: ChainReader) -> None:
                     live_px = float(dump_bid or 0)
                     intent["last_sell_attempt_at"] = now
                     dump_fills: list = []
-                    sold_total, last_status, last_px, used_attempts, live_px = (
-                        _run_dump_fak_with_refire(
-                            token_id=d_tok,
-                            size=size,
-                            initial_bid=live_px,
-                            initial_bids=books.get(held),
-                            held=held,
-                            slug=intent.get("slug"),
-                            condition_id=cid,
-                            ttm_s=ttm_s,
-                            floor=floor,
-                            min_bid_size=min_bid_size,
-                            retries=dump_retries,
-                            ladder_step=dump_ladder_step,
-                            ladder_rungs=dump_ladder_rungs,
-                            dry_run=dry_run,
-                            tol=tol,
-                            fills=dump_fills,
+                    with _mark_sell_exit(intent):
+                        sold_total, last_status, last_px, used_attempts, live_px = (
+                            _run_dump_fak_with_refire(
+                                token_id=d_tok,
+                                size=size,
+                                initial_bid=live_px,
+                                initial_bids=books.get(held),
+                                held=held,
+                                slug=intent.get("slug"),
+                                condition_id=cid,
+                                ttm_s=ttm_s,
+                                floor=floor,
+                                min_bid_size=min_bid_size,
+                                retries=dump_retries,
+                                ladder_step=dump_ladder_step,
+                                ladder_rungs=dump_ladder_rungs,
+                                dry_run=dry_run,
+                                tol=tol,
+                                fills=dump_fills,
+                            )
                         )
-                    )
                     record_fill_px(intent, "sell_dump_fill_px", dump_fills)
                     intent["sell_dump_attempts"] = int(
                         intent.get("sell_dump_attempts") or 0

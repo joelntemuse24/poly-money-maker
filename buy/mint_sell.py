@@ -118,6 +118,8 @@ DEFAULT_SELL_KNOBS = {
     "reclaim_max_price": 0.96,
     # 0 leaves the entry time gate off (scrap_time_gate_open). Unknown ttm stays open.
     "reclaim_max_ttm_s": 0.0,
+    # 0 leaves the close gate off. Above 0, no reclaim entry when ttm is under it.
+    "reclaim_min_ttm_s": 0.0,
     "sell_min_bid_size": 1.0,
     # Cycle sleep while a loser persist arm is live. Does not change persist_s.
     "sell_armed_poll_s": 2.0,
@@ -1961,6 +1963,29 @@ def reclaim_candidate_order(
     return [leg for _px, _tie, leg in rows]
 
 
+def reclaim_too_close(ttm_s: Optional[float], min_ttm_s: Optional[float]) -> bool:
+    """True when a positive ``min_ttm_s`` and a known ttm are inside it.
+
+    ``0`` (the default) is off. An unknown ttm stays open, same as the
+    max-ttm gate.
+    """
+    try:
+        floor = float(min_ttm_s or 0.0)
+    except (TypeError, ValueError):
+        return False
+    if not math.isfinite(floor) or floor <= 0:
+        return False
+    if ttm_s is None:
+        return False
+    try:
+        left = float(ttm_s)
+    except (TypeError, ValueError):
+        return False
+    if not math.isfinite(left):
+        return False
+    return left + 1e-12 < floor
+
+
 def reclaim_window_open(
     now_s: float,
     end_ts: float,
@@ -2027,6 +2052,7 @@ def reclaim_entry_decision(
     end_ts: float,
     ttm_s: Optional[float],
     max_ttm_s: Optional[float],
+    min_ttm_s: float = 0.0,
     entry: float,
     usd: float,
     persist_s: float,
@@ -2054,9 +2080,10 @@ def reclaim_entry_decision(
     post on this same tick: the persist window has already elapsed, or a
     remainder is retrying a side that already fired. The posted price is
     ``min(ask + slippage, max_price)``. The first clip is sized off that
-    limit. A locked retry whose ask is already above ``max_price`` skips
-    with ``above_cap`` and keeps the arm. Callers must not sleep or
-    refetch between this result and the FAK.
+    limit. Every send, including a re-send, has to pass the entry checks
+    on this tick's quotes, including ``ask <= max_price``. A failed check
+    clears the persist clock so the next send needs a fresh hold. Callers
+    must not sleep or refetch between this result and the FAK.
     """
     dumped = {leg for leg in (dumped_legs or ()) if leg in ("up", "dn")}
 
@@ -2086,6 +2113,8 @@ def reclaim_entry_decision(
     open_ok, open_why = reclaim_window_open(now_s, end_ts, ttm_s, max_ttm_s)
     if not open_ok:
         return _out("skip", open_why)
+    if reclaim_too_close(ttm_s, min_ttm_s):
+        return _out("skip", "too_close")
 
     try:
         filled_f = float(filled or 0.0)
@@ -2104,8 +2133,19 @@ def reclaim_entry_decision(
             if remainder < 1:
                 return _out("skip", "filled", leg=locked_leg)
 
+    def _over_cap(leg: str) -> bool:
+        ask = up_ask if leg == "up" else dn_ask
+        try:
+            ask_f = float(ask)
+            cap = float(max_price)
+        except (TypeError, ValueError):
+            return True
+        if not math.isfinite(ask_f) or not math.isfinite(cap):
+            return True
+        return ask_f > cap + 1e-12
+
     def _qualify(leg: str) -> Tuple[bool, str, float]:
-        return _reclaim_quote(
+        ok, reason, shares = _reclaim_quote(
             leg,
             up_bid=up_bid,
             up_ask=up_ask,
@@ -2119,40 +2159,31 @@ def reclaim_entry_decision(
             max_age_s=max_age_s,
             max_spread=max_spread,
         )
+        if ok and _over_cap(leg):
+            return False, "above_cap", 0.0
+        return ok, reason, shares
 
     if locked_leg in ("up", "dn"):
         ok, reason, shares = _qualify(locked_leg)
         if not ok:
+            # Failed check: drop the persist clock. The next send has to
+            # hold again. Do not keep the old arm and re-send next tick.
+            return _out("skip", reason, leg=locked_leg)
+        fire, new_armed, why = persist_ready(
+            True, now_s=now_s, armed_ts=armed_ts, persist_s=persist_s,
+        )
+        if not fire:
             return _out(
-                "skip", reason, leg=locked_leg,
-                new_armed=armed_ts, new_leg=locked_leg,
+                "wait", why, leg=locked_leg, shares=shares,
+                new_armed=new_armed, new_leg=locked_leg,
             )
         ask = up_ask if locked_leg == "up" else dn_ask
-        try:
-            ask_f = float(ask)
-            cap = float(max_price)
-        except (TypeError, ValueError):
-            ask_f, cap = None, None
-        if (
-            ask_f is not None
-            and cap is not None
-            and math.isfinite(ask_f)
-            and math.isfinite(cap)
-            and ask_f > cap + 1e-12
-        ):
-            return _out(
-                "skip", "above_cap", leg=locked_leg,
-                new_armed=armed_ts, new_leg=locked_leg,
-            )
         limit = reclaim_buy_limit(ask, slippage, max_price)
         if limit is None:
-            return _out(
-                "skip", "above_cap", leg=locked_leg,
-                new_armed=armed_ts, new_leg=locked_leg,
-            )
+            return _out("skip", "above_cap", leg=locked_leg)
         return _out(
             "buy", "retry", leg=locked_leg, shares=shares, limit=limit,
-            new_armed=armed_ts, new_leg=locked_leg,
+            new_armed=new_armed, new_leg=locked_leg,
         )
 
     ranked = reclaim_candidate_order(up_ask, dn_ask, entry)
@@ -2223,6 +2254,8 @@ def reclaim_stop_decision(
     bid: Optional[float],
     latched: bool,
     stop_enabled: bool,
+    book_age_s: Optional[float] = None,
+    max_age_s: float = RECLAIM_BOOK_MAX_AGE_S,
 ) -> dict:
     """Stop clock. ``sell`` means post on this tick, at ``limit`` (the bid).
 
@@ -2232,10 +2265,33 @@ def reclaim_stop_decision(
     """
     if not stop_enabled:
         return {"action": "hold", "reason": "stop_off", "armed_ts": None, "limit": None}
+    if armed_ts is not None:
+        try:
+            if float(armed_ts) > float(now_s):
+                armed_ts = float(now_s)
+        except (TypeError, ValueError):
+            armed_ts = None
+    stale = False
+    if book_age_s is not None:
+        try:
+            stale = float(book_age_s) > float(max_age_s) + 1e-12
+        except (TypeError, ValueError):
+            stale = False
+    # A missing or stale quote is not a bid back above the stop. Keep the
+    # clock so a tick gap still fires once a live bid is back and the hold
+    # has already elapsed.
+    if bid is None or stale:
+        held_clock = armed_ts is not None or latched
+        return {
+            "action": "wait" if held_clock else "skip",
+            "reason": "stale_book" if stale else "no_bid",
+            "armed_ts": armed_ts,
+            "limit": None,
+        }
     if latched:
         limit = None
         try:
-            if bid is not None and float(bid) > 0:
+            if float(bid) > 0:
                 limit = float(bid)
         except (TypeError, ValueError):
             limit = None
@@ -2309,6 +2365,9 @@ def sell_plan_banner(cfg: dict) -> str:
             f"reclaim ${usd:g} ask>={_cents(entry)} persist {persist:g}s"
             f" slip {_cents(slip)} cap {_cents(cap)}"
         )
+        min_ttm = cfg_seconds(cfg, "reclaim_min_ttm_s", 0.0)
+        if min_ttm > 0:
+            text += f" ttm>={min_ttm:g}s"
         if cfg.get("reclaim_stop_enabled", True):
             stop = float(cfg.get("reclaim_stop") or DEFAULT_SELL_KNOBS["reclaim_stop"])
             stop_p = cfg_seconds(
