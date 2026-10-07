@@ -40,8 +40,11 @@ Opt-in reclaim (``reclaim_enabled``, default false): after a both-sides
 dump, buy about ``reclaim_usd`` of the first side whose book holds at
 ``reclaim_entry`` for ``reclaim_entry_persist_s``. The other side confirms
 when its best ask is at or under ``1 - reclaim_entry``. There is no
-ask-depth gate. The FAK is a market buy in USDC
-truncated to cents. Stop-sell at ``reclaim_stop``
+ask-depth gate. The FAK is a market buy at
+``min(ask + reclaim_slippage, reclaim_max_price)`` (default 3¢ over the
+ask, hard cap 96¢), sized off that limit, with USDC truncated to cents.
+A top-up whose ask is already above the cap logs
+``reclaim_topup_skipped_cap`` and is not posted. Stop-sell at ``reclaim_stop``
 (default on) or hold to redeem. The watch stays on ``sell_armed_poll_s``
 until that finishes. A position still held at resolution is redeemed by
 the existing redeem thread.
@@ -315,6 +318,9 @@ DEFAULTS = {
     "reclaim_stop": 0.75,
     "reclaim_stop_enabled": True,
     "reclaim_stop_persist_s": 0.5,
+    # FAK may pay this much over the ask, and never more than the cap.
+    "reclaim_slippage": 0.03,
+    "reclaim_max_price": 0.96,
     "reclaim_max_ttm_s": 0.0,
     "sell_min_bid_size": 1.0,
     # 0 skips the late-window Chainlink veto on loser scrap.
@@ -620,6 +626,22 @@ def validate_strategy(cfg: dict) -> None:
         raise ValueError("0 < reclaim_stop < reclaim_entry < 1 must hold")
     if not (0 < reclaim_stop < reclaim_entry < 1):
         raise ValueError("0 < reclaim_stop < reclaim_entry < 1 must hold")
+    try:
+        reclaim_slip = float(cfg.get("reclaim_slippage", 0.03))
+        reclaim_cap = float(cfg.get("reclaim_max_price", 0.96))
+    except (TypeError, ValueError):
+        raise ValueError("reclaim_slippage must be >= 0 and 0 < reclaim_max_price < 1")
+    # NaN fails the ordered compare. Inf is not a price.
+    if reclaim_slip != reclaim_slip or reclaim_slip < 0 or reclaim_slip == float("inf"):
+        raise ValueError("reclaim_slippage must be >= 0")
+    if (
+        reclaim_cap != reclaim_cap
+        or reclaim_cap in (float("inf"), float("-inf"))
+        or not (0 < reclaim_cap < 1)
+    ):
+        raise ValueError("0 < reclaim_max_price < 1 must hold")
+    if reclaim_cap + 1e-12 < reclaim_entry:
+        raise ValueError("reclaim_max_price must be >= reclaim_entry")
     # Explicit 0 is immediate (persist_ready), same as sell_persist_s and
     # sell_dump_persist_s. Negatives are rejected. sell_armed_poll_s stays
     # on its own >= 0.2 floor; that floor is the loop cadence, not a persist.
@@ -3164,6 +3186,12 @@ def _reclaim_tick(
         entry=float(cfg.get("reclaim_entry") or 0.91),
         usd=float(cfg.get("reclaim_usd") or 100.0),
         persist_s=cfg_seconds(cfg, "reclaim_entry_persist_s", 0.5),
+        slippage=float(
+            0.03 if cfg.get("reclaim_slippage") is None else cfg.get("reclaim_slippage")
+        ),
+        max_price=float(
+            0.96 if cfg.get("reclaim_max_price") is None else cfg.get("reclaim_max_price")
+        ),
         armed_ts=intent.get("reclaim_entry_armed_at"),
         armed_leg=intent.get("reclaim_entry_leg"),
         locked_leg=locked if locked in ("up", "dn") else None,
@@ -3216,6 +3244,20 @@ def _reclaim_tick(
             ask=asks_px.get(decision.get("leg")),
             persist_s=cfg_seconds(cfg, "reclaim_entry_persist_s", 0.5),
         )
+        return
+    if decision.get("reason") == "above_cap":
+        # Stay in the buy. A later ask at or under the cap can still top up.
+        if intent.get("reclaim_skip_reason") != "above_cap":
+            intent["reclaim_skip_reason"] = "above_cap"
+            cap = cfg.get("reclaim_max_price", 0.96)
+            log_event(
+                "reclaim_topup_skipped_cap",
+                condition_id=cid,
+                slug=intent.get("slug"),
+                leg=decision.get("leg"),
+                ask=asks_px.get(decision.get("leg")),
+                cap=float(cap) if cap is not None else 0.96,
+            )
         return
     if action != "buy":
         held_now = float(intent.get("reclaim_filled") or 0.0)

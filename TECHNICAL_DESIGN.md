@@ -1329,6 +1329,8 @@ Adjacent mint may already have been submitted **before** expiry (lookahead). Tha
 
 # Changelog
 
+- **2026-10-07** — The reclaim FAK limit is `min(ask + reclaim_slippage, reclaim_max_price)`, default 3¢ over the observed ask and hard-capped at 96¢. The first clip is `floor(reclaim_usd / that limit)` so the cent-rounded USDC stays about $100. A top-up uses the same limit; an ask already above the cap logs `reclaim_topup_skipped_cap` and is not posted. Entry, sister confirm, spread, freshness, and the stop are unchanged.
+
 - **2026-10-07** — Reclaim no longer requires the ask to cover `floor(reclaim_usd / ask)`, and it no longer uses `classify_loser` for the sister check. The other side confirms when its best ask is at or under `1 - reclaim_entry` (0.09 at 0.91). Books stay fresh, uncrossed, and within a 10¢ spread. There is no trade-print tape on the sell loop, so a last trade is not a second way to confirm.
 
 - **2026-10-07** — Reclaim FAK buys are market orders sized in USDC truncated to cents, so the maker amount has at most two decimals at tick 0.01 and 0.001. A hard refusal logs `reclaim_fak_reject` and does not take the uncertain-fill path; the same price and size is not posted again. Moving from the buy to the stop logs `reclaim_done` (filled shares, average price, cost, why the top-up stopped). No added REST, sleep, or guard change.

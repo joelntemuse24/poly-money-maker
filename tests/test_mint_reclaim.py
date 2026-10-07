@@ -13,10 +13,12 @@ from decimal import Decimal
 from buy.mint_sell import (
     cycle_sleep_s,
     reclaim_arm_block,
+    reclaim_buy_limit,
     reclaim_buy_usdc,
     reclaim_candidate_order,
     reclaim_entry_decision,
     reclaim_entry_qualify,
+    reclaim_share_size,
     reclaim_fak_status,
     reclaim_market_buy_amounts,
     sell_intent_hot,
@@ -234,7 +236,7 @@ class GuardDecisionTests(unittest.TestCase):
         out = self._decision(up_bid=0.90, up_ask=0.94, dn_bid=0.08, dn_ask=0.09)
         self.assertEqual(out["action"], "buy")
         self.assertEqual(out["leg"], "up")
-        self.assertAlmostEqual(out["limit"], 0.94)
+        self.assertAlmostEqual(out["limit"], 0.96)
 
     def test_other_ask_at_ten_cents_does_not_confirm(self):
         out = self._decision(up_bid=0.93, up_ask=0.94, dn_bid=0.08, dn_ask=0.10)
@@ -257,8 +259,9 @@ class GuardDecisionTests(unittest.TestCase):
         out = self._decision(armed_ts=99.5, now_s=100.0)
         self.assertEqual(out["action"], "buy")
         self.assertEqual(out["leg"], "up")
-        self.assertAlmostEqual(out["shares"], 106.0)
-        self.assertAlmostEqual(out["limit"], 0.94)
+        self.assertAlmostEqual(out["shares"], 104.0)
+        self.assertAlmostEqual(out["limit"], 0.96)
+        self.assertEqual(reclaim_buy_usdc(out["shares"], out["limit"]), 99.84)
 
     def test_stale_empty_crossed_locked_and_wide(self):
         stale = self._decision(up_age=5.01)
@@ -306,6 +309,54 @@ class GuardDecisionTests(unittest.TestCase):
         ok = self._decision(dumped_legs=("up",))
         self.assertEqual(ok["action"], "buy")
         self.assertTrue(ok["dumped_leg"])
+
+    def test_limit_is_ask_plus_slippage_until_the_cap(self):
+        under = self._decision(up_bid=0.90, up_ask=0.92, dn_bid=0.06, dn_ask=0.07)
+        self.assertEqual(under["action"], "buy")
+        self.assertAlmostEqual(under["limit"], 0.92 + 0.03)
+        self.assertLess(under["limit"], 0.96)
+        self.assertAlmostEqual(under["shares"], reclaim_share_size(100.0, under["limit"]))
+        self.assertEqual(reclaim_buy_usdc(under["shares"], under["limit"]), 99.75)
+        capped = self._decision(up_bid=0.93, up_ask=0.932, dn_bid=0.06, dn_ask=0.07)
+        self.assertEqual(capped["action"], "buy")
+        self.assertEqual(capped["limit"], 0.96)
+        self.assertAlmostEqual(capped["shares"], 104.0)
+        self.assertEqual(reclaim_buy_usdc(capped["shares"], capped["limit"]), 99.84)
+        rich = self._decision(up_bid=0.96, up_ask=0.97, dn_bid=0.02, dn_ask=0.03)
+        self.assertEqual(rich["action"], "buy")
+        self.assertEqual(rich["limit"], 0.96)
+        self.assertAlmostEqual(reclaim_buy_limit(0.92, 0.03, 0.96), 0.92 + 0.03)
+        self.assertEqual(reclaim_buy_limit(0.94, 0.03, 0.96), 0.96)
+
+    def test_topup_above_the_cap_keeps_the_arm(self):
+        out = self._decision(
+            locked_leg="up",
+            filled=50.0,
+            target=104.0,
+            armed_ts=95.0,
+            up_bid=0.96,
+            up_ask=0.97,
+            dn_bid=0.02,
+            dn_ask=0.03,
+        )
+        self.assertEqual(out["action"], "skip")
+        self.assertEqual(out["reason"], "above_cap")
+        self.assertEqual(out["armed_ts"], 95.0)
+        self.assertEqual(out["armed_leg"], "up")
+        at_cap = self._decision(
+            locked_leg="up",
+            filled=50.0,
+            target=104.0,
+            up_bid=0.95,
+            up_ask=0.96,
+            dn_bid=0.03,
+            dn_ask=0.04,
+        )
+        self.assertEqual(at_cap["action"], "buy")
+        self.assertEqual(at_cap["reason"], "retry")
+        self.assertEqual(at_cap["limit"], 0.96)
+        self.assertAlmostEqual(at_cap["shares"], 54.0)
+        self.assertEqual(reclaim_buy_usdc(at_cap["shares"], at_cap["limit"]), 51.84)
 
     def test_miss_retries_the_locked_leg_without_a_new_persist(self):
         out = self._decision(
@@ -402,11 +453,25 @@ class ArmTests(unittest.TestCase):
         self.assertIs(defaults["reclaim_stop_enabled"], True)
         self.assertEqual(defaults["reclaim_entry_persist_s"], 0.5)
         self.assertEqual(defaults["reclaim_stop_persist_s"], 0.5)
+        self.assertEqual(defaults["reclaim_slippage"], 0.03)
+        self.assertEqual(defaults["reclaim_max_price"], 0.96)
         self.assertIn("reclaim off", sell_plan_banner({"sell_enabled": True}))
         text = sell_plan_banner(
             {"sell_enabled": True, "reclaim_enabled": True}
         )
-        self.assertIn("reclaim $100 ask>=91c persist 0.5s stop<=75c/0.5s", text)
+        self.assertIn(
+            "reclaim $100 ask>=91c persist 0.5s slip 3c cap 96c stop<=75c/0.5s",
+            text,
+        )
+        live = sell_plan_banner({
+            "sell_enabled": True,
+            "reclaim_enabled": True,
+            "reclaim_entry_persist_s": 1.0,
+        })
+        self.assertIn(
+            "reclaim $100 ask>=91c persist 1s slip 3c cap 96c stop<=75c/0.5s",
+            live,
+        )
 
     def test_entry_persist_allows_zero_and_rejects_negative(self):
         from buy.mint_gas import validate_mint_gas
@@ -427,6 +492,13 @@ class ArmTests(unittest.TestCase):
         with self.assertRaises(ValueError) as caught:
             validate(dict(defaults, reclaim_entry_persist_s=-0.01))
         self.assertIn("reclaim_entry_persist_s", str(caught.exception))
+        validate(dict(defaults, reclaim_slippage=0))
+        with self.assertRaises(ValueError) as slip_caught:
+            validate(dict(defaults, reclaim_slippage=-0.01))
+        self.assertIn("reclaim_slippage", str(slip_caught.exception))
+        with self.assertRaises(ValueError) as cap_caught:
+            validate(dict(defaults, reclaim_max_price=0.90))
+        self.assertIn("reclaim_max_price", str(cap_caught.exception))
 
     def test_done_bag_stays_cold_until_reclaim_hot(self):
         done = {
@@ -519,8 +591,8 @@ class LoopTests(unittest.TestCase):
         loop.book = _qualifying(up=(0.90, 0.94, 10.0, None), dn=(0.08, 0.09, 500.0, None))
         loop.tick(_reclaim_cfg(), intent)
         self.assertEqual(len(loop.buys), 1)
-        self.assertAlmostEqual(loop.buys[0]["size"], 106.0)
-        self.assertAlmostEqual(loop.buys[0]["price"], 0.94)
+        self.assertAlmostEqual(loop.buys[0]["size"], 104.0)
+        self.assertAlmostEqual(loop.buys[0]["price"], 0.96)
         self.assertFalse(any(row["reason"] == "thin_depth" for row in loop.events_named("reclaim_skip")))
 
     def test_guards_block_the_buy_until_every_check_holds(self):
@@ -570,8 +642,8 @@ class LoopTests(unittest.TestCase):
         loop.tick(cfg, intent)
         self.assertEqual(len(loop.buys), 1)
         self.assertEqual(loop.buys[0]["token_id"], "up-tok")
-        self.assertAlmostEqual(loop.buys[0]["price"], 0.94)
-        self.assertAlmostEqual(loop.buys[0]["size"], 106.0)
+        self.assertAlmostEqual(loop.buys[0]["price"], 0.96)
+        self.assertAlmostEqual(loop.buys[0]["size"], 104.0)
         self.assertTrue(intent.get("reclaim_bought"))
         self.assertFalse(intent.get("reclaim_buy_inflight"))
         self.assertEqual(len(loop.fetches), before_fetch)
@@ -636,7 +708,7 @@ class LoopTests(unittest.TestCase):
         buy = loop.events_named("reclaim_buy")
         self.assertEqual(len(buy), 1)
         self.assertTrue(buy[0]["dry_run"])
-        self.assertAlmostEqual(buy[0]["price"], 0.94)
+        self.assertAlmostEqual(buy[0]["price"], 0.96)
         self.assertFalse(any("reclaim_paper" in row["event"] for row in loop.events))
         self.assertNotIn("reclaim_paper", MINT.read_text())
         loop.clock["now"] = now + 0.2
@@ -887,6 +959,19 @@ class ReclaimAmountTests(unittest.TestCase):
         self.assertEqual(top_cent["taker"], 26_364_500)
         self.assertEqual(top_cent["shares"], 26.3645)
 
+    def test_slippage_clip_usdc_stays_two_decimals_and_near_100(self):
+        for ask in (0.91, 0.92, 0.929, 0.93, 0.932, 0.94, 0.95):
+            limit = reclaim_buy_limit(ask, 0.03, 0.96)
+            shares = reclaim_share_size(100.0, limit)
+            usdc = reclaim_buy_usdc(shares, limit)
+            self.assertGreaterEqual(usdc, 99.0, ask)
+            self.assertLessEqual(usdc, 100.0, ask)
+            self.assertLessEqual(_places(usdc), 2, ask)
+            for tick in ("0.01", "0.001"):
+                got = reclaim_market_buy_amounts(usdc, limit, tick)
+                self.assertEqual(got["maker"] % 10_000, 0, (ask, tick))
+                self.assertLessEqual(_places(got["usdc"]), 2, (ask, tick))
+
     def test_fak_buy_signs_cents_without_a_market_info_fetch(self):
         loop = _Loop(real_buy=True)
         seen: dict = {}
@@ -976,13 +1061,14 @@ class ReclaimRejectTests(unittest.TestCase):
         def buy_result(shares, price):
             calls["n"] += 1
             if calls["n"] == 1:
-                self.assertAlmostEqual(price, 0.95)
-                self.assertAlmostEqual(shares, 105.0)
-                self.assertEqual(reclaim_buy_usdc(shares, price), 99.75)
+                self.assertAlmostEqual(price, 0.96)
+                self.assertAlmostEqual(shares, 104.0)
+                self.assertEqual(reclaim_buy_usdc(shares, price), 99.84)
                 return 78.63, "matched"
             self.assertAlmostEqual(price, 0.96)
-            self.assertAlmostEqual(shares, 26.37, places=4)
-            self.assertEqual(reclaim_buy_usdc(shares, price), 25.31)
+            self.assertAlmostEqual(shares, 25.37, places=2)
+            self.assertEqual(reclaim_buy_usdc(shares, price), 24.35)
+            self.assertLessEqual(_places(reclaim_buy_usdc(shares, price)), 2)
             return float(shares), "matched"
 
         loop = _Loop(buy_result=buy_result)
@@ -1003,9 +1089,9 @@ class ReclaimRejectTests(unittest.TestCase):
         done = loop.events_named("reclaim_done")
         self.assertEqual(len(done), 1)
         self.assertEqual(done[0]["reason"], "filled")
-        self.assertAlmostEqual(done[0]["filled"], 105.0)
+        self.assertAlmostEqual(done[0]["filled"], 104.0)
         self.assertIsNotNone(done[0]["avg_px"])
-        self.assertAlmostEqual(done[0]["cost"], 105.0 * float(done[0]["avg_px"]), places=4)
+        self.assertAlmostEqual(done[0]["cost"], 104.0 * float(done[0]["avg_px"]), places=4)
         self.assertFalse(intent.get("reclaim_buy_uncertain"))
 
     def test_hard_400_is_not_uncertain_and_the_same_order_is_not_retried(self):
@@ -1077,15 +1163,60 @@ class ReclaimRejectTests(unittest.TestCase):
         now = loop.clock["now"]
         intent = _dumped(now + 200.0)
         _arm_entry(intent, now)
-        loop.book = _qualifying(up=(0.94, 0.95, 500.0, None), dn=(0.05, 0.06, 500.0, None))
+        loop.book = _qualifying(up=(0.90, 0.92, 500.0, None), dn=(0.06, 0.07, 500.0, None))
         cfg = _reclaim_cfg()
         loop.tick(cfg, intent)
-        loop.book = _qualifying(up=(0.95, 0.96, 500.0, None), dn=(0.04, 0.05, 500.0, None))
+        loop.book = _qualifying(up=(0.93, 0.94, 500.0, None), dn=(0.05, 0.06, 500.0, None))
         loop.clock["now"] = now + 0.2
         loop.tick(cfg, intent)
         self.assertEqual(len(loop.buys), 2)
+        self.assertNotAlmostEqual(loop.buys[0]["price"], loop.buys[1]["price"])
         self.assertTrue(intent.get("reclaim_bought"))
         self.assertEqual(loop.events_named("reclaim_done")[-1]["reason"], "filled")
+
+    def test_topup_above_cap_is_logged_and_a_later_ask_still_posts(self):
+        calls = {"n": 0}
+
+        def buy_result(shares, price):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                return 50.0, "matched"
+            self.assertLessEqual(_places(reclaim_buy_usdc(shares, price)), 2)
+            return float(shares), "matched"
+
+        loop = _Loop(buy_result=buy_result)
+        now = loop.clock["now"]
+        intent = _dumped(now + 200.0)
+        _arm_entry(intent, now)
+        loop.book = _qualifying(up=(0.92, 0.93, 500.0, None), dn=(0.05, 0.06, 500.0, None))
+        cfg = _reclaim_cfg()
+        loop.tick(cfg, intent)
+        self.assertEqual(len(loop.buys), 1)
+        self.assertAlmostEqual(loop.buys[0]["price"], 0.96)
+        self.assertAlmostEqual(loop.buys[0]["size"], 104.0)
+        self.assertEqual(reclaim_buy_usdc(104, 0.96), 99.84)
+        self.assertFalse(intent.get("reclaim_bought"))
+        loop.book = _qualifying(up=(0.96, 0.97, 500.0, None), dn=(0.02, 0.03, 500.0, None))
+        loop.clock["now"] = now + 0.2
+        loop.tick(cfg, intent)
+        self.assertEqual(len(loop.buys), 1)
+        self.assertFalse(intent.get("reclaim_bought"))
+        skipped = loop.events_named("reclaim_topup_skipped_cap")
+        self.assertEqual(len(skipped), 1)
+        self.assertAlmostEqual(skipped[0]["ask"], 0.97)
+        self.assertAlmostEqual(skipped[0]["cap"], 0.96)
+        self.assertEqual(skipped[0]["leg"], "up")
+        loop.clock["now"] = now + 0.3
+        loop.tick(cfg, intent)
+        self.assertEqual(len(loop.events_named("reclaim_topup_skipped_cap")), 1)
+        loop.book = _qualifying(up=(0.93, 0.94, 500.0, None), dn=(0.05, 0.06, 500.0, None))
+        loop.clock["now"] = now + 0.5
+        loop.tick(cfg, intent)
+        self.assertEqual(len(loop.buys), 2)
+        self.assertAlmostEqual(loop.buys[1]["size"], 54.0)
+        self.assertAlmostEqual(loop.buys[1]["price"], 0.96)
+        self.assertEqual(reclaim_buy_usdc(loop.buys[1]["size"], loop.buys[1]["price"]), 51.84)
+        self.assertTrue(intent.get("reclaim_bought"))
 
     def test_partial_that_stops_qualifying_logs_reclaim_done(self):
         loop = _Loop(buy_result=lambda _s, _p: (78.63, "matched"))

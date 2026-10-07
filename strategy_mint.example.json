@@ -85,6 +85,8 @@
   "reclaim_stop": 0.75,
   "reclaim_stop_enabled": true,
   "reclaim_stop_persist_s": 0.5,
+  "reclaim_slippage": 0.03,
+  "reclaim_max_price": 0.96,
   "reclaim_max_ttm_s": 0.0,
   "sell_late_window_s": 0.0,
   "sell_oracle_edge_per_ttm": 0.0,

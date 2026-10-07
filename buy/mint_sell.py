@@ -113,6 +113,9 @@ DEFAULT_SELL_KNOBS = {
     "reclaim_stop_enabled": True,
     # Stop clock. Same default as the entry and the dump persist.
     "reclaim_stop_persist_s": 0.5,
+    # Marketable FAK may pay this much over the observed ask, hard-capped.
+    "reclaim_slippage": 0.03,
+    "reclaim_max_price": 0.96,
     # 0 leaves the entry time gate off (scrap_time_gate_open). Unknown ttm stays open.
     "reclaim_max_ttm_s": 0.0,
     "sell_min_bid_size": 1.0,
@@ -1660,6 +1663,33 @@ def reclaim_complement_max(entry: float) -> float:
     return round(max(0.0, 1.0 - px), 4)
 
 
+def reclaim_buy_limit(
+    ask: float,
+    slippage: float = 0.03,
+    max_price: float = 0.96,
+) -> Optional[float]:
+    """Worst reclaim FAK price: ``min(ask + slippage, max_price)``."""
+    try:
+        ask_f = float(ask)
+        slip = float(slippage)
+        cap = float(max_price)
+    except (TypeError, ValueError):
+        return None
+    if (
+        not math.isfinite(ask_f)
+        or not math.isfinite(slip)
+        or not math.isfinite(cap)
+        or ask_f <= 0
+        or slip < 0
+        or not (0 < cap < 1)
+    ):
+        return None
+    limit = min(ask_f + slip, cap)
+    if not (0 < limit < 1):
+        return None
+    return float(limit)
+
+
 def reclaim_share_size(usd: float, price: float) -> float:
     """``floor(usd / price)`` whole shares. 0 when the price cannot size a buy."""
     try:
@@ -1863,8 +1893,9 @@ def reclaim_entry_qualify(
     """Gates for buying ``leg``. ``(ok, reason, shares)``.
 
     The other side confirms when its best ask is at or under
-    ``1 - entry`` (0.09 when entry is 0.91). This side's sized ask is the
-    limit and must clear the entry. There is no ask-depth gate. An empty,
+    ``1 - entry`` (0.09 when entry is 0.91). This side's ask must clear
+    the entry. The posted limit is ``reclaim_buy_limit``, not this ask.
+    There is no ask-depth gate. An empty,
     crossed, locked, or wide book resets; it does not keep the arm.
     """
     if leg not in ("up", "dn"):
@@ -1999,6 +2030,8 @@ def reclaim_entry_decision(
     entry: float,
     usd: float,
     persist_s: float,
+    slippage: float = 0.03,
+    max_price: float = 0.96,
     armed_ts: Optional[float],
     armed_leg: Optional[str],
     locked_leg: Optional[str],
@@ -2019,8 +2052,11 @@ def reclaim_entry_decision(
 
     ``action`` is ``buy``, ``wait``, or ``skip``. A ``buy`` is ready to
     post on this same tick: the persist window has already elapsed, or a
-    remainder is retrying a side that already fired. Callers must not
-    sleep or refetch between this result and the FAK.
+    remainder is retrying a side that already fired. The posted price is
+    ``min(ask + slippage, max_price)``. The first clip is sized off that
+    limit. A locked retry whose ask is already above ``max_price`` skips
+    with ``above_cap`` and keeps the arm. Callers must not sleep or
+    refetch between this result and the FAK.
     """
     dumped = {leg for leg in (dumped_legs or ()) if leg in ("up", "dn")}
 
@@ -2091,7 +2127,29 @@ def reclaim_entry_decision(
                 "skip", reason, leg=locked_leg,
                 new_armed=armed_ts, new_leg=locked_leg,
             )
-        limit = up_ask if locked_leg == "up" else dn_ask
+        ask = up_ask if locked_leg == "up" else dn_ask
+        try:
+            ask_f = float(ask)
+            cap = float(max_price)
+        except (TypeError, ValueError):
+            ask_f, cap = None, None
+        if (
+            ask_f is not None
+            and cap is not None
+            and math.isfinite(ask_f)
+            and math.isfinite(cap)
+            and ask_f > cap + 1e-12
+        ):
+            return _out(
+                "skip", "above_cap", leg=locked_leg,
+                new_armed=armed_ts, new_leg=locked_leg,
+            )
+        limit = reclaim_buy_limit(ask, slippage, max_price)
+        if limit is None:
+            return _out(
+                "skip", "above_cap", leg=locked_leg,
+                new_armed=armed_ts, new_leg=locked_leg,
+            )
         return _out(
             "buy", "retry", leg=locked_leg, shares=shares, limit=limit,
             new_armed=armed_ts, new_leg=locked_leg,
@@ -2136,18 +2194,22 @@ def reclaim_entry_decision(
         True, now_s=now_s, armed_ts=clock, persist_s=persist_s,
     )
     _ok, _why, shares = results[chosen]
-    limit = up_ask if chosen == "up" else dn_ask
+    ask = up_ask if chosen == "up" else dn_ask
     if not fire:
         return _out(
-            "wait", why, leg=chosen, shares=shares, limit=limit,
+            "wait", why, leg=chosen, shares=shares, limit=ask,
             new_armed=new_armed, new_leg=chosen,
         )
     # Same quotes that armed the persist. This is the fire re-check.
-    ok, reason, shares = _qualify(chosen)
+    ok, reason, _shares = _qualify(chosen)
     if not ok:
         return _out("skip", reason, leg=chosen)
+    limit = reclaim_buy_limit(ask, slippage, max_price)
+    sized = reclaim_share_size(usd, limit if limit is not None else 0.0)
+    if limit is None or sized < 1:
+        return _out("skip", "size_zero", leg=chosen)
     return _out(
-        "buy", why, leg=chosen, shares=shares, limit=limit,
+        "buy", why, leg=chosen, shares=sized, limit=limit,
         new_armed=new_armed, new_leg=chosen,
     )
 
@@ -2237,7 +2299,16 @@ def sell_plan_banner(cfg: dict) -> str:
         persist = cfg_seconds(
             cfg, "reclaim_entry_persist_s", DEFAULT_SELL_KNOBS["reclaim_entry_persist_s"],
         )
-        text = f"reclaim ${usd:g} ask>={_cents(entry)} persist {persist:g}s"
+        slip = cfg.get("reclaim_slippage")
+        if slip is None:
+            slip = DEFAULT_SELL_KNOBS["reclaim_slippage"]
+        cap = cfg.get("reclaim_max_price")
+        if cap is None:
+            cap = DEFAULT_SELL_KNOBS["reclaim_max_price"]
+        text = (
+            f"reclaim ${usd:g} ask>={_cents(entry)} persist {persist:g}s"
+            f" slip {_cents(slip)} cap {_cents(cap)}"
+        )
         if cfg.get("reclaim_stop_enabled", True):
             stop = float(cfg.get("reclaim_stop") or DEFAULT_SELL_KNOBS["reclaim_stop"])
             stop_p = cfg_seconds(
