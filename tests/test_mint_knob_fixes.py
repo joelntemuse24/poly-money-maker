@@ -41,7 +41,8 @@ class StartupBannerTests(unittest.TestCase):
         self.assertEqual(
             text,
             "loser <=3c -> one FAK @ floor 1c · scrap 50% keep rest · "
-            "scrap ttm<=360s · dump held <40c ttm<=240s · keep winner (cash >=0.9995)",
+            "scrap ttm<=360s · dump held <40c ttm<=240s · keep winner (cash >=0.9995)"
+            " · reclaim off",
         )
         self.assertNotIn("ladder", text)
 
@@ -59,7 +60,7 @@ class StartupBannerTests(unittest.TestCase):
         self.assertEqual(
             sell_plan_banner(example),
             "loser <=2c -> one FAK @ floor 2c · scrap ttm<=600s · "
-            "dump held <80c ttm<=240s · keep winner (cash >=0.999)",
+            "dump held <80c ttm<=240s · keep winner (cash >=0.999) · reclaim off",
         )
 
     def test_main_prints_and_logs_the_loaded_plan(self):

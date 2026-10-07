@@ -54,6 +54,62 @@ def best_from_levels(levels: Any, side: str) -> Tuple[Optional[float], float]:
         return None, 0.0
 
 
+def best_ask_with_min_size(
+    levels: Any, min_size: float = 0.0
+) -> Tuple[Optional[float], float]:
+    """Lowest ask whose displayed size is at least ``min_size``.
+
+    Same dust filter as ``best_bid_with_min_size``. Empty book → ``(None, 0.0)``.
+    """
+    need = float(min_size or 0.0)
+    if not levels:
+        return None, 0.0
+    try:
+        valid = []
+        for level in levels:
+            if not isinstance(level, dict):
+                continue
+            price = finite_float(level.get("price"))
+            size = finite_float(level.get("size"))
+            if (
+                price is None
+                or size is None
+                or not 0 < price < 1
+                or size <= 0
+                or size + 1e-12 < need
+            ):
+                continue
+            valid.append((price, size))
+        if not valid:
+            return None, 0.0
+        return min(valid, key=lambda level: level[0])
+    except Exception:
+        return None, 0.0
+
+
+def book_age_s(timestamp: Any, now_s: float) -> Optional[float]:
+    """Age in seconds of a CLOB book ``timestamp``, or None if it has none.
+
+    Polymarket sends milliseconds. A missing stamp is not an age: the
+    caller fetched the book on this tick. A future stamp is age 0.
+    """
+    parsed = finite_float(timestamp)
+    if parsed is None or parsed <= 0:
+        return None
+    if parsed > 1e12:
+        parsed = parsed / 1000.0
+    try:
+        now = float(now_s)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(now):
+        return None
+    age = now - parsed
+    if not math.isfinite(age):
+        return None
+    return 0.0 if age < 0 else age
+
+
 def best_bid_with_min_size(
     levels: Any, min_size: float = 0.0
 ) -> Tuple[Optional[float], float]:
@@ -154,6 +210,77 @@ def bid_fill_depth(
     return {
         "best_bid": best_bid,
         "best_bid_size": best_bid_size,
+        "depth_at_limit": depth_at_limit,
+        "ladder": ladder,
+    }
+
+
+def _parsed_ask_levels(levels: Any) -> list[Tuple[float, float]]:
+    """Valid ask levels merged by price, lowest first."""
+    merged: dict[float, float] = {}
+    if not levels:
+        return []
+    try:
+        for level in levels:
+            if not isinstance(level, dict):
+                continue
+            price = finite_float(level.get("price"))
+            size = finite_float(level.get("size"))
+            if (
+                price is None
+                or size is None
+                or not 0 < price < 1
+                or size <= 0
+            ):
+                continue
+            key = round(price, 4)
+            merged[key] = merged.get(key, 0.0) + size
+    except Exception:
+        return []
+    return sorted(merged.items(), key=lambda item: item[0])
+
+
+def ask_fill_depth(
+    levels: Any,
+    limit: Optional[float],
+    *,
+    tick: float = 0.01,
+    extra_ticks: int = 2,
+) -> dict:
+    """Cumulative ask size a buy FAK at ``limit`` can lift.
+
+    A CLOB BUY FAK at ``limit`` matches resting asks with ``price <= limit``.
+    Same shape as ``bid_fill_depth``. Log and the reclaim size check both
+    read ``depth_at_limit``.
+    """
+    parsed = _parsed_ask_levels(levels)
+    best_ask: Optional[float] = parsed[0][0] if parsed else None
+    best_ask_size = float(parsed[0][1]) if parsed else 0.0
+
+    def depth_at(px: float) -> float:
+        return round(
+            float(sum(size for price, size in parsed if price <= px + 1e-12)),
+            4,
+        )
+
+    lim = finite_float(limit)
+    depth_at_limit = depth_at(lim) if lim is not None and lim > 0 else 0.0
+    ladder: list[dict] = []
+    if lim is not None and lim > 0:
+        step = float(tick or 0.01)
+        for i in range(int(extra_ticks) + 1):
+            px = round(lim + step * i, 4)
+            if px >= 1:
+                break
+            ladder.append({"price": px, "depth": depth_at(px)})
+    elif parsed:
+        cum = 0.0
+        for price, size in parsed[:3]:
+            cum = round(cum + size, 4)
+            ladder.append({"price": price, "depth": cum})
+    return {
+        "best_ask": best_ask,
+        "best_ask_size": best_ask_size,
         "depth_at_limit": depth_at_limit,
         "ladder": ladder,
     }

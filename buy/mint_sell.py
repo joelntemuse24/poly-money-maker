@@ -99,6 +99,20 @@ DEFAULT_SELL_KNOBS = {
     "sell_dump_max_ttm_s": 0.0,
     # When the held dump fills, also sell the kept scrap half (1c floor sweep).
     "sell_dump_also_kept": False,
+    # After a both-sides dump, optional FAK buy of the side that reclaims.
+    # Off until the operator sets reclaim_enabled. The stop is on unless
+    # reclaim_stop_enabled is set false (hold to redeem).
+    "reclaim_enabled": False,
+    "reclaim_usd": 100.0,
+    "reclaim_entry": 0.91,
+    # Entry must hold this long. Matches sell_persist_s (5s), not one tick.
+    "reclaim_entry_persist_s": 5.0,
+    "reclaim_stop": 0.75,
+    "reclaim_stop_enabled": True,
+    # Stop clock. Same spirit as the dump persist; live dump is ~0.5s.
+    "reclaim_stop_persist_s": 0.5,
+    # 0 leaves the entry time gate off (scrap_time_gate_open). Unknown ttm stays open.
+    "reclaim_max_ttm_s": 0.0,
     "sell_min_bid_size": 1.0,
     # Cycle sleep while a loser persist arm is live. Does not change persist_s.
     "sell_armed_poll_s": 2.0,
@@ -227,6 +241,8 @@ def sell_intent_hot(intent: Any, now_s: float) -> bool:
     - loser persist arm is live and the loser is not yet sold
     - loser is sold and dump/winner exit is not done (``sold_dump`` /
       ``sold_winner``)
+    - a both-sides dump is done and ``reclaim_hot`` is set (entry watch
+      or a live stop). Cleared when the reclaim finishes.
 
     This is sell-loop scheduling only. Concurrent mint must not skip
     discovery because a bag is hot — that was the #193 serial-cycle
@@ -246,7 +262,11 @@ def sell_intent_hot(intent: Any, now_s: float) -> bool:
         return False
     sold_exit = bool(intent.get("sold_dump") or intent.get("sold_winner"))
     if intent.get("sold_loser") or intent.get("sold_leg"):
-        return not sold_exit
+        if not sold_exit:
+            return True
+        # Set by the sell loop only while reclaim_enabled and the bag can
+        # still buy or stop. Keeps sell_armed_poll_s until that finishes.
+        return bool(intent.get("reclaim_hot"))
     return intent.get("sell_loser_armed_at") is not None
 
 
@@ -1488,6 +1508,28 @@ def sell_fill_vwap(result: Any, sold_shares: float) -> Optional[float]:
     return round(px, 4)
 
 
+def buy_fill_vwap(result: Any, bought_shares: float) -> Optional[float]:
+    """USDC per share from a BUY fill. ``makingAmount`` is collateral paid."""
+    try:
+        bought = float(bought_shares or 0.0)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(bought) or bought <= 1e-12 or not isinstance(result, dict):
+        return None
+    usdc = None
+    for key in ("makingAmount", "making_amount"):
+        parsed = _decode_amount(result.get(key), 0.0)
+        if parsed is not None and parsed > 0:
+            usdc = parsed
+            break
+    if usdc is None:
+        return None
+    px = usdc / bought
+    if not math.isfinite(px) or px <= 0 or px >= 1:
+        return None
+    return round(px, 4)
+
+
 def record_fill_px(intent: dict, key: str, fills: Any) -> Optional[float]:
     """Fold ``(shares, px)`` fills into a running share-weighted average.
 
@@ -1598,6 +1640,495 @@ def dump_persist_knobs(cfg: dict) -> Tuple[float, float, float]:
     return persist, last_min, window
 
 
+# A 91¢ token with a bid more than this far under the ask is not a real print.
+# Scrap has no spread knob; this is stricter than the scrap, on purpose.
+RECLAIM_MAX_SPREAD = 0.10
+# Old scrap tape-stale window. Applied only when the book payload has a timestamp.
+RECLAIM_BOOK_MAX_AGE_S = 5.0
+
+
+def reclaim_complement_max(entry: float) -> float:
+    """Other-side bid ceiling. 0.91 entry → 0.09, the mirror of a 91¢ favourite."""
+    try:
+        px = float(entry)
+    except (TypeError, ValueError):
+        return 0.0
+    if not math.isfinite(px):
+        return 0.0
+    return round(max(0.0, 1.0 - px), 4)
+
+
+def reclaim_share_size(usd: float, price: float) -> float:
+    """``floor(usd / price)`` whole shares. 0 when the price cannot size a buy."""
+    try:
+        usd_f = float(usd)
+        px = float(price)
+    except (TypeError, ValueError):
+        return 0.0
+    if (
+        not math.isfinite(usd_f)
+        or not math.isfinite(px)
+        or usd_f <= 0
+        or px <= 0
+        or px >= 1
+    ):
+        return 0.0
+    return float(math.floor(usd_f / px + 1e-9))
+
+
+def reclaim_arm_block(
+    intent: Any,
+    *,
+    also_kept: bool,
+    tol: float = 0.01,
+) -> Optional[str]:
+    """None when a both-sides dump has finished. Otherwise a skip reason.
+
+    ``sold_dump`` is the durable form of the ``sell_dump_done`` log.
+    ``sell_dump_also_kept`` also requires ``sell_dump_kept_done``. A kept
+    half that was never sold (flag off, keep > 0) does not arm.
+    """
+    if not isinstance(intent, dict) or not intent.get("sold_dump"):
+        return "no_dump"
+    try:
+        keep = float(intent.get("sell_scrap_keep") or 0.0)
+    except (TypeError, ValueError):
+        keep = 0.0
+    if not math.isfinite(keep) or keep < 0:
+        keep = 0.0
+    kept_done = bool(intent.get("sell_dump_kept_done"))
+    if also_kept and not kept_done:
+        return "kept_pending"
+    if keep > float(tol) and not kept_done:
+        return "kept_open"
+    return None
+
+
+def reclaim_book_problem(
+    bid: Optional[float],
+    ask: Optional[float],
+    *,
+    max_spread: float = RECLAIM_MAX_SPREAD,
+) -> Optional[str]:
+    """``empty_book`` / ``crossed`` / ``locked`` / ``wide_spread``, or None.
+
+    Locked means bid == ask. Crossed means bid > ask. A spread wider than
+    ``max_spread`` is not a usable print.
+    """
+    if bid is None or ask is None:
+        return "empty_book"
+    try:
+        b = float(bid)
+        a = float(ask)
+    except (TypeError, ValueError):
+        return "empty_book"
+    if not math.isfinite(b) or not math.isfinite(a) or not (0 < b < 1) or not (0 < a < 1):
+        return "empty_book"
+    if b > a + 1e-12:
+        return "crossed"
+    if abs(b - a) <= 1e-12:
+        return "locked"
+    try:
+        cap = float(max_spread)
+    except (TypeError, ValueError):
+        cap = RECLAIM_MAX_SPREAD
+    if not math.isfinite(cap) or cap <= 0:
+        cap = RECLAIM_MAX_SPREAD
+    if a - b > cap + 1e-12:
+        return "wide_spread"
+    return None
+
+
+def _reclaim_stale(age_s: Optional[float], max_age_s: float) -> bool:
+    if age_s is None:
+        return False
+    try:
+        age = float(age_s)
+        cap = float(max_age_s)
+    except (TypeError, ValueError):
+        return True
+    if not math.isfinite(age) or not math.isfinite(cap):
+        return True
+    return age > cap + 1e-12
+
+
+def reclaim_entry_qualify(
+    *,
+    leg: str,
+    bid: Optional[float],
+    ask: Optional[float],
+    other_bid: Optional[float],
+    other_ask: Optional[float],
+    entry: float,
+    usd: float,
+    ask_depth: Optional[float],
+    order_shares: Optional[float] = None,
+    book_age_s: Optional[float] = None,
+    other_book_age_s: Optional[float] = None,
+    max_age_s: float = RECLAIM_BOOK_MAX_AGE_S,
+    max_spread: float = RECLAIM_MAX_SPREAD,
+) -> Tuple[bool, str, float]:
+    """Scrap-equivalent gates for buying ``leg``. ``(ok, reason, shares)``.
+
+    Sister check is ``classify_loser`` with ``threshold = 1 - entry`` and
+    ``opposite_min = entry``: the other side's sized bid must be the cheap
+    leg, and this side's sized bid must clear the entry. The fill price is
+    this side's sized ask, which must also clear the entry. Depth must
+    cover the share size. An empty book resets; it does not keep the arm.
+    """
+    if leg not in ("up", "dn"):
+        return False, "bad_leg", 0.0
+    if _reclaim_stale(book_age_s, max_age_s) or _reclaim_stale(other_book_age_s, max_age_s):
+        return False, "stale_book", 0.0
+    own = reclaim_book_problem(bid, ask, max_spread=max_spread)
+    if own:
+        return False, own, 0.0
+    other = reclaim_book_problem(other_bid, other_ask, max_spread=max_spread)
+    if other:
+        return False, other, 0.0
+    try:
+        entry_f = float(entry)
+        ask_f = float(ask)
+        other_ask_f = float(other_ask)
+    except (TypeError, ValueError):
+        return False, "empty_book", 0.0
+    if not math.isfinite(entry_f) or not (0 < entry_f < 1):
+        return False, "bad_entry", 0.0
+    if ask_f + 1e-12 >= entry_f and other_ask_f + 1e-12 >= entry_f:
+        return False, "both_rich", 0.0
+    cheap_max = reclaim_complement_max(entry_f)
+    up_bid = bid if leg == "up" else other_bid
+    dn_bid = other_bid if leg == "up" else bid
+    loser, why = classify_loser(
+        up_bid, dn_bid, threshold=cheap_max, opposite_min=entry_f,
+    )
+    other_leg = "dn" if leg == "up" else "up"
+    if loser != other_leg:
+        if why == "both_cheap":
+            return False, "both_cheap", 0.0
+        return False, "wick_unconfirmed", 0.0
+    if ask_f + 1e-12 < entry_f:
+        return False, "below_entry", 0.0
+    if order_shares is None:
+        shares = reclaim_share_size(usd, ask_f)
+    else:
+        try:
+            shares = float(order_shares)
+        except (TypeError, ValueError):
+            shares = 0.0
+        if not math.isfinite(shares) or shares < 0:
+            shares = 0.0
+    if shares < 1:
+        return False, "size_zero", 0.0
+    if not depth_covers_size(ask_depth, shares):
+        return False, "thin_depth", 0.0
+    return True, "ok", shares
+
+
+def reclaim_candidate_order(
+    up_ask: Optional[float],
+    dn_ask: Optional[float],
+    entry: float,
+) -> list:
+    """Legs whose ask is at/over ``entry``, higher ask first. Tie → up."""
+    rows = []
+    try:
+        entry_f = float(entry)
+    except (TypeError, ValueError):
+        return []
+    if not math.isfinite(entry_f):
+        return []
+    for leg, ask in (("up", up_ask), ("dn", dn_ask)):
+        try:
+            px = float(ask) if ask is not None else None
+        except (TypeError, ValueError):
+            px = None
+        if px is None or not math.isfinite(px) or px + 1e-12 < entry_f:
+            continue
+        rows.append((px, 0 if leg == "up" else 1, leg))
+    rows.sort(key=lambda row: (-row[0], row[1]))
+    return [leg for _px, _tie, leg in rows]
+
+
+def reclaim_window_open(
+    now_s: float,
+    end_ts: float,
+    ttm_s: Optional[float],
+    max_ttm_s: Optional[float],
+) -> Tuple[bool, str]:
+    """Scrap window gates: ``sell_window_open`` then ``scrap_time_gate_open``."""
+    if not sell_window_open(now_s, float(end_ts or 0)):
+        return False, "window_closed"
+    if not scrap_time_gate_open(ttm_s, max_ttm_s):
+        return False, "time_gated"
+    return True, "open"
+
+
+def _reclaim_quote(
+    leg: str,
+    *,
+    up_bid,
+    up_ask,
+    dn_bid,
+    dn_ask,
+    up_depth,
+    dn_depth,
+    up_age,
+    dn_age,
+    entry: float,
+    usd: float,
+    order_shares: Optional[float],
+    max_age_s: float,
+    max_spread: float,
+) -> Tuple[bool, str, float]:
+    if leg == "up":
+        return reclaim_entry_qualify(
+            leg="up",
+            bid=up_bid,
+            ask=up_ask,
+            other_bid=dn_bid,
+            other_ask=dn_ask,
+            entry=entry,
+            usd=usd,
+            ask_depth=up_depth,
+            order_shares=order_shares,
+            book_age_s=up_age,
+            other_book_age_s=dn_age,
+            max_age_s=max_age_s,
+            max_spread=max_spread,
+        )
+    return reclaim_entry_qualify(
+        leg="dn",
+        bid=dn_bid,
+        ask=dn_ask,
+        other_bid=up_bid,
+        other_ask=up_ask,
+        entry=entry,
+        usd=usd,
+        ask_depth=dn_depth,
+        order_shares=order_shares,
+        book_age_s=dn_age,
+        other_book_age_s=up_age,
+        max_age_s=max_age_s,
+        max_spread=max_spread,
+    )
+
+
+def reclaim_entry_decision(
+    *,
+    now_s: float,
+    end_ts: float,
+    ttm_s: Optional[float],
+    max_ttm_s: Optional[float],
+    entry: float,
+    usd: float,
+    persist_s: float,
+    armed_ts: Optional[float],
+    armed_leg: Optional[str],
+    locked_leg: Optional[str],
+    filled: float = 0.0,
+    target: Optional[float] = None,
+    up_bid: Optional[float] = None,
+    up_ask: Optional[float] = None,
+    dn_bid: Optional[float] = None,
+    dn_ask: Optional[float] = None,
+    up_depth: Optional[float] = None,
+    dn_depth: Optional[float] = None,
+    up_age: Optional[float] = None,
+    dn_age: Optional[float] = None,
+    inflight: bool = False,
+    dumped_legs: Optional[Sequence[str]] = None,
+    max_age_s: float = RECLAIM_BOOK_MAX_AGE_S,
+    max_spread: float = RECLAIM_MAX_SPREAD,
+) -> dict:
+    """One tick of the reclaim buy. No I/O.
+
+    ``action`` is ``buy``, ``wait``, or ``skip``. A ``buy`` is ready to
+    post on this same tick: the persist window has already elapsed, or a
+    remainder is retrying a side that already fired. Callers must not
+    sleep or refetch between this result and the FAK.
+    """
+    dumped = {leg for leg in (dumped_legs or ()) if leg in ("up", "dn")}
+
+    def _out(
+        action: str,
+        reason: str,
+        *,
+        leg: Optional[str] = None,
+        shares: float = 0.0,
+        limit: Optional[float] = None,
+        new_armed: Optional[float] = None,
+        new_leg: Optional[str] = None,
+    ) -> dict:
+        return {
+            "action": action,
+            "reason": reason,
+            "leg": leg,
+            "shares": float(shares or 0.0),
+            "limit": limit,
+            "armed_ts": new_armed,
+            "armed_leg": new_leg,
+            "dumped_leg": bool(leg in dumped) if leg else False,
+        }
+
+    if inflight:
+        return _out("skip", "inflight", new_armed=armed_ts, new_leg=armed_leg)
+    open_ok, open_why = reclaim_window_open(now_s, end_ts, ttm_s, max_ttm_s)
+    if not open_ok:
+        return _out("skip", open_why)
+
+    try:
+        filled_f = float(filled or 0.0)
+    except (TypeError, ValueError):
+        filled_f = 0.0
+    if not math.isfinite(filled_f) or filled_f < 0:
+        filled_f = 0.0
+    remainder: Optional[float] = None
+    if locked_leg in ("up", "dn") and target is not None:
+        try:
+            target_f = float(target)
+        except (TypeError, ValueError):
+            target_f = 0.0
+        if math.isfinite(target_f) and target_f > 0:
+            remainder = max(0.0, target_f - filled_f)
+            if remainder < 1:
+                return _out("skip", "filled", leg=locked_leg)
+
+    def _qualify(leg: str) -> Tuple[bool, str, float]:
+        return _reclaim_quote(
+            leg,
+            up_bid=up_bid,
+            up_ask=up_ask,
+            dn_bid=dn_bid,
+            dn_ask=dn_ask,
+            up_depth=up_depth,
+            dn_depth=dn_depth,
+            up_age=up_age,
+            dn_age=dn_age,
+            entry=entry,
+            usd=usd,
+            order_shares=remainder if locked_leg == leg else None,
+            max_age_s=max_age_s,
+            max_spread=max_spread,
+        )
+
+    if locked_leg in ("up", "dn"):
+        ok, reason, shares = _qualify(locked_leg)
+        if not ok:
+            return _out(
+                "skip", reason, leg=locked_leg,
+                new_armed=armed_ts, new_leg=locked_leg,
+            )
+        limit = up_ask if locked_leg == "up" else dn_ask
+        return _out(
+            "buy", "retry", leg=locked_leg, shares=shares, limit=limit,
+            new_armed=armed_ts, new_leg=locked_leg,
+        )
+
+    ranked = reclaim_candidate_order(up_ask, dn_ask, entry)
+    results = {leg: _qualify(leg) for leg in ("up", "dn")}
+    qualifying = [leg for leg in ranked if results[leg][0]]
+    if armed_leg in qualifying:
+        chosen = armed_leg
+        clock = armed_ts
+    elif qualifying:
+        chosen = qualifying[0]
+        clock = None if armed_leg != chosen else armed_ts
+    else:
+        book_fail = {
+            "empty_book", "crossed", "locked", "wide_spread",
+            "stale_book", "both_rich", "both_cheap",
+        }
+        if ranked:
+            reason = results[ranked[0]][1]
+            report: Optional[str] = ranked[0]
+            for leg in ranked:
+                why = results[leg][1]
+                reason = why
+                report = leg
+                if leg in dumped:
+                    break
+            return _out("skip", reason, leg=report)
+        reason = "no_entry"
+        report = None
+        for leg in ("up", "dn"):
+            why = results[leg][1]
+            if why in book_fail:
+                reason = why
+                report = leg
+                if leg in dumped:
+                    break
+        return _out("skip", reason, leg=report)
+
+    fire, new_armed, why = persist_ready(
+        True, now_s=now_s, armed_ts=clock, persist_s=persist_s,
+    )
+    _ok, _why, shares = results[chosen]
+    limit = up_ask if chosen == "up" else dn_ask
+    if not fire:
+        return _out(
+            "wait", why, leg=chosen, shares=shares, limit=limit,
+            new_armed=new_armed, new_leg=chosen,
+        )
+    # Same quotes that armed the persist. This is the fire re-check.
+    ok, reason, shares = _qualify(chosen)
+    if not ok:
+        return _out("skip", reason, leg=chosen)
+    return _out(
+        "buy", why, leg=chosen, shares=shares, limit=limit,
+        new_armed=new_armed, new_leg=chosen,
+    )
+
+
+def reclaim_stop_decision(
+    *,
+    now_s: float,
+    stop: float,
+    persist_s: float,
+    armed_ts: Optional[float],
+    bid: Optional[float],
+    latched: bool,
+    stop_enabled: bool,
+) -> dict:
+    """Stop clock. ``sell`` means post on this tick, at ``limit`` (the bid).
+
+    ``latched`` is after the persist has already fired: later ticks chase
+    the live bid with no new wait. A bid back above the stop before the
+    latch resets the clock (``persist_ready``).
+    """
+    if not stop_enabled:
+        return {"action": "hold", "reason": "stop_off", "armed_ts": None, "limit": None}
+    if latched:
+        limit = None
+        try:
+            if bid is not None and float(bid) > 0:
+                limit = float(bid)
+        except (TypeError, ValueError):
+            limit = None
+        return {"action": "sell", "reason": "chase", "armed_ts": armed_ts, "limit": limit}
+    qualify = False
+    try:
+        qualify = bid is not None and float(bid) <= float(stop) + 1e-12
+    except (TypeError, ValueError):
+        qualify = False
+    fire, new_armed, why = persist_ready(
+        qualify, now_s=now_s, armed_ts=armed_ts, persist_s=persist_s,
+    )
+    if fire:
+        return {
+            "action": "sell",
+            "reason": why,
+            "armed_ts": new_armed,
+            "limit": float(bid) if bid is not None else None,
+        }
+    return {
+        "action": "wait" if qualify else "skip",
+        "reason": why,
+        "armed_ts": new_armed,
+        "limit": None,
+    }
+
+
 def sell_plan_banner(cfg: dict) -> str:
     """One-line description of the loaded sell plan for the startup panel."""
     if not cfg.get("sell_enabled"):
@@ -1628,6 +2159,24 @@ def sell_plan_banner(cfg: dict) -> str:
         parts.append(dump)
     winner = cfg.get("sell_winner_min") or DEFAULT_SELL_KNOBS["sell_winner_min"]
     parts.append(f"keep winner (cash >={float(winner):g})")
+    if cfg.get("reclaim_enabled"):
+        usd = float(cfg.get("reclaim_usd") or DEFAULT_SELL_KNOBS["reclaim_usd"])
+        entry = float(cfg.get("reclaim_entry") or DEFAULT_SELL_KNOBS["reclaim_entry"])
+        persist = cfg_seconds(
+            cfg, "reclaim_entry_persist_s", DEFAULT_SELL_KNOBS["reclaim_entry_persist_s"],
+        )
+        text = f"reclaim ${usd:g} ask>={_cents(entry)} persist {persist:g}s"
+        if cfg.get("reclaim_stop_enabled", True):
+            stop = float(cfg.get("reclaim_stop") or DEFAULT_SELL_KNOBS["reclaim_stop"])
+            stop_p = cfg_seconds(
+                cfg, "reclaim_stop_persist_s", DEFAULT_SELL_KNOBS["reclaim_stop_persist_s"],
+            )
+            text += f" stop<={_cents(stop)}/{stop_p:g}s"
+        else:
+            text += " stop off"
+        parts.append(text)
+    else:
+        parts.append("reclaim off")
     return " · ".join(parts)
 
 
