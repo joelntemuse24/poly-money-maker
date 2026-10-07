@@ -306,7 +306,8 @@ DEFAULTS = {
     "reclaim_enabled": False,
     "reclaim_usd": 100.0,
     "reclaim_entry": 0.91,
-    "reclaim_entry_persist_s": 5.0,
+    # Same default as the dump persist. Explicit 0 fires on the qualifying tick.
+    "reclaim_entry_persist_s": 0.5,
     "reclaim_stop": 0.75,
     "reclaim_stop_enabled": True,
     "reclaim_stop_persist_s": 0.5,
@@ -615,6 +616,9 @@ def validate_strategy(cfg: dict) -> None:
         raise ValueError("0 < reclaim_stop < reclaim_entry < 1 must hold")
     if not (0 < reclaim_stop < reclaim_entry < 1):
         raise ValueError("0 < reclaim_stop < reclaim_entry < 1 must hold")
+    # Explicit 0 is immediate (persist_ready), same as sell_persist_s and
+    # sell_dump_persist_s. Negatives are rejected. sell_armed_poll_s stays
+    # on its own >= 0.2 floor; that floor is the loop cadence, not a persist.
     for key in (
         "reclaim_entry_persist_s",
         "reclaim_stop_persist_s",
@@ -3093,7 +3097,7 @@ def _reclaim_tick(
         max_ttm_s=cfg_seconds(cfg, "reclaim_max_ttm_s", 0.0),
         entry=float(cfg.get("reclaim_entry") or 0.91),
         usd=float(cfg.get("reclaim_usd") or 100.0),
-        persist_s=cfg_seconds(cfg, "reclaim_entry_persist_s", 5.0),
+        persist_s=cfg_seconds(cfg, "reclaim_entry_persist_s", 0.5),
         armed_ts=intent.get("reclaim_entry_armed_at"),
         armed_leg=intent.get("reclaim_entry_leg"),
         locked_leg=locked if locked in ("up", "dn") else None,
@@ -3148,7 +3152,7 @@ def _reclaim_tick(
             why=decision.get("reason"),
             bid=bids.get(decision.get("leg")),
             ask=asks_px.get(decision.get("leg")),
-            persist_s=cfg_seconds(cfg, "reclaim_entry_persist_s", 5.0),
+            persist_s=cfg_seconds(cfg, "reclaim_entry_persist_s", 0.5),
         )
         return
     if action != "buy":

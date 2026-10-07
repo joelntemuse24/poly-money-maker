@@ -18,7 +18,7 @@ from buy.mint_sell import (
     sell_plan_banner,
 )
 from test_mint_cpu import _dump_cfg, _held_after_scrap, _sell_runtime
-from test_mint_only_ops import _assign
+from test_mint_only_ops import _assign, _fn
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -43,7 +43,7 @@ def _reclaim_cfg(**extra) -> dict:
         reclaim_enabled=True,
         reclaim_usd=100.0,
         reclaim_entry=0.91,
-        reclaim_entry_persist_s=5.0,
+        reclaim_entry_persist_s=0.5,
         reclaim_stop=0.75,
         reclaim_stop_enabled=True,
         reclaim_stop_persist_s=0.5,
@@ -180,7 +180,7 @@ class _Loop:
 
 def _arm_entry(intent: dict, now: float, leg: str = "up") -> None:
     intent["reclaim_armed"] = True
-    intent["reclaim_entry_armed_at"] = now - 5.0
+    intent["reclaim_entry_armed_at"] = now - 0.5
     intent["reclaim_entry_leg"] = leg
 
 
@@ -211,8 +211,8 @@ class GuardDecisionTests(unittest.TestCase):
             max_ttm_s=0.0,
             entry=0.91,
             usd=100.0,
-            persist_s=5.0,
-            armed_ts=95.0,
+            persist_s=0.5,
+            armed_ts=99.5,
             armed_leg="up",
             locked_leg=None,
             up_bid=0.93,
@@ -238,12 +238,14 @@ class GuardDecisionTests(unittest.TestCase):
         self.assertEqual(out["action"], "wait")
         self.assertEqual(out["reason"], "armed")
         self.assertEqual(out["armed_ts"], 100.0)
-        waiting = self._decision(armed_ts=100.0, now_s=104.9)
+        waiting = self._decision(armed_ts=100.0, now_s=100.4)
         self.assertEqual(waiting["action"], "wait")
         self.assertEqual(waiting["reason"], "waiting")
 
     def test_fires_on_the_first_tick_after_persist(self):
-        out = self._decision(armed_ts=95.0, now_s=100.0)
+        early = self._decision(armed_ts=99.5, now_s=99.99)
+        self.assertEqual(early["action"], "wait")
+        out = self._decision(armed_ts=99.5, now_s=100.0)
         self.assertEqual(out["action"], "buy")
         self.assertEqual(out["leg"], "up")
         self.assertAlmostEqual(out["shares"], 106.0)
@@ -322,6 +324,11 @@ class GuardDecisionTests(unittest.TestCase):
         self.assertEqual(blocked["leg"], "up")
         self.assertNotEqual(blocked["leg"], "dn")
 
+    def test_zero_persist_fires_on_the_arming_tick(self):
+        out = self._decision(persist_s=0, armed_ts=None, armed_leg=None)
+        self.assertEqual(out["action"], "buy")
+        self.assertEqual(out["reason"], "immediate")
+
     def test_inflight_does_not_post_and_time_gate_resets(self):
         inflight = self._decision(inflight=True)
         self.assertEqual(inflight["reason"], "inflight")
@@ -380,21 +387,33 @@ class ArmTests(unittest.TestCase):
         defaults = _assign("DEFAULTS")
         self.assertIs(defaults["reclaim_enabled"], False)
         self.assertIs(defaults["reclaim_stop_enabled"], True)
-        self.assertEqual(defaults["reclaim_entry_persist_s"], 5.0)
+        self.assertEqual(defaults["reclaim_entry_persist_s"], 0.5)
         self.assertEqual(defaults["reclaim_stop_persist_s"], 0.5)
         self.assertIn("reclaim off", sell_plan_banner({"sell_enabled": True}))
         text = sell_plan_banner(
-            {
-                "sell_enabled": True,
-                "reclaim_enabled": True,
-                "reclaim_usd": 100,
-                "reclaim_entry": 0.91,
-                "reclaim_entry_persist_s": 5,
-                "reclaim_stop": 0.75,
-                "reclaim_stop_persist_s": 0.5,
-            }
+            {"sell_enabled": True, "reclaim_enabled": True}
         )
-        self.assertIn("reclaim $100 ask>=91c persist 5s stop<=75c/0.5s", text)
+        self.assertIn("reclaim $100 ask>=91c persist 0.5s stop<=75c/0.5s", text)
+
+    def test_entry_persist_allows_zero_and_rejects_negative(self):
+        from buy.mint_gas import validate_mint_gas
+        from buy.mint_redeem import validate_redeem
+        from buy.mint_sequence import validate_seq
+
+        validate = _fn(
+            "validate_strategy",
+            {
+                "validate_mint_gas": validate_mint_gas,
+                "validate_seq": validate_seq,
+                "validate_redeem": validate_redeem,
+            },
+        )
+        defaults = _assign("DEFAULTS")
+        validate(dict(defaults, reclaim_entry_persist_s=0))
+        validate(dict(defaults, reclaim_stop_persist_s=0))
+        with self.assertRaises(ValueError) as caught:
+            validate(dict(defaults, reclaim_entry_persist_s=-0.01))
+        self.assertIn("reclaim_entry_persist_s", str(caught.exception))
 
     def test_done_bag_stays_cold_until_reclaim_hot(self):
         done = {
@@ -513,10 +532,10 @@ class LoopTests(unittest.TestCase):
         loop.tick(cfg, intent)
         self.assertEqual(loop.buys, [])
         self.assertEqual(intent.get("reclaim_entry_armed_at"), now)
-        loop.clock["now"] = now + 4.9
+        loop.clock["now"] = now + 0.49
         loop.tick(cfg, intent)
         self.assertEqual(loop.buys, [])
-        loop.clock["now"] = now + 5.0
+        loop.clock["now"] = now + 0.5
         before_fetch = len(loop.fetches)
         before_inv = len(loop.inventories)
         before_sleep = len(loop.sleeps)
@@ -531,7 +550,7 @@ class LoopTests(unittest.TestCase):
         self.assertEqual(len(loop.inventories), before_inv)
         self.assertEqual(len(loop.sleeps), before_sleep)
         self.assertFalse(any(row["event"] == "reclaim_paper" for row in loop.events))
-        loop.clock["now"] = now + 5.2
+        loop.clock["now"] = now + 0.7
         loop.tick(cfg, intent)
         self.assertEqual(len(loop.buys), 1)
         self.assertTrue(intent.get("reclaim_hot"))

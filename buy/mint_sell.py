@@ -105,11 +105,13 @@ DEFAULT_SELL_KNOBS = {
     "reclaim_enabled": False,
     "reclaim_usd": 100.0,
     "reclaim_entry": 0.91,
-    # Entry must hold this long. Matches sell_persist_s (5s), not one tick.
-    "reclaim_entry_persist_s": 5.0,
+    # How long the entry print must hold. Same default as the dump persist
+    # (0.5s). Explicit 0 fires on the tick the book first qualifies
+    # (persist_ready). Negatives are rejected.
+    "reclaim_entry_persist_s": 0.5,
     "reclaim_stop": 0.75,
     "reclaim_stop_enabled": True,
-    # Stop clock. Same spirit as the dump persist; live dump is ~0.5s.
+    # Stop clock. Same default as the entry and the dump persist.
     "reclaim_stop_persist_s": 0.5,
     # 0 leaves the entry time gate off (scrap_time_gate_open). Unknown ttm stays open.
     "reclaim_max_ttm_s": 0.0,

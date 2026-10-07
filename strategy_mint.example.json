@@ -81,7 +81,7 @@
   "reclaim_enabled": false,
   "reclaim_usd": 100.0,
   "reclaim_entry": 0.91,
-  "reclaim_entry_persist_s": 5.0,
+  "reclaim_entry_persist_s": 0.5,
   "reclaim_stop": 0.75,
   "reclaim_stop_enabled": true,
   "reclaim_stop_persist_s": 0.5,
