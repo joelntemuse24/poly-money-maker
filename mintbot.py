@@ -38,8 +38,9 @@ defaults until the operator edits them.
 
 Opt-in reclaim (``reclaim_enabled``, default false): after a both-sides
 dump, buy about ``reclaim_usd`` of the first side whose book holds at
-``reclaim_entry`` for ``reclaim_entry_persist_s``, using the same
-sister-book checks as the loser scrap. The FAK is a market buy in USDC
+``reclaim_entry`` for ``reclaim_entry_persist_s``. The other side confirms
+when its best ask is at or under ``1 - reclaim_entry``. There is no
+ask-depth gate. The FAK is a market buy in USDC
 truncated to cents. Stop-sell at ``reclaim_stop``
 (default on) or hold to redeem. The watch stays on ``sell_armed_poll_s``
 until that finishes. A position still held at resolution is redeemed by
@@ -90,7 +91,6 @@ from rich.console import Console
 from rich.panel import Panel
 
 from buy.book import (
-    ask_fill_depth,
     best_ask_with_min_size,
     best_bid_with_min_size,
     bid_fill_depth,
@@ -2773,7 +2773,6 @@ def _reclaim_quote_fields(
     *,
     bids: dict,
     asks_px: dict,
-    depths: dict,
     ttm_s: Optional[float],
 ) -> dict:
     leg = decision.get("leg")
@@ -2784,25 +2783,9 @@ def _reclaim_quote_fields(
         "ask": asks_px.get(leg) if leg else None,
         "other_bid": bids.get(other) if other else None,
         "other_ask": asks_px.get(other) if other else None,
-        "depth": depths.get(leg) if leg else None,
         "ttm": ttm_s,
         "dumped_leg": bool(decision.get("dumped_leg")),
     }
-
-
-def _reclaim_ask_depth(ask_books: dict, asks_px: dict, leg: str) -> float:
-    """Depth at this tick's sized ask. No fetch."""
-    from buy.book import ask_fill_depth
-
-    ask = asks_px.get(leg)
-    if ask is None:
-        return 0.0
-    try:
-        return float(
-            ask_fill_depth(ask_books.get(leg) or [], ask).get("depth_at_limit") or 0.0
-        )
-    except Exception:
-        return 0.0
 
 
 def _reclaim_finish_hot(intent: dict, *, stop_enabled: bool) -> None:
@@ -3108,7 +3091,6 @@ def _reclaim_tick(
     ttm_s: Optional[float],
     bids: dict,
     asks_px: dict,
-    ask_books: dict,
     ages: dict,
     tokens: dict,
     dry_run: bool,
@@ -3173,10 +3155,6 @@ def _reclaim_tick(
             intent["reclaim_hot"] = False
         return
     intent["reclaim_hot"] = True
-    depths = {
-        "up": _reclaim_ask_depth(ask_books, asks_px, "up"),
-        "dn": _reclaim_ask_depth(ask_books, asks_px, "dn"),
-    }
     locked = intent.get("reclaim_leg") if intent.get("reclaim_buy_posted") else None
     decision = reclaim_entry_decision(
         now_s=now,
@@ -3195,8 +3173,6 @@ def _reclaim_tick(
         up_ask=asks_px.get("up"),
         dn_bid=bids.get("dn"),
         dn_ask=asks_px.get("dn"),
-        up_depth=depths["up"],
-        dn_depth=depths["dn"],
         up_age=ages.get("up"),
         dn_age=ages.get("dn"),
         inflight=bool(
@@ -3216,7 +3192,7 @@ def _reclaim_tick(
         _reclaim_skip(
             intent, cid, "inflight",
             **_reclaim_quote_fields(
-                decision, bids=bids, asks_px=asks_px, depths=depths, ttm_s=ttm_s,
+                decision, bids=bids, asks_px=asks_px, ttm_s=ttm_s,
             ),
         )
         if intent.get("reclaim_bought"):
@@ -3258,7 +3234,7 @@ def _reclaim_tick(
         _reclaim_skip(
             intent, cid, str(decision.get("reason") or "skip"),
             **_reclaim_quote_fields(
-                decision, bids=bids, asks_px=asks_px, depths=depths, ttm_s=ttm_s,
+                decision, bids=bids, asks_px=asks_px, ttm_s=ttm_s,
             ),
         )
         return
@@ -3270,7 +3246,7 @@ def _reclaim_tick(
         _reclaim_skip(
             intent, cid, "no_token",
             **_reclaim_quote_fields(
-                decision, bids=bids, asks_px=asks_px, depths=depths, ttm_s=ttm_s,
+                decision, bids=bids, asks_px=asks_px, ttm_s=ttm_s,
             ),
         )
         return
@@ -3291,7 +3267,7 @@ def _reclaim_tick(
             _reclaim_skip(
                 intent, cid, "rejected",
                 **_reclaim_quote_fields(
-                    decision, bids=bids, asks_px=asks_px, depths=depths, ttm_s=ttm_s,
+                    decision, bids=bids, asks_px=asks_px, ttm_s=ttm_s,
                 ),
             )
         return
@@ -3465,10 +3441,10 @@ def _manage_sells_locked(cfg: dict, state: dict, chain: ChainReader) -> None:
         with _io_unlocked():
             up_row, dn_row = _fetch_books(up_tok, dn_tok, min_bid_size)
         (
-            up_bid, up_sz, up_bids, up_ask, _up_ask_sz, up_asks, up_age,
+            up_bid, up_sz, up_bids, up_ask, _up_ask_sz, _up_asks, up_age,
         ) = _book_quote(up_row)
         (
-            dn_bid, dn_sz, dn_bids, dn_ask, _dn_ask_sz, dn_asks, dn_age,
+            dn_bid, dn_sz, dn_bids, dn_ask, _dn_ask_sz, _dn_asks, dn_age,
         ) = _book_quote(dn_row)
         _whatsapp("note_bids", cid, up_bid, dn_bid)
         books = {"up": up_bids, "dn": dn_bids}
@@ -4612,7 +4588,6 @@ def _manage_sells_locked(cfg: dict, state: dict, chain: ChainReader) -> None:
                 ttm_s=ttm_s,
                 bids=bids,
                 asks_px={"up": up_ask, "dn": dn_ask},
-                ask_books={"up": up_asks, "dn": dn_asks},
                 ages={"up": up_age, "dn": dn_age},
                 tokens=tokens,
                 dry_run=dry_run,

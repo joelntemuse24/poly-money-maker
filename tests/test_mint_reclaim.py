@@ -224,18 +224,22 @@ class GuardDecisionTests(unittest.TestCase):
             up_ask=0.94,
             dn_bid=0.06,
             dn_ask=0.07,
-            up_depth=500.0,
-            dn_depth=500.0,
             up_age=None,
             dn_age=None,
         )
         base.update(kwargs)
         return reclaim_entry_decision(**base)
 
-    def test_other_side_does_not_confirm(self):
-        out = self._decision(up_bid=0.90, dn_bid=0.07, dn_ask=0.08)
+    def test_other_ask_at_nine_cents_confirms_with_a_90_bid(self):
+        out = self._decision(up_bid=0.90, up_ask=0.94, dn_bid=0.08, dn_ask=0.09)
+        self.assertEqual(out["action"], "buy")
+        self.assertEqual(out["leg"], "up")
+        self.assertAlmostEqual(out["limit"], 0.94)
+
+    def test_other_ask_at_ten_cents_does_not_confirm(self):
+        out = self._decision(up_bid=0.93, up_ask=0.94, dn_bid=0.08, dn_ask=0.10)
         self.assertEqual(out["action"], "skip")
-        self.assertEqual(out["reason"], "wick_unconfirmed")
+        self.assertEqual(out["reason"], "sister_unconfirmed")
         self.assertIsNone(out["armed_ts"])
 
     def test_single_tick_does_not_fire(self):
@@ -256,7 +260,7 @@ class GuardDecisionTests(unittest.TestCase):
         self.assertAlmostEqual(out["shares"], 106.0)
         self.assertAlmostEqual(out["limit"], 0.94)
 
-    def test_stale_empty_crossed_locked_wide_and_thin(self):
+    def test_stale_empty_crossed_locked_and_wide(self):
         stale = self._decision(up_age=5.01)
         self.assertEqual((stale["action"], stale["reason"]), ("skip", "stale_book"))
         fresh = self._decision(up_age=5.0)
@@ -271,8 +275,6 @@ class GuardDecisionTests(unittest.TestCase):
         self.assertEqual(locked["reason"], "locked")
         wide = self._decision(up_bid=0.82, up_ask=0.94)
         self.assertEqual(wide["reason"], "wide_spread")
-        thin = self._decision(up_depth=10.0)
-        self.assertEqual(thin["reason"], "thin_depth")
 
     def test_quiet_book_is_no_entry_and_both_rich_skips(self):
         quiet = self._decision(
@@ -298,8 +300,8 @@ class GuardDecisionTests(unittest.TestCase):
         self.assertEqual(reclaim_candidate_order(0.95, 0.97, 0.91), ["dn", "up"])
 
     def test_dumped_leg_is_named_when_the_guard_fails(self):
-        out = self._decision(up_depth=1.0, dumped_legs=("up", "dn"))
-        self.assertEqual(out["reason"], "thin_depth")
+        out = self._decision(dn_ask=0.10, dn_bid=0.08, dumped_legs=("up", "dn"))
+        self.assertEqual(out["reason"], "sister_unconfirmed")
         self.assertTrue(out["dumped_leg"])
         ok = self._decision(dumped_legs=("up",))
         self.assertEqual(ok["action"], "buy")
@@ -341,14 +343,20 @@ class GuardDecisionTests(unittest.TestCase):
         self.assertEqual(gated["reason"], "time_gated")
         self.assertIsNone(gated["armed_ts"])
 
-    def test_qualify_matches_classify_loser_shape(self):
+    def test_qualify_uses_the_other_ask_and_ignores_depth(self):
         ok, reason, shares = reclaim_entry_qualify(
-            leg="up", bid=0.93, ask=0.94, other_bid=0.06, other_ask=0.07,
-            entry=0.91, usd=100.0, ask_depth=500.0,
+            leg="up", bid=0.90, ask=0.94, other_bid=0.08, other_ask=0.09,
+            entry=0.91, usd=100.0,
         )
         self.assertTrue(ok)
         self.assertEqual(reason, "ok")
         self.assertEqual(shares, 106.0)
+        bad, why, _shares = reclaim_entry_qualify(
+            leg="up", bid=0.93, ask=0.94, other_bid=0.08, other_ask=0.10,
+            entry=0.91, usd=100.0,
+        )
+        self.assertFalse(bad)
+        self.assertEqual(why, "sister_unconfirmed")
 
 
 class ArmTests(unittest.TestCase):
@@ -503,17 +511,28 @@ class LoopTests(unittest.TestCase):
             5.0,
         )
 
+    def test_ask_smaller_than_the_clip_still_buys(self):
+        loop = _Loop()
+        now = loop.clock["now"]
+        intent = _dumped(now + 200.0)
+        _arm_entry(intent, now)
+        loop.book = _qualifying(up=(0.90, 0.94, 10.0, None), dn=(0.08, 0.09, 500.0, None))
+        loop.tick(_reclaim_cfg(), intent)
+        self.assertEqual(len(loop.buys), 1)
+        self.assertAlmostEqual(loop.buys[0]["size"], 106.0)
+        self.assertAlmostEqual(loop.buys[0]["price"], 0.94)
+        self.assertFalse(any(row["reason"] == "thin_depth" for row in loop.events_named("reclaim_skip")))
+
     def test_guards_block_the_buy_until_every_check_holds(self):
         loop = _Loop()
         end = loop.clock["now"] + 200.0
         intent = _dumped(end)
         cfg = _reclaim_cfg()
         cases = [
-            ("wick", _qualifying(up=(0.90, 0.94, 500.0, None), dn=(0.07, 0.08, 500.0, None)), "wick_unconfirmed"),
+            ("sister", _qualifying(up=(0.93, 0.94, 1.0, None), dn=(0.08, 0.10, 500.0, None)), "sister_unconfirmed"),
             ("stale", _qualifying(up=(0.93, 0.94, 500.0, 6.0)), "stale_book"),
             ("empty", {"up": _row(None, None), "dn": _row(0.06, 0.07)}, "empty_book"),
             ("crossed", _qualifying(up=(0.95, 0.93, 500.0, None)), "crossed"),
-            ("thin", _qualifying(up=(0.93, 0.94, 10.0, None)), "thin_depth"),
         ]
         for _name, book, reason in cases:
             loop.book = book
@@ -524,8 +543,12 @@ class LoopTests(unittest.TestCase):
             loop.tick(cfg, intent)
             self.assertEqual(loop.buys, [], reason)
             self.assertEqual(loop.events_named("reclaim_skip")[-1]["reason"], reason)
-        thin = [row for row in loop.events_named("reclaim_skip") if row["reason"] == "thin_depth"]
-        self.assertTrue(thin[-1]["dumped_leg"])
+        sister = [
+            row for row in loop.events_named("reclaim_skip")
+            if row["reason"] == "sister_unconfirmed"
+        ]
+        self.assertTrue(sister[-1]["dumped_leg"])
+        self.assertAlmostEqual(sister[-1]["other_ask"], 0.10)
 
     def test_one_buy_after_persist_ignores_cooldown_and_does_not_rebuy(self):
         loop = _Loop()
@@ -805,6 +828,9 @@ class LoopTests(unittest.TestCase):
         self.assertNotIn("client.create_market_order", buy_fn)
         self.assertNotIn("__ensure_market_info_cached", buy_fn)
         self.assertNotIn("time.sleep", buy_fn)
+        self.assertNotIn("thin_depth", tick)
+        self.assertNotIn("_reclaim_ask_depth", src)
+        self.assertNotIn("classify_loser", tick)
 
 
 def _places(value: float) -> int:

@@ -1650,7 +1650,7 @@ RECLAIM_BOOK_MAX_AGE_S = 5.0
 
 
 def reclaim_complement_max(entry: float) -> float:
-    """Other-side bid ceiling. 0.91 entry → 0.09, the mirror of a 91¢ favourite."""
+    """Other-side ask ceiling. 0.91 entry → 0.09."""
     try:
         px = float(entry)
     except (TypeError, ValueError):
@@ -1854,20 +1854,18 @@ def reclaim_entry_qualify(
     other_ask: Optional[float],
     entry: float,
     usd: float,
-    ask_depth: Optional[float],
     order_shares: Optional[float] = None,
     book_age_s: Optional[float] = None,
     other_book_age_s: Optional[float] = None,
     max_age_s: float = RECLAIM_BOOK_MAX_AGE_S,
     max_spread: float = RECLAIM_MAX_SPREAD,
 ) -> Tuple[bool, str, float]:
-    """Scrap-equivalent gates for buying ``leg``. ``(ok, reason, shares)``.
+    """Gates for buying ``leg``. ``(ok, reason, shares)``.
 
-    Sister check is ``classify_loser`` with ``threshold = 1 - entry`` and
-    ``opposite_min = entry``: the other side's sized bid must be the cheap
-    leg, and this side's sized bid must clear the entry. The fill price is
-    this side's sized ask, which must also clear the entry. Depth must
-    cover the share size. An empty book resets; it does not keep the arm.
+    The other side confirms when its best ask is at or under
+    ``1 - entry`` (0.09 when entry is 0.91). This side's sized ask is the
+    limit and must clear the entry. There is no ask-depth gate. An empty,
+    crossed, locked, or wide book resets; it does not keep the arm.
     """
     if leg not in ("up", "dn"):
         return False, "bad_leg", 0.0
@@ -1889,17 +1887,8 @@ def reclaim_entry_qualify(
         return False, "bad_entry", 0.0
     if ask_f + 1e-12 >= entry_f and other_ask_f + 1e-12 >= entry_f:
         return False, "both_rich", 0.0
-    cheap_max = reclaim_complement_max(entry_f)
-    up_bid = bid if leg == "up" else other_bid
-    dn_bid = other_bid if leg == "up" else bid
-    loser, why = classify_loser(
-        up_bid, dn_bid, threshold=cheap_max, opposite_min=entry_f,
-    )
-    other_leg = "dn" if leg == "up" else "up"
-    if loser != other_leg:
-        if why == "both_cheap":
-            return False, "both_cheap", 0.0
-        return False, "wick_unconfirmed", 0.0
+    if other_ask_f > reclaim_complement_max(entry_f) + 1e-12:
+        return False, "sister_unconfirmed", 0.0
     if ask_f + 1e-12 < entry_f:
         return False, "below_entry", 0.0
     if order_shares is None:
@@ -1913,8 +1902,6 @@ def reclaim_entry_qualify(
             shares = 0.0
     if shares < 1:
         return False, "size_zero", 0.0
-    if not depth_covers_size(ask_depth, shares):
-        return False, "thin_depth", 0.0
     return True, "ok", shares
 
 
@@ -1964,8 +1951,6 @@ def _reclaim_quote(
     up_ask,
     dn_bid,
     dn_ask,
-    up_depth,
-    dn_depth,
     up_age,
     dn_age,
     entry: float,
@@ -1983,7 +1968,6 @@ def _reclaim_quote(
             other_ask=dn_ask,
             entry=entry,
             usd=usd,
-            ask_depth=up_depth,
             order_shares=order_shares,
             book_age_s=up_age,
             other_book_age_s=dn_age,
@@ -1998,7 +1982,6 @@ def _reclaim_quote(
         other_ask=up_ask,
         entry=entry,
         usd=usd,
-        ask_depth=dn_depth,
         order_shares=order_shares,
         book_age_s=dn_age,
         other_book_age_s=up_age,
@@ -2025,8 +2008,6 @@ def reclaim_entry_decision(
     up_ask: Optional[float] = None,
     dn_bid: Optional[float] = None,
     dn_ask: Optional[float] = None,
-    up_depth: Optional[float] = None,
-    dn_depth: Optional[float] = None,
     up_age: Optional[float] = None,
     dn_age: Optional[float] = None,
     inflight: bool = False,
@@ -2094,8 +2075,6 @@ def reclaim_entry_decision(
             up_ask=up_ask,
             dn_bid=dn_bid,
             dn_ask=dn_ask,
-            up_depth=up_depth,
-            dn_depth=dn_depth,
             up_age=up_age,
             dn_age=dn_age,
             entry=entry,
