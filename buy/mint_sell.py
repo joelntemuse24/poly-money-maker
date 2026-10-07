@@ -1678,6 +1678,97 @@ def reclaim_share_size(usd: float, price: float) -> float:
     return float(math.floor(usd_f / px + 1e-9))
 
 
+def reclaim_buy_usdc(shares: float, price: float) -> float:
+    """Dollars for a marketable reclaim BUY, truncated to whole cents.
+
+    Polymarket accepts at most two decimals of USDC on a marketable buy.
+    The market-order builder rounds that dollar amount down again to the
+    tick's size precision (2 on every tick in ``ROUNDING_CONFIG``). A
+    notional under one cent returns 0.
+    """
+    try:
+        sh = float(shares)
+        px = float(price)
+    except (TypeError, ValueError):
+        return 0.0
+    if (
+        not math.isfinite(sh)
+        or not math.isfinite(px)
+        or sh <= 0
+        or px <= 0
+        or px >= 1
+    ):
+        return 0.0
+    cents = math.floor(sh * px * 100.0 + 1e-9) / 100.0
+    if cents < 0.01:
+        return 0.0
+    return cents
+
+
+def reclaim_buy_order_key(shares: float, price: float) -> str:
+    """Identity of one reclaim BUY. The same key is the same doomed order."""
+    usdc = reclaim_buy_usdc(shares, price)
+    try:
+        sh = float(shares)
+        px = float(price)
+    except (TypeError, ValueError):
+        return f"bad@{usdc:.2f}"
+    if not math.isfinite(sh) or not math.isfinite(px):
+        return f"bad@{usdc:.2f}"
+    return f"{sh:.4f}@{px:.6f}@{usdc:.2f}"
+
+
+def reclaim_market_buy_amounts(usdc: float, price: float, tick_size: str) -> dict:
+    """Maker and taker units from the real market-order builder.
+
+    ``usdc`` is the BUY amount in dollars. ``maker`` is that USDC in
+    6-decimal units. ``taker`` is outcome shares in 6-decimal units.
+    """
+    from py_clob_client_v2.order_builder.builder import OrderBuilder, ROUNDING_CONFIG
+    from py_clob_client_v2.order_builder.constants import BUY
+
+    cfg = ROUNDING_CONFIG[str(tick_size)]
+    _side, maker, taker = OrderBuilder(signer=None).get_market_order_amounts(
+        BUY, float(usdc), float(price), cfg,
+    )
+    return {
+        "maker": int(maker),
+        "taker": int(taker),
+        "usdc": int(maker) / 1_000_000,
+        "shares": int(taker) / 1_000_000,
+        "tick_size": str(tick_size),
+        "taker_digits": int(cfg.amount),
+    }
+
+
+def reclaim_fak_status(exc: BaseException) -> str:
+    """``reject:`` for a definite refusal, ``error:`` when the fill is unknown.
+
+    HTTP 400 and the hard CLOB messages (invalid amounts, not enough
+    balance or allowance) did not land. Timeouts, network errors, and
+    5xx stay ``error:`` so the caller keeps the uncertain-fill path.
+    """
+    text = str(exc).replace("\n", " ").strip()
+    low = text.lower()
+    status = getattr(exc, "status_code", None)
+    code = status if isinstance(status, int) else None
+    hard_msg = (
+        "invalid amount" in low
+        or "not enough balance" in low
+        or "not enough allowance" in low
+        or "insufficient balance" in low
+        or "insufficient allowance" in low
+    )
+    definite = hard_msg or (
+        code is not None and 400 <= code < 500 and code not in (408, 429)
+    )
+    if code is not None and code >= 500:
+        definite = False
+    kind = "reject" if definite else "error"
+    shown = code if code is not None else "net"
+    return f"{kind}:{shown}:{text[:120]}"
+
+
 def reclaim_arm_block(
     intent: Any,
     *,
