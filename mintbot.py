@@ -1800,7 +1800,9 @@ def _run_dump_fak_with_refire(
     """Held-dump path: first live-bid FAK, then one fresh-bid FAK per retry.
 
     Each retry refetches that leg and posts a single FAK at the new best
-    bid. It does not walk a ladder off the first snapshot. ``fills``
+    bid. It does not walk a ladder off the first snapshot. A partial fill
+    refires at once, inside ``retries``. A zero fill still needs
+    ``dump_fast_retry_eligible`` (empty book or kill/cancel). ``fills``
     collects ``(shares, avg_px)`` across every post.
     """
     live_bid = float(initial_bid or 0.0)
@@ -1831,9 +1833,21 @@ def _run_dump_fak_with_refire(
         )
     attempts += 1
     sold_total += float(sold or 0.0)
+
+    def _keep_refiring(posted: float, status: Any) -> bool:
+        # A partial (anything at or above tolerance) still has shares out.
+        # Refire those now. A zero fill keeps the old empty/kill rule.
+        try:
+            got = float(posted or 0.0)
+        except (TypeError, ValueError):
+            got = 0.0
+        if got + 1e-12 >= float(tol):
+            return True
+        return bool(dump_fast_retry_eligible(sold=got, status=status, tol=tol))
+
     if dry_run or sold_total >= size - tol:
         return sold_total, last_status, last_px, attempts, live_bid
-    if not dump_fast_retry_eligible(sold=sold, status=last_status, tol=tol):
+    if not _keep_refiring(sold, last_status):
         return sold_total, last_status, last_px, attempts, live_bid
 
     for retry_idx in range(max(0, int(retries or 0))):
@@ -1877,6 +1891,7 @@ def _run_dump_fak_with_refire(
             attempts=attempts + 1,
             bid=live_bid,
             limits=limits,
+            sold=round(sold_total, 4),
         )
         with _io_unlocked():
             sold, last_status, last_px = _run_fak_ladder(
@@ -1899,7 +1914,7 @@ def _run_dump_fak_with_refire(
         sold_total += float(sold or 0.0)
         if dry_run or sold_total >= size - tol:
             break
-        if not dump_fast_retry_eligible(sold=sold, status=last_status, tol=tol):
+        if not _keep_refiring(sold, last_status):
             log_event(
                 "sell_dump_fast_refire_stop",
                 condition_id=condition_id,
