@@ -8,6 +8,7 @@ from pathlib import Path
 from buy.book import best_bid_with_min_size
 from buy.mint_sell import (
     DEFAULT_SELL_KNOBS,
+    scrap_active_prices,
     scrap_live_bid_limit,
     classify_loser,
     cycle_sleep_s,
@@ -2002,6 +2003,54 @@ class ScrapFractionTests(unittest.TestCase):
                 "up", 0.995, sold_leg="up", keep=0, winner_min=0.999,
             )
         )
+
+
+class ScrapActivePriceTests(unittest.TestCase):
+    """Late scrap pair is a compare on ttm. Window 0 or an unset price stays base."""
+
+    CFG = {
+        "sell_threshold": 0.03,
+        "sell_fak_px": 0.03,
+        "sell_threshold_late": 0.04,
+        "sell_fak_px_late": 0.04,
+        "sell_late_price_window_s": 180.0,
+    }
+
+    def test_before_the_window_uses_the_base_pair(self):
+        thr, fak, late = scrap_active_prices(self.CFG, 181.0)
+        self.assertEqual((thr, fak, late), (0.03, 0.03, False))
+        thr, fak, late = scrap_active_prices(self.CFG, 360.0)
+        self.assertEqual((thr, fak, late), (0.03, 0.03, False))
+
+    def test_at_and_under_the_window_uses_the_late_pair(self):
+        for ttm in (180.0, 179.0, 1.0):
+            thr, fak, late = scrap_active_prices(self.CFG, ttm)
+            self.assertEqual((thr, fak, late), (0.04, 0.04, True), ttm)
+        capped = scrap_live_bid_limit(0.05, 0.04, min_px=0.01)
+        self.assertAlmostEqual(capped, 0.04)
+        self.assertAlmostEqual(scrap_live_bid_limit(0.03, 0.03, min_px=0.01), 0.03)
+
+    def test_unset_window_or_prices_keep_the_base_pair(self):
+        base = {"sell_threshold": 0.02, "sell_fak_px": 0.02}
+        self.assertEqual(scrap_active_prices(base, 100.0), (0.02, 0.02, False))
+        self.assertEqual(scrap_active_prices(dict(base), None), (0.02, 0.02, False))
+        window_off = dict(self.CFG, sell_late_price_window_s=0)
+        self.assertEqual(scrap_active_prices(window_off, 100.0), (0.03, 0.03, False))
+        missing = dict(self.CFG)
+        missing["sell_threshold_late"] = None
+        missing["sell_fak_px_late"] = None
+        self.assertEqual(scrap_active_prices(missing, 100.0), (0.03, 0.03, False))
+        self.assertEqual(scrap_active_prices(self.CFG, None), (0.03, 0.03, False))
+
+    def test_helper_does_not_read_the_oracle_window_or_sleep(self):
+        src = Path(__file__).resolve().parents[1].joinpath("buy/mint_sell.py").read_text()
+        fn = src[src.find("def scrap_active_prices") : src.find("\ndef classify_loser")]
+        self.assertNotIn('sell_late_window_s"', fn)
+        self.assertNotIn("time.sleep", fn)
+        self.assertNotIn("_fetch_book", fn)
+        self.assertEqual(DEFAULT_SELL_KNOBS["sell_late_price_window_s"], 0.0)
+        self.assertIsNone(DEFAULT_SELL_KNOBS["sell_threshold_late"])
+        self.assertIsNone(DEFAULT_SELL_KNOBS["sell_fak_px_late"])
 
 
 if __name__ == "__main__":

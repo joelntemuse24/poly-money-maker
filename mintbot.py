@@ -20,7 +20,13 @@ never clamped up to ``sell_floor``) for the scrap remainder and retries each
 tick at the new bid. ``sell_scrap_fraction`` defaults to 1 (the whole
 loser). Below 1, the first fire locks ``floor(held × fraction)`` and does
 not sell the rest. False restores the 1¢ ladder from ``sell_fak_px``.
-Empty keep fires a blind 1¢ FAK (backoff ~3s).
+``sell_late_price_window_s`` (default 0) leaves that pair in place. When
+it is positive and both late prices are set, a known ttm at or under the
+window uses ``sell_threshold_late`` / ``sell_fak_px_late`` for the arm,
+the persist check, and the FAK cap. Unknown ttm stays on the base pair.
+This is not ``sell_late_window_s`` (the oracle veto, still off at 0).
+Empty keep fires a blind 1¢ FAK (backoff ~3s) under that same active
+threshold; the blind print stays ``sell_scrap_blind_px``.
 A FAK miss rests a GTD/GTC sell at ``min(sell_scrap_rest_px, live or
 last-seen loser bid)`` so a 1¢ book is not posted at the 2¢ print.
 ``sell_scrap_rest_px`` stays ~2¢. GTD only when expiration is at least
@@ -179,6 +185,7 @@ from buy.mint_sell import (
     rest_order_matched_shares,
     resting_tif,
     scrap_rest_action,
+    scrap_active_prices,
     scrap_live_bid_limit,
     scrap_rest_px,
     scrap_time_gate_open,
@@ -265,6 +272,12 @@ DEFAULTS = {
     "sell_enabled": False,
     "sell_threshold": 0.02,
     "sell_fak_px": 0.02,
+    # 0 keeps sell_threshold / sell_fak_px for the whole scrap window.
+    # A positive window uses the late pair when ttm is known and <= it.
+    # Unset late prices stay on the base pair. Not sell_late_window_s.
+    "sell_threshold_late": None,
+    "sell_fak_px_late": None,
+    "sell_late_price_window_s": 0.0,
     # sell_floor is the cent-ladder / dump floor only. The loser sweep does
     # NOT use it: once triggered (loser <= sell_threshold, favourite >=
     # sell_opposite_min) the sweep FAK posts at the live loser bid, capped
@@ -591,6 +604,46 @@ def validate_strategy(cfg: dict) -> None:
     fak_px = float(cfg.get("sell_fak_px", 0.02) or 0)
     if not (floor <= fak_px <= threshold):
         raise ValueError("sell_floor <= sell_fak_px <= sell_threshold must hold")
+    late_window_raw = cfg.get("sell_late_price_window_s", 0.0)
+    if late_window_raw is None:
+        late_window = 0.0
+    else:
+        try:
+            late_window = float(late_window_raw)
+        except (TypeError, ValueError):
+            raise ValueError("sell_late_price_window_s must be >= 0")
+        if (
+            late_window != late_window
+            or late_window < 0
+            or late_window == float("inf")
+        ):
+            raise ValueError("sell_late_price_window_s must be >= 0")
+    late_thr_set = cfg.get("sell_threshold_late") is not None
+    late_fak_set = cfg.get("sell_fak_px_late") is not None
+    if late_thr_set != late_fak_set:
+        raise ValueError(
+            "sell_threshold_late and sell_fak_px_late must both be set"
+        )
+    if late_thr_set:
+        try:
+            late_thr = float(cfg.get("sell_threshold_late"))
+            late_fak = float(cfg.get("sell_fak_px_late"))
+        except (TypeError, ValueError):
+            raise ValueError(
+                "sell_floor <= sell_fak_px_late <= sell_threshold_late < "
+                "sell_opposite_min must hold"
+            )
+        if (
+            late_thr != late_thr
+            or late_fak != late_fak
+            or late_thr in (float("inf"), float("-inf"))
+            or late_fak in (float("inf"), float("-inf"))
+            or not (floor <= late_fak <= late_thr < opposite)
+        ):
+            raise ValueError(
+                "sell_floor <= sell_fak_px_late <= sell_threshold_late < "
+                "sell_opposite_min must hold"
+            )
     if float(cfg.get("sell_scrap_blind_px") or 0) <= 0:
         raise ValueError("sell_scrap_blind_px must be > 0")
     if float(cfg.get("sell_scrap_rest_px") or 0) <= 0:
@@ -1712,6 +1765,7 @@ def _fire_loser_scrap(
             avg_px=avg,
             offered=round(post_size, 4),
             status=status,
+            threshold=round(float(threshold), 4),
             **(log_extra or {}),
         )
         try:
@@ -1729,6 +1783,15 @@ def _fire_loser_scrap(
         )
         flat = latch == "already_flat"
         return float(sold or 0), status, limit, flat
+    log_event(
+        "sell_scrap_ladder",
+        condition_id=condition_id,
+        slug=slug,
+        leg=leg,
+        threshold=round(float(threshold), 4),
+        fak_px=round(float(fak_px), 4),
+        **(log_extra or {}),
+    )
     ladder_fills: list = []
     sold, status, last_px = _run_fak_ladder(
         token_id,
@@ -2431,6 +2494,7 @@ def _lock_scrap_plan(
     fraction: float,
     cid: str,
     leg: Optional[str],
+    threshold: Optional[float] = None,
 ) -> Tuple[float, float]:
     """Fix ``(target, keep)`` on the first scrap post. Later fires reuse it."""
     existing = intent.get("sell_scrap_target")
@@ -2453,6 +2517,7 @@ def _lock_scrap_plan(
         fraction=float(fraction),
         target=float(target),
         keep=round(float(keep), 6),
+        threshold=None if threshold is None else round(float(threshold), 4),
     )
     return float(target), float(keep)
 
@@ -2463,12 +2528,18 @@ def _scrap_post_shares(
     fraction: float,
     cid: str,
     leg: Optional[str],
+    threshold: Optional[float] = None,
 ) -> float:
     """Shares to offer. Fraction 1 with no plan returns ``inventory``."""
     if not _uses_scrap_plan(intent, fraction):
         return float(inventory)
     _lock_scrap_plan(
-        intent, held=float(inventory), fraction=fraction, cid=cid, leg=leg,
+        intent,
+        held=float(inventory),
+        fraction=fraction,
+        cid=cid,
+        leg=leg,
+        threshold=threshold,
     )
     return scrap_order_shares(
         target=float(intent.get("sell_scrap_target") or 0.0),
@@ -3464,14 +3535,12 @@ def manage_sells(cfg: dict, state: dict, chain: ChainReader) -> None:
 def _manage_sells_locked(cfg: dict, state: dict, chain: ChainReader) -> None:
     now = time.time()
     _whatsapp("configure", cfg)
-    thr = float(cfg.get("sell_threshold") or 0.02)
     floor = float(cfg.get("sell_floor") or 0.02)
     opp_min = float(cfg.get("sell_opposite_min") or 0.90)
     persist_s = float(cfg.get("sell_persist_s") or 0.0)
     last_min_s = float(cfg.get("sell_persist_last_min_s", 2.0))
     last_min_window_s = float(cfg.get("sell_persist_last_min_window_s", 60.0))
     skip_when_sized = bool(cfg.get("sell_persist_skip_when_sized", False))
-    fak_px = float(cfg.get("sell_fak_px", 0.02) or 0.02)
     blind_enabled = bool(cfg.get("sell_scrap_blind_enabled", True))
     blind_px = float(cfg.get("sell_scrap_blind_px", 0.01) or 0.01)
     blind_backoff = float(cfg.get("sell_scrap_blind_backoff_s", 3.0) or 0.0)
@@ -3541,6 +3610,8 @@ def _manage_sells_locked(cfg: dict, state: dict, chain: ChainReader) -> None:
         _whatsapp("note_bids", cid, up_bid, dn_bid)
         books = {"up": up_bids, "dn": dn_bids}
         ttm_s = (end_ts - now) if end_ts else None
+        # Per bag, per tick. Dump and winner do not read this pair.
+        thr, fak_px, scrap_price_late = scrap_active_prices(cfg, ttm_s)
         # Keep the previous positive print so an empty book after a FAK
         # miss still rests at the bid that armed the scrap, not 2¢.
         seen_bids = {
@@ -4257,6 +4328,8 @@ def _manage_sells_locked(cfg: dict, state: dict, chain: ChainReader) -> None:
                 leg=loser,
                 why=why_l,
                 bid=bids.get(loser),
+                threshold=thr,
+                late_price=scrap_price_late,
             )
         elif why_l in {"empty_fak_keep_arm", "empty_fak_rearm", "empty_keep_arm"}:
             log_event(
@@ -4266,6 +4339,8 @@ def _manage_sells_locked(cfg: dict, state: dict, chain: ChainReader) -> None:
                 leg=persist_leg,
                 why=why_l,
                 bid=bids.get(persist_leg) if persist_leg in bids else None,
+                threshold=thr,
+                late_price=scrap_price_late,
             )
 
         if (
@@ -4351,6 +4426,7 @@ def _manage_sells_locked(cfg: dict, state: dict, chain: ChainReader) -> None:
                     if _uses_scrap_plan(intent, scrap_fraction):
                         post_size = _scrap_post_shares(
                             intent, size, scrap_fraction, cid, loser,
+                            threshold=thr,
                         )
                     plan_done = (
                         _uses_scrap_plan(intent, scrap_fraction)
@@ -4387,10 +4463,11 @@ def _manage_sells_locked(cfg: dict, state: dict, chain: ChainReader) -> None:
                     elif fire_veto:
                         intent["sell_loser_armed_at"] = None
                     else:
-                        oracle_fields = _scrap_oracle_fields(fire_oracle)
-                        if oracle_fields:
+                        oracle_fields = dict(_scrap_oracle_fields(fire_oracle))
+                        if "oracle_margin" in oracle_fields:
                             intent["sell_scrap_oracle_margin"] = oracle_fields["oracle_margin"]
                             intent["sell_scrap_oracle_live_margin"] = oracle_fields["oracle_live_margin"]
+                        oracle_fields["late_price"] = scrap_price_late
                         scrap_fills: list = []
                         with _io_unlocked():
                             sold_total, last_status, last_px, balance_flat = (
@@ -4503,6 +4580,7 @@ def _manage_sells_locked(cfg: dict, state: dict, chain: ChainReader) -> None:
             if b_latch != "already_flat" and _uses_scrap_plan(intent, scrap_fraction):
                 clipped = _scrap_post_shares(
                     intent, b_size, scrap_fraction, cid, persist_leg,
+                    threshold=thr,
                 )
                 if clipped < 0.01:
                     _met, why = scrap_target_met(
@@ -4577,6 +4655,8 @@ def _manage_sells_locked(cfg: dict, state: dict, chain: ChainReader) -> None:
                         sold=blind_sold,
                         status=blind_status,
                         why=blind_why,
+                        threshold=thr,
+                        late_price=scrap_price_late,
                         **blind_fields,
                     )
                     intent["sell_attempts"] = int(intent.get("sell_attempts") or 0) + 1
@@ -4646,6 +4726,7 @@ def _manage_sells_locked(cfg: dict, state: dict, chain: ChainReader) -> None:
                         fraction=scrap_fraction,
                         cid=cid,
                         leg=persist_leg,
+                        threshold=thr,
                     )
                 rest_size = max(
                     0.0,

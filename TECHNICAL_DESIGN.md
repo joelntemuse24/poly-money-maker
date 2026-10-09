@@ -544,7 +544,7 @@ The first tick after the window closes does three things for that bag: cancel a 
 
 Values below are **code default / live**.
 
-**Arm (`classify_loser`).** One leg's sized bid ≤ `sell_threshold` (0.02 / **0.03**) and the other leg's sized bid ≥ `sell_opposite_min` (0.90 / 0.90). Both cheap → `both_cheap`, no arm. Cheap leg with a weak or missing opposite → `wick_unconfirmed`, no arm.
+**Arm (`classify_loser`).** One leg's sized bid ≤ `sell_threshold` (0.02 / **0.03**) and the other leg's sized bid ≥ `sell_opposite_min` (0.90 / 0.90). Both cheap → `both_cheap`, no arm. Cheap leg with a weak or missing opposite → `wick_unconfirmed`, no arm. `scrap_active_prices` picks that threshold each tick: when `sell_late_price_window_s` is positive, both late prices are set, and ttm is known and at or under the window, the arm, the persist check, and the FAK cap use `sell_threshold_late` / `sell_fak_px_late`. Otherwise the base pair is used. An arm that still qualifies under the new cap keeps `sell_loser_armed_at`. The blind print stays `sell_scrap_blind_px`. This window is not `sell_late_window_s`.
 
 **Time gate (#222).** `sell_scrap_max_ttm_s` (0 / **360**; example 600). While seconds-to-close is above the cutoff, `scrap_time_gate_open` is false and the arm, the persist clock, and every scrap fire (sweep, blind, new rest) are blocked. A cheap leg seen while gated logs `sell_scrap_time_gated` (`condition_id`, `slug`, `leg`, `bid`, `ttm`, `cutoff`) at most once per 15s per condition/leg. Unknown TTM (no `end_ts`) leaves the gate **open**, the opposite of the dump gate. Because the arm itself is blocked, persist starts only once TTM ≤ cutoff: a bid that was cheap at T−8m still waits the full persist after T−6m. Live, no loser is sold before the last six minutes.
 
@@ -876,7 +876,8 @@ Never enable retired buy units (`polycomplement`, buybots, DangerZone, shadow) f
 | `sell_armed_poll_s` | 2 | 2 | **1** | Sell sleep while hot |
 | `sell_enabled` | false | false | **true** | Run `manage_sells` |
 | `sell_threshold` | 0.02 | 0.02 | **0.03** † | Loser arm ceiling |
-| `sell_fak_px` | 0.02 | 0.02 | **0.03** | Top ladder rung (ladder mode only) |
+| `sell_fak_px` | 0.02 | 0.02 | **0.03** | Top ladder rung (ladder mode only); sweep cap is the active threshold |
+| `sell_threshold_late` / `sell_fak_px_late` / `sell_late_price_window_s` | unset / unset / 0 | same | not set yet (0.04 / 0.04 / 180) | Late scrap arm and FAK cap when ttm ≤ window. Window 0 or an unset late price keeps the base pair. Not `sell_late_window_s` |
 | `sell_floor` | 0.02 | 0.02 | **0.01** † | Ladder bottom; dump ladder floor (no longer the sweep limit) |
 | `sell_scrap_sweep_enabled` | true | true | — (true) | One floor FAK vs cent ladder |
 | `sell_opposite_min` | 0.90 | | 0.90 | Opposite must be rich |
@@ -1328,6 +1329,8 @@ redeem_enabled (opt-in), separate thread:
 Adjacent mint may already have been submitted **before** expiry (lookahead). That is intentional and is the main fix for the “skipped 15m” bug.
 
 # Changelog
+
+- **2026-10-09** — Optional late scrap price. `sell_late_price_window_s` defaults to 0. When it is positive and both late prices are set, a known ttm at or under the window uses `sell_threshold_late` / `sell_fak_px_late` for the arm, the persist check, and the FAK cap. The choice is one compare per bag on the ttm the sell tick already has. Suggested live keys: base 0.03/0.03, late 0.04/0.04, window 180. `sell_late_window_s` stays the oracle veto and stays 0.
 
 - **2026-10-09** — A dump or stop FAK that leaves shares unsold refires immediately at a freshly fetched bid, inside `sell_dump_fak_retries`. That covers a partial fill as well as the existing zero-fill miss. The same path serves the held dump, the kept-half dump, and the reclaim stop. Each attempt logs shares sold so far. No ladder and no added sleep.
 

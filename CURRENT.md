@@ -39,6 +39,7 @@ pathlog are **stopped / retired**. Do not start them.
     - **Arm:** opposite ≥ 0.90 and loser ≤ **0.03** (`sell_threshold`), only when seconds-to-close ≤ `sell_scrap_max_ttm_s` **360**.
     - **Persist:** `sell_persist_s` **3.0** (was 5 until 3 Oct). Within `sell_persist_last_min_window_s` **90** of the end, the persist is `sell_persist_last_min_s` **2.0**.
     - **Fire:** at fire it re-checks the range; out of range logs `sell_cancel_out_of_range` and does not POST. One FAK at the **live loser bid** (capped at `sell_threshold`, floored at `sell_clob_min_price` 1¢; `sell_floor` no longer clamps the sweep). A remainder retries next tick at the new live bid, so the scrap chases a falling bid instead of freezing at a fixed limit (bag `btc-updown-15m-1791215100`).
+    - **Late scrap price is not live until these keys are set.** Code default `sell_late_price_window_s` is 0, so the arm and the cap stay the base pair. When the window is positive and both late prices are set, a known ttm at or under the window uses `sell_threshold_late` / `sell_fak_px_late` for the arm, the persist check, and the FAK cap. Unknown ttm stays on the base pair. The blind print stays `sell_scrap_blind_px`. This is not `sell_late_window_s` (oracle veto, still 0). To turn it on: `sell_threshold` 0.03, `sell_fak_px` 0.03, `sell_threshold_late` 0.04, `sell_fak_px_late` 0.04, `sell_late_price_window_s` 180.
     - **Partial scrap:** `sell_scrap_fraction` **0.5**. The first fire locks target **100** / keep **100** of the 200 held (`sell_scrap_plan`, `sell_scrap_outcome`). The kept 100 ride to resolution unless the held dump fires (see `sell_dump_also_kept`).
     - Post-miss rest is off (`sell_scrap_rest_enabled` false). **The late-window oracle veto is off** (`sell_late_window_s` 0).
     - **Scrap oracle veto is disabled in the live sell path.** The pure helper retains these settings for tests: `scrap_oracle_veto_enabled` **false**, `scrap_oracle_veto_usd` **5.0**, `scrap_oracle_veto_stale_s` **3.0** and `scrap_oracle_veto_use_live` **true**.
@@ -71,7 +72,7 @@ pathlog are **stopped / retired**. Do not start them.
 `strategy_mint.example.json` and `mintbot` `DEFAULTS`:
 
 - `enter_max_ttm_min` **45**. A bag booked about 30m out still leaves the following 15m window inside the lookahead. `mint_max_attempts` **3**. `mint_fail_cooldown_s` **30**.
-- `sell_threshold` **0.02**. Print is FAK `sell_fak_px` **0.02**, equal to `sell_floor` **0.02**, or the live bid when the book is thinner. Post-miss rest ceiling `sell_scrap_rest_px` stays **0.02**. The posted rest is `min(sell_scrap_rest_px, live or last-seen loser bid)` so a 1¢ book is not left at 2¢. GTD only when expiration is at least `sell_scrap_rest_min_ahead_s` (**180s**) ahead; otherwise GTC. `validate_strategy` requires `sell_floor` ≤ `sell_fak_px` ≤ `sell_threshold`.
+- `sell_threshold` **0.02**. Print is FAK `sell_fak_px` **0.02**, equal to `sell_floor` **0.02**, or the live bid when the book is thinner. `sell_threshold_late` and `sell_fak_px_late` are unset and `sell_late_price_window_s` is **0**, so that pair does not change. A positive window with both late prices set uses them for the arm, the persist check, and the FAK cap when ttm is known and at or under the window. `validate_strategy` then requires `sell_floor` ≤ `sell_fak_px_late` ≤ `sell_threshold_late` < `sell_opposite_min`. Post-miss rest ceiling `sell_scrap_rest_px` stays **0.02**. The posted rest is `min(sell_scrap_rest_px, live or last-seen loser bid)` so a 1¢ book is not left at 2¢. GTD only when expiration is at least `sell_scrap_rest_min_ahead_s` (**180s**) ahead; otherwise GTC. `validate_strategy` requires `sell_floor` ≤ `sell_fak_px` ≤ `sell_threshold`.
 - `sell_persist_s` **5**, `sell_persist_last_min_s` **2**, window **60s** (code defaults; live is 3 / 2 / 90). Dump persist stays 2s.
 - `sell_persist_skip_when_sized` **false**. A sized book waits the full persist. The 2s last-minute persist applies through market close. There is no late TTM skip.
 - `sell_late_window_s` **0** skips the late Chainlink scrap veto. `sell_oracle_edge_floor_usd`, `sell_oracle_edge_per_ttm`, and `sell_oracle_stale_s` are **0**, so raising only the window does not restore the old $25 / 1.5×TTM / 5s-stale veto. `sell_oracle_edge_persist_s` stays **3**. `oracle_log_enabled` stays false (audit tape).
@@ -189,6 +190,8 @@ unless the operator asks. `polypathlog` is retired. Lockbot/`polylockbot`
 is deleted. Creating a PR is not a merge and not a restart.
 
 ## Changelog
+
+- **2026-10-09** — Optional late scrap price. `sell_late_price_window_s` defaults to 0. When it is positive and both late prices are set, a known ttm at or under the window uses `sell_threshold_late` / `sell_fak_px_late` for the arm, the persist check, and the FAK cap. Suggested live keys: base 0.03/0.03, late 0.04/0.04, window 180. `sell_late_window_s` (oracle veto) stays 0.
 
 - **2026-10-05** — Lockbot deleted entirely (code + VM unit). Copy-trading strategies s1/s2/s3 already removed (#242). Mintbot left live for scrap.
 
