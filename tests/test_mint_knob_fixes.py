@@ -50,6 +50,19 @@ class StartupBannerTests(unittest.TestCase):
         cfg = dict(LIVE_30_SEP, sell_scrap_sweep_enabled=False)
         self.assertTrue(sell_plan_banner(cfg).startswith("loser <=3c -> ladder 3c->2c->1c"))
 
+    def test_late_price_window_is_printed_only_when_it_is_on(self):
+        text = sell_plan_banner(
+            dict(
+                LIVE_30_SEP,
+                sell_threshold_late=0.04,
+                sell_fak_px_late=0.04,
+                sell_late_price_window_s=180,
+            )
+        )
+        self.assertIn("late <=4c fak 4c ttm<=180s", text)
+        self.assertTrue(text.startswith("loser <=3c -> one FAK @ floor 1c"))
+        self.assertNotIn("late <=", sell_plan_banner(LIVE_30_SEP))
+
     def test_sell_off_and_example_defaults(self):
         self.assertEqual(
             sell_plan_banner({"sell_enabled": False}),
@@ -201,6 +214,69 @@ class ExplicitZeroSecondsTests(unittest.TestCase):
             with self.assertRaises(ValueError) as caught:
                 validate(bad)
             self.assertIn(key, str(caught.exception))
+
+
+class LateScrapPriceValidationTests(unittest.TestCase):
+    def _validate(self):
+        return _fn(
+            "validate_strategy",
+            {
+                "validate_mint_gas": validate_mint_gas,
+                "validate_seq": validate_seq,
+                "validate_redeem": validate_redeem,
+            },
+        )
+
+    def test_unset_and_window_zero_stay_valid(self):
+        validate = self._validate()
+        base = _assign("DEFAULTS")
+        example = json.loads(MINT_EXAMPLE.read_text())
+        self.assertEqual(base["sell_late_price_window_s"], 0.0)
+        self.assertIsNone(base["sell_threshold_late"])
+        self.assertIsNone(base["sell_fak_px_late"])
+        self.assertEqual(base["sell_late_window_s"], 0.0)
+        self.assertEqual(example["sell_late_price_window_s"], 0.0)
+        self.assertIsNone(example["sell_threshold_late"])
+        self.assertIsNone(example["sell_fak_px_late"])
+        self.assertEqual(example["sell_late_window_s"], 0.0)
+        validate(base)
+        validate(example)
+        validate(dict(base, sell_late_price_window_s=180))
+        validate(
+            dict(
+                base,
+                sell_late_price_window_s=0,
+                sell_threshold_late=0.04,
+                sell_fak_px_late=0.04,
+            )
+        )
+
+    def test_late_pair_must_sit_between_floor_and_opposite(self):
+        validate = self._validate()
+        base = _assign("DEFAULTS")
+        ok = dict(
+            base,
+            sell_floor=0.02,
+            sell_threshold_late=0.04,
+            sell_fak_px_late=0.04,
+            sell_late_price_window_s=180,
+        )
+        validate(ok)
+        for bad in (
+            dict(ok, sell_fak_px_late=0.05),
+            dict(ok, sell_threshold_late=0.90),
+            dict(ok, sell_fak_px_late=0.01),
+            dict(ok, sell_late_price_window_s=-1),
+            dict(base, sell_threshold_late=0.04),
+        ):
+            with self.assertRaises(ValueError):
+                validate(bad)
+        with self.assertRaises(ValueError) as caught:
+            validate(dict(ok, sell_fak_px_late=0.05))
+        self.assertIn("sell_fak_px_late", str(caught.exception))
+        with self.assertRaises(ValueError) as caught:
+            validate(dict(ok, sell_late_price_window_s=-1))
+        self.assertIn("sell_late_price_window_s", str(caught.exception))
 
 
 class PollFloorTests(unittest.TestCase):

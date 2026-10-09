@@ -1486,5 +1486,238 @@ class ScrapFractionLoopTests(unittest.TestCase):
         self.assertAlmostEqual(fak_calls[1]["size"], 100.0)
 
 
+def _late_price_cfg(**extra) -> dict:
+    cfg = _scrap_cfg(
+        sell_threshold=0.03,
+        sell_fak_px=0.03,
+        sell_floor=0.01,
+        sell_threshold_late=0.04,
+        sell_fak_px_late=0.04,
+        sell_late_price_window_s=180.0,
+        sell_scrap_max_ttm_s=360.0,
+        sell_scrap_blind_enabled=False,
+        sell_persist_s=0.0,
+        sell_persist_last_min_window_s=0.0,
+        sell_dump_enabled=False,
+        sell_late_window_s=0.0,
+    )
+    cfg.update(extra)
+    return cfg
+
+
+def _set_book(book, up, dn=0.96):
+    book["up"] = (up, 40.0, [{"price": str(up), "size": "40"}])
+    book["dn"] = (dn, 80.0, [{"price": str(dn), "size": "80"}])
+
+
+class ScrapLatePriceTests(unittest.TestCase):
+    """3¢ until the last 180s, then 4¢. The tick already has ttm."""
+
+    def _tick(self, ns, cfg, intent, cid="cid-late", chain=None):
+        state = {"intents": {cid: intent}}
+        ns["remember_persisted_state"](state)
+        ns["_manage_sells_locked"](cfg, state, chain if chain is not None else object())
+        return intent
+
+    def test_before_180s_arms_and_caps_at_3c(self):
+        ns, events, fak_calls, clock, book = _scrap_harness()
+        _set_book(book, 0.03)
+        end = clock["now"] + 181.0
+        intent = _open_scrap_bag(end)
+        self._tick(ns, _late_price_cfg(), intent)
+        self.assertEqual(len(fak_calls), 1)
+        self.assertAlmostEqual(fak_calls[0]["price"], 0.03)
+        sweep = [row for row in events if row["event"] == "sell_scrap_sweep"]
+        self.assertEqual(len(sweep), 1)
+        self.assertAlmostEqual(sweep[0]["threshold"], 0.03)
+        self.assertIs(sweep[0]["late_price"], False)
+
+        ns, events, fak_calls, clock, book = _scrap_harness()
+        _set_book(book, 0.031)
+        intent = _open_scrap_bag(clock["now"] + 181.0)
+        self._tick(ns, _late_price_cfg(), intent)
+        self.assertEqual(fak_calls, [])
+        self.assertIsNone(intent.get("sell_loser_armed_at"))
+        self.assertFalse(any(row["event"] == "sell_loser_persist" for row in events))
+
+    def test_at_and_under_180s_arms_and_caps_at_4c(self):
+        for ttm in (180.0, 100.0):
+            ns, events, fak_calls, clock, book = _scrap_harness()
+            _set_book(book, 0.04)
+            intent = _open_scrap_bag(clock["now"] + ttm)
+            self._tick(ns, _late_price_cfg(), intent)
+            self.assertEqual(len(fak_calls), 1, ttm)
+            self.assertAlmostEqual(fak_calls[0]["price"], 0.04, msg=ttm)
+            sweep = [row for row in events if row["event"] == "sell_scrap_sweep"]
+            self.assertAlmostEqual(sweep[0]["threshold"], 0.04, msg=ttm)
+            self.assertIs(sweep[0]["late_price"], True, ttm)
+
+            ns, events, fak_calls, clock, book = _scrap_harness()
+            _set_book(book, 0.041)
+            intent = _open_scrap_bag(clock["now"] + ttm)
+            self._tick(ns, _late_price_cfg(), intent)
+            self.assertEqual(fak_calls, [], ttm)
+            self.assertIsNone(intent.get("sell_loser_armed_at"))
+
+    def test_window_cross_keeps_the_arm_and_uses_4c(self):
+        ns, events, fak_calls, clock, book = _scrap_harness()
+        _set_book(book, 0.03)
+        end = clock["now"] + 200.0
+        intent = _open_scrap_bag(end)
+        cfg = _late_price_cfg(sell_persist_s=40.0)
+        self._tick(ns, cfg, intent)
+        self.assertEqual(fak_calls, [])
+        armed = intent.get("sell_loser_armed_at")
+        self.assertEqual(armed, clock["now"])
+        waiting = [row for row in events if row["event"] == "sell_loser_persist"]
+        self.assertEqual(waiting[-1]["why"], "armed")
+        self.assertAlmostEqual(waiting[-1]["threshold"], 0.03)
+        self.assertIs(waiting[-1]["late_price"], False)
+
+        clock["now"] += 25.0
+        self._tick(ns, cfg, intent)
+        self.assertEqual(intent.get("sell_loser_armed_at"), armed)
+        self.assertEqual(fak_calls, [])
+        waiting = [row for row in events if row["event"] == "sell_loser_persist"]
+        self.assertEqual(waiting[-1]["why"], "waiting")
+        self.assertAlmostEqual(waiting[-1]["threshold"], 0.04)
+        self.assertIs(waiting[-1]["late_price"], True)
+
+        _set_book(book, 0.04)
+        clock["now"] += 20.0
+        self._tick(ns, cfg, intent)
+        self.assertEqual(intent.get("sell_loser_armed_at"), armed)
+        self.assertEqual(len(fak_calls), 1)
+        self.assertAlmostEqual(fak_calls[0]["price"], 0.04)
+        sweep = [row for row in events if row["event"] == "sell_scrap_sweep"]
+        self.assertAlmostEqual(sweep[0]["threshold"], 0.04)
+        self.assertIs(sweep[0]["late_price"], True)
+        plan = [row for row in events if row["event"] == "sell_scrap_plan"]
+        self.assertEqual(plan, [])
+
+    def test_half_scrap_plan_logs_the_active_threshold(self):
+        ns, events, fak_calls, clock, book = _scrap_harness()
+        _set_book(book, 0.04)
+        intent = _open_scrap_bag(clock["now"] + 100.0, shares=100.0)
+        cfg = _late_price_cfg(shares=100.0, sell_scrap_fraction=0.5)
+        self._tick(ns, cfg, intent)
+        plan = [row for row in events if row["event"] == "sell_scrap_plan"]
+        self.assertEqual(len(plan), 1)
+        self.assertAlmostEqual(plan[0]["threshold"], 0.04)
+        self.assertAlmostEqual(fak_calls[0]["price"], 0.04)
+        self.assertAlmostEqual(fak_calls[0]["size"], 50.0)
+
+    def test_unset_knobs_do_not_change_the_base_scrap(self):
+        ns, events, fak_calls, clock, book = _scrap_harness()
+        _set_book(book, 0.03)
+        intent = _open_scrap_bag(clock["now"] + 100.0)
+        cfg = _scrap_cfg(
+            sell_threshold=0.02,
+            sell_fak_px=0.02,
+            sell_scrap_max_ttm_s=360.0,
+            sell_persist_s=0.0,
+            sell_dump_enabled=False,
+            sell_scrap_blind_enabled=False,
+        )
+        cfg.pop("sell_threshold_late", None)
+        cfg.pop("sell_fak_px_late", None)
+        cfg.pop("sell_late_price_window_s", None)
+        self._tick(ns, cfg, intent)
+        self.assertEqual(fak_calls, [])
+        self.assertIsNone(intent.get("sell_loser_armed_at"))
+
+        ns, events, fak_calls, clock, book = _scrap_harness()
+        _set_book(book, 0.03)
+        intent = _open_scrap_bag(clock["now"] + 100.0)
+        cfg = _late_price_cfg(sell_threshold=0.02, sell_fak_px=0.02, sell_late_price_window_s=0)
+        self._tick(ns, cfg, intent)
+        self.assertEqual(fak_calls, [])
+        self.assertIsNone(intent.get("sell_loser_armed_at"))
+
+        ns, events, fak_calls, clock, book = _scrap_harness()
+        _set_book(book, 0.035)
+        intent = _open_scrap_bag(clock["now"] + 100.0)
+        cfg = _late_price_cfg()
+        cfg["sell_threshold_late"] = None
+        cfg["sell_fak_px_late"] = None
+        self._tick(ns, cfg, intent)
+        self.assertEqual(fak_calls, [])
+        self.assertIsNone(intent.get("sell_loser_armed_at"))
+
+        ns, events, fak_calls, clock, book = _scrap_harness()
+        _set_book(book, 0.04)
+        intent = _open_scrap_bag(0.0)
+        self._tick(ns, _late_price_cfg(), intent)
+        self.assertEqual(fak_calls, [])
+        self.assertIsNone(intent.get("sell_loser_armed_at"))
+
+    def test_ladder_top_rung_uses_the_late_fak_px(self):
+        ns, events, fak_calls, clock, book = _scrap_harness()
+        _set_book(book, 0.04)
+        intent = _open_scrap_bag(clock["now"] + 100.0)
+        cfg = _late_price_cfg(
+            sell_scrap_sweep_enabled=False,
+            sell_fak_px_late=0.03,
+            sell_floor=0.01,
+        )
+        self._tick(ns, cfg, intent)
+        self.assertEqual(len(fak_calls), 1)
+        self.assertAlmostEqual(fak_calls[0]["price"], 0.03)
+        ladder = [row for row in events if row["event"] == "sell_scrap_ladder"]
+        self.assertEqual(len(ladder), 1)
+        self.assertAlmostEqual(ladder[0]["threshold"], 0.04)
+        self.assertAlmostEqual(ladder[0]["fak_px"], 0.03)
+
+    def test_blind_stays_at_one_cent_under_the_late_threshold(self):
+        from eth_utils import to_checksum_address
+        import os
+
+        ns, events, fak_calls, clock, book = _scrap_harness()
+        ns["to_checksum_address"] = to_checksum_address
+        book["up"] = (None, 0.0, [])
+        book["dn"] = (0.98, 80.0, [{"price": "0.98", "size": "80"}])
+        end = clock["now"] + 100.0
+        intent = _open_scrap_bag(end, sell_loser_armed_at=clock["now"] - 10.0)
+
+        class Chain:
+            def position_balance(self, _ctf, _funder, token):
+                return 50.0
+
+        cfg = _late_price_cfg(
+            sell_scrap_blind_enabled=True,
+            sell_persist_s=5.0,
+            ctf_address="0x0000000000000000000000000000000000000002",
+        )
+        prior = os.environ.get("FUNDER_ADDRESS")
+        os.environ["FUNDER_ADDRESS"] = "0x0000000000000000000000000000000000000001"
+        try:
+            self._tick(ns, cfg, intent, chain=Chain())
+        finally:
+            if prior is None:
+                os.environ.pop("FUNDER_ADDRESS", None)
+            else:
+                os.environ["FUNDER_ADDRESS"] = prior
+        self.assertEqual(len(fak_calls), 1)
+        self.assertAlmostEqual(fak_calls[0]["price"], 0.01)
+        blind = [row for row in events if row["event"] == "sell_scrap_blind"]
+        self.assertEqual(len(blind), 1)
+        self.assertAlmostEqual(blind[0]["threshold"], 0.04)
+        self.assertAlmostEqual(blind[0]["price"], 0.01)
+        self.assertIs(blind[0]["late_price"], True)
+
+    def test_sell_loop_picks_the_price_without_another_fetch(self):
+        src = MINT.read_text()
+        manage = src[src.find("def _manage_sells_locked") : src.find("\ndef _claim_mint_intent")]
+        choose = manage[manage.find("scrap_active_prices") : manage.find("scrap_active_prices") + 80]
+        self.assertIn("scrap_active_prices(cfg, ttm_s)", manage)
+        self.assertEqual(manage.count("scrap_active_prices("), 1)
+        self.assertNotIn("time.sleep", choose)
+        self.assertNotIn("_fetch_book", choose)
+        self.assertIn('cfg.get("sell_late_window_s", 0.0)', manage)
+        dump = src[src.find("def _run_dump_fak_with_refire") : src.find("\ndef _apply_sell_fire_cancel")]
+        self.assertNotIn("scrap_active_prices", dump)
+        self.assertNotIn("sell_threshold_late", dump)
+
+
 if __name__ == "__main__":
     unittest.main()

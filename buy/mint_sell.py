@@ -10,7 +10,11 @@ last-minute wait applies through market close. Sized depth does not skip
 is above the cutoff; the example sets 600. Unknown time-to-end leaves
 that gate open. A bid that was already cheap still waits the full persist
 once the gate opens. Then re-check
-in-range at fire and FAK ``sell_fak_px`` (~2¢). That rung equals
+in-range at fire and FAK ``sell_fak_px`` (~2¢). Optional
+``sell_late_price_window_s`` (default 0, off) swaps in
+``sell_threshold_late`` / ``sell_fak_px_late`` for the arm, the persist
+check, and that cap when time-to-end is known and inside the window.
+That window is not the oracle veto ``sell_late_window_s``. The rung equals
 ``sell_floor`` (~2¢) when the live sized bid is at/over the floor; if the
 live bid is below the floor, FAK at that live bid. ``sell_scrap_fraction``
 defaults to 1 and scraps the whole loser. Below 1, the first fire locks
@@ -52,6 +56,12 @@ DEFAULT_SELL_KNOBS = {
     # Arm ceiling is sell_threshold. The scrap print is this rung (~2¢),
     # equal to the floor, or the live bid when the book is thinner.
     "sell_fak_px": 0.02,
+    # 0 keeps the base pair for the whole scrap window. A positive window
+    # uses the late pair when ttm is known and at or under it. Unset late
+    # prices stay on the base pair. Not the oracle veto (sell_late_window_s).
+    "sell_threshold_late": None,
+    "sell_fak_px_late": None,
+    "sell_late_price_window_s": 0.0,
     "sell_floor": 0.02,
     # One FAK at sell_floor for the full remainder. False restores the cent ladder.
     "sell_scrap_sweep_enabled": True,
@@ -201,6 +211,56 @@ def inventory_latch(
     if seen_inventory:
         return "already_flat"
     return "await_inventory"
+
+
+def scrap_active_prices(
+    cfg: dict,
+    ttm_s: Optional[float],
+) -> Tuple[float, float, bool]:
+    """Loser scrap ``(threshold, fak_px, late)`` for this tick.
+
+    The late pair replaces ``sell_threshold`` / ``sell_fak_px`` only when
+    ``sell_late_price_window_s`` is positive, both late prices are set, and
+    ``ttm_s`` is known and at or under that window. A zero window, an unset
+    late price, or an unknown ttm keeps the base pair. This is not the
+    oracle veto (``sell_late_window_s``). No I/O.
+    """
+    base_thr = float(cfg.get("sell_threshold") or 0.02)
+    base_fak = float(cfg.get("sell_fak_px", 0.02) or 0.02)
+    raw_window = cfg.get("sell_late_price_window_s", 0.0)
+    try:
+        window = 0.0 if raw_window is None else float(raw_window)
+    except (TypeError, ValueError):
+        window = 0.0
+    if not math.isfinite(window) or window <= 0:
+        return base_thr, base_fak, False
+    late_thr_raw = cfg.get("sell_threshold_late")
+    late_fak_raw = cfg.get("sell_fak_px_late")
+    if late_thr_raw is None or late_fak_raw is None:
+        return base_thr, base_fak, False
+    try:
+        late_thr = float(late_thr_raw)
+        late_fak = float(late_fak_raw)
+    except (TypeError, ValueError):
+        return base_thr, base_fak, False
+    if (
+        not math.isfinite(late_thr)
+        or not math.isfinite(late_fak)
+        or late_thr <= 0
+        or late_fak <= 0
+    ):
+        return base_thr, base_fak, False
+    if ttm_s is None:
+        return base_thr, base_fak, False
+    try:
+        ttm = float(ttm_s)
+    except (TypeError, ValueError):
+        return base_thr, base_fak, False
+    if not math.isfinite(ttm):
+        return base_thr, base_fak, False
+    if ttm <= window + 1e-12:
+        return late_thr, late_fak, True
+    return base_thr, base_fak, False
 
 
 def classify_loser(
@@ -2338,6 +2398,17 @@ def sell_plan_banner(cfg: dict) -> str:
     scrap_ttm = float(cfg.get("sell_scrap_max_ttm_s") or 0.0)
     if scrap_ttm > 0:
         parts.append(f"scrap ttm<={scrap_ttm:g}s")
+    late_window_raw = cfg.get("sell_late_price_window_s") or 0.0
+    try:
+        late_window_s = float(late_window_raw)
+    except (TypeError, ValueError):
+        late_window_s = 0.0
+    late_thr = cfg.get("sell_threshold_late")
+    late_fak = cfg.get("sell_fak_px_late")
+    if late_window_s > 0 and late_thr is not None and late_fak is not None:
+        parts.append(
+            f"late <={_cents(late_thr)} fak {_cents(late_fak)} ttm<={late_window_s:g}s"
+        )
     if bool(cfg.get("sell_dump_enabled", True)):
         dump = f"dump held <{_cents(cfg.get('sell_dump_below') or DEFAULT_SELL_KNOBS['sell_dump_below'])}"
         dump_ttm = float(cfg.get("sell_dump_max_ttm_s") or 0.0)
