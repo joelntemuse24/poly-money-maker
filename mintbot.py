@@ -153,6 +153,8 @@ from buy.mint_sell import (
     fresh_bag_risk,
     empty_fak_status,
     inventory_latch,
+    is_balance_allowance_reject,
+    tracked_sell_size,
     advance_oracle_edge_arm,
     late_oracle_scrap_ok,
     loser_blind_fak_due,
@@ -264,6 +266,10 @@ DEFAULTS = {
     "count_kept_loser_as_open": False,
     "poll_s": 5.0,
     "sell_armed_poll_s": 2.0,
+    # CLOB /book and /books. A hung read costs one short tick.
+    "book_timeout_s": 1.2,
+    # Wallet pUSD while a sequential mint is waiting on cash.
+    "mint_cash_poll_s": 2.0,
     # Chainlink 60s TWAP tape. The scrap veto is off unless
     # sell_late_window_s is positive.
     "oracle_log_enabled": False,
@@ -586,6 +592,14 @@ def validate_strategy(cfg: dict) -> None:
         raise ValueError("poll_s must be >= 1")
     if float(cfg.get("sell_armed_poll_s") or 0) < 0.2:
         raise ValueError("sell_armed_poll_s must be >= 0.2")
+    for key, floor in (("book_timeout_s", 0.05), ("mint_cash_poll_s", 0.0)):
+        raw = cfg.get(key)
+        try:
+            value = float(raw)
+        except (TypeError, ValueError):
+            raise ValueError(f"{key} must be >= {floor}")
+        if value != value or value < floor or value == float("inf"):
+            raise ValueError(f"{key} must be >= {floor}")
     floor = float(cfg.get("sell_floor") or 0)
     threshold = float(cfg.get("sell_threshold") or 0)
     opposite = float(cfg.get("sell_opposite_min") or 0)
@@ -1196,11 +1210,13 @@ def reconcile_intents(
             status = str(intent.get("status") or "")
             if status not in ("confirmed_waiting_inventory", "confirmed", "mined"):
                 continue
-            # Ended confirmed bags are not polled. One read after the grace
-            # can still flip an empty bag to completed, then chain_reconcile_done
-            # stops further eth_calls. In-flight statuses keep querying so
-            # pending cash can release. Live confirmed stays on the old path,
-            # including skip_confirmed_inventory while a sell is hot.
+            # Ended confirmed bags are not polled until one read after the
+            # grace, which can still flip an empty bag to completed.
+            # chain_reconcile_done stops further eth_calls. In-flight statuses
+            # keep querying so pending cash can release. A confirmed bag whose
+            # window is still open is not balanceOf'd (tracked fills size the
+            # sells). skip_confirmed_inventory still skips a confirmed bag
+            # when a sell is hot and a query would otherwise run.
             action = chain_reconcile_action(intent, now)
             if action == "skip":
                 continue
@@ -1236,6 +1252,15 @@ def reconcile_intents(
                         up=up,
                         dn=dn,
                     )
+                    # Off the sell path. First order of the bag should not
+                    # pay tick-size / neg-risk / allowance lookups.
+                    try:
+                        _schedule_order_prewarm(
+                            str(intent.get("up_token") or up_tok),
+                            str(intent.get("dn_token") or dn_tok),
+                        )
+                    except NameError:
+                        pass
                     notify(
                         "Mint confirmed",
                         f"{intent.get('slug')}\n{intent.get('shares')} Up + Down",
@@ -1322,34 +1347,103 @@ def _book_quote(row: Any):
     return bid, bid_sz, bids or [], ask, ask_sz, asks or [], age
 
 
+def _book_timeout_s() -> float:
+    """CLOB book HTTP timeout. Default 1.2s so a hung read is one short tick."""
+    raw = getattr(_book_timeout_s, "seconds", 1.2)
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return 1.2
+    if value != value or value <= 0 or value == float("inf"):
+        return 1.2
+    return value
+
+
+def _apply_book_timeout(cfg: Optional[dict]) -> None:
+    if not isinstance(cfg, dict):
+        return
+    try:
+        _book_timeout_s.seconds = float(cfg.get("book_timeout_s") or 1.2)
+    except (TypeError, ValueError):
+        _book_timeout_s.seconds = 1.2
+
+
+def _parse_book_payload(payload: Any, min_size: float):
+    book = payload if isinstance(payload, dict) else {}
+    bids = book.get("bids") or []
+    asks = book.get("asks") or []
+    price, size = best_bid_with_min_size(bids, min_size=min_size)
+    ask_px, ask_sz = best_ask_with_min_size(asks, min_size=min_size)
+    age = book_age_s(book.get("timestamp"), time.time())
+    return price, size, bids, ask_px, ask_sz, asks, age
+
+
 def _fetch_book(token_id: str, min_size: float):
     """REST `/book` → sized bid and ask, raw levels, and book age if stamped."""
     try:
         response = thread_session("clob_book").get(
             "https://clob.polymarket.com/book",
             params={"token_id": str(token_id)},
-            timeout=5,
+            timeout=_book_timeout_s(),
         )
         if response.status_code != 200:
             return None, 0.0, [], None, 0.0, [], None
-        payload = response.json()
-        book = payload if isinstance(payload, dict) else {}
-        bids = book.get("bids") or []
-        asks = book.get("asks") or []
-        price, size = best_bid_with_min_size(bids, min_size=min_size)
-        ask_px, ask_sz = best_ask_with_min_size(asks, min_size=min_size)
-        age = book_age_s(book.get("timestamp"), time.time())
-        return price, size, bids, ask_px, ask_sz, asks, age
+        return _parse_book_payload(response.json(), min_size)
     except Exception as exc:
         log_event("book_fetch_fail", token_id=str(token_id)[:18], error=str(exc)[:160])
         return None, 0.0, [], None, 0.0, [], None
 
 
-def _fetch_books(up_tok: str, dn_tok: str, min_size: float):
-    """Parallel UP/DN `/book` GETs (same-tick persist + FAK, no extra refetch)."""
+def _fetch_books_parallel(up_tok: str, dn_tok: str, min_size: float):
     fut_up = _book_pool.submit(_fetch_book, up_tok, min_size)
     fut_dn = _book_pool.submit(_fetch_book, dn_tok, min_size)
     return fut_up.result(), fut_dn.result()
+
+
+def _fetch_books(up_tok: str, dn_tok: str, min_size: float):
+    """Both sides in one CLOB `/books` POST.
+
+    A timeout returns empty books (one short tick, no second fetch). Any
+    other error, or a body that does not carry both tokens, falls back to
+    the two parallel `/book` GETs.
+    """
+    timeout = _book_timeout_s()
+    try:
+        response = thread_session("clob_book").post(
+            "https://clob.polymarket.com/books",
+            json=[{"token_id": str(up_tok)}, {"token_id": str(dn_tok)}],
+            timeout=timeout,
+        )
+        if response.status_code != 200:
+            raise RuntimeError(f"books_http_{response.status_code}")
+        payload = response.json()
+        if not isinstance(payload, list):
+            raise RuntimeError("books_not_list")
+        by_id = {}
+        for book in payload:
+            if not isinstance(book, dict):
+                continue
+            asset = str(book.get("asset_id") or book.get("token_id") or "")
+            if asset:
+                by_id[asset] = book
+        up_book = by_id.get(str(up_tok))
+        dn_book = by_id.get(str(dn_tok))
+        if up_book is None or dn_book is None:
+            raise RuntimeError("books_missing_side")
+        return (
+            _parse_book_payload(up_book, min_size),
+            _parse_book_payload(dn_book, min_size),
+        )
+    except Exception as exc:
+        if isinstance(exc, (requests.Timeout, TimeoutError)):
+            log_event(
+                "book_fetch_fail",
+                token_id="books",
+                error=str(exc)[:160],
+            )
+            empty = (None, 0.0, [], None, 0.0, [], None)
+            return empty, empty
+        return _fetch_books_parallel(up_tok, dn_tok, min_size)
 
 
 def _log_sell_book_depth(
@@ -1429,6 +1523,7 @@ def _get_clob_client():
             client.update_balance_allowance(
                 BalanceAllowanceParams(asset_type=AssetType.COLLATERAL)
             )
+            _allowance_box()["collateral"] = True
         except Exception:
             pass
         _clob_client = client
@@ -1438,6 +1533,173 @@ def _get_clob_client():
         _clob_init_error = str(exc)[:200]
         log_event("clob_client_init_fail", error=_clob_init_error)
         return None
+
+def _allowance_box() -> dict:
+    box = getattr(_allowance_box, "data", None)
+    if not isinstance(box, dict):
+        box = {"tokens": set(), "collateral": False, "warmed": set()}
+        _allowance_box.data = box
+    return box
+
+
+def _bind_sell_chain(chain: Any, ctf: str, funder: Optional[str]) -> None:
+    """Chain reader for the balance-reject fallback. Not used before a post."""
+    _bind_sell_chain.slot = (chain, str(ctf or ""), funder)
+    _bind_sell_chain.last_balance = None
+
+
+def _read_sell_balance(token_id: str) -> Optional[float]:
+    slot = getattr(_bind_sell_chain, "slot", None)
+    if not slot or not token_id:
+        return None
+    chain, ctf, funder = slot
+    if not ctf or not funder:
+        return None
+    try:
+        with _io_unlocked():
+            bal = chain.position_balance(ctf, funder, token_id)
+        value = float(bal)
+    except Exception as exc:
+        log_event("sell_balance_fail", error=str(exc)[:160])
+        return None
+    if value != value:
+        return None
+    _bind_sell_chain.last_balance = value
+    return value
+
+
+def _refresh_conditional_allowance(token_id: str, *, force: bool) -> None:
+    box = _allowance_box()
+    key = str(token_id or "")
+    if not key:
+        return
+    if not force and key in box["tokens"]:
+        return
+    try:
+        client = _get_clob_client()
+    except Exception:
+        return
+    if client is None:
+        return
+    try:
+        from py_clob_client_v2 import AssetType, BalanceAllowanceParams
+
+        client.update_balance_allowance(
+            BalanceAllowanceParams(asset_type=AssetType.CONDITIONAL, token_id=key)
+        )
+        box["tokens"].add(key)
+    except Exception as exc:
+        log_event("sell_allowance_warn", error=str(exc)[:160])
+
+
+def _refresh_collateral_allowance(*, force: bool) -> None:
+    box = _allowance_box()
+    if not force and box.get("collateral"):
+        return
+    try:
+        client = _get_clob_client()
+    except Exception:
+        return
+    if client is None:
+        return
+    try:
+        from py_clob_client_v2 import AssetType, BalanceAllowanceParams
+
+        client.update_balance_allowance(
+            BalanceAllowanceParams(asset_type=AssetType.COLLATERAL)
+        )
+        box["collateral"] = True
+    except Exception as exc:
+        log_event("reclaim_allowance_warn", error=str(exc)[:160])
+
+
+def _schedule_order_prewarm(up_token: str, dn_token: str) -> None:
+    """Tick size, neg-risk, and one allowance refresh per token. Not on the sell tick."""
+    tokens = [str(token) for token in (up_token, dn_token) if token]
+    if not tokens:
+        return
+
+    def _run() -> None:
+        try:
+            client = _get_clob_client()
+        except Exception:
+            return
+        if client is None:
+            return
+        box = _allowance_box()
+        warmed = box.setdefault("warmed", set())
+        for token_id in tokens:
+            if token_id in warmed:
+                continue
+            try:
+                client.get_tick_size(token_id)
+            except Exception:
+                pass
+            try:
+                getter = getattr(client, "get_neg_risk", None)
+                if getter is not None:
+                    getter(token_id)
+            except Exception:
+                pass
+            _refresh_conditional_allowance(token_id, force=False)
+            warmed.add(token_id)
+        _refresh_collateral_allowance(force=False)
+
+    threading.Thread(target=_run, name="mintbot-prewarm", daemon=True).start()
+
+
+def _resize_after_balance_reject(
+    token_id: str,
+    size: float,
+    *,
+    keep: float,
+    tol: float,
+) -> Tuple[float, str]:
+    """One allowance refresh and one chain read after a balance reject.
+
+    Returns ``(retry_size, latch)``. ``already_flat`` means do not post again.
+    A missing chain read retries the same size (the refresh may be enough).
+    """
+    _refresh_conditional_allowance(token_id, force=True)
+    bal = _read_sell_balance(token_id)
+    if bal is None:
+        return float(size), "unknown"
+    try:
+        keep_f = float(keep or 0.0)
+    except (TypeError, ValueError):
+        keep_f = 0.0
+    if keep_f != keep_f or keep_f < 0:
+        keep_f = 0.0
+    sellable = float(bal) - keep_f if keep_f > 1e-12 else float(bal)
+    if sellable < 0:
+        sellable = 0.0
+    retry = min(float(size), sellable)
+    if retry < float(tol):
+        return 0.0, "already_flat"
+    return retry, "has_inventory"
+
+
+def _sell_fak_with_fallback(
+    token_id: str,
+    size: float,
+    price: float,
+    dry_run: bool,
+    capture: Optional[list],
+    *,
+    keep: float,
+    tol: float,
+) -> Tuple[float, str]:
+    """One FAK. On a balance/allowance reject, refresh, resize, retry once."""
+    sold, status = _fak_sell(token_id, size, price, dry_run, capture=capture)
+    if dry_run or float(sold or 0) >= float(tol):
+        return sold, status
+    if not is_balance_allowance_reject(status):
+        return sold, status
+    retry, latch = _resize_after_balance_reject(token_id, size, keep=keep, tol=tol)
+    if latch == "already_flat" or retry < float(tol):
+        return 0.0, "already_flat"
+    return _fak_sell(token_id, retry, price, dry_run, capture=capture)
+
 
 def _fak_sell(
     token_id: str,
@@ -1460,18 +1722,10 @@ def _fak_sell(
     client = _get_clob_client()
     if client is None:
         return 0.0, f"no_clob:{_clob_init_error or 'unknown'}"
+    triggered = time.perf_counter()
     try:
-        from py_clob_client_v2 import MarketOrderArgs, OrderType, BalanceAllowanceParams, AssetType
+        from py_clob_client_v2 import MarketOrderArgs, OrderType
         from py_clob_client_v2.order_builder.constants import SELL
-
-        try:
-            client.update_balance_allowance(
-                BalanceAllowanceParams(
-                    asset_type=AssetType.CONDITIONAL, token_id=str(token_id)
-                )
-            )
-        except Exception as exc:
-            log_event("sell_allowance_warn", error=str(exc)[:160])
 
         signed = client.create_market_order(
             MarketOrderArgs(
@@ -1481,14 +1735,23 @@ def _fak_sell(
                 price=price,
             )
         )
+        send_at = time.perf_counter()
         result = client.post_order(signed, order_type=OrderType.FAK)
+        responded = time.perf_counter()
         sold = 0.0
         status = "posted"
         if isinstance(result, dict):
             status = str(result.get("status") or "posted")
+            err = result.get("error") or result.get("errorMsg")
+            if err and is_balance_allowance_reject(err):
+                status = f"error:{err}"
             sold = parse_sell_fill_shares(result, size)
-            if capture is not None:
+            if capture is not None and not is_balance_allowance_reject(status):
                 capture.append(result)
+        latency = {
+            "trigger_to_send_ms": round((send_at - triggered) * 1000.0, 3),
+            "send_to_response_ms": round((responded - send_at) * 1000.0, 3),
+        }
         log_event(
             "sell_fak_result",
             token_id=str(token_id),
@@ -1497,10 +1760,18 @@ def _fak_sell(
             sold=sold,
             status=status,
             raw=str(result)[:240] if result is not None else None,
+            **latency,
         )
         return sold, status
     except Exception as exc:
-        log_event("sell_fak_fail", token_id=str(token_id)[:18], error=str(exc)[:200])
+        responded = time.perf_counter()
+        log_event(
+            "sell_fak_fail",
+            token_id=str(token_id)[:18],
+            error=str(exc)[:200],
+            trigger_to_send_ms=round((responded - triggered) * 1000.0, 3),
+            send_to_response_ms=None,
+        )
         return 0.0, f"error:{str(exc)[:80]}"
 
 
@@ -1534,24 +1805,13 @@ def _fak_buy(
     if client is None:
         return 0.0, f"no_clob:{_clob_init_error or 'unknown'}"
     try:
-        from py_clob_client_v2 import (
-            BalanceAllowanceParams,
-            AssetType,
-            MarketOrderArgs,
-            OrderType,
-        )
+        from py_clob_client_v2 import MarketOrderArgs, OrderType
         from py_clob_client_v2.clob_types import CreateOrderOptions
         from py_clob_client_v2.constants import BYTES32_ZERO
         from py_clob_client_v2.order_builder.constants import BUY
         from py_clob_client_v2.utilities import price_valid
         from buy.sister_bid import buy_matched_shares
 
-        try:
-            client.update_balance_allowance(
-                BalanceAllowanceParams(asset_type=AssetType.COLLATERAL)
-            )
-        except Exception as exc:
-            log_event("reclaim_allowance_warn", error=str(exc)[:160])
         order_args = MarketOrderArgs(
             token_id=str(token_id),
             amount=usdc,
@@ -1571,30 +1831,52 @@ def _fak_buy(
             current = getattr(order_args, "builder_code", None)
             if not current or current == BYTES32_ZERO:
                 order_args.builder_code = code
-        signed = client.builder.build_market_order(
-            order_args,
-            CreateOrderOptions(tick_size=tick_size, neg_risk=neg_risk),
-            version=version,
-        )
-        result = client.post_order(signed, order_type=OrderType.FAK)
-        bought = 0.0
-        status = "posted"
-        if isinstance(result, dict):
-            status = str(result.get("status") or "posted")
-            bought = buy_matched_shares(result, shares)
-            if capture is not None:
-                capture.append(result)
-        log_event(
-            "reclaim_fak_result",
-            token_id=str(token_id),
-            size=shares,
-            price=price,
-            usdc=usdc,
-            bought=bought,
-            status=status,
-            raw=str(result)[:240] if result is not None else None,
-        )
-        return bought, status
+        refreshed = False
+        while True:
+            signed = client.builder.build_market_order(
+                order_args,
+                CreateOrderOptions(tick_size=tick_size, neg_risk=neg_risk),
+                version=version,
+            )
+            try:
+                result = client.post_order(signed, order_type=OrderType.FAK)
+            except Exception as exc:
+                status = reclaim_fak_status(exc)
+                if not refreshed and is_balance_allowance_reject(status):
+                    refreshed = True
+                    _refresh_collateral_allowance(force=True)
+                    continue
+                log_event(
+                    "reclaim_fak_fail",
+                    token_id=str(token_id)[:18],
+                    error=str(exc)[:200],
+                )
+                return 0.0, status
+            bought = 0.0
+            status = "posted"
+            if isinstance(result, dict):
+                status = str(result.get("status") or "posted")
+                err = result.get("error") or result.get("errorMsg")
+                if err and is_balance_allowance_reject(err):
+                    status = f"error:{err}"
+                bought = buy_matched_shares(result, shares)
+                if capture is not None and not is_balance_allowance_reject(status):
+                    capture.append(result)
+            if not refreshed and is_balance_allowance_reject(status):
+                refreshed = True
+                _refresh_collateral_allowance(force=True)
+                continue
+            log_event(
+                "reclaim_fak_result",
+                token_id=str(token_id),
+                size=shares,
+                price=price,
+                usdc=usdc,
+                bought=bought,
+                status=status,
+                raw=str(result)[:240] if result is not None else None,
+            )
+            return bought, status
     except Exception as exc:
         log_event("reclaim_fak_fail", token_id=str(token_id)[:18], error=str(exc)[:200])
         return 0.0, reclaim_fak_status(exc)
@@ -1609,7 +1891,17 @@ def _sell_inventory(
     tol: float,
     seen_key: str,
     intent: dict,
+    *,
+    read_chain: bool = False,
 ) -> Tuple[float, str]:
+    """Tracked size (minted minus recorded fills). No chain read on the sell path.
+
+    ``read_chain`` is the uncertain-buy recovery only. A sell that the
+    exchange rejects for balance reads the chain once in
+    ``_resize_after_balance_reject``, not here.
+    """
+    if not read_chain:
+        return tracked_sell_size(intent, shares, seen_key=seen_key, tol=tol)
     size = float(shares)
     if not (funder_cs and ctf):
         return size, "unknown"
@@ -1643,8 +1935,14 @@ def _run_fak_ladder(
     ttm_s: Optional[float] = None,
     condition_id: Any = None,
     fills: Optional[list] = None,
+    inventory_keep: float = 0.0,
 ) -> Tuple[float, str, Optional[float]]:
-    """FAK each limit in turn. ``fills`` collects ``(shares, avg_px)`` per post."""
+    """FAK each limit in turn. ``fills`` collects ``(shares, avg_px)`` per post.
+
+    No sleep between rungs or after the last miss. The caller's refire
+    fetches a fresh book and posts immediately. A balance/allowance reject
+    refreshes allowance, reads the chain once, and retries that rung once.
+    """
     sold_total = 0.0
     last_status = "none"
     last_px: Optional[float] = None
@@ -1669,8 +1967,14 @@ def _run_fak_ladder(
             f"bid={bid:.3f}  limit>={use_px:.3f}  size={remaining:.2f}"
         )
         captured: list = []
-        sold, last_status = _fak_sell(
-            token_id, remaining, use_px, dry_run=dry_run, capture=captured,
+        sold, last_status = _sell_fak_with_fallback(
+            token_id,
+            remaining,
+            use_px,
+            dry_run,
+            captured,
+            keep=inventory_keep,
+            tol=tol,
         )
         sold_total += float(sold or 0)
         last_px = float(use_px)
@@ -1678,9 +1982,8 @@ def _run_fak_ladder(
             fills.append(
                 (float(sold), sell_fill_vwap(captured[0] if captured else None, sold))
             )
-        if dry_run or sold_total >= size - tol:
+        if dry_run or sold_total >= size - tol or last_status == "already_flat":
             break
-        time.sleep(0.35)
     return sold_total, last_status, last_px
 
 
@@ -1748,8 +2051,18 @@ def _fire_loser_scrap(
             f"bid={loser_bid:.3f}  limit>={limit:.3f}  size={post_size:.2f}"
         )
         captured: list = []
-        sold, status = _fak_sell(
-            token_id, post_size, limit, dry_run, capture=captured,
+        try:
+            scrap_keep = float(intent.get("sell_scrap_keep") or 0.0)
+        except (TypeError, ValueError):
+            scrap_keep = 0.0
+        sold, status = _sell_fak_with_fallback(
+            token_id,
+            post_size,
+            limit,
+            dry_run,
+            captured,
+            keep=scrap_keep,
+            tol=tol,
         )
         raw = captured[0] if captured else None
         avg = sell_fill_vwap(raw, sold)
@@ -1781,7 +2094,7 @@ def _fire_loser_scrap(
             chain, ctf, funder_cs, token_id, shares, tol,
             "seen_loser_inventory", intent,
         )
-        flat = latch == "already_flat"
+        flat = latch == "already_flat" or status == "already_flat"
         return float(sold or 0), status, limit, flat
     log_event(
         "sell_scrap_ladder",
@@ -1808,6 +2121,7 @@ def _fire_loser_scrap(
         ttm_s=ttm_s,
         condition_id=condition_id,
         fills=ladder_fills,
+        inventory_keep=float(intent.get("sell_scrap_keep") or 0.0),
     )
     if fills is not None:
         fills.extend(ladder_fills)
@@ -2081,7 +2395,11 @@ def _sell_kept_after_dump(
             )
             sold_total = float(sold_total or 0.0)
             swept = 0.0
-            if not dry_run and size - sold_total >= tol:
+            if (
+                not dry_run
+                and size - sold_total >= tol
+                and last_status != "already_flat"
+            ):
                 with _io_unlocked():
                     swept, sweep_status, sweep_px = _run_fak_ladder(
                         token,
@@ -2105,6 +2423,8 @@ def _sell_kept_after_dump(
         remaining = max(0.0, size - sold_total)
         if dry_run:
             outcome = "dry_run"
+        elif last_status == "already_flat" and sold_total < tol:
+            outcome = "nothing_kept"
         elif remaining < tol:
             outcome = "filled"
         elif sold_total >= tol:
@@ -2207,47 +2527,67 @@ def _limit_sell(
     if client is None:
         return "", f"no_clob:{_clob_init_error or 'unknown'}"
     try:
-        from py_clob_client_v2 import (
-            BalanceAllowanceParams,
-            AssetType,
-            OrderArgs,
-            OrderType,
-        )
+        from py_clob_client_v2 import OrderArgs, OrderType
         from py_clob_client_v2.order_builder.constants import SELL
 
-        try:
-            client.update_balance_allowance(
-                BalanceAllowanceParams(
-                    asset_type=AssetType.CONDITIONAL, token_id=str(token_id)
+        order_type = OrderType.GTD if str(tif) == "GTD" else OrderType.GTC
+        refreshed = False
+        while True:
+            triggered = time.perf_counter()
+            signed = client.create_order(
+                OrderArgs(
+                    token_id=str(token_id),
+                    price=price,
+                    size=size,
+                    side=SELL,
+                    expiration=int(expiration or 0),
                 )
             )
-        except Exception as exc:
-            log_event("sell_allowance_warn", error=str(exc)[:160])
-        signed = client.create_order(
-            OrderArgs(
+            try:
+                send_at = time.perf_counter()
+                result = client.post_order(signed, order_type=order_type)
+                responded = time.perf_counter()
+            except Exception as exc:
+                status = f"error:{str(exc)[:80]}"
+                if not refreshed and is_balance_allowance_reject(status):
+                    refreshed = True
+                    retry, latch = _resize_after_balance_reject(
+                        token_id, size, keep=0.0, tol=0.01,
+                    )
+                    if latch == "already_flat" or retry < 0.01:
+                        return "", "already_flat"
+                    size = retry
+                    continue
+                log_event("sell_scrap_rest_fail", error=str(exc)[:200])
+                return "", status
+            status = "posted"
+            if isinstance(result, dict):
+                status = str(result.get("status") or "posted")
+                err = result.get("error") or result.get("errorMsg")
+                if err and is_balance_allowance_reject(err):
+                    status = f"error:{err}"
+            if not refreshed and is_balance_allowance_reject(status):
+                refreshed = True
+                retry, latch = _resize_after_balance_reject(
+                    token_id, size, keep=0.0, tol=0.01,
+                )
+                if latch == "already_flat" or retry < 0.01:
+                    return "", "already_flat"
+                size = retry
+                continue
+            oid = posted_order_id(result) or ""
+            log_event(
+                "sell_scrap_rest_result",
                 token_id=str(token_id),
-                price=price,
                 size=size,
-                side=SELL,
-                expiration=int(expiration or 0),
+                price=price,
+                tif=tif,
+                order_id=oid,
+                status=status,
+                trigger_to_send_ms=round((send_at - triggered) * 1000.0, 3),
+                send_to_response_ms=round((responded - send_at) * 1000.0, 3),
             )
-        )
-        order_type = OrderType.GTD if str(tif) == "GTD" else OrderType.GTC
-        result = client.post_order(signed, order_type=order_type)
-        status = "posted"
-        if isinstance(result, dict):
-            status = str(result.get("status") or "posted")
-        oid = posted_order_id(result) or ""
-        log_event(
-            "sell_scrap_rest_result",
-            token_id=str(token_id),
-            size=size,
-            price=price,
-            tif=tif,
-            order_id=oid,
-            status=status,
-        )
-        return oid, status
+            return oid, status
     except Exception as exc:
         log_event("sell_scrap_rest_fail", error=str(exc)[:200])
         return "", f"error:{str(exc)[:80]}"
@@ -3027,6 +3367,7 @@ def _reclaim_recover_buy(
     _bal, latch = _sell_inventory(
         chain, ctf, funder_cs, token, max(target, 0.0), tol,
         "seen_reclaim_buy_inventory", intent,
+        read_chain=True,
     )
     if latch == "has_inventory":
         seen = float(intent.get("reclaim_filled") or 0.0)
@@ -3181,9 +3522,24 @@ def _reclaim_stop_tick(
                 fills=fills,
             )
         else:
-            sold, status = _fak_sell(token, size, floor, dry_run, capture=None)
+            sold, status = _sell_fak_with_fallback(
+                token, size, floor, dry_run, None, keep=0.0, tol=tol,
+            )
             last_px = floor
             sold = float(sold or 0.0)
+    if str(status) == "already_flat" and float(sold or 0.0) < tol and not dry_run:
+        intent["reclaim_stopped"] = True
+        intent["reclaim_hot"] = False
+        intent["reclaim_stop_note"] = "already_flat"
+        log_event(
+            "reclaim_stop",
+            condition_id=cid,
+            slug=intent.get("slug"),
+            leg=leg,
+            outcome="already_flat",
+            dry_run=dry_run,
+        )
+        return
     intent["reclaim_stop_limit"] = last_px
     intent["reclaim_stop_status"] = status
     if float(sold or 0.0) > 0:
@@ -3557,6 +3913,8 @@ def _manage_sells_locked(cfg: dict, state: dict, chain: ChainReader) -> None:
     dry_run = bool(cfg.get("dry_run"))
     funder = os.getenv("FUNDER_ADDRESS") or ""
     funder_cs = to_checksum_address(funder) if funder else None
+    _bind_sell_chain(chain, str(cfg.get("ctf_address") or ""), funder_cs)
+    _apply_book_timeout(cfg)
     dirty = False
     ctf = str(cfg.get("ctf_address") or "")
 
@@ -3798,7 +4156,15 @@ def _manage_sells_locked(cfg: dict, state: dict, chain: ChainReader) -> None:
                         intent.get("sell_winner_attempts") or 0
                     ) + 1
                     intent["sell_winner_last_status"] = last_status
-                    if dry_run or sold_total >= size - tol:
+                    if (
+                        not dry_run
+                        and last_status == "already_flat"
+                        and sold_total < tol
+                    ):
+                        intent["sold_winner"] = True
+                        intent["sell_winner_leg"] = winner
+                        intent["sell_winner_note"] = "already_flat"
+                    elif dry_run or sold_total >= size - tol:
                         intent["sold_winner"] = True
                         intent["sell_winner_leg"] = winner
                         intent["sell_winner_filled"] = float(
@@ -3957,7 +4323,17 @@ def _manage_sells_locked(cfg: dict, state: dict, chain: ChainReader) -> None:
                         intent.get("sell_dump_attempts") or 0
                     ) + int(used_attempts)
                     intent["sell_dump_last_status"] = last_status
-                    if dry_run or sold_total >= size - tol:
+                    if (
+                        not dry_run
+                        and last_status == "already_flat"
+                        and sold_total < tol
+                    ):
+                        intent["sold_dump"] = True
+                        intent["sold_winner"] = True
+                        intent["sell_dump_note"] = "already_flat"
+                    elif dry_run or sold_total >= size - tol or (
+                        not dry_run and last_status == "already_flat"
+                    ):
                         intent["sold_dump"] = True
                         intent["sold_winner"] = True
                         # Normal held dump only. Sister B buys the other leg.
@@ -4500,7 +4876,12 @@ def _manage_sells_locked(cfg: dict, state: dict, chain: ChainReader) -> None:
                         record_fill_px(intent, "sell_fill_px", scrap_fills)
                         intent["sell_attempts"] = int(intent.get("sell_attempts") or 0) + 1
                         intent["sell_last_status"] = last_status
-                        done = dry_run or balance_flat or sold_total >= post_size - tol
+                        done = (
+                            dry_run
+                            or balance_flat
+                            or last_status == "already_flat"
+                            or sold_total >= post_size - tol
+                        )
                         if sold_total >= tol or dry_run:
                             intent["sell_filled"] = float(
                                 intent.get("sell_filled") or 0
@@ -4509,9 +4890,19 @@ def _manage_sells_locked(cfg: dict, state: dict, chain: ChainReader) -> None:
                         if done:
                             outcome = (
                                 "dry_run" if dry_run
-                                else "flat" if balance_flat
                                 else "target_filled"
                             )
+                            if not dry_run and (
+                                balance_flat or last_status == "already_flat"
+                            ):
+                                _met, why_flat = scrap_target_met(
+                                    filled=float(intent.get("sell_filled") or 0),
+                                    target=float(intent.get("sell_scrap_target") or 0),
+                                    keep=float(intent.get("sell_scrap_keep") or 0),
+                                    tol=tol,
+                                    balance=getattr(_bind_sell_chain, "last_balance", None),
+                                )
+                                outcome = why_flat or "flat"
                             _finish_scrap(intent, cid, loser, outcome=outcome)
                             if dry_run:
                                 intent["sell_dry"] = True
@@ -4641,9 +5032,14 @@ def _manage_sells_locked(cfg: dict, state: dict, chain: ChainReader) -> None:
                         intent["sell_scrap_oracle_live_margin"] = blind_fields["oracle_live_margin"]
                     blind_raw: list = []
                     with _io_unlocked():
-                        blind_sold, blind_status = _fak_sell(
-                            b_tok, b_size, blind_px, dry_run=dry_run,
-                            capture=blind_raw,
+                        blind_sold, blind_status = _sell_fak_with_fallback(
+                            b_tok,
+                            b_size,
+                            blind_px,
+                            dry_run,
+                            blind_raw,
+                            keep=float(intent.get("sell_scrap_keep") or 0.0),
+                            tol=tol,
                         )
                     log_event(
                         "sell_scrap_blind",
@@ -4676,7 +5072,20 @@ def _manage_sells_locked(cfg: dict, state: dict, chain: ChainReader) -> None:
                                 ),
                             )],
                         )
-                    if float(blind_sold or 0) >= b_size - tol and not dry_run:
+                    if blind_status == "already_flat" and float(blind_sold or 0) < tol and not dry_run:
+                        _met, why_flat = scrap_target_met(
+                            filled=float(intent.get("sell_filled") or 0),
+                            target=float(intent.get("sell_scrap_target") or 0),
+                            keep=float(intent.get("sell_scrap_keep") or 0),
+                            tol=tol,
+                            balance=getattr(_bind_sell_chain, "last_balance", None),
+                        )
+                        _finish_scrap(
+                            intent, cid, persist_leg,
+                            note="already_flat",
+                            outcome=why_flat or "flat",
+                        )
+                    elif float(blind_sold or 0) >= b_size - tol and not dry_run:
                         _finish_scrap(
                             intent, cid, persist_leg, outcome="target_filled",
                         )
@@ -4911,13 +5320,8 @@ def run_mint_cycle(
         write_loop_heartbeat("mint", "idle", markets=len(markets), eligible=0)
         return "idle"
 
-    data_positions: Dict[str, float] = {}
-    if funder:
-        try:
-            data_positions = gateway.positions(funder)
-        except Exception as exc:
-            log_event("positions_fetch_fail", error=str(exc)[:160])
-
+    # Data-api /positions is not polled every tick (it was the 429 source).
+    # One check runs only once a candidate is about to be submitted.
     tol = float(cfg["position_tolerance"])
     with STATE_LOCK:
         def _fail_attempts(condition_id: str) -> int:
@@ -4932,10 +5336,7 @@ def run_mint_cycle(
         pick, status = select_mint_candidate(
             candidates,
             is_blocked=lambda condition_id: already_minted(state, condition_id, cfg, now),
-            is_owned=lambda market: (
-                float(data_positions.get(market.up_token, 0)) > tol
-                or float(data_positions.get(market.dn_token, 0)) > tol
-            ),
+            is_owned=lambda market: False,
             slots_full=lambda market: (
                 seq_busy_bag(state, now, ACTIVE_STATUSES, exclude=market.condition_id) is not None
                 if seq_on
@@ -5025,14 +5426,85 @@ def run_mint_cycle(
     funder_cs = to_checksum_address(funder)
 
     try:
-        if not chain.has_contract(str(cfg["pUSD_address"])):
+        code_cache = getattr(chain, "_code_ok", None)
+        if not isinstance(code_cache, dict):
+            code_cache = {}
+            try:
+                chain._code_ok = code_cache
+            except Exception:
+                pass
+        outcome_cache = getattr(chain, "_outcome_count", None)
+        if not isinstance(outcome_cache, dict):
+            outcome_cache = {}
+            try:
+                chain._outcome_count = outcome_cache
+            except Exception:
+                pass
+        pusd_addr = str(cfg["pUSD_address"])
+        adapter_addr = str(cfg["standard_adapter_address"])
+        if pusd_addr not in code_cache:
+            if not chain.has_contract(pusd_addr):
+                return "no_pusd_contract"
+            code_cache[pusd_addr] = True
+        elif not code_cache[pusd_addr]:
             return "no_pusd_contract"
-        if not chain.has_contract(str(cfg["standard_adapter_address"])):
+        if adapter_addr not in code_cache:
+            if not chain.has_contract(adapter_addr):
+                return "no_adapter"
+            code_cache[adapter_addr] = True
+        elif not code_cache[adapter_addr]:
             return "no_adapter"
-        if chain.outcome_slot_count(str(cfg["ctf_address"]), pick.condition_id) != 2:
+        outcome_key = str(pick.condition_id)
+        if outcome_key in outcome_cache:
+            outcome_n = outcome_cache[outcome_key]
+        else:
+            outcome_n = chain.outcome_slot_count(str(cfg["ctf_address"]), pick.condition_id)
+            if outcome_n == 2:
+                outcome_cache[outcome_key] = outcome_n
+        if outcome_n != 2:
             log_event("mint_skip_not_binary", condition_id=pick.condition_id, slug=pick.slug)
             return "not_binary"
-        balance = chain.pUSD_balance(str(cfg["pUSD_address"]), funder_cs)
+        try:
+            cash_poll_s = float(cfg.get("mint_cash_poll_s") or 2.0)
+        except (TypeError, ValueError):
+            cash_poll_s = 2.0
+        if cash_poll_s != cash_poll_s or cash_poll_s < 0 or cash_poll_s == float("inf"):
+            cash_poll_s = 2.0
+        sample = getattr(chain, "_pusd_sample", None)
+        force_cash = False
+        redeems = state.get("redeems") or {}
+        if isinstance(redeems, dict) and isinstance(sample, dict):
+            sample_ts = float(sample.get("ts") or 0.0)
+            for job in redeems.values():
+                if not isinstance(job, dict):
+                    continue
+                if job.get("status") != "done" or job.get("reason") != "redeemed":
+                    continue
+                try:
+                    updated = float(job.get("updated_at") or 0.0)
+                except (TypeError, ValueError):
+                    updated = 0.0
+                if updated > sample_ts:
+                    force_cash = True
+                    break
+        if (
+            isinstance(sample, dict)
+            and not force_cash
+            and sample.get("key") == funder_cs
+            and sample.get("balance") is not None
+            and now - float(sample.get("ts") or 0.0) < cash_poll_s
+        ):
+            balance = float(sample["balance"])
+        else:
+            balance = chain.pUSD_balance(pusd_addr, funder_cs)
+            try:
+                chain._pusd_sample = {
+                    "ts": now,
+                    "balance": balance,
+                    "key": funder_cs,
+                }
+            except Exception:
+                pass
         with STATE_LOCK:
             reserved = pending_mint_reserve(state)
         block = mint_cash_block(balance, shares, reserved)
@@ -5084,6 +5556,23 @@ def run_mint_cycle(
             log_event("mint_skip_balance", balance=balance, need=shares)
             write_loop_heartbeat("mint", "no_balance", balance=balance)
             return "no_balance"
+        held_positions: Dict[str, float] = {}
+        try:
+            held_positions = gateway.positions(funder) or {}
+        except Exception as exc:
+            log_event("positions_fetch_fail", error=str(exc)[:160])
+            held_positions = {}
+        if (
+            float(held_positions.get(pick.up_token, 0) or 0) > tol
+            or float(held_positions.get(pick.dn_token, 0) or 0) > tol
+        ):
+            log_event(
+                "mint_skip_existing",
+                condition_id=pick.condition_id,
+                slug=pick.slug,
+                source="positions",
+            )
+            return "existing_position"
         before_up = chain.position_balance(str(cfg["ctf_address"]), funder_cs, pick.up_token)
         before_dn = chain.position_balance(str(cfg["ctf_address"]), funder_cs, pick.dn_token)
     except Exception as exc:
@@ -5223,6 +5712,21 @@ def run_mint_cycle(
 
 
 def _reload_cfg(cfg_box: Dict[str, Any]) -> dict:
+    """Reload strategy_mint.json only when its mtime or size changes.
+
+    A missing stat still loads, so a replaced file is not stuck on the
+    previous config. Hot reload stays: the next tick after a write sees
+    the new stamp and picks the edit up. An unchanged file is not reread.
+    """
+    stamp = None
+    try:
+        info = STRATEGY_FILE.stat()
+        stamp = (int(info.st_mtime_ns), int(info.st_size))
+    except OSError:
+        stamp = None
+    cached = cfg_box.get("cfg")
+    if isinstance(cached, dict) and stamp is not None and stamp == cfg_box.get("_mtime_ns"):
+        return cached
     try:
         loaded = load_strategy()
     except Exception as exc:
@@ -5230,6 +5734,12 @@ def _reload_cfg(cfg_box: Dict[str, Any]) -> dict:
         current = cfg_box.get("cfg") or {}
         loaded = {**current, "entry_enabled": False}
     cfg_box["cfg"] = loaded
+    if stamp is not None:
+        cfg_box["_mtime_ns"] = stamp
+    try:
+        _apply_book_timeout(loaded)
+    except NameError:
+        pass
     return loaded
 
 
@@ -5304,6 +5814,7 @@ def main() -> int:
 
     try:
         cfg = load_strategy()
+        _apply_book_timeout(cfg)
     except Exception as exc:
         console.print(f"[bold red]strategy load failed:[/] {exc}")
         return 1

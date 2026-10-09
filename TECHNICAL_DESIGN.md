@@ -300,7 +300,7 @@ Saves are cheap and rare: `commit_state` compares a **digest** (`persist_digest`
 
 `load_strategy` copies only keys that exist in `DEFAULTS`; anything else in the live file (for example the leftover `sell_persist_skip_ttm_s`) is ignored. `validate_strategy` enforces `sell_floor ≤ sell_threshold < sell_opposite_min < sell_winner_min < 1`, `sell_floor ≤ sell_fak_px ≤ sell_threshold`, `0 < sell_scrap_fraction ≤ 1`, mint gas bounds, `sell_dump_persist_s` / `sell_dump_persist_last_min_s` / `sell_dump_persist_last_min_window_s` / `sell_cooldown_s` / `sell_scrap_rest_min_ahead_s` ≥ 0, and `poll_s ≥ 1` (it was 2 until 30 Sep; the VM carried a local patch for live `poll_s: 1`, [§32](#section-32)).
 
-Every tick of both loops re-reads the strategy file (`_reload_cfg`), so a knob edit takes effect within a second or two without a restart. If the reload fails validation, the loop logs `strategy_reload_fail` and keeps the **previous** config with `entry_enabled` forced false: sells continue, new mints stop.
+Each loop calls `_reload_cfg`, which re-reads `strategy_mint.json` only when the file mtime changes, so a knob edit still takes effect on the next tick without a restart. If the reload fails validation, the loop logs `strategy_reload_fail` and keeps the **previous** config with `entry_enabled` forced false: sells continue, new mints stop.
 
 Sleep cadence: the sell loop sleeps `poll_s`, or `min(poll_s, sell_armed_poll_s)` while any bag is sell-hot (loser armed, or loser sold and dump/winner not done). Code defaults 5s / 2s; live **1s / 1s**. Mint always sleeps `poll_s`. Armed poll does **not** replace persist math. Shared intent writes take `STATE_LOCK`; book / FAK / Gamma / relayer / RPC stay outside that lock (`_io_unlocked`).
 
@@ -380,12 +380,12 @@ These rows go to the tape, and `mintbot` logs them through an `on_event` hook. N
 | Multi-intent serial in `manage_sells` (N dump FAK then N+1 books) | Medium | Leftover — one intent's FAK can delay the other's look |
 | Sequential chain prechecks (5+ RPCs) | Low-Med | Leftover — mint-only latency |
 | Relayer submit/poll timeouts 15–20s | Low-Med | Leftover — mint-only; sell continues |
-| CLOB `update_balance_allowance` on every FAK | Low | Leftover — extra ~100ms on fire |
-| Data API `positions` after Gamma | Low | Leftover — mint-only |
+| CLOB `update_balance_allowance` on every FAK | Low | **Fixed** — once per token after mint confirm; again only on a balance/allowance reject |
+| Data API `positions` after Gamma | Low | **Fixed** — one check immediately before a live mint submit, not every tick |
 | Sequential reconcile per pending intent | Low | Leftover — mint-only |
 | pathlog JSONL / Gamma I/O | n/a | Separate process; does not block mintbot |
 | Redeem vs sell | Separate thread | Opt-in `redeem_enabled` runs on `mintbot-redeem`; sells stop at `end_ts` and never wait on it |
-| Sequential UP/DN `/book` | Already fixed | Parallel `ThreadPoolExecutor` |
+| Sequential UP/DN `/book` | Already fixed | One `/books` POST, parallel GETs if that body fails; book timeout `book_timeout_s` (1.2s) |
 
 <a id="section-11"></a>
 ## Eligibility: not-yet-open 15m windows
@@ -568,7 +568,7 @@ size, latch = _sell_inventory(chain, ctf, funder_cs, l_tok, shares, tol,
                               "seen_loser_inventory", intent)
 ```
 
-`_sell_inventory` reads the on-chain balance (lock released) and returns `(min(shares, balance), latch)`. `inventory_latch` distinguishes `await_inventory` (zero before any inventory was ever seen: the split may still be settling, so skip) from `already_flat` (zero after inventory was seen: finish without a POST) from `has_inventory`. Then the size is clipped by the partial plan ([§17b](#section-17b)) and `_fire_loser_scrap` posts.
+`_sell_inventory` sizes from tracked inventory (minted shares minus recorded fills) and does not `balanceOf` before the post. `inventory_latch` still distinguishes `await_inventory` (not yet confirmed and no fill seen: skip) from `already_flat` (confirmed remainder under tolerance: finish without a POST) from `has_inventory`. A CLOB reject for balance/allowance refreshes allowance once, reads the chain once, resizes, and retries immediately. Then the size is clipped by the partial plan ([§17b](#section-17b)) and `_fire_loser_scrap` posts. There is no fixed sleep between FAK attempts. Each sell logs `trigger_to_send_ms` and `send_to_response_ms`.
 
 **Update (5 Oct 2026, bag `btc-updown-15m-1791215100`):** the sweep limit is now the live loser bid (`scrap_live_bid_limit`), capped at `sell_threshold` and floored at `sell_clob_min_price`; `sell_floor` no longer clamps it. With live `sell_floor` 0.09 the old sweep posted `limit>=0.090` into an 8¢→7¢→1¢ book ~45 times and 39 Up resolved at $0. The history below describes the old floor sweep.
 

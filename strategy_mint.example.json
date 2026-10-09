@@ -34,6 +34,8 @@
   "count_kept_loser_as_open": false,
   "poll_s": 5.0,
   "sell_armed_poll_s": 2.0,
+  "book_timeout_s": 1.2,
+  "mint_cash_poll_s": 2.0,
   "oracle_log_enabled": false,
   "position_tolerance": 0.01,
   "require_accepting_orders": true,

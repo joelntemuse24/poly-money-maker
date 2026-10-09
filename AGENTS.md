@@ -220,7 +220,10 @@ already sets. Code defaults arm at `sell_threshold` 0.02, print
 `sell_late_window_s` 0, floor / per-TTM / stale edge knobs 0,
 `sell_oracle_edge_persist_s` 3, `sell_dump_max_ttm_s` 0 (example 240),
 and `sell_scrap_max_ttm_s` 0 (example 600).
-`oracle_log_enabled` stays false. New keys absent from the live file take these
+`oracle_log_enabled` stays false. CLOB book reads use `book_timeout_s`
+(code default 1.2). The mint loop polls wallet pUSD at `mint_cash_poll_s`
+(code default 2) while waiting on cash, and skips the live confirmed bag's
+balanceOf until the window has ended. New keys absent from the live file take these
 defaults after the operator pulls and restarts. Do not edit live JSON
 from this repo.
 
@@ -257,7 +260,8 @@ retries after the dump has fired are not re-checked.
 `sell_dump_also_kept` (default false and false in the example; **true
 live** since 10:31 IST on 2026-10-03)
 also exits the kept scrap half in the same dump event. Once the held dump
-fills, mintbot sells `min(sell_scrap_keep, on-chain balance)` of the
+fills, mintbot sells the tracked kept shares (`sell_scrap_keep` minus
+`sell_dump_kept_filled`) of the
 scrapped leg with the dump's live-bid FAK and refire. It then sends one
 FAK at the 1¢ floor for any remainder and logs `sell_dump_kept`
 (planned, sold, avg_px, outcome). This runs once per bag. Kept 0 is a
