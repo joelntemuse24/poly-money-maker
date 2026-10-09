@@ -6,6 +6,8 @@ window is minted only inside ``[start - mint_seq_lead_s, start +
 mint_seq_cutoff_s]`` and only once no other bag is still live and uncashed.
 A bag stops blocking when its winner is cashed (``sold_winner``, which a
 held dump also sets) or its window ends (cash then comes back by redeem).
+A cashed winner still blocks while a reclaim buy or position is open
+(``seq_exit_open``) and the window has not ended.
 Short pUSD inside the range is a wait, retried every mint tick. Past the
 cutoff the window is skipped and logged once.
 
@@ -102,22 +104,35 @@ def seq_late_markets(markets: Iterable[Any], cfg: Any, now: float) -> list:
 
 
 def seq_exit_open(intent: dict) -> bool:
-    """True while a dump, stop, or reclaim position is still in progress.
+    """True while a dump, stop, or reclaim is still in progress.
 
-    A bag whose window has ended does not use this: the caller skips it
-    first. ``sell_exit_inflight`` covers the synchronous dump/stop FAK.
-    ``reclaim_bought`` without ``reclaim_stopped`` covers the open position,
-    including the stop persist before the sell.
+    Reads flags already on the intent. No I/O. ``seq_busy_bag`` skips a
+    bag whose window has ended, and a settled status is not active, so
+    this cannot hold the next mint after the bag closes.
+
+    ``sell_exit_inflight`` covers the synchronous dump or stop FAK, including
+    after ``reclaim_stopped`` is set but before that sell returns.
+    While ``reclaim_stopped`` is false, an open exit is also the bought
+    position, a latched stop, the entry watch (``reclaim_hot``), a posted,
+    in-flight, or uncertain buy, or any ``reclaim_filled`` shares. A stopped
+    reclaim with the stop sell finished does not hold the next mint.
     """
     if not isinstance(intent, dict):
         return False
     if intent.get("sell_exit_inflight"):
         return True
-    if intent.get("reclaim_bought") and not intent.get("reclaim_stopped"):
+    if intent.get("reclaim_stopped"):
+        return False
+    if intent.get("reclaim_bought") or intent.get("reclaim_stop_latched"):
         return True
-    if intent.get("reclaim_stop_latched") and not intent.get("reclaim_stopped"):
+    if (
+        intent.get("reclaim_hot")
+        or intent.get("reclaim_buy_posted")
+        or intent.get("reclaim_buy_inflight")
+        or intent.get("reclaim_buy_uncertain")
+    ):
         return True
-    return False
+    return _num(intent.get("reclaim_filled"), 0.0) > 0
 
 
 def seq_busy_bag(
@@ -147,8 +162,9 @@ def seq_busy_bag(
         if end and float(now) >= end:
             continue
         # sold_winner is set when the held dump fills. That used to free
-        # the next window while the reclaim position or its stop was still
-        # open, and the mint then stalled the sell loop.
+        # the next window while the reclaim buy, position, or stop was
+        # still open, and the mint then stalled the sell loop. An ended
+        # window is already skipped above, so a closed bag cannot stick.
         if intent.get("sold_winner") and not seq_exit_open(intent):
             continue
         if busy is None or _num(intent.get("start_ts"), 0.0) < _num(busy[1].get("start_ts"), 0.0):
