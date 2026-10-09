@@ -154,7 +154,8 @@ class KeptLoserSlotTests(unittest.TestCase):
 
     def test_winner_fill_records_its_leg(self):
         src = MINT.read_text(encoding="utf-8")
-        self.assertEqual(src.count('intent["sell_winner_leg"] = winner'), 2)
+        # Pre-check flat, fill, and the balance-reject flat each record the leg.
+        self.assertEqual(src.count('intent["sell_winner_leg"] = winner'), 3)
 
     def test_defaults_and_example_keep_it_off(self):
         self.assertIs(_assign("DEFAULTS")["count_kept_loser_as_open"], False)

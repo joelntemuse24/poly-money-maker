@@ -278,17 +278,35 @@ class DumpAlsoKeptBalanceTests(unittest.TestCase):
         ns["_manage_sells_locked"](cfg, state, _Chain(balances))
         return intent, events, fak_calls
 
-    def test_on_chain_balance_below_keep_caps_the_size(self):
-        intent, _events_, fak_calls = self._run({"up-tok": 50.0, "dn-tok": 12.0})
-        self.assertEqual([(c["token_id"], c["size"]) for c in fak_calls], [("up-tok", 50.0), ("dn-tok", 12.0)])
-        self.assertEqual(intent["sell_dump_kept_planned"], 12.0)
-        self.assertEqual(intent["sell_dump_kept_outcome"], "filled")
+    def test_tracked_keep_is_offered_without_a_pre_sell_balance_read(self):
+        # Chain says 12 or 0. The post uses the locked keep (25) and does
+        # not balanceOf first. A short chain balance is handled on reject.
+        for dn in (12.0, 0.0, 40.0):
+            chain = _Chain({"up-tok": 50.0, "dn-tok": dn})
+            chain.calls = []
+            real = chain.position_balance
 
-    def test_zero_position_is_a_no_op(self):
-        intent, events, fak_calls = self._run({"up-tok": 50.0, "dn-tok": 0.0})
-        self.assertEqual([c["token_id"] for c in fak_calls], ["up-tok"])
-        self.assertEqual(intent["sell_dump_kept_outcome"], "nothing_kept")
-        self.assertEqual(_events(events, "sell_dump_kept")[0]["planned"], 0.0)
+            def position_balance(_ctf, _owner, token_id, _real=real):
+                chain.calls.append(token_id)
+                return _real(_ctf, _owner, token_id)
+
+            chain.position_balance = position_balance
+            ns, _events, fak_calls, clock = _dump_harness(_fill_fak)
+            ns["os"] = SimpleNamespace(
+                getenv=lambda key, default=None: "0xfunder" if key == "FUNDER_ADDRESS" else default
+            )
+            ns["to_checksum_address"] = lambda addr: addr
+            intent = _ready_bag(clock, keep=25.0)
+            state = {"intents": {"cid-kept": intent}}
+            ns["remember_persisted_state"](state)
+            cfg = _dump_cfg(sell_dump_also_kept=True, ctf_address="0xctf")
+            ns["_manage_sells_locked"](cfg, state, chain)
+            self.assertEqual(
+                [(c["token_id"], c["size"]) for c in fak_calls],
+                [("up-tok", 50.0), ("dn-tok", 25.0)],
+            )
+            self.assertEqual(intent["sell_dump_kept_planned"], 25.0)
+            self.assertEqual(chain.calls, [])
 
     def test_keep_caps_a_larger_balance(self):
         intent, _events_, fak_calls = self._run({"up-tok": 50.0, "dn-tok": 40.0})
@@ -331,7 +349,15 @@ class DumpAlsoKeptHotReloadTests(unittest.TestCase):
                 "load_strategy",
                 {"json": json, "DEFAULTS": defaults, "validate_strategy": validate, "STRATEGY_FILE": path},
             )
-            reload_cfg = _fn("_reload_cfg", {"load_strategy": load, "log_event": lambda *_a, **_k: None})
+            reload_cfg = _fn(
+                "_reload_cfg",
+                {
+                    "load_strategy": load,
+                    "log_event": lambda *_a, **_k: None,
+                    "STRATEGY_FILE": path,
+                    "_apply_book_timeout": lambda *_a, **_k: None,
+                },
+            )
             box: dict = {}
             path.write_text(json.dumps(raw))
             self.assertIs(reload_cfg(box)["sell_dump_also_kept"], False)

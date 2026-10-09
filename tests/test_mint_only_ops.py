@@ -1468,6 +1468,9 @@ class DeployUnitsTests(unittest.TestCase):
                     ("sell_book_depth", kwargs)
                 ),
                 "_fak_sell": _fak,
+                "_sell_fak_with_fallback": lambda token, size, price, dry, capture=None, **_k: _fak(
+                    token, size, price, dry, capture
+                ),
                 "_run_fak_ladder": lambda *a, **k: ladder_calls.append((a, k)) or (0, "no", None),
                 "_sell_inventory": _inventory,
             },
@@ -1535,6 +1538,9 @@ class DeployUnitsTests(unittest.TestCase):
                     ("sell_book_depth", kwargs)
                 ),
                 "_fak_sell": _fak_full,
+                "_sell_fak_with_fallback": lambda token, size, price, dry, capture=None, **_k: _fak_full(
+                    token, size, price, dry, capture
+                ),
                 "_run_fak_ladder": lambda *a, **k: ladder_calls.append((a, k)) or (0, "no", None),
                 "_sell_inventory": _flat,
             },

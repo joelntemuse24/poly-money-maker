@@ -366,9 +366,11 @@ def chain_reconcile_action(
 ) -> str:
     """Whether reconcile should eth_call this bag.
 
-    ``query`` — live window, or an in-flight mint that has not settled.
+    ``query`` — an in-flight mint that has not settled.
     ``final`` — ended ``confirmed`` bag, once, after ``grace_s``.
-    ``skip`` — do not chain-query.
+    ``skip`` — do not chain-query. A confirmed bag whose window is still
+    open is skipped: the sell loop sizes from tracked fills, and the one
+    post-window read still runs after ``grace_s``.
 
     ``chain_reconcile_done`` on the intent means the final read already
     happened. In-flight statuses ignore that flag and the market end:
@@ -392,8 +394,9 @@ def chain_reconcile_action(
         now_ts = float(now)
     except (TypeError, ValueError):
         now_ts = 0.0
+    # Open window: do not balanceOf a live confirmed bag every mint tick.
     if end_ts <= 0 or now_ts <= end_ts:
-        return "query"
+        return "skip"
     try:
         grace = float(grace_s)
     except (TypeError, ValueError):

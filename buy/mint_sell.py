@@ -213,6 +213,88 @@ def inventory_latch(
     return "await_inventory"
 
 
+def _finite_num(value: Any, default: float = 0.0) -> float:
+    try:
+        out = float(value)
+    except (TypeError, ValueError):
+        return default
+    if out != out or out in (float("inf"), float("-inf")):
+        return default
+    return out
+
+
+def is_balance_allowance_reject(status: Any) -> bool:
+    """True when the exchange rejected for balance or allowance.
+
+    The match is the CLOB text (``not enough balance / allowance``). Other
+    rejects, including ``invalid amounts``, stay false so they are not retried.
+    """
+    text = str(status or "").lower()
+    if "not enough balance" in text or "insufficient balance" in text:
+        return True
+    if "balance / allowance" in text or "not enough allowance" in text:
+        return True
+    return False
+
+
+def tracked_sell_size(
+    intent: Any,
+    requested: float,
+    *,
+    seen_key: str,
+    tol: float,
+) -> Tuple[float, str]:
+    """Size a sell from minted shares minus recorded fills. No I/O.
+
+    A confirmed bag, or any bag that already recorded a fill for this role,
+    counts as inventory seen. The remainder under ``tol`` is ``already_flat``.
+    A positive remainder is ``has_inventory`` and is capped at ``requested``.
+    Before confirm, with no fill and no seen flag, the latch is
+    ``await_inventory`` so a not-yet-landed mint is not treated as flat and
+    is not posted.
+    """
+    requested_f = max(0.0, _finite_num(requested))
+    if not isinstance(intent, dict):
+        return requested_f, "unknown"
+    tol_f = _finite_num(tol, 0.01)
+    if tol_f < 0:
+        tol_f = 0.0
+    role = str(seen_key or "")
+    minted = max(0.0, _finite_num(intent.get("shares")))
+    if role == "seen_loser_inventory":
+        sold = _finite_num(intent.get("sell_filled"))
+        base = minted if minted > 0 else requested_f
+    elif role == "seen_dump_inventory":
+        sold = _finite_num(intent.get("sell_dump_filled")) + _finite_num(
+            intent.get("sell_winner_filled")
+        )
+        base = minted if minted > 0 else requested_f
+    elif role == "seen_winner_inventory":
+        sold = _finite_num(intent.get("sell_winner_filled"))
+        base = minted if minted > 0 else requested_f
+    elif role == "seen_kept_inventory":
+        sold = _finite_num(intent.get("sell_dump_kept_filled"))
+        base = requested_f
+    else:
+        # Reclaim stop and unknown roles: the caller already passed the
+        # remainder it wants to sell (filled minus sold, or the keep).
+        sold = 0.0
+        base = requested_f
+    remaining = max(0.0, base - max(0.0, sold))
+    status = str(intent.get("status") or "")
+    seen = bool(intent.get(role)) or status == "confirmed" or sold >= tol_f
+    if role == "seen_reclaim_inventory" and _finite_num(intent.get("reclaim_filled")) >= tol_f:
+        seen = True
+    if not seen:
+        return requested_f, "await_inventory"
+    capped = remaining if role == "seen_reclaim_inventory" else min(requested_f, remaining)
+    latch = inventory_latch(capped, tol=tol_f, seen_inventory=True)
+    if latch == "has_inventory":
+        intent[role] = True
+        return capped, latch
+    return requested_f, latch
+
+
 def scrap_active_prices(
     cfg: dict,
     ttm_s: Optional[float],

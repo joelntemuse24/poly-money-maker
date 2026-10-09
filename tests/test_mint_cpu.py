@@ -195,7 +195,8 @@ class SessionReuseTests(unittest.TestCase):
         submit = src[src.find("def submit_mint_batch") : src.find("def get_relayer_transaction")]
         self.assertIn('thread_session("clob_book").get', book)
         self.assertNotIn("requests.get", book)
-        self.assertIn("timeout=5", book)
+        self.assertIn("timeout=_book_timeout_s()", book)
+        self.assertNotIn("timeout=5", book)
         self.assertIn('thread_session("relayer").get', relayer)
         self.assertIn("timeout=15", relayer)
         self.assertIn("requests.get", submit)
@@ -205,7 +206,7 @@ class SessionReuseTests(unittest.TestCase):
 class EndedReconcileTests(unittest.TestCase):
     def test_action_skips_ended_confirmed_until_one_final_read(self):
         live = _bag(end_ts=_END)
-        self.assertEqual(chain_reconcile_action(live, _NOW_LIVE), "query")
+        self.assertEqual(chain_reconcile_action(live, _NOW_LIVE), "skip")
         self.assertEqual(chain_reconcile_action(live, _NOW_GRACE), "skip")
         self.assertEqual(chain_reconcile_action(live, _NOW_FINAL), "final")
         done = _bag(chain_reconcile_done=True)
@@ -256,8 +257,9 @@ class EndedReconcileTests(unittest.TestCase):
         }
         chain = Chain()
         reconcile(grace, cfg, chain, "0xfunder", _NOW_GRACE)
-        self.assertEqual(chain.calls, ["live-up", "live-dn"])
+        self.assertEqual(chain.calls, [])
         self.assertNotIn("chain_reconcile_done", grace["intents"]["old"])
+        self.assertNotIn("chain_reconcile_done", grace["intents"]["live"])
 
         final_state = {"intents": {"old": _bag()}}
         chain = Chain()
@@ -1332,9 +1334,14 @@ class ScrapFractionLoopTests(unittest.TestCase):
     def test_balance_at_keep_marks_sold_without_another_fire(self):
         from eth_utils import to_checksum_address
 
-        ns, events, fak_calls, clock, _book = _scrap_harness(
-            lambda *_a: (0.0, "error:temporary")
-        )
+        phase = {"reject": False}
+
+        def fak_sell(*_a):
+            if phase["reject"]:
+                return 0.0, "error:not enough balance / allowance"
+            return 0.0, "error:temporary"
+
+        ns, events, fak_calls, clock, _book = _scrap_harness(fak_sell)
         ns["to_checksum_address"] = to_checksum_address
         end = clock["now"] + 200.0
         intent = self._arm(clock, end, shares=100.0)
@@ -1361,6 +1368,9 @@ class ScrapFractionLoopTests(unittest.TestCase):
             self.assertAlmostEqual(fak_calls[0]["size"], 50.0)
             self.assertFalse(intent.get("sold_loser"))
             balances["up-tok"] = 50.0
+            # Tracked fills are still 0, so the next tick posts again. The
+            # exchange reject is what reads the chain (keep already on hand).
+            phase["reject"] = True
             clock["now"] += 3.1
             self._tick(ns, cfg, intent, chain=Chain())
         finally:
@@ -1368,7 +1378,7 @@ class ScrapFractionLoopTests(unittest.TestCase):
                 os.environ.pop("FUNDER_ADDRESS", None)
             else:
                 os.environ["FUNDER_ADDRESS"] = prior
-        self.assertEqual(len(fak_calls), 1)
+        self.assertEqual(len(fak_calls), 2)
         self.assertTrue(intent.get("sold_loser"))
         outcome = [row for row in events if row["event"] == "sell_scrap_outcome"]
         self.assertEqual(outcome[-1]["outcome"], "balance_at_keep")
