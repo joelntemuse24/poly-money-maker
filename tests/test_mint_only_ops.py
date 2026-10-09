@@ -9,6 +9,7 @@ from contextlib import nullcontext
 from pathlib import Path
 
 from buy.mint_redeem import validate_redeem
+from buy.mint_sell import dump_fast_retry_eligible
 from buy.mint_sequence import validate_seq
 
 import pathlog
@@ -1250,6 +1251,113 @@ class DeployUnitsTests(unittest.TestCase):
                 and payload.get("reason") == "empty_book"
                 for event, payload in events
             )
+        )
+
+    def _refire(self, outcomes, books, **kwargs):
+        calls: list[dict] = []
+        events: list[tuple[str, dict]] = []
+        book_iter = iter(books)
+
+        def ladder(*args, **_kwargs):
+            calls.append({"limits": list(args[2]), "size": args[1]})
+            return next(outcomes)
+
+        fn = _fn(
+            "_run_dump_fak_with_refire",
+            {
+                "_run_fak_ladder": ladder,
+                "_fetch_book": lambda *_args, **_kw: next(book_iter),
+                "_io_unlocked": nullcontext,
+                "dump_fast_retry_eligible": dump_fast_retry_eligible,
+                "log_event": lambda event, **payload: events.append((event, payload)),
+            },
+        )
+        base = dict(
+            token_id="tok",
+            size=100.0,
+            initial_bid=0.72,
+            initial_bids=[{"price": "0.72", "size": "60.67"}],
+            held="up",
+            slug="btc-updown-15m-1791506700",
+            condition_id="cid",
+            ttm_s=40.0,
+            floor=0.01,
+            min_bid_size=1.0,
+            retries=2,
+            ladder_step=0.04,
+            ladder_rungs=4,
+            dry_run=False,
+            tol=0.01,
+        )
+        base.update(kwargs)
+        sold, status, px, attempts, last_bid = fn(**base)
+        return calls, events, sold, status, px, attempts, last_bid
+
+    def test_partial_fill_refires_immediately_at_the_fresh_bid(self):
+        """01:45 IST: 9.4 of 100 at 72¢ must not wait for the next sell pass."""
+        calls, events, sold, status, px, attempts, last_bid = self._refire(
+            iter(
+                [
+                    (9.4, "matched", 0.72),
+                    (90.6, "matched", 0.62),
+                ]
+            ),
+            [(0.62, 90.0, [{"price": "0.62", "size": "90"}])],
+        )
+        self.assertAlmostEqual(sold, 100.0)
+        self.assertEqual(status, "matched")
+        self.assertEqual(px, 0.62)
+        self.assertEqual(attempts, 2)
+        self.assertEqual(last_bid, 0.62)
+        self.assertEqual([row["limits"] for row in calls], [[0.72], [0.62]])
+        self.assertAlmostEqual(calls[1]["size"], 90.6)
+        attempt = [payload for event, payload in events if event == "sell_dump_fast_refire_attempt"]
+        self.assertEqual(len(attempt), 1)
+        self.assertAlmostEqual(attempt[0]["sold"], 9.4)
+        self.assertEqual(attempt[0]["bid"], 0.62)
+        self.assertNotIn(0.68, calls[1]["limits"])
+
+    def test_zero_fill_still_refires_only_when_the_miss_is_retryable(self):
+        calls, events, sold, _status, _px, attempts, last_bid = self._refire(
+            iter(
+                [
+                    (0.0, "error:no orders found to match with FAK order", 0.72),
+                    (0.0, "error:timeout", 0.62),
+                ]
+            ),
+            [(0.62, 40.0, [{"price": "0.62", "size": "40"}])],
+        )
+        self.assertEqual(sold, 0.0)
+        self.assertEqual(attempts, 2)
+        self.assertEqual(last_bid, 0.62)
+        self.assertEqual([row["limits"] for row in calls], [[0.72], [0.62]])
+        self.assertAlmostEqual(events[-1][1]["sold"], 0.0)
+        self.assertEqual(events[-1][0], "sell_dump_fast_refire_stop")
+        self.assertEqual(events[-1][1]["reason"], "non_retryable_status")
+
+        quiet, _events, quiet_sold, _st, _px2, quiet_attempts, quiet_bid = self._refire(
+            iter([(0.0, "error:timeout", 0.72)]),
+            [(0.62, 40.0, [])],
+        )
+        self.assertEqual([row["limits"] for row in quiet], [[0.72]])
+        self.assertEqual(quiet_sold, 0.0)
+        self.assertEqual(quiet_attempts, 1)
+        self.assertEqual(quiet_bid, 0.72)
+
+    def test_full_fill_does_not_refire(self):
+        calls, events, sold, status, px, attempts, last_bid = self._refire(
+            iter([(100.0, "matched", 0.72)]),
+            [(0.01, 1.0, [{"price": "0.01", "size": "1"}])],
+        )
+        self.assertEqual(sold, 100.0)
+        self.assertEqual(status, "matched")
+        self.assertEqual(px, 0.72)
+        self.assertEqual(attempts, 1)
+        self.assertEqual(last_bid, 0.72)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(
+            [event for event, _payload in events if event == "sell_dump_fast_refire_attempt"],
+            [],
         )
 
     def test_concurrent_loops_do_not_skip_mint_or_change_persist(self):

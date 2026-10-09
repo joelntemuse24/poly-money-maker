@@ -109,7 +109,8 @@ class DumpAlsoKeptFiresTests(unittest.TestCase):
 
     def test_partial_dump_waits_and_kept_sells_only_when_the_dump_completes(self):
         ns, events, fak_calls, clock = _dump_harness(_fill_fak)
-        held_fills = iter([30.0, float("inf")])
+        # First shot plus two refires still leave the held leg short.
+        held_fills = iter([10.0, 10.0, 10.0, float("inf")])
 
         def fill_for(token, size, _price):
             if token == "up-tok":
@@ -120,6 +121,8 @@ class DumpAlsoKeptFiresTests(unittest.TestCase):
         intent = _ready_bag(clock)
         cfg = _dump_cfg(sell_dump_also_kept=True)
         _tick(ns, cfg, intent)
+        held = [(c["size"], c["price"]) for c in fak_calls if c["token_id"] == "up-tok"]
+        self.assertEqual(held, [(50.0, 0.51), (40.0, 0.48), (30.0, 0.48)])
         self.assertFalse(intent.get("sold_dump"))
         self.assertNotIn("dn-tok", [c["token_id"] for c in fak_calls])
         self.assertEqual(_events(events, "sell_dump_kept"), [])
@@ -166,22 +169,26 @@ class DumpAlsoKeptPartialTests(unittest.TestCase):
 
         def fill_for(token, size, price):
             if token == "dn-tok" and price > 0.01:
-                return min(size, 10.0)
+                return min(size, 5.0)
             return size
 
         ns["_fak_sell"] = _priced(fak_calls, fill_for)
         intent = _ready_bag(clock, keep=25.0)
         _tick(ns, _dump_cfg(sell_dump_also_kept=True), intent)
         kept_calls = [(c["size"], c["price"]) for c in fak_calls if c["token_id"] == "dn-tok"]
-        self.assertEqual(kept_calls, [(25.0, 0.49), (15.0, 0.01)])
+        # Fresh bids for the retry budget, then the 1¢ sweep for what is left.
+        self.assertEqual(
+            kept_calls,
+            [(25.0, 0.49), (20.0, 0.48), (15.0, 0.48), (10.0, 0.01)],
+        )
         self.assertEqual(intent["sell_dump_kept_outcome"], "filled")
         self.assertAlmostEqual(intent["sell_dump_kept_filled"], 25.0)
-        self.assertEqual(intent["sell_dump_kept_fill_px"], 0.202)
+        self.assertAlmostEqual(intent["sell_dump_kept_fill_px"], 0.294)
         self.assertTrue(intent["sell_dump_kept_sold"])
         kept = _events(events, "sell_dump_kept")[0]
-        self.assertEqual(kept["swept"], 15.0)
-        self.assertEqual(kept["fills"], 2)
-        self.assertEqual(kept["avg_px"], 0.202)
+        self.assertEqual(kept["swept"], 10.0)
+        self.assertEqual(kept["fills"], 4)
+        self.assertAlmostEqual(kept["avg_px"], 0.294)
 
     def test_zero_fill_miss_refires_the_ladder_down_to_the_floor(self):
         ns, events, fak_calls, clock = _dump_harness(_fill_fak)
