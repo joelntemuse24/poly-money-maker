@@ -97,7 +97,10 @@ instead of two:
   lookahead.
 - It is minted only once no other bag is still live and uncashed. A bag
   stops blocking when its winner is sold (`sold_winner`, which the held
-  dump also sets) or its window ends.
+  dump also sets) or its window ends. A cashed winner still blocks while
+  a reclaim is open and not stopped: the entry watch, a posted, in-flight,
+  or uncertain buy, any filled shares, the bought position, or a latched
+  stop. The stop sell finishing, or the window ending, releases it.
   - A winner cashed at 0.9995 before the end lets the next bag mint at
     start − 30s.
   - An unsold winner frees the gate at the end. Its cash comes back from

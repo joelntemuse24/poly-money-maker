@@ -338,6 +338,59 @@ class SequentialMintCycleTests(unittest.TestCase):
         ended = {"intents": {_cid(1): _prev_bag(sold_winner=True, reclaim_bought=True)}}
         self.assertIsNone(seq_busy_bag(ended, S, ACTIVE))
 
+    def test_reclaim_buy_phase_defers_until_stop_or_close(self):
+        """Pending, partial, uncertain, and the entry watch hold the next mint."""
+        cashed = dict(
+            sold_loser=True, sold_dump=True, sold_winner=True,
+        )
+        phases = (
+            {"reclaim_hot": True},
+            {"reclaim_buy_posted": True},
+            {"reclaim_buy_inflight": True},
+            {"reclaim_buy_uncertain": True},
+            {"reclaim_filled": 9.4, "reclaim_bought": False},
+            {
+                "reclaim_buy_posted": True,
+                "reclaim_filled": 9.4,
+                "reclaim_bought": False,
+            },
+        )
+        for extra in phases:
+            bag = _prev_bag(**cashed, **extra)
+            state = {"intents": {_cid(1): bag}}
+            self.assertTrue(seq_exit_open(bag), extra)
+            self.assertIsNotNone(seq_busy_bag(state, S - 30.0, ACTIVE), extra)
+            closed = {"intents": {_cid(1): bag}}
+            self.assertIsNone(seq_busy_bag(closed, S, ACTIVE), extra)
+            settled = {"intents": {_cid(1): _prev_bag(**cashed, **extra, status="completed")}}
+            self.assertIsNone(seq_busy_bag(settled, S - 30.0, ACTIVE), extra)
+            stopped = _prev_bag(**cashed, **extra, reclaim_stopped=True)
+            self.assertFalse(seq_exit_open(stopped), extra)
+            self.assertIsNone(
+                seq_busy_bag({"intents": {_cid(1): stopped}}, S - 30.0, ACTIVE),
+                extra,
+            )
+
+        idle = _prev_bag(**cashed, reclaim_filled=0, reclaim_hot=False)
+        self.assertFalse(seq_exit_open(idle))
+        self.assertIsNone(
+            seq_busy_bag({"intents": {_cid(1): idle}}, S - 30.0, ACTIVE)
+        )
+        still_selling = _prev_bag(
+            **cashed, reclaim_stopped=True, sell_exit_inflight=True,
+        )
+        self.assertTrue(seq_exit_open(still_selling))
+        self.assertIsNotNone(
+            seq_busy_bag({"intents": {_cid(1): still_selling}}, S - 30.0, ACTIVE)
+        )
+
+        partial = _prev_bag(**cashed, reclaim_buy_posted=True, reclaim_filled=9.4)
+        state = {"intents": {_cid(1): partial}}
+        h = MintHarness(_cfg(reclaim_enabled=False), state, [_market(S, 2)], balance=200.0)
+        self.assertEqual(h.tick(S - 30.0), "seq_wait_prev")
+        self.assertEqual(h.submits, [])
+        self.assertEqual(h.tick(S), "submitted")
+
     def test_cash_short_waits_then_mints_when_redeem_lands(self):
         state = {"intents": {_cid(1): _prev_bag()}}
         h = MintHarness(_cfg(), state, [_market(S, 2)], balance=12.0)

@@ -426,7 +426,7 @@ Because the adjacent lookahead mints about 14 minutes before the open, two bags 
 
 **Sequential capacity (live).** With `mint_sequential` on, `seq_busy_bag` replaces `mint_slots_full` in `select_mint_candidate` and in `_claim_mint_intent`.
 
-- **Busy bag.** A busy bag is any other active, non-dry intent whose window has not ended and whose `sold_winner` is not set. The held dump also sets `sold_winner`. A sold loser alone does not free the gate, because the winner's capital is still in tokens.
+- **Busy bag.** A busy bag is any other active, non-dry intent whose window has not ended and whose `sold_winner` is not set, or whose `seq_exit_open` is still true. The held dump also sets `sold_winner`. That flag stays true through the reclaim entry watch (`reclaim_hot`), a posted, in-flight, or uncertain buy, any `reclaim_filled` shares, the bought position, and a latched stop, until `reclaim_stopped` and the stop sell has returned. A sold loser alone does not free the gate, because the winner's capital is still in tokens. An ended window or a settled status does not stay busy.
 - **Previous bag busy.** A busy bag gives `seq_wait_prev` and logs `mint_seq_wait_prev` (throttled to 30s per window).
 - **Cash short.** Short cash (`mint_cash_block`, including `pending_reserve`) gives `seq_wait_cash` and logs `mint_seq_wait_cash`. It is retried every `poll_s`.
 - **Skip.** After the cutoff, `_log_seq_skips` logs one `mint_seq_skip` per unminted live window, with the last wait reason and how long it waited.
@@ -1329,6 +1329,8 @@ redeem_enabled (opt-in), separate thread:
 Adjacent mint may already have been submitted **before** expiry (lookahead). That is intentional and is the main fix for the “skipped 15m” bug.
 
 # Changelog
+
+- **2026-10-09** — A sequential mint waits while a reclaim buy is still open, not only after `reclaim_bought`. The entry watch, a posted, in-flight, or uncertain buy, and any filled shares hold the next window until the reclaim is stopped and its stop sell has finished. A closed or settled bag does not.
 
 - **2026-10-09** — Optional late scrap price. `sell_late_price_window_s` defaults to 0. When it is positive and both late prices are set, a known ttm at or under the window uses `sell_threshold_late` / `sell_fak_px_late` for the arm, the persist check, and the FAK cap. The choice is one compare per bag on the ttm the sell tick already has. Suggested live keys: base 0.03/0.03, late 0.04/0.04, window 180. `sell_late_window_s` stays the oracle veto and stays 0.
 

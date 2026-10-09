@@ -149,8 +149,13 @@ When on:
 - The next window mints only in `[start - lead, start + cutoff]`. The
   14-minute lookahead and `max_open_sets` are not used.
 - It mints only when no other live, non-dry, active bag still lacks
-  `sold_winner`. The held dump also sets `sold_winner`. A bag whose
-  window has ended no longer blocks.
+  `sold_winner`. The held dump also sets `sold_winner`. A cashed winner
+  still blocks while `seq_exit_open` is true: a dump or stop sell in
+  flight, or, until `reclaim_stopped`, the entry watch (`reclaim_hot`),
+  a posted, in-flight, or uncertain reclaim buy, any `reclaim_filled`
+  shares, a bought position, or a latched stop. A stopped reclaim whose
+  stop sell has finished no longer blocks. A bag whose window has ended
+  no longer blocks.
 - `seq_busy_bag` is checked both in `select_mint_candidate` and again in
   `_claim_mint_intent`.
 - Short pUSD (`mint_cash_block`, including `pending_reserve`) is a wait:
