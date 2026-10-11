@@ -143,8 +143,8 @@ DEFAULT_SELL_KNOBS = {
     # Extra FAK posts after a zero or partial hedge fill. The whole
     # sequence, first post included, stays inside RECLAIM_HEDGE_RETRY_BUDGET_S.
     "reclaim_hedge_retries": 3,
-    # Fresh ask + slippage above this stops the retry. Do not lift the cap.
-    "reclaim_hedge_max_price": 0.20,
+    # A retry ask above this stops the refire. The retry posts at the ask.
+    "reclaim_hedge_max_price": 0.15,
     "sell_min_bid_size": 1.0,
     # Cycle sleep while a loser persist arm is live. Does not change persist_s.
     "sell_armed_poll_s": 2.0,
@@ -1932,7 +1932,6 @@ def reclaim_hedge_plan(
 
 def reclaim_hedge_retry_plan(
     ask: Optional[float],
-    slippage: float,
     remaining: float,
     max_price: float,
     *,
@@ -1941,9 +1940,10 @@ def reclaim_hedge_retry_plan(
 ) -> dict:
     """Size one hedge refire from the shares still unfilled. No I/O.
 
-    Limit is ``ask + slippage``. Above ``max_price`` (or not a price) does
-    not post: ``reason`` is ``above_cap``. The unfilled share count is then
-    raised to the 5-share and $1 minimums, same as the first clip.
+    Limit is the fresh ask. Slippage is not added. An ask above
+    ``max_price`` (or not a price) does not post: ``reason`` is
+    ``above_cap``. The unfilled share count is then raised to the 5-share
+    and $1 minimums, same as the first clip.
     """
     empty = {
         "ok": False,
@@ -1964,15 +1964,14 @@ def reclaim_hedge_retry_plan(
         return out
     try:
         ask_f = float(ask) if ask is not None else float("nan")
-        slip = float(slippage)
         cap = float(max_price)
         floor_usd = float(min_notional)
         floor_shares = float(min_shares)
     except (TypeError, ValueError):
         return dict(empty)
-    if not math.isfinite(ask_f) or ask_f <= 0 or not math.isfinite(slip) or slip < 0:
+    if not math.isfinite(ask_f) or ask_f <= 0:
         return dict(empty)
-    limit = ask_f + slip
+    limit = ask_f
     if not math.isfinite(cap) or not (0 < cap < 1) or limit > cap + 1e-12 or not (0 < limit < 1):
         out = dict(empty)
         out["reason"] = "above_cap"

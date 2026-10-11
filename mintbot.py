@@ -59,8 +59,10 @@ skips entry with ``too_close`` when seconds-to-close is under it. When
 ``reclaim_hedge_enabled`` is on, the other side is FAK-bought in the same
 moment as the main buy (a parallel post, not after the fill). A zero
 or partial hedge fill refires on that same thread, up to
-``reclaim_hedge_retries`` inside about a second, at the fresh ask plus
-slippage, and never above ``reclaim_hedge_max_price``. The main buy does
+``reclaim_hedge_retries`` inside about a second, at the fresh ask with
+no added slippage, and only while that ask is at or under
+``reclaim_hedge_max_price``. The first hedge order still pays
+``reclaim_hedge_slippage`` over the ask. The main buy does
 not wait on those refires. A hedge
 miss does not cancel the main. After the stop fires, the hedge is kept
 only if its bid stays above ``reclaim_hedge_keep_above`` for
@@ -377,7 +379,7 @@ DEFAULTS = {
     "reclaim_hedge_keep_above": 0.50,
     "reclaim_hedge_keep_persist_s": 1.0,
     "reclaim_hedge_retries": 3,
-    "reclaim_hedge_max_price": 0.20,
+    "reclaim_hedge_max_price": 0.15,
     "sell_min_bid_size": 1.0,
     # 0 skips the late-window Chainlink veto on loser scrap.
     # Floor, per-TTM, and stale are 0 so a positive window does not
@@ -775,7 +777,7 @@ def validate_strategy(cfg: dict) -> None:
         hedge_usd = float(cfg.get("reclaim_hedge_usd", 1.0))
         hedge_slip = float(cfg.get("reclaim_hedge_slippage", 0.02))
         hedge_keep = float(cfg.get("reclaim_hedge_keep_above", 0.50))
-        hedge_cap = float(cfg.get("reclaim_hedge_max_price", 0.20))
+        hedge_cap = float(cfg.get("reclaim_hedge_max_price", 0.15))
         hedge_retries = int(cfg.get("reclaim_hedge_retries", 3))
     except (TypeError, ValueError):
         raise ValueError("reclaim hedge knobs must be numeric")
@@ -3491,7 +3493,6 @@ def _reclaim_hedge_run(
     plan: dict,
     token: str,
     dry_run: bool,
-    slippage: float,
     max_price: float,
     retries: int,
     min_bid_size: float,
@@ -3500,10 +3501,11 @@ def _reclaim_hedge_run(
     """Post the hedge FAK, then refire a miss on this thread. The main buy does not wait.
 
     A zero or partial fill refetches the other book and posts the unfilled
-    shares at the fresh ask plus slippage, up to ``retries`` inside
-    ``RECLAIM_HEDGE_RETRY_BUDGET_S`` of the first post. A limit above
-    ``max_price`` stops the sequence. ``error:`` and a balance/allowance
-    reject do not refire. This thread never calls ``_io_unlocked``.
+    shares at that ask, with no slippage, up to ``retries`` inside
+    ``RECLAIM_HEDGE_RETRY_BUDGET_S`` of the first post. An ask above
+    ``max_price`` stops the sequence. The first post keeps its own limit.
+    ``error:`` and a balance/allowance reject do not refire. This thread
+    never calls ``_io_unlocked``.
     """
     started = time.time()
     try:
@@ -3545,9 +3547,7 @@ def _reclaim_hedge_run(
                 except Exception:
                     ask = None
                 remaining = max(0.0, goal - filled)
-                resized = reclaim_hedge_retry_plan(
-                    ask, slippage, remaining, max_price,
-                )
+                resized = reclaim_hedge_retry_plan(ask, remaining, max_price)
                 attempts += 1
                 log_event(
                     "reclaim_hedge_retry",
@@ -4406,16 +4406,16 @@ def _reclaim_tick(
             plan = reclaim_hedge_plan(asks_px.get(other), hedge_usd, hedge_slip)
             hedge_token = str(tokens.get(other) or "")
             try:
-                cap_raw = cfg.get("reclaim_hedge_max_price", 0.20)
-                hedge_cap = 0.20 if cap_raw is None else float(cap_raw)
+                cap_raw = cfg.get("reclaim_hedge_max_price", 0.15)
+                hedge_cap = 0.15 if cap_raw is None else float(cap_raw)
             except (TypeError, ValueError):
-                hedge_cap = 0.20
+                hedge_cap = 0.15
             if (
                 hedge_cap != hedge_cap
                 or hedge_cap in (float("inf"), float("-inf"))
                 or not (0 < hedge_cap < 1)
             ):
-                hedge_cap = 0.20
+                hedge_cap = 0.15
             try:
                 retry_raw = cfg.get("reclaim_hedge_retries", 3)
                 hedge_retries = 3 if retry_raw is None else int(retry_raw)
@@ -4423,28 +4423,7 @@ def _reclaim_tick(
                 hedge_retries = 3
             if hedge_retries < 0:
                 hedge_retries = 0
-            plan_limit = plan.get("limit")
-            try:
-                above_cap = plan_limit is not None and float(plan_limit) > hedge_cap + 1e-12
-            except (TypeError, ValueError):
-                above_cap = False
-            if above_cap:
-                intent["reclaim_hedge_buy_done"] = True
-                log_event(
-                    "reclaim_hedge_buy",
-                    condition_id=cid,
-                    slug=intent.get("slug"),
-                    leg=other,
-                    sent=False,
-                    size=plan.get("shares"),
-                    px=plan_limit,
-                    usdc=plan.get("usdc"),
-                    filled=0.0,
-                    status="above_cap",
-                    cap=hedge_cap,
-                    rounded_up=bool(plan.get("rounded_up")),
-                )
-            elif not plan.get("ok") or not hedge_token:
+            if not plan.get("ok") or not hedge_token:
                 intent["reclaim_hedge_buy_done"] = True
                 log_event(
                     "reclaim_hedge_buy",
@@ -4489,7 +4468,6 @@ def _reclaim_tick(
                 hedge_plan = plan
                 hedge_cap_box = hedge_cap
                 hedge_retries_box = hedge_retries
-                hedge_slip_box = hedge_slip
         except Exception as exc:
             hedge_plan = None
             intent["reclaim_hedge_buy_done"] = True
@@ -4514,7 +4492,6 @@ def _reclaim_tick(
                     "plan": hedge_plan,
                     "token": hedge_token,
                     "dry_run": dry_run,
-                    "slippage": hedge_slip_box,
                     "max_price": hedge_cap_box,
                     "retries": hedge_retries_box,
                     "min_bid_size": min_bid_size,

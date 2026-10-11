@@ -163,8 +163,10 @@ When on:
   reserves its outstanding USDC on top of any in-flight mint. A zero or
   partial hedge fill refires on the hedge thread only, up to
   `reclaim_hedge_retries` (default 3) inside about a second, at the fresh
-  ask plus slippage, and never above `reclaim_hedge_max_price` (default
-  0.20). The main reclaim buy does not wait on those refires.
+  ask with no added slippage, and only when that ask is at or under
+  `reclaim_hedge_max_price` (default 0.15). The first hedge order still
+  pays `reclaim_hedge_slippage` over the ask. The main reclaim buy does
+  not wait on those refires.
 - `seq_busy_bag` is checked both in `select_mint_candidate` and again in
   `_claim_mint_intent`.
 - Short pUSD (`mint_cash_block`, including `pending_reserve`) is a wait:

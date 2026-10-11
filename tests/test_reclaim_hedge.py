@@ -81,7 +81,7 @@ class CeilingTests(unittest.TestCase):
         self.assertEqual(defaults["reclaim_hedge_keep_above"], 0.50)
         self.assertEqual(defaults["reclaim_hedge_keep_persist_s"], 1.0)
         self.assertEqual(defaults["reclaim_hedge_retries"], 3)
-        self.assertEqual(defaults["reclaim_hedge_max_price"], 0.20)
+        self.assertEqual(defaults["reclaim_hedge_max_price"], 0.15)
         from buy.mint_gas import validate_mint_gas
         from buy.mint_redeem import validate_redeem
         from buy.mint_sequence import validate_seq
@@ -136,17 +136,20 @@ class HedgePlanTests(unittest.TestCase):
         self.assertTrue(reclaim_wallet_covers(100.86, 99.84, 1.02))
 
     def test_retry_plan_keeps_the_minimums_and_stops_above_the_cap(self):
-        bumped = reclaim_hedge_retry_plan(0.10, 0.02, 6.0, 0.20)
+        bumped = reclaim_hedge_retry_plan(0.10, 6.0, 0.15)
         self.assertTrue(bumped["ok"])
-        self.assertAlmostEqual(bumped["limit"], 0.12)
-        self.assertAlmostEqual(bumped["shares"], 9.0)
-        self.assertAlmostEqual(bumped["usdc"], 1.08)
+        self.assertAlmostEqual(bumped["limit"], 0.10)
+        self.assertAlmostEqual(bumped["shares"], 10.0)
+        self.assertAlmostEqual(bumped["usdc"], 1.00)
         self.assertTrue(bumped["rounded_up"])
-        capped = reclaim_hedge_retry_plan(0.19, 0.02, 6.0, 0.20)
+        at_cap = reclaim_hedge_retry_plan(0.15, 6.0, 0.15)
+        self.assertTrue(at_cap["ok"])
+        self.assertAlmostEqual(at_cap["limit"], 0.15)
+        capped = reclaim_hedge_retry_plan(0.16, 6.0, 0.15)
         self.assertFalse(capped["ok"])
         self.assertEqual(capped["reason"], "above_cap")
-        self.assertAlmostEqual(capped["limit"], 0.21)
-        self.assertEqual(reclaim_hedge_retry_plan(None, 0.02, 6.0, 0.20)["reason"], "no_ask")
+        self.assertAlmostEqual(capped["limit"], 0.16)
+        self.assertEqual(reclaim_hedge_retry_plan(None, 6.0, 0.15)["reason"], "no_ask")
         self.assertFalse(reclaim_hedge_retry_allowed(10.0, 10.2, 3, 3))
         self.assertFalse(reclaim_hedge_retry_allowed(10.0, 11.1, 0, 3, RECLAIM_HEDGE_RETRY_BUDGET_S))
         self.assertTrue(reclaim_hedge_retry_allowed(10.0, 10.2, 2, 3))
@@ -445,12 +448,12 @@ class HedgeRetryTests(unittest.TestCase):
         hedge = [row for row in loop.buys if row["token_id"] == "dn-tok"]
         self.assertEqual(len(hedge), 2)
         self.assertAlmostEqual(hedge[0]["price"], 0.09)
-        self.assertAlmostEqual(hedge[1]["price"], 0.12)
+        self.assertAlmostEqual(hedge[1]["price"], 0.10)
         self.assertAlmostEqual(hedge[1]["size"], 12.0)
         retry = loop.events_named("reclaim_hedge_retry")
         self.assertEqual(len(retry), 1)
         self.assertEqual(retry[0]["attempt"], 1)
-        self.assertAlmostEqual(retry[0]["px"], 0.12)
+        self.assertAlmostEqual(retry[0]["px"], 0.10)
         self.assertAlmostEqual(retry[0]["ask"], 0.10)
         self.assertEqual(retry[0]["filled"], 0.0)
         self.assertAlmostEqual(retry[0]["remaining"], 12.0)
@@ -486,12 +489,13 @@ class HedgeRetryTests(unittest.TestCase):
         hedge = [row for row in loop.buys if row["token_id"] == "dn-tok"]
         self.assertEqual(len(hedge), 2)
         self.assertAlmostEqual(hedge[0]["size"], 12.0)
-        self.assertAlmostEqual(hedge[1]["price"], 0.12)
-        self.assertAlmostEqual(hedge[1]["size"], 9.0)
+        self.assertAlmostEqual(hedge[0]["price"], 0.09)
+        self.assertAlmostEqual(hedge[1]["price"], 0.10)
+        self.assertAlmostEqual(hedge[1]["size"], 10.0)
         retry = loop.events_named("reclaim_hedge_retry")[-1]
         self.assertAlmostEqual(retry["filled"], 6.0)
         self.assertAlmostEqual(retry["remaining"], 6.0)
-        self.assertAlmostEqual(retry["px"], 0.12)
+        self.assertAlmostEqual(retry["px"], 0.10)
         self.assertEqual(loop.events_named("reclaim_hedge_outcome")[-1]["outcome"], "filled")
 
     def test_cap_stops_retries(self):
@@ -508,7 +512,7 @@ class HedgeRetryTests(unittest.TestCase):
             return 0.0, "no orders found to match with FAK order"
 
         def fetch_book(*args, **_kwargs):
-            return (0.18, 100.0, [], 0.19, 100.0, [], None)
+            return (0.15, 100.0, [], 0.16, 100.0, [], None)
 
         loop.ns["_fak_buy"] = fak
         loop.ns["_fetch_book"] = fetch_book
@@ -519,8 +523,8 @@ class HedgeRetryTests(unittest.TestCase):
         self.assertEqual(len(hedge), 1)
         retry = loop.events_named("reclaim_hedge_retry")
         self.assertEqual(len(retry), 1)
-        self.assertAlmostEqual(retry[0]["ask"], 0.19)
-        self.assertAlmostEqual(retry[0]["px"], 0.21)
+        self.assertAlmostEqual(retry[0]["ask"], 0.16)
+        self.assertAlmostEqual(retry[0]["px"], 0.16)
         self.assertEqual(retry[0]["status"], "above_cap")
         self.assertEqual(loop.events_named("reclaim_hedge_outcome")[-1]["outcome"], "above_cap")
         self.assertTrue(intent.get("reclaim_bought"))
