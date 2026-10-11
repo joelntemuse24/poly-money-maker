@@ -112,9 +112,9 @@ def seq_exit_open(intent: dict) -> bool:
 
     ``sell_exit_inflight`` covers the synchronous dump or stop FAK, including
     after ``reclaim_stopped`` is set but before that sell returns.
-    An open hedge buy (posted and not done, in flight, or uncertain) holds
-    the next mint even after the main reclaim is stopped. A kept hedge
-    riding to resolution does not.
+    An open hedge buy (posted and not done, in flight, retrying, or
+    uncertain) holds the next mint even after the main reclaim is stopped.
+    A kept hedge riding to resolution does not.
     While ``reclaim_stopped`` is false, an open exit is also the bought
     position, a latched stop, the entry watch (``reclaim_hot``), a posted,
     in-flight, or uncertain buy, or any ``reclaim_filled`` shares. A stopped
@@ -127,6 +127,7 @@ def seq_exit_open(intent: dict) -> bool:
         return True
     if (
         intent.get("reclaim_hedge_buy_inflight")
+        or intent.get("reclaim_hedge_retrying")
         or intent.get("reclaim_hedge_buy_uncertain")
         or (
             intent.get("reclaim_hedge_buy_posted")
