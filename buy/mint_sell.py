@@ -130,6 +130,16 @@ DEFAULT_SELL_KNOBS = {
     "reclaim_max_ttm_s": 0.0,
     # 0 leaves the close gate off. Above 0, no reclaim entry when ttm is under it.
     "reclaim_min_ttm_s": 0.0,
+    # None keeps the other-side ask ceiling at 1 - reclaim_entry.
+    "reclaim_other_max": None,
+    # Cheap-side hedge posted with the reclaim buy. Off until set true.
+    "reclaim_hedge_enabled": False,
+    "reclaim_hedge_usd": 1.0,
+    # FAK may pay this much over the other side's ask.
+    "reclaim_hedge_slippage": 0.02,
+    # After the stop fires, keep the hedge only while its bid stays above this.
+    "reclaim_hedge_keep_above": 0.50,
+    "reclaim_hedge_keep_persist_s": 1.0,
     "sell_min_bid_size": 1.0,
     # Cycle sleep while a loser persist arm is live. Does not change persist_s.
     "sell_armed_poll_s": 2.0,
@@ -1796,8 +1806,19 @@ RECLAIM_MAX_SPREAD = 0.10
 RECLAIM_BOOK_MAX_AGE_S = 5.0
 
 
-def reclaim_complement_max(entry: float) -> float:
-    """Other-side ask ceiling. 0.91 entry → 0.09."""
+def reclaim_complement_max(entry: float, other_max: Optional[float] = None) -> float:
+    """Other-side ask ceiling.
+
+    ``other_max`` (``reclaim_other_max``) replaces ``1 - entry`` when it is
+    a price in (0, 1). Null keeps the old ceiling: 0.91 entry → 0.09.
+    """
+    if other_max is not None and other_max != "":
+        try:
+            cap = float(other_max)
+        except (TypeError, ValueError):
+            cap = float("nan")
+        if math.isfinite(cap) and 0 < cap < 1:
+            return round(cap, 4)
     try:
         px = float(entry)
     except (TypeError, ValueError):
@@ -1805,6 +1826,165 @@ def reclaim_complement_max(entry: float) -> float:
     if not math.isfinite(px):
         return 0.0
     return round(max(0.0, 1.0 - px), 4)
+
+
+# Polymarket marketable buys need about $1 and at least 5 shares.
+RECLAIM_HEDGE_MIN_NOTIONAL = 1.0
+RECLAIM_HEDGE_MIN_SHARES = 5.0
+
+
+def reclaim_hedge_plan(
+    ask: Optional[float],
+    usd: float,
+    slippage: float,
+    *,
+    min_notional: float = RECLAIM_HEDGE_MIN_NOTIONAL,
+    min_shares: float = RECLAIM_HEDGE_MIN_SHARES,
+) -> dict:
+    """Size one hedge FAK on the other side. No I/O.
+
+    Limit is ``ask + slippage``. Share count is ``floor(usd / limit)``,
+    then raised to the share minimum and until the cent-truncated USDC
+    clears the notional minimum. ``rounded_up`` is true when that bump
+    happens. A bad ask returns ``ok`` false and does not invent a size.
+    """
+    empty = {
+        "ok": False,
+        "reason": "bad_ask",
+        "shares": 0.0,
+        "limit": None,
+        "usdc": 0.0,
+        "rounded_up": False,
+        "raw_shares": 0.0,
+    }
+    try:
+        ask_f = float(ask) if ask is not None else float("nan")
+        slip = float(slippage)
+        usd_f = float(usd)
+        floor_usd = float(min_notional)
+        floor_shares = float(min_shares)
+    except (TypeError, ValueError):
+        return dict(empty)
+    if (
+        not math.isfinite(ask_f)
+        or not math.isfinite(slip)
+        or not math.isfinite(usd_f)
+        or ask_f <= 0
+        or slip < 0
+        or usd_f <= 0
+    ):
+        return dict(empty)
+    limit = ask_f + slip
+    if not (0 < limit < 1):
+        out = dict(empty)
+        out["reason"] = "bad_limit"
+        out["limit"] = limit
+        return out
+    if not math.isfinite(floor_usd) or floor_usd < 0:
+        floor_usd = RECLAIM_HEDGE_MIN_NOTIONAL
+    if not math.isfinite(floor_shares) or floor_shares < 1:
+        floor_shares = RECLAIM_HEDGE_MIN_SHARES
+    raw = reclaim_share_size(usd_f, limit)
+    shares = raw
+    rounded = False
+    if shares + 1e-12 < floor_shares:
+        shares = float(math.floor(floor_shares))
+        rounded = True
+    usdc = reclaim_buy_usdc(shares, limit)
+    guard = 0
+    while usdc + 1e-9 < floor_usd and guard < 10000:
+        shares += 1.0
+        rounded = True
+        usdc = reclaim_buy_usdc(shares, limit)
+        guard += 1
+        if shares * limit >= 1.0:
+            # A one-cent bump can still truncate under the floor. Keep going
+            # until the truncated dollars clear it, or the price cannot.
+            pass
+    if usdc + 1e-9 < floor_usd or shares < 1:
+        out = dict(empty)
+        out.update(
+            reason="below_minimum",
+            shares=shares,
+            limit=limit,
+            usdc=usdc,
+            rounded_up=rounded,
+            raw_shares=raw,
+        )
+        return out
+    return {
+        "ok": True,
+        "reason": "rounded_up" if rounded else "ok",
+        "shares": float(shares),
+        "limit": float(limit),
+        "usdc": float(usdc),
+        "rounded_up": rounded,
+        "raw_shares": float(raw),
+    }
+
+
+def reclaim_wallet_covers(
+    balance: Optional[float],
+    main_usdc: float,
+    hedge_usdc: float,
+) -> bool:
+    """True when a known pUSD balance covers the main buy plus the hedge.
+
+    ``None`` means the balance was not already in memory. That does not
+    block the hedge: reading the wallet here would sit on the order path.
+    """
+    if balance is None:
+        return True
+    try:
+        bal = float(balance)
+        need = float(main_usdc) + float(hedge_usdc)
+    except (TypeError, ValueError):
+        return True
+    if not math.isfinite(bal) or not math.isfinite(need):
+        return True
+    return bal + 1e-9 >= need
+
+
+def reclaim_hedge_keep_decision(
+    *,
+    now_s: float,
+    bid: Optional[float],
+    armed_ts: Optional[float],
+    keep_above: float,
+    persist_s: float,
+) -> dict:
+    """After the stop has fired. ``keep`` only when the bid holds above.
+
+    A bid at or under ``keep_above``, or one that leaves before
+    ``persist_s``, is ``sell``. A missing bid is ``sell`` as well: the
+    keep rule is the only hold.
+    """
+    above = False
+    px: Optional[float] = None
+    try:
+        if bid is not None:
+            px = float(bid)
+            above = math.isfinite(px) and px > float(keep_above) + 1e-12
+    except (TypeError, ValueError):
+        above = False
+        px = None
+    if above:
+        fire, new_armed, why = persist_ready(
+            True, now_s=now_s, armed_ts=armed_ts, persist_s=persist_s,
+        )
+        return {
+            "action": "keep" if fire else "wait",
+            "reason": why,
+            "armed_ts": new_armed,
+            "bid": px,
+        }
+    if px is None:
+        reason = "no_bid"
+    elif armed_ts is not None:
+        reason = "not_persisting"
+    else:
+        reason = "below"
+    return {"action": "sell", "reason": reason, "armed_ts": None, "bid": px}
 
 
 def reclaim_buy_limit(
@@ -2033,14 +2213,15 @@ def reclaim_entry_qualify(
     other_book_age_s: Optional[float] = None,
     max_age_s: float = RECLAIM_BOOK_MAX_AGE_S,
     max_spread: float = RECLAIM_MAX_SPREAD,
+    other_max: Optional[float] = None,
 ) -> Tuple[bool, str, float]:
     """Gates for buying ``leg``. ``(ok, reason, shares)``.
 
     The other side confirms when its best ask is at or under
-    ``1 - entry`` (0.09 when entry is 0.91). This side's ask must clear
-    the entry. The posted limit is ``reclaim_buy_limit``, not this ask.
-    There is no ask-depth gate. An empty,
-    crossed, locked, or wide book resets; it does not keep the arm.
+    ``reclaim_complement_max`` (``1 - entry`` unless ``other_max`` is set).
+    This side's ask must clear the entry. The posted limit is
+    ``reclaim_buy_limit``, not this ask. There is no ask-depth gate. An
+    empty, crossed, locked, or wide book resets; it does not keep the arm.
     """
     if leg not in ("up", "dn"):
         return False, "bad_leg", 0.0
@@ -2062,7 +2243,7 @@ def reclaim_entry_qualify(
         return False, "bad_entry", 0.0
     if ask_f + 1e-12 >= entry_f and other_ask_f + 1e-12 >= entry_f:
         return False, "both_rich", 0.0
-    if other_ask_f > reclaim_complement_max(entry_f) + 1e-12:
+    if other_ask_f > reclaim_complement_max(entry_f, other_max) + 1e-12:
         return False, "sister_unconfirmed", 0.0
     if ask_f + 1e-12 < entry_f:
         return False, "below_entry", 0.0
@@ -2156,6 +2337,7 @@ def _reclaim_quote(
     order_shares: Optional[float],
     max_age_s: float,
     max_spread: float,
+    other_max: Optional[float] = None,
 ) -> Tuple[bool, str, float]:
     if leg == "up":
         return reclaim_entry_qualify(
@@ -2171,6 +2353,7 @@ def _reclaim_quote(
             other_book_age_s=dn_age,
             max_age_s=max_age_s,
             max_spread=max_spread,
+            other_max=other_max,
         )
     return reclaim_entry_qualify(
         leg="dn",
@@ -2185,6 +2368,7 @@ def _reclaim_quote(
         other_book_age_s=up_age,
         max_age_s=max_age_s,
         max_spread=max_spread,
+        other_max=other_max,
     )
 
 
@@ -2215,6 +2399,7 @@ def reclaim_entry_decision(
     dumped_legs: Optional[Sequence[str]] = None,
     max_age_s: float = RECLAIM_BOOK_MAX_AGE_S,
     max_spread: float = RECLAIM_MAX_SPREAD,
+    other_max: Optional[float] = None,
 ) -> dict:
     """One tick of the reclaim buy. No I/O.
 
@@ -2300,6 +2485,7 @@ def reclaim_entry_decision(
             order_shares=remainder if locked_leg == leg else None,
             max_age_s=max_age_s,
             max_spread=max_spread,
+            other_max=other_max,
         )
         if ok and _over_cap(leg):
             return False, "above_cap", 0.0
@@ -2529,6 +2715,20 @@ def sell_plan_banner(cfg: dict) -> str:
             text += f" stop<={_cents(stop)}/{stop_p:g}s"
         else:
             text += " stop off"
+        other_max = cfg.get("reclaim_other_max")
+        if other_max is not None and other_max != "":
+            try:
+                text += f" other<={_cents(other_max)}"
+            except (TypeError, ValueError):
+                pass
+        if cfg.get("reclaim_hedge_enabled"):
+            hedge_usd = cfg.get("reclaim_hedge_usd")
+            if hedge_usd is None:
+                hedge_usd = DEFAULT_SELL_KNOBS["reclaim_hedge_usd"]
+            hedge_slip = cfg.get("reclaim_hedge_slippage")
+            if hedge_slip is None:
+                hedge_slip = DEFAULT_SELL_KNOBS["reclaim_hedge_slippage"]
+            text += f" hedge ${float(hedge_usd):g} slip {_cents(hedge_slip)}"
         parts.append(text)
     else:
         parts.append("reclaim off")
