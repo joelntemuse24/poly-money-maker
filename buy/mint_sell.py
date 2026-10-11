@@ -140,6 +140,11 @@ DEFAULT_SELL_KNOBS = {
     # After the stop fires, keep the hedge only while its bid stays above this.
     "reclaim_hedge_keep_above": 0.50,
     "reclaim_hedge_keep_persist_s": 1.0,
+    # Extra FAK posts after a zero or partial hedge fill. The whole
+    # sequence, first post included, stays inside RECLAIM_HEDGE_RETRY_BUDGET_S.
+    "reclaim_hedge_retries": 3,
+    # Fresh ask + slippage above this stops the retry. Do not lift the cap.
+    "reclaim_hedge_max_price": 0.20,
     "sell_min_bid_size": 1.0,
     # Cycle sleep while a loser persist arm is live. Does not change persist_s.
     "sell_armed_poll_s": 2.0,
@@ -1831,6 +1836,8 @@ def reclaim_complement_max(entry: float, other_max: Optional[float] = None) -> f
 # Polymarket marketable buys need about $1 and at least 5 shares.
 RECLAIM_HEDGE_MIN_NOTIONAL = 1.0
 RECLAIM_HEDGE_MIN_SHARES = 5.0
+# First hedge post plus its refires. A new attempt is not started after this.
+RECLAIM_HEDGE_RETRY_BUDGET_S = 1.0
 
 
 def reclaim_hedge_plan(
@@ -1921,6 +1928,116 @@ def reclaim_hedge_plan(
         "rounded_up": rounded,
         "raw_shares": float(raw),
     }
+
+
+def reclaim_hedge_retry_plan(
+    ask: Optional[float],
+    slippage: float,
+    remaining: float,
+    max_price: float,
+    *,
+    min_notional: float = RECLAIM_HEDGE_MIN_NOTIONAL,
+    min_shares: float = RECLAIM_HEDGE_MIN_SHARES,
+) -> dict:
+    """Size one hedge refire from the shares still unfilled. No I/O.
+
+    Limit is ``ask + slippage``. Above ``max_price`` (or not a price) does
+    not post: ``reason`` is ``above_cap``. The unfilled share count is then
+    raised to the 5-share and $1 minimums, same as the first clip.
+    """
+    empty = {
+        "ok": False,
+        "reason": "no_ask",
+        "shares": 0.0,
+        "limit": None,
+        "usdc": 0.0,
+        "rounded_up": False,
+        "raw_shares": 0.0,
+    }
+    try:
+        left = float(remaining)
+    except (TypeError, ValueError):
+        left = 0.0
+    if not math.isfinite(left) or left <= 0:
+        out = dict(empty)
+        out["reason"] = "filled"
+        return out
+    try:
+        ask_f = float(ask) if ask is not None else float("nan")
+        slip = float(slippage)
+        cap = float(max_price)
+        floor_usd = float(min_notional)
+        floor_shares = float(min_shares)
+    except (TypeError, ValueError):
+        return dict(empty)
+    if not math.isfinite(ask_f) or ask_f <= 0 or not math.isfinite(slip) or slip < 0:
+        return dict(empty)
+    limit = ask_f + slip
+    if not math.isfinite(cap) or not (0 < cap < 1) or limit > cap + 1e-12 or not (0 < limit < 1):
+        out = dict(empty)
+        out["reason"] = "above_cap"
+        out["limit"] = limit if math.isfinite(limit) else None
+        out["raw_shares"] = left
+        return out
+    if not math.isfinite(floor_usd) or floor_usd < 0:
+        floor_usd = RECLAIM_HEDGE_MIN_NOTIONAL
+    if not math.isfinite(floor_shares) or floor_shares < 1:
+        floor_shares = RECLAIM_HEDGE_MIN_SHARES
+    raw = left
+    shares = left
+    rounded = False
+    if shares + 1e-12 < floor_shares:
+        shares = float(math.floor(floor_shares))
+        rounded = True
+    usdc = reclaim_buy_usdc(shares, limit)
+    guard = 0
+    while usdc + 1e-9 < floor_usd and guard < 10000:
+        shares += 1.0
+        rounded = True
+        usdc = reclaim_buy_usdc(shares, limit)
+        guard += 1
+    if usdc + 1e-9 < floor_usd or shares < 1:
+        out = dict(empty)
+        out.update(
+            reason="below_minimum",
+            shares=shares,
+            limit=limit,
+            usdc=usdc,
+            rounded_up=rounded,
+            raw_shares=raw,
+        )
+        return out
+    return {
+        "ok": True,
+        "reason": "rounded_up" if rounded else "ok",
+        "shares": float(shares),
+        "limit": float(limit),
+        "usdc": float(usdc),
+        "rounded_up": rounded,
+        "raw_shares": float(raw),
+    }
+
+
+def reclaim_hedge_retry_allowed(
+    started_s: float,
+    now_s: float,
+    attempt: int,
+    retries: int,
+    budget_s: float = RECLAIM_HEDGE_RETRY_BUDGET_S,
+) -> bool:
+    """True when another hedge refire may start.
+
+    ``attempt`` is how many refires have already been sent. ``retries`` is
+    the cap. ``budget_s`` is measured from the first post, not from each miss.
+    """
+    try:
+        if int(attempt) >= int(retries):
+            return False
+        if float(now_s) > float(started_s) + float(budget_s) + 1e-9:
+            return False
+    except (TypeError, ValueError):
+        return False
+    return True
 
 
 def reclaim_wallet_covers(

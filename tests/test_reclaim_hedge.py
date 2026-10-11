@@ -9,11 +9,14 @@ from types import SimpleNamespace
 
 from buy.mint_loops import reclaim_hedge_cash_reserve
 from buy.mint_sell import (
+    RECLAIM_HEDGE_RETRY_BUDGET_S,
     reclaim_complement_max,
     reclaim_entry_decision,
     reclaim_entry_qualify,
     reclaim_hedge_keep_decision,
     reclaim_hedge_plan,
+    reclaim_hedge_retry_allowed,
+    reclaim_hedge_retry_plan,
     reclaim_wallet_covers,
 )
 from buy.mint_sequence import seq_busy_bag, seq_exit_open
@@ -77,6 +80,8 @@ class CeilingTests(unittest.TestCase):
         self.assertEqual(defaults["reclaim_hedge_slippage"], 0.02)
         self.assertEqual(defaults["reclaim_hedge_keep_above"], 0.50)
         self.assertEqual(defaults["reclaim_hedge_keep_persist_s"], 1.0)
+        self.assertEqual(defaults["reclaim_hedge_retries"], 3)
+        self.assertEqual(defaults["reclaim_hedge_max_price"], 0.20)
         from buy.mint_gas import validate_mint_gas
         from buy.mint_redeem import validate_redeem
         from buy.mint_sequence import validate_seq
@@ -96,6 +101,12 @@ class CeilingTests(unittest.TestCase):
             validate(dict(defaults, reclaim_other_max=0))
         with self.assertRaises(ValueError):
             validate(dict(defaults, reclaim_hedge_usd=0))
+        with self.assertRaises(ValueError):
+            validate(dict(defaults, reclaim_hedge_retries=-1))
+        with self.assertRaises(ValueError):
+            validate(dict(defaults, reclaim_hedge_max_price=0))
+        with self.assertRaises(ValueError):
+            validate(dict(defaults, reclaim_hedge_max_price=1))
 
 
 class HedgePlanTests(unittest.TestCase):
@@ -124,6 +135,32 @@ class HedgePlanTests(unittest.TestCase):
         self.assertFalse(reclaim_wallet_covers(100.0, 99.84, 1.02))
         self.assertTrue(reclaim_wallet_covers(100.86, 99.84, 1.02))
 
+    def test_retry_plan_keeps_the_minimums_and_stops_above_the_cap(self):
+        bumped = reclaim_hedge_retry_plan(0.10, 0.02, 6.0, 0.20)
+        self.assertTrue(bumped["ok"])
+        self.assertAlmostEqual(bumped["limit"], 0.12)
+        self.assertAlmostEqual(bumped["shares"], 9.0)
+        self.assertAlmostEqual(bumped["usdc"], 1.08)
+        self.assertTrue(bumped["rounded_up"])
+        capped = reclaim_hedge_retry_plan(0.19, 0.02, 6.0, 0.20)
+        self.assertFalse(capped["ok"])
+        self.assertEqual(capped["reason"], "above_cap")
+        self.assertAlmostEqual(capped["limit"], 0.21)
+        self.assertEqual(reclaim_hedge_retry_plan(None, 0.02, 6.0, 0.20)["reason"], "no_ask")
+        self.assertFalse(reclaim_hedge_retry_allowed(10.0, 10.2, 3, 3))
+        self.assertFalse(reclaim_hedge_retry_allowed(10.0, 11.1, 0, 3, RECLAIM_HEDGE_RETRY_BUDGET_S))
+        self.assertTrue(reclaim_hedge_retry_allowed(10.0, 10.2, 2, 3))
+
+
+def _wait_hedge(intent, loop, event="reclaim_hedge_buy", timeout=2.0):
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        flagged = intent.get("reclaim_hedge_buy_done") or intent.get("reclaim_hedge_buy_uncertain")
+        if flagged and loop.events_named(event):
+            return
+        time.sleep(0.005)
+    raise AssertionError(f"hedge did not finish: {intent.get('reclaim_hedge_buy_done')}")
+
 
 class HedgeLoopTests(unittest.TestCase):
     def _buy(self, loop, intent, cfg):
@@ -131,6 +168,7 @@ class HedgeLoopTests(unittest.TestCase):
         _arm_entry(intent, now)
         loop.book = _qualifying()
         loop.tick(cfg, intent)
+        _wait_hedge(intent, loop)
         return now
 
     def test_hedge_posts_concurrently_with_the_main(self):
@@ -321,6 +359,7 @@ class HedgeDeferTests(unittest.TestCase):
             {"reclaim_hedge_buy_inflight": True},
             {"reclaim_hedge_buy_uncertain": True},
             {"reclaim_hedge_buy_posted": True, "reclaim_hedge_buy_done": False},
+            {"reclaim_hedge_retrying": True, "reclaim_hedge_buy_inflight": True},
         ):
             bag = _prev_bag(**cashed, reclaim_stopped=True, **extra)
             self.assertTrue(seq_exit_open(bag), extra)
@@ -368,6 +407,183 @@ class HedgeDeferTests(unittest.TestCase):
         clear = {"intents": {"0x1": done}}
         h2 = MintHarness(_cfg(), clear, [_market(S, 2)], balance=200.0)
         self.assertEqual(h2.tick(S + 1.0), "submitted")
+
+
+class HedgeRetryTests(unittest.TestCase):
+    def _arm(self, loop, intent, cfg):
+        _arm_entry(intent, loop.clock["now"])
+        loop.book = _qualifying()
+        loop.ns["remember_persisted_state"]({"intents": {"cid-reclaim": intent}})
+        loop.ns["_manage_sells_locked"](cfg, {"intents": {"cid-reclaim": intent}}, object())
+
+    def test_miss_then_fill_on_retry(self):
+        loop = _Loop()
+        intent = _dumped(loop.clock["now"] + 200.0)
+        posts = {"n": 0}
+        real = loop.ns["_fak_buy"]
+
+        def fak(token, shares, price, dry_run, capture=None):
+            if token != "dn-tok":
+                return real(token, shares, price, dry_run, capture)
+            posts["n"] += 1
+            loop.buys.append(
+                {"token_id": token, "size": float(shares), "price": float(price), "dry_run": dry_run}
+            )
+            if posts["n"] == 1:
+                return 0.0, "reject:400:no orders found to match with FAK order"
+            return float(shares), "matched"
+
+        def fetch_book(*args, **_kwargs):
+            loop.fetches.append(args)
+            return (0.09, 100.0, [], 0.10, 100.0, [], None)
+
+        loop.ns["_fak_buy"] = fak
+        loop.ns["_fetch_book"] = fetch_book
+        cfg = _reclaim_cfg(reclaim_hedge_enabled=True, reclaim_hedge_usd=1.0)
+        self._arm(loop, intent, cfg)
+        _wait_hedge(intent, loop, "reclaim_hedge_outcome")
+        hedge = [row for row in loop.buys if row["token_id"] == "dn-tok"]
+        self.assertEqual(len(hedge), 2)
+        self.assertAlmostEqual(hedge[0]["price"], 0.09)
+        self.assertAlmostEqual(hedge[1]["price"], 0.12)
+        self.assertAlmostEqual(hedge[1]["size"], 12.0)
+        retry = loop.events_named("reclaim_hedge_retry")
+        self.assertEqual(len(retry), 1)
+        self.assertEqual(retry[0]["attempt"], 1)
+        self.assertAlmostEqual(retry[0]["px"], 0.12)
+        self.assertAlmostEqual(retry[0]["ask"], 0.10)
+        self.assertEqual(retry[0]["filled"], 0.0)
+        self.assertAlmostEqual(retry[0]["remaining"], 12.0)
+        self.assertEqual(loop.events_named("reclaim_hedge_outcome")[-1]["outcome"], "filled")
+        self.assertTrue(intent.get("reclaim_bought"))
+        self.assertTrue(intent.get("reclaim_hedge_buy_done"))
+
+    def test_partial_then_fill_rounds_the_remainder(self):
+        loop = _Loop()
+        intent = _dumped(loop.clock["now"] + 200.0)
+        posts = {"n": 0}
+        real = loop.ns["_fak_buy"]
+
+        def fak(token, shares, price, dry_run, capture=None):
+            if token != "dn-tok":
+                return real(token, shares, price, dry_run, capture)
+            posts["n"] += 1
+            loop.buys.append(
+                {"token_id": token, "size": float(shares), "price": float(price), "dry_run": dry_run}
+            )
+            if posts["n"] == 1:
+                return float(shares) / 2.0, "matched"
+            return float(shares), "matched"
+
+        def fetch_book(*args, **_kwargs):
+            return (0.09, 100.0, [], 0.10, 100.0, [], None)
+
+        loop.ns["_fak_buy"] = fak
+        loop.ns["_fetch_book"] = fetch_book
+        cfg = _reclaim_cfg(reclaim_hedge_enabled=True, reclaim_hedge_usd=1.0)
+        self._arm(loop, intent, cfg)
+        _wait_hedge(intent, loop, "reclaim_hedge_outcome")
+        hedge = [row for row in loop.buys if row["token_id"] == "dn-tok"]
+        self.assertEqual(len(hedge), 2)
+        self.assertAlmostEqual(hedge[0]["size"], 12.0)
+        self.assertAlmostEqual(hedge[1]["price"], 0.12)
+        self.assertAlmostEqual(hedge[1]["size"], 9.0)
+        retry = loop.events_named("reclaim_hedge_retry")[-1]
+        self.assertAlmostEqual(retry["filled"], 6.0)
+        self.assertAlmostEqual(retry["remaining"], 6.0)
+        self.assertAlmostEqual(retry["px"], 0.12)
+        self.assertEqual(loop.events_named("reclaim_hedge_outcome")[-1]["outcome"], "filled")
+
+    def test_cap_stops_retries(self):
+        loop = _Loop()
+        intent = _dumped(loop.clock["now"] + 200.0)
+        real = loop.ns["_fak_buy"]
+
+        def fak(token, shares, price, dry_run, capture=None):
+            if token != "dn-tok":
+                return real(token, shares, price, dry_run, capture)
+            loop.buys.append(
+                {"token_id": token, "size": float(shares), "price": float(price), "dry_run": dry_run}
+            )
+            return 0.0, "no orders found to match with FAK order"
+
+        def fetch_book(*args, **_kwargs):
+            return (0.18, 100.0, [], 0.19, 100.0, [], None)
+
+        loop.ns["_fak_buy"] = fak
+        loop.ns["_fetch_book"] = fetch_book
+        cfg = _reclaim_cfg(reclaim_hedge_enabled=True)
+        self._arm(loop, intent, cfg)
+        _wait_hedge(intent, loop, "reclaim_hedge_outcome")
+        hedge = [row for row in loop.buys if row["token_id"] == "dn-tok"]
+        self.assertEqual(len(hedge), 1)
+        retry = loop.events_named("reclaim_hedge_retry")
+        self.assertEqual(len(retry), 1)
+        self.assertAlmostEqual(retry[0]["ask"], 0.19)
+        self.assertAlmostEqual(retry[0]["px"], 0.21)
+        self.assertEqual(retry[0]["status"], "above_cap")
+        self.assertEqual(loop.events_named("reclaim_hedge_outcome")[-1]["outcome"], "above_cap")
+        self.assertTrue(intent.get("reclaim_bought"))
+
+    def test_retries_do_not_delay_the_main_buy(self):
+        loop = _Loop()
+        intent = _dumped(loop.clock["now"] + 200.0)
+        real = loop.ns["_fak_buy"]
+        entered = threading.Event()
+        release = threading.Event()
+
+        def fak(token, shares, price, dry_run, capture=None):
+            if token == "up-tok":
+                time.sleep(0.05)
+                return real(token, shares, price, dry_run, capture)
+            loop.buys.append(
+                {"token_id": token, "size": float(shares), "price": float(price), "dry_run": dry_run}
+            )
+            if not entered.is_set() and len([row for row in loop.buys if row["token_id"] == "dn-tok"]) == 1:
+                return 0.0, "no orders found to match with FAK order"
+            entered.set()
+            release.wait(2.0)
+            return float(shares), "matched"
+
+        def fetch_book(*args, **_kwargs):
+            return (0.09, 100.0, [], 0.10, 100.0, [], None)
+
+        loop.ns["_fak_buy"] = fak
+        loop.ns["_fetch_book"] = fetch_book
+        cfg = _reclaim_cfg(reclaim_hedge_enabled=True)
+        _arm_entry(intent, loop.clock["now"])
+        loop.book = _qualifying()
+        started = time.time()
+        loop.tick(cfg, intent)
+        elapsed = time.time() - started
+        self.assertLess(elapsed, 0.25)
+        self.assertTrue(entered.is_set())
+        self.assertTrue(intent.get("reclaim_bought"))
+        self.assertFalse(intent.get("reclaim_hedge_buy_done"))
+        self.assertTrue(
+            intent.get("reclaim_hedge_retrying") or intent.get("reclaim_hedge_buy_inflight")
+        )
+        self.assertTrue(seq_exit_open(intent))
+        self.assertGreater(reclaim_hedge_cash_reserve({"intents": {"cid-reclaim": intent}}), 0.0)
+        open_bag = _prev_bag(
+            reclaim_stopped=True,
+            sold_loser=True,
+            sold_dump=True,
+            sold_winner=True,
+            reclaim_hedge_retrying=True,
+            reclaim_hedge_buy_inflight=True,
+            reclaim_hedge_usdc=intent.get("reclaim_hedge_usdc"),
+        )
+        self.assertTrue(seq_exit_open(open_bag))
+        h = MintHarness(_cfg(), {"intents": {"0x1": open_bag}}, [_market(S, 2)], balance=200.0)
+        self.assertEqual(h.tick(S - 30.0), "seq_wait_prev")
+        self.assertEqual(h.submits, [])
+        closed = dict(open_bag)
+        closed["end_ts"] = S - 10.0
+        self.assertIsNone(seq_busy_bag({"intents": {"0x1": closed}}, S, ACTIVE))
+        release.set()
+        _wait_hedge(intent, loop, "reclaim_hedge_outcome")
+        self.assertEqual(loop.events_named("reclaim_hedge_outcome")[-1]["outcome"], "filled")
 
 
 if __name__ == "__main__":

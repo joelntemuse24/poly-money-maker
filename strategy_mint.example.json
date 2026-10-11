@@ -100,6 +100,8 @@
   "reclaim_hedge_slippage": 0.02,
   "reclaim_hedge_keep_above": 0.50,
   "reclaim_hedge_keep_persist_s": 1.0,
+  "reclaim_hedge_retries": 3,
+  "reclaim_hedge_max_price": 0.20,
   "sell_late_window_s": 0.0,
   "sell_oracle_edge_per_ttm": 0.0,
   "sell_oracle_edge_persist_s": 3.0,

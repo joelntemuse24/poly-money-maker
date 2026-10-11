@@ -333,9 +333,11 @@ def pending_mint_reserve(state: Any) -> float:
 def reclaim_hedge_cash_reserve(state: Any) -> float:
     """pUSD still promised to an open reclaim hedge buy.
 
-    The live balance does not drop until that FAK lands. A finished hedge
-    (filled, rejected, or skipped) is not reserved: the spent dollars are
-    already out of the balance, and a kept hedge is tokens, not cash.
+    The live balance does not drop until that FAK lands. A refire still
+    in flight reserves the outstanding clip (`reclaim_hedge_usdc`). A
+    finished hedge (filled, rejected, or skipped) is not reserved: the
+    spent dollars are already out of the balance, and a kept hedge is
+    tokens, not cash.
     """
     if not isinstance(state, dict):
         return 0.0
@@ -348,6 +350,7 @@ def reclaim_hedge_cash_reserve(state: Any) -> float:
             continue
         open_buy = (
             intent.get("reclaim_hedge_buy_inflight")
+            or intent.get("reclaim_hedge_retrying")
             or intent.get("reclaim_hedge_buy_uncertain")
             or intent.get("reclaim_hedge_buy_posted")
         )

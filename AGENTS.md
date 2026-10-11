@@ -154,12 +154,17 @@ When on:
   flight, or, until `reclaim_stopped`, the entry watch (`reclaim_hot`),
   a posted, in-flight, or uncertain reclaim buy, any `reclaim_filled`
   shares, a bought position, or a latched stop. An open hedge buy
-  (posted and not done, in flight, or uncertain) also blocks, including
-  after the main stop. A kept hedge riding to resolution does not. A
+  (posted and not done, in flight, retrying, or uncertain) also blocks,
+  including after the main stop and while a hedge refire is still
+  running. A kept hedge riding to resolution does not. A
   stopped reclaim whose stop sell has finished and whose hedge buy is
   done no longer blocks. A bag whose window has ended no longer blocks.
-  While that hedge buy is open, the mint cash check reserves its USDC
-  on top of any in-flight mint.
+  While that hedge buy is open, including a refire, the mint cash check
+  reserves its outstanding USDC on top of any in-flight mint. A zero or
+  partial hedge fill refires on the hedge thread only, up to
+  `reclaim_hedge_retries` (default 3) inside about a second, at the fresh
+  ask plus slippage, and never above `reclaim_hedge_max_price` (default
+  0.20). The main reclaim buy does not wait on those refires.
 - `seq_busy_bag` is checked both in `select_mint_candidate` and again in
   `_claim_mint_intent`.
 - Short pUSD (`mint_cash_block`, including `pending_reserve`) is a wait:

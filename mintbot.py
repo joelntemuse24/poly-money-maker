@@ -57,7 +57,11 @@ book, spread, and ask at or under the cap). A failed check does not send
 and starts the persist hold again. ``reclaim_min_ttm_s`` (default 0, off)
 skips entry with ``too_close`` when seconds-to-close is under it. When
 ``reclaim_hedge_enabled`` is on, the other side is FAK-bought in the same
-moment as the main buy (a parallel post, not after the fill). A hedge
+moment as the main buy (a parallel post, not after the fill). A zero
+or partial hedge fill refires on that same thread, up to
+``reclaim_hedge_retries`` inside about a second, at the fresh ask plus
+slippage, and never above ``reclaim_hedge_max_price``. The main buy does
+not wait on those refires. A hedge
 miss does not cancel the main. After the stop fires, the hedge is kept
 only if its bid stays above ``reclaim_hedge_keep_above`` for
 ``reclaim_hedge_keep_persist_s``; otherwise it uses the dump FAK refire.
@@ -184,6 +188,9 @@ from buy.mint_sell import (
     reclaim_fak_status,
     reclaim_hedge_keep_decision,
     reclaim_hedge_plan,
+    reclaim_hedge_retry_allowed,
+    reclaim_hedge_retry_plan,
+    RECLAIM_HEDGE_RETRY_BUDGET_S,
     reclaim_stop_decision,
     reclaim_wallet_covers,
     recorded_fill_px,
@@ -369,6 +376,8 @@ DEFAULTS = {
     "reclaim_hedge_slippage": 0.02,
     "reclaim_hedge_keep_above": 0.50,
     "reclaim_hedge_keep_persist_s": 1.0,
+    "reclaim_hedge_retries": 3,
+    "reclaim_hedge_max_price": 0.20,
     "sell_min_bid_size": 1.0,
     # 0 skips the late-window Chainlink veto on loser scrap.
     # Floor, per-TTM, and stale are 0 so a positive window does not
@@ -766,6 +775,8 @@ def validate_strategy(cfg: dict) -> None:
         hedge_usd = float(cfg.get("reclaim_hedge_usd", 1.0))
         hedge_slip = float(cfg.get("reclaim_hedge_slippage", 0.02))
         hedge_keep = float(cfg.get("reclaim_hedge_keep_above", 0.50))
+        hedge_cap = float(cfg.get("reclaim_hedge_max_price", 0.20))
+        hedge_retries = int(cfg.get("reclaim_hedge_retries", 3))
     except (TypeError, ValueError):
         raise ValueError("reclaim hedge knobs must be numeric")
     if hedge_usd != hedge_usd or hedge_usd <= 0 or hedge_usd == float("inf"):
@@ -778,6 +789,14 @@ def validate_strategy(cfg: dict) -> None:
         or not (0 < hedge_keep < 1)
     ):
         raise ValueError("0 < reclaim_hedge_keep_above < 1 must hold")
+    if (
+        hedge_cap != hedge_cap
+        or hedge_cap in (float("inf"), float("-inf"))
+        or not (0 < hedge_cap < 1)
+    ):
+        raise ValueError("0 < reclaim_hedge_max_price < 1 must hold")
+    if hedge_retries < 0:
+        raise ValueError("reclaim_hedge_retries must be >= 0")
 
 def eligible_markets(markets: List[MintMarket], cfg: dict, now: float) -> List[MintMarket]:
     """Only markets that have not opened yet, starting within the configured window.
@@ -3465,6 +3484,182 @@ def _cached_pusd(chain: Any) -> Optional[float]:
     return bal
 
 
+def _reclaim_hedge_run(
+    *,
+    intent: dict,
+    cid: str,
+    plan: dict,
+    token: str,
+    dry_run: bool,
+    slippage: float,
+    max_price: float,
+    retries: int,
+    min_bid_size: float,
+    tol: float,
+) -> None:
+    """Post the hedge FAK, then refire a miss on this thread. The main buy does not wait.
+
+    A zero or partial fill refetches the other book and posts the unfilled
+    shares at the fresh ask plus slippage, up to ``retries`` inside
+    ``RECLAIM_HEDGE_RETRY_BUDGET_S`` of the first post. A limit above
+    ``max_price`` stops the sequence. ``error:`` and a balance/allowance
+    reject do not refire. This thread never calls ``_io_unlocked``.
+    """
+    started = time.time()
+    try:
+        goal = float(plan.get("shares") or 0.0)
+    except (TypeError, ValueError):
+        goal = 0.0
+    filled = 0.0
+    status_s = "error:missing"
+    outcome = "miss"
+    attempts = 0
+    last_limit = plan.get("limit")
+    last_usdc = plan.get("usdc")
+    tol_f = float(tol or 0.0)
+    try:
+        try:
+            bought, status_s = _fak_buy(token, goal, float(plan["limit"]), dry_run)
+            filled = float(bought or 0.0)
+        except Exception as exc:
+            filled = 0.0
+            status_s = f"error:{str(exc)[:120]}"
+        status_s = str(status_s or "")
+        if dry_run or status_s == "dry":
+            outcome = "filled"
+        elif status_s.startswith("error"):
+            outcome = "uncertain"
+        elif is_balance_allowance_reject(status_s):
+            outcome = "reject"
+        else:
+            while filled + tol_f < goal and reclaim_hedge_retry_allowed(
+                started, time.time(), attempts, int(retries),
+            ):
+                with STATE_LOCK:
+                    intent["reclaim_hedge_retrying"] = True
+                ask = None
+                try:
+                    _bid, _bsz, _bids, ask, _asz, _asks, _age = _book_quote(
+                        _fetch_book(token, min_bid_size)
+                    )
+                except Exception:
+                    ask = None
+                remaining = max(0.0, goal - filled)
+                resized = reclaim_hedge_retry_plan(
+                    ask, slippage, remaining, max_price,
+                )
+                attempts += 1
+                log_event(
+                    "reclaim_hedge_retry",
+                    condition_id=cid,
+                    slug=intent.get("slug"),
+                    leg=intent.get("reclaim_hedge_leg"),
+                    attempt=attempts,
+                    px=resized.get("limit"),
+                    ask=ask,
+                    filled=filled,
+                    remaining=remaining,
+                    status=str(resized.get("reason") or ""),
+                    shares=resized.get("shares"),
+                    usdc=resized.get("usdc"),
+                )
+                reason = str(resized.get("reason") or "")
+                if not resized.get("ok"):
+                    if reason == "above_cap":
+                        outcome = "above_cap"
+                        break
+                    if reason == "no_ask":
+                        outcome = "no_ask"
+                        continue
+                    outcome = reason or "skip"
+                    break
+                goal = filled + float(resized["shares"])
+                last_limit = resized.get("limit")
+                last_usdc = resized.get("usdc")
+                with STATE_LOCK:
+                    intent["reclaim_hedge_usdc"] = last_usdc
+                    intent["reclaim_hedge_target"] = goal
+                    intent["reclaim_hedge_limit"] = last_limit
+                    intent["reclaim_hedge_retrying"] = True
+                if time.time() > started + float(RECLAIM_HEDGE_RETRY_BUDGET_S) + 1e-9:
+                    outcome = "budget"
+                    break
+                try:
+                    bought, status_s = _fak_buy(
+                        token, float(resized["shares"]), float(resized["limit"]), dry_run,
+                    )
+                    filled += float(bought or 0.0)
+                except Exception as exc:
+                    status_s = f"error:{str(exc)[:120]}"
+                status_s = str(status_s or "")
+                if status_s.startswith("error"):
+                    outcome = "uncertain"
+                    break
+                if is_balance_allowance_reject(status_s):
+                    outcome = "reject"
+                    break
+            if filled + tol_f >= goal:
+                outcome = "filled"
+            elif outcome in ("above_cap", "budget", "uncertain", "reject"):
+                pass
+            elif outcome == "no_ask" and filled <= tol_f:
+                pass
+            elif time.time() > started + float(RECLAIM_HEDGE_RETRY_BUDGET_S) + 1e-9:
+                outcome = "budget"
+            else:
+                outcome = "miss" if filled <= tol_f else "partial"
+        noted = dict(plan)
+        noted["shares"] = goal
+        noted["limit"] = last_limit
+        noted["usdc"] = last_usdc
+        with STATE_LOCK:
+            intent["reclaim_hedge_retrying"] = False
+            if filled > 0 and status_s.startswith("error"):
+                intent["reclaim_hedge_filled"] = filled
+            _reclaim_note_hedge(
+                intent, cid, noted, (filled, status_s), dry_run=dry_run,
+            )
+        log_event(
+            "reclaim_hedge_outcome",
+            condition_id=cid,
+            slug=intent.get("slug"),
+            leg=intent.get("reclaim_hedge_leg"),
+            outcome=outcome,
+            attempt=attempts,
+            px=last_limit,
+            filled=intent.get("reclaim_hedge_filled"),
+            remaining=max(0.0, goal - filled),
+            status=status_s,
+        )
+    except Exception as exc:
+        with STATE_LOCK:
+            intent["reclaim_hedge_retrying"] = False
+            intent["reclaim_hedge_buy_inflight"] = False
+            intent["reclaim_hedge_buy_uncertain"] = False
+            intent["reclaim_hedge_buy_done"] = True
+        log_event(
+            "reclaim_hedge_buy",
+            condition_id=cid,
+            slug=intent.get("slug"),
+            leg=intent.get("reclaim_hedge_leg"),
+            sent=True,
+            size=plan.get("shares"),
+            px=plan.get("limit"),
+            filled=filled,
+            status=f"error:{str(exc)[:120]}",
+        )
+        log_event(
+            "reclaim_hedge_outcome",
+            condition_id=cid,
+            slug=intent.get("slug"),
+            leg=intent.get("reclaim_hedge_leg"),
+            outcome="error",
+            attempt=attempts,
+            filled=filled,
+            status=f"error:{str(exc)[:120]}",
+        )
+
+
 def _reclaim_note_hedge(
     intent: dict,
     cid: str,
@@ -3589,7 +3784,11 @@ def _reclaim_recover_hedge(
 
 def _reclaim_hedge_watching(intent: dict) -> bool:
     """True while the hedge buy is open or the post-stop decision is not done."""
-    if intent.get("reclaim_hedge_buy_inflight") or intent.get("reclaim_hedge_buy_uncertain"):
+    if (
+        intent.get("reclaim_hedge_buy_inflight")
+        or intent.get("reclaim_hedge_retrying")
+        or intent.get("reclaim_hedge_buy_uncertain")
+    ):
         return True
     if intent.get("reclaim_hedge_kept") or intent.get("reclaim_hedge_sold"):
         return False
@@ -3626,7 +3825,11 @@ def _reclaim_hedge_after_stop(
             return
         if not (intent.get("reclaim_stop_latched") or intent.get("reclaim_stopped")):
             return
-        if intent.get("reclaim_hedge_buy_inflight") or intent.get("reclaim_hedge_buy_uncertain"):
+        if (
+            intent.get("reclaim_hedge_buy_inflight")
+            or intent.get("reclaim_hedge_retrying")
+            or intent.get("reclaim_hedge_buy_uncertain")
+        ):
             intent["reclaim_hot"] = True
             return
         try:
@@ -4202,7 +4405,46 @@ def _reclaim_tick(
             hedge_usd = 1.0 if usd_raw is None else float(usd_raw)
             plan = reclaim_hedge_plan(asks_px.get(other), hedge_usd, hedge_slip)
             hedge_token = str(tokens.get(other) or "")
-            if not plan.get("ok") or not hedge_token:
+            try:
+                cap_raw = cfg.get("reclaim_hedge_max_price", 0.20)
+                hedge_cap = 0.20 if cap_raw is None else float(cap_raw)
+            except (TypeError, ValueError):
+                hedge_cap = 0.20
+            if (
+                hedge_cap != hedge_cap
+                or hedge_cap in (float("inf"), float("-inf"))
+                or not (0 < hedge_cap < 1)
+            ):
+                hedge_cap = 0.20
+            try:
+                retry_raw = cfg.get("reclaim_hedge_retries", 3)
+                hedge_retries = 3 if retry_raw is None else int(retry_raw)
+            except (TypeError, ValueError):
+                hedge_retries = 3
+            if hedge_retries < 0:
+                hedge_retries = 0
+            plan_limit = plan.get("limit")
+            try:
+                above_cap = plan_limit is not None and float(plan_limit) > hedge_cap + 1e-12
+            except (TypeError, ValueError):
+                above_cap = False
+            if above_cap:
+                intent["reclaim_hedge_buy_done"] = True
+                log_event(
+                    "reclaim_hedge_buy",
+                    condition_id=cid,
+                    slug=intent.get("slug"),
+                    leg=other,
+                    sent=False,
+                    size=plan.get("shares"),
+                    px=plan_limit,
+                    usdc=plan.get("usdc"),
+                    filled=0.0,
+                    status="above_cap",
+                    cap=hedge_cap,
+                    rounded_up=bool(plan.get("rounded_up")),
+                )
+            elif not plan.get("ok") or not hedge_token:
                 intent["reclaim_hedge_buy_done"] = True
                 log_event(
                     "reclaim_hedge_buy",
@@ -4245,6 +4487,9 @@ def _reclaim_tick(
                 intent["reclaim_hedge_buy_inflight"] = True
                 intent["reclaim_hedge_buy_done"] = False
                 hedge_plan = plan
+                hedge_cap_box = hedge_cap
+                hedge_retries_box = hedge_retries
+                hedge_slip_box = hedge_slip
         except Exception as exc:
             hedge_plan = None
             intent["reclaim_hedge_buy_done"] = True
@@ -4259,47 +4504,28 @@ def _reclaim_tick(
                 status=f"error:{str(exc)[:120]}",
             )
     captured: list = []
-    hedge_box: dict = {}
     with _io_unlocked():
-        hedge_thread = None
         if hedge_plan is not None:
-            def _post_hedge(
-                tok: str = hedge_token,
-                sh: float = float(hedge_plan["shares"]),
-                px: float = float(hedge_plan["limit"]),
-            ) -> None:
-                try:
-                    hedge_box["result"] = _fak_buy(tok, sh, px, dry_run)
-                except Exception as exc:
-                    hedge_box["result"] = (0.0, f"error:{str(exc)[:120]}")
-
-            hedge_thread = threading.Thread(
-                target=_post_hedge, name="reclaim-hedge", daemon=True,
-            )
-            hedge_thread.start()
+            threading.Thread(
+                target=_reclaim_hedge_run,
+                kwargs={
+                    "intent": intent,
+                    "cid": cid,
+                    "plan": hedge_plan,
+                    "token": hedge_token,
+                    "dry_run": dry_run,
+                    "slippage": hedge_slip_box,
+                    "max_price": hedge_cap_box,
+                    "retries": hedge_retries_box,
+                    "min_bid_size": min_bid_size,
+                    "tol": tol,
+                },
+                name="reclaim-hedge",
+                daemon=True,
+            ).start()
         bought, status = _fak_buy(
             str(token), shares, float(limit), dry_run, capture=captured,
         )
-        if hedge_thread is not None:
-            hedge_thread.join()
-    if hedge_plan is not None:
-        try:
-            _reclaim_note_hedge(
-                intent, cid, hedge_plan, hedge_box.get("result"), dry_run=dry_run,
-            )
-        except Exception as exc:
-            intent["reclaim_hedge_buy_inflight"] = False
-            log_event(
-                "reclaim_hedge_buy",
-                condition_id=cid,
-                slug=intent.get("slug"),
-                leg=other,
-                sent=True,
-                size=hedge_plan.get("shares"),
-                px=hedge_plan.get("limit"),
-                filled=0.0,
-                status=f"error:{str(exc)[:120]}",
-            )
     status_s = str(status or "")
     post_fields = {
         "condition_id": cid,
