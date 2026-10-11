@@ -45,7 +45,8 @@ defaults until the operator edits them.
 Opt-in reclaim (``reclaim_enabled``, default false): after a both-sides
 dump, buy about ``reclaim_usd`` of the first side whose book holds at
 ``reclaim_entry`` for ``reclaim_entry_persist_s``. The other side confirms
-when its best ask is at or under ``1 - reclaim_entry``. There is no
+when its best ask is at or under ``reclaim_other_max`` or, when that is
+null, ``1 - reclaim_entry``. There is no
 ask-depth gate. The FAK is a market buy at
 ``min(ask + reclaim_slippage, reclaim_max_price)`` (default 3¢ over the
 ask, hard cap 96¢), sized off that limit, with USDC truncated to cents.
@@ -54,7 +55,13 @@ A top-up whose ask is already above the cap logs
 retry, re-checks that tick's books (entry, sister ask, fresh uncrossed
 book, spread, and ask at or under the cap). A failed check does not send
 and starts the persist hold again. ``reclaim_min_ttm_s`` (default 0, off)
-skips entry with ``too_close`` when seconds-to-close is under it. Stop-sell
+skips entry with ``too_close`` when seconds-to-close is under it. When
+``reclaim_hedge_enabled`` is on, the other side is FAK-bought in the same
+moment as the main buy (a parallel post, not after the fill). A hedge
+miss does not cancel the main. After the stop fires, the hedge is kept
+only if its bid stays above ``reclaim_hedge_keep_above`` for
+``reclaim_hedge_keep_persist_s``; otherwise it uses the dump FAK refire.
+No stop, or a kept hedge, rides to resolution. Stop-sell
 at ``reclaim_stop`` (default on) or hold to redeem. A missing or stale bid
 does not clear the stop clock. Each dump or stop refire refetches that
 leg and sells at the live bid. While the reclaim is open, or a dump or
@@ -132,6 +139,7 @@ from buy.mint_loops import (
     mint_cash_block,
     chain_reconcile_action,
     pending_mint_reserve,
+    reclaim_hedge_cash_reserve,
     persist_digest,
     run_job_loop,
     select_mint_candidate,
@@ -174,7 +182,10 @@ from buy.mint_sell import (
     reclaim_buy_usdc,
     reclaim_entry_decision,
     reclaim_fak_status,
+    reclaim_hedge_keep_decision,
+    reclaim_hedge_plan,
     reclaim_stop_decision,
+    reclaim_wallet_covers,
     recorded_fill_px,
     cfg_seconds,
     sell_plan_banner,
@@ -350,6 +361,14 @@ DEFAULTS = {
     "reclaim_max_ttm_s": 0.0,
     # 0 leaves the close gate off. No reclaim entry when ttm is under this.
     "reclaim_min_ttm_s": 0.0,
+    # None keeps the other-side ceiling at 1 - reclaim_entry.
+    "reclaim_other_max": None,
+    # Cheap-side hedge, posted at the same time as the reclaim buy. Off.
+    "reclaim_hedge_enabled": False,
+    "reclaim_hedge_usd": 1.0,
+    "reclaim_hedge_slippage": 0.02,
+    "reclaim_hedge_keep_above": 0.50,
+    "reclaim_hedge_keep_persist_s": 1.0,
     "sell_min_bid_size": 1.0,
     # 0 skips the late-window Chainlink veto on loser scrap.
     # Floor, per-TTM, and stale are 0 so a positive window does not
@@ -726,10 +745,39 @@ def validate_strategy(cfg: dict) -> None:
         "reclaim_stop_persist_s",
         "reclaim_max_ttm_s",
         "reclaim_min_ttm_s",
+        "reclaim_hedge_keep_persist_s",
     ):
         raw = cfg.get(key)
         if raw is not None and float(raw) < 0:
             raise ValueError(f"{key} must be >= 0")
+    other_max = cfg.get("reclaim_other_max", None)
+    if other_max is not None and other_max != "":
+        try:
+            other_cap = float(other_max)
+        except (TypeError, ValueError):
+            raise ValueError("reclaim_other_max must be null or 0 < price < 1")
+        if (
+            other_cap != other_cap
+            or other_cap in (float("inf"), float("-inf"))
+            or not (0 < other_cap < 1)
+        ):
+            raise ValueError("reclaim_other_max must be null or 0 < price < 1")
+    try:
+        hedge_usd = float(cfg.get("reclaim_hedge_usd", 1.0))
+        hedge_slip = float(cfg.get("reclaim_hedge_slippage", 0.02))
+        hedge_keep = float(cfg.get("reclaim_hedge_keep_above", 0.50))
+    except (TypeError, ValueError):
+        raise ValueError("reclaim hedge knobs must be numeric")
+    if hedge_usd != hedge_usd or hedge_usd <= 0 or hedge_usd == float("inf"):
+        raise ValueError("reclaim_hedge_usd must be > 0")
+    if hedge_slip != hedge_slip or hedge_slip < 0 or hedge_slip == float("inf"):
+        raise ValueError("reclaim_hedge_slippage must be >= 0")
+    if (
+        hedge_keep != hedge_keep
+        or hedge_keep in (float("inf"), float("-inf"))
+        or not (0 < hedge_keep < 1)
+    ):
+        raise ValueError("0 < reclaim_hedge_keep_above < 1 must hold")
 
 def eligible_markets(markets: List[MintMarket], cfg: dict, now: float) -> List[MintMarket]:
     """Only markets that have not opened yet, starting within the configured window.
@@ -3403,6 +3451,304 @@ def _reclaim_recover_buy(
     )
 
 
+def _cached_pusd(chain: Any) -> Optional[float]:
+    """pUSD already read by the mint loop. No new wallet call."""
+    sample = getattr(chain, "_pusd_sample", None)
+    if not isinstance(sample, dict):
+        return None
+    try:
+        bal = float(sample.get("balance"))
+    except (TypeError, ValueError):
+        return None
+    if bal != bal or bal < 0 or bal == float("inf"):
+        return None
+    return bal
+
+
+def _reclaim_note_hedge(
+    intent: dict,
+    cid: str,
+    plan: dict,
+    result: Any,
+    *,
+    dry_run: bool,
+) -> None:
+    """Record the hedge post. Never changes the main reclaim buy."""
+    bought, status = (0.0, "error:missing")
+    if isinstance(result, tuple) and len(result) >= 2:
+        bought, status = result[0], result[1]
+    status_s = str(status or "")
+    try:
+        filled = float(bought or 0.0)
+    except (TypeError, ValueError):
+        filled = 0.0
+    shares = float(plan.get("shares") or 0.0)
+    limit = plan.get("limit")
+    intent["reclaim_hedge_buy_inflight"] = False
+    if dry_run or status_s == "dry":
+        intent["reclaim_hedge_filled"] = shares
+        intent["reclaim_hedge_buy_px"] = limit
+        intent["reclaim_hedge_buy_done"] = True
+        intent["reclaim_hedge_buy_uncertain"] = False
+        filled = shares
+        status_s = "dry"
+    elif status_s.startswith("error"):
+        intent["reclaim_hedge_buy_uncertain"] = True
+        intent["reclaim_hedge_buy_done"] = False
+    elif status_s.startswith("reject") or filled <= 0:
+        intent["reclaim_hedge_buy_done"] = True
+        intent["reclaim_hedge_buy_uncertain"] = False
+        intent["reclaim_hedge_filled"] = max(0.0, filled)
+    else:
+        intent["reclaim_hedge_filled"] = filled
+        intent["reclaim_hedge_buy_px"] = limit
+        intent["reclaim_hedge_buy_done"] = True
+        intent["reclaim_hedge_buy_uncertain"] = False
+    log_event(
+        "reclaim_hedge_buy",
+        condition_id=cid,
+        slug=intent.get("slug"),
+        leg=intent.get("reclaim_hedge_leg"),
+        sent=True,
+        size=shares,
+        px=limit,
+        usdc=plan.get("usdc"),
+        filled=filled,
+        status=status_s,
+        rounded_up=bool(plan.get("rounded_up")),
+        raw_shares=plan.get("raw_shares"),
+        dry_run=dry_run,
+    )
+
+
+def _reclaim_recover_hedge(
+    intent: dict,
+    *,
+    cid: str,
+    tokens: dict,
+    tol: float,
+    chain: ChainReader,
+    ctf: str,
+    funder_cs: Optional[str],
+) -> None:
+    """One balance read after an uncertain hedge. A single zero is not proof."""
+    if not intent.get("reclaim_hedge_buy_uncertain"):
+        return
+    leg = intent.get("reclaim_hedge_leg")
+    token = tokens.get(leg) if leg in ("up", "dn") else None
+    if not token:
+        return
+    target = float(intent.get("reclaim_hedge_target") or 0.0)
+    _bal, latch = _sell_inventory(
+        chain, ctf, funder_cs, token, max(target, 0.0), tol,
+        "seen_reclaim_hedge_inventory", intent,
+        read_chain=True,
+    )
+    if latch == "has_inventory":
+        intent["reclaim_hedge_filled"] = max(
+            float(intent.get("reclaim_hedge_filled") or 0.0),
+            float(_bal or 0.0),
+        )
+        intent["reclaim_hedge_buy_inflight"] = False
+        intent["reclaim_hedge_buy_uncertain"] = False
+        intent["reclaim_hedge_buy_done"] = True
+        intent["reclaim_hedge_buy_flat_reads"] = 0
+        log_event(
+            "reclaim_hedge_buy",
+            condition_id=cid,
+            slug=intent.get("slug"),
+            leg=leg,
+            sent=True,
+            size=target,
+            px=intent.get("reclaim_hedge_limit"),
+            filled=intent.get("reclaim_hedge_filled"),
+            status="recovered",
+        )
+        return
+    if latch != "already_flat":
+        return
+    flats = int(intent.get("reclaim_hedge_buy_flat_reads") or 0) + 1
+    intent["reclaim_hedge_buy_flat_reads"] = flats
+    if flats < 2:
+        return
+    intent["reclaim_hedge_buy_inflight"] = False
+    intent["reclaim_hedge_buy_uncertain"] = False
+    intent["reclaim_hedge_buy_done"] = True
+    log_event(
+        "reclaim_hedge_buy",
+        condition_id=cid,
+        slug=intent.get("slug"),
+        leg=leg,
+        sent=True,
+        size=target,
+        filled=0.0,
+        status="uncertain_cleared",
+        reads=flats,
+    )
+
+
+def _reclaim_hedge_watching(intent: dict) -> bool:
+    """True while the hedge buy is open or the post-stop decision is not done."""
+    if intent.get("reclaim_hedge_buy_inflight") or intent.get("reclaim_hedge_buy_uncertain"):
+        return True
+    if intent.get("reclaim_hedge_kept") or intent.get("reclaim_hedge_sold"):
+        return False
+    try:
+        filled = float(intent.get("reclaim_hedge_filled") or 0.0)
+    except (TypeError, ValueError):
+        filled = 0.0
+    if filled <= 0:
+        return False
+    return bool(intent.get("reclaim_stop_latched") or intent.get("reclaim_stopped"))
+
+
+def _reclaim_hedge_after_stop(
+    *,
+    cfg: dict,
+    intent: dict,
+    cid: str,
+    now: float,
+    ttm_s: Optional[float],
+    bids: dict,
+    tokens: dict,
+    dry_run: bool,
+    tol: float,
+    min_bid_size: float,
+    clob_min: float,
+) -> None:
+    """Keep or sell the hedge once the main stop has fired.
+
+    A hedge miss, or no hedge, does nothing. The keep clock is the hedge
+    bid already on this tick. The sell is the dump FAK refire.
+    """
+    try:
+        if intent.get("reclaim_hedge_kept") or intent.get("reclaim_hedge_sold"):
+            return
+        if not (intent.get("reclaim_stop_latched") or intent.get("reclaim_stopped")):
+            return
+        if intent.get("reclaim_hedge_buy_inflight") or intent.get("reclaim_hedge_buy_uncertain"):
+            intent["reclaim_hot"] = True
+            return
+        try:
+            filled = float(intent.get("reclaim_hedge_filled") or 0.0)
+            sold_already = float(intent.get("reclaim_hedge_sold_shares") or 0.0)
+        except (TypeError, ValueError):
+            return
+        remaining = max(0.0, filled - sold_already)
+        if remaining < float(tol):
+            return
+        leg = intent.get("reclaim_hedge_leg")
+        if leg not in ("up", "dn"):
+            return
+        keep_raw = cfg.get("reclaim_hedge_keep_above", 0.50)
+        keep_above = 0.50 if keep_raw is None else float(keep_raw)
+        decision = reclaim_hedge_keep_decision(
+            now_s=now,
+            bid=bids.get(leg),
+            armed_ts=intent.get("reclaim_hedge_keep_armed_at"),
+            keep_above=keep_above,
+            persist_s=cfg_seconds(cfg, "reclaim_hedge_keep_persist_s", 1.0),
+        )
+        intent["reclaim_hedge_keep_armed_at"] = decision.get("armed_ts")
+        log_event(
+            "reclaim_hedge_keep_decision",
+            condition_id=cid,
+            slug=intent.get("slug"),
+            leg=leg,
+            action=decision.get("action"),
+            reason=decision.get("reason"),
+            bid=decision.get("bid"),
+            keep_above=keep_above,
+            persist_s=cfg_seconds(cfg, "reclaim_hedge_keep_persist_s", 1.0),
+        )
+        action = decision.get("action")
+        if action == "wait":
+            intent["reclaim_hot"] = True
+            return
+        if action == "keep":
+            intent["reclaim_hedge_kept"] = True
+            if intent.get("reclaim_stopped"):
+                intent["reclaim_hot"] = False
+            return
+        token = str(tokens.get(leg) or "")
+        if not token:
+            intent["reclaim_hot"] = True
+            return
+        try:
+            live = float(bids.get(leg) or 0.0)
+        except (TypeError, ValueError):
+            live = 0.0
+        floor = float(clob_min or 0.01)
+        if live > 0 and live < floor:
+            live = floor
+        fills: list = []
+        with _mark_sell_exit(intent):
+            if live > 0:
+                sold, status, last_px, _attempts, live = _run_dump_fak_with_refire(
+                    token_id=token,
+                    size=remaining,
+                    initial_bid=live,
+                    initial_bids=[],
+                    held=leg,
+                    slug=intent.get("slug"),
+                    condition_id=cid,
+                    ttm_s=ttm_s,
+                    floor=floor,
+                    min_bid_size=min_bid_size,
+                    retries=int(cfg.get("sell_dump_fak_retries") or 0),
+                    ladder_step=float(cfg.get("sell_dump_ladder_step") or 0.04),
+                    ladder_rungs=int(cfg.get("sell_dump_ladder_rungs") or 1),
+                    dry_run=dry_run,
+                    tol=tol,
+                    fills=fills,
+                )
+            else:
+                sold, status = _sell_fak_with_fallback(
+                    token, remaining, floor, dry_run, None, keep=0.0, tol=tol,
+                )
+                last_px = floor
+                sold = float(sold or 0.0)
+        sold_f = float(sold or 0.0)
+        if sold_f > 0:
+            intent["reclaim_hedge_sold_shares"] = sold_already + sold_f
+            record_fill_px(
+                intent, "reclaim_hedge_sell_px", fills or [(sold_f, last_px)],
+            )
+        done = bool(dry_run) or (
+            float(intent.get("reclaim_hedge_sold_shares") or 0.0) + tol >= filled
+        ) or (str(status) == "already_flat" and sold_f < tol and not dry_run)
+        log_event(
+            "reclaim_hedge_sell",
+            condition_id=cid,
+            slug=intent.get("slug"),
+            leg=leg,
+            bid=bids.get(leg),
+            limit=last_px,
+            sold=sold_f,
+            planned=remaining,
+            filled=filled,
+            status=status,
+            dry_run=dry_run,
+            outcome="done" if done else "partial",
+        )
+        if done:
+            if dry_run:
+                intent["reclaim_hedge_sold_shares"] = filled
+            intent["reclaim_hedge_sold"] = True
+            if intent.get("reclaim_stopped"):
+                intent["reclaim_hot"] = False
+        else:
+            intent["reclaim_hot"] = True
+    except Exception as exc:
+        log_event(
+            "reclaim_hedge_sell",
+            condition_id=cid,
+            slug=intent.get("slug"),
+            status=f"error:{str(exc)[:160]}",
+            outcome="error",
+        )
+
+
 def _reclaim_stop_tick(
     *,
     cfg: dict,
@@ -3466,9 +3812,19 @@ def _reclaim_stop_tick(
     if remaining < 0.01:
         intent["reclaim_stopped"] = True
         intent["reclaim_hot"] = False
+        _reclaim_hedge_after_stop(
+            cfg=cfg, intent=intent, cid=cid, now=now, ttm_s=ttm_s,
+            bids=bids, tokens=tokens, dry_run=dry_run, tol=tol,
+            min_bid_size=min_bid_size, clob_min=clob_min,
+        )
         return
     token = str(tokens.get(leg) or "")
     if not token:
+        _reclaim_hedge_after_stop(
+            cfg=cfg, intent=intent, cid=cid, now=now, ttm_s=ttm_s,
+            bids=bids, tokens=tokens, dry_run=dry_run, tol=tol,
+            min_bid_size=min_bid_size, clob_min=clob_min,
+        )
         return
     # Cap by a known balance. A lagging zero must not delay the stop.
     inv, latch = _sell_inventory(
@@ -3487,11 +3843,21 @@ def _reclaim_stop_tick(
             outcome="already_flat",
             dry_run=dry_run,
         )
+        _reclaim_hedge_after_stop(
+            cfg=cfg, intent=intent, cid=cid, now=now, ttm_s=ttm_s,
+            bids=bids, tokens=tokens, dry_run=dry_run, tol=tol,
+            min_bid_size=min_bid_size, clob_min=clob_min,
+        )
         return
     size = remaining
     if latch == "has_inventory":
         size = min(remaining, float(inv or 0.0))
     if size < 0.01:
+        _reclaim_hedge_after_stop(
+            cfg=cfg, intent=intent, cid=cid, now=now, ttm_s=ttm_s,
+            bids=bids, tokens=tokens, dry_run=dry_run, tol=tol,
+            min_bid_size=min_bid_size, clob_min=clob_min,
+        )
         return
     try:
         live = float(bid) if bid is not None else 0.0
@@ -3539,6 +3905,11 @@ def _reclaim_stop_tick(
             outcome="already_flat",
             dry_run=dry_run,
         )
+        _reclaim_hedge_after_stop(
+            cfg=cfg, intent=intent, cid=cid, now=now, ttm_s=ttm_s,
+            bids=bids, tokens=tokens, dry_run=dry_run, tol=tol,
+            min_bid_size=min_bid_size, clob_min=clob_min,
+        )
         return
     intent["reclaim_stop_limit"] = last_px
     intent["reclaim_stop_status"] = status
@@ -3554,6 +3925,11 @@ def _reclaim_stop_tick(
             leg=leg,
             status=status,
             bid=bid,
+        )
+        _reclaim_hedge_after_stop(
+            cfg=cfg, intent=intent, cid=cid, now=now, ttm_s=ttm_s,
+            bids=bids, tokens=tokens, dry_run=dry_run, tol=tol,
+            min_bid_size=min_bid_size, clob_min=clob_min,
         )
         return
     log_event(
@@ -3576,6 +3952,11 @@ def _reclaim_stop_tick(
             intent["reclaim_stop_dry"] = True
         intent["reclaim_stopped"] = True
         intent["reclaim_hot"] = False
+    _reclaim_hedge_after_stop(
+        cfg=cfg, intent=intent, cid=cid, now=now, ttm_s=ttm_s,
+        bids=bids, tokens=tokens, dry_run=dry_run, tol=tol,
+        min_bid_size=min_bid_size, clob_min=clob_min,
+    )
 
 
 def _reclaim_tick(
@@ -3634,8 +4015,18 @@ def _reclaim_tick(
             sell_dump_leg=intent.get("sell_dump_leg"),
             kept_done=bool(intent.get("sell_dump_kept_done")),
         )
+    if intent.get("reclaim_hedge_buy_uncertain"):
+        _reclaim_recover_hedge(
+            intent, cid=cid, tokens=tokens, tol=tol,
+            chain=chain, ctf=ctf, funder_cs=funder_cs,
+        )
     if intent.get("reclaim_stopped"):
-        intent["reclaim_hot"] = False
+        _reclaim_hedge_after_stop(
+            cfg=cfg, intent=intent, cid=cid, now=now, ttm_s=ttm_s,
+            bids=bids, tokens=tokens, dry_run=dry_run, tol=tol,
+            min_bid_size=min_bid_size, clob_min=clob_min,
+        )
+        intent["reclaim_hot"] = bool(_reclaim_hedge_watching(intent))
         return
     if intent.get("reclaim_bought"):
         _reclaim_finish_hot(intent, stop_enabled=stop_enabled)
@@ -3683,6 +4074,7 @@ def _reclaim_tick(
             intent.get("reclaim_buy_inflight") or intent.get("reclaim_buy_uncertain")
         ),
         dumped_legs=(intent.get("sell_dump_leg"), intent.get("sell_dump_kept_leg")),
+        other_max=cfg.get("reclaim_other_max", None),
     )
     if decision.get("reason") != "inflight":
         intent["reclaim_entry_armed_at"] = decision.get("armed_ts")
@@ -3798,11 +4190,116 @@ def _reclaim_tick(
     intent["reclaim_buy_posted"] = True
     intent["reclaim_buy_inflight"] = True
     intent.pop("reclaim_skip_reason", None)
+    other = "dn" if leg == "up" else "up"
+    hedge_plan = None
+    hedge_token = ""
+    if cfg.get("reclaim_hedge_enabled") and not intent.get("reclaim_hedge_attempted"):
+        intent["reclaim_hedge_attempted"] = True
+        try:
+            slip_raw = cfg.get("reclaim_hedge_slippage", 0.02)
+            hedge_slip = 0.02 if slip_raw is None else float(slip_raw)
+            usd_raw = cfg.get("reclaim_hedge_usd", 1.0)
+            hedge_usd = 1.0 if usd_raw is None else float(usd_raw)
+            plan = reclaim_hedge_plan(asks_px.get(other), hedge_usd, hedge_slip)
+            hedge_token = str(tokens.get(other) or "")
+            if not plan.get("ok") or not hedge_token:
+                intent["reclaim_hedge_buy_done"] = True
+                log_event(
+                    "reclaim_hedge_buy",
+                    condition_id=cid,
+                    slug=intent.get("slug"),
+                    leg=other,
+                    sent=False,
+                    size=plan.get("shares"),
+                    px=plan.get("limit"),
+                    usdc=plan.get("usdc"),
+                    filled=0.0,
+                    status=str(plan.get("reason") or "no_token"),
+                    rounded_up=bool(plan.get("rounded_up")),
+                )
+            elif not reclaim_wallet_covers(
+                _cached_pusd(chain), usdc, float(plan.get("usdc") or 0.0),
+            ):
+                intent["reclaim_hedge_buy_done"] = True
+                log_event(
+                    "reclaim_hedge_buy",
+                    condition_id=cid,
+                    slug=intent.get("slug"),
+                    leg=other,
+                    sent=False,
+                    size=plan.get("shares"),
+                    px=plan.get("limit"),
+                    usdc=plan.get("usdc"),
+                    filled=0.0,
+                    status="cash_short",
+                    need=round(usdc + float(plan.get("usdc") or 0.0), 4),
+                    balance=_cached_pusd(chain),
+                    rounded_up=bool(plan.get("rounded_up")),
+                )
+            else:
+                intent["reclaim_hedge_leg"] = other
+                intent["reclaim_hedge_usdc"] = plan.get("usdc")
+                intent["reclaim_hedge_target"] = plan.get("shares")
+                intent["reclaim_hedge_limit"] = plan.get("limit")
+                intent["reclaim_hedge_buy_posted"] = True
+                intent["reclaim_hedge_buy_inflight"] = True
+                intent["reclaim_hedge_buy_done"] = False
+                hedge_plan = plan
+        except Exception as exc:
+            hedge_plan = None
+            intent["reclaim_hedge_buy_done"] = True
+            intent["reclaim_hedge_buy_inflight"] = False
+            log_event(
+                "reclaim_hedge_buy",
+                condition_id=cid,
+                slug=intent.get("slug"),
+                leg=other,
+                sent=False,
+                filled=0.0,
+                status=f"error:{str(exc)[:120]}",
+            )
     captured: list = []
+    hedge_box: dict = {}
     with _io_unlocked():
+        hedge_thread = None
+        if hedge_plan is not None:
+            def _post_hedge(
+                tok: str = hedge_token,
+                sh: float = float(hedge_plan["shares"]),
+                px: float = float(hedge_plan["limit"]),
+            ) -> None:
+                try:
+                    hedge_box["result"] = _fak_buy(tok, sh, px, dry_run)
+                except Exception as exc:
+                    hedge_box["result"] = (0.0, f"error:{str(exc)[:120]}")
+
+            hedge_thread = threading.Thread(
+                target=_post_hedge, name="reclaim-hedge", daemon=True,
+            )
+            hedge_thread.start()
         bought, status = _fak_buy(
             str(token), shares, float(limit), dry_run, capture=captured,
         )
+        if hedge_thread is not None:
+            hedge_thread.join()
+    if hedge_plan is not None:
+        try:
+            _reclaim_note_hedge(
+                intent, cid, hedge_plan, hedge_box.get("result"), dry_run=dry_run,
+            )
+        except Exception as exc:
+            intent["reclaim_hedge_buy_inflight"] = False
+            log_event(
+                "reclaim_hedge_buy",
+                condition_id=cid,
+                slug=intent.get("slug"),
+                leg=other,
+                sent=True,
+                size=hedge_plan.get("shares"),
+                px=hedge_plan.get("limit"),
+                filled=0.0,
+                status=f"error:{str(exc)[:120]}",
+            )
     status_s = str(status or "")
     post_fields = {
         "condition_id": cid,
@@ -5506,7 +6003,7 @@ def run_mint_cycle(
             except Exception:
                 pass
         with STATE_LOCK:
-            reserved = pending_mint_reserve(state)
+            reserved = pending_mint_reserve(state) + reclaim_hedge_cash_reserve(state)
         block = mint_cash_block(balance, shares, reserved)
         if seq_on and block is not None:
             if _SEQ_WAITS.note_wait(pick.condition_id, "cash", now):
