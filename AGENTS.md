@@ -268,6 +268,13 @@ replaces that persist when seconds-to-close is within
 change); `armed_ts` is not reset on the switch. Live is meant to set
 `last_min_s` 1.0 and window 120 after merge. Ladder
 retries after the dump has fired are not re-checked.
+After `sold_dump` (`sell_dump_done`), and while `post_dump_log_enabled`
+is true (the default, hot-reloaded), mintbot journals `post_dump_book`
+(`leg_dumped`, `up_bid`, `up_ask`, `dn_bid`, `dn_ask`, `ttm_s`) about
+every 0.25s until the window ends. The sell tick reuses the books it
+already fetched and logs only after the bag's orders. A sampler thread
+fills the gaps between ticks and is the only place that reads the book
+for this journal. It does not place orders or change a decision.
 `sell_dump_also_kept` (default false and false in the example; **true
 live** since 10:31 IST on 2026-10-03)
 also exits the kept scrap half in the same dump event. Once the held dump

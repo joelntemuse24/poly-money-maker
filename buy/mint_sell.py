@@ -109,6 +109,8 @@ DEFAULT_SELL_KNOBS = {
     "sell_dump_max_ttm_s": 0.0,
     # When the held dump fills, also sell the kept scrap half (1c floor sweep).
     "sell_dump_also_kept": False,
+    # Journal both books after the dump until the window ends. No orders.
+    "post_dump_log_enabled": True,
     # After a both-sides dump, optional FAK buy of the side that reclaims.
     # Off until the operator sets reclaim_enabled. The stop is on unless
     # reclaim_stop_enabled is set false (hold to redeem).
@@ -388,6 +390,80 @@ def sell_window_open(now_s: float, end_ts: float) -> bool:
     if not end_ts:
         return True
     return float(end_ts) - float(now_s) > 0
+
+
+# How often a dumped bag journals both books. Observation only.
+POST_DUMP_BOOK_INTERVAL_S = 0.25
+
+
+def post_dump_book_due(
+    now_s: float,
+    last_at: Optional[float],
+    interval_s: float = POST_DUMP_BOOK_INTERVAL_S,
+) -> bool:
+    """True when a dumped bag is due for another book line.
+
+    The first line (no ``last_at``) is due immediately. Later lines wait
+    ``interval_s``. This does not read a book and does not place an order.
+    """
+    try:
+        now = float(now_s)
+        interval = float(interval_s)
+    except (TypeError, ValueError):
+        return False
+    if interval != interval or interval <= 0 or interval == float("inf"):
+        return False
+    if now != now or now == float("inf"):
+        return False
+    if last_at is None:
+        return True
+    try:
+        last = float(last_at)
+    except (TypeError, ValueError):
+        return True
+    if last != last:
+        return True
+    return now + 1e-9 >= last + interval
+
+
+def post_dump_book_sample(
+    *,
+    enabled: bool,
+    sold_dump: bool,
+    now_s: float,
+    end_ts: float,
+    last_logged_at: Optional[float],
+    book_ts: Optional[float],
+    interval_s: float = POST_DUMP_BOOK_INTERVAL_S,
+) -> str:
+    """``skip``, ``emit``, or ``fetch``.
+
+    ``emit`` journals a book read that is already in hand and newer than
+    the last line. ``fetch`` means the caller is off the order path and
+    the last read has already been journaled. ``skip`` is the flag, a bag
+    that has not dumped, a closed window, or a line that is not due.
+    """
+    if not enabled or not sold_dump:
+        return "skip"
+    try:
+        end = float(end_ts or 0)
+    except (TypeError, ValueError):
+        end = 0.0
+    if not sell_window_open(now_s, end):
+        return "skip"
+    if not post_dump_book_due(now_s, last_logged_at, interval_s):
+        return "skip"
+    if book_ts is None:
+        return "fetch"
+    try:
+        read_at = float(book_ts)
+    except (TypeError, ValueError):
+        return "fetch"
+    if read_at != read_at:
+        return "fetch"
+    if last_logged_at is None or read_at > float(last_logged_at) + 1e-9:
+        return "emit"
+    return "fetch"
 
 
 _SELL_HOT_STATUSES = (

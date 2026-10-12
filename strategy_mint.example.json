@@ -83,6 +83,7 @@
   "sell_dump_ladder_rungs": 4,
   "sell_dump_max_ttm_s": 240.0,
   "sell_dump_also_kept": false,
+  "post_dump_log_enabled": true,
   "reclaim_enabled": false,
   "reclaim_usd": 100.0,
   "reclaim_entry": 0.91,
