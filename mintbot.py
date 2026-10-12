@@ -213,6 +213,8 @@ from buy.mint_sell import (
     scrap_time_gate_open,
     sell_fire_decision,
     sell_window_open,
+    post_dump_book_sample,
+    POST_DUMP_BOOK_INTERVAL_S,
     skip_mint_discovery_for_sell,
     winner_cashout_leg,
     winner_cheap_decision,
@@ -354,6 +356,8 @@ DEFAULTS = {
     "sell_dump_max_ttm_s": 0.0,
     # When the held dump fills, also sell the kept scrap half (1c floor sweep).
     "sell_dump_also_kept": False,
+    # After sell_dump_done, journal both books until the window ends.
+    "post_dump_log_enabled": True,
     # Post-dump reclaim buy. Off until strategy_mint.json sets it true.
     # The stop stays on unless reclaim_stop_enabled is false.
     "reclaim_enabled": False,
@@ -4588,8 +4592,232 @@ def manage_sells(cfg: dict, state: dict, chain: ChainReader) -> None:
         STATE_LOCK.release()
 
 
+def _post_dump_box() -> dict:
+    """In-memory journal state. Not written to positions_mint.json."""
+    box = getattr(_post_dump_box, "box", None)
+    if box is None:
+        box = {
+            "snaps": {},
+            "lock": threading.Lock(),
+            "started": False,
+            "cfg": {},
+        }
+        _post_dump_box.box = box
+    return box
+
+
+def _post_dump_quote(row: Any) -> tuple:
+    _bid, _bsz, _bids, ask, _asz, _asks, _age = _book_quote(row)
+    return _bid, ask
+
+
+def _observe_post_dump_book(
+    *,
+    cfg: dict,
+    intent: dict,
+    cid: str,
+    now: float,
+    end_ts: float,
+    ttm_s: Optional[float],
+    up_bid: Any,
+    up_ask: Any,
+    dn_bid: Any,
+    dn_ask: Any,
+    up_tok: str,
+    dn_tok: str,
+    min_bid_size: float,
+) -> None:
+    """Journal the books this tick already fetched. No network, no orders.
+
+    Runs after the bag's sell, reclaim, and hedge work. A fresher off-path
+    sample is left in place. The 0.25s gap between sell ticks is filled by
+    ``_post_dump_logger``, which is the only caller allowed to fetch.
+    """
+    if not intent.get("sold_dump"):
+        return
+    if not sell_window_open(now, end_ts):
+        return
+    if not bool(cfg.get("post_dump_log_enabled", True)):
+        return
+    box = _post_dump_box()
+    with box["lock"]:
+        prev = box["snaps"].get(cid) or {}
+        try:
+            prev_book = float(prev.get("book_ts"))
+        except (TypeError, ValueError):
+            prev_book = None
+        if prev_book is not None and prev_book > float(now) + 1e-9:
+            prev["enabled"] = True
+            prev["end_ts"] = end_ts
+            prev["leg_dumped"] = intent.get("sell_dump_leg")
+            prev["slug"] = intent.get("slug")
+            box["snaps"][cid] = prev
+        else:
+            box["snaps"][cid] = {
+                "enabled": True,
+                "sold_dump": True,
+                "end_ts": end_ts,
+                "slug": intent.get("slug"),
+                "leg_dumped": intent.get("sell_dump_leg"),
+                "up_bid": up_bid,
+                "up_ask": up_ask,
+                "dn_bid": dn_bid,
+                "dn_ask": dn_ask,
+                "book_ts": now,
+                "up_token": up_tok,
+                "dn_token": dn_tok,
+                "min_bid_size": min_bid_size,
+                "logged_at": prev.get("logged_at"),
+            }
+    _post_dump_book_emit(cid, now, allow_fetch=False, ttm_s=ttm_s)
+
+
+def _post_dump_book_emit(
+    cid: str,
+    now: float,
+    *,
+    allow_fetch: bool,
+    ttm_s: Optional[float] = None,
+) -> None:
+    """Write one ``post_dump_book`` line, or fetch only when ``allow_fetch``."""
+    box = _post_dump_box()
+    fetch_args = None
+    row = None
+    with box["lock"]:
+        snap = box["snaps"].get(cid)
+        if not snap:
+            return
+        action = post_dump_book_sample(
+            enabled=bool(snap.get("enabled")),
+            sold_dump=bool(snap.get("sold_dump")),
+            now_s=now,
+            end_ts=float(snap.get("end_ts") or 0),
+            last_logged_at=snap.get("logged_at"),
+            book_ts=snap.get("book_ts"),
+        )
+        if action == "skip":
+            if not sell_window_open(now, float(snap.get("end_ts") or 0)):
+                box["snaps"].pop(cid, None)
+            return
+        if action == "fetch":
+            if not allow_fetch:
+                return
+            fetch_args = (
+                str(snap.get("up_token") or ""),
+                str(snap.get("dn_token") or ""),
+                float(snap.get("min_bid_size") or 1.0),
+                snap.get("leg_dumped"),
+                snap.get("slug"),
+                float(snap.get("end_ts") or 0),
+            )
+        else:
+            end = float(snap.get("end_ts") or 0)
+            logged_ttm = ttm_s
+            if logged_ttm is None and end:
+                logged_ttm = end - float(now)
+            row = {
+                "condition_id": cid,
+                "slug": snap.get("slug"),
+                "leg_dumped": snap.get("leg_dumped"),
+                "up_bid": snap.get("up_bid"),
+                "up_ask": snap.get("up_ask"),
+                "dn_bid": snap.get("dn_bid"),
+                "dn_ask": snap.get("dn_ask"),
+                "ttm_s": logged_ttm,
+            }
+            snap["logged_at"] = now
+    if row is not None:
+        log_event("post_dump_book", **row)
+        return
+    if fetch_args is None:
+        return
+    up_tok, dn_tok, min_size, leg, slug, end = fetch_args
+    if not up_tok or not dn_tok:
+        return
+    try:
+        up_row, dn_row = _fetch_books(up_tok, dn_tok, min_size)
+    except Exception as exc:
+        log_event(
+            "post_dump_book_fail",
+            condition_id=cid,
+            error=str(exc)[:160],
+        )
+        return
+    up_bid, up_ask = _post_dump_quote(up_row)
+    dn_bid, dn_ask = _post_dump_quote(dn_row)
+    ttm = (end - float(now)) if end else None
+    with box["lock"]:
+        snap = box["snaps"].get(cid)
+        if not snap:
+            return
+        # A sell tick that landed while we were reading wins if it is newer.
+        try:
+            current = float(snap.get("book_ts"))
+        except (TypeError, ValueError):
+            current = None
+        if current is not None and current > float(now) + 1e-9:
+            return
+        snap["up_bid"] = up_bid
+        snap["up_ask"] = up_ask
+        snap["dn_bid"] = dn_bid
+        snap["dn_ask"] = dn_ask
+        snap["book_ts"] = now
+        snap["logged_at"] = now
+        snap["leg_dumped"] = leg
+    log_event(
+        "post_dump_book",
+        condition_id=cid,
+        slug=slug,
+        leg_dumped=leg,
+        up_bid=up_bid,
+        up_ask=up_ask,
+        dn_bid=dn_bid,
+        dn_ask=dn_ask,
+        ttm_s=ttm,
+    )
+
+
+def _post_dump_book_pass(now: Optional[float] = None) -> None:
+    """One off-path sample of every dumped bag. Never called from an order."""
+    if now is None:
+        now = time.time()
+    box = _post_dump_box()
+    cfg = box.get("cfg") or {}
+    if not bool(cfg.get("post_dump_log_enabled", True)):
+        return
+    with box["lock"]:
+        ids = list(box["snaps"])
+    for cid in ids:
+        _post_dump_book_emit(cid, float(now), allow_fetch=True)
+
+
+def _post_dump_logger() -> None:
+    """Sleep 0.25s, then sample. Independent of the sell loop's poll."""
+    while not _shutdown:
+        time.sleep(POST_DUMP_BOOK_INTERVAL_S)
+        if _shutdown:
+            return
+        try:
+            _post_dump_book_pass()
+        except Exception as exc:
+            log_event("post_dump_book_fail", error=str(exc)[:160])
+
+
+def _ensure_post_dump_logger() -> None:
+    """Start the sampler once, after a sell cycle has already returned."""
+    box = _post_dump_box()
+    with box["lock"]:
+        if box["started"]:
+            return
+        box["started"] = True
+    threading.Thread(
+        target=_post_dump_logger, name="post-dump-book", daemon=True,
+    ).start()
+
+
 def _manage_sells_locked(cfg: dict, state: dict, chain: ChainReader) -> None:
     now = time.time()
+    _post_dump_box()["cfg"] = cfg
     _whatsapp("configure", cfg)
     floor = float(cfg.get("sell_floor") or 0.02)
     opp_min = float(cfg.get("sell_opposite_min") or 0.90)
@@ -5888,6 +6116,21 @@ def _manage_sells_locked(cfg: dict, state: dict, chain: ChainReader) -> None:
             cid, intent, now=now, end_ts=end_ts, ttm_s=ttm_s,
             bids=bids, books=books,
         )
+        _observe_post_dump_book(
+            cfg=cfg,
+            intent=intent,
+            cid=cid,
+            now=now,
+            end_ts=end_ts,
+            ttm_s=ttm_s,
+            up_bid=up_bid,
+            up_ask=up_ask,
+            dn_bid=dn_bid,
+            dn_ask=dn_ask,
+            up_tok=up_tok,
+            dn_tok=dn_tok,
+            min_bid_size=min_bid_size,
+        )
 
     commit_state(state, dirty=dirty)
 
@@ -5962,6 +6205,8 @@ def run_sell_cycle(cfg: dict, state: dict, chain: ChainReader) -> str:
         log_event("sell_cycle_error", error=str(sell_exc)[:240])
         write_loop_heartbeat("sell", "error", error=str(sell_exc)[:120])
         return "error"
+    finally:
+        _ensure_post_dump_logger()
     with STATE_LOCK:
         hot = skip_mint_discovery_for_sell(state, time.time())
     write_loop_heartbeat("sell", "hot" if hot else "idle")
