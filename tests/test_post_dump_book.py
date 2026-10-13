@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import threading
 import unittest
 
 from buy.mint_sell import (
@@ -169,7 +170,7 @@ class PostDumpBookLoopTests(unittest.TestCase):
         names = [row["event"] for row in events]
         self.assertIn("sell_dump_done", names)
         self.assertIn("post_dump_book", names)
-        self.assertLess(names.index("sell_dump_done"), names.index("post_dump_book"))
+        self.assertLess(names.index("post_dump_book"), names.index("sell_dump_done"))
         self.assertEqual(fetches["n"], 1)
         self.assertTrue(fak_calls)
         self.assertEqual(intent["sell_dump_leg"], "up")
@@ -295,6 +296,54 @@ class PostDumpBookLoopTests(unittest.TestCase):
         )
         self.assertEqual(row["dn_ask_near"], 15.0)
         self.assertEqual(loop.buys, [])
+
+    def test_journal_starts_when_the_dump_fires(self):
+        seen = threading.Event()
+        ns, events, fak_calls, clock = _dump_harness(
+            lambda _token, size, _price, _dry: (
+                self.assertTrue(seen.wait(2.0)) or (float(size), "matched")
+            )
+        )
+        fetches = {"sell": 0}
+
+        def fetch_books(*args, **kwargs):
+            if threading.current_thread() is threading.main_thread():
+                fetches["sell"] += 1
+            return real(*args, **kwargs)
+
+        real = ns["_fetch_books"]
+        ns["_fetch_books"] = fetch_books
+
+        def log_event(event, **kwargs):
+            events.append({"event": event, **kwargs})
+            if event == "post_dump_book":
+                seen.set()
+
+        ns["log_event"] = log_event
+        intent = _held_after_scrap(
+            clock["now"] + 200.0,
+            sell_dump_armed_at=clock["now"] - 2.0,
+        )
+        state = {"intents": {"cid-dump": intent}}
+        ns["remember_persisted_state"](state)
+        try:
+            ns["_manage_sells_locked"](_dump_cfg(), state, object())
+        finally:
+            box = ns["_post_dump_box"]()
+            box["stop"] = True
+            box["wake"].set()
+            thread = box.get("thread")
+            if thread is not None:
+                thread.join(timeout=2.0)
+        names = [row["event"] for row in events]
+        self.assertIn("post_dump_book", names)
+        self.assertIn("sell_dump_done", names)
+        self.assertLess(names.index("post_dump_book"), names.index("sell_dump_done"))
+        self.assertEqual(fetches["sell"], 1)
+        self.assertTrue(fak_calls)
+        logged = [row for row in events if row["event"] == "post_dump_book"][0]
+        self.assertEqual(logged["leg_dumped"], "up")
+        self.assertAlmostEqual(logged["up_bid"], 0.51)
 
 
 if __name__ == "__main__":

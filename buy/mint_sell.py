@@ -100,8 +100,8 @@ DEFAULT_SELL_KNOBS = {
     # Window 0 disables the last-minute clock.
     "sell_dump_persist_last_min_s": None,
     "sell_dump_persist_last_min_window_s": 0.0,
-    # After first dump no-match/kill-0-fill, quickly refire this many times.
-    "sell_dump_fak_retries": 2,
+    # Extra fresh-bid FAKs after the first dump shot. 0 or null: no cap.
+    "sell_dump_fak_retries": 0,
     # Dump retry ladder: top bid, then step down toward floor (short burst).
     "sell_dump_ladder_step": 0.04,
     "sell_dump_ladder_rungs": 4,
@@ -722,6 +722,23 @@ def winner_sell_limit(
 def empty_fak_status(status: Any) -> bool:
     """True when CLOB rejected a FAK because no resting bid matched."""
     return "no orders found" in str(status or "").lower()
+
+
+def dump_refire_cap(raw: Any) -> Optional[int]:
+    """Extra fresh-bid dump FAKs, or None when the leg should keep selling.
+
+    None, blank, and any number <= 0 mean no cap. A positive int is that
+    many refires after the first shot.
+    """
+    if raw is None or raw == "":
+        return None
+    try:
+        n = int(raw)
+    except (TypeError, ValueError):
+        return None
+    if n <= 0:
+        return None
+    return n
 
 
 def dump_fast_retry_eligible(*, sold: float, status: Any, tol: float) -> bool:
