@@ -107,6 +107,9 @@ DEFAULT_SELL_KNOBS = {
     "sell_dump_ladder_rungs": 4,
     # 0 disables the time-left gate (old behavior). The example sets 240.
     "sell_dump_max_ttm_s": 0.0,
+    # Held bid and this other-side bid must hold together for the persist.
+    # 0 or null disables. A dip resets the arm.
+    "sell_dump_other_min": 0.30,
     # When the held dump fills, also sell the kept scrap half (1c floor sweep).
     "sell_dump_also_kept": False,
     # Journal both books after the dump until the window ends. No orders.
@@ -1092,6 +1095,40 @@ def loser_ladder_limits(
             break
         px = fl if nxt + 1e-12 < fl else nxt
     return limits
+
+
+def sell_dump_other_confirms(other_bid: Optional[float], other_min: Any) -> bool:
+    """True when this tick may arm or keep the dump persist.
+
+    The caller ANDs this with the held-bid trigger. False is a persist
+    reset, the same as the held bid recovering.
+
+    ``other_min`` of ``None``, blank, or ``<= 0`` leaves the check off.
+    While it is on, a missing bid does not confirm, and the other side's
+    best bid must be ``>=`` the minimum. A value that is not a price in
+    ``(0, 1)`` does not confirm.
+    """
+    if other_min is None or other_min == "":
+        return True
+    try:
+        minimum = float(other_min)
+    except (TypeError, ValueError):
+        return False
+    if minimum != minimum or minimum in (float("inf"), float("-inf")):
+        return False
+    if minimum <= 0:
+        return True
+    if not (0 < minimum < 1):
+        return False
+    if other_bid is None:
+        return False
+    try:
+        bid = float(other_bid)
+    except (TypeError, ValueError):
+        return False
+    if bid != bid or bid in (float("inf"), float("-inf")):
+        return False
+    return bid + 1e-12 >= minimum
 
 
 def sell_fire_decision(

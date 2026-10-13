@@ -211,6 +211,7 @@ from buy.mint_sell import (
     scrap_live_bid_limit,
     scrap_rest_px,
     scrap_time_gate_open,
+    sell_dump_other_confirms,
     sell_fire_decision,
     sell_window_open,
     post_dump_book_sample,
@@ -354,6 +355,9 @@ DEFAULTS = {
     # 0 disables the time-left gate (old behavior). The example sets 240:
     # arm and fire the held dump only when seconds-to-close is at or under this.
     "sell_dump_max_ttm_s": 0.0,
+    # Other side's bid must stay at least this for the whole persist.
+    # 0 or null disables. A dip resets sell_dump_armed_at.
+    "sell_dump_other_min": 0.30,
     # When the held dump fills, also sell the kept scrap half (1c floor sweep).
     "sell_dump_also_kept": False,
     # After sell_dump_done, journal both books until the window ends.
@@ -716,6 +720,19 @@ def validate_strategy(cfg: dict) -> None:
         raise ValueError("sell_dump_ladder_rungs must be >= 1")
     if float(cfg.get("sell_dump_max_ttm_s") or 0) < 0:
         raise ValueError("sell_dump_max_ttm_s must be >= 0")
+    other_min_raw = cfg.get("sell_dump_other_min", 0.30)
+    if other_min_raw is not None and other_min_raw != "":
+        try:
+            other_min = float(other_min_raw)
+        except (TypeError, ValueError):
+            raise ValueError("sell_dump_other_min must be null, 0, or 0 < price < 1")
+        if (
+            other_min != other_min
+            or other_min in (float("inf"), float("-inf"))
+            or other_min < 0
+            or other_min >= 1
+        ):
+            raise ValueError("sell_dump_other_min must be null, 0, or 0 < price < 1")
     if float(cfg.get("sell_scrap_max_ttm_s") or 0) < 0:
         raise ValueError("sell_scrap_max_ttm_s must be >= 0")
     try:
@@ -5120,8 +5137,10 @@ def _manage_sells_locked(cfg: dict, state: dict, chain: ChainReader) -> None:
                             intent.get("sell_winner_filled") or 0
                         ) + sold_total
 
-        # Held-leg dump: after loser is sold, if the remaining leg stays under
-        # sell_dump_below for sell_dump_persist_s, live-bid FAK (not a "hedge").
+        # Held-leg dump: after loser is sold, live-bid FAK once the held bid
+        # has stayed under sell_dump_below AND the other side's bid has stayed
+        # at or over sell_dump_other_min for sell_dump_persist_s. Either miss
+        # resets the arm. Refires and the kept sell do not re-check.
         sold_dump = bool(intent.get("sold_dump") or intent.get("sold_winner"))
         dump_enabled = bool(cfg.get("sell_dump_enabled", True))
         dump_below = float(cfg.get("sell_dump_below") or 0.80)
@@ -5171,7 +5190,12 @@ def _manage_sells_locked(cfg: dict, state: dict, chain: ChainReader) -> None:
                 cutoff=dump_max_ttm_s,
                 now_s=now,
             )
-        dump_armed = dump_price_ok and dump_ttm_ok
+        other_leg = "dn" if held == "up" else ("up" if held == "dn" else None)
+        other_bid = bids.get(other_leg) if other_leg else None
+        # Missing key stays 0.30. Explicit 0 or null disables. Do not use `or`.
+        other_min = cfg.get("sell_dump_other_min", 0.30)
+        other_ok = sell_dump_other_confirms(other_bid, other_min)
+        dump_armed = dump_price_ok and dump_ttm_ok and other_ok
         fire_d, armed_d, why_d = persist_ready(
             dump_armed,
             now_s=now,
@@ -5179,7 +5203,21 @@ def _manage_sells_locked(cfg: dict, state: dict, chain: ChainReader) -> None:
             persist_s=dump_persist_s,
         )
         intent["sell_dump_armed_at"] = armed_d
-        if dump_armed and why_d in {"armed", "waiting"}:
+        if dump_price_ok and dump_ttm_ok and not other_ok:
+            log_event(
+                "sell_dump_persist",
+                condition_id=cid,
+                slug=intent.get("slug"),
+                leg=held,
+                why="other_low",
+                bid=dump_bid,
+                other_leg=other_leg,
+                other_bid=other_bid,
+                other_min=other_min,
+                below=dump_below,
+                persist_s=dump_persist_s,
+            )
+        elif dump_armed and why_d in {"armed", "waiting"}:
             log_event(
                 "sell_dump_persist",
                 condition_id=cid,
@@ -5187,6 +5225,9 @@ def _manage_sells_locked(cfg: dict, state: dict, chain: ChainReader) -> None:
                 leg=held,
                 why=why_d,
                 bid=dump_bid,
+                other_leg=other_leg,
+                other_bid=other_bid,
+                other_min=other_min,
                 below=dump_below,
                 persist_s=dump_persist_s,
             )
