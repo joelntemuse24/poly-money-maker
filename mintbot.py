@@ -78,13 +78,14 @@ resolution is redeemed by the existing redeem thread.
 
 A third loop records Chainlink BTC/USD 60s TWAP (Polymarket RTDS) to
 ``logs/oracle_twap.jsonl`` while a 15m bag is open. ``oracle_log_enabled``
-defaults on (audit tape only). ``sell_late_window_s`` defaults to 0,
+defaults on. Scrap, dump, reclaim, and bag-end lines copy that thread's
+in-memory price and strike. They do not wait on the socket, and no
+trading decision reads the tape. ``sell_late_window_s`` defaults to 0,
 which skips the late-window loser-scrap veto entirely.
 ``sell_oracle_edge_floor_usd``, ``sell_oracle_edge_per_ttm``, and
 ``sell_oracle_stale_s`` also default to 0, so setting the window back
 above 0 does not restore the old $25 / 1.5×TTM / 5s-stale veto.
-``sell_oracle_edge_persist_s`` stays 3s. Mint, winner cash-out, and held
-dump do not read the tape. If the feed
+``sell_oracle_edge_persist_s`` stays 3s. If the feed
 fails, the loop logs ``oracle_log_fail`` and trading continues.
 
 Usage:
@@ -153,7 +154,12 @@ from buy.mint_loops import (
     select_mint_candidate,
     start_mint_sell_loops,
 )
-from buy.oracle_log import OracleBagView, OracleLogService, snapshot_intents
+from buy.oracle_log import (
+    OracleBagView,
+    OracleLogService,
+    oracle_mark_fields,
+    snapshot_intents,
+)
 from buy.whatsapp_notify import BagAlerts, WhatsAppNotifier
 from buy.mint_sell import (
     buy_fill_vwap,
@@ -298,7 +304,7 @@ DEFAULTS = {
     "mint_cash_poll_s": 2.0,
     # Chainlink 60s TWAP tape. The scrap veto is off unless
     # sell_late_window_s is positive.
-    "oracle_log_enabled": False,
+    "oracle_log_enabled": True,
     "position_tolerance": 0.01,
     "require_accepting_orders": True,
     "sell_enabled": False,
@@ -464,6 +470,21 @@ def _oracle_bag_view(condition_id: str) -> OracleBagView:
         return svc.bag_view(condition_id)
     except Exception:
         return OracleBagView(twap=None, open_usd=None, obs_ts=None)
+
+
+def _oracle_mark(condition_id: str, cfg: Optional[dict], now: float) -> dict:
+    """Cache read for a log line. Disabled or any failure stays off the order."""
+    try:
+        enabled = True
+        if isinstance(cfg, dict):
+            enabled = bool(cfg.get("oracle_log_enabled", True))
+        if not enabled:
+            return oracle_mark_fields(None, now_s=now, enabled=False)
+        return oracle_mark_fields(
+            _oracle_bag_view(condition_id), now_s=now, enabled=True,
+        )
+    except Exception:
+        return oracle_mark_fields(None, now_s=now, enabled=True)
 
 
 _notify_pool = ThreadPoolExecutor(max_workers=2, thread_name_prefix="ntfy")
@@ -3195,6 +3216,8 @@ def _lock_scrap_plan(
     cid: str,
     leg: Optional[str],
     threshold: Optional[float] = None,
+    cfg: Optional[dict] = None,
+    now: Optional[float] = None,
 ) -> Tuple[float, float]:
     """Fix ``(target, keep)`` on the first scrap post. Later fires reuse it."""
     existing = intent.get("sell_scrap_target")
@@ -3218,6 +3241,7 @@ def _lock_scrap_plan(
         target=float(target),
         keep=round(float(keep), 6),
         threshold=None if threshold is None else round(float(threshold), 4),
+        **_oracle_mark(cid, cfg, time.time() if now is None else now),
     )
     return float(target), float(keep)
 
@@ -3229,6 +3253,8 @@ def _scrap_post_shares(
     cid: str,
     leg: Optional[str],
     threshold: Optional[float] = None,
+    cfg: Optional[dict] = None,
+    now: Optional[float] = None,
 ) -> float:
     """Shares to offer. Fraction 1 with no plan returns ``inventory``."""
     if not _uses_scrap_plan(intent, fraction):
@@ -3240,6 +3266,8 @@ def _scrap_post_shares(
         cid=cid,
         leg=leg,
         threshold=threshold,
+        cfg=cfg,
+        now=now,
     )
     return scrap_order_shares(
         target=float(intent.get("sell_scrap_target") or 0.0),
@@ -3564,7 +3592,9 @@ def _note_bag_risk(
         return
 
 
-def _close_bag_risk(condition_id: str, intent: dict, *, now: float) -> None:
+def _close_bag_risk(
+    condition_id: str, intent: dict, *, now: float, cfg: Optional[dict] = None,
+) -> None:
     """Emit one ``bag_risk`` line when the sell window closes. Log only."""
     try:
         done = _bag_risk_emitted()
@@ -3583,6 +3613,7 @@ def _close_bag_risk(condition_id: str, intent: dict, *, now: float) -> None:
                 slug=intent.get("slug"),
                 shares=shares,
             ),
+            **_oracle_mark(condition_id, cfg, now),
         )
         done.add(condition_id)
         _bag_risk_rows().pop(condition_id, None)
@@ -4821,6 +4852,7 @@ def _reclaim_tick(
         "ask_depth": book_top_levels(levels.get(leg), "ask"),
         "hedge_ask_depth": book_top_levels(levels.get(other), "ask"),
     }
+    post_fields.update(_oracle_mark(cid, cfg, time.time()))
     if dry_run or status_s == "dry":
         intent["reclaim_filled"] = float(intent.get("reclaim_target") or shares)
         intent["reclaim_buy_px"] = float(limit)
@@ -5298,7 +5330,7 @@ def _manage_sells_locked(cfg: dict, state: dict, chain: ChainReader) -> None:
                 dirty = True
             _log_scrap_outcome(intent, cid, "window_end")
             _whatsapp("scrap_filled", intent, cid, now=now, window_end=True)
-            _close_bag_risk(cid, intent, now=now)
+            _close_bag_risk(cid, intent, now=now, cfg=cfg)
             continue
 
         up_tok = str(intent.get("up_token") or "")
@@ -5625,6 +5657,9 @@ def _manage_sells_locked(cfg: dict, state: dict, chain: ChainReader) -> None:
                 persist_s=dump_persist_s,
             )
         elif dump_armed and why_d in {"armed", "waiting"}:
+            arm_mark = (
+                _oracle_mark(cid, cfg, time.time()) if why_d == "armed" else {}
+            )
             log_event(
                 "sell_dump_persist",
                 condition_id=cid,
@@ -5637,6 +5672,7 @@ def _manage_sells_locked(cfg: dict, state: dict, chain: ChainReader) -> None:
                 other_min=other_min,
                 below=dump_below,
                 persist_s=dump_persist_s,
+                **arm_mark,
             )
         if fire_d and held and not cooling:
             fire_action, fire_reason = sell_fire_decision(
@@ -5787,6 +5823,7 @@ def _manage_sells_locked(cfg: dict, state: dict, chain: ChainReader) -> None:
                             avg_px=intent.get("sell_dump_fill_px"),
                             bid=dump_bid,
                             status=last_status,
+                            **_oracle_mark(cid, cfg, time.time()),
                         )
                         _whatsapp("dump_filled", intent, cid, now=now, leg=held)
                         notify(
@@ -6239,7 +6276,7 @@ def _manage_sells_locked(cfg: dict, state: dict, chain: ChainReader) -> None:
                     if _uses_scrap_plan(intent, scrap_fraction):
                         post_size = _scrap_post_shares(
                             intent, size, scrap_fraction, cid, loser,
-                            threshold=thr,
+                            threshold=thr, cfg=cfg, now=now,
                         )
                     plan_done = (
                         _uses_scrap_plan(intent, scrap_fraction)
@@ -6361,6 +6398,7 @@ def _manage_sells_locked(cfg: dict, state: dict, chain: ChainReader) -> None:
                                 status=last_status,
                                 **done_extra,
                                 **oracle_fields,
+                                **_oracle_mark(cid, cfg, time.time()),
                             )
                             notify(
                                 "Mint loser sold",
@@ -6408,7 +6446,7 @@ def _manage_sells_locked(cfg: dict, state: dict, chain: ChainReader) -> None:
             if b_latch != "already_flat" and _uses_scrap_plan(intent, scrap_fraction):
                 clipped = _scrap_post_shares(
                     intent, b_size, scrap_fraction, cid, persist_leg,
-                    threshold=thr,
+                    threshold=thr, cfg=cfg, now=now,
                 )
                 if clipped < 0.01:
                     _met, why = scrap_target_met(
@@ -6534,6 +6572,7 @@ def _manage_sells_locked(cfg: dict, state: dict, chain: ChainReader) -> None:
                             sold=blind_sold,
                             status=blind_status,
                             **blind_fields,
+                            **_oracle_mark(cid, cfg, time.time()),
                         )
                     elif empty_fak_status(blind_status):
                         _place_scrap_rest(
@@ -6573,6 +6612,8 @@ def _manage_sells_locked(cfg: dict, state: dict, chain: ChainReader) -> None:
                         cid=cid,
                         leg=persist_leg,
                         threshold=thr,
+                        cfg=cfg,
+                        now=now,
                     )
                 rest_size = max(
                     0.0,
@@ -7318,7 +7359,7 @@ def main() -> int:
         max_ttm=cfg["enter_max_ttm_min"],
         series=cfg["series_slugs"],
         loops=("sell", "mint", "oracle", "redeem"),
-        oracle_log_enabled=bool(cfg.get("oracle_log_enabled", False)),
+        oracle_log_enabled=bool(cfg.get("oracle_log_enabled", True)),
         sell_plan=sell_plan_banner(cfg),
         mint_sequential=seq_settings(cfg)[0],
         mint_seq_lead_s=seq_settings(cfg)[1],
@@ -7326,7 +7367,7 @@ def main() -> int:
         redeem_enabled=redeem_settings(cfg).enabled,
     )
     _whatsapp("startup", cfg)
-    if cfg.get("oracle_log_enabled", False):
+    if cfg.get("oracle_log_enabled", True):
         late_s = float(cfg.get("sell_late_window_s") or 0.0)
         if late_s > 0:
             veto = f"[dim](+ late loser-scrap veto ≤{late_s:g}s TTM)[/]"
@@ -7365,7 +7406,7 @@ def main() -> int:
 
     def oracle_tick() -> None:
         current = cfg_box.get("cfg") or {}
-        enabled = bool(current.get("oracle_log_enabled", False))
+        enabled = bool(current.get("oracle_log_enabled", True))
         with STATE_LOCK:
             snap = snapshot_intents(state)
         oracle.tick(

@@ -20,7 +20,7 @@ from buy.mint_loops import (
     persist_digest,
     state_persist_changed,
 )
-from buy.oracle_log import fetch_crypto_price
+from buy.oracle_log import fetch_crypto_price, oracle_mark_fields
 import buy.mint_sell as mint_sell
 
 
@@ -84,6 +84,7 @@ def _sell_runtime(saves: list) -> dict:
     ns["bid_fill_depth"] = bid_fill_depth
     ns["book_top_levels"] = book_top_levels
     ns["ask_size_within"] = ask_size_within
+    ns["oracle_mark_fields"] = oracle_mark_fields
     ns["log_event"] = lambda *_a, **_k: None
     ns["notify"] = lambda *_a, **_k: None
     ns["console"] = SimpleNamespace(print=lambda *_a, **_k: None)
@@ -1731,6 +1732,134 @@ class ScrapLatePriceTests(unittest.TestCase):
         dump = src[src.find("def _run_dump_fak_with_refire") : src.find("\ndef _apply_sell_fire_cancel")]
         self.assertNotIn("scrap_active_prices", dump)
         self.assertNotIn("sell_threshold_late", dump)
+
+
+class OracleMarkLoopTests(unittest.TestCase):
+    def test_scrap_dump_and_bag_end_copy_the_cache(self):
+        ns, events, _fak, clock, _book = _scrap_harness()
+        fetches = {"n": 0}
+        real = ns["_fetch_books"]
+
+        def counting(*args, **kwargs):
+            fetches["n"] += 1
+            return real(*args, **kwargs)
+
+        ns["_fetch_books"] = counting
+
+        def view(_cid):
+            now = clock["now"]
+            return SimpleNamespace(
+                twap="101000",
+                open_usd="100000",
+                obs_ts=now - 2.0,
+                recv_ts=now - 1.0,
+                open_source="rtds_twap_at_start",
+            )
+
+        ns["_oracle_bag_view"] = view
+        end = clock["now"] + 200.0
+        intent = _open_scrap_bag(
+            end, shares=100.0, sell_loser_armed_at=clock["now"] - 10.0,
+        )
+        cfg = _scrap_cfg(shares=100.0, sell_scrap_fraction=0.5, sell_persist_s=0.0)
+        state = {"intents": {"cid-mark": intent}}
+        ns["remember_persisted_state"](state)
+        ns["_manage_sells_locked"](cfg, state, object())
+        self.assertEqual(fetches["n"], 1)
+        plan = [row for row in events if row["event"] == "sell_scrap_plan"]
+        done = [row for row in events if row["event"] == "sell_loser_done"]
+        self.assertEqual(len(plan), 1)
+        self.assertEqual(len(done), 1)
+        for row in (plan[0], done[0]):
+            self.assertEqual(row["oracle_px"], 101000.0)
+            self.assertEqual(row["oracle_start"], 100000.0)
+            self.assertEqual(row["oracle_dist_usd"], 1000.0)
+            self.assertEqual(row["oracle_dist_bps"], 100.0)
+            self.assertEqual(row["oracle_source"], "polymarket_rtds_twap_sixty")
+            self.assertEqual(row["oracle_start_source"], "rtds_twap_at_start")
+            self.assertEqual(row["oracle_age_s"], 1.0)
+            self.assertIsNone(row["oracle_reason"])
+
+        ns2, events2, _fak2, clock2 = _dump_harness(_fill_fak)
+        fetches2 = {"n": 0}
+        real2 = ns2["_fetch_books"]
+
+        def counting2(*args, **kwargs):
+            fetches2["n"] += 1
+            return real2(*args, **kwargs)
+
+        ns2["_fetch_books"] = counting2
+
+        def view2(_cid):
+            now = clock2["now"]
+            return SimpleNamespace(
+                twap="99000",
+                open_usd="100000",
+                obs_ts=now - 2.0,
+                recv_ts=now - 0.4,
+                open_source="rtds_twap_at_start",
+            )
+
+        ns2["_oracle_bag_view"] = view2
+        end2 = clock2["now"] + 100.0
+        intent2 = _held_after_scrap(end2)
+        cfg2 = _dump_cfg(sell_dump_persist_s=2.0)
+        state2 = {"intents": {"cid-dump": intent2}}
+        ns2["remember_persisted_state"](state2)
+        ns2["_manage_sells_locked"](cfg2, state2, object())
+        armed = [
+            row for row in events2
+            if row["event"] == "sell_dump_persist" and row["why"] == "armed"
+        ]
+        self.assertEqual(len(armed), 1)
+        self.assertEqual(armed[0]["oracle_dist_usd"], -1000.0)
+        self.assertEqual(armed[0]["oracle_dist_bps"], -100.0)
+        clock2["now"] += 1.0
+        ns2["_manage_sells_locked"](cfg2, state2, object())
+        waiting = [
+            row for row in events2
+            if row["event"] == "sell_dump_persist" and row["why"] == "waiting"
+        ]
+        self.assertTrue(waiting)
+        self.assertNotIn("oracle_px", waiting[-1])
+        before_fire = fetches2["n"]
+        clock2["now"] += 1.0
+        ns2["_manage_sells_locked"](cfg2, state2, object())
+        dumped = [row for row in events2 if row["event"] == "sell_dump_done"]
+        self.assertEqual(len(dumped), 1)
+        self.assertEqual(dumped[0]["oracle_px"], 99000.0)
+        self.assertEqual(dumped[0]["oracle_reason"], None)
+        self.assertEqual(fetches2["n"], before_fire + 1)
+
+        clock["now"] = end + 1.0
+        before_close = fetches["n"]
+        ns["_manage_sells_locked"](cfg, state, object())
+        risks = [row for row in events if row["event"] == "bag_risk"]
+        self.assertEqual(len(risks), 1)
+        self.assertEqual(risks[0]["oracle_px"], 101000.0)
+        self.assertEqual(risks[0]["oracle_dist_bps"], 100.0)
+        self.assertEqual(fetches["n"], before_close)
+
+    def test_disabled_mark_does_not_read_the_cache(self):
+        ns, events, _fak, clock, _book = _scrap_harness()
+        reads = {"n": 0}
+
+        def view(_cid):
+            reads["n"] += 1
+            raise AssertionError("cache read")
+
+        ns["_oracle_bag_view"] = view
+        end = clock["now"] + 200.0
+        intent = _open_scrap_bag(end, sell_loser_armed_at=clock["now"] - 10.0)
+        cfg = _scrap_cfg(oracle_log_enabled=False, sell_persist_s=0.0)
+        state = {"intents": {"cid-off": intent}}
+        ns["remember_persisted_state"](state)
+        ns["_manage_sells_locked"](cfg, state, object())
+        done = [row for row in events if row["event"] == "sell_loser_done"]
+        self.assertEqual(len(done), 1)
+        self.assertEqual(done[0]["oracle_reason"], "disabled")
+        self.assertIsNone(done[0]["oracle_px"])
+        self.assertEqual(reads["n"], 0)
 
 
 if __name__ == "__main__":

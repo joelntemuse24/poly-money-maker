@@ -225,6 +225,88 @@ class OracleBagView:
     live_recv_ts: Optional[float] = None
 
 
+# Log label for the settlement series. ``OracleBagView.source`` stays
+# ``polymarket_rtds`` because the same socket also carries the live print.
+ORACLE_MARK_SOURCE = "polymarket_rtds_twap_sixty"
+
+
+def _blank_oracle_mark(reason: Optional[str]) -> dict:
+    return {
+        "oracle_px": None,
+        "oracle_start": None,
+        "oracle_dist_usd": None,
+        "oracle_dist_bps": None,
+        "oracle_source": None,
+        "oracle_start_source": None,
+        "oracle_age_s": None,
+        "oracle_reason": reason,
+    }
+
+
+def oracle_mark_fields(
+    view: Any,
+    *,
+    now_s: float,
+    enabled: bool = True,
+    stale_s: float = STALE_AFTER_S,
+) -> dict:
+    """TWAP vs the bag's strike, from a cache snapshot. No I/O, never raises.
+
+    ``oracle_px`` is the Chainlink BTC/USD 60s TWAP (the series Polymarket
+    uses to resolve btc-up-or-down-15m). ``oracle_start`` is that TWAP at
+    the window open (price to beat). ``oracle_dist_usd`` is signed
+    (TWAP − strike): positive means the TWAP is above the strike. Basis
+    points use the same sign. A reading older than ``stale_s`` (local
+    ``recv_ts``, default 20s) keeps the age and drops the prices.
+    """
+    try:
+        if not enabled:
+            return _blank_oracle_mark("disabled")
+        twap = _as_float(getattr(view, "twap", None))
+        if twap is None:
+            return _blank_oracle_mark("no_price")
+        start_source = getattr(view, "open_source", None)
+        if not isinstance(start_source, str) or not start_source:
+            start_source = None
+        recv = _as_float(getattr(view, "recv_ts", None))
+        now = _as_float(now_s)
+        if recv is None or now is None:
+            out = _blank_oracle_mark("no_age")
+            out["oracle_source"] = ORACLE_MARK_SOURCE
+            out["oracle_start_source"] = start_source
+            return out
+        age = now - recv
+        if age < 0:
+            age = 0.0
+        age_r = round(age, 3)
+        cutoff = _as_float(stale_s)
+        if cutoff is None:
+            cutoff = STALE_AFTER_S
+        if age > cutoff:
+            out = _blank_oracle_mark("stale")
+            out["oracle_source"] = ORACLE_MARK_SOURCE
+            out["oracle_start_source"] = start_source
+            out["oracle_age_s"] = age_r
+            return out
+        out = _blank_oracle_mark(None)
+        out["oracle_px"] = round(twap, 2)
+        out["oracle_source"] = ORACLE_MARK_SOURCE
+        out["oracle_start_source"] = start_source
+        out["oracle_age_s"] = age_r
+        start = _as_float(getattr(view, "open_usd", None))
+        if start is None:
+            out["oracle_reason"] = "no_start"
+            return out
+        dist = twap - start
+        out["oracle_start"] = round(start, 2)
+        out["oracle_dist_usd"] = round(dist, 2)
+        if start != 0.0:
+            out["oracle_dist_bps"] = round((dist / start) * 10000.0, 1)
+        return out
+    except Exception:
+        return _blank_oracle_mark("no_price")
+
+
 @dataclass(frozen=True)
 class OracleWindow:
     condition_id: str

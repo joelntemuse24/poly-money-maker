@@ -637,6 +637,39 @@ class ArmTests(unittest.TestCase):
 
 
 class LoopTests(unittest.TestCase):
+    def test_reclaim_buy_logs_the_oracle_mark_after_the_order(self):
+        loop = _Loop()
+        reads = {"n": 0}
+
+        def view(_cid):
+            reads["n"] += 1
+            now = loop.clock["now"]
+            return SimpleNamespace(
+                twap="100050",
+                open_usd="100000",
+                obs_ts=now - 2.0,
+                recv_ts=now - 0.8,
+                open_source="rtds_twap_at_start",
+            )
+
+        loop.ns["_oracle_bag_view"] = view
+        now = loop.clock["now"]
+        intent = _dumped(now + 200.0)
+        _arm_entry(intent, now)
+        loop.book = _qualifying()
+        before_fetch = len(loop.fetches)
+        loop.tick(_reclaim_cfg(), intent)
+        self.assertEqual(len(loop.buys), 1)
+        self.assertEqual(len(loop.fetches), before_fetch)
+        buy = loop.events_named("reclaim_buy")[-1]
+        self.assertEqual(buy["oracle_px"], 100050.0)
+        self.assertEqual(buy["oracle_start"], 100000.0)
+        self.assertEqual(buy["oracle_dist_usd"], 50.0)
+        self.assertEqual(buy["oracle_dist_bps"], 5.0)
+        self.assertEqual(buy["oracle_source"], "polymarket_rtds_twap_sixty")
+        self.assertEqual(buy["oracle_age_s"], 0.8)
+        self.assertIsNone(buy["oracle_reason"])
+        self.assertGreaterEqual(reads["n"], 1)
     def test_scrap_only_and_incomplete_dump_do_not_buy(self):
         loop = _Loop()
         end = loop.clock["now"] + 200.0
