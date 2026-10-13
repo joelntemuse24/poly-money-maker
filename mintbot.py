@@ -360,6 +360,9 @@ DEFAULTS = {
     "sell_dump_other_min": 0.30,
     # When the held dump fills, also sell the kept scrap half (1c floor sweep).
     "sell_dump_also_kept": False,
+    # With also_kept, post the kept leg at the same time as the held leg.
+    # False restores the old order: kept starts only after the held dump fills.
+    "sell_dump_parallel_kept": True,
     # After sell_dump_done, journal both books until the window ends.
     "post_dump_log_enabled": True,
     # Post-dump reclaim buy. Off until strategy_mint.json sets it true.
@@ -2397,6 +2400,313 @@ def _run_dump_fak_with_refire(
     return sold_total, last_status, last_px, attempts, live_bid
 
 
+def _dump_parallel_kept(cfg: dict) -> bool:
+    """True unless ``sell_dump_parallel_kept`` is explicitly off.
+
+    Missing or null keeps the default (post the kept leg with the held leg).
+    """
+    raw = cfg.get("sell_dump_parallel_kept", True)
+    if raw is None or raw == "":
+        return True
+    return bool(raw)
+
+
+def _prepare_kept_dump(
+    *,
+    intent: dict,
+    kept: str,
+    tokens: dict,
+    tol: float,
+    chain: ChainReader,
+    ctf: str,
+    funder_cs: Optional[str],
+) -> dict:
+    """Size the kept sell on the caller. No order."""
+    try:
+        keep = float(intent.get("sell_scrap_keep") or 0.0)
+    except (TypeError, ValueError):
+        keep = 0.0
+    if not math.isfinite(keep) or keep < 0:
+        keep = 0.0
+    token = tokens.get(kept)
+    size = 0.0
+    latch = "no_keep"
+    if keep >= tol and token:
+        size, latch = _sell_inventory(
+            chain, ctf, funder_cs, token, keep, tol,
+            "seen_kept_inventory", intent,
+        )
+        if latch in {"already_flat", "await_inventory"}:
+            size = 0.0
+    return {
+        "leg": kept,
+        "keep": keep,
+        "token": token,
+        "size": float(size),
+        "latch": latch,
+        "planned": round(float(size), 4),
+    }
+
+
+def _empty_kept_result(prep: dict) -> dict:
+    return {
+        "leg": prep.get("leg"),
+        "keep": prep.get("keep"),
+        "planned": prep.get("planned"),
+        "latch": prep.get("latch") or "no_keep",
+        "sold": 0.0,
+        "swept": 0.0,
+        "fills": [],
+        "bid": None,
+        "limit": None,
+        "attempts": 0,
+        "status": prep.get("latch") or "no_keep",
+        "outcome": "nothing_kept",
+        "remaining": 0.0,
+        "posted": False,
+    }
+
+
+def _post_kept_dump(
+    prep: dict,
+    *,
+    cfg: dict,
+    cid: str,
+    slug: Any,
+    bids: dict,
+    books: dict,
+    ttm_s: Optional[float],
+    min_bid_size: float,
+    retries: int,
+    ladder_step: float,
+    ladder_rungs: int,
+    dry_run: bool,
+    tol: float,
+) -> dict:
+    """Kept-leg FAK, fresh-bid refire, and one floor sweep. Does not write the intent."""
+    size = float(prep.get("size") or 0.0)
+    if size < tol:
+        return _empty_kept_result(prep)
+    kept = prep.get("leg")
+    token = prep.get("token")
+    floor = max(0.01, float(cfg.get("sell_clob_min_price") or 0.01))
+    kept_fills: list = []
+    sold_total, last_status, last_px, attempts, live_bid = _run_dump_fak_with_refire(
+        token_id=token,
+        size=size,
+        initial_bid=float(bids.get(kept) or 0.0),
+        initial_bids=books.get(kept),
+        held=kept,
+        slug=slug,
+        condition_id=cid,
+        ttm_s=ttm_s,
+        floor=floor,
+        min_bid_size=min_bid_size,
+        retries=retries,
+        ladder_step=ladder_step,
+        ladder_rungs=ladder_rungs,
+        dry_run=dry_run,
+        tol=tol,
+        fills=kept_fills,
+    )
+    sold_total = float(sold_total or 0.0)
+    swept = 0.0
+    if (
+        not dry_run
+        and size - sold_total >= tol
+        and last_status != "already_flat"
+    ):
+        with _io_unlocked():
+            swept, sweep_status, sweep_px = _run_fak_ladder(
+                token,
+                size - sold_total,
+                [round(floor, 4)],
+                dry_run=dry_run,
+                bid=live_bid,
+                label=f"dump kept {kept}",
+                slug=slug,
+                tol=tol,
+                depth_bids=books.get(kept),
+                depth_path="dump_kept",
+                depth_leg=kept,
+                ttm_s=ttm_s,
+                condition_id=cid,
+                fills=kept_fills,
+            )
+        attempts += 1
+        sold_total += float(swept or 0.0)
+        last_status, last_px = sweep_status, sweep_px
+    remaining = max(0.0, size - sold_total)
+    if dry_run:
+        outcome = "dry_run"
+    elif last_status == "already_flat" and sold_total < tol:
+        outcome = "nothing_kept"
+    elif remaining < tol:
+        outcome = "filled"
+    elif sold_total >= tol:
+        outcome = "partial"
+    else:
+        outcome = "no_fill"
+    return {
+        "leg": kept,
+        "keep": prep.get("keep"),
+        "planned": prep.get("planned"),
+        "latch": prep.get("latch"),
+        "sold": sold_total,
+        "swept": float(swept or 0.0),
+        "fills": kept_fills,
+        "bid": live_bid,
+        "limit": last_px,
+        "attempts": int(attempts),
+        "status": last_status,
+        "outcome": outcome,
+        "remaining": remaining,
+        "posted": True,
+    }
+
+
+def _apply_kept_dump_result(intent: dict, cid: str, result: dict) -> None:
+    """Write one kept-dump result onto the intent. Caller holds the sell thread."""
+    slug = intent.get("slug")
+    kept = result.get("leg")
+    planned = result.get("planned")
+    keep = result.get("keep")
+    intent["sell_dump_kept_done"] = True
+    intent["sell_dump_kept_planned"] = planned
+    if not result.get("posted"):
+        intent["sell_dump_kept_outcome"] = "nothing_kept"
+        log_event(
+            "sell_dump_kept",
+            condition_id=cid,
+            slug=slug,
+            leg=kept,
+            planned=planned,
+            keep=keep,
+            sold=0.0,
+            avg_px=None,
+            status=result.get("status"),
+            outcome="nothing_kept",
+            remaining=0.0,
+        )
+        return
+    sold_total = float(result.get("sold") or 0.0)
+    outcome = result.get("outcome")
+    avg_px = record_fill_px(intent, "sell_dump_kept_fill_px", result.get("fills") or [])
+    intent["sell_dump_kept_leg"] = kept
+    intent["sell_dump_kept_filled"] = round(sold_total, 6)
+    intent["sell_dump_kept_limit"] = result.get("limit")
+    intent["sell_dump_kept_attempts"] = int(result.get("attempts") or 0)
+    intent["sell_dump_kept_outcome"] = outcome
+    if outcome in {"filled", "dry_run"}:
+        intent["sell_dump_kept_sold"] = True
+    log_event(
+        "sell_dump_kept",
+        condition_id=cid,
+        slug=slug,
+        leg=kept,
+        planned=planned,
+        keep=keep,
+        sold=round(sold_total, 4),
+        swept=round(float(result.get("swept") or 0.0), 4),
+        fills=len(result.get("fills") or []),
+        avg_px=avg_px,
+        bid=result.get("bid"),
+        limit=result.get("limit"),
+        attempts=int(result.get("attempts") or 0),
+        status=result.get("status"),
+        outcome=outcome,
+        remaining=round(float(result.get("remaining") or 0.0), 4),
+    )
+    console.print(
+        f"  [bold bright_yellow][DUMP KEPT {str(outcome).upper()}][/] {kept} "
+        f"{sold_total:.2f}/{float(result.get('planned') or 0.0):.2f}  avg={avg_px}"
+    )
+
+
+def _start_parallel_kept(
+    *,
+    cfg: dict,
+    intent: dict,
+    cid: str,
+    kept: str,
+    tokens: dict,
+    bids: dict,
+    books: dict,
+    ttm_s: Optional[float],
+    min_bid_size: float,
+    retries: int,
+    ladder_step: float,
+    ladder_rungs: int,
+    dry_run: bool,
+    tol: float,
+    chain: ChainReader,
+    ctf: str,
+    funder_cs: Optional[str],
+) -> Tuple[Optional[threading.Thread], dict]:
+    """Size the kept leg, then start its sell. The caller posts the held leg next.
+
+    The worker does not write ``intent``. A zero keep is a result with no thread.
+    """
+    prep = _prepare_kept_dump(
+        intent=intent,
+        kept=kept,
+        tokens=tokens,
+        tol=tol,
+        chain=chain,
+        ctf=ctf,
+        funder_cs=funder_cs,
+    )
+    box: dict = {"prep": prep}
+    if float(prep["size"]) < tol:
+        box["result"] = _empty_kept_result(prep)
+        return None, box
+    slug = intent.get("slug")
+
+    def _run() -> None:
+        try:
+            box["result"] = _post_kept_dump(
+                prep,
+                cfg=cfg,
+                cid=cid,
+                slug=slug,
+                bids=bids,
+                books=books,
+                ttm_s=ttm_s,
+                min_bid_size=min_bid_size,
+                retries=retries,
+                ladder_step=ladder_step,
+                ladder_rungs=ladder_rungs,
+                dry_run=dry_run,
+                tol=tol,
+            )
+        except Exception as exc:
+            failed = _empty_kept_result(prep)
+            failed["posted"] = True
+            failed["outcome"] = "no_fill"
+            failed["status"] = f"error:{str(exc)[:160]}"
+            failed["remaining"] = float(prep["size"])
+            box["result"] = failed
+
+    worker = threading.Thread(target=_run, name="dump-kept", daemon=True)
+    worker.start()
+    return worker, box
+
+
+def _finish_parallel_kept(intent: dict, cid: str, box: Optional[dict]) -> None:
+    """Join already happened. Merge the kept result once."""
+    if not box or box.get("applied"):
+        return
+    box["applied"] = True
+    result = box.get("result")
+    if result is None:
+        result = _empty_kept_result(box.get("prep") or {})
+        result["posted"] = True
+        result["outcome"] = "no_fill"
+        result["status"] = "error:kept_missing"
+        result["remaining"] = float((box.get("prep") or {}).get("size") or 0.0)
+    _apply_kept_dump_result(intent, cid, result)
+
+
 def _sell_kept_after_dump(
     *,
     cfg: dict,
@@ -2417,7 +2727,7 @@ def _sell_kept_after_dump(
     ctf: str,
     funder_cs: Optional[str],
 ) -> None:
-    """``sell_dump_also_kept``: exit the kept scrap half in the dump event.
+    """``sell_dump_also_kept`` when the kept leg waits for the held fill.
 
     Same live-bid FAK + fast refire as the held dump, then one FAK at the
     1c floor for any remainder. Runs once per bag (``sell_dump_kept_done``).
@@ -2425,132 +2735,31 @@ def _sell_kept_after_dump(
     already_exit = bool(intent.get("sell_exit_inflight"))
     intent["sell_exit_inflight"] = True
     try:
-        intent["sell_dump_kept_done"] = True
-        slug = intent.get("slug")
-        floor = max(0.01, float(cfg.get("sell_clob_min_price") or 0.01))
-        try:
-            keep = float(intent.get("sell_scrap_keep") or 0.0)
-        except (TypeError, ValueError):
-            keep = 0.0
-        if not math.isfinite(keep) or keep < 0:
-            keep = 0.0
-        token = tokens.get(kept)
-        size = 0.0
-        latch = "no_keep"
-        if keep >= tol and token:
-            size, latch = _sell_inventory(
-                chain, ctf, funder_cs, token, keep, tol,
-                "seen_kept_inventory", intent,
-            )
-            if latch in {"already_flat", "await_inventory"}:
-                size = 0.0
-        planned = round(float(size), 4)
-        intent["sell_dump_kept_planned"] = planned
-        if size < tol:
-            intent["sell_dump_kept_outcome"] = "nothing_kept"
-            log_event(
-                "sell_dump_kept",
-                condition_id=cid,
-                slug=slug,
-                leg=kept,
-                planned=planned,
-                keep=keep,
-                sold=0.0,
-                avg_px=None,
-                status=latch,
-                outcome="nothing_kept",
-                remaining=0.0,
-            )
-            return
-
-        kept_fills: list = []
-        with _mark_sell_exit(intent):
-            sold_total, last_status, last_px, attempts, live_bid = _run_dump_fak_with_refire(
-                token_id=token,
-                size=size,
-                initial_bid=float(bids.get(kept) or 0.0),
-                initial_bids=books.get(kept),
-                held=kept,
-                slug=slug,
-                condition_id=cid,
-                ttm_s=ttm_s,
-                floor=floor,
-                min_bid_size=min_bid_size,
-                retries=retries,
-                ladder_step=ladder_step,
-                ladder_rungs=ladder_rungs,
-                dry_run=dry_run,
-                tol=tol,
-                fills=kept_fills,
-            )
-            sold_total = float(sold_total or 0.0)
-            swept = 0.0
-            if (
-                not dry_run
-                and size - sold_total >= tol
-                and last_status != "already_flat"
-            ):
-                with _io_unlocked():
-                    swept, sweep_status, sweep_px = _run_fak_ladder(
-                        token,
-                        size - sold_total,
-                        [round(floor, 4)],
-                        dry_run=dry_run,
-                        bid=live_bid,
-                        label=f"dump kept {kept}",
-                        slug=slug,
-                        tol=tol,
-                        depth_bids=books.get(kept),
-                        depth_path="dump_kept",
-                        depth_leg=kept,
-                        ttm_s=ttm_s,
-                        condition_id=cid,
-                        fills=kept_fills,
-                    )
-                attempts += 1
-                sold_total += float(swept or 0.0)
-                last_status, last_px = sweep_status, sweep_px
-        remaining = max(0.0, size - sold_total)
-        if dry_run:
-            outcome = "dry_run"
-        elif last_status == "already_flat" and sold_total < tol:
-            outcome = "nothing_kept"
-        elif remaining < tol:
-            outcome = "filled"
-        elif sold_total >= tol:
-            outcome = "partial"
-        else:
-            outcome = "no_fill"
-        avg_px = record_fill_px(intent, "sell_dump_kept_fill_px", kept_fills)
-        intent["sell_dump_kept_leg"] = kept
-        intent["sell_dump_kept_filled"] = round(sold_total, 6)
-        intent["sell_dump_kept_limit"] = last_px
-        intent["sell_dump_kept_attempts"] = int(attempts)
-        intent["sell_dump_kept_outcome"] = outcome
-        if outcome in {"filled", "dry_run"}:
-            intent["sell_dump_kept_sold"] = True
-        log_event(
-            "sell_dump_kept",
-            condition_id=cid,
-            slug=slug,
-            leg=kept,
-            planned=planned,
-            keep=keep,
-            sold=round(sold_total, 4),
-            swept=round(float(swept or 0.0), 4),
-            fills=len(kept_fills),
-            avg_px=avg_px,
-            bid=live_bid,
-            limit=last_px,
-            attempts=int(attempts),
-            status=last_status,
-            outcome=outcome,
-            remaining=round(remaining, 4),
+        prep = _prepare_kept_dump(
+            intent=intent,
+            kept=kept,
+            tokens=tokens,
+            tol=tol,
+            chain=chain,
+            ctf=ctf,
+            funder_cs=funder_cs,
         )
-        console.print(
-            f"  [bold bright_yellow][DUMP KEPT {outcome.upper()}][/] {kept} "
-            f"{sold_total:.2f}/{size:.2f}  avg={avg_px}"
+        result = _post_kept_dump(
+            prep,
+            cfg=cfg,
+            cid=cid,
+            slug=intent.get("slug"),
+            bids=bids,
+            books=books,
+            ttm_s=ttm_s,
+            min_bid_size=min_bid_size,
+            retries=retries,
+            ladder_step=ladder_step,
+            ladder_rungs=ladder_rungs,
+            dry_run=dry_run,
+            tol=tol,
         )
+        _apply_kept_dump_result(intent, cid, result)
     finally:
         if not already_exit:
             intent["sell_exit_inflight"] = False
@@ -5266,27 +5475,61 @@ def _manage_sells_locked(cfg: dict, state: dict, chain: ChainReader) -> None:
                     live_px = float(dump_bid or 0)
                     intent["last_sell_attempt_at"] = now
                     dump_fills: list = []
+                    also_kept = bool(cfg.get("sell_dump_also_kept", False))
+                    launch_kept = (
+                        also_kept
+                        and _dump_parallel_kept(cfg)
+                        and not intent.get("sell_dump_kept_done")
+                    )
+                    kept_thread = None
+                    kept_box = None
                     with _mark_sell_exit(intent):
-                        sold_total, last_status, last_px, used_attempts, live_px = (
-                            _run_dump_fak_with_refire(
-                                token_id=d_tok,
-                                size=size,
-                                initial_bid=live_px,
-                                initial_bids=books.get(held),
-                                held=held,
-                                slug=intent.get("slug"),
-                                condition_id=cid,
+                        if launch_kept:
+                            # Size locally, start the kept FAK, then post the
+                            # held FAK on this thread. No join before that post.
+                            kept_thread, kept_box = _start_parallel_kept(
+                                cfg=cfg,
+                                intent=intent,
+                                cid=cid,
+                                kept=sold_leg,
+                                tokens=tokens,
+                                bids=bids,
+                                books=books,
                                 ttm_s=ttm_s,
-                                floor=floor,
                                 min_bid_size=min_bid_size,
                                 retries=dump_retries,
                                 ladder_step=dump_ladder_step,
                                 ladder_rungs=dump_ladder_rungs,
                                 dry_run=dry_run,
                                 tol=tol,
-                                fills=dump_fills,
+                                chain=chain,
+                                ctf=ctf,
+                                funder_cs=funder_cs,
                             )
-                        )
+                        try:
+                            sold_total, last_status, last_px, used_attempts, live_px = (
+                                _run_dump_fak_with_refire(
+                                    token_id=d_tok,
+                                    size=size,
+                                    initial_bid=live_px,
+                                    initial_bids=books.get(held),
+                                    held=held,
+                                    slug=intent.get("slug"),
+                                    condition_id=cid,
+                                    ttm_s=ttm_s,
+                                    floor=floor,
+                                    min_bid_size=min_bid_size,
+                                    retries=dump_retries,
+                                    ladder_step=dump_ladder_step,
+                                    ladder_rungs=dump_ladder_rungs,
+                                    dry_run=dry_run,
+                                    tol=tol,
+                                    fills=dump_fills,
+                                )
+                            )
+                        finally:
+                            if kept_thread is not None:
+                                kept_thread.join()
                     record_fill_px(intent, "sell_dump_fill_px", dump_fills)
                     intent["sell_dump_attempts"] = int(
                         intent.get("sell_dump_attempts") or 0
@@ -5338,7 +5581,8 @@ def _manage_sells_locked(cfg: dict, state: dict, chain: ChainReader) -> None:
                             f"bid={live_px:.3f} (<{dump_below:.2f})"
                         )
                         if (
-                            bool(cfg.get("sell_dump_also_kept", False))
+                            also_kept
+                            and not launch_kept
                             and not intent.get("sell_dump_kept_done")
                         ):
                             _sell_kept_after_dump(
@@ -5364,6 +5608,10 @@ def _manage_sells_locked(cfg: dict, state: dict, chain: ChainReader) -> None:
                         intent["sell_dump_filled"] = float(
                             intent.get("sell_dump_filled") or 0
                         ) + sold_total
+                    # Parallel kept started with the held FAK. Merge only
+                    # after both legs have returned, before reclaim on this tick.
+                    if launch_kept:
+                        _finish_parallel_kept(intent, cid, kept_box)
 
         prev_leg = intent.get("sell_loser_leg")
         if prev_leg not in ("up", "dn"):

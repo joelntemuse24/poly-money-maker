@@ -112,6 +112,8 @@ DEFAULT_SELL_KNOBS = {
     "sell_dump_other_min": 0.30,
     # When the held dump fills, also sell the kept scrap half (1c floor sweep).
     "sell_dump_also_kept": False,
+    # Post that kept leg together with the held leg. False waits for the held fill.
+    "sell_dump_parallel_kept": True,
     # Journal both books after the dump until the window ends. No orders.
     "post_dump_log_enabled": True,
     # After a both-sides dump, optional FAK buy of the side that reclaims.

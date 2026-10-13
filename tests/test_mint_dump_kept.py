@@ -69,7 +69,7 @@ class DumpAlsoKeptFiresTests(unittest.TestCase):
         intent = _ready_bag(clock, keep=25.0)
         _tick(ns, _dump_cfg(sell_dump_also_kept=True), intent)
 
-        self.assertEqual(
+        self.assertCountEqual(
             [(c["token_id"], c["size"], c["price"]) for c in fak_calls],
             [("up-tok", 50.0, 0.51), ("dn-tok", 25.0, 0.49)],
         )
@@ -119,7 +119,7 @@ class DumpAlsoKeptFiresTests(unittest.TestCase):
 
         ns["_fak_sell"] = _priced(fak_calls, fill_for)
         intent = _ready_bag(clock)
-        cfg = _dump_cfg(sell_dump_also_kept=True)
+        cfg = _dump_cfg(sell_dump_also_kept=True, sell_dump_parallel_kept=False)
         _tick(ns, cfg, intent)
         held = [(c["size"], c["price"]) for c in fak_calls if c["token_id"] == "up-tok"]
         self.assertEqual(held, [(50.0, 0.51), (40.0, 0.48), (30.0, 0.48)])
@@ -137,7 +137,7 @@ class DumpAlsoKeptFiresTests(unittest.TestCase):
         ns, events, fak_calls, clock = _dump_harness(_fill_fak)
         intent = _ready_bag(clock)
         _tick(ns, _dump_cfg(sell_dump_also_kept=True, dry_run=True), intent)
-        self.assertEqual([c["token_id"] for c in fak_calls], ["up-tok", "dn-tok"])
+        self.assertCountEqual([c["token_id"] for c in fak_calls], ["up-tok", "dn-tok"])
         self.assertTrue(all(c["dry_run"] for c in fak_calls))
         self.assertEqual(intent["sell_dump_kept_outcome"], "dry_run")
         self.assertEqual(_events(events, "sell_dump_kept")[0]["outcome"], "dry_run")
@@ -301,7 +301,7 @@ class DumpAlsoKeptBalanceTests(unittest.TestCase):
             ns["remember_persisted_state"](state)
             cfg = _dump_cfg(sell_dump_also_kept=True, ctf_address="0xctf")
             ns["_manage_sells_locked"](cfg, state, chain)
-            self.assertEqual(
+            self.assertCountEqual(
                 [(c["token_id"], c["size"]) for c in fak_calls],
                 [("up-tok", 50.0), ("dn-tok", 25.0)],
             )
@@ -310,7 +310,8 @@ class DumpAlsoKeptBalanceTests(unittest.TestCase):
 
     def test_keep_caps_a_larger_balance(self):
         intent, _events_, fak_calls = self._run({"up-tok": 50.0, "dn-tok": 40.0})
-        self.assertEqual(fak_calls[-1]["size"], 25.0)
+        kept_posts = [c for c in fak_calls if c["token_id"] == "dn-tok"]
+        self.assertEqual(kept_posts[-1]["size"], 25.0)
         self.assertEqual(intent["sell_dump_kept_planned"], 25.0)
 
 
@@ -323,7 +324,7 @@ class DumpAlsoKeptHotReloadTests(unittest.TestCase):
         self.assertEqual(fak_calls, [])
         clock["now"] += 2.0
         _tick(ns, _dump_cfg(sell_dump_also_kept=True), intent)
-        self.assertEqual([c["token_id"] for c in fak_calls], ["up-tok", "dn-tok"])
+        self.assertCountEqual([c["token_id"] for c in fak_calls], ["up-tok", "dn-tok"])
         self.assertEqual(intent["sell_dump_kept_outcome"], "filled")
 
     def test_enabling_after_the_dump_does_not_sell_kept_later(self):

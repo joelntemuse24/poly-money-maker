@@ -281,11 +281,15 @@ fills the gaps between ticks and is the only place that reads the book
 for this journal. It does not place orders or change a decision.
 `sell_dump_also_kept` (default false and false in the example; **true
 live** since 10:31 IST on 2026-10-03)
-also exits the kept scrap half in the same dump event. Once the held dump
-fills, mintbot sells the tracked kept shares (`sell_scrap_keep` minus
-`sell_dump_kept_filled`) of the
-scrapped leg with the dump's live-bid FAK and refire. It then sends one
-FAK at the 1¢ floor for any remainder and logs `sell_dump_kept`
+also exits the kept scrap half in the same dump event. With
+`sell_dump_parallel_kept` (default true, hot-reloaded) that kept sell
+starts at the same instant as the held leg's first FAK. Neither waits.
+Each leg keeps its own fresh-bid refire. The intent is updated after
+both return, so reclaim cannot arm while either sell is still posting.
+Set the flag false and the kept leg starts only after the held dump
+fills. The size is still the tracked keep (`sell_scrap_keep` minus
+`sell_dump_kept_filled`) of the scrapped leg, live-bid FAK and refire,
+then one FAK at the 1¢ floor for any remainder. It logs `sell_dump_kept`
 (planned, sold, avg_px, outcome). This runs once per bag. Kept 0 is a
 logged no-op. Turning the flag on after a dump does not sell later. When
 that dump fills, mintbot sets `sell_dump_leg` and B FAK-buys
