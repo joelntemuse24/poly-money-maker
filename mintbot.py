@@ -121,10 +121,12 @@ from rich.console import Console
 from rich.panel import Panel
 
 from buy.book import (
+    ask_size_within,
     best_ask_with_min_size,
     best_bid_with_min_size,
     bid_fill_depth,
     book_age_s,
+    book_top_levels,
 )
 from buy.chain import ChainReader, thread_session
 from buy.contracts import ContractCall, build_atomic_mint_calls, build_redeem_calls
@@ -211,6 +213,7 @@ from buy.mint_sell import (
     scrap_live_bid_limit,
     scrap_rest_px,
     scrap_time_gate_open,
+    dump_refire_cap,
     sell_dump_other_confirms,
     sell_fire_decision,
     sell_window_open,
@@ -349,7 +352,8 @@ DEFAULTS = {
     # Window 0 = off.
     "sell_dump_persist_last_min_s": None,
     "sell_dump_persist_last_min_window_s": 0.0,
-    "sell_dump_fak_retries": 2,
+    # 0 or null: after the dump fires, refire until sold or the window ends.
+    "sell_dump_fak_retries": 0,
     "sell_dump_ladder_step": 0.04,
     "sell_dump_ladder_rungs": 4,
     # 0 disables the time-left gate (old behavior). The example sets 240:
@@ -2266,14 +2270,17 @@ def _run_dump_fak_with_refire(
     dry_run: bool,
     tol: float,
     fills: Optional[list] = None,
+    end_ts: Optional[float] = None,
 ) -> Tuple[float, str, Optional[float], int, float]:
-    """Held-dump path: first live-bid FAK, then one fresh-bid FAK per retry.
+    """Held-dump path: first live-bid FAK, then fresh-bid FAKs with no sleep.
 
-    Each retry refetches that leg and posts a single FAK at the new best
-    bid. It does not walk a ladder off the first snapshot. A partial fill
-    refires at once, inside ``retries``. A zero fill still needs
-    ``dump_fast_retry_eligible`` (empty book or kill/cancel). ``fills``
-    collects ``(shares, avg_px)`` across every post.
+    Each retry refetches that leg and posts one FAK at the new best bid.
+    It does not walk a ladder off the first snapshot. A partial fill
+    refires at once. A zero fill still needs ``dump_fast_retry_eligible``
+    (empty book or kill/cancel). An empty refetch is not a stop: the next
+    read is immediate. ``retries`` <= 0 or None keeps going until the size
+    is sold or ``end_ts`` has passed. A positive ``retries`` is a cap on
+    those refires. ``fills`` collects ``(shares, avg_px)`` across every post.
     """
     live_bid = float(initial_bid or 0.0)
     initial_limits = [round(live_bid, 4)] if live_bid > 0 else []
@@ -2315,12 +2322,73 @@ def _run_dump_fak_with_refire(
             return True
         return bool(dump_fast_retry_eligible(sold=got, status=status, tol=tol))
 
-    if dry_run or sold_total >= size - tol:
-        return sold_total, last_status, last_px, attempts, live_bid
-    if not _keep_refiring(sold, last_status):
-        return sold_total, last_status, last_px, attempts, live_bid
+    if retries is None or retries == "":
+        cap = None
+    else:
+        try:
+            cap_n = int(retries)
+        except (TypeError, ValueError):
+            cap_n = 0
+        cap = None if cap_n <= 0 else cap_n
 
-    for retry_idx in range(max(0, int(retries or 0))):
+    def _window_open() -> bool:
+        if end_ts is None or end_ts == "":
+            return True
+        try:
+            end = float(end_ts)
+        except (TypeError, ValueError):
+            return True
+        if end != end or end <= 0 or end == float("inf"):
+            return True
+        try:
+            now = float(time.time())
+        except (TypeError, ValueError):
+            return True
+        if now != now:
+            return True
+        return now < end
+
+    refires = 0
+    while not dry_run and sold_total < size - tol:
+        if not _keep_refiring(sold, last_status):
+            if refires:
+                log_event(
+                    "sell_dump_fast_refire_stop",
+                    condition_id=condition_id,
+                    slug=slug,
+                    leg=held,
+                    retry=refires,
+                    attempts=attempts,
+                    reason="non_retryable_status",
+                    status=last_status,
+                    sold=float(sold or 0.0),
+                )
+            break
+        if not _window_open():
+            log_event(
+                "sell_dump_fast_refire_stop",
+                condition_id=condition_id,
+                slug=slug,
+                leg=held,
+                retry=refires,
+                attempts=attempts,
+                reason="window_end",
+                sold=round(sold_total, 4),
+            )
+            break
+        if cap is not None and refires >= cap:
+            log_event(
+                "sell_dump_fast_refire_stop",
+                condition_id=condition_id,
+                slug=slug,
+                leg=held,
+                retry=refires,
+                attempts=attempts,
+                reason="retry_cap",
+                sold=round(sold_total, 4),
+            )
+            break
+        refires += 1
         with _io_unlocked():
             # Tolerate a 3-tuple stub. Ask fields are not used on this retry.
             row = _fetch_book(token_id, min_bid_size)
@@ -2338,17 +2406,9 @@ def _run_dump_fak_with_refire(
             except (TypeError, ValueError):
                 fresh_bid = 0.0
         if fresh_bid is None or fresh_bid != fresh_bid or fresh_bid <= 0:
-            log_event(
-                "sell_dump_fast_refire_stop",
-                condition_id=condition_id,
-                slug=slug,
-                leg=held,
-                retry=retry_idx + 1,
-                attempts=attempts,
-                reason="empty_book",
-                bid=fresh_bid,
-            )
-            break
+            # The bid is gone. Read again immediately. Do not wait for the
+            # next sell pass, and do not treat an empty book as done.
+            continue
         # One FAK at the bid just fetched. The next retry fetches again.
         live_bid = fresh_bid
         limits = [round(live_bid, 4)]
@@ -2357,7 +2417,7 @@ def _run_dump_fak_with_refire(
             condition_id=condition_id,
             slug=slug,
             leg=held,
-            retry=retry_idx + 1,
+            retry=refires,
             attempts=attempts + 1,
             bid=live_bid,
             limits=limits,
@@ -2382,22 +2442,17 @@ def _run_dump_fak_with_refire(
             )
         attempts += 1
         sold_total += float(sold or 0.0)
-        if dry_run or sold_total >= size - tol:
-            break
-        if not _keep_refiring(sold, last_status):
-            log_event(
-                "sell_dump_fast_refire_stop",
-                condition_id=condition_id,
-                slug=slug,
-                leg=held,
-                retry=retry_idx + 1,
-                attempts=attempts,
-                reason="non_retryable_status",
-                status=last_status,
-                sold=float(sold or 0.0),
-            )
-            break
     return sold_total, last_status, last_px, attempts, live_bid
+
+
+def _reclaim_dump_retries(cfg: dict) -> int:
+    """Finite refire count for the reclaim stop and the hedge sell.
+
+    The dump treats 0/null as unlimited. Those two sells keep a positive
+    cap: the configured count, or 2 when that count is missing or not positive.
+    """
+    cap = dump_refire_cap(cfg.get("sell_dump_fak_retries", 2))
+    return 2 if cap is None else cap
 
 
 def _dump_parallel_kept(cfg: dict) -> bool:
@@ -2482,6 +2537,7 @@ def _post_kept_dump(
     ladder_rungs: int,
     dry_run: bool,
     tol: float,
+    end_ts: Optional[float] = None,
 ) -> dict:
     """Kept-leg FAK, fresh-bid refire, and one floor sweep. Does not write the intent."""
     size = float(prep.get("size") or 0.0)
@@ -2508,6 +2564,7 @@ def _post_kept_dump(
         dry_run=dry_run,
         tol=tol,
         fills=kept_fills,
+        end_ts=end_ts,
     )
     sold_total = float(sold_total or 0.0)
     swept = 0.0
@@ -2634,7 +2691,7 @@ def _start_parallel_kept(
     books: dict,
     ttm_s: Optional[float],
     min_bid_size: float,
-    retries: int,
+    retries: Any,
     ladder_step: float,
     ladder_rungs: int,
     dry_run: bool,
@@ -2642,6 +2699,7 @@ def _start_parallel_kept(
     chain: ChainReader,
     ctf: str,
     funder_cs: Optional[str],
+    end_ts: Optional[float] = None,
 ) -> Tuple[Optional[threading.Thread], dict]:
     """Size the kept leg, then start its sell. The caller posts the held leg next.
 
@@ -2678,6 +2736,7 @@ def _start_parallel_kept(
                 ladder_rungs=ladder_rungs,
                 dry_run=dry_run,
                 tol=tol,
+                end_ts=end_ts,
             )
         except Exception as exc:
             failed = _empty_kept_result(prep)
@@ -2718,7 +2777,7 @@ def _sell_kept_after_dump(
     books: dict,
     ttm_s: Optional[float],
     min_bid_size: float,
-    retries: int,
+    retries: Any,
     ladder_step: float,
     ladder_rungs: int,
     dry_run: bool,
@@ -2726,6 +2785,7 @@ def _sell_kept_after_dump(
     chain: ChainReader,
     ctf: str,
     funder_cs: Optional[str],
+    end_ts: Optional[float] = None,
 ) -> None:
     """``sell_dump_also_kept`` when the kept leg waits for the held fill.
 
@@ -2758,6 +2818,7 @@ def _sell_kept_after_dump(
             ladder_rungs=ladder_rungs,
             dry_run=dry_run,
             tol=tol,
+            end_ts=end_ts,
         )
         _apply_kept_dump_result(intent, cid, result)
     finally:
@@ -3727,6 +3788,7 @@ def _reclaim_hedge_run(
     retries: int,
     min_bid_size: float,
     tol: float,
+    ask_levels: Any = None,
 ) -> None:
     """Post the hedge FAK, then refire a miss on this thread. The main buy does not wait.
 
@@ -3847,7 +3909,8 @@ def _reclaim_hedge_run(
             if filled > 0 and status_s.startswith("error"):
                 intent["reclaim_hedge_filled"] = filled
             _reclaim_note_hedge(
-                intent, cid, noted, (filled, status_s), dry_run=dry_run,
+                intent, cid, noted, (filled, status_s),
+                dry_run=dry_run, ask_levels=ask_levels,
             )
         log_event(
             "reclaim_hedge_outcome",
@@ -3877,6 +3940,7 @@ def _reclaim_hedge_run(
             px=plan.get("limit"),
             filled=filled,
             status=f"error:{str(exc)[:120]}",
+            ask_depth=book_top_levels(ask_levels, "ask"),
         )
         log_event(
             "reclaim_hedge_outcome",
@@ -3897,6 +3961,7 @@ def _reclaim_note_hedge(
     result: Any,
     *,
     dry_run: bool,
+    ask_levels: Any = None,
 ) -> None:
     """Record the hedge post. Never changes the main reclaim buy."""
     bought, status = (0.0, "error:missing")
@@ -3943,6 +4008,7 @@ def _reclaim_note_hedge(
         rounded_up=bool(plan.get("rounded_up")),
         raw_shares=plan.get("raw_shares"),
         dry_run=dry_run,
+        ask_depth=book_top_levels(ask_levels, "ask"),
     )
 
 
@@ -4128,7 +4194,7 @@ def _reclaim_hedge_after_stop(
                     ttm_s=ttm_s,
                     floor=floor,
                     min_bid_size=min_bid_size,
-                    retries=int(cfg.get("sell_dump_fak_retries") or 0),
+                    retries=_reclaim_dump_retries(cfg),
                     ladder_step=float(cfg.get("sell_dump_ladder_step") or 0.04),
                     ladder_rungs=int(cfg.get("sell_dump_ladder_rungs") or 1),
                     dry_run=dry_run,
@@ -4313,7 +4379,7 @@ def _reclaim_stop_tick(
                 ttm_s=ttm_s,
                 floor=floor,
                 min_bid_size=min_bid_size,
-                retries=int(cfg.get("sell_dump_fak_retries") or 0),
+                retries=_reclaim_dump_retries(cfg),
                 ladder_step=float(cfg.get("sell_dump_ladder_step") or 0.04),
                 ladder_rungs=int(cfg.get("sell_dump_ladder_rungs") or 1),
                 dry_run=dry_run,
@@ -4411,6 +4477,7 @@ def _reclaim_tick(
     funder_cs: Optional[str],
     min_bid_size: float,
     clob_min: float,
+    ask_levels: Optional[dict] = None,
 ) -> None:
     """Reclaim buy and stop on books this tick already fetched.
 
@@ -4726,6 +4793,11 @@ def _reclaim_tick(
                     "retries": hedge_retries_box,
                     "min_bid_size": min_bid_size,
                     "tol": tol,
+                    "ask_levels": (
+                        ask_levels.get(other)
+                        if isinstance(ask_levels, dict)
+                        else None
+                    ),
                 },
                 name="reclaim-hedge",
                 daemon=True,
@@ -4734,6 +4806,7 @@ def _reclaim_tick(
             str(token), shares, float(limit), dry_run, capture=captured,
         )
     status_s = str(status or "")
+    levels = ask_levels if isinstance(ask_levels, dict) else {}
     post_fields = {
         "condition_id": cid,
         "slug": intent.get("slug"),
@@ -4745,6 +4818,8 @@ def _reclaim_tick(
         "status": status_s,
         "dry_run": dry_run,
         "dumped_leg": bool(decision.get("dumped_leg")),
+        "ask_depth": book_top_levels(levels.get(leg), "ask"),
+        "hedge_ask_depth": book_top_levels(levels.get(other), "ask"),
     }
     if dry_run or status_s == "dry":
         intent["reclaim_filled"] = float(intent.get("reclaim_target") or shares)
@@ -4827,14 +4902,67 @@ def _post_dump_box() -> dict:
             "lock": threading.Lock(),
             "started": False,
             "cfg": {},
+            "wake": threading.Event(),
+            "stop": False,
+            "thread": None,
         }
         _post_dump_box.box = box
     return box
 
 
+def _post_dump_side(bids: Any, asks: Any) -> tuple:
+    """Top-5 ladders and ask size within 3¢, from levels already parsed."""
+    return (
+        book_top_levels(bids, "bid"),
+        book_top_levels(asks, "ask"),
+        ask_size_within(asks),
+    )
+
+
 def _post_dump_quote(row: Any) -> tuple:
-    _bid, _bsz, _bids, ask, _asz, _asks, _age = _book_quote(row)
-    return _bid, ask
+    bid, _bsz, bids, ask, _asz, asks, _age = _book_quote(row)
+    return (bid, ask, *_post_dump_side(bids, asks))
+
+
+def _compact_snap_depth(snap: dict) -> None:
+    """Turn raw ladders into the top-5 log fields. Caller holds the box lock."""
+    if snap.get("depth_ready"):
+        return
+    if "up_bids_raw" not in snap and snap.get("up_bids") is not None:
+        snap["depth_ready"] = True
+        return
+    up_bids, up_asks, up_near = _post_dump_side(
+        snap.get("up_bids_raw"), snap.get("up_asks_raw"),
+    )
+    dn_bids, dn_asks, dn_near = _post_dump_side(
+        snap.get("dn_bids_raw"), snap.get("dn_asks_raw"),
+    )
+    snap["up_bids"] = up_bids
+    snap["up_asks"] = up_asks
+    snap["dn_bids"] = dn_bids
+    snap["dn_asks"] = dn_asks
+    snap["up_ask_near"] = up_near
+    snap["dn_ask_near"] = dn_near
+    snap["depth_ready"] = True
+
+
+def _post_dump_fields(snap: dict, cid: str, ttm: Any) -> dict:
+    return {
+        "condition_id": cid,
+        "slug": snap.get("slug"),
+        "leg_dumped": snap.get("leg_dumped"),
+        "up_bid": snap.get("up_bid"),
+        "up_ask": snap.get("up_ask"),
+        "dn_bid": snap.get("dn_bid"),
+        "dn_ask": snap.get("dn_ask"),
+        "up_bids": snap.get("up_bids") or [],
+        "up_asks": snap.get("up_asks") or [],
+        "dn_bids": snap.get("dn_bids") or [],
+        "dn_asks": snap.get("dn_asks") or [],
+        "up_ask_near": snap.get("up_ask_near"),
+        "dn_ask_near": snap.get("dn_ask_near"),
+        "ttm_s": ttm,
+    }
 
 
 def _observe_post_dump_book(
@@ -4852,6 +4980,10 @@ def _observe_post_dump_book(
     up_tok: str,
     dn_tok: str,
     min_bid_size: float,
+    up_bids: Any = None,
+    up_asks: Any = None,
+    dn_bids: Any = None,
+    dn_asks: Any = None,
 ) -> None:
     """Journal the books this tick already fetched. No network, no orders.
 
@@ -4879,6 +5011,8 @@ def _observe_post_dump_book(
             prev["slug"] = intent.get("slug")
             box["snaps"][cid] = prev
         else:
+            up_top_bids, up_top_asks, up_near = _post_dump_side(up_bids, up_asks)
+            dn_top_bids, dn_top_asks, dn_near = _post_dump_side(dn_bids, dn_asks)
             box["snaps"][cid] = {
                 "enabled": True,
                 "sold_dump": True,
@@ -4889,6 +5023,12 @@ def _observe_post_dump_book(
                 "up_ask": up_ask,
                 "dn_bid": dn_bid,
                 "dn_ask": dn_ask,
+                "up_bids": up_top_bids,
+                "up_asks": up_top_asks,
+                "dn_bids": dn_top_bids,
+                "dn_asks": dn_top_asks,
+                "up_ask_near": up_near,
+                "dn_ask_near": dn_near,
                 "book_ts": now,
                 "up_token": up_tok,
                 "dn_token": dn_tok,
@@ -4941,23 +5081,15 @@ def _post_dump_book_emit(
             logged_ttm = ttm_s
             if logged_ttm is None and end:
                 logged_ttm = end - float(now)
-            row = {
-                "condition_id": cid,
-                "slug": snap.get("slug"),
-                "leg_dumped": snap.get("leg_dumped"),
-                "up_bid": snap.get("up_bid"),
-                "up_ask": snap.get("up_ask"),
-                "dn_bid": snap.get("dn_bid"),
-                "dn_ask": snap.get("dn_ask"),
-                "ttm_s": logged_ttm,
-            }
+            _compact_snap_depth(snap)
+            row = _post_dump_fields(snap, cid, logged_ttm)
             snap["logged_at"] = now
     if row is not None:
         log_event("post_dump_book", **row)
         return
     if fetch_args is None:
         return
-    up_tok, dn_tok, min_size, leg, slug, end = fetch_args
+    up_tok, dn_tok, min_size, leg, _slug, end = fetch_args
     if not up_tok or not dn_tok:
         return
     try:
@@ -4969,9 +5101,10 @@ def _post_dump_book_emit(
             error=str(exc)[:160],
         )
         return
-    up_bid, up_ask = _post_dump_quote(up_row)
-    dn_bid, dn_ask = _post_dump_quote(dn_row)
+    up_bid, up_ask, up_bids, up_asks, up_near = _post_dump_quote(up_row)
+    dn_bid, dn_ask, dn_bids, dn_asks, dn_near = _post_dump_quote(dn_row)
     ttm = (end - float(now)) if end else None
+    row = None
     with box["lock"]:
         snap = box["snaps"].get(cid)
         if not snap:
@@ -4987,20 +5120,18 @@ def _post_dump_book_emit(
         snap["up_ask"] = up_ask
         snap["dn_bid"] = dn_bid
         snap["dn_ask"] = dn_ask
+        snap["up_bids"] = up_bids
+        snap["up_asks"] = up_asks
+        snap["dn_bids"] = dn_bids
+        snap["dn_asks"] = dn_asks
+        snap["up_ask_near"] = up_near
+        snap["dn_ask_near"] = dn_near
         snap["book_ts"] = now
         snap["logged_at"] = now
         snap["leg_dumped"] = leg
-    log_event(
-        "post_dump_book",
-        condition_id=cid,
-        slug=slug,
-        leg_dumped=leg,
-        up_bid=up_bid,
-        up_ask=up_ask,
-        dn_bid=dn_bid,
-        dn_ask=dn_ask,
-        ttm_s=ttm,
-    )
+        row = _post_dump_fields(snap, cid, ttm)
+    if row is not None:
+        log_event("post_dump_book", **row)
 
 
 def _post_dump_book_pass(now: Optional[float] = None) -> None:
@@ -5018,27 +5149,94 @@ def _post_dump_book_pass(now: Optional[float] = None) -> None:
 
 
 def _post_dump_logger() -> None:
-    """Sleep 0.25s, then sample. Independent of the sell loop's poll."""
-    while not _shutdown:
-        time.sleep(POST_DUMP_BOOK_INTERVAL_S)
-        if _shutdown:
-            return
+    """Sample immediately, then wait 0.25s or until a dump arms another read.
+
+    ``Event.wait`` is the delay. This thread is the only one that fetches
+    for the journal. It never places an order.
+    """
+    box = _post_dump_box()
+    while not box.get("stop") and not globals().get("_shutdown"):
         try:
             _post_dump_book_pass()
         except Exception as exc:
             log_event("post_dump_book_fail", error=str(exc)[:160])
+        if box.get("stop") or globals().get("_shutdown"):
+            return
+        box["wake"].wait(POST_DUMP_BOOK_INTERVAL_S)
+        box["wake"].clear()
 
 
 def _ensure_post_dump_logger() -> None:
-    """Start the sampler once, after a sell cycle has already returned."""
+    """Start the sampler if it is not already running."""
     box = _post_dump_box()
     with box["lock"]:
-        if box["started"]:
+        thread = box.get("thread")
+        if thread is not None and thread.is_alive():
             return
+        box["stop"] = False
         box["started"] = True
-    threading.Thread(
-        target=_post_dump_logger, name="post-dump-book", daemon=True,
-    ).start()
+        thread = threading.Thread(
+            target=_post_dump_logger, name="post-dump-book", daemon=True,
+        )
+        box["thread"] = thread
+    thread.start()
+
+
+def _arm_post_dump_book(
+    *,
+    cfg: dict,
+    intent: dict,
+    cid: str,
+    now: float,
+    end_ts: float,
+    up_bid: Any,
+    up_ask: Any,
+    dn_bid: Any,
+    dn_ask: Any,
+    up_tok: str,
+    dn_tok: str,
+    min_bid_size: float,
+    leg_dumped: Optional[str] = None,
+    up_bids: Any = None,
+    up_asks: Any = None,
+    dn_bids: Any = None,
+    dn_asks: Any = None,
+) -> None:
+    """Hand the fire-time books to the sampler. No fetch and no log here.
+
+    Called when the dump fires, before either leg's FAK. The sampler thread
+    writes ``post_dump_book`` from these ladders and keeps reading until
+    the window ends. The sell thread does not wait for that write.
+    """
+    if not bool(cfg.get("post_dump_log_enabled", True)):
+        return
+    box = _post_dump_box()
+    with box["lock"]:
+        prev = box["snaps"].get(cid) or {}
+        box["snaps"][cid] = {
+            "enabled": True,
+            "sold_dump": True,
+            "end_ts": end_ts,
+            "slug": intent.get("slug"),
+            "leg_dumped": leg_dumped,
+            "up_bid": up_bid,
+            "up_ask": up_ask,
+            "dn_bid": dn_bid,
+            "dn_ask": dn_ask,
+            "up_bids_raw": up_bids,
+            "up_asks_raw": up_asks,
+            "dn_bids_raw": dn_bids,
+            "dn_asks_raw": dn_asks,
+            "depth_ready": False,
+            "book_ts": now,
+            "up_token": up_tok,
+            "dn_token": dn_tok,
+            "min_bid_size": min_bid_size,
+            "logged_at": prev.get("logged_at"),
+        }
+        box["cfg"] = cfg
+    _ensure_post_dump_logger()
+    box["wake"].set()
 
 
 def _manage_sells_locked(cfg: dict, state: dict, chain: ChainReader) -> None:
@@ -5366,7 +5564,7 @@ def _manage_sells_locked(cfg: dict, state: dict, chain: ChainReader) -> None:
                 cfg, "sell_dump_persist_last_min_window_s", 0.0
             ),
         )
-        dump_retries = int(cfg.get("sell_dump_fak_retries", 2))
+        dump_retries = dump_refire_cap(cfg.get("sell_dump_fak_retries", 0))
         dump_ladder_step = float(cfg.get("sell_dump_ladder_step") or 0.04)
         dump_ladder_rungs = int(cfg.get("sell_dump_ladder_rungs", 4))
         # 0 or missing: no time gate (old behavior). Ladder rungs after the
@@ -5475,6 +5673,25 @@ def _manage_sells_locked(cfg: dict, state: dict, chain: ChainReader) -> None:
                     live_px = float(dump_bid or 0)
                     intent["last_sell_attempt_at"] = now
                     dump_fills: list = []
+                    _arm_post_dump_book(
+                        cfg=cfg,
+                        intent=intent,
+                        cid=cid,
+                        now=now,
+                        end_ts=end_ts,
+                        up_bid=up_bid,
+                        up_ask=up_ask,
+                        dn_bid=dn_bid,
+                        dn_ask=dn_ask,
+                        up_tok=up_tok,
+                        dn_tok=dn_tok,
+                        min_bid_size=min_bid_size,
+                        leg_dumped=held,
+                        up_bids=up_bids,
+                        up_asks=_up_asks,
+                        dn_bids=dn_bids,
+                        dn_asks=_dn_asks,
+                    )
                     also_kept = bool(cfg.get("sell_dump_also_kept", False))
                     launch_kept = (
                         also_kept
@@ -5505,6 +5722,7 @@ def _manage_sells_locked(cfg: dict, state: dict, chain: ChainReader) -> None:
                                 chain=chain,
                                 ctf=ctf,
                                 funder_cs=funder_cs,
+                                end_ts=end_ts,
                             )
                         try:
                             sold_total, last_status, last_px, used_attempts, live_px = (
@@ -5525,6 +5743,7 @@ def _manage_sells_locked(cfg: dict, state: dict, chain: ChainReader) -> None:
                                     dry_run=dry_run,
                                     tol=tol,
                                     fills=dump_fills,
+                                    end_ts=end_ts,
                                 )
                             )
                         finally:
@@ -5603,6 +5822,7 @@ def _manage_sells_locked(cfg: dict, state: dict, chain: ChainReader) -> None:
                                 chain=chain,
                                 ctf=ctf,
                                 funder_cs=funder_cs,
+                                end_ts=end_ts,
                             )
                     elif sold_total >= tol:
                         intent["sell_dump_filled"] = float(
@@ -6388,6 +6608,7 @@ def _manage_sells_locked(cfg: dict, state: dict, chain: ChainReader) -> None:
                 ttm_s=ttm_s,
                 bids=bids,
                 asks_px={"up": up_ask, "dn": dn_ask},
+                ask_levels={"up": _up_asks, "dn": _dn_asks},
                 ages={"up": up_age, "dn": dn_age},
                 tokens=tokens,
                 dry_run=dry_run,
@@ -6419,6 +6640,10 @@ def _manage_sells_locked(cfg: dict, state: dict, chain: ChainReader) -> None:
             up_tok=up_tok,
             dn_tok=dn_tok,
             min_bid_size=min_bid_size,
+            up_bids=up_bids,
+            up_asks=_up_asks,
+            dn_bids=dn_bids,
+            dn_asks=_dn_asks,
         )
 
     commit_state(state, dirty=dirty)

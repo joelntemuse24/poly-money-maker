@@ -669,7 +669,7 @@ Preconditions (all required):
 
 1. `_sell_inventory` on the held token. `already_flat` sets `sold_dump` / `sold_winner` with note `already_flat` and no `sell_dump_leg`.
 2. First shot: one FAK at the fire-time sized bid. A single limit, the bid just read.
-3. If shares remain, each retry **refetches that leg** and posts one FAK at the new best bid, up to `sell_dump_fak_retries` (code **2**) in the same tick. A partial fill (anything at or above tolerance) refires at once. A zero fill still needs `dump_fast_retry_eligible` (`no orders found`, or kill/cancel). `sell_dump_fast_refire_attempt` logs `sold` (shares already filled) and the new bid. Stop on an empty or non-positive book (`sell_dump_fast_refire_stop reason=empty_book`), a non-retryable zero fill (`non_retryable_status`), or exhausted retries. These refires are not re-checked against the TTM gate or `sell_dump_other_min`. There is no added sleep.
+3. If shares remain, each retry **refetches that leg** and posts one FAK at the new best bid, back to back, with no sleep and no wait for the next sell pass. A partial fill refires at once. A zero fill still needs `dump_fast_retry_eligible` (`no orders found`, or kill/cancel). An empty or non-positive book is not a stop: the next read is immediate. The loop ends when the size is sold, the window has ended (`window_end`), the status is not retryable (`non_retryable_status`), or a positive `sell_dump_fak_retries` cap is hit (`retry_cap`). Code default **0** (and null) means no cap. The kept leg uses the same loop. The reclaim stop and the hedge sell stay on a finite burst: a positive cap, or **2** when the knob is 0 or null. `sell_dump_fast_refire_attempt` logs `sold` and the new bid. These refires are not re-checked against the TTM gate or `sell_dump_other_min`.
 4. `sell_dump_ladder_step` (0.04) and `sell_dump_ladder_rungs` (4) are still validated and still passed into the function. The refire does **not** call `dump_retry_ladder_limits`. That helper remains for tests. A dump does not walk 4¢ rungs off one snapshot.
 5. Full fill (or dry run): `sold_dump=True`, `sold_winner=True`, `sell_dump_leg = held`, `sold_dump_at`, `sell_dump_filled`, `sell_dump_limit` = last limit, and `sell_dump_fill_px` = share-weighted average of every priced fill. Log `sell_dump_done` (`hedge_leg`, `avg_px`). `bag_risk.dump_px` reads the average, falling back to the limit.
 
@@ -731,9 +731,11 @@ An in-flight refire (`reclaim_hedge_retrying`) still defers the next sequential 
 
 `post_dump_log_enabled` defaults **true** and is **true** in the live reference. It hot-reloads. After `sold_dump`, and while the window is still open, mintbot journals `post_dump_book` about every **0.25s** (`POST_DUMP_BOOK_INTERVAL_S`) until `end_ts`.
 
-Fields: `condition_id`, `slug`, `leg_dumped`, `up_bid`, `up_ask`, `dn_bid`, `dn_ask`, `ttm_s`.
+Fields: `condition_id`, `slug`, `leg_dumped`, `up_bid`, `up_ask`, `dn_bid`, `dn_ask`, `ttm_s`, plus the top 5 bid and ask levels on each leg (`up_bids`, `up_asks`, `dn_bids`, `dn_asks` as `[price, size]` lists, best first) and `up_ask_near` / `dn_ask_near` (ask size within 3¢ of the best ask).
 
-The sell tick reuses the books it already fetched and logs only after that bag's orders, reclaim, and hedge work. A sampler thread (`_post_dump_logger`) fills the gaps between ticks and is the only place that reads the book for this journal. It does not place orders and does not change a decision. The cadence state lives in memory (`_post_dump_box`), not in `positions_mint.json`. A fetch error logs `post_dump_book_fail`. The flag off, a bag that has not dumped, a closed window, or a line that is not yet due is a skip.
+The sell tick reuses the books it already fetched. Depth is taken from those same ladders. When the dump fires, the sell thread hands those ladders to the sampler (`_post_dump_logger`) and does not log or fetch for the journal before the FAK. The sampler writes the first `post_dump_book` immediately, then keeps sampling about every 0.25s until the window ends, including while the dump is still selling. It is the only place that reads the book for this journal. It does not place orders and does not change a decision. The cadence state lives in memory (`_post_dump_box`), not in `positions_mint.json`. A fetch error logs `post_dump_book_fail`. The flag off, a bag that has not dumped, a closed window, or a line that is not yet due is a skip.
+
+`reclaim_buy` logs `ask_depth` and `hedge_ask_depth` (top 5 asks of the bought leg and the other leg) after the buy FAK, from the same tick's book. A sent `reclaim_hedge_buy` logs `ask_depth` for the hedge leg after that FAK. Neither read adds a book fetch.
 
 <a id="section-20"></a>
 ## Live-bid FAK vs floor FAK
@@ -1017,7 +1019,7 @@ The late pair also needs `sell_fak_px_late` and `sell_late_price_window_s` (180)
 | `sell_dump_max_ttm_s` | 0 | Dump only in the last N seconds. 0 is off. Example **240**. Unknown ttm is closed |
 | `sell_dump_also_kept` | false | Sell the kept scrap half once in the dump event, then one 1¢ FAK for a remainder |
 | `sell_dump_parallel_kept` | true | Post that kept leg with the held leg. False waits until the held dump fills. Missing or null stays on |
-| `sell_dump_fak_retries` | 2 | Extra fresh-bid FAKs after the first shot, in the same tick. Also used by the stop and the hedge sell |
+| `sell_dump_fak_retries` | 0 | Extra fresh-bid dump FAKs after the first shot. 0 or null keeps selling until the leg is sold or the window ends. A positive number is a cap. The reclaim stop and the hedge sell use that cap, or 2 when it is 0 or null |
 | `sell_dump_ladder_step` | 0.04 | Still validated. The refire does not walk this ladder |
 | `sell_dump_ladder_rungs` | 4 | Still validated. The refire does not walk this ladder |
 | `post_dump_log_enabled` | true | Journal both books after a dump until the window ends. Live reference **true** |
@@ -1157,7 +1159,7 @@ Do not import `mintbot.py` in unit tests (credentials, lock, clients). Test `buy
 | Held dump | After loser sold, sell the held leg if its sized bid is under `sell_dump_below` (80¢ code, 67¢ in the 13 Oct reference) |
 | Reclaim | After a both-sides dump, FAK-buy about `reclaim_usd` of a side that holds at `reclaim_entry` |
 | Reclaim hedge | Optional concurrent FAK buy of the other side, retried at the fresh ask up to `reclaim_hedge_max_price` |
-| `post_dump_book` | Both books, about every 0.25s, from the dump until the window ends. No orders |
+| `post_dump_book` | Both books and the top 5 levels each side, about every 0.25s, from the dump until the window ends. No orders |
 | Redeem | Exchange winning tokens for $1 collateral after resolution, on `mintbot-redeem` when `redeem_enabled` is true (code default false; not in the 13 Oct list) |
 | FAK | Fill-and-kill marketable limit |
 | Sized bid | Best bid with minimum size |
@@ -1536,6 +1538,10 @@ redeem_enabled (opt-in), separate thread:
 Adjacent mint may already have been submitted **before** expiry (lookahead). That is intentional and is the main fix for the “skipped 15m” bug.
 
 # Changelog
+
+- **2026-10-13** — After a dump fires, the held leg and the kept leg keep posting fresh-bid FAKs with no sleep until that leg is sold or the window ends. An empty book is read again immediately. `sell_dump_fak_retries` defaults to 0 (no cap); a positive value is a safety cap (`retry_cap`). The reclaim stop and the hedge sell stay on a finite burst. `post_dump_book` starts on the sampler thread at the fire, from the books already in hand, and keeps sampling while the sell is in progress. The sell thread does not fetch for that journal.
+
+- **2026-10-13** — `post_dump_book` also records the top 5 bid and ask levels on each leg (`up_bids`, `up_asks`, `dn_bids`, `dn_asks`) and the ask size within 3¢ of the best ask (`up_ask_near`, `dn_ask_near`). `reclaim_buy` records `ask_depth` and `hedge_ask_depth` after the buy FAK; a sent `reclaim_hedge_buy` records `ask_depth` after the hedge FAK. All of it comes from ladders already in hand. No extra book read and no change to an order.
 
 - **2026-10-13** — When `sell_dump_also_kept` is on, `sell_dump_parallel_kept` (default true, hot-reloaded) posts the kept leg at the same time as the held leg. Each leg keeps its own fresh-bid refire. The intent is merged after both return, and reclaim does not arm before that. False restores the old order: the kept sell starts only after the held dump fills. One kept launch per bag.
 

@@ -7,6 +7,7 @@ import json
 import unittest
 from contextlib import nullcontext
 from pathlib import Path
+from types import SimpleNamespace
 
 from buy.mint_redeem import validate_redeem
 from buy.mint_sell import dump_fast_retry_eligible
@@ -102,7 +103,7 @@ class MintDefaultsTests(unittest.TestCase):
             self.assertEqual(blob["sell_scrap_fraction"], 1.0, label)
             self.assertIs(blob["sell_scrap_rest_enabled"], True, label)
             self.assertEqual(blob["sell_dump_persist_s"], 2.0, label)
-            self.assertEqual(blob["sell_dump_fak_retries"], 2, label)
+            self.assertEqual(blob["sell_dump_fak_retries"], 0, label)
             self.assertEqual(blob["sell_dump_ladder_step"], 0.04, label)
             self.assertEqual(blob["sell_dump_ladder_rungs"], 4, label)
             self.assertNotIn("sell_dump_if_sister_miss_s", blob)
@@ -1205,7 +1206,7 @@ class DeployUnitsTests(unittest.TestCase):
         self.assertNotIn("dump_retry_ladder_limits", refire)
         self.assertNotIn("time.sleep", refire)
 
-    def test_dump_refire_stops_when_book_turns_empty(self):
+    def test_dump_refire_rereads_an_empty_book_until_the_cap(self):
         calls: list[dict] = []
         events: list[tuple[str, dict]] = []
         fn = _fn(
@@ -1245,33 +1246,96 @@ class DeployUnitsTests(unittest.TestCase):
         self.assertEqual(attempts, 1)
         self.assertEqual(last_bid, 0.22)
         self.assertEqual(len(calls), 1)
-        self.assertTrue(
-            any(
-                event == "sell_dump_fast_refire_stop"
-                and payload.get("reason") == "empty_book"
-                for event, payload in events
-            )
+        self.assertEqual(events[-1][0], "sell_dump_fast_refire_stop")
+        self.assertEqual(events[-1][1]["reason"], "retry_cap")
+        self.assertEqual(events[-1][1]["retry"], 3)
+
+    def test_refire_cap_zero_means_until_sold(self):
+        from buy.mint_sell import dump_refire_cap
+
+        self.assertIsNone(dump_refire_cap(0))
+        self.assertIsNone(dump_refire_cap(None))
+        self.assertIsNone(dump_refire_cap(""))
+        self.assertEqual(dump_refire_cap(40), 40)
+        self.assertEqual(dump_refire_cap("2"), 2)
+
+    def test_uncapped_refire_sells_through_an_empty_book(self):
+        calls, events, sold, status, px, attempts, last_bid = self._refire(
+            iter(
+                [
+                    (0.0, "error:no orders found to match with FAK order", 0.59),
+                    (100.0, "matched", 0.18),
+                ]
+            ),
+            [
+                (None, 0.0, []),
+                (0.18, 40.0, [{"price": "0.18", "size": "40"}]),
+            ],
+            retries=0,
+            end_ts=10_000_000_000.0,
+            initial_bid=0.59,
+            initial_bids=[{"price": "0.59", "size": "20"}],
         )
+        self.assertEqual(sold, 100.0)
+        self.assertEqual(status, "matched")
+        self.assertEqual(px, 0.18)
+        self.assertEqual(attempts, 2)
+        self.assertEqual(last_bid, 0.18)
+        self.assertEqual([row["limits"] for row in calls], [[0.59], [0.18]])
+        self.assertFalse(
+            any(event == "sell_dump_fast_refire_stop" for event, _payload in events)
+        )
+
+    def test_uncapped_refire_stops_when_the_window_ends(self):
+        fetches = {"n": 0}
+
+        def book(*_args, **_kwargs):
+            fetches["n"] += 1
+            return (None, 0.0, [])
+
+        def now():
+            return 50.0 if fetches["n"] == 0 else 200.0
+
+        calls, events, sold, _status, _px, attempts, _bid = self._refire(
+            iter([(0.0, "error:no orders found to match with FAK order", 0.59)]),
+            [],
+            retries=None,
+            end_ts=100.0,
+            initial_bid=0.59,
+            _book=book,
+            _now=now,
+        )
+        self.assertEqual(sold, 0.0)
+        self.assertEqual(attempts, 1)
+        self.assertEqual(fetches["n"], 1)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(events[-1][0], "sell_dump_fast_refire_stop")
+        self.assertEqual(events[-1][1]["reason"], "window_end")
 
     def _refire(self, outcomes, books, **kwargs):
         calls: list[dict] = []
         events: list[tuple[str, dict]] = []
         book_iter = iter(books)
+        fetch_book = kwargs.pop("_book", None)
+        now = kwargs.pop("_now", None)
+        if fetch_book is None:
+            def fetch_book(*_args, **_kwargs):
+                return next(book_iter)
 
         def ladder(*args, **_kwargs):
             calls.append({"limits": list(args[2]), "size": args[1]})
             return next(outcomes)
 
-        fn = _fn(
-            "_run_dump_fak_with_refire",
-            {
-                "_run_fak_ladder": ladder,
-                "_fetch_book": lambda *_args, **_kw: next(book_iter),
-                "_io_unlocked": nullcontext,
-                "dump_fast_retry_eligible": dump_fast_retry_eligible,
-                "log_event": lambda event, **payload: events.append((event, payload)),
-            },
-        )
+        extras = {
+            "_run_fak_ladder": ladder,
+            "_fetch_book": fetch_book,
+            "_io_unlocked": nullcontext,
+            "dump_fast_retry_eligible": dump_fast_retry_eligible,
+            "log_event": lambda event, **payload: events.append((event, payload)),
+        }
+        if now is not None:
+            extras["time"] = SimpleNamespace(time=now)
+        fn = _fn("_run_dump_fak_with_refire", extras)
         base = dict(
             token_id="tok",
             size=100.0,
@@ -1378,8 +1442,8 @@ class DeployUnitsTests(unittest.TestCase):
         self.assertIs(example["sell_persist_skip_when_sized"], False)
         self.assertEqual(defaults["sell_dump_persist_s"], 2.0)
         self.assertEqual(example["sell_dump_persist_s"], 2.0)
-        self.assertEqual(defaults["sell_dump_fak_retries"], 2)
-        self.assertEqual(example["sell_dump_fak_retries"], 2)
+        self.assertEqual(defaults["sell_dump_fak_retries"], 0)
+        self.assertEqual(example["sell_dump_fak_retries"], 0)
         self.assertEqual(defaults["sell_dump_ladder_step"], 0.04)
         self.assertEqual(example["sell_dump_ladder_step"], 0.04)
         self.assertEqual(defaults["sell_dump_ladder_rungs"], 4)

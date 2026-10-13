@@ -7,7 +7,13 @@ import unittest
 from pathlib import Path
 from types import SimpleNamespace
 
-from buy.book import ask_fill_depth, best_ask_with_min_size, book_age_s
+from buy.book import (
+    ask_fill_depth,
+    ask_size_within,
+    best_ask_with_min_size,
+    book_age_s,
+    book_top_levels,
+)
 from decimal import Decimal
 
 from buy.mint_sell import (
@@ -209,6 +215,43 @@ class BookHelpersTests(unittest.TestCase):
         self.assertEqual(book_age_s(1_700_000_010.0, 1_700_000_000.0), 0.0)
         depth = ask_fill_depth(asks, 0.94)["depth_at_limit"]
         self.assertAlmostEqual(depth, 80.1)
+
+    def test_top_levels_and_near_ask_size(self):
+        bids = [
+            {"price": "0.10", "size": "1"},
+            {"price": "0.62", "size": "10.004"},
+            {"price": "0.61", "size": "20"},
+            {"price": "0.60", "size": "30"},
+            {"price": "0.59", "size": "40"},
+            {"price": "0.58", "size": "50"},
+            {"price": "0.90", "size": "0"},
+            {"price": "1", "size": "9"},
+            "nope",
+        ]
+        asks = [
+            {"price": "0.70", "size": "5"},
+            {"price": "0.63", "size": "11"},
+            {"price": "0.64", "size": "12"},
+            {"price": "0.65", "size": "13"},
+            {"price": "0.66", "size": "14"},
+            {"price": "0.80", "size": "99"},
+            {"price": "0", "size": "4"},
+        ]
+        self.assertEqual(
+            book_top_levels(bids, "bid"),
+            [[0.62, 10.0], [0.61, 20.0], [0.60, 30.0], [0.59, 40.0], [0.58, 50.0]],
+        )
+        self.assertEqual(
+            book_top_levels(asks, "ask"),
+            [[0.63, 11.0], [0.64, 12.0], [0.65, 13.0], [0.66, 14.0], [0.70, 5.0]],
+        )
+        self.assertEqual(book_top_levels(asks, "ask", n=2), [[0.63, 11.0], [0.64, 12.0]])
+        self.assertEqual(book_top_levels(None, "bid"), [])
+        self.assertEqual(book_top_levels(asks, "mid"), [])
+        self.assertEqual(ask_size_within(asks), 50.0)
+        self.assertEqual(ask_size_within(asks, cents=0.01), 23.0)
+        self.assertIsNone(ask_size_within([]))
+        self.assertIsNone(ask_size_within([{"price": "nope", "size": "1"}]))
 
 
 class GuardDecisionTests(unittest.TestCase):
