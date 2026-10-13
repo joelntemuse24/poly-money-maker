@@ -17,6 +17,7 @@ from buy.mint_sell import (
 from buy.oracle_log import (
     CRYPTO_PRICE_VARIANT,
     GammaStrike,
+    ORACLE_MARK_SOURCE,
     OracleBagView,
     OracleLogService,
     RtdsTwapFeed,
@@ -26,6 +27,7 @@ from buy.oracle_log import (
     crypto_price_params,
     e18_to_decimal_str,
     notes_for,
+    oracle_mark_fields,
     parse_crypto_price_body,
     parse_rtds_message,
     sample_interval_s,
@@ -601,13 +603,13 @@ class DecisionIsolationTests(unittest.TestCase):
                 for target in node.targets:
                     if isinstance(target, ast.Name) and target.id == "DEFAULTS":
                         defaults_value = ast.literal_eval(node.value)
-        self.assertIs(defaults_value["oracle_log_enabled"], False)
+        self.assertIs(defaults_value["oracle_log_enabled"], True)
         self.assertEqual(defaults_value["sell_late_window_s"], 0.0)
         self.assertEqual(defaults_value["sell_oracle_edge_per_ttm"], 0.0)
         self.assertEqual(defaults_value["sell_oracle_edge_persist_s"], 3.0)
         self.assertEqual(defaults_value["sell_oracle_stale_s"], 0.0)
         self.assertEqual(defaults_value["sell_oracle_edge_floor_usd"], 0.0)
-        self.assertIs(example["oracle_log_enabled"], False)
+        self.assertIs(example["oracle_log_enabled"], True)
         self.assertEqual(example["sell_late_window_s"], 0.0)
         self.assertEqual(example["sell_oracle_edge_per_ttm"], 0.0)
         self.assertEqual(example["sell_oracle_edge_persist_s"], 3.0)
@@ -633,6 +635,120 @@ class DecisionIsolationTests(unittest.TestCase):
         self.assertNotIn("late_oracle_scrap_ok", _fn_source(MINT, "run_mint_cycle"))
         dump_tail = manage[manage.find("Held-leg dump") : manage.find("loser_persist_s")]
         self.assertNotIn("late_oracle_scrap_ok", dump_tail)
+        reclaim = _fn_source(MINT, "_reclaim_tick")
+        buy_at = reclaim.find("_fak_buy(")
+        mark_at = reclaim.find("_oracle_mark(")
+        self.assertGreater(buy_at, 0)
+        self.assertGreater(mark_at, buy_at)
+
+
+def _view(**kwargs) -> OracleBagView:
+    base = dict(twap=None, open_usd=None, obs_ts=None, recv_ts=None, open_source=None)
+    base.update(kwargs)
+    return OracleBagView(**base)
+
+
+class OracleMarkTests(unittest.TestCase):
+    def test_signed_distance_from_a_fresh_twap(self):
+        now = 1_700_000_100.0
+        mark = oracle_mark_fields(
+            _view(
+                twap="101000.125",
+                open_usd="100000",
+                obs_ts=now - 2.0,
+                recv_ts=now - 1.25,
+                open_source="rtds_twap_at_start",
+            ),
+            now_s=now,
+        )
+        self.assertEqual(mark["oracle_px"], 101000.12)
+        self.assertEqual(mark["oracle_start"], 100000.0)
+        self.assertEqual(mark["oracle_dist_usd"], 1000.12)
+        self.assertEqual(mark["oracle_dist_bps"], 100.0)
+        self.assertEqual(mark["oracle_source"], ORACLE_MARK_SOURCE)
+        self.assertEqual(mark["oracle_start_source"], "rtds_twap_at_start")
+        self.assertEqual(mark["oracle_age_s"], 1.25)
+        self.assertIsNone(mark["oracle_reason"])
+
+    def test_distance_below_the_strike_stays_negative(self):
+        now = 1_700_000_100.0
+        mark = oracle_mark_fields(
+            _view(twap="99000", open_usd="100000", recv_ts=now - 0.5),
+            now_s=now,
+        )
+        self.assertEqual(mark["oracle_dist_usd"], -1000.0)
+        self.assertEqual(mark["oracle_dist_bps"], -100.0)
+        self.assertIsNone(mark["oracle_reason"])
+
+    def test_stale_keeps_age_and_drops_prices(self):
+        now = 1_700_000_100.0
+        mark = oracle_mark_fields(
+            _view(
+                twap="101000",
+                open_usd="100000",
+                recv_ts=now - 21.0,
+                open_source="gamma_price_to_beat",
+            ),
+            now_s=now,
+        )
+        self.assertIsNone(mark["oracle_px"])
+        self.assertIsNone(mark["oracle_start"])
+        self.assertIsNone(mark["oracle_dist_usd"])
+        self.assertIsNone(mark["oracle_dist_bps"])
+        self.assertEqual(mark["oracle_age_s"], 21.0)
+        self.assertEqual(mark["oracle_source"], ORACLE_MARK_SOURCE)
+        self.assertEqual(mark["oracle_start_source"], "gamma_price_to_beat")
+        self.assertEqual(mark["oracle_reason"], "stale")
+
+    def test_missing_recv_clock_does_not_invent_freshness(self):
+        mark = oracle_mark_fields(
+            _view(twap="101000", open_usd="100000", obs_ts=1_700_000_098.0),
+            now_s=1_700_000_100.0,
+        )
+        self.assertIsNone(mark["oracle_px"])
+        self.assertEqual(mark["oracle_source"], ORACLE_MARK_SOURCE)
+        self.assertEqual(mark["oracle_reason"], "no_age")
+
+    def test_fresh_price_without_a_strike(self):
+        now = 1_700_000_100.0
+        mark = oracle_mark_fields(
+            _view(twap="101000", recv_ts=now - 1.0),
+            now_s=now,
+        )
+        self.assertEqual(mark["oracle_px"], 101000.0)
+        self.assertIsNone(mark["oracle_start"])
+        self.assertIsNone(mark["oracle_dist_usd"])
+        self.assertEqual(mark["oracle_reason"], "no_start")
+
+    def test_empty_disabled_and_a_raising_view(self):
+        now = 50.0
+        self.assertEqual(oracle_mark_fields(None, now_s=now)["oracle_reason"], "no_price")
+        off = oracle_mark_fields(
+            _view(twap="1", open_usd="1", recv_ts=now),
+            now_s=now,
+            enabled=False,
+        )
+        self.assertEqual(off["oracle_reason"], "disabled")
+        self.assertIsNone(off["oracle_px"])
+
+        class Boom:
+            @property
+            def twap(self):
+                raise RuntimeError("cache")
+
+        self.assertEqual(
+            oracle_mark_fields(Boom(), now_s=now)["oracle_reason"], "no_price",
+        )
+
+    def test_negative_age_clamps_to_zero(self):
+        now = 100.0
+        mark = oracle_mark_fields(
+            _view(twap="100", open_usd="100", recv_ts=now + 5.0),
+            now_s=now,
+        )
+        self.assertEqual(mark["oracle_age_s"], 0.0)
+        self.assertEqual(mark["oracle_dist_usd"], 0.0)
+        self.assertIsNone(mark["oracle_reason"])
 
 
 if __name__ == "__main__":

@@ -365,9 +365,11 @@ The thread wakes every second while a bag is open. Stored rows are 15s mid-windo
 - **Stall lines.** A stale TWAP (> `STALE_AFTER_S` 20s) logs one `oracle_feed_stall` (`age_s`, `last_error`), a reminder at most every `STALL_REMIND_S` (60s), and one `oracle_feed_recovered` (`duration_s`). `oracle_log_fail` is now deduped per kind, not exact text.
 - **HTTP.** crypto-price (strike fallback) and Gamma (reconciliation) each keep one request at a time per window, with 0–3s jitter (`HTTP_JITTER_S`) on the first. crypto-price retries every 20s; a 429 backs off 20 → 40 → 80 → 120s (`HTTP_BACKOFF_CAP_S`). Gamma retries every 120s; a 429 backs off 120 → 240 → 480 → 600s. Both honour a longer Retry-After. Each error kind (`http_400`, `http_429`, ...) is logged once per window per source via `oracle_log_fail`.
 
-These rows go to the tape, and `mintbot` logs them through an `on_event` hook. None of this is read by mint, sell, winner or dump.
+These rows go to the tape, and `mintbot` logs them through an `on_event` hook. Mint eligibility, winner cash-out, held dump, reclaim, and loser scrap do not change an order from the tape.
 
-`oracle_log_enabled` defaults **false** (example false). The module comment that says the tape defaults on is stale; `DEFAULTS` and the example are false, and a missing live key stays off. When the feed is down the thread logs the stall and keeps going. Mint eligibility, winner cash-out, held dump, reclaim, and loser scrap do not read the tape. Since #245, `_scrap_oracle_gate` ignores the in-memory sample and always returns disabled ([§17](#section-17)). The late-window veto stays off while `sell_late_window_s` is **0** (code default). `sell_oracle_edge_floor_usd`, `sell_oracle_edge_per_ttm`, and `sell_oracle_stale_s` also default to **0**, so raising only the window does not restore the old $25 / 1.5×TTM / 5s-stale veto. `sell_oracle_edge_persist_s` defaults to **3** and only matters when that window is positive. If the veto is ever turned back on, #214 keeps its edge-persist clock running on the kept scrap leg while the loser book is momentarily empty, instead of resetting it.
+**Oracle mark (log only).** The same in-memory `bag_view` is copied onto `sell_scrap_plan`, `sell_loser_done`, the dump countdown's `sell_dump_persist` line when `why=armed`, `sell_dump_done`, `reclaim_buy` (after the buy FAK), and `bag_risk`. The fields are `oracle_px`, `oracle_start`, `oracle_dist_usd`, `oracle_dist_bps`, `oracle_source`, `oracle_start_source`, `oracle_age_s`, and `oracle_reason`. `oracle_px` is the 60s TWAP, labelled `polymarket_rtds_twap_sixty`, because that is the series in the market rules. Direct Chainlink Data Streams needs credentials this bot does not have. The live `crypto_prices_chainlink` print on the same socket, and any Binance price, are not the settlement series, so they are not this field. `oracle_start` is the bag's strike (`open_ref`: `rtds_twap_at_start`, or a labelled `crypto_price_open` / `gamma_price_to_beat` fallback). `oracle_dist_usd` is signed TWAP − strike (positive means the TWAP is above the strike); basis points use the same sign. Age is local `recv_ts`. Older than `STALE_AFTER_S` (20s) keeps the age and nulls the prices with `oracle_reason=stale`. Missing price, missing receive time, or a missing strike are `no_price`, `no_age`, and `no_start`. The flag off is `disabled`. The sell path only reads the cache. It does not open a socket, call Gamma, or wait.
+
+`oracle_log_enabled` defaults **true** (example true). A missing live key turns the background tape on after the operator restarts. Set it false to stop the thread and to log `disabled` on those lines. When the feed is down the thread logs the stall and keeps going, and the mark lines carry a null with a reason. Since #245, `_scrap_oracle_gate` ignores the in-memory sample and always returns disabled ([§17](#section-17)). The late-window veto stays off while `sell_late_window_s` is **0** (code default). `sell_oracle_edge_floor_usd`, `sell_oracle_edge_per_ttm`, and `sell_oracle_stale_s` also default to **0**, so raising only the window does not restore the old $25 / 1.5×TTM / 5s-stale veto. `sell_oracle_edge_persist_s` defaults to **3** and only matters when that window is positive. If the veto is ever turned back on, #214 keeps its edge-persist clock running on the kept scrap leg while the loser book is momentarily empty, instead of resetting it.
 
 <a id="section-10b"></a>
 ## Sync-loop audit (same class as mint stealing the dump cycle)
@@ -1052,7 +1054,7 @@ The late pair also needs `sell_fak_px_late` and `sell_late_price_window_s` (180)
 
 | Key | Code | Meaning |
 |---|---:|---|
-| `oracle_log_enabled` | false | Chainlink 60s TWAP tape. Audit only. Example false |
+| `oracle_log_enabled` | true | Chainlink 60s TWAP tape, plus the oracle-mark fields on scrap, dump, reclaim, and bag end. Example true. False logs `oracle_reason=disabled` and does not start the thread |
 | `sell_late_window_s` | 0 | Late-window scrap veto. 0 skips it. Not the late price window |
 | `sell_oracle_edge_floor_usd` | 0 | Old veto floor. 0 does not restore the $25 rule |
 | `sell_oracle_edge_per_ttm` | 0 | Old veto dollars per second of ttm |
@@ -1113,7 +1115,7 @@ The `Deploy to GCP` workflow runs on pushes to `main` that touch `mintbot.py`, `
 
 **Redeem.** `redeem_cycle`, `redeem_cycle_error`, `redeem_sweep`, `redeem_sweep_fail`, `redeem_wait_resolution`, `redeem_nothing_held`, `redeem_no_winner`, `redeem_dry_run`, `redeem_submitted`, `redeem_submit_fail`, `redeem_submit_uncertain`, `redeem_confirmed`, `redeem_gave_up`, `redeem_check_fail`.
 
-**Oracle tape** (only while `oracle_log_enabled`). `oracle_twap`, `oracle_open_ref`, `oracle_window_end`, `oracle_strike_revised`, `oracle_strike_late`, `oracle_strike_check`, `oracle_close_check`, `oracle_check_missed`, `oracle_window_end_missed`, `oracle_feed_watchdog`, `oracle_feed_reconnect`, `oracle_feed_stall`, `oracle_feed_recovered`, `oracle_log_fail`.
+**Oracle tape** (only while `oracle_log_enabled`). `oracle_twap`, `oracle_open_ref`, `oracle_window_end`, `oracle_strike_revised`, `oracle_strike_late`, `oracle_strike_check`, `oracle_close_check`, `oracle_check_missed`, `oracle_window_end_missed`, `oracle_feed_watchdog`, `oracle_feed_reconnect`, `oracle_feed_stall`, `oracle_feed_recovered`, `oracle_log_fail`. The same flag adds `oracle_px`, `oracle_start`, `oracle_dist_usd`, `oracle_dist_bps`, `oracle_source` (`polymarket_rtds_twap_sixty`), `oracle_start_source`, `oracle_age_s`, and `oracle_reason` onto `sell_scrap_plan`, `sell_loser_done`, the dump arm (`sell_dump_persist` `why=armed`), `sell_dump_done`, `reclaim_buy`, and `bag_risk`.
 
 **WhatsApp.** `danger_zone` (always, even when the send is off), `notify_whatsapp_on`, `notify_whatsapp_off`, `notify_sent`, `notify_failed`, `notify_dropped`.
 
@@ -1538,6 +1540,8 @@ redeem_enabled (opt-in), separate thread:
 Adjacent mint may already have been submitted **before** expiry (lookahead). That is intentional and is the main fix for the “skipped 15m” bug.
 
 # Changelog
+
+- **2026-10-13** — `oracle_log_enabled` defaults true. Scrap plan, scrap done, dump arm, dump done, reclaim buy, and bag end copy the in-memory Chainlink 60s TWAP and the bag's strike (`oracle_px`, `oracle_start`, signed `oracle_dist_usd` / `oracle_dist_bps`, source `polymarket_rtds_twap_sixty`, age). A stale or missing cache logs null with `oracle_reason`. The sell path does not open a socket or change an order. The live `crypto_prices_chainlink` print is not the settlement series.
 
 - **2026-10-13** — After a dump fires, the held leg and the kept leg keep posting fresh-bid FAKs with no sleep until that leg is sold or the window ends. An empty book is read again immediately. `sell_dump_fak_retries` defaults to 0 (no cap); a positive value is a safety cap (`retry_cap`). The reclaim stop and the hedge sell stay on a finite burst. `post_dump_book` starts on the sampler thread at the fire, from the books already in hand, and keeps sampling while the sell is in progress. The sell thread does not fetch for that journal.
 
