@@ -21,7 +21,9 @@ from buy.mint_sell import (
 )
 from buy.mint_sequence import seq_busy_bag, seq_exit_open
 from test_mint_only_ops import _assign, _fn
-from test_mint_reclaim import _Loop, _arm_entry, _dumped, _qualifying, _reclaim_cfg
+from test_mint_reclaim import (
+    _Loop, _arm_entry, _dumped, _lvl, _qualifying, _reclaim_cfg,
+)
 from test_mint_sequential import ACTIVE, S, MintHarness, _cfg, _market, _prev_bag
 
 
@@ -212,6 +214,62 @@ class HedgeLoopTests(unittest.TestCase):
         self.assertTrue(posted[-1]["sent"])
         self.assertGreater(posted[-1]["filled"], 0)
         self.assertTrue(posted[-1]["rounded_up"])
+
+    def test_reclaim_logs_ask_depth_from_the_tick_book(self):
+        loop = _Loop()
+        fetches = {"n": 0}
+        real = loop.ns["_fetch_books"]
+
+        def fetch_books(*args, **kwargs):
+            fetches["n"] += 1
+            return real(*args, **kwargs)
+
+        loop.ns["_fetch_books"] = fetch_books
+        singles = {"n": 0}
+        real_one = loop.ns["_fetch_book"]
+
+        def fetch_book(*args, **kwargs):
+            singles["n"] += 1
+            return real_one(*args, **kwargs)
+
+        loop.ns["_fetch_book"] = fetch_book
+
+        def levels(pairs):
+            return [{"price": f"{px:.4f}", "size": f"{sz:.4f}"} for px, sz in pairs]
+
+        up_asks = levels([
+            (0.94, 40), (0.95, 30), (0.96, 20),
+            (0.97, 10), (0.98, 5), (0.99, 1),
+        ])
+        dn_asks = levels([
+            (0.07, 8), (0.08, 9), (0.09, 10),
+            (0.10, 11), (0.11, 12), (0.20, 50),
+        ])
+        loop.book = {
+            "up": (0.93, 500.0, _lvl(0.93, 500), 0.94, 40.0, up_asks, None),
+            "dn": (0.06, 500.0, _lvl(0.06, 500), 0.07, 8.0, dn_asks, None),
+        }
+        now = loop.clock["now"]
+        intent = _dumped(now + 200.0)
+        _arm_entry(intent, now)
+        cfg = _reclaim_cfg(reclaim_hedge_enabled=True, reclaim_hedge_usd=1.0)
+        loop.tick(cfg, intent)
+        _wait_hedge(intent, loop)
+        self.assertEqual(fetches["n"], 1)
+        self.assertEqual(singles["n"], 0)
+        buy = loop.events_named("reclaim_buy")[-1]
+        self.assertEqual(
+            buy["ask_depth"],
+            [[0.94, 40.0], [0.95, 30.0], [0.96, 20.0], [0.97, 10.0], [0.98, 5.0]],
+        )
+        self.assertEqual(
+            buy["hedge_ask_depth"],
+            [[0.07, 8.0], [0.08, 9.0], [0.09, 10.0], [0.10, 11.0], [0.11, 12.0]],
+        )
+        hedge = loop.events_named("reclaim_hedge_buy")[-1]
+        self.assertTrue(hedge["sent"])
+        self.assertEqual(hedge["ask_depth"], buy["hedge_ask_depth"])
+        self.assertTrue(intent.get("reclaim_bought"))
 
     def test_hedge_failure_does_not_change_the_main_buy(self):
         loop = _Loop()

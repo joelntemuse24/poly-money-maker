@@ -731,9 +731,11 @@ An in-flight refire (`reclaim_hedge_retrying`) still defers the next sequential 
 
 `post_dump_log_enabled` defaults **true** and is **true** in the live reference. It hot-reloads. After `sold_dump`, and while the window is still open, mintbot journals `post_dump_book` about every **0.25s** (`POST_DUMP_BOOK_INTERVAL_S`) until `end_ts`.
 
-Fields: `condition_id`, `slug`, `leg_dumped`, `up_bid`, `up_ask`, `dn_bid`, `dn_ask`, `ttm_s`.
+Fields: `condition_id`, `slug`, `leg_dumped`, `up_bid`, `up_ask`, `dn_bid`, `dn_ask`, `ttm_s`, plus the top 5 bid and ask levels on each leg (`up_bids`, `up_asks`, `dn_bids`, `dn_asks` as `[price, size]` lists, best first) and `up_ask_near` / `dn_ask_near` (ask size within 3¢ of the best ask).
 
-The sell tick reuses the books it already fetched and logs only after that bag's orders, reclaim, and hedge work. A sampler thread (`_post_dump_logger`) fills the gaps between ticks and is the only place that reads the book for this journal. It does not place orders and does not change a decision. The cadence state lives in memory (`_post_dump_box`), not in `positions_mint.json`. A fetch error logs `post_dump_book_fail`. The flag off, a bag that has not dumped, a closed window, or a line that is not yet due is a skip.
+The sell tick reuses the books it already fetched and logs only after that bag's orders, reclaim, and hedge work. Depth is taken from those same ladders. A sampler thread (`_post_dump_logger`) fills the gaps between ticks and is the only place that reads the book for this journal. It does not place orders and does not change a decision. The cadence state lives in memory (`_post_dump_box`), not in `positions_mint.json`. A fetch error logs `post_dump_book_fail`. The flag off, a bag that has not dumped, a closed window, or a line that is not yet due is a skip.
+
+`reclaim_buy` logs `ask_depth` and `hedge_ask_depth` (top 5 asks of the bought leg and the other leg) after the buy FAK, from the same tick's book. A sent `reclaim_hedge_buy` logs `ask_depth` for the hedge leg after that FAK. Neither read adds a book fetch.
 
 <a id="section-20"></a>
 ## Live-bid FAK vs floor FAK
@@ -1157,7 +1159,7 @@ Do not import `mintbot.py` in unit tests (credentials, lock, clients). Test `buy
 | Held dump | After loser sold, sell the held leg if its sized bid is under `sell_dump_below` (80¢ code, 67¢ in the 13 Oct reference) |
 | Reclaim | After a both-sides dump, FAK-buy about `reclaim_usd` of a side that holds at `reclaim_entry` |
 | Reclaim hedge | Optional concurrent FAK buy of the other side, retried at the fresh ask up to `reclaim_hedge_max_price` |
-| `post_dump_book` | Both books, about every 0.25s, from the dump until the window ends. No orders |
+| `post_dump_book` | Both books and the top 5 levels each side, about every 0.25s, from the dump until the window ends. No orders |
 | Redeem | Exchange winning tokens for $1 collateral after resolution, on `mintbot-redeem` when `redeem_enabled` is true (code default false; not in the 13 Oct list) |
 | FAK | Fill-and-kill marketable limit |
 | Sized bid | Best bid with minimum size |
@@ -1536,6 +1538,8 @@ redeem_enabled (opt-in), separate thread:
 Adjacent mint may already have been submitted **before** expiry (lookahead). That is intentional and is the main fix for the “skipped 15m” bug.
 
 # Changelog
+
+- **2026-10-13** — `post_dump_book` also records the top 5 bid and ask levels on each leg (`up_bids`, `up_asks`, `dn_bids`, `dn_asks`) and the ask size within 3¢ of the best ask (`up_ask_near`, `dn_ask_near`). `reclaim_buy` records `ask_depth` and `hedge_ask_depth` after the buy FAK; a sent `reclaim_hedge_buy` records `ask_depth` after the hedge FAK. All of it comes from ladders already in hand. No extra book read and no change to an order.
 
 - **2026-10-13** — When `sell_dump_also_kept` is on, `sell_dump_parallel_kept` (default true, hot-reloaded) posts the kept leg at the same time as the held leg. Each leg keeps its own fresh-bid refire. The intent is merged after both return, and reclaim does not arm before that. False restores the old order: the kept sell starts only after the held dump fills. One kept launch per bag.
 

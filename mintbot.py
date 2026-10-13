@@ -121,10 +121,12 @@ from rich.console import Console
 from rich.panel import Panel
 
 from buy.book import (
+    ask_size_within,
     best_ask_with_min_size,
     best_bid_with_min_size,
     bid_fill_depth,
     book_age_s,
+    book_top_levels,
 )
 from buy.chain import ChainReader, thread_session
 from buy.contracts import ContractCall, build_atomic_mint_calls, build_redeem_calls
@@ -3727,6 +3729,7 @@ def _reclaim_hedge_run(
     retries: int,
     min_bid_size: float,
     tol: float,
+    ask_levels: Any = None,
 ) -> None:
     """Post the hedge FAK, then refire a miss on this thread. The main buy does not wait.
 
@@ -3847,7 +3850,8 @@ def _reclaim_hedge_run(
             if filled > 0 and status_s.startswith("error"):
                 intent["reclaim_hedge_filled"] = filled
             _reclaim_note_hedge(
-                intent, cid, noted, (filled, status_s), dry_run=dry_run,
+                intent, cid, noted, (filled, status_s),
+                dry_run=dry_run, ask_levels=ask_levels,
             )
         log_event(
             "reclaim_hedge_outcome",
@@ -3877,6 +3881,7 @@ def _reclaim_hedge_run(
             px=plan.get("limit"),
             filled=filled,
             status=f"error:{str(exc)[:120]}",
+            ask_depth=book_top_levels(ask_levels, "ask"),
         )
         log_event(
             "reclaim_hedge_outcome",
@@ -3897,6 +3902,7 @@ def _reclaim_note_hedge(
     result: Any,
     *,
     dry_run: bool,
+    ask_levels: Any = None,
 ) -> None:
     """Record the hedge post. Never changes the main reclaim buy."""
     bought, status = (0.0, "error:missing")
@@ -3943,6 +3949,7 @@ def _reclaim_note_hedge(
         rounded_up=bool(plan.get("rounded_up")),
         raw_shares=plan.get("raw_shares"),
         dry_run=dry_run,
+        ask_depth=book_top_levels(ask_levels, "ask"),
     )
 
 
@@ -4411,6 +4418,7 @@ def _reclaim_tick(
     funder_cs: Optional[str],
     min_bid_size: float,
     clob_min: float,
+    ask_levels: Optional[dict] = None,
 ) -> None:
     """Reclaim buy and stop on books this tick already fetched.
 
@@ -4726,6 +4734,11 @@ def _reclaim_tick(
                     "retries": hedge_retries_box,
                     "min_bid_size": min_bid_size,
                     "tol": tol,
+                    "ask_levels": (
+                        ask_levels.get(other)
+                        if isinstance(ask_levels, dict)
+                        else None
+                    ),
                 },
                 name="reclaim-hedge",
                 daemon=True,
@@ -4734,6 +4747,7 @@ def _reclaim_tick(
             str(token), shares, float(limit), dry_run, capture=captured,
         )
     status_s = str(status or "")
+    levels = ask_levels if isinstance(ask_levels, dict) else {}
     post_fields = {
         "condition_id": cid,
         "slug": intent.get("slug"),
@@ -4745,6 +4759,8 @@ def _reclaim_tick(
         "status": status_s,
         "dry_run": dry_run,
         "dumped_leg": bool(decision.get("dumped_leg")),
+        "ask_depth": book_top_levels(levels.get(leg), "ask"),
+        "hedge_ask_depth": book_top_levels(levels.get(other), "ask"),
     }
     if dry_run or status_s == "dry":
         intent["reclaim_filled"] = float(intent.get("reclaim_target") or shares)
@@ -4832,9 +4848,37 @@ def _post_dump_box() -> dict:
     return box
 
 
+def _post_dump_side(bids: Any, asks: Any) -> tuple:
+    """Top-5 ladders and ask size within 3¢, from levels already parsed."""
+    return (
+        book_top_levels(bids, "bid"),
+        book_top_levels(asks, "ask"),
+        ask_size_within(asks),
+    )
+
+
 def _post_dump_quote(row: Any) -> tuple:
-    _bid, _bsz, _bids, ask, _asz, _asks, _age = _book_quote(row)
-    return _bid, ask
+    bid, _bsz, bids, ask, _asz, asks, _age = _book_quote(row)
+    return (bid, ask, *_post_dump_side(bids, asks))
+
+
+def _post_dump_fields(snap: dict, cid: str, ttm: Any) -> dict:
+    return {
+        "condition_id": cid,
+        "slug": snap.get("slug"),
+        "leg_dumped": snap.get("leg_dumped"),
+        "up_bid": snap.get("up_bid"),
+        "up_ask": snap.get("up_ask"),
+        "dn_bid": snap.get("dn_bid"),
+        "dn_ask": snap.get("dn_ask"),
+        "up_bids": snap.get("up_bids") or [],
+        "up_asks": snap.get("up_asks") or [],
+        "dn_bids": snap.get("dn_bids") or [],
+        "dn_asks": snap.get("dn_asks") or [],
+        "up_ask_near": snap.get("up_ask_near"),
+        "dn_ask_near": snap.get("dn_ask_near"),
+        "ttm_s": ttm,
+    }
 
 
 def _observe_post_dump_book(
@@ -4852,6 +4896,10 @@ def _observe_post_dump_book(
     up_tok: str,
     dn_tok: str,
     min_bid_size: float,
+    up_bids: Any = None,
+    up_asks: Any = None,
+    dn_bids: Any = None,
+    dn_asks: Any = None,
 ) -> None:
     """Journal the books this tick already fetched. No network, no orders.
 
@@ -4879,6 +4927,8 @@ def _observe_post_dump_book(
             prev["slug"] = intent.get("slug")
             box["snaps"][cid] = prev
         else:
+            up_top_bids, up_top_asks, up_near = _post_dump_side(up_bids, up_asks)
+            dn_top_bids, dn_top_asks, dn_near = _post_dump_side(dn_bids, dn_asks)
             box["snaps"][cid] = {
                 "enabled": True,
                 "sold_dump": True,
@@ -4889,6 +4939,12 @@ def _observe_post_dump_book(
                 "up_ask": up_ask,
                 "dn_bid": dn_bid,
                 "dn_ask": dn_ask,
+                "up_bids": up_top_bids,
+                "up_asks": up_top_asks,
+                "dn_bids": dn_top_bids,
+                "dn_asks": dn_top_asks,
+                "up_ask_near": up_near,
+                "dn_ask_near": dn_near,
                 "book_ts": now,
                 "up_token": up_tok,
                 "dn_token": dn_tok,
@@ -4941,23 +4997,14 @@ def _post_dump_book_emit(
             logged_ttm = ttm_s
             if logged_ttm is None and end:
                 logged_ttm = end - float(now)
-            row = {
-                "condition_id": cid,
-                "slug": snap.get("slug"),
-                "leg_dumped": snap.get("leg_dumped"),
-                "up_bid": snap.get("up_bid"),
-                "up_ask": snap.get("up_ask"),
-                "dn_bid": snap.get("dn_bid"),
-                "dn_ask": snap.get("dn_ask"),
-                "ttm_s": logged_ttm,
-            }
+            row = _post_dump_fields(snap, cid, logged_ttm)
             snap["logged_at"] = now
     if row is not None:
         log_event("post_dump_book", **row)
         return
     if fetch_args is None:
         return
-    up_tok, dn_tok, min_size, leg, slug, end = fetch_args
+    up_tok, dn_tok, min_size, leg, _slug, end = fetch_args
     if not up_tok or not dn_tok:
         return
     try:
@@ -4969,9 +5016,10 @@ def _post_dump_book_emit(
             error=str(exc)[:160],
         )
         return
-    up_bid, up_ask = _post_dump_quote(up_row)
-    dn_bid, dn_ask = _post_dump_quote(dn_row)
+    up_bid, up_ask, up_bids, up_asks, up_near = _post_dump_quote(up_row)
+    dn_bid, dn_ask, dn_bids, dn_asks, dn_near = _post_dump_quote(dn_row)
     ttm = (end - float(now)) if end else None
+    row = None
     with box["lock"]:
         snap = box["snaps"].get(cid)
         if not snap:
@@ -4987,20 +5035,18 @@ def _post_dump_book_emit(
         snap["up_ask"] = up_ask
         snap["dn_bid"] = dn_bid
         snap["dn_ask"] = dn_ask
+        snap["up_bids"] = up_bids
+        snap["up_asks"] = up_asks
+        snap["dn_bids"] = dn_bids
+        snap["dn_asks"] = dn_asks
+        snap["up_ask_near"] = up_near
+        snap["dn_ask_near"] = dn_near
         snap["book_ts"] = now
         snap["logged_at"] = now
         snap["leg_dumped"] = leg
-    log_event(
-        "post_dump_book",
-        condition_id=cid,
-        slug=slug,
-        leg_dumped=leg,
-        up_bid=up_bid,
-        up_ask=up_ask,
-        dn_bid=dn_bid,
-        dn_ask=dn_ask,
-        ttm_s=ttm,
-    )
+        row = _post_dump_fields(snap, cid, ttm)
+    if row is not None:
+        log_event("post_dump_book", **row)
 
 
 def _post_dump_book_pass(now: Optional[float] = None) -> None:
@@ -6388,6 +6434,7 @@ def _manage_sells_locked(cfg: dict, state: dict, chain: ChainReader) -> None:
                 ttm_s=ttm_s,
                 bids=bids,
                 asks_px={"up": up_ask, "dn": dn_ask},
+                ask_levels={"up": _up_asks, "dn": _dn_asks},
                 ages={"up": up_age, "dn": dn_age},
                 tokens=tokens,
                 dry_run=dry_run,
@@ -6419,6 +6466,10 @@ def _manage_sells_locked(cfg: dict, state: dict, chain: ChainReader) -> None:
             up_tok=up_tok,
             dn_tok=dn_tok,
             min_bid_size=min_bid_size,
+            up_bids=up_bids,
+            up_asks=_up_asks,
+            dn_bids=dn_bids,
+            dn_asks=_dn_asks,
         )
 
     commit_state(state, dirty=dirty)

@@ -112,6 +112,12 @@ class PostDumpBookLoopTests(unittest.TestCase):
         self.assertAlmostEqual(row["dn_bid"], 0.36)
         self.assertAlmostEqual(row["dn_ask"], 0.37)
         self.assertAlmostEqual(row["ttm_s"], 200.0)
+        self.assertEqual(row["up_bids"], [[0.62, 500.0]])
+        self.assertEqual(row["up_asks"], [[0.63, 500.0]])
+        self.assertEqual(row["dn_bids"], [[0.36, 500.0]])
+        self.assertEqual(row["dn_asks"], [[0.37, 500.0]])
+        self.assertEqual(row["up_ask_near"], 500.0)
+        self.assertEqual(row["dn_ask_near"], 500.0)
         loop.clock["now"] = now + 0.1
         loop.tick(cfg, intent)
         self.assertEqual(len(_events(loop, "post_dump_book")), 1)
@@ -205,6 +211,9 @@ class PostDumpBookLoopTests(unittest.TestCase):
         self.assertAlmostEqual(fresh["dn_bid"], 0.58)
         self.assertAlmostEqual(fresh["dn_ask"], 0.59)
         self.assertEqual(fresh["leg_dumped"], "dn")
+        self.assertEqual(fresh["up_bids"], [[0.40, 500.0]])
+        self.assertEqual(fresh["dn_asks"], [[0.59, 500.0]])
+        self.assertEqual(fresh["up_ask_near"], 500.0)
 
         snap = box["snaps"]["cid-reclaim"]
         snap["logged_at"] = now - 1.0
@@ -237,6 +246,55 @@ class PostDumpBookLoopTests(unittest.TestCase):
         loop.ns["_post_dump_book_pass"](now + 1.0)
         self.assertEqual(fetches["n"], 1)
         self.assertEqual(len(_events(loop, "post_dump_book")), 1)
+
+    def test_multi_level_depth_uses_the_tick_book(self):
+        loop = _Loop()
+        fetches = {"n": 0}
+        real = loop.ns["_fetch_books"]
+
+        def fetch_books(up, dn, min_size):
+            fetches["n"] += 1
+            return real(up, dn, min_size)
+
+        loop.ns["_fetch_books"] = fetch_books
+
+        def levels(pairs):
+            return [{"price": f"{px:.4f}", "size": f"{sz:.4f}"} for px, sz in pairs]
+
+        up_bids = levels([
+            (0.10, 1), (0.62, 10), (0.61, 20), (0.60, 30),
+            (0.59, 40), (0.58, 50), (0.90, 0),
+        ])
+        up_asks = levels([
+            (0.70, 5), (0.63, 11), (0.64, 12), (0.65, 13),
+            (0.66, 14), (0.80, 99),
+        ])
+        dn_bids = levels([(0.36, 7), (0.35, 8), (0.34, 9)])
+        dn_asks = levels([(0.40, 4), (0.37, 6), (0.38, 3), (0.39, 2)])
+        loop.book = {
+            "up": (0.62, 10.0, up_bids, 0.63, 11.0, up_asks, None),
+            "dn": (0.36, 7.0, dn_bids, 0.37, 6.0, dn_asks, None),
+        }
+        now = loop.clock["now"]
+        loop.tick(_dump_cfg(), _dumped(now + 80.0))
+        self.assertEqual(fetches["n"], 1)
+        row = _events(loop, "post_dump_book")[-1]
+        self.assertEqual(
+            row["up_bids"],
+            [[0.62, 10.0], [0.61, 20.0], [0.60, 30.0], [0.59, 40.0], [0.58, 50.0]],
+        )
+        self.assertEqual(
+            row["up_asks"],
+            [[0.63, 11.0], [0.64, 12.0], [0.65, 13.0], [0.66, 14.0], [0.70, 5.0]],
+        )
+        self.assertEqual(row["up_ask_near"], 50.0)
+        self.assertEqual(row["dn_bids"], [[0.36, 7.0], [0.35, 8.0], [0.34, 9.0]])
+        self.assertEqual(
+            row["dn_asks"],
+            [[0.37, 6.0], [0.38, 3.0], [0.39, 2.0], [0.40, 4.0]],
+        )
+        self.assertEqual(row["dn_ask_near"], 15.0)
+        self.assertEqual(loop.buys, [])
 
 
 if __name__ == "__main__":

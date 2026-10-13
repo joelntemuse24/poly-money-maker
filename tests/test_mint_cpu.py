@@ -11,7 +11,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from types import SimpleNamespace
 
-from buy.book import bid_fill_depth
+from buy.book import ask_size_within, bid_fill_depth, book_top_levels
 from buy.chain import ChainReader, thread_session
 from buy.mint_loops import (
     ENDED_CHAIN_GRACE_S,
@@ -82,6 +82,8 @@ def _sell_runtime(saves: list) -> dict:
             continue
         ns.setdefault(name, getattr(mint_sell, name))
     ns["bid_fill_depth"] = bid_fill_depth
+    ns["book_top_levels"] = book_top_levels
+    ns["ask_size_within"] = ask_size_within
     ns["log_event"] = lambda *_a, **_k: None
     ns["notify"] = lambda *_a, **_k: None
     ns["console"] = SimpleNamespace(print=lambda *_a, **_k: None)

@@ -87,6 +87,87 @@ def best_ask_with_min_size(
         return None, 0.0
 
 
+def book_top_levels(levels: Any, side: str, n: int = 5) -> list:
+    """Best ``n`` levels as ``[price, size]``, best first.
+
+    Asks sort lowest first, bids highest first. Skips non-dicts, size ≤ 0,
+    and prices outside ``(0, 1)``. Does not apply a minimum size. Never
+    raises: a bad book is ``[]``.
+    """
+    if not levels or side not in ("bid", "ask"):
+        return []
+    try:
+        keep = int(n)
+    except (TypeError, ValueError):
+        return []
+    if keep <= 0:
+        return []
+    try:
+        valid = []
+        for level in levels:
+            if not isinstance(level, dict):
+                continue
+            price = finite_float(level.get("price"))
+            size = finite_float(level.get("size"))
+            if (
+                price is None
+                or size is None
+                or not 0 < price < 1
+                or size <= 0
+            ):
+                continue
+            valid.append((price, size))
+        if not valid:
+            return []
+        valid.sort(key=lambda level: level[0], reverse=(side == "bid"))
+        return [
+            [round(price, 4), round(size, 2)]
+            for price, size in valid[:keep]
+        ]
+    except Exception:
+        return []
+
+
+def ask_size_within(levels: Any, cents: float = 0.03) -> Optional[float]:
+    """Sum of ask size at or within ``cents`` of the best ask.
+
+    One walk of the ladder. ``None`` when there is no usable ask.
+    """
+    if not levels:
+        return None
+    try:
+        band = finite_float(cents)
+        if band is None or band < 0:
+            band = 0.03
+        best = None
+        rows = []
+        for level in levels:
+            if not isinstance(level, dict):
+                continue
+            price = finite_float(level.get("price"))
+            size = finite_float(level.get("size"))
+            if (
+                price is None
+                or size is None
+                or not 0 < price < 1
+                or size <= 0
+            ):
+                continue
+            rows.append((price, size))
+            if best is None or price < best:
+                best = price
+        if best is None:
+            return None
+        ceiling = best + band
+        total = 0.0
+        for price, size in rows:
+            if price <= ceiling + 1e-12:
+                total += size
+        return round(total, 2)
+    except Exception:
+        return None
+
+
 def book_age_s(timestamp: Any, now_s: float) -> Optional[float]:
     """Age in seconds of a CLOB book ``timestamp``, or None if it has none.
 
