@@ -315,7 +315,14 @@ class SellLoopVetoTests(unittest.TestCase):
         self.assertEqual(len(fak_calls), 1)
         self.assertFalse(_named(events, "scrap_oracle_veto"))
         self.assertFalse(_named(events, "scrap_oracle_stale"))
-        self.assertEqual(view.calls, 0)
+        # The disabled veto still does not read the cache. The one read is
+        # the log-only mark on sell_loser_done, and it uses the TWAP strike.
+        done = _named(events, "sell_loser_done")
+        self.assertEqual(len(done), 1)
+        self.assertEqual(view.calls, 1)
+        self.assertEqual(done[0]["oracle_start"], round(85530.99, 2))
+        self.assertNotEqual(done[0]["oracle_px"], 85508.10)
+        self.assertEqual(done[0]["oracle_source"], "polymarket_rtds_twap_sixty")
 
     def test_scrap_time_gate_still_applies_before_disabled_oracle_gate(self):
         ns, events, fak_calls, clock, intent, view, _end = self._setup(
