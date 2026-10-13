@@ -266,8 +266,12 @@ still persist the full `sell_dump_persist_s` after entering it. Optional
 replaces that persist when seconds-to-close is within
 `sell_dump_persist_last_min_window_s` (default 0 = off, no behaviour
 change); `armed_ts` is not reset on the switch. Live is meant to set
-`last_min_s` 1.0 and window 120 after merge. Ladder
-retries after the dump has fired are not re-checked.
+`last_min_s` 1.0 and window 120 after merge. The dump arms only while the
+held bid is under `sell_dump_below` and the other side's bid is at least
+`sell_dump_other_min` (default 0.30; 0 or null disables) on the same tick.
+Either side failing resets `sell_dump_armed_at`. `sell_dump_persist` logs
+the other bid, with `why=other_low` when that side blocks. Ladder
+retries after the dump has fired, and the kept-side sell, are not re-checked.
 After `sold_dump` (`sell_dump_done`), and while `post_dump_log_enabled`
 is true (the default, hot-reloaded), mintbot journals `post_dump_book`
 (`leg_dumped`, `up_bid`, `up_ask`, `dn_bid`, `dn_ask`, `ttm_s`) about

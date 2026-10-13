@@ -1425,7 +1425,9 @@ class ScrapFractionLoopTests(unittest.TestCase):
         )
         self._tick(ns, cfg, intent)
         self.assertAlmostEqual(fak_calls[0]["size"], 50.0)
-        book["up"] = (0.10, 40.0, [{"price": "0.10", "size": "40"}])
+        # Held Down is under the dump trigger. Kept Up stays at 0.55 so the
+        # other-side persist can hold; the dump still sells only Down.
+        book["up"] = (0.55, 40.0, [{"price": "0.55", "size": "40"}])
         book["dn"] = (0.35, 80.0, [{"price": "0.35", "size": "80"}])
         clock["now"] += 0.1
         self._tick(ns, cfg, intent)
