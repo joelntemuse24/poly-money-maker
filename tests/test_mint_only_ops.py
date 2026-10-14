@@ -101,6 +101,7 @@ class MintDefaultsTests(unittest.TestCase):
             self.assertEqual(blob["sell_scrap_rest_px"], 0.02, label)
             self.assertEqual(blob["sell_scrap_rest_min_ahead_s"], 180.0, label)
             self.assertEqual(blob["sell_scrap_fraction"], 1.0, label)
+            self.assertIsNone(blob["sell_scrap_min_px"], label)
             self.assertIs(blob["sell_scrap_rest_enabled"], True, label)
             self.assertEqual(blob["sell_dump_persist_s"], 2.0, label)
             self.assertEqual(blob["sell_dump_fak_retries"], 0, label)

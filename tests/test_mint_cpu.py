@@ -1862,5 +1862,80 @@ class OracleMarkLoopTests(unittest.TestCase):
         self.assertEqual(reads["n"], 0)
 
 
+class ScrapMinPxLoopTests(unittest.TestCase):
+    def test_cheap_bid_waits_and_a_recovered_bid_posts_at_the_bid(self):
+        ns, events, fak_calls, clock, book = _scrap_harness()
+        book["up"] = (0.10, 40.0, [{"price": "0.10", "size": "40"}])
+        book["dn"] = (0.90, 80.0, [{"price": "0.90", "size": "80"}])
+        end = clock["now"] + 200.0
+        intent = _open_scrap_bag(end)
+        cfg = _scrap_cfg(
+            sell_threshold=0.20,
+            sell_fak_px=0.20,
+            sell_floor=0.02,
+            sell_persist_s=0.0,
+            sell_scrap_min_px=0.15,
+            sell_scrap_rest_enabled=True,
+            sell_scrap_blind_enabled=True,
+        )
+        state = {"intents": {"cid-floor": intent}}
+        ns["remember_persisted_state"](state)
+        ns["_manage_sells_locked"](cfg, state, object())
+        self.assertEqual(fak_calls, [])
+        self.assertIsNotNone(intent.get("sell_loser_armed_at"))
+        skips = [row for row in events if row["event"] == "sell_scrap_floor_skip"]
+        self.assertEqual(len(skips), 1)
+        self.assertAlmostEqual(skips[0]["bid"], 0.10)
+        self.assertAlmostEqual(skips[0]["floor"], 0.15)
+        clock["now"] += 1.0
+        ns["_manage_sells_locked"](cfg, state, object())
+        skips = [row for row in events if row["event"] == "sell_scrap_floor_skip"]
+        self.assertEqual(len(skips), 1)
+        self.assertEqual(fak_calls, [])
+        book["up"] = (0.16, 40.0, [{"price": "0.16", "size": "40"}])
+        clock["now"] += 1.0
+        ns["_manage_sells_locked"](cfg, state, object())
+        self.assertEqual(len(fak_calls), 1)
+        self.assertAlmostEqual(fak_calls[0]["price"], 0.16)
+        self.assertTrue(intent.get("sold_loser"))
+
+    def test_zero_floor_still_posts_the_one_cent_bid(self):
+        ns, events, fak_calls, clock, book = _scrap_harness()
+        book["up"] = (0.01, 40.0, [{"price": "0.01", "size": "40"}])
+        end = clock["now"] + 200.0
+        intent = _open_scrap_bag(end, sell_loser_armed_at=clock["now"] - 10.0)
+        cfg = _scrap_cfg(sell_scrap_min_px=0, sell_persist_s=0.0)
+        state = {"intents": {"cid-off": intent}}
+        ns["remember_persisted_state"](state)
+        ns["_manage_sells_locked"](cfg, state, object())
+        self.assertEqual(len(fak_calls), 1)
+        self.assertAlmostEqual(fak_calls[0]["price"], 0.01)
+        self.assertFalse(any(row["event"] == "sell_scrap_floor_skip" for row in events))
+
+    def test_dump_still_sells_under_the_scrap_floor(self):
+        ns, events, fak_calls, clock = _dump_harness(_fill_fak)
+        ns["_fetch_books"] = lambda *_a, **_k: (
+            (0.10, 50.0, [{"price": "0.10", "size": "50"}]),
+            (0.90, 50.0, [{"price": "0.90", "size": "50"}]),
+        )
+        ns["_fetch_book"] = lambda *_a, **_k: (
+            0.10, 50.0, [{"price": "0.10", "size": "50"}],
+        )
+        end = clock["now"] + 100.0
+        intent = _held_after_scrap(end, sell_dump_armed_at=clock["now"] - 5.0)
+        cfg = _dump_cfg(sell_scrap_min_px=0.15, sell_dump_below=0.60)
+        state = {"intents": {"cid-dump": intent}}
+        ns["remember_persisted_state"](state)
+        ns["_manage_sells_locked"](cfg, state, object())
+        self.assertTrue(fak_calls)
+        self.assertAlmostEqual(fak_calls[0]["price"], 0.10)
+        self.assertFalse(any(row["event"] == "sell_scrap_floor_skip" for row in events))
+        src = MINT.read_text()
+        for name in ("_post_kept_dump", "_run_dump_fak_with_refire", "_reclaim_stop_tick"):
+            start = src.find(f"def {name}(")
+            end_at = src.find("\ndef ", start + 5)
+            self.assertNotIn("sell_scrap_min_px", src[start:end_at], name)
+
+
 if __name__ == "__main__":
     unittest.main()

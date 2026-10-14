@@ -87,6 +87,11 @@ DEFAULT_SELL_KNOBS = {
     # 1 scraps the whole loser. Below 1, floor(held × fraction) is the
     # scrap target and the remainder is held to resolution.
     "sell_scrap_fraction": 1.0,
+    # Null or <= 0: loser scrap may post down to the 1c exchange minimum.
+    # A positive price is a scrap-only floor. A live bid under it is not
+    # posted (the limit is not lifted to the floor). Dump, kept, stop, and
+    # hedge sells do not read this.
+    "sell_scrap_min_px": None,
     "sell_cooldown_s": 3.0,
     "sell_winner_min": 0.999,
     "sell_winner_cheap_if_loser_le": 0.03,
@@ -1085,6 +1090,7 @@ def loser_ladder_limits(
     loser_bid: float,
     *,
     fak_px: Optional[float] = None,
+    min_post: Optional[float] = None,
 ) -> Sequence[float]:
     """FAK limits. The arm ceiling is not the print.
 
@@ -1094,26 +1100,95 @@ def loser_ladder_limits(
     are skipped. A live bid below the floor is the only rung. Defaults post
     a single 2¢ rung (``fak_px`` equals ``sell_floor``). A thinner book
     starts at the live bid.
+
+    ``min_post`` is the scrap-only floor (``sell_scrap_min_px``). When it
+    is above ``floor``, the walk stops there. A live bid under it returns
+    no rungs: the caller must not post that bid, and must not lift it.
     """
     tick = 0.01
     top = round(float(threshold if fak_px is None else fak_px), 4)
     fl = round(float(floor), 4)
+    stop = fl
+    if min_post is not None:
+        try:
+            posted = round(float(min_post), 4)
+        except (TypeError, ValueError):
+            posted = None
+        if posted is not None and posted > stop:
+            stop = posted
     bid = round(float(loser_bid), 4)
-    if bid + 1e-12 < fl:
+    if bid + 1e-12 < stop:
+        if stop > fl + 1e-12:
+            return []
         return [bid] if bid > 1e-12 else []
     limits: list[float] = []
     px = round(min(top, bid), 4)
     while True:
-        use_px = round(max(fl, min(px, bid)), 4)
+        use_px = round(max(stop, min(px, bid)), 4)
         if not limits or abs(use_px - limits[-1]) > 1e-12:
             limits.append(use_px)
-        if use_px <= fl + 1e-12:
+        if use_px <= stop + 1e-12:
             break
         nxt = round(px - tick, 4)
         if nxt + 1e-12 >= px:
             break
-        px = fl if nxt + 1e-12 < fl else nxt
+        px = stop if nxt + 1e-12 < stop else nxt
     return limits
+
+
+def scrap_min_px(value: Any) -> Optional[float]:
+    """Positive loser-scrap floor, or None when the knob is off.
+
+    Missing, null, blank, non-numeric, and ``<= 0`` are off. A value
+    outside ``(0, 1)`` is off here; ``validate_strategy`` rejects it.
+    """
+    if value is None or value == "":
+        return None
+    try:
+        px = float(value)
+    except (TypeError, ValueError):
+        return None
+    if px != px or px in (float("inf"), float("-inf")):
+        return None
+    if not (0 < px < 1):
+        return None
+    return round(px, 4)
+
+
+def scrap_limit_allowed(
+    bid: Optional[float],
+    limit: Optional[float],
+    floor: Optional[float],
+) -> bool:
+    """False when a scrap post would sell under ``sell_scrap_min_px``.
+
+    Floor off always allows the post, including a 1¢ live bid. A missing
+    bid, a bid under the floor, or a limit under the floor does not post.
+    The limit is not raised to the floor.
+    """
+    if floor is None:
+        return True
+    try:
+        lo = float(floor)
+    except (TypeError, ValueError):
+        return True
+    if not math.isfinite(lo) or lo <= 0:
+        return True
+    try:
+        live = None if bid is None else float(bid)
+    except (TypeError, ValueError):
+        live = None
+    if live is None or not math.isfinite(live) or live + 1e-12 < lo:
+        return False
+    if limit is None:
+        return False
+    try:
+        posted = float(limit)
+    except (TypeError, ValueError):
+        return False
+    if not math.isfinite(posted) or posted + 1e-12 < lo:
+        return False
+    return True
 
 
 def sell_dump_other_confirms(other_bid: Optional[float], other_min: Any) -> bool:
@@ -1754,6 +1829,7 @@ def loser_scrap_post(
     fak_px: Optional[float] = None,
     depth_at_limit: Optional[float] = None,
     min_px: float = 0.01,
+    min_post: Optional[float] = None,
 ) -> dict:
     """Loser scrap order for this fire.
 
@@ -1765,13 +1841,14 @@ def loser_scrap_post(
     """
     rem = max(0.0, float(remaining or 0.0))
     if sweep:
-        return {
-            "mode": "sweep",
-            "limits": [scrap_live_bid_limit(loser_bid, threshold, min_px=min_px)],
-            "size": rem,
-        }
+        limit = scrap_live_bid_limit(loser_bid, threshold, min_px=min_px)
+        if not scrap_limit_allowed(loser_bid, limit, min_post):
+            return {"mode": "sweep", "limits": [], "size": rem}
+        return {"mode": "sweep", "limits": [limit], "size": rem}
     limits = list(
-        loser_ladder_limits(threshold, floor, loser_bid, fak_px=fak_px)
+        loser_ladder_limits(
+            threshold, floor, loser_bid, fak_px=fak_px, min_post=min_post,
+        )
     )
     return {
         "mode": "ladder",

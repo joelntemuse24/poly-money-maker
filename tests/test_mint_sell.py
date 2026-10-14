@@ -32,6 +32,8 @@ from buy.mint_sell import (
     loser_empty_keep_qualify,
     loser_ladder_limits,
     loser_partial_fak_shares,
+    scrap_limit_allowed,
+    scrap_min_px,
     loser_scrap_post,
     sell_fill_vwap,
     loser_persist_ready,
@@ -493,6 +495,24 @@ class WinnerSellLimitTests(unittest.TestCase):
         )
 
 
+class ScrapMinPxTests(unittest.TestCase):
+    def test_null_and_zero_are_off(self):
+        for raw in (None, "", 0, 0.0, "0"):
+            self.assertIsNone(scrap_min_px(raw))
+            self.assertTrue(scrap_limit_allowed(0.01, 0.01, scrap_min_px(raw)))
+        self.assertIsNone(DEFAULT_SELL_KNOBS["sell_scrap_min_px"])
+
+    def test_bid_under_the_floor_is_not_lifted(self):
+        floor = scrap_min_px(0.15)
+        self.assertEqual(floor, 0.15)
+        self.assertFalse(scrap_limit_allowed(0.14, 0.15, floor))
+        self.assertFalse(scrap_limit_allowed(0.10, 0.10, floor))
+        self.assertFalse(scrap_limit_allowed(None, 0.01, floor))
+        self.assertFalse(scrap_limit_allowed(0.18, 0.02, floor))
+        self.assertTrue(scrap_limit_allowed(0.15, 0.15, floor))
+        self.assertTrue(scrap_limit_allowed(0.16, 0.16, floor))
+
+
 class LoserLadderTests(unittest.TestCase):
     def test_persist_then_threshold_then_floor(self):
         self.assertEqual(
@@ -505,6 +525,34 @@ class LoserLadderTests(unittest.TestCase):
             loser_ladder_limits(threshold=0.03, floor=0.02, loser_bid=0.025),
             [0.025, 0.02],
         )
+
+    def test_scrap_min_stops_the_ladder_and_does_not_post_under_it(self):
+        self.assertEqual(
+            loser_ladder_limits(
+                threshold=0.20, floor=0.02, loser_bid=0.18,
+                fak_px=0.18, min_post=0.15,
+            ),
+            [0.18, 0.17, 0.16, 0.15],
+        )
+        self.assertEqual(
+            loser_ladder_limits(
+                threshold=0.20, floor=0.02, loser_bid=0.10,
+                fak_px=0.18, min_post=0.15,
+            ),
+            [],
+        )
+        self.assertEqual(
+            loser_scrap_post(
+                sweep=True, remaining=10, floor=0.02, threshold=0.20,
+                loser_bid=0.10, min_px=0.01, min_post=0.15,
+            )["limits"],
+            [],
+        )
+        kept = loser_scrap_post(
+            sweep=True, remaining=10, floor=0.02, threshold=0.20,
+            loser_bid=0.16, min_px=0.01, min_post=0.15,
+        )
+        self.assertEqual(kept["limits"], [0.16])
 
     def test_bid_below_floor_limit_equals_live_bid(self):
         """Incident 1789800300: 1¢ book must FAK at 1¢, not clamp to the 2¢ floor."""
