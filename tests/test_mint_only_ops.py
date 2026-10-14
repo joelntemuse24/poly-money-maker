@@ -105,6 +105,11 @@ class MintDefaultsTests(unittest.TestCase):
             self.assertIsNone(blob["sell_scrap_early_threshold"], label)
             self.assertAlmostEqual(blob["sell_opposite_min_early"], 0.75, msg=label)
             self.assertIsNone(blob["sell_opposite_min_old"], label)
+            self.assertIs(blob["shadow_early_scrap_enabled"], False, label)
+            self.assertAlmostEqual(blob["shadow_early_threshold"], 0.20, msg=label)
+            self.assertAlmostEqual(blob["shadow_early_min_px"], 0.15, msg=label)
+            self.assertAlmostEqual(blob["shadow_early_opposite_min"], 0.75, msg=label)
+            self.assertAlmostEqual(blob["shadow_early_fraction"], 0.5, msg=label)
             self.assertIs(blob["sell_scrap_rest_enabled"], True, label)
             self.assertEqual(blob["sell_dump_persist_s"], 2.0, label)
             self.assertEqual(blob["sell_dump_fak_retries"], 0, label)
@@ -835,6 +840,7 @@ class DeployUnitsTests(unittest.TestCase):
                 "mint_redeem.py",
                 "mint_sequence.py",
                 "oracle_log.py",
+                "shadow_early_scrap.py",
                 "sister_bid.py",
                 "sister_topup.py",
                 "whatsapp_notify.py",

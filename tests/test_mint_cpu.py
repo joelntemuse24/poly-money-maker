@@ -2187,5 +2187,247 @@ class ScrapModeLatchLoopTests(unittest.TestCase):
         self.assertFalse(any(row["event"] == "sell_scrap_floor_skip" for row in events))
 
 
+class ShadowEarlyScrapLoopTests(unittest.TestCase):
+    """Paper early scrap must not post, even when it would have filled."""
+
+    def setUp(self):
+        import tempfile
+        from pathlib import Path
+
+        from buy.shadow_early_scrap import reset_for_tests
+
+        reset_for_tests()
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.log_path = str(Path(self._tmp.name) / "shadow_early_scrap.jsonl")
+
+    def _prepare(self, ns, book, up, dn):
+        book["up"] = up
+        book["dn"] = dn
+        ns["_shadow_bind"].log_path = self.log_path
+        return {"intents": {}}
+
+    def _cfg(self, **extra):
+        cfg = _scrap_cfg(
+            sell_threshold=0.03,
+            sell_fak_px=0.03,
+            sell_persist_s=0.0,
+            sell_scrap_max_ttm_s=360.0,
+            sell_scrap_early_threshold=None,
+            shadow_early_scrap_enabled=True,
+            shadow_early_threshold=0.20,
+            shadow_early_min_px=0.15,
+            shadow_early_opposite_min=0.75,
+            shadow_early_fraction=0.5,
+        )
+        cfg.update(extra)
+        return cfg
+
+    def test_shadow_fill_does_not_call_an_order(self):
+        ns, events, fak_calls, clock, book = _scrap_harness()
+        self._prepare(
+            ns, book,
+            (0.18, 40.0, [
+                {"price": "0.18", "size": "10"},
+                {"price": "0.16", "size": "100"},
+            ]),
+            (0.82, 80.0, [{"price": "0.82", "size": "80"}]),
+        )
+        end = clock["now"] + 300.0
+        intent = _open_scrap_bag(end)
+        state = {"intents": {"cid-shadow": intent}}
+        ns["remember_persisted_state"](state)
+        ns["_manage_sells_locked"](self._cfg(), state, object())
+        self.assertEqual(fak_calls, [])
+        self.assertFalse(intent.get("sold_loser"))
+        self.assertNotIn("sell_scrap_mode", intent)
+        fills = [row for row in events if row["event"] == "shadow_scrap_fill"]
+        self.assertEqual(len(fills), 1)
+        self.assertEqual(fills[0]["leg"], "up")
+        self.assertAlmostEqual(fills[0]["bid"], 0.18)
+        self.assertAlmostEqual(fills[0]["best_bid_size"], 40.0)
+        self.assertAlmostEqual(fills[0]["size"], 25.0)
+        self.assertAlmostEqual(fills[0]["est_filled_size"], 25.0)
+        self.assertAlmostEqual(fills[0]["est_vwap"], 0.168)
+        self.assertAlmostEqual(fills[0]["est_proceeds"], 4.2)
+        self.assertIn("no queue", fills[0]["est_note"])
+        src = (ROOT / "buy" / "shadow_early_scrap.py").read_text()
+        for name in ("_fak_sell", "create_order", "post_order", "ClobClient"):
+            self.assertNotIn(name, src)
+        tick = MINT.read_text()
+        body = tick[tick.find("def _shadow_early_tick") : tick.find("def _shadow_early_close")]
+        self.assertNotIn("_fak_sell", body)
+        self.assertNotIn("_limit_sell", body)
+
+    def test_mode_latch_waits_for_the_window_and_stays_put(self):
+        ns, events, fak_calls, clock, book = _scrap_harness()
+        self._prepare(
+            ns, book,
+            (0.10, 40.0, [{"price": "0.10", "size": "40"}]),
+            (0.90, 80.0, [{"price": "0.90", "size": "80"}]),
+        )
+        end = clock["now"] + 400.0
+        intent = _open_scrap_bag(end)
+        state = {"intents": {"cid-mode": intent}}
+        ns["remember_persisted_state"](state)
+        cfg = self._cfg()
+        ns["_manage_sells_locked"](cfg, state, object())
+        self.assertFalse(any(row["event"] == "shadow_scrap_mode" for row in events))
+        clock["now"] = end - 360.0
+        book["up"] = (0.40, 40.0, [{"price": "0.40", "size": "40"}])
+        book["dn"] = (0.60, 80.0, [{"price": "0.60", "size": "80"}])
+        ns["_manage_sells_locked"](cfg, state, object())
+        modes = [row for row in events if row["event"] == "shadow_scrap_mode"]
+        self.assertEqual(len(modes), 1)
+        self.assertEqual(modes[0]["mode"], "early")
+        self.assertAlmostEqual(modes[0]["loser_bid"], 0.40)
+        book["up"] = (0.16, 40.0, [{"price": "0.16", "size": "40"}])
+        book["dn"] = (0.84, 80.0, [{"price": "0.84", "size": "80"}])
+        clock["now"] += 1.0
+        ns["_manage_sells_locked"](cfg, state, object())
+        self.assertEqual(
+            [row["mode"] for row in events if row["event"] == "shadow_scrap_mode"],
+            ["early"],
+        )
+        self.assertFalse(any(row["event"] == "shadow_scrap_floor_skip" for row in events))
+        self.assertEqual(fak_calls, [])
+
+    def test_old_open_does_not_paper_fill_a_later_three_cent_bid(self):
+        ns, events, fak_calls, clock, book = _scrap_harness()
+        self._prepare(
+            ns, book,
+            (0.10, 40.0, [{"price": "0.10", "size": "40"}]),
+            (0.90, 80.0, [{"price": "0.90", "size": "80"}]),
+        )
+        end = clock["now"] + 300.0
+        intent = _open_scrap_bag(end)
+        state = {"intents": {"cid-old": intent}}
+        ns["remember_persisted_state"](state)
+        cfg = self._cfg(sell_persist_s=0.0)
+        ns["_manage_sells_locked"](cfg, state, object())
+        self.assertEqual(
+            [row["mode"] for row in events if row["event"] == "shadow_scrap_mode"],
+            ["old"],
+        )
+        book["up"] = (0.02, 40.0, [{"price": "0.02", "size": "40"}])
+        book["dn"] = (0.98, 80.0, [{"price": "0.98", "size": "80"}])
+        clock["now"] += 1.0
+        ns["_manage_sells_locked"](cfg, state, object())
+        self.assertFalse(any(row["event"] == "shadow_scrap_fill" for row in events))
+
+    def test_persist_uses_the_last_window_clock(self):
+        ns, events, fak_calls, clock, book = _scrap_harness()
+        self._prepare(
+            ns, book,
+            (0.40, 40.0, [{"price": "0.40", "size": "40"}]),
+            (0.60, 80.0, [{"price": "0.60", "size": "80"}]),
+        )
+        end = clock["now"] + 40.0
+        intent = _open_scrap_bag(end)
+        state = {"intents": {"cid-persist": intent}}
+        ns["remember_persisted_state"](state)
+        cfg = self._cfg(
+            sell_persist_s=5.0,
+            sell_persist_last_min_s=2.0,
+            sell_persist_last_min_window_s=90.0,
+        )
+        ns["_manage_sells_locked"](cfg, state, object())
+        book["up"] = (0.18, 40.0, [{"price": "0.18", "size": "40"}])
+        book["dn"] = (0.82, 80.0, [{"price": "0.82", "size": "80"}])
+        clock["now"] += 1.0
+        ns["_manage_sells_locked"](cfg, state, object())
+        self.assertFalse(any(row["event"] == "shadow_scrap_fill" for row in events))
+        clock["now"] += 2.0
+        ns["_manage_sells_locked"](cfg, state, object())
+        fills = [row for row in events if row["event"] == "shadow_scrap_fill"]
+        self.assertEqual(len(fills), 1)
+        self.assertAlmostEqual(fills[0]["bid"], 0.18)
+        self.assertEqual(fak_calls, [])
+
+    def test_floor_skip_stays_early_and_does_not_fill(self):
+        ns, events, fak_calls, clock, book = _scrap_harness()
+        self._prepare(
+            ns, book,
+            (0.40, 40.0, [{"price": "0.40", "size": "40"}]),
+            (0.60, 80.0, [{"price": "0.60", "size": "80"}]),
+        )
+        end = clock["now"] + 300.0
+        intent = _open_scrap_bag(end)
+        state = {"intents": {"cid-floor": intent}}
+        ns["remember_persisted_state"](state)
+        cfg = self._cfg(sell_threshold=0.02)
+        ns["_manage_sells_locked"](cfg, state, object())
+        book["up"] = (0.10, 40.0, [{"price": "0.10", "size": "40"}])
+        book["dn"] = (0.90, 80.0, [{"price": "0.90", "size": "80"}])
+        clock["now"] += 1.0
+        ns["_manage_sells_locked"](cfg, state, object())
+        skips = [row for row in events if row["event"] == "shadow_scrap_floor_skip"]
+        self.assertEqual(len(skips), 1)
+        self.assertAlmostEqual(skips[0]["bid"], 0.10)
+        self.assertAlmostEqual(skips[0]["floor"], 0.15)
+        self.assertFalse(any(row["event"] == "shadow_scrap_fill" for row in events))
+        book["up"] = (0.03, 40.0, [{"price": "0.03", "size": "40"}])
+        clock["now"] += 1.0
+        ns["_manage_sells_locked"](cfg, state, object())
+        self.assertFalse(any(row["event"] == "shadow_scrap_fill" for row in events))
+        self.assertEqual(
+            [row["mode"] for row in events if row["event"] == "shadow_scrap_mode"],
+            ["early"],
+        )
+        self.assertEqual(fak_calls, [])
+
+    def test_window_end_writes_one_result_line(self):
+        import json
+        from pathlib import Path
+
+        ns, events, fak_calls, clock, book = _scrap_harness()
+        self._prepare(
+            ns, book,
+            (0.18, 40.0, [{"price": "0.18", "size": "40"}]),
+            (0.82, 80.0, [{"price": "0.82", "size": "80"}]),
+        )
+        end = clock["now"] + 200.0
+        intent = _open_scrap_bag(end)
+        state = {"intents": {"cid-result": intent}}
+        ns["remember_persisted_state"](state)
+        cfg = self._cfg()
+        ns["_manage_sells_locked"](cfg, state, object())
+        intent["sold_loser"] = True
+        intent["sold_leg"] = "dn"
+        intent["sell_filled"] = 25.0
+        intent["sell_fill_px"] = 0.03
+        intent["sold_dump"] = True
+        intent["sell_dump_leg"] = "up"
+        intent["sell_dump_filled"] = 50.0
+        intent["sell_dump_fill_px"] = 0.40
+        clock["now"] = end + 1.0
+        ns["_manage_sells_locked"](cfg, state, object())
+        results = [row for row in events if row["event"] == "shadow_bag_result"]
+        self.assertEqual(len(results), 1)
+        row = results[0]
+        self.assertEqual(row["mode"], "early")
+        self.assertEqual(row["shadow_leg"], "up")
+        self.assertAlmostEqual(row["shadow_size"], 25.0)
+        self.assertAlmostEqual(row["est_proceeds"], 4.5)
+        self.assertEqual(row["live_scrap_leg"], "dn")
+        self.assertAlmostEqual(row["live_scrap_size"], 25.0)
+        self.assertAlmostEqual(row["live_scrap_avg_px"], 0.03)
+        self.assertTrue(row["live_dump_fired"])
+        self.assertEqual(row["live_dump_leg"], "up")
+        self.assertAlmostEqual(row["est_scrap_delta_usd"], 3.75)
+        self.assertAlmostEqual(row["est_dump_share_delta"], 25.0)
+        self.assertAlmostEqual(row["est_dump_cash_delta"], 10.0)
+        self.assertIsNone(row["winning_side"])
+        self.assertEqual(row["winning_side_reason"], "pending_resolution")
+        self.assertIn("live scrap proceeds only", row["assumption"])
+        self.assertEqual(fak_calls, [])
+        lines = Path(self.log_path).read_text().splitlines()
+        self.assertEqual(len(lines), 1)
+        saved = json.loads(lines[0])
+        self.assertEqual(saved["event"], "shadow_bag_result")
+        self.assertEqual(saved["condition_id"], "cid-result")
+        self.assertAlmostEqual(saved["est_scrap_delta_usd"], 3.75)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -29,6 +29,8 @@ a cheaper bid already under ``sell_scrap_min_px`` stays on
 Any other open latches the early threshold with
 ``sell_opposite_min_early``, keeps the floor, and does not fire a blind
 FAK. That choice is logged once as ``sell_scrap_mode``.
+``shadow_early_scrap_enabled`` (default false) is a paper log of that
+early rule. It does not post, and it does not change the live scrap.
 ``sell_scrap_fraction`` defaults to 1 (the whole
 loser). Below 1, the first fire locks ``floor(held × fraction)`` and does
 not sell the rest. False restores the 1¢ ladder from ``sell_fak_px``.
@@ -369,6 +371,12 @@ DEFAULTS = {
     "sell_opposite_min_early": 0.75,
     # Null uses sell_opposite_min for a bag latched to the old rules.
     "sell_opposite_min_old": None,
+    # Paper log only. False leaves the sell loop unchanged.
+    "shadow_early_scrap_enabled": False,
+    "shadow_early_threshold": 0.20,
+    "shadow_early_min_px": 0.15,
+    "shadow_early_opposite_min": 0.75,
+    "shadow_early_fraction": 0.5,
     "sell_cooldown_s": 3.0,
     "sell_winner_min": 0.999,
     # Cheap 0.99 winner only if loser ≤ this AND loser+cheap_min > 1.0 (else redeem).
@@ -829,6 +837,36 @@ def validate_strategy(cfg: dict) -> None:
             or px_value >= 1
         ):
             raise ValueError(f"{px_name} must be null, 0, or 0 < price < 1")
+    for px_name in (
+        "shadow_early_threshold",
+        "shadow_early_min_px",
+        "shadow_early_opposite_min",
+    ):
+        px_raw = cfg.get(px_name, None)
+        if px_raw is None or px_raw == "":
+            continue
+        try:
+            px_value = float(px_raw)
+        except (TypeError, ValueError):
+            raise ValueError(f"{px_name} must be empty or 0 < price < 1")
+        if (
+            px_value != px_value
+            or px_value in (float("inf"), float("-inf"))
+            or not (0 < px_value < 1)
+        ):
+            raise ValueError(f"{px_name} must be empty or 0 < price < 1")
+    fraction_raw = cfg.get("shadow_early_fraction", 0.5)
+    if fraction_raw is not None and fraction_raw != "":
+        try:
+            shadow_fraction = float(fraction_raw)
+        except (TypeError, ValueError):
+            raise ValueError("shadow_early_fraction must be empty or 0 < fraction <= 1")
+        if (
+            shadow_fraction != shadow_fraction
+            or shadow_fraction in (float("inf"), float("-inf"))
+            or not (0 < shadow_fraction <= 1)
+        ):
+            raise ValueError("shadow_early_fraction must be empty or 0 < fraction <= 1")
     if float(cfg.get("sell_min_bid_size") or 0) < 0:
         raise ValueError("sell_min_bid_size must be >= 0")
     if float(cfg.get("reclaim_usd") or 0) <= 0:
@@ -5404,6 +5442,43 @@ def _arm_post_dump_book(
     box["wake"].set()
 
 
+def _shadow_bind():
+    """Point the paper scrap at its jsonl file. No orders."""
+    from buy import shadow_early_scrap as shadow
+
+    path = getattr(_shadow_bind, "log_path", None)
+    if path is None:
+        path = REPO / "logs" / "shadow_early_scrap.jsonl"
+        _shadow_bind.log_path = path
+    shadow.set_log_path(path)
+    shadow.set_logger(log_event)
+    return shadow
+
+
+def _shadow_early_tick(cfg: dict, **fields: Any) -> None:
+    """Paper early-scrap tick. Failures are swallowed and no order is sent."""
+    try:
+        if not bool(cfg.get("shadow_early_scrap_enabled", False)):
+            return
+        shadow = _shadow_bind()
+        for event, payload in shadow.observe(cfg, **fields):
+            log_event(event, **payload)
+    except Exception:
+        return
+
+
+def _shadow_early_close(cfg: dict, **fields: Any) -> None:
+    """One paper result when the sell window ends. Log only."""
+    try:
+        if not bool(cfg.get("shadow_early_scrap_enabled", False)):
+            return
+        shadow = _shadow_bind()
+        for event, payload in shadow.close_bag(cfg, **fields):
+            log_event(event, **payload)
+    except Exception:
+        return
+
+
 def _manage_sells_locked(cfg: dict, state: dict, chain: ChainReader) -> None:
     now = time.time()
     _post_dump_box()["cfg"] = cfg
@@ -5469,6 +5544,13 @@ def _manage_sells_locked(cfg: dict, state: dict, chain: ChainReader) -> None:
             _log_scrap_outcome(intent, cid, "window_end")
             _whatsapp("scrap_filled", intent, cid, now=now, window_end=True)
             _close_bag_risk(cid, intent, now=now, cfg=cfg)
+            _shadow_early_close(
+                cfg,
+                condition_id=cid,
+                slug=intent.get("slug"),
+                intent=intent,
+                now_s=now,
+            )
             continue
 
         up_tok = str(intent.get("up_token") or "")
@@ -6913,6 +6995,21 @@ def _manage_sells_locked(cfg: dict, state: dict, chain: ChainReader) -> None:
             up_asks=_up_asks,
             dn_bids=dn_bids,
             dn_asks=_dn_asks,
+        )
+        _shadow_early_tick(
+            cfg,
+            condition_id=cid,
+            slug=intent.get("slug"),
+            now_s=now,
+            end_ts=end_ts,
+            ttm_s=ttm_s,
+            shares=shares,
+            up_bid=up_bid,
+            dn_bid=dn_bid,
+            up_bids=up_bids,
+            dn_bids=dn_bids,
+            up_bid_size=up_sz,
+            dn_bid_size=dn_sz,
         )
 
     commit_state(state, dirty=dirty)
