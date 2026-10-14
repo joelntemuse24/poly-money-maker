@@ -1888,7 +1888,9 @@ def _resize_after_balance_reject(
     sellable = float(bal) - keep_f if keep_f > 1e-12 else float(bal)
     if sellable < 0:
         sellable = 0.0
-    retry = min(float(size), sellable)
+    from buy.mint_sell import floor_sell_shares
+
+    retry = floor_sell_shares(min(float(size), sellable))
     if retry < float(tol):
         return 0.0, "already_flat"
     return retry, "has_inventory"
@@ -2156,13 +2158,16 @@ def _run_fak_ladder(
 
     No sleep between rungs or after the last miss. The caller's refire
     fetches a fresh book and posts immediately. A balance/allowance reject
-    refreshes allowance, reads the chain once, and retries that rung once.
+    refreshes allowance, reads the chain once, and retries that rung once
+    at the floored remainder.
     """
+    from buy.mint_sell import floor_sell_shares
+
     sold_total = 0.0
     last_status = "none"
     last_px: Optional[float] = None
     for use_px in limits:
-        remaining = size - sold_total
+        remaining = floor_sell_shares(size - sold_total)
         if remaining < 0.01:
             break
         if depth_path:
@@ -2398,12 +2403,20 @@ def _run_dump_fak_with_refire(
 
     Each retry refetches that leg and posts one FAK at the new best bid.
     It does not walk a ladder off the first snapshot. A partial fill
-    refires at once. A zero fill still needs ``dump_fast_retry_eligible``
-    (empty book or kill/cancel). An empty refetch is not a stop: the next
-    read is immediate. ``retries`` <= 0 or None keeps going until the size
-    is sold or ``end_ts`` has passed. A positive ``retries`` is a cap on
-    those refires. ``fills`` collects ``(shares, avg_px)`` across every post.
+    refires at once at ``floor(target - filled)``. A zero fill still needs
+    ``dump_fast_retry_eligible`` (empty book or kill/cancel), except a
+    balance/allowance reject: that refetches the token balance and posts
+    ``floor(min(remaining, balance))`` immediately. Shares the wallet no
+    longer holds are counted as sold with no price, so the average stays
+    on real fills. A missing balance read, or a read that does not shrink
+    the order, ends this pass (the in-rung resize already tried once) so
+    the loop cannot spin. An empty refetch is not a stop: the next read is
+    immediate. ``retries`` <= 0 or None keeps going until the size is sold
+    or ``end_ts`` has passed. A positive ``retries`` is a cap on those
+    refires. ``fills`` collects ``(shares, avg_px)`` across every post.
     """
+    from buy.mint_sell import is_balance_allowance_reject, sell_remaining_shares
+
     live_bid = float(initial_bid or 0.0)
     initial_limits = [round(live_bid, 4)] if live_bid > 0 else []
     sold_total = 0.0
@@ -2412,11 +2425,14 @@ def _run_dump_fak_with_refire(
     attempts = 0
     if not initial_limits:
         return sold_total, "bad_bid", last_px, attempts, live_bid
+    opening = sell_remaining_shares(size, 0.0)
+    if opening < 0.01:
+        return sold_total, "bad_size", last_px, attempts, live_bid
 
     with _io_unlocked():
         sold, last_status, last_px = _run_fak_ladder(
             token_id,
-            size,
+            opening,
             initial_limits,
             dry_run=dry_run,
             bid=live_bid,
@@ -2441,6 +2457,10 @@ def _run_dump_fak_with_refire(
         except (TypeError, ValueError):
             got = 0.0
         if got + 1e-12 >= float(tol):
+            return True
+        # Balance rejects are not empty-book misses. Keep selling the
+        # remainder the wallet actually holds; do not stop the dump on them.
+        if is_balance_allowance_reject(status):
             return True
         return bool(dump_fast_retry_eligible(sold=got, status=status, tol=tol))
 
@@ -2471,6 +2491,7 @@ def _run_dump_fak_with_refire(
         return now < end
 
     refires = 0
+    balance_applied = False
     while not dry_run and sold_total < size - tol:
         if not _keep_refiring(sold, last_status):
             if refires:
@@ -2510,6 +2531,70 @@ def _run_dump_fak_with_refire(
                 sold=round(sold_total, 4),
             )
             break
+        post = sell_remaining_shares(size, sold_total)
+        if is_balance_allowance_reject(last_status) and not balance_applied:
+            balance_applied = True
+            bal = _read_sell_balance(token_id)
+            try:
+                bal_f = float(bal) if bal is not None else None
+            except (TypeError, ValueError):
+                bal_f = None
+            if bal_f is None or bal_f != bal_f:
+                log_event(
+                    "sell_dump_fast_refire_stop",
+                    condition_id=condition_id,
+                    slug=slug,
+                    leg=held,
+                    retry=refires,
+                    attempts=attempts,
+                    reason="balance_unknown",
+                    status=last_status,
+                    sold=round(sold_total, 4),
+                )
+                break
+            if bal_f < 0.01:
+                # One short read is not a fill. Leave the counted shares as
+                # they are and let the caller treat the wallet as flat.
+                last_status = "already_flat"
+                log_event(
+                    "sell_dump_fast_refire_stop",
+                    condition_id=condition_id,
+                    slug=slug,
+                    leg=held,
+                    retry=refires,
+                    attempts=attempts,
+                    reason="balance_flat",
+                    status=last_status,
+                    sold=round(sold_total, 4),
+                    balance=bal_f,
+                )
+                break
+            capped = sell_remaining_shares(size, sold_total, bal_f)
+            if capped + 1e-9 >= post:
+                # The wallet still shows the size we just failed to post.
+                # Another identical post would spin the sell thread.
+                log_event(
+                    "sell_dump_fast_refire_stop",
+                    condition_id=condition_id,
+                    slug=slug,
+                    leg=held,
+                    retry=refires,
+                    attempts=attempts,
+                    reason="balance_unchanged",
+                    status=last_status,
+                    sold=round(sold_total, 4),
+                    balance=bal_f,
+                )
+                break
+            gap = post - capped
+            if gap >= 0.01:
+                # Tokens already gone, with no price in the reply. Count
+                # them so the next post is the remainder, not the original
+                # target. The fill average ignores this unpriced gap.
+                sold_total += gap
+            post = capped
+        if post < 0.01:
+            break
         refires += 1
         with _io_unlocked():
             # Tolerate a 3-tuple stub. Ask fields are not used on this retry.
@@ -2548,7 +2633,7 @@ def _run_dump_fak_with_refire(
         with _io_unlocked():
             sold, last_status, last_px = _run_fak_ladder(
                 token_id,
-                size - sold_total,
+                post,
                 limits,
                 dry_run=dry_run,
                 bid=live_bid,
@@ -2564,6 +2649,7 @@ def _run_dump_fak_with_refire(
             )
         attempts += 1
         sold_total += float(sold or 0.0)
+        balance_applied = False
     return sold_total, last_status, last_px, attempts, live_bid
 
 
@@ -2695,10 +2781,13 @@ def _post_kept_dump(
         and size - sold_total >= tol
         and last_status != "already_flat"
     ):
+        from buy.mint_sell import sell_remaining_shares
+
+        sweep_size = sell_remaining_shares(size, sold_total)
         with _io_unlocked():
             swept, sweep_status, sweep_px = _run_fak_ladder(
                 token,
-                size - sold_total,
+                sweep_size,
                 [round(floor, 4)],
                 dry_run=dry_run,
                 bid=live_bid,
@@ -6062,9 +6151,10 @@ def _manage_sells_locked(cfg: dict, state: dict, chain: ChainReader) -> None:
                         intent["sell_dump_leg"] = held
                         if not intent.get("sold_dump_at"):
                             intent["sold_dump_at"] = now
-                        intent["sell_dump_filled"] = float(
+                        filled_total = float(
                             intent.get("sell_dump_filled") or 0
                         ) + sold_total
+                        intent["sell_dump_filled"] = filled_total
                         intent["sell_dump_limit"] = last_px
                         if dry_run:
                             intent["sell_dump_dry"] = True
@@ -6074,7 +6164,7 @@ def _manage_sells_locked(cfg: dict, state: dict, chain: ChainReader) -> None:
                             slug=intent.get("slug"),
                             leg=held,
                             hedge_leg="dn" if held == "up" else "up",
-                            sold=sold_total,
+                            sold=round(filled_total, 4),
                             avg_px=intent.get("sell_dump_fill_px"),
                             bid=dump_bid,
                             status=last_status,
@@ -6083,12 +6173,12 @@ def _manage_sells_locked(cfg: dict, state: dict, chain: ChainReader) -> None:
                         _whatsapp("dump_filled", intent, cid, now=now, leg=held)
                         notify(
                             "Mint held dump",
-                            f"{intent.get('slug')}\n{held} x{sold_total:.1f} "
+                            f"{intent.get('slug')}\n{held} x{filled_total:.1f} "
                             f"@<{dump_below:.2f} (live {live_px:.3f})",
                             priority="default",
                         )
                         console.print(
-                            f"  [bold bright_yellow][DUMP OK][/] {held} {sold_total:.2f}  "
+                            f"  [bold bright_yellow][DUMP OK][/] {held} {filled_total:.2f}  "
                             f"bid={live_px:.3f} (<{dump_below:.2f})"
                         )
                         if (
@@ -6650,6 +6740,7 @@ def _manage_sells_locked(cfg: dict, state: dict, chain: ChainReader) -> None:
                             ) + sold_total
                             intent["sell_limit"] = last_px
                         if done:
+                            logged_sold = float(intent.get("sell_filled") or 0)
                             outcome = (
                                 "dry_run" if dry_run
                                 else "target_filled"
@@ -6680,7 +6771,7 @@ def _manage_sells_locked(cfg: dict, state: dict, chain: ChainReader) -> None:
                                 condition_id=cid,
                                 slug=intent.get("slug"),
                                 leg=loser,
-                                sold=sold_total,
+                                sold=logged_sold,
                                 avg_px=intent.get("sell_fill_px"),
                                 bid=loser_bid,
                                 status=last_status,
@@ -6690,12 +6781,12 @@ def _manage_sells_locked(cfg: dict, state: dict, chain: ChainReader) -> None:
                             )
                             notify(
                                 "Mint loser sold",
-                                f"{intent.get('slug')}\n{loser} x{sold_total:.1f} "
+                                f"{intent.get('slug')}\n{loser} x{logged_sold:.1f} "
                                 f"@bid<={thr:.2f} avg={intent.get('sell_fill_px')}",
                                 priority="default",
                             )
                             console.print(
-                                f"  [bold bright_green][SELL OK][/] {loser} {sold_total:.2f}  "
+                                f"  [bold bright_green][SELL OK][/] {loser} {logged_sold:.2f}  "
                                 f"kept opposite for redeem"
                             )
                         elif empty_fak_status(last_status):
@@ -6875,7 +6966,7 @@ def _manage_sells_locked(cfg: dict, state: dict, chain: ChainReader) -> None:
                             condition_id=cid,
                             slug=intent.get("slug"),
                             leg=persist_leg,
-                            sold=blind_sold,
+                            sold=float(intent.get("sell_filled") or 0),
                             status=blind_status,
                             **blind_fields,
                             **_oracle_mark(cid, cfg, time.time()),

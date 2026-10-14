@@ -48,6 +48,7 @@ reads ``sell_dump_leg`` after this fill and buys the other side.
 from __future__ import annotations
 
 import math
+from decimal import Decimal, InvalidOperation, ROUND_DOWN
 from typing import Any, Optional, Sequence, Tuple
 
 DEFAULT_SELL_KNOBS = {
@@ -209,6 +210,48 @@ def _decode_amount(raw: Any, expected: float) -> Optional[float]:
     if "." in raw_text or "e" in raw_text:
         return human
     return fixed if abs(human) >= 10_000 else human
+
+
+# CLOB market SELL amounts are round_down to 2 share decimals (ROUNDING_CONFIG size).
+_SELL_SHARE_QUANTUM = Decimal("0.01")
+
+
+def floor_sell_shares(shares: Any) -> float:
+    """Floor a sell size to the exchange share precision (2 decimals).
+
+    A market sell that rounds up, or a float a hair above the wallet, is
+    rejected with ``not enough balance``. Undersizing by one quantum still
+    leaves the exchange able to take the bid.
+    """
+    try:
+        value = Decimal(str(shares))
+    except (InvalidOperation, ArithmeticError, ValueError, TypeError):
+        return 0.0
+    if not value.is_finite() or value <= 0:
+        return 0.0
+    return float(value.quantize(_SELL_SHARE_QUANTUM, rounding=ROUND_DOWN))
+
+
+def sell_remaining_shares(target: Any, filled: Any, balance: Any = None) -> float:
+    """Floored shares still to post: ``target - filled``, then the wallet cap.
+
+    ``balance`` None does not cap. A read below the ledger remainder is the
+    size the exchange will accept on the next post.
+    """
+    try:
+        rem = Decimal(str(target)) - Decimal(str(filled or 0))
+    except (InvalidOperation, ArithmeticError, ValueError, TypeError):
+        return 0.0
+    if not rem.is_finite() or rem <= 0:
+        return 0.0
+    if balance is not None:
+        try:
+            bal = Decimal(str(balance))
+        except (InvalidOperation, ArithmeticError, ValueError, TypeError):
+            bal = None
+        if bal is not None and bal.is_finite() and bal >= 0 and bal < rem:
+            rem = bal
+    return floor_sell_shares(rem)
 
 
 def parse_sell_fill_shares(result: Any, offered_shares: float) -> float:
