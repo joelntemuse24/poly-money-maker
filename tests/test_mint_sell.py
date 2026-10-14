@@ -32,6 +32,12 @@ from buy.mint_sell import (
     loser_empty_keep_qualify,
     loser_ladder_limits,
     loser_partial_fak_shares,
+    apply_scrap_mode,
+    lower_priced_side,
+    scrap_limit_allowed,
+    scrap_min_px,
+    scrap_mode_for_open,
+    scrap_mode_latch_due,
     loser_scrap_post,
     sell_fill_vwap,
     loser_persist_ready,
@@ -493,6 +499,106 @@ class WinnerSellLimitTests(unittest.TestCase):
         )
 
 
+class ScrapMinPxTests(unittest.TestCase):
+    def test_null_and_zero_are_off(self):
+        for raw in (None, "", 0, 0.0, "0"):
+            self.assertIsNone(scrap_min_px(raw))
+            self.assertTrue(scrap_limit_allowed(0.01, 0.01, scrap_min_px(raw)))
+        self.assertIsNone(DEFAULT_SELL_KNOBS["sell_scrap_min_px"])
+
+    def test_bid_under_the_floor_is_not_lifted(self):
+        floor = scrap_min_px(0.15)
+        self.assertEqual(floor, 0.15)
+        self.assertFalse(scrap_limit_allowed(0.14, 0.15, floor))
+        self.assertFalse(scrap_limit_allowed(0.10, 0.10, floor))
+        self.assertFalse(scrap_limit_allowed(None, 0.01, floor))
+        self.assertFalse(scrap_limit_allowed(0.18, 0.02, floor))
+        self.assertTrue(scrap_limit_allowed(0.15, 0.15, floor))
+        self.assertTrue(scrap_limit_allowed(0.16, 0.16, floor))
+
+
+class ScrapModeLatchTests(unittest.TestCase):
+    def test_open_snapshot_picks_old_only_under_the_floor(self):
+        self.assertEqual(lower_priced_side(0.10, 0.90), ("up", 0.10, 0.90))
+        self.assertEqual(lower_priced_side(0.90, 0.10), ("dn", 0.10, 0.90))
+        self.assertIsNone(lower_priced_side(0.40, 0.40))
+        self.assertIsNone(lower_priced_side(None, 0.90))
+        self.assertEqual(scrap_mode_for_open(0.10, 0.90, 0.15), "old")
+        self.assertEqual(scrap_mode_for_open(0.90, 0.10, 0.15), "old")
+        self.assertEqual(scrap_mode_for_open(0.149, 0.85, 0.15), "old")
+        self.assertEqual(scrap_mode_for_open(0.15, 0.85, 0.15), "early")
+        self.assertEqual(scrap_mode_for_open(0.40, 0.60, 0.15), "early")
+        self.assertEqual(scrap_mode_for_open(0.40, 0.40, 0.15), "early")
+        self.assertEqual(scrap_mode_for_open(None, 0.90, 0.15), "early")
+        self.assertEqual(scrap_mode_for_open(0.10, 0.90, None), "early")
+
+    def test_latch_waits_for_a_known_open_window(self):
+        self.assertFalse(scrap_mode_latch_due(400.0, 360.0, None))
+        self.assertTrue(scrap_mode_latch_due(360.0, 360.0, None))
+        self.assertFalse(scrap_mode_latch_due(360.0, 360.0, "old"))
+        self.assertFalse(scrap_mode_latch_due(None, 360.0, None))
+        self.assertTrue(scrap_mode_latch_due(500.0, 0, None))
+        self.assertFalse(scrap_mode_latch_due(None, 0, None))
+
+    def test_null_threshold_does_not_override(self):
+        self.assertIsNone(DEFAULT_SELL_KNOBS["sell_scrap_early_threshold"])
+        self.assertEqual(DEFAULT_SELL_KNOBS["sell_opposite_min_early"], 0.75)
+        self.assertIsNone(DEFAULT_SELL_KNOBS["sell_opposite_min_old"])
+        cfg = {
+            "sell_threshold": 0.03,
+            "sell_fak_px": 0.03,
+            "sell_scrap_min_px": 0.15,
+            "sell_opposite_min": 0.90,
+        }
+        self.assertIsNone(apply_scrap_mode(cfg, "old", 100.0))
+        self.assertIsNone(apply_scrap_mode(cfg, None, 100.0))
+
+    def test_old_keeps_the_late_pair_and_drops_the_floor(self):
+        cfg = {
+            "sell_scrap_early_threshold": 0.20,
+            "sell_scrap_min_px": 0.15,
+            "sell_threshold": 0.03,
+            "sell_fak_px": 0.03,
+            "sell_threshold_late": 0.04,
+            "sell_fak_px_late": 0.04,
+            "sell_late_price_window_s": 180.0,
+            "sell_opposite_min": 0.90,
+            "sell_opposite_min_old": 0.85,
+            "sell_scrap_blind_enabled": True,
+        }
+        old = apply_scrap_mode(cfg, "old", 100.0)
+        self.assertEqual(old["threshold"], 0.04)
+        self.assertEqual(old["fak_px"], 0.04)
+        self.assertTrue(old["late"])
+        self.assertEqual(old["opposite_min"], 0.85)
+        self.assertTrue(old["blind"])
+        self.assertIsNone(old["floor"])
+        fallback = dict(cfg)
+        fallback["sell_opposite_min_old"] = None
+        self.assertEqual(apply_scrap_mode(fallback, "old", 200.0)["opposite_min"], 0.90)
+        self.assertEqual(apply_scrap_mode(fallback, "old", 200.0)["threshold"], 0.03)
+
+    def test_early_uses_the_high_threshold_and_keeps_the_floor(self):
+        cfg = {
+            "sell_scrap_early_threshold": 0.20,
+            "sell_scrap_min_px": 0.15,
+            "sell_threshold": 0.03,
+            "sell_fak_px": 0.02,
+            "sell_threshold_late": 0.04,
+            "sell_fak_px_late": 0.04,
+            "sell_late_price_window_s": 180.0,
+            "sell_opposite_min": 0.90,
+            "sell_scrap_blind_enabled": True,
+        }
+        early = apply_scrap_mode(cfg, "early", 100.0)
+        self.assertEqual(early["threshold"], 0.20)
+        self.assertEqual(early["fak_px"], 0.20)
+        self.assertFalse(early["late"])
+        self.assertEqual(early["opposite_min"], 0.75)
+        self.assertFalse(early["blind"])
+        self.assertEqual(early["floor"], 0.15)
+
+
 class LoserLadderTests(unittest.TestCase):
     def test_persist_then_threshold_then_floor(self):
         self.assertEqual(
@@ -505,6 +611,34 @@ class LoserLadderTests(unittest.TestCase):
             loser_ladder_limits(threshold=0.03, floor=0.02, loser_bid=0.025),
             [0.025, 0.02],
         )
+
+    def test_scrap_min_stops_the_ladder_and_does_not_post_under_it(self):
+        self.assertEqual(
+            loser_ladder_limits(
+                threshold=0.20, floor=0.02, loser_bid=0.18,
+                fak_px=0.18, min_post=0.15,
+            ),
+            [0.18, 0.17, 0.16, 0.15],
+        )
+        self.assertEqual(
+            loser_ladder_limits(
+                threshold=0.20, floor=0.02, loser_bid=0.10,
+                fak_px=0.18, min_post=0.15,
+            ),
+            [],
+        )
+        self.assertEqual(
+            loser_scrap_post(
+                sweep=True, remaining=10, floor=0.02, threshold=0.20,
+                loser_bid=0.10, min_px=0.01, min_post=0.15,
+            )["limits"],
+            [],
+        )
+        kept = loser_scrap_post(
+            sweep=True, remaining=10, floor=0.02, threshold=0.20,
+            loser_bid=0.16, min_px=0.01, min_post=0.15,
+        )
+        self.assertEqual(kept["limits"], [0.16])
 
     def test_bid_below_floor_limit_equals_live_bid(self):
         """Incident 1789800300: 1¢ book must FAK at 1¢, not clamp to the 2¢ floor."""

@@ -17,7 +17,19 @@ leaves that gate open. Persist starts only once the gate is open. At fire,
 ``sell_scrap_sweep_enabled`` (default true) posts one FAK at the live loser
 bid (capped at ``sell_threshold``, floored at ``sell_clob_min_price`` 1¢,
 never clamped up to ``sell_floor``) for the scrap remainder and retries each
-tick at the new bid. ``sell_scrap_fraction`` defaults to 1 (the whole
+tick at the new bid. ``sell_scrap_min_px`` (default null) is a scrap-only
+floor: null or 0 keeps this chase, and a positive price skips the post
+while the live bid or the scrap limit is under it (no FAK lifted to the
+floor). Dump, kept, stop, and hedge sells do not read it.
+``sell_scrap_early_threshold`` (default null) leaves that path in place.
+When it is set, the first reading inside the scrap window latches the bag:
+a cheaper bid already under ``sell_scrap_min_px`` stays on
+``sell_threshold`` / the late pair, ``sell_opposite_min_old`` (or
+``sell_opposite_min``), and the blind FAK, and the floor does not apply.
+Any other open latches the early threshold with
+``sell_opposite_min_early``, keeps the floor, and does not fire a blind
+FAK. That choice is logged once as ``sell_scrap_mode``.
+``sell_scrap_fraction`` defaults to 1 (the whole
 loser). Below 1, the first fire locks ``floor(held × fraction)`` and does
 not sell the rest. False restores the 1¢ ladder from ``sell_fak_px``.
 ``sell_late_price_window_s`` (default 0) leaves that pair in place. When
@@ -215,8 +227,14 @@ from buy.mint_sell import (
     rest_order_matched_shares,
     resting_tif,
     scrap_rest_action,
+    apply_scrap_mode,
+    lower_priced_side,
     scrap_active_prices,
     scrap_live_bid_limit,
+    scrap_mode_for_open,
+    scrap_mode_latch_due,
+    scrap_limit_allowed,
+    scrap_min_px,
     scrap_rest_px,
     scrap_time_gate_open,
     dump_refire_cap,
@@ -342,6 +360,15 @@ DEFAULTS = {
     # 1 scraps the whole loser. Below 1, the first fire locks
     # floor(held * fraction) and holds the remainder to resolution.
     "sell_scrap_fraction": 1.0,
+    # Null or 0: loser scrap may post at the live bid down to 1c.
+    # A positive price skips the scrap while the bid is under it.
+    # Dump, kept, reclaim stop, and hedge sells ignore this.
+    "sell_scrap_min_px": None,
+    # Null: no per-bag latch. A positive price is the early-scrap arm.
+    "sell_scrap_early_threshold": None,
+    "sell_opposite_min_early": 0.75,
+    # Null uses sell_opposite_min for a bag latched to the old rules.
+    "sell_opposite_min_old": None,
     "sell_cooldown_s": 3.0,
     "sell_winner_min": 0.999,
     # Cheap 0.99 winner only if loser ≤ this AND loser+cheap_min > 1.0 (else redeem).
@@ -770,6 +797,38 @@ def validate_strategy(cfg: dict) -> None:
     # NaN fails the ordered compare. Inf is > 1.
     if not (0 < scrap_fraction <= 1) or scrap_fraction != scrap_fraction:
         raise ValueError("sell_scrap_fraction must be > 0 and <= 1")
+    scrap_floor_raw = cfg.get("sell_scrap_min_px", None)
+    if scrap_floor_raw is not None and scrap_floor_raw != "":
+        try:
+            scrap_floor_px = float(scrap_floor_raw)
+        except (TypeError, ValueError):
+            raise ValueError("sell_scrap_min_px must be null, 0, or 0 < price < 1")
+        if (
+            scrap_floor_px != scrap_floor_px
+            or scrap_floor_px in (float("inf"), float("-inf"))
+            or scrap_floor_px < 0
+            or scrap_floor_px >= 1
+        ):
+            raise ValueError("sell_scrap_min_px must be null, 0, or 0 < price < 1")
+    for px_name in (
+        "sell_scrap_early_threshold",
+        "sell_opposite_min_early",
+        "sell_opposite_min_old",
+    ):
+        px_raw = cfg.get(px_name, None)
+        if px_raw is None or px_raw == "":
+            continue
+        try:
+            px_value = float(px_raw)
+        except (TypeError, ValueError):
+            raise ValueError(f"{px_name} must be null, 0, or 0 < price < 1")
+        if (
+            px_value != px_value
+            or px_value in (float("inf"), float("-inf"))
+            or px_value < 0
+            or px_value >= 1
+        ):
+            raise ValueError(f"{px_name} must be null, 0, or 0 < price < 1")
     if float(cfg.get("sell_min_bid_size") or 0) < 0:
         raise ValueError("sell_min_bid_size must be >= 0")
     if float(cfg.get("reclaim_usd") or 0) <= 0:
@@ -2130,6 +2189,7 @@ def _fire_loser_scrap(
     fills: Optional[list] = None,
     log_extra: Optional[dict] = None,
     min_px: float = 0.01,
+    min_post: Optional[float] = None,
 ) -> Tuple[float, str, Optional[float], bool]:
     """One live-bid sweep FAK, or the clipped cent ladder when sweep is off.
 
@@ -2149,7 +2209,10 @@ def _fire_loser_scrap(
         fak_px=fak_px,
         depth_at_limit=depth_at_limit,
         min_px=min_px,
+        min_post=min_post,
     )
+    if not plan["limits"]:
+        return 0.0, "below_floor", None, False
     if plan["mode"] == "sweep":
         limit = float(plan["limits"][0]) if plan["limits"] else round(float(min_px), 4)
         post_size = float(plan["size"])
@@ -3050,6 +3113,8 @@ def _place_scrap_rest(
     loser_qualifies: bool,
     armed: bool,
     fak_miss: bool,
+    bid: Optional[float] = None,
+    scrap_floor: Optional[float] = None,
 ) -> None:
     action, why = scrap_rest_action(
         enabled=rest_enabled,
@@ -3062,6 +3127,16 @@ def _place_scrap_rest(
         armed=armed,
     )
     if action != "place" or float(size) < 0.01 or not token_id:
+        return
+    if not scrap_limit_allowed(bid, rest_px, scrap_floor):
+        _log_sell_scrap_floor_skip(
+            condition_id=cid,
+            slug=intent.get("slug"),
+            leg=intent.get("sell_loser_leg") or intent.get("sold_leg"),
+            bid=bid,
+            floor=scrap_floor,
+            now_s=now,
+        )
         return
     tif, exp = resting_tif(
         now_s=now, expire_ts=float(end_ts or 0), min_ahead_s=rest_ahead
@@ -3112,8 +3187,27 @@ def _sync_scrap_rest(
     oracle_blocks: bool,
     loser_qualifies: bool,
     window_open: bool,
+    scrap_floor: Optional[float] = None,
+    now_s: float = 0.0,
+    bid: Optional[float] = None,
 ) -> None:
     oid = intent.get("sell_scrap_rest_id")
+    if oid and scrap_floor is not None:
+        try:
+            posted = float(intent.get("sell_scrap_rest_px") or 0.0)
+        except (TypeError, ValueError):
+            posted = 0.0
+        if posted + 1e-12 < float(scrap_floor):
+            _drop_scrap_rest(intent, cid, reason="below_floor")
+            _log_sell_scrap_floor_skip(
+                condition_id=cid,
+                slug=intent.get("slug"),
+                leg=intent.get("sell_loser_leg"),
+                bid=bid,
+                floor=scrap_floor,
+                now_s=now_s,
+            )
+            return
     if not oid:
         return
     offered = float(intent.get("sell_scrap_rest_size") or shares or 0)
@@ -3348,6 +3442,45 @@ def _log_sell_dump_time_gated(
         bid=bid,
         ttm=None if ttm is None else round(float(ttm), 3),
         cutoff=float(cutoff),
+    )
+    return True
+
+
+def _log_sell_scrap_floor_skip(
+    *,
+    condition_id: str,
+    slug: Any,
+    leg: Any,
+    bid: Any,
+    floor: Any,
+    now_s: float,
+    interval_s: float = 15.0,
+) -> bool:
+    """Log ``sell_scrap_floor_skip`` at most once per leg per ``interval_s``."""
+    stamps = getattr(_log_sell_scrap_floor_skip, "_last_at", None)
+    if not isinstance(stamps, dict):
+        stamps = {}
+        setattr(_log_sell_scrap_floor_skip, "_last_at", stamps)
+    key = f"{condition_id}:{leg}"
+    prev = stamps.get(key)
+    if prev is not None and float(now_s) + 1e-12 < float(prev) + float(interval_s):
+        return False
+    stamps[key] = float(now_s)
+    try:
+        bid_out = None if bid is None else round(float(bid), 4)
+    except (TypeError, ValueError):
+        bid_out = None
+    try:
+        floor_out = None if floor is None else round(float(floor), 4)
+    except (TypeError, ValueError):
+        floor_out = None
+    log_event(
+        "sell_scrap_floor_skip",
+        condition_id=condition_id,
+        slug=slug,
+        leg=leg,
+        bid=bid_out,
+        floor=floor_out,
     )
     return True
 
@@ -5291,6 +5424,11 @@ def _manage_sells_locked(cfg: dict, state: dict, chain: ChainReader) -> None:
     winner_min = float(cfg.get("sell_winner_min") or 0.999)
     clob_max = float(cfg.get("sell_clob_max_price") or 0.99)
     clob_min = float(cfg.get("sell_clob_min_price") or 0.01)
+    scrap_floor = scrap_min_px(cfg.get("sell_scrap_min_px", None))
+    base_opp_min = opp_min
+    base_blind_enabled = blind_enabled
+    base_scrap_floor = scrap_floor
+    early_scrap = scrap_min_px(cfg.get("sell_scrap_early_threshold", None))
     min_bid_size = float(cfg.get("sell_min_bid_size") or 1.0)
     tol = float(cfg.get("position_tolerance") or 0.01)
     scrap_fraction = normalize_scrap_fraction(cfg.get("sell_scrap_fraction", 1.0))
@@ -5354,6 +5492,41 @@ def _manage_sells_locked(cfg: dict, state: dict, chain: ChainReader) -> None:
         ttm_s = (end_ts - now) if end_ts else None
         # Per bag, per tick. Dump and winner do not read this pair.
         thr, fak_px, scrap_price_late = scrap_active_prices(cfg, ttm_s)
+        # Early latch is off when the threshold is null. While it is on,
+        # reset the shared locals so one bag's mode cannot leak, then
+        # latch once on the first known ttm inside the scrap window.
+        if early_scrap is not None:
+            opp_min = base_opp_min
+            blind_enabled = base_blind_enabled
+            scrap_floor = base_scrap_floor
+            stored_mode = intent.get("sell_scrap_mode")
+            if scrap_mode_latch_due(
+                ttm_s, cfg.get("sell_scrap_max_ttm_s"), stored_mode,
+            ):
+                stored_mode = scrap_mode_for_open(
+                    up_bid, dn_bid, base_scrap_floor,
+                )
+                intent["sell_scrap_mode"] = stored_mode
+                dirty = True
+                side = lower_priced_side(up_bid, dn_bid)
+                log_event(
+                    "sell_scrap_mode",
+                    condition_id=cid,
+                    slug=intent.get("slug"),
+                    mode=stored_mode,
+                    leg=None if side is None else side[0],
+                    loser_bid=None if side is None else side[1],
+                    other_bid=None if side is None else side[2],
+                    ttm=ttm_s,
+                )
+            applied = apply_scrap_mode(cfg, stored_mode, ttm_s)
+            if applied is not None:
+                thr = applied["threshold"]
+                fak_px = applied["fak_px"]
+                scrap_price_late = applied["late"]
+                opp_min = applied["opposite_min"]
+                blind_enabled = applied["blind"]
+                scrap_floor = applied["floor"]
         # Keep the previous positive print so an empty book after a FAK
         # miss still rests at the bid that armed the scrap, not 2¢.
         seen_bids = {
@@ -6145,6 +6318,9 @@ def _manage_sells_locked(cfg: dict, state: dict, chain: ChainReader) -> None:
             oracle_blocks=oracle_hard_block or scrap_veto,
             loser_qualifies=loser_qualifies,
             window_open=True,
+            scrap_floor=scrap_floor,
+            now_s=now,
+            bid=bids.get(loser) if loser in ("up", "dn") else None,
         )
         sold_loser = bool(intent.get("sold_loser") or intent.get("sold_leg"))
 
@@ -6252,13 +6428,42 @@ def _manage_sells_locked(cfg: dict, state: dict, chain: ChainReader) -> None:
                         twap=edge_detail.get("twap"),
                         age_s=edge_detail.get("age_s"),
                     )
-                l_tok = tokens[loser]
-                loser_bid = float(bids[loser] or thr)
-                size, latch = _sell_inventory(
-                    chain, ctf, funder_cs, l_tok, shares, tol,
-                    "seen_loser_inventory", intent,
-                )
-                if latch == "await_inventory":
+                raw_bid = bids.get(loser)
+                try:
+                    live_bid = None if raw_bid is None else float(raw_bid)
+                except (TypeError, ValueError):
+                    live_bid = None
+                loser_bid = float(raw_bid or thr)
+                sweep_on = bool(cfg.get("sell_scrap_sweep_enabled", True))
+                if sweep_on:
+                    floor_limit = scrap_live_bid_limit(
+                        loser_bid, thr, min_px=clob_min,
+                    )
+                else:
+                    floor_rungs = loser_ladder_limits(
+                        thr, floor, loser_bid, fak_px=fak_px, min_post=scrap_floor,
+                    )
+                    floor_limit = floor_rungs[0] if floor_rungs else None
+                if not scrap_limit_allowed(live_bid, floor_limit, scrap_floor):
+                    _log_sell_scrap_floor_skip(
+                        condition_id=cid,
+                        slug=intent.get("slug"),
+                        leg=loser,
+                        bid=live_bid,
+                        floor=scrap_floor,
+                        now_s=now,
+                    )
+                    size, latch = 0.0, "floor_skip"
+                    l_tok = ""
+                else:
+                    l_tok = tokens[loser]
+                    size, latch = _sell_inventory(
+                        chain, ctf, funder_cs, l_tok, shares, tol,
+                        "seen_loser_inventory", intent,
+                    )
+                if latch == "floor_skip":
+                    pass
+                elif latch == "await_inventory":
                     log_event(
                         "sell_skip_await_inventory",
                         condition_id=cid,
@@ -6345,6 +6550,7 @@ def _manage_sells_locked(cfg: dict, state: dict, chain: ChainReader) -> None:
                                     fills=scrap_fills,
                                     log_extra=oracle_fields,
                                     min_px=clob_min,
+                                    min_post=scrap_floor,
                                 )
                             )
                         record_fill_px(intent, "sell_fill_px", scrap_fills)
@@ -6428,6 +6634,8 @@ def _manage_sells_locked(cfg: dict, state: dict, chain: ChainReader) -> None:
                                 loser_qualifies=True,
                                 armed=intent.get("sell_loser_armed_at") is not None,
                                 fak_miss=True,
+                                bid=_observed_loser_bid(loser, bids, seen_bids),
+                                scrap_floor=scrap_floor,
                             )
 
         if (
@@ -6499,6 +6707,22 @@ def _manage_sells_locked(cfg: dict, state: dict, chain: ChainReader) -> None:
                     if blind_veto:
                         blind_fire = False
                         intent["sell_loser_armed_at"] = None
+                if (
+                    blind_fire
+                    and b_tok
+                    and not scrap_limit_allowed(
+                        bids.get(persist_leg), blind_px, scrap_floor,
+                    )
+                ):
+                    _log_sell_scrap_floor_skip(
+                        condition_id=cid,
+                        slug=intent.get("slug"),
+                        leg=persist_leg,
+                        bid=bids.get(persist_leg),
+                        floor=scrap_floor,
+                        now_s=now,
+                    )
+                    blind_fire = False
                 if blind_fire and b_tok:
                     intent["sell_blind_last_at"] = now
                     blind_fields = _scrap_oracle_fields(blind_oracle)
@@ -6593,6 +6817,8 @@ def _manage_sells_locked(cfg: dict, state: dict, chain: ChainReader) -> None:
                             loser_qualifies=True,
                             armed=True,
                             fak_miss=True,
+                            bid=_observed_loser_bid(persist_leg, bids, seen_bids),
+                            scrap_floor=scrap_floor,
                         )
         elif (
             scrap_ok
@@ -6637,6 +6863,8 @@ def _manage_sells_locked(cfg: dict, state: dict, chain: ChainReader) -> None:
                 loser_qualifies=loser_qualifies,
                 armed=intent.get("sell_loser_armed_at") is not None,
                 fak_miss=True,
+                bid=_observed_loser_bid(persist_leg, bids, seen_bids),
+                scrap_floor=scrap_floor,
             )
 
         try:
