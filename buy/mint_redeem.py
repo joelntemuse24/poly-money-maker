@@ -424,6 +424,18 @@ class RedeemDesk:
         payout = (up * num_up + dn * num_dn) / float(den)
         job["payout_est"] = round(payout, 6)
         job["payout_numerators"] = [num_up, num_dn]
+        try:
+            from buy.shadow_early_scrap import note_resolution
+
+            note_resolution(
+                str(cid),
+                num_up=num_up,
+                num_dn=num_dn,
+                slug=job.get("slug"),
+                now_s=now,
+            )
+        except Exception:
+            pass
         if payout < settings.min_payout_usd:
             self._finish(state, cid, job, "no_winner", now, reason="worthless")
             self.io.log(
