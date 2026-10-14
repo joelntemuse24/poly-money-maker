@@ -1937,5 +1937,255 @@ class ScrapMinPxLoopTests(unittest.TestCase):
             self.assertNotIn("sell_scrap_min_px", src[start:end_at], name)
 
 
+def _mode_cfg(**extra) -> dict:
+    cfg = _scrap_cfg(
+        sell_threshold=0.03,
+        sell_fak_px=0.03,
+        sell_floor=0.02,
+        sell_persist_s=0.0,
+        sell_scrap_max_ttm_s=360.0,
+        sell_scrap_min_px=0.15,
+        sell_scrap_early_threshold=0.20,
+        sell_opposite_min=0.90,
+        sell_opposite_min_early=0.75,
+        sell_opposite_min_old=None,
+        sell_scrap_blind_enabled=True,
+        sell_scrap_rest_enabled=False,
+    )
+    cfg.update(extra)
+    return cfg
+
+
+class ScrapModeLatchLoopTests(unittest.TestCase):
+    def _tick(self, ns, cfg, state):
+        ns["_manage_sells_locked"](cfg, state, object())
+
+    def test_window_closed_does_not_latch_the_earlier_cheap_print(self):
+        ns, events, fak_calls, clock, book = _scrap_harness()
+        book["up"] = (0.10, 40.0, [{"price": "0.10", "size": "40"}])
+        book["dn"] = (0.90, 80.0, [{"price": "0.90", "size": "80"}])
+        end = clock["now"] + 400.0
+        intent = _open_scrap_bag(end)
+        cfg = _mode_cfg()
+        state = {"intents": {"cid-wait": intent}}
+        ns["remember_persisted_state"](state)
+        self._tick(ns, cfg, state)
+        self.assertIsNone(intent.get("sell_scrap_mode"))
+        self.assertFalse(any(row["event"] == "sell_scrap_mode" for row in events))
+        self.assertEqual(fak_calls, [])
+        clock["now"] = end - 360.0
+        book["up"] = (0.40, 40.0, [{"price": "0.40", "size": "40"}])
+        book["dn"] = (0.60, 80.0, [{"price": "0.60", "size": "80"}])
+        self._tick(ns, cfg, state)
+        self.assertEqual(intent.get("sell_scrap_mode"), "early")
+        modes = [row for row in events if row["event"] == "sell_scrap_mode"]
+        self.assertEqual(len(modes), 1)
+        self.assertEqual(modes[0]["mode"], "early")
+        self.assertAlmostEqual(modes[0]["loser_bid"], 0.40)
+        self.assertAlmostEqual(modes[0]["other_bid"], 0.60)
+        self.assertEqual(modes[0]["leg"], "up")
+
+    def test_old_latch_ignores_a_rising_bid_and_scraps_at_three_cents(self):
+        ns, events, fak_calls, clock, book = _scrap_harness()
+        book["up"] = (0.10, 40.0, [{"price": "0.10", "size": "40"}])
+        book["dn"] = (0.90, 80.0, [{"price": "0.90", "size": "80"}])
+        end = clock["now"] + 360.0
+        intent = _open_scrap_bag(end)
+        cfg = _mode_cfg()
+        state = {"intents": {"cid-old": intent}}
+        ns["remember_persisted_state"](state)
+        self._tick(ns, cfg, state)
+        self.assertEqual(intent.get("sell_scrap_mode"), "old")
+        self.assertEqual(fak_calls, [])
+        book["up"] = (0.18, 40.0, [{"price": "0.18", "size": "40"}])
+        book["dn"] = (0.82, 80.0, [{"price": "0.82", "size": "80"}])
+        clock["now"] += 1.0
+        self._tick(ns, cfg, state)
+        self.assertEqual(fak_calls, [])
+        self.assertFalse(any(row["event"] == "sell_scrap_floor_skip" for row in events))
+        book["up"] = (0.02, 40.0, [{"price": "0.02", "size": "40"}])
+        book["dn"] = (0.98, 80.0, [{"price": "0.98", "size": "80"}])
+        clock["now"] += 1.0
+        self._tick(ns, cfg, state)
+        self.assertEqual(len(fak_calls), 1)
+        self.assertAlmostEqual(fak_calls[0]["price"], 0.02)
+        self.assertFalse(any(row["event"] == "sell_scrap_floor_skip" for row in events))
+        modes = [row for row in events if row["event"] == "sell_scrap_mode"]
+        self.assertEqual(len(modes), 1)
+        self.assertEqual(modes[0]["mode"], "old")
+        self.assertAlmostEqual(modes[0]["loser_bid"], 0.10)
+
+    def test_early_latch_scraps_at_twenty_and_skips_under_the_floor(self):
+        ns, events, fak_calls, clock, book = _scrap_harness()
+        book["up"] = (0.40, 40.0, [{"price": "0.40", "size": "40"}])
+        book["dn"] = (0.60, 80.0, [{"price": "0.60", "size": "80"}])
+        end = clock["now"] + 300.0
+        intent = _open_scrap_bag(end)
+        cfg = _mode_cfg()
+        state = {"intents": {"cid-early": intent}}
+        ns["remember_persisted_state"](state)
+        self._tick(ns, cfg, state)
+        self.assertEqual(intent.get("sell_scrap_mode"), "early")
+        book["up"] = (0.18, 40.0, [{"price": "0.18", "size": "40"}])
+        book["dn"] = (0.70, 80.0, [{"price": "0.70", "size": "80"}])
+        clock["now"] += 1.0
+        self._tick(ns, cfg, state)
+        self.assertEqual(fak_calls, [])
+        book["dn"] = (0.82, 80.0, [{"price": "0.82", "size": "80"}])
+        clock["now"] += 1.0
+        self._tick(ns, cfg, state)
+        self.assertEqual(len(fak_calls), 1)
+        self.assertAlmostEqual(fak_calls[0]["price"], 0.18)
+        self.assertTrue(intent.get("sold_loser"))
+
+    def test_early_persist_still_waits_the_full_clock(self):
+        ns, _events, fak_calls, clock, book = _scrap_harness()
+        book["up"] = (0.40, 40.0, [{"price": "0.40", "size": "40"}])
+        book["dn"] = (0.60, 80.0, [{"price": "0.60", "size": "80"}])
+        end = clock["now"] + 300.0
+        intent = _open_scrap_bag(end)
+        cfg = _mode_cfg(sell_persist_s=5.0)
+        state = {"intents": {"cid-persist": intent}}
+        ns["remember_persisted_state"](state)
+        self._tick(ns, cfg, state)
+        armed = intent.get("sell_loser_armed_at")
+        book["up"] = (0.18, 40.0, [{"price": "0.18", "size": "40"}])
+        book["dn"] = (0.82, 80.0, [{"price": "0.82", "size": "80"}])
+        clock["now"] += 1.0
+        self._tick(ns, cfg, state)
+        self.assertEqual(intent.get("sell_loser_armed_at"), clock["now"])
+        self.assertNotEqual(intent.get("sell_loser_armed_at"), armed)
+        self.assertEqual(fak_calls, [])
+        clock["now"] += 5.0
+        self._tick(ns, cfg, state)
+        self.assertEqual(len(fak_calls), 1)
+        self.assertAlmostEqual(fak_calls[0]["price"], 0.18)
+
+    def test_early_crash_under_the_floor_does_not_post_or_go_blind(self):
+        def miss(_tok, size, _price, _dry):
+            return 0.0, "no orders found to match with FAK order"
+
+        ns, events, fak_calls, clock, book = _scrap_harness(miss)
+        book["up"] = (0.40, 40.0, [{"price": "0.40", "size": "40"}])
+        book["dn"] = (0.60, 80.0, [{"price": "0.60", "size": "80"}])
+        end = clock["now"] + 300.0
+        intent = _open_scrap_bag(end)
+        cfg = _mode_cfg()
+        state = {"intents": {"cid-blind": intent}}
+        ns["remember_persisted_state"](state)
+        self._tick(ns, cfg, state)
+        book["up"] = (0.10, 40.0, [{"price": "0.10", "size": "40"}])
+        book["dn"] = (0.90, 80.0, [{"price": "0.90", "size": "80"}])
+        clock["now"] += 1.0
+        self._tick(ns, cfg, state)
+        self.assertEqual(fak_calls, [])
+        skips = [row for row in events if row["event"] == "sell_scrap_floor_skip"]
+        self.assertEqual(len(skips), 1)
+        self.assertAlmostEqual(skips[0]["bid"], 0.10)
+        book["up"] = (None, 0.0, [])
+        clock["now"] += 4.0
+        self._tick(ns, cfg, state)
+        self.assertEqual(fak_calls, [])
+        self.assertFalse(any(row["event"] == "sell_scrap_blind" for row in events))
+
+    def test_null_early_threshold_keeps_the_three_cent_floor(self):
+        ns, events, fak_calls, clock, book = _scrap_harness()
+        book["up"] = (0.18, 40.0, [{"price": "0.18", "size": "40"}])
+        book["dn"] = (0.82, 80.0, [{"price": "0.82", "size": "80"}])
+        end = clock["now"] + 200.0
+        intent = _open_scrap_bag(end, sell_loser_armed_at=clock["now"] - 10.0)
+        cfg = _mode_cfg(sell_scrap_early_threshold=None)
+        state = {"intents": {"cid-off": intent}}
+        ns["remember_persisted_state"](state)
+        self._tick(ns, cfg, state)
+        self.assertIsNone(intent.get("sell_scrap_mode"))
+        self.assertEqual(fak_calls, [])
+        self.assertFalse(any(row["event"] == "sell_scrap_mode" for row in events))
+        book["up"] = (0.02, 40.0, [{"price": "0.02", "size": "40"}])
+        book["dn"] = (0.98, 80.0, [{"price": "0.98", "size": "80"}])
+        clock["now"] += 1.0
+        self._tick(ns, cfg, state)
+        self.assertEqual(fak_calls, [])
+        self.assertTrue(any(row["event"] == "sell_scrap_floor_skip" for row in events))
+
+    def test_stored_old_mode_survives_a_healthier_restart_book(self):
+        ns, events, fak_calls, clock, book = _scrap_harness()
+        book["up"] = (0.40, 40.0, [{"price": "0.40", "size": "40"}])
+        book["dn"] = (0.60, 80.0, [{"price": "0.60", "size": "80"}])
+        end = clock["now"] + 200.0
+        intent = _open_scrap_bag(end, sell_scrap_mode="old")
+        cfg = _mode_cfg()
+        state = {"intents": {"cid-restart": intent}}
+        ns["remember_persisted_state"](state)
+        self._tick(ns, cfg, state)
+        self.assertEqual(intent.get("sell_scrap_mode"), "old")
+        self.assertFalse(any(row["event"] == "sell_scrap_mode" for row in events))
+        book["up"] = (0.02, 40.0, [{"price": "0.02", "size": "40"}])
+        book["dn"] = (0.98, 80.0, [{"price": "0.98", "size": "80"}])
+        clock["now"] += 1.0
+        self._tick(ns, cfg, state)
+        self.assertEqual(len(fak_calls), 1)
+        self.assertAlmostEqual(fak_calls[0]["price"], 0.02)
+
+    def test_old_and_early_bags_do_not_share_a_floor(self):
+        ns, events, fak_calls, clock, _book = _scrap_harness()
+        books = {
+            "up-old": (0.10, 40.0, [{"price": "0.10", "size": "40"}]),
+            "dn-old": (0.90, 80.0, [{"price": "0.90", "size": "80"}]),
+            "up-early": (0.40, 40.0, [{"price": "0.40", "size": "40"}]),
+            "dn-early": (0.60, 80.0, [{"price": "0.60", "size": "80"}]),
+        }
+
+        def fetch_books(up, dn, _min):
+            return books[up], books[dn]
+
+        ns["_fetch_books"] = fetch_books
+        end = clock["now"] + 300.0
+        old = _open_scrap_bag(end, up_token="up-old", dn_token="dn-old")
+        early = _open_scrap_bag(end, up_token="up-early", dn_token="dn-early")
+        state = {"intents": {"cid-old": old, "cid-early": early}}
+        ns["remember_persisted_state"](state)
+        cfg = _mode_cfg()
+        self._tick(ns, cfg, state)
+        self.assertEqual(old.get("sell_scrap_mode"), "old")
+        self.assertEqual(early.get("sell_scrap_mode"), "early")
+        books["up-old"] = (0.02, 40.0, [{"price": "0.02", "size": "40"}])
+        books["dn-old"] = (0.98, 80.0, [{"price": "0.98", "size": "80"}])
+        books["up-early"] = (0.10, 40.0, [{"price": "0.10", "size": "40"}])
+        books["dn-early"] = (0.90, 80.0, [{"price": "0.90", "size": "80"}])
+        clock["now"] += 1.0
+        self._tick(ns, cfg, state)
+        self.assertEqual([row["price"] for row in fak_calls], [0.02])
+        self.assertEqual(fak_calls[0]["token_id"], "up-old")
+        skips = [row for row in events if row["event"] == "sell_scrap_floor_skip"]
+        self.assertEqual(len(skips), 1)
+        self.assertEqual(skips[0]["condition_id"], "cid-early")
+
+    def test_dump_still_sells_when_the_bag_is_latched_early(self):
+        ns, events, fak_calls, clock = _dump_harness(_fill_fak)
+        ns["_fetch_books"] = lambda *_a, **_k: (
+            (0.10, 50.0, [{"price": "0.10", "size": "50"}]),
+            (0.90, 50.0, [{"price": "0.90", "size": "50"}]),
+        )
+        ns["_fetch_book"] = lambda *_a, **_k: (
+            0.10, 50.0, [{"price": "0.10", "size": "50"}],
+        )
+        end = clock["now"] + 100.0
+        intent = _held_after_scrap(
+            end, sell_dump_armed_at=clock["now"] - 5.0, sell_scrap_mode="early",
+        )
+        cfg = _dump_cfg(
+            sell_scrap_min_px=0.15,
+            sell_scrap_early_threshold=0.20,
+            sell_dump_below=0.60,
+        )
+        state = {"intents": {"cid-dump-mode": intent}}
+        ns["remember_persisted_state"](state)
+        ns["_manage_sells_locked"](cfg, state, object())
+        self.assertTrue(fak_calls)
+        self.assertAlmostEqual(fak_calls[0]["price"], 0.10)
+        self.assertFalse(any(row["event"] == "sell_scrap_floor_skip" for row in events))
+
+
 if __name__ == "__main__":
     unittest.main()

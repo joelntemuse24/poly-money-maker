@@ -21,6 +21,14 @@ tick at the new bid. ``sell_scrap_min_px`` (default null) is a scrap-only
 floor: null or 0 keeps this chase, and a positive price skips the post
 while the live bid or the scrap limit is under it (no FAK lifted to the
 floor). Dump, kept, stop, and hedge sells do not read it.
+``sell_scrap_early_threshold`` (default null) leaves that path in place.
+When it is set, the first reading inside the scrap window latches the bag:
+a cheaper bid already under ``sell_scrap_min_px`` stays on
+``sell_threshold`` / the late pair, ``sell_opposite_min_old`` (or
+``sell_opposite_min``), and the blind FAK, and the floor does not apply.
+Any other open latches the early threshold with
+``sell_opposite_min_early``, keeps the floor, and does not fire a blind
+FAK. That choice is logged once as ``sell_scrap_mode``.
 ``sell_scrap_fraction`` defaults to 1 (the whole
 loser). Below 1, the first fire locks ``floor(held × fraction)`` and does
 not sell the rest. False restores the 1¢ ladder from ``sell_fak_px``.
@@ -219,8 +227,12 @@ from buy.mint_sell import (
     rest_order_matched_shares,
     resting_tif,
     scrap_rest_action,
+    apply_scrap_mode,
+    lower_priced_side,
     scrap_active_prices,
     scrap_live_bid_limit,
+    scrap_mode_for_open,
+    scrap_mode_latch_due,
     scrap_limit_allowed,
     scrap_min_px,
     scrap_rest_px,
@@ -352,6 +364,11 @@ DEFAULTS = {
     # A positive price skips the scrap while the bid is under it.
     # Dump, kept, reclaim stop, and hedge sells ignore this.
     "sell_scrap_min_px": None,
+    # Null: no per-bag latch. A positive price is the early-scrap arm.
+    "sell_scrap_early_threshold": None,
+    "sell_opposite_min_early": 0.75,
+    # Null uses sell_opposite_min for a bag latched to the old rules.
+    "sell_opposite_min_old": None,
     "sell_cooldown_s": 3.0,
     "sell_winner_min": 0.999,
     # Cheap 0.99 winner only if loser ≤ this AND loser+cheap_min > 1.0 (else redeem).
@@ -793,6 +810,25 @@ def validate_strategy(cfg: dict) -> None:
             or scrap_floor_px >= 1
         ):
             raise ValueError("sell_scrap_min_px must be null, 0, or 0 < price < 1")
+    for px_name in (
+        "sell_scrap_early_threshold",
+        "sell_opposite_min_early",
+        "sell_opposite_min_old",
+    ):
+        px_raw = cfg.get(px_name, None)
+        if px_raw is None or px_raw == "":
+            continue
+        try:
+            px_value = float(px_raw)
+        except (TypeError, ValueError):
+            raise ValueError(f"{px_name} must be null, 0, or 0 < price < 1")
+        if (
+            px_value != px_value
+            or px_value in (float("inf"), float("-inf"))
+            or px_value < 0
+            or px_value >= 1
+        ):
+            raise ValueError(f"{px_name} must be null, 0, or 0 < price < 1")
     if float(cfg.get("sell_min_bid_size") or 0) < 0:
         raise ValueError("sell_min_bid_size must be >= 0")
     if float(cfg.get("reclaim_usd") or 0) <= 0:
@@ -5389,6 +5425,10 @@ def _manage_sells_locked(cfg: dict, state: dict, chain: ChainReader) -> None:
     clob_max = float(cfg.get("sell_clob_max_price") or 0.99)
     clob_min = float(cfg.get("sell_clob_min_price") or 0.01)
     scrap_floor = scrap_min_px(cfg.get("sell_scrap_min_px", None))
+    base_opp_min = opp_min
+    base_blind_enabled = blind_enabled
+    base_scrap_floor = scrap_floor
+    early_scrap = scrap_min_px(cfg.get("sell_scrap_early_threshold", None))
     min_bid_size = float(cfg.get("sell_min_bid_size") or 1.0)
     tol = float(cfg.get("position_tolerance") or 0.01)
     scrap_fraction = normalize_scrap_fraction(cfg.get("sell_scrap_fraction", 1.0))
@@ -5452,6 +5492,41 @@ def _manage_sells_locked(cfg: dict, state: dict, chain: ChainReader) -> None:
         ttm_s = (end_ts - now) if end_ts else None
         # Per bag, per tick. Dump and winner do not read this pair.
         thr, fak_px, scrap_price_late = scrap_active_prices(cfg, ttm_s)
+        # Early latch is off when the threshold is null. While it is on,
+        # reset the shared locals so one bag's mode cannot leak, then
+        # latch once on the first known ttm inside the scrap window.
+        if early_scrap is not None:
+            opp_min = base_opp_min
+            blind_enabled = base_blind_enabled
+            scrap_floor = base_scrap_floor
+            stored_mode = intent.get("sell_scrap_mode")
+            if scrap_mode_latch_due(
+                ttm_s, cfg.get("sell_scrap_max_ttm_s"), stored_mode,
+            ):
+                stored_mode = scrap_mode_for_open(
+                    up_bid, dn_bid, base_scrap_floor,
+                )
+                intent["sell_scrap_mode"] = stored_mode
+                dirty = True
+                side = lower_priced_side(up_bid, dn_bid)
+                log_event(
+                    "sell_scrap_mode",
+                    condition_id=cid,
+                    slug=intent.get("slug"),
+                    mode=stored_mode,
+                    leg=None if side is None else side[0],
+                    loser_bid=None if side is None else side[1],
+                    other_bid=None if side is None else side[2],
+                    ttm=ttm_s,
+                )
+            applied = apply_scrap_mode(cfg, stored_mode, ttm_s)
+            if applied is not None:
+                thr = applied["threshold"]
+                fak_px = applied["fak_px"]
+                scrap_price_late = applied["late"]
+                opp_min = applied["opposite_min"]
+                blind_enabled = applied["blind"]
+                scrap_floor = applied["floor"]
         # Keep the previous positive print so an empty book after a FAK
         # miss still rests at the bid that armed the scrap, not 2¢.
         seen_bids = {

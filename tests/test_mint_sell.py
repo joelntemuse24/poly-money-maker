@@ -32,8 +32,12 @@ from buy.mint_sell import (
     loser_empty_keep_qualify,
     loser_ladder_limits,
     loser_partial_fak_shares,
+    apply_scrap_mode,
+    lower_priced_side,
     scrap_limit_allowed,
     scrap_min_px,
+    scrap_mode_for_open,
+    scrap_mode_latch_due,
     loser_scrap_post,
     sell_fill_vwap,
     loser_persist_ready,
@@ -511,6 +515,88 @@ class ScrapMinPxTests(unittest.TestCase):
         self.assertFalse(scrap_limit_allowed(0.18, 0.02, floor))
         self.assertTrue(scrap_limit_allowed(0.15, 0.15, floor))
         self.assertTrue(scrap_limit_allowed(0.16, 0.16, floor))
+
+
+class ScrapModeLatchTests(unittest.TestCase):
+    def test_open_snapshot_picks_old_only_under_the_floor(self):
+        self.assertEqual(lower_priced_side(0.10, 0.90), ("up", 0.10, 0.90))
+        self.assertEqual(lower_priced_side(0.90, 0.10), ("dn", 0.10, 0.90))
+        self.assertIsNone(lower_priced_side(0.40, 0.40))
+        self.assertIsNone(lower_priced_side(None, 0.90))
+        self.assertEqual(scrap_mode_for_open(0.10, 0.90, 0.15), "old")
+        self.assertEqual(scrap_mode_for_open(0.90, 0.10, 0.15), "old")
+        self.assertEqual(scrap_mode_for_open(0.149, 0.85, 0.15), "old")
+        self.assertEqual(scrap_mode_for_open(0.15, 0.85, 0.15), "early")
+        self.assertEqual(scrap_mode_for_open(0.40, 0.60, 0.15), "early")
+        self.assertEqual(scrap_mode_for_open(0.40, 0.40, 0.15), "early")
+        self.assertEqual(scrap_mode_for_open(None, 0.90, 0.15), "early")
+        self.assertEqual(scrap_mode_for_open(0.10, 0.90, None), "early")
+
+    def test_latch_waits_for_a_known_open_window(self):
+        self.assertFalse(scrap_mode_latch_due(400.0, 360.0, None))
+        self.assertTrue(scrap_mode_latch_due(360.0, 360.0, None))
+        self.assertFalse(scrap_mode_latch_due(360.0, 360.0, "old"))
+        self.assertFalse(scrap_mode_latch_due(None, 360.0, None))
+        self.assertTrue(scrap_mode_latch_due(500.0, 0, None))
+        self.assertFalse(scrap_mode_latch_due(None, 0, None))
+
+    def test_null_threshold_does_not_override(self):
+        self.assertIsNone(DEFAULT_SELL_KNOBS["sell_scrap_early_threshold"])
+        self.assertEqual(DEFAULT_SELL_KNOBS["sell_opposite_min_early"], 0.75)
+        self.assertIsNone(DEFAULT_SELL_KNOBS["sell_opposite_min_old"])
+        cfg = {
+            "sell_threshold": 0.03,
+            "sell_fak_px": 0.03,
+            "sell_scrap_min_px": 0.15,
+            "sell_opposite_min": 0.90,
+        }
+        self.assertIsNone(apply_scrap_mode(cfg, "old", 100.0))
+        self.assertIsNone(apply_scrap_mode(cfg, None, 100.0))
+
+    def test_old_keeps_the_late_pair_and_drops_the_floor(self):
+        cfg = {
+            "sell_scrap_early_threshold": 0.20,
+            "sell_scrap_min_px": 0.15,
+            "sell_threshold": 0.03,
+            "sell_fak_px": 0.03,
+            "sell_threshold_late": 0.04,
+            "sell_fak_px_late": 0.04,
+            "sell_late_price_window_s": 180.0,
+            "sell_opposite_min": 0.90,
+            "sell_opposite_min_old": 0.85,
+            "sell_scrap_blind_enabled": True,
+        }
+        old = apply_scrap_mode(cfg, "old", 100.0)
+        self.assertEqual(old["threshold"], 0.04)
+        self.assertEqual(old["fak_px"], 0.04)
+        self.assertTrue(old["late"])
+        self.assertEqual(old["opposite_min"], 0.85)
+        self.assertTrue(old["blind"])
+        self.assertIsNone(old["floor"])
+        fallback = dict(cfg)
+        fallback["sell_opposite_min_old"] = None
+        self.assertEqual(apply_scrap_mode(fallback, "old", 200.0)["opposite_min"], 0.90)
+        self.assertEqual(apply_scrap_mode(fallback, "old", 200.0)["threshold"], 0.03)
+
+    def test_early_uses_the_high_threshold_and_keeps_the_floor(self):
+        cfg = {
+            "sell_scrap_early_threshold": 0.20,
+            "sell_scrap_min_px": 0.15,
+            "sell_threshold": 0.03,
+            "sell_fak_px": 0.02,
+            "sell_threshold_late": 0.04,
+            "sell_fak_px_late": 0.04,
+            "sell_late_price_window_s": 180.0,
+            "sell_opposite_min": 0.90,
+            "sell_scrap_blind_enabled": True,
+        }
+        early = apply_scrap_mode(cfg, "early", 100.0)
+        self.assertEqual(early["threshold"], 0.20)
+        self.assertEqual(early["fak_px"], 0.20)
+        self.assertFalse(early["late"])
+        self.assertEqual(early["opposite_min"], 0.75)
+        self.assertFalse(early["blind"])
+        self.assertEqual(early["floor"], 0.15)
 
 
 class LoserLadderTests(unittest.TestCase):

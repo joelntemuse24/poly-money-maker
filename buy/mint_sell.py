@@ -92,6 +92,13 @@ DEFAULT_SELL_KNOBS = {
     # posted (the limit is not lifted to the floor). Dump, kept, stop, and
     # hedge sells do not read this.
     "sell_scrap_min_px": None,
+    # Null or <= 0: no per-bag latch (today's threshold, floor, and blind).
+    # A positive price latches once when the scrap window opens.
+    "sell_scrap_early_threshold": None,
+    # Early latch only. The opposite bid must be at least this rich.
+    "sell_opposite_min_early": 0.75,
+    # Old latch only. Null uses sell_opposite_min.
+    "sell_opposite_min_old": None,
     "sell_cooldown_s": 3.0,
     "sell_winner_min": 0.999,
     "sell_winner_cheap_if_loser_le": 0.03,
@@ -1189,6 +1196,136 @@ def scrap_limit_allowed(
     if not math.isfinite(posted) or posted + 1e-12 < lo:
         return False
     return True
+
+
+def lower_priced_side(
+    up_bid: Optional[float],
+    dn_bid: Optional[float],
+) -> Optional[Tuple[str, float, float]]:
+    """``(leg, cheaper_bid, other_bid)`` when one side is strictly cheaper.
+
+    A tie, a missing side, or a non-finite bid is no clear loser. No I/O.
+    """
+
+    def _px(value: Any) -> Optional[float]:
+        if value is None:
+            return None
+        try:
+            px = float(value)
+        except (TypeError, ValueError):
+            return None
+        if not math.isfinite(px):
+            return None
+        return px
+
+    up = _px(up_bid)
+    dn = _px(dn_bid)
+    if up is None or dn is None:
+        return None
+    if up + 1e-12 < dn:
+        return ("up", up, dn)
+    if dn + 1e-12 < up:
+        return ("dn", dn, up)
+    return None
+
+
+def scrap_mode_for_open(
+    up_bid: Optional[float],
+    dn_bid: Optional[float],
+    floor: Optional[float],
+) -> str:
+    """``old`` when the cheaper bid is already under the scrap floor.
+
+    Otherwise ``early``: the cheaper bid is at or above the floor, the
+    sides tie, or a side is missing. A floor that is off cannot be under,
+    so a clear loser is still ``early``. No I/O.
+    """
+    side = lower_priced_side(up_bid, dn_bid)
+    lo = scrap_min_px(floor)
+    if side is None or lo is None:
+        return "early"
+    if side[1] + 1e-12 < lo:
+        return "old"
+    return "early"
+
+
+def scrap_mode_latch_due(
+    ttm_s: Optional[float],
+    max_ttm_s: Optional[float],
+    stored: Any,
+) -> bool:
+    """True on the first in-window reading that may latch a scrap mode.
+
+    A stored ``old`` or ``early`` is already decided. The scrap time gate
+    must be open and time-to-close must be finite. Unknown ttm leaves the
+    scrap gate open but does not latch. No I/O.
+    """
+    if stored in ("old", "early"):
+        return False
+    if not scrap_time_gate_open(ttm_s, max_ttm_s):
+        return False
+    if ttm_s is None:
+        return False
+    try:
+        ttm = float(ttm_s)
+    except (TypeError, ValueError):
+        return False
+    return math.isfinite(ttm)
+
+
+def _positive_px_or(value: Any, fallback: float) -> float:
+    px = scrap_min_px(value)
+    if px is None:
+        return float(fallback)
+    return px
+
+
+def apply_scrap_mode(
+    cfg: dict,
+    mode: Any,
+    ttm_s: Optional[float] = None,
+) -> Optional[dict]:
+    """Per-bag scrap prices, or None when the early latch is off.
+
+    ``sell_scrap_early_threshold`` null, blank, or ``<= 0`` returns None
+    and the caller keeps today's threshold, opposite min, blind flag, and
+    floor. ``old`` keeps ``scrap_active_prices``, uses
+    ``sell_opposite_min_old`` when that is a positive price (else
+    ``sell_opposite_min``), leaves blind on the config flag, and clears
+    the scrap floor. ``early`` arms and caps the FAK at the early
+    threshold, requires ``sell_opposite_min_early`` (default 0.75),
+    forces blind off, and keeps the scrap floor. No I/O.
+    """
+    early = scrap_min_px(cfg.get("sell_scrap_early_threshold"))
+    if early is None or mode not in ("old", "early"):
+        return None
+    base_opp = _positive_px_or(cfg.get("sell_opposite_min"), 0.90)
+    if mode == "old":
+        thr, fak, late = scrap_active_prices(cfg, ttm_s)
+        return {
+            "threshold": thr,
+            "fak_px": fak,
+            "late": late,
+            "opposite_min": _positive_px_or(
+                cfg.get("sell_opposite_min_old"), base_opp,
+            ),
+            "blind": bool(cfg.get("sell_scrap_blind_enabled", True)),
+            "floor": None,
+        }
+    return {
+        "threshold": early,
+        "fak_px": early,
+        "late": False,
+        "opposite_min": _positive_px_or(
+            cfg.get(
+                "sell_opposite_min_early",
+                DEFAULT_SELL_KNOBS["sell_opposite_min_early"],
+            ),
+            float(DEFAULT_SELL_KNOBS["sell_opposite_min_early"]),
+        ),
+        "blind": False,
+        "floor": scrap_min_px(cfg.get("sell_scrap_min_px")),
+    }
 
 
 def sell_dump_other_confirms(other_bid: Optional[float], other_min: Any) -> bool:
