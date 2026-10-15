@@ -2779,9 +2779,15 @@ def reclaim_arm_block(
     if keep > float(tol) and not kept_done:
         return "kept_open"
     # Held because the kept bid was at or over sell_dump_kept_max_px.
-    # Those shares stay through resolution; reclaim must not treat the
-    # bag as flat.
-    if intent.get("sell_dump_kept_outcome") == "held_above_max" and keep > float(tol):
+    # Cap-held leftovers stay open through partial/no-fill retries.
+    if (
+        keep > float(tol)
+        and kept_loser_open(intent)
+        and (
+            intent.get("sell_dump_kept_outcome") == "held_above_max"
+            or intent.get("sell_dump_kept_cap_hold")
+        )
+    ):
         return "kept_open"
     return None
 
