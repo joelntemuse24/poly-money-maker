@@ -192,6 +192,8 @@ class BookFetchTests(unittest.TestCase):
             "_fetch_book",
             "_fetch_books_parallel",
             "_fetch_books",
+            "_book_fail_box",
+            "_note_book_fetch_failed",
             extras={
                 "time": time,
                 "requests": requests,

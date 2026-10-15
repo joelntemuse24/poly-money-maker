@@ -1213,6 +1213,26 @@ class SellArmedPollTests(unittest.TestCase):
         state = {"intents": {"a": self._intent(sell_loser_armed_at=1.0)}}
         self.assertEqual(cycle_sleep_s(cfg, state, now_s=2.0), 5.0)
 
+    def test_armed_poll_zero_returns_immediately_unless_the_fetch_failed(self):
+        from buy.mint_sell import BOOK_FAIL_BACKOFF_S
+
+        cfg = {**self._CFG, "sell_armed_poll_s": 0}
+        state = {"intents": {"a": self._intent(sell_loser_armed_at=1.0)}}
+        self.assertEqual(cycle_sleep_s(cfg, state, now_s=2.0), 0.0)
+        self.assertEqual(
+            cycle_sleep_s(cfg, state, now_s=2.0, fetch_failed=True),
+            BOOK_FAIL_BACKOFF_S,
+        )
+        self.assertEqual(
+            cycle_sleep_s(self._CFG, state, now_s=2.0, fetch_failed=True),
+            2.0,
+        )
+        idle = {"intents": {"a": self._intent()}}
+        self.assertEqual(
+            cycle_sleep_s(cfg, idle, now_s=1_000_000.0, fetch_failed=True),
+            5.0,
+        )
+
 
 class SellFireDecisionTests(unittest.TestCase):
     """At FAK time, cancel if the path is no longer in range; do not POST."""

@@ -50,7 +50,8 @@ never posts a resting bid. Keep the winner for redeem unless its bid reaches
 ``strategy_mint.json`` turns it on. Sell and mint run as independent loops
 so Gamma/relayer work cannot steal a dump tick (bag
 ``btc-updown-15m-1789905600``). The sell loop sleeps ``sell_armed_poll_s``
-(~2s, allowed below the ``poll_s >= 1`` floor) while a bag is sell-hot
+(~2s, or 0 to poll again immediately, allowed below the ``poll_s >= 1``
+floor) while a bag is sell-hot
 (loser armed, or loser sold and dump/winner not done, or a reclaim is
 still watching). Mint keeps ``poll_s``. Persist defaults are 5/2/60.
 Live JSON keys that already exist (threshold, persist) override these
@@ -179,6 +180,8 @@ from buy.mint_sell import (
     buy_fill_vwap,
     classify_loser,
     cycle_sleep_s,
+    ws_book_enabled,
+    ws_book_stale_s,
     dump_fast_retry_eligible,
     bag_risk_flush,
     bag_risk_observe,
@@ -321,6 +324,11 @@ DEFAULTS = {
     "sell_armed_poll_s": 2.0,
     # CLOB /book and /books. A hung read costs one short tick.
     "book_timeout_s": 1.2,
+    # Off until set. A fresh CLOB market websocket top replaces the
+    # /books poll for scrap, dump, kept, and reclaim. Stale falls back
+    # to REST, and that path is the same poll as today.
+    "ws_book_enabled": False,
+    "ws_book_stale_s": 1.5,
     # Wallet pUSD while a sequential mint is waiting on cash.
     "mint_cash_poll_s": 2.0,
     # Chainlink 60s TWAP tape. The scrap veto is off unless
@@ -700,8 +708,20 @@ def validate_strategy(cfg: dict) -> None:
         raise ValueError("max_open_sets must be >= 1")
     if float(cfg["poll_s"]) < 1:
         raise ValueError("poll_s must be >= 1")
-    if float(cfg.get("sell_armed_poll_s") or 0) < 0.2:
-        raise ValueError("sell_armed_poll_s must be >= 0.2")
+    armed_raw = cfg.get("sell_armed_poll_s")
+    try:
+        armed_poll = float(armed_raw)
+    except (TypeError, ValueError):
+        raise ValueError("sell_armed_poll_s must be >= 0")
+    if armed_poll != armed_poll or armed_poll < 0 or armed_poll == float("inf"):
+        raise ValueError("sell_armed_poll_s must be >= 0")
+    stale_raw = cfg.get("ws_book_stale_s", 1.5)
+    try:
+        ws_stale = float(stale_raw)
+    except (TypeError, ValueError):
+        raise ValueError("ws_book_stale_s must be > 0")
+    if ws_stale != ws_stale or ws_stale <= 0 or ws_stale == float("inf"):
+        raise ValueError("ws_book_stale_s must be > 0")
     for key, floor in (("book_timeout_s", 0.05), ("mint_cash_poll_s", 0.0)):
         raw = cfg.get(key)
         try:
@@ -917,8 +937,8 @@ def validate_strategy(cfg: dict) -> None:
     if reclaim_cap + 1e-12 < reclaim_entry:
         raise ValueError("reclaim_max_price must be >= reclaim_entry")
     # Explicit 0 is immediate (persist_ready), same as sell_persist_s and
-    # sell_dump_persist_s. Negatives are rejected. sell_armed_poll_s stays
-    # on its own >= 0.2 floor; that floor is the loop cadence, not a persist.
+    # sell_dump_persist_s. Negatives are rejected. sell_armed_poll_s is
+    # its own cadence and may be 0; that is not a persist.
     for key in (
         "reclaim_entry_persist_s",
         "reclaim_stop_persist_s",
@@ -1624,9 +1644,11 @@ def _fetch_book(token_id: str, min_size: float):
             timeout=_book_timeout_s(),
         )
         if response.status_code != 200:
+            _note_book_fetch_failed()
             return None, 0.0, [], None, 0.0, [], None
         return _parse_book_payload(response.json(), min_size)
     except Exception as exc:
+        _note_book_fetch_failed()
         log_event("book_fetch_fail", token_id=str(token_id)[:18], error=str(exc)[:160])
         return None, 0.0, [], None, 0.0, [], None
 
@@ -1673,6 +1695,7 @@ def _fetch_books(up_tok: str, dn_tok: str, min_size: float):
         )
     except Exception as exc:
         if isinstance(exc, (requests.Timeout, TimeoutError)):
+            _note_book_fetch_failed()
             log_event(
                 "book_fetch_fail",
                 token_id="books",
@@ -1681,6 +1704,137 @@ def _fetch_books(up_tok: str, dn_tok: str, min_size: float):
             empty = (None, 0.0, [], None, 0.0, [], None)
             return empty, empty
         return _fetch_books_parallel(up_tok, dn_tok, min_size)
+
+
+def _book_fail_box() -> dict:
+    box = globals().get("_BOOK_FAIL_BOX")
+    if box is None:
+        box = {"failed": False}
+        globals()["_BOOK_FAIL_BOX"] = box
+    return box
+
+
+def _note_book_fetch_failed() -> None:
+    _book_fail_box()["failed"] = True
+
+
+def take_book_fetch_failed() -> bool:
+    """True once after a book read failed. The sell sleep consumes it."""
+    box = _book_fail_box()
+    failed = bool(box.get("failed"))
+    box["failed"] = False
+    return failed
+
+
+def _book_feed_box() -> dict:
+    box = globals().get("_BOOK_FEED_BOX")
+    if box is None:
+        box = {"feed": None}
+        globals()["_BOOK_FEED_BOX"] = box
+    return box
+
+
+def _set_book_tick(meta: dict) -> None:
+    globals()["_BOOK_TICK"] = meta
+
+
+def _sync_book_feed(cfg: dict, state: dict) -> None:
+    """Subscribe the current bag and the next. Off leaves the socket down."""
+    if not ws_book_enabled(cfg):
+        box = globals().get("_BOOK_FEED_BOX")
+        feed = box.get("feed") if isinstance(box, dict) else None
+        if feed is not None:
+            feed.stop()
+        return
+    from buy.clob_book_ws import ClobBookFeed, watch_token_ids
+
+    box = _book_feed_box()
+    feed = box.get("feed")
+    if feed is None:
+        feed = ClobBookFeed(
+            on_error=lambda msg, delay: log_event(
+                "ws_book_error", error=str(msg)[:200], backoff_s=delay,
+            ),
+        )
+        box["feed"] = feed
+    feed.set_stale_s(ws_book_stale_s(cfg))
+    feed.set_min_size(float(cfg.get("sell_min_bid_size") or 1.0))
+    feed.set_tokens(watch_token_ids(state.get("intents") or {}, time.time()))
+    feed.start()
+
+
+def _books_for_sell(cfg: dict, up_tok: str, dn_tok: str, min_size: float):
+    """Websocket tops when both are fresh. Otherwise the REST ``/books`` poll.
+
+    Disabled, stale, or an unhealthy socket returns the REST rows unchanged.
+    """
+    if not ws_book_enabled(cfg):
+        up_row, dn_row = _fetch_books(up_tok, dn_tok, min_size)
+        return up_row, dn_row, {"source": "rest", "legs": {}}
+    from buy.clob_book_ws import ws_book_row
+
+    feed = _book_feed_box().get("feed")
+    up_top = feed.usable(up_tok) if feed is not None else None
+    dn_top = feed.usable(dn_tok) if feed is not None else None
+    if up_top is not None and dn_top is not None:
+        meta = {
+            "source": "ws",
+            "legs": {
+                "up": {"ws": up_top.bid, "rest": feed.rest_bid(up_tok)},
+                "dn": {"ws": dn_top.bid, "rest": feed.rest_bid(dn_tok)},
+            },
+        }
+        return ws_book_row(up_top), ws_book_row(dn_top), meta
+    up_row, dn_row = _fetch_books(up_tok, dn_tok, min_size)
+    up_bid = up_row[0] if isinstance(up_row, (tuple, list)) and up_row else None
+    dn_bid = dn_row[0] if isinstance(dn_row, (tuple, list)) and dn_row else None
+    if feed is not None:
+        feed.remember_rest(up_tok, up_bid)
+        feed.remember_rest(dn_tok, dn_bid)
+        legs = {
+            "up": {"ws": feed.cached_bid(up_tok), "rest": up_bid},
+            "dn": {"ws": feed.cached_bid(dn_tok), "rest": dn_bid},
+        }
+    else:
+        legs = {
+            "up": {"ws": None, "rest": up_bid},
+            "dn": {"ws": None, "rest": dn_bid},
+        }
+    return up_row, dn_row, {"source": "rest", "legs": legs}
+
+
+def _log_book_source(
+    cfg: dict,
+    *,
+    path: str,
+    leg: Any,
+    bid: Any,
+    cid: Any,
+    slug: Any,
+) -> None:
+    """One line when a scrap, dump, kept, or reclaim trigger uses a book.
+
+    Disabled stays silent so the journal matches today.
+    """
+    if not ws_book_enabled(cfg):
+        return
+    from buy.clob_book_ws import book_diff_fields
+
+    meta = globals().get("_BOOK_TICK") or {}
+    legs = meta.get("legs") if isinstance(meta, dict) else {}
+    side = legs.get(leg) if isinstance(legs, dict) else None
+    if not isinstance(side, dict):
+        side = {}
+    log_event(
+        "book_source",
+        condition_id=cid,
+        slug=slug,
+        path=path,
+        leg=leg,
+        bid=bid,
+        book_source=meta.get("source") if isinstance(meta, dict) else None,
+        **book_diff_fields(side.get("ws"), side.get("rest")),
+    )
 
 
 def _log_sell_book_depth(
@@ -3000,6 +3154,10 @@ def _start_parallel_kept(
         box["result"] = _empty_kept_result(prep)
         return None, box
     slug = intent.get("slug")
+    _log_book_source(
+        cfg, path="kept", leg=kept, bid=bids.get(kept) if isinstance(bids, dict) else None,
+        cid=cid, slug=slug,
+    )
 
     def _run() -> None:
         try:
@@ -3085,6 +3243,12 @@ def _sell_kept_after_dump(
             ctf=ctf,
             funder_cs=funder_cs,
         )
+        if float(prep.get("size") or 0.0) >= tol:
+            _log_book_source(
+                cfg, path="kept", leg=kept,
+                bid=bids.get(kept) if isinstance(bids, dict) else None,
+                cid=cid, slug=intent.get("slug"),
+            )
         result = _post_kept_dump(
             prep,
             cfg=cfg,
@@ -5010,6 +5174,11 @@ def _reclaim_tick(
             ),
         )
         return
+    _log_book_source(
+        cfg, path="reclaim", leg=decision.get("leg"),
+        bid=bids.get(decision.get("leg")),
+        cid=cid, slug=intent.get("slug"),
+    )
     leg = decision.get("leg")
     shares = float(decision.get("shares") or 0.0)
     limit = decision.get("limit")
@@ -5703,6 +5872,7 @@ def _manage_sells_locked(cfg: dict, state: dict, chain: ChainReader) -> None:
     funder_cs = to_checksum_address(funder) if funder else None
     _bind_sell_chain(chain, str(cfg.get("ctf_address") or ""), funder_cs)
     _apply_book_timeout(cfg)
+    _sync_book_feed(cfg, state)
     dirty = False
     ctf = str(cfg.get("ctf_address") or "")
 
@@ -5753,7 +5923,10 @@ def _manage_sells_locked(cfg: dict, state: dict, chain: ChainReader) -> None:
         # persist-ready. Parallel UP/DN cuts sequential REST wait on the
         # armed path. The ~8.6–10.5s gap was poll_s plus mint-path work.
         with _io_unlocked():
-            up_row, dn_row = _fetch_books(up_tok, dn_tok, min_bid_size)
+            up_row, dn_row, book_meta = _books_for_sell(
+                cfg, up_tok, dn_tok, min_bid_size,
+            )
+        _set_book_tick(book_meta)
         (
             up_bid, up_sz, up_bids, up_ask, _up_ask_sz, _up_asks, up_age,
         ) = _book_quote(up_row)
@@ -6150,6 +6323,10 @@ def _manage_sells_locked(cfg: dict, state: dict, chain: ChainReader) -> None:
                     extra={"below": dump_below},
                 )
             else:
+                _log_book_source(
+                    cfg, path="dump", leg=held, bid=dump_bid,
+                    cid=cid, slug=intent.get("slug"),
+                )
                 d_tok = tokens[held]
                 size, latch = _sell_inventory(
                     chain, ctf, funder_cs, d_tok, shares, tol,
@@ -6702,6 +6879,10 @@ def _manage_sells_locked(cfg: dict, state: dict, chain: ChainReader) -> None:
                     clob_ready=True,
                 )
             else:
+                _log_book_source(
+                    cfg, path="scrap", leg=loser, bid=bids.get(loser),
+                    cid=cid, slug=intent.get("slug"),
+                )
                 if in_late:
                     log_event(
                         "sell_loser_oracle_ok",
@@ -7290,6 +7471,7 @@ def run_sell_cycle(cfg: dict, state: dict, chain: ChainReader) -> str:
     try:
         manage_sells(cfg, state, chain)
     except Exception as sell_exc:
+        _note_book_fetch_failed()
         log_event("sell_cycle_error", error=str(sell_exc)[:240])
         write_loop_heartbeat("sell", "error", error=str(sell_exc)[:120])
         return "error"
@@ -7927,8 +8109,11 @@ def main() -> int:
 
     def sell_sleep() -> float:
         current = cfg_box.get("cfg") or cfg
+        failed = take_book_fetch_failed()
         with STATE_LOCK:
-            return cycle_sleep_s(current, state, time.time())
+            return cycle_sleep_s(
+                current, state, time.time(), fetch_failed=failed,
+            )
 
     def mint_sleep() -> float:
         current = cfg_box.get("cfg") or cfg

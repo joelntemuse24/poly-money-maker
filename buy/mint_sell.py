@@ -167,7 +167,12 @@ DEFAULT_SELL_KNOBS = {
     "reclaim_hedge_max_price": 0.15,
     "sell_min_bid_size": 1.0,
     # Cycle sleep while a loser persist arm is live. Does not change persist_s.
+    # Explicit 0 polls again as soon as the tick returns.
     "sell_armed_poll_s": 2.0,
+    # Off: the sell loop keeps using REST /books. On: a fresh websocket
+    # top replaces that poll for the trigger. Stale falls back to REST.
+    "ws_book_enabled": False,
+    "ws_book_stale_s": 1.5,
     # 0 skips the late-window Chainlink veto on loser scrap.
     # Floor, per-TTM, and stale are 0 so a positive window does not
     # restore the old veto. Edge persist stays 3s.
@@ -606,29 +611,65 @@ def mint_cycle_sleep_s(cfg: Any) -> float:
     return poll
 
 
-def cycle_sleep_s(cfg: Any, state: Any, now_s: float) -> float:
+# After a failed book read, do not spin even when sell_armed_poll_s is 0.
+BOOK_FAIL_BACKOFF_S = 0.25
+
+
+def ws_book_enabled(cfg: Any) -> bool:
+    """True only for an explicit true. Missing and false leave REST in place."""
+    return isinstance(cfg, dict) and cfg.get("ws_book_enabled") is True
+
+
+def ws_book_stale_s(cfg: Any) -> float:
+    """How long a websocket top may be used. Bad values stay at 1.5s."""
+    raw = 1.5
+    if isinstance(cfg, dict) and "ws_book_stale_s" in cfg:
+        raw = cfg.get("ws_book_stale_s")
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return 1.5
+    if value != value or value <= 0 or value == float("inf"):
+        return 1.5
+    return value
+
+
+def cycle_sleep_s(
+    cfg: Any,
+    state: Any,
+    now_s: float,
+    *,
+    fetch_failed: bool = False,
+) -> float:
     """Sell-loop sleep: ``poll_s``, or ``sell_armed_poll_s`` while hot.
 
     Missing/invalid ``sell_armed_poll_s`` keeps ``poll_s`` so persist math is
-    never replaced by the armed interval. Armed poll may be below the
-    ``poll_s >= 1`` floor (code default 2.0). Mint uses
+    never replaced by the armed interval. Armed poll may be 0 (poll again
+    as soon as the tick returns) and may be below the ``poll_s >= 1`` floor.
+    A failed book read waits at least ``BOOK_FAIL_BACKOFF_S``. Mint uses
     ``mint_cycle_sleep_s`` and is not gated by this.
     """
     poll = float((cfg or {}).get("poll_s") or 10)
-    if poll < 0:
+    if poll < 0 or poll != poll:
         poll = 0.0
-    if not skip_mint_discovery_for_sell(state, now_s):
-        return poll
-    raw = (cfg or {}).get("sell_armed_poll_s")
-    if raw is None or raw == "":
-        return poll
-    try:
-        armed = float(raw)
-    except (TypeError, ValueError):
-        return poll
-    if armed <= 0:
-        return poll
-    return min(poll, armed)
+    delay = poll
+    if skip_mint_discovery_for_sell(state, now_s):
+        raw = (cfg or {}).get("sell_armed_poll_s")
+        if raw is not None and raw != "":
+            try:
+                armed = float(raw)
+            except (TypeError, ValueError):
+                armed = None
+            if (
+                armed is not None
+                and armed == armed
+                and armed >= 0
+                and armed != float("inf")
+            ):
+                delay = min(poll, armed)
+    if fetch_failed:
+        return max(delay, BOOK_FAIL_BACKOFF_S)
+    return delay
 
 
 def effective_loser_persist_s(

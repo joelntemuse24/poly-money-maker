@@ -303,11 +303,13 @@ Saves are cheap and rare: `commit_state` compares a **digest** (`persist_digest`
 
 `main()` installs signal handlers, acquires `.mintbot.lock`, loads `strategy_mint.json` merged over `DEFAULTS`, validates knobs, builds the market gateway and **two** `ChainReader`s (one per loop, one keep-alive session each), then starts three daemon threads: sell (`run_sell_cycle`), mint (`run_mint_cycle`) and the oracle tape.
 
-`load_strategy` copies only keys that exist in `DEFAULTS`; anything else in the live file (for example a leftover `sell_persist_skip_ttm_s` or `sell_dump_tiers`) is ignored. `validate_strategy` enforces `sell_floor ≤ sell_threshold < sell_opposite_min < sell_winner_min < 1`, `sell_floor ≤ sell_fak_px ≤ sell_threshold`, the same chain for the late pair when both late prices are set, `0 < sell_scrap_fraction ≤ 1`, `0 < reclaim_stop < reclaim_entry < 1`, `reclaim_max_price ≥ reclaim_entry`, mint gas bounds, non-negative second knobs, and `poll_s ≥ 1`. `sell_armed_poll_s` must be ≥ 0.2. Explicit 0 on a seconds knob is kept (`cfg_seconds`); a negative is rejected.
+`load_strategy` copies only keys that exist in `DEFAULTS`; anything else in the live file (for example a leftover `sell_persist_skip_ttm_s` or `sell_dump_tiers`) is ignored. `validate_strategy` enforces `sell_floor ≤ sell_threshold < sell_opposite_min < sell_winner_min < 1`, `sell_floor ≤ sell_fak_px ≤ sell_threshold`, the same chain for the late pair when both late prices are set, `0 < sell_scrap_fraction ≤ 1`, `0 < reclaim_stop < reclaim_entry < 1`, `reclaim_max_price ≥ reclaim_entry`, mint gas bounds, non-negative second knobs, and `poll_s ≥ 1`. `sell_armed_poll_s` must be ≥ 0 (explicit 0 polls again as soon as the tick returns). Explicit 0 on a seconds knob is kept (`cfg_seconds`); a negative is rejected. A failed book read waits at least 0.25s so that 0 does not spin.
 
 Each loop calls `_reload_cfg`, which re-reads `strategy_mint.json` only when the file mtime changes, so a knob edit still takes effect on the next tick without a restart. If the reload fails validation, the loop logs `strategy_reload_fail` and keeps the **previous** config with `entry_enabled` forced false: sells continue, new mints stop.
 
-Sleep cadence: the sell loop sleeps `poll_s`, or `min(poll_s, sell_armed_poll_s)` while any bag is sell-hot (loser armed, loser sold and dump/winner not done, or a reclaim still watching). Code defaults 5s / 2s. The 13 Oct live list does not restate either sleep. Mint always sleeps `poll_s`. Armed poll does **not** replace persist math. Shared intent writes take `STATE_LOCK`; book / FAK / Gamma / relayer / RPC stay outside that lock (`_io_unlocked`).
+Sleep cadence: the sell loop sleeps `poll_s`, or `min(poll_s, sell_armed_poll_s)` while any bag is sell-hot (loser armed, loser sold and dump/winner not done, or a reclaim still watching). Code defaults 5s / 2s. Explicit 0 on the armed poll returns immediately; the `/books` round trip is the gap, and a failed read waits 0.25s. The 13 Oct live list does not restate either sleep. Mint always sleeps `poll_s`. Armed poll does **not** replace persist math. Shared intent writes take `STATE_LOCK`; book / FAK / Gamma / relayer / RPC stay outside that lock (`_io_unlocked`).
+
+`ws_book_enabled` (default false) keeps one CLOB market websocket for the current bag and the next (four tokens). Scrap, dump, kept, and reclaim use that top when both legs updated within `ws_book_stale_s` (default 1.5s) and the socket is up. Otherwise the tick uses REST `/books` and the order path is unchanged. A trigger logs `book_source` with the source and the websocket-minus-REST bid difference. Reconnects back off. Old tokens are dropped.
 
 Incident `btc-updown-15m-1789905600`: after `loser_done`, next-window mint ran on the same thread and delayed the first dump look ~16s while UP cliffed 97→31. A skip-Gamma bandage (draft PR #193) is unnecessary once the loops are independent.
 
@@ -957,8 +959,10 @@ The late pair also needs `sell_fak_px_late` and `sell_late_price_window_s` (180)
 | `mint_seq_lead_s` | 30 | Sequential mint opens at start − lead |
 | `mint_seq_cutoff_s` | 240 | Sequential mint closes at start + cutoff, then `mint_seq_skip` |
 | `poll_s` | 5 | Mint sleep, and sell sleep when idle. Must be ≥ 1 |
-| `sell_armed_poll_s` | 2 | Sell sleep while a bag is hot, including an open reclaim. Must be ≥ 0.2 |
+| `sell_armed_poll_s` | 2 | Sell sleep while a bag is hot, including an open reclaim. 0 polls again immediately. Must be ≥ 0 |
 | `book_timeout_s` | 1.2 | CLOB `/book` and `/books` timeout |
+| `ws_book_enabled` | false | When true, a fresh market-websocket top replaces the sell-loop `/books` poll. False is today's REST path |
+| `ws_book_stale_s` | 1.5 | Websocket top older than this, or an unhealthy socket, falls back to REST |
 | `mint_cash_poll_s` | 2 | How often to re-read pUSD while a sequential mint waits on cash |
 | `position_tolerance` | 0.01 | Share dust ignored for flat / filled |
 | `require_accepting_orders` | true | Skip markets Gamma says are not accepting orders |
@@ -1560,6 +1564,8 @@ redeem_enabled (opt-in), separate thread:
 Adjacent mint may already have been submitted **before** expiry (lookahead). That is intentional and is the main fix for the “skipped 15m” bug.
 
 # Changelog
+
+- **2026-10-15** — `sell_armed_poll_s` may be 0 (poll again as soon as the tick returns; a failed book read still waits 0.25s). `ws_book_enabled` (default false) subscribes one CLOB market websocket to the current bag and the next, and the sell loop uses that bid for scrap, dump, kept, and reclaim when it is newer than `ws_book_stale_s` (default 1.5s) and the socket is healthy. Otherwise REST `/books` is unchanged. Triggers log `book_source` (source and ws−rest bid difference). The cache holds at most four tokens.
 
 - **2026-10-15** — `sell_dump_kept_max_px` (default null) sells the kept scrap half on a dump only when that leg's best bid is strictly under the cap at the moment the kept sell starts. Null keeps selling it whenever `sell_dump_also_kept` fires. At or above the cap the shares are not posted (`sell_dump_kept` outcome `held_above_max`), stay open for redeem, and do not arm reclaim. The held leg is unchanged. One check, no retry.
 
