@@ -1,0 +1,24 @@
+[Unit]
+Description=Polymarket BTC 15m full-depth tape (no orders; not mintbot)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ntemusejoel
+WorkingDirectory=/home/ntemusejoel/poly-money-maker
+Environment=PYTHONUNBUFFERED=1
+Nice=10
+IOSchedulingClass=idle
+IOSchedulingPriority=7
+CPUQuota=25%
+MemoryMax=150M
+MemoryHigh=120M
+ExecStart=/home/ntemusejoel/poly-money-maker/.venv/bin/python recorder.py
+Restart=on-failure
+RestartSec=30
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Install]
+WantedBy=multi-user.target

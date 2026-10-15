@@ -1,0 +1,17 @@
+[Unit]
+Description=Copy yesterday's poly logs into durable storage (no log deletion)
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=ntemusejoel
+WorkingDirectory=/home/ntemusejoel/poly-money-maker
+Nice=19
+IOSchedulingClass=idle
+IOSchedulingPriority=7
+CPUQuota=15%
+MemoryMax=120M
+ExecStart=/home/ntemusejoel/poly-money-maker/.venv/bin/python tools/archive_logs.py
+
+[Install]
+WantedBy=multi-user.target

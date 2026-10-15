@@ -15,7 +15,21 @@ bots, and hourly-dense pathlog stay **off**. Do not start them, and do
 not add those sources back. `scrapbidder.py` /
 `deploy/polyscrapbid.service` is an opt-in bids-only sister process
 (wallet B). It is not a restore of `complementbot.py`. Leave it stopped
-until the operator asks.
+until the operator asks. `recorder.py` / `deploy/polyrecorder.service`
+is an opt-in full-depth tape (current and next BTC 15m books plus the
+Chainlink reference, one oracle file per UTC day). It is not part of
+mintbot. Leave it stopped until the operator asks. It closes a bag's
+file after the window (or 60s idle). Durable tape lives in
+`logs/durable` under the repo root. Free disk under 4GB still deletes
+the oldest tape days and logs `recorder_disk_emergency`. Going over 5GB
+does not delete: `polyupload.timer` uploads those days to the rclone
+remote (`gdrive:poly-tape/<day>/` via `POLY_TAPE_REMOTE`) and deletes
+them only after size and hash match. A failed upload keeps the files.
+Leave `polyupload` stopped until the operator asks. The same job
+uploads a day once its age is no longer under 7 days, even under 5GB,
+and still deletes only after the check. No remote means those days
+stay. The only unverified delete is the under-4GB emergency path. It
+does not delete mintbot logs. `polyarchive.timer` only copies logs.
 
 Never infer service state from filenames or old documentation. Read
 current configuration and read-only service status before operational

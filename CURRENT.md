@@ -9,6 +9,24 @@ read from the VM on 30 Sep 2026 and were not re-confirmed on 3 Oct.
 or change `strategy_mint.json` unless the operator asks. This doc's mint
 knob rows below remain the last confirmed snapshot.
 
+**Full-depth tape (not started).** `recorder.py` and
+`deploy/polyrecorder.service` are a separate process from mintbot. They
+record the current and next BTC 15m books plus the Chainlink reference
+the bot already parses. Leave the unit stopped until the operator asks.
+`polyarchive.timer` copies logs into `logs/durable/` and does not trade.
+The recorder closes a bag file once its window is 30s past the end (or
+after 60s idle) and writes the Chainlink feed once per UTC day. Replay
+of a bag that crosses midnight also reads the next day's oracle file.
+Free disk under 4GB deletes the oldest tape days and logs
+`recorder_disk_emergency`. Tape over 5GB is uploaded by
+`polyupload.timer` (nice 19, idle IO, `--bwlimit 2M`) and deleted only
+after the remote hash matches. A day that is 7 days old is uploaded
+the same way, even under 5GB, and is kept when no remote is set.
+Mintbot logs are not deleted.
+Install steps are in `deploy/RECORDER.md`. `logs/books.jsonl` was
+lockbot's tape (`book_log_enabled` true on the VM). It stopped at
+2026-10-05 14:12:43Z when lockbot was removed; mintbot never wrote it.
+
 **Lockbot deleted (2026-10-05).** Entry point, lock modules, tests,
 example config, and `deploy/polylockbot.service` removed from the repo.
 On the VM: unit stopped, disabled, unit file removed; no `lockbot.py`
@@ -193,6 +211,22 @@ unless the operator asks. `polypathlog` is retired. Lockbot/`polylockbot`
 is deleted. Creating a PR is not a merge and not a restart.
 
 ## Changelog
+
+- **2026-10-15** — Standalone full-depth recorder (`recorder.py`,
+  `polyrecorder.service`) and a daily archive (`polyarchive.timer`) that
+  copies logs and does not delete them. Replay is `tools/replay.py`.
+  The recorder closes bag files after the window and writes the
+  Chainlink feed once per day. Tape over 5GB is uploaded by
+  `polyupload.timer` and deleted only after a size and hash check.
+  Free disk under 4GB still deletes oldest tape and logs that loudly.
+  Age does not delete in the recorder; a day 7 days old is uploaded
+  even under 5GB and kept when no remote is set.
+  `pathlog.log` and `scrapbid.log`
+  keep their previous size rotation. Journal retention in
+  `deploy/journald-size.conf` no longer uses `MaxRetentionSec`. Nothing
+  here changes mint or sell defaults. `logs/books.jsonl` stopped
+  because lockbot, the only writer, was deleted on 2026-10-05. Do not
+  start `polyrecorder` unless asked.
 
 - **2026-10-09** — Optional late scrap price. `sell_late_price_window_s` defaults to 0. When it is positive and both late prices are set, a known ttm at or under the window uses `sell_threshold_late` / `sell_fak_px_late` for the arm, the persist check, and the FAK cap. Suggested live keys: base 0.03/0.03, late 0.04/0.04, window 180. `sell_late_window_s` (oracle veto) stays 0.
 

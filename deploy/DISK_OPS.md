@@ -17,13 +17,21 @@ bot data matters.
 
 ## Prevention (do all of these on the VM)
 
-1. **Cap journal permanently**
+1. **Cap journal without deleting it before the daily archive**
    ```bash
+   sudo rm -f /etc/systemd/journald.conf.d/99-size.conf
    sudo mkdir -p /etc/systemd/journald.conf.d
    sudo cp deploy/journald-size.conf /etc/systemd/journald.conf.d/size.conf
    sudo systemctl restart systemd-journald
-   sudo journalctl --vacuum-size=50M
    ```
+   The live VM on 2026-10-15 was already at `SystemMaxUse=100M` (directory
+   99M) with `99-size.conf` setting `MaxFileSec=3day`. That vacuum is why
+   the oldest closed system journal file was 2026-10-12. The repo file
+   used to set `MaxRetentionSec=7day`, which deletes by age even when
+   nothing has been copied off the box. The replacement keeps about two
+   weeks (`SystemMaxUse=400M`) and does not set `MaxRetentionSec`.
+   `SystemKeepFree=2G` is the disk backstop. Do not `vacuum-size=50M` as
+   a steady state. Details and the daily copy are in `deploy/RECORDER.md`.
 
 2. **Monitor free space**
    ```bash
