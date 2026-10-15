@@ -93,6 +93,7 @@
   "sell_dump_max_ttm_s": 240.0,
   "sell_dump_other_min": 0.30,
   "sell_dump_also_kept": false,
+  "sell_dump_kept_max_px": null,
   "sell_dump_parallel_kept": true,
   "post_dump_log_enabled": true,
   "reclaim_enabled": false,

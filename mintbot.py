@@ -189,6 +189,7 @@ from buy.mint_sell import (
     fresh_bag_risk,
     empty_fak_status,
     inventory_latch,
+    kept_dump_blocked,
     is_balance_allowance_reject,
     tracked_sell_size,
     advance_oracle_edge_arm,
@@ -405,6 +406,10 @@ DEFAULTS = {
     "sell_dump_other_min": 0.30,
     # When the held dump fills, also sell the kept scrap half (1c floor sweep).
     "sell_dump_also_kept": False,
+    # Null sells that kept half whenever the held dump fires. A price in
+    # (0, 1) sells it only when its best bid is strictly under that price
+    # at the moment the kept sell starts. At or above, hold to redeem.
+    "sell_dump_kept_max_px": None,
     # With also_kept, post the kept leg at the same time as the held leg.
     # False restores the old order: kept starts only after the held dump fills.
     "sell_dump_parallel_kept": True,
@@ -783,6 +788,19 @@ def validate_strategy(cfg: dict) -> None:
         raise ValueError("sell_dump_ladder_rungs must be >= 1")
     if float(cfg.get("sell_dump_max_ttm_s") or 0) < 0:
         raise ValueError("sell_dump_max_ttm_s must be >= 0")
+    kept_max_raw = cfg.get("sell_dump_kept_max_px", None)
+    if kept_max_raw not in (None, ""):
+        try:
+            kept_max = float(kept_max_raw)
+        except (TypeError, ValueError):
+            raise ValueError("sell_dump_kept_max_px must be null or in (0, 1)")
+        if (
+            kept_max != kept_max
+            or kept_max <= 0
+            or kept_max >= 1
+            or kept_max == float("inf")
+        ):
+            raise ValueError("sell_dump_kept_max_px must be null or in (0, 1)")
     other_min_raw = cfg.get("sell_dump_other_min", 0.30)
     if other_min_raw is not None and other_min_raw != "":
         try:
@@ -2747,11 +2765,34 @@ def _post_kept_dump(
     tol: float,
     end_ts: Optional[float] = None,
 ) -> dict:
-    """Kept-leg FAK, fresh-bid refire, and one floor sweep. Does not write the intent."""
+    """Kept-leg FAK, fresh-bid refire, and one floor sweep. Does not write the intent.
+
+    ``sell_dump_kept_max_px`` is read once here. At or above that bid the
+    kept shares are not posted; the held leg is unaffected.
+    """
     size = float(prep.get("size") or 0.0)
     if size < tol:
         return _empty_kept_result(prep)
     kept = prep.get("leg")
+    kept_bid = bids.get(kept) if isinstance(bids, dict) else None
+    if kept_dump_blocked(kept_bid, cfg.get("sell_dump_kept_max_px", None)):
+        return {
+            "leg": kept,
+            "keep": prep.get("keep"),
+            "planned": prep.get("planned"),
+            "latch": prep.get("latch"),
+            "sold": 0.0,
+            "swept": 0.0,
+            "fills": [],
+            "bid": kept_bid,
+            "limit": None,
+            "attempts": 0,
+            "status": "held_above_max",
+            "outcome": "held_above_max",
+            "remaining": float(size),
+            "posted": False,
+            "max_px": cfg.get("sell_dump_kept_max_px", None),
+        }
     token = prep.get("token")
     floor = max(0.01, float(cfg.get("sell_clob_min_price") or 0.01))
     kept_fills: list = []
@@ -2841,6 +2882,31 @@ def _apply_kept_dump_result(intent: dict, cid: str, result: dict) -> None:
     keep = result.get("keep")
     intent["sell_dump_kept_done"] = True
     intent["sell_dump_kept_planned"] = planned
+    if result.get("outcome") == "held_above_max":
+        intent["sell_dump_kept_outcome"] = "held_above_max"
+        intent["sell_dump_kept_leg"] = kept
+        intent["sell_dump_kept_sold"] = False
+        intent["sell_dump_kept_filled"] = 0.0
+        log_event(
+            "sell_dump_kept",
+            condition_id=cid,
+            slug=slug,
+            leg=kept,
+            planned=planned,
+            keep=keep,
+            sold=0.0,
+            avg_px=None,
+            bid=result.get("bid"),
+            max_px=result.get("max_px"),
+            status="held_above_max",
+            outcome="held_above_max",
+            remaining=round(float(result.get("remaining") or 0.0), 4),
+        )
+        console.print(
+            f"  [bold bright_yellow][DUMP KEPT HELD][/] {kept} "
+            f"bid={result.get('bid')} >= {result.get('max_px')}"
+        )
+        return
     if not result.get("posted"):
         intent["sell_dump_kept_outcome"] = "nothing_kept"
         log_event(
