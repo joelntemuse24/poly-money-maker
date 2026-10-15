@@ -207,6 +207,23 @@ class RotationConfigTests(unittest.TestCase):
         self.assertIn("Type=oneshot", unit)
         self.assertIn("Nice=19", unit)
         self.assertIn("tools/archive_logs.py", unit)
+        upload = (ROOT / "deploy" / "polyupload.service").read_text(encoding="utf-8")
+        self.assertIn("Nice=19", upload)
+        self.assertIn("IOSchedulingClass=idle", upload)
+        self.assertIn("CPUQuota=10%", upload)
+        self.assertIn("MemoryMax=100M", upload)
+        self.assertIn("tools/upload_tape.py", upload)
+        self.assertNotIn("recorder.py", upload)
+        timer = (ROOT / "deploy" / "polyupload.timer").read_text(encoding="utf-8")
+        self.assertIn("OnCalendar=*:0/15", timer)
+        source = (ROOT / "recorder" / "upload.py").read_text(encoding="utf-8")
+        self.assertIn('"--bwlimit"', source)
+        self.assertIn('"2M"', source)
+        run_source = (ROOT / "recorder" / "run.py").read_text(encoding="utf-8")
+        self.assertIn('REPO_ROOT / "logs" / "durable"', run_source)
+        self.assertNotIn("tape_dir.parent", run_source)
+        self.assertNotIn("rclone", run_source)
+        self.assertIn("recorder_disk_emergency", run_source)
 
     def test_pathlog_and_scrapbidder_keep_a_small_rotation(self):
         expected = {"pathlog.py": "backupCount=3", "scrapbidder.py": "backupCount=2"}
@@ -223,7 +240,41 @@ class RotationConfigTests(unittest.TestCase):
 
 
 class TapeCapTests(unittest.TestCase):
-    def test_cap_deletes_oldest_durable_tape_before_that_days_spool(self):
+    def test_size_cap_does_not_delete_unuploaded_tape(self):
+        today = date(2026, 10, 15)
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            spool = root / "data" / "tape"
+            durable = root / "logs" / "durable"
+            old_tape = durable / "2026-10-01" / "tape"
+            old_tape.mkdir(parents=True)
+            (old_tape / "a.jsonl.gz").write_bytes(b"x" * 100)
+            (durable / "2026-10-01" / "mintbot.jsonl.gz").write_bytes(b"keep-log")
+            spool_day = spool / "2026-10-02"
+            spool_day.mkdir(parents=True)
+            (spool_day / "b.jsonl.gz").write_bytes(b"y" * 100)
+            writer = TapeWriter(spool)
+            result = enforce_tape_cap(
+                spool,
+                durable,
+                free_min=0,
+                tape_max=40,
+                keep_days=30,
+                today=today,
+                free_bytes_fn=lambda _path: 10**12,
+                writer=writer,
+            )
+            self.assertEqual(result["deleted"], [])
+            self.assertTrue(result["over_tape_cap"])
+            self.assertFalse(result["low_disk"])
+            self.assertTrue(writer.writes_enabled)
+            self.assertEqual((old_tape / "a.jsonl.gz").read_bytes(), b"x" * 100)
+            self.assertEqual((spool_day / "b.jsonl.gz").read_bytes(), b"y" * 100)
+            self.assertEqual((durable / "2026-10-01" / "mintbot.jsonl.gz").read_bytes(), b"keep-log")
+
+    def test_low_disk_deletes_oldest_durable_then_spool_and_alerts(self):
+        from recorder.disk import disk_alerts
+
         today = date(2026, 10, 15)
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -243,41 +294,41 @@ class TapeCapTests(unittest.TestCase):
             archive = root / "logs" / "archive"
             archive.mkdir(parents=True)
             (archive / "mintbot.log.1.gz").write_bytes(b"archive")
+
+            def free(_path: Path) -> int:
+                if old_tape.exists():
+                    return 0
+                if spool_day.exists():
+                    return 0
+                return 10**12
+
             writer = TapeWriter(spool)
             result = enforce_tape_cap(
                 spool,
                 durable,
-                free_min=0,
-                tape_max=160,
+                free_min=100,
+                tape_max=10**12,
                 keep_days=30,
                 today=today,
                 protected_days={"2026-10-15"},
-                free_bytes_fn=lambda _path: 10**12,
+                free_bytes_fn=free,
                 writer=writer,
             )
-            self.assertEqual([(row["day"], row["where"], row["why"]) for row in result["deleted"]], [("2026-10-01", "durable", "cap")])
+            self.assertEqual(
+                [(row["day"], row["where"], row["why"]) for row in result["deleted"]],
+                [("2026-10-01", "durable", "low_disk"), ("2026-10-02", "spool", "low_disk")],
+            )
             self.assertFalse(old_tape.exists())
+            self.assertFalse(spool_day.exists())
             self.assertEqual((durable / "2026-10-01" / "mintbot.jsonl.gz").read_bytes(), b"keep-log")
             self.assertEqual((durable / "2026-10-01" / "journal-polymintbot.jsonl.gz").read_bytes(), b"keep-journal")
-            self.assertEqual((spool_day / "b.jsonl.gz").read_bytes(), b"y" * 100)
             self.assertEqual((open_day / "c.jsonl.gz").read_bytes(), b"z" * 50)
             self.assertEqual((archive / "mintbot.log.1.gz").read_bytes(), b"archive")
             self.assertTrue(writer.writes_enabled)
-            tighter = enforce_tape_cap(
-                spool,
-                durable,
-                free_min=0,
-                tape_max=40,
-                keep_days=30,
-                today=today,
-                protected_days={"2026-10-15"},
-                free_bytes_fn=lambda _path: 10**12,
-                writer=writer,
-            )
-            self.assertEqual([(row["day"], row["where"]) for row in tighter["deleted"]], [("2026-10-02", "spool")])
-            self.assertFalse(spool_day.exists())
-            self.assertTrue((open_day / "c.jsonl.gz").is_file())
-            self.assertFalse(writer.writes_enabled)
+            alert = disk_alerts(result)[0]
+            self.assertEqual(alert["event"], "recorder_disk_emergency")
+            self.assertEqual(alert["level"], "error")
+            self.assertIn("without a verified upload", alert["message"])
 
     def test_open_day_survives_a_full_disk_and_writes_can_resume(self):
         start = datetime(2026, 10, 15, 12, tzinfo=timezone.utc).timestamp()
@@ -337,6 +388,12 @@ class TapeCapTests(unittest.TestCase):
             recent = durable / "2026-10-14" / "tape"
             recent.mkdir(parents=True)
             (recent / "recent.jsonl.gz").write_bytes(b"new")
+            boundary = durable / "2026-10-08" / "tape"
+            boundary.mkdir(parents=True)
+            (boundary / "edge.jsonl.gz").write_bytes(b"edge")
+            kept = durable / "2026-10-09" / "tape"
+            kept.mkdir(parents=True)
+            (kept / "kept.jsonl.gz").write_bytes(b"kept")
             stale_spool = spool / "2026-10-01"
             stale_spool.mkdir(parents=True)
             (stale_spool / "still.jsonl.gz").write_bytes(b"spool")
@@ -349,8 +406,16 @@ class TapeCapTests(unittest.TestCase):
                 today=today,
                 free_bytes_fn=lambda _path: 10**12,
             )
-            self.assertEqual(result["deleted"], [{"day": "2026-10-01", "where": "durable", "why": "retention"}])
+            self.assertEqual(
+                result["deleted"],
+                [
+                    {"day": "2026-10-01", "where": "durable", "why": "retention"},
+                    {"day": "2026-10-08", "where": "durable", "why": "retention"},
+                ],
+            )
             self.assertFalse(old.exists())
+            self.assertFalse(boundary.exists())
+            self.assertEqual((kept / "kept.jsonl.gz").read_bytes(), b"kept")
             self.assertEqual((durable / "2026-10-01" / "mintbot.jsonl.gz").read_bytes(), b"keep-log")
             self.assertEqual((recent / "recent.jsonl.gz").read_bytes(), b"new")
             self.assertEqual((stale_spool / "still.jsonl.gz").read_bytes(), b"spool")

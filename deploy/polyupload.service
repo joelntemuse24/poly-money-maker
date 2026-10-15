@@ -1,0 +1,18 @@
+[Unit]
+Description=Upload oldest tape days to Drive when over 5GB (delete only after verify)
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=ntemusejoel
+WorkingDirectory=/home/ntemusejoel/poly-money-maker
+Nice=19
+IOSchedulingClass=idle
+IOSchedulingPriority=7
+CPUQuota=10%
+MemoryMax=100M
+TimeoutStartSec=6h
+ExecStart=/home/ntemusejoel/poly-money-maker/.venv/bin/python tools/upload_tape.py
+
+[Install]
+WantedBy=multi-user.target

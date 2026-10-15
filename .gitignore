@@ -96,6 +96,8 @@ data/
 STOP_RECORDER
 .recorder.lock
 deploy/archive_remote.path
+deploy/tape_remote.path
+.tape-upload.lock
 
 # Runtime rotations and operator backups
 *.log.*

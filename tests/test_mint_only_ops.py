@@ -795,6 +795,7 @@ class DeployUnitsTests(unittest.TestCase):
                 "polypathlog.service",
                 "polyrecorder.service",
                 "polyarchive.service",
+                "polyupload.service",
                 "polyscrapbid.service",
             },
         )

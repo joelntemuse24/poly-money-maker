@@ -13,7 +13,7 @@ import time
 from pathlib import Path
 from typing import Any, Callable, Optional
 
-from recorder.disk import enforce_tape_cap
+from recorder.disk import disk_alerts, enforce_tape_cap
 from recorder.markets import bags_to_record, market_key
 from recorder.oracle_rows import oracle_records, oracle_tape_row
 from recorder.parse import TokenRef, backoff_s, records_from_payload
@@ -332,15 +332,16 @@ def discover_loop(
         stop.wait(interval_s)
 
 
-def _repo_for(tape_dir: Path) -> Path:
-    if tape_dir.name == "tape" and tape_dir.parent.name == "data":
-        return tape_dir.parent.parent
-    return tape_dir.parent
+REPO_ROOT = Path(__file__).resolve().parents[1]
+
+
+def durable_dir() -> Path:
+    """Always the repo's ``logs/durable``, whatever ``--tape-dir`` is."""
+    return REPO_ROOT / "logs" / "durable"
 
 
 def _guard_disk(writer: TapeWriter, tape_dir: Path) -> dict:
-    root = _repo_for(tape_dir)
-    return enforce_tape_cap(tape_dir, root / "logs" / "durable", writer=writer)
+    return enforce_tape_cap(Path(tape_dir), durable_dir(), writer=writer)
 
 
 def _note_disk(writer: TapeWriter, tape_dir: Path) -> dict:
@@ -349,6 +350,16 @@ def _note_disk(writer: TapeWriter, tape_dir: Path) -> dict:
     except OSError as exc:
         log_event("recorder_disk_error", error=str(exc)[:200])
         return {"deleted": [], "free_bytes": None, "tape_bytes": None, "writes_enabled": writer.writes_enabled}
+    for alert in disk_alerts(disk):
+        event = str(alert.get("event") or "recorder_disk_emergency")
+        fields = {key: value for key, value in alert.items() if key != "event"}
+        log_event(event, **fields)
+    if disk.get("over_tape_cap"):
+        log_event(
+            "recorder_tape_over_cap",
+            tape_bytes=disk.get("tape_bytes"),
+            message="oldest days stay on disk until the upload job verifies them on Drive",
+        )
     if disk.get("deleted") or not disk.get("writes_enabled", True):
         log_event(
             "recorder_disk",
@@ -356,6 +367,8 @@ def _note_disk(writer: TapeWriter, tape_dir: Path) -> dict:
             free_bytes=disk.get("free_bytes"),
             tape_bytes=disk.get("tape_bytes"),
             writes_enabled=disk.get("writes_enabled"),
+            low_disk=disk.get("low_disk"),
+            over_tape_cap=disk.get("over_tape_cap"),
         )
     return disk
 
@@ -431,6 +444,8 @@ def run(
                     last_error=state.last_error,
                     tape_bytes=disk.get("tape_bytes"),
                     free_bytes=disk.get("free_bytes"),
+                    over_tape_cap=disk.get("over_tape_cap"),
+                    low_disk=disk.get("low_disk"),
                 )
                 last_status = now_m
             stop.wait(1.0)

@@ -81,7 +81,9 @@ bids from high to low and returns the share-weighted average. That is
 the displayed book only: no queue and no latency. `--clock exch` uses
 the exchange stamp instead of local arrival.
 
-Library: `recorder.replay.Tape.load(path)`.
+Library: `recorder.replay.Tape.load(path)`. A bag whose 15m window
+reaches the next UTC midnight also loads that next day's
+`oracle.jsonl.gz`. Other bags in the same directory do not.
 
 ## How far logs go (read-only VM check, 2026-10-15)
 
@@ -122,9 +124,8 @@ few days earlier would have seen the cliff nearer Oct 7.
 
 It does not delete mintbot logs or `logs/archive/`.
 `MANIFEST.json` records `deleted_logs: []`. A journal permission error
-is written into the manifest and the job still finishes. Durable tape
-bytes are the recorder's to drop under the disk cap below; this job
-does not.
+is written into the manifest and the job still finishes. Shedding tape
+for the 5GB cap is the upload job below, not this one.
 
 Point it at remote storage when rclone is already configured:
 
@@ -139,9 +140,9 @@ echo 'gdrive:poly-logs' > deploy/archive_remote.path
 
 The archive job still leaves the local durable directory in place.
 `s3:bucket/prefix` works the same way if that remote exists in
-rclone. There is no built-in Google Drive client here. The recorder's
-disk cap can later remove `logs/durable/<day>/tape/` (the copied
-books, not the log extracts).
+rclone. There is no built-in Google Drive client here. Log extracts
+under `logs/durable/<day>/` stay. Tape bytes in `logs/durable/<day>/tape/`
+can be uploaded, or removed if free disk is under 4GB, as below.
 
 Journal export needs the group:
 
@@ -162,11 +163,14 @@ cd /home/ntemusejoel/poly-money-maker
 sudo cp deploy/polyrecorder.service /etc/systemd/system/
 sudo cp deploy/polyarchive.service /etc/systemd/system/
 sudo cp deploy/polyarchive.timer /etc/systemd/system/
+sudo cp deploy/polyupload.service /etc/systemd/system/
+sudo cp deploy/polyupload.timer /etc/systemd/system/
 sudo rm -f /etc/systemd/journald.conf.d/99-size.conf
 sudo cp deploy/journald-size.conf /etc/systemd/journald.conf.d/size.conf
 sudo systemctl daemon-reload
 sudo systemctl restart systemd-journald
 sudo systemctl enable --now polyarchive.timer
+sudo systemctl enable --now polyupload.timer
 # recorder stays stopped until you want the tape:
 # sudo systemctl enable --now polyrecorder.service
 ```
@@ -189,19 +193,72 @@ The unit cap is 25% of one core and 150MB. In that window the current
 bag wrote 1.0MB gzip (~21k `price_change` rows, 144 full books, 69
 trades, and the Chainlink feed from the first second). The next bag
 was 15KB. At the hot bag's rate (~50KB/s gzip) a full day would be
-several GB. The recorder checks at startup and about every minute. If
-free space on the tape filesystem is under 4GB, or `data/tape` plus
-`logs/durable/*/tape` is over 5GB, it deletes the oldest tape day
-(durable tape first, then that day's spool) and repeats. A day that
-still has an open handle is left alone. If the cap still fails, it
-stops appending until a later check is back under the line. Durable
-tape older than 7 days is removed on the same check even when usage
-is under 5GB. Mintbot logs, `logs/archive/`, and journal extracts are
-not part of that delete. A full disk must not come from this process:
-mintbot's state writes have to keep working. Set
-`POLY_ARCHIVE_REMOTE` if you want a copy that survives that cap. The
-boot disk had about 14GB free on 2026-10-15. RAM is the tight resource
-(~1GB, ~540MB available).
+several GB. The recorder checks at startup and about every minute.
+Durable paths are always `<repo>/logs/durable`, including when
+`--tape-dir` is not `data/tape`.
+
+**Over 5GB.** `data/tape` plus `logs/durable/*/tape` over 5GB does not
+delete by itself. `polyupload.timer` (every 15 minutes) runs
+`tools/upload_tape.py` outside the recorder: Nice=19, idle IO,
+`CPUQuota=10%`, `MemoryMax=100M`, and `rclone copy --bwlimit 2M`.
+It uploads the oldest day to `gdrive:poly-tape/<YYYY-MM-DD>/` (or
+`POLY_TAPE_REMOTE`), then `rclone check --one-way` (size and hash).
+If the remote has no hashes, it compares MD5 and `rclone ls` sizes.
+The local day is removed only after that match. A failed copy or check
+keeps the files and the next timer run retries the same oldest day.
+Today's directory is left alone, and so is any day touched in the last
+two minutes. Mintbot logs in that durable directory are not part of
+the upload or the delete.
+
+**Under 4GB free.** The recorder may delete the oldest tape day
+(durable tape first, then that day's spool) so mintbot's state writes
+still fit. It logs `recorder_disk_emergency` at level error, including
+that the upload was not verified. An open bag's day is left in place.
+If free space is still under 4GB, the recorder stops appending.
+
+**Age.** Durable tape is removed locally once the UTC day is 7 days
+old or older. A day younger than 7 days is kept. That age check is
+separate from the 5GB upload.
+
+The boot disk had about 14GB free on 2026-10-15. RAM is the tight
+resource (~1GB, ~540MB available).
+
+## Google Drive auth (once, headless)
+
+Do this on the VM as `ntemusejoel`. The token stays in rclone's config
+(`~/.config/rclone/rclone.conf`), not in git.
+
+```bash
+rclone config
+```
+
+Choose `n` for a new remote, name it `gdrive`, storage `drive`.
+Leave `client_id` and `client_secret` blank unless you have your own
+Google client. Scope `1` (full drive). Leave the root folder and
+service account blank. Skip advanced config. When asked to use auto
+config, answer `n`. rclone then prints a command of the form:
+
+```bash
+rclone authorize "drive" "<blob>"
+```
+
+Run that exact command on a machine that has a browser and the same
+rclone major version. Approve the drive access. Paste the token it
+prints back into the VM's `config_token>` prompt. Quit config.
+
+Point the upload job at that remote (the file is gitignored):
+
+```bash
+echo 'gdrive:poly-tape' > deploy/tape_remote.path
+# or, instead of the file:
+# sudo systemctl edit polyupload.service
+# [Service]
+# Environment=POLY_TAPE_REMOTE=gdrive:poly-tape
+```
+
+`gdrive:poly-logs` (the log archive) and `gdrive:poly-tape` are
+different prefixes. The first copy creates `poly-tape`. Confirm with
+`rclone lsd gdrive:` before enabling the timer if the remote is new.
 
 Pathlog's tick prune (14 days / 400MB) is unchanged. Pathlog stays
 stopped, so it is not deleting anything now. `pathlog.log` rotates at

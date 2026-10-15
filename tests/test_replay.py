@@ -156,6 +156,70 @@ class ReplayMathTests(unittest.TestCase):
             oracle_only = Tape.load(files["oracle.jsonl.gz"])
             self.assertEqual(len(oracle_only.records), 1)
 
+    def test_midnight_bag_loads_the_next_days_oracle(self):
+        from datetime import datetime, timezone
+
+        start = datetime(2026, 10, 14, 23, 45, tzinfo=timezone.utc).timestamp()
+        end = start + 900.0
+        midday = datetime(2026, 10, 14, 12, 0, tzinfo=timezone.utc).timestamp()
+        with tempfile.TemporaryDirectory() as tmp:
+            writer = TapeWriter(tmp)
+            writer.write(
+                {
+                    "event_type": "bag",
+                    "recv_ts": start,
+                    "slug": "btc-updown-15m-late",
+                    "start_ts": start,
+                    "end_ts": end,
+                    "leg": "",
+                }
+            )
+            writer.write(
+                {
+                    "event_type": "oracle",
+                    "source": "twap",
+                    "recv_ts": start + 10,
+                    "slug": "oracle",
+                    "start_ts": start + 10,
+                    "leg": "",
+                    "price": "same-day",
+                }
+            )
+            writer.write(
+                {
+                    "event_type": "oracle",
+                    "source": "twap",
+                    "recv_ts": end + 1,
+                    "slug": "oracle",
+                    "start_ts": end + 1,
+                    "leg": "",
+                    "price": "next-day",
+                }
+            )
+            writer.write(
+                {
+                    "event_type": "book",
+                    "recv_ts": midday,
+                    "exch_ts": midday,
+                    "slug": "btc-updown-15m-mid",
+                    "start_ts": midday,
+                    "end_ts": midday + 900.0,
+                    "leg": "up",
+                    "bids": [["0.50", "4"]],
+                    "asks": [],
+                }
+            )
+            writer.close()
+            late = next(path for path in Path(tmp).rglob("btc-updown-15m-late.jsonl.gz"))
+            mid = next(path for path in Path(tmp).rglob("btc-updown-15m-mid.jsonl.gz"))
+            loaded = Tape.load(late)
+            self.assertEqual(loaded.oracle_at(start + 10, "twap"), "same-day")
+            self.assertEqual(loaded.oracle_at(end + 1, "twap"), "next-day")
+            midday_tape = Tape.load(mid)
+            self.assertFalse(any(row.get("price") == "next-day" for row in midday_tape.records))
+            self.assertEqual(midday_tape.oracle_at(start + 10, "twap"), "same-day")
+            self.assertEqual(midday_tape.depth_at(midday, "bid", 0.50), 4.0)
+
     def test_example_cli_prints_the_scenario(self):
         import io
         from contextlib import redirect_stdout

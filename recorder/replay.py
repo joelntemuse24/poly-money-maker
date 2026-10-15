@@ -5,6 +5,7 @@ from __future__ import annotations
 import gzip
 import json
 from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Iterable, Iterator, Optional
 
@@ -51,6 +52,36 @@ def _stamp(record: dict, clock: str) -> Optional[float]:
     return parsed
 
 
+def _dir_day(path: Path) -> Optional[datetime]:
+    try:
+        return datetime.strptime(path.name, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+    except ValueError:
+        return None
+
+
+def _as_float(value: object) -> float:
+    try:
+        parsed = float(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return 0.0
+    if parsed != parsed or parsed <= 0:
+        return 0.0
+    return parsed
+
+
+def crosses_midnight(records: Iterable[dict], file_day: datetime) -> bool:
+    """True when a 15m window stored under ``file_day`` reaches the next UTC day."""
+    next_midnight = file_day.timestamp() + 86400.0
+    for record in records:
+        start = _as_float(record.get("start_ts"))
+        end = _as_float(record.get("end_ts"))
+        if start > 0 and start < next_midnight and start + 900.0 >= next_midnight:
+            return True
+        if end >= next_midnight and (start <= 0 or start < next_midnight):
+            return True
+    return False
+
+
 class Tape:
     """One bag file. Each query replays rows up to ``ts`` from the start."""
 
@@ -60,11 +91,20 @@ class Tape:
     @classmethod
     def load(cls, path: Path | str) -> "Tape":
         file_path = Path(path)
-        rows = list(iter_records(file_path))
-        if file_path.name != "oracle.jsonl.gz":
-            sibling = file_path.with_name("oracle.jsonl.gz")
-            if sibling.is_file():
-                rows.extend(iter_records(sibling))
+        bag_rows = list(iter_records(file_path))
+        if file_path.name == "oracle.jsonl.gz":
+            return cls(bag_rows)
+        rows = list(bag_rows)
+        sibling = file_path.with_name("oracle.jsonl.gz")
+        if sibling.is_file():
+            rows.extend(iter_records(sibling))
+        file_day = _dir_day(file_path.parent)
+        # The bag's own window decides. The shared oracle file also holds
+        # later bags from the same UTC day, and those must not pull in tomorrow.
+        if file_day is not None and crosses_midnight(bag_rows, file_day):
+            nxt = file_path.parent.parent / (file_day + timedelta(days=1)).strftime("%Y-%m-%d") / "oracle.jsonl.gz"
+            if nxt.is_file():
+                rows.extend(iter_records(nxt))
         return cls(rows)
 
     def book_at(self, ts: float, *, leg: str = "up", clock: str = "recv") -> dict[str, dict[float, float]]:
