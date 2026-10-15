@@ -843,6 +843,7 @@ class DeployUnitsTests(unittest.TestCase):
                 "mint_redeem.py",
                 "mint_sequence.py",
                 "oracle_log.py",
+                "clob_book_ws.py",
                 "price_tape.py",
                 "shadow_early_scrap.py",
                 "sister_bid.py",

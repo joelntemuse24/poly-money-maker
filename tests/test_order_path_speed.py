@@ -192,6 +192,10 @@ class BookFetchTests(unittest.TestCase):
             "_fetch_book",
             "_fetch_books_parallel",
             "_fetch_books",
+            "_book_pace",
+            "_note_book_fetch_failed",
+            "_note_book_fetch_ok",
+            "take_book_pace",
             extras={
                 "time": time,
                 "requests": requests,
