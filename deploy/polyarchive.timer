@@ -1,0 +1,11 @@
+[Unit]
+Description=Daily poly log archive (00:20 UTC)
+
+[Timer]
+OnCalendar=*-*-* 00:20:00 UTC
+Persistent=true
+RandomizedDelaySec=5min
+AccuracySec=1min
+
+[Install]
+WantedBy=timers.target

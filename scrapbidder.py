@@ -67,13 +67,14 @@ def _log(event: str, **kwargs: Any) -> None:
 
 def _setup_log() -> None:
     import logging
-    from logging.handlers import RotatingFileHandler
+    from buy.log_archive import ArchiveRotatingFileHandler
 
     logger = logging.getLogger("scrapbid")
     logger.setLevel(logging.INFO)
     logger.handlers.clear()
     fmt = logging.Formatter("%(message)s")
-    fh = RotatingFileHandler(LOG_FILE, maxBytes=1_000_000, backupCount=2)
+    # Roll into logs/archive. Numbered backups used to delete history.
+    fh = ArchiveRotatingFileHandler(LOG_FILE, maxBytes=1_000_000)
     fh.setFormatter(fmt)
     logger.addHandler(fh)
     sh = logging.StreamHandler(sys.stdout)

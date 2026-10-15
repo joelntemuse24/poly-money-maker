@@ -91,6 +91,12 @@ exports/*.csv
 exports/*.parquet
 exports/*.json
 
+# Recorder spool and the no-delete durable copy (see deploy/RECORDER.md)
+data/
+STOP_RECORDER
+.recorder.lock
+deploy/archive_remote.path
+
 # Runtime rotations and operator backups
 *.log.*
 *.bak-*

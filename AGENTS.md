@@ -15,7 +15,10 @@ bots, and hourly-dense pathlog stay **off**. Do not start them, and do
 not add those sources back. `scrapbidder.py` /
 `deploy/polyscrapbid.service` is an opt-in bids-only sister process
 (wallet B). It is not a restore of `complementbot.py`. Leave it stopped
-until the operator asks.
+until the operator asks. `recorder.py` / `deploy/polyrecorder.service`
+is an opt-in full-depth tape (current and next BTC 15m books plus the
+Chainlink reference). It is not part of mintbot. Leave it stopped until
+the operator asks. `polyarchive.timer` only copies logs.
 
 Never infer service state from filenames or old documentation. Read
 current configuration and read-only service status before operational

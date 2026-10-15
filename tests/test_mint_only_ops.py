@@ -793,6 +793,8 @@ class DeployUnitsTests(unittest.TestCase):
             {
                 "polymintbot.service",
                 "polypathlog.service",
+                "polyrecorder.service",
+                "polyarchive.service",
                 "polyscrapbid.service",
             },
         )
