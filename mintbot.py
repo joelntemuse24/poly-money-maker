@@ -719,7 +719,11 @@ def validate_strategy(cfg: dict) -> None:
         raise ValueError("sell_armed_poll_s must be >= 0")
     if armed_poll != armed_poll or armed_poll < 0 or armed_poll == float("inf"):
         raise ValueError("sell_armed_poll_s must be >= 0")
-    if cfg.get("ws_book_enabled") is True and armed_poll < 0.05:
+    if (
+        cfg.get("ws_book_enabled") is True
+        and str(cfg.get("ws_book_mode") or "shadow").strip().lower() == "live"
+        and armed_poll < 0.05
+    ):
         raise ValueError("ws_book_enabled requires sell_armed_poll_s >= 0.05")
     mode_raw = cfg.get("ws_book_mode", None)
     if mode_raw is not None and str(mode_raw).strip() != "":

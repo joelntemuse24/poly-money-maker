@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import threading
 import unittest
+from unittest.mock import patch
 
 import time
 
@@ -145,6 +146,46 @@ class FeedTests(unittest.TestCase):
         clock["t"] = bid_at + 1.6
         self.assertIsNone(feed.usable("up-tok"))
         self.assertGreater(feed._books["up-tok"].ask_at, bid_at)
+
+    def test_snapshot_keeps_levels_and_metadata_after_updates(self):
+        feed, clock = self._feed(["up-tok"])
+        feed.apply_event(_book("up-tok", "0.39", "0.60"))
+        snapshot, stale, need = feed._snapshot("up-tok")
+        self.assertIsNot(snapshot, feed._books["up-tok"])
+        self.assertIsNot(snapshot.bids, feed._books["up-tok"].bids)
+        self.assertIsNot(snapshot.asks, feed._books["up-tok"].asks)
+        self.assertEqual(stale, 1.5)
+        clock["t"] += 1.0
+        for side, price, size in (("BUY", "0.39", "0"), ("SELL", "0.60", "5")):
+            feed.apply_event({
+                "event_type": "price_change", "asset_id": "up-tok",
+                "side": side, "price": price, "size": size,
+            })
+        feed.apply_event(_book("up-tok", "0.40", "0.70"))
+        top = feed._view(snapshot, clock["t"], need)
+        self.assertEqual((top.bid, top.ask, top.bid_sz, top.ask_sz), (0.39, 0.60, 20, 20))
+        self.assertEqual((snapshot.bid_at, snapshot.ask_at), (1000.0, 1000.0))
+        self.assertTrue(snapshot.bid_ok)
+        self.assertTrue(snapshot.ask_ok)
+        self.assertEqual(feed.cached_bid("up-tok"), 0.40)
+        self.assertEqual(feed.usable("up-tok").ask, 0.70)
+
+    def test_book_and_price_changes_hold_the_lock(self):
+        feed, _clock = self._feed(["up-tok"])
+        book_for = feed._book_for
+
+        def locked_book_for(asset):
+            self.assertTrue(feed._lock.locked())
+            return book_for(asset)
+
+        with patch.object(feed, "_book_for", side_effect=locked_book_for) as lookup:
+            feed.apply_event(_book("up-tok", "0.39", "0.60"))
+            for side in ("BUY", "SELL"):
+                feed.apply_event({
+                    "event_type": "price_change", "asset_id": "up-tok",
+                    "side": side, "price": "0.50", "size": "5",
+                })
+            self.assertEqual(lookup.call_count, 3)
 
     def test_ping_does_not_refresh_the_bid(self):
         feed, clock = self._feed(["up-tok"])
@@ -494,7 +535,7 @@ class SellLoopBookTests(unittest.TestCase):
         again, _ws, _missing = ns["take_book_pace"]()
         self.assertAlmostEqual(again, 0.25)
 
-    def test_enabled_socket_rejects_a_spin_poll(self):
+    def test_only_live_socket_rejects_a_spin_poll(self):
         validate = _fn(
             "validate_strategy",
             {
@@ -505,13 +546,17 @@ class SellLoopBookTests(unittest.TestCase):
         )
         base = _assign("DEFAULTS")
         validate(dict(base, sell_armed_poll_s=0))
+        for mode in ("shadow", " SHADOW ", None, ""):
+            with self.subTest(mode=mode):
+                validate(dict(base, ws_book_enabled=True, ws_book_mode=mode, sell_armed_poll_s=0))
+        validate(dict(base, ws_book_enabled=True, sell_armed_poll_s=0))
         with self.assertRaises(ValueError) as caught:
-            validate(dict(base, ws_book_enabled=True, sell_armed_poll_s=0))
+            validate(dict(base, ws_book_enabled=True, ws_book_mode="live", sell_armed_poll_s=0))
         self.assertIn(
             "ws_book_enabled requires sell_armed_poll_s >= 0.05",
             str(caught.exception),
         )
-        validate(dict(base, ws_book_enabled=True, sell_armed_poll_s=0.05))
+        validate(dict(base, ws_book_enabled=True, ws_book_mode="live", sell_armed_poll_s=0.05))
         with self.assertRaises(ValueError) as caught:
             validate(dict(base, ws_book_mode="fast"))
         self.assertIn("ws_book_mode must be shadow or live", str(caught.exception))

@@ -339,6 +339,15 @@ class ClobBookFeed:
     def _snapshot(self, token_id: str) -> tuple[Optional[_Book], float, float]:
         with self._lock:
             book = self._books.get(str(token_id))
+            if book is not None:
+                book = _Book(
+                    bids=book.bids.copy(),
+                    asks=book.asks.copy(),
+                    bid_at=book.bid_at,
+                    ask_at=book.ask_at,
+                    bid_ok=book.bid_ok,
+                    ask_ok=book.ask_ok,
+                )
             return book, self._stale_s, self._min_size
 
     def _view(self, book: _Book, now_m: float, need: float) -> Top:
@@ -551,26 +560,27 @@ class ClobBookFeed:
             return
 
     def _book_for(self, asset: str) -> Optional[_Book]:
-        with self._lock:
-            if asset not in self._wanted:
-                return None
-            book = self._books.get(asset)
-            if book is None:
-                book = _Book()
-                self._books[asset] = book
-            return book
+        """Return the live book. The caller must hold ``_lock``."""
+        if asset not in self._wanted:
+            return None
+        book = self._books.get(asset)
+        if book is None:
+            book = _Book()
+            self._books[asset] = book
+        return book
 
     def _apply_book(self, event: dict, now_m: float) -> None:
         asset = str(event.get("asset_id") or "")
-        book = self._book_for(asset)
-        if book is None:
-            return
-        book.bids = _pairs_to_map(event.get("bids") or [], "bid")
-        book.asks = _pairs_to_map(event.get("asks") or [], "ask")
-        book.bid_at = now_m
-        book.ask_at = now_m
-        book.bid_ok = True
-        book.ask_ok = True
+        with self._lock:
+            book = self._book_for(asset)
+            if book is None:
+                return
+            book.bids = _pairs_to_map(event.get("bids") or [], "bid")
+            book.asks = _pairs_to_map(event.get("asks") or [], "ask")
+            book.bid_at = now_m
+            book.ask_at = now_m
+            book.bid_ok = True
+            book.ask_ok = True
 
     def _apply_one_change(self, change: dict, now_m: float) -> None:
         asset = str(change.get("asset_id") or "")
@@ -579,21 +589,22 @@ class ClobBookFeed:
         sz = _size_value(change.get("size"))
         if side is None or px is None or sz is None:
             return
-        book = self._book_for(asset)
-        if book is None:
-            return
-        levels = book.bids if side == "bid" else book.asks
-        if sz <= 0:
-            levels.pop(px, None)
-        else:
-            levels[px] = sz
-            _cap_levels(levels, side)
-        if side == "bid":
-            book.bid_at = now_m
-            book.bid_ok = True
-        else:
-            book.ask_at = now_m
-            book.ask_ok = True
+        with self._lock:
+            book = self._book_for(asset)
+            if book is None:
+                return
+            levels = book.bids if side == "bid" else book.asks
+            if sz <= 0:
+                levels.pop(px, None)
+            else:
+                levels[px] = sz
+                _cap_levels(levels, side)
+            if side == "bid":
+                book.bid_at = now_m
+                book.bid_ok = True
+            else:
+                book.ask_at = now_m
+                book.ask_ok = True
 
     def _apply_change(self, event: dict, now_m: float) -> None:
         changes = event.get("price_changes") or event.get("changes")
