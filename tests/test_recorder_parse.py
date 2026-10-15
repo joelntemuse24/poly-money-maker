@@ -10,7 +10,7 @@ from pathlib import Path
 
 from buy.market import MintMarket
 from recorder.markets import bags_to_record, select_bags
-from recorder.oracle_rows import oracle_records
+from recorder.oracle_rows import oracle_records, oracle_tape_row
 from recorder.parse import (
     TokenRef,
     apply_record,
@@ -220,6 +220,112 @@ class TapeWriteTests(unittest.TestCase):
             writer.close()
             tape = Tape.load(files[0])
             self.assertEqual(len(tape.records), 2)
+
+    def test_release_closes_a_bag_after_grace_or_idle(self):
+        clock = {"t": 0.0}
+
+        def now() -> float:
+            return clock["t"]
+
+        end = 1_700_000_900.0
+        slug = "btc-updown-15m-1700000000"
+        row = {
+            "event_type": "bag",
+            "recv_ts": 1.0,
+            "slug": slug,
+            "start_ts": 1700000000.0,
+            "end_ts": end,
+            "leg": "",
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            writer = TapeWriter(tmp, clock=now, flush_s=30.0)
+            writer.write(row)
+            self.assertEqual(list(Path(tmp).rglob("*.jsonl.gz")), [])
+            self.assertEqual(writer.release_stale(end + 29.0), 0)
+            writer.flush(force=True)
+            handle = next(iter(writer._files.values()))
+            self.assertFalse(handle.closed)
+            self.assertEqual(writer.release_stale(end + 29.0), 0)
+            self.assertFalse(handle.closed)
+            self.assertEqual(writer.release_stale(end + 30.0), 1)
+            self.assertTrue(handle.closed)
+            self.assertEqual(writer._files, {})
+            self.assertEqual(writer._buf, {})
+            self.assertEqual(writer._buf_bytes, {})
+            self.assertEqual(writer._last, {})
+            self.assertEqual(writer._synced, {})
+            self.assertEqual(writer._activity, {})
+            self.assertEqual(writer._end, {})
+            from recorder.replay import Tape
+
+            files = list(Path(tmp).rglob("*.jsonl.gz"))
+            self.assertEqual(len(files), 1)
+            self.assertEqual(Tape.load(files[0]).records[0]["slug"], slug)
+            writer.write({**row, "recv_ts": 2.0})
+            writer.flush(force=True)
+            self.assertEqual(writer.open_count(), 1)
+            self.assertEqual(len(Tape.load(files[0]).records), 2)
+            clock["t"] = 60.0
+            reopened = next(iter(writer._files.values()))
+            self.assertEqual(writer.release_stale(end - 10.0, idle_s=60.0, grace_s=30.0), 1)
+            self.assertTrue(reopened.closed)
+            self.assertEqual(writer.open_count(), 0)
+            self.assertEqual(writer._files, {})
+
+    def test_stopped_writer_drops_rows_until_writes_resume(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            writer = TapeWriter(tmp, flush_s=30.0)
+            writer.set_writes_enabled(False)
+            writer.write(
+                {
+                    "event_type": "book",
+                    "recv_ts": 1.0,
+                    "slug": "btc-updown-15m-1700000000",
+                    "start_ts": 1700000000.0,
+                    "leg": "up",
+                }
+            )
+            writer.flush(force=True)
+            self.assertEqual(writer.dropped, 1)
+            self.assertEqual(list(Path(tmp).rglob("*.jsonl.gz")), [])
+            writer.set_writes_enabled(True)
+            writer.write(
+                {
+                    "event_type": "book",
+                    "recv_ts": 2.0,
+                    "slug": "btc-updown-15m-1700000000",
+                    "start_ts": 1700000000.0,
+                    "leg": "up",
+                }
+            )
+            writer.flush(force=True)
+            self.assertEqual(len(list(Path(tmp).rglob("*.jsonl.gz"))), 1)
+            writer.close()
+
+    def test_oracle_rows_share_one_daily_file(self):
+        raw = json.dumps(
+            {
+                "topic": "crypto_prices_chainlink",
+                "type": "update",
+                "timestamp": 1_700_000_000_000,
+                "payload": {
+                    "symbol": "btc/usd",
+                    "timestamp": 1_700_000_000_000,
+                    "value": 42000.0,
+                },
+            }
+        )
+        row = oracle_tape_row(oracle_records(raw, 1700000000.5)[0])
+        self.assertEqual(row["slug"], "oracle")
+        self.assertEqual(row["start_ts"], 1700000000.5)
+        with tempfile.TemporaryDirectory() as tmp:
+            writer = TapeWriter(tmp, flush_s=30.0)
+            writer.write(row)
+            writer.write(oracle_tape_row(oracle_records(raw, 1700000001.5)[0]))
+            writer.close()
+            files = list(Path(tmp).rglob("*.jsonl.gz"))
+            self.assertEqual([path.name for path in files], ["oracle.jsonl.gz"])
+            self.assertEqual(len(files), 1)
 
 
 class ConsumeTests(unittest.TestCase):

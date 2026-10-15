@@ -26,6 +26,7 @@ import signal
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
@@ -88,14 +89,11 @@ def _signal_handler(signum, frame):
 def log_setup() -> None:
     import logging
 
-    from buy.log_archive import ArchiveRotatingFileHandler
-
     logger = logging.getLogger("pathlog")
     logger.setLevel(logging.INFO)
     logger.handlers.clear()
     fmt = logging.Formatter("%(message)s")
-    # Same archive as mintbot.log: roll into logs/archive and do not delete.
-    fh = ArchiveRotatingFileHandler(LOG_FILE, maxBytes=2_000_000)
+    fh = RotatingFileHandler(LOG_FILE, maxBytes=2_000_000, backupCount=3)
     fh.setFormatter(fmt)
     logger.addHandler(fh)
     sh = logging.StreamHandler(sys.stdout)

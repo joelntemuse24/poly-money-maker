@@ -13,8 +13,9 @@ import time
 from pathlib import Path
 from typing import Any, Callable, Optional
 
+from recorder.disk import enforce_tape_cap
 from recorder.markets import bags_to_record, market_key
-from recorder.oracle_rows import oracle_records, stamp_bag
+from recorder.oracle_rows import oracle_records, oracle_tape_row
 from recorder.parse import TokenRef, backoff_s, records_from_payload
 from recorder.tape import TapeWriter
 
@@ -283,12 +284,8 @@ def oracle_loop(
                 last_rx = time.monotonic()
                 recv_ts = time.time()
                 rows = oracle_records(raw, recv_ts)
-                if not rows:
-                    continue
-                markets, _gen = state.snapshot()
-                for market in markets:
-                    for row in rows:
-                        writer.write(stamp_bag(row, str(market.slug), float(market.start_ts or 0.0)))
+                for row in rows:
+                    writer.write(oracle_tape_row(row))
         except Exception as exc:
             attempt += 1
             state.note_error(str(exc))
@@ -335,6 +332,34 @@ def discover_loop(
         stop.wait(interval_s)
 
 
+def _repo_for(tape_dir: Path) -> Path:
+    if tape_dir.name == "tape" and tape_dir.parent.name == "data":
+        return tape_dir.parent.parent
+    return tape_dir.parent
+
+
+def _guard_disk(writer: TapeWriter, tape_dir: Path) -> dict:
+    root = _repo_for(tape_dir)
+    return enforce_tape_cap(tape_dir, root / "logs" / "durable", writer=writer)
+
+
+def _note_disk(writer: TapeWriter, tape_dir: Path) -> dict:
+    try:
+        disk = _guard_disk(writer, tape_dir)
+    except OSError as exc:
+        log_event("recorder_disk_error", error=str(exc)[:200])
+        return {"deleted": [], "free_bytes": None, "tape_bytes": None, "writes_enabled": writer.writes_enabled}
+    if disk.get("deleted") or not disk.get("writes_enabled", True):
+        log_event(
+            "recorder_disk",
+            deleted=disk.get("deleted"),
+            free_bytes=disk.get("free_bytes"),
+            tape_bytes=disk.get("tape_bytes"),
+            writes_enabled=disk.get("writes_enabled"),
+        )
+    return disk
+
+
 def run(
     *,
     tape_dir: Path | str,
@@ -354,6 +379,16 @@ def run(
 
     signal.signal(signal.SIGTERM, _stop_signal)
     signal.signal(signal.SIGINT, _stop_signal)
+    spool = Path(tape_dir)
+    disk = _note_disk(writer, spool)
+    log_event(
+        "recorder_start",
+        tape_dir=str(tape_dir),
+        rss=rss_bytes(),
+        writes=disk.get("writes_enabled"),
+        tape_bytes=disk.get("tape_bytes"),
+        free_bytes=disk.get("free_bytes"),
+    )
     threads = [
         threading.Thread(target=discover_loop, args=(state, stop), kwargs={"gamma_url": gamma_url}, name="recorder-discover", daemon=True),
         threading.Thread(target=book_loop, args=(state, writer, stop), name="recorder-book", daemon=True),
@@ -361,7 +396,6 @@ def run(
     ]
     for thread in threads:
         thread.start()
-    log_event("recorder_start", tape_dir=str(tape_dir), rss=rss_bytes())
     deadline = time.monotonic() + float(seconds) if seconds and seconds > 0 else None
     stop_path = Path(stop_file)
     last_status = time.monotonic()
@@ -376,16 +410,27 @@ def run(
                 log_event("recorder_seconds_done", seconds=seconds)
                 stop.set()
                 break
-            writer.flush()
+            try:
+                writer.flush()
+                writer.release_stale(time.time())
+            except OSError as exc:
+                writer.set_writes_enabled(False)
+                log_event("recorder_flush_error", error=str(exc)[:200])
             if now_m - last_status >= 60.0:
+                disk = _note_disk(writer, spool)
                 markets, generation = state.snapshot()
                 log_event(
                     "recorder_status",
                     markets=[str(getattr(m, "slug", "")) for m in markets],
                     generation=generation,
                     rows=writer.rows,
+                    dropped=writer.dropped,
+                    open_files=writer.open_count(),
+                    writes=writer.writes_enabled,
                     rss=rss_bytes(),
                     last_error=state.last_error,
+                    tape_bytes=disk.get("tape_bytes"),
+                    free_bytes=disk.get("free_bytes"),
                 )
                 last_status = now_m
             stop.wait(1.0)

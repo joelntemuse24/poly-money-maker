@@ -9,6 +9,7 @@ copied and left where they are.
 from __future__ import annotations
 
 import gzip
+import hashlib
 import json
 import os
 import shutil
@@ -218,30 +219,75 @@ def extract_logs(repo: Path, day: date, dest: Path) -> list[dict]:
     return notes
 
 
+def _file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(64 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _payload_match(src: Path, dst: Path) -> str:
+    """``""`` when size and sha256 match, else ``size``, ``hash``, or ``stat``."""
+    try:
+        src_size = src.stat().st_size
+        dst_size = dst.stat().st_size
+    except OSError:
+        return "stat"
+    if src_size != dst_size:
+        return "size"
+    try:
+        if _file_sha256(src) != _file_sha256(dst):
+            return "hash"
+    except OSError:
+        return "hash"
+    return ""
+
+
+def _move_one(path: Path, target: Path) -> dict:
+    """Copy one spool file. Unlink the source only when the hash matches."""
+    landing = target / path.name
+    if landing.exists():
+        kind = _payload_match(path, landing)
+        if kind == "":
+            path.unlink()
+            return {"moved": str(landing), "already": True}
+        if kind == "hash":
+            return {"path": str(path), "error": "hash_mismatch"}
+        landing = target / f"{path.name}.dup"
+        if landing.exists():
+            kind = _payload_match(path, landing)
+            if kind == "":
+                path.unlink()
+                return {"moved": str(landing), "already": True}
+            error = "hash_mismatch" if kind == "hash" else "copy_size_mismatch"
+            return {"path": str(path), "error": error}
+    shutil.copy2(path, landing)
+    kind = _payload_match(path, landing)
+    if kind == "":
+        path.unlink()
+        return {"moved": str(landing), "bytes": landing.stat().st_size}
+    try:
+        landing.unlink()
+    except OSError:
+        pass
+    error = "hash_mismatch" if kind == "hash" else "copy_size_mismatch"
+    return {"path": str(path), "error": error}
+
+
 def move_tape_day(repo: Path, day: date, dest: Path) -> list[dict]:
-    """Move ``data/tape/<day>`` into ``dest/tape``. Leave other days put."""
+    """Move ``data/tape/<day>`` into ``dest/tape``. Leave other days put.
+
+    The spool file is removed only when the destination has the same
+    size and the same sha256. A same-size different-bytes destination
+    keeps the source and records ``hash_mismatch``.
+    """
     source = repo / "data" / "tape" / day.isoformat()
     if not source.is_dir():
         return []
     target = dest / "tape"
     target.mkdir(parents=True, exist_ok=True)
-    notes = []
-    for path in sorted(source.iterdir()):
-        if not path.is_file():
-            continue
-        landing = target / path.name
-        if landing.exists() and landing.stat().st_size == path.stat().st_size:
-            path.unlink()
-            notes.append({"moved": str(landing), "already": True})
-            continue
-        if landing.exists():
-            landing = target / f"{path.name}.dup"
-        shutil.copy2(path, landing)
-        if landing.is_file() and landing.stat().st_size == path.stat().st_size:
-            path.unlink()
-            notes.append({"moved": str(landing), "bytes": landing.stat().st_size})
-        else:
-            notes.append({"path": str(path), "error": "copy_size_mismatch"})
+    notes = [_move_one(path, target) for path in sorted(source.iterdir()) if path.is_file()]
     try:
         if source.is_dir() and not any(source.iterdir()):
             source.rmdir()

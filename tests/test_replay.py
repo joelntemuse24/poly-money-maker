@@ -131,6 +131,31 @@ class ReplayMathTests(unittest.TestCase):
             loaded = Tape.load(path)
             self.assertEqual(up_bid_scenario(loaded, 100.0)["sell_vwap"], 0.924)
 
+    def test_load_reads_the_sibling_oracle_file(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            writer = TapeWriter(tmp)
+            writer.write(_book(100.0, [(0.92, 10)]))
+            writer.write(
+                {
+                    "event_type": "oracle",
+                    "source": "twap",
+                    "recv_ts": 100.2,
+                    "exch_ts": 99.0,
+                    "slug": "oracle",
+                    "start_ts": 1700000000.0,
+                    "leg": "",
+                    "price": "67000.5",
+                }
+            )
+            writer.close()
+            files = {path.name: path for path in Path(tmp).rglob("*.jsonl.gz")}
+            self.assertEqual(set(files), {"btc-updown-15m-1700000000.jsonl.gz", "oracle.jsonl.gz"})
+            loaded = Tape.load(files["btc-updown-15m-1700000000.jsonl.gz"])
+            self.assertEqual(loaded.depth_at(100.0, "bid", 0.92), 10.0)
+            self.assertEqual(loaded.oracle_at(100.2, "twap"), "67000.5")
+            oracle_only = Tape.load(files["oracle.jsonl.gz"])
+            self.assertEqual(len(oracle_only.records), 1)
+
     def test_example_cli_prints_the_scenario(self):
         import io
         from contextlib import redirect_stdout

@@ -6,8 +6,9 @@
 
 Remote copy: set POLY_ARCHIVE_REMOTE (for example ``gdrive:poly-logs``)
 or write that string on one line in deploy/archive_remote.path.
-rclone must already be configured for that remote. The local durable
-copy is kept either way.
+rclone must already be configured for that remote. This job does not
+delete the local copy. The recorder may later remove durable tape
+days under its disk cap; see deploy/RECORDER.md.
 """
 
 from __future__ import annotations

@@ -32,20 +32,28 @@ in the last 30s:
 
 The BTC reference is a second socket to the same RTDS feed mintbot
 parses (`buy.oracle_log.parse_rtds_message` / `parse_rtds_live` /
-`SUBSCRIBE_FRAME`). Each update is written into the open bag files.
-`OracleLogService` is not started, so `logs/oracle_twap.jsonl` is not
-touched.
+`SUBSCRIBE_FRAME`). Each update is written once, to
+`data/tape/YYYY-MM-DD/oracle.jsonl.gz` for that UTC day. It is not
+copied into every open bag. Replay loads that sibling next to the bag
+file. `OracleLogService` is not started, so `logs/oracle_twap.jsonl`
+is not touched.
 
 Files:
 
 ```
 data/tape/YYYY-MM-DD/<slug>.jsonl.gz
+data/tape/YYYY-MM-DD/oracle.jsonl.gz
 ```
 
-The date is the window start in UTC, so one bag stays one file. Gzip
-members are appended and fsync'd about once a second (or at 32KB). A
-crash loses at most that buffer. There is no in-memory history of the
-book.
+The date is the window start in UTC, so one bag stays one file. The
+oracle file uses the receive time, so one day has one reference file.
+Gzip members are appended and fsync'd about once a second (or at 32KB).
+A crash loses at most that buffer. There is no in-memory history of the
+book. When a bag's window is at least 30s past its end, or the file has
+had no rows for 60s, the writer flushes, closes the handle, and drops
+that bag's buffer. The next row for the same path appends a new gzip
+member. That keeps the open-file count on the current and next windows
+instead of one handle per bag for the life of the process.
 
 Reconnects back off from 1s to 30s. The process stays up on socket
 errors. `STOP_RECORDER` or SIGTERM exits 0. A second process exits 0
@@ -109,11 +117,14 @@ few days earlier would have seen the cliff nearer Oct 7.
 - `journalctl -u polymintbot` for that UTC day, if the user can read
   the journal
 - `data/tape/<day>/` moved into `logs/durable/<day>/tape/` after the
-  copy matches byte-for-byte
+  copy matches in size and sha256. A same-size file with different
+  bytes stays in the spool and the manifest records `hash_mismatch`
 
-It does not delete mintbot logs, `logs/archive/`, or the durable tree.
+It does not delete mintbot logs or `logs/archive/`.
 `MANIFEST.json` records `deleted_logs: []`. A journal permission error
-is written into the manifest and the job still finishes.
+is written into the manifest and the job still finishes. Durable tape
+bytes are the recorder's to drop under the disk cap below; this job
+does not.
 
 Point it at remote storage when rclone is already configured:
 
@@ -126,9 +137,11 @@ echo 'gdrive:poly-logs' > deploy/archive_remote.path
 # Environment=POLY_ARCHIVE_REMOTE=gdrive:poly-logs
 ```
 
-The local durable directory is still kept. Nothing in this repo deletes
-it. `s3:bucket/prefix` works the same way if that remote exists in
-rclone. There is no built-in Google Drive client here.
+The archive job still leaves the local durable directory in place.
+`s3:bucket/prefix` works the same way if that remote exists in
+rclone. There is no built-in Google Drive client here. The recorder's
+disk cap can later remove `logs/durable/<day>/tape/` (the copied
+books, not the log extracts).
 
 Journal export needs the group:
 
@@ -176,13 +189,22 @@ The unit cap is 25% of one core and 150MB. In that window the current
 bag wrote 1.0MB gzip (~21k `price_change` rows, 144 full books, 69
 trades, and the Chainlink feed from the first second). The next bag
 was 15KB. At the hot bag's rate (~50KB/s gzip) a full day would be
-several GB, so set `POLY_ARCHIVE_REMOTE` before leaving the recorder
-on. The daily job moves yesterday's spool into `logs/durable/` and
-does not keep a second copy. That directory is not pruned. The boot
-disk had about 14GB free on 2026-10-15. RAM is the tight resource
+several GB. The recorder checks at startup and about every minute. If
+free space on the tape filesystem is under 4GB, or `data/tape` plus
+`logs/durable/*/tape` is over 5GB, it deletes the oldest tape day
+(durable tape first, then that day's spool) and repeats. A day that
+still has an open handle is left alone. If the cap still fails, it
+stops appending until a later check is back under the line. Durable
+tape older than 7 days is removed on the same check even when usage
+is under 5GB. Mintbot logs, `logs/archive/`, and journal extracts are
+not part of that delete. A full disk must not come from this process:
+mintbot's state writes have to keep working. Set
+`POLY_ARCHIVE_REMOTE` if you want a copy that survives that cap. The
+boot disk had about 14GB free on 2026-10-15. RAM is the tight resource
 (~1GB, ~540MB available).
 
 Pathlog's tick prune (14 days / 400MB) is unchanged. Pathlog stays
-stopped, so it is not deleting anything now. `pathlog.log` and
-`scrapbid.log` now roll through `ArchiveRotatingFileHandler` instead of
-`backupCount`, which used to delete old files.
+stopped, so it is not deleting anything now. `pathlog.log` rotates at
+2MB with `backupCount=3`. `scrapbid.log` rotates at 1MB with
+`backupCount=2`. Mintbot's log still rolls into `logs/archive/` and
+that archive is not pruned.

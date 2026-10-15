@@ -50,9 +50,17 @@ def _live_row(source: str, price: Any, obs_ts: float, recv_ts: float) -> dict:
     }
 
 
-def stamp_bag(record: dict, slug: str, start_ts: float) -> dict:
+def oracle_tape_row(record: dict) -> dict:
+    """One shared file per UTC day: ``data/tape/YYYY-MM-DD/oracle.jsonl.gz``.
+
+    The row is not copied into each open bag. Replay reads this sibling.
+    """
     row = dict(record)
-    row["slug"] = slug
-    row["start_ts"] = float(start_ts)
+    try:
+        start = float(row.get("recv_ts") or 0.0)
+    except (TypeError, ValueError):
+        start = 0.0
+    row["slug"] = "oracle"
+    row["start_ts"] = start
     row["leg"] = ""
     return row

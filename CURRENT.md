@@ -14,6 +14,11 @@ knob rows below remain the last confirmed snapshot.
 record the current and next BTC 15m books plus the Chainlink reference
 the bot already parses. Leave the unit stopped until the operator asks.
 `polyarchive.timer` copies logs into `logs/durable/` and does not trade.
+The recorder closes a bag file once its window is 30s past the end (or
+after 60s idle), writes the Chainlink feed once per UTC day, and deletes
+the oldest tape days if free disk is under 4GB or tape bytes exceed 5GB.
+Durable tape older than 7 days is removed on that check. Mintbot logs
+are not deleted. It stops writing while the cap still fails.
 Install steps are in `deploy/RECORDER.md`. `logs/books.jsonl` was
 lockbot's tape (`book_log_enabled` true on the VM). It stopped at
 2026-10-05 14:12:43Z when lockbot was removed; mintbot never wrote it.
@@ -206,10 +211,14 @@ is deleted. Creating a PR is not a merge and not a restart.
 - **2026-10-15** — Standalone full-depth recorder (`recorder.py`,
   `polyrecorder.service`) and a daily archive (`polyarchive.timer`) that
   copies logs and does not delete them. Replay is `tools/replay.py`.
-  Journal retention in `deploy/journald-size.conf` no longer uses
-  `MaxRetentionSec`. Nothing here changes mint or sell defaults.
-  `logs/books.jsonl` stopped because lockbot, the only writer, was
-  deleted on 2026-10-05. Do not start `polyrecorder` unless asked.
+  The recorder caps its own tape (4GB free, 5GB of tape, durable tape
+  older than 7 days), writes the Chainlink feed once per day, and
+  closes bag files after the window. `pathlog.log` and `scrapbid.log`
+  keep their previous size rotation. Journal retention in
+  `deploy/journald-size.conf` no longer uses `MaxRetentionSec`. Nothing
+  here changes mint or sell defaults. `logs/books.jsonl` stopped
+  because lockbot, the only writer, was deleted on 2026-10-05. Do not
+  start `polyrecorder` unless asked.
 
 - **2026-10-09** — Optional late scrap price. `sell_late_price_window_s` defaults to 0. When it is positive and both late prices are set, a known ttm at or under the window uses `sell_threshold_late` / `sell_fak_px_late` for the arm, the persist check, and the FAK cap. Suggested live keys: base 0.03/0.03, late 0.04/0.04, window 180. `sell_late_window_s` (oracle veto) stays 0.
 

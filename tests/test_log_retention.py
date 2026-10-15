@@ -15,9 +15,12 @@ from recorder.archive import (
     bucket_name,
     in_day,
     journal_command,
+    move_tape_day,
     overlaps_day,
     resolve_remote,
 )
+from recorder.disk import enforce_tape_cap
+from recorder.tape import TapeWriter
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -150,6 +153,28 @@ class ArchiveRunTests(unittest.TestCase):
             self.assertEqual(calls[0][0], "rclone")
             self.assertIn("gdrive:poly-logs/2026-10-14", calls[0])
 
+    def test_same_size_different_bytes_keeps_the_source(self):
+        day = date(2026, 10, 14)
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            source = repo / "data" / "tape" / "2026-10-14" / "bag.jsonl.gz"
+            source.parent.mkdir(parents=True)
+            source.write_bytes(b"AAAAAAAA")
+            dest = repo / "logs" / "durable" / "2026-10-14"
+            landing = dest / "tape" / "bag.jsonl.gz"
+            landing.parent.mkdir(parents=True)
+            landing.write_bytes(b"BBBBBBBB")
+            notes = move_tape_day(repo, day, dest)
+            self.assertTrue(source.is_file())
+            self.assertEqual(source.read_bytes(), b"AAAAAAAA")
+            self.assertEqual(landing.read_bytes(), b"BBBBBBBB")
+            self.assertEqual(notes[0]["error"], "hash_mismatch")
+            landing.write_bytes(b"AAAAAAAA")
+            notes = move_tape_day(repo, day, dest)
+            self.assertFalse(source.exists())
+            self.assertTrue(notes[0]["already"])
+            self.assertEqual(landing.read_bytes(), b"AAAAAAAA")
+
     def test_journal_command_is_the_utc_day(self):
         cmd = journal_command("polymintbot", date(2026, 10, 14))
         self.assertIn("polymintbot", cmd)
@@ -183,12 +208,150 @@ class RotationConfigTests(unittest.TestCase):
         self.assertIn("Nice=19", unit)
         self.assertIn("tools/archive_logs.py", unit)
 
-    def test_pathlog_and_scrapbidder_archive_instead_of_deleting(self):
-        for name in ("pathlog.py", "scrapbidder.py"):
-            tree = ast.parse((ROOT / name).read_text(encoding="utf-8"))
+    def test_pathlog_and_scrapbidder_keep_a_small_rotation(self):
+        expected = {"pathlog.py": "backupCount=3", "scrapbidder.py": "backupCount=2"}
+        for name, count in expected.items():
+            source = (ROOT / name).read_text(encoding="utf-8")
+            tree = ast.parse(source)
             segment = ""
             for node in tree.body:
                 if isinstance(node, ast.FunctionDef) and node.name in {"log_setup", "_setup_log"}:
-                    segment = ast.get_source_segment((ROOT / name).read_text(encoding="utf-8"), node) or ""
-            self.assertIn("ArchiveRotatingFileHandler", segment, name)
-            self.assertNotIn("backupCount", segment, name)
+                    segment = ast.get_source_segment(source, node) or ""
+            self.assertIn("RotatingFileHandler", segment, name)
+            self.assertNotIn("ArchiveRotatingFileHandler", segment, name)
+            self.assertIn(count, segment, name)
+
+
+class TapeCapTests(unittest.TestCase):
+    def test_cap_deletes_oldest_durable_tape_before_that_days_spool(self):
+        today = date(2026, 10, 15)
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            spool = root / "data" / "tape"
+            durable = root / "logs" / "durable"
+            old_tape = durable / "2026-10-01" / "tape"
+            old_tape.mkdir(parents=True)
+            (old_tape / "a.jsonl.gz").write_bytes(b"x" * 100)
+            (durable / "2026-10-01" / "mintbot.jsonl.gz").write_bytes(b"keep-log")
+            (durable / "2026-10-01" / "journal-polymintbot.jsonl.gz").write_bytes(b"keep-journal")
+            spool_day = spool / "2026-10-02"
+            spool_day.mkdir(parents=True)
+            (spool_day / "b.jsonl.gz").write_bytes(b"y" * 100)
+            open_day = spool / "2026-10-15"
+            open_day.mkdir(parents=True)
+            (open_day / "c.jsonl.gz").write_bytes(b"z" * 50)
+            archive = root / "logs" / "archive"
+            archive.mkdir(parents=True)
+            (archive / "mintbot.log.1.gz").write_bytes(b"archive")
+            writer = TapeWriter(spool)
+            result = enforce_tape_cap(
+                spool,
+                durable,
+                free_min=0,
+                tape_max=160,
+                keep_days=30,
+                today=today,
+                protected_days={"2026-10-15"},
+                free_bytes_fn=lambda _path: 10**12,
+                writer=writer,
+            )
+            self.assertEqual([(row["day"], row["where"], row["why"]) for row in result["deleted"]], [("2026-10-01", "durable", "cap")])
+            self.assertFalse(old_tape.exists())
+            self.assertEqual((durable / "2026-10-01" / "mintbot.jsonl.gz").read_bytes(), b"keep-log")
+            self.assertEqual((durable / "2026-10-01" / "journal-polymintbot.jsonl.gz").read_bytes(), b"keep-journal")
+            self.assertEqual((spool_day / "b.jsonl.gz").read_bytes(), b"y" * 100)
+            self.assertEqual((open_day / "c.jsonl.gz").read_bytes(), b"z" * 50)
+            self.assertEqual((archive / "mintbot.log.1.gz").read_bytes(), b"archive")
+            self.assertTrue(writer.writes_enabled)
+            tighter = enforce_tape_cap(
+                spool,
+                durable,
+                free_min=0,
+                tape_max=40,
+                keep_days=30,
+                today=today,
+                protected_days={"2026-10-15"},
+                free_bytes_fn=lambda _path: 10**12,
+                writer=writer,
+            )
+            self.assertEqual([(row["day"], row["where"]) for row in tighter["deleted"]], [("2026-10-02", "spool")])
+            self.assertFalse(spool_day.exists())
+            self.assertTrue((open_day / "c.jsonl.gz").is_file())
+            self.assertFalse(writer.writes_enabled)
+
+    def test_open_day_survives_a_full_disk_and_writes_can_resume(self):
+        start = datetime(2026, 10, 15, 12, tzinfo=timezone.utc).timestamp()
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            spool = root / "data" / "tape"
+            durable = root / "logs" / "durable"
+            writer = TapeWriter(spool, flush_s=30.0)
+            writer.write(
+                {
+                    "event_type": "bag",
+                    "recv_ts": start,
+                    "slug": "btc-updown-15m-open",
+                    "start_ts": start,
+                    "leg": "",
+                }
+            )
+            writer.flush(force=True)
+            self.assertEqual(writer.open_days(), {"2026-10-15"})
+            stopped = enforce_tape_cap(
+                spool,
+                durable,
+                free_min=100,
+                tape_max=10**12,
+                keep_days=7,
+                today=date(2026, 10, 15),
+                free_bytes_fn=lambda _path: 0,
+                writer=writer,
+            )
+            self.assertEqual(stopped["deleted"], [])
+            self.assertFalse(writer.writes_enabled)
+            self.assertTrue(next(spool.rglob("*.jsonl.gz")).is_file())
+            resumed = enforce_tape_cap(
+                spool,
+                durable,
+                free_min=100,
+                tape_max=10**12,
+                keep_days=7,
+                today=date(2026, 10, 15),
+                free_bytes_fn=lambda _path: 10**12,
+                writer=writer,
+            )
+            self.assertTrue(resumed["writes_enabled"])
+            self.assertTrue(writer.writes_enabled)
+            writer.close()
+
+    def test_durable_tape_older_than_keep_days_is_removed(self):
+        today = date(2026, 10, 15)
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            spool = root / "data" / "tape"
+            durable = root / "logs" / "durable"
+            old = durable / "2026-10-01" / "tape"
+            old.mkdir(parents=True)
+            (old / "old.jsonl.gz").write_bytes(b"old")
+            (durable / "2026-10-01" / "mintbot.jsonl.gz").write_bytes(b"keep-log")
+            recent = durable / "2026-10-14" / "tape"
+            recent.mkdir(parents=True)
+            (recent / "recent.jsonl.gz").write_bytes(b"new")
+            stale_spool = spool / "2026-10-01"
+            stale_spool.mkdir(parents=True)
+            (stale_spool / "still.jsonl.gz").write_bytes(b"spool")
+            result = enforce_tape_cap(
+                spool,
+                durable,
+                free_min=0,
+                tape_max=10**12,
+                keep_days=7,
+                today=today,
+                free_bytes_fn=lambda _path: 10**12,
+            )
+            self.assertEqual(result["deleted"], [{"day": "2026-10-01", "where": "durable", "why": "retention"}])
+            self.assertFalse(old.exists())
+            self.assertEqual((durable / "2026-10-01" / "mintbot.jsonl.gz").read_bytes(), b"keep-log")
+            self.assertEqual((recent / "recent.jsonl.gz").read_bytes(), b"new")
+            self.assertEqual((stale_spool / "still.jsonl.gz").read_bytes(), b"spool")
+            self.assertTrue(result["writes_enabled"])

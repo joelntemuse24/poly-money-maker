@@ -59,7 +59,13 @@ class Tape:
 
     @classmethod
     def load(cls, path: Path | str) -> "Tape":
-        return cls(iter_records(path))
+        file_path = Path(path)
+        rows = list(iter_records(file_path))
+        if file_path.name != "oracle.jsonl.gz":
+            sibling = file_path.with_name("oracle.jsonl.gz")
+            if sibling.is_file():
+                rows.extend(iter_records(sibling))
+        return cls(rows)
 
     def book_at(self, ts: float, *, leg: str = "up", clock: str = "recv") -> dict[str, dict[float, float]]:
         moment = float(ts)
