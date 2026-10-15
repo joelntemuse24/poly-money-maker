@@ -20,8 +20,9 @@ of a bag that crosses midnight also reads the next day's oracle file.
 Free disk under 4GB deletes the oldest tape days and logs
 `recorder_disk_emergency`. Tape over 5GB is uploaded by
 `polyupload.timer` (nice 19, idle IO, `--bwlimit 2M`) and deleted only
-after the remote hash matches. Durable tape aged 7 days is removed
-locally. Mintbot logs are not deleted.
+after the remote hash matches. A day that is 7 days old is uploaded
+the same way, even under 5GB, and is kept when no remote is set.
+Mintbot logs are not deleted.
 Install steps are in `deploy/RECORDER.md`. `logs/books.jsonl` was
 lockbot's tape (`book_log_enabled` true on the VM). It stopped at
 2026-10-05 14:12:43Z when lockbot was removed; mintbot never wrote it.
@@ -218,6 +219,8 @@ is deleted. Creating a PR is not a merge and not a restart.
   Chainlink feed once per day. Tape over 5GB is uploaded by
   `polyupload.timer` and deleted only after a size and hash check.
   Free disk under 4GB still deletes oldest tape and logs that loudly.
+  Age does not delete in the recorder; a day 7 days old is uploaded
+  even under 5GB and kept when no remote is set.
   `pathlog.log` and `scrapbid.log`
   keep their previous size rotation. Journal retention in
   `deploy/journald-size.conf` no longer uses `MaxRetentionSec`. Nothing

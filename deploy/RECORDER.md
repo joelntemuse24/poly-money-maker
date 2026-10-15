@@ -201,8 +201,9 @@ Durable paths are always `<repo>/logs/durable`, including when
 delete by itself. `polyupload.timer` (every 15 minutes) runs
 `tools/upload_tape.py` outside the recorder: Nice=19, idle IO,
 `CPUQuota=10%`, `MemoryMax=100M`, and `rclone copy --bwlimit 2M`.
-It uploads the oldest day to `gdrive:poly-tape/<YYYY-MM-DD>/` (or
-`POLY_TAPE_REMOTE`), then `rclone check --one-way` (size and hash).
+It uploads the oldest day that is either over the cap or at least 7
+days old to `gdrive:poly-tape/<YYYY-MM-DD>/` (or `POLY_TAPE_REMOTE`),
+then `rclone check --one-way` (size and hash).
 If the remote has no hashes, it compares MD5 and `rclone ls` sizes.
 The local day is removed only after that match. A failed copy or check
 keeps the files and the next timer run retries the same oldest day.
@@ -216,9 +217,11 @@ still fit. It logs `recorder_disk_emergency` at level error, including
 that the upload was not verified. An open bag's day is left in place.
 If free space is still under 4GB, the recorder stops appending.
 
-**Age.** Durable tape is removed locally once the UTC day is 7 days
-old or older. A day younger than 7 days is kept. That age check is
-separate from the 5GB upload.
+**Age.** The recorder does not delete tape by age. A day whose age is
+no longer under 7 days is eligible for the same upload job, even when
+the total is under 5GB. It is deleted locally only after `rclone check`
+passes. With no remote configured, that day stays on disk. A day
+younger than 7 days is uploaded only when the 5GB cap requires it.
 
 The boot disk had about 14GB free on 2026-10-15. RAM is the tight
 resource (~1GB, ~540MB available).

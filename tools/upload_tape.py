@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Upload oldest tape days when data/tape plus durable tape is over 5GB.
+"""Upload oldest tape days over 5GB, and days that are at least 7 days old.
 
 A day is deleted locally only after rclone check (or size plus MD5)
 matches. A failed upload keeps the files. This process is the only

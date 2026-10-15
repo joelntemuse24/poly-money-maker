@@ -1,21 +1,20 @@
 """Keep the recorder from filling the disk mintbot writes state to.
 
-Checked at startup and about once a minute. Durable tape is removed
-once its age in days is no longer below ``DURABLE_TAPE_KEEP_DAYS``.
-Crossing ``TAPE_MAX_BYTES`` does not delete anything here: the upload
-job copies those days to Drive and deletes them only after the hash
-matches. Free space under ``DISK_FREE_MIN`` still deletes the oldest
-tape day (durable copy, then that day's spool) so mintbot can write.
-A day with an open writer handle is left in place. If free space is
-still under the floor, new tape rows are dropped. Mintbot logs,
-journals, and ``logs/archive`` are not touched.
+Checked at startup and about once a minute. Crossing ``TAPE_MAX_BYTES``
+does not delete anything here, and neither does age. The upload job
+copies those days to Drive and deletes them only after the hash
+matches. Free space under ``DISK_FREE_MIN`` is the only unverified
+delete: the oldest tape day (durable copy, then that day's spool) so
+mintbot can write. A day with an open writer handle is left in place.
+If free space is still under the floor, new tape rows are dropped.
+Mintbot logs, journals, and ``logs/archive`` are not touched.
 """
 
 from __future__ import annotations
 
 import os
 import shutil
-from datetime import date, datetime, timezone
+from datetime import date, datetime
 from pathlib import Path
 from typing import Callable, Optional
 
@@ -92,15 +91,11 @@ def enforce_tape_cap(
     *,
     free_min: int = DISK_FREE_MIN,
     tape_max: int = TAPE_MAX_BYTES,
-    keep_days: int = DURABLE_TAPE_KEEP_DAYS,
-    today: Optional[date] = None,
     protected_days: Optional[set[str]] = None,
     free_bytes_fn: Optional[Callable[[Path], int]] = None,
     writer: object = None,
 ) -> dict:
-    """Apply retention and the hard cap. Returns what was removed."""
-    day = today or datetime.now(timezone.utc).date()
-    limit = max(0, int(keep_days))
+    """Apply the low-disk floor. Age and the 5GB cap do not delete."""
     free_of = free_bytes_fn or _free_space
     deleted: list[dict] = []
 
@@ -110,23 +105,6 @@ def enforce_tape_cap(
         if opener is not None:
             days |= set(opener())
         return days
-
-    if durable_root.is_dir():
-        for child in sorted(durable_root.iterdir(), key=lambda item: item.name):
-            parsed = _parse_day(child.name)
-            if parsed is None or (day - parsed).days < limit:
-                continue
-            if child.name in protected():
-                continue
-            tape = child / "tape"
-            if not tape.is_dir():
-                continue
-            try:
-                _remove_tree(tape)
-            except OSError:
-                deleted.append({"day": child.name, "where": "durable", "why": "retention", "error": "unlink"})
-                continue
-            deleted.append({"day": child.name, "where": "durable", "why": "retention"})
 
     def measure() -> tuple[int, int]:
         return int(free_of(spool)), tape_bytes(spool, durable_root)

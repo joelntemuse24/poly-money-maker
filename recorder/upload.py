@@ -1,4 +1,4 @@
-"""Upload oldest tape days once the spool is over the size cap.
+"""Upload oldest tape days that are over the size cap or at least 7 days old.
 
 This is not called from the recorder write path. A separate low-priority
 process runs it. A day is removed locally only after ``rclone check``
@@ -15,7 +15,7 @@ from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Callable, Optional
 
-from recorder.disk import TAPE_MAX_BYTES, _remove_tree, tape_bytes, tape_days
+from recorder.disk import DURABLE_TAPE_KEEP_DAYS, TAPE_MAX_BYTES, _parse_day, _remove_tree, tape_bytes, tape_days
 
 
 BWLIMIT = "2M"
@@ -183,6 +183,14 @@ def _skip_reason(repo: Path, day: str, today: date, now: float, protect_recent_s
     return ""
 
 
+def _aged(name: str, today: date, keep_days: int) -> bool:
+    """True once the day's age is no longer under ``keep_days``."""
+    parsed = _parse_day(name)
+    if parsed is None:
+        return False
+    return (today - parsed).days >= max(0, int(keep_days))
+
+
 def _delete_day(repo: Path, day: str) -> None:
     _remove_tree(repo / "data" / "tape" / day)
     _remove_tree(repo / "logs" / "durable" / day / "tape")
@@ -213,41 +221,40 @@ def upload_over_cap(
     runner: Callable,
     *,
     tape_max: int = TAPE_MAX_BYTES,
+    keep_days: int = DURABLE_TAPE_KEEP_DAYS,
     today: Optional[date] = None,
     now: Optional[float] = None,
     protect_recent_s: float = PROTECT_RECENT_S,
     bwlimit: str = BWLIMIT,
 ) -> dict:
-    """Upload oldest days until tape bytes are at or under ``tape_max``.
+    """Upload oldest days that are over the cap or at least ``keep_days`` old.
 
-    Stops on the first copy or verify failure and leaves that day on disk.
+    A day under the cap is still uploaded once its age is no longer under
+    ``keep_days``. Nothing is deleted until ``rclone check`` passes. With
+    no remote the files stay. Stops on the first copy or verify failure.
     """
     day = today or datetime.now(timezone.utc).date()
     moment = time_now() if now is None else float(now)
     spool = repo / "data" / "tape"
     durable = repo / "logs" / "durable"
     deleted: list[dict] = []
-    used = tape_bytes(spool, durable)
-    if used <= int(tape_max):
-        return {"ok": True, "deleted": deleted, "tape_bytes": used}
-    if not str(remote or "").strip():
-        return {"ok": False, "error": "no_remote", "deleted": deleted, "tape_bytes": used}
-    while tape_bytes(spool, durable) > int(tape_max):
+    while True:
+        used = tape_bytes(spool, durable)
+        over = used > int(tape_max)
         chosen = ""
         for name in tape_days(spool, durable):
             if not _sources(repo, name):
                 continue
             if _skip_reason(repo, name, day, moment, protect_recent_s):
                 continue
+            if not over and not _aged(name, day, keep_days):
+                continue
             chosen = name
             break
         if not chosen:
-            return {
-                "ok": False,
-                "error": "no_deletable_day",
-                "deleted": deleted,
-                "tape_bytes": tape_bytes(spool, durable),
-            }
+            return {"ok": True, "deleted": deleted, "tape_bytes": used}
+        if not str(remote or "").strip():
+            return {"ok": False, "error": "no_remote", "deleted": deleted, "tape_bytes": used, "pending": chosen}
         uploaded = upload_day(repo, chosen, remote.strip(), runner, bwlimit=bwlimit)
         if not uploaded.get("ok"):
             return {
@@ -284,7 +291,6 @@ def upload_over_cap(
                 "tape_bytes": tape_bytes(spool, durable),
             }
         deleted.append({"day": chosen, "verified": uploaded.get("verified")})
-    return {"ok": True, "deleted": deleted, "tape_bytes": tape_bytes(spool, durable)}
 
 
 def time_now() -> float:

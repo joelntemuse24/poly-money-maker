@@ -25,9 +25,11 @@ the oldest tape days and logs `recorder_disk_emergency`. Going over 5GB
 does not delete: `polyupload.timer` uploads those days to the rclone
 remote (`gdrive:poly-tape/<day>/` via `POLY_TAPE_REMOTE`) and deletes
 them only after size and hash match. A failed upload keeps the files.
-Leave `polyupload` stopped until the operator asks. Durable tape aged
-7 days is removed locally (`age < 7` is kept). It does not delete
-mintbot logs. `polyarchive.timer` only copies logs.
+Leave `polyupload` stopped until the operator asks. The same job
+uploads a day once its age is no longer under 7 days, even under 5GB,
+and still deletes only after the check. No remote means those days
+stay. The only unverified delete is the under-4GB emergency path. It
+does not delete mintbot logs. `polyarchive.timer` only copies logs.
 
 Never infer service state from filenames or old documentation. Read
 current configuration and read-only service status before operational

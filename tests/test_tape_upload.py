@@ -54,6 +54,7 @@ class TapeUploadTests(unittest.TestCase):
                 "gdrive:poly-tape",
                 runner,
                 tape_max=10,
+                keep_days=30,
                 today=date(2026, 10, 15),
                 now=2_000_000,
                 protect_recent_s=120,
@@ -118,11 +119,13 @@ class TapeUploadTests(unittest.TestCase):
                 "gdrive:poly-tape",
                 runner,
                 tape_max=10,
+                keep_days=30,
                 today=date(2026, 10, 15),
                 now=2_000_000,
             )
             self.assertTrue(result["ok"])
             self.assertFalse(old.exists())
+            self.assertTrue((root / "data" / "tape" / "2026-10-02" / "stay.jsonl.gz").is_file())
 
         def mismatch(cmd: list[str]) -> Result:
             if cmd[1] == "check":
@@ -158,9 +161,10 @@ class TapeUploadTests(unittest.TestCase):
             result = upload_over_cap(root, "", runner, tape_max=10, today=date(2026, 10, 15), now=2_000_000)
             self.assertEqual(result["error"], "no_remote")
             self.assertTrue((old / "bag.jsonl.gz").is_file())
-            under = upload_over_cap(root, "", runner, tape_max=10**9, today=date(2026, 10, 15), now=2_000_000)
-            self.assertTrue(under["ok"])
-            self.assertEqual(under["deleted"], [])
+            aged = upload_over_cap(root, "", runner, tape_max=10**9, today=date(2026, 10, 15), now=2_000_000)
+            self.assertEqual(aged["error"], "no_remote")
+            self.assertEqual(aged["pending"], "2026-10-01")
+            self.assertEqual((old / "bag.jsonl.gz").read_bytes(), b"old-bytes")
             self.assertEqual(resolve_tape_remote(root, {}), "")
             (root / "deploy").mkdir()
             (root / "deploy" / "tape_remote.path").write_text("# c\ngdrive:poly-tape\n", encoding="utf-8")
@@ -178,5 +182,64 @@ class TapeUploadTests(unittest.TestCase):
             live.write_bytes(b"x" * 50)
             _age(live)
             result = upload_over_cap(root, "gdrive:poly-tape", boom, tape_max=10, today=date(2026, 10, 15), now=2_000_000)
-            self.assertEqual(result["error"], "no_deletable_day")
+            self.assertTrue(result["ok"])
+            self.assertEqual(result["deleted"], [])
             self.assertEqual(live.read_bytes(), b"x" * 50)
+
+    def test_aged_day_uploads_under_the_cap_and_a_younger_day_stays(self):
+        calls: list[str] = []
+
+        def runner(cmd: list[str]) -> Result:
+            calls.append(cmd[1])
+            return Result(0)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            aged = root / "logs" / "durable" / "2026-10-08" / "tape"
+            aged.mkdir(parents=True)
+            (aged / "edge.jsonl.gz").write_bytes(b"edge")
+            _age(aged / "edge.jsonl.gz")
+            (root / "logs" / "durable" / "2026-10-08" / "mintbot.jsonl.gz").write_bytes(b"keep-log")
+            young = root / "logs" / "durable" / "2026-10-09" / "tape"
+            young.mkdir(parents=True)
+            (young / "kept.jsonl.gz").write_bytes(b"kept")
+            _age(young / "kept.jsonl.gz")
+            result = upload_over_cap(
+                root,
+                "gdrive:poly-tape",
+                runner,
+                tape_max=10**9,
+                keep_days=7,
+                today=date(2026, 10, 15),
+                now=2_000_000,
+            )
+            self.assertTrue(result["ok"])
+            self.assertEqual([row["day"] for row in result["deleted"]], ["2026-10-08"])
+            self.assertFalse(aged.exists())
+            self.assertEqual((young / "kept.jsonl.gz").read_bytes(), b"kept")
+            self.assertEqual((root / "logs" / "durable" / "2026-10-08" / "mintbot.jsonl.gz").read_bytes(), b"keep-log")
+            self.assertEqual(calls, ["copy", "check"])
+
+        def fail_check(cmd: list[str]) -> Result:
+            if cmd[1] == "check":
+                return Result(1, b"", b"ERROR : hashes differ")
+            return Result(0)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            aged = root / "logs" / "durable" / "2026-10-01" / "tape"
+            aged.mkdir(parents=True)
+            (aged / "old.jsonl.gz").write_bytes(b"old")
+            _age(aged / "old.jsonl.gz")
+            result = upload_over_cap(
+                root,
+                "gdrive:poly-tape",
+                fail_check,
+                tape_max=10**9,
+                keep_days=7,
+                today=date(2026, 10, 15),
+                now=2_000_000,
+            )
+            self.assertFalse(result["ok"])
+            self.assertEqual(result["failed"], "2026-10-01")
+            self.assertEqual((aged / "old.jsonl.gz").read_bytes(), b"old")
