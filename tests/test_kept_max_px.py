@@ -4,11 +4,12 @@ from __future__ import annotations
 
 import json
 import unittest
+from unittest.mock import Mock
 
 from buy.mint_redeem import RedeemDesk, RedeemIO, RedeemSettings
 from buy.mint_sell import kept_dump_blocked, kept_dump_max_px, kept_loser_open, reclaim_arm_block
 from test_mint_cpu import _dump_cfg, _dump_harness, _fill_fak, _held_after_scrap
-from test_mint_dump_kept import _ready_bag, _tick
+from test_mint_dump_kept import _priced, _ready_bag, _tick
 from test_mint_only_ops import MINT_EXAMPLE, _assign
 
 
@@ -87,7 +88,7 @@ class KeptMaxLoopTests(unittest.TestCase):
                 reclaim_arm_block(intent, also_kept=True),
                 "kept_open",
             )
-            # One check. A later tick does not post the kept leg.
+            # A later blocked tick keeps the original hold result and log.
             before = len(fak_calls)
             clock["now"] += 5.0
             _tick(ns, _dump_cfg(sell_dump_also_kept=True, sell_dump_kept_max_px=0.40), intent)
@@ -96,6 +97,86 @@ class KeptMaxLoopTests(unittest.TestCase):
                 len([e for e in events if e["event"] == "sell_dump_kept"]),
                 1,
             )
+
+    def test_later_ticks_recheck_and_sell_under_cap_despite_cooldown(self):
+        for parallel in (False, True):
+            with self.subTest(parallel=parallel):
+                ns, events, calls, clock, intent = self._fire(
+                    0.85, sell_dump_parallel_kept=parallel,
+                )
+                cfg = _dump_cfg(sell_dump_also_kept=True, sell_dump_kept_max_px=0.40,
+                                sell_cooldown_s=60.0, sell_dump_parallel_kept=parallel)
+                for bid in (0.70, 0.40):
+                    _set_book(ns, 0.51, bid)
+                    ns["_fetch_book"] = Mock(side_effect=AssertionError("extra fetch"))
+                    clock["now"] += 0.1
+                    _tick(ns, cfg, intent)
+                    ns["_fetch_book"].assert_not_called()
+                    self.assertEqual(len(calls), 1)
+                    self.assertEqual(intent["sell_dump_kept_outcome"], "held_above_max")
+                self.assertEqual(len([e for e in events if e["event"] == "sell_dump_kept"]), 1)
+                _set_book(ns, 0.51, 0.39)
+                ns["_fetch_book"] = Mock(return_value=(
+                    0.38, 50.0, [{"price": "0.38", "size": "50"}],
+                ))
+                ns["_fak_sell"] = _priced(
+                    calls, lambda _token, size, px: min(size, 5.0) if px > 0.01 else size,
+                )
+                clock["now"] += 0.1
+                _tick(ns, cfg, intent)
+                self.assertEqual(
+                    [(c["size"], c["price"]) for c in calls if c["token_id"] == "dn-tok"],
+                    [(25.0, 0.39), (20.0, 0.38), (15.0, 0.38), (10.0, 0.01)],
+                )
+                self.assertEqual(ns["_fetch_book"].call_count, 2)
+                self.assertTrue(intent["sell_dump_kept_sold"])
+                self.assertEqual(intent["sell_dump_kept_filled"], 25.0)
+                self.assertAlmostEqual(intent["sell_dump_kept_fill_px"], 0.234)
+                kept = [e for e in events if e["event"] == "sell_dump_kept"]
+                self.assertEqual([e["outcome"] for e in kept], ["held_above_max", "filled"])
+                self.assertEqual(kept[-1]["swept"], 10.0)
+                clock["now"] += 61.0
+                ns["_fetch_book"] = Mock(side_effect=AssertionError("sold refetch"))
+                _tick(ns, cfg, intent)
+                self.assertEqual(len(calls), 5)
+                ns["_fetch_book"].assert_not_called()
+                self.assertEqual(len([e for e in events if e["event"] == "sell_dump_kept"]), 2)
+
+    def test_never_retried_after_window_end(self):
+        ns, events, calls, clock, intent = self._fire(0.85)
+        _set_book(ns, 0.51, 0.39)
+        clock["now"] = intent["end_ts"]
+        ns["_fetch_books"] = Mock(side_effect=AssertionError("closed window fetch"))
+        _tick(ns, _dump_cfg(sell_dump_also_kept=True, sell_dump_kept_max_px=0.40), intent)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(intent["sell_dump_kept_outcome"], "held_above_max")
+        self.assertTrue(kept_loser_open(intent))
+        ns["_fetch_books"].assert_not_called()
+
+    def test_retry_requires_dump_open_shares_and_no_inflight_exit(self):
+        for extra in (
+            {"sold_dump": False}, {"sell_dump_kept_sold": True},
+            {"sell_scrap_keep": 0.0}, {"sell_exit_inflight": True},
+            {"sell_winner_leg": "dn", "sold_winner": True},
+        ):
+            with self.subTest(extra=extra):
+                ns, events, calls, clock, intent = self._fire(0.85)
+                intent.update(extra)
+                _set_book(ns, 0.70, 0.39)
+                ns["_fetch_book"] = Mock(side_effect=AssertionError("ineligible fetch"))
+                clock["now"] += 0.1
+                _tick(ns, _dump_cfg(sell_dump_also_kept=True, sell_dump_kept_max_px=0.40), intent)
+                self.assertEqual(len(calls), 1)
+                ns["_fetch_book"].assert_not_called()
+
+    def test_retry_checks_inventory_before_posting(self):
+        ns, events, calls, clock, intent = self._fire(0.85)
+        _set_book(ns, 0.51, 0.39)
+        ns["_sell_inventory"] = lambda *_a, **_k: (0.0, "already_flat")
+        clock["now"] += 0.1
+        _tick(ns, _dump_cfg(sell_dump_also_kept=True, sell_dump_kept_max_px=0.40), intent)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(intent["sell_dump_kept_outcome"], "nothing_kept")
 
     def test_null_cap_sells_as_before(self):
         ns, events, fak_calls, clock = _dump_harness(_fill_fak)

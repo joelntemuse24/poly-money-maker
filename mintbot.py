@@ -6456,6 +6456,37 @@ def _manage_sells_locked(cfg: dict, state: dict, chain: ChainReader) -> None:
         # are not re-checked against this cutoff.
         dump_max_ttm_s = float(cfg.get("sell_dump_max_ttm_s") or 0.0)
         sold_leg = intent.get("sold_leg")
+        if (
+            cfg.get("sell_dump_also_kept", False)
+            and intent.get("sold_dump")
+            and intent.get("sell_dump_kept_outcome") == "held_above_max"
+            and not intent.get("sell_exit_inflight")
+            and sold_leg in tokens
+            and kept_loser_open(intent)
+            and not kept_dump_blocked(bids.get(sold_leg), cfg.get("sell_dump_kept_max_px"))
+        ):
+            # A cap hold stays eligible each tick, independently of sell cooldown.
+            _sell_kept_after_dump(
+                cfg=cfg,
+                intent=intent,
+                cid=cid,
+                kept=sold_leg,
+                tokens=tokens,
+                bids=bids,
+                books=books,
+                ttm_s=ttm_s,
+                min_bid_size=min_bid_size,
+                retries=dump_retries,
+                ladder_step=dump_ladder_step,
+                ladder_rungs=dump_ladder_rungs,
+                dry_run=dry_run,
+                tol=tol,
+                chain=chain,
+                ctf=ctf,
+                funder_cs=funder_cs,
+                end_ts=end_ts,
+            )
+            dirty = True
         held = None
         if sold_leg == "up":
             held = "dn"
