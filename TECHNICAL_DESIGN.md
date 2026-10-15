@@ -1070,6 +1070,8 @@ The late pair also needs `sell_fak_px_late` and `sell_late_price_window_s` (180)
 | Key | Code | Meaning |
 |---|---:|---|
 | `oracle_log_enabled` | true | Chainlink 60s TWAP tape, plus the oracle-mark fields on scrap, dump, reclaim, and bag end. Example true. False logs `oracle_reason=disabled` and does not start the thread |
+| `price_tape_enabled` | true | One `logs/price_tape.jsonl` line per sell tick in the last `price_tape_window_s` of an open bag. Example true. False writes nothing |
+| `price_tape_window_s` | 360 | Tape only while `0 < ttm <=` this. 0 is off. Uses the tick's books and the in-memory oracle. Rolls at 50MB |
 | `sell_late_window_s` | 0 | Late-window scrap veto. 0 skips it. Not the late price window |
 | `sell_oracle_edge_floor_usd` | 0 | Old veto floor. 0 does not restore the $25 rule |
 | `sell_oracle_edge_per_ttm` | 0 | Old veto dollars per second of ttm |
@@ -1557,6 +1559,8 @@ redeem_enabled (opt-in), separate thread:
 Adjacent mint may already have been submitted **before** expiry (lookahead). That is intentional and is the main fix for the “skipped 15m” bug.
 
 # Changelog
+
+- **2026-10-15** — `price_tape_enabled` (default true) appends one JSON line per sell tick to `logs/price_tape.jsonl` while a bag's ttm is inside `price_tape_window_s` (default 360) and the window is still open. The line is the books and sizes already fetched on that tick, plus the in-memory oracle mark. The sell thread only queues it. The file rolls at 50MB. A writer error is swallowed. No order changes.
 
 - **2026-10-14** — `shadow_early_scrap_enabled` (default false) paper-logs an early 20¢ scrap beside the live 3¢/4¢ path. It latches `shadow_scrap_mode` with the same open-snapshot rule, persists on the live loser clocks, and logs `shadow_scrap_fill` or `shadow_scrap_floor_skip`. Window end writes `shadow_bag_result` to the journal and to `logs/shadow_early_scrap.jsonl`, including the live scrap, the live dump, `est_scrap_delta_usd`, and `est_dump_share_delta`. Estimated fields are prefixed `est_`. No order is sent and the mint intent is not written.
 

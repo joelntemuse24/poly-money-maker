@@ -325,6 +325,10 @@ DEFAULTS = {
     # Chainlink 60s TWAP tape. The scrap veto is off unless
     # sell_late_window_s is positive.
     "oracle_log_enabled": True,
+    # Last 360s of each open bag: one JSON line per sell tick in
+    # logs/price_tape.jsonl. Off the journal. Does not place an order.
+    "price_tape_enabled": True,
+    "price_tape_window_s": 360.0,
     "position_tolerance": 0.01,
     "require_accepting_orders": True,
     "sell_enabled": False,
@@ -5544,6 +5548,38 @@ def _shadow_bind():
     return shadow
 
 
+def _price_tape_tick(cfg: dict, **fields: Any) -> None:
+    """Queue one price-tape line from this tick's books. Never raises.
+
+    The oracle mark is the in-memory cache. There is no book refetch and
+    no sleep. A full queue or a writer error drops the line.
+    """
+    try:
+        from buy import price_tape
+
+        if not price_tape.tape_due(
+            fields.get("ttm_s"),
+            price_tape.window_s(cfg),
+            enabled_flag=price_tape.enabled(cfg),
+        ):
+            return
+        path = getattr(_price_tape_tick, "log_path", None)
+        if path is None:
+            path = REPO / "logs" / "price_tape.jsonl"
+            _price_tape_tick.log_path = path
+        price_tape.set_log_path(path)
+        try:
+            now_f = float(fields.get("ts"))
+        except (TypeError, ValueError):
+            now_f = time.time()
+        fields["oracle"] = _oracle_mark(
+            str(fields.get("condition_id") or ""), cfg, now_f,
+        )
+        price_tape.note(**fields)
+    except Exception:
+        return
+
+
 def _shadow_early_tick(cfg: dict, **fields: Any) -> None:
     """Paper early-scrap tick. Failures are swallowed and no order is sent."""
     try:
@@ -5711,6 +5747,21 @@ def _manage_sells_locked(cfg: dict, state: dict, chain: ChainReader) -> None:
         intent["last_up_bid_size"] = up_sz
         intent["last_dn_bid_size"] = dn_sz
         intent["updated_at"] = now
+        _price_tape_tick(
+            cfg,
+            ts=now,
+            slug=intent.get("slug"),
+            condition_id=cid,
+            ttm_s=ttm_s,
+            up_bid=up_bid,
+            up_ask=up_ask,
+            dn_bid=dn_bid,
+            dn_ask=dn_ask,
+            up_bid_sz=up_sz,
+            up_ask_sz=_up_ask_sz,
+            dn_bid_sz=dn_sz,
+            dn_ask_sz=_dn_ask_sz,
+        )
 
         last = float(intent.get("last_sell_attempt_at") or 0)
         cooling = bool(last and now - last < cooldown)
