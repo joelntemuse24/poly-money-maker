@@ -1,9 +1,12 @@
 """One CLOB market websocket for the sell loop's current bag and the next.
 
 Same channel the recorder uses
-(``wss://ws-subscriptions-clob.polymarket.com/ws/market``). The cache keeps
-only the best bid and ask for at most four tokens. Old bags are dropped.
-A stale or unhealthy quote is not a book: the sell loop falls back to REST.
+(``wss://ws-subscriptions-clob.polymarket.com/ws/market``). Each token
+keeps a bid map and an ask map (at most 200 levels a side). A ``book``
+event replaces both maps. A ``price_change`` sets or deletes one level.
+The best bid and ask are computed from those maps. The event's
+``best_bid`` is ignored. Old bags are dropped. A stale, crossed, or
+unhealthy quote is not a book: the sell loop falls back to REST.
 """
 
 from __future__ import annotations
@@ -12,21 +15,22 @@ import json
 import socket
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Callable, Optional
 
 from buy.book import (
     best_ask_with_min_size,
     best_bid_with_min_size,
-    best_from_levels,
     finite_float,
 )
 
 
 CLOB_MARKET_URL = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
 MAX_TOKENS = 4
-PING_S = 10.0
-SILENCE_S = 5.0
+MAX_LEVELS = 200
+PING_S = 3.0
+# Silence must sit above the ping interval so one missed PONG is not a drop.
+SILENCE_S = 10.0
 REST_DIFF_MAX_AGE_S = 30.0
 _OPEN_STATUSES = frozenset(
     {"confirmed", "confirmed_waiting_inventory", "mined", "executed"}
@@ -108,6 +112,67 @@ def book_diff_fields(ws_bid: Any, rest_bid: Any) -> dict:
     return {"ws_bid": ws, "rest_bid": rest, "bid_diff": diff}
 
 
+def _price_key(value: Any) -> Optional[float]:
+    """Six-decimal price so ``0.1`` and ``0.10`` are the same level."""
+    parsed = finite_float(value)
+    if parsed is None or not 0.0 < parsed < 1.0:
+        return None
+    return round(parsed, 6)
+
+
+def _size_value(value: Any) -> Optional[float]:
+    parsed = finite_float(value)
+    if parsed is None or parsed < 0:
+        return None
+    return parsed
+
+
+def _ladder_name(side: Any) -> Optional[str]:
+    text = str(side or "").strip().upper()
+    if text in {"BUY", "BID"}:
+        return "bid"
+    if text in {"SELL", "ASK"}:
+        return "ask"
+    return None
+
+
+def _cap_levels(levels: dict[float, float], side: str) -> None:
+    """Drop the worst prices once a side exceeds ``MAX_LEVELS``."""
+    extra = len(levels) - MAX_LEVELS
+    if extra <= 0:
+        return
+    ordered = sorted(levels)
+    # Lowest bids and highest asks are the ones a sell does not need.
+    drop = ordered[:extra] if side == "bid" else ordered[-extra:]
+    for key in drop:
+        levels.pop(key, None)
+
+
+def _pairs_to_map(raw: Any, side: str) -> dict[float, float]:
+    levels: dict[float, float] = {}
+    if not isinstance(raw, list):
+        return levels
+    for level in raw:
+        if isinstance(level, dict):
+            px = _price_key(level.get("price"))
+            sz = _size_value(level.get("size"))
+        elif isinstance(level, (list, tuple)) and len(level) >= 2:
+            px = _price_key(level[0])
+            sz = _size_value(level[1])
+        else:
+            continue
+        if px is None or sz is None or sz <= 0:
+            continue
+        levels[px] = sz
+    _cap_levels(levels, side)
+    return levels
+
+
+def _level_rows(levels: dict[float, float], side: str) -> list[dict]:
+    ordered = sorted(levels.items(), reverse=(side == "bid"))
+    return [{"price": px, "size": sz} for px, sz in ordered]
+
+
 @dataclass
 class Top:
     bid: Optional[float] = None
@@ -117,29 +182,43 @@ class Top:
     updated: float = 0.0
     size_known: bool = False
     age: Optional[float] = None
+    bids: list = field(default_factory=list)
+    asks: list = field(default_factory=list)
+
+
+@dataclass
+class _Book:
+    bids: dict[float, float] = field(default_factory=dict)
+    asks: dict[float, float] = field(default_factory=dict)
+    bid_at: float = 0.0
+    ask_at: float = 0.0
+    bid_ok: bool = False
+    ask_ok: bool = False
 
 
 def ws_book_row(top: Top) -> tuple:
-    """One sell-loop book row shaped like a REST ``_parse_book_payload`` result."""
+    """Sell-loop book row shaped like a REST ``_parse_book_payload`` result.
+
+    ``bids`` / ``asks`` are the full maps (bids high to low, asks low to
+    high) so ladder depth matches a REST book. The prices are the sized tops.
+    """
     bid = top.bid
     bid_sz = float(top.bid_sz or 0.0)
     ask = top.ask
     ask_sz = float(top.ask_sz or 0.0)
-    bids = [{"price": bid, "size": bid_sz}] if bid is not None and bid_sz > 0 else []
-    asks = [{"price": ask, "size": ask_sz}] if ask is not None and ask_sz > 0 else []
-    return (bid, bid_sz, bids, ask, ask_sz, asks, top.age)
-
-
-def _price(value: Any) -> Optional[float]:
-    parsed = finite_float(value)
-    if parsed is None or not 0.0 < parsed < 1.0:
-        return None
-    return parsed
+    return (bid, bid_sz, list(top.bids), ask, ask_sz, list(top.asks), top.age)
 
 
 def _is_timeout(exc: BaseException) -> bool:
     name = type(exc).__name__
     return isinstance(exc, (TimeoutError, socket.timeout)) or "Timeout" in name
+
+
+def _close_socket(ws: Any) -> None:
+    try:
+        ws.close()
+    except Exception:
+        return
 
 
 class ClobBookFeed:
@@ -160,12 +239,15 @@ class ClobBookFeed:
         self._on_error = on_error
         self._url = url
         self._lock = threading.Lock()
-        self._tops: dict[str, Top] = {}
+        self._books: dict[str, _Book] = {}
         self._rest: dict[str, tuple[Optional[float], float]] = {}
         self._wanted: list[str] = []
         self._min_size = 1.0
         self._stale_s = 1.5
         self._healthy = False
+        # 0 means no socket timestamp yet. Tests that only set ``_healthy``
+        # stay usable; a live socket must have heard something inside SILENCE_S.
+        self._last_rx = 0.0
         self._stop = threading.Event()
         self._wake = threading.Event()
         self._thread: Optional[threading.Thread] = None
@@ -202,16 +284,22 @@ class ClobBookFeed:
                 return
             self._wanted = wanted
             keep = set(wanted)
-            for key in list(self._tops):
+            for key in list(self._books):
                 if key not in keep:
-                    self._tops.pop(key, None)
+                    self._books.pop(key, None)
             for key in list(self._rest):
                 if key not in keep:
                     self._rest.pop(key, None)
         self._wake.set()
 
     def start(self) -> None:
-        if self._started:
+        """Open the socket. A previous ``run`` that is still exiting is left alone.
+
+        Clearing ``_stop`` while that thread is alive would leave two loops
+        on one socket. The next call starts again once it has joined.
+        """
+        thread = self._thread
+        if thread is not None and thread.is_alive():
             return
         self._started = True
         self._stop.clear()
@@ -221,53 +309,103 @@ class ClobBookFeed:
         self._thread.start()
 
     def stop(self) -> None:
+        """Mark the feed stopped and close the socket off the caller thread.
+
+        ``_started`` goes false so a later ``start`` can run when the flag
+        is turned back on. ``close`` can block, so it runs on a daemon
+        thread and cannot stall the sell loop.
+        """
         self._stop.set()
         self._wake.set()
         self._healthy = False
+        self._started = False
         ws = self._ws
         self._ws = None
-        if ws is not None:
-            try:
-                ws.close()
-            except Exception:
-                return
+        if ws is None:
+            return
+        threading.Thread(
+            target=_close_socket, args=(ws,), name="clob-book-ws-close", daemon=True,
+        ).start()
 
     def healthy(self) -> bool:
-        return bool(self._healthy) and not self._stop.is_set()
+        if self._stop.is_set() or not self._healthy:
+            return False
+        last = float(self._last_rx or 0.0)
+        if last <= 0:
+            return True
+        age = self._clock() - last
+        return age >= 0 and age <= SILENCE_S
 
-    def usable(self, token_id: str) -> Optional[Top]:
-        """Sized top when the socket is up and the update is inside the stale window."""
-        if not self.healthy():
-            return None
-        now_m = self._clock()
+    def _snapshot(self, token_id: str) -> tuple[Optional[_Book], float, float]:
         with self._lock:
-            top = self._tops.get(str(token_id))
-            stale = self._stale_s
-            need = self._min_size
-        if top is None or not top.size_known or top.bid is None:
-            return None
-        age = now_m - float(top.updated)
-        if age < 0 or age > stale:
-            return None
-        if float(top.bid_sz) + 1e-12 < float(need):
-            return None
+            book = self._books.get(str(token_id))
+            return book, self._stale_s, self._min_size
+
+    def _view(self, book: _Book, now_m: float, need: float) -> Top:
+        bids = _level_rows(book.bids, "bid")
+        asks = _level_rows(book.asks, "ask")
+        bid, bid_sz = best_bid_with_min_size(bids, need)
+        ask, ask_sz = best_ask_with_min_size(asks, need)
+        age = None
+        if book.bid_ok:
+            age = now_m - float(book.bid_at)
         return Top(
-            bid=top.bid,
-            bid_sz=top.bid_sz,
-            ask=top.ask,
-            ask_sz=top.ask_sz,
-            updated=top.updated,
-            size_known=True,
+            bid=bid,
+            bid_sz=float(bid_sz or 0.0),
+            ask=ask,
+            ask_sz=float(ask_sz or 0.0),
+            updated=float(book.bid_at or 0.0),
+            size_known=bid is not None,
             age=age,
+            bids=bids,
+            asks=asks,
         )
 
-    def cached_bid(self, token_id: str) -> Optional[float]:
-        """Last websocket bid, including a stale one, for the trigger diff."""
-        with self._lock:
-            top = self._tops.get(str(token_id))
-        if top is None:
+    def usable(self, token_id: str) -> Optional[Top]:
+        """Sized top when the bid side is fresh and the book is not crossed.
+
+        A bid is fresh only after a ``book`` event or a bid-side
+        ``price_change``. An ask-side change does not refresh it. A ping
+        does not either: a ping proves the socket is up, not that the
+        level is still there. When ask levels exist, that side must be
+        confirmed and inside the same window. ``bid >= ask`` is unusable.
+        """
+        if not self.healthy():
             return None
-        return top.bid
+        book, stale, need = self._snapshot(token_id)
+        if book is None or not book.bid_ok:
+            return None
+        now_m = self._clock()
+        bid_age = now_m - float(book.bid_at)
+        if bid_age < 0 or bid_age > stale:
+            return None
+        if book.asks:
+            if not book.ask_ok:
+                return None
+            ask_age = now_m - float(book.ask_at)
+            if ask_age < 0 or ask_age > stale:
+                return None
+        top = self._view(book, now_m, need)
+        if top.bid is None:
+            return None
+        any_bid, _any_bid_sz = best_bid_with_min_size(top.bids, 0.0)
+        any_ask, _any_ask_sz = best_ask_with_min_size(top.asks, 0.0)
+        if (
+            any_bid is not None
+            and any_ask is not None
+            and float(any_bid) >= float(any_ask) - 1e-12
+        ):
+            return None
+        return top
+
+    def cached_bid(self, token_id: str) -> Optional[float]:
+        """Last websocket bid, including a stale or crossed one, for the diff."""
+        book, _stale, _need = self._snapshot(token_id)
+        if book is None:
+            return None
+        rows = _level_rows(book.bids, "bid")
+        bid, _sz = best_bid_with_min_size(rows, 0.0)
+        return bid
 
     def rest_bid(self, token_id: str) -> Optional[float]:
         now_m = self._clock()
@@ -287,7 +425,8 @@ class ClobBookFeed:
         with self._lock:
             if token not in self._wanted and self._wanted:
                 return
-            self._rest[token] = (_price(bid) if bid is not None else None, self._clock())
+            px = _price_key(bid) if bid is not None else None
+            self._rest[token] = (px, self._clock())
             if len(self._rest) > MAX_TOKENS:
                 for key in list(self._rest):
                     if key not in set(self._wanted):
@@ -300,10 +439,9 @@ class ClobBookFeed:
         now_m = self._clock()
         if kind == "book":
             self._apply_book(event, now_m)
-        elif kind == "best_bid_ask":
-            self._apply_bba(event, now_m)
         elif kind == "price_change":
             self._apply_change(event, now_m)
+        # best_bid_ask is not applied. The maps are the book.
 
     def apply_raw(self, raw: Any) -> None:
         if isinstance(raw, (bytes, bytearray)):
@@ -357,12 +495,12 @@ class ClobBookFeed:
                 sleeper(delay)
             finally:
                 self._healthy = False
+                held = self._ws
                 self._ws = None
+                if held is not None and held is not ws:
+                    _close_socket(held)
                 if ws is not None:
-                    try:
-                        ws.close()
-                    except Exception:
-                        pass
+                    _close_socket(ws)
             if gate.is_set():
                 return
             if attempt == 0:
@@ -370,6 +508,7 @@ class ClobBookFeed:
 
     def _consume(self, ws: Any, ids: list[str], gate: threading.Event) -> str:
         last_rx = self._clock()
+        self._last_rx = last_rx
         last_ping = last_rx
         while not gate.is_set():
             with self._lock:
@@ -377,6 +516,9 @@ class ClobBookFeed:
                     return "resubscribe"
             now_m = self._clock()
             if now_m - last_ping >= PING_S:
+                # A ping proves the socket is up. It does not confirm a
+                # bid or an ask, so side timestamps stay where the last
+                # book or price_change left them.
                 ws.send("PING")
                 last_ping = now_m
             if now_m - last_rx >= SILENCE_S:
@@ -390,9 +532,12 @@ class ClobBookFeed:
             if raw is None:
                 return "closed"
             last_rx = self._clock()
+            self._last_rx = last_rx
             text = raw.decode("utf-8", "replace") if isinstance(raw, (bytes, bytearray)) else str(raw)
             if text.strip().upper() == "PING":
                 ws.send("PONG")
+                continue
+            if text.strip().upper() == "PONG":
                 continue
             self.apply_raw(raw)
         return "stop"
@@ -405,74 +550,64 @@ class ClobBookFeed:
         except Exception:
             return
 
-    def _wanted_has(self, asset: str) -> bool:
-        with self._lock:
-            return bool(asset) and asset in self._wanted
-
-    def _put(self, asset: str, top: Top) -> None:
+    def _book_for(self, asset: str) -> Optional[_Book]:
         with self._lock:
             if asset not in self._wanted:
-                return
-            self._tops[asset] = top
-            if len(self._tops) > MAX_TOKENS:
-                for key in list(self._tops):
-                    if key not in self._wanted:
-                        self._tops.pop(key, None)
-
-    def _prev(self, asset: str) -> Optional[Top]:
-        with self._lock:
-            return self._tops.get(asset)
+                return None
+            book = self._books.get(asset)
+            if book is None:
+                book = _Book()
+                self._books[asset] = book
+            return book
 
     def _apply_book(self, event: dict, now_m: float) -> None:
         asset = str(event.get("asset_id") or "")
-        if not self._wanted_has(asset):
+        book = self._book_for(asset)
+        if book is None:
             return
-        need = self._min_size
-        bid, bid_sz = best_bid_with_min_size(event.get("bids") or [], need)
-        ask, ask_sz = best_ask_with_min_size(event.get("asks") or [], need)
-        known = bid is not None
-        if bid is None:
-            bid, bid_sz = best_from_levels(event.get("bids") or [], "bid")
-            known = False
-        if ask is None:
-            ask, ask_sz = best_from_levels(event.get("asks") or [], "ask")
-        self._put(asset, Top(
-            bid=bid, bid_sz=float(bid_sz or 0.0),
-            ask=ask, ask_sz=float(ask_sz or 0.0),
-            updated=now_m, size_known=known,
-        ))
+        book.bids = _pairs_to_map(event.get("bids") or [], "bid")
+        book.asks = _pairs_to_map(event.get("asks") or [], "ask")
+        book.bid_at = now_m
+        book.ask_at = now_m
+        book.bid_ok = True
+        book.ask_ok = True
 
-    def _apply_bba(self, event: dict, now_m: float) -> None:
-        asset = str(event.get("asset_id") or "")
-        if not self._wanted_has(asset):
+    def _apply_one_change(self, change: dict, now_m: float) -> None:
+        asset = str(change.get("asset_id") or "")
+        side = _ladder_name(change.get("side"))
+        px = _price_key(change.get("price"))
+        sz = _size_value(change.get("size"))
+        if side is None or px is None or sz is None:
             return
-        prev = self._prev(asset)
-        bid = _price(event.get("best_bid")) if "best_bid" in event else (prev.bid if prev else None)
-        ask = _price(event.get("best_ask")) if "best_ask" in event else (prev.ask if prev else None)
-        bid_sz = finite_float(event.get("best_bid_size"))
-        ask_sz = finite_float(event.get("best_ask_size"))
-        known = True
-        if bid_sz is None:
-            if prev is not None and prev.bid is not None and bid is not None and abs(prev.bid - bid) < 1e-12 and prev.size_known:
-                bid_sz = prev.bid_sz
-            else:
-                bid_sz = 0.0
-                known = False
-        if ask_sz is None and prev is not None and prev.ask is not None and ask is not None and abs(prev.ask - ask) < 1e-12:
-            ask_sz = prev.ask_sz
-        self._put(asset, Top(
-            bid=bid, bid_sz=float(bid_sz or 0.0),
-            ask=ask, ask_sz=float(ask_sz or 0.0),
-            updated=now_m, size_known=known and bid is not None,
-        ))
+        book = self._book_for(asset)
+        if book is None:
+            return
+        levels = book.bids if side == "bid" else book.asks
+        if sz <= 0:
+            levels.pop(px, None)
+        else:
+            levels[px] = sz
+            _cap_levels(levels, side)
+        if side == "bid":
+            book.bid_at = now_m
+            book.bid_ok = True
+        else:
+            book.ask_at = now_m
+            book.ask_ok = True
 
     def _apply_change(self, event: dict, now_m: float) -> None:
-        changes = event.get("price_changes") or event.get("changes") or []
-        if not isinstance(changes, list):
+        changes = event.get("price_changes") or event.get("changes")
+        if isinstance(changes, list):
+            for change in changes:
+                if not isinstance(change, dict):
+                    continue
+                merged = dict(event)
+                merged.update(change)
+                merged.pop("price_changes", None)
+                merged.pop("changes", None)
+                self._apply_one_change(merged, now_m)
             return
-        for change in changes:
-            if isinstance(change, dict):
-                self._apply_bba({**event, **change, "event_type": "best_bid_ask"}, now_m)
+        self._apply_one_change(event, now_m)
 
 
 def _default_connect(url: str) -> Any:

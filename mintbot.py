@@ -180,7 +180,9 @@ from buy.mint_sell import (
     buy_fill_vwap,
     classify_loser,
     cycle_sleep_s,
+    sell_intent_hot,
     ws_book_enabled,
+    ws_book_mode,
     ws_book_stale_s,
     dump_fast_retry_eligible,
     bag_risk_flush,
@@ -324,10 +326,12 @@ DEFAULTS = {
     "sell_armed_poll_s": 2.0,
     # CLOB /book and /books. A hung read costs one short tick.
     "book_timeout_s": 1.2,
-    # Off until set. A fresh CLOB market websocket top replaces the
-    # /books poll for scrap, dump, kept, and reclaim. Stale falls back
-    # to REST, and that path is the same poll as today.
+    # Off until set. shadow (the default when on) still decides on REST
+    # and logs the websocket difference. live uses the websocket bid
+    # and logs REST on the following tick. Stale or crossed falls back
+    # to the same REST poll as today.
     "ws_book_enabled": False,
+    "ws_book_mode": "shadow",
     "ws_book_stale_s": 1.5,
     # Wallet pUSD while a sequential mint is waiting on cash.
     "mint_cash_poll_s": 2.0,
@@ -715,6 +719,12 @@ def validate_strategy(cfg: dict) -> None:
         raise ValueError("sell_armed_poll_s must be >= 0")
     if armed_poll != armed_poll or armed_poll < 0 or armed_poll == float("inf"):
         raise ValueError("sell_armed_poll_s must be >= 0")
+    if cfg.get("ws_book_enabled") is True and armed_poll < 0.05:
+        raise ValueError("ws_book_enabled requires sell_armed_poll_s >= 0.05")
+    mode_raw = cfg.get("ws_book_mode", None)
+    if mode_raw is not None and str(mode_raw).strip() != "":
+        if str(mode_raw).strip().lower() not in ("shadow", "live"):
+            raise ValueError("ws_book_mode must be shadow or live")
     stale_raw = cfg.get("ws_book_stale_s", 1.5)
     try:
         ws_stale = float(stale_raw)
@@ -1635,8 +1645,12 @@ def _parse_book_payload(payload: Any, min_size: float):
     return price, size, bids, ask_px, ask_sz, asks, age
 
 
-def _fetch_book(token_id: str, min_size: float):
-    """REST `/book` → sized bid and ask, raw levels, and book age if stamped."""
+def _fetch_book(token_id: str, min_size: float, fail: Optional[dict] = None):
+    """REST `/book` → sized bid and ask, raw levels, and book age if stamped.
+
+    A failure sets ``fail['failed']`` when the caller passed a dict. The
+    note itself stays on the sell thread: these reads run on the pool.
+    """
     try:
         response = thread_session("clob_book").get(
             "https://clob.polymarket.com/book",
@@ -1644,18 +1658,20 @@ def _fetch_book(token_id: str, min_size: float):
             timeout=_book_timeout_s(),
         )
         if response.status_code != 200:
-            _note_book_fetch_failed()
+            if isinstance(fail, dict):
+                fail["failed"] = True
             return None, 0.0, [], None, 0.0, [], None
         return _parse_book_payload(response.json(), min_size)
     except Exception as exc:
-        _note_book_fetch_failed()
+        if isinstance(fail, dict):
+            fail["failed"] = True
         log_event("book_fetch_fail", token_id=str(token_id)[:18], error=str(exc)[:160])
         return None, 0.0, [], None, 0.0, [], None
 
 
-def _fetch_books_parallel(up_tok: str, dn_tok: str, min_size: float):
-    fut_up = _book_pool.submit(_fetch_book, up_tok, min_size)
-    fut_dn = _book_pool.submit(_fetch_book, dn_tok, min_size)
+def _fetch_books_parallel(up_tok: str, dn_tok: str, min_size: float, fail: Optional[dict] = None):
+    fut_up = _book_pool.submit(_fetch_book, up_tok, min_size, fail)
+    fut_dn = _book_pool.submit(_fetch_book, dn_tok, min_size, fail)
     return fut_up.result(), fut_dn.result()
 
 
@@ -1689,10 +1705,12 @@ def _fetch_books(up_tok: str, dn_tok: str, min_size: float):
         dn_book = by_id.get(str(dn_tok))
         if up_book is None or dn_book is None:
             raise RuntimeError("books_missing_side")
-        return (
+        rows = (
             _parse_book_payload(up_book, min_size),
             _parse_book_payload(dn_book, min_size),
         )
+        _note_book_fetch_ok()
+        return rows
     except Exception as exc:
         if isinstance(exc, (requests.Timeout, TimeoutError)):
             _note_book_fetch_failed()
@@ -1703,27 +1721,78 @@ def _fetch_books(up_tok: str, dn_tok: str, min_size: float):
             )
             empty = (None, 0.0, [], None, 0.0, [], None)
             return empty, empty
-        return _fetch_books_parallel(up_tok, dn_tok, min_size)
+        fail: dict = {}
+        rows = _fetch_books_parallel(up_tok, dn_tok, min_size, fail)
+        if fail.get("failed"):
+            _note_book_fetch_failed()
+        else:
+            _note_book_fetch_ok()
+        return rows
 
 
-def _book_fail_box() -> dict:
-    box = globals().get("_BOOK_FAIL_BOX")
-    if box is None:
-        box = {"failed": False}
-        globals()["_BOOK_FAIL_BOX"] = box
-    return box
+def _book_pace():
+    """Per-thread book pacing. Created here so extracted tests see it.
+
+    A pool worker's note stays on that worker. The sell thread notes
+    once per ``_fetch_books`` call, so a 429 cannot be cleared by another
+    thread and cannot be counted twice for one pair.
+    """
+    local = globals().get("_BOOK_PACE_LOCAL")
+    if local is None:
+        local = threading.local()
+        globals()["_BOOK_PACE_LOCAL"] = local
+    state = getattr(local, "state", None)
+    if state is None:
+        state = {
+            "streak": 0,
+            "backoff": 0.0,
+            "ws_tick": False,
+            "missing_token": False,
+        }
+        local.state = state
+    return state
 
 
 def _note_book_fetch_failed() -> None:
-    _book_fail_box()["failed"] = True
+    from buy.mint_sell import book_fail_backoff
+
+    state = _book_pace()
+    streak = int(state.get("streak") or 0) + 1
+    state["streak"] = streak
+    state["backoff"] = book_fail_backoff(streak)
 
 
-def take_book_fetch_failed() -> bool:
-    """True once after a book read failed. The sell sleep consumes it."""
-    box = _book_fail_box()
-    failed = bool(box.get("failed"))
-    box["failed"] = False
-    return failed
+def _note_book_fetch_ok() -> None:
+    state = _book_pace()
+    state["streak"] = 0
+    state["backoff"] = 0.0
+
+
+def _note_ws_book_tick() -> None:
+    _book_pace()["ws_tick"] = True
+
+
+def _note_missing_token() -> None:
+    _book_pace()["missing_token"] = True
+
+
+def take_book_pace() -> tuple:
+    """``(backoff, ws_tick, missing_token)`` for this thread's sell sleep.
+
+    The failure streak stays until a successful book. The backoff value
+    and the two flags are consumed.
+    """
+    state = _book_pace()
+    try:
+        backoff = float(state.get("backoff") or 0.0)
+    except (TypeError, ValueError):
+        backoff = 0.0
+    ws_tick = bool(state.get("ws_tick"))
+    missing = bool(state.get("missing_token"))
+    state["backoff"] = 0.0
+    state["ws_tick"] = False
+    state["missing_token"] = False
+    return backoff, ws_tick, missing
 
 
 def _book_feed_box() -> dict:
@@ -1763,29 +1832,50 @@ def _sync_book_feed(cfg: dict, state: dict) -> None:
     feed.start()
 
 
-def _books_for_sell(cfg: dict, up_tok: str, dn_tok: str, min_size: float):
-    """Websocket tops when both are fresh. Otherwise the REST ``/books`` poll.
+def _mono_now() -> float:
+    fn = getattr(time, "monotonic", None)
+    if not callable(fn):
+        return float(time.time())
+    return float(fn())
 
-    Disabled, stale, or an unhealthy socket returns the REST rows unchanged.
+
+def _books_for_sell(cfg: dict, up_tok: str, dn_tok: str, min_size: float):
+    """Book rows for one sell tick.
+
+    Disabled is REST, unchanged. ``shadow`` (the default when the socket
+    is on) also decides on REST and records the websocket diff. ``live``
+    uses the websocket when both legs are fresh and not crossed, and
+    leaves the REST comparison for the next tick.
     """
     if not ws_book_enabled(cfg):
         up_row, dn_row = _fetch_books(up_tok, dn_tok, min_size)
         return up_row, dn_row, {"source": "rest", "legs": {}}
     from buy.clob_book_ws import ws_book_row
 
+    mode = ws_book_mode(cfg)
     feed = _book_feed_box().get("feed")
     up_top = feed.usable(up_tok) if feed is not None else None
     dn_top = feed.usable(dn_tok) if feed is not None else None
-    if up_top is not None and dn_top is not None:
+    both = up_top is not None and dn_top is not None
+    if mode == "live" and both:
+        _note_book_fetch_ok()
+        _note_ws_book_tick()
+        ages = [up_top.age, dn_top.age]
+        known = [age for age in ages if age is not None]
         meta = {
             "source": "ws",
             "legs": {
-                "up": {"ws": up_top.bid, "rest": feed.rest_bid(up_tok)},
-                "dn": {"ws": dn_top.bid, "rest": feed.rest_bid(dn_tok)},
+                "up": {"ws": up_top.bid, "rest": None},
+                "dn": {"ws": dn_top.bid, "rest": None},
             },
+            "rest_fetch_s": None,
+            "lead_s": None,
+            "ws_age_s": max(known) if known else None,
         }
         return ws_book_row(up_top), ws_book_row(dn_top), meta
+    started = _mono_now()
     up_row, dn_row = _fetch_books(up_tok, dn_tok, min_size)
+    elapsed = max(0.0, _mono_now() - started)
     up_bid = up_row[0] if isinstance(up_row, (tuple, list)) and up_row else None
     dn_bid = dn_row[0] if isinstance(dn_row, (tuple, list)) and dn_row else None
     if feed is not None:
@@ -1800,7 +1890,20 @@ def _books_for_sell(cfg: dict, up_tok: str, dn_tok: str, min_size: float):
             "up": {"ws": None, "rest": up_bid},
             "dn": {"ws": None, "rest": dn_bid},
         }
-    return up_row, dn_row, {"source": "rest", "legs": legs}
+    ages = []
+    if up_top is not None and up_top.age is not None:
+        ages.append(up_top.age)
+    if dn_top is not None and dn_top.age is not None:
+        ages.append(dn_top.age)
+    meta = {
+        "source": "rest",
+        "legs": legs,
+        "shadow": mode == "shadow",
+        "rest_fetch_s": elapsed,
+        "lead_s": elapsed if both else None,
+        "ws_age_s": max(ages) if ages else None,
+    }
+    return up_row, dn_row, meta
 
 
 def _log_book_source(
@@ -1825,6 +1928,11 @@ def _log_book_source(
     side = legs.get(leg) if isinstance(legs, dict) else None
     if not isinstance(side, dict):
         side = {}
+    extra = {}
+    if isinstance(meta, dict):
+        for key in ("rest_fetch_s", "lead_s", "ws_age_s"):
+            if key in meta:
+                extra[key] = meta.get(key)
     log_event(
         "book_source",
         condition_id=cid,
@@ -1834,7 +1942,97 @@ def _log_book_source(
         bid=bid,
         book_source=meta.get("source") if isinstance(meta, dict) else None,
         **book_diff_fields(side.get("ws"), side.get("rest")),
+        **extra,
     )
+
+
+def _log_book_shadow(cid: Any, slug: Any, meta: dict) -> None:
+    """One comparison per bag per tick while the socket is in shadow."""
+    if not isinstance(meta, dict) or not meta.get("shadow"):
+        return
+    from buy.clob_book_ws import book_diff_fields
+
+    legs = meta.get("legs") if isinstance(meta.get("legs"), dict) else {}
+    up = legs.get("up") if isinstance(legs.get("up"), dict) else {}
+    dn = legs.get("dn") if isinstance(legs.get("dn"), dict) else {}
+    up_diff = book_diff_fields(up.get("ws"), up.get("rest"))
+    dn_diff = book_diff_fields(dn.get("ws"), dn.get("rest"))
+    log_event(
+        "book_shadow",
+        condition_id=cid,
+        slug=slug,
+        rest_fetch_s=meta.get("rest_fetch_s"),
+        lead_s=meta.get("lead_s"),
+        ws_age_s=meta.get("ws_age_s"),
+        up_ws=up_diff["ws_bid"],
+        up_rest=up_diff["rest_bid"],
+        up_diff=up_diff["bid_diff"],
+        dn_ws=dn_diff["ws_bid"],
+        dn_rest=dn_diff["rest_bid"],
+        dn_diff=dn_diff["bid_diff"],
+    )
+
+
+def _follow_box() -> dict:
+    box = globals().get("_WS_FOLLOW_BOX")
+    if not isinstance(box, dict):
+        box = {"pending": [], "next": []}
+        globals()["_WS_FOLLOW_BOX"] = box
+    return box
+
+
+def _queue_live_followup(item: dict) -> None:
+    box = _follow_box()
+    nxt = box.get("next")
+    if not isinstance(nxt, list):
+        nxt = []
+        box["next"] = nxt
+    nxt.append(item)
+
+
+def _flush_deferred_rest(cfg: dict) -> None:
+    """Log the previous live tick's websocket bids against REST.
+
+    The order on that tick already used the websocket. This fetch runs
+    after the orders, on the following pass, so it cannot delay them.
+    """
+    box = _follow_box()
+    pending = box.get("pending") if isinstance(box.get("pending"), list) else []
+    nxt = box.get("next") if isinstance(box.get("next"), list) else []
+    box["pending"] = list(nxt)
+    box["next"] = []
+    if ws_book_mode(cfg) != "live":
+        box["pending"] = []
+        return
+    for item in pending:
+        if not isinstance(item, dict):
+            continue
+        up_tok = str(item.get("up_tok") or "")
+        dn_tok = str(item.get("dn_tok") or "")
+        if not up_tok or not dn_tok:
+            continue
+        try:
+            min_size = float(item.get("min_size") or 1.0)
+        except (TypeError, ValueError):
+            min_size = 1.0
+        up_row, dn_row = _fetch_books(up_tok, dn_tok, min_size)
+        rows = {"up": up_row, "dn": dn_row}
+        ws_bids = {"up": item.get("up_ws"), "dn": item.get("dn_ws")}
+        from buy.clob_book_ws import book_diff_fields
+
+        for leg in ("up", "dn"):
+            row = rows[leg]
+            rest = row[0] if isinstance(row, (tuple, list)) and row else None
+            log_event(
+                "book_source",
+                condition_id=item.get("cid"),
+                slug=item.get("slug"),
+                path="ws_followup",
+                leg=leg,
+                bid=ws_bids[leg],
+                book_source="ws",
+                **book_diff_fields(ws_bids[leg], rest),
+            )
 
 
 def _log_sell_book_depth(
@@ -5917,6 +6115,8 @@ def _manage_sells_locked(cfg: dict, state: dict, chain: ChainReader) -> None:
         up_tok = str(intent.get("up_token") or "")
         dn_tok = str(intent.get("dn_token") or "")
         if not up_tok or not dn_tok:
+            if sell_intent_hot(intent, now):
+                _note_missing_token()
             continue
 
         # Same-tick books feed persist_ready and FAK; do not refetch after
@@ -5927,6 +6127,20 @@ def _manage_sells_locked(cfg: dict, state: dict, chain: ChainReader) -> None:
                 cfg, up_tok, dn_tok, min_bid_size,
             )
         _set_book_tick(book_meta)
+        if book_meta.get("source") == "ws":
+            legs = book_meta.get("legs") if isinstance(book_meta.get("legs"), dict) else {}
+            up_leg = legs.get("up") if isinstance(legs.get("up"), dict) else {}
+            dn_leg = legs.get("dn") if isinstance(legs.get("dn"), dict) else {}
+            _queue_live_followup({
+                "cid": cid,
+                "slug": intent.get("slug"),
+                "up_tok": up_tok,
+                "dn_tok": dn_tok,
+                "up_ws": up_leg.get("ws"),
+                "dn_ws": dn_leg.get("ws"),
+                "min_size": min_bid_size,
+            })
+        _log_book_shadow(cid, intent.get("slug"), book_meta)
         (
             up_bid, up_sz, up_bids, up_ask, _up_ask_sz, _up_asks, up_age,
         ) = _book_quote(up_row)
@@ -7401,6 +7615,7 @@ def _manage_sells_locked(cfg: dict, state: dict, chain: ChainReader) -> None:
             dn_bid_size=dn_sz,
         )
 
+    _flush_deferred_rest(cfg)
     commit_state(state, dirty=dirty)
 
 def _claim_mint_intent(
@@ -8109,10 +8324,15 @@ def main() -> int:
 
     def sell_sleep() -> float:
         current = cfg_box.get("cfg") or cfg
-        failed = take_book_fetch_failed()
+        backoff, ws_tick, missing = take_book_pace()
         with STATE_LOCK:
             return cycle_sleep_s(
-                current, state, time.time(), fetch_failed=failed,
+                current,
+                state,
+                time.time(),
+                fetch_backoff=backoff,
+                ws_book=ws_tick,
+                missing_token=missing,
             )
 
     def mint_sleep() -> float:

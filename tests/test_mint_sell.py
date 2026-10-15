@@ -1213,24 +1213,41 @@ class SellArmedPollTests(unittest.TestCase):
         state = {"intents": {"a": self._intent(sell_loser_armed_at=1.0)}}
         self.assertEqual(cycle_sleep_s(cfg, state, now_s=2.0), 5.0)
 
-    def test_armed_poll_zero_returns_immediately_unless_the_fetch_failed(self):
-        from buy.mint_sell import BOOK_FAIL_BACKOFF_S
+    def test_armed_poll_zero_backs_off_and_a_ws_tick_keeps_a_floor(self):
+        from buy.mint_sell import (
+            BOOK_FAIL_BACKOFF_S,
+            WS_TICK_FLOOR_S,
+            book_fail_backoff,
+        )
 
         cfg = {**self._CFG, "sell_armed_poll_s": 0}
         state = {"intents": {"a": self._intent(sell_loser_armed_at=1.0)}}
         self.assertEqual(cycle_sleep_s(cfg, state, now_s=2.0), 0.0)
+        self.assertEqual(book_fail_backoff(1), BOOK_FAIL_BACKOFF_S)
         self.assertEqual(
-            cycle_sleep_s(cfg, state, now_s=2.0, fetch_failed=True),
-            BOOK_FAIL_BACKOFF_S,
+            cycle_sleep_s(cfg, state, now_s=2.0, fetch_backoff=book_fail_backoff(1)),
+            0.25,
         )
+        self.assertEqual(book_fail_backoff(2), 0.5)
+        self.assertEqual(book_fail_backoff(3), 1.0)
+        self.assertEqual(book_fail_backoff(4), 2.0)
+        self.assertEqual(book_fail_backoff(9), 2.0)
         self.assertEqual(
-            cycle_sleep_s(self._CFG, state, now_s=2.0, fetch_failed=True),
+            cycle_sleep_s(self._CFG, state, now_s=2.0, fetch_backoff=0.25),
             2.0,
         )
         idle = {"intents": {"a": self._intent()}}
         self.assertEqual(
-            cycle_sleep_s(cfg, idle, now_s=1_000_000.0, fetch_failed=True),
+            cycle_sleep_s(cfg, idle, now_s=1_000_000.0, fetch_backoff=0.25),
             5.0,
+        )
+        self.assertEqual(
+            cycle_sleep_s(cfg, state, now_s=2.0, ws_book=True),
+            WS_TICK_FLOOR_S,
+        )
+        self.assertEqual(
+            cycle_sleep_s(cfg, state, now_s=2.0, missing_token=True),
+            WS_TICK_FLOOR_S,
         )
 
 

@@ -169,9 +169,11 @@ DEFAULT_SELL_KNOBS = {
     # Cycle sleep while a loser persist arm is live. Does not change persist_s.
     # Explicit 0 polls again as soon as the tick returns.
     "sell_armed_poll_s": 2.0,
-    # Off: the sell loop keeps using REST /books. On: a fresh websocket
-    # top replaces that poll for the trigger. Stale falls back to REST.
+    # Off: the sell loop keeps using REST /books. On: shadow compares a
+    # fresh websocket book with REST and still decides on REST. live
+    # uses the websocket bid and logs REST on the next tick.
     "ws_book_enabled": False,
+    "ws_book_mode": "shadow",
     "ws_book_stale_s": 1.5,
     # 0 skips the late-window Chainlink veto on loser scrap.
     # Floor, per-TTM, and stale are 0 so a positive window does not
@@ -612,7 +614,25 @@ def mint_cycle_sleep_s(cfg: Any) -> float:
 
 
 # After a failed book read, do not spin even when sell_armed_poll_s is 0.
+# Repeated failures double this until BOOK_FAIL_BACKOFF_CAP_S.
 BOOK_FAIL_BACKOFF_S = 0.25
+BOOK_FAIL_BACKOFF_CAP_S = 2.0
+# A websocket book has no REST round trip. Keep at least this between ticks.
+WS_TICK_FLOOR_S = 0.05
+
+
+def book_fail_backoff(streak: int) -> float:
+    """0.25, 0.5, 1.0, then 2.0. ``streak`` is 1 on the first failure."""
+    try:
+        n = int(streak)
+    except (TypeError, ValueError):
+        n = 1
+    if n < 1:
+        n = 1
+    delay = BOOK_FAIL_BACKOFF_S * (2 ** (n - 1))
+    if delay > BOOK_FAIL_BACKOFF_CAP_S:
+        return BOOK_FAIL_BACKOFF_CAP_S
+    return delay
 
 
 def ws_book_enabled(cfg: Any) -> bool:
@@ -620,8 +640,28 @@ def ws_book_enabled(cfg: Any) -> bool:
     return isinstance(cfg, dict) and cfg.get("ws_book_enabled") is True
 
 
+def ws_book_mode(cfg: Any) -> str:
+    """``off`` when the socket is disabled. Otherwise ``shadow`` or ``live``.
+
+    Missing, null, and blank stay ``shadow`` so turning the flag on does
+    not change the order price. Anything else also stays ``shadow``;
+    ``validate_strategy`` rejects a present invalid mode.
+    """
+    if not ws_book_enabled(cfg):
+        return "off"
+    raw = None
+    if isinstance(cfg, dict):
+        raw = cfg.get("ws_book_mode", None)
+    if raw is None or raw == "":
+        return "shadow"
+    text = str(raw).strip().lower()
+    if text in ("shadow", "live"):
+        return text
+    return "shadow"
+
+
 def ws_book_stale_s(cfg: Any) -> float:
-    """How long a websocket top may be used. Bad values stay at 1.5s."""
+    """How long a websocket side may be used. Bad values stay at 1.5s."""
     raw = 1.5
     if isinstance(cfg, dict) and "ws_book_stale_s" in cfg:
         raw = cfg.get("ws_book_stale_s")
@@ -639,15 +679,19 @@ def cycle_sleep_s(
     state: Any,
     now_s: float,
     *,
-    fetch_failed: bool = False,
+    fetch_backoff: float = 0.0,
+    ws_book: bool = False,
+    missing_token: bool = False,
 ) -> float:
     """Sell-loop sleep: ``poll_s``, or ``sell_armed_poll_s`` while hot.
 
     Missing/invalid ``sell_armed_poll_s`` keeps ``poll_s`` so persist math is
     never replaced by the armed interval. Armed poll may be 0 (poll again
     as soon as the tick returns) and may be below the ``poll_s >= 1`` floor.
-    A failed book read waits at least ``BOOK_FAIL_BACKOFF_S``. Mint uses
-    ``mint_cycle_sleep_s`` and is not gated by this.
+    ``fetch_backoff`` is the grown book-fail delay (0 when the last read
+    worked). A live websocket book, or a hot intent missing its tokens,
+    waits at least ``WS_TICK_FLOOR_S``. Mint uses ``mint_cycle_sleep_s``
+    and is not gated by this.
     """
     poll = float((cfg or {}).get("poll_s") or 10)
     if poll < 0 or poll != poll:
@@ -667,9 +711,14 @@ def cycle_sleep_s(
                 and armed != float("inf")
             ):
                 delay = min(poll, armed)
-    if fetch_failed:
-        return max(delay, BOOK_FAIL_BACKOFF_S)
-    return delay
+    try:
+        backoff = float(fetch_backoff or 0.0)
+    except (TypeError, ValueError):
+        backoff = 0.0
+    if backoff != backoff or backoff < 0 or backoff == float("inf"):
+        backoff = 0.0
+    floor = WS_TICK_FLOOR_S if ws_book or missing_token else 0.0
+    return max(delay, backoff, floor)
 
 
 def effective_loser_persist_s(
