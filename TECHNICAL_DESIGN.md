@@ -1035,6 +1035,7 @@ The late pair also needs `sell_fak_px_late` and `sell_late_price_window_s` (180)
 | `sell_dump_persist_last_min_window_s` | 0 | That window. 0 leaves the last-minute clock off. Not in the 13 Oct list |
 | `sell_dump_max_ttm_s` | 0 | Dump only in the last N seconds. 0 is off. Example **240**. Unknown ttm is closed |
 | `sell_dump_also_kept` | false | Sell the kept scrap half once in the dump event, then one 1¢ FAK for a remainder |
+| `sell_dump_kept_max_px` | null | Null sells that half whenever the held dump fires. A price sells it only when its bid is strictly under that price at start. At or above, hold to redeem (`held_above_max`) |
 | `sell_dump_parallel_kept` | true | Post that kept leg with the held leg. False waits until the held dump fills. Missing or null stays on |
 | `sell_dump_fak_retries` | 0 | Extra fresh-bid dump FAKs after the first shot. 0 or null keeps selling until the leg is sold or the window ends. A positive number is a cap. The reclaim stop and the hedge sell use that cap, or 2 when it is 0 or null |
 | `sell_dump_ladder_step` | 0.04 | Still validated. The refire does not walk this ladder |
@@ -1559,6 +1560,8 @@ redeem_enabled (opt-in), separate thread:
 Adjacent mint may already have been submitted **before** expiry (lookahead). That is intentional and is the main fix for the “skipped 15m” bug.
 
 # Changelog
+
+- **2026-10-15** — `sell_dump_kept_max_px` (default null) sells the kept scrap half on a dump only when that leg's best bid is strictly under the cap at the moment the kept sell starts. Null keeps selling it whenever `sell_dump_also_kept` fires. At or above the cap the shares are not posted (`sell_dump_kept` outcome `held_above_max`), stay open for redeem, and do not arm reclaim. The held leg is unchanged. One check, no retry.
 
 - **2026-10-15** — `price_tape_enabled` (default true) appends one JSON line per sell tick to `logs/price_tape.jsonl` while a bag's ttm is inside `price_tape_window_s` (default 360) and the window is still open. The line is the books and sizes already fetched on that tick, plus the in-memory oracle mark. The sell thread only queues it. The file rolls at 50MB. A writer error is swallowed. No order changes.
 

@@ -2120,6 +2120,41 @@ def record_fill_px(intent: dict, key: str, fills: Any) -> Optional[float]:
     return avg
 
 
+def kept_dump_max_px(raw: Any) -> Optional[float]:
+    """Cap for the kept-leg dump. Null, blank, and non-positive mean no cap.
+
+    A live file that omits ``sell_dump_kept_max_px`` keeps selling the kept
+    half whenever the held dump fires. A price in ``(0, 1)`` is the ceiling.
+    """
+    if raw is None or raw == "" or isinstance(raw, bool):
+        return None
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return None
+    if value != value or value <= 0 or value >= 1 or value == float("inf"):
+        return None
+    return value
+
+
+def kept_dump_blocked(bid: Any, max_px: Any) -> bool:
+    """True when a cap is set and the kept bid is not strictly under it.
+
+    Checked once, from the book the kept sell is about to use. A missing
+    bid is not under the cap, so the shares stay. No cap means never blocked.
+    """
+    cap = kept_dump_max_px(max_px)
+    if cap is None:
+        return False
+    try:
+        px = float(bid)
+    except (TypeError, ValueError):
+        return True
+    if px != px or px <= 0 or px == float("inf"):
+        return True
+    return px + 1e-12 >= cap
+
+
 def kept_loser_open(intent: Any) -> bool:
     """True while a partial scrap still holds kept loser shares.
 
@@ -2652,6 +2687,11 @@ def reclaim_arm_block(
     if also_kept and not kept_done:
         return "kept_pending"
     if keep > float(tol) and not kept_done:
+        return "kept_open"
+    # Held because the kept bid was at or over sell_dump_kept_max_px.
+    # Those shares stay through resolution; reclaim must not treat the
+    # bag as flat.
+    if intent.get("sell_dump_kept_outcome") == "held_above_max" and keep > float(tol):
         return "kept_open"
     return None
 
