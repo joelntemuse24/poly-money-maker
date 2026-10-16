@@ -40,7 +40,7 @@ def _ready_bag(clock, keep=25.0, **extra):
 def _priced(fak_calls, fill_for):
     """FAK stub: ``fill_for(token, size, price)`` -> shares; reply priced at the limit."""
 
-    def fak(token_id, size, price, dry_run, capture=None):
+    def fak(token_id, size, price, dry_run, capture=None, decision_at=None):
         fak_calls.append(
             {"token_id": token_id, "size": float(size), "price": float(price), "dry_run": dry_run}
         )

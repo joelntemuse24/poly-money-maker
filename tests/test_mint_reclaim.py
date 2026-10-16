@@ -150,7 +150,7 @@ class _Loop:
                 )
             return bought, status
 
-        def fak_sell(token, size, price, dry_run, capture=None):
+        def fak_sell(token, size, price, dry_run, capture=None, decision_at=None):
             self.sells.append(
                 {
                     "token_id": token,

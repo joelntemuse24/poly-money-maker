@@ -2068,6 +2068,49 @@ def _log_sell_book_depth(
         phase=phase,
     )
 
+def _configure_clob_http_client() -> Any:
+    """Install one HTTP/2 client for the CLOB helper module at startup."""
+    import httpx
+    from py_clob_client_v2.http_helpers import helpers
+
+    client = httpx.Client(
+        http2=True,
+        limits=httpx.Limits(keepalive_expiry=120),
+    )
+    helpers._http_client = client
+    return client
+
+
+def _start_clob_keepalive(state: dict) -> None:
+    """Keep the CLOB connection warm only around active sell windows."""
+    client = _configure_clob_http_client()
+    host = str(getattr(client, "host", "https://clob.polymarket.com")).rstrip("/")
+
+    def _run() -> None:
+        while not _shutdown:
+            try:
+                now = time.time()
+                intents = list(state.get("intents", {}).values())
+                active = any(
+                    any(intent.get(key) for key in (
+                        "sell_loser_armed_at",
+                        "sell_dump_armed_at",
+                        "sell_winner_armed_at",
+                    ))
+                    or 0 <= float(intent.get("end_ts") or 0) - now <= 360
+                    for intent in intents
+                )
+                if active:
+                    clob = globals().get("_clob_client")
+                    clob_host = str(getattr(clob, "host", host)).rstrip("/")
+                    client.get(f"{clob_host}/time", timeout=1.0)
+            except Exception:
+                pass
+            time.sleep(3.0)
+
+    threading.Thread(target=_run, name="mintbot-clob-keepalive", daemon=True).start()
+
+
 def _get_clob_client():
     global _clob_client, _clob_init_error
     if _clob_client is not None:
@@ -2130,7 +2173,12 @@ def _get_clob_client():
 def _allowance_box() -> dict:
     box = getattr(_allowance_box, "data", None)
     if not isinstance(box, dict):
-        box = {"tokens": set(), "collateral": False, "warmed": set()}
+        box = {
+            "tokens": set(),
+            "collateral": False,
+            "warmed": set(),
+            "order_options": {},
+        }
         _allowance_box.data = box
     return box
 
@@ -2225,17 +2273,15 @@ def _schedule_order_prewarm(up_token: str, dn_token: str) -> None:
             if token_id in warmed:
                 continue
             try:
-                client.get_tick_size(token_id)
-            except Exception:
-                pass
-            try:
-                getter = getattr(client, "get_neg_risk", None)
-                if getter is not None:
-                    getter(token_id)
+                tick_size = client.get_tick_size(token_id)
+                resolve_version = getattr(client, "_ClobClient__resolve_version", None)
+                version = int(resolve_version() if resolve_version is not None else 2)
+                neg_risk = False if version == 3 else bool(client.get_neg_risk(token_id))
+                box.setdefault("order_options", {})[token_id] = (tick_size, neg_risk, version)
+                warmed.add(token_id)
             except Exception:
                 pass
             _refresh_conditional_allowance(token_id, force=False)
-            warmed.add(token_id)
         _refresh_collateral_allowance(force=False)
 
     threading.Thread(target=_run, name="mintbot-prewarm", daemon=True).start()
@@ -2283,9 +2329,12 @@ def _sell_fak_with_fallback(
     *,
     keep: float,
     tol: float,
+    decision_at: Optional[float] = None,
 ) -> Tuple[float, str]:
     """One FAK. On a balance/allowance reject, refresh, resize, retry once."""
-    sold, status = _fak_sell(token_id, size, price, dry_run, capture=capture)
+    sold, status = _fak_sell(
+        token_id, size, price, dry_run, capture=capture, decision_at=decision_at,
+    )
     if dry_run or float(sold or 0) >= float(tol):
         return sold, status
     if not is_balance_allowance_reject(status):
@@ -2293,7 +2342,9 @@ def _sell_fak_with_fallback(
     retry, latch = _resize_after_balance_reject(token_id, size, keep=keep, tol=tol)
     if latch == "already_flat" or retry < float(tol):
         return 0.0, "already_flat"
-    return _fak_sell(token_id, retry, price, dry_run, capture=capture)
+    return _fak_sell(
+        token_id, retry, price, dry_run, capture=capture, decision_at=decision_at,
+    )
 
 
 def _fak_sell(
@@ -2302,6 +2353,7 @@ def _fak_sell(
     price: float,
     dry_run: bool,
     capture: Optional[list] = None,
+    decision_at: Optional[float] = None,
 ):
     size = float(size)
     price = float(price)
@@ -2318,17 +2370,51 @@ def _fak_sell(
     if client is None:
         return 0.0, f"no_clob:{_clob_init_error or 'unknown'}"
     triggered = time.perf_counter()
+    send_at = None
     try:
         from py_clob_client_v2 import MarketOrderArgs, OrderType
+        from py_clob_client_v2.clob_types import CreateOrderOptions
+        from py_clob_client_v2.constants import BYTES32_ZERO
         from py_clob_client_v2.order_builder.constants import SELL
+        from py_clob_client_v2.utilities import price_valid
 
-        signed = client.create_market_order(
-            MarketOrderArgs(
+        order_options = _allowance_box().setdefault("order_options", {})
+        options = order_options.get(str(token_id))
+        if options is None:
+            tick_size = client.get_tick_size(str(token_id))
+            resolve_version = getattr(client, "_ClobClient__resolve_version", None)
+            version = int(resolve_version() if resolve_version is not None else 2)
+            neg_risk = False if version == 3 else bool(client.get_neg_risk(str(token_id)))
+            options = (tick_size, neg_risk, version)
+            order_options[str(token_id)] = options
+            log_event(
+                "sell_order_options_cold",
                 token_id=str(token_id),
-                amount=size,
-                side=SELL,
-                price=price,
+                tick_size=tick_size,
+                neg_risk=neg_risk,
+                version=version,
             )
+        tick_size, neg_risk, version = options
+        if not price_valid(price, tick_size):
+            return 0.0, "bad_args"
+        order_args = MarketOrderArgs(
+            token_id=str(token_id),
+            amount=size,
+            side=SELL,
+            price=price,
+            order_type=OrderType.FAK,
+        )
+        builder_config = getattr(client, "builder_config", None)
+        if builder_config and getattr(builder_config, "builder_code", None):
+            code = builder_config.builder_code
+            current = getattr(order_args, "builder_code", None)
+            if not current or current == BYTES32_ZERO:
+                order_args.builder_code = code
+        # fee_rate_bps uses the same builder default (0) as _fak_buy.
+        signed = client.builder.build_market_order(
+            order_args,
+            CreateOrderOptions(tick_size=tick_size, neg_risk=neg_risk),
+            version=version,
         )
         send_at = time.perf_counter()
         result = client.post_order(signed, order_type=OrderType.FAK)
@@ -2346,6 +2432,10 @@ def _fak_sell(
         latency = {
             "trigger_to_send_ms": round((send_at - triggered) * 1000.0, 3),
             "send_to_response_ms": round((responded - send_at) * 1000.0, 3),
+            "decision_to_send_ms": (
+                round((send_at - decision_at) * 1000.0, 3)
+                if decision_at is not None else None
+            ),
         }
         log_event(
             "sell_fak_result",
@@ -2364,8 +2454,16 @@ def _fak_sell(
             "sell_fak_fail",
             token_id=str(token_id)[:18],
             error=str(exc)[:200],
-            trigger_to_send_ms=round((responded - triggered) * 1000.0, 3),
-            send_to_response_ms=None,
+            trigger_to_send_ms=(
+                round((send_at - triggered) * 1000.0, 3) if send_at is not None else None
+            ),
+            send_to_response_ms=(
+                round((responded - send_at) * 1000.0, 3) if send_at is not None else None
+            ),
+            decision_to_send_ms=(
+                round((send_at - decision_at) * 1000.0, 3)
+                if send_at is not None and decision_at is not None else None
+            ),
         )
         return 0.0, f"error:{str(exc)[:80]}"
 
@@ -2531,6 +2629,7 @@ def _run_fak_ladder(
     condition_id: Any = None,
     fills: Optional[list] = None,
     inventory_keep: float = 0.0,
+    decision_at: Optional[float] = None,
 ) -> Tuple[float, str, Optional[float]]:
     """FAK each limit in turn. ``fills`` collects ``(shares, avg_px)`` per post.
 
@@ -2573,6 +2672,7 @@ def _run_fak_ladder(
             captured,
             keep=inventory_keep,
             tol=tol,
+            decision_at=decision_at,
         )
         sold_total += float(sold or 0)
         last_px = float(use_px)
@@ -2611,6 +2711,7 @@ def _fire_loser_scrap(
     log_extra: Optional[dict] = None,
     min_px: float = 0.01,
     min_post: Optional[float] = None,
+    decision_at: Optional[float] = None,
 ) -> Tuple[float, str, Optional[float], bool]:
     """One live-bid sweep FAK, or the clipped cent ladder when sweep is off.
 
@@ -2665,6 +2766,7 @@ def _fire_loser_scrap(
             captured,
             keep=scrap_keep,
             tol=tol,
+            decision_at=decision_at,
         )
         raw = captured[0] if captured else None
         avg = sell_fill_vwap(raw, sold)
@@ -2724,6 +2826,7 @@ def _fire_loser_scrap(
         condition_id=condition_id,
         fills=ladder_fills,
         inventory_keep=float(intent.get("sell_scrap_keep") or 0.0),
+        decision_at=decision_at,
     )
     if fills is not None:
         fills.extend(ladder_fills)
@@ -2776,6 +2879,7 @@ def _run_dump_fak_with_refire(
     tol: float,
     fills: Optional[list] = None,
     end_ts: Optional[float] = None,
+    decision_at: Optional[float] = None,
 ) -> Tuple[float, str, Optional[float], int, float]:
     """Held-dump path: first live-bid FAK, then fresh-bid FAKs with no sleep.
 
@@ -2823,6 +2927,7 @@ def _run_dump_fak_with_refire(
             ttm_s=ttm_s,
             condition_id=condition_id,
             fills=fills,
+            decision_at=decision_at,
         )
     attempts += 1
     sold_total += float(sold or 0.0)
@@ -3024,6 +3129,7 @@ def _run_dump_fak_with_refire(
                 ttm_s=ttm_s,
                 condition_id=condition_id,
                 fills=fills,
+                decision_at=decision_at,
             )
         attempts += 1
         sold_total += float(sold or 0.0)
@@ -3039,6 +3145,7 @@ def _reclaim_dump_retries(cfg: dict) -> int:
     """
     cap = dump_refire_cap(cfg.get("sell_dump_fak_retries", 2))
     return 2 if cap is None else cap
+
 
 
 def _dump_parallel_kept(cfg: dict) -> bool:
@@ -3124,6 +3231,7 @@ def _post_kept_dump(
     dry_run: bool,
     tol: float,
     end_ts: Optional[float] = None,
+    decision_at: Optional[float] = None,
 ) -> dict:
     """Kept-leg FAK, fresh-bid refire, and one floor sweep. Does not write the intent.
 
@@ -3174,6 +3282,7 @@ def _post_kept_dump(
         tol=tol,
         fills=kept_fills,
         end_ts=end_ts,
+        decision_at=decision_at,
     )
     sold_total = float(sold_total or 0.0)
     swept = 0.0
@@ -3201,6 +3310,7 @@ def _post_kept_dump(
                 ttm_s=ttm_s,
                 condition_id=cid,
                 fills=kept_fills,
+                decision_at=decision_at,
             )
         attempts += 1
         sold_total += float(swept or 0.0)
@@ -3347,6 +3457,7 @@ def _start_parallel_kept(
     ctf: str,
     funder_cs: Optional[str],
     end_ts: Optional[float] = None,
+    decision_at: Optional[float] = None,
 ) -> Tuple[Optional[threading.Thread], dict]:
     """Size the kept leg, then start its sell. The caller posts the held leg next.
 
@@ -3388,6 +3499,7 @@ def _start_parallel_kept(
                 dry_run=dry_run,
                 tol=tol,
                 end_ts=end_ts,
+                decision_at=decision_at,
             )
         except Exception as exc:
             failed = _empty_kept_result(prep)
@@ -3437,6 +3549,7 @@ def _sell_kept_after_dump(
     ctf: str,
     funder_cs: Optional[str],
     end_ts: Optional[float] = None,
+    decision_at: Optional[float] = None,
 ) -> None:
     """``sell_dump_also_kept`` when the kept leg waits for the held fill.
 
@@ -3476,6 +3589,7 @@ def _sell_kept_after_dump(
             dry_run=dry_run,
             tol=tol,
             end_ts=end_ts,
+            decision_at=decision_at,
         )
         _apply_kept_dump_result(intent, cid, result)
     finally:
@@ -4498,6 +4612,7 @@ def _reclaim_recover_buy(
         leg=leg,
         reads=flats,
     )
+
 
 
 def _cached_pusd(chain: Any) -> Optional[float]:
@@ -5625,6 +5740,7 @@ def _reclaim_tick(
         )
 
 
+
 def manage_sells(cfg: dict, state: dict, chain: ChainReader) -> None:
     """Loser scrap: arm ≤2¢, FAK at 2¢ or the live bid; winner; held dump."""
     if not cfg.get("sell_enabled"):
@@ -6052,6 +6168,8 @@ def _shadow_early_close(cfg: dict, **fields: Any) -> None:
 
 
 def _manage_sells_locked(cfg: dict, state: dict, chain: ChainReader) -> None:
+    from time import perf_counter
+
     now = time.time()
     _post_dump_box()["cfg"] = cfg
     _whatsapp("configure", cfg)
@@ -6164,6 +6282,7 @@ def _manage_sells_locked(cfg: dict, state: dict, chain: ChainReader) -> None:
         _whatsapp("note_bids", cid, up_bid, dn_bid)
         books = {"up": up_bids, "dn": dn_bids}
         ttm_s = (end_ts - now) if end_ts else None
+        decision_at = perf_counter()
         # Per bag, per tick. Dump and winner do not read this pair.
         thr, fak_px, scrap_price_late = scrap_active_prices(cfg, ttm_s)
         # Early latch is off when the threshold is null. While it is on,
@@ -6329,6 +6448,7 @@ def _manage_sells_locked(cfg: dict, state: dict, chain: ChainReader) -> None:
 
         if fire_w and winner and not cooling:
             w_bid = bids.get(winner)
+            decision_at = perf_counter()
             fire_action, fire_reason = sell_fire_decision(
                 "winner",
                 bid=w_bid,
@@ -6397,6 +6517,7 @@ def _manage_sells_locked(cfg: dict, state: dict, chain: ChainReader) -> None:
                             depth_leg=winner,
                             ttm_s=ttm_s,
                             condition_id=cid,
+                            decision_at=decision_at,
                         )
                     intent["sell_winner_attempts"] = int(
                         intent.get("sell_winner_attempts") or 0
@@ -6500,6 +6621,7 @@ def _manage_sells_locked(cfg: dict, state: dict, chain: ChainReader) -> None:
                 ctf=ctf,
                 funder_cs=funder_cs,
                 end_ts=end_ts,
+                decision_at=decision_at,
             )
             dirty = True
         held = None
@@ -6573,6 +6695,7 @@ def _manage_sells_locked(cfg: dict, state: dict, chain: ChainReader) -> None:
                 **arm_mark,
             )
         if fire_d and held and not cooling:
+            decision_at = perf_counter()
             fire_action, fire_reason = sell_fire_decision(
                 "dump", bid=dump_bid, dump_below=dump_below,
             )
@@ -6661,6 +6784,7 @@ def _manage_sells_locked(cfg: dict, state: dict, chain: ChainReader) -> None:
                                 ctf=ctf,
                                 funder_cs=funder_cs,
                                 end_ts=end_ts,
+                                decision_at=decision_at,
                             )
                         try:
                             sold_total, last_status, last_px, used_attempts, live_px = (
@@ -6682,6 +6806,7 @@ def _manage_sells_locked(cfg: dict, state: dict, chain: ChainReader) -> None:
                                     tol=tol,
                                     fills=dump_fills,
                                     end_ts=end_ts,
+                                    decision_at=decision_at,
                                 )
                             )
                         finally:
@@ -6763,6 +6888,7 @@ def _manage_sells_locked(cfg: dict, state: dict, chain: ChainReader) -> None:
                                 ctf=ctf,
                                 funder_cs=funder_cs,
                                 end_ts=end_ts,
+                                decision_at=decision_at,
                             )
                     elif sold_total >= tol:
                         intent["sell_dump_filled"] = float(
@@ -7108,6 +7234,7 @@ def _manage_sells_locked(cfg: dict, state: dict, chain: ChainReader) -> None:
             and not intent.get("sell_scrap_rest_id")
         ):
             opp_leg = "dn" if loser == "up" else "up"
+            decision_at = perf_counter()
             fire_action, fire_reason = sell_fire_decision(
                 "loser",
                 bid=bids.get(loser),
@@ -7285,6 +7412,7 @@ def _manage_sells_locked(cfg: dict, state: dict, chain: ChainReader) -> None:
                                     log_extra=oracle_fields,
                                     min_px=clob_min,
                                     min_post=scrap_floor,
+                                    decision_at=decision_at,
                                 )
                             )
                         record_fill_px(intent, "sell_fill_px", scrap_fills)
@@ -7459,6 +7587,7 @@ def _manage_sells_locked(cfg: dict, state: dict, chain: ChainReader) -> None:
                     )
                     blind_fire = False
                 if blind_fire and b_tok:
+                    decision_at = perf_counter()
                     intent["sell_blind_last_at"] = now
                     blind_fields = _scrap_oracle_fields(blind_oracle)
                     if blind_fields:
@@ -7474,6 +7603,7 @@ def _manage_sells_locked(cfg: dict, state: dict, chain: ChainReader) -> None:
                             blind_raw,
                             keep=float(intent.get("sell_scrap_keep") or 0.0),
                             tol=tol,
+                            decision_at=decision_at,
                         )
                     log_event(
                         "sell_scrap_blind",
@@ -8300,6 +8430,12 @@ def main() -> int:
         return 1
 
     state = load_state()
+    _start_clob_keepalive(state)
+    for intent in state.get("intents", {}).values():
+        if intent.get("status") in ACTIVE_STATUSES and float(intent.get("end_ts") or 0) > time.time():
+            _schedule_order_prewarm(
+                str(intent.get("up_token") or ""), str(intent.get("dn_token") or ""),
+            )
     _intent_store = IntentStore(state, lock=STATE_LOCK)
     gateway = MarketGateway(
         gamma_url=str(cfg["gamma_url"]),

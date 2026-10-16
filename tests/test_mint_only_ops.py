@@ -1521,7 +1521,7 @@ class DeployUnitsTests(unittest.TestCase):
         ladder_calls: list = []
         balances = {"n": 0}
 
-        def _fak(token_id, size, price, dry_run, capture=None):
+        def _fak(token_id, size, price, dry_run, capture=None, decision_at=None):
             fak_calls.append((size, price))
             result = {
                 "status": "matched",
@@ -1596,7 +1596,7 @@ class DeployUnitsTests(unittest.TestCase):
         self.assertEqual(sweep[0]["avg_px"], 0.02)
         self.assertEqual(sweep[0]["offered"], 50.0)
 
-        def _fak_full(token_id, size, price, dry_run, capture=None):
+        def _fak_full(token_id, size, price, dry_run, capture=None, decision_at=None):
             fak_calls.append((size, price))
             result = {"status": "matched", "makingAmount": str(size), "takingAmount": "0.30"}
             if capture is not None:

@@ -144,7 +144,7 @@ class DumpFillPxTests(unittest.TestCase):
     def test_dump_records_avg_fill_and_bag_risk_reports_it(self):
         ns, events, fak_calls, clock = _dump_harness(_fill_fak)
 
-        def priced_fak(token_id, size, price, dry_run, capture=None):
+        def priced_fak(token_id, size, price, dry_run, capture=None, decision_at=None):
             fak_calls.append({"token_id": token_id, "size": float(size), "price": float(price)})
             if capture is not None:
                 capture.append(

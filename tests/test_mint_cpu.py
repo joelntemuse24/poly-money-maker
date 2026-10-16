@@ -625,7 +625,7 @@ def _dump_harness(fak_sell):
     def fetch_books(_up, _dn, _min_size):
         return book["up"], book["dn"]
 
-    def wrapped_fak(token_id, size, price, dry_run, capture=None):
+    def wrapped_fak(token_id, size, price, dry_run, capture=None, decision_at=None):
         fak_calls.append(
             {
                 "token_id": token_id,
@@ -846,7 +846,7 @@ def _scrap_harness(fak_sell=None):
     def fetch_books(_up, _dn, _min_size):
         return book["up"], book["dn"]
 
-    def wrapped_fak(token_id, size, price, dry_run, capture=None):
+    def wrapped_fak(token_id, size, price, dry_run, capture=None, decision_at=None):
         fak_calls.append(
             {
                 "token_id": token_id,
