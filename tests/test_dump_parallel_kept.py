@@ -43,7 +43,7 @@ class DumpParallelKeptTests(unittest.TestCase):
         inflight = {"n": 0, "max": 0}
         entered = {"up-tok": threading.Event(), "dn-tok": threading.Event()}
 
-        def fak(token, size, price, dry, capture=None):
+        def fak(token, size, price, dry, capture=None, decision_at=None):
             fak_calls.append(
                 {"token_id": token, "size": float(size), "price": float(price)}
             )
@@ -72,7 +72,7 @@ class DumpParallelKeptTests(unittest.TestCase):
         ns, events, fak_calls, clock = _dump_harness(_fill_fak)
         entered = {"up-tok": threading.Event(), "dn-tok": threading.Event()}
 
-        def fak(token, size, price, dry, capture=None):
+        def fak(token, size, price, dry, capture=None, decision_at=None):
             fak_calls.append({"token_id": token, "size": float(size), "price": float(price)})
             entered[token].set()
             self.assertTrue(entered["up-tok"].wait(2.0))
@@ -102,7 +102,7 @@ class DumpParallelKeptTests(unittest.TestCase):
         entered = {"up-tok": threading.Event(), "dn-tok": threading.Event()}
         saw_arm_during_post = {"n": 0}
 
-        def fak(token, size, price, dry, capture=None):
+        def fak(token, size, price, dry, capture=None, decision_at=None):
             fak_calls.append({"token_id": token})
             if any(row["event"] == "reclaim_arm" for row in events):
                 saw_arm_during_post["n"] += 1
@@ -128,7 +128,7 @@ class DumpParallelKeptTests(unittest.TestCase):
         lock = threading.Lock()
         inflight = {"n": 0, "max": 0}
 
-        def fak(token, size, price, dry, capture=None):
+        def fak(token, size, price, dry, capture=None, decision_at=None):
             with lock:
                 inflight["n"] += 1
                 inflight["max"] = max(inflight["max"], inflight["n"])

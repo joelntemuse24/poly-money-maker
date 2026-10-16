@@ -61,8 +61,9 @@ while `.recorder.lock` is held, so systemd does not crash-loop it.
 `Restart=on-failure` with `RestartSec=30` and a start limit of 5 per
 5 minutes covers a hard crash.
 
-The unit is `Nice=10`, `IOSchedulingClass=idle`, `CPUQuota=25%`,
-`MemoryMax=150M`. It has no `EnvironmentFile`.
+The unit is `Nice=19`, `IOSchedulingClass=idle`, `CPUQuota=25%`,
+`MemoryMax=150M`. The low CPU priority and idle I/O class give trading
+work priority when the recorder shares the host. It has no `EnvironmentFile`.
 
 ## Replay
 

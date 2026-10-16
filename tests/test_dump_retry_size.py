@@ -124,7 +124,7 @@ class DumpAndLoserLogTotalTests(unittest.TestCase):
         ns, events, fak_calls, clock = _dump_harness(lambda *_a, **_k: (0.0, "idle"))
         calls = {"n": 0}
 
-        def priced(token_id, size, price, dry_run, capture=None):
+        def priced(token_id, size, price, dry_run, capture=None, decision_at=None):
             calls["n"] += 1
             fak_calls.append(
                 {"token_id": token_id, "size": float(size), "price": float(price)}

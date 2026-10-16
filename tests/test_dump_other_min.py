@@ -206,7 +206,7 @@ class DumpOtherMinPersistTests(unittest.TestCase):
             book["dn"] = _level(0.05)
             return row
 
-        def fak(token, size, price, dry, capture=None):
+        def fak(token, size, price, dry, capture=None, decision_at=None):
             fak_calls.append(
                 {
                     "token_id": token,

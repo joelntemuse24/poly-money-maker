@@ -87,7 +87,7 @@ class NoSleepAndLatencyTests(unittest.TestCase):
         sleeps = []
         posts = []
 
-        def fallback(token, size, price, dry, capture, *, keep, tol):
+        def fallback(token, size, price, dry, capture, *, keep, tol, decision_at=None):
             posts.append((round(float(size), 4), round(float(price), 4)))
             if len(posts) == 1:
                 return 4.0, "matched"
@@ -119,6 +119,125 @@ class NoSleepAndLatencyTests(unittest.TestCase):
         self.assertEqual(status, "matched")
 
 
+class ClobKeepaliveTests(unittest.TestCase):
+    def test_keepalive_checks_hot_windows_and_releases_state_lock(self):
+        import threading
+
+        class ForbiddenLock:
+            def __enter__(self):
+                raise AssertionError("keepalive acquired STATE_LOCK")
+
+        lock = threading.RLock()
+        state = {"intents": {"bag": {"end_ts": 1300}}}
+        requests_seen = []
+        threads = []
+        ticks = iter([1000, 1200, 1200, 1200])
+        ns = _load("_start_clob_keepalive")
+
+        def get(url, timeout):
+            self.assertFalse(lock._is_owned())
+            requests_seen.append((url, timeout))
+            raise RuntimeError("keepalive failure is harmless")
+
+        def sleep(delay):
+            self.assertEqual(delay, 3.0)
+            if len(requests_seen) == 1:
+                state["intents"]["bag"] = {"end_ts": 900, "sell_loser_armed_at": 1}
+            if len(requests_seen) == 2:
+                ns["_shutdown"] = True
+
+        ns.update(
+            _shutdown=False,
+            STATE_LOCK=ForbiddenLock(),
+            _configure_clob_http_client=lambda: SimpleNamespace(
+                host="https://custom-clob.example", get=get,
+            ),
+            time=SimpleNamespace(time=lambda: next(ticks), sleep=sleep),
+            threading=SimpleNamespace(Thread=lambda **kw: SimpleNamespace(
+                start=lambda: threads.append(kw),
+            )),
+        )
+        ns["_start_clob_keepalive"](state)
+        self.assertTrue(threads[0]["daemon"])
+        threads[0]["target"]()
+        self.assertEqual(len(requests_seen), 2)
+        self.assertEqual(requests_seen[0][0], "https://custom-clob.example/time")
+
+
+class SellMarketBuilderTests(unittest.TestCase):
+    def test_sell_cold_options_fetch_once_cache_and_log(self):
+        client = _BuilderClient(fail=None)
+        options_box = {"order_options": {}}
+        events = []
+        ns = _load(
+            "_fak_sell",
+            extras={
+                "time": time,
+                "log_event": lambda event, **fields: events.append((event, fields)),
+                "console": SimpleNamespace(print=lambda *_a, **_k: None),
+                "parse_sell_fill_shares": lambda result, _size: float(result.get("makingAmount", 0)),
+                "_get_clob_client": lambda: client,
+                "_allowance_box": lambda: options_box,
+                "is_balance_allowance_reject": lambda _value: False,
+            },
+        )
+        sold, status = ns["_fak_sell"]("tok", 25.0, 0.41, False)
+        self.assertEqual(status, "matched")
+        self.assertAlmostEqual(sold, 25.0)
+        self.assertEqual(client.tick_calls, 1)
+        self.assertEqual(client.neg_risk_calls, 1)
+        self.assertEqual([event for event, _fields in events], ["sell_order_options_cold", "sell_fak_result"])
+        self.assertEqual(options_box["order_options"]["tok"], ("0.01", False, 2))
+        self.assertEqual(ns["_fak_sell"]("tok", 25.0, 0.41, False)[1], "matched")
+        self.assertEqual(client.tick_calls, 1)
+        self.assertEqual(client.neg_risk_calls, 1)
+        self.assertEqual(client.market_calls, 0)
+
+    def test_sell_uses_cached_builder_without_market_info_or_fee_rest(self):
+        client = _BuilderClient(fail=None)
+        ns = _load(
+            "_fak_sell",
+            extras={
+                "time": time,
+                "log_event": lambda *_a, **_k: None,
+                "console": SimpleNamespace(print=lambda *_a, **_k: None),
+                "parse_sell_fill_shares": lambda result, _size: float(result.get("makingAmount", 0)),
+                "_get_clob_client": lambda: client,
+                "_allowance_box": lambda: {"order_options": {"tok": ("0.01", False, 2)}},
+                "is_balance_allowance_reject": lambda _value: False,
+            },
+        )
+        sold, status = ns["_fak_sell"]("tok", 25.0, 0.41, False)
+        self.assertEqual(status, "matched")
+        self.assertAlmostEqual(sold, 25.0)
+        self.assertEqual(client.market_calls, 0)
+        self.assertEqual(client.tick_calls, 0)
+        self.assertEqual(client.neg_risk_calls, 0)
+        self.assertEqual(client.builder.calls, 1)
+
+    def test_sell_exception_after_send_reports_separate_timings(self):
+        client = _BuilderClient(fail="post failed")
+        events = []
+        ns = _load(
+            "_fak_sell",
+            extras={
+                "time": time,
+                "log_event": lambda event, **fields: events.append((event, fields)),
+                "console": SimpleNamespace(print=lambda *_a, **_k: None),
+                "_get_clob_client": lambda: client,
+                "_allowance_box": lambda: {"order_options": {"tok": ("0.01", False, 2)}},
+                "is_balance_allowance_reject": lambda _value: False,
+            },
+        )
+        sold, status = ns["_fak_sell"]("tok", 25.0, 0.41, False, decision_at=time.perf_counter())
+        self.assertEqual(sold, 0.0)
+        self.assertTrue(status.startswith("error:"))
+        fields = next(fields for event, fields in events if event == "sell_fak_fail")
+        self.assertIsNotNone(fields["trigger_to_send_ms"])
+        self.assertIsNotNone(fields["send_to_response_ms"])
+        self.assertIsNotNone(fields["decision_to_send_ms"])
+
+
 class BalanceRejectFallbackTests(unittest.TestCase):
     def _ns(self, client, chain):
         ns = _load(
@@ -139,6 +258,7 @@ class BalanceRejectFallbackTests(unittest.TestCase):
             ),
             is_balance_allowance_reject=is_balance_allowance_reject,
             _get_clob_client=lambda: client,
+            _allowance_box=lambda: {"order_options": {"tok": ("0.01", False, 2)}},
             _io_unlocked=lambda: _Null(),
         )
         ns["_bind_sell_chain"](chain, "ctf", "0xfunder")
@@ -382,16 +502,52 @@ class _BalChain:
         return self.balance
 
 
+class _Builder:
+    def __init__(self):
+        self.calls = 0
+
+    def build_market_order(self, args, options, version=None):
+        self.calls += 1
+        return {"amount": float(args.amount), "price": float(args.price), "version": version}
+
+
+class _BuilderClient:
+    def __init__(self, fail):
+        self.fail = fail
+        self.builder = _Builder()
+        self.market_calls = 0
+        self.tick_calls = 0
+        self.neg_risk_calls = 0
+
+    def create_market_order(self, _args):
+        self.market_calls += 1
+        raise AssertionError("legacy create_market_order was called")
+
+    def get_tick_size(self, _token):
+        self.tick_calls += 1
+        return "0.01"
+
+    def get_neg_risk(self, _token):
+        self.neg_risk_calls += 1
+        return False
+
+    def post_order(self, signed, order_type=None):
+        if self.fail:
+            raise RuntimeError(self.fail)
+        return {"status": "matched", "makingAmount": str(signed["amount"])}
+
+
 class _Client:
     def __init__(self, fail):
         self.fail = fail
         self.allowance = []
         self.amounts = []
+        self.builder = SimpleNamespace(build_market_order=self.build_market_order)
 
     def update_balance_allowance(self, params):
         self.allowance.append(params)
 
-    def create_market_order(self, args):
+    def build_market_order(self, args, options, version=None):
         self.amounts.append(float(args.amount))
         return {"amount": float(args.amount)}
 

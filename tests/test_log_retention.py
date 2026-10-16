@@ -193,7 +193,7 @@ class RotationConfigTests(unittest.TestCase):
 
     def test_recorder_unit_is_idle_and_capped(self):
         text = (ROOT / "deploy" / "polyrecorder.service").read_text(encoding="utf-8")
-        self.assertIn("Nice=10", text)
+        self.assertIn("Nice=19", text)
         self.assertIn("IOSchedulingClass=idle", text)
         self.assertIn("MemoryMax=150M", text)
         self.assertIn("CPUQuota=25%", text)

@@ -8,7 +8,7 @@ Type=simple
 User=ntemusejoel
 WorkingDirectory=/home/ntemusejoel/poly-money-maker
 Environment=PYTHONUNBUFFERED=1
-Nice=10
+Nice=19
 IOSchedulingClass=idle
 IOSchedulingPriority=7
 CPUQuota=25%
