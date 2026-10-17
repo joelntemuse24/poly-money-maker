@@ -842,6 +842,8 @@ class DeployUnitsTests(unittest.TestCase):
                 "mint_loops.py",
                 "mint_redeem.py",
                 "mint_sequence.py",
+                "state_writer.py",
+                "state_prune.py",
                 "oracle_log.py",
                 "clob_book_ws.py",
                 "price_tape.py",

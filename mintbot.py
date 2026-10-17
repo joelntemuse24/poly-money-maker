@@ -114,6 +114,7 @@ pathlog_hourly_dense.
 
 from __future__ import annotations
 
+import atexit
 import fcntl
 import json
 import math
@@ -477,6 +478,7 @@ DEFAULTS = {
     "scrap_oracle_veto_usd": 5.0,
     "scrap_oracle_veto_stale_s": 3.0,
     "scrap_oracle_veto_use_live": True,
+    "state_prune_completed_after_s": 21600,
     "rpc_url": "https://polygon.drpc.org",
     "gamma_url": "https://gamma-api.polymarket.com",
     "data_api_url": "https://data-api.polymarket.com",
@@ -504,10 +506,13 @@ STATE_LOCK = threading.RLock()
 # /submit). One submit at a time.
 RELAY_SUBMIT_LOCK = threading.Lock()
 _SEQ_WAITS = SeqWaits()
-# Persist form of the last atomic_save that finished. None until load or
-# the first successful save. Ticks compare against this, so a mutation
-# that raised before the save is still written on the next tick.
+# Detached digest of the latest submitted snapshot (or synchronous save).
+# A writer failure invalidates it so the next tick submits fresh state.
 _saved_persist_form: Any = None
+_STATE_WRITER = None
+_HEARTBEAT_WRITER = None
+_LOG_LISTENER = None
+_OUTPUT_POOL = None
 _intent_store: Optional[IntentStore] = None
 _heartbeat_lock = threading.Lock()
 _heartbeat_parts: Dict[str, dict] = {}
@@ -568,7 +573,10 @@ def _signal_handler(signum, frame):
 
 def log_setup() -> None:
     import logging
+    import queue
+    from logging.handlers import QueueHandler, QueueListener
 
+    global _LOG_LISTENER
     from buy.log_archive import ArchiveRotatingFileHandler
 
     logger = logging.getLogger("mintbot")
@@ -579,10 +587,13 @@ def log_setup() -> None:
     # and are gzipped off the trading loop. Nothing in the archive is pruned.
     fh = ArchiveRotatingFileHandler(LOG_FILE, maxBytes=2_000_000)
     fh.setFormatter(fmt)
-    logger.addHandler(fh)
     sh = logging.StreamHandler(sys.stdout)
     sh.setFormatter(fmt)
-    logger.addHandler(sh)
+    records = queue.Queue()
+    logger.addHandler(QueueHandler(records))
+    logger.propagate = False
+    _LOG_LISTENER = QueueListener(records, fh, sh)
+    _LOG_LISTENER.start()
 
 def log_event(event: str, **kwargs: Any) -> None:
     import logging
@@ -629,13 +640,15 @@ def atomic_save(path: Path, payload: dict) -> None:
 
 
 def remember_persisted_state(payload: dict) -> None:
-    """Record the digest of a state that is now on disk."""
+    """Record a detached digest of the saved or submitted snapshot."""
     global _saved_persist_form
-    _saved_persist_form = persist_digest(payload if isinstance(payload, dict) else {})
+    from buy.state_writer import snapshot_state
+
+    _saved_persist_form = persist_digest(snapshot_state(payload if isinstance(payload, dict) else {}))
 
 
 def persist_dirty(state: dict) -> bool:
-    """True when ``state`` differs from the last successful save.
+    """True when ``state`` differs from the latest submitted snapshot.
 
     Compares the digest: live intents in full, terminal intents as id plus
     status, and any top-level keys other than ``intents``.
@@ -643,17 +656,79 @@ def persist_dirty(state: dict) -> bool:
     return persist_digest(state if isinstance(state, dict) else {}) != _saved_persist_form
 
 
-def commit_state(state: dict, *, dirty: bool = False) -> bool:
-    """Write positions when something persist-relevant is unsaved.
+def commit_state(state: dict, *, dirty: bool = False, durable: bool = False):
+    """Submit detached state; durable callers holding STATE_LOCK wait after release.
 
-    ``dirty`` covers callers that already know they mutated state. The
-    compare is against the last successful ``atomic_save``, not a copy
-    taken at the start of this tick.
+    Returns a sequence for a deferred durable wait, True for a queued save,
+    or False when unchanged. Tests without a writer retain synchronous saves.
     """
-    if not dirty and not persist_dirty(state):
-        return False
-    atomic_save(STATE_FILE, state)
+    global _saved_persist_form
+    writer = globals().get("_STATE_WRITER")
+    if writer is None:
+        if not dirty and not persist_dirty(state):
+            return False
+        atomic_save(STATE_FILE, state)
+        return True
+    from buy.state_writer import snapshot_state
+
+    already_owned = STATE_LOCK._is_owned()
+    with STATE_LOCK:
+        if not dirty and not persist_dirty(state):
+            return False
+        snapshot = snapshot_state(state)
+        _saved_persist_form = persist_digest(snapshot)
+        seq = writer.submit(snapshot)
+        if not seq:
+            _saved_persist_form = None
+            return False
+    if durable:
+        if already_owned:
+            return seq
+        if not writer.wait(seq):
+            raise OSError("durable state save failed")
     return True
+
+
+def _state_save_error(seq: int, exc: Exception) -> None:
+    global _saved_persist_form
+    with STATE_LOCK:
+        _saved_persist_form = None
+
+
+def _wait_state_save(seq) -> None:
+    writer = globals().get("_STATE_WRITER")
+    if writer is not None and seq and not writer.wait(seq):
+        raise OSError("durable state save failed")
+
+
+def _prune_state_tick(state: dict, cfg: dict, now: float, *, force: bool = False) -> None:
+    writer = globals().get("_STATE_WRITER")
+    if writer is None:
+        return
+    last = getattr(_prune_state_tick, "last", None)
+    if not force and last is not None and now - last < 600:
+        return
+    _prune_state_tick.last = now
+    from buy.state_prune import prune_state
+    from buy.state_writer import snapshot_state
+
+    with STATE_LOCK:
+        rows = prune_state(state, now, cfg.get("state_prune_completed_after_s", 21600))
+        if not rows:
+            return
+        snapshot = snapshot_state(state)
+        global _saved_persist_form
+        _saved_persist_form = persist_digest(snapshot)
+        writer.submit(snapshot, archive_rows=rows)
+
+
+def _console_print(*args, **kwargs) -> None:
+    pool = globals().get("_OUTPUT_POOL")
+    if pool is None:
+        console.print(*args, **kwargs)
+    else:
+        pool.submit(console.print, *args, **kwargs)
+
 
 def load_state() -> dict:
     if not STATE_FILE.exists():
@@ -1247,7 +1322,12 @@ def fail_stale_submitting_intents(state: dict, cfg: dict, now: float) -> int:
             stale += 1
             dirty = True
         if dirty:
-            atomic_save(STATE_FILE, state)
+            if globals().get("_STATE_WRITER") is None:
+                atomic_save(STATE_FILE, state)
+            else:
+                seq = commit_state(state, dirty=True, durable=True)
+    if dirty and globals().get("_STATE_WRITER") is not None:
+        _wait_state_save(seq)
     return stale
 
 def get_relayer_headers(body: dict) -> Optional[dict]:
@@ -1538,7 +1618,7 @@ def reconcile_intents(
                         f"{intent.get('slug')}\n{intent.get('shares')} Up + Down",
                         priority="high",
                     )
-                    console.print(
+                    globals().get("_console_print", console.print)(
                         f"  [bold bright_green][MINT OK][/] {intent.get('slug')}  "
                         f"up={up:.2f} dn={dn:.2f}"
                     )
@@ -1575,6 +1655,10 @@ def write_loop_heartbeat(loop: str, status: str, **fields: Any) -> None:
         }
         if loop == "mint" and not sell:
             payload = {"ts": part["ts"], "status": status, "mint": part, **fields}
+        writer = globals().get("_HEARTBEAT_WRITER")
+        if writer is not None:
+            writer.submit(payload)
+            return
         temporary = str(HEARTBEAT_FILE) + ".tmp"
         with open(temporary, "w", encoding="utf-8") as handle:
             json.dump(payload, handle, sort_keys=True)
@@ -2361,7 +2445,7 @@ def _fak_sell(
     if size < 0.01 or price <= 0:
         return 0.0, "bad_args"
     if dry_run:
-        console.print(
+        globals().get("_console_print", console.print)(
             f"  [bold black on yellow][DRY SELL][/] {size:.2f} @ >={price:.3f} "
             f"token={str(token_id)[:12]}..."
         )
@@ -2660,7 +2744,7 @@ def _run_fak_ladder(
                 phase="fak",
                 condition_id=condition_id,
             )
-        console.print(
+        globals().get("_console_print", console.print)(
             f"  [bold bright_yellow][SELL {label.upper()}][/] {slug}  "
             f"bid={bid:.3f}  limit>={use_px:.3f}  size={remaining:.2f}"
         )
@@ -2750,7 +2834,7 @@ def _fire_loser_scrap(
             phase="fak",
             condition_id=condition_id,
         )
-        console.print(
+        globals().get("_console_print", console.print)(
             f"  [bold bright_yellow][SELL {str(leg).upper()}][/] {slug}  "
             f"bid={loser_bid:.3f}  limit>={limit:.3f}  size={post_size:.2f}"
         )
@@ -3393,7 +3477,7 @@ def _apply_kept_dump_result(intent: dict, cid: str, result: dict) -> None:
             outcome="held_above_max",
             remaining=round(float(result.get("remaining") or 0.0), 4),
         )
-        console.print(
+        globals().get("_console_print", console.print)(
             f"  [bold bright_yellow][DUMP KEPT HELD][/] {kept} "
             f"bid={result.get('bid')} >= {result.get('max_px')}"
         )
@@ -3451,7 +3535,7 @@ def _apply_kept_dump_result(intent: dict, cid: str, result: dict) -> None:
         outcome=outcome,
         remaining=round(float(result.get("remaining") or 0.0), 4),
     )
-    console.print(
+    globals().get("_console_print", console.print)(
         f"  [bold bright_yellow][DUMP KEPT {str(outcome).upper()}][/] {kept} "
         f"{sold_total:.2f}/{float(result.get('planned') or 0.0):.2f}  avg={avg_px}"
     )
@@ -6903,7 +6987,7 @@ def _manage_sells_locked(cfg: dict, state: dict, chain: ChainReader) -> None:
                             f"@<{dump_below:.2f} (live {live_px:.3f})",
                             priority="default",
                         )
-                        console.print(
+                        globals().get("_console_print", console.print)(
                             f"  [bold bright_yellow][DUMP OK][/] {held} {filled_total:.2f}  "
                             f"bid={live_px:.3f} (<{dump_below:.2f})"
                         )
@@ -7518,7 +7602,7 @@ def _manage_sells_locked(cfg: dict, state: dict, chain: ChainReader) -> None:
                                 f"@bid<={thr:.2f} avg={intent.get('sell_fill_px')}",
                                 priority="default",
                             )
-                            console.print(
+                            globals().get("_console_print", console.print)(
                                 f"  [bold bright_green][SELL OK][/] {loser} {logged_sold:.2f}  "
                                 f"kept opposite for redeem"
                             )
@@ -7932,6 +8016,8 @@ def run_mint_cycle(
     if STOP_FILE.exists():
         write_loop_heartbeat("mint", "stopped")
         return "stopped"
+    if globals().get("_STATE_WRITER") is not None:
+        _prune_state_tick(state, cfg, now)
     fail_stale_submitting_intents(state, cfg, now)
 
     funder = os.getenv("FUNDER_ADDRESS") or ""
@@ -8035,7 +8121,7 @@ def run_mint_cycle(
     mts = pick.minutes_to_start(now)
 
     if cfg.get("dry_run"):
-        console.print(
+        globals().get("_console_print", console.print)(
             f"  [bold black on yellow][DRY MINT][/] {pick.slug}  "
             f"shares={shares:.2f}  opens_in={mts:.1f}m  cost=${shares:.2f}"
         )
@@ -8067,7 +8153,12 @@ def run_mint_cycle(
                 state, pick.condition_id, dry_intent, cfg, now, float(pick.start_ts)
             )
             if reason is None:
-                atomic_save(STATE_FILE, state)
+                if globals().get("_STATE_WRITER") is None:
+                    atomic_save(STATE_FILE, state)
+                else:
+                    seq = commit_state(state, dirty=True, durable=True)
+        if reason is None and globals().get("_STATE_WRITER") is not None:
+            _wait_state_save(seq)
         if reason is not None:
             write_loop_heartbeat("mint", reason, slug=pick.slug)
             return reason
@@ -8180,7 +8271,7 @@ def run_mint_cycle(
             )
             return "seq_wait_cash"
         if block is not None and block["reason"] == "pending_reserve":
-            console.print(
+            globals().get("_console_print", console.print)(
                 "  [dim red][SKIP][/] pending reserve  "
                 f"bal={block['balance']:.2f} reserved={block['reserved']:.2f} "
                 f"free={block['free']:.2f} need={block['need']:.2f}"
@@ -8203,7 +8294,7 @@ def run_mint_cycle(
             )
             return "pending_reserve"
         if block is not None:
-            console.print(
+            globals().get("_console_print", console.print)(
                 f"  [dim red][SKIP][/] insufficient pUSD  bal={balance:.2f} need={shares:.2f}"
             )
             log_event("mint_skip_balance", balance=balance, need=shares)
@@ -8279,12 +8370,17 @@ def run_mint_cycle(
             state, pick.condition_id, intent, cfg, now, float(pick.start_ts)
         )
         if reason is None:
-            atomic_save(STATE_FILE, state)
+            if globals().get("_STATE_WRITER") is None:
+                atomic_save(STATE_FILE, state)
+            else:
+                seq = commit_state(state, dirty=True, durable=True)
+    if reason is None and globals().get("_STATE_WRITER") is not None:
+        _wait_state_save(seq)
     if reason is not None:
         write_loop_heartbeat("mint", reason, slug=pick.slug)
         return reason
 
-    console.print(
+    globals().get("_console_print", console.print)(
         Panel(
             f"  [bright_white]{pick.question}[/]\n"
             f"  shares [bold]{shares:.2f}[/] Up+Down  ·  cost [bold]${shares:.2f}[/]  ·  "
@@ -8323,16 +8419,20 @@ def run_mint_cycle(
         intent["updated_at"] = time.time()
         if not tx_id:
             mark_intent_failed(intent, time.time(), error_msg=str(err or ""))
-            atomic_save(STATE_FILE, state)
             fail_msg = intent.get("errorMsg")
         else:
             intent["transaction_id"] = tx_id
             intent["submitted_at"] = time.time()
             intent["status"] = "pending"
-            atomic_save(STATE_FILE, state)
             fail_msg = None
+        if globals().get("_STATE_WRITER") is None:
+            atomic_save(STATE_FILE, state)
+        else:
+            seq = commit_state(state, dirty=True, durable=True)
+    if globals().get("_STATE_WRITER") is not None:
+        _wait_state_save(seq)
     if not tx_id:
-        console.print(f"  [dim red][MINT FAIL][/] {err}")
+        globals().get("_console_print", console.print)(f"  [dim red][MINT FAIL][/] {err}")
         log_event("mint_submit_fail",
             condition_id=pick.condition_id,
             error=err,
@@ -8348,7 +8448,7 @@ def run_mint_cycle(
         write_loop_heartbeat("mint", "submit_fail")
         return "submit_fail"
 
-    console.print(f"  [bold bright_green][MINT ▶][/] tx={tx_id[:18]}…")
+    globals().get("_console_print", console.print)(f"  [bold bright_green][MINT ▶][/] tx={tx_id[:18]}…")
     log_event("mint_submitted",
         condition_id=pick.condition_id,
         transaction_id=tx_id,
@@ -8429,6 +8529,13 @@ def build_redeem_desk(
     def ctf() -> str:
         return str(cfg()["ctf_address"])
 
+    def submit(cid: str, approve: bool):
+        # RedeemDesk queued its submitting job before releasing its state lock.
+        writer = globals().get("_STATE_WRITER")
+        if writer is not None and not writer.flush():
+            return None, "durable redeem claim save failed", {}
+        return submit_redeem(cfg(), chain, cid, approve)
+
     io = RedeemIO(
         payout_denominator=lambda cid: chain.payout_denominator(ctf(), cid),
         payout_numerator=lambda cid, index: chain.payout_numerator(ctf(), cid, index),
@@ -8436,7 +8543,7 @@ def build_redeem_desk(
         is_approved=lambda: chain.is_approved_for_all(
             ctf(), funder, str(cfg()["standard_adapter_address"])
         ),
-        submit=lambda cid, approve: submit_redeem(cfg(), chain, cid, approve),
+        submit=submit,
         relayer_status=lambda tx_id: get_relayer_transaction(str(cfg()["relayer_url"]), tx_id),
         log=log_event,
         notify=lambda title, message: notify(title, message, priority="high"),
@@ -8459,7 +8566,7 @@ def run_redeem_cycle(cfg: dict, state: dict, desk: Optional[RedeemDesk]) -> str:
 
 
 def main() -> int:
-    global _intent_store
+    global _intent_store, _STATE_WRITER, _HEARTBEAT_WRITER, _OUTPUT_POOL
     signal.signal(signal.SIGINT, _signal_handler)
     signal.signal(signal.SIGTERM, _signal_handler)
     log_setup()
@@ -8469,10 +8576,21 @@ def main() -> int:
         cfg = load_strategy()
         _apply_book_timeout(cfg)
     except Exception as exc:
-        console.print(f"[bold red]strategy load failed:[/] {exc}")
+        globals().get("_console_print", console.print)(f"[bold red]strategy load failed:[/] {exc}")
         return 1
 
     state = load_state()
+    from buy.state_writer import StateWriter
+
+    _STATE_WRITER = StateWriter(
+        STATE_FILE, archive_path=REPO / "logs" / "state_archive.jsonl",
+        on_error=_state_save_error, log=log_event,
+    )
+    _HEARTBEAT_WRITER = StateWriter(HEARTBEAT_FILE, log=log_event)
+    _OUTPUT_POOL = ThreadPoolExecutor(max_workers=1, thread_name_prefix="mintbot-console")
+    atexit.register(_STATE_WRITER.flush, timeout=10)
+    atexit.register(_HEARTBEAT_WRITER.flush, timeout=10)
+    _prune_state_tick(state, cfg, time.time(), force=True)
     _start_clob_keepalive(state)
     for intent in state.get("intents", {}).values():
         if intent.get("status") in ACTIVE_STATUSES and float(intent.get("end_ts") or 0) > time.time():
@@ -8489,7 +8607,7 @@ def main() -> int:
     mint_chain = ChainReader(str(cfg["rpc_url"]))
     cfg_box: Dict[str, Any] = {"cfg": cfg}
 
-    console.print(
+    globals().get("_console_print", console.print)(
         Panel(
             Align.center(
                 "[bold bright_cyan]MINT DESK[/]\n"
@@ -8506,9 +8624,9 @@ def main() -> int:
         )
     )
     if cfg["dry_run"]:
-        console.print("[bold black on yellow]▶ DRY RUN[/] [dim]no relayer submits[/]")
+        globals().get("_console_print", console.print)("[bold black on yellow]▶ DRY RUN[/] [dim]no relayer submits[/]")
     if not cfg["entry_enabled"]:
-        console.print("[bold yellow]▶ ENTRY OFF[/] [dim]set entry_enabled=true to mint[/]")
+        globals().get("_console_print", console.print)("[bold yellow]▶ ENTRY OFF[/] [dim]set entry_enabled=true to mint[/]")
 
     log_event(
         "startup",
@@ -8532,7 +8650,7 @@ def main() -> int:
             veto = f"[dim](+ late loser-scrap veto ≤{late_s:g}s TTM)[/]"
         else:
             veto = "[dim](audit only; scrap veto off)[/]"
-        console.print(
+        globals().get("_console_print", console.print)(
             "[dim]▶ oracle tape[/] logs/oracle_twap.jsonl  " + veto
         )
 
@@ -8602,7 +8720,7 @@ def main() -> int:
         ),
         on_mint_error=lambda exc: (
             log_event("cycle_error", error=str(exc)[:300]),
-            console.print(f"[red]cycle_error[/] {exc}"),
+            globals().get("_console_print", console.print)(f"[red]cycle_error[/] {exc}"),
             write_loop_heartbeat("mint", "error", error=str(exc)[:120]),
         ),
     )
@@ -8663,12 +8781,18 @@ def main() -> int:
     redeem_thread.start()
     while not should_stop():
         time.sleep(0.25)
-    sell_thread.join(timeout=5)
-    mint_thread.join(timeout=5)
-    oracle_thread.join(timeout=5)
-    redeem_thread.join(timeout=5)
+    sell_thread.join(timeout=15)
+    mint_thread.join(timeout=15)
+    oracle_thread.join(timeout=15)
+    redeem_thread.join(timeout=15)
 
-    console.print("[dim]mintbot stopped[/]")
+    if not _STATE_WRITER.stop(timeout=10):
+        log_event("state_save_fail", error="shutdown state flush incomplete")
+    _HEARTBEAT_WRITER.stop(timeout=10)
+    globals().get("_console_print", console.print)("[dim]mintbot stopped[/]")
+    _OUTPUT_POOL.shutdown(wait=True)
+    if _LOG_LISTENER is not None:
+        _LOG_LISTENER.stop()
     try:
         lock.close()
     except Exception:

@@ -74,6 +74,8 @@ def bucket_name(path: Path) -> str:
         return "mintbot.jsonl.gz"
     if "oracle_twap" in name:
         return "oracle_twap.jsonl.gz"
+    if name.startswith("state_archive.jsonl"):
+        return "state_archive.jsonl.gz"
     if "price_tape" in name:
         return "price_tape.jsonl.gz"
     if "shadow_early" in name:
@@ -101,6 +103,7 @@ def iter_sources(repo: Path) -> list[Path]:
         "logs/oracle_twap.jsonl",
         "logs/shadow_early_scrap.jsonl",
         "logs/price_tape.jsonl",
+        "logs/state_archive.jsonl",
         "logs/books.jsonl",
         "logs/lockbot.jsonl",
     ]

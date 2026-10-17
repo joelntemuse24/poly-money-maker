@@ -6,6 +6,7 @@
   "enter_max_ttm_min": 45.0,
   "mint_fail_cooldown_s": 30.0,
   "mint_submitting_timeout_s": 90.0,
+  "state_prune_completed_after_s": 21600,
   "mint_max_attempts": 3,
   "mint_gas_margin": 0.15,
   "mint_gas_fallback": 650000,
