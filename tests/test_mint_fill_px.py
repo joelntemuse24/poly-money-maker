@@ -177,13 +177,15 @@ class DumpFillPxTests(unittest.TestCase):
         end = clock["now"] + 200.0
         intent = _held_after_scrap(end, sell_dump_armed_at=clock["now"] - 2.0)
         cfg = _dump_cfg()
+        cfg.pop("sell_dump_limit_offset")
         _tick(ns, cfg, intent, cid="cid-dump")
         self.assertTrue(intent.get("sold_dump"))
         self.assertNotIn("sell_dump_fill_px", intent)
         clock["now"] = end + 1.0
         _tick(ns, cfg, intent, cid="cid-dump")
         risks = [row for row in events if row["event"] == "bag_risk"]
-        self.assertAlmostEqual(risks[0]["dump_px"], 0.51)
+        self.assertAlmostEqual(intent["sell_dump_limit"], 0.31)
+        self.assertAlmostEqual(risks[0]["dump_px"], 0.31)
 
 
 if __name__ == "__main__":

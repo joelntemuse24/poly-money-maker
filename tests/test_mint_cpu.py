@@ -595,6 +595,8 @@ def _dump_cfg(**extra) -> dict:
         "sell_dump_below": 0.60,
         "sell_dump_persist_s": 2.0,
         "sell_dump_fak_retries": 2,
+        # legacy exact-bid limit; deep limit covered in test_dump_deep_limit.py
+        "sell_dump_limit_offset": 0.0,
         "sell_dump_ladder_step": 0.04,
         "sell_dump_ladder_rungs": 4,
         "sell_dump_max_ttm_s": 240.0,
