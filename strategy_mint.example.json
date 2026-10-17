@@ -94,6 +94,8 @@
   "sell_dump_persist_last_min_window_s": 0,
   "sell_dump_fak_retries": 0,
   "sell_dump_ladder_step": 0.04,
+  "sell_dump_limit_offset": 0.20,
+  "sell_dump_limit_floor": 0.05,
   "sell_dump_ladder_rungs": 4,
   "sell_dump_max_ttm_s": 240.0,
   "sell_dump_other_min": 0.30,

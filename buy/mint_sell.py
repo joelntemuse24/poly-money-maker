@@ -869,6 +869,27 @@ def empty_fak_status(status: Any) -> bool:
     return "no orders found" in str(status or "").lower()
 
 
+def dump_deep_limit(
+    seen_bid: float,
+    *,
+    offset: float = 0.20,
+    floor: float = 0.05,
+    clob_min: float = 0.01,
+) -> float:
+    """Deep sell limit on a cent grid, capped at the observed bid."""
+    import math
+
+    bid = float(seen_bid)
+    if bid <= 0:
+        return 0.0
+    offset = max(0.0, float(offset))
+    if offset == 0:
+        return round(bid, 4)
+    limit = math.floor((max(bid - offset, float(floor)) + 1e-12) * 100) / 100
+    minimum = math.ceil((float(clob_min) - 1e-12) * 100) / 100
+    return round(min(bid, max(limit, minimum)), 4)
+
+
 def dump_refire_cap(raw: Any) -> Optional[int]:
     """Extra fresh-bid dump FAKs, or None when the leg should keep selling.
 

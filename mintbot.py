@@ -246,6 +246,7 @@ from buy.mint_sell import (
     scrap_rest_px,
     scrap_time_gate_open,
     dump_refire_cap,
+    dump_deep_limit,
     sell_dump_other_confirms,
     sell_fire_decision,
     sell_window_open,
@@ -2880,6 +2881,8 @@ def _run_dump_fak_with_refire(
     fills: Optional[list] = None,
     end_ts: Optional[float] = None,
     decision_at: Optional[float] = None,
+    limit_offset: float = 0.0,
+    limit_floor: float = 0.0,
 ) -> Tuple[float, str, Optional[float], int, float]:
     """Held-dump path: first live-bid FAK, then fresh-bid FAKs with no sleep.
 
@@ -2897,10 +2900,13 @@ def _run_dump_fak_with_refire(
     or ``end_ts`` has passed. A positive ``retries`` is a cap on those
     refires. ``fills`` collects ``(shares, avg_px)`` across every post.
     """
-    from buy.mint_sell import is_balance_allowance_reject, sell_remaining_shares
+    from buy.mint_sell import dump_deep_limit, is_balance_allowance_reject, sell_remaining_shares
 
     live_bid = float(initial_bid or 0.0)
-    initial_limits = [round(live_bid, 4)] if live_bid > 0 else []
+    initial_limits = [
+        dump_deep_limit(live_bid, offset=limit_offset, floor=limit_floor, clob_min=floor)
+        if limit_offset > 0 else round(live_bid, 4)
+    ] if live_bid > 0 else []
     sold_total = 0.0
     last_status = "none"
     last_px: Optional[float] = None
@@ -2911,6 +2917,16 @@ def _run_dump_fak_with_refire(
     if opening < 0.01:
         return sold_total, "bad_size", last_px, attempts, live_bid
 
+    log_event(
+        "sell_dump_limit",
+        condition_id=condition_id,
+        slug=slug,
+        leg=held,
+        bid=live_bid,
+        limit=initial_limits[0],
+        offset=limit_offset,
+        floor=limit_floor,
+    )
     with _io_unlocked():
         sold, last_status, last_px = _run_fak_ladder(
             token_id,
@@ -3101,7 +3117,10 @@ def _run_dump_fak_with_refire(
             continue
         # One FAK at the bid just fetched. The next retry fetches again.
         live_bid = fresh_bid
-        limits = [round(live_bid, 4)]
+        limits = [
+            dump_deep_limit(live_bid, offset=limit_offset, floor=limit_floor, clob_min=floor)
+            if limit_offset > 0 else round(live_bid, 4)
+        ]
         log_event(
             "sell_dump_fast_refire_attempt",
             condition_id=condition_id,
@@ -3111,6 +3130,7 @@ def _run_dump_fak_with_refire(
             attempts=attempts + 1,
             bid=live_bid,
             limits=limits,
+            limit=limits[0],
             sold=round(sold_total, 4),
         )
         with _io_unlocked():
@@ -6168,6 +6188,7 @@ def _shadow_early_close(cfg: dict, **fields: Any) -> None:
 
 
 def _manage_sells_locked(cfg: dict, state: dict, chain: ChainReader) -> None:
+    from math import isfinite
     from time import perf_counter
 
     now = time.time()
@@ -6580,6 +6601,18 @@ def _manage_sells_locked(cfg: dict, state: dict, chain: ChainReader) -> None:
             ),
         )
         dump_retries = dump_refire_cap(cfg.get("sell_dump_fak_retries", 0))
+        try:
+            dump_limit_offset = float(cfg.get("sell_dump_limit_offset", 0.20))
+            if not isfinite(dump_limit_offset):
+                dump_limit_offset = 0.20
+        except (TypeError, ValueError):
+            dump_limit_offset = 0.20
+        try:
+            dump_limit_floor = float(cfg.get("sell_dump_limit_floor", 0.05))
+            if not isfinite(dump_limit_floor):
+                dump_limit_floor = 0.05
+        except (TypeError, ValueError):
+            dump_limit_floor = 0.05
         dump_ladder_step = float(cfg.get("sell_dump_ladder_step") or 0.04)
         dump_ladder_rungs = int(cfg.get("sell_dump_ladder_rungs", 4))
         # 0 or missing: no time gate (old behavior). Ladder rungs after the
@@ -6733,6 +6766,12 @@ def _manage_sells_locked(cfg: dict, state: dict, chain: ChainReader) -> None:
                 else:
                     live_px = float(dump_bid or 0)
                     intent["last_sell_attempt_at"] = now
+                    first_limit = (
+                        dump_deep_limit(
+                            live_px, offset=dump_limit_offset,
+                            floor=dump_limit_floor, clob_min=floor,
+                        ) if dump_limit_offset > 0 else round(live_px, 4)
+                    )
                     dump_fills: list = []
                     _arm_post_dump_book(
                         cfg=cfg,
@@ -6805,6 +6844,8 @@ def _manage_sells_locked(cfg: dict, state: dict, chain: ChainReader) -> None:
                                     dry_run=dry_run,
                                     tol=tol,
                                     fills=dump_fills,
+                                    limit_offset=dump_limit_offset,
+                                    limit_floor=dump_limit_floor,
                                     end_ts=end_ts,
                                     decision_at=decision_at,
                                 )
@@ -6849,6 +6890,8 @@ def _manage_sells_locked(cfg: dict, state: dict, chain: ChainReader) -> None:
                             hedge_leg="dn" if held == "up" else "up",
                             sold=round(filled_total, 4),
                             avg_px=intent.get("sell_dump_fill_px"),
+                            limit=intent["sell_dump_limit"],
+                            first_limit=first_limit,
                             bid=dump_bid,
                             status=last_status,
                             **_oracle_mark(cid, cfg, time.time()),
