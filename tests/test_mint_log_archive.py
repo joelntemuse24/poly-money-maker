@@ -296,11 +296,21 @@ class MintLogArchiveTests(unittest.TestCase):
         logger.handlers.clear()
         try:
             ns["log_setup"]()
-            handlers = [h for h in logger.handlers if isinstance(h, ArchiveRotatingFileHandler)]
+            from logging.handlers import QueueHandler
+
+            self.assertEqual(len(logger.handlers), 1)
+            self.assertIsInstance(logger.handlers[0], QueueHandler)
+            listener = ns["_LOG_LISTENER"]
+            handlers = [h for h in listener.handlers if isinstance(h, ArchiveRotatingFileHandler)]
             self.assertEqual(len(handlers), 1)
             self.assertEqual(handlers[0].maxBytes, 2_000_000)
             self.assertEqual(handlers[0].archive_dir, self.log_path.parent / "logs" / "archive")
         finally:
+            listener = ns.get("_LOG_LISTENER")
+            if listener is not None:
+                listener.stop()
+                for handler in listener.handlers:
+                    handler.close()
             for handler in list(logger.handlers):
                 handler.close()
             logger.handlers[:] = previous
