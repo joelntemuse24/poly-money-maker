@@ -851,6 +851,8 @@ class DeployUnitsTests(unittest.TestCase):
                 "sister_bid.py",
                 "sister_topup.py",
                 "whatsapp_notify.py",
+                "fivemin.py",
+                "binance_trades.py",
             },
         )
         market_src = (BUY / "market.py").read_text()

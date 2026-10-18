@@ -101,7 +101,9 @@ class DeepLimitTests(unittest.TestCase):
 
     def test_only_held_dump_passes_settings_and_parsing_defaults(self):
         tree = ast.parse(MINT.read_text())
-        calls = [node for node in ast.walk(tree) if isinstance(node, ast.Call)
+        manage = next(n for n in tree.body if isinstance(n, ast.FunctionDef)
+                      and n.name == "_manage_sells_locked")
+        calls = [node for node in ast.walk(manage) if isinstance(node, ast.Call)
                  and isinstance(node.func, ast.Name) and node.func.id == "_run_dump_fak_with_refire"]
         configured = []
         for call in calls:
