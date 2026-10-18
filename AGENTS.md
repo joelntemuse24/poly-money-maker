@@ -409,3 +409,13 @@ Creating a PR is not authorization to merge or deploy it. After a pull,
 only `polymintbot` may be restarted, and only when the operator asks.
 `polypathlog` is retired. `polyscrapbid` stays stopped until the operator asks to
 start it. Lockbot/`polylockbot` is deleted; do not reinstall or start it.
+
+## Optional BTC 5-minute strategy
+
+`buy/fivemin.py` is startup-gated by `fivemin_enabled` and defaults off. It
+owns its Binance trade grid, RTDS boundary-TWAP strike, CLOB book feed, market
+discovery, state file, entry/dump/settlement policy, and daily stop. It uses
+injected callbacks for orders, persistence, logging, alerts, and redeem jobs.
+Keep its sockets and state isolated from the 15-minute sell/mint/oracle paths.
+Do not add network work at module import time. Tests must keep using pure
+helpers or stubs and must not import `mintbot.py`.

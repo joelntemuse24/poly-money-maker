@@ -274,6 +274,29 @@ HEARTBEAT_FILE = REPO / ".heartbeat_mint"
 STOP_FILE = REPO / "STOP_MINT"
 
 DEFAULTS = {
+    'fivemin_enabled': False,
+    'fivemin_series_slug': 'btc-up-or-down-5m',
+    'fivemin_binance_url': 'wss://stream.binance.com:9443/ws/btcusdt@aggTrade',
+    'fivemin_shares': 25,
+    'fivemin_buy_limit': 0.99,
+    'fivemin_gate_k': 1.0,
+    'fivemin_loser_max': 0.1,
+    'fivemin_loser_min': 0.01,
+    'fivemin_fav_min': 0.8,
+    'fivemin_max_ttm_s': 210,
+    'fivemin_persist_s': 3.0,
+    'fivemin_persist_last_s': 2.0,
+    'fivemin_persist_last_window_s': 90,
+    'fivemin_dump_held_below': 0.4,
+    'fivemin_dump_other_min': 0.7,
+    'fivemin_dump_persist_s': 3.0,
+    'fivemin_dump_limit_offset': 0.2,
+    'fivemin_dump_limit_floor': 0.05,
+    'fivemin_min_notional_usd': 1.0,
+    'fivemin_daily_stop_usd': -30.0,
+    'fivemin_cash_buffer_usd': 5.0,
+    'fivemin_book_stale_s': 30.0,
+    'fivemin_dry_run': None,
     "entry_enabled": False,
     "dry_run": True,
     "shares": 50.0,
@@ -764,6 +787,32 @@ def load_strategy() -> dict:
     return cfg
 
 def validate_strategy(cfg: dict) -> None:
+    # Optional 5m configuration validates without importing its runtime module.
+    if not isinstance(cfg.get("fivemin_enabled", False), bool):
+        raise ValueError("fivemin_enabled must be boolean")
+    if cfg.get("fivemin_dry_run") is not None and not isinstance(cfg["fivemin_dry_run"], bool):
+        raise ValueError("fivemin_dry_run must be boolean or null")
+    if not str(cfg.get("fivemin_series_slug", "btc-up-or-down-5m")).strip():
+        raise ValueError("fivemin_series_slug must not be empty")
+    if not str(cfg.get("fivemin_binance_url", "")).strip():
+        raise ValueError("fivemin_binance_url must not be empty")
+    for key, default, low, high in (
+        ("fivemin_shares", 25, 1, 25), ("fivemin_buy_limit", 0.99, 0.01, 0.99),
+        ("fivemin_gate_k", 1.0, 0, None), ("fivemin_loser_max", 0.10, 0, 1),
+        ("fivemin_loser_min", 0.01, 0, 1), ("fivemin_fav_min", 0.80, 0, 1),
+        ("fivemin_max_ttm_s", 210, 0, 300), ("fivemin_persist_s", 3, 0, None),
+        ("fivemin_persist_last_s", 2, 0, None), ("fivemin_persist_last_window_s", 90, 0, 300),
+        ("fivemin_dump_held_below", 0.40, 0, 1), ("fivemin_dump_other_min", 0.70, 0, 1),
+        ("fivemin_dump_persist_s", 3, 0, None), ("fivemin_dump_limit_offset", 0.20, 0, 1),
+        ("fivemin_dump_limit_floor", 0.05, 0.01, 0.99),
+        ("fivemin_min_notional_usd", 1, 0, None), ("fivemin_daily_stop_usd", -30, None, 0),
+        ("fivemin_cash_buffer_usd", 5, 0, None), ("fivemin_book_stale_s", 30, 0.01, None),
+    ):
+        value = float(cfg.get(key, default))
+        if not (value == value and value not in (float("inf"), float("-inf"))) or (low is not None and value < low) or (high is not None and value > high):
+            raise ValueError(f"invalid {key}")
+    if float(cfg.get("fivemin_loser_min", 0.01)) > float(cfg.get("fivemin_loser_max", 0.10)):
+        raise ValueError("fivemin_loser_min must be <= fivemin_loser_max")
     if float(cfg["shares"]) <= 0:
         raise ValueError("shares must be positive")
     amount = int(round(float(cfg["shares"]) * 1_000_000))
@@ -8565,6 +8614,101 @@ def run_redeem_cycle(cfg: dict, state: dict, desk: Optional[RedeemDesk]) -> str:
     return str(result.get("status") or "ok")
 
 
+def _fivemin_buy(token: str, shares: float, limit: float, dry: bool) -> dict:
+    captured = []
+    bought, status = _fak_buy(token, shares, limit, dry, capture=captured)
+    if dry:
+        bought = shares
+    raw = captured[0] if captured else {}
+    avg = buy_fill_vwap(raw, bought)
+    cost = float(bought) * (avg if avg is not None else limit)
+    if bought > 0 and raw.get("makingAmount") is not None:
+        try:
+            reported_cost = float(raw["makingAmount"])
+            if math.isfinite(reported_cost) and 0 < reported_cost <= shares * limit + 0.01:
+                cost = reported_cost
+        except (TypeError, ValueError):
+            pass
+    return {"shares": float(bought), "cost": cost, "status": status,
+            "fees": raw.get("fee") or raw.get("feeAmount")}
+
+
+def _fivemin_sell(row: dict, position: dict, book: dict, cfg: dict, now: float) -> dict:
+    fills = []
+    sold, status, limit, attempts, bid = _run_dump_fak_with_refire(
+        token_id=position["token"], size=position["shares"], initial_bid=book["bid"],
+        initial_bids=book.get("bids", []), held=position["side"], slug=row["slug"],
+        condition_id=row["condition_id"], ttm_s=row["end"] - now,
+        floor=float(cfg.get("sell_clob_min_price", 0.01)), min_bid_size=0.0,
+        retries=cfg.get("sell_dump_fak_retries", 0),
+        ladder_step=float(cfg.get("sell_dump_ladder_step", 0.04)),
+        ladder_rungs=int(cfg.get("sell_dump_ladder_rungs", 4)), dry_run=position["dry_run"],
+        tol=0.01, fills=fills, end_ts=row["end"],
+        limit_offset=float(cfg["fivemin_dump_limit_offset"]),
+        limit_floor=float(cfg["fivemin_dump_limit_floor"]),
+    )
+    if position["dry_run"]:
+        sold = position["shares"]
+    average = record_fill_px({}, "price", fills)
+    price = average if average is not None else float(limit or book["bid"])
+    return {"shares": sold, "proceeds": sold * price, "price": price, "status": status}
+
+
+def _fivemin_reserves(state: dict, cfg: dict) -> float:
+    with STATE_LOCK:
+        reserve = pending_mint_reserve(state) + reclaim_hedge_cash_reserve(state)
+    if cfg.get("entry_enabled") and not cfg.get("dry_run", True):
+        reserve += float(cfg["shares"])
+    return reserve
+
+
+def _fivemin_redeem(state: dict, row: dict, now: float) -> None:
+    from buy.mint_redeem import new_job
+
+    with STATE_LOCK:
+        jobs = state.setdefault("redeems", {})
+        if row["condition_id"] not in jobs:
+            jobs[row["condition_id"]] = new_job(
+                row["condition_id"], row["up_token"], row["dn_token"], now,
+                slug=row["slug"], end_ts=row["end"], source="fivemin",
+            )
+            commit_state(state, dirty=True)
+
+
+def _fivemin_label(start: float) -> str:
+    from buy.whatsapp_notify import bag_start_label
+    return bag_start_label(start)
+
+
+def _fivemin_alert(text: str, *, kind: str) -> None:
+    try:
+        _BAG_ALERTS.notifier.send(text, kind=kind)
+    except Exception:
+        pass
+
+
+def _fivemin_gamma_winner(cfg: dict, slug: str):
+    response = thread_session("fivemin-gamma").get(
+        str(cfg["gamma_url"]).rstrip("/") + "/events", params={"slug": slug}, timeout=5,
+    )
+    response.raise_for_status()
+    events = response.json()
+    if isinstance(events, dict):
+        events = [events]
+    for event in events:
+        for market in event.get("markets", []):
+            prices = market.get("outcomePrices", [])
+            outcomes = market.get("outcomes", ["Up", "Down"])
+            if isinstance(prices, str):
+                prices = json.loads(prices)
+            if isinstance(outcomes, str):
+                outcomes = json.loads(outcomes)
+            for label, price in zip(outcomes, prices):
+                if float(price) >= 1 - 1e-9 and str(label).lower() in ("up", "down"):
+                    return str(label).lower()
+    return None
+
+
 def main() -> int:
     global _intent_store, _STATE_WRITER, _HEARTBEAT_WRITER, _OUTPUT_POOL
     signal.signal(signal.SIGINT, _signal_handler)
@@ -8779,6 +8923,50 @@ def main() -> int:
         daemon=True,
     )
     redeem_thread.start()
+    if cfg.get("fivemin_enabled", False):
+        from buy.fivemin import FiveMinIO, Runner, Strategy, load_state as load_fivemin_state
+        from buy.binance_trades import BinanceTrades, PriceGrid
+        from buy.clob_book_ws import ClobBookFeed
+        from buy.oracle_log import RtdsTwapFeed
+        from buy.state_writer import snapshot_state
+
+        def run_fivemin() -> None:
+            path = REPO / "logs" / "fivemin_state.json"
+            path.parent.mkdir(parents=True, exist_ok=True)
+            writer = StateWriter(path, log=log_event)
+            runner = None
+            try:
+                current_cfg = lambda: cfg_box.get("cfg") or cfg
+                io = FiveMinIO(
+                    buy=_fivemin_buy, sell=_fivemin_sell,
+                    reserves=lambda current: _fivemin_reserves(state, current),
+                    redeem=lambda row, now: _fivemin_redeem(state, row, now),
+                    save=lambda payload: writer.submit(snapshot_state(payload)),
+                    durable=lambda: writer.flush(timeout=10), log=log_event, alert=_fivemin_alert,
+                    clock=time.time, label=_fivemin_label,
+                    gamma_winner=lambda slug: _fivemin_gamma_winner(current_cfg(), slug),
+                )
+                grid = PriceGrid()
+                runner = Runner(
+                    Strategy(io, load_fivemin_state(path)), current_cfg,
+                    MarketGateway(gamma_url=str(cfg["gamma_url"]), data_api_url=str(cfg["data_api_url"]), discover_cache_s=20),
+                    ChainReader(str(cfg["rpc_url"])), to_checksum_address(funder_env) if funder_env else "",
+                    grid, BinanceTrades(
+                        grid, url=str(current_cfg().get("fivemin_binance_url")),
+                        on_error=lambda error: log_event("fivemin_binance_error", error=str(error)[:240]),
+                    ), RtdsTwapFeed(), ClobBookFeed(),
+                )
+                runner.gamma_fetch = lambda slug: _fivemin_gamma_winner(current_cfg(), slug)
+                runner.start()
+                run_job_loop(name="fivemin", tick=runner.tick, sleep_s=runner.sleep_s,
+                             should_stop=should_stop,
+                             on_error=lambda exc: log_event("fivemin_error", error=str(exc)[:240]))
+            finally:
+                if runner is not None:
+                    runner.stop()
+                writer.stop(timeout=10)
+
+        threading.Thread(target=run_fivemin, name="mintbot-fivemin", daemon=True).start()
     while not should_stop():
         time.sleep(0.25)
     sell_thread.join(timeout=15)
