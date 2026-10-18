@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import math
 import time
+import threading
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -12,6 +13,7 @@ from zoneinfo import ZoneInfo
 
 DEFAULTS = {
     "fivemin_enabled": False, "fivemin_series_slug": "btc-up-or-down-5m",
+    "fivemin_binance_url": "wss://stream.binance.com:9443/ws/btcusdt@aggTrade",
     "fivemin_shares": 25, "fivemin_buy_limit": 0.99, "fivemin_gate_k": 1.0,
     "fivemin_loser_max": 0.10, "fivemin_loser_min": 0.01, "fivemin_fav_min": 0.80,
     "fivemin_max_ttm_s": 210, "fivemin_persist_s": 3.0, "fivemin_persist_last_s": 2.0,
@@ -93,24 +95,34 @@ class FiveMinIO:
     gamma_winner: Callable = lambda *_a: None
     durable: Callable = lambda: True
     clock: Optional[Callable] = None
+    label: Callable = lambda start: str(start)
 
 
 class Strategy:
-    def __init__(self, io: FiveMinIO, state: Optional[dict] = None):
+    def __init__(self, io: FiveMinIO, state: Optional[dict] = None, *, startup_ts: Optional[float] = None):
         self.io = io
+        self.startup_ts = time.time() if startup_ts is None else float(startup_ts)
+        self._last_prune = 0.0
+        self._last_btc_stale = 0.0
         self.state = state if state is not None else {}
         self.state.setdefault("markets", {})
         self.state.setdefault("day", "")
         self.state.setdefault("realized", 0.0)
         self.state.setdefault("paused_until_day", None)
         self.boundaries: dict[int, float] = {}
-        self._active = {
-            cid for cid, row in self.state["markets"].items()
-            if not (row.get("position") or {}).get("settled")
-            or ((row.get("position") or {}).get("shares", 0) > 0
-                and not (row.get("position") or {}).get("redeem_enqueued")
-                and not (row.get("position") or {}).get("dry_run"))
-        }
+        self._active = set()
+        for cid, row in self.state["markets"].items():
+            position = row.get("position")
+            if float(row.get("start") or 0) < self.startup_ts and position is None:
+                row["entered"] = True
+                row.setdefault("skip_reason", "startup")
+                self.io.log("fivemin_skip_startup_market", condition_id=cid,
+                            slug=row.get("slug"), start=row.get("start"))
+            if not position or not position.get("settled") or (
+                position.get("shares", 0) > 0 and not position.get("redeem_enqueued")
+                and not position.get("dry_run")
+            ):
+                self._active.add(cid)
         self.runs: dict[str, dict] = {}
         self.balance = None
         self.sampled_at = None
@@ -153,12 +165,35 @@ class Strategy:
         cid = str(market.condition_id)
         if cid not in self.state["markets"]:
             start = int(str(market.slug).rsplit("-", 1)[1])
+            skipped = start < self.startup_ts
             self.state["markets"][cid] = {
                 "condition_id": cid, "slug": market.slug, "start": start, "end": start + 300,
                 "up_token": str(market.up_token), "dn_token": str(market.dn_token),
-                "entered": False, "position": None,
+                "entered": skipped, "position": None,
             }
             self._active.add(cid)
+            if skipped:
+                self.state["markets"][cid]["skip_reason"] = "startup"
+                self.io.log("fivemin_skip_startup_market", condition_id=cid, slug=market.slug, start=start)
+            self.save()
+
+    def _prune(self, now):
+        if now - self._last_prune < 60:
+            return
+        self._last_prune = now
+        removed = False
+        for cid, row in list(self.state["markets"].items()):
+            if row.get("end", 0) >= now - 6 * 3600:
+                continue
+            position = row.get("position")
+            if position is None or (position.get("settled") and (
+                position.get("redeem_enqueued") or position.get("shares", 0) <= 0 or position.get("dry_run")
+            )):
+                self.state["markets"].pop(cid, None)
+                self._active.discard(cid)
+                self.runs.pop(cid, None)
+                removed = True
+        if removed:
             self.save()
 
     def _proxy(self, grid, now, row):
@@ -166,10 +201,17 @@ class Strategy:
         if g not in self._twap_cache:
             self._twap_cache = {g: twap60(grid, g)}
         value = self._twap_cache[g]
+        latest = getattr(grid, "latest_exchange_ms", lambda: None)()
+        if latest is None or now * 1000.0 - latest > 5000.0:
+            if now - self._last_btc_stale >= 60:
+                self._last_btc_stale = now
+                self.io.log("fivemin_btc_stale", age_s=None if latest is None else now - latest / 1000.0)
+            return None
         return None if value is None or row.get("offset") is None else value + row["offset"]
 
     def tick(self, cfg: dict, now: float, grid, books: dict):
         cfg = settings(cfg)
+        self._prune(now)
         self.roll_day(now)
         if self.state["realized"] <= cfg["fivemin_daily_stop_usd"] and self.state.get("paused_until_day") != self.state["day"]:
             self.state["paused_until_day"] = self.state["day"]
@@ -178,7 +220,7 @@ class Strategy:
             self.alert(f"5m daily stop {self.state['day']}: {self.state['realized']:.2f}", cfg, "fivemin_daily_stop")
         for cid in list(self._active):
             row = self.state["markets"][cid]
-            if row.get("start_twap") is None and now >= row["start"]:
+            if row.get("start_twap") is None and now >= row["start"] + 1.0:
                 start_twap = twap60(grid, int(row["start"] * 10))
                 if start_twap is not None:
                     row["start_twap"] = start_twap
@@ -235,15 +277,17 @@ class Strategy:
     def _enter(self, cfg, now, row, quotes, loser, fav, ratio, proxy, persisted):
         row["entered"] = True
         self.save()
-        if not self.io.durable():
-            raise OSError("fivemin entry flag not durable")
         sent_now = self.io.clock() if self.io.clock is not None else now
         if sent_now >= row["end"]:
             self.io.log("fivemin_signal_blocked", slug=row["slug"], reason="expired")
             return
+        log_books = {side: {**(quotes.get(side) or {}),
+                            "bids": (quotes.get(side) or {}).get("bids", [])[:3],
+                            "asks": (quotes.get(side) or {}).get("asks", [])[:3]}
+                     for side in ("up", "down")}
         self.io.log("fivemin_signal", ts=now, slug=row["slug"], condition_id=row["condition_id"],
                     ttm=row["end"] - now, gate_ratio=ratio, proxy=proxy, strike=row["strike"],
-                    offset=row.get("offset"), books=quotes, loser=loser, persisted_s=persisted)
+                    offset=row.get("offset"), books=log_books, loser=loser, persisted_s=persisted)
         reason = None
         if not cfg["fivemin_enabled"]:
             reason = "disabled"
@@ -275,7 +319,7 @@ class Strategy:
         self.io.log("fivemin_fill", slug=row["slug"], condition_id=row["condition_id"],
                     price=avg, size=filled, usdc=cost, status=result.get("status"), fees=result.get("fees"))
         if filled > 0:
-            self.alert(f"5m {row['start']} {fav.upper()} fill {filled:g} @ {avg:.4f}; ttm={row['end']-now:.1f}s gate={ratio:.3f}", cfg, "fivemin_fill")
+            self.alert(f"5m {self.io.label(row['start'])} {fav.upper()} fill {filled:g} @ {avg:.4f}; ttm={row['end']-now:.1f}s gate={ratio:.3f}", cfg, "fivemin_fill")
 
     def _manage(self, cfg, now, row, quotes):
         p = row["position"]
@@ -312,8 +356,6 @@ class Strategy:
             return
         p["dumped"] = True
         self.save()
-        if not self.io.durable():
-            raise OSError("fivemin dump flag not durable")
         if self.io.clock is not None and self.io.clock() >= row["end"]:
             return
         result = self.io.sell(row, p, quotes[held], cfg, now)
@@ -325,7 +367,7 @@ class Strategy:
         self.io.log("fivemin_dump", slug=row["slug"], condition_id=row["condition_id"],
                     shares=sold, price=proceeds / sold if sold else None,
                     proceeds=proceeds, pnl=p["proceeds"] - p["cost"], status=result.get("status"))
-        self.alert(f"5m {row['start']} dump {sold:g} @ {proceeds/sold if sold else 0:.4f}; P&L={p['proceeds']-p['cost']:.2f}",
+        self.alert(f"5m {self.io.label(row['start'])} dump {sold:g} @ {proceeds/sold if sold else 0:.4f}; P&L={p['proceeds']-p['cost']:.2f}",
                    {**cfg, "fivemin_dry_run": p.get("dry_run", dry_run(cfg))}, "fivemin_dump")
 
     def _settle(self, cfg, now, row, winner, source):
@@ -370,29 +412,102 @@ class Runner:
         self.next_discover = 0.0
         self.next_cash = 0.0
         self.current = None
+        self._io_stop = threading.Event()
+        self._io_thread = None
+        self._io_lock = threading.Lock()
+        self._markets = []
+        self._balance = None
+        self._gamma_pending = set()
+        self._gamma_results = {}
+        self.gamma_fetch = None
+        self.rtds_last_sample = self.clock()
+        self.rtds_last_reconnect = 0.0
 
     def start(self):
+        self._io_stop.clear()
         self.binance.start()
         self.rtds.start()
         self.books.start()
+        self._io_thread = threading.Thread(target=self._io_run, name="mintbot-fivemin-io", daemon=True)
+        self._io_thread.start()
 
     def stop(self):
+        self._io_stop.set()
+        if self._io_thread is not None:
+            self._io_thread.join(timeout=5)
         self.binance.stop()
         self.rtds.stop()
         self.books.stop()
 
-    def tick(self):
-        now, cfg = self.clock(), settings(self.cfg())
-        self.strategy.boundary_samples(self.rtds.drain())
+    def request_gamma(self, slug):
+        with self._io_lock:
+            if slug in self._gamma_results:
+                return self._gamma_results.pop(slug)
+            self._gamma_pending.add(slug)
+        return None
+
+    def _io_run(self):
+        while not self._io_stop.is_set():
+            self._io_once(self.clock())
+            self._io_stop.wait(0.1)
+
+    def _io_once(self, now):
+        """One IO-thread pass: discovery, balance, Gamma requests, RTDS watchdog."""
+        cfg = settings(self.cfg())
         if now >= self.next_discover:
             self.next_discover = now + 20
-            markets = self.gateway.discover([cfg["fivemin_series_slug"]])
-            available = [m for m in markets if m.active and not m.closed and not m.neg_risk]
-            live = [m for m in available if int(m.slug.rsplit("-", 1)[1]) <= now < int(m.slug.rsplit("-", 1)[1]) + 300]
-            future = sorted((m for m in available if int(m.slug.rsplit("-", 1)[1]) > now), key=lambda m: m.start_ts)
-            chosen_markets = ([max(live, key=lambda m: m.start_ts)] if live else []) + future[:1 if live else 2]
-            for market in chosen_markets:
-                self.strategy.add_market(market)
+            try:
+                markets = self.gateway.discover([cfg["fivemin_series_slug"]])
+                with self._io_lock:
+                    self._markets = list(markets)
+            except Exception as exc:
+                self._on_error("fivemin_discovery_error", exc)
+        if now >= self.next_cash:
+            self.next_cash = now + 30
+            try:
+                balance = self.chain.pUSD_balance(cfg["pUSD_address"], self.funder)
+                with self._io_lock:
+                    self._balance = (now, balance)
+            except Exception as exc:
+                self._on_error("fivemin_balance_error", exc)
+        with self._io_lock:
+            requests = list(self._gamma_pending)
+            self._gamma_pending.clear()
+        for slug in requests:
+            try:
+                result = self.gamma_fetch(slug) if self.gamma_fetch else None
+            except Exception as exc:
+                self._on_error("fivemin_gamma_error", exc)
+                result = None
+            with self._io_lock:
+                self._gamma_results[slug] = result
+        if now - self.rtds_last_sample >= 60 and now - self.rtds_last_reconnect >= 60:
+            try:
+                self.rtds.reconnect("fivemin_silent")
+            except Exception:
+                pass
+            self.rtds_last_reconnect = now
+            self._on_error("fivemin_rtds_stall", "fivemin_silent")
+
+    def _on_error(self, event, exc):
+        try: self.strategy.io.log(event, error=str(exc)[:240])
+        except Exception: pass
+
+    def tick(self):
+        now, cfg = self.clock(), settings(self.cfg())
+        samples = list(self.rtds.drain())
+        if samples:
+            self.rtds_last_sample = now
+        self.strategy.boundary_samples(samples)
+        with self._io_lock:
+            markets = list(self._markets)
+            balance = self._balance
+            self._balance = None
+        available = [m for m in markets if m.active and not m.closed and not m.neg_risk]
+        for market in available:
+            self.strategy.add_market(market)
+        if balance is not None:
+            self.strategy.sample_cash(*balance)
         rows = [self.strategy.state["markets"][cid] for cid in self.strategy._active]
         current = [row for row in rows if row["start"] <= now < row["end"]]
         upcoming = sorted((row for row in rows if row["start"] > now), key=lambda row: row["start"])
@@ -401,20 +516,15 @@ class Runner:
         self.books.set_tokens([token for row in chosen for token in (row["up_token"], row["dn_token"])])
         self.books.set_stale_s(cfg["fivemin_book_stale_s"])
         self.books.set_min_size(0.0)
-        if now >= self.next_cash:
-            self.next_cash = now + 30
-            try:
-                self.strategy.sample_cash(now, self.chain.pUSD_balance(cfg["pUSD_address"], self.funder))
-            except Exception:
-                pass
         quotes = {}
         for row in chosen:
             sides = {}
             for side, token in (("up", row["up_token"]), ("down", row["dn_token"])):
                 top = self.books.usable(token)
                 if top is not None:
-                    sides[side] = {"bid": top.bid, "ask": top.ask, "bids": top.bids[:3], "asks": top.asks[:3]}
+                    sides[side] = {"bid": top.bid, "ask": top.ask, "bids": top.bids, "asks": top.asks}
             quotes[row["condition_id"]] = sides
+        self.strategy.io.gamma_winner = self.request_gamma
         self.strategy.tick(cfg, self.clock(), self.grid, quotes)
 
     def sleep_s(self):

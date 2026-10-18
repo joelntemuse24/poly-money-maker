@@ -1,4 +1,5 @@
 {
+  "fivemin_binance_url": "wss://stream.binance.com:9443/ws/btcusdt@aggTrade",
   "fivemin_enabled": false,
   "fivemin_series_slug": "btc-up-or-down-5m",
   "fivemin_shares": 25,

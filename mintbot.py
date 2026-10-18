@@ -276,6 +276,7 @@ STOP_FILE = REPO / "STOP_MINT"
 DEFAULTS = {
     'fivemin_enabled': False,
     'fivemin_series_slug': 'btc-up-or-down-5m',
+    'fivemin_binance_url': 'wss://stream.binance.com:9443/ws/btcusdt@aggTrade',
     'fivemin_shares': 25,
     'fivemin_buy_limit': 0.99,
     'fivemin_gate_k': 1.0,
@@ -793,6 +794,8 @@ def validate_strategy(cfg: dict) -> None:
         raise ValueError("fivemin_dry_run must be boolean or null")
     if not str(cfg.get("fivemin_series_slug", "btc-up-or-down-5m")).strip():
         raise ValueError("fivemin_series_slug must not be empty")
+    if not str(cfg.get("fivemin_binance_url", "")).strip():
+        raise ValueError("fivemin_binance_url must not be empty")
     for key, default, low, high in (
         ("fivemin_shares", 25, 1, 25), ("fivemin_buy_limit", 0.99, 0.01, 0.99),
         ("fivemin_gate_k", 1.0, 0, None), ("fivemin_loser_max", 0.10, 0, 1),
@@ -8672,6 +8675,11 @@ def _fivemin_redeem(state: dict, row: dict, now: float) -> None:
             commit_state(state, dirty=True)
 
 
+def _fivemin_label(start: float) -> str:
+    from buy.whatsapp_notify import bag_start_label
+    return bag_start_label(start)
+
+
 def _fivemin_alert(text: str, *, kind: str) -> None:
     try:
         _BAG_ALERTS.notifier.send(text, kind=kind)
@@ -8934,7 +8942,8 @@ def main() -> int:
                     reserves=lambda current: _fivemin_reserves(state, current),
                     redeem=lambda row, now: _fivemin_redeem(state, row, now),
                     save=lambda payload: writer.submit(snapshot_state(payload)),
-                    durable=lambda: writer.flush(timeout=10), log=log_event, alert=_fivemin_alert, clock=time.time,
+                    durable=lambda: writer.flush(timeout=10), log=log_event, alert=_fivemin_alert,
+                    clock=time.time, label=_fivemin_label,
                     gamma_winner=lambda slug: _fivemin_gamma_winner(current_cfg(), slug),
                 )
                 grid = PriceGrid()
@@ -8942,8 +8951,12 @@ def main() -> int:
                     Strategy(io, load_fivemin_state(path)), current_cfg,
                     MarketGateway(gamma_url=str(cfg["gamma_url"]), data_api_url=str(cfg["data_api_url"]), discover_cache_s=20),
                     ChainReader(str(cfg["rpc_url"])), to_checksum_address(funder_env) if funder_env else "",
-                    grid, BinanceTrades(grid), RtdsTwapFeed(), ClobBookFeed(),
+                    grid, BinanceTrades(
+                        grid, url=str(current_cfg().get("fivemin_binance_url")),
+                        on_error=lambda error: log_event("fivemin_binance_error", error=str(error)[:240]),
+                    ), RtdsTwapFeed(), ClobBookFeed(),
                 )
+                runner.gamma_fetch = lambda slug: _fivemin_gamma_winner(current_cfg(), slug)
                 runner.start()
                 run_job_loop(name="fivemin", tick=runner.tick, sleep_s=runner.sleep_s,
                              should_stop=should_stop,

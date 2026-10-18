@@ -31,6 +31,10 @@ class PriceGrid:
             self._rows[g % self.slots] = (g, px)
         return g
 
+    def latest_exchange_ms(self) -> Optional[float]:
+        with self._lock:
+            return None if self._latest is None else self._latest * 100.0
+
     def price_at(self, g: int) -> Optional[float]:
         with self._lock:
             if self._latest is None:
@@ -55,11 +59,13 @@ def parse_agg_trade(message: Any) -> Optional[tuple[float, float]]:
 
 class BinanceTrades:
     def __init__(self, grid: Optional[PriceGrid] = None, *, url: str = URL,
-                 connect=None, sleep=None):
+                 connect=None, sleep=None, on_error=None):
         self.grid = grid or PriceGrid()
         self.url = url
         self._connect = connect
         self._sleep = sleep or time.sleep
+        self._on_error = on_error
+        self._last_error_at = 0.0
         self._stop = threading.Event()
         self._thread = None
         self._ws = None
@@ -100,8 +106,15 @@ class BinanceTrades:
                 attempt = 0 if received else attempt + 1
                 if not self._stop.is_set():
                     self._stop.wait(min(30.0, 0.5 * (2 ** min(attempt, 6))))
-            except Exception:
+            except Exception as exc:
                 attempt += 1
+                now = time.time()
+                if self._on_error is not None and now - self._last_error_at >= 60:
+                    self._last_error_at = now
+                    try:
+                        self._on_error(str(exc))
+                    except Exception:
+                        pass
                 if self._sleep is time.sleep:
                     self._stop.wait(min(30.0, 0.5 * (2 ** min(attempt, 6))))
                 else:
