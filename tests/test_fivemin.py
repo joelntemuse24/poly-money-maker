@@ -132,15 +132,15 @@ class StrategyTests(unittest.TestCase):
         row = self.strategy.state["markets"]["cid"]
         row["position"] = {"token": "down", "side": "down", "shares": 10.0, "cost": 9.0,
                             "avg_px": .9, "dumped": False, "proceeds": 0.0, "settled": False}
-        self.strategy.tick(cfg(), 1100, self.grid, self.quotes(up=.8, down=.39))
-        self.strategy.tick(cfg(), 1102.8, self.grid, self.quotes(up=.8, down=.39))
+        self.strategy.tick(cfg(), 1100, self.grid, self.quotes(up=.8, down=.19))
+        self.strategy.tick(cfg(), 1102.8, self.grid, self.quotes(up=.8, down=.19))
         self.assertFalse(self.sells)
-        self.strategy.tick(cfg(), 1103, self.grid, self.quotes(up=.8, down=.39))
+        self.strategy.tick(cfg(), 1103, self.grid, self.quotes(up=.8, down=.19))
         self.assertEqual(self.sells, ["cid"])
         self.strategy.boundaries[1300] = 100
-        self.strategy.tick(cfg(), 1301, self.grid, self.quotes(up=.8, down=.39))
+        self.strategy.tick(cfg(), 1301, self.grid, self.quotes(up=.8, down=.19))
         self.assertTrue(row["position"]["settled"])
-        self.assertAlmostEqual(row["position"]["pnl"], -5.1)
+        self.assertAlmostEqual(row["position"]["pnl"], -7.1)
 
     def test_notional_hold_and_one_entry_per_market(self):
         row = self.strategy.state["markets"]["cid"]
@@ -220,8 +220,8 @@ class AdditionalFiveMinTests(unittest.TestCase):
         row = strat.state["markets"]["cid"]
         row["position"] = {"token": "down", "side": "down", "shares": 10, "cost": 9,
                             "dumped": False, "proceeds": 0, "settled": False, "dry_run": False}
-        strat.tick(cfg(fivemin_enabled=False), 1100, SimpleNamespace(price_at=lambda _: 100, latest_exchange_ms=lambda: 1e15), {"cid": {"up": {"bid": .8}, "down": {"bid": .39}}})
-        strat.tick(cfg(fivemin_enabled=False), 1103, SimpleNamespace(price_at=lambda _: 100, latest_exchange_ms=lambda: 1e15), {"cid": {"up": {"bid": .8}, "down": {"bid": .39}}})
+        strat.tick(cfg(fivemin_enabled=False), 1100, SimpleNamespace(price_at=lambda _: 100, latest_exchange_ms=lambda: 1e15), {"cid": {"up": {"bid": .8}, "down": {"bid": .19}}})
+        strat.tick(cfg(fivemin_enabled=False), 1103, SimpleNamespace(price_at=lambda _: 100, latest_exchange_ms=lambda: 1e15), {"cid": {"up": {"bid": .8}, "down": {"bid": .19}}})
         self.assertEqual(sells, ["cid"])
 
 class RunnerTests(unittest.TestCase):
@@ -286,9 +286,9 @@ class RunnerTests(unittest.TestCase):
 
     def test_full_levels_reach_the_dump_and_gamma_goes_through_io_inbox(self):
         clock = [1201.0]
-        levels = [(0.39 - i * 0.01, 10.0) for i in range(6)]
+        levels = [(0.19 - i * 0.01, 10.0) for i in range(6)]
         tops = {"up": SimpleNamespace(bid=.8, ask=.81, bids=[(0.8, 5.0)] * 6, asks=[]),
-                "dn": SimpleNamespace(bid=.39, ask=.40, bids=levels, asks=[])}
+                "dn": SimpleNamespace(bid=.19, ask=.20, bids=levels, asks=[])}
         runner = self.make_runner(clock, [], [], [], usable=lambda token: tops.get(token))
         seen = []
         runner.strategy.io.sell = lambda row, pos, book, cfg, now: seen.append(book) or {"shares": pos["shares"], "proceeds": 1.0}
@@ -343,7 +343,7 @@ class ReviewFixTests(unittest.TestCase):
         grid = SimpleNamespace(price_at=lambda _: 100, latest_exchange_ms=lambda: 1e15)
         strat.tick(cfg(fivemin_gate_k=0), 1203.0, grid, {"cid": {"up": {"bid": .05}, "down": {"bid": .9}}})
         self.assertIn("buy", order)
-        q = {"cid": {"down": {"bid": .3, "bids": [(.3, 50)]}, "up": {"bid": .75}}}
+        q = {"cid": {"down": {"bid": .19, "bids": [(.19, 50)]}, "up": {"bid": .75}}}
         strat.tick(cfg(), 1210.0, grid, q); strat.tick(cfg(), 1213.0, grid, q)
         self.assertIn("sell", order)
 
@@ -412,7 +412,7 @@ class ReviewFixTests(unittest.TestCase):
                            "dumped": True, "settled": False, "dry_run": False}
         strat.boundaries[1500] = 99
         strat.tick(cfg(), 1501, PriceGrid(), {})
-        self.assertEqual(strat.state["paused_until_day"], strat.state["day"])
+        self.assertIsNone(strat.state["paused_until_day"])
         clone = Strategy(io, json.loads(json.dumps(strat.state)), startup_ts=0)
         self.assertTrue(clone.state["markets"]["cid"]["entered"])
         next_day = datetime(1970, 1, 2, tzinfo=timezone.utc).timestamp()

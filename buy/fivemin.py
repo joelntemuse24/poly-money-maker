@@ -14,13 +14,14 @@ from zoneinfo import ZoneInfo
 DEFAULTS = {
     "fivemin_enabled": False, "fivemin_series_slug": "btc-up-or-down-5m",
     "fivemin_binance_url": "wss://stream.binance.com:9443/ws/btcusdt@aggTrade",
-    "fivemin_shares": 25, "fivemin_buy_limit": 0.99, "fivemin_gate_k": 1.0,
-    "fivemin_loser_max": 0.10, "fivemin_loser_min": 0.01, "fivemin_fav_min": 0.80,
-    "fivemin_max_ttm_s": 210, "fivemin_persist_s": 3.0, "fivemin_persist_last_s": 2.0,
-    "fivemin_persist_last_window_s": 90, "fivemin_dump_held_below": 0.40,
-    "fivemin_dump_other_min": 0.70, "fivemin_dump_persist_s": 3.0,
+    "fivemin_shares": 10, "fivemin_buy_limit": 0.99, "fivemin_gate_k": 1.0,
+    "fivemin_loser_max": 0.10, "fivemin_loser_min": 0.01, "fivemin_fav_min": 0.90,
+    "fivemin_max_ttm_s": 120, "fivemin_persist_s": 2.0, "fivemin_persist_last_s": 1.0,
+    "fivemin_persist_last_window_s": 90, "fivemin_dump_held_below": 0.20,
+    "fivemin_dump_other_min": 0.60, "fivemin_dump_persist_s": 3.0,
     "fivemin_dump_limit_offset": 0.20, "fivemin_dump_limit_floor": 0.05,
-    "fivemin_min_notional_usd": 1.0, "fivemin_daily_stop_usd": -30.0,
+    "fivemin_min_notional_usd": 1.0, "fivemin_daily_stop_usd": -150.0,
+    "fivemin_btc_max_age_s": 2.0,
     "fivemin_cash_buffer_usd": 5.0, "fivemin_book_stale_s": 30.0, "fivemin_dry_run": None,
 }
 EPS = 1e-9
@@ -36,6 +37,9 @@ def dry_run(cfg: dict) -> bool:
 
 
 def twap60(grid, g_end: int) -> Optional[float]:
+    fast = getattr(grid, "twap60", None)
+    if callable(fast):
+        return fast(g_end)
     values = [grid.price_at(int(g_end) - 10 * j) for j in range(60)]
     return None if any(v is None for v in values) else sum(values) / 60
 
@@ -196,18 +200,27 @@ class Strategy:
         if removed:
             self.save()
 
-    def _proxy(self, grid, now, row):
+    def _proxy(self, grid, now, row, cfg):
         g = math.floor(now * 10) - 5
         if g not in self._twap_cache:
-            self._twap_cache = {g: twap60(grid, g)}
+            self._twap_cache[g] = twap60(grid, g)
         value = self._twap_cache[g]
         latest = getattr(grid, "latest_exchange_ms", lambda: None)()
-        if latest is None or now * 1000.0 - latest > 5000.0:
+        max_age = float(cfg.get("fivemin_btc_max_age_s", 2.0))
+        if latest is None or now * 1000.0 - latest > max_age * 1000.0:
             if now - self._last_btc_stale >= 60:
                 self._last_btc_stale = now
                 self.io.log("fivemin_btc_stale", age_s=None if latest is None else now - latest / 1000.0)
             return None
         return None if value is None or row.get("offset") is None else value + row["offset"]
+
+    def _eval(self, row, decision, reason, ttm, bids, ratio=None):
+        run = self.runs.setdefault(row["condition_id"], {})
+        if run.get("eval_logged"):
+            return
+        run["eval_logged"] = True
+        self.io.log("fivemin_eval", slug=row["slug"], decision=decision,
+                    reason=reason, ttm=round(ttm, 3), bids=bids, ratio=ratio)
 
     def tick(self, cfg: dict, now: float, grid, books: dict):
         cfg = settings(cfg)
@@ -257,8 +270,21 @@ class Strategy:
             quotes = books.get(cid, {})
             bids = {side: quotes.get(side, {}).get("bid") for side in ("up", "down")}
             run = self.runs.setdefault(cid, {})
+            if ttm <= 0 or ttm > cfg["fivemin_max_ttm_s"]:
+                if ttm <= 0:
+                    self._eval(row, "skip", run.get("last_reason", "window_end"), ttm, bids)
+                continue
+            prefilter = any(
+                bids[loser] is not None and bids[fav] is not None and
+                cfg["fivemin_loser_min"] - EPS <= bids[loser] <= cfg["fivemin_loser_max"] + EPS and
+                bids[fav] + EPS >= cfg["fivemin_fav_min"]
+                for loser, fav in (("up", "down"), ("down", "up"))
+            )
+            if not prefilter:
+                run["last_reason"] = "book_outside"
+                continue
             need = cfg["fivemin_persist_last_s"] if ttm <= cfg["fivemin_persist_last_window_s"] else cfg["fivemin_persist_s"]
-            proxy = self._proxy(grid, now, row)
+            proxy = self._proxy(grid, now, row, cfg)
             signals = []
             for loser, fav in (("up", "down"), ("down", "up")):
                 bid, other = bids[loser], bids[fav]
@@ -270,8 +296,15 @@ class Strategy:
                 ratio = gate_ratio(proxy, strike, fav, ttm)
                 if persisted and ratio is not None and ratio + EPS >= cfg["fivemin_gate_k"]:
                     signals.append((run[loser], loser, fav, ratio))
+                elif not persisted:
+                    run["last_reason"] = "not_persisted"
+                elif ratio is None:
+                    run["last_reason"] = "btc_stale"
+                else:
+                    run["last_reason"] = "gate_below_k"
             if signals:
                 since, loser, fav, ratio = min(signals)
+                self._eval(row, "enter", "signal", ttm, bids, ratio)
                 self._enter(cfg, now, row, quotes, loser, fav, ratio, proxy, now - since)
 
     def _enter(self, cfg, now, row, quotes, loser, fav, ratio, proxy, persisted):

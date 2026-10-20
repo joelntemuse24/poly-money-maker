@@ -14,6 +14,7 @@ class PriceGrid:
         self.slots = max(1800, int(slots))
         self._rows: list[Optional[tuple[int, float]]] = [None] * self.slots
         self._latest: Optional[int] = None
+        self._twap_cache: dict[int, Optional[float]] = {}
         self._lock = threading.Lock()
 
     def add(self, exchange_ms: Any, price: Any) -> Optional[int]:
@@ -29,7 +30,32 @@ class PriceGrid:
                 return None
             self._latest = max(g, self._latest if self._latest is not None else g)
             self._rows[g % self.slots] = (g, px)
+            self._twap_cache.clear()
         return g
+
+    def twap60(self, g_end: int) -> Optional[float]:
+        target = int(g_end)
+        with self._lock:
+            if target in self._twap_cache:
+                return self._twap_cache[target]
+            values = []
+            for j in range(60):
+                wanted = target - 10 * j
+                value = None
+                upper = min(wanted, self._latest if self._latest is not None else wanted)
+                lower = max(upper - self.slots, self._latest - self.slots if self._latest is not None else upper - self.slots)
+                for slot in range(upper, lower, -1):
+                    row = self._rows[slot % self.slots]
+                    if row is not None and row[0] == slot:
+                        value = row[1]
+                        break
+                if value is None:
+                    self._twap_cache[target] = None
+                    return None
+                values.append(value)
+            result = sum(values) / 60.0
+            self._twap_cache[target] = result
+            return result
 
     def latest_exchange_ms(self) -> Optional[float]:
         with self._lock:
@@ -49,9 +75,32 @@ class PriceGrid:
 
 def parse_agg_trade(message: Any) -> Optional[tuple[float, float]]:
     try:
-        obj = json.loads(message) if isinstance(message, (str, bytes, bytearray)) else message
-        if not isinstance(obj, dict):
-            return None
+        text = message.decode("utf-8") if isinstance(message, (bytes, bytearray)) else message
+        if isinstance(text, str):
+            def field(name):
+                marker = chr(34) + name + chr(34) + ":"
+                start = text.find(marker)
+                if start < 0:
+                    raise ValueError(name)
+                start += len(marker)
+                end = start
+                quoted = start < len(text) and text[start] == chr(34)
+                if quoted:
+                    start += 1
+                    end = text.find(chr(34), start)
+                    if end < 0:
+                        raise ValueError(name)
+                else:
+                    while end < len(text) and text[end] not in ",}":
+                        end += 1
+                return float(text[start:end])
+            return field("T"), field("p")
+        if isinstance(message, dict):
+            return float(message["T"]), float(message["p"])
+    except (KeyError, TypeError, ValueError, UnicodeDecodeError):
+        pass
+    try:
+        obj = json.loads(message)
         return float(obj["T"]), float(obj["p"])
     except (KeyError, TypeError, ValueError, json.JSONDecodeError):
         return None
@@ -94,13 +143,19 @@ class BinanceTrades:
                 ws = self._connect(self.url) if self._connect else websocket.create_connection(self.url, timeout=10, enable_multithread=True)
                 self._ws = ws
                 received = False
+                last_slot = None
+                last_price = None
                 while not self._stop.is_set():
                     raw = ws.recv()
                     if not raw:
                         break
                     parsed = parse_agg_trade(raw)
                     if parsed:
-                        self.grid.add(*parsed)
+                        exchange_ms, price = parsed
+                        slot = (int(exchange_ms) + 99) // 100
+                        if slot != last_slot or price != last_price:
+                            self.grid.add(exchange_ms, price)
+                            last_slot, last_price = slot, price
                         received = True
                 ws.close()
                 attempt = 0 if received else attempt + 1
