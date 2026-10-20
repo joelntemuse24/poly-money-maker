@@ -84,7 +84,7 @@ class StrategyTests(unittest.TestCase):
             alert=lambda text, **kw: self.alerts.append(text), durable=lambda: True,
         )
         self.strategy = Strategy(self.io, startup_ts=0)
-        self.strategy.add_market(market())
+        self.strategy.add_market(market(), now=1000)
         row = self.strategy.state["markets"]["cid"]
         row["strike"] = 100.0
         row["offset"] = 0.0
@@ -132,15 +132,15 @@ class StrategyTests(unittest.TestCase):
         row = self.strategy.state["markets"]["cid"]
         row["position"] = {"token": "down", "side": "down", "shares": 10.0, "cost": 9.0,
                             "avg_px": .9, "dumped": False, "proceeds": 0.0, "settled": False}
-        self.strategy.tick(cfg(), 1100, self.grid, self.quotes(up=.8, down=.39))
-        self.strategy.tick(cfg(), 1102.8, self.grid, self.quotes(up=.8, down=.39))
+        self.strategy.tick(cfg(), 1100, self.grid, self.quotes(up=.8, down=.19))
+        self.strategy.tick(cfg(), 1102.8, self.grid, self.quotes(up=.8, down=.19))
         self.assertFalse(self.sells)
-        self.strategy.tick(cfg(), 1103, self.grid, self.quotes(up=.8, down=.39))
+        self.strategy.tick(cfg(), 1103, self.grid, self.quotes(up=.8, down=.19))
         self.assertEqual(self.sells, ["cid"])
         self.strategy.boundaries[1300] = 100
-        self.strategy.tick(cfg(), 1301, self.grid, self.quotes(up=.8, down=.39))
+        self.strategy.tick(cfg(), 1301, self.grid, self.quotes(up=.8, down=.19))
         self.assertTrue(row["position"]["settled"])
-        self.assertAlmostEqual(row["position"]["pnl"], -5.1)
+        self.assertAlmostEqual(row["position"]["pnl"], -7.1)
 
     def test_notional_hold_and_one_entry_per_market(self):
         row = self.strategy.state["markets"]["cid"]
@@ -177,7 +177,7 @@ class AdditionalFiveMinTests(unittest.TestCase):
             save=lambda state: saved.append(state), log=lambda event, **kw: logs.append((event, kw)), durable=lambda: True,
         )
         strat = Strategy(io, startup_ts=0)
-        strat.add_market(market(start=1000))
+        strat.add_market(market(start=1000), now=1000)
         row = strat.state["markets"]["cid"]
         row.update(strike=100.0, offset=0.0)
         strat.sample_cash(1200, 1000)
@@ -220,8 +220,8 @@ class AdditionalFiveMinTests(unittest.TestCase):
         row = strat.state["markets"]["cid"]
         row["position"] = {"token": "down", "side": "down", "shares": 10, "cost": 9,
                             "dumped": False, "proceeds": 0, "settled": False, "dry_run": False}
-        strat.tick(cfg(fivemin_enabled=False), 1100, SimpleNamespace(price_at=lambda _: 100, latest_exchange_ms=lambda: 1e15), {"cid": {"up": {"bid": .8}, "down": {"bid": .39}}})
-        strat.tick(cfg(fivemin_enabled=False), 1103, SimpleNamespace(price_at=lambda _: 100, latest_exchange_ms=lambda: 1e15), {"cid": {"up": {"bid": .8}, "down": {"bid": .39}}})
+        strat.tick(cfg(fivemin_enabled=False), 1100, SimpleNamespace(price_at=lambda _: 100, latest_exchange_ms=lambda: 1e15), {"cid": {"up": {"bid": .8}, "down": {"bid": .19}}})
+        strat.tick(cfg(fivemin_enabled=False), 1103, SimpleNamespace(price_at=lambda _: 100, latest_exchange_ms=lambda: 1e15), {"cid": {"up": {"bid": .8}, "down": {"bid": .19}}})
         self.assertEqual(sells, ["cid"])
 
 class RunnerTests(unittest.TestCase):
@@ -286,9 +286,9 @@ class RunnerTests(unittest.TestCase):
 
     def test_full_levels_reach_the_dump_and_gamma_goes_through_io_inbox(self):
         clock = [1201.0]
-        levels = [(0.39 - i * 0.01, 10.0) for i in range(6)]
+        levels = [(0.19 - i * 0.01, 10.0) for i in range(6)]
         tops = {"up": SimpleNamespace(bid=.8, ask=.81, bids=[(0.8, 5.0)] * 6, asks=[]),
-                "dn": SimpleNamespace(bid=.39, ask=.40, bids=levels, asks=[])}
+                "dn": SimpleNamespace(bid=.19, ask=.20, bids=levels, asks=[])}
         runner = self.make_runner(clock, [], [], [], usable=lambda token: tops.get(token))
         seen = []
         runner.strategy.io.sell = lambda row, pos, book, cfg, now: seen.append(book) or {"shares": pos["shares"], "proceeds": 1.0}
@@ -322,8 +322,8 @@ class ReviewFixTests(unittest.TestCase):
 
     def test_market_in_progress_at_startup_is_skipped(self):
         strat, order = self.make(startup_ts=1100)
-        strat.add_market(market("cid", 1000))
-        strat.add_market(market("next", 1300))
+        strat.add_market(market("cid", 1000), now=1000)
+        strat.add_market(market("next", 1300), now=1000)
         self.assertTrue(strat.state["markets"]["cid"]["entered"])
         self.assertEqual(strat.state["markets"]["cid"]["skip_reason"], "startup")
         self.assertFalse(strat.state["markets"]["next"]["entered"])
@@ -335,7 +335,7 @@ class ReviewFixTests(unittest.TestCase):
 
     def test_buy_and_dump_never_wait_on_a_durable_flush(self):
         strat, order = self.make(durable=lambda: (_ for _ in ()).throw(AssertionError("flush before order")))
-        strat.add_market(market("cid", 1000))
+        strat.add_market(market("cid", 1000), now=1000)
         row = strat.state["markets"]["cid"]
         row.update(strike=100.0, offset=0.0)
         strat.sample_cash(1200, 1000)
@@ -343,13 +343,13 @@ class ReviewFixTests(unittest.TestCase):
         grid = SimpleNamespace(price_at=lambda _: 100, latest_exchange_ms=lambda: 1e15)
         strat.tick(cfg(fivemin_gate_k=0), 1203.0, grid, {"cid": {"up": {"bid": .05}, "down": {"bid": .9}}})
         self.assertIn("buy", order)
-        q = {"cid": {"down": {"bid": .3, "bids": [(.3, 50)]}, "up": {"bid": .75}}}
+        q = {"cid": {"down": {"bid": .19, "bids": [(.19, 50)]}, "up": {"bid": .75}}}
         strat.tick(cfg(), 1210.0, grid, q); strat.tick(cfg(), 1213.0, grid, q)
         self.assertIn("sell", order)
 
     def test_start_twap_waits_one_second(self):
         strat, _ = self.make()
-        strat.add_market(market("cid", 1000))
+        strat.add_market(market("cid", 1000), now=1000)
         grid = PriceGrid()
         for ms in range(900_000, 1_001_000, 100):
             grid.add(ms, 100.0)
@@ -370,7 +370,7 @@ class ReviewFixTests(unittest.TestCase):
 
     def test_stale_btc_blocks_gate(self):
         strat, order = self.make()
-        strat.add_market(market("cid", 1000))
+        strat.add_market(market("cid", 1000), now=1000)
         row = strat.state["markets"]["cid"]
         row.update(strike=100.0, offset=0.0)
         strat.sample_cash(1200, 1000)
@@ -386,7 +386,7 @@ class ReviewFixTests(unittest.TestCase):
                        redeem=lambda row, now: redemptions.append(row["condition_id"]), save=lambda *a: None,
                        gamma_winner=lambda slug: calls.append(slug) or "up")
         strategy = Strategy(io, startup_ts=0)
-        strategy.add_market(market("cid", 1200))
+        strategy.add_market(market("cid", 1200), now=1200)
         row = strategy.state["markets"]["cid"]
         row.update(entered=True, strike=100, offset=0)
         row["position"] = {"side": "up", "token": "up", "shares": 10, "cost": 8,
@@ -405,14 +405,14 @@ class ReviewFixTests(unittest.TestCase):
         io = FiveMinIO(buy=lambda *a: self.fail("duplicate entry"), sell=lambda *a: {},
                        reserves=lambda cfg: 0, redeem=lambda *a: None, save=lambda *a: None)
         strat = Strategy(io, startup_ts=0)
-        strat.add_market(market("cid", 1200))
+        strat.add_market(market("cid", 1200), now=1200)
         row = strat.state["markets"]["cid"]
         row.update(entered=True, strike=100, offset=0)
         row["position"] = {"side": "up", "shares": 0, "cost": 31, "proceeds": 0,
                            "dumped": True, "settled": False, "dry_run": False}
         strat.boundaries[1500] = 99
         strat.tick(cfg(), 1501, PriceGrid(), {})
-        self.assertEqual(strat.state["paused_until_day"], strat.state["day"])
+        self.assertIsNone(strat.state["paused_until_day"])
         clone = Strategy(io, json.loads(json.dumps(strat.state)), startup_ts=0)
         self.assertTrue(clone.state["markets"]["cid"]["entered"])
         next_day = datetime(1970, 1, 2, tzinfo=timezone.utc).timestamp()
@@ -423,3 +423,124 @@ class ReviewFixTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+class CacheBoundTests(unittest.TestCase):
+    def test_twap_caches_stay_bounded(self):
+        grid = PriceGrid()
+        for g in range(1000):
+            grid.add(g * 100, 100.0 + g * 0.001)
+            grid.twap60(g)
+        self.assertLessEqual(len(grid._twap_cache), 8)
+
+        io = FiveMinIO(buy=lambda *a: {}, sell=lambda *a: {}, reserves=lambda c: 0,
+                       redeem=lambda *a: None, save=lambda s: None)
+        strategy = Strategy(io, startup_ts=0)
+        row = market("cache", 1000)
+        strategy.add_market(row, now=1000)
+        state_row = strategy.state["markets"]["cache"]
+        state_row.update(strike=100.0, offset=0.0)
+        strategy.sample_cash(1000, 1000)
+        for now in range(1000, 1100):
+            strategy._proxy(grid, float(now), state_row, dict(DEFAULTS, fivemin_btc_max_age_s=100000))
+        self.assertLessEqual(len(strategy._twap_cache), 1)
+
+class RequestedFollowupTests(unittest.TestCase):
+    def test_defaults_and_fast_parser(self):
+        self.assertEqual(DEFAULTS["fivemin_shares"], 10)
+        self.assertEqual(DEFAULTS["fivemin_max_ttm_s"], 120)
+        self.assertEqual(DEFAULTS["fivemin_fav_min"], 0.90)
+        self.assertEqual(DEFAULTS["fivemin_persist_s"], 2.0)
+        self.assertEqual(DEFAULTS["fivemin_persist_last_s"], 1.0)
+        self.assertEqual(DEFAULTS["fivemin_dump_held_below"], 0.20)
+        self.assertEqual(DEFAULTS["fivemin_dump_other_min"], 0.60)
+        self.assertEqual(DEFAULTS["fivemin_daily_stop_usd"], -150.0)
+        self.assertEqual(DEFAULTS["fivemin_btc_max_age_s"], 2.0)
+        self.assertEqual(parse_agg_trade('{"T":1234,"p":"12.5","x":1}'), (1234.0, 12.5))
+
+    def test_price_grid_twap_matches_legacy_with_gaps_and_out_of_order(self):
+        import random
+        rng = random.Random(7)
+        rows = [(100000 + i * 100, 100 + rng.random()) for i in range(900)]
+        shuffled = rows[:]
+        rng.shuffle(shuffled)
+        grid = PriceGrid()
+        for timestamp, price in shuffled:
+            grid.add(timestamp, price)
+        for end in (1000, 1050, 1100, 1200, 1500, 1800):
+            legacy = [grid.price_at(end - 10 * j) for j in range(60)]
+            expected = None if any(v is None for v in legacy) else sum(legacy) / 60
+            self.assertEqual(grid.twap60(end), expected)
+            self.assertEqual(twap60(grid, end), expected)
+
+    def test_stale_btc_age_two_point_five_blocks_and_one_point_five_allows(self):
+        logs = []
+        io = FiveMinIO(
+            buy=lambda *a: {"shares": 10, "cost": 9}, sell=lambda *a: {}, reserves=lambda c: 0,
+            redeem=lambda *a: None, save=lambda s: None, log=lambda e, **k: logs.append(e), durable=lambda: True,
+        )
+        strategy = Strategy(io, startup_ts=0)
+        strategy.add_market(market("cid", 1000), now=1000)
+        row = strategy.state["markets"]["cid"]
+        row.update(strike=100, offset=0)
+        strategy.sample_cash(1200, 1000)
+        strategy.runs["cid"] = {"up": 1200}
+        for age, expected in ((2.5, False), (1.5, True)):
+            row["entered"] = False
+            row["position"] = None
+            strategy.runs["cid"] = {"up": 1200}
+            grid = SimpleNamespace(price_at=lambda _: 100, latest_exchange_ms=lambda age=age: (1203 - age) * 1000)
+            strategy.tick(cfg(fivemin_gate_k=0), 1203, grid,
+                          {"cid": {"up": {"bid": .05}, "down": {"bid": .9}}})
+            self.assertEqual(bool(row.get("position")), expected)
+
+    def test_eval_logged_once_for_entry_and_terminal_skip(self):
+        events = []
+        io = FiveMinIO(
+            buy=lambda *a: {"shares": 10, "cost": 9}, sell=lambda *a: {}, reserves=lambda c: 0,
+            redeem=lambda *a: None, save=lambda s: None, log=lambda e, **k: events.append((e, k)), durable=lambda: True,
+        )
+        strategy = Strategy(io, startup_ts=0)
+        strategy.add_market(market("entry", 1000), now=1000)
+        entry = strategy.state["markets"]["entry"]
+        entry.update(strike=100, offset=0)
+        strategy.sample_cash(1200, 1000)
+        strategy.runs["entry"] = {"up": 1200}
+        grid = SimpleNamespace(price_at=lambda _: 100, latest_exchange_ms=lambda: 1e15)
+        quotes = {"entry": {"up": {"bid": .05}, "down": {"bid": .9}}}
+        strategy.tick(cfg(fivemin_gate_k=0), 1203, grid, quotes)
+        strategy.tick(cfg(fivemin_gate_k=0), 1204, grid, quotes)
+        self.assertEqual([e for e, _ in events if e == "fivemin_eval"], ["fivemin_eval"])
+        skipped = Strategy(io, startup_ts=0)
+        skipped.add_market(market("skip", 1000), now=1000)
+        skipped.state["markets"]["skip"]["entered"] = False
+        skipped.tick(cfg(), 1301, grid, {})
+        skipped.tick(cfg(), 1302, grid, {})
+        skip_rows = [k for e, k in events if e == "fivemin_eval" and k.get("decision") == "skip"]
+        self.assertEqual(len(skip_rows), 1)
+        self.assertTrue(skip_rows[0]["reason"])
+
+    def test_dump_thresholds(self):
+        logs, sells = [], []
+        io = FiveMinIO(
+            buy=lambda *a: {}, sell=lambda row, pos, book, cfg, now: sells.append(1) or {"shares": 10, "proceeds": 1},
+            reserves=lambda c: 0, redeem=lambda *a: None, save=lambda s: None,
+            log=lambda e, **k: logs.append(e), durable=lambda: True,
+        )
+        strategy = Strategy(io, startup_ts=0)
+        strategy.add_market(market("dump", 1000), now=1000)
+        row = strategy.state["markets"]["dump"]
+        row["position"] = {"side": "up", "shares": 10, "cost": 9, "proceeds": 0, "dumped": False, "settled": False}
+        for now in (1100, 1102.8):
+            strategy.tick(cfg(), now, SimpleNamespace(price_at=lambda _: 100, latest_exchange_ms=lambda: 1e15),
+                          {"dump": {"up": {"bid": .19, "bids": []}, "down": {"bid": .60, "bids": []}}})
+        self.assertFalse(sells)
+        strategy.tick(cfg(), 1103, SimpleNamespace(price_at=lambda _: 100, latest_exchange_ms=lambda: 1e15),
+                      {"dump": {"up": {"bid": .19, "bids": []}, "down": {"bid": .60, "bids": []}}})
+        self.assertEqual(sells, [1])
+        row["position"] = {"side": "up", "shares": 10, "cost": 9, "proceeds": 0, "dumped": False, "settled": False}
+        strategy.runs["dump"].pop("dump", None)
+        strategy.tick(cfg(), 1110, SimpleNamespace(price_at=lambda _: 100, latest_exchange_ms=lambda: 1e15),
+                      {"dump": {"up": {"bid": .25, "bids": []}, "down": {"bid": .60, "bids": []}}})
+        strategy.tick(cfg(), 1113, SimpleNamespace(price_at=lambda _: 100, latest_exchange_ms=lambda: 1e15),
+                      {"dump": {"up": {"bid": .25, "bids": []}, "down": {"bid": .60, "bids": []}}})
+        self.assertEqual(sells, [1])
