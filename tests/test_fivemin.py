@@ -9,7 +9,7 @@ from types import SimpleNamespace
 
 from buy.binance_trades import PriceGrid, parse_agg_trade
 from buy.fivemin import (
-    DEFAULTS, FiveMinIO, Strategy, cash_free, dry_run, gate_ratio,
+    DEFAULTS, FiveMinIO, Strategy, ask_depth, cash_free, dry_fill, dry_run, gate_ratio,
     local_day, market_offset, proxy_price, run_ready, settlement_pnl, twap60,
 )
 
@@ -704,3 +704,185 @@ class RequestedFollowupTests(unittest.TestCase):
         strategy.tick(cfg(), 1113, SimpleNamespace(price_at=lambda _: 100, latest_exchange_ms=lambda: 1e15),
                       {"dump": {"up": {"bid": .25, "bids": []}, "down": {"bid": .60, "bids": []}}})
         self.assertEqual(sells, [1])
+
+
+class EntryDepthTests(unittest.TestCase):
+    setUp = StrategyTests.setUp
+    quotes = StrategyTests.quotes
+
+    def enter(self, **extra):
+        row = self.strategy.state["markets"]["cid"]
+        self.strategy._enter(cfg(**extra), 1203, row, self.book, "up", "down", 1, 0, 3)
+        return row
+
+    def set_book(self):
+        self.book = self.quotes()["cid"]
+        self.book["down"]["asks"] = [
+            {"price": "1", "size": "100"}, {"price": ".99", "size": "4"},
+            {"price": ".98", "size": "3"}, {"price": ".97", "size": "2"},
+        ]
+
+    def test_depth_order_and_cumulative_sizes(self):
+        self.set_book()
+        self.assertEqual(ask_depth(self.book["down"]), {
+            "asks_depth": [[.97, 2], [.98, 3], [.99, 4]], "cum_098": 5, "cum_099": 9})
+        self.assertEqual(ask_depth({}), {"asks_depth": [], "cum_098": 0, "cum_099": 0})
+        self.assertEqual(ask_depth({"asks": [(1, 5), (.98, 2), (.97, 1)]})["cum_098"], 3)
+        self.enter()
+        signal = next(fields for event, fields in self.logs if event == "fivemin_signal")
+        self.assertEqual(signal["asks_depth"], [[.97, 2], [.98, 3], [.99, 4]])
+        self.assertEqual(signal["books"]["down"]["asks"], signal["asks_depth"])
+
+    def test_book_walk_full_partial_and_zero(self):
+        self.set_book()
+        for shares, limit, expected, notional in ((4, .99, 4, 2 * .97 + 2 * .98),
+                                                 (10, .98, 5, 2 * .97 + 3 * .98),
+                                                 (10, .96, 0, 0)):
+            with self.subTest(shares=shares, limit=limit):
+                result = dry_fill(self.book["down"], shares, limit)
+                self.assertEqual(result["shares"], expected)
+                self.assertAlmostEqual(result["cost"] - result["fees"], notional)
+                self.assertAlmostEqual(result["price"], notional / expected if expected else 0)
+        self.assertEqual(dry_fill({}, 10, .99)["shares"], 0)
+
+    def test_dry_fill_logs_alert_and_settlement_include_book_fees(self):
+        self.set_book()
+        row = self.enter(fivemin_dry_run=True, fivemin_buy_limit=.98)
+        fees = 2 * .07 * .97 * .03 + 3 * .07 * .98 * .02
+        notional = 2 * .97 + 3 * .98
+        position = row["position"]
+        self.assertEqual(position["shares"], 5)
+        self.assertAlmostEqual(position["avg_px"], notional / 5)
+        self.assertAlmostEqual(position["cost"], notional + fees)
+        fill = next(fields for event, fields in self.logs if event == "fivemin_fill")
+        self.assertTrue(fill["dry_run"])
+        self.assertEqual(fill["size"], 5)
+        self.assertAlmostEqual(fill["fees"], fees)
+        self.assertAlmostEqual(fill["price"], notional / 5)
+        self.assertIn("[DRY]", self.alerts[-1])
+        self.assertIn(f"fill 5 @ {notional / 5:.4f}", self.alerts[-1])
+        self.strategy._settle(cfg(fivemin_dry_run=True), 1301, row, "down", "test")
+        self.assertAlmostEqual(position["pnl"], 5 - notional - fees)
+        self.assertFalse(self.strategy.spends)
+
+    def test_dry_empty_book_logs_zero_fill(self):
+        self.book = self.quotes()["cid"]
+        row = self.enter(fivemin_dry_run=True)
+        self.assertEqual(row["position"]["shares"], 0)
+        self.assertEqual(row["position"]["cost"], 0)
+        self.assertIn("[DRY]", self.alerts[-1])
+        self.assertIn("fill 0 @ 0.0000", self.alerts[-1])
+
+    def test_buy_error_and_success_save_and_log_after_buy(self):
+        from unittest.mock import patch
+        import buy.fivemin as module
+        for fails in (False, True):
+            with self.subTest(fails=fails):
+                self.setUp()
+                self.set_book()
+                order = []
+                clock = [1203.0]
+                self.io.clock = lambda: clock[0]
+                original_save, original_log = self.io.save, self.io.log
+                self.io.save = lambda state: (order.append("save"), original_save(state))
+                self.io.log = lambda event, **fields: (order.append(event), original_log(event, **fields))
+                def buy(*args):
+                    self.assertTrue(self.strategy.state["markets"]["cid"]["entered"])
+                    self.assertEqual(order, [])
+                    order.append("buy")
+                    clock[0] += .125
+                    if fails:
+                        raise RuntimeError("exchange unavailable")
+                    return {"shares": 2, "cost": 1.96}
+                self.io.buy = buy
+                original_copy = module.deepcopy
+                def copy_after_buy(value):
+                    self.assertIn("buy", order)
+                    order.append("copy")
+                    return original_copy(value)
+                with patch.object(module, "deepcopy", side_effect=copy_after_buy):
+                    row = self.enter()
+                self.assertLess(order.index("buy"), order.index("save"))
+                self.assertLess(order.index("buy"), order.index("fivemin_signal"))
+                self.assertTrue(self.saved[-1]["markets"]["cid"]["entered"])
+                event = "fivemin_order_error" if fails else "fivemin_fill"
+                fields = next(fields for name, fields in self.logs if name == event)
+                self.assertAlmostEqual(fields["latency_ms"], 125)
+                self.assertTrue(self.alerts)
+                if fails:
+                    self.assertEqual(fields["error"], "exchange unavailable")
+                    self.assertEqual(fields["slug"], row["slug"])
+                    self.assertEqual(fields["side"], "down")
+                    self.assertEqual(fields["limit"], .99)
+                    self.assertIsNone(row["position"])
+                    clone = Strategy(self.io, self.saved[-1], startup_ts=1204)
+                    self.assertTrue(clone.state["markets"]["cid"]["entered"])
+                    self.assertTrue(any(name == "fivemin_skip_startup_market" for name, _ in self.logs))
+
+    def test_live_nofill_logs_and_alerts(self):
+        self.set_book()
+        self.io.buy = lambda *args: {"shares": 0, "cost": 0}
+        self.enter()
+        fields = next(fields for event, fields in self.logs if event == "fivemin_signal_nofill")
+        self.assertEqual(fields["side"], "down")
+        self.assertIn("no fill", self.alerts[-1])
+
+    def test_window_depth_maxima_only_include_in_band_ticks(self):
+        self.set_book()
+        for now, size, up in ((1200, 100, .5), (1201, 7, .05), (1202, 2, .05)):
+            self.book["up"]["bid"] = up
+            self.book["down"]["asks"] = [(1, 99), (.99, size + 1), (.98, size)]
+            self.strategy.tick(cfg(fivemin_gate_k=1000), now, self.grid, {"cid": self.book})
+        self.strategy.tick(cfg(), 1301, self.grid, {})
+        summary = next(fields for event, fields in self.logs if event == "fivemin_eval")
+        self.assertEqual(summary["asks_depth"], [[.98, 2], [.99, 3]])
+        self.assertEqual(summary["cum_098"], 2)
+        self.assertEqual(summary["cum_099"], 5)
+        self.assertEqual(summary["max_cum_098"], 7)
+        self.assertEqual(summary["max_cum_099"], 15)
+
+
+class MintDisabledLoopTests(unittest.TestCase):
+    def test_disabled_returns_after_stop_check_before_maintenance(self):
+        from unittest.mock import Mock
+        source = (ROOT / "mintbot.py").read_text()
+        # Read only the mint-loop preamble under test.
+        preamble = source.split("def run_mint_cycle(", 1)[1].split("    markets = gateway.discover", 1)[0]
+        tree = ast.parse("def run_mint_cycle(" + preamble)
+        heartbeats = Mock()
+        stop = Mock(return_value=False)
+        ns = dict(MarketGateway=object, ChainReader=object, time=SimpleNamespace(time=lambda: 1200),
+                  STOP_FILE=SimpleNamespace(exists=stop), write_loop_heartbeat=heartbeats,
+                  _STATE_WRITER=object(), _prune_state_tick=Mock(),
+                  fail_stale_submitting_intents=Mock(), reconcile_intents=Mock())
+        exec(compile(tree, "mint-loop", "exec"), ns)
+        self.assertEqual(ns["run_mint_cycle"]({"entry_enabled": False}, {}, None, None), "disabled")
+        stop.assert_called_once_with()
+        heartbeats.assert_called_once_with("mint", "disabled")
+        for name in ("_prune_state_tick", "fail_stale_submitting_intents", "reconcile_intents"):
+            ns[name].assert_not_called()
+        stop.return_value = True
+        self.assertEqual(ns["run_mint_cycle"]({"entry_enabled": False}, {}, None, None), "stopped")
+        self.assertEqual(heartbeats.call_args.args, ("mint", "stopped"))
+
+
+    def test_enabled_keeps_maintenance_before_wait_submit(self):
+        from contextlib import nullcontext
+        source = (ROOT / "mintbot.py").read_text()
+        preamble = source.split("def run_mint_cycle(", 1)[1].split("    markets = gateway.discover", 1)[0]
+        calls = []
+        ns = dict(MarketGateway=object, ChainReader=object, time=SimpleNamespace(time=lambda: 1200),
+                  STOP_FILE=SimpleNamespace(exists=lambda: False),
+                  write_loop_heartbeat=lambda *args: calls.append(args), _STATE_WRITER=object(),
+                  _prune_state_tick=lambda *args: calls.append("prune"),
+                  fail_stale_submitting_intents=lambda *args: calls.append("fail_stale"),
+                  reconcile_intents=lambda *args, **kwargs: calls.append("reconcile"),
+                  os=SimpleNamespace(getenv=lambda _: "funder"), STATE_LOCK=nullcontext(),
+                  skip_mint_discovery_for_sell=lambda *args: False,
+                  to_checksum_address=lambda value: value,
+                  commit_state=lambda *args: calls.append("commit"))
+        exec(compile(ast.parse("def run_mint_cycle(" + preamble), "mint-loop", "exec"), ns)
+        result = ns["run_mint_cycle"]({"entry_enabled": True},
+                                       {"intents": {"cid": {"status": "submitting"}}}, None, None)
+        self.assertEqual(result, "wait_submit")
+        self.assertEqual(calls, ["prune", "fail_stale", "reconcile", "commit", ("mint", "wait_submit")])

@@ -8088,6 +8088,9 @@ def run_mint_cycle(
     if STOP_FILE.exists():
         write_loop_heartbeat("mint", "stopped")
         return "stopped"
+    if not cfg.get("entry_enabled"):
+        write_loop_heartbeat("mint", "disabled")
+        return "disabled"
     if globals().get("_STATE_WRITER") is not None:
         _prune_state_tick(state, cfg, now)
     fail_stale_submitting_intents(state, cfg, now)
@@ -8115,10 +8118,6 @@ def run_mint_cycle(
     if submitting:
         write_loop_heartbeat("mint", "wait_submit")
         return "wait_submit"
-
-    if not cfg.get("entry_enabled"):
-        write_loop_heartbeat("mint", "disabled")
-        return "disabled"
 
     markets = gateway.discover(list(cfg["series_slugs"]))
     seq_on = seq_settings(cfg)[0]
