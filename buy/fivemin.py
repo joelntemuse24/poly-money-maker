@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+from copy import deepcopy
 import math
 import time
 import threading
@@ -81,6 +82,39 @@ def cash_free(balance: Optional[float], sampled_at: Optional[float], now: float,
         return None
     spent = sum(float(row["cost"]) for row in spends if float(row["ts"]) >= sampled_at)
     return balance - reserved - spent
+
+
+def ask_levels(book: dict) -> list[list[float]]:
+    levels = []
+    for level in book.get("asks", []):
+        if isinstance(level, dict):
+            price, size = float(level["price"]), float(level["size"])
+        else:
+            price, size = map(float, level)
+        if math.isfinite(price) and math.isfinite(size) and price > 0 and size > 0:
+            levels.append([price, size])
+    return sorted(levels, key=lambda level: level[0])
+
+
+def ask_depth(book: dict) -> dict:
+    levels = [level for level in ask_levels(book) if level[0] <= 0.99]
+    return {"asks_depth": levels,
+            "cum_098": sum(size for price, size in levels if price <= 0.98),
+            "cum_099": sum(size for price, size in levels)}
+
+
+def dry_fill(book: dict, shares: float, limit: float) -> dict:
+    filled = notional = fees = 0.0
+    for price, size in ask_levels(book):
+        if price > limit or filled >= shares:
+            break
+        take = min(size, shares - filled)
+        filled += take
+        notional += take * price
+        fees += take * 0.07 * price * (1 - price)
+    return {"shares": filled, "cost": notional + fees, "fees": fees,
+            "price": notional / filled if filled else 0.0,
+            "status": "matched" if filled >= shares else "partial" if filled else "unfilled"}
 
 
 def settlement_pnl(position: dict, winner: str) -> float:
@@ -256,8 +290,11 @@ class Strategy:
         if run.get("eval_logged"):
             return
         run["eval_logged"] = True
+        depth = run.get("depth", ask_depth({}))
         self.io.log("fivemin_eval", slug=row["slug"], decision=decision,
-                    reason=reason, ttm=round(ttm, 3), bids=bids, ratio=ratio, **extra)
+                    reason=reason, ttm=round(ttm, 3), bids=bids, ratio=ratio,
+                    **depth, max_cum_098=run.get("max_cum_098", 0),
+                    max_cum_099=run.get("max_cum_099", 0), **extra)
 
     def tick(self, cfg: dict, now: float, grid, books: dict):
         self._tick_now = now
@@ -333,6 +370,9 @@ class Strategy:
             run = self.runs.setdefault(cid, {})
             if ttm > cfg["fivemin_max_ttm_s"]:
                 continue
+            fav = max((side for side in bids if bids[side] is not None),
+                      key=lambda side: bids[side], default=None)
+            run["depth"] = ask_depth(quotes.get(fav, {}))
             run.update(last_bids=bids, last_ttm=ttm, last_ratio=None)
             run["in_window_ticks"] = run.get("in_window_ticks", 0) + 1
             run["book_ticks"] = run.get("book_ticks", 0) + int(all(bid is not None for bid in bids.values()))
@@ -365,6 +405,9 @@ class Strategy:
                 run[loser], persisted = run_ready(run.get(loser), ok, now, need)
                 ratio = gate_ratio(proxy, strike, fav, ttm)
                 if ok:
+                    run["depth"] = ask_depth(quotes.get(fav, {}))
+                    for key in ("cum_098", "cum_099"):
+                        run["max_" + key] = max(run.get("max_" + key, 0), run["depth"][key])
                     run["persist_max_s"] = max(run.get("persist_max_s", 0), now - run[loser])
                     run["last_ratio"] = ratio
                     if ratio is not None:
@@ -388,53 +431,81 @@ class Strategy:
                 self._enter(cfg, now, row, quotes, loser, fav, ratio, proxy, now - since)
 
     def _enter(self, cfg, now, row, quotes, loser, fav, ratio, proxy, persisted):
+        decision_time = self.io.clock() if self.io.clock is not None else time.perf_counter()
         row["entered"] = True
-        self.save(force=True)
-        sent_now = self.io.clock() if self.io.clock is not None else now
-        if sent_now >= row["end"]:
-            self.io.log("fivemin_signal_blocked", slug=row["slug"], reason="expired")
-            return
-        log_books = {side: {**(quotes.get(side) or {}),
-                            "bids": (quotes.get(side) or {}).get("bids", [])[:3],
-                            "asks": (quotes.get(side) or {}).get("asks", [])[:3]}
-                     for side in ("up", "down")}
-        self.io.log("fivemin_signal", ts=now, slug=row["slug"], condition_id=row["condition_id"],
-                    ttm=row["end"] - now, gate_ratio=ratio, proxy=proxy, strike=row["strike"],
-                    offset=row.get("offset"), books=log_books, loser=loser, persisted_s=persisted)
+        sent_now = decision_time if self.io.clock is not None else now
+
+        def record_signal():
+            self.save(force=True)
+            log_books = deepcopy({side: quotes.get(side) or {} for side in ("up", "down")})
+            for book in log_books.values():
+                book["bids"] = book.get("bids", [])[:3]
+                book["asks"] = ask_levels(book)[:3]
+            self.io.log("fivemin_signal", ts=now, slug=row["slug"], condition_id=row["condition_id"],
+                        ttm=row["end"] - now, gate_ratio=ratio, proxy=proxy, strike=row["strike"],
+                        offset=row.get("offset"), books=log_books, loser=loser,
+                        persisted_s=persisted, **ask_depth(quotes.get(fav, {})))
+
         reason = None
-        if not cfg["fivemin_enabled"]:
+        if sent_now >= row["end"]:
+            reason = "expired"
+        elif not cfg["fivemin_enabled"]:
             reason = "disabled"
         elif self.state.get("paused_until_day") == self.state["day"]:
             reason = "daily_stop"
         if reason:
             if reason == "daily_stop":
                 self.runs.setdefault(row["condition_id"], {})["last_reason"] = "daily_stop"
+            record_signal()
             self.io.log("fivemin_signal_blocked", slug=row["slug"], reason=reason)
             return
         shares, limit = float(cfg["fivemin_shares"]), float(cfg["fivemin_buy_limit"])
         reserved = self.io.reserves(cfg)
         free = cash_free(self.balance, self.sampled_at, sent_now, reserved + cfg["fivemin_cash_buffer_usd"], self.spends)
         if free is None or free + EPS < shares * limit:
+            record_signal()
             self.io.log("fivemin_cash_skip", slug=row["slug"], free=free, required=shares * limit)
             return
         token = row["up_token"] if fav == "up" else row["dn_token"]
-        result = self.io.buy(token, shares, limit, dry_run(cfg))
+        is_dry = dry_run(cfg)
+        error = None
+        try:
+            result = self.io.buy(token, shares, limit, is_dry)
+        except Exception as exc:
+            error = str(exc)
+        response_time = self.io.clock() if self.io.clock is not None else time.perf_counter()
+        latency_ms = (response_time - decision_time) * 1000
+        if error is not None:
+            record_signal()
+            self.io.log("fivemin_order_error", slug=row["slug"], side=fav, limit=limit,
+                        error=error, latency_ms=latency_ms)
+            self.alert(f"5m {row['slug']} {fav.upper()} order error @ {limit:.4f}: {error}",
+                       cfg, "fivemin_order_error")
+            return
+        if is_dry:
+            result = dry_fill(quotes.get(fav, {}), shares, limit)
         filled = float(result.get("shares", 0))
         cost = float(result.get("cost", filled * limit))
-        avg = cost / filled if filled else limit
+        avg = result["price"] if is_dry else cost / filled if filled else 0.0
         row["position"] = {
             "token": token, "side": fav, "shares": filled, "cost": cost, "avg_px": avg,
             "dumped": False, "proceeds": 0.0, "settled": False, "pnl": None,
-            "status": result.get("status", "posted"), "dry_run": dry_run(cfg),
+            "status": result.get("status", "posted"), "dry_run": is_dry,
             "filled_at": now,
         }
-        if cost > 0 and not dry_run(cfg):
+        if cost > 0 and not is_dry:
             self.spends.append({"ts": now, "cost": cost})
-        self.save(force=True)
+        record_signal()
         self.io.log("fivemin_fill", slug=row["slug"], condition_id=row["condition_id"],
-                    price=avg, size=filled, usdc=cost, status=result.get("status"), fees=result.get("fees"))
-        if filled > 0:
-            self.alert(f"5m {self.io.label(row['start'])} {fav.upper()} fill {filled:g} @ {avg:.4f}; ttm={row['end']-now:.1f}s gate={ratio:.3f}", cfg, "fivemin_fill")
+                    price=avg, size=filled, usdc=cost, status=result.get("status"),
+                    fees=result.get("fees"), dry_run=is_dry, latency_ms=latency_ms)
+        if filled == 0 and not is_dry:
+            self.io.log("fivemin_signal_nofill", slug=row["slug"], side=fav, limit=limit,
+                        latency_ms=latency_ms)
+            self.alert(f"5m {row['slug']} {fav.upper()} no fill @ {limit:.4f}", cfg, "fivemin_signal_nofill")
+        else:
+            tag = f"realistic fill {filled:g} @ {avg:.4f} (of {shares:g}, book walk, fee {float(result.get('fees') or 0):.2f})" if is_dry else f"fill {filled:g} @ {avg:.4f}; {latency_ms:.0f}ms"
+            self.alert(f"5m {self.io.label(row['start'])} {fav.upper()} {tag}; ttm={row['end']-now:.1f}s gate={ratio:.3f}", cfg, "fivemin_fill")
 
     def _manage(self, cfg, now, row, quotes):
         p = row["position"]
