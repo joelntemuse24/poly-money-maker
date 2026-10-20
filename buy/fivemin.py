@@ -22,10 +22,11 @@ DEFAULTS = {
     "fivemin_dump_other_min": 0.60, "fivemin_dump_persist_s": 3.0,
     "fivemin_dump_limit_offset": 0.20, "fivemin_dump_limit_floor": 0.05,
     "fivemin_min_notional_usd": 1.0, "fivemin_daily_stop_usd": -150.0,
-    "fivemin_btc_max_age_s": 2.0,
+    "fivemin_btc_max_age_s": 3.0,
     "fivemin_cash_buffer_usd": 5.0, "fivemin_book_stale_s": 30.0, "fivemin_dry_run": None,
 }
 EPS = 1e-9
+STRIKE_GRACE_S = 5.0
 
 
 def settings(cfg: dict) -> dict:
@@ -118,6 +119,7 @@ class Strategy:
         self.state.setdefault("realized", 0.0)
         self.state.setdefault("paused_until_day", None)
         self.boundaries: dict[int, float] = {}
+        self._near_boundaries: dict[int, tuple[float, float]] = {}
         self._active = set()
         for cid, row in list(self.state["markets"].items()):
             if row.get("skip_reason") == "startup" and row.get("end", 0) < self.startup_ts - 600 and not row.get("position"):
@@ -166,12 +168,21 @@ class Strategy:
                 obs = float(sample.obs_ts)
                 stamp = round(obs)
                 value = float(sample.twap)
-                if abs(obs - stamp) <= 0.0005 and stamp % 300 == 0 and math.isfinite(value):
+                if not math.isfinite(value):
+                    continue
+                if abs(obs - stamp) <= 0.0005 and stamp % 300 == 0:
                     self.boundaries.setdefault(stamp, value)
+                boundary = round(obs / 300) * 300
+                diff = abs(obs - boundary)
+                if diff <= 1.0 and (
+                    boundary not in self._near_boundaries or diff < self._near_boundaries[boundary][0]
+                ):
+                    self._near_boundaries[boundary] = (diff, value)
             except (TypeError, ValueError, AttributeError):
                 continue
-        for key in sorted(self.boundaries)[:-32]:
-            del self.boundaries[key]
+        for cache in (self.boundaries, self._near_boundaries):
+            for key in sorted(cache)[:-32]:
+                del cache[key]
 
     def roll_day(self, now):
         day = local_day(now)
@@ -232,7 +243,7 @@ class Strategy:
             self._twap_cache = {g: twap60(grid, g)}
         value = self._twap_cache[g]
         latest = getattr(grid, "latest_exchange_ms", lambda: None)()
-        max_age = float(cfg.get("fivemin_btc_max_age_s", 2.0))
+        max_age = float(cfg.get("fivemin_btc_max_age_s", 3.0))
         if latest is None or now * 1000.0 - latest > max_age * 1000.0:
             if now - self._last_btc_stale >= 60:
                 self._last_btc_stale = now
@@ -240,13 +251,13 @@ class Strategy:
             return None
         return None if value is None or row.get("offset") is None else value + row["offset"]
 
-    def _eval(self, row, decision, reason, ttm, bids, ratio=None):
+    def _eval(self, row, decision, reason, ttm, bids, ratio=None, **extra):
         run = self.runs.setdefault(row["condition_id"], {})
         if run.get("eval_logged"):
             return
         run["eval_logged"] = True
         self.io.log("fivemin_eval", slug=row["slug"], decision=decision,
-                    reason=reason, ttm=round(ttm, 3), bids=bids, ratio=ratio)
+                    reason=reason, ttm=round(ttm, 3), bids=bids, ratio=ratio, **extra)
 
     def tick(self, cfg: dict, now: float, grid, books: dict):
         self._tick_now = now
@@ -270,6 +281,12 @@ class Strategy:
             strike = row.get("strike")
             if strike is None and row["start"] in self.boundaries:
                 row["strike"] = strike = self.boundaries[row["start"]]
+                row["strike_source"] = "rtds_boundary"
+                self.save()
+            elif strike is None and now >= row["start"] + STRIKE_GRACE_S and row["start"] in self._near_boundaries:
+                diff, strike = self._near_boundaries[row["start"]]
+                row.update(strike=strike, strike_source="rtds_near")
+                self.io.log("fivemin_strike_fallback", slug=row["slug"], diff_s=diff)
                 self.save()
             if strike is not None and row.get("offset") is None:
                 offset = strike - row["start_twap"] if row.get("start_twap") is not None else None
@@ -284,7 +301,11 @@ class Strategy:
                 continue
             if not position and now >= row["end"]:
                 if not row.get("entered"):
-                    self._eval(row, "skip", self.runs.get(cid, {}).get("last_reason", "never_in_window"), row["end"] - now, {})
+                    run = self.runs.get(cid, {})
+                    self._eval(row, "skip", run.get("last_reason", "never_in_window"),
+                               run.get("last_ttm", row["end"] - now), run.get("last_bids", {}),
+                               run.get("last_ratio"), close_ttm=round(row["end"] - now, 3),
+                               in_window_ticks=run.get("in_window_ticks", 0), book_ticks=run.get("book_ticks", 0))
                 self._active.discard(cid)
                 continue
             if position and not position.get("settled"):
@@ -292,9 +313,9 @@ class Strategy:
             if row["entered"] or not row["start"] <= now < row["end"]:
                 continue
             if strike is None:
-                if not row.get("no_strike_logged"):
+                self.runs.setdefault(cid, {})["last_reason"] = "no_strike"
+                if now >= row["start"] + STRIKE_GRACE_S and not row.get("no_strike_logged"):
                     row["no_strike_logged"] = True
-                    self.runs.setdefault(cid, {})["last_reason"] = "no_strike"
                     self.io.log("fivemin_no_strike", slug=row["slug"], condition_id=cid)
                     self.save()
                 continue
@@ -302,10 +323,11 @@ class Strategy:
             quotes = books.get(cid, {})
             bids = {side: quotes.get(side, {}).get("bid") for side in ("up", "down")}
             run = self.runs.setdefault(cid, {})
-            if ttm <= 0 or ttm > cfg["fivemin_max_ttm_s"]:
-                if ttm <= 0:
-                    self._eval(row, "skip", run.get("last_reason", "window_end"), ttm, bids)
+            if ttm > cfg["fivemin_max_ttm_s"]:
                 continue
+            run.update(last_bids=bids, last_ttm=ttm, last_ratio=None)
+            run["in_window_ticks"] = run.get("in_window_ticks", 0) + 1
+            run["book_ticks"] = run.get("book_ticks", 0) + int(all(bid is not None for bid in bids.values()))
             prefilter = any(
                 bids[loser] is not None and bids[fav] is not None and
                 cfg["fivemin_loser_min"] - EPS <= bids[loser] <= cfg["fivemin_loser_max"] + EPS and
@@ -326,6 +348,8 @@ class Strategy:
                     and 0 < ttm <= cfg["fivemin_max_ttm_s"] + EPS)
                 run[loser], persisted = run_ready(run.get(loser), ok, now, need)
                 ratio = gate_ratio(proxy, strike, fav, ttm)
+                if ok:
+                    run["last_ratio"] = ratio
                 if persisted and ratio is not None and ratio + EPS >= cfg["fivemin_gate_k"]:
                     signals.append((run[loser], loser, fav, ratio))
                 elif not persisted:
