@@ -852,6 +852,7 @@ class DeployUnitsTests(unittest.TestCase):
                 "sister_topup.py",
                 "whatsapp_notify.py",
                 "fivemin.py",
+                "fivemin_books.py",
                 "binance_trades.py",
             },
         )
