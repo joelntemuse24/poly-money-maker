@@ -280,7 +280,7 @@ DEFAULTS = {
     'fivemin_enabled': False,
     'fivemin_series_slug': 'btc-up-or-down-5m',
     'fivemin_binance_url': 'wss://stream.binance.com:9443/ws/btcusdt@aggTrade',
-    'fivemin_btc_max_age_s': 2.0,
+    'fivemin_btc_max_age_s': 3.0,
     'fivemin_shares': 10,
     'fivemin_buy_limit': 0.99,
     'fivemin_gate_k': 1.0,
@@ -813,7 +813,7 @@ def validate_strategy(cfg: dict) -> None:
         ("fivemin_dump_persist_s", 3, 0, None), ("fivemin_dump_limit_offset", 0.20, 0, 1),
         ("fivemin_dump_limit_floor", 0.05, 0.01, 0.99),
         ("fivemin_min_notional_usd", 1, 0, None), ("fivemin_daily_stop_usd", -150, None, 0),
-        ("fivemin_cash_buffer_usd", 5, 0, None), ("fivemin_book_stale_s", 30, 0.01, None), ("fivemin_btc_max_age_s", 2.0, 0.01, None),
+        ("fivemin_cash_buffer_usd", 5, 0, None), ("fivemin_book_stale_s", 30, 0.01, None), ("fivemin_btc_max_age_s", 3.0, 0.01, None),
     ):
         value = float(cfg.get(key, default))
         if not (value == value and value not in (float("inf"), float("-inf"))) or (low is not None and value < low) or (high is not None and value > high):

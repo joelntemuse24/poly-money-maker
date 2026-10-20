@@ -193,6 +193,90 @@ class AdditionalFiveMinTests(unittest.TestCase):
         self.assertFalse(buys)
         self.assertTrue(any(e == "fivemin_no_strike" for e, _ in logs))
 
+    def test_no_strike_waits_for_grace_and_logs_once(self):
+        strat, logs, buys, _ = self.make_strategy()
+        row = strat.state["markets"]["cid"]
+        row["strike"] = None
+        for now in (1000, 1002, 1004.9):
+            strat.tick(cfg(), now, PriceGrid(), {})
+        self.assertEqual(strat.runs["cid"]["last_reason"], "no_strike")
+        self.assertFalse(row.get("no_strike_logged"))
+        self.assertFalse(any(e == "fivemin_no_strike" for e, _ in logs))
+        for now in (1005, 1006):
+            strat.tick(cfg(), now, PriceGrid(), {})
+        self.assertEqual(sum(e == "fivemin_no_strike" for e, _ in logs), 1)
+        self.assertFalse(buys)
+
+    def test_exact_boundary_arriving_two_seconds_late_sets_strike(self):
+        strat, logs, _, _ = self.make_strategy()
+        strat.add_market(market("late", start=1200), now=1200)
+        row = strat.state["markets"]["late"]
+        strat.tick(cfg(), 1200, PriceGrid(), {})
+        strat.boundary_samples([SimpleNamespace(obs_ts=1200, twap="101")])
+        strat.tick(cfg(), 1202, PriceGrid(), {})
+        self.assertEqual(row["strike"], 101)
+        self.assertEqual(row["strike_source"], "rtds_boundary")
+        self.assertFalse(any(e == "fivemin_no_strike" for e, _ in logs))
+
+    def test_nearest_boundary_fallback_waits_for_grace(self):
+        strat, logs, _, _ = self.make_strategy()
+        strat.add_market(market("near", start=1200), now=1200)
+        row = strat.state["markets"]["near"]
+        strat.boundary_samples([
+            SimpleNamespace(obs_ts=1198.9, twap="90"),
+            SimpleNamespace(obs_ts=1199.0, twap="99"),
+            SimpleNamespace(obs_ts=1200.25, twap="101"),
+            SimpleNamespace(obs_ts=1199.5, twap="102"),
+        ])
+        self.assertNotIn(1200, strat.boundaries)
+        self.assertEqual(strat._near_boundaries[1200], (0.25, 101))
+        strat.tick(cfg(), 1204.9, PriceGrid(), {})
+        self.assertIsNone(row.get("strike"))
+        strat.tick(cfg(), 1205, PriceGrid(), {})
+        strat.tick(cfg(), 1206, PriceGrid(), {})
+        self.assertEqual(row["strike"], 101)
+        self.assertEqual(row["strike_source"], "rtds_near")
+        fallback = [kw for e, kw in logs if e == "fivemin_strike_fallback"]
+        self.assertEqual(fallback, [{"slug": row["slug"], "diff_s": 0.25}])
+        self.assertFalse(any(e == "fivemin_no_strike" for e, _ in logs))
+
+    def test_boundary_caches_keep_last_32(self):
+        strat, _, _, _ = self.make_strategy()
+        strat.boundary_samples([
+            SimpleNamespace(obs_ts=boundary + diff, twap="101")
+            for boundary in range(300, 300 * 41, 300)
+            for diff in (0, 0.5)
+        ])
+        expected = list(range(300 * 9, 300 * 41, 300))
+        self.assertEqual(sorted(strat.boundaries), expected)
+        self.assertEqual(sorted(strat._near_boundaries), expected)
+
+    def test_close_eval_retains_last_window_books_ttm_ratio_and_counters(self):
+        strat, logs, buys, _ = self.make_strategy()
+        grid = SimpleNamespace(price_at=lambda _: 100, latest_exchange_ms=lambda: 1e15)
+        quotes = {"cid": {"up": {"bid": .05}, "down": {"bid": .9}}}
+        strat.tick(cfg(), 1179.9, grid, quotes)
+        self.assertNotIn("last_bids", strat.runs["cid"])
+        strat.tick(cfg(), 1180, grid, {})
+        strat.tick(cfg(), 1200, grid, quotes)
+        strat.tick(cfg(), 1203, grid, quotes)
+        self.assertFalse(buys)
+        self.assertEqual(strat.runs["cid"]["last_ratio"], 0)
+        strat.tick(cfg(), 1300.1, grid, {})
+        strat.tick(cfg(), 1300.2, grid, {})
+        evaluations = [kw for e, kw in logs if e == "fivemin_eval"]
+        self.assertEqual(len(evaluations), 1)
+        evaluation = evaluations[0]
+        self.assertEqual(evaluation["decision"], "skip")
+        self.assertEqual(evaluation["bids"], {"up": .05, "down": .9})
+        self.assertEqual(evaluation["ttm"], 97)
+        self.assertGreater(evaluation["ttm"], 0)
+        self.assertLessEqual(evaluation["ttm"], 120)
+        self.assertEqual(evaluation["ratio"], 0)
+        self.assertEqual(evaluation["close_ttm"], -0.1)
+        self.assertEqual(evaluation["in_window_ticks"], 3)
+        self.assertEqual(evaluation["book_ticks"], 2)
+
     def test_both_loser_runs_choose_earlier_run_and_gate_does_not_extend_persistence(self):
         strat, logs, buys, _ = self.make_strategy()
         grid = SimpleNamespace(price_at=lambda _: 100, latest_exchange_ms=lambda: 1e15)
@@ -454,7 +538,7 @@ class RequestedFollowupTests(unittest.TestCase):
         self.assertEqual(DEFAULTS["fivemin_dump_held_below"], 0.20)
         self.assertEqual(DEFAULTS["fivemin_dump_other_min"], 0.60)
         self.assertEqual(DEFAULTS["fivemin_daily_stop_usd"], -150.0)
-        self.assertEqual(DEFAULTS["fivemin_btc_max_age_s"], 2.0)
+        self.assertEqual(DEFAULTS["fivemin_btc_max_age_s"], 3.0)
         self.assertEqual(parse_agg_trade('{"T":1234,"p":"12.5","x":1}'), (1234.0, 12.5))
 
     def test_price_grid_twap_matches_legacy_with_gaps_and_out_of_order(self):
@@ -472,7 +556,7 @@ class RequestedFollowupTests(unittest.TestCase):
             self.assertEqual(grid.twap60(end), expected)
             self.assertEqual(twap60(grid, end), expected)
 
-    def test_stale_btc_age_two_point_five_blocks_and_one_point_five_allows(self):
+    def test_stale_btc_age_above_three_blocks_and_up_to_three_allows(self):
         logs = []
         io = FiveMinIO(
             buy=lambda *a: {"shares": 10, "cost": 9}, sell=lambda *a: {}, reserves=lambda c: 0,
@@ -484,7 +568,7 @@ class RequestedFollowupTests(unittest.TestCase):
         row.update(strike=100, offset=0)
         strategy.sample_cash(1200, 1000)
         strategy.runs["cid"] = {"up": 1200}
-        for age, expected in ((2.5, False), (1.5, True)):
+        for age, expected in ((3.1, False), (3.0, True), (2.5, True), (1.5, True)):
             row["entered"] = False
             row["position"] = None
             strategy.runs["cid"] = {"up": 1200}
