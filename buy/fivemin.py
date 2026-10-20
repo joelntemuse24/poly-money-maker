@@ -211,7 +211,7 @@ class Strategy:
     def _proxy(self, grid, now, row, cfg):
         g = math.floor(now * 10) - 5
         if g not in self._twap_cache:
-            self._twap_cache[g] = twap60(grid, g)
+            self._twap_cache = {g: twap60(grid, g)}
         value = self._twap_cache[g]
         latest = getattr(grid, "latest_exchange_ms", lambda: None)()
         max_age = float(cfg.get("fivemin_btc_max_age_s", 2.0))

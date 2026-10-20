@@ -424,6 +424,26 @@ class ReviewFixTests(unittest.TestCase):
 if __name__ == "__main__":
     unittest.main()
 
+class CacheBoundTests(unittest.TestCase):
+    def test_twap_caches_stay_bounded(self):
+        grid = PriceGrid()
+        for g in range(1000):
+            grid.add(g * 100, 100.0 + g * 0.001)
+            grid.twap60(g)
+        self.assertLessEqual(len(grid._twap_cache), 8)
+
+        io = FiveMinIO(buy=lambda *a: {}, sell=lambda *a: {}, reserves=lambda c: 0,
+                       redeem=lambda *a: None, save=lambda s: None)
+        strategy = Strategy(io, startup_ts=0)
+        row = market("cache", 1000)
+        strategy.add_market(row, now=1000)
+        state_row = strategy.state["markets"]["cache"]
+        state_row.update(strike=100.0, offset=0.0)
+        strategy.sample_cash(1000, 1000)
+        for now in range(1000, 1100):
+            strategy._proxy(grid, float(now), state_row, dict(DEFAULTS, fivemin_btc_max_age_s=100000))
+        self.assertLessEqual(len(strategy._twap_cache), 1)
+
 class RequestedFollowupTests(unittest.TestCase):
     def test_defaults_and_fast_parser(self):
         self.assertEqual(DEFAULTS["fivemin_shares"], 10)

@@ -30,8 +30,7 @@ class PriceGrid:
                 return None
             self._latest = max(g, self._latest if self._latest is not None else g)
             self._rows[g % self.slots] = (g, px)
-            if any(cached >= g for cached in self._twap_cache):
-                self._twap_cache = {cached: value for cached, value in self._twap_cache.items() if cached < g}
+            self._twap_cache = {cached: value for cached, value in self._twap_cache.items() if cached < g}
         return g
 
     def twap60(self, g_end: int) -> Optional[float]:
@@ -56,6 +55,8 @@ class PriceGrid:
                 values.append(value)
             result = sum(values) / 60.0
             self._twap_cache[target] = result
+            while len(self._twap_cache) > 8:
+                self._twap_cache.pop(min(self._twap_cache))
             return result
 
     def latest_exchange_ms(self) -> Optional[float]:
@@ -76,36 +77,9 @@ class PriceGrid:
 
 def parse_agg_trade(message: Any) -> Optional[tuple[float, float]]:
     try:
-        obj = json.loads(message)
+        obj = message if isinstance(message, dict) else json.loads(message)
         return float(obj["T"]), float(obj["p"])
     except (KeyError, TypeError, ValueError, json.JSONDecodeError):
-        pass
-    try:
-        text = message.decode("utf-8") if isinstance(message, (bytes, bytearray)) else message
-        if isinstance(text, str):
-            def field(name):
-                marker = chr(34) + name + chr(34) + ":"
-                start = text.find(marker)
-                if start < 0:
-                    raise ValueError(name)
-                start += len(marker)
-                end = start
-                quoted = start < len(text) and text[start] == chr(34)
-                if quoted:
-                    start += 1
-                    end = text.find(chr(34), start)
-                    if end < 0:
-                        raise ValueError(name)
-                else:
-                    while end < len(text) and text[end] not in ",}":
-                        end += 1
-                return float(text[start:end])
-            return field("T"), field("p")
-        if isinstance(message, dict):
-            return float(message["T"]), float(message["p"])
-    except (KeyError, TypeError, ValueError, UnicodeDecodeError):
-        pass
-    except (KeyError, TypeError, ValueError, UnicodeDecodeError):
         return None
 
 
