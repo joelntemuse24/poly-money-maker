@@ -12,6 +12,7 @@ from typing import Callable, Optional
 from zoneinfo import ZoneInfo
 
 DEFAULTS = {
+    "fivemin_book_ws": False, "fivemin_poll_s": 0.2, "fivemin_active_window_s": 130,
     "fivemin_enabled": False, "fivemin_series_slug": "btc-up-or-down-5m",
     "fivemin_binance_url": "wss://stream.binance.com:9443/ws/btcusdt@aggTrade",
     "fivemin_shares": 10, "fivemin_buy_limit": 0.99, "fivemin_gate_k": 1.0,
@@ -106,6 +107,9 @@ class Strategy:
     def __init__(self, io: FiveMinIO, state: Optional[dict] = None, *, startup_ts: Optional[float] = None):
         self.io = io
         self.startup_ts = time.time() if startup_ts is None else float(startup_ts)
+        self._last_save = None
+        self._save_dirty = False
+        self._tick_now = None
         self._last_prune = 0.0
         self._last_btc_stale = 0.0
         self.state = state if state is not None else {}
@@ -115,7 +119,11 @@ class Strategy:
         self.state.setdefault("paused_until_day", None)
         self.boundaries: dict[int, float] = {}
         self._active = set()
-        for cid, row in self.state["markets"].items():
+        for cid, row in list(self.state["markets"].items()):
+            if row.get("skip_reason") == "startup" and row.get("end", 0) < self.startup_ts - 600 and not row.get("position"):
+                del self.state["markets"][cid]
+                self._save_dirty = True
+                continue
             position = row.get("position")
             if float(row.get("start") or 0) < self.startup_ts and position is None:
                 row["entered"] = True
@@ -133,8 +141,18 @@ class Strategy:
         self.spends: list[dict] = []
         self._twap_cache = {}
 
-    def save(self):
-        self.io.save(self.state)
+    def _save_time(self):
+        if self.io.clock is not None:
+            return self.io.clock()
+        return self._tick_now if self._tick_now is not None else time.time()
+
+    def save(self, force=False):
+        self._save_dirty = True
+        now = self._save_time()
+        if force or self._last_save is None or now - self._last_save >= 1.0:
+            self.io.save(self.state)
+            self._last_save = now
+            self._save_dirty = False
 
     def alert(self, text: str, cfg: dict, kind: str):
         try:
@@ -193,7 +211,7 @@ class Strategy:
         self._last_prune = now
         removed = False
         for cid, row in list(self.state["markets"].items()):
-            if row.get("end", 0) >= now - 6 * 3600:
+            if row.get("end", 0) >= now - 600:
                 continue
             position = row.get("position")
             if position is None or (position.get("settled") and (
@@ -231,6 +249,9 @@ class Strategy:
                     reason=reason, ttm=round(ttm, 3), bids=bids, ratio=ratio)
 
     def tick(self, cfg: dict, now: float, grid, books: dict):
+        self._tick_now = now
+        if self._save_dirty:
+            self.save()
         cfg = settings(cfg)
         self._prune(now)
         self.roll_day(now)
@@ -320,7 +341,7 @@ class Strategy:
 
     def _enter(self, cfg, now, row, quotes, loser, fav, ratio, proxy, persisted):
         row["entered"] = True
-        self.save()
+        self.save(force=True)
         sent_now = self.io.clock() if self.io.clock is not None else now
         if sent_now >= row["end"]:
             self.io.log("fivemin_signal_blocked", slug=row["slug"], reason="expired")
@@ -361,7 +382,7 @@ class Strategy:
         }
         if cost > 0 and not dry_run(cfg):
             self.spends.append({"ts": now, "cost": cost})
-        self.save()
+        self.save(force=True)
         self.io.log("fivemin_fill", slug=row["slug"], condition_id=row["condition_id"],
                     price=avg, size=filled, usdc=cost, status=result.get("status"), fees=result.get("fees"))
         if filled > 0:
@@ -398,10 +419,10 @@ class Strategy:
             if not p.get("notional_logged"):
                 p["notional_logged"] = True
                 self.io.log("fivemin_dump_skip_notional", slug=row["slug"], shares=p["shares"], bid=bid)
-                self.save()
+                self.save(force=True)
             return
         p["dumped"] = True
-        self.save()
+        self.save(force=True)
         if self.io.clock is not None and self.io.clock() >= row["end"]:
             return
         result = self.io.sell(row, p, quotes[held], cfg, now)
@@ -409,7 +430,7 @@ class Strategy:
         proceeds = float(result.get("proceeds", sold * float(result.get("price", bid))))
         p["shares"] -= sold
         p["proceeds"] += proceeds
-        self.save()
+        self.save(force=True)
         self.io.log("fivemin_dump", slug=row["slug"], condition_id=row["condition_id"],
                     shares=sold, price=proceeds / sold if sold else None,
                     proceeds=proceeds, pnl=p["proceeds"] - p["cost"], status=result.get("status"))
@@ -424,7 +445,7 @@ class Strategy:
         stopped = self.state["realized"] <= cfg["fivemin_daily_stop_usd"] and self.state.get("paused_until_day") != self.state["day"]
         if stopped:
             self.state["paused_until_day"] = self.state["day"]
-        self.save()
+        self.save(force=True)
         if not self.io.durable():
             raise OSError("fivemin settlement not durable")
         self.io.log("fivemin_settle", slug=row["slug"], condition_id=row["condition_id"], winner=winner, source=source, pnl=pnl)
@@ -440,11 +461,11 @@ class Strategy:
         if cfg.get("redeem_enabled"):
             self.io.redeem(row, now)
             p["redeem_enqueued"] = True
-            self.save()
+            self.save(force=True)
         elif not p.get("redeem_disabled_logged"):
             p["redeem_disabled_logged"] = True
             self.io.log("fivemin_redeem_disabled", slug=row["slug"])
-            self.save()
+            self.save(force=True)
 
 
 class Runner:
@@ -458,6 +479,8 @@ class Runner:
         self.next_discover = 0.0
         self.next_cash = 0.0
         self.current = None
+        self._last_markets = None
+        self._last_poll = {}
         self._io_stop = threading.Event()
         self._io_thread = None
         self._io_lock = threading.Lock()
@@ -546,24 +569,38 @@ class Runner:
             self.rtds_last_sample = now
         self.strategy.boundary_samples(samples)
         with self._io_lock:
-            markets = list(self._markets)
+            markets = self._markets
             balance = self._balance
             self._balance = None
-        available = [m for m in markets if m.active and not m.closed and not m.neg_risk]
-        for market in available:
-            self.strategy.add_market(market, now=now)
+        if markets is not self._last_markets:
+            self._last_markets = markets
+            for market in markets:
+                if market.active and not market.closed and not market.neg_risk and str(market.condition_id) not in self.strategy.state["markets"]:
+                    self.strategy.add_market(market, now=now)
         if balance is not None:
             self.strategy.sample_cash(*balance)
+        self._last_poll = {cid: stamp for cid, stamp in self._last_poll.items()
+                           if cid in self.strategy.state["markets"]}
         rows = [self.strategy.state["markets"][cid] for cid in self.strategy._active]
         current = [row for row in rows if row["start"] <= now < row["end"]]
         upcoming = sorted((row for row in rows if row["start"] > now), key=lambda row: row["start"])
         self.current = max(current, key=lambda row: row["start"]) if current else (upcoming[0] if upcoming else None)
         chosen = ([self.current] if self.current else []) + [row for row in upcoming if row is not self.current][:1]
+        # Restored open positions remain managed outside their entry window.
+        for row in rows:
+            if self._has_position(row) and row not in chosen:
+                chosen.append(row)
+        chosen = [row for row in chosen if self._market_active(row, now, cfg)]
         self.books.set_tokens([token for row in chosen for token in (row["up_token"], row["dn_token"])])
         self.books.set_stale_s(cfg["fivemin_book_stale_s"])
         self.books.set_min_size(0.0)
         quotes = {}
         for row in chosen:
+            cid = row["condition_id"]
+            poll = getattr(self.books, "poll", None)
+            if callable(poll) and now - self._last_poll.get(cid, float("-inf")) + EPS >= float(cfg["fivemin_poll_s"]):
+                self._last_poll[cid] = now
+                poll(now, row["up_token"], row["dn_token"])
             sides = {}
             for side, token in (("up", row["up_token"]), ("down", row["dn_token"])):
                 top = self.books.usable(token)
@@ -573,9 +610,22 @@ class Runner:
         self.strategy.io.gamma_winner = self.request_gamma
         self.strategy.tick(cfg, self.clock(), self.grid, quotes)
 
+    @staticmethod
+    def _has_position(row):
+        position = row.get("position")
+        return bool(position and not position.get("settled"))
+
+    def _market_active(self, row, now, cfg):
+        return 0 < row["end"] - now <= float(cfg["fivemin_active_window_s"]) or self._has_position(row)
+
     def sleep_s(self):
         now = self.clock()
-        return 0.1 if self.current and self.current["start"] - 65 <= now <= self.current["end"] + 5 else 1.0
+        cfg = settings(self.cfg())
+        for cid in self.strategy._active:
+            row = self.strategy.state["markets"][cid]
+            if self._has_position(row) or 0 < row["end"] - now <= float(cfg["fivemin_active_window_s"]) + 1:
+                return max(0.1, float(cfg["fivemin_poll_s"]))
+        return 1.0
 
 
 def load_state(path: Path) -> dict:
