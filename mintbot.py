@@ -274,6 +274,9 @@ HEARTBEAT_FILE = REPO / ".heartbeat_mint"
 STOP_FILE = REPO / "STOP_MINT"
 
 DEFAULTS = {
+    'fivemin_book_ws': False,
+    'fivemin_poll_s': 0.2,
+    'fivemin_active_window_s': 130,
     'fivemin_enabled': False,
     'fivemin_series_slug': 'btc-up-or-down-5m',
     'fivemin_binance_url': 'wss://stream.binance.com:9443/ws/btcusdt@aggTrade',
@@ -797,7 +800,10 @@ def validate_strategy(cfg: dict) -> None:
         raise ValueError("fivemin_series_slug must not be empty")
     if not str(cfg.get("fivemin_binance_url", "")).strip():
         raise ValueError("fivemin_binance_url must not be empty")
+    if not isinstance(cfg.get("fivemin_book_ws", False), bool):
+        raise ValueError("fivemin_book_ws must be boolean")
     for key, default, low, high in (
+        ("fivemin_poll_s", 0.2, 0.1, None), ("fivemin_active_window_s", 130, 0, 300),
         ("fivemin_shares", 10, 1, 200), ("fivemin_buy_limit", 0.99, 0.01, 0.99),
         ("fivemin_gate_k", 1.0, 0, None), ("fivemin_loser_max", 0.10, 0, 1),
         ("fivemin_loser_min", 0.01, 0, 1), ("fivemin_fav_min", 0.90, 0, 1),
@@ -8799,8 +8805,16 @@ def main() -> int:
             "[dim]▶ oracle tape[/] logs/oracle_twap.jsonl  " + veto
         )
 
+    stop_check = {"at": None, "exists": False}
+
     def should_stop() -> bool:
-        return _shutdown or STOP_FILE.exists()
+        if _shutdown:
+            return True
+        now = time.monotonic()
+        if stop_check["at"] is None or now - stop_check["at"] >= 1.0:
+            stop_check["exists"] = STOP_FILE.exists()
+            stop_check["at"] = now
+        return stop_check["exists"]
 
     def sell_tick() -> None:
         current = _reload_cfg(cfg_box)
@@ -8928,6 +8942,7 @@ def main() -> int:
         from buy.fivemin import FiveMinIO, Runner, Strategy, load_state as load_fivemin_state
         from buy.binance_trades import BinanceTrades, PriceGrid
         from buy.clob_book_ws import ClobBookFeed
+        from buy.fivemin_books import RestBookFeed
         from buy.oracle_log import RtdsTwapFeed
         from buy.state_writer import snapshot_state
 
@@ -8955,7 +8970,10 @@ def main() -> int:
                     grid, BinanceTrades(
                         grid, url=str(current_cfg().get("fivemin_binance_url")),
                         on_error=lambda error: log_event("fivemin_binance_error", error=str(error)[:240]),
-                    ), RtdsTwapFeed(), ClobBookFeed(),
+                    ), RtdsTwapFeed(), (
+                        ClobBookFeed() if cfg.get("fivemin_book_ws", False) else
+                        RestBookFeed(fetch_pair=lambda u, d: _fetch_books(u, d, 0.0))
+                    ),
                 )
                 runner.gamma_fetch = lambda slug: _fivemin_gamma_winner(current_cfg(), slug)
                 runner.start()

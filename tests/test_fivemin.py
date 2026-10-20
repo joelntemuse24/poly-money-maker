@@ -249,9 +249,9 @@ class RunnerTests(unittest.TestCase):
         runner._io_once(clock[0])
         self.assertEqual((len(discoveries), len(balances)), (1, 1))
         runner.tick()
-        self.assertEqual(token_sets[-1], ["up", "dn", "up", "dn"])
+        self.assertEqual(token_sets[-1], [])
         self.assertEqual(runner.strategy.balance, 100)
-        self.assertEqual(runner.sleep_s(), .1)
+        self.assertEqual(runner.sleep_s(), 1.0)
         clock[0] += 19
         runner._io_once(clock[0])
         self.assertEqual(len(discoveries), 1)
