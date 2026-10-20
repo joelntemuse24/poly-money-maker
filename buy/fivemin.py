@@ -165,10 +165,16 @@ class Strategy:
         self.balance, self.sampled_at = float(balance), now
         self.spends = [row for row in self.spends if row["ts"] >= now]
 
-    def add_market(self, market):
+    def add_market(self, market, now=None):
+        now = time.time() if now is None else now
+        try:
+            start = int(str(market.slug).rsplit("-", 1)[1])
+        except (IndexError, TypeError, ValueError):
+            return
+        if start + 300 <= now:
+            return
         cid = str(market.condition_id)
         if cid not in self.state["markets"]:
-            start = int(str(market.slug).rsplit("-", 1)[1])
             skipped = start < self.startup_ts
             self.state["markets"][cid] = {
                 "condition_id": cid, "slug": market.slug, "start": start, "end": start + 300,
@@ -193,6 +199,8 @@ class Strategy:
             if position is None or (position.get("settled") and (
                 position.get("redeem_enqueued") or position.get("shares", 0) <= 0 or position.get("dry_run")
             )):
+                if not row.get("entered"):
+                    self._eval(row, "skip", self.runs.get(cid, {}).get("last_reason", "never_in_window"), now - row.get("end", now), {})
                 self.state["markets"].pop(cid, None)
                 self._active.discard(cid)
                 self.runs.pop(cid, None)
@@ -254,6 +262,8 @@ class Strategy:
                     self._active.discard(cid)
                 continue
             if not position and now >= row["end"]:
+                if not row.get("entered"):
+                    self._eval(row, "skip", self.runs.get(cid, {}).get("last_reason", "never_in_window"), row["end"] - now, {})
                 self._active.discard(cid)
                 continue
             if position and not position.get("settled"):
@@ -263,6 +273,7 @@ class Strategy:
             if strike is None:
                 if not row.get("no_strike_logged"):
                     row["no_strike_logged"] = True
+                    self.runs.setdefault(cid, {})["last_reason"] = "no_strike"
                     self.io.log("fivemin_no_strike", slug=row["slug"], condition_id=cid)
                     self.save()
                 continue
@@ -327,6 +338,8 @@ class Strategy:
         elif self.state.get("paused_until_day") == self.state["day"]:
             reason = "daily_stop"
         if reason:
+            if reason == "daily_stop":
+                self.runs.setdefault(row["condition_id"], {})["last_reason"] = "daily_stop"
             self.io.log("fivemin_signal_blocked", slug=row["slug"], reason=reason)
             return
         shares, limit = float(cfg["fivemin_shares"]), float(cfg["fivemin_buy_limit"])
@@ -538,7 +551,7 @@ class Runner:
             self._balance = None
         available = [m for m in markets if m.active and not m.closed and not m.neg_risk]
         for market in available:
-            self.strategy.add_market(market)
+            self.strategy.add_market(market, now=now)
         if balance is not None:
             self.strategy.sample_cash(*balance)
         rows = [self.strategy.state["markets"][cid] for cid in self.strategy._active]

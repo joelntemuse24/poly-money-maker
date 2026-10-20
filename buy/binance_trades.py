@@ -30,7 +30,8 @@ class PriceGrid:
                 return None
             self._latest = max(g, self._latest if self._latest is not None else g)
             self._rows[g % self.slots] = (g, px)
-            self._twap_cache.clear()
+            if any(cached >= g for cached in self._twap_cache):
+                self._twap_cache = {cached: value for cached, value in self._twap_cache.items() if cached < g}
         return g
 
     def twap60(self, g_end: int) -> Optional[float]:
@@ -75,6 +76,11 @@ class PriceGrid:
 
 def parse_agg_trade(message: Any) -> Optional[tuple[float, float]]:
     try:
+        obj = json.loads(message)
+        return float(obj["T"]), float(obj["p"])
+    except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+        pass
+    try:
         text = message.decode("utf-8") if isinstance(message, (bytes, bytearray)) else message
         if isinstance(text, str):
             def field(name):
@@ -99,10 +105,7 @@ def parse_agg_trade(message: Any) -> Optional[tuple[float, float]]:
             return float(message["T"]), float(message["p"])
     except (KeyError, TypeError, ValueError, UnicodeDecodeError):
         pass
-    try:
-        obj = json.loads(message)
-        return float(obj["T"]), float(obj["p"])
-    except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+    except (KeyError, TypeError, ValueError, UnicodeDecodeError):
         return None
 
 

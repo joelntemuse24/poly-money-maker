@@ -798,11 +798,11 @@ def validate_strategy(cfg: dict) -> None:
     if not str(cfg.get("fivemin_binance_url", "")).strip():
         raise ValueError("fivemin_binance_url must not be empty")
     for key, default, low, high in (
-        ("fivemin_shares", 10, 1, 25), ("fivemin_buy_limit", 0.99, 0.01, 0.99),
+        ("fivemin_shares", 10, 1, 200), ("fivemin_buy_limit", 0.99, 0.01, 0.99),
         ("fivemin_gate_k", 1.0, 0, None), ("fivemin_loser_max", 0.10, 0, 1),
         ("fivemin_loser_min", 0.01, 0, 1), ("fivemin_fav_min", 0.90, 0, 1),
-        ("fivemin_max_ttm_s", 120, 0, 300), ("fivemin_persist_s", 3, 0, None),
-        ("fivemin_persist_last_s", 2, 0, None), ("fivemin_persist_last_window_s", 90, 0, 300),
+        ("fivemin_max_ttm_s", 120, 0, 300), ("fivemin_persist_s", 2, 0, None),
+        ("fivemin_persist_last_s", 1, 0, None), ("fivemin_persist_last_window_s", 90, 0, 300),
         ("fivemin_dump_held_below", 0.20, 0, 1), ("fivemin_dump_other_min", 0.60, 0, 1),
         ("fivemin_dump_persist_s", 3, 0, None), ("fivemin_dump_limit_offset", 0.20, 0, 1),
         ("fivemin_dump_limit_floor", 0.05, 0.01, 0.99),
