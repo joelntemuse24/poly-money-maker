@@ -9,6 +9,12 @@ from buy.clob_book_ws import Top
 class RestBookFeed:
     def __init__(self, fetch_pair, *, clock=time.time, log=None):
         self.fetch_pair = fetch_pair
+        try:
+            inspect.signature(fetch_pair).bind(None, None, fail={})
+        except (TypeError, ValueError):
+            self._fetch_accepts_fail = False
+        else:
+            self._fetch_accepts_fail = True
         self.clock = clock
         self.log = log
         self._status = {}
@@ -50,12 +56,10 @@ class RestBookFeed:
     def poll(self, now, up_tok, dn_tok):
         fail = {}
         try:
-            try:
-                inspect.signature(self.fetch_pair).bind(up_tok, dn_tok, fail=fail)
-            except (TypeError, ValueError):
-                rows = self.fetch_pair(up_tok, dn_tok)
-            else:
+            if self._fetch_accepts_fail:
                 rows = self.fetch_pair(up_tok, dn_tok, fail=fail)
+            else:
+                rows = self.fetch_pair(up_tok, dn_tok)
         except Exception as exc:
             self._fetch_failed(self.clock(), (up_tok, dn_tok), str(exc))
             return
@@ -64,7 +68,7 @@ class RestBookFeed:
         for side, token, row in zip(("up", "down"), (up_tok, dn_tok), rows):
             if side in fail or (isinstance(row, dict) and row.get("failed")):
                 failed.append(token)
-                error = fail.get(side) or row.get("error", error)
+                error = fail.get(side) or (row.get("error") if isinstance(row, dict) else None) or error
                 continue
             bid, size, bids, ask, ask_size, asks, age = row
             self._status[token] = "ok" if bid is not None else "empty"

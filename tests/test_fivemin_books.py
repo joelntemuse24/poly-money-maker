@@ -61,7 +61,7 @@ class RestBooksTests(unittest.TestCase):
 
     def test_fetch_failure_keeps_previous_top_and_independent_side_status(self):
         clock = [1000.0]
-        books = RestBookFeed(lambda u, d: (BOOK, BOOK), clock=lambda: clock[0])
+        books = RestBookFeed(lambda u, d, fail=None: (BOOK, BOOK), clock=lambda: clock[0])
         books.poll(clock[0], "up", "dn")
         previous = books.usable("up")
 
@@ -82,6 +82,18 @@ class RestBooksTests(unittest.TestCase):
         books.set_tokens(["dn"])
         self.assertNotIn("up", books._status)
         self.assertEqual(books.bid_status("up"), "no_book")
+
+    def test_empty_string_failure_with_tuple_rows(self):
+        def fetch_pair(u, d, fail=None):
+            fail["up"] = ""
+            return BOOK, BOOK
+
+        books = RestBookFeed(fetch_pair, clock=lambda: 1000.0)
+        books.poll(1000.0, "up", "dn")
+        self.assertEqual(books._status, {"up": "fetch_fail", "dn": "ok"})
+        self.assertEqual(books.bid_status("up"), "fetch_fail")
+        self.assertIsNone(books.usable("up"))
+        self.assertEqual(books.usable("dn").bid, BOOK[0])
 
     def test_bid_status_empty_stale_crossed_and_exception(self):
         clock = [1000.0]
