@@ -22,7 +22,7 @@ DEFAULTS = {
     "fivemin_dump_other_min": 0.60, "fivemin_dump_persist_s": 3.0,
     "fivemin_dump_limit_offset": 0.20, "fivemin_dump_limit_floor": 0.05,
     "fivemin_min_notional_usd": 1.0, "fivemin_daily_stop_usd": -150.0,
-    "fivemin_btc_max_age_s": 3.0,
+    "fivemin_btc_max_age_s": 3.0, "fivemin_rtds_silent_s": 20.0,
     "fivemin_cash_buffer_usd": 5.0, "fivemin_book_stale_s": 30.0, "fivemin_dry_run": None,
 }
 EPS = 1e-9
@@ -305,7 +305,11 @@ class Strategy:
                     self._eval(row, "skip", run.get("last_reason", "never_in_window"),
                                run.get("last_ttm", row["end"] - now), run.get("last_bids", {}),
                                run.get("last_ratio"), close_ttm=round(row["end"] - now, 3),
-                               in_window_ticks=run.get("in_window_ticks", 0), book_ticks=run.get("book_ticks", 0))
+                               in_window_ticks=run.get("in_window_ticks", 0), book_ticks=run.get("book_ticks", 0),
+                               band_ticks=run.get("band_ticks", 0), persist_max_s=round(run.get("persist_max_s", 0), 3),
+                               best_ratio=run.get("best_ratio"), blocked_btc_stale=run.get("blocked_btc_stale", 0),
+                               blocked_no_strike=run.get("blocked_no_strike", 0), blocked_no_bid=run.get("blocked_no_bid", 0),
+                               blocked_gate_below_k=run.get("blocked_gate_below_k", 0), miss=run.get("miss", {"up": {}, "down": {}}))
                 self._active.discard(cid)
                 continue
             if position and not position.get("settled"):
@@ -313,7 +317,11 @@ class Strategy:
             if row["entered"] or not row["start"] <= now < row["end"]:
                 continue
             if strike is None:
-                self.runs.setdefault(cid, {})["last_reason"] = "no_strike"
+                run = self.runs.setdefault(cid, {})
+                run["last_reason"] = "no_strike"
+                ttm = row["end"] - now
+                if ttm <= cfg["fivemin_max_ttm_s"]:
+                    run["blocked_no_strike"] = run.get("blocked_no_strike", 0) + 1
                 if now >= row["start"] + STRIKE_GRACE_S and not row.get("no_strike_logged"):
                     row["no_strike_logged"] = True
                     self.io.log("fivemin_no_strike", slug=row["slug"], condition_id=cid)
@@ -328,6 +336,12 @@ class Strategy:
             run.update(last_bids=bids, last_ttm=ttm, last_ratio=None)
             run["in_window_ticks"] = run.get("in_window_ticks", 0) + 1
             run["book_ticks"] = run.get("book_ticks", 0) + int(all(bid is not None for bid in bids.values()))
+            run["blocked_no_bid"] = run.get("blocked_no_bid", 0) + int(any(bid is None for bid in bids.values()))
+            missing = run.setdefault("miss", {"up": {}, "down": {}})
+            for side in ("up", "down"):
+                if bids[side] is None:
+                    reason = quotes.get(side, {}).get("miss", "missing")
+                    missing[side][reason] = missing[side].get(reason, 0) + 1
             prefilter = any(
                 bids[loser] is not None and bids[fav] is not None and
                 cfg["fivemin_loser_min"] - EPS <= bids[loser] <= cfg["fivemin_loser_max"] + EPS and
@@ -337,9 +351,11 @@ class Strategy:
             if not prefilter:
                 run["last_reason"] = "book_outside"
                 continue
+            run["band_ticks"] = run.get("band_ticks", 0) + 1
             need = cfg["fivemin_persist_last_s"] if ttm <= cfg["fivemin_persist_last_window_s"] else cfg["fivemin_persist_s"]
             proxy = self._proxy(grid, now, row, cfg)
             signals = []
+            blocked_btc_stale = blocked_gate_below_k = False
             for loser, fav in (("up", "down"), ("down", "up")):
                 bid, other = bids[loser], bids[fav]
                 ok = bid is not None and other is not None and (
@@ -349,7 +365,13 @@ class Strategy:
                 run[loser], persisted = run_ready(run.get(loser), ok, now, need)
                 ratio = gate_ratio(proxy, strike, fav, ttm)
                 if ok:
+                    run["persist_max_s"] = max(run.get("persist_max_s", 0), now - run[loser])
                     run["last_ratio"] = ratio
+                    if ratio is not None:
+                        run["best_ratio"] = ratio if run.get("best_ratio") is None else max(run["best_ratio"], ratio)
+                if ok and persisted:
+                    blocked_btc_stale |= ratio is None
+                    blocked_gate_below_k |= ratio is not None and ratio < cfg["fivemin_gate_k"]
                 if persisted and ratio is not None and ratio + EPS >= cfg["fivemin_gate_k"]:
                     signals.append((run[loser], loser, fav, ratio))
                 elif not persisted:
@@ -358,6 +380,8 @@ class Strategy:
                     run["last_reason"] = "btc_stale"
                 else:
                     run["last_reason"] = "gate_below_k"
+            run["blocked_btc_stale"] = run.get("blocked_btc_stale", 0) + int(blocked_btc_stale)
+            run["blocked_gate_below_k"] = run.get("blocked_gate_below_k", 0) + int(blocked_gate_below_k and not signals)
             if signals:
                 since, loser, fav, ratio = min(signals)
                 self._eval(row, "enter", "signal", ttm, bids, ratio)
@@ -574,13 +598,14 @@ class Runner:
                 result = None
             with self._io_lock:
                 self._gamma_results[slug] = result
-        if now - self.rtds_last_sample >= 60 and now - self.rtds_last_reconnect >= 60:
+        silent_s = float(cfg["fivemin_rtds_silent_s"])
+        if now - self.rtds_last_sample >= silent_s and now - self.rtds_last_reconnect >= silent_s:
             try:
                 self.rtds.reconnect("fivemin_silent")
             except Exception:
                 pass
             self.rtds_last_reconnect = now
-            self._on_error("fivemin_rtds_stall", "fivemin_silent")
+            self._on_error("fivemin_rtds_stall", f"fivemin_silent silent_s={silent_s:g}")
 
     def _on_error(self, event, exc):
         try: self.strategy.io.log(event, error=str(exc)[:240])
@@ -630,6 +655,10 @@ class Runner:
                 top = self.books.usable(token)
                 if top is not None:
                     sides[side] = {"bid": top.bid, "ask": top.ask, "bids": top.bids, "asks": top.asks}
+                else:
+                    bid_status = getattr(self.books, "reason", None) or getattr(self.books, "bid_status", None)
+                    status = bid_status(token) if callable(bid_status) else "missing"
+                    sides[side] = {"bid": None, "miss": status}
             quotes[row["condition_id"]] = sides
         self.strategy.io.gamma_winner = self.request_gamma
         self.strategy.tick(cfg, self.clock(), self.grid, quotes)

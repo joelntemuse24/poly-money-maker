@@ -300,6 +300,7 @@ DEFAULTS = {
     'fivemin_daily_stop_usd': -150.0,
     'fivemin_cash_buffer_usd': 5.0,
     'fivemin_book_stale_s': 30.0,
+    'fivemin_rtds_silent_s': 20.0,
     'fivemin_dry_run': None,
     "entry_enabled": False,
     "dry_run": True,
@@ -803,6 +804,7 @@ def validate_strategy(cfg: dict) -> None:
     if not isinstance(cfg.get("fivemin_book_ws", False), bool):
         raise ValueError("fivemin_book_ws must be boolean")
     for key, default, low, high in (
+        ("fivemin_rtds_silent_s", 20.0, 1, None),
         ("fivemin_poll_s", 0.2, 0.1, None), ("fivemin_active_window_s", 130, 0, 300),
         ("fivemin_shares", 10, 1, 200), ("fivemin_buy_limit", 0.99, 0.01, 0.99),
         ("fivemin_gate_k", 1.0, 0, None), ("fivemin_loser_max", 0.10, 0, 1),
@@ -1805,22 +1807,32 @@ def _fetch_book(token_id: str, min_size: float, fail: Optional[dict] = None):
         if response.status_code != 200:
             if isinstance(fail, dict):
                 fail["failed"] = True
+                fail["error"] = f"http_{response.status_code}"
             return None, 0.0, [], None, 0.0, [], None
         return _parse_book_payload(response.json(), min_size)
     except Exception as exc:
         if isinstance(fail, dict):
             fail["failed"] = True
+            fail["error"] = str(exc)
         log_event("book_fetch_fail", token_id=str(token_id)[:18], error=str(exc)[:160])
         return None, 0.0, [], None, 0.0, [], None
 
 
 def _fetch_books_parallel(up_tok: str, dn_tok: str, min_size: float, fail: Optional[dict] = None):
-    fut_up = _book_pool.submit(_fetch_book, up_tok, min_size, fail)
-    fut_dn = _book_pool.submit(_fetch_book, dn_tok, min_size, fail)
-    return fut_up.result(), fut_dn.result()
+    up_fail, dn_fail = {}, {}
+    fut_up = _book_pool.submit(_fetch_book, up_tok, min_size, up_fail)
+    fut_dn = _book_pool.submit(_fetch_book, dn_tok, min_size, dn_fail)
+    rows = fut_up.result(), fut_dn.result()
+    if isinstance(fail, dict):
+        for side, side_fail in (("up", up_fail), ("down", dn_fail)):
+            if side_fail.get("failed"):
+                fail["failed"] = True
+                fail[side] = side_fail["error"]
+                fail["error"] = side_fail["error"]
+    return rows
 
 
-def _fetch_books(up_tok: str, dn_tok: str, min_size: float):
+def _fetch_books(up_tok: str, dn_tok: str, min_size: float, fail: Optional[dict] = None):
     """Both sides in one CLOB `/books` POST.
 
     A timeout returns empty books (one short tick, no second fetch). Any
@@ -1858,6 +1870,8 @@ def _fetch_books(up_tok: str, dn_tok: str, min_size: float):
         return rows
     except Exception as exc:
         if isinstance(exc, (requests.Timeout, TimeoutError)):
+            if isinstance(fail, dict):
+                fail.update(failed=True, error=str(exc), up="timeout", down="timeout")
             _note_book_fetch_failed()
             log_event(
                 "book_fetch_fail",
@@ -1866,9 +1880,11 @@ def _fetch_books(up_tok: str, dn_tok: str, min_size: float):
             )
             empty = (None, 0.0, [], None, 0.0, [], None)
             return empty, empty
-        fail: dict = {}
-        rows = _fetch_books_parallel(up_tok, dn_tok, min_size, fail)
-        if fail.get("failed"):
+        pair_fail = {}
+        rows = _fetch_books_parallel(up_tok, dn_tok, min_size, pair_fail)
+        if isinstance(fail, dict):
+            fail.update(pair_fail)
+        if pair_fail.get("failed"):
             _note_book_fetch_failed()
         else:
             _note_book_fetch_ok()
@@ -8972,7 +8988,7 @@ def main() -> int:
                         on_error=lambda error: log_event("fivemin_binance_error", error=str(error)[:240]),
                     ), RtdsTwapFeed(), (
                         ClobBookFeed() if cfg.get("fivemin_book_ws", False) else
-                        RestBookFeed(fetch_pair=lambda u, d: _fetch_books(u, d, 0.0))
+                        RestBookFeed(fetch_pair=lambda u, d, fail=None: _fetch_books(u, d, 0.0, fail), log=log_event)
                     ),
                 )
                 runner.gamma_fetch = lambda slug: _fivemin_gamma_winner(current_cfg(), slug)

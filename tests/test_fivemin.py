@@ -276,6 +276,52 @@ class AdditionalFiveMinTests(unittest.TestCase):
         self.assertEqual(evaluation["close_ttm"], -0.1)
         self.assertEqual(evaluation["in_window_ticks"], 3)
         self.assertEqual(evaluation["book_ticks"], 2)
+        self.assertEqual(evaluation["band_ticks"], 2)
+        self.assertEqual(evaluation["persist_max_s"], 3)
+        self.assertEqual(evaluation["best_ratio"], 0)
+        self.assertEqual(evaluation["blocked_gate_below_k"], 1)
+        self.assertEqual(evaluation["blocked_no_bid"], 1)
+        self.assertEqual(evaluation["blocked_btc_stale"], 0)
+        self.assertEqual(evaluation["blocked_no_strike"], 0)
+        self.assertEqual(evaluation["miss"], {"up": {"missing": 1}, "down": {"missing": 1}})
+
+    def test_skip_summary_no_strike_stale_btc_and_missing_reasons(self):
+        strat, logs, buys, _ = self.make_strategy()
+        row = strat.state["markets"]["cid"]
+        row["strike"] = None
+        grid = SimpleNamespace(price_at=lambda _: 100, latest_exchange_ms=lambda: 0)
+        for now in (1100, 1180, 1181):
+            strat.tick(cfg(), now, grid, {})
+        row["strike"] = 100
+        q = {"cid": {"up": {"bid": .05}, "down": {"bid": .9}}}
+        for now in (1200, 1203):
+            strat.tick(cfg(), now, grid, q)
+        strat.tick(cfg(), 1204, grid, {"cid": {"up": {"bid": None, "miss": "fetch_fail"},
+                                                   "down": {"bid": None, "miss": "empty"}}})
+        strat.tick(cfg(), 1300, grid, {})
+        evaluation = next(fields for event, fields in logs if event == "fivemin_eval")
+        self.assertEqual(evaluation["blocked_no_strike"], 2)
+        self.assertEqual(evaluation["blocked_btc_stale"], 1)
+        self.assertEqual(evaluation["blocked_no_bid"], 1)
+        self.assertEqual(evaluation["band_ticks"], 2)
+        self.assertEqual(evaluation["persist_max_s"], 3)
+        self.assertIsNone(evaluation["best_ratio"])
+        self.assertEqual(evaluation["miss"], {"up": {"fetch_fail": 1}, "down": {"empty": 1}})
+        self.assertFalse(buys)
+
+    def test_skip_summary_persistence_uses_entry_run_across_missing_books(self):
+        strat, logs, buys, _ = self.make_strategy()
+        grid = SimpleNamespace(price_at=lambda _: 100, latest_exchange_ms=lambda: 1e15)
+        quotes = {"cid": {"up": {"bid": .05}, "down": {"bid": .9}}}
+        for now, books in ((1200, quotes), (1203, quotes), (1204, {}),
+                           (1210, quotes), (1211, quotes), (1300, {})):
+            strat.tick(cfg(), now, grid, books)
+        evaluation = next(fields for event, fields in logs if event == "fivemin_eval")
+        self.assertEqual(evaluation["persist_max_s"], 11)
+        self.assertEqual(evaluation["band_ticks"], 4)
+        self.assertEqual(evaluation["blocked_no_bid"], 1)
+        self.assertEqual(evaluation["best_ratio"], 0)
+        self.assertFalse(buys)
 
     def test_both_loser_runs_choose_earlier_run_and_gate_does_not_extend_persistence(self):
         strat, logs, buys, _ = self.make_strategy()
@@ -354,19 +400,49 @@ class RunnerTests(unittest.TestCase):
                                drain=lambda: [pending.pop()] if pending else [],
                                reconnect=lambda reason: reconnects.append(reason))
         runner = self.make_runner(clock, [], [], [], rtds=rtds)
-        clock[0] += 59
+        clock[0] += 19
         runner._io_once(clock[0])
         self.assertEqual(reconnects, [])
         clock[0] += 1
-        runner._io_once(clock[0]); runner._io_once(clock[0] + 30)
+        runner._io_once(clock[0]); runner._io_once(clock[0] + 19)
         self.assertEqual(reconnects, ["fivemin_silent"])
-        runner._io_once(clock[0] + 60)
+        runner._io_once(clock[0] + 20)
         self.assertEqual(len(reconnects), 2)
         pending.append(SimpleNamespace(obs_ts=1500.0, twap="1"))
-        clock[0] += 61
+        clock[0] += 21
         runner.tick()
-        runner._io_once(clock[0] + 30)
+        runner._io_once(clock[0] + 19)
         self.assertEqual(len(reconnects), 2)
+
+    def test_rtds_silence_override_controls_reconnect_spacing_and_error(self):
+        clock = [1201.0]
+        runner = self.make_runner(clock, [], [], [])
+        runner.cfg = lambda: cfg(pUSD_address="cash", fivemin_rtds_silent_s=45)
+        reconnects, logs = [], []
+        runner.rtds.reconnect = lambda reason: reconnects.append(reason)
+        runner.strategy.io.log = lambda event, **fields: logs.append((event, fields))
+        runner._io_once(1245.9)
+        self.assertEqual(reconnects, [])
+        runner._io_once(1246)
+        runner._io_once(1290.9)
+        self.assertEqual(reconnects, ["fivemin_silent"])
+        runner._io_once(1291)
+        self.assertEqual(len(reconnects), 2)
+        self.assertIn(("fivemin_rtds_stall", {"error": "fivemin_silent silent_s=45"}), logs)
+
+    def test_missing_quote_status_reaches_strategy_with_legacy_feed_default(self):
+        clock = [1380.0]
+        runner = self.make_runner(clock, [], [], [])
+        runner._io_once(clock[0])
+        seen = []
+        runner.strategy.tick = lambda cfg, now, grid, quotes: seen.append(quotes)
+        runner.tick()
+        self.assertEqual(seen[-1]["cid"], {"up": {"bid": None, "miss": "missing"},
+                                             "down": {"bid": None, "miss": "missing"}})
+        runner.books.bid_status = lambda token: "empty" if token == "up" else "fetch_fail"
+        runner.tick()
+        self.assertEqual(seen[-1]["cid"]["up"]["miss"], "empty")
+        self.assertEqual(seen[-1]["cid"]["down"]["miss"], "fetch_fail")
 
     def test_full_levels_reach_the_dump_and_gamma_goes_through_io_inbox(self):
         clock = [1201.0]
