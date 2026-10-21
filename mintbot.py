@@ -275,6 +275,7 @@ STOP_FILE = REPO / "STOP_MINT"
 
 DEFAULTS = {
     'fivemin_book_ws': False,
+    'fivemin_book_ws_stale_s': 1.0,
     'fivemin_poll_s': 0.2,
     'fivemin_active_window_s': 130,
     'fivemin_enabled': False,
@@ -803,6 +804,8 @@ def validate_strategy(cfg: dict) -> None:
         raise ValueError("fivemin_binance_url must not be empty")
     if not isinstance(cfg.get("fivemin_book_ws", False), bool):
         raise ValueError("fivemin_book_ws must be boolean")
+    if not 0 < float(cfg.get("fivemin_book_ws_stale_s", 1.0)) < float("inf"):
+        raise ValueError("fivemin_book_ws_stale_s must be positive and finite")
     for key, default, low, high in (
         ("fivemin_rtds_silent_s", 20.0, 1, None),
         ("fivemin_poll_s", 0.2, 0.1, None), ("fivemin_active_window_s", 130, 0, 300),
@@ -8954,10 +8957,10 @@ def main() -> int:
     )
     redeem_thread.start()
     if cfg.get("fivemin_enabled", False):
-        from buy.fivemin import FiveMinIO, Runner, Strategy, load_state as load_fivemin_state
+        from buy.fivemin import FiveMinIO, Runner, Strategy, load_state as load_fivemin_state, settings
         from buy.binance_trades import BinanceTrades, PriceGrid
         from buy.clob_book_ws import ClobBookFeed
-        from buy.fivemin_books import RestBookFeed
+        from buy.fivemin_books import RestBookFeed, WsFallbackBookFeed
         from buy.oracle_log import RtdsTwapFeed
         from buy.state_writer import snapshot_state
 
@@ -8978,6 +8981,15 @@ def main() -> int:
                     gamma_winner=lambda slug: _fivemin_gamma_winner(current_cfg(), slug),
                 )
                 grid = PriceGrid()
+                ws_error_at = None
+
+                def fivemin_ws_error(error, delay):
+                    nonlocal ws_error_at
+                    now = time.monotonic()
+                    if ws_error_at is None or now - ws_error_at >= 30:
+                        ws_error_at = now
+                        log_event("fivemin_ws_error", error=str(error)[:240], retry_s=delay)
+
                 runner = Runner(
                     Strategy(io, load_fivemin_state(path)), current_cfg,
                     MarketGateway(gamma_url=str(cfg["gamma_url"]), data_api_url=str(cfg["data_api_url"]), discover_cache_s=20),
@@ -8986,7 +8998,12 @@ def main() -> int:
                         grid, url=str(current_cfg().get("fivemin_binance_url")),
                         on_error=lambda error: log_event("fivemin_binance_error", error=str(error)[:240]),
                     ), RtdsTwapFeed(), (
-                        ClobBookFeed() if cfg.get("fivemin_book_ws", False) else
+                        WsFallbackBookFeed(
+                            ClobBookFeed(on_error=fivemin_ws_error, custom_features=False),
+                            RestBookFeed(fetch_pair=lambda u, d, fail=None: _fetch_books(u, d, 0.0, fail), log=log_event),
+                            ws_stale_s=lambda: float(settings(current_cfg())["fivemin_book_ws_stale_s"]),
+                            log=log_event,
+                        ) if cfg.get("fivemin_book_ws", False) else
                         RestBookFeed(fetch_pair=lambda u, d, fail=None: _fetch_books(u, d, 0.0, fail), log=log_event)
                     ),
                 )

@@ -48,11 +48,11 @@ def backoff_s(attempt: int, *, base: float = 0.5, cap: float = 8.0) -> float:
     return min(float(cap), float(base) * (2 ** min(n, 8)))
 
 
-def subscribe_payload(asset_ids: list[str]) -> dict:
+def subscribe_payload(asset_ids: list[str], custom_features: bool = True) -> dict:
     return {
         "assets_ids": list(asset_ids),
         "type": "market",
-        "custom_feature_enabled": True,
+        "custom_feature_enabled": bool(custom_features),
     }
 
 
@@ -232,7 +232,10 @@ class ClobBookFeed:
         clock: Optional[Callable[[], float]] = None,
         on_error: Optional[Callable[[str, float], None]] = None,
         url: str = CLOB_MARKET_URL,
+        custom_features: bool = True,
     ) -> None:
+        # False skips the extra best_bid_ask stream (unused here) to cut traffic/CPU.
+        self._custom_features = bool(custom_features)
         self._connect = connect
         self._sleep = sleep
         self._clock = clock or time.monotonic
@@ -490,7 +493,7 @@ class ClobBookFeed:
                     ws.settimeout(1.0)
                 except Exception:
                     pass
-                ws.send(json.dumps(subscribe_payload(ids), separators=(",", ":")))
+                ws.send(json.dumps(subscribe_payload(ids, self._custom_features), separators=(",", ":")))
                 attempt = 0
                 self._healthy = True
                 why = self._consume(ws, ids, gate)
