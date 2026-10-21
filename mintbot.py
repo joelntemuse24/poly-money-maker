@@ -1744,6 +1744,11 @@ def _io_unlocked():
 
 _clob_client = None
 _clob_init_error = None
+_fak_market_cache: dict[str, tuple[str, bool]] = {}
+_fak_warmup_attempted: dict[str, None] = {}
+_fak_warmup_lock = threading.Lock()
+_fak_warmup_client_attempted = False
+_fak_warmup_warn_at = None
 _book_pool = ThreadPoolExecutor(max_workers=2)
 
 def _book_quote(row: Any):
@@ -2628,12 +2633,64 @@ def _fak_sell(
         return 0.0, f"error:{str(exc)[:80]}"
 
 
+def _fak_warmup_sync(token_ids):
+    """Warm entry metadata once per token within the recent 64-token window."""
+    global _fak_warmup_client_attempted, _fak_warmup_warn_at
+    with _fak_warmup_lock:
+        tokens = list(dict.fromkeys(str(token) for token in token_ids
+                                   if str(token) not in _fak_warmup_attempted
+                                   and str(token) not in _fak_market_cache))
+        if not tokens and _fak_warmup_client_attempted:
+            return
+        _fak_warmup_client_attempted = True
+
+        def warn(exc):
+            global _fak_warmup_warn_at
+            now = time.monotonic()
+            if _fak_warmup_warn_at is None or now - _fak_warmup_warn_at >= 300:
+                _fak_warmup_warn_at = now
+                log_event("clob_warmup_fail", level="warning", error=str(exc)[:200])
+
+        for token in tokens:
+            _fak_warmup_attempted[token] = None
+        while len(_fak_warmup_attempted) > 64:
+            oldest = next(iter(_fak_warmup_attempted))
+            del _fak_warmup_attempted[oldest]
+            _fak_market_cache.pop(oldest, None)
+        try:
+            client = _get_clob_client()
+            if client is None:
+                raise RuntimeError(_clob_init_error or "CLOB client unavailable")
+            resolve_version = getattr(client, "_ClobClient__resolve_version", None)
+            version = int(resolve_version() if resolve_version is not None else 2)
+        except Exception as exc:
+            warn(exc)
+            return
+        for token in tokens:
+            if token not in _fak_warmup_attempted:
+                continue
+            try:
+                tick_size = client.get_tick_size(token)
+                neg_risk = False if version == 3 else bool(client.get_neg_risk(token))
+                _fak_market_cache[token] = (tick_size, neg_risk)
+            except Exception as exc:
+                warn(exc)
+
+
+def _fak_warmup_tokens(token_ids):
+    """Live-only callers schedule metadata work off the strategy tick."""
+    threading.Thread(target=_fak_warmup_sync, args=(tuple(token_ids),),
+                     name="mintbot-fivemin-clob-warmup", daemon=True).start()
+
+
 def _fak_buy(
     token_id: str,
     shares: float,
     price: float,
     dry_run: bool,
     capture: Optional[list] = None,
+    *,
+    timing: Optional[dict] = None,
 ):
     """One FAK buy. ``shares`` sizes the clip; the post is a market BUY in USDC.
 
@@ -2644,6 +2701,22 @@ def _fak_buy(
     does. ``create_market_order``'s market-info prefetch is not called.
     Dry-run returns before any client call. No sleep.
     """
+    from time import perf_counter
+
+    timings = timing if timing is not None else {}
+    timings.update({step: 0.0 for step in
+                    ("client_init", "tick_size", "version", "neg_risk", "sign", "post")})
+    timings["retry"] = {"count": 0, "ms": 0.0}
+    retry_started = None
+
+    @contextmanager
+    def measure(step):
+        started = perf_counter()
+        try:
+            yield
+        finally:
+            timings[step] += (perf_counter() - started) * 1000
+
     shares = float(shares)
     price = float(price)
     usdc = reclaim_buy_usdc(shares, price)
@@ -2654,7 +2727,8 @@ def _fak_buy(
             "dry_buy", token_id=str(token_id), size=shares, price=price, usdc=usdc,
         )
         return 0.0, "dry"
-    client = _get_clob_client()
+    with measure("client_init"):
+        client = _get_clob_client()
     if client is None:
         return 0.0, f"no_clob:{_clob_init_error or 'unknown'}"
     try:
@@ -2672,12 +2746,17 @@ def _fak_buy(
             price=price,
             order_type=OrderType.FAK,
         )
-        tick_size = client.get_tick_size(str(token_id))
+        cached = globals().get("_fak_market_cache", {}).get(str(token_id))
+        with measure("tick_size"):
+            tick_size = cached[0] if cached is not None else client.get_tick_size(str(token_id))
         if not price_valid(price, tick_size):
             return 0.0, "bad_args"
-        resolve_version = getattr(client, "_ClobClient__resolve_version", None)
-        version = int(resolve_version() if resolve_version is not None else 2)
-        neg_risk = False if version == 3 else bool(client.get_neg_risk(str(token_id)))
+        with measure("version"):
+            resolve_version = getattr(client, "_ClobClient__resolve_version", None)
+            version = int(resolve_version() if resolve_version is not None else 2)
+        with measure("neg_risk"):
+            neg_risk = cached[1] if cached is not None else (
+                False if version == 3 else bool(client.get_neg_risk(str(token_id))))
         builder_config = getattr(client, "builder_config", None)
         if builder_config and getattr(builder_config, "builder_code", None):
             code = builder_config.builder_code
@@ -2686,17 +2765,21 @@ def _fak_buy(
                 order_args.builder_code = code
         refreshed = False
         while True:
-            signed = client.builder.build_market_order(
-                order_args,
-                CreateOrderOptions(tick_size=tick_size, neg_risk=neg_risk),
-                version=version,
-            )
+            with measure("sign"):
+                signed = client.builder.build_market_order(
+                    order_args,
+                    CreateOrderOptions(tick_size=tick_size, neg_risk=neg_risk),
+                    version=version,
+                )
             try:
-                result = client.post_order(signed, order_type=OrderType.FAK)
+                with measure("post"):
+                    result = client.post_order(signed, order_type=OrderType.FAK)
             except Exception as exc:
                 status = reclaim_fak_status(exc)
                 if not refreshed and is_balance_allowance_reject(status):
                     refreshed = True
+                    timings["retry"]["count"] += 1
+                    retry_started = perf_counter()
                     _refresh_collateral_allowance(force=True)
                     continue
                 log_event(
@@ -2717,6 +2800,8 @@ def _fak_buy(
                     capture.append(result)
             if not refreshed and is_balance_allowance_reject(status):
                 refreshed = True
+                timings["retry"]["count"] += 1
+                retry_started = perf_counter()
                 _refresh_collateral_allowance(force=True)
                 continue
             log_event(
@@ -2733,6 +2818,9 @@ def _fak_buy(
     except Exception as exc:
         log_event("reclaim_fak_fail", token_id=str(token_id)[:18], error=str(exc)[:200])
         return 0.0, reclaim_fak_status(exc)
+    finally:
+        if retry_started is not None:
+            timings["retry"]["ms"] = (perf_counter() - retry_started) * 1000
 
 
 def _sell_inventory(
@@ -8641,7 +8729,8 @@ def run_redeem_cycle(cfg: dict, state: dict, desk: Optional[RedeemDesk]) -> str:
 
 def _fivemin_buy(token: str, shares: float, limit: float, dry: bool) -> dict:
     captured = []
-    bought, status = _fak_buy(token, shares, limit, dry, capture=captured)
+    timing = {}
+    bought, status = _fak_buy(token, shares, limit, dry, capture=captured, timing=timing)
     if dry:
         bought = shares
     raw = captured[0] if captured else {}
@@ -8655,7 +8744,7 @@ def _fivemin_buy(token: str, shares: float, limit: float, dry: bool) -> dict:
         except (TypeError, ValueError):
             pass
     return {"shares": float(bought), "cost": cost, "status": status,
-            "fees": raw.get("fee") or raw.get("feeAmount")}
+            "fees": raw.get("fee") or raw.get("feeAmount"), "timing": timing}
 
 
 def _fivemin_sell(row: dict, position: dict, book: dict, cfg: dict, now: float) -> dict:
@@ -8957,7 +9046,7 @@ def main() -> int:
     )
     redeem_thread.start()
     if cfg.get("fivemin_enabled", False):
-        from buy.fivemin import FiveMinIO, Runner, Strategy, load_state as load_fivemin_state, settings
+        from buy.fivemin import FiveMinIO, Runner, Strategy, dry_run as fivemin_dry_run, load_state as load_fivemin_state, settings
         from buy.binance_trades import BinanceTrades, PriceGrid
         from buy.clob_book_ws import ClobBookFeed
         from buy.fivemin_books import RestBookFeed, WsFallbackBookFeed
@@ -8979,7 +9068,10 @@ def main() -> int:
                     durable=lambda: writer.flush(timeout=10), log=log_event, alert=_fivemin_alert,
                     clock=time.time, label=_fivemin_label,
                     gamma_winner=lambda slug: _fivemin_gamma_winner(current_cfg(), slug),
+                    warmup=_fak_warmup_tokens,
                 )
+                if not fivemin_dry_run(current_cfg()):
+                    io.warmup([])
                 grid = PriceGrid()
                 ws_error_at = None
 
