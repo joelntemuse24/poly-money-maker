@@ -104,3 +104,69 @@ class RestBookFeed:
 
     def usable(self, token):
         return self._tops.get(token) if self.reason(token) is None else None
+
+
+class WsFallbackBookFeed:
+    """Prefer fresh websocket tops and poll REST only while either token is missing."""
+
+    def __init__(self, ws, rest, *, ws_stale_s=lambda: 1.0, clock=time.time, log=None):
+        self.ws, self.rest = ws, rest
+        self.ws_stale_s = ws_stale_s
+        self.clock, self.log = clock, log
+        self._healthy = None
+        self._fallback = None
+        self._last_log = {}
+
+    def start(self):
+        self.ws.start()
+        self.rest.start()
+
+    def stop(self):
+        self.ws.stop()
+        self.rest.stop()
+
+    def set_tokens(self, tokens):
+        tokens = list(tokens)
+        self.ws.set_stale_s(self.ws_stale_s())
+        self.ws.set_tokens(tokens)
+        self.rest.set_tokens(tokens)
+
+    def set_stale_s(self, seconds):
+        self.rest.set_stale_s(seconds)
+
+    def set_min_size(self, size):
+        self.ws.set_min_size(size)
+        self.rest.set_min_size(size)
+
+    def _event(self, event, **fields):
+        now = self.clock()
+        if self.log and now - self._last_log.get(event, float("-inf")) >= 30:
+            self.log(event, **fields)
+            self._last_log[event] = now
+
+    def poll(self, now, up_tok, dn_tok):
+        self.ws.set_stale_s(self.ws_stale_s())
+        healthy = bool(self.ws.healthy())
+        if healthy != self._healthy:
+            self._healthy = healthy
+            if healthy:
+                self._event("fivemin_ws_connect")
+            else:
+                self._event("fivemin_ws_disconnect")
+        tops = (self.ws.usable(up_tok), self.ws.usable(dn_tok))
+        fallback = not all(top is not None for top in tops)
+        if fallback:
+            if not self._fallback:
+                self._event("fivemin_ws_fallback", token_count=sum(top is None for top in tops),
+                            reason="disconnected" if not healthy else "stale_or_missing")
+            self.rest.poll(now, up_tok, dn_tok)
+        self._fallback = fallback
+
+    def usable(self, token):
+        top = self.ws.usable(token)
+        return top if top is not None else self.rest.usable(token)
+
+    def reason(self, token):
+        if self.ws.usable(token) is not None:
+            return None
+        return self.rest.reason(token)

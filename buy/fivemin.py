@@ -13,7 +13,7 @@ from typing import Callable, Optional
 from zoneinfo import ZoneInfo
 
 DEFAULTS = {
-    "fivemin_book_ws": False, "fivemin_poll_s": 0.2, "fivemin_active_window_s": 130,
+    "fivemin_book_ws": False, "fivemin_book_ws_stale_s": 1.0, "fivemin_poll_s": 0.2, "fivemin_active_window_s": 130,
     "fivemin_enabled": False, "fivemin_series_slug": "btc-up-or-down-5m",
     "fivemin_binance_url": "wss://stream.binance.com:9443/ws/btcusdt@aggTrade",
     "fivemin_shares": 10, "fivemin_buy_limit": 0.99, "fivemin_gate_k": 1.0,
