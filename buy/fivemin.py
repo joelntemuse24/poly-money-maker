@@ -136,6 +136,7 @@ class FiveMinIO:
     durable: Callable = lambda: True
     clock: Optional[Callable] = None
     label: Callable = lambda start: str(start)
+    warmup: Optional[Callable] = None
 
 
 class Strategy:
@@ -498,10 +499,11 @@ class Strategy:
         record_signal()
         self.io.log("fivemin_fill", slug=row["slug"], condition_id=row["condition_id"],
                     price=avg, size=filled, usdc=cost, status=result.get("status"),
-                    fees=result.get("fees"), dry_run=is_dry, latency_ms=latency_ms)
+                    fees=result.get("fees"), dry_run=is_dry, latency_ms=latency_ms,
+                    timing=result.get("timing"))
         if filled == 0 and not is_dry:
             self.io.log("fivemin_signal_nofill", slug=row["slug"], side=fav, limit=limit,
-                        latency_ms=latency_ms)
+                        latency_ms=latency_ms, timing=result.get("timing"))
             self.alert(f"5m {row['slug']} {fav.upper()} no fill @ {limit:.4f}", cfg, "fivemin_signal_nofill")
         else:
             tag = f"realistic fill {filled:g} @ {avg:.4f} (of {shares:g}, book walk, fee {float(result.get('fees') or 0):.2f})" if is_dry else f"fill {filled:g} @ {avg:.4f}; {latency_ms:.0f}ms"
@@ -600,6 +602,7 @@ class Runner:
         self.current = None
         self._last_markets = None
         self._last_poll = {}
+        self._warmup_tokens = frozenset()
         self._io_stop = threading.Event()
         self._io_thread = None
         self._io_lock = threading.Lock()
@@ -711,7 +714,13 @@ class Runner:
             if self._has_position(row) and row not in chosen:
                 chosen.append(row)
         chosen = [row for row in chosen if self._market_active(row, now, cfg)]
-        self.books.set_tokens([token for row in chosen for token in (row["up_token"], row["dn_token"])])
+        tokens = [token for row in chosen for token in (row["up_token"], row["dn_token"])]
+        self.books.set_tokens(tokens)
+        if not dry_run(cfg) and self.strategy.io.warmup is not None:
+            token_set = frozenset(tokens)
+            if token_set != self._warmup_tokens:
+                self._warmup_tokens = token_set
+                self.strategy.io.warmup(tokens)
         self.books.set_stale_s(cfg["fivemin_book_stale_s"])
         self.books.set_min_size(0.0)
         quotes = {}
