@@ -34,6 +34,7 @@ DEFAULTS = {
     "fivemin_min_notional_usd": 1.0, "fivemin_daily_stop_usd": -150.0,
     "fivemin_btc_max_age_s": 3.0, "fivemin_rtds_silent_s": 20.0,
     "fivemin_cash_buffer_usd": 5.0, "fivemin_book_stale_s": 30.0, "fivemin_dry_run": None,
+    "fivemin_min_fill_px": 0.95, "fivemin_low_fill_exit": True,
 }
 EPS = 1e-9
 STRIKE_GRACE_S = 5.0
@@ -548,6 +549,24 @@ class Strategy:
         sign = 1 if fav == "up" else -1
         return spot, sign * (spot - past)
 
+    def _min_fill_blocked(self, cfg, row, quotes, side, kind) -> bool:
+        floor = float(cfg.get("fivemin_min_fill_px", 0))
+        if floor <= 0:
+            return False
+        levels = ask_levels(quotes.get(side, {}))
+        if not levels:
+            return False
+        best = levels[0][0]
+        if best < floor - EPS:
+            logged = self.runs.setdefault(row["condition_id"], {}).setdefault("min_fill_logged", {})
+            if kind not in logged:
+                logged[kind] = True
+                self.io.log("fivemin_min_fill_skip", slug=row["slug"], condition_id=row["condition_id"],
+                            side=side, kind=kind, best_ask=best, floor=floor,
+                            depth=round(sum(size for _, size in levels), 6))
+            return True
+        return False
+
     def _side98_check(self, cfg, now, row, quotes, grid, ttm):
         if not 0 < ttm <= cfg["fivemin_side98_max_ttc_s"] + EPS:
             return
@@ -565,6 +584,8 @@ class Strategy:
         sign = 1 if fav == "up" else -1
         gap = sign * (spot + row["offset"] - row["strike"])
         if gap < cfg["fivemin_side98_min_gap_usd"] - EPS or mom30 < -cfg["fivemin_side98_max_adverse_30s_usd"] - EPS:
+            return
+        if self._min_fill_blocked(cfg, row, quotes, fav, "side98"):
             return
         self._side98_enter(cfg, now, row, quotes, fav, gap, mom30)
 
@@ -627,6 +648,44 @@ class Strategy:
         tag = f"no fill @ {limit:.4f}" if kind == "fivemin_side98_nofill" else f"fill {filled:g} @ {avg:.4f}"
         self.alert(f"5m 98 SIDE ORDER {self.io.label(row['start'])} {fav.upper()} {tag}; ttm={row['end']-now:.1f}s gap=${gap:.2f} mom30=${mom30:.2f}",
                    cfg, kind)
+        if filled > 0:
+            self._low_fill_exit(cfg, now, row, row["side98"]["position"], quotes, "side98")
+
+    def _low_fill_exit(self, cfg, now, row, p, quotes, kind):
+        if not cfg.get("fivemin_low_fill_exit", True):
+            return
+        floor = float(cfg.get("fivemin_min_fill_px", 0))
+        if floor <= 0 or p["shares"] <= 0 or p["dumped"] or p["avg_px"] >= floor - EPS:
+            return
+        book = quotes.get(p["side"], {})
+        if book.get("bid") is None:
+            self.io.log("fivemin_low_fill_exit_skip", slug=row["slug"], condition_id=row["condition_id"],
+                        kind=kind, side=p["side"], reason="no_bid")
+            return
+        p["dumped"] = True
+        p["low_fill_exit"] = True
+        self.save(force=True)
+        shares = p["shares"]
+        try:
+            result = self.io.sell(row, p, book, cfg, now)
+        except Exception as exc:
+            self.io.log("fivemin_low_fill_exit_error", slug=row["slug"], condition_id=row["condition_id"],
+                        kind=kind, side=p["side"], error=str(exc))
+            self.alert(f"5m {self.io.label(row['start'])} LOW FILL EXIT {kind} error: {exc}",
+                       cfg, "fivemin_low_fill_exit_error")
+            return
+        sold = min(shares, max(0.0, float(result.get("shares", 0))))
+        proceeds = float(result.get("proceeds", sold * float(result.get("price", book["bid"]))))
+        p["shares"] -= sold
+        p["proceeds"] += proceeds
+        self.save(force=True)
+        pnl = p["proceeds"] - p["cost"]
+        self.io.log("fivemin_low_fill_exit", slug=row["slug"], condition_id=row["condition_id"],
+                    kind=kind, side=p["side"], avg_fill=p["avg_px"], floor=floor,
+                    shares=sold, proceeds=proceeds, pnl=pnl, status=result.get("status"))
+        self.alert(f"5m {self.io.label(row['start'])} LOW FILL EXIT {kind} avg {p['avg_px']:.4f} < {floor:.2f}; "
+                   f"sold {sold:g} for {proceeds:.2f}; P&L={pnl:.2f}",
+                   {**cfg, "fivemin_dry_run": p.get("dry_run", dry_run(cfg))}, "fivemin_low_fill_exit")
 
     def _schedule_post_reject(self, row, fav, token, limit):
         fetch = getattr(self.io, "rest_book", None)
@@ -658,6 +717,8 @@ class Strategy:
             self._refetch_threads.remove(thread)
 
     def _enter(self, cfg, now, row, quotes, loser, fav, ratio, proxy, persisted, mom30=None):
+        if self._min_fill_blocked(cfg, row, quotes, fav, "main"):
+            return
         decision_time = self.io.clock() if self.io.clock is not None else time.perf_counter()
         row["entered"] = True
         row["main_attempts"] = row.get("main_attempts", 0) + 1
@@ -754,6 +815,8 @@ class Strategy:
         else:
             tag = f"realistic fill {filled:g} @ {avg:.4f} (of {shares:g}, book walk, fee {float(result.get('fees') or 0):.2f})" if is_dry else f"fill {filled:g} @ {avg:.4f}; {latency_ms:.0f}ms"
             self.alert(f"5m {self.io.label(row['start'])} {fav.upper()} {tag}; ttm={row['end']-now:.1f}s gate={ratio:.3f}", cfg, "fivemin_fill")
+        if filled > 0:
+            self._low_fill_exit(cfg, now, row, row["position"], quotes, "main")
 
     def _winner(self, now, row):
         winner = None
