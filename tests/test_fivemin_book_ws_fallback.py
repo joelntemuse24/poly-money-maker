@@ -97,8 +97,8 @@ def test_disconnected_rest_and_transition_logs_once():
         feed.poll(now, "up", "dn")
     assert rest.poll.call_count == 4
     assert logs.call_args_list == [
-        (("fivemin_ws_disconnect",), {}),
-        (("fivemin_ws_fallback",), {"token_count": 2, "reason": "disconnected"}),
+        (("fivemin_ws_disconnect",), {"ws_down_ms": 0.0}),
+        (("fivemin_ws_feed_stale",), {"last_ws_msg_age_ms": None}),
     ]
     assert feed.usable("up") is rest.usable.return_value
     rest.reason.return_value = "fetch_fail"
@@ -112,7 +112,7 @@ def test_fresh_ws_skips_rest_and_mixed_books_prefer_ws():
     feed.poll(1000, "up", "dn")
     feed.poll(1000, "up", "dn")
     rest.poll.assert_not_called()
-    logs.assert_called_once_with("fivemin_ws_connect")
+    logs.assert_called_once_with("fivemin_ws_connect", ws_down_ms=None)
     assert feed.usable("up") is top
     assert feed.reason("up") is None
     rest.reason.assert_not_called()
@@ -121,7 +121,8 @@ def test_fresh_ws_skips_rest_and_mixed_books_prefer_ws():
     rest.poll.assert_called_once_with(1000, "up", "dn")
     assert feed.usable("up") is top
     assert feed.usable("dn") is rest.usable.return_value
-    logs.assert_called_with("fivemin_ws_fallback", token_count=1, reason="stale_or_missing")
+    logs.assert_called_with("fivemin_book_quiet_token", token="dn",
+                            last_token_msg_age_ms=None, ws_book_empty=False)
 
 
 def test_transitions_rate_limited_per_event_and_recovery():
@@ -140,7 +141,9 @@ def test_transitions_rate_limited_per_event_and_recovery():
     names = [call.args[0] for call in logs.call_args_list]
     assert names.count("fivemin_ws_connect") == 2
     assert names.count("fivemin_ws_disconnect") == 2
-    assert names.count("fivemin_ws_fallback") == 2
+    assert names.count("fivemin_ws_feed_stale") == 2
+    assert names.count("fivemin_book_quiet_token") == 0
+    assert not any(name == "fivemin_ws_fallback" for name in names)
 
 
 def test_lifecycle_and_settings_forwarded_to_both():

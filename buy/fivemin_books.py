@@ -83,6 +83,9 @@ class RestBookFeed:
     def reason(self, token):
         return self.bid_status(token)
 
+    def source(self, token) -> str:
+        return "rest"
+
     def bid_status(self, token, now=None) -> str | None:
         now = self.clock() if now is None else now
         top = self._tops.get(token)
@@ -107,7 +110,17 @@ class RestBookFeed:
 
 
 class WsFallbackBookFeed:
-    """Prefer fresh websocket tops and poll REST only while either token is missing."""
+    """Prefer fresh websocket tops; poll REST only for stale, missing or
+    disconnected ws data.
+
+    A fresh empty ws book is a valid empty reading: the market simply
+    has no bid, so it stays an ``empty`` miss reason downstream instead
+    of triggering a REST refetch. Feed health is logged as
+    ``fivemin_ws_feed_stale`` (whole feed stale/disconnected) or
+    ``fivemin_book_quiet_token`` (feed alive, one token without recent
+    updates), and ``fivemin_ws_connect`` / ``fivemin_ws_disconnect``
+    carry the down duration.
+    """
 
     def __init__(self, ws, rest, *, ws_stale_s=lambda: 1.0, clock=time.time, log=None):
         self.ws, self.rest = ws, rest
@@ -115,6 +128,7 @@ class WsFallbackBookFeed:
         self.clock, self.log = clock, log
         self._healthy = None
         self._fallback = None
+        self._down_since = None
         self._last_log = {}
 
     def start(self):
@@ -138,35 +152,93 @@ class WsFallbackBookFeed:
         self.ws.set_min_size(size)
         self.rest.set_min_size(size)
 
-    def _event(self, event, **fields):
+    def _event(self, event, key=None, **fields):
         now = self.clock()
-        if self.log and now - self._last_log.get(event, float("-inf")) >= 30:
+        name = event if key is None else (event, key)
+        if self.log and now - self._last_log.get(name, float("-inf")) >= 30:
             self.log(event, **fields)
-            self._last_log[event] = now
+            self._last_log[name] = now
+
+    def _fresh_empty_ws(self, token):
+        probe = getattr(self.ws, "fresh_empty", None)
+        if not callable(probe):
+            return False
+        try:
+            return probe(token) is True
+        except Exception:
+            return False
+
+    def _ws_silence_ms(self):
+        probe = getattr(self.ws, "silence_s", None)
+        value = None
+        if callable(probe):
+            try:
+                value = probe()
+            except Exception:
+                return None
+        if isinstance(value, (int, float)) and value >= 0:
+            return round(float(value) * 1000.0, 1)
+        return None
+
+    def _ws_health(self, token):
+        state = getattr(self.ws, "token_health", None)
+        if callable(state):
+            try:
+                state = state(token)
+                if isinstance(state, dict):
+                    return state
+            except Exception:
+                pass
+        return {}
+
+    def source(self, token) -> str:
+        return "ws" if self.ws.usable(token) is not None else "rest"
 
     def poll(self, now, up_tok, dn_tok):
         self.ws.set_stale_s(self.ws_stale_s())
         healthy = bool(self.ws.healthy())
         if healthy != self._healthy:
+            down_ms = None
+            if not healthy:
+                self._down_since = now
+            elif self._down_since is not None:
+                down_ms = round(max(0.0, now - self._down_since) * 1000.0, 1)
             self._healthy = healthy
             if healthy:
-                self._event("fivemin_ws_connect")
+                self._event("fivemin_ws_connect", ws_down_ms=down_ms)
             else:
-                self._event("fivemin_ws_disconnect")
-        tops = (self.ws.usable(up_tok), self.ws.usable(dn_tok))
-        fallback = not all(top is not None for top in tops)
+                self._event("fivemin_ws_disconnect", ws_down_ms=0.0)
+        missing = [tok for tok in (up_tok, dn_tok)
+                   if self.ws.usable(tok) is None and not self._fresh_empty_ws(tok)]
+        fallback = bool(missing)
         if fallback:
             if not self._fallback:
-                self._event("fivemin_ws_fallback", token_count=sum(top is None for top in tops),
-                            reason="disconnected" if not healthy else "stale_or_missing")
+                if not healthy:
+                    # Whole feed stale or disconnected: one event, not per token.
+                    self._event("fivemin_ws_feed_stale",
+                                last_ws_msg_age_ms=self._ws_silence_ms())
+                else:
+                    for token in missing:
+                        health = self._ws_health(token)
+                        self._event("fivemin_book_quiet_token", key=token, token=token,
+                                    last_token_msg_age_ms=health.get("last_ws_msg_age_ms"),
+                                    ws_book_empty=bool(health.get("ws_book_empty")))
             self.rest.poll(now, up_tok, dn_tok)
         self._fallback = fallback
 
     def usable(self, token):
         top = self.ws.usable(token)
-        return top if top is not None else self.rest.usable(token)
+        if top is not None:
+            return top
+        if self._fresh_empty_ws(token):
+            # The ws book is the live truth: a fresh empty book means no bid,
+            # so a stale REST top must not resurrect one.
+            return None
+        return self.rest.usable(token)
 
     def reason(self, token):
         if self.ws.usable(token) is not None:
             return None
+        if self._fresh_empty_ws(token):
+            return "empty"
         return self.rest.reason(token)

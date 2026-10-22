@@ -1,6 +1,7 @@
 """Isolated BTC 5-minute policy; no mintbot import or import-time I/O."""
 from __future__ import annotations
 
+import inspect
 import json
 from copy import deepcopy
 import math
@@ -114,6 +115,14 @@ def ask_depth(book: dict) -> dict:
             "cum_099": sum(size for price, size in levels)}
 
 
+def decision_book_fields(book: dict, limit: float) -> dict:
+    levels = ask_levels(book)
+    return {"book_age_ms": book.get("age_ms"),
+            "book_src": book.get("src", "rest"),
+            "decision_ask_depth": round(sum(size for px, size in levels if px <= limit + EPS), 6),
+            "decision_best_ask": levels[0][0] if levels else None}
+
+
 def dry_fill(book: dict, shares: float, limit: float) -> dict:
     filled = notional = fees = 0.0
     for price, size in ask_levels(book):
@@ -158,6 +167,7 @@ class FiveMinIO:
     clock: Optional[Callable] = None
     label: Callable = lambda start: str(start)
     warmup: Optional[Callable] = None
+    rest_book: Optional[Callable] = None
 
 
 class Strategy:
@@ -194,6 +204,7 @@ class Strategy:
         self.sampled_at = None
         self.spends: list[dict] = []
         self._twap_cache = {}
+        self._refetch_threads: list[threading.Thread] = []
 
     def _save_time(self):
         if self.io.clock is not None:
@@ -609,10 +620,42 @@ class Strategy:
         self.io.log(kind, slug=row["slug"], condition_id=row["condition_id"],
                     price=avg, size=filled, usdc=cost, status=result.get("status"),
                     fees=result.get("fees"), dry_run=is_dry, latency_ms=latency_ms,
-                    timing=result.get("timing"), gap=gap, mom30=mom30, ttm=row["end"] - now)
+                    timing=result.get("timing"), gap=gap, mom30=mom30, ttm=row["end"] - now,
+                    **decision_book_fields(quotes.get(fav, {}), limit))
+        if kind == "fivemin_side98_nofill":
+            self._schedule_post_reject(row, fav, token, limit)
         tag = f"no fill @ {limit:.4f}" if kind == "fivemin_side98_nofill" else f"fill {filled:g} @ {avg:.4f}"
         self.alert(f"5m 98 SIDE ORDER {self.io.label(row['start'])} {fav.upper()} {tag}; ttm={row['end']-now:.1f}s gap=${gap:.2f} mom30=${mom30:.2f}",
                    cfg, kind)
+
+    def _schedule_post_reject(self, row, fav, token, limit):
+        fetch = getattr(self.io, "rest_book", None)
+        if fetch is None:
+            return
+
+        def worker():
+            try:
+                started = time.perf_counter()
+                book = fetch(token)
+                refetch_ms = (time.perf_counter() - started) * 1000.0
+                all_asks = ask_levels(book or {})
+                below = [size for px, size in all_asks if px <= limit + EPS]
+                self.io.log("fivemin_post_reject_book", slug=row["slug"],
+                            condition_id=row["condition_id"], side=fav, token=token,
+                            limit=limit,
+                            post_reject_best_ask=all_asks[0][0] if all_asks else None,
+                            post_reject_depth=round(sum(below), 6),
+                            refetch_ms=round(refetch_ms, 1))
+            except Exception:
+                return
+
+        thread = threading.Thread(target=worker, daemon=True, name="fivemin-post-reject-book")
+        self._refetch_threads.append(thread)
+        del self._refetch_threads[:-8]
+        try:
+            thread.start()
+        except Exception:
+            self._refetch_threads.remove(thread)
 
     def _enter(self, cfg, now, row, quotes, loser, fav, ratio, proxy, persisted, mom30=None):
         decision_time = self.io.clock() if self.io.clock is not None else time.perf_counter()
@@ -696,11 +739,14 @@ class Strategy:
                     attempt=row["main_attempts"],
                     price=avg, size=filled, usdc=cost, status=result.get("status"),
                     fees=result.get("fees"), dry_run=is_dry, latency_ms=latency_ms,
-                    timing=result.get("timing"), btc_mom30_usd=mom30)
+                    timing=result.get("timing"), btc_mom30_usd=mom30,
+                    **decision_book_fields(quotes.get(fav, {}), limit))
         if filled == 0 and not is_dry:
             self.io.log("fivemin_signal_nofill", slug=row["slug"], side=fav, limit=limit,
                         attempt=row["main_attempts"], retryable=retryable,
-                        latency_ms=latency_ms, timing=result.get("timing"), btc_mom30_usd=mom30)
+                        latency_ms=latency_ms, timing=result.get("timing"), btc_mom30_usd=mom30,
+                        **decision_book_fields(quotes.get(fav, {}), limit))
+            self._schedule_post_reject(row, fav, token, limit)
             if row["nofill_count"] == 1:
                 self.alert(f"5m {row['slug']} {fav.upper()} no fill @ {limit:.4f}", cfg, "fivemin_signal_nofill")
             self.save(force=True)
@@ -824,6 +870,40 @@ class Runner:
         self.gamma_fetch = None
         self.rtds_last_sample = self.clock()
         self.rtds_last_reconnect = 0.0
+        try:
+            self.strategy.io.rest_book = self._rest_refetch_book
+        except Exception:
+            pass
+
+    def _rest_refetch_book(self, token):
+        rest = getattr(self.books, "rest", None)
+        fetch = getattr(rest if rest is not None else self.books, "fetch_pair", None)
+        if fetch is None:
+            return None
+        row = next((r for r in self.strategy.state["markets"].values()
+                    if token in (r.get("up_token"), r.get("dn_token"))), None)
+        if row is None:
+            return None
+        fail = {}
+        up_tok, dn_tok = row.get("up_token"), row.get("dn_token")
+        try:
+            accepts_fail = inspect.signature(fetch).bind(None, None, fail={}) is not None
+        except (TypeError, ValueError):
+            accepts_fail = False
+        try:
+            rows = fetch(up_tok, dn_tok, fail=fail) if accepts_fail else fetch(up_tok, dn_tok)
+        except Exception:
+            return None
+        if not isinstance(rows, (tuple, list)) or len(rows) < 2 or fail.get("failed"):
+            return None
+        entry = rows[0] if token == up_tok else rows[1]
+        if isinstance(entry, dict) and entry.get("failed"):
+            return None
+        try:
+            _bid, _size, bids, _ask, _ask_size, asks, _age = entry
+        except (TypeError, ValueError):
+            return None
+        return {"bids": bids, "asks": asks}
 
     def start(self):
         self._io_stop.clear()
@@ -945,7 +1025,12 @@ class Runner:
             for side, token in (("up", row["up_token"]), ("down", row["dn_token"])):
                 top = self.books.usable(token)
                 if top is not None:
-                    sides[side] = {"bid": top.bid, "ask": top.ask, "bids": top.bids, "asks": top.asks}
+                    source = getattr(self.books, "source", None)
+                    src = source(token) if callable(source) else None
+                    sides[side] = {"bid": top.bid, "ask": top.ask, "bids": top.bids, "asks": top.asks,
+                                   "src": src if isinstance(src, str) else "rest",
+                                   "age_ms": None if getattr(top, "age", None) is None
+                                   else round(top.age * 1000.0, 1)}
                 else:
                     bid_status = getattr(self.books, "reason", None) or getattr(self.books, "bid_status", None)
                     status = bid_status(token) if callable(bid_status) else "missing"
