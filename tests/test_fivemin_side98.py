@@ -7,7 +7,7 @@ from types import SimpleNamespace
 import pytest
 
 import test_fivemin as helpers
-from buy.fivemin import DEFAULTS, Runner, Strategy, dry_fill, local_day
+from buy.fivemin import DEFAULTS, Runner, Strategy, dry_fill, local_day, pending_position
 
 
 @pytest.fixture
@@ -143,6 +143,65 @@ def test_side98_when_main_gate_below_threshold_then_main_later(bot):
     assert [order[2] for order in bot.buys] == [.98, .99]
     assert bot.row["side98"]["position"] is side
     assert bot.row["position"]["shares"] == 10
+
+
+@pytest.mark.parametrize("main_state", ["real", "dry", "settled"])
+def test_side98_fires_on_later_tick_after_main_fill(bot, main_state):
+    bot.price = 200
+    bot.books["cid"]["up"]["bid"] = .97
+    bot.books["cid"]["down"]["bid"] = .02
+    bot.strategy.runs["cid"] = {"down": 1240}
+    options = {"fivemin_dry_run": main_state == "dry"}
+    tick(bot, **options)
+    main = bot.row["position"]
+    assert bot.row["entered"]
+    assert main["shares"] == 10
+    assert not bot.row.get("side98")
+    if main_state in ("dry", "settled"):
+        main.update(settled=True, redeem_enqueued=main_state == "settled")
+        assert not pending_position(bot.row)
+    bot.now += .2
+    bot.price = 115
+    tick(bot, **options)
+    assert [order[2] for order in bot.buys] == [.99, .98]
+    assert bot.row["position"] is main
+    assert bot.row["side98"]["position"]["shares"] == 20
+    assert bot.row["main_attempts"] == 1
+    assert pending_position(bot.row)
+    assert "cid" in bot.strategy._active
+    tick(bot, **options)
+    assert len(bot.buys) == 2
+
+
+def test_main_then_side98_both_settle_and_redeem_once(bot):
+    bot.price = 200
+    bot.books["cid"]["up"]["bid"] = .97
+    bot.books["cid"]["down"]["bid"] = .02
+    bot.strategy.runs["cid"] = {"down": 1240}
+    tick(bot)
+    bot.now += .2
+    bot.price = 115
+    tick(bot)
+    main, side = bot.row["position"], bot.row["side98"]["position"]
+    assert pending_position(bot.row)
+    bot.strategy.boundaries[1300] = 120
+    bot.now = 1301
+    tick(bot, redeem_enabled=False)
+    assert main["settled"] and side["settled"]
+    assert main["pnl"] == pytest.approx(.1)
+    assert side["pnl"] == pytest.approx(.4)
+    assert bot.strategy.state["realized"] == pytest.approx(.5)
+    assert pending_position(bot.row)
+    assert "cid" in bot.strategy._active
+    assert not any(event == "redeem" for event, _ in bot.logs)
+    tick(bot)
+    tick(bot)
+    assert main["redeem_enqueued"] and side["redeem_enqueued"]
+    assert not pending_position(bot.row)
+    assert "cid" not in bot.strategy._active
+    for event in ("fivemin_settle", "fivemin_side98_settle", "redeem"):
+        assert sum(name == event for name, _ in bot.logs) == 1
+    assert bot.strategy.state["realized"] == pytest.approx(.5)
 
 
 @pytest.mark.parametrize("outcome", ["nofill", "error", "disabled", "daily_stop", "cash", "expired"])
