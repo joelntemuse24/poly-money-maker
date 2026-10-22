@@ -186,7 +186,8 @@ def test_startup_flag_off_keeps_rest_flag_on_wraps_and_hot_reloads(flag):
     assert isinstance(rest, RestBookFeed)
     if flag:
         assert isinstance(feed, WsFallbackBookFeed)
-        ws_ctor.assert_called_once_with(on_error=error, custom_features=False)
+        ws_ctor.assert_called_once_with(on_error=error, custom_features=False,
+                                        token_msg_fresh=True)
         assert feed.ws_stale_s() == 1
         cfg["fivemin_book_ws_stale_s"] = .25
         assert feed.ws_stale_s() == .25

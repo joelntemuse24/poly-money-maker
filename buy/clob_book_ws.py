@@ -192,6 +192,7 @@ class _Book:
     asks: dict[float, float] = field(default_factory=dict)
     bid_at: float = 0.0
     ask_at: float = 0.0
+    msg_at: float = 0.0
     bid_ok: bool = False
     ask_ok: bool = False
 
@@ -233,9 +234,14 @@ class ClobBookFeed:
         on_error: Optional[Callable[[str, float], None]] = None,
         url: str = CLOB_MARKET_URL,
         custom_features: bool = True,
+        token_msg_fresh: bool = False,
     ) -> None:
         # False skips the extra best_bid_ask stream (unused here) to cut traffic/CPU.
         self._custom_features = bool(custom_features)
+        # True treats the last token message (book or either-sided
+        # price_change; never a PING/PONG) as the freshness clock for
+        # both sides instead of the per-side bid_at/ask_at ages.
+        self._token_msg_fresh = bool(token_msg_fresh)
         self._connect = connect
         self._sleep = sleep
         self._clock = clock or time.monotonic
@@ -348,6 +354,7 @@ class ClobBookFeed:
                     asks=book.asks.copy(),
                     bid_at=book.bid_at,
                     ask_at=book.ask_at,
+                    msg_at=book.msg_at,
                     bid_ok=book.bid_ok,
                     ask_ok=book.ask_ok,
                 )
@@ -380,7 +387,10 @@ class ClobBookFeed:
         same freshness window. A bid is fresh only after a ``book`` event
         or a bid-side ``price_change``; an ask-side change does not
         refresh it. When ask levels exist, that side must be confirmed
-        and inside the same window.
+        and inside the same window. With ``token_msg_fresh`` the last
+        token message (``book`` or either-sided ``price_change``, never a
+        ping) sets a single window for the whole book and the per-side
+        ages and ``ask_ok`` are ignored.
         """
         if not self.healthy():
             return None
@@ -388,6 +398,11 @@ class ClobBookFeed:
         if book is None or not book.bid_ok:
             return None
         now_m = self._clock()
+        if self._token_msg_fresh:
+            msg_age = now_m - float(book.msg_at)
+            if msg_age < 0 or msg_age > stale:
+                return None
+            return (book, now_m, need)
         bid_age = now_m - float(book.bid_at)
         if bid_age < 0 or bid_age > stale:
             return None
@@ -406,7 +421,11 @@ class ClobBookFeed:
         ``price_change``. An ask-side change does not refresh it. A ping
         does not either: a ping proves the socket is up, not that the
         level is still there. When ask levels exist, that side must be
-        confirmed and inside the same window. ``bid >= ask`` is unusable.
+        confirmed and inside the same window. With ``token_msg_fresh``
+        any ``book`` or either-sided ``price_change`` (never a ping)
+        keeps the whole book inside the freshness window; the crossed
+        check and the empty-bid handling are unchanged.
+        ``bid >= ask`` is unusable.
         """
         fresh = self._fresh_state(token_id)
         if fresh is None:
@@ -432,7 +451,8 @@ class ClobBookFeed:
         has no bid, so it is not a reason to top up from REST. A missing,
         stale, crossed or disconnected book is not fresh and still
         falls back to REST. A ping does not refresh freshness either: the
-        same window rules as ``usable`` apply.
+        same window rules as ``usable`` apply, so fresh also means a
+        token message (book or price_change) landed inside the window.
         """
         fresh = self._fresh_state(token_id)
         if fresh is None:
@@ -454,7 +474,9 @@ class ClobBookFeed:
             book = self._books.get(str(token_id))
             if book is None:
                 return {"ws_book_empty": False, "last_ws_msg_age_ms": None}
-            msg_at = max(float(book.bid_at or 0.0), float(book.ask_at or 0.0))
+            msg_at = float(book.msg_at or 0.0)
+            if msg_at <= 0:
+                msg_at = max(float(book.bid_at or 0.0), float(book.ask_at or 0.0))
             age_ms = None if msg_at <= 0 else round(max(0.0, now_m - msg_at) * 1000.0, 1)
             return {"ws_book_empty": not book.bids and not book.asks,
                     "last_ws_msg_age_ms": age_ms}
@@ -631,6 +653,7 @@ class ClobBookFeed:
             book.asks = _pairs_to_map(event.get("asks") or [], "ask")
             book.bid_at = now_m
             book.ask_at = now_m
+            book.msg_at = now_m
             book.bid_ok = True
             book.ask_ok = True
 
@@ -651,6 +674,7 @@ class ClobBookFeed:
             else:
                 levels[px] = sz
                 _cap_levels(levels, side)
+            book.msg_at = now_m
             if side == "bid":
                 book.bid_at = now_m
                 book.bid_ok = True
