@@ -828,7 +828,7 @@ def validate_strategy(cfg: dict) -> None:
         ("fivemin_max_attempts_per_market", 3, 1, 20),
         ("fivemin_rtds_silent_s", 20.0, 1, None),
         ("fivemin_poll_s", 0.2, 0.1, None), ("fivemin_active_window_s", 130, 0, 300),
-        ("fivemin_shares", 10, 1, 200), ("fivemin_buy_limit", 0.99, 0.01, 0.99),
+        ("fivemin_shares", 10, 1, 200), ("fivemin_buy_limit", 0.99, 0.01, 0.995),
         ("fivemin_gate_k", 1.0, 0, None), ("fivemin_side98_shares", 20, 1, 200),
         ("fivemin_side98_price", 0.98, 0.01, 0.99),
         ("fivemin_side98_min_gap_usd", 15.0, 0, None),

@@ -6,7 +6,7 @@
   "fivemin_enabled": false,
   "fivemin_series_slug": "btc-up-or-down-5m",
   "fivemin_shares": 10,
-  "fivemin_buy_limit": 0.99,
+  "fivemin_buy_limit": 0.995,
   "fivemin_gate_k": 1.0,
   "fivemin_loser_max": 0.1,
   "fivemin_loser_min": 0.01,
