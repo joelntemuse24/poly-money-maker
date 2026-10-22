@@ -16,6 +16,7 @@ DEFAULTS = {
     "fivemin_book_ws": False, "fivemin_book_ws_stale_s": 1.0, "fivemin_poll_s": 0.2, "fivemin_active_window_s": 130,
     "fivemin_enabled": False, "fivemin_series_slug": "btc-up-or-down-5m",
     "fivemin_binance_url": "wss://stream.binance.com:9443/ws/btcusdt@aggTrade",
+    "fivemin_loser_empty_as_zero": True,
     "fivemin_shares": 10, "fivemin_buy_limit": 0.99, "fivemin_gate_k": 1.0,
     "fivemin_side98_enabled": False, "fivemin_side98_shares": 20, "fivemin_side98_price": 0.98,
     "fivemin_side98_min_gap_usd": 15.0, "fivemin_side98_max_ttc_s": 60,
@@ -361,7 +362,9 @@ class Strategy:
                                band_ticks=run.get("band_ticks", 0), persist_max_s=round(run.get("persist_max_s", 0), 3),
                                best_ratio=run.get("best_ratio"), blocked_btc_stale=run.get("blocked_btc_stale", 0),
                                blocked_no_strike=run.get("blocked_no_strike", 0), blocked_no_bid=run.get("blocked_no_bid", 0),
-                               blocked_gate_below_k=run.get("blocked_gate_below_k", 0), miss=run.get("miss", {"up": {}, "down": {}}))
+                               blocked_gate_below_k=run.get("blocked_gate_below_k", 0),
+                               loser_empty_as_zero=run.get("loser_empty_as_zero", 0),
+                               miss=run.get("miss", {"up": {}, "down": {}}))
                 if not pending_position(row):
                     self._active.discard(cid)
                 continue
@@ -400,10 +403,23 @@ class Strategy:
                 if bids[side] is None:
                     reason = quotes.get(side, {}).get("miss", "missing")
                     missing[side][reason] = missing[side].get(reason, 0) + 1
+            empty_zero = {
+                side for side, other in (("up", "down"), ("down", "up"))
+                if cfg.get("fivemin_loser_empty_as_zero", True)
+                and bids[side] is None
+                and quotes.get(side, {}).get("miss") == "empty"
+                and bids[other] is not None
+                and bids[other] + EPS >= cfg["fivemin_fav_min"]
+            }
+            gate_bids = dict(bids)
+            for side in empty_zero:
+                gate_bids[side] = 0.0
+            if empty_zero:
+                run["loser_empty_as_zero"] = run.get("loser_empty_as_zero", 0) + 1
             prefilter = any(
-                bids[loser] is not None and bids[fav] is not None and
-                cfg["fivemin_loser_min"] - EPS <= bids[loser] <= cfg["fivemin_loser_max"] + EPS and
-                bids[fav] + EPS >= cfg["fivemin_fav_min"]
+                gate_bids[loser] is not None and gate_bids[fav] is not None and
+                (loser in empty_zero or cfg["fivemin_loser_min"] - EPS <= gate_bids[loser] <= cfg["fivemin_loser_max"] + EPS) and
+                gate_bids[fav] + EPS >= cfg["fivemin_fav_min"]
                 for loser, fav in (("up", "down"), ("down", "up"))
             )
             if not prefilter:
@@ -417,9 +433,9 @@ class Strategy:
             signals = []
             blocked_btc_stale = blocked_gate_below_k = False
             for loser, fav in (("up", "down"), ("down", "up")):
-                bid, other = bids[loser], bids[fav]
+                bid, other = gate_bids[loser], gate_bids[fav]
                 ok = bid is not None and other is not None and (
-                    cfg["fivemin_loser_min"] - EPS <= bid <= cfg["fivemin_loser_max"] + EPS
+                    (loser in empty_zero or cfg["fivemin_loser_min"] - EPS <= bid <= cfg["fivemin_loser_max"] + EPS)
                     and other + EPS >= cfg["fivemin_fav_min"]
                     and 0 < ttm <= cfg["fivemin_max_ttm_s"] + EPS)
                 run[loser], persisted = run_ready(run.get(loser), ok, now, need)
@@ -468,7 +484,11 @@ class Strategy:
                         row["momentum_data_missing_logged"] = True
                         self.io.log("fivemin_momentum_data_missing", slug=row["slug"], condition_id=row["condition_id"], side=fav)
             if signals:
-                self._eval(row, "enter", "signal", ttm, bids, ratio)
+                if loser in empty_zero:
+                    self._eval(row, "enter", "signal_loser_empty_as_zero", ttm, bids, ratio,
+                               loser_empty_as_zero=True)
+                else:
+                    self._eval(row, "enter", "signal", ttm, bids, ratio)
                 self._enter(cfg, now, row, quotes, loser, fav, ratio, proxy, now - since, mom30)
             elif cfg["fivemin_side98_enabled"] and not row.get("side98"):
                 self._side98_check(cfg, now, row, quotes, grid, ttm)
