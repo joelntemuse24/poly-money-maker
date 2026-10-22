@@ -20,7 +20,7 @@ def empty_loser_quotes(fav_bid=0.95, fav_side="down", fav_asks=None, miss="empty
     return {
         "cid": {
             loser: {"bid": None, "miss": miss},
-            fav_side: {"bid": fav_bid, "asks": fav_asks or [[0.99, 100]]},
+            fav_side: {"bid": fav_bid, "asks": [[0.99, 100]] if fav_asks is None else fav_asks},
         }
     }
 
@@ -94,6 +94,64 @@ def test_side98_uses_raw_quotes_when_main_gate_is_below_threshold():
     assert bot.buys == [("up", 20.0, 0.98, False)]
     assert bot.row["side98"]["side"] == "up"
     assert not bot.row["entered"]
+
+
+@pytest.mark.parametrize("asks", [[], [[1.0, 100]], [[0.99, 0.99]], [[0.98, 0.4], [0.99, 0.5], [1.0, 100]]])
+def test_empty_loser_without_minimum_ask_depth_leaves_row_untouched(asks):
+    bot = make_bot()
+    bot.strategy.tick(helpers.cfg(), 1200.0, bot.grid, empty_loser_quotes(fav_asks=asks))
+    before = dict(bot.row)
+    for now in (1202.0, 1203.0):
+        bot.strategy.tick(helpers.cfg(), now, bot.grid, empty_loser_quotes(fav_asks=asks))
+    assert not bot.buys
+    assert bot.row == before
+    assert not bot.row["entered"]
+    assert bot.strategy.runs["cid"]["loser_empty_no_ask"] == 2
+    assert bot.strategy.runs["cid"]["last_reason"] == "loser_empty_no_ask"
+    assert not any(event == "fivemin_eval" for event, _ in bot.logs)
+    bot.strategy.tick(helpers.cfg(), 1300.0, bot.grid, {})
+    summary = next(fields for event, fields in bot.logs if event == "fivemin_eval")
+    assert summary["decision"] == "skip"
+    assert summary["loser_empty_no_ask"] == 2
+
+
+@pytest.mark.parametrize("asks", [[[0.99, 1]], [[0.98, 0.4], [0.99, 0.6]], [[0.98, 2]]])
+def test_empty_loser_with_minimum_ask_depth_enters(asks):
+    bot = make_bot()
+    for now in (1200.0, 1202.0):
+        bot.strategy.tick(helpers.cfg(), now, bot.grid, empty_loser_quotes(fav_asks=asks))
+    assert bot.buys == [("dn", 10.0, 0.99, False)]
+    assert bot.row["entered"]
+
+
+@pytest.mark.parametrize("asks", [[], [[1.0, 100]]])
+def test_two_sided_signal_preserves_entry_without_eligible_asks(asks):
+    bot = make_bot()
+    quotes = bot.quotes()
+    quotes["cid"]["down"]["asks"] = asks
+    for now in (1200.0, 1202.0):
+        bot.strategy.tick(helpers.cfg(), now, bot.grid, quotes)
+    assert bot.buys == [("dn", 10.0, 0.99, False)]
+    assert "loser_empty_no_ask" not in bot.strategy.runs["cid"]
+
+
+def test_empty_loser_ask_guard_allows_side98_later_in_same_market():
+    bot = make_bot()
+    bot.price = 200.0
+    quotes = empty_loser_quotes(fav_side="up", fav_asks=[])
+    options = helpers.cfg(fivemin_side98_enabled=True)
+    for now in (1200.0, 1202.0):
+        bot.strategy.tick(options, now, bot.grid, quotes)
+    assert not bot.buys
+    assert not bot.row["entered"]
+    assert bot.strategy.runs["cid"]["loser_empty_no_ask"] == 1
+    quotes["cid"]["up"]["asks"] = [[0.98, 0.5]]
+    bot.strategy.tick(options, 1250.0, bot.grid, quotes)
+    assert bot.buys == [("up", 20.0, 0.98, False)]
+    assert bot.row["side98"]["side"] == "up"
+    assert bot.row["position"] is None
+    assert not bot.row["entered"]
+    assert bot.strategy.runs["cid"]["loser_empty_no_ask"] == 2
 
 
 def test_default_and_validation_for_empty_loser_flag():

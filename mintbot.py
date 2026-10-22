@@ -283,6 +283,8 @@ DEFAULTS = {
     'fivemin_binance_url': 'wss://stream.binance.com:9443/ws/btcusdt@aggTrade',
     'fivemin_btc_max_age_s': 3.0,
     'fivemin_loser_empty_as_zero': True,
+    'fivemin_nofill_retry_s': 2.0,
+    'fivemin_max_attempts_per_market': 3,
     'fivemin_shares': 10,
     'fivemin_buy_limit': 0.99,
     'fivemin_gate_k': 1.0,
@@ -822,6 +824,8 @@ def validate_strategy(cfg: dict) -> None:
     if not 0 < float(cfg.get("fivemin_book_ws_stale_s", 1.0)) < float("inf"):
         raise ValueError("fivemin_book_ws_stale_s must be positive and finite")
     for key, default, low, high in (
+        ("fivemin_nofill_retry_s", 2.0, 0, None),
+        ("fivemin_max_attempts_per_market", 3, 1, 20),
         ("fivemin_rtds_silent_s", 20.0, 1, None),
         ("fivemin_poll_s", 0.2, 0.1, None), ("fivemin_active_window_s", 130, 0, 300),
         ("fivemin_shares", 10, 1, 200), ("fivemin_buy_limit", 0.99, 0.01, 0.99),
@@ -844,6 +848,8 @@ def validate_strategy(cfg: dict) -> None:
         value = float(cfg.get(key, default))
         if not (value == value and value not in (float("inf"), float("-inf"))) or (low is not None and value < low) or (high is not None and value > high):
             raise ValueError(f"invalid {key}")
+        if key == "fivemin_max_attempts_per_market" and (isinstance(cfg.get(key, default), bool) or not value.is_integer()):
+            raise ValueError(f"invalid {key}: must be int")
     if float(cfg.get("fivemin_loser_min", 0.01)) > float(cfg.get("fivemin_loser_max", 0.10)):
         raise ValueError("fivemin_loser_min must be <= fivemin_loser_max")
     if float(cfg["shares"]) <= 0:

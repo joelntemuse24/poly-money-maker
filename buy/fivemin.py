@@ -17,6 +17,7 @@ DEFAULTS = {
     "fivemin_enabled": False, "fivemin_series_slug": "btc-up-or-down-5m",
     "fivemin_binance_url": "wss://stream.binance.com:9443/ws/btcusdt@aggTrade",
     "fivemin_loser_empty_as_zero": True,
+    "fivemin_nofill_retry_s": 2.0, "fivemin_max_attempts_per_market": 3,
     "fivemin_shares": 10, "fivemin_buy_limit": 0.99, "fivemin_gate_k": 1.0,
     "fivemin_side98_enabled": False, "fivemin_side98_shares": 20, "fivemin_side98_price": 0.98,
     "fivemin_side98_min_gap_usd": 15.0, "fivemin_side98_max_ttc_s": 60,
@@ -33,6 +34,9 @@ DEFAULTS = {
 }
 EPS = 1e-9
 STRIKE_GRACE_S = 5.0
+# Empty-loser signal valid only if favoured side shows asks at <=0.99 = fivemin_buy_limit;
+# #286 fired 5x live into empty asks, FAK rejected.
+FIVEMIN_LOSER_EMPTY_MIN_ASK_SHARES = 1.0
 
 
 def settings(cfg: dict) -> dict:
@@ -364,6 +368,8 @@ class Strategy:
                                blocked_no_strike=run.get("blocked_no_strike", 0), blocked_no_bid=run.get("blocked_no_bid", 0),
                                blocked_gate_below_k=run.get("blocked_gate_below_k", 0),
                                loser_empty_as_zero=run.get("loser_empty_as_zero", 0),
+                               loser_empty_no_ask=run.get("loser_empty_no_ask", 0),
+                               nofill_count=row.get("nofill_count", 0), main_attempts=row.get("main_attempts", 0),
                                miss=run.get("miss", {"up": {}, "down": {}}))
                 if not pending_position(row):
                     self._active.discard(cid)
@@ -485,6 +491,24 @@ class Strategy:
                         self.io.log("fivemin_momentum_data_missing", slug=row["slug"], condition_id=row["condition_id"], side=fav)
             if signals:
                 if loser in empty_zero:
+                    depth = ask_depth(quotes.get(fav, {}))
+                    if depth["cum_099"] < FIVEMIN_LOSER_EMPTY_MIN_ASK_SHARES:
+                        run["loser_empty_no_ask"] = run.get("loser_empty_no_ask", 0) + 1
+                        run["last_reason"] = "loser_empty_no_ask"
+                        if cfg["fivemin_side98_enabled"] and not row.get("side98"):
+                            self._side98_check(cfg, now, row, quotes, grid, ttm)
+                        continue
+                if row.get("main_attempts", 0) >= cfg["fivemin_max_attempts_per_market"]:
+                    run["last_reason"] = "max_attempts"
+                    if cfg["fivemin_side98_enabled"] and not row.get("side98"):
+                        self._side98_check(cfg, now, row, quotes, grid, ttm)
+                    continue
+                if row.get("nofill_count", 0) and now - row.get("last_main_attempt_ts", float("-inf")) < cfg["fivemin_nofill_retry_s"]:
+                    run["last_reason"] = "nofill_cooldown"
+                    if cfg["fivemin_side98_enabled"] and not row.get("side98"):
+                        self._side98_check(cfg, now, row, quotes, grid, ttm)
+                    continue
+                if loser in empty_zero:
                     self._eval(row, "enter", "signal_loser_empty_as_zero", ttm, bids, ratio,
                                loser_empty_as_zero=True)
                 else:
@@ -584,6 +608,8 @@ class Strategy:
     def _enter(self, cfg, now, row, quotes, loser, fav, ratio, proxy, persisted, mom30=None):
         decision_time = self.io.clock() if self.io.clock is not None else time.perf_counter()
         row["entered"] = True
+        row["main_attempts"] = row.get("main_attempts", 0) + 1
+        row["last_main_attempt_ts"] = now
         sent_now = decision_time if self.io.clock is not None else now
 
         def record_signal():
@@ -593,6 +619,7 @@ class Strategy:
                 book["bids"] = book.get("bids", [])[:3]
                 book["asks"] = ask_levels(book)[:3]
             self.io.log("fivemin_signal", ts=now, slug=row["slug"], condition_id=row["condition_id"],
+                        attempt=row["main_attempts"],
                         ttm=row["end"] - now, gate_ratio=ratio, proxy=proxy, strike=row["strike"],
                         offset=row.get("offset"), books=log_books, loser=loser,
                         persisted_s=persisted, **ask_depth(quotes.get(fav, {})))
@@ -638,23 +665,33 @@ class Strategy:
         filled = float(result.get("shares", 0))
         cost = float(result.get("cost", filled * limit))
         avg = result["price"] if is_dry else cost / filled if filled else 0.0
-        row["position"] = {
-            "token": token, "side": fav, "shares": filled, "cost": cost, "avg_px": avg,
-            "dumped": False, "proceeds": 0.0, "settled": False, "pnl": None,
-            "status": result.get("status", "posted"), "dry_run": is_dry,
-            "filled_at": now,
-        }
+        if filled == 0 and not is_dry:
+            row["entered"] = False
+            row["nofill_count"] = row.get("nofill_count", 0) + 1
+            self.runs.setdefault(row["condition_id"], {})["eval_logged"] = False
+        else:
+            row["position"] = {
+                "token": token, "side": fav, "shares": filled, "cost": cost, "avg_px": avg,
+                "dumped": False, "proceeds": 0.0, "settled": False, "pnl": None,
+                "status": result.get("status", "posted"), "dry_run": is_dry,
+                "filled_at": now,
+            }
         if cost > 0 and not is_dry:
             self.spends.append({"ts": now, "cost": cost})
         record_signal()
         self.io.log("fivemin_fill", slug=row["slug"], condition_id=row["condition_id"],
+                    attempt=row["main_attempts"],
                     price=avg, size=filled, usdc=cost, status=result.get("status"),
                     fees=result.get("fees"), dry_run=is_dry, latency_ms=latency_ms,
                     timing=result.get("timing"), btc_mom30_usd=mom30)
         if filled == 0 and not is_dry:
             self.io.log("fivemin_signal_nofill", slug=row["slug"], side=fav, limit=limit,
+                        attempt=row["main_attempts"],
                         latency_ms=latency_ms, timing=result.get("timing"), btc_mom30_usd=mom30)
-            self.alert(f"5m {row['slug']} {fav.upper()} no fill @ {limit:.4f}", cfg, "fivemin_signal_nofill")
+            if row["nofill_count"] == 1:
+                self.alert(f"5m {row['slug']} {fav.upper()} no fill @ {limit:.4f}", cfg, "fivemin_signal_nofill")
+            self.save(force=True)
+            return
         else:
             tag = f"realistic fill {filled:g} @ {avg:.4f} (of {shares:g}, book walk, fee {float(result.get('fees') or 0):.2f})" if is_dry else f"fill {filled:g} @ {avg:.4f}; {latency_ms:.0f}ms"
             self.alert(f"5m {self.io.label(row['start'])} {fav.upper()} {tag}; ttm={row['end']-now:.1f}s gate={ratio:.3f}", cfg, "fivemin_fill")
