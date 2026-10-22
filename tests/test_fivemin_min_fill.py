@@ -201,6 +201,119 @@ def test_low_fill_exit_flag_off_keeps_position(bot):
     assert bot.row["position"].get("low_fill_exit") is None
 
 
+def test_sell_error_clears_dumped_so_later_manage_dump_sells(bot):
+    bot.fills["avg"] = .90
+    bot.books = quotes(down_asks=[[.95, 5]])
+    calls = []
+
+    def flaky(row, pos, book, cfg_, now):
+        calls.append((row["condition_id"], dict(pos), dict(book)))
+        if len(calls) == 1:
+            raise RuntimeError("gateway down")
+        return {"shares": pos["shares"], "proceeds": pos["shares"] * book["bid"],
+                "price": book["bid"], "status": "matched"}
+
+    bot.io.sell = flaky
+    tick(bot)
+    position = bot.row["position"]
+    assert position["dumped"] is False
+    assert position["low_fill_exit_failed"] is True
+    assert position["shares"] == 10
+    assert len(calls) == 1
+    assert any(name == "fivemin_low_fill_exit_error" for name, _ in bot.logs)
+    persisted = bot.saved[-1]["markets"]["cid"]["position"]
+    assert persisted["dumped"] is False
+    assert persisted["low_fill_exit_failed"] is True
+    bot.books = quotes(up=.80, down=.19)
+    bot.now = 1204.0
+    tick(bot)
+    assert len(calls) == 1
+    bot.now = 1207.5
+    tick(bot)
+    assert len(calls) == 2
+    assert calls[1][2]["bid"] == .19
+    assert position["shares"] == 0
+    assert position["dumped"] is True
+    assert any(name == "fivemin_dump" for name, _ in bot.logs)
+
+
+def test_partial_low_fill_sell_allows_later_dump_of_remainder(bot):
+    bot.fills["avg"] = .90
+    bot.books = quotes(down_asks=[[.95, 5]])
+    calls = []
+
+    def half_first(row, pos, book, cfg_, now):
+        calls.append((row["condition_id"], dict(pos), dict(book)))
+        shares = pos["shares"] / 2.0 if len(calls) == 1 else pos["shares"]
+        return {"shares": shares, "proceeds": shares * book["bid"],
+                "price": book["bid"], "status": "partial"}
+
+    bot.io.sell = half_first
+    tick(bot, fivemin_shares=20)
+    position = bot.row["position"]
+    assert position["dumped"] is False
+    assert position["shares"] == pytest.approx(10.0)
+    logged = [fields for name, fields in bot.logs if name == "fivemin_low_fill_exit"]
+    assert logged[0]["shares"] == pytest.approx(10.0)
+    assert logged[0]["remaining"] == pytest.approx(10.0)
+    bot.books = quotes(up=.80, down=.19)
+    bot.now = 1204.0
+    tick(bot, fivemin_shares=20)
+    bot.now = 1207.5
+    tick(bot, fivemin_shares=20)
+    assert len(calls) == 2
+    assert calls[1][1]["shares"] == pytest.approx(10.0)
+    assert calls[1][2]["bid"] == .19
+    assert position["shares"] == 0
+    assert position["dumped"] is True
+
+
+def test_live_book_replaces_decision_quotes_for_low_fill_exit(bot):
+    bot.fills["avg"] = .90
+    bot.books = quotes(down_asks=[[.95, 5]])
+    bot.io.live_book = lambda token: {"bid": .85, "ask": .86, "bids": [], "asks": [], "src": "live"}
+    tick(bot)
+    assert len(bot.sells) == 1
+    assert bot.sells[0][2]["bid"] == .85
+    logged = [fields for name, fields in bot.logs if name == "fivemin_low_fill_exit"]
+    assert logged[0]["book_src"] == "live"
+
+
+def test_live_book_none_falls_back_to_decision_quotes(bot):
+    bot.fills["avg"] = .90
+    bot.books = quotes(down_asks=[[.95, 5]])
+    bot.io.live_book = lambda token: None
+    tick(bot)
+    assert len(bot.sells) == 1
+    assert bot.sells[0][2]["bid"] == .90
+    logged = [fields for name, fields in bot.logs if name == "fivemin_low_fill_exit"]
+    assert logged[0]["book_src"] == "decision"
+
+
+def test_no_main_reentry_after_low_fill_exit(bot):
+    bot.fills["avg"] = .90
+    bot.books = quotes(down_asks=[[.95, 5]])
+    tick(bot)
+    assert len(bot.buys) == 1
+    assert len(bot.sells) == 1
+    assert bot.row["entered"] is True
+    for stamp in (1204.0, 1205.0, 1207.0):
+        bot.now = stamp
+        tick(bot)
+    assert len(bot.buys) == 1
+    assert bot.row["entered"] is True
+
+
+def test_side98_buys_once_per_market(side98_bot):
+    bot = side98_bot
+    for _ in range(3):
+        bot.strategy.tick(cfg(fivemin_side98_enabled=True, fivemin_gate_k=0),
+                          bot.now, bot.grid, bot.books)
+        bot.now += .2
+    assert bot.buys == [("up", 20.0, .98, False)]
+    assert bot.row["side98"]["side"] == "up"
+
+
 def test_low_fill_exit_blocks_later_dump_from_selling_again(bot):
     bot.fills["avg"] = .90
     bot.books = quotes(down_asks=[[.95, 5]])

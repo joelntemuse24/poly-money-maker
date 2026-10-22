@@ -169,6 +169,7 @@ class FiveMinIO:
     label: Callable = lambda start: str(start)
     warmup: Optional[Callable] = None
     rest_book: Optional[Callable] = None
+    live_book: Optional[Callable] = None
 
 
 class Strategy:
@@ -657,7 +658,16 @@ class Strategy:
         floor = float(cfg.get("fivemin_min_fill_px", 0))
         if floor <= 0 or p["shares"] <= 0 or p["dumped"] or p["avg_px"] >= floor - EPS:
             return
-        book = quotes.get(p["side"], {})
+        decision = quotes.get(p["side"], {})
+        book = decision
+        live = getattr(self.io, "live_book", None)
+        if live is not None:
+            try:
+                fresh = live(p["token"])
+            except Exception:
+                fresh = None
+            if fresh and fresh.get("bid") is not None:
+                book = fresh
         if book.get("bid") is None:
             self.io.log("fivemin_low_fill_exit_skip", slug=row["slug"], condition_id=row["condition_id"],
                         kind=kind, side=p["side"], reason="no_bid")
@@ -669,6 +679,9 @@ class Strategy:
         try:
             result = self.io.sell(row, p, book, cfg, now)
         except Exception as exc:
+            p["dumped"] = False
+            p["low_fill_exit_failed"] = True
+            self.save(force=True)
             self.io.log("fivemin_low_fill_exit_error", slug=row["slug"], condition_id=row["condition_id"],
                         kind=kind, side=p["side"], error=str(exc))
             self.alert(f"5m {self.io.label(row['start'])} LOW FILL EXIT {kind} error: {exc}",
@@ -678,11 +691,16 @@ class Strategy:
         proceeds = float(result.get("proceeds", sold * float(result.get("price", book["bid"]))))
         p["shares"] -= sold
         p["proceeds"] += proceeds
+        remaining = p["shares"]
+        if remaining > 0.01:
+            p["dumped"] = False
         self.save(force=True)
         pnl = p["proceeds"] - p["cost"]
         self.io.log("fivemin_low_fill_exit", slug=row["slug"], condition_id=row["condition_id"],
                     kind=kind, side=p["side"], avg_fill=p["avg_px"], floor=floor,
-                    shares=sold, proceeds=proceeds, pnl=pnl, status=result.get("status"))
+                    shares=sold, proceeds=proceeds, remaining=remaining, pnl=pnl,
+                    book_src="live" if book is not decision else "decision",
+                    status=result.get("status"))
         self.alert(f"5m {self.io.label(row['start'])} LOW FILL EXIT {kind} avg {p['avg_px']:.4f} < {floor:.2f}; "
                    f"sold {sold:g} for {proceeds:.2f}; P&L={pnl:.2f}",
                    {**cfg, "fivemin_dry_run": p.get("dry_run", dry_run(cfg))}, "fivemin_low_fill_exit")
@@ -935,8 +953,20 @@ class Runner:
         self.rtds_last_reconnect = 0.0
         try:
             self.strategy.io.rest_book = self._rest_refetch_book
+            self.strategy.io.live_book = self._live_book
         except Exception:
             pass
+
+    def _live_book(self, token):
+        try:
+            ws = getattr(self.books, "ws", None)
+            src = ws if ws is not None else self.books
+            top = src.usable(token)
+        except Exception:
+            return None
+        if top is None or top.bid is None:
+            return None
+        return {"bid": top.bid, "ask": top.ask, "bids": top.bids, "asks": top.asks, "src": "live"}
 
     def _rest_refetch_book(self, token):
         rest = getattr(self.books, "rest", None)
