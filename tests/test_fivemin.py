@@ -340,7 +340,7 @@ class AdditionalFiveMinTests(unittest.TestCase):
             log=strat.io.log, durable=lambda: True,
         )
         strat.runs["cid"] = {"up": 1200.0}
-        strat.tick(cfg(fivemin_gate_k=0), 1203, SimpleNamespace(price_at=lambda _: 100, latest_exchange_ms=lambda: 1e15), {"cid": {"up": {"bid": .05}, "down": {"bid": .9}}})
+        strat.tick(cfg(fivemin_gate_k=0, fivemin_low_fill_exit=False), 1203, SimpleNamespace(price_at=lambda _: 100, latest_exchange_ms=lambda: 1e15), {"cid": {"up": {"bid": .05}, "down": {"bid": .9}}})
         self.assertEqual(strat.state["markets"]["cid"]["position"]["shares"], 10)
         strat.roll_day(1_700_000_000)
         self.assertEqual(strat.state["day"], local_day(1_700_000_000))
