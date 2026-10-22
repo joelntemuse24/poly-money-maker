@@ -285,6 +285,12 @@ DEFAULTS = {
     'fivemin_shares': 10,
     'fivemin_buy_limit': 0.99,
     'fivemin_gate_k': 1.0,
+    'fivemin_side98_enabled': False,
+    'fivemin_side98_shares': 20,
+    'fivemin_side98_price': 0.98,
+    'fivemin_side98_min_gap_usd': 15.0,
+    'fivemin_side98_max_ttc_s': 60,
+    'fivemin_side98_max_adverse_30s_usd': 5.0,
     'fivemin_loser_max': 0.1,
     'fivemin_loser_min': 0.01,
     'fivemin_fav_min': 0.9,
@@ -796,6 +802,8 @@ def validate_strategy(cfg: dict) -> None:
     # Optional 5m configuration validates without importing its runtime module.
     if not isinstance(cfg.get("fivemin_enabled", False), bool):
         raise ValueError("fivemin_enabled must be boolean")
+    if not isinstance(cfg.get("fivemin_side98_enabled", False), bool):
+        raise ValueError("fivemin_side98_enabled must be boolean")
     if cfg.get("fivemin_dry_run") is not None and not isinstance(cfg["fivemin_dry_run"], bool):
         raise ValueError("fivemin_dry_run must be boolean or null")
     if not str(cfg.get("fivemin_series_slug", "btc-up-or-down-5m")).strip():
@@ -810,7 +818,12 @@ def validate_strategy(cfg: dict) -> None:
         ("fivemin_rtds_silent_s", 20.0, 1, None),
         ("fivemin_poll_s", 0.2, 0.1, None), ("fivemin_active_window_s", 130, 0, 300),
         ("fivemin_shares", 10, 1, 200), ("fivemin_buy_limit", 0.99, 0.01, 0.99),
-        ("fivemin_gate_k", 1.0, 0, None), ("fivemin_loser_max", 0.10, 0, 1),
+        ("fivemin_gate_k", 1.0, 0, None), ("fivemin_side98_shares", 20, 1, 200),
+        ("fivemin_side98_price", 0.98, 0.01, 0.99),
+        ("fivemin_side98_min_gap_usd", 15.0, 0, None),
+        ("fivemin_side98_max_ttc_s", 60, 0, 300),
+        ("fivemin_side98_max_adverse_30s_usd", 5.0, 0, None),
+        ("fivemin_loser_max", 0.10, 0, 1),
         ("fivemin_loser_min", 0.01, 0, 1), ("fivemin_fav_min", 0.90, 0, 1),
         ("fivemin_max_ttm_s", 120, 0, 300), ("fivemin_persist_s", 2, 0, None),
         ("fivemin_persist_last_s", 1, 0, None), ("fivemin_persist_last_window_s", 90, 0, 300),
