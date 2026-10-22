@@ -26,6 +26,7 @@ DEFAULTS = {
     "fivemin_side98_min_gap_usd": 15.0, "fivemin_side98_max_ttc_s": 60,
     "fivemin_side98_max_adverse_30s_usd": 5.0,
     "fivemin_momentum_block_enabled": False, "fivemin_momentum_max_adverse_30s_usd": 15.0,
+    "fivemin_momentum_gate_aware": False,
     "fivemin_loser_max": 0.10, "fivemin_loser_min": 0.01, "fivemin_fav_min": 0.90,
     "fivemin_max_ttm_s": 120, "fivemin_persist_s": 2.0, "fivemin_persist_last_s": 1.0,
     "fivemin_persist_last_window_s": 90, "fivemin_dump_held_below": 0.20,
@@ -494,7 +495,16 @@ class Strategy:
                 since, loser, fav, ratio = min(signals)
                 momentum = self._btc_mom30(cfg, now, grid, fav)
                 mom30 = None if momentum is None else momentum[1]
-                if cfg["fivemin_momentum_block_enabled"] and mom30 is not None and mom30 < -cfg["fivemin_momentum_max_adverse_30s_usd"] - EPS:
+                adverse_exceeded = (cfg["fivemin_momentum_block_enabled"] and mom30 is not None
+                                    and mom30 < -cfg["fivemin_momentum_max_adverse_30s_usd"] - EPS)
+                blocked, headroom = adverse_exceeded, None
+                if adverse_exceeded and cfg.get("fivemin_momentum_gate_aware", False):
+                    # gate_ratio * ttm is the favoured-side proxy-minus-strike gap in USD.
+                    gate_t = max(ttm, 0.1)
+                    gate_gap = ratio * gate_t
+                    headroom = gate_gap - (-mom30) - cfg["fivemin_gate_k"] * gate_t
+                    blocked = headroom < 0
+                if blocked:
                     run["last_reason"] = "momentum_block"
                     run["blocked_momentum"] = run.get("blocked_momentum", 0) + 1
                     if not row.get("momentum_block_logged"):
@@ -507,6 +517,16 @@ class Strategy:
                                     gap_usd=None if offset is None else sign * (spot + offset - strike),
                                     gate_ratio=ratio, ttc_s=ttm)
                     signals = []
+                elif headroom is not None:
+                    if not row.get("momentum_pass_headroom_logged"):
+                        row["momentum_pass_headroom_logged"] = True
+                        spot, _ = momentum
+                        offset = row.get("offset")
+                        sign = 1 if fav == "up" else -1
+                        self.io.log("fivemin_momentum_pass_headroom", slug=row["slug"], condition_id=row["condition_id"],
+                                    side=fav, adverse_30s_usd=-mom30,
+                                    gap_usd=None if offset is None else sign * (spot + offset - strike),
+                                    gate_ratio=ratio, ttc_s=ttm, headroom=headroom)
                 else:
                     # Missing momentum data allows entry to preserve prior behavior.
                     if cfg["fivemin_momentum_block_enabled"] and mom30 is None and not row.get("momentum_data_missing_logged"):

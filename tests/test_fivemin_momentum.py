@@ -46,6 +46,7 @@ def test_defaults_and_validation():
                 and any(isinstance(t, ast.Name) and t.id == "DEFAULTS" for t in n.targets))
     defaults = {ast.literal_eval(k): v for k, v in zip(node.keys, node.values)}
     for key, value in {"fivemin_momentum_block_enabled": False,
+                       "fivemin_momentum_gate_aware": False,
                        "fivemin_momentum_max_adverse_30s_usd": 15.0}.items():
         assert DEFAULTS[key] == ast.literal_eval(defaults[key]) == value
     func = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "validate_strategy")
@@ -64,6 +65,9 @@ def test_defaults_and_validation():
     for value in (0, 1, "true", None):
         with pytest.raises(ValueError, match="fivemin_momentum_block_enabled"):
             validate(helpers.cfg(fivemin_momentum_block_enabled=value))
+    for value in (0, 1, "true", None):
+        with pytest.raises(ValueError, match="fivemin_momentum_gate_aware must be boolean"):
+            validate(helpers.cfg(fivemin_momentum_gate_aware=value))
 
 
 def test_off_by_default_enters_despite_large_adverse_move(bot):
@@ -96,6 +100,57 @@ def test_blocks_adverse_logs_once_and_preserves_persist_runs(bot):
     assert run["blocked_momentum"] == 2
     assert run["down"] == 1250.0
     assert sum(event == "fivemin_momentum_block" for event, _ in bot.logs) == 1
+
+
+def test_gate_aware_off_matches_existing_block(bot):
+    mature(bot, fivemin_momentum_gate_aware=False)
+    run = bot.strategy.runs["cid"]
+    assert not bot.buys and not bot.row["entered"]
+    assert run["last_reason"] == "momentum_block"
+    assert run["blocked_momentum"] == 1
+    fields = [fields for event, fields in bot.logs if event.startswith("fivemin_momentum_")]
+    assert fields == [{"slug": bot.row["slug"], "condition_id": "cid", "side": "up",
+                       "adverse_30s_usd": 20.0, "gap_usd": 60.0,
+                       "gate_ratio": 60 / 49, "ttc_s": 49.0}]
+
+
+def test_gate_aware_small_headroom_still_blocks(bot):
+    mature(bot, fivemin_momentum_gate_aware=True)
+    run = bot.strategy.runs["cid"]
+    assert not bot.buys and not bot.row["entered"]
+    assert run["last_reason"] == "momentum_block"
+    assert not any(event == "fivemin_momentum_pass_headroom" for event, _ in bot.logs)
+    fields = [fields for event, fields in bot.logs if event == "fivemin_momentum_block"]
+    assert fields == [{"slug": bot.row["slug"], "condition_id": "cid", "side": "up",
+                       "adverse_30s_usd": 20.0, "gap_usd": 60.0,
+                       "gate_ratio": 60 / 49, "ttc_s": 49.0}]
+
+
+def test_gate_aware_large_headroom_enters_and_logs_pass_once(bot):
+    bot.price, bot.past = 300.0, 320.0
+    extra = {"fivemin_momentum_gate_aware": True}
+    bot.row["main_attempts"] = 3
+    mature(bot, **extra)
+    for now in (1251.2, 1251.4):
+        bot.now = now
+        tick(bot, **extra)
+    run = bot.strategy.runs["cid"]
+    assert not bot.buys and not bot.row["entered"]
+    assert not any(event == "fivemin_momentum_block" for event, _ in bot.logs)
+    passes = [fields for event, fields in bot.logs if event == "fivemin_momentum_pass_headroom"]
+    assert len(passes) == 1
+    assert passes[0]["side"] == "up" and passes[0]["adverse_30s_usd"] == 20.0
+    assert passes[0]["gap_usd"] == 210.0 and passes[0]["ttc_s"] == 49.0
+    assert passes[0]["gate_ratio"] == pytest.approx(210 / 49)
+    assert passes[0]["headroom"] == pytest.approx(210 - 20 - 49)
+    bot.row["main_attempts"] = 0
+    bot.now += .2
+    tick(bot, **extra)
+    assert bot.buys and bot.row["entered"]
+    assert run["last_reason"] != "momentum_block"
+    bot.now += .2
+    tick(bot, **extra)
+    assert sum(event == "fivemin_momentum_pass_headroom" for event, _ in bot.logs) == 1
 
 
 @pytest.mark.parametrize("mom30", [-15.0, -15.0 - EPS / 2, 10.0])

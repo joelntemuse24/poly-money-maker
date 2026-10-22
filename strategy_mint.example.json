@@ -8,6 +8,7 @@
   "fivemin_shares": 10,
   "fivemin_buy_limit": 0.995,
   "fivemin_gate_k": 1.0,
+  "fivemin_momentum_gate_aware": false,
   "fivemin_loser_max": 0.1,
   "fivemin_loser_min": 0.01,
   "fivemin_fav_min": 0.9,

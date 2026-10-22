@@ -290,6 +290,7 @@ DEFAULTS = {
     'fivemin_gate_k': 1.0,
     'fivemin_side98_enabled': False,
     'fivemin_momentum_block_enabled': False,
+    'fivemin_momentum_gate_aware': False,
     'fivemin_momentum_max_adverse_30s_usd': 15.0,
     'fivemin_side98_shares': 20,
     'fivemin_side98_price': 0.98,
@@ -813,6 +814,8 @@ def validate_strategy(cfg: dict) -> None:
         raise ValueError("fivemin_loser_empty_as_zero must be boolean")
     if not isinstance(cfg.get("fivemin_momentum_block_enabled", False), bool):
         raise ValueError("fivemin_momentum_block_enabled must be boolean")
+    if not isinstance(cfg.get("fivemin_momentum_gate_aware", False), bool):
+        raise ValueError("fivemin_momentum_gate_aware must be boolean")
     if cfg.get("fivemin_dry_run") is not None and not isinstance(cfg["fivemin_dry_run"], bool):
         raise ValueError("fivemin_dry_run must be boolean or null")
     if not str(cfg.get("fivemin_series_slug", "btc-up-or-down-5m")).strip():
