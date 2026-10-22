@@ -12,6 +12,8 @@ from pathlib import Path
 from typing import Callable, Optional
 from zoneinfo import ZoneInfo
 
+from buy.mint_sell import empty_fak_status
+
 DEFAULTS = {
     "fivemin_book_ws": False, "fivemin_book_ws_stale_s": 1.0, "fivemin_poll_s": 0.2, "fivemin_active_window_s": 130,
     "fivemin_enabled": False, "fivemin_series_slug": "btc-up-or-down-5m",
@@ -353,7 +355,9 @@ class Strategy:
                             self._settle(cfg, now, row, winner, source, p)
             if any(p.get("settled") for p in held):
                 self._redeem_remainder(cfg, now, row)
-            if held and not pending_position(row):
+            if held and not pending_position(row) and (
+                now >= row["end"] or row.get("side98") or not cfg["fivemin_side98_enabled"]
+            ):
                 self._active.discard(cid)
                 continue
             if not held and now >= row["end"]:
@@ -377,6 +381,11 @@ class Strategy:
             if position and not position.get("settled") and now < row["end"]:
                 self._manage(cfg, now, row, books.get(cid, {}))
             if row["entered"] or not row["start"] <= now < row["end"]:
+                if (row["entered"] and row["start"] <= now < row["end"]
+                        and row.get("strike") is not None
+                        and row.get("skip_reason") != "startup"
+                        and cfg["fivemin_side98_enabled"] and not row.get("side98")):
+                    self._side98_check(cfg, now, row, books.get(cid, {}), grid, row["end"] - now)
                 continue
             if strike is None:
                 run = self.runs.setdefault(cid, {})
@@ -665,9 +674,13 @@ class Strategy:
         filled = float(result.get("shares", 0))
         cost = float(result.get("cost", filled * limit))
         avg = result["price"] if is_dry else cost / filled if filled else 0.0
+        status = result.get("status")
+        retryable = (filled == 0 and not is_dry and isinstance(status, str)
+                     and status.lower().startswith("reject:") and empty_fak_status(status))
         if filled == 0 and not is_dry:
-            row["entered"] = False
             row["nofill_count"] = row.get("nofill_count", 0) + 1
+        if retryable:
+            row["entered"] = False
             self.runs.setdefault(row["condition_id"], {})["eval_logged"] = False
         else:
             row["position"] = {
@@ -686,7 +699,7 @@ class Strategy:
                     timing=result.get("timing"), btc_mom30_usd=mom30)
         if filled == 0 and not is_dry:
             self.io.log("fivemin_signal_nofill", slug=row["slug"], side=fav, limit=limit,
-                        attempt=row["main_attempts"],
+                        attempt=row["main_attempts"], retryable=retryable,
                         latency_ms=latency_ms, timing=result.get("timing"), btc_mom30_usd=mom30)
             if row["nofill_count"] == 1:
                 self.alert(f"5m {row['slug']} {fav.upper()} no fill @ {limit:.4f}", cfg, "fivemin_signal_nofill")

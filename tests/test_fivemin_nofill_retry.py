@@ -14,7 +14,7 @@ def bot():
     case.row = case.strategy.state["markets"]["cid"]
     case.strategy.runs["cid"] = {"up": 1198.0}
     case.books = case.quotes()
-    case.result = {"shares": 0, "cost": 0, "status": "unfilled", "timing": {"post": 12}}
+    case.result = {"shares": 0, "cost": 0, "status": "reject:400:no orders found to match", "timing": {"post": 12}}
 
     def buy(*args):
         assert case.row["entered"]
@@ -30,7 +30,12 @@ def tick(bot, now=1200.0, **options):
     bot.strategy.tick(helpers.cfg(**options), now, bot.grid, bot.books)
 
 
-def test_real_nofill_preserves_market_and_persists_retry_state(bot):
+@pytest.mark.parametrize("status", [
+    "reject:400:no orders found to match",
+    "ReJeCt:400:NO ORDERS FOUND to match",
+])
+def test_real_nofill_preserves_market_and_persists_retry_state(bot, status):
+    bot.result["status"] = status
     tick(bot)
     assert len(bot.buys) == 1
     assert bot.row["entered"] is False
@@ -51,6 +56,65 @@ def test_real_nofill_preserves_market_and_persists_retry_state(bot):
         fields = next(fields for name, fields in bot.logs if name == event)
         assert fields["attempt"] == 1
     assert len(bot.alerts) == 1
+    assert next(fields for name, fields in bot.logs
+                if name == "fivemin_signal_nofill")["retryable"] is True
+
+
+@pytest.mark.parametrize("result", [
+    {}, {"status": None}, {"status": 400}, {"status": "unknown"},
+    {"status": "posted"}, {"status": "unfilled"},
+    {"status": "timeout"}, {"status": "error:timeout"},
+    {"status": "error:400:no orders found to match"},
+    {"status": "no orders found to match"},
+    {"status": "reject:400:insufficient balance"},
+])
+def test_uncertain_zero_fill_consumes_main_entry_without_retry(bot, result):
+    bot.result = {"shares": 0, "cost": 0, "timing": {"post": 12}, **result}
+    tick(bot)
+    tick(bot, 1203.0)
+    tick(bot, 1206.0)
+    assert len(bot.buys) == 1
+    assert bot.row["entered"] is True
+    assert bot.row["position"] == {
+        "token": "dn", "side": "down", "shares": 0, "cost": 0, "avg_px": 0,
+        "dumped": False, "proceeds": 0, "settled": False, "pnl": None,
+        "status": result.get("status", "posted"), "dry_run": False, "filled_at": 1200,
+    }
+    assert bot.row["main_attempts"] == bot.row["nofill_count"] == 1
+    assert bot.row["last_main_attempt_ts"] == 1200
+    assert bot.strategy.runs["cid"]["eval_logged"] is True
+    assert bot.saved[-1]["markets"]["cid"] == bot.row
+    assert pending_position(bot.row)
+    assert not bot.strategy.spends
+    assert len(bot.alerts) == 1 and "no fill" in bot.alerts[0]
+    for event in ("fivemin_signal", "fivemin_fill", "fivemin_signal_nofill"):
+        fields = [fields for name, fields in bot.logs if name == event]
+        assert len(fields) == 1
+        assert fields[0]["attempt"] == 1
+    nofill = next(fields for name, fields in bot.logs if name == "fivemin_signal_nofill")
+    assert nofill["retryable"] is False
+    assert nofill["timing"] == {"post": 12}
+
+
+def test_buy_exception_keeps_entry_consumed_without_nofill_retry(bot):
+    def fail(*args):
+        assert bot.row["entered"]
+        bot.buys.append(args)
+        raise TimeoutError("exchange timeout")
+
+    bot.io.buy = fail
+    tick(bot)
+    tick(bot, 1203.0)
+    assert len(bot.buys) == 1
+    assert bot.row["entered"] is True
+    assert bot.row["position"] is None
+    assert bot.row["main_attempts"] == 1
+    assert "nofill_count" not in bot.row
+    assert bot.saved[-1]["markets"]["cid"] == bot.row
+    assert not any(name == "fivemin_signal_nofill" for name, _ in bot.logs)
+    error = next(fields for name, fields in bot.logs if name == "fivemin_order_error")
+    assert error["error"] == "exchange timeout"
+    assert len(bot.alerts) == 1 and "order error" in bot.alerts[0]
 
 
 def test_retry_waits_for_cooldown_and_logs_later_enter_eval(bot):
@@ -87,7 +151,13 @@ def test_attempt_cap_and_one_nofill_alert_per_market(bot, cap):
 
 
 @pytest.mark.parametrize("guard", ["cooldown", "cap"])
-def test_side98_can_fire_after_main_nofill(bot, guard):
+@pytest.mark.parametrize("status,retryable", [
+    ("reject:400:no orders found to match", True),
+    ("error:400:no orders found to match", False),
+    ("timeout", False), (None, False),
+])
+def test_side98_can_fire_after_main_nofill(bot, guard, status, retryable):
+    bot.result["status"] = status
     bot.price = 0.0
     bot.books["cid"]["down"]["asks"] = [[0.98, 100]]
     bot.strategy.runs["cid"] = {"up": 1248.0}
@@ -104,10 +174,16 @@ def test_side98_can_fire_after_main_nofill(bot, guard):
     tick(bot, 1250.2, **options)
     assert [order[2] for order in bot.buys] == [0.99, 0.98]
     assert bot.row["side98"]["position"]["shares"] == 20
-    assert not bot.row["entered"]
-    assert bot.row["position"] is None
+    assert bot.row["entered"] is not retryable
+    if retryable:
+        assert bot.row["position"] is None
+    else:
+        assert bot.row["position"]["shares"] == 0
     assert bot.row["main_attempts"] == 1
-    assert bot.strategy.runs["cid"]["last_reason"] == ("max_attempts" if guard == "cap" else "nofill_cooldown")
+    if retryable:
+        assert bot.strategy.runs["cid"]["last_reason"] == ("max_attempts" if guard == "cap" else "nofill_cooldown")
+    tick(bot, 1250.3, **options)
+    assert len(bot.buys) == 2
 
 
 def test_partial_fill_stays_entered_at_actual_size(bot):
