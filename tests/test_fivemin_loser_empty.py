@@ -4,7 +4,7 @@ from types import SimpleNamespace
 import pytest
 
 import test_fivemin as helpers
-from buy.fivemin import DEFAULTS
+from buy.fivemin import DEFAULTS, ask_depth
 
 
 def make_bot():
@@ -187,3 +187,67 @@ def test_default_and_validation_for_empty_loser_flag():
     for value in (0, 1, "true", None):
         with pytest.raises(ValueError, match="fivemin_loser_empty_as_zero must be boolean"):
             namespace["validate_strategy"]({**base, "fivemin_loser_empty_as_zero": value})
+
+
+def test_ask_depth_cap_counts_between_default_and_configured_limit():
+    book = {"asks": [[0.993, 5], [0.996, 7]]}
+
+    depth = ask_depth(book, cap=0.995)
+
+    assert depth["asks_depth"] == [[0.993, 5.0]]
+    assert depth["cum_099"] == 5.0
+
+
+def test_ask_depth_default_cap_excludes_above_default_limit():
+    depth = ask_depth({"asks": [[0.993, 5]]})
+
+    assert depth["asks_depth"] == []
+    assert depth["cum_099"] == 0
+
+
+def test_empty_loser_uses_configured_buy_limit_for_ask_guard():
+    bot = make_bot()
+    options = helpers.cfg(fivemin_buy_limit=0.995)
+    for now in (1200.0, 1202.0):
+        bot.strategy.tick(options, now, bot.grid, empty_loser_quotes(fav_asks=[[0.993, 100]]))
+
+    assert bot.buys == [("dn", 10.0, 0.995, False)]
+    assert bot.row["entered"]
+    assert "loser_empty_no_ask" not in bot.strategy.runs["cid"]
+
+
+def test_empty_loser_above_configured_buy_limit_stays_empty():
+    bot = make_bot()
+    options = helpers.cfg(fivemin_buy_limit=0.995)
+    bot.strategy.tick(options, 1200.0, bot.grid, empty_loser_quotes(fav_asks=[[0.996, 100]]))
+    before = dict(bot.row)
+    for now in (1202.0, 1203.0):
+        bot.strategy.tick(options, now, bot.grid, empty_loser_quotes(fav_asks=[[0.996, 100]]))
+
+    assert not bot.buys
+    assert bot.row == before
+    assert not bot.row["entered"]
+    assert bot.strategy.runs["cid"]["loser_empty_no_ask"] == 2
+    assert bot.strategy.runs["cid"]["last_reason"] == "loser_empty_no_ask"
+
+
+def test_validation_accepts_configured_buy_limit_at_0995():
+    tree = ast.parse((helpers.ROOT / "mintbot.py").read_text())
+    validate_node = next(
+        node for node in tree.body
+        if isinstance(node, ast.FunctionDef) and node.name == "validate_strategy"
+    )
+    stop = next(
+        index for index, node in enumerate(validate_node.body)
+        if isinstance(node, ast.If) and ast.unparse(node.test) == "float(cfg['shares']) <= 0"
+    )
+    validate_node.body = validate_node.body[:stop]
+    namespace = {}
+    exec(compile(ast.Module(body=[validate_node], type_ignores=[]), "mintbot-validation", "exec"), namespace)
+    validate = namespace["validate_strategy"]
+    base = helpers.cfg()
+
+    validate({**base, "fivemin_buy_limit": 0.995})
+    validate({**base, "fivemin_buy_limit": 0.99})
+    with pytest.raises(ValueError, match="invalid fivemin_buy_limit"):
+        validate({**base, "fivemin_buy_limit": 1.0})

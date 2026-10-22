@@ -38,8 +38,8 @@ DEFAULTS = {
 }
 EPS = 1e-9
 STRIKE_GRACE_S = 5.0
-# Empty-loser signal valid only if favoured side shows asks at <=0.99 = fivemin_buy_limit;
-# #286 fired 5x live into empty asks, FAK rejected.
+# Empty-loser signal valid only if favoured side shows asks at <= cap, where the cap is the
+# configured fivemin_buy_limit; #286 fired 5x live into empty asks, FAK rejected.
 FIVEMIN_LOSER_EMPTY_MIN_ASK_SHARES = 1.0
 
 
@@ -109,11 +109,12 @@ def ask_levels(book: dict) -> list[list[float]]:
     return sorted(levels, key=lambda level: level[0])
 
 
-def ask_depth(book: dict) -> dict:
-    levels = [level for level in ask_levels(book) if level[0] <= 0.99]
+def ask_depth(book: dict, cap: float = 0.99) -> dict:
+    levels = [level for level in ask_levels(book) if level[0] <= cap + EPS]
+    cum = sum(size for price, size in levels)
     return {"asks_depth": levels,
             "cum_098": sum(size for price, size in levels if price <= 0.98),
-            "cum_099": sum(size for price, size in levels)}
+            "cum_099": cum}
 
 
 def decision_book_fields(book: dict, limit: float) -> dict:
@@ -469,7 +470,7 @@ class Strategy:
                 run[loser], persisted = run_ready(run.get(loser), ok, now, need)
                 ratio = gate_ratio(proxy, strike, fav, ttm)
                 if ok:
-                    run["depth"] = ask_depth(quotes.get(fav, {}))
+                    run["depth"] = ask_depth(quotes.get(fav, {}), cap=float(cfg["fivemin_buy_limit"]))
                     for key in ("cum_098", "cum_099"):
                         run["max_" + key] = max(run.get("max_" + key, 0), run["depth"][key])
                     run["persist_max_s"] = max(run.get("persist_max_s", 0), now - run[loser])
@@ -513,7 +514,7 @@ class Strategy:
                         self.io.log("fivemin_momentum_data_missing", slug=row["slug"], condition_id=row["condition_id"], side=fav)
             if signals:
                 if loser in empty_zero:
-                    depth = ask_depth(quotes.get(fav, {}))
+                    depth = ask_depth(quotes.get(fav, {}), cap=float(cfg["fivemin_buy_limit"]))
                     if depth["cum_099"] < FIVEMIN_LOSER_EMPTY_MIN_ASK_SHARES:
                         run["loser_empty_no_ask"] = run.get("loser_empty_no_ask", 0) + 1
                         run["last_reason"] = "loser_empty_no_ask"
