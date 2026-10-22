@@ -286,6 +286,8 @@ DEFAULTS = {
     'fivemin_buy_limit': 0.99,
     'fivemin_gate_k': 1.0,
     'fivemin_side98_enabled': False,
+    'fivemin_momentum_block_enabled': False,
+    'fivemin_momentum_max_adverse_30s_usd': 15.0,
     'fivemin_side98_shares': 20,
     'fivemin_side98_price': 0.98,
     'fivemin_side98_min_gap_usd': 15.0,
@@ -804,6 +806,8 @@ def validate_strategy(cfg: dict) -> None:
         raise ValueError("fivemin_enabled must be boolean")
     if not isinstance(cfg.get("fivemin_side98_enabled", False), bool):
         raise ValueError("fivemin_side98_enabled must be boolean")
+    if not isinstance(cfg.get("fivemin_momentum_block_enabled", False), bool):
+        raise ValueError("fivemin_momentum_block_enabled must be boolean")
     if cfg.get("fivemin_dry_run") is not None and not isinstance(cfg["fivemin_dry_run"], bool):
         raise ValueError("fivemin_dry_run must be boolean or null")
     if not str(cfg.get("fivemin_series_slug", "btc-up-or-down-5m")).strip():
@@ -823,6 +827,7 @@ def validate_strategy(cfg: dict) -> None:
         ("fivemin_side98_min_gap_usd", 15.0, 0, None),
         ("fivemin_side98_max_ttc_s", 60, 0, 300),
         ("fivemin_side98_max_adverse_30s_usd", 5.0, 0, None),
+        ("fivemin_momentum_max_adverse_30s_usd", 15.0, 0, None),
         ("fivemin_loser_max", 0.10, 0, 1),
         ("fivemin_loser_min", 0.01, 0, 1), ("fivemin_fav_min", 0.90, 0, 1),
         ("fivemin_max_ttm_s", 120, 0, 300), ("fivemin_persist_s", 2, 0, None),

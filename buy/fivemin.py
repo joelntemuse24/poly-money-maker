@@ -20,6 +20,7 @@ DEFAULTS = {
     "fivemin_side98_enabled": False, "fivemin_side98_shares": 20, "fivemin_side98_price": 0.98,
     "fivemin_side98_min_gap_usd": 15.0, "fivemin_side98_max_ttc_s": 60,
     "fivemin_side98_max_adverse_30s_usd": 5.0,
+    "fivemin_momentum_block_enabled": False, "fivemin_momentum_max_adverse_30s_usd": 15.0,
     "fivemin_loser_max": 0.10, "fivemin_loser_min": 0.01, "fivemin_fav_min": 0.90,
     "fivemin_max_ttm_s": 120, "fivemin_persist_s": 2.0, "fivemin_persist_last_s": 1.0,
     "fivemin_persist_last_window_s": 90, "fivemin_dump_held_below": 0.20,
@@ -446,10 +447,42 @@ class Strategy:
             run["blocked_gate_below_k"] = run.get("blocked_gate_below_k", 0) + int(blocked_gate_below_k and not signals)
             if signals:
                 since, loser, fav, ratio = min(signals)
+                momentum = self._btc_mom30(cfg, now, grid, fav)
+                mom30 = None if momentum is None else momentum[1]
+                if cfg["fivemin_momentum_block_enabled"] and mom30 is not None and mom30 < -cfg["fivemin_momentum_max_adverse_30s_usd"] - EPS:
+                    run["last_reason"] = "momentum_block"
+                    run["blocked_momentum"] = run.get("blocked_momentum", 0) + 1
+                    if not row.get("momentum_block_logged"):
+                        row["momentum_block_logged"] = True
+                        spot, _ = momentum
+                        offset = row.get("offset")
+                        sign = 1 if fav == "up" else -1
+                        self.io.log("fivemin_momentum_block", slug=row["slug"], condition_id=row["condition_id"],
+                                    side=fav, adverse_30s_usd=-mom30,
+                                    gap_usd=None if offset is None else sign * (spot + offset - strike),
+                                    gate_ratio=ratio, ttc_s=ttm)
+                    signals = []
+                else:
+                    # Missing momentum data allows entry to preserve prior behavior.
+                    if cfg["fivemin_momentum_block_enabled"] and mom30 is None and not row.get("momentum_data_missing_logged"):
+                        row["momentum_data_missing_logged"] = True
+                        self.io.log("fivemin_momentum_data_missing", slug=row["slug"], condition_id=row["condition_id"], side=fav)
+            if signals:
                 self._eval(row, "enter", "signal", ttm, bids, ratio)
-                self._enter(cfg, now, row, quotes, loser, fav, ratio, proxy, now - since)
+                self._enter(cfg, now, row, quotes, loser, fav, ratio, proxy, now - since, mom30)
             elif cfg["fivemin_side98_enabled"] and not row.get("side98"):
                 self._side98_check(cfg, now, row, quotes, grid, ttm)
+
+    def _btc_mom30(self, cfg, now, grid, fav):
+        latest = getattr(grid, "latest_exchange_ms", lambda: None)()
+        if latest is None or now * 1000 - latest > cfg["fivemin_btc_max_age_s"] * 1000:
+            return None
+        g = math.floor(now * 10) - 5
+        spot, past = grid.price_at(g), grid.price_at(g - 300)
+        if spot is None or past is None:
+            return None
+        sign = 1 if fav == "up" else -1
+        return spot, sign * (spot - past)
 
     def _side98_check(self, cfg, now, row, quotes, grid, ttm):
         if not 0 < ttm <= cfg["fivemin_side98_max_ttc_s"] + EPS:
@@ -461,16 +494,12 @@ class Strategy:
         levels = ask_levels(quotes.get(fav, {}))
         if not levels or abs(levels[0][0] - cfg["fivemin_side98_price"]) > EPS:
             return
-        latest = getattr(grid, "latest_exchange_ms", lambda: None)()
-        if latest is None or now * 1000 - latest > cfg["fivemin_btc_max_age_s"] * 1000:
+        momentum = self._btc_mom30(cfg, now, grid, fav)
+        if momentum is None:
             return
-        g = math.floor(now * 10) - 5
-        spot, past = grid.price_at(g), grid.price_at(g - 300)
-        if spot is None or past is None:
-            return
+        spot, mom30 = momentum
         sign = 1 if fav == "up" else -1
         gap = sign * (spot + row["offset"] - row["strike"])
-        mom30 = sign * (spot - past)
         if gap < cfg["fivemin_side98_min_gap_usd"] - EPS or mom30 < -cfg["fivemin_side98_max_adverse_30s_usd"] - EPS:
             return
         self._side98_enter(cfg, now, row, quotes, fav, gap, mom30)
@@ -532,7 +561,7 @@ class Strategy:
         self.alert(f"5m 98 SIDE ORDER {self.io.label(row['start'])} {fav.upper()} {tag}; ttm={row['end']-now:.1f}s gap=${gap:.2f} mom30=${mom30:.2f}",
                    cfg, kind)
 
-    def _enter(self, cfg, now, row, quotes, loser, fav, ratio, proxy, persisted):
+    def _enter(self, cfg, now, row, quotes, loser, fav, ratio, proxy, persisted, mom30=None):
         decision_time = self.io.clock() if self.io.clock is not None else time.perf_counter()
         row["entered"] = True
         sent_now = decision_time if self.io.clock is not None else now
@@ -601,10 +630,10 @@ class Strategy:
         self.io.log("fivemin_fill", slug=row["slug"], condition_id=row["condition_id"],
                     price=avg, size=filled, usdc=cost, status=result.get("status"),
                     fees=result.get("fees"), dry_run=is_dry, latency_ms=latency_ms,
-                    timing=result.get("timing"))
+                    timing=result.get("timing"), btc_mom30_usd=mom30)
         if filled == 0 and not is_dry:
             self.io.log("fivemin_signal_nofill", slug=row["slug"], side=fav, limit=limit,
-                        latency_ms=latency_ms, timing=result.get("timing"))
+                        latency_ms=latency_ms, timing=result.get("timing"), btc_mom30_usd=mom30)
             self.alert(f"5m {row['slug']} {fav.upper()} no fill @ {limit:.4f}", cfg, "fivemin_signal_nofill")
         else:
             tag = f"realistic fill {filled:g} @ {avg:.4f} (of {shares:g}, book walk, fee {float(result.get('fees') or 0):.2f})" if is_dry else f"fill {filled:g} @ {avg:.4f}; {latency_ms:.0f}ms"
