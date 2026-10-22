@@ -282,6 +282,7 @@ DEFAULTS = {
     'fivemin_series_slug': 'btc-up-or-down-5m',
     'fivemin_binance_url': 'wss://stream.binance.com:9443/ws/btcusdt@aggTrade',
     'fivemin_btc_max_age_s': 3.0,
+    'fivemin_loser_empty_as_zero': True,
     'fivemin_shares': 10,
     'fivemin_buy_limit': 0.99,
     'fivemin_gate_k': 1.0,
@@ -806,6 +807,8 @@ def validate_strategy(cfg: dict) -> None:
         raise ValueError("fivemin_enabled must be boolean")
     if not isinstance(cfg.get("fivemin_side98_enabled", False), bool):
         raise ValueError("fivemin_side98_enabled must be boolean")
+    if not isinstance(cfg.get("fivemin_loser_empty_as_zero", True), bool):
+        raise ValueError("fivemin_loser_empty_as_zero must be boolean")
     if not isinstance(cfg.get("fivemin_momentum_block_enabled", False), bool):
         raise ValueError("fivemin_momentum_block_enabled must be boolean")
     if cfg.get("fivemin_dry_run") is not None and not isinstance(cfg["fivemin_dry_run"], bool):
