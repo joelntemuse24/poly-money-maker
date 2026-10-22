@@ -373,14 +373,14 @@ class ClobBookFeed:
             asks=asks,
         )
 
-    def usable(self, token_id: str) -> Optional[Top]:
-        """Sized top when the bid side is fresh and the book is not crossed.
+    def _fresh_state(self, token_id: str) -> Optional[tuple]:
+        """Validated fresh book state, or None when missing/stale.
 
-        A bid is fresh only after a ``book`` event or a bid-side
-        ``price_change``. An ask-side change does not refresh it. A ping
-        does not either: a ping proves the socket is up, not that the
-        level is still there. When ask levels exist, that side must be
-        confirmed and inside the same window. ``bid >= ask`` is unusable.
+        Shared by ``usable`` and ``fresh_empty`` so both apply exactly the
+        same freshness window. A bid is fresh only after a ``book`` event
+        or a bid-side ``price_change``; an ask-side change does not
+        refresh it. When ask levels exist, that side must be confirmed
+        and inside the same window.
         """
         if not self.healthy():
             return None
@@ -397,6 +397,21 @@ class ClobBookFeed:
             ask_age = now_m - float(book.ask_at)
             if ask_age < 0 or ask_age > stale:
                 return None
+        return (book, now_m, need)
+
+    def usable(self, token_id: str) -> Optional[Top]:
+        """Sized top when the bid side is fresh and the book is not crossed.
+
+        A bid is fresh only after a ``book`` event or a bid-side
+        ``price_change``. An ask-side change does not refresh it. A ping
+        does not either: a ping proves the socket is up, not that the
+        level is still there. When ask levels exist, that side must be
+        confirmed and inside the same window. ``bid >= ask`` is unusable.
+        """
+        fresh = self._fresh_state(token_id)
+        if fresh is None:
+            return None
+        book, now_m, need = fresh
         top = self._view(book, now_m, need)
         if top.bid is None:
             return None
@@ -409,6 +424,40 @@ class ClobBookFeed:
         ):
             return None
         return top
+
+    def fresh_empty(self, token_id: str) -> bool:
+        """True when the token book is fresh but has no bid.
+
+        A fresh empty book is a valid empty reading: the market simply
+        has no bid, so it is not a reason to top up from REST. A missing,
+        stale, crossed or disconnected book is not fresh and still
+        falls back to REST. A ping does not refresh freshness either: the
+        same window rules as ``usable`` apply.
+        """
+        fresh = self._fresh_state(token_id)
+        if fresh is None:
+            return False
+        book, now_m, need = fresh
+        return self._view(book, now_m, need).bid is None
+
+    def silence_s(self) -> Optional[float]:
+        """Seconds since the last message on this socket; None before the first."""
+        last = float(self._last_rx or 0.0)
+        if last <= 0:
+            return None
+        return max(0.0, self._clock() - last)
+
+    def token_health(self, token_id: str) -> dict:
+        """Diagnostic snapshot of one cached token book (logging only)."""
+        now_m = self._clock()
+        with self._lock:
+            book = self._books.get(str(token_id))
+            if book is None:
+                return {"ws_book_empty": False, "last_ws_msg_age_ms": None}
+            msg_at = max(float(book.bid_at or 0.0), float(book.ask_at or 0.0))
+            age_ms = None if msg_at <= 0 else round(max(0.0, now_m - msg_at) * 1000.0, 1)
+            return {"ws_book_empty": not book.bids and not book.asks,
+                    "last_ws_msg_age_ms": age_ms}
 
     def cached_bid(self, token_id: str) -> Optional[float]:
         """Last websocket bid, including a stale or crossed one, for the diff."""
