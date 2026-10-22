@@ -9118,7 +9118,8 @@ def main() -> int:
                         on_error=lambda error: log_event("fivemin_binance_error", error=str(error)[:240]),
                     ), RtdsTwapFeed(), (
                         WsFallbackBookFeed(
-                            ClobBookFeed(on_error=fivemin_ws_error, custom_features=False),
+                            ClobBookFeed(on_error=fivemin_ws_error, custom_features=False,
+                                         token_msg_fresh=True),
                             RestBookFeed(fetch_pair=lambda u, d, fail=None: _fetch_books(u, d, 0.0, fail), log=log_event),
                             ws_stale_s=lambda: float(settings(current_cfg())["fivemin_book_ws_stale_s"]),
                             log=log_event,
