@@ -276,6 +276,8 @@ STOP_FILE = REPO / "STOP_MINT"
 DEFAULTS = {
     'fivemin_book_ws': False,
     'fivemin_book_ws_stale_s': 1.0,
+    'fivemin_book_record': True,
+    'fivemin_book_record_window_s': 150,
     'fivemin_poll_s': 0.2,
     'fivemin_active_window_s': 130,
     'fivemin_enabled': False,
@@ -824,6 +826,8 @@ def validate_strategy(cfg: dict) -> None:
         raise ValueError("fivemin_binance_url must not be empty")
     if not isinstance(cfg.get("fivemin_book_ws", False), bool):
         raise ValueError("fivemin_book_ws must be boolean")
+    if not isinstance(cfg.get("fivemin_book_record", True), bool):
+        raise ValueError("fivemin_book_record must be boolean")
     if not 0 < float(cfg.get("fivemin_book_ws_stale_s", 1.0)) < float("inf"):
         raise ValueError("fivemin_book_ws_stale_s must be positive and finite")
     for key, default, low, high in (
@@ -847,6 +851,7 @@ def validate_strategy(cfg: dict) -> None:
         ("fivemin_dump_limit_floor", 0.05, 0.01, 0.99),
         ("fivemin_min_notional_usd", 1, 0, None), ("fivemin_daily_stop_usd", -150, None, 0),
         ("fivemin_cash_buffer_usd", 5, 0, None), ("fivemin_book_stale_s", 30, 0.01, None), ("fivemin_btc_max_age_s", 3.0, 0.01, None),
+        ("fivemin_book_record_window_s", 150, 1, 300),
     ):
         value = float(cfg.get(key, default))
         if not (value == value and value not in (float("inf"), float("-inf"))) or (low is not None and value < low) or (high is not None and value > high):
@@ -9080,6 +9085,7 @@ def main() -> int:
         from buy.binance_trades import BinanceTrades, PriceGrid
         from buy.clob_book_ws import ClobBookFeed
         from buy.fivemin_books import RestBookFeed, WsFallbackBookFeed
+        from buy.fivemin_tape import BookTape
         from buy.oracle_log import RtdsTwapFeed
         from buy.state_writer import snapshot_state
 
@@ -9129,6 +9135,7 @@ def main() -> int:
                         ) if cfg.get("fivemin_book_ws", False) else
                         RestBookFeed(fetch_pair=lambda u, d, fail=None: _fetch_books(u, d, 0.0, fail), log=log_event)
                     ),
+                    tape=BookTape(REPO / "logs" / "fivemin_books", log=log_event),
                 )
                 runner.gamma_fetch = lambda slug: _fivemin_gamma_winner(current_cfg(), slug)
                 runner.start()

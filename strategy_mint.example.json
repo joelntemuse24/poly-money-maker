@@ -1,5 +1,7 @@
 {
   "fivemin_book_ws": false,
+  "fivemin_book_record": true,
+  "fivemin_book_record_window_s": 150,
   "fivemin_poll_s": 0.2,
   "fivemin_active_window_s": 130,
   "fivemin_binance_url": "wss://stream.binance.com:9443/ws/btcusdt@aggTrade",

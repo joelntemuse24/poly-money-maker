@@ -13,10 +13,12 @@ from pathlib import Path
 from typing import Callable, Optional
 from zoneinfo import ZoneInfo
 
+from buy.fivemin_tape import RECORD_EVENTS
 from buy.mint_sell import empty_fak_status
 
 DEFAULTS = {
     "fivemin_book_ws": False, "fivemin_book_ws_stale_s": 1.0, "fivemin_poll_s": 0.2, "fivemin_active_window_s": 130,
+    "fivemin_book_record": True, "fivemin_book_record_window_s": 150,
     "fivemin_enabled": False, "fivemin_series_slug": "btc-up-or-down-5m",
     "fivemin_binance_url": "wss://stream.binance.com:9443/ws/btcusdt@aggTrade",
     "fivemin_loser_empty_as_zero": True,
@@ -951,8 +953,9 @@ class Strategy:
 class Runner:
     """Own discovery, feeds and cash polling on the isolated 5m loop."""
     def __init__(self, strategy: Strategy, cfg: Callable, gateway, chain, funder: str,
-                 grid, binance, rtds, book_feed, *, clock=time.time):
+                 grid, binance, rtds, book_feed, *, clock=time.time, tape=None):
         self.strategy, self.cfg = strategy, cfg
+        self.tape = tape
         self.gateway, self.chain, self.funder = gateway, chain, funder
         self.grid, self.binance, self.rtds, self.books = grid, binance, rtds, book_feed
         self.clock = clock
@@ -975,6 +978,18 @@ class Runner:
         try:
             self.strategy.io.rest_book = self._rest_refetch_book
             self.strategy.io.live_book = self._live_book
+            if tape is not None:
+                orig = self.strategy.io.log
+
+                def tee(event, **fields):
+                    orig(event, **fields)
+                    if event in RECORD_EVENTS:
+                        try:
+                            tape.event(event, fields)
+                        except Exception:
+                            pass
+
+                self.strategy.io.log = tee
         except Exception:
             pass
 
@@ -1034,6 +1049,11 @@ class Runner:
         self.binance.stop()
         self.rtds.stop()
         self.books.stop()
+        if self.tape is not None:
+            try:
+                self.tape.close()
+            except Exception:
+                pass
 
     def request_gamma(self, slug):
         with self._io_lock:
@@ -1152,6 +1172,12 @@ class Runner:
             quotes[row["condition_id"]] = sides
         self.strategy.io.gamma_winner = self.request_gamma
         self.strategy.tick(cfg, self.clock(), self.grid, quotes)
+        if self.tape is not None:
+            try:
+                self.tape.sample(cfg, now, chosen, quotes, self.grid, self.strategy)
+                self.tape.prune(now)
+            except Exception:
+                pass
 
     @staticmethod
     def _has_position(row):
