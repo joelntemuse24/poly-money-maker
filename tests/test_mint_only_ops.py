@@ -853,6 +853,7 @@ class DeployUnitsTests(unittest.TestCase):
                 "whatsapp_notify.py",
                 "fivemin.py",
                 "fivemin_books.py",
+                "fivemin_tape.py",
                 "binance_trades.py",
             },
         )
