@@ -399,6 +399,71 @@ class FiveMinSniperTests(unittest.TestCase):
         self.assertEqual(len(buys), 1)
         self.assertEqual(buys[0][0], "tok_up")
 
+    def test_sniper_blocks_stale_book_age_ms(self):
+        strat, row, cfg, _events, buys = self._setup_strategy()
+        cfg["sniper_max_book_age_ms"] = 1500.0
+        row["offset"] = -80.0
+        row["strike"] = 69900.0
+        grid = PriceGrid()
+        grid.add(1099600.0, 70000.0)
+        grid.add(1100000.0, 70030.0)
+
+        stale_quotes = {
+            "cid1": {
+                "up": {"bid": 0.74, "ask": 0.75, "asks": [[0.75, 25.0]], "src": "rest", "age_ms": 1600.0},
+                "down": {"bid": 0.24, "ask": 0.25, "asks": [[0.25, 25.0]], "src": "rest", "age_ms": 1600.0},
+            }
+        }
+        strat.tick(cfg, 1100.0, grid, stale_quotes)
+        self.assertEqual(len(buys), 0)
+
+        fresh_quotes = {
+            "cid1": {
+                "up": {"bid": 0.74, "ask": 0.75, "asks": [[0.75, 25.0]], "src": "ws", "age_ms": 80.0},
+                "down": {"bid": 0.24, "ask": 0.25, "asks": [[0.25, 25.0]], "src": "ws", "age_ms": 80.0},
+            }
+        }
+        strat.tick(cfg, 1100.0, grid, fresh_quotes)
+        self.assertEqual(len(buys), 1)
+
+    def test_runner_releases_tick_lock_during_books_poll(self):
+        strat, row, cfg, _events, buys = self._setup_strategy()
+        row["offset"] = 0.0
+        grid = PriceGrid()
+        grid.add(1099600.0, 70000.0)
+        grid.add(1100000.0, 70030.0)
+
+        books = Mock()
+        books.source.return_value = "ws"
+        books.usable.side_effect = lambda tok: SimpleNamespace(
+            bid=0.74 if tok == "tok_up" else 0.24,
+            ask=0.75 if tok == "tok_up" else 0.25,
+            bids=[[0.74, 20.0]],
+            asks=[[0.75, 20.0]] if tok == "tok_up" else [[0.25, 20.0]],
+            age=0.05,
+        )
+        rtds = SimpleNamespace(drain=lambda: [], start=lambda: None, stop=lambda: None)
+        binance = SimpleNamespace(start=lambda: None, stop=lambda: None, _on_tick=None)
+        runner = Runner(
+            strat,
+            lambda: cfg,
+            Mock(),
+            Mock(),
+            "0xfunder",
+            grid,
+            binance,
+            rtds,
+            books,
+            clock=lambda: 1100.0,
+        )
+        def slow_poll(now, up_tok, dn_tok):
+            runner.on_binance_tick(1100000.0, 70030.0)
+
+        books.poll.side_effect = slow_poll
+        runner.tick()
+        self.assertEqual(len(buys), 1)
+        self.assertEqual(buys[0][0], "tok_up")
+
 
     def test_price_grid_isolates_extra_sources_from_primary_jump_window(self):
         grid = PriceGrid()

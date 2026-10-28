@@ -332,6 +332,7 @@ DEFAULTS = {
     'sniper_event_driven': True,
     'sniper_futures_ws_enabled': False,
     'sniper_futures_ws_url': 'wss://fstream.binance.com/stream?streams=btcusdt@aggTrade/btcusdt@bookTicker',
+    'sniper_max_book_age_ms': 1500.0,
     'fivemin_min_fill_px': 0.95,
     'fivemin_low_fill_exit': True,
     "entry_enabled": False,

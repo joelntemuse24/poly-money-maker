@@ -38,6 +38,7 @@ DEFAULTS = {
     "sniper_event_driven": True,
     "sniper_futures_ws_enabled": False,
     "sniper_futures_ws_url": "wss://fstream.binance.com/stream?streams=btcusdt@aggTrade/btcusdt@bookTicker",
+    "sniper_max_book_age_ms": 1500.0,
     "fivemin_side98_enabled": False, "fivemin_side98_shares": 20, "fivemin_side98_price": 0.98,
     "fivemin_side98_min_gap_usd": 15.0, "fivemin_side98_max_ttc_s": 60,
     "fivemin_side98_max_adverse_30s_usd": 5.0,
@@ -731,8 +732,13 @@ class Strategy:
             gap_usd = sign * (spot_ref - strike)
             if jump_usd + EPS < float(cfg["sniper_jump_usd"]) or gap_usd + EPS < float(cfg["sniper_min_gap_usd"]):
                 continue
-            levels = ask_levels(quotes.get(side, {}))
-            best_ask = levels[0][0] if levels else quotes.get(side, {}).get("ask")
+            side_quote = quotes.get(side, {})
+            age_ms = side_quote.get("age_ms")
+            max_age_ms = float(cfg.get("sniper_max_book_age_ms", 1500.0))
+            if age_ms is not None and max_age_ms > 0 and float(age_ms) > max_age_ms + EPS:
+                continue
+            levels = ask_levels(side_quote)
+            best_ask = levels[0][0] if levels else side_quote.get("ask")
             if best_ask is None:
                 continue
             best_ask = float(best_ask)
@@ -1150,18 +1156,25 @@ class Runner:
         threshold = float(cfg["sniper_jump_usd"]) - EPS
         if float(info["up_jump"]) < threshold and float(info["down_jump"]) < threshold:
             return
-        if not self._tick_lock.acquire(blocking=False):
+        if not self._tick_lock.acquire(timeout=0.05):
             return
         try:
+            if row.get("sniper_5m"):
+                return
             sides = {}
+            source_fn = getattr(self.books, "source", None)
             for side, token in (("up", row["up_token"]), ("down", row["dn_token"])):
                 try:
                     top = self.books.usable(token)
                 except Exception:
                     top = None
                 if top is not None:
+                    raw_src = source_fn(token) if callable(source_fn) else None
+                    src = raw_src if isinstance(raw_src, str) else "live"
+                    age_val = getattr(top, "age", None)
+                    age_ms = round(float(age_val) * 1000.0, 1) if isinstance(age_val, (int, float)) else None
                     sides[side] = {"bid": top.bid, "ask": top.ask, "bids": top.bids, "asks": top.asks,
-                                   "src": "live"}
+                                   "src": src, "age_ms": age_ms}
             self.strategy._sniper_check(cfg, now, row, sides, self.grid, row["end"] - now)
         except Exception as exc:
             self._on_error("fivemin_sniper_tick_error", exc)
@@ -1286,71 +1299,77 @@ class Runner:
         except Exception: pass
 
     def tick(self):
-        with self._tick_lock:
-            self._tick_once()
+        self._tick_once()
 
     def _tick_once(self):
-        now, cfg = self.clock(), settings(self.cfg())
-        samples = list(self.rtds.drain())
-        if samples:
-            self.rtds_last_sample = now
-        self.strategy.boundary_samples(samples)
-        with self._io_lock:
-            markets = self._markets
-            balance = self._balance
-            self._balance = None
-        if markets is not self._last_markets:
-            self._last_markets = markets
-            for market in markets:
-                if market.active and not market.closed and not market.neg_risk and str(market.condition_id) not in self.strategy.state["markets"]:
-                    self.strategy.add_market(market, now=now)
-        if balance is not None:
-            self.strategy.sample_cash(*balance)
-        self._last_poll = {cid: stamp for cid, stamp in self._last_poll.items()
-                           if cid in self.strategy.state["markets"]}
-        rows = [self.strategy.state["markets"][cid] for cid in self.strategy._active]
-        current = [row for row in rows if row["start"] <= now < row["end"]]
-        upcoming = sorted((row for row in rows if row["start"] > now), key=lambda row: row["start"])
-        self.current = max(current, key=lambda row: row["start"]) if current else (upcoming[0] if upcoming else None)
-        chosen = ([self.current] if self.current else []) + [row for row in upcoming if row is not self.current][:1]
-        # Restored open positions remain managed outside their entry window.
-        for row in rows:
-            if self._has_position(row) and row not in chosen:
-                chosen.append(row)
-        chosen = [row for row in chosen if self._market_active(row, now, cfg)]
-        tokens = [token for row in chosen for token in (row["up_token"], row["dn_token"])]
-        self.books.set_tokens(tokens)
-        if not dry_run(cfg) and self.strategy.io.warmup is not None:
-            token_set = frozenset(tokens)
-            if token_set != self._warmup_tokens:
-                self._warmup_tokens = token_set
-                self.strategy.io.warmup(tokens)
-        self.books.set_stale_s(cfg["fivemin_book_stale_s"])
-        self.books.set_min_size(0.0)
-        quotes = {}
-        for row in chosen:
-            cid = row["condition_id"]
+        with self._tick_lock:
+            now, cfg = self.clock(), settings(self.cfg())
+            samples = list(self.rtds.drain())
+            if samples:
+                self.rtds_last_sample = now
+            self.strategy.boundary_samples(samples)
+            with self._io_lock:
+                markets = self._markets
+                balance = self._balance
+                self._balance = None
+            if markets is not self._last_markets:
+                self._last_markets = markets
+                for market in markets:
+                    if market.active and not market.closed and not market.neg_risk and str(market.condition_id) not in self.strategy.state["markets"]:
+                        self.strategy.add_market(market, now=now)
+            if balance is not None:
+                self.strategy.sample_cash(*balance)
+            self._last_poll = {cid: stamp for cid, stamp in self._last_poll.items()
+                               if cid in self.strategy.state["markets"]}
+            rows = [self.strategy.state["markets"][cid] for cid in self.strategy._active]
+            current = [row for row in rows if row["start"] <= now < row["end"]]
+            upcoming = sorted((row for row in rows if row["start"] > now), key=lambda row: row["start"])
+            self.current = max(current, key=lambda row: row["start"]) if current else (upcoming[0] if upcoming else None)
+            chosen = ([self.current] if self.current else []) + [row for row in upcoming if row is not self.current][:1]
+            # Restored open positions remain managed outside their entry window.
+            for row in rows:
+                if self._has_position(row) and row not in chosen:
+                    chosen.append(row)
+            chosen = [row for row in chosen if self._market_active(row, now, cfg)]
+            tokens = [token for row in chosen for token in (row["up_token"], row["dn_token"])]
+            self.books.set_tokens(tokens)
+            if not dry_run(cfg) and self.strategy.io.warmup is not None:
+                token_set = frozenset(tokens)
+                if token_set != self._warmup_tokens:
+                    self._warmup_tokens = token_set
+                    self.strategy.io.warmup(tokens)
+            self.books.set_stale_s(cfg["fivemin_book_stale_s"])
+            self.books.set_min_size(0.0)
+            to_poll = []
             poll = getattr(self.books, "poll", None)
-            if callable(poll) and now - self._last_poll.get(cid, float("-inf")) + EPS >= float(cfg["fivemin_poll_s"]):
-                self._last_poll[cid] = now
-                poll(now, row["up_token"], row["dn_token"])
-            sides = {}
-            for side, token in (("up", row["up_token"]), ("down", row["dn_token"])):
-                top = self.books.usable(token)
-                if top is not None:
-                    source = getattr(self.books, "source", None)
-                    src = source(token) if callable(source) else None
-                    sides[side] = {"bid": top.bid, "ask": top.ask, "bids": top.bids, "asks": top.asks,
-                                   "src": src if isinstance(src, str) else "rest",
-                                   "age_ms": None if getattr(top, "age", None) is None
-                                   else round(top.age * 1000.0, 1)}
-                else:
-                    bid_status = getattr(self.books, "reason", None) or getattr(self.books, "bid_status", None)
-                    status = bid_status(token) if callable(bid_status) else "missing"
-                    sides[side] = {"bid": None, "miss": status}
-            quotes[row["condition_id"]] = sides
-        self.strategy.io.gamma_winner = self.request_gamma
-        self.strategy.tick(cfg, self.clock(), self.grid, quotes)
+            if callable(poll):
+                for row in chosen:
+                    cid = row["condition_id"]
+                    if now - self._last_poll.get(cid, float("-inf")) + EPS >= float(cfg["fivemin_poll_s"]):
+                        self._last_poll[cid] = now
+                        to_poll.append((row["up_token"], row["dn_token"]))
+        for up_tok, dn_tok in to_poll:
+            poll(now, up_tok, dn_tok)
+        with self._tick_lock:
+            quotes = {}
+            for row in chosen:
+                sides = {}
+                for side, token in (("up", row["up_token"]), ("down", row["dn_token"])):
+                    top = self.books.usable(token)
+                    if top is not None:
+                        source = getattr(self.books, "source", None)
+                        src = source(token) if callable(source) else None
+                        sides[side] = {"bid": top.bid, "ask": top.ask, "bids": top.bids, "asks": top.asks,
+                                       "src": src if isinstance(src, str) else "rest",
+                                       "age_ms": None if getattr(top, "age", None) is None
+                                       else round(top.age * 1000.0, 1)}
+                    else:
+                        bid_status = getattr(self.books, "reason", None) or getattr(self.books, "bid_status", None)
+                        status = bid_status(token) if callable(bid_status) else "missing"
+                        sides[side] = {"bid": None, "miss": status}
+                quotes[row["condition_id"]] = sides
+            self.strategy.io.gamma_winner = self.request_gamma
+            self.strategy.tick(cfg, self.clock(), self.grid, quotes)
         if self.tape is not None:
             try:
                 self.tape.sample(cfg, now, chosen, quotes, self.grid, self.strategy)
