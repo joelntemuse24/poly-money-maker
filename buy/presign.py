@@ -155,7 +155,7 @@ def build_order_payload(
 class PreSignedOrderCache:
     """Thread-safe, TTL-bounded cache of pre-signed market orders."""
 
-    def __init__(self, ttl_s: float = 240.0, max_entries: int = 256) -> None:
+    def __init__(self, ttl_s: float = 360.0, max_entries: int = 256) -> None:
         self.ttl_s = float(ttl_s)
         self.max_entries = int(max_entries)
         self._lock = threading.Lock()

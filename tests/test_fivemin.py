@@ -163,7 +163,7 @@ class MintbotGateTest(unittest.TestCase):
         imports = [n for n in ast.walk(tree) if isinstance(n, ast.ImportFrom) and n.module in ("buy.fivemin", "buy.binance_trades")]
         self.assertTrue(imports)
         main = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "main")
-        guarded = [n for n in ast.walk(main) if isinstance(n, ast.If) and ast.unparse(n.test) == "cfg.get('fivemin_enabled', False)"]
+        guarded = [n for n in ast.walk(main) if isinstance(n, ast.If) and ast.unparse(n.test) in ("cfg.get('fivemin_enabled', False)", "cfg.get('fivemin_enabled', False) or cfg.get('sniper_5m_enabled', False)")]
         self.assertTrue(guarded)
         self.assertTrue(all(any(n in ast.walk(branch) for branch in guarded) for n in imports))
 

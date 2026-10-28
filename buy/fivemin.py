@@ -1357,15 +1357,22 @@ class Runner:
     def _has_position(row):
         return pending_position(row)
 
+    def _active_window_s(self, cfg):
+        win = float(cfg["fivemin_active_window_s"])
+        if cfg.get("sniper_5m_enabled", False):
+            win = max(win, float(cfg.get("sniper_ttm_max_s", 240)) + 60.0)
+        return win
+
     def _market_active(self, row, now, cfg):
-        return 0 < row["end"] - now <= float(cfg["fivemin_active_window_s"]) or self._has_position(row)
+        return 0 < row["end"] - now <= self._active_window_s(cfg) or self._has_position(row)
 
     def sleep_s(self):
         now = self.clock()
         cfg = settings(self.cfg())
+        win = self._active_window_s(cfg)
         for cid in self.strategy._active:
             row = self.strategy.state["markets"][cid]
-            if self._has_position(row) or 0 < row["end"] - now <= float(cfg["fivemin_active_window_s"]) + 1:
+            if self._has_position(row) or 0 < row["end"] - now <= win + 1:
                 return max(0.1, float(cfg["fivemin_poll_s"]))
         return 1.0
 

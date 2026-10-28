@@ -317,6 +317,23 @@ DEFAULTS = {
     'fivemin_book_stale_s': 30.0,
     'fivemin_rtds_silent_s': 20.0,
     'fivemin_dry_run': None,
+    'fivemin_gap_source': 'twap',
+    'fivemin_ttm_min_s': 0.0,
+    'sniper_5m_enabled': False,
+    'sniper_jump_usd': 25.0,
+    'sniper_window_ms': 500,
+    'sniper_min_gap_usd': 20.0,
+    'sniper_max_ask': 0.97,
+    'sniper_min_ask': 0.5,
+    'sniper_ttm_min_s': 15,
+    'sniper_ttm_max_s': 240,
+    'sniper_shares': 10,
+    'sniper_use_offset': False,
+    'sniper_event_driven': True,
+    'sniper_futures_ws_enabled': False,
+    'sniper_futures_ws_url': 'wss://fstream.binance.com/stream?streams=btcusdt@aggTrade/btcusdt@bookTicker',
+    'fivemin_min_fill_px': 0.95,
+    'fivemin_low_fill_exit': True,
     "entry_enabled": False,
     "dry_run": True,
     "shares": 50.0,
@@ -2317,7 +2334,7 @@ def _start_clob_keepalive(state: dict, cfg: Optional[dict] = None) -> None:
                     or 0 <= float(intent.get("end_ts") or 0) - now <= 360
                     for intent in intents
                 )
-                active_cfg = cfg if isinstance(cfg, dict) else (state.get("cfg") if isinstance(state.get("cfg"), dict) else {})
+                active_cfg = cfg if isinstance(cfg, dict) else (state.get("cfg") if isinstance(state.get("cfg"), dict) else (globals().get("_keepalive_cfg") or {}))
                 always_on = bool(
                     active_cfg.get("clob_keepalive_always_on")
                     or active_cfg.get("sniper_5m_enabled")
@@ -2760,6 +2777,18 @@ def _fak_warmup_sync(token_ids):
                 tick_size = client.get_tick_size(token)
                 neg_risk = False if version == 3 else bool(client.get_neg_risk(token))
                 _fak_market_cache[token] = (tick_size, neg_risk)
+                if type(client).__name__ == "ClobClient":
+                    acfg = globals().get("_keepalive_cfg") or {}
+                    if acfg.get("presign_enabled", True) and acfg.get("sniper_5m_enabled", False):
+                        from buy.presign import get_presign_cache
+                        s_shares = float(acfg.get("sniper_shares", 10))
+                        s_limit = float(acfg.get("sniper_max_ask", 0.97))
+                        s_usdc = reclaim_buy_usdc(s_shares, s_limit)
+                        get_presign_cache().presign_market_order(
+                            client, token, "BUY", s_usdc, s_limit,
+                            tick_size=str(tick_size), neg_risk=bool(neg_risk), version=int(version),
+                        )
+                        log_event("presign_warmed", token_id=str(token)[:18], usdc=s_usdc, price=s_limit)
             except Exception as exc:
                 warn(exc)
 
@@ -8746,6 +8775,7 @@ def _reload_cfg(cfg_box: Dict[str, Any]) -> dict:
         current = cfg_box.get("cfg") or {}
         loaded = {**current, "entry_enabled": False}
     cfg_box["cfg"] = loaded
+    globals()["_keepalive_cfg"] = loaded
     if stamp is not None:
         cfg_box["_mtime_ns"] = stamp
     try:
@@ -8946,6 +8976,7 @@ def main() -> int:
     atexit.register(_STATE_WRITER.flush, timeout=10)
     atexit.register(_HEARTBEAT_WRITER.flush, timeout=10)
     _prune_state_tick(state, cfg, time.time(), force=True)
+    globals()["_keepalive_cfg"] = cfg
     _start_clob_keepalive(state)
     for intent in state.get("intents", {}).values():
         if intent.get("status") in ACTIVE_STATUSES and float(intent.get("end_ts") or 0) > time.time():
@@ -9142,7 +9173,7 @@ def main() -> int:
         daemon=True,
     )
     redeem_thread.start()
-    if cfg.get("fivemin_enabled", False):
+    if cfg.get("fivemin_enabled", False) or cfg.get("sniper_5m_enabled", False):
         from buy.fivemin import FiveMinIO, Runner, Strategy, dry_run as fivemin_dry_run, load_state as load_fivemin_state, settings
         from buy.binance_trades import BinanceTrades, PriceGrid
         from buy.clob_book_ws import ClobBookFeed
