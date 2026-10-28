@@ -3,10 +3,10 @@
 This module provides a small, dependency-light layer that:
 
 * pre-signs market orders once and reuses the exact signed payload bytes,
-* builds L2 (HMAC) authentication headers without going through the client,
+* pre-computes L2 (HMAC) authentication headers for the current and next integer
+  seconds so hot-path order submission performs zero HMAC/base64 work,
 * posts the pre-serialized body directly to the CLOB ``/order`` endpoint,
-* offers a few optional transport/latency helpers (uvloop, TCP_NODELAY,
-  fastest Cloudflare edge probing).
+* offers transport/latency helpers (uvloop, TCP_NODELAY, fastest Cloudflare edge probing).
 
 The cache is single-use: an entry is popped when consumed so that the order
 salt is never reused, which would otherwise be rejected by the exchange.
@@ -49,6 +49,52 @@ class PreSignedEntry:
     serialized_bytes: bytes
     created_at: float
     client_id: int
+    signer_address: str = ""
+    creds: Any = None
+    l2_headers_by_sec: dict[int, dict[str, str]] = field(default_factory=dict)
+
+    def warm_l2_headers(self, now_sec: Optional[int] = None) -> None:
+        """Pre-compute L2 HMAC headers for ``now_sec``, ``now_sec+1``, and ``now_sec+2``."""
+        if not self.signer_address or self.creds is None or not self.serialized_body:
+            return
+        base_sec = int(time.time()) if now_sec is None else int(now_sec)
+        for sec in (base_sec, base_sec + 1, base_sec + 2):
+            if sec not in self.l2_headers_by_sec:
+                try:
+                    self.l2_headers_by_sec[sec] = fast_l2_headers(
+                        self.signer_address,
+                        self.creds,
+                        "POST",
+                        "/order",
+                        self.serialized_body,
+                        timestamp=sec,
+                    )
+                except Exception:
+                    return
+        if len(self.l2_headers_by_sec) > 6:
+            for old_sec in [k for k in self.l2_headers_by_sec if k < base_sec - 1]:
+                self.l2_headers_by_sec.pop(old_sec, None)
+
+    def get_l2_headers(self, signer_address: str, creds: Any, now_sec: Optional[int] = None) -> dict[str, str]:
+        """Return pre-computed L2 headers for ``now_sec`` on hit, else compute immediately."""
+        sec = int(time.time()) if now_sec is None else int(now_sec)
+        cached = self.l2_headers_by_sec.get(sec)
+        if (
+            cached is not None
+            and cached.get("POLY_ADDRESS") == signer_address
+            and cached.get("POLY_API_KEY") == getattr(creds, "api_key", None)
+        ):
+            return cached
+        headers = fast_l2_headers(
+            signer_address,
+            creds,
+            "POST",
+            "/order",
+            self.serialized_body,
+            timestamp=sec,
+        )
+        self.l2_headers_by_sec[sec] = headers
+        return headers
 
 
 # Cache decoded API secrets so the base64 work happens only once per secret.
@@ -93,6 +139,10 @@ def fast_l2_headers(
         "POLY_TIMESTAMP": ts_str,
         "POLY_API_KEY": creds.api_key,
         "POLY_PASSPHRASE": creds.api_passphrase,
+        "User-Agent": "py_clob_client_v2",
+        "Accept": "*/*",
+        "Connection": "keep-alive",
+        "Content-Type": "application/json",
     }
 
 
@@ -162,6 +212,7 @@ class PreSignedOrderCache:
         self._entries: "collections.OrderedDict[tuple, PreSignedEntry]" = (
             collections.OrderedDict()
         )
+        self._warmer_started = False
 
     @staticmethod
     def _key(client: Any, token_id: Any, side: Any, amount: Any, price: Any, order_type: Any) -> tuple:
@@ -176,6 +227,33 @@ class PreSignedOrderCache:
 
     def _expired(self, entry: PreSignedEntry) -> bool:
         return (time.monotonic() - entry.created_at) > self.ttl_s
+
+    def refresh_all_l2_headers(self, now_sec: Optional[int] = None) -> int:
+        """Pre-compute L2 headers for all live cached entries for the current & next second."""
+        with self._lock:
+            entries = [e for e in self._entries.values() if not self._expired(e)]
+        sec = int(time.time()) if now_sec is None else int(now_sec)
+        warmed = 0
+        for entry in entries:
+            entry.warm_l2_headers(sec)
+            if sec in entry.l2_headers_by_sec:
+                warmed += 1
+        return warmed
+
+    def _ensure_header_warmer(self) -> None:
+        if self._warmer_started:
+            return
+        self._warmer_started = True
+
+        def _loop() -> None:
+            while True:
+                try:
+                    self.refresh_all_l2_headers()
+                except Exception:
+                    pass
+                time.sleep(0.4)
+
+        threading.Thread(target=_loop, name="presign-l2-warmer", daemon=True).start()
 
     def put(
         self,
@@ -197,6 +275,14 @@ class PreSignedOrderCache:
             defer_exec=defer_exec,
         )
         body = fast_serialize_json(payload)
+        signer_addr = ""
+        creds = getattr(client, "creds", None)
+        signer = getattr(client, "signer", None)
+        if signer is not None and callable(getattr(signer, "address", None)):
+            try:
+                signer_addr = str(signer.address() or "")
+            except Exception:
+                signer_addr = ""
         entry = PreSignedEntry(
             token_id=str(token_id),
             side=str(side).upper(),
@@ -209,7 +295,12 @@ class PreSignedOrderCache:
             serialized_bytes=body.encode("utf-8"),
             created_at=time.monotonic(),
             client_id=id(client),
+            signer_address=signer_addr,
+            creds=creds,
         )
+        entry.warm_l2_headers()
+        if signer_addr and creds is not None:
+            self._ensure_header_warmer()
         key = self._key(client, token_id, side, amount, price, order_type)
         with self._lock:
             # Drop expired entries opportunistically.
@@ -324,34 +415,65 @@ class PreSignedOrderCache:
         )
 
 
+_ORDER_HTTP_CLIENT: Any = None
+_LAST_ORDER_ACTIVITY_TS: float = 0.0
+
+
+def set_order_http_client(http_client: Any) -> None:
+    """Register a dedicated warm HTTP/2 client for ``fast_post_order``."""
+    global _ORDER_HTTP_CLIENT
+    _ORDER_HTTP_CLIENT = http_client
+
+
+def get_order_http_client() -> Any:
+    return _ORDER_HTTP_CLIENT
+
+
+def last_order_activity_ts() -> float:
+    return _LAST_ORDER_ACTIVITY_TS
+
+
 def fast_post_order(
     client: Any,
     signed_order: Any,
     entry: Optional[PreSignedEntry] = None,
     order_type: Any = "FAK",
     defer_exec: bool = True,
+    *,
+    http_client: Any = None,
 ):
-    """Post an order, bypassing client re-serialization when possible."""
+    """Post an order, bypassing client re-serialization and using pre-computed L2 headers when possible."""
+    global _LAST_ORDER_ACTIVITY_TS
     if (
         entry is not None
         and entry.serialized_body
         and type(client).__name__ == "ClobClient"
-        and callable(getattr(client, "_post", None))
         and getattr(client, "creds", None) is not None
         and getattr(client, "signer", None) is not None
     ):
-        headers = fast_l2_headers(
-            client.signer.address(),
-            client.creds,
-            "POST",
-            "/order",
-            entry.serialized_body,
-        )
-        return client._post(
-            f"{str(client.host).rstrip('/')}/order",
-            headers=headers,
-            data=entry.serialized_body,
-        )
+        headers = entry.get_l2_headers(client.signer.address(), client.creds)
+        url = f"{str(client.host).rstrip('/')}/order"
+        hclient = http_client if http_client is not None else _ORDER_HTTP_CLIENT
+        if hclient is not None and callable(getattr(hclient, "post", None)):
+            _LAST_ORDER_ACTIVITY_TS = time.time()
+            resp = hclient.post(url, headers=headers, content=entry.serialized_bytes)
+            if getattr(resp, "status_code", 200) != 200:
+                try:
+                    from py_clob_client_v2.exceptions import PolyApiException  # type: ignore
+
+                    raise PolyApiException(resp)
+                except ImportError:
+                    raise RuntimeError(f"CLOB order post failed status={resp.status_code}")
+            if _HAS_ORJSON and hasattr(resp, "content"):
+                return orjson.loads(resp.content)
+            return resp.json()
+        if callable(getattr(client, "_post", None)):
+            _LAST_ORDER_ACTIVITY_TS = time.time()
+            return client._post(
+                url,
+                headers=headers,
+                data=entry.serialized_body,
+            )
     return client.post_order(signed_order, order_type=order_type)
 
 

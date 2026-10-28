@@ -1,15 +1,41 @@
-"""Tiny Binance BTCUSDT aggTrade client and 100ms last-trade grid."""
+"""Multi-source BTC trade/quote WebSocket client and 100ms last-trade grid."""
 from __future__ import annotations
 
 import collections
 import json
 import math
+import socket
 import threading
 import time
 from datetime import datetime, timezone
 from typing import Any, Optional
 
+try:
+    import orjson  # type: ignore
+
+    _HAS_ORJSON = True
+except Exception:  # pragma: no cover - optional dependency
+    orjson = None  # type: ignore
+    _HAS_ORJSON = False
+
 URL = "wss://stream.binance.com:9443/ws/btcusdt@aggTrade"
+DEFAULT_EXTRA_WS_URLS = (
+    "wss://stream.binance.com:9443/ws/btcusdt@bookTicker",
+    "wss://stream.bybit.com/v5/public/linear",
+    "wss://ws-feed.exchange.coinbase.com",
+    "wss://www.deribit.com/ws/api/v2",
+    "wss://ws.kraken.com/v2",
+    "wss://ws.bitstamp.net",
+)
+MAX_BBO_SPREAD_USD = 5.0
+
+
+def _fast_loads(raw: Any) -> Any:
+    if isinstance(raw, dict):
+        return raw
+    if _HAS_ORJSON and isinstance(raw, (bytes, bytearray, str)):
+        return orjson.loads(raw)
+    return json.loads(raw)
 
 
 class PriceGrid:
@@ -20,28 +46,60 @@ class PriceGrid:
         self._twap_cache: dict[int, Optional[float]] = {}
         self._ms_ticks: collections.deque[tuple[float, float]] = collections.deque(maxlen=4096)
         self._ms_ticks_by_source: dict[str, collections.deque[tuple[float, float]]] = {}
+        self._recv_ticks_by_source: dict[str, collections.deque[tuple[float, float]]] = {}
+        self._latest_by_source: dict[str, tuple[float, float, float]] = {}
+        self._basis_to_primary: dict[str, float] = {}
         self._lock = threading.Lock()
 
-    def add(self, exchange_ms: Any, price: Any, *, source: str = "primary") -> Optional[int]:
+    def add(
+        self,
+        exchange_ms: Any,
+        price: Any,
+        *,
+        source: str = "primary",
+        recv_ms: Optional[float] = None,
+    ) -> Optional[int]:
         try:
             g = (int(exchange_ms) + 99) // 100
             px = float(price)
-            if not math.isfinite(px) or px <= 0:
+            ex_ms = float(exchange_ms)
+            if not math.isfinite(px) or px <= 0 or not math.isfinite(ex_ms):
                 return None
         except (TypeError, ValueError, OverflowError):
             return None
         src_key = str(source or "primary")
+        r_ms = ex_ms if recv_ms is None else float(recv_ms)
         with self._lock:
             buf = self._ms_ticks_by_source.get(src_key)
             if buf is None:
                 buf = collections.deque(maxlen=4096)
                 self._ms_ticks_by_source[src_key] = buf
-            buf.append((float(exchange_ms), px))
-            if src_key != "primary":
+            buf.append((ex_ms, px))
+
+            rbuf = self._recv_ticks_by_source.get(src_key)
+            if rbuf is None:
+                rbuf = collections.deque(maxlen=4096)
+                self._recv_ticks_by_source[src_key] = rbuf
+            rbuf.append((r_ms, px))
+
+            self._latest_by_source[src_key] = (r_ms, ex_ms, px)
+            if src_key == "primary":
+                self._basis_to_primary["primary"] = 0.0
+                for other_src, (_o_r, _o_e, o_px) in self._latest_by_source.items():
+                    if other_src != "primary":
+                        diff = px - o_px
+                        prev = self._basis_to_primary.get(other_src)
+                        self._basis_to_primary[other_src] = (
+                            diff if prev is None else (0.8 * prev + 0.2 * diff)
+                        )
+            else:
+                prim = self._latest_by_source.get("primary")
+                if prim is not None and src_key not in self._basis_to_primary:
+                    self._basis_to_primary[src_key] = prim[2] - px
                 return g
             if self._latest is not None and g <= self._latest - self.slots:
                 return None
-            self._ms_ticks.append((float(exchange_ms), px))
+            self._ms_ticks.append((ex_ms, px))
             self._latest = max(g, self._latest if self._latest is not None else g)
             self._rows[g % self.slots] = (g, px)
             self._twap_cache = {cached: value for cached, value in self._twap_cache.items() if cached < g}
@@ -127,6 +185,8 @@ class PriceGrid:
         *,
         source: str = "primary",
     ) -> Optional[dict]:
+        if str(source or "primary") == "all":
+            return self.best_jump_in_window(window_ms=window_ms, now_ms=now_ms)
         extrema = self.window_extrema(window_ms=window_ms, now_ms=now_ms, source=source)
         if extrema is None:
             return None
@@ -138,7 +198,80 @@ class PriceGrid:
             "up_jump": spot_now - min_px,
             "down_jump": max_px - spot_now,
             "ts_ms": latest_ms,
+            "source": str(source or "primary"),
         }
+
+    def best_jump_in_window(
+        self,
+        window_ms: float = 500.0,
+        now_ms: Optional[float] = None,
+        *,
+        recv_now_ms: Optional[float] = None,
+    ) -> Optional[dict]:
+        """Return the largest single-source jump across primary and extra feeds.
+
+        Each source is evaluated purely against its own sliding window so cross-exchange
+        price spreads never create false jumps. When an extra feed triggers first, its
+        current price is translated into the primary (Binance Spot) basis using the
+        tracked EMA basis ``primary - source``.
+        """
+        win = float(window_ms)
+        with self._lock:
+            if not self._recv_ticks_by_source and not self._ms_ticks:
+                return None
+            best: Optional[dict] = None
+            best_mag = -1.0
+            prim_latest = self._latest_by_source.get("primary")
+            for src_key, rticks in self._recv_ticks_by_source.items():
+                if not rticks:
+                    continue
+                latest_r, spot_raw = rticks[-1]
+                latest_info = self._latest_by_source.get(src_key)
+                latest_ex = latest_info[1] if latest_info is not None else latest_r
+                if recv_now_ms is not None:
+                    ref_r = float(recv_now_ms)
+                elif now_ms is not None and abs(float(now_ms) - latest_r) <= 60_000.0:
+                    ref_r = float(now_ms)
+                else:
+                    ref_r = latest_r
+                # Ignore sources that have not ticked recently relative to ref_r
+                if ref_r - latest_r > max(win * 2.0, 1500.0):
+                    continue
+                lower = ref_r - win
+                prices = [px for ts, px in rticks if lower <= ts <= ref_r]
+                if not prices:
+                    continue
+                min_px = min(prices)
+                max_px = max(prices)
+                up_j = spot_raw - min_px
+                dn_j = max_px - spot_raw
+                mag = max(up_j, dn_j)
+                if src_key == "primary":
+                    implied_spot = spot_raw
+                    ts_out = latest_ex
+                else:
+                    basis = self._basis_to_primary.get(src_key)
+                    if basis is not None:
+                        implied_spot = spot_raw + basis
+                    elif prim_latest is not None:
+                        implied_spot = prim_latest[2] + (up_j if up_j >= dn_j else -dn_j)
+                    else:
+                        implied_spot = spot_raw
+                    ts_out = prim_latest[1] if prim_latest is not None and abs(latest_ex - prim_latest[1]) > 60_000.0 else latest_ex
+                cand = {
+                    "spot": implied_spot,
+                    "raw_spot": spot_raw,
+                    "min": min_px,
+                    "max": max_px,
+                    "up_jump": up_j,
+                    "down_jump": dn_j,
+                    "ts_ms": ts_out,
+                    "source": src_key,
+                }
+                if mag > best_mag or (mag == best_mag and src_key == "primary"):
+                    best_mag = mag
+                    best = cand
+            return best
 
 
 def _parse_iso_ms(value: Any) -> Optional[float]:
@@ -156,35 +289,105 @@ def _parse_iso_ms(value: Any) -> Optional[float]:
 
 def parse_agg_trade(message: Any) -> Optional[tuple[float, float]]:
     try:
-        obj = message if isinstance(message, dict) else json.loads(message)
+        obj = _fast_loads(message)
         if not isinstance(obj, dict):
             return None
         # Combined stream wrapper: {"stream": ..., "data": {...}}
-        if isinstance(obj.get("data"), dict):
+        if isinstance(obj.get("data"), dict) and "stream" in obj:
             obj = obj["data"]
 
-        # Binance aggTrade.
+        # 1. Binance trade / aggTrade
         if "T" in obj and "p" in obj:
             return float(obj["T"]), float(obj["p"])
 
-        # Binance bookTicker -> mid price.
-        if "b" in obj and "a" in obj:
+        # 2. Binance bookTicker -> mid price (tight spread sanity filter <= $5)
+        if "b" in obj and "a" in obj and not isinstance(obj["b"], list):
             bid = float(obj["b"])
             ask = float(obj["a"])
-            if bid > 0 and ask > 0:
+            if bid > 0 and ask >= bid and (ask - bid) <= MAX_BBO_SPREAD_USD:
                 ts = obj.get("T") or obj.get("E") or (time.time() * 1000.0)
                 return float(ts), (bid + ask) / 2.0
 
-        # Coinbase ticker.
-        if obj.get("type") == "ticker" and "price" in obj:
+        # 3. Coinbase matches or ticker
+        msg_type = obj.get("type")
+        if msg_type in ("match", "last_match", "ticker") and "price" in obj:
+            if msg_type == "ticker" and "best_bid" in obj and "best_ask" in obj:
+                bid = float(obj["best_bid"])
+                ask = float(obj["best_ask"])
+                if bid > 0 and ask >= bid and (ask - bid) <= MAX_BBO_SPREAD_USD:
+                    ts = _parse_iso_ms(obj.get("time")) or (time.time() * 1000.0)
+                    return float(ts), (bid + ask) / 2.0
             ts = obj.get("T") or obj.get("E") or _parse_iso_ms(obj.get("time")) or (time.time() * 1000.0)
             return float(ts), float(obj["price"])
+
+        # 4. Bybit v5 publicTrade.BTCUSDT or orderbook.1.BTCUSDT
+        topic = obj.get("topic")
+        if isinstance(topic, str):
+            data = obj.get("data")
+            if topic.startswith("publicTrade.") and isinstance(data, list) and data:
+                last = data[-1]
+                return float(last["T"]), float(last["p"])
+            if topic.startswith("orderbook.") and isinstance(data, dict):
+                bids, asks = data.get("b"), data.get("a")
+                if isinstance(bids, list) and bids and isinstance(asks, list) and asks:
+                    bid = float(bids[0][0])
+                    ask = float(asks[0][0])
+                    if bid > 0 and ask >= bid and (ask - bid) <= MAX_BBO_SPREAD_USD:
+                        ts = obj.get("cts") or obj.get("ts") or (time.time() * 1000.0)
+                        return float(ts), (bid + ask) / 2.0
+
+        # 5. Deribit trades / ticker
+        params = obj.get("params")
+        if isinstance(params, dict):
+            ch = str(params.get("channel") or "")
+            pdata = params.get("data")
+            if ch.startswith("trades.") and isinstance(pdata, list) and pdata:
+                last = pdata[-1]
+                return float(last["timestamp"]), float(last["price"])
+            if ch.startswith("ticker.") and isinstance(pdata, dict):
+                bid = pdata.get("best_bid_price")
+                ask = pdata.get("best_ask_price")
+                if bid is not None and ask is not None:
+                    b_f, a_f = float(bid), float(ask)
+                    if b_f > 0 and a_f >= b_f and (a_f - b_f) <= MAX_BBO_SPREAD_USD:
+                        return float(pdata.get("timestamp") or (time.time() * 1000.0)), (b_f + a_f) / 2.0
+
+        # 6. Kraken v2 trade / ticker
+        if obj.get("channel") == "trade" and isinstance(obj.get("data"), list) and obj["data"]:
+            last = obj["data"][-1]
+            if "price" in last:
+                ts = _parse_iso_ms(last.get("timestamp")) or (time.time() * 1000.0)
+                return float(ts), float(last["price"])
+
+        # 7. Bitstamp live_trades_btcusd
+        if obj.get("event") == "trade" and isinstance(obj.get("data"), dict):
+            bdata = obj["data"]
+            if "price" in bdata:
+                mts = bdata.get("microtimestamp")
+                ts = (float(mts) / 1000.0) if mts is not None else float(bdata.get("timestamp", time.time())) * 1000.0
+                return float(ts), float(bdata["price"])
     except (KeyError, TypeError, ValueError, json.JSONDecodeError):
         return None
     return None
 
 
 parse_price_message = parse_agg_trade
+
+
+def subscription_for_url(url: str) -> Optional[str]:
+    """Return initial JSON subscription message when ``url`` requires one."""
+    u = str(url or "").lower()
+    if "bybit.com" in u:
+        return '{"op":"subscribe","args":["publicTrade.BTCUSDT","orderbook.1.BTCUSDT"]}'
+    if "coinbase.com" in u:
+        return '{"type":"subscribe","product_ids":["BTC-USD"],"channels":["matches","ticker"]}'
+    if "deribit.com" in u:
+        return '{"jsonrpc":"2.0","id":1,"method":"public/subscribe","params":{"channels":["trades.BTC-PERPETUAL.100ms","ticker.BTC-PERPETUAL.100ms"]}}'
+    if "kraken.com" in u:
+        return '{"method":"subscribe","params":{"channel":"trade","symbol":["BTC/USD"],"snapshot":false}}'
+    if "bitstamp.net" in u:
+        return '{"event":"bts:subscribe","data":{"channel":"live_trades_btcusd"}}'
+    return None
 
 
 class BinanceTrades:
@@ -249,33 +452,54 @@ class BinanceTrades:
     def _run(self, run_url: Optional[str] = None):
         import websocket
         target_url = run_url or self.url
+        sub_msg = subscription_for_url(target_url)
+        is_bybit = "bybit.com" in str(target_url).lower()
         attempt = 0
         while not self._stop.is_set():
             ws = None
             tracked = False
             try:
-                ws = self._connect(target_url) if self._connect else websocket.create_connection(target_url, timeout=10, enable_multithread=True)
+                if self._connect:
+                    ws = self._connect(target_url)
+                else:
+                    ws = websocket.create_connection(
+                        target_url,
+                        timeout=10,
+                        enable_multithread=True,
+                        sockopt=((socket.IPPROTO_TCP, socket.TCP_NODELAY, 1),),
+                    )
                 self._track_ws(ws, True)
                 tracked = True
+                if sub_msg and hasattr(ws, "send"):
+                    ws.send(sub_msg)
                 received = False
-                last_slot = None
                 last_price = None
+                last_ping = time.monotonic()
                 while not self._stop.is_set():
+                    if is_bybit and time.monotonic() - last_ping >= 20.0 and hasattr(ws, "send"):
+                        try:
+                            ws.send('{"op":"ping"}')
+                        except Exception:
+                            pass
+                        last_ping = time.monotonic()
                     raw = ws.recv()
                     if not raw:
                         break
+                    recv_ms = time.monotonic() * 1000.0
                     parsed = parse_agg_trade(raw)
                     if parsed:
                         exchange_ms, price = parsed
-                        slot = (int(exchange_ms) + 99) // 100
-                        if slot != last_slot or price != last_price:
+                        if price != last_price:
                             src = "primary" if run_url is None else str(run_url)
                             try:
-                                self.grid.add(exchange_ms, price, source=src)
+                                self.grid.add(exchange_ms, price, source=src, recv_ms=recv_ms)
                             except TypeError:
-                                if src == "primary":
-                                    self.grid.add(exchange_ms, price)
-                            last_slot, last_price = slot, price
+                                try:
+                                    self.grid.add(exchange_ms, price, source=src)
+                                except TypeError:
+                                    if src == "primary":
+                                        self.grid.add(exchange_ms, price)
+                            last_price = price
                             if self._on_tick is not None:
                                 try:
                                     self._on_tick(exchange_ms, price)

@@ -332,6 +332,15 @@ DEFAULTS = {
     'sniper_event_driven': True,
     'sniper_futures_ws_enabled': False,
     'sniper_futures_ws_url': 'wss://fstream.binance.com/stream?streams=btcusdt@aggTrade/btcusdt@bookTicker',
+    'sniper_extra_ws_enabled': True,
+    'sniper_extra_ws_urls': [
+        'wss://stream.binance.com:9443/ws/btcusdt@bookTicker',
+        'wss://stream.bybit.com/v5/public/linear',
+        'wss://ws-feed.exchange.coinbase.com',
+        'wss://www.deribit.com/ws/api/v2',
+        'wss://ws.kraken.com/v2',
+        'wss://ws.bitstamp.net',
+    ],
     'sniper_max_book_age_ms': 1500.0,
     'fivemin_min_fill_px': 0.95,
     'fivemin_low_fill_exit': True,
@@ -2300,18 +2309,31 @@ def _configure_clob_http_client() -> Any:
     from py_clob_client_v2.http_helpers import helpers
 
     try:
-        from buy.presign import configure_low_latency_sockets, select_fastest_cf_edge
+        from buy.presign import (
+            configure_low_latency_sockets,
+            select_fastest_cf_edge,
+            set_order_http_client,
+        )
 
         configure_low_latency_sockets()
-        if os.getenv("CLOB_PROBE_CF_EDGE") == "1":
+        if os.getenv("CLOB_PROBE_CF_EDGE", "1") == "1":
             select_fastest_cf_edge()
     except Exception:
-        pass
+        set_order_http_client = None  # type: ignore
     client = httpx.Client(
         http2=True,
         limits=httpx.Limits(keepalive_expiry=120),
     )
     helpers._http_client = client
+    try:
+        order_client = httpx.Client(
+            http2=True,
+            limits=httpx.Limits(keepalive_expiry=120),
+        )
+        if callable(set_order_http_client):
+            set_order_http_client(order_client)
+    except Exception:
+        pass
     return client
 
 
@@ -2346,6 +2368,19 @@ def _start_clob_keepalive(state: dict, cfg: Optional[dict] = None) -> None:
                     clob = globals().get("_clob_client")
                     clob_host = str(getattr(clob, "host", host)).rstrip("/")
                     client.get(f"{clob_host}/time", timeout=1.0)
+                    try:
+                        from buy.presign import get_order_http_client, last_order_activity_ts
+
+                        order_hc = get_order_http_client()
+                        if (
+                            order_hc is not None
+                            and order_hc is not client
+                            and callable(getattr(order_hc, "get", None))
+                            and now - float(last_order_activity_ts() or 0.0) >= interval_s
+                        ):
+                            order_hc.get(f"{clob_host}/time", timeout=1.0)
+                    except Exception:
+                        pass
                     last_ping = now
             except Exception:
                 pass
@@ -8880,15 +8915,21 @@ def _fivemin_buy(token: str, shares: float, limit: float, dry: bool) -> dict:
     bought, status = _fak_buy(token, shares, limit, dry, capture=captured, timing=timing)
     if dry:
         bought = shares
+    if float(bought or 0.0) < 0.01 and not dry:
+        return {"shares": 0.0, "cost": 0.0, "status": status, "fees": None, "timing": timing}
     raw = captured[0] if captured else {}
     avg = buy_fill_vwap(raw, bought)
     cost = float(bought) * (avg if avg is not None else limit)
     if bought > 0 and raw.get("makingAmount") is not None:
         try:
             reported_cost = float(raw["makingAmount"])
-            if math.isfinite(reported_cost) and 0 < reported_cost <= shares * limit + 0.01:
+            if (
+                math.isfinite(reported_cost)
+                and 0 < reported_cost <= shares * limit + 0.01
+                and 0.01 <= (reported_cost / float(bought)) <= 1.0
+            ):
                 cost = reported_cost
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, ZeroDivisionError):
             pass
     return {"shares": float(bought), "cost": cost, "status": status,
             "fees": raw.get("fee") or raw.get("feeAmount"), "timing": timing}
@@ -9232,11 +9273,15 @@ def main() -> int:
                         log_event("fivemin_ws_error", error=str(error)[:240], retry_s=delay)
 
                 sniper_cfg = settings(current_cfg())
-                extra_urls = (
-                    [str(sniper_cfg["sniper_futures_ws_url"])]
-                    if sniper_cfg.get("sniper_futures_ws_enabled") and sniper_cfg.get("sniper_futures_ws_url")
-                    else []
-                )
+                extra_urls: list[str] = []
+                if sniper_cfg.get("sniper_extra_ws_enabled", True):
+                    for u in sniper_cfg.get("sniper_extra_ws_urls") or []:
+                        if u and str(u) not in extra_urls:
+                            extra_urls.append(str(u))
+                if sniper_cfg.get("sniper_futures_ws_enabled") and sniper_cfg.get("sniper_futures_ws_url"):
+                    fu = str(sniper_cfg["sniper_futures_ws_url"])
+                    if fu not in extra_urls:
+                        extra_urls.append(fu)
                 runner = Runner(
                     Strategy(io, load_fivemin_state(path)), current_cfg,
                     MarketGateway(gamma_url=str(cfg["gamma_url"]), data_api_url=str(cfg["data_api_url"]), discover_cache_s=20),

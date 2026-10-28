@@ -542,7 +542,7 @@ class FiveMinSniperTests(unittest.TestCase):
         self.assertAlmostEqual(mintbot._scale_fill_amount("23634147", 10.0), 23.634147, places=6)
 
 
-class MintbotPresignAndDualDumpTests(unittest.TestCase):
+class MintbotPresignAndDualDumpTests(FiveMinSniperTests):
     def setUp(self):
         get_presign_cache().clear()
 
@@ -695,6 +695,163 @@ class MintbotPresignAndDualDumpTests(unittest.TestCase):
             run_threads[0]["target"]()
         self.assertEqual(len(built), 2)
         self.assertEqual(get_presign_cache().size(), 2)
+
+
+
+    def test_multi_exchange_parsers_bybit_coinbase_deribit_kraken_bitstamp_and_spread_filter(self):
+        from buy.binance_trades import subscription_for_url
+
+        # 1. Wide BBO spread (> $5) is rejected to prevent false jumps
+        self.assertIsNone(parse_agg_trade('{"T": 1700000200, "b": "71000.0", "a": "71006.0"}'))
+        # 2. Bybit publicTrade
+        byb_tr = '{"topic":"publicTrade.BTCUSDT","data":[{"T":1700000500,"p":"81250.5"}]}'
+        self.assertEqual(parse_agg_trade(byb_tr), (1700000500.0, 81250.5))
+        # 3. Bybit orderbook.1
+        byb_ob = '{"topic":"orderbook.1.BTCUSDT","ts":1700000600,"cts":1700000595,"data":{"b":[["81200.0","1.5"]],"a":[["81201.0","2.0"]]}}'
+        self.assertEqual(parse_agg_trade(byb_ob), (1700000595.0, 81200.5))
+        # 4. Coinbase match
+        cb_m = '{"type":"match","price":"81300.00","time":"2026-10-28T23:00:00.250Z"}'
+        res_cb = parse_agg_trade(cb_m)
+        self.assertIsNotNone(res_cb)
+        self.assertAlmostEqual(res_cb[1], 81300.0)
+        # 5. Deribit ticker
+        der_t = '{"params":{"channel":"ticker.BTC-PERPETUAL.100ms","data":{"timestamp":1700000700,"best_bid_price":81400.0,"best_ask_price":81401.0}}}'
+        self.assertEqual(parse_agg_trade(der_t), (1700000700.0, 81400.5))
+        # 6. Kraken trade
+        krk_t = '{"channel":"trade","data":[{"price":81450.2,"timestamp":"2026-10-28T23:00:01.100Z"}]}'
+        res_krk = parse_agg_trade(krk_t)
+        self.assertIsNotNone(res_krk)
+        self.assertAlmostEqual(res_krk[1], 81450.2)
+        # 7. Bitstamp trade
+        bst_t = '{"event":"trade","data":{"price":81460.0,"microtimestamp":"1700000800000"}}'
+        self.assertEqual(parse_agg_trade(bst_t), (1700000800.0, 81460.0))
+        # 8. Subscription payloads
+        self.assertIn("publicTrade.BTCUSDT", subscription_for_url("wss://stream.bybit.com/v5/public/linear") or "")
+        self.assertIn("BTC-USD", subscription_for_url("wss://ws-feed.exchange.coinbase.com") or "")
+        self.assertIn("BTC-PERPETUAL", subscription_for_url("wss://www.deribit.com/ws/api/v2") or "")
+        self.assertIn("BTC/USD", subscription_for_url("wss://ws.kraken.com/v2") or "")
+        self.assertIn("live_trades_btcusd", subscription_for_url("wss://ws.bitstamp.net") or "")
+
+    def test_best_jump_in_window_uses_basis_to_primary_and_triggers_sniper(self):
+        grid = PriceGrid()
+        # Primary Binance Spot at 81000.0 (t=1000ms)
+        grid.add(1099600.0, 81000.0, source="primary", recv_ms=1099600.0)
+        # Bybit Perp at 80960.0 (-$40 basis vs primary) at t=1099620ms
+        byb = "wss://stream.bybit.com/v5/public/linear"
+        grid.add(1099620.0, 80960.0, source=byb, recv_ms=1099620.0)
+        # No jump yet: best_jump_in_window should be 0 despite $40 basis between primary and bybit
+        jmp0 = grid.best_jump_in_window(500.0, recv_now_ms=1099650.0)
+        self.assertIsNotNone(jmp0)
+        self.assertAlmostEqual(jmp0["up_jump"], 0.0)
+        self.assertAlmostEqual(jmp0["down_jump"], 0.0)
+
+        # Now Bybit jumps +$30 to 80990.0 before Binance Spot arrives!
+        grid.add(1099900.0, 80990.0, source=byb, recv_ms=1099900.0)
+        jmp1 = grid.best_jump_in_window(500.0, recv_now_ms=1099900.0)
+        self.assertIsNotNone(jmp1)
+        self.assertEqual(jmp1["source"], byb)
+        self.assertAlmostEqual(jmp1["up_jump"], 30.0)
+        # Implied primary spot is 80990.0 + (+40.0 basis) = 81030.0!
+        self.assertAlmostEqual(jmp1["spot"], 81030.0)
+        # Meanwhile primary 60s TWAP grid only has primary ticks (81000.0)
+        self.assertAlmostEqual(grid.latest_spot()[1], 81000.0)
+
+    def test_sniper_zero_pre_buy_disk_io_and_releases_tick_lock_during_buy(self):
+        saves_at_buy = []
+        lock_held_at_buy = []
+        strat, row, cfg, events, buys = self._setup_strategy()
+        grid = PriceGrid()
+        grid.add(1099600.0, 70000.0, recv_ms=1099600.0)
+        grid.add(1100000.0, 70030.0, recv_ms=1100000.0)
+
+        books = Mock()
+        books.usable.side_effect = lambda tok: SimpleNamespace(
+            bid=0.92 if tok == "tok_up" else 0.06,
+            ask=0.94 if tok == "tok_up" else 0.08,
+            bids=[[0.92, 20.0]],
+            asks=[[0.94, 20.0]] if tok == "tok_up" else [[0.08, 20.0]],
+            age=0.02,
+        )
+        rtds = SimpleNamespace(drain=lambda: [], start=lambda: None, stop=lambda: None)
+        binance = SimpleNamespace(start=lambda: None, stop=lambda: None, _on_tick=None)
+        runner = Runner(
+            strat, lambda: cfg, Mock(), Mock(), "0xfunder", grid, binance, rtds, books, clock=lambda: 1100.0
+        )
+        runner.current = row
+        save_count = {"n": 0}
+        orig_save = strat.io.save
+        strat.io.save = lambda s: (save_count.__setitem__("n", save_count["n"] + 1), orig_save(s))
+
+        def check_buy(token, shares, limit, is_dry):
+            saves_at_buy.append(save_count["n"])
+            # Probe from another thread whether runner._tick_lock is free while buy() is in flight!
+            acquired = []
+            def probe():
+                got = runner._tick_lock.acquire(blocking=False)
+                if got:
+                    runner._tick_lock.release()
+                acquired.append(got)
+            t = threading.Thread(target=probe)
+            t.start()
+            t.join()
+            lock_held_at_buy.append(not acquired[0])
+            buys.append((token, shares, limit, is_dry))
+            return {"shares": shares, "cost": shares * 0.94, "price": 0.94, "status": "matched", "timing": {"post": 200.0}}
+
+        strat.io.buy = check_buy
+        runner.on_binance_tick(1100000.0, 70030.0)
+        self.assertEqual(len(buys), 1)
+        # Zero state saves happened BEFORE io.buy()!
+        self.assertEqual(saves_at_buy, [0])
+        # State save happened AFTER io.buy() completed!
+        self.assertGreaterEqual(save_count["n"], 1)
+        # runner._tick_lock was NOT held during io.buy()!
+        self.assertEqual(lock_held_at_buy, [False])
+
+    def test_precomputed_l2_headers_and_dedicated_order_http_client(self):
+        from buy.presign import set_order_http_client, get_order_http_client
+
+        raw_secret = base64.urlsafe_b64encode(b"0123456789abcdef0123456789abcdef").decode("utf-8")
+        order_posts = []
+
+        class FakeOrderHttp:
+            def post(self, url, headers=None, content=None):
+                order_posts.append((url, headers, content))
+                return SimpleNamespace(status_code=200, content=b'{"status":"matched","takingAmount":"5"}', json=lambda: {"status": "matched", "takingAmount": "5"})
+
+        class ClobClient:
+            host = "https://clob.polymarket.com"
+            creds = SimpleNamespace(api_key="k1", api_secret=raw_secret, api_passphrase="p1")
+            signer = SimpleNamespace(address=lambda: "0xsigner")
+
+            def _post(self, *_a, **_k):
+                raise AssertionError("client._post should be bypassed when dedicated order_http_client is set")
+
+        clob = ClobClient()
+        cache = PreSignedOrderCache()
+        entry = cache.put(clob, "tok1", "BUY", 4.85, 0.97, {"salt": 77}, owner="k1")
+        now_s = int(time.time())
+        self.assertIn(now_s, entry.l2_headers_by_sec)
+        self.assertIn(now_s + 1, entry.l2_headers_by_sec)
+
+        fake_hc = FakeOrderHttp()
+        set_order_http_client(fake_hc)
+        try:
+            self.assertIs(get_order_http_client(), fake_hc)
+            res = fast_post_order(clob, entry.signed_order, entry=entry, order_type="FAK")
+            self.assertEqual(res["status"], "matched")
+            self.assertEqual(len(order_posts), 1)
+            self.assertEqual(order_posts[0][0], "https://clob.polymarket.com/order")
+            self.assertEqual(order_posts[0][2], entry.serialized_bytes)
+        finally:
+            set_order_http_client(None)
+
+    def test_fivemin_buy_rejects_dust_zero_fill_phantom_price(self):
+        # Regression test for slug 1793207100 where bought=2.36e-5 shares and makingAmount=9.69 logged price=409999.99
+        with patch.object(mintbot, "_fak_buy", return_value=(2.3634147e-05, "matched")):
+            res = mintbot._fivemin_buy("tok_up", 10.0, 0.97, False)
+            self.assertEqual(res["shares"], 0.0)
+            self.assertEqual(res["cost"], 0.0)
 
 
 if __name__ == "__main__":

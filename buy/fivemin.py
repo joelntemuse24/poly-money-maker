@@ -38,6 +38,15 @@ DEFAULTS = {
     "sniper_event_driven": True,
     "sniper_futures_ws_enabled": False,
     "sniper_futures_ws_url": "wss://fstream.binance.com/stream?streams=btcusdt@aggTrade/btcusdt@bookTicker",
+    "sniper_extra_ws_enabled": True,
+    "sniper_extra_ws_urls": [
+        "wss://stream.binance.com:9443/ws/btcusdt@bookTicker",
+        "wss://stream.bybit.com/v5/public/linear",
+        "wss://ws-feed.exchange.coinbase.com",
+        "wss://www.deribit.com/ws/api/v2",
+        "wss://ws.kraken.com/v2",
+        "wss://ws.bitstamp.net",
+    ],
     "sniper_max_book_age_ms": 1500.0,
     "fivemin_side98_enabled": False, "fivemin_side98_shares": 20, "fivemin_side98_price": 0.98,
     "fivemin_side98_min_gap_usd": 15.0, "fivemin_side98_max_ttc_s": 60,
@@ -225,6 +234,7 @@ class Strategy:
         self.balance = None
         self.sampled_at = None
         self.spends: list[dict] = []
+        self._cached_reserves: Optional[float] = None
         self._twap_cache = {}
         self._refetch_threads: list[threading.Thread] = []
 
@@ -356,6 +366,10 @@ class Strategy:
         cfg = settings(cfg)
         self._prune(now)
         self.roll_day(now)
+        try:
+            self._cached_reserves = float(self.io.reserves(cfg))
+        except Exception:
+            pass
         if self.state["realized"] <= cfg["fivemin_daily_stop_usd"] and self.state.get("paused_until_day") != self.state["day"]:
             self.state["paused_until_day"] = self.state["day"]
             self.save()
@@ -701,27 +715,33 @@ class Strategy:
         if filled > 0:
             self._low_fill_exit(cfg, now, row, row["side98"]["position"], quotes, "side98")
 
-    def _sniper_check(self, cfg, now, row, quotes, grid, ttm):
+    def _sniper_check(self, cfg, now, row, quotes, grid, ttm, *, defer_buy: bool = False):
         if not cfg.get("sniper_5m_enabled", False):
-            return False
+            return None if defer_buy else False
         if row.get("sniper_5m"):
-            return False
+            return None if defer_buy else False
         if row.get("strike") is None:
-            return False
+            return None if defer_buy else False
         if row.get("skip_reason") == "startup":
-            return False
+            return None if defer_buy else False
         if not (float(cfg["sniper_ttm_min_s"]) - EPS <= ttm <= float(cfg["sniper_ttm_max_s"]) + EPS):
-            return False
+            return None if defer_buy else False
+        best_fn = getattr(grid, "best_jump_in_window", None) if cfg.get("sniper_extra_ws_enabled", True) else None
         jump_fn = getattr(grid, "jump_in_window", None)
-        info = jump_fn(float(cfg["sniper_window_ms"]), now_ms=now * 1000.0) if callable(jump_fn) else None
+        info = None
+        if callable(best_fn):
+            info = best_fn(float(cfg["sniper_window_ms"]), now_ms=now * 1000.0)
+        if info is None and callable(jump_fn):
+            info = jump_fn(float(cfg["sniper_window_ms"]), now_ms=now * 1000.0)
         if info is None:
-            return False
+            return None if defer_buy else False
         if now * 1000.0 - float(info["ts_ms"]) > float(cfg["fivemin_btc_max_age_s"]) * 1000.0 + EPS:
-            return False
+            return None if defer_buy else False
         spot_now = float(info["spot"])
+        trigger_source = str(info.get("source") or "primary")
         if cfg.get("sniper_use_offset", True):
             if row.get("offset") is None:
-                return False
+                return None if defer_buy else False
             offset = float(row["offset"])
         else:
             offset = 0.0
@@ -746,16 +766,22 @@ class Strategy:
                 continue
             if self._min_fill_blocked(cfg, row, quotes, side, "sniper_5m"):
                 continue
-            self._sniper_enter(cfg, now, row, quotes, side, jump_usd, gap_usd, spot_now)
+            prepared = self._sniper_prepare(
+                cfg, now, row, quotes, side, jump_usd, gap_usd, spot_now, trigger_source=trigger_source
+            )
+            if defer_buy:
+                return prepared
+            if prepared is not None:
+                self._sniper_execute(prepared)
             return True
-        return False
+        return None if defer_buy else False
 
-    def _sniper_enter(self, cfg, now, row, quotes, fav, jump_usd, gap_usd, spot_now):
+    def _sniper_prepare(self, cfg, now, row, quotes, fav, jump_usd, gap_usd, spot_now, *, trigger_source: str = "primary"):
         decision_time = self.io.clock() if self.io.clock is not None else time.perf_counter()
         sent_now = decision_time if self.io.clock is not None else now
         row["sniper_5m"] = {"attempted": True, "side": fav, "attempted_at": now,
-                            "jump_usd": jump_usd, "gap_usd": gap_usd, "spot": spot_now}
-        self.save(force=True)
+                            "jump_usd": jump_usd, "gap_usd": gap_usd, "spot": spot_now,
+                            "trigger_source": trigger_source}
         reason = None
         if sent_now >= row["end"]:
             reason = "expired"
@@ -765,18 +791,51 @@ class Strategy:
             reason = "daily_stop"
         shares, limit = float(cfg["sniper_shares"]), float(cfg["sniper_max_ask"])
         if reason is None:
+            reserves_val = (
+                self._cached_reserves
+                if self._cached_reserves is not None
+                else float(self.io.reserves(cfg))
+            )
             free = cash_free(self.balance, self.sampled_at, sent_now,
-                             self.io.reserves(cfg) + cfg["fivemin_cash_buffer_usd"], self.spends)
+                             reserves_val + cfg["fivemin_cash_buffer_usd"], self.spends)
             if free is None or free + EPS < shares * limit:
                 reason = "cash"
         if reason:
+            self.save(force=True)
             self.io.log("fivemin_sniper_blocked", slug=row["slug"], reason=reason)
-            return
+            return None
         token = row["up_token"] if fav == "up" else row["dn_token"]
         is_dry = dry_run(cfg)
+        return {
+            "cfg": cfg, "now": now, "row": row, "quotes": quotes, "fav": fav,
+            "jump_usd": jump_usd, "gap_usd": gap_usd, "spot_now": spot_now,
+            "trigger_source": trigger_source, "decision_time": decision_time,
+            "shares": shares, "limit": limit, "token": token, "is_dry": is_dry,
+        }
+
+    def _sniper_execute(self, prepared: dict, *, lock: Optional[threading.RLock] = None):
+        cfg = prepared["cfg"]
+        now = prepared["now"]
+        row = prepared["row"]
+        quotes = prepared["quotes"]
+        fav = prepared["fav"]
+        jump_usd = prepared["jump_usd"]
+        gap_usd = prepared["gap_usd"]
+        spot_now = prepared["spot_now"]
+        trigger_source = prepared.get("trigger_source", "primary")
+        decision_time = prepared["decision_time"]
+        shares = prepared["shares"]
+        limit = prepared["limit"]
+        token = prepared["token"]
+        is_dry = prepared["is_dry"]
         try:
             result = self.io.buy(token, shares, limit, is_dry)
         except Exception as exc:
+            if lock is not None:
+                with lock:
+                    self.save(force=True)
+            else:
+                self.save(force=True)
             self.io.log("fivemin_sniper_order_error", slug=row["slug"], side=fav,
                         limit=limit, error=str(exc))
             self.alert(f"5m SNIPER ORDER {self.io.label(row['start'])} {fav.upper()} order error @ {limit:.4f}: {exc}",
@@ -789,23 +848,43 @@ class Strategy:
         filled = float(result.get("shares", 0))
         cost = float(result.get("cost", filled * limit))
         avg = result["price"] if is_dry else cost / filled if filled else 0.0
-        row["sniper_5m"]["position"] = {
-            "token": token, "side": fav, "shares": filled, "cost": cost, "avg_px": avg,
-            "dumped": False, "proceeds": 0.0, "settled": False, "pnl": None,
-            "status": result.get("status", "posted"), "dry_run": is_dry,
-            "filled_at": now, "kind": "sniper_5m",
-        }
-        if cost > 0 and not is_dry:
-            self.spends.append({"ts": now, "cost": cost})
-        self.save(force=True)
+
+        def _commit():
+            row["sniper_5m"]["position"] = {
+                "token": token, "side": fav, "shares": filled, "cost": cost, "avg_px": avg,
+                "dumped": False, "proceeds": 0.0, "settled": False, "pnl": None,
+                "status": result.get("status", "posted"), "dry_run": is_dry,
+                "filled_at": now, "kind": "sniper_5m",
+            }
+            if cost > 0 and not is_dry:
+                self.spends.append({"ts": now, "cost": cost})
+            self.save(force=True)
+
+        if lock is not None:
+            with lock:
+                _commit()
+        else:
+            _commit()
         kind = "fivemin_sniper_nofill" if filled == 0 and not is_dry else "fivemin_sniper_fill"
         self.io.log(kind, slug=row["slug"], condition_id=row["condition_id"], side=fav,
                     price=avg, size=filled, usdc=cost, status=result.get("status"),
                     latency_ms=latency_ms, timing=result.get("timing"),
-                    jump_usd=jump_usd, gap_usd=gap_usd, spot=spot_now, ttm=row["end"] - now,
+                    jump_usd=jump_usd, gap_usd=gap_usd, spot=spot_now,
+                    trigger_source=trigger_source, ttm=row["end"] - now,
                     **decision_book_fields(quotes.get(fav, {}), limit))
         if filled > 0:
-            self._low_fill_exit(cfg, now, row, row["sniper_5m"]["position"], quotes, "sniper_5m")
+            if lock is not None:
+                with lock:
+                    self._low_fill_exit(cfg, now, row, row["sniper_5m"]["position"], quotes, "sniper_5m")
+            else:
+                self._low_fill_exit(cfg, now, row, row["sniper_5m"]["position"], quotes, "sniper_5m")
+
+    def _sniper_enter(self, cfg, now, row, quotes, fav, jump_usd, gap_usd, spot_now, *, trigger_source: str = "primary"):
+        prepared = self._sniper_prepare(
+            cfg, now, row, quotes, fav, jump_usd, gap_usd, spot_now, trigger_source=trigger_source
+        )
+        if prepared is not None:
+            self._sniper_execute(prepared)
 
     def _low_fill_exit(self, cfg, now, row, p, quotes, kind):
         if not cfg.get("fivemin_low_fill_exit", True):
@@ -1144,11 +1223,14 @@ class Runner:
         now = self.clock()
         if not row["start"] <= now < row["end"] or row.get("skip_reason") == "startup":
             return
+        best_fn = getattr(self.grid, "best_jump_in_window", None) if cfg.get("sniper_extra_ws_enabled", True) else None
         jump_fn = getattr(self.grid, "jump_in_window", None)
-        if not callable(jump_fn):
+        if not callable(best_fn) and not callable(jump_fn):
             return
         try:
-            info = jump_fn(float(cfg["sniper_window_ms"]))
+            info = best_fn(float(cfg["sniper_window_ms"])) if callable(best_fn) else None
+            if info is None and callable(jump_fn):
+                info = jump_fn(float(cfg["sniper_window_ms"]))
         except Exception:
             return
         if info is None:
@@ -1158,6 +1240,7 @@ class Runner:
             return
         if not self._tick_lock.acquire(timeout=0.05):
             return
+        prepared = None
         try:
             if row.get("sniper_5m"):
                 return
@@ -1175,11 +1258,18 @@ class Runner:
                     age_ms = round(float(age_val) * 1000.0, 1) if isinstance(age_val, (int, float)) else None
                     sides[side] = {"bid": top.bid, "ask": top.ask, "bids": top.bids, "asks": top.asks,
                                    "src": src, "age_ms": age_ms}
-            self.strategy._sniper_check(cfg, now, row, sides, self.grid, row["end"] - now)
+            prepared = self.strategy._sniper_check(
+                cfg, now, row, sides, self.grid, row["end"] - now, defer_buy=True
+            )
         except Exception as exc:
             self._on_error("fivemin_sniper_tick_error", exc)
         finally:
             self._tick_lock.release()
+        if prepared is not None:
+            try:
+                self.strategy._sniper_execute(prepared, lock=self._tick_lock)
+            except Exception as exc:
+                self._on_error("fivemin_sniper_tick_error", exc)
 
     def _live_book(self, token):
         try:

@@ -15,6 +15,14 @@ import json
 import socket
 import threading
 import time
+
+try:
+    import orjson  # type: ignore
+
+    _HAS_ORJSON = True
+except Exception:  # pragma: no cover - optional dependency
+    orjson = None  # type: ignore
+    _HAS_ORJSON = False
 from dataclasses import dataclass, field
 from typing import Any, Callable, Optional
 
@@ -533,8 +541,8 @@ class ClobBookFeed:
         if not text or text.upper() in {"PING", "PONG"}:
             return
         try:
-            payload = json.loads(text)
-        except (json.JSONDecodeError, ValueError, TypeError):
+            payload = orjson.loads(text) if _HAS_ORJSON else json.loads(text)
+        except Exception:
             return
         if isinstance(payload, list):
             for item in payload:
@@ -700,4 +708,8 @@ class ClobBookFeed:
 def _default_connect(url: str) -> Any:
     import websocket
 
-    return websocket.create_connection(url, timeout=20)
+    return websocket.create_connection(
+        url,
+        timeout=20,
+        sockopt=((socket.IPPROTO_TCP, socket.TCP_NODELAY, 1),),
+    )
