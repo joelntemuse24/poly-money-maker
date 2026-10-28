@@ -24,6 +24,20 @@ DEFAULTS = {
     "fivemin_loser_empty_as_zero": True,
     "fivemin_nofill_retry_s": 2.0, "fivemin_max_attempts_per_market": 3,
     "fivemin_shares": 10, "fivemin_buy_limit": 0.99, "fivemin_gate_k": 1.0,
+    "fivemin_gap_source": "twap", "fivemin_ttm_min_s": 0.0,
+    "sniper_5m_enabled": False,
+    "sniper_jump_usd": 25.0,
+    "sniper_window_ms": 500,
+    "sniper_min_gap_usd": 20.0,
+    "sniper_max_ask": 0.97,
+    "sniper_min_ask": 0.50,
+    "sniper_ttm_min_s": 15,
+    "sniper_ttm_max_s": 240,
+    "sniper_shares": 10,
+    "sniper_use_offset": False,
+    "sniper_event_driven": True,
+    "sniper_futures_ws_enabled": False,
+    "sniper_futures_ws_url": "wss://fstream.binance.com/stream?streams=btcusdt@aggTrade/btcusdt@bookTicker",
     "fivemin_side98_enabled": False, "fivemin_side98_shares": 20, "fivemin_side98_price": 0.98,
     "fivemin_side98_min_gap_usd": 15.0, "fivemin_side98_max_ttc_s": 60,
     "fivemin_side98_max_adverse_30s_usd": 5.0,
@@ -149,7 +163,8 @@ def settlement_pnl(position: dict, winner: str) -> float:
 
 
 def positions(row):
-    return [p for p in (row.get("position"), (row.get("side98") or {}).get("position")) if p]
+    return [p for p in (row.get("position"), (row.get("side98") or {}).get("position"),
+                        (row.get("sniper_5m") or {}).get("position")) if p]
 
 
 def pending_position(row):
@@ -304,10 +319,11 @@ class Strategy:
             self.save()
 
     def _proxy(self, grid, now, row, cfg):
+        source = cfg.get("fivemin_gap_source", "twap")
         g = math.floor(now * 10) - 5
         if g not in self._twap_cache:
-            self._twap_cache = {g: twap60(grid, g)}
-        value = self._twap_cache[g]
+            self._twap_cache = {g: (twap60(grid, g), grid.price_at(g))}
+        twap, spot = self._twap_cache[g]
         latest = getattr(grid, "latest_exchange_ms", lambda: None)()
         max_age = float(cfg.get("fivemin_btc_max_age_s", 3.0))
         if latest is None or now * 1000.0 - latest > max_age * 1000.0:
@@ -315,7 +331,11 @@ class Strategy:
                 self._last_btc_stale = now
                 self.io.log("fivemin_btc_stale", age_s=None if latest is None else now - latest / 1000.0)
             return None
-        return None if value is None or row.get("offset") is None else value + row["offset"]
+        if source == "strike":
+            return spot
+        if row.get("offset") is None or (source == "twap" and twap is None):
+            return None
+        return (spot if source == "spot" else twap) + row["offset"]
 
     def _eval(self, row, decision, reason, ttm, bids, ratio=None, **extra):
         run = self.runs.setdefault(row["condition_id"], {})
@@ -374,7 +394,7 @@ class Strategy:
                 self._redeem_remainder(cfg, now, row)
             if held and not pending_position(row) and (
                 now >= row["end"] or row.get("side98") or not cfg["fivemin_side98_enabled"]
-            ):
+            ) and (row.get("sniper_5m") or not cfg.get("sniper_5m_enabled", False)):
                 self._active.discard(cid)
                 continue
             if not held and now >= row["end"]:
@@ -397,6 +417,11 @@ class Strategy:
                 continue
             if position and not position.get("settled") and now < row["end"]:
                 self._manage(cfg, now, row, books.get(cid, {}))
+            if (cfg.get("sniper_5m_enabled", False) and not row.get("sniper_5m")
+                    and row["start"] <= now < row["end"]
+                    and row.get("strike") is not None
+                    and row.get("skip_reason") != "startup"):
+                self._sniper_check(cfg, now, row, books.get(cid, {}), grid, row["end"] - now)
             if row["entered"] or not row["start"] <= now < row["end"]:
                 if (row["entered"] and row["start"] <= now < row["end"]
                         and row.get("strike") is not None
@@ -419,7 +444,7 @@ class Strategy:
             quotes = books.get(cid, {})
             bids = {side: quotes.get(side, {}).get("bid") for side in ("up", "down")}
             run = self.runs.setdefault(cid, {})
-            if ttm > cfg["fivemin_max_ttm_s"]:
+            if ttm > cfg["fivemin_max_ttm_s"] or ttm <= cfg["fivemin_ttm_min_s"]:
                 if cfg["fivemin_side98_enabled"] and not row.get("side98"):
                     self._side98_check(cfg, now, row, quotes, grid, ttm)
                 continue
@@ -469,7 +494,7 @@ class Strategy:
                 ok = bid is not None and other is not None and (
                     (loser in empty_zero or cfg["fivemin_loser_min"] - EPS <= bid <= cfg["fivemin_loser_max"] + EPS)
                     and other + EPS >= cfg["fivemin_fav_min"]
-                    and 0 < ttm <= cfg["fivemin_max_ttm_s"] + EPS)
+                    and cfg["fivemin_ttm_min_s"] < ttm <= cfg["fivemin_max_ttm_s"] + EPS)
                 run[loser], persisted = run_ready(run.get(loser), ok, now, need)
                 ratio = gate_ratio(proxy, strike, fav, ttm)
                 if ok:
@@ -574,7 +599,7 @@ class Strategy:
         return spot, sign * (spot - past)
 
     def _min_fill_blocked(self, cfg, row, quotes, side, kind) -> bool:
-        floor = float(cfg.get("fivemin_min_fill_px", 0))
+        floor = float(cfg.get("sniper_min_ask" if kind == "sniper_5m" else "fivemin_min_fill_px", 0))
         if floor <= 0:
             return False
         levels = ask_levels(quotes.get(side, {}))
@@ -675,10 +700,106 @@ class Strategy:
         if filled > 0:
             self._low_fill_exit(cfg, now, row, row["side98"]["position"], quotes, "side98")
 
+    def _sniper_check(self, cfg, now, row, quotes, grid, ttm):
+        if not cfg.get("sniper_5m_enabled", False):
+            return False
+        if row.get("sniper_5m"):
+            return False
+        if row.get("strike") is None:
+            return False
+        if row.get("skip_reason") == "startup":
+            return False
+        if not (float(cfg["sniper_ttm_min_s"]) - EPS <= ttm <= float(cfg["sniper_ttm_max_s"]) + EPS):
+            return False
+        jump_fn = getattr(grid, "jump_in_window", None)
+        info = jump_fn(float(cfg["sniper_window_ms"]), now_ms=now * 1000.0) if callable(jump_fn) else None
+        if info is None:
+            return False
+        if now * 1000.0 - float(info["ts_ms"]) > float(cfg["fivemin_btc_max_age_s"]) * 1000.0 + EPS:
+            return False
+        spot_now = float(info["spot"])
+        offset = float(row["offset"]) if (cfg.get("sniper_use_offset", False) and row.get("offset") is not None) else 0.0
+        spot_ref = spot_now + offset
+        strike = float(row["strike"])
+        for side, jump_key, sign in (("up", "up_jump", 1.0), ("down", "down_jump", -1.0)):
+            jump_usd = float(info[jump_key])
+            gap_usd = sign * (spot_ref - strike)
+            if jump_usd + EPS < float(cfg["sniper_jump_usd"]) or gap_usd + EPS < float(cfg["sniper_min_gap_usd"]):
+                continue
+            levels = ask_levels(quotes.get(side, {}))
+            best_ask = levels[0][0] if levels else quotes.get(side, {}).get("ask")
+            if best_ask is None:
+                continue
+            best_ask = float(best_ask)
+            if not (float(cfg["sniper_min_ask"]) - EPS <= best_ask <= float(cfg["sniper_max_ask"]) + EPS):
+                continue
+            if self._min_fill_blocked(cfg, row, quotes, side, "sniper_5m"):
+                continue
+            self._sniper_enter(cfg, now, row, quotes, side, jump_usd, gap_usd, spot_now)
+            return True
+        return False
+
+    def _sniper_enter(self, cfg, now, row, quotes, fav, jump_usd, gap_usd, spot_now):
+        decision_time = self.io.clock() if self.io.clock is not None else time.perf_counter()
+        sent_now = decision_time if self.io.clock is not None else now
+        row["sniper_5m"] = {"attempted": True, "side": fav, "attempted_at": now,
+                            "jump_usd": jump_usd, "gap_usd": gap_usd, "spot": spot_now}
+        self.save(force=True)
+        reason = None
+        if sent_now >= row["end"]:
+            reason = "expired"
+        elif not cfg["fivemin_enabled"] and not cfg.get("sniper_5m_enabled"):
+            reason = "disabled"
+        elif self.state.get("paused_until_day") == self.state["day"]:
+            reason = "daily_stop"
+        shares, limit = float(cfg["sniper_shares"]), float(cfg["sniper_max_ask"])
+        if reason is None:
+            free = cash_free(self.balance, self.sampled_at, sent_now,
+                             self.io.reserves(cfg) + cfg["fivemin_cash_buffer_usd"], self.spends)
+            if free is None or free + EPS < shares * limit:
+                reason = "cash"
+        if reason:
+            self.io.log("fivemin_sniper_blocked", slug=row["slug"], reason=reason)
+            return
+        token = row["up_token"] if fav == "up" else row["dn_token"]
+        is_dry = dry_run(cfg)
+        try:
+            result = self.io.buy(token, shares, limit, is_dry)
+        except Exception as exc:
+            self.io.log("fivemin_sniper_order_error", slug=row["slug"], side=fav,
+                        limit=limit, error=str(exc))
+            self.alert(f"5m SNIPER ORDER {self.io.label(row['start'])} {fav.upper()} order error @ {limit:.4f}: {exc}",
+                       cfg, "fivemin_sniper_order_error")
+            return
+        response_time = self.io.clock() if self.io.clock is not None else time.perf_counter()
+        latency_ms = (response_time - decision_time) * 1000
+        if is_dry:
+            result = dry_fill(quotes.get(fav, {}), shares, limit)
+        filled = float(result.get("shares", 0))
+        cost = float(result.get("cost", filled * limit))
+        avg = result["price"] if is_dry else cost / filled if filled else 0.0
+        row["sniper_5m"]["position"] = {
+            "token": token, "side": fav, "shares": filled, "cost": cost, "avg_px": avg,
+            "dumped": False, "proceeds": 0.0, "settled": False, "pnl": None,
+            "status": result.get("status", "posted"), "dry_run": is_dry,
+            "filled_at": now, "kind": "sniper_5m",
+        }
+        if cost > 0 and not is_dry:
+            self.spends.append({"ts": now, "cost": cost})
+        self.save(force=True)
+        kind = "fivemin_sniper_nofill" if filled == 0 and not is_dry else "fivemin_sniper_fill"
+        self.io.log(kind, slug=row["slug"], condition_id=row["condition_id"], side=fav,
+                    price=avg, size=filled, usdc=cost, status=result.get("status"),
+                    latency_ms=latency_ms, timing=result.get("timing"),
+                    jump_usd=jump_usd, gap_usd=gap_usd, spot=spot_now, ttm=row["end"] - now,
+                    **decision_book_fields(quotes.get(fav, {}), limit))
+        if filled > 0:
+            self._low_fill_exit(cfg, now, row, row["sniper_5m"]["position"], quotes, "sniper_5m")
+
     def _low_fill_exit(self, cfg, now, row, p, quotes, kind):
         if not cfg.get("fivemin_low_fill_exit", True):
             return
-        floor = float(cfg.get("fivemin_min_fill_px", 0))
+        floor = float(cfg.get("sniper_min_ask" if kind == "sniper_5m" else "fivemin_min_fill_px", 0))
         if floor <= 0 or p["shares"] <= 0 or p["dumped"] or p["avg_px"] >= floor - EPS:
             return
         decision = quotes.get(p["side"], {})
@@ -925,7 +1046,10 @@ class Strategy:
         self.save(force=True)
         if not self.io.durable():
             raise OSError("fivemin settlement not durable")
-        self.io.log("fivemin_side98_settle" if p.get("kind") == "side98" else "fivemin_settle", slug=row["slug"], condition_id=row["condition_id"], winner=winner, source=source, pnl=pnl)
+        kind = p.get("kind")
+        event = ("fivemin_side98_settle" if kind == "side98"
+                 else "fivemin_sniper_settle" if kind == "sniper_5m" else "fivemin_settle")
+        self.io.log(event, slug=row["slug"], condition_id=row["condition_id"], winner=winner, source=source, pnl=pnl)
         self._redeem_remainder(cfg, now, row)
         if stopped:
             self.io.log("fivemin_daily_stop", day=self.state["day"], pnl=self.state["realized"])
@@ -968,6 +1092,7 @@ class Runner:
         self._io_stop = threading.Event()
         self._io_thread = None
         self._io_lock = threading.Lock()
+        self._tick_lock = threading.RLock()
         self._markets = []
         self._balance = None
         self._gamma_pending = set()
@@ -975,6 +1100,11 @@ class Runner:
         self.gamma_fetch = None
         self.rtds_last_sample = self.clock()
         self.rtds_last_reconnect = 0.0
+        try:
+            if hasattr(self.binance, "_on_tick") and getattr(self.binance, "_on_tick", None) is None:
+                self.binance._on_tick = self.on_binance_tick
+        except Exception:
+            pass
         try:
             self.strategy.io.rest_book = self._rest_refetch_book
             self.strategy.io.live_book = self._live_book
@@ -992,6 +1122,46 @@ class Runner:
                 self.strategy.io.log = tee
         except Exception:
             pass
+
+    def on_binance_tick(self, exchange_ms: float, price: float):
+        cfg = settings(self.cfg())
+        if not cfg.get("sniper_5m_enabled", False) or not cfg.get("sniper_event_driven", True):
+            return
+        row = self.current
+        if row is None or row.get("sniper_5m") or row.get("strike") is None:
+            return
+        now = self.clock()
+        if not row["start"] <= now < row["end"] or row.get("skip_reason") == "startup":
+            return
+        jump_fn = getattr(self.grid, "jump_in_window", None)
+        if not callable(jump_fn):
+            return
+        try:
+            info = jump_fn(float(cfg["sniper_window_ms"]))
+        except Exception:
+            return
+        if info is None:
+            return
+        threshold = float(cfg["sniper_jump_usd"]) - EPS
+        if float(info["up_jump"]) < threshold and float(info["down_jump"]) < threshold:
+            return
+        if not self._tick_lock.acquire(blocking=False):
+            return
+        try:
+            sides = {}
+            for side, token in (("up", row["up_token"]), ("down", row["dn_token"])):
+                try:
+                    top = self.books.usable(token)
+                except Exception:
+                    top = None
+                if top is not None:
+                    sides[side] = {"bid": top.bid, "ask": top.ask, "bids": top.bids, "asks": top.asks,
+                                   "src": "live"}
+            self.strategy._sniper_check(cfg, now, row, sides, self.grid, row["end"] - now)
+        except Exception as exc:
+            self._on_error("fivemin_sniper_tick_error", exc)
+        finally:
+            self._tick_lock.release()
 
     def _live_book(self, token):
         try:
@@ -1111,6 +1281,10 @@ class Runner:
         except Exception: pass
 
     def tick(self):
+        with self._tick_lock:
+            self._tick_once()
+
+    def _tick_once(self):
         now, cfg = self.clock(), settings(self.cfg())
         samples = list(self.rtds.drain())
         if samples:

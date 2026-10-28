@@ -109,6 +109,9 @@ DEFAULT_SELL_KNOBS = {
     "sell_dump_enabled": True,
     "sell_dump_below": 0.80,
     "sell_dump_persist_s": 2.0,
+    "sell_dump_dual_enabled": False,
+    "sell_dump_dual_persist_s": 0.5,
+    "sell_dump_dual_oracle_usd": 15.0,
     # Dump persist inside the last window seconds. None = same as sell_dump_persist_s.
     # Window 0 disables the last-minute clock.
     "sell_dump_persist_last_min_s": None,
@@ -2337,6 +2340,43 @@ def dump_persist_knobs(cfg: dict) -> Tuple[float, float, float]:
     last_min = cfg_seconds(cfg, "sell_dump_persist_last_min_s", persist)
     window = cfg_seconds(cfg, "sell_dump_persist_last_min_window_s", 0.0)
     return persist, last_min, window
+
+
+def sell_dump_dual_persist_s(
+    cfg: dict,
+    *,
+    held: Optional[str] = None,
+    oracle_gap_usd: Optional[float] = None,
+    base_persist_s: Optional[float] = None,
+) -> float:
+    """Effective dump persist when ``sell_dump_dual_enabled`` is active."""
+    base = (
+        float(base_persist_s)
+        if base_persist_s is not None
+        else cfg_seconds(cfg, "sell_dump_persist_s", 2.0)
+    )
+    if not bool(cfg.get("sell_dump_dual_enabled", False)):
+        return base
+    dual_raw = cfg.get("sell_dump_dual_persist_s", cfg.get("sell_dump_dual_Persist_s", 0.5))
+    try:
+        dual_persist = float(dual_raw if dual_raw is not None else 0.5)
+    except (TypeError, ValueError):
+        dual_persist = 0.5
+    if not math.isfinite(dual_persist) or dual_persist < 0:
+        dual_persist = 0.5
+    dual_oracle_usd = cfg_seconds(cfg, "sell_dump_dual_oracle_usd", 15.0)
+    if held not in ("up", "dn", "down") or oracle_gap_usd is None:
+        return base
+    try:
+        gap = float(oracle_gap_usd)
+    except (TypeError, ValueError):
+        return base
+    if not math.isfinite(gap):
+        return base
+    adverse = -gap if held == "up" else gap
+    if adverse + 1e-12 >= dual_oracle_usd:
+        return min(base, dual_persist)
+    return base
 
 
 # A 91¢ token with a bid more than this far under the ask is not a real print.

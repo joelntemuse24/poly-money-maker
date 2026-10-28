@@ -451,6 +451,9 @@ DEFAULTS = {
     "sell_dump_enabled": True,
     "sell_dump_below": 0.80,
     "sell_dump_persist_s": 2.0,
+    "sell_dump_dual_enabled": False,
+    "sell_dump_dual_persist_s": 0.5,
+    "sell_dump_dual_oracle_usd": 15.0,
     # Dump persist in the last window seconds; None follows sell_dump_persist_s.
     # Window 0 = off.
     "sell_dump_persist_last_min_s": None,
@@ -530,6 +533,11 @@ DEFAULTS = {
     "pUSD_address": "0xC011a7E12a19f7B1f670d46F03B03f3342E82DFB",
     "ctf_address": "0x4D97DCd97eC945f40cF65F87097ACe5EA0476045",
     "standard_adapter_address": "0xAdA100Db00Ca00073811820692005400218FcE1f",
+    "presign_enabled": True,
+    "presign_ttl_s": 240.0,
+    "clob_keepalive_always_on": True,
+    "clob_keepalive_interval_s": 12.0,
+    "clob_probe_fastest_edge": False,
 }
 
 ACTIVE_STATUSES = frozenset(
@@ -2273,6 +2281,14 @@ def _configure_clob_http_client() -> Any:
     import httpx
     from py_clob_client_v2.http_helpers import helpers
 
+    try:
+        from buy.presign import configure_low_latency_sockets, select_fastest_cf_edge
+
+        configure_low_latency_sockets()
+        if os.getenv("CLOB_PROBE_CF_EDGE") == "1":
+            select_fastest_cf_edge()
+    except Exception:
+        pass
     client = httpx.Client(
         http2=True,
         limits=httpx.Limits(keepalive_expiry=120),
@@ -2281,12 +2297,13 @@ def _configure_clob_http_client() -> Any:
     return client
 
 
-def _start_clob_keepalive(state: dict) -> None:
-    """Keep the CLOB connection warm only around active sell windows."""
+def _start_clob_keepalive(state: dict, cfg: Optional[dict] = None) -> None:
+    """Keep the CLOB connection warm around active sell windows or always-on heartbeat."""
     client = _configure_clob_http_client()
     host = str(getattr(client, "host", "https://clob.polymarket.com")).rstrip("/")
 
     def _run() -> None:
+        last_ping = 0.0
         while not _shutdown:
             try:
                 now = time.time()
@@ -2300,10 +2317,18 @@ def _start_clob_keepalive(state: dict) -> None:
                     or 0 <= float(intent.get("end_ts") or 0) - now <= 360
                     for intent in intents
                 )
-                if active:
+                active_cfg = cfg if isinstance(cfg, dict) else (state.get("cfg") if isinstance(state.get("cfg"), dict) else {})
+                always_on = bool(
+                    active_cfg.get("clob_keepalive_always_on")
+                    or active_cfg.get("sniper_5m_enabled")
+                    or state.get("clob_keepalive_always_on")
+                )
+                interval_s = float(active_cfg.get("clob_keepalive_interval_s", 12.0) or 12.0)
+                if active or (always_on and now - last_ping >= interval_s):
                     clob = globals().get("_clob_client")
                     clob_host = str(getattr(clob, "host", host)).rstrip("/")
                     client.get(f"{clob_host}/time", timeout=1.0)
+                    last_ping = now
             except Exception:
                 pass
             time.sleep(3.0)
@@ -2454,8 +2479,10 @@ def _refresh_collateral_allowance(*, force: bool) -> None:
         log_event("reclaim_allowance_warn", error=str(exc)[:160])
 
 
-def _schedule_order_prewarm(up_token: str, dn_token: str) -> None:
-    """Tick size, neg-risk, and one allowance refresh per token. Not on the sell tick."""
+def _schedule_order_prewarm(
+    up_token: str, dn_token: str, *, presign_specs: Optional[list] = None
+) -> None:
+    """Tick size, neg-risk, one allowance refresh, and optional pre-signing per token."""
     tokens = [str(token) for token in (up_token, dn_token) if token]
     if not tokens:
         return
@@ -2469,19 +2496,38 @@ def _schedule_order_prewarm(up_token: str, dn_token: str) -> None:
             return
         box = _allowance_box()
         warmed = box.setdefault("warmed", set())
+        specs = presign_specs if presign_specs is not None else box.get("presign_specs")
         for token_id in tokens:
-            if token_id in warmed:
-                continue
-            try:
-                tick_size = client.get_tick_size(token_id)
-                resolve_version = getattr(client, "_ClobClient__resolve_version", None)
-                version = int(resolve_version() if resolve_version is not None else 2)
-                neg_risk = False if version == 3 else bool(client.get_neg_risk(token_id))
-                box.setdefault("order_options", {})[token_id] = (tick_size, neg_risk, version)
-                warmed.add(token_id)
-            except Exception:
-                pass
-            _refresh_conditional_allowance(token_id, force=False)
+            if token_id not in warmed:
+                try:
+                    tick_size = client.get_tick_size(token_id)
+                    resolve_version = getattr(client, "_ClobClient__resolve_version", None)
+                    version = int(resolve_version() if resolve_version is not None else 2)
+                    neg_risk = False if version == 3 else bool(client.get_neg_risk(token_id))
+                    box.setdefault("order_options", {})[token_id] = (tick_size, neg_risk, version)
+                    warmed.add(token_id)
+                except Exception:
+                    pass
+                _refresh_conditional_allowance(token_id, force=False)
+            if specs:
+                try:
+                    from buy.presign import get_presign_cache
+
+                    opt = box.get("order_options", {}).get(token_id, ("0.01", False, 2))
+                    for spec in specs:
+                        get_presign_cache().presign_market_order(
+                            client,
+                            token_id,
+                            str(spec.get("side", "BUY")),
+                            float(spec["amount"]),
+                            float(spec["price"]),
+                            tick_size=str(opt[0]),
+                            neg_risk=bool(opt[1]),
+                            version=int(opt[2]),
+                            order_type=str(spec.get("order_type", "FAK")),
+                        )
+                except Exception:
+                    pass
         _refresh_collateral_allowance(force=False)
 
     threading.Thread(target=_run, name="mintbot-prewarm", daemon=True).start()
@@ -2610,14 +2656,20 @@ def _fak_sell(
             current = getattr(order_args, "builder_code", None)
             if not current or current == BYTES32_ZERO:
                 order_args.builder_code = code
-        # fee_rate_bps uses the same builder default (0) as _fak_buy.
-        signed = client.builder.build_market_order(
-            order_args,
-            CreateOrderOptions(tick_size=tick_size, neg_risk=neg_risk),
-            version=version,
-        )
+        from buy.presign import fast_post_order, get_presign_cache
+
+        entry = get_presign_cache().pop(client, str(token_id), "SELL", size, price, "FAK")
+        if entry is not None:
+            signed = entry.signed_order
+        else:
+            # fee_rate_bps uses the same builder default (0) as _fak_buy.
+            signed = client.builder.build_market_order(
+                order_args,
+                CreateOrderOptions(tick_size=tick_size, neg_risk=neg_risk),
+                version=version,
+            )
         send_at = time.perf_counter()
-        result = client.post_order(signed, order_type=OrderType.FAK)
+        result = fast_post_order(client, signed, entry=entry, order_type=OrderType.FAK)
         responded = time.perf_counter()
         sold = 0.0
         status = "posted"
@@ -2798,17 +2850,27 @@ def _fak_buy(
             current = getattr(order_args, "builder_code", None)
             if not current or current == BYTES32_ZERO:
                 order_args.builder_code = code
+        from buy.presign import fast_post_order, get_presign_cache
+
         refreshed = False
         while True:
             with measure("sign"):
-                signed = client.builder.build_market_order(
-                    order_args,
-                    CreateOrderOptions(tick_size=tick_size, neg_risk=neg_risk),
-                    version=version,
+                entry = (
+                    get_presign_cache().pop(client, str(token_id), "BUY", usdc, price, "FAK")
+                    if not refreshed
+                    else None
                 )
+                if entry is not None:
+                    signed = entry.signed_order
+                else:
+                    signed = client.builder.build_market_order(
+                        order_args,
+                        CreateOrderOptions(tick_size=tick_size, neg_risk=neg_risk),
+                        version=version,
+                    )
             try:
                 with measure("post"):
-                    result = client.post_order(signed, order_type=OrderType.FAK)
+                    result = fast_post_order(client, signed, entry=entry, order_type=OrderType.FAK)
             except Exception as exc:
                 status = reclaim_fak_status(exc)
                 if not refreshed and is_balance_allowance_reject(status):
@@ -9118,6 +9180,12 @@ def main() -> int:
                         ws_error_at = now
                         log_event("fivemin_ws_error", error=str(error)[:240], retry_s=delay)
 
+                sniper_cfg = settings(current_cfg())
+                extra_urls = (
+                    [str(sniper_cfg["sniper_futures_ws_url"])]
+                    if sniper_cfg.get("sniper_futures_ws_enabled") and sniper_cfg.get("sniper_futures_ws_url")
+                    else []
+                )
                 runner = Runner(
                     Strategy(io, load_fivemin_state(path)), current_cfg,
                     MarketGateway(gamma_url=str(cfg["gamma_url"]), data_api_url=str(cfg["data_api_url"]), discover_cache_s=20),
@@ -9125,6 +9193,8 @@ def main() -> int:
                     grid, BinanceTrades(
                         grid, url=str(current_cfg().get("fivemin_binance_url")),
                         on_error=lambda error: log_event("fivemin_binance_error", error=str(error)[:240]),
+                        on_tick=lambda ms, px: runner.on_binance_tick(ms, px) if runner is not None else None,
+                        extra_urls=extra_urls,
                     ), RtdsTwapFeed(), (
                         WsFallbackBookFeed(
                             ClobBookFeed(on_error=fivemin_ws_error, custom_features=False,
