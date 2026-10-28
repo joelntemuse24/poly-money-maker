@@ -335,11 +335,14 @@ def buy_matched_shares(result: Any, offered: float) -> float:
             continue
         if human != human or human <= 0:
             continue
+        raw_text = str(raw).strip().lower()
         fixed = human / 1_000_000.0
-        if offered_f > 0:
-            value = human if abs(human - offered_f) <= abs(fixed - offered_f) else fixed
+        if "." in raw_text or "e" in raw_text:
+            value = human
+        elif human >= max(offered_f * 100.0, 10_000.0):
+            value = fixed
         else:
-            value = fixed if human >= 10_000 else human
+            value = human
         if value > 0:
             return value
     return 0.0

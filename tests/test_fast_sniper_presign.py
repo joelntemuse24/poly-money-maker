@@ -400,6 +400,83 @@ class FiveMinSniperTests(unittest.TestCase):
         self.assertEqual(buys[0][0], "tok_up")
 
 
+    def test_price_grid_isolates_extra_sources_from_primary_jump_window(self):
+        grid = PriceGrid()
+        # Primary Spot tick at $80,500
+        grid.add(1000.0, 80500.0, source="primary")
+        # Extra Futures stream tick at $80,460 (-$40 basis) must NOT pollute primary jump window
+        grid.add(1100.0, 80460.0, source="wss://fstream.binance.com/stream")
+        # Next Primary Spot tick at $80,501 (+$1 true spot move)
+        grid.add(1200.0, 80501.0, source="primary")
+
+        jmp = grid.jump_in_window(500.0)
+        self.assertIsNotNone(jmp)
+        self.assertAlmostEqual(jmp["up_jump"], 1.0)
+        self.assertAlmostEqual(jmp["down_jump"], 0.0)
+        self.assertAlmostEqual(jmp["min"], 80500.0)
+
+        # Querying the futures source explicitly uses its own ring buffer
+        jmp_fut = grid.jump_in_window(500.0, source="wss://fstream.binance.com/stream")
+        self.assertIsNotNone(jmp_fut)
+        self.assertAlmostEqual(jmp_fut["spot"], 80460.0)
+        self.assertAlmostEqual(jmp_fut["up_jump"], 0.0)
+
+    def test_sniper_use_offset_default_and_blocks_when_offset_missing_or_basis_adjusted_gap_small(self):
+        from buy.fivemin import DEFAULTS as FM_DEFAULTS
+        self.assertIs(FM_DEFAULTS["sniper_use_offset"], True)
+        self.assertIs(FM_DEFAULTS["sniper_futures_ws_enabled"], False)
+        self.assertIs(mintbot.DEFAULTS["sniper_use_offset"], True)
+        self.assertIs(mintbot.DEFAULTS["sniper_futures_ws_enabled"], False)
+
+        strat, row, cfg, _events, buys = self._setup_strategy()
+        grid = PriceGrid()
+        # Spot jumps +$30 from 80470 to 80500, while Chainlink strike is 80400 and offset is -85.0
+        # True Chainlink-adjusted price = 80500 - 85 = 80415 (+15 gap < 20 min_gap_usd)
+        grid.add(1099600.0, 80470.0)
+        grid.add(1100000.0, 80500.0)
+        row["strike"] = 80400.0
+        quotes = {
+            "cid1": {
+                "up": {"bid": 0.90, "ask": 0.92, "asks": [[0.92, 25.0]]},
+                "down": {"bid": 0.08, "ask": 0.10, "asks": [[0.10, 25.0]]},
+            }
+        }
+        # 1. offset is None -> blocks entry
+        row["offset"] = None
+        strat.tick(cfg, 1100.0, grid, quotes)
+        self.assertEqual(len(buys), 0)
+
+        # 2. offset = -85.0 -> adjusted gap is +$15 < $20 -> blocks entry
+        row["offset"] = -85.0
+        strat.tick(cfg, 1100.0, grid, quotes)
+        self.assertEqual(len(buys), 0)
+
+        # 3. offset = -75.0 -> adjusted gap is +$25 >= $20 -> fires entry!
+        row["offset"] = -75.0
+        strat.tick(cfg, 1100.0, grid, quotes)
+        self.assertEqual(len(buys), 1)
+
+    def test_buy_matched_shares_and_scale_fill_amount_preserve_cheap_ask_sweep_shares(self):
+        from buy.sister_bid import buy_matched_shares
+        from buy.mint_sell import buy_fill_vwap
+
+        # Buying $9.69 at ~0.41 ask with target 10 shares yields 23.634147 shares (> 2x target)
+        raw_reply = {
+            "status": "matched",
+            "takingAmount": "23.634147",
+            "makingAmount": "9.69",
+        }
+        shares = buy_matched_shares(raw_reply, 10.0)
+        self.assertAlmostEqual(shares, 23.634147, places=6)
+        self.assertAlmostEqual(mintbot._scale_fill_amount("23.634147", 10.0), 23.634147, places=6)
+        vwap = buy_fill_vwap(raw_reply, shares)
+        self.assertAlmostEqual(vwap, 0.41, places=4)
+
+        # Unscaled 6-decimal integer string still scales by 1e6
+        self.assertAlmostEqual(buy_matched_shares({"takingAmount": "23634147"}, 10.0), 23.634147, places=6)
+        self.assertAlmostEqual(mintbot._scale_fill_amount("23634147", 10.0), 23.634147, places=6)
+
+
 class MintbotPresignAndDualDumpTests(unittest.TestCase):
     def setUp(self):
         get_presign_cache().clear()

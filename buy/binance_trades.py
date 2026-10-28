@@ -19,9 +19,10 @@ class PriceGrid:
         self._latest: Optional[int] = None
         self._twap_cache: dict[int, Optional[float]] = {}
         self._ms_ticks: collections.deque[tuple[float, float]] = collections.deque(maxlen=4096)
+        self._ms_ticks_by_source: dict[str, collections.deque[tuple[float, float]]] = {}
         self._lock = threading.Lock()
 
-    def add(self, exchange_ms: Any, price: Any) -> Optional[int]:
+    def add(self, exchange_ms: Any, price: Any, *, source: str = "primary") -> Optional[int]:
         try:
             g = (int(exchange_ms) + 99) // 100
             px = float(price)
@@ -29,7 +30,15 @@ class PriceGrid:
                 return None
         except (TypeError, ValueError, OverflowError):
             return None
+        src_key = str(source or "primary")
         with self._lock:
+            buf = self._ms_ticks_by_source.get(src_key)
+            if buf is None:
+                buf = collections.deque(maxlen=4096)
+                self._ms_ticks_by_source[src_key] = buf
+            buf.append((float(exchange_ms), px))
+            if src_key != "primary":
+                return g
             if self._latest is not None and g <= self._latest - self.slots:
                 return None
             self._ms_ticks.append((float(exchange_ms), px))
@@ -91,24 +100,34 @@ class PriceGrid:
             return (self._latest * 100.0, px)
 
     def window_extrema(
-        self, window_ms: float = 500.0, now_ms: Optional[float] = None
+        self,
+        window_ms: float = 500.0,
+        now_ms: Optional[float] = None,
+        *,
+        source: str = "primary",
     ) -> Optional[tuple[float, float, float, float]]:
+        src_key = str(source or "primary")
         with self._lock:
-            if not self._ms_ticks:
+            ticks = self._ms_ticks if src_key == "primary" else self._ms_ticks_by_source.get(src_key)
+            if not ticks:
                 return None
-            latest_ms = self._ms_ticks[-1][0]
+            latest_ms = ticks[-1][0]
             ref_ms = latest_ms if now_ms is None else float(now_ms)
             lower = ref_ms - float(window_ms)
-            prices = [px for ts, px in self._ms_ticks if lower <= ts <= ref_ms]
+            prices = [px for ts, px in ticks if lower <= ts <= ref_ms]
             if not prices:
                 return None
-            spot_now = self._ms_ticks[-1][1]
+            spot_now = ticks[-1][1]
             return (spot_now, min(prices), max(prices), latest_ms)
 
     def jump_in_window(
-        self, window_ms: float = 500.0, now_ms: Optional[float] = None
+        self,
+        window_ms: float = 500.0,
+        now_ms: Optional[float] = None,
+        *,
+        source: str = "primary",
     ) -> Optional[dict]:
-        extrema = self.window_extrema(window_ms=window_ms, now_ms=now_ms)
+        extrema = self.window_extrema(window_ms=window_ms, now_ms=now_ms, source=source)
         if extrema is None:
             return None
         spot_now, min_px, max_px, latest_ms = extrema
@@ -250,7 +269,12 @@ class BinanceTrades:
                         exchange_ms, price = parsed
                         slot = (int(exchange_ms) + 99) // 100
                         if slot != last_slot or price != last_price:
-                            self.grid.add(exchange_ms, price)
+                            src = "primary" if run_url is None else str(run_url)
+                            try:
+                                self.grid.add(exchange_ms, price, source=src)
+                            except TypeError:
+                                if src == "primary":
+                                    self.grid.add(exchange_ms, price)
                             last_slot, last_price = slot, price
                             if self._on_tick is not None:
                                 try:

@@ -34,7 +34,7 @@ DEFAULTS = {
     "sniper_ttm_min_s": 15,
     "sniper_ttm_max_s": 240,
     "sniper_shares": 10,
-    "sniper_use_offset": False,
+    "sniper_use_offset": True,
     "sniper_event_driven": True,
     "sniper_futures_ws_enabled": False,
     "sniper_futures_ws_url": "wss://fstream.binance.com/stream?streams=btcusdt@aggTrade/btcusdt@bookTicker",
@@ -718,7 +718,12 @@ class Strategy:
         if now * 1000.0 - float(info["ts_ms"]) > float(cfg["fivemin_btc_max_age_s"]) * 1000.0 + EPS:
             return False
         spot_now = float(info["spot"])
-        offset = float(row["offset"]) if (cfg.get("sniper_use_offset", False) and row.get("offset") is not None) else 0.0
+        if cfg.get("sniper_use_offset", True):
+            if row.get("offset") is None:
+                return False
+            offset = float(row["offset"])
+        else:
+            offset = 0.0
         spot_ref = spot_now + offset
         strike = float(row["strike"])
         for side, jump_key, sign in (("up", "up_jump", 1.0), ("down", "down_jump", -1.0)):

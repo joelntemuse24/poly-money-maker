@@ -328,7 +328,7 @@ DEFAULTS = {
     'sniper_ttm_min_s': 15,
     'sniper_ttm_max_s': 240,
     'sniper_shares': 10,
-    'sniper_use_offset': False,
+    'sniper_use_offset': True,
     'sniper_event_driven': True,
     'sniper_futures_ws_enabled': False,
     'sniper_futures_ws_url': 'wss://fstream.binance.com/stream?streams=btcusdt@aggTrade/btcusdt@bookTicker',
@@ -8852,6 +8852,25 @@ def run_redeem_cycle(cfg: dict, state: dict, desk: Optional[RedeemDesk]) -> str:
         return "no_funder"
     result = desk.tick(state, cfg, time.time())
     return str(result.get("status") or "ok")
+
+
+
+def _scale_fill_amount(raw_val: Any, expected_max: float = 0.0) -> float:
+    """Parse a CLOB fill amount, dividing by 1e6 only for unscaled integer base units."""
+    if raw_val is None or raw_val == "":
+        return 0.0
+    try:
+        val = float(raw_val)
+    except (TypeError, ValueError):
+        return 0.0
+    if not math.isfinite(val) or val <= 0:
+        return 0.0
+    raw_text = str(raw_val).strip().lower()
+    if "." in raw_text or "e" in raw_text:
+        return val
+    if val > max(float(expected_max or 0.0) * 100.0, 10_000.0):
+        return val / 1_000_000.0
+    return val
 
 
 def _fivemin_buy(token: str, shares: float, limit: float, dry: bool) -> dict:

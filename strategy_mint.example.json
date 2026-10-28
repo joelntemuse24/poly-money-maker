@@ -179,7 +179,7 @@
   "sniper_ttm_min_s": 15,
   "sniper_ttm_max_s": 240,
   "sniper_shares": 10,
-  "sniper_use_offset": false,
+  "sniper_use_offset": true,
   "sniper_event_driven": true,
   "sniper_futures_ws_enabled": false,
   "sniper_futures_ws_url": "wss://fstream.binance.com/stream?streams=btcusdt@aggTrade/btcusdt@bookTicker"
