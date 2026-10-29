@@ -28,6 +28,7 @@ BINANCE_FALLBACK_URLS = (
 )
 DEFAULT_EXTRA_WS_URLS = (
     "wss://stream.binance.com:9443/ws/btcusdt@bookTicker",
+    "wss://fstream.binance.com/ws/btcusdt@bookTicker",
     "wss://stream.bybit.com/v5/public/linear",
     "wss://ws-feed.exchange.coinbase.com",
     "wss://www.deribit.com/ws/api/v2",
@@ -280,6 +281,33 @@ class PriceGrid:
         with self._lock:
             return self._latest_recv_wall_ms.get(str(source or "primary"))
 
+    def feed_recv_snapshot(self, window_ms: float,
+                           ref_ms: Optional[float] = None) -> dict[str, Any]:
+        """Cheap snapshot of feeds whose newest tick landed within ``window_ms`` of ``ref_ms``.
+
+        Uses only the per-source timestamps already tracked by ``add``, so it is safe to call
+        on the logging path. ``feed_recv`` values are local recv wall ms (epoch). Feeds without
+        a stored wall stamp fall back to their monotonic recv stamp shifted by the current
+        ``time.time() - time.monotonic()`` offset.
+        """
+        win = float(window_ms)
+        wall_offset_ms = time.time() * 1000.0 - time.monotonic() * 1000.0
+        with self._lock:
+            recv_by_src = {src: info[0] for src, info in self._latest_by_source.items()}
+            if not recv_by_src:
+                return {"feed_recv": {}, "first_feed": None}
+            # ``recv_ms`` is monotonic; default the window anchor to the newest tick.
+            ref = max(recv_by_src.values()) if ref_ms is None else float(ref_ms)
+            seen = {src: recv for src, recv in recv_by_src.items() if ref - recv <= win}
+            if not seen:
+                return {"feed_recv": {}, "first_feed": None}
+            feed_recv = {}
+            for src, recv in seen.items():
+                wall = self._latest_recv_wall_ms.get(src)
+                feed_recv[src] = wall if wall is not None else recv + wall_offset_ms
+            first_feed = min(seen, key=seen.__getitem__)
+        return {"feed_recv": feed_recv, "first_feed": first_feed}
+
     def best_jump_in_window(
         self,
         window_ms: float = 500.0,
@@ -388,7 +416,7 @@ def parse_agg_trade(message: Any) -> Optional[tuple[float, float]]:
         if "T" in obj and "p" in obj:
             return float(obj["T"]), float(obj["p"])
 
-        # 2. Binance bookTicker -> mid price (tight spread sanity filter <= $5)
+        # 2. Binance bookTicker (spot or USD-M futures) -> mid price (tight spread filter <= $5)
         if "b" in obj and "a" in obj and not isinstance(obj["b"], list):
             bid = float(obj["b"])
             ask = float(obj["a"])
@@ -460,6 +488,28 @@ def parse_agg_trade(message: Any) -> Optional[tuple[float, float]]:
 
 
 parse_price_message = parse_agg_trade
+
+
+def feed_name_for_url(url: str, *, primary: bool = False) -> str:
+    """Short feed name for a WS URL; ``fstream`` (USD-M futures) is ``binance_fut``."""
+    if primary:
+        return "primary"
+    u = str(url or "").lower()
+    if "fstream.binance.com" in u:
+        return "binance_fut"
+    if "binance.com" in u or "binance.vision" in u:
+        return "binance_spot"
+    if "bybit.com" in u:
+        return "bybit"
+    if "coinbase.com" in u:
+        return "coinbase"
+    if "deribit.com" in u:
+        return "deribit"
+    if "kraken.com" in u:
+        return "kraken"
+    if "bitstamp.net" in u:
+        return "bitstamp"
+    return str(url)
 
 
 def subscription_for_url(url: str) -> Optional[str]:
@@ -583,7 +633,7 @@ class BinanceTrades:
             (self.url,) + tuple(u for u in BINANCE_FALLBACK_URLS if u != self.url)
             if primary and self.url.startswith("wss://") else (URL,) if primary else (run_url,)
         )
-        feed = "primary" if primary else str(run_url)
+        feed = feed_name_for_url(run_url, primary=primary)
         attempt = 0
         while not self._stop.is_set():
             target_url = candidates[attempt % len(candidates)]
@@ -651,7 +701,7 @@ class BinanceTrades:
                     if parsed:
                         exchange_ms, price = parsed
                         if price != last_price:
-                            src = "primary" if run_url is None else str(run_url)
+                            src = feed
                             try:
                                 self.grid.add(exchange_ms, price, source=src, recv_ms=recv_ms,
                                               recv_wall_ms=recv_wall_ms)

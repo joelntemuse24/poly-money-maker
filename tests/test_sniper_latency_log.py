@@ -136,6 +136,50 @@ def test_error_logs_a_line_with_error_status():
     assert fields["resp_complete_ts"] is not None
 
 
+def test_feed_recv_and_first_feed_in_latency_line():
+    case = _case()
+    grid = _grid(recv_wall_ms=1_200_020.0)
+    # Futures feed tick arrived 6ms before spot: both inside the jump window.
+    grid.add(1_200_000.0, 70030.0, source="binance_fut",
+             recv_ms=1_199_994.0, recv_wall_ms=1_200_014.0)
+    prepared = case.strategy._sniper_check(
+        helpers.cfg(fivemin_dry_run=False, sniper_5m_enabled=True, sniper_use_offset=False), 1200.0,
+        case.strategy.state["markets"]["cid"], _quotes(), grid, 100.0, defer_buy=True,
+    )
+    assert prepared is not None
+    case.strategy._sniper_execute(prepared)
+    fields = [kw for event, kw in case.logs if event == "sniper_order_latency"][0]
+    assert fields["feed_recv"] == {"primary": 1_200_020.0, "binance_fut": 1_200_014.0}
+    assert fields["first_feed"] == "binance_fut"
+    json.dumps(fields)
+
+
+def test_feed_recv_excludes_feeds_outside_the_jump_window():
+    case = _case()
+    grid = _grid(recv_wall_ms=1_200_020.0)
+    grid.add(1_200_000.0, 70030.0, source="deribit",
+             recv_ms=1_198_000.0, recv_wall_ms=1_198_000.0)
+    prepared = case.strategy._sniper_check(
+        helpers.cfg(fivemin_dry_run=False, sniper_5m_enabled=True, sniper_use_offset=False), 1200.0,
+        case.strategy.state["markets"]["cid"], _quotes(), grid, 100.0, defer_buy=True,
+    )
+    case.strategy._sniper_execute(prepared)
+    fields = [kw for event, kw in case.logs if event == "sniper_order_latency"][0]
+    assert fields["feed_recv"] == {"primary": 1_200_020.0}
+    assert fields["first_feed"] == "primary"
+
+
+def test_latency_fields_accept_explicit_feed_snapshot():
+    prepared = {"row": {"slug": "s"}, "quotes": {}, "fav": "up", "limit": 0.97,
+                "trigger_source": "binance_fut", "is_dry": False,
+                "post_meta": {"decision_ts": 10.0}}
+    fields = order_latency_fields(prepared, {"shares": 0, "status": "unfilled"},
+                                  feed_recv={"binance_fut": 500.0}, first_feed="binance_fut")
+    assert fields["feed_recv"] == {"binance_fut": 500.0}
+    assert fields["first_feed"] == "binance_fut"
+    assert fields["feed"] == "binance_fut"
+
+
 def test_missing_timestamps_yield_null_deltas():
     prepared = {"row": {"slug": "s"}, "quotes": {}, "fav": "up", "limit": 0.97,
                 "trigger_source": "primary", "is_dry": False,

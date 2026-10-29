@@ -262,6 +262,90 @@ class BinanceTradesSubSecondTests(unittest.TestCase):
         self.assertTrue(ticks)
         self.assertIsNotNone(grid.latest_spot())
 
+    def test_parse_futures_book_ticker_uses_T_then_E_and_same_spread_filter(self):
+        # USD-M futures bookTicker: e/s/b/a/T/E
+        fut = json.dumps({"e": "bookTicker", "s": "BTCUSDT", "b": "70000.0", "a": "70002.0",
+                          "T": 1700000400, "E": 1700000401})
+        self.assertEqual(parse_agg_trade(fut), (1700000400.0, 70001.0))
+        # Combined-stream wrapper, T missing -> fall back to E
+        wrapped = json.dumps({"stream": "btcusdt@bookTicker",
+                              "data": {"e": "bookTicker", "s": "BTCUSDT", "b": "70000.0",
+                                       "a": "70002.0", "E": 1700000500}})
+        self.assertEqual(parse_agg_trade(wrapped), (1700000500.0, 70001.0))
+        # Same $5 spread filter as spot bookTicker
+        wide = json.dumps({"e": "bookTicker", "b": "70000.0", "a": "70006.0", "T": 1700000600})
+        self.assertIsNone(parse_agg_trade(wide))
+        # Crossed book is rejected
+        crossed = json.dumps({"e": "bookTicker", "b": "70002.0", "a": "70000.0", "T": 1700000600})
+        self.assertIsNone(parse_agg_trade(crossed))
+
+    def test_feed_names_distinguish_futures_from_spot(self):
+        from buy.binance_trades import DEFAULT_EXTRA_WS_URLS, feed_name_for_url
+        self.assertEqual(
+            feed_name_for_url("wss://fstream.binance.com/ws/btcusdt@bookTicker"), "binance_fut")
+        self.assertEqual(
+            feed_name_for_url("wss://stream.binance.com:9443/ws/btcusdt@bookTicker"), "binance_spot")
+        self.assertEqual(feed_name_for_url("wss://fstream.binance.com/ws/btcusdt@bookTicker",
+                                           primary=True), "primary")
+        self.assertEqual(feed_name_for_url("wss://stream.bybit.com/v5/public/linear"), "bybit")
+        self.assertIn("wss://fstream.binance.com/ws/btcusdt@bookTicker", DEFAULT_EXTRA_WS_URLS)
+        self.assertIn("wss://fstream.binance.com/ws/btcusdt@bookTicker", DEFAULTS["sniper_extra_ws_urls"])
+        self.assertIn("wss://fstream.binance.com/ws/btcusdt@bookTicker", mintbot.DEFAULTS["sniper_extra_ws_urls"])
+
+    def test_futures_book_ticker_feed_tracks_jumps_under_its_own_source(self):
+        grid = PriceGrid()
+        ticks = []
+        seen_feeds = []
+
+        class FakeWS:
+            def __init__(self, messages):
+                self._messages = list(messages)
+                self.sent = []
+
+            def recv(self):
+                if self._messages:
+                    return self._messages.pop(0)
+                return ""
+
+            def send(self, _message):
+                self.sent.append(_message)
+
+            def close(self):
+                pass
+
+        url = "wss://fstream.binance.com/ws/btcusdt@bookTicker"
+
+        def fake_connect(_url):
+            return FakeWS([json.dumps({"e": "bookTicker", "s": "BTCUSDT", "b": "70100.0",
+                                       "a": "70102.0", "T": 1700000700, "E": 1700000701})])
+
+        bt = BinanceTrades(
+            grid, url="wss://stream.binance.com:9443/ws/btcusdt@aggTrade",
+            connect=fake_connect,
+            extra_urls=[url],
+            on_event=lambda event, **kw: seen_feeds.append(kw.get("feed")),
+            on_tick=lambda ms, px: (ticks.append((ms, px)), bt.stop()),
+        )
+        bt._run(url)
+        self.assertTrue(ticks)
+        self.assertEqual(ticks[0], (1700000700.0, 70101.0))
+        self.assertIn("binance_fut", seen_feeds)
+        self.assertIsNotNone(grid.latest_recv_wall_ms("binance_fut"))
+        self.assertIsNone(grid.latest_recv_wall_ms("primary"))
+
+    def test_futures_feed_jump_detection_matches_spot_rules(self):
+        grid = PriceGrid()
+        grid.add(1_000_000.0, 70000.0, source="primary", recv_ms=1_000_000.0)
+        grid.add(1_000_000.0, 70000.0, source="binance_fut", recv_ms=1_000_000.0)
+        grid.add(1_000_200.0, 70040.0, source="binance_fut", recv_ms=1_000_200.0)
+        grid.add(1_000_200.0, 70005.0, source="primary", recv_ms=1_000_200.0)
+        jmp = grid.best_jump_in_window(500.0)
+        self.assertEqual(jmp["source"], "binance_fut")
+        self.assertEqual(jmp["up_jump"], 40.0)
+        # Same window, same per-source rules: the spot move stays small and isolated.
+        self.assertEqual(grid.jump_in_window(500.0, source="primary")["up_jump"], 5.0)
+        self.assertEqual(grid.jump_in_window(500.0, source="binance_fut")["up_jump"], 40.0)
+
     def test_primary_endpoint_rotates_after_failed_connect(self):
         from buy.binance_trades import URL, BINANCE_FALLBACK_URLS
         urls = []

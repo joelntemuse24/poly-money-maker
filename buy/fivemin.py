@@ -41,6 +41,7 @@ DEFAULTS = {
     "sniper_extra_ws_enabled": True,
     "sniper_extra_ws_urls": [
         "wss://stream.binance.com:9443/ws/btcusdt@bookTicker",
+        "wss://fstream.binance.com/ws/btcusdt@bookTicker",
         "wss://stream.bybit.com/v5/public/linear",
         "wss://ws-feed.exchange.coinbase.com",
         "wss://www.deribit.com/ws/api/v2",
@@ -156,7 +157,9 @@ def _epoch_s(value) -> Optional[float]:
 
 
 def order_latency_fields(prepared: dict, result: Optional[dict] = None, *,
-                         error: Optional[str] = None) -> dict:
+                         error: Optional[str] = None,
+                         feed_recv: Optional[dict] = None,
+                         first_feed: Optional[str] = None) -> dict:
     """Structured per-order latency breakdown for one sniper order (fill, nofill or error)."""
     row, quotes, fav = prepared["row"], prepared["quotes"], prepared["fav"]
     meta = prepared.get("post_meta") or {}
@@ -211,6 +214,8 @@ def order_latency_fields(prepared: dict, result: Optional[dict] = None, *,
         "user_ws_match_ts": prepared.get("user_ws_match_ts"),
         "status": result.get("status") if error is None else f"error:{error}",
         "dry_run": prepared.get("is_dry"),
+        "feed_recv": feed_recv,
+        "first_feed": first_feed,
     }
 
 
@@ -845,7 +850,7 @@ class Strategy:
             prepared = self._sniper_prepare(
                 cfg, now, row, quotes, side, jump_usd, gap_usd, spot_now, trigger_source=trigger_source,
                 trigger_exchange_ts=_epoch_s(info.get("ts_ms")),
-                trigger_recv_ts=_epoch_s(info.get("recv_wall_ms")),
+                trigger_recv_ts=_epoch_s(info.get("recv_wall_ms")), grid=grid,
             )
             if defer_buy:
                 return prepared
@@ -857,7 +862,8 @@ class Strategy:
     def _sniper_prepare(self, cfg, now, row, quotes, fav, jump_usd, gap_usd, spot_now, *,
                         trigger_source: str = "primary",
                         trigger_exchange_ts: Optional[float] = None,
-                        trigger_recv_ts: Optional[float] = None):
+                        trigger_recv_ts: Optional[float] = None,
+                        grid=None):
         decision_time = self.io.clock() if self.io.clock is not None else time.perf_counter()
         decision_ts = time.time()
         sent_now = decision_time if self.io.clock is not None else now
@@ -895,6 +901,7 @@ class Strategy:
             "shares": shares, "limit": limit, "token": token, "is_dry": is_dry,
             "trigger_exchange_ts": trigger_exchange_ts, "trigger_recv_ts": trigger_recv_ts,
             "post_meta": {"decision_ts": decision_ts},
+            "grid": grid,
         }
 
     def _sniper_execute(self, prepared: dict, *, lock: Optional[threading.RLock] = None):
@@ -993,8 +1000,21 @@ class Strategy:
 
     def _log_sniper_latency(self, prepared: dict, result: Optional[dict] = None, *, error: Optional[str] = None):
         """One JSON line per sniper order; built only after the POST returned."""
+        feed_recv = None
+        first_feed = None
         try:
-            fields = order_latency_fields(prepared, result, error=error)
+            grid = prepared.get("grid")
+            snapshot_fn = getattr(grid, "feed_recv_snapshot", None)
+            if callable(snapshot_fn):
+                # Uses only cached per-source recv stamps, so it stays off the send path.
+                snap = snapshot_fn(float(prepared["cfg"].get("sniper_window_ms", 500.0)))
+                feed_recv = snap.get("feed_recv") or None
+                first_feed = snap.get("first_feed")
+        except Exception:
+            feed_recv = first_feed = None
+        try:
+            fields = order_latency_fields(prepared, result, error=error,
+                                          feed_recv=feed_recv, first_feed=first_feed)
         except Exception:
             return
         self.io.log("sniper_order_latency", **fields)
