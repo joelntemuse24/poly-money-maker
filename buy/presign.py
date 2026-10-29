@@ -441,8 +441,13 @@ def fast_post_order(
     defer_exec: bool = True,
     *,
     http_client: Any = None,
+    post_meta: Optional[dict] = None,
 ):
-    """Post an order, bypassing client re-serialization and using pre-computed L2 headers when possible."""
+    """Post an order, bypassing client re-serialization and using pre-computed L2 headers when possible.
+
+    ``post_meta`` (optional) is filled in place with send/response epochs and the raw
+    response, so the caller can build a latency log after the POST returns.
+    """
     global _LAST_ORDER_ACTIVITY_TS
     if (
         entry is not None
@@ -456,7 +461,12 @@ def fast_post_order(
         hclient = http_client if http_client is not None else _ORDER_HTTP_CLIENT
         if hclient is not None and callable(getattr(hclient, "post", None)):
             _LAST_ORDER_ACTIVITY_TS = time.time()
+            if post_meta is not None:
+                post_meta["send_start_ts"] = time.time()
             resp = hclient.post(url, headers=headers, content=entry.serialized_bytes)
+            if post_meta is not None:
+                post_meta["resp_complete_ts"] = time.time()
+                record_response_meta(post_meta, resp)
             if getattr(resp, "status_code", 200) != 200:
                 try:
                     from py_clob_client_v2.exceptions import PolyApiException  # type: ignore
@@ -465,16 +475,68 @@ def fast_post_order(
                 except ImportError:
                     raise RuntimeError(f"CLOB order post failed status={resp.status_code}")
             if _HAS_ORJSON and hasattr(resp, "content"):
-                return orjson.loads(resp.content)
-            return resp.json()
+                body = orjson.loads(resp.content)
+            else:
+                body = resp.json()
+            if post_meta is not None:
+                post_meta["server_body_ts"] = response_body_ts(body)
+            return body
         if callable(getattr(client, "_post", None)):
             _LAST_ORDER_ACTIVITY_TS = time.time()
-            return client._post(
+            if post_meta is not None:
+                post_meta["send_start_ts"] = time.time()
+            result = client._post(
                 url,
                 headers=headers,
                 data=entry.serialized_body,
             )
-    return client.post_order(signed_order, order_type=order_type)
+            if post_meta is not None:
+                post_meta["resp_complete_ts"] = time.time()
+                post_meta["server_body_ts"] = response_body_ts(result)
+            return result
+    if post_meta is not None:
+        post_meta["send_start_ts"] = time.time()
+    result = client.post_order(signed_order, order_type=order_type)
+    if post_meta is not None:
+        post_meta["resp_complete_ts"] = time.time()
+        post_meta["server_body_ts"] = response_body_ts(result)
+    return result
+
+
+_BODY_TS_KEYS = ("timestamp", "serverTime", "server_time", "transactTime", "matchTime", "ts")
+
+
+def record_response_meta(post_meta: dict, resp: Any) -> None:
+    """Record HTTP status, ``date`` header and first response byte time from an httpx response."""
+    try:
+        post_meta["http_status"] = getattr(resp, "status_code", None)
+    except Exception:
+        post_meta["http_status"] = None
+    headers = getattr(resp, "headers", None)
+    try:
+        post_meta["server_date"] = headers.get("date") if headers is not None else None
+    except Exception:
+        post_meta["server_date"] = None
+    first_byte = None
+    elapsed = getattr(resp, "elapsed", None)
+    complete = post_meta.get("resp_complete_ts")
+    try:
+        if elapsed is not None and complete is not None:
+            first_byte = complete - float(elapsed.total_seconds())
+    except Exception:
+        first_byte = None
+    post_meta["resp_first_byte_ts"] = first_byte
+
+
+def response_body_ts(body: Any) -> Optional[float]:
+    """Return the first server-side timestamp found in an order response body."""
+    if not isinstance(body, dict):
+        return None
+    for key in _BODY_TS_KEYS:
+        value = body.get(key)
+        if value is not None:
+            return value
+    return None
 
 
 def enable_uvloop_if_available() -> bool:

@@ -57,6 +57,7 @@ class PriceGrid:
         self._ms_ticks_by_source: dict[str, collections.deque[tuple[float, float]]] = {}
         self._recv_ticks_by_source: dict[str, collections.deque[tuple[float, float]]] = {}
         self._latest_by_source: dict[str, tuple[float, float, float]] = {}
+        self._latest_recv_wall_ms: dict[str, float] = {}
         self._basis_to_primary: dict[str, float] = {}
         self._lock = threading.Lock()
 
@@ -67,6 +68,7 @@ class PriceGrid:
         *,
         source: str = "primary",
         recv_ms: Optional[float] = None,
+        recv_wall_ms: Optional[float] = None,
     ) -> Optional[int]:
         try:
             g = (int(exchange_ms) + 99) // 100
@@ -92,6 +94,8 @@ class PriceGrid:
             rbuf.append((r_ms, px))
 
             self._latest_by_source[src_key] = (r_ms, ex_ms, px)
+            if recv_wall_ms is not None:
+                self._latest_recv_wall_ms[src_key] = float(recv_wall_ms)
             if src_key == "primary":
                 self._basis_to_primary["primary"] = 0.0
                 for other_src, (_o_r, _o_e, o_px) in self._latest_by_source.items():
@@ -207,8 +211,20 @@ class PriceGrid:
             "up_jump": spot_now - min_px,
             "down_jump": max_px - spot_now,
             "ts_ms": latest_ms,
+            "recv_ms": self._latest_recv_ms(str(source or "primary")),
+            "recv_wall_ms": self.latest_recv_wall_ms(source),
             "source": str(source or "primary"),
         }
+
+    def _latest_recv_ms(self, source: str) -> Optional[float]:
+        with self._lock:
+            latest = self._latest_by_source.get(source)
+            return None if latest is None else latest[0]
+
+    def latest_recv_wall_ms(self, source: str = "primary") -> Optional[float]:
+        """Local wall-clock receive time (epoch ms) of the newest tick from ``source``."""
+        with self._lock:
+            return self._latest_recv_wall_ms.get(str(source or "primary"))
 
     def best_jump_in_window(
         self,
@@ -275,6 +291,8 @@ class PriceGrid:
                     "up_jump": up_j,
                     "down_jump": dn_j,
                     "ts_ms": ts_out,
+                    "recv_ms": latest_r,
+                    "recv_wall_ms": self._latest_recv_wall_ms.get(src_key),
                     "source": src_key,
                 }
                 if mag > best_mag or (mag == best_mag and src_key == "primary"):
@@ -567,13 +585,15 @@ class BinanceTrades:
                     last_message = time.monotonic()
                     self._feed_update(feed, True, message=True)
                     recv_ms = time.monotonic() * 1000.0
+                    recv_wall_ms = time.time() * 1000.0
                     parsed = parse_agg_trade(raw)
                     if parsed:
                         exchange_ms, price = parsed
                         if price != last_price:
                             src = "primary" if run_url is None else str(run_url)
                             try:
-                                self.grid.add(exchange_ms, price, source=src, recv_ms=recv_ms)
+                                self.grid.add(exchange_ms, price, source=src, recv_ms=recv_ms,
+                                              recv_wall_ms=recv_wall_ms)
                             except TypeError:
                                 try:
                                     self.grid.add(exchange_ms, price, source=src)

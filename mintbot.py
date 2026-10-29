@@ -2843,6 +2843,7 @@ def _fak_buy(
     capture: Optional[list] = None,
     *,
     timing: Optional[dict] = None,
+    post_meta: Optional[dict] = None,
 ):
     """One FAK buy. ``shares`` sizes the clip; the post is a market BUY in USDC.
 
@@ -2933,9 +2934,13 @@ def _fak_buy(
                         CreateOrderOptions(tick_size=tick_size, neg_risk=neg_risk),
                         version=version,
                     )
+            if post_meta is not None:
+                post_meta["sign_done_ts"] = time.time()
+                post_meta["presign_hit"] = entry is not None
             try:
                 with measure("post"):
-                    result = fast_post_order(client, signed, entry=entry, order_type=OrderType.FAK)
+                    result = fast_post_order(client, signed, entry=entry, order_type=OrderType.FAK,
+                                             post_meta=post_meta)
             except Exception as exc:
                 status = reclaim_fak_status(exc)
                 if not refreshed and is_balance_allowance_reject(status):
@@ -2944,6 +2949,8 @@ def _fak_buy(
                     retry_started = perf_counter()
                     _refresh_collateral_allowance(force=True)
                     continue
+                if post_meta is not None and post_meta.get("resp_complete_ts") is None:
+                    post_meta["resp_complete_ts"] = time.time()
                 log_event(
                     "reclaim_fak_fail",
                     token_id=str(token_id)[:18],
@@ -8909,10 +8916,12 @@ def _scale_fill_amount(raw_val: Any, expected_max: float = 0.0) -> float:
     return val
 
 
-def _fivemin_buy(token: str, shares: float, limit: float, dry: bool) -> dict:
+def _fivemin_buy(token: str, shares: float, limit: float, dry: bool, *,
+                 post_meta: Optional[dict] = None) -> dict:
     captured = []
     timing = {}
-    bought, status = _fak_buy(token, shares, limit, dry, capture=captured, timing=timing)
+    bought, status = _fak_buy(token, shares, limit, dry, capture=captured, timing=timing,
+                              post_meta=post_meta)
     if dry:
         bought = shares
     if float(bought or 0.0) < 0.01 and not dry:

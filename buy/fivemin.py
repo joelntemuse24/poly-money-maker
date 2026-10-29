@@ -144,6 +144,74 @@ def ask_depth(book: dict, cap: float = 0.99) -> dict:
             "cum_099": cum}
 
 
+def _epoch_s(value) -> Optional[float]:
+    """Convert epoch milliseconds to epoch seconds; ``None`` passes through."""
+    try:
+        out = float(value) / 1000.0
+    except (TypeError, ValueError):
+        return None
+    return out if math.isfinite(out) else None
+
+
+def order_latency_fields(prepared: dict, result: Optional[dict] = None, *,
+                         error: Optional[str] = None) -> dict:
+    """Structured per-order latency breakdown for one sniper order (fill, nofill or error)."""
+    row, quotes, fav = prepared["row"], prepared["quotes"], prepared["fav"]
+    meta = prepared.get("post_meta") or {}
+    result = result if isinstance(result, dict) else {}
+    timing = result.get("timing") if isinstance(result.get("timing"), dict) else {}
+
+    def _ts(value):
+        try:
+            out = float(value)
+        except (TypeError, ValueError):
+            return None
+        return out if math.isfinite(out) else None
+
+    def _delta(end, start):
+        if end is None or start is None:
+            return None
+        return round((end - start) * 1000.0, 3)
+
+    # Only the epoch capture is usable here; ``decision_time`` may be perf_counter-based.
+    decision_ts = _ts(meta.get("decision_ts"))
+    send_ts = _ts(meta.get("send_start_ts"))
+    complete_ts = _ts(meta.get("resp_complete_ts"))
+    trigger_exchange_ts = _ts(prepared.get("trigger_exchange_ts"))
+    trigger_recv_ts = _ts(prepared.get("trigger_recv_ts"))
+    filled = float(result.get("shares") or 0.0)
+    book_fields = decision_book_fields(quotes.get(fav, {}), prepared["limit"])
+    return {
+        "slug": row.get("slug"), "side": fav,
+        "feed": prepared.get("trigger_source"),
+        "trigger_exchange_ts": trigger_exchange_ts,
+        "trigger_recv_ts": trigger_recv_ts,
+        "decision_ts": decision_ts,
+        "sign_done_ts": _ts(meta.get("sign_done_ts")),
+        "presign_hit": meta.get("presign_hit"),
+        "send_start_ts": send_ts,
+        "resp_first_byte_ts": _ts(meta.get("resp_first_byte_ts")),
+        "resp_complete_ts": complete_ts,
+        "server_date": meta.get("server_date"),
+        "server_body_ts": meta.get("server_body_ts"),
+        "http_status": meta.get("http_status"),
+        "recv_to_decision_ms": _delta(decision_ts, trigger_recv_ts),
+        "trigger_exchange_to_decision_ms": _delta(decision_ts, trigger_exchange_ts),
+        "decision_to_send_ms": _delta(send_ts, decision_ts),
+        "send_to_complete_ms": _delta(complete_ts, send_ts),
+        "trigger_exchange_to_complete_ms": _delta(complete_ts, trigger_exchange_ts),
+        "recv_to_complete_ms": _delta(complete_ts, trigger_recv_ts),
+        "transport_ms": timing.get("post"),
+        "ask_seen": book_fields.get("decision_best_ask"),
+        "limit": prepared["limit"],
+        "fill_price": result.get("price"),
+        "filled_shares": filled,
+        "user_ws_match_ts": prepared.get("user_ws_match_ts"),
+        "status": result.get("status") if error is None else f"error:{error}",
+        "dry_run": prepared.get("is_dry"),
+    }
+
+
 def decision_book_fields(book: dict, limit: float) -> dict:
     levels = ask_levels(book)
     return {"book_age_ms": book.get("age_ms"),
@@ -237,6 +305,7 @@ class Strategy:
         self._cached_reserves: Optional[float] = None
         self._twap_cache = {}
         self._refetch_threads: list[threading.Thread] = []
+        self._buy_post_meta_ok: Optional[tuple[Callable, bool]] = None
 
     def _save_time(self):
         if self.io.clock is not None:
@@ -772,7 +841,9 @@ class Strategy:
             if self._min_fill_blocked(cfg, row, quotes, side, "sniper_5m"):
                 continue
             prepared = self._sniper_prepare(
-                cfg, now, row, quotes, side, jump_usd, gap_usd, spot_now, trigger_source=trigger_source
+                cfg, now, row, quotes, side, jump_usd, gap_usd, spot_now, trigger_source=trigger_source,
+                trigger_exchange_ts=_epoch_s(info.get("ts_ms")),
+                trigger_recv_ts=_epoch_s(info.get("recv_wall_ms")),
             )
             if defer_buy:
                 return prepared
@@ -781,8 +852,12 @@ class Strategy:
             return True
         return None if defer_buy else False
 
-    def _sniper_prepare(self, cfg, now, row, quotes, fav, jump_usd, gap_usd, spot_now, *, trigger_source: str = "primary"):
+    def _sniper_prepare(self, cfg, now, row, quotes, fav, jump_usd, gap_usd, spot_now, *,
+                        trigger_source: str = "primary",
+                        trigger_exchange_ts: Optional[float] = None,
+                        trigger_recv_ts: Optional[float] = None):
         decision_time = self.io.clock() if self.io.clock is not None else time.perf_counter()
+        decision_ts = time.time()
         sent_now = decision_time if self.io.clock is not None else now
         row["sniper_5m"] = {"attempted": True, "side": fav, "attempted_at": now,
                             "jump_usd": jump_usd, "gap_usd": gap_usd, "spot": spot_now,
@@ -816,6 +891,8 @@ class Strategy:
             "jump_usd": jump_usd, "gap_usd": gap_usd, "spot_now": spot_now,
             "trigger_source": trigger_source, "decision_time": decision_time,
             "shares": shares, "limit": limit, "token": token, "is_dry": is_dry,
+            "trigger_exchange_ts": trigger_exchange_ts, "trigger_recv_ts": trigger_recv_ts,
+            "post_meta": {"decision_ts": decision_ts},
         }
 
     def _sniper_execute(self, prepared: dict, *, lock: Optional[threading.RLock] = None):
@@ -833,19 +910,27 @@ class Strategy:
         limit = prepared["limit"]
         token = prepared["token"]
         is_dry = prepared["is_dry"]
+        post_meta = prepared.setdefault("post_meta", {})
         try:
-            result = self.io.buy(token, shares, limit, is_dry)
+            if self._buy_takes_post_meta():
+                result = self.io.buy(token, shares, limit, is_dry, post_meta=post_meta)
+            else:
+                result = self.io.buy(token, shares, limit, is_dry)
         except Exception as exc:
             if lock is not None:
                 with lock:
                     self.save(force=True)
             else:
                 self.save(force=True)
+            post_meta.setdefault("resp_complete_ts", time.time())
+            self._log_sniper_latency(prepared, error=str(exc))
             self.io.log("fivemin_sniper_order_error", slug=row["slug"], side=fav,
                         limit=limit, error=str(exc))
             self.alert(f"5m SNIPER ORDER {self.io.label(row['start'])} {fav.upper()} order error @ {limit:.4f}: {exc}",
                        cfg, "fivemin_sniper_order_error")
             return
+        if post_meta.get("resp_complete_ts") is None:
+            post_meta["resp_complete_ts"] = time.time()
         response_time = self.io.clock() if self.io.clock is not None else time.perf_counter()
         latency_ms = (response_time - decision_time) * 1000
         if is_dry:
@@ -871,6 +956,11 @@ class Strategy:
         else:
             _commit()
         kind = "fivemin_sniper_nofill" if filled == 0 and not is_dry else "fivemin_sniper_fill"
+        self._log_sniper_latency(
+            prepared, result={"status": result.get("status"), "shares": filled,
+                              "price": avg if filled else None,
+                              "timing": result.get("timing")},
+        )
         self.io.log(kind, slug=row["slug"], condition_id=row["condition_id"], side=fav,
                     price=avg, size=filled, usdc=cost, status=result.get("status"),
                     latency_ms=latency_ms, timing=result.get("timing"),
@@ -883,6 +973,29 @@ class Strategy:
                     self._low_fill_exit(cfg, now, row, row["sniper_5m"]["position"], quotes, "sniper_5m")
             else:
                 self._low_fill_exit(cfg, now, row, row["sniper_5m"]["position"], quotes, "sniper_5m")
+
+    def _buy_takes_post_meta(self) -> bool:
+        """True when ``io.buy`` accepts the ``post_meta`` capture keyword."""
+        buy = self.io.buy
+        cached = self._buy_post_meta_ok
+        if cached is not None and cached[0] is buy:
+            return cached[1]
+        try:
+            inspect.signature(buy).bind("tok", 1.0, 0.5, False, post_meta={})
+        except (TypeError, ValueError):
+            ok = False
+        else:
+            ok = True
+        self._buy_post_meta_ok = (buy, ok)
+        return ok
+
+    def _log_sniper_latency(self, prepared: dict, result: Optional[dict] = None, *, error: Optional[str] = None):
+        """One JSON line per sniper order; built only after the POST returned."""
+        try:
+            fields = order_latency_fields(prepared, result, error=error)
+        except Exception:
+            return
+        self.io.log("sniper_order_latency", **fields)
 
     def _sniper_enter(self, cfg, now, row, quotes, fav, jump_usd, gap_usd, spot_now, *, trigger_source: str = "primary"):
         prepared = self._sniper_prepare(
