@@ -998,7 +998,11 @@ class Strategy:
         jump_fn = getattr(grid, "jump_in_window", None)
         info = None
         if callable(best_fn):
-            info = best_fn(float(cfg["sniper_window_ms"]), now_ms=now * 1000.0)
+            # Ticks are keyed by ``time.monotonic()`` receive ms, so anchor the window
+            # on that clock. ``now`` is wall clock and misses the ticks, which made each
+            # source anchor on its own newest tick and kept an old jump in window.
+            info = best_fn(float(cfg["sniper_window_ms"]), now_ms=now * 1000.0,
+                           recv_now_ms=time.monotonic() * 1000.0)
         if info is None and callable(jump_fn):
             info = jump_fn(float(cfg["sniper_window_ms"]), now_ms=now * 1000.0)
         if info is None:
