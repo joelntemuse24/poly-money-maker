@@ -34,6 +34,9 @@ DEFAULT_EXTRA_WS_URLS = (
     "wss://ws.bitstamp.net",
 )
 MAX_BBO_SPREAD_USD = 5.0
+# Deribit closes a session after 10 minutes without a client request, even while
+# subscribed data keeps flowing. ``public/test`` is a cheap no-op request.
+DERIBIT_KEEPALIVE = '{"jsonrpc":"2.0","id":99,"method":"public/test"}'
 
 
 def _fast_loads(raw: Any) -> Any:
@@ -507,6 +510,7 @@ class BinanceTrades:
             target_url = candidates[attempt % len(candidates)]
             sub_msg = subscription_for_url(target_url)
             is_bybit = "bybit.com" in target_url.lower()
+            is_deribit = "deribit.com" in target_url.lower()
             ws = None
             tracked = False
             try:
@@ -530,12 +534,21 @@ class BinanceTrades:
                 last_ping = time.monotonic()
                 last_message = last_ping
                 while not self._stop.is_set():
-                    if is_bybit and time.monotonic() - last_ping >= 20.0 and hasattr(ws, "send"):
+                    now_m = time.monotonic()
+                    if is_bybit and now_m - last_ping >= 20.0 and hasattr(ws, "send"):
                         try:
                             ws.send('{"op":"ping"}')
                         except Exception:
                             pass
-                        last_ping = time.monotonic()
+                        last_ping = now_m
+                    elif is_deribit and now_m - last_ping >= 60.0 and hasattr(ws, "send"):
+                        # Deribit closes sessions that send no request for 10 min;
+                        # market data alone does not count as client activity.
+                        try:
+                            ws.send(DERIBIT_KEEPALIVE)
+                        except Exception:
+                            pass
+                        last_ping = now_m
                     try:
                         raw = ws.recv()
                     except websocket.WebSocketTimeoutException:

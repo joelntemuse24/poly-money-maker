@@ -281,6 +281,44 @@ class BinanceTradesSubSecondTests(unittest.TestCase):
         self.assertFalse(bt.health()["primary"]["connected"])
         self.assertIsNotNone(bt.grid.latest_exchange_ms())
 
+    def test_deribit_feed_sends_keepalive_before_idle_timeout(self):
+        from unittest.mock import patch
+        import websocket
+        from buy.binance_trades import BinanceTrades, DERIBIT_KEEPALIVE
+
+        events = []
+        clock = [0.0]
+
+        class QuietWS:
+            def __init__(self):
+                self.sent = []
+                self.calls = 0
+
+            def send(self, message):
+                self.sent.append(message)
+                if message == DERIBIT_KEEPALIVE:
+                    bt.stop()
+
+            def recv(self):
+                self.calls += 1
+                # Deribit sends data constantly, but never times out the socket.
+                clock[0] += 31.0
+                return '{"jsonrpc":"2.0","method":"subscription","params":{"channel":"ticker.BTC-PERPETUAL.100ms","data":{"best_bid_price":70000,"best_ask_price":70002,"timestamp":1950}}}'
+
+            def close(self):
+                pass
+
+        ws = QuietWS()
+        bt = BinanceTrades(connect=lambda _url: ws,
+                           on_event=lambda event, **kw: events.append((event, kw)))
+        with patch("buy.binance_trades.time.monotonic", side_effect=lambda: clock[0]):
+            bt._run("wss://www.deribit.com/ws/api/v2")
+        self.assertEqual(ws.sent[0].count("public/subscribe"), 1)
+        self.assertIn(DERIBIT_KEEPALIVE, ws.sent)
+        self.assertNotIn("fivemin_binance_error", [e for e, _ in events])
+        reasons = [kw.get("reason") for event, kw in events if event == "fivemin_binance_disconnect"]
+        self.assertEqual(reasons, ["closed"])
+
     def test_extra_feed_timeout_sends_heartbeat_and_stays_connected(self):
         from unittest.mock import patch
         import websocket
