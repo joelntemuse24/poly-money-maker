@@ -1563,7 +1563,6 @@ class Runner:
         self.local_grid = self.grid
         if client.grid is not None:
             self.grid = client.grid
-            self.strategy._grid_source = client.grid
         self._feedproc_log("feed_process_grid", mode="shared_ring")
         return True
 
@@ -1589,7 +1588,6 @@ class Runner:
             self.feed_process = None
         if self.local_grid is not None:
             self.grid = self.local_grid
-            self.strategy._grid_source = self.local_grid
         self._feedproc_log("feed_process_fallback_ready", reason=reason, mode="in_process")
 
     def _stop_feed_process(self) -> None:
