@@ -247,6 +247,62 @@ def order_latency_fields(prepared: dict, result: Optional[dict] = None, *,
     }
 
 
+def rtds_compare_fields(prepared: dict) -> dict:
+    """Live RTDS/Chainlink print next to the sniper's offset-adjusted estimate.
+
+    Diagnostics only, built after the POST returned. Every field degrades to
+    ``None`` and the helper never raises.
+    """
+    out = {"rtds_price": None, "rtds_obs_ts": None, "rtds_recv_ts": None,
+           "rtds_age_ms": None, "offset": None, "est_price": None,
+           "rtds_gap_usd": None, "est_minus_rtds_usd": None}
+    try:
+        prepared = prepared if isinstance(prepared, dict) else {}
+        live = prepared.get("rtds_live")
+        meta = prepared.get("post_meta") or {}
+        row = prepared.get("row") or {}
+
+        def _num(value):
+            try:
+                number = float(value)
+            except (TypeError, ValueError):
+                return None
+            return number if math.isfinite(number) else None
+
+        def _usd(value):
+            return None if value is None else round(value, 2)
+
+        price = _num(getattr(live, "price", None))
+        obs_ts = _num(getattr(live, "obs_ts", None))
+        recv_ts = _num(getattr(live, "recv_ts", None))
+        # row["offset"] is set once per market before any sniper decision, so reading
+        # it after the POST equals the value the decision used.
+        offset = _num(prepared["offset"] if "offset" in prepared else row.get("offset"))
+        spot_now = _num(prepared.get("spot_now"))
+        strike = _num(row.get("strike"))
+        decision_ts = _num(meta.get("decision_ts"))
+        fav = prepared.get("fav")
+        sign = 1.0 if fav == "up" else -1.0 if fav == "down" else None
+
+        out["rtds_price"] = _usd(price)
+        out["rtds_obs_ts"] = obs_ts
+        out["rtds_recv_ts"] = recv_ts
+        # Echoed unrounded so ``spot_now + offset`` reproduces ``est_price``.
+        out["offset"] = offset
+        age_ts = recv_ts if recv_ts is not None else obs_ts
+        if decision_ts is not None and age_ts is not None:
+            out["rtds_age_ms"] = round((decision_ts - age_ts) * 1000.0, 1)
+        est_price = None if offset is None or spot_now is None else spot_now + offset
+        out["est_price"] = _usd(est_price)
+        if price is not None and strike is not None and sign is not None:
+            out["rtds_gap_usd"] = _usd(sign * (price - strike))
+        if est_price is not None and price is not None:
+            out["est_minus_rtds_usd"] = _usd(est_price - price)
+    except Exception:
+        return {key: None for key in out}
+    return out
+
+
 def decision_book_fields(book: dict, limit: float) -> dict:
     levels = ask_levels(book)
     return {"book_age_ms": book.get("age_ms"),
@@ -345,6 +401,8 @@ class Strategy:
         # Diagnostics only: per (slug, side) first sighting of a qualifying jump
         # and the gates already journaled (at most once per gate per slug/side).
         self._sniper_notes: dict[tuple, dict] = {}
+        # Diagnostics only: live RTDS/Chainlink feed, wired by ``Runner`` when present.
+        self.rtds_feed = None
 
     def _save_time(self):
         if self.io.clock is not None:
@@ -1079,6 +1137,8 @@ class Strategy:
             "first_seen_ts": note["first_seen_ts"],
             "first_reject_gate": note["first_reject_gate"],
             "first_reject_detail": note["first_reject_detail"],
+            # Diagnostics: one reference read of the feed's latest live print; formatted after the POST.
+            "rtds_live": getattr(self.rtds_feed, "_live", None),
         }
 
     def _sniper_execute(self, prepared: dict, *, lock: Optional[threading.RLock] = None):
@@ -1154,7 +1214,8 @@ class Strategy:
                     latency_ms=latency_ms, timing=result.get("timing"),
                     jump_usd=jump_usd, gap_usd=gap_usd, spot=spot_now,
                     trigger_source=trigger_source, ttm=row["end"] - now,
-                    **decision_book_fields(quotes.get(fav, {}), limit))
+                    **decision_book_fields(quotes.get(fav, {}), limit),
+                    **rtds_compare_fields(prepared))
         if filled > 0:
             if lock is not None:
                 with lock:
@@ -1196,6 +1257,7 @@ class Strategy:
                                           feed_recv=feed_recv, first_feed=first_feed)
         except Exception:
             return
+        fields.update(rtds_compare_fields(prepared))
         self.io.log("sniper_order_latency", **fields)
 
     def _sniper_enter(self, cfg, now, row, quotes, fav, jump_usd, gap_usd, spot_now, *, trigger_source: str = "primary"):
@@ -1504,6 +1566,10 @@ class Runner:
         self.tape = tape
         self.gateway, self.chain, self.funder = gateway, chain, funder
         self.grid, self.binance, self.rtds, self.books = grid, binance, rtds, book_feed
+        try:
+            self.strategy.rtds_feed = rtds
+        except Exception:
+            pass
         self.clock = clock
         self.next_discover = 0.0
         self.next_cash = 0.0
