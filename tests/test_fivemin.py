@@ -507,15 +507,13 @@ class ReviewFixTests(unittest.TestCase):
         strat.tick(cfg(), 1210.0, grid, q); strat.tick(cfg(), 1213.0, grid, q)
         self.assertIn("sell", order)
 
-    def test_start_twap_waits_one_second(self):
+    def test_start_twap_captures_at_market_boundary(self):
         strat, _ = self.make()
         strat.add_market(market("cid", 1000), now=1000)
         grid = PriceGrid()
         for ms in range(900_000, 1_001_000, 100):
             grid.add(ms, 100.0)
-        strat.tick(cfg(), 1000.5, grid, {})
-        self.assertNotIn("start_twap", strat.state["markets"]["cid"])
-        strat.tick(cfg(), 1001.0, grid, {})
+        strat.tick(cfg(), 1000.0, grid, {})
         self.assertEqual(strat.state["markets"]["cid"]["start_twap"], 100.0)
 
     def test_prune_keeps_unsettled_positions(self):

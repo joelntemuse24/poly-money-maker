@@ -377,14 +377,11 @@ class Strategy:
             self.alert(f"5m daily stop {self.state['day']}: {self.state['realized']:.2f}", cfg, "fivemin_daily_stop")
         for cid in list(self._active):
             row = self.state["markets"][cid]
-            if row.get("start_twap") is None and now >= row["start"] + 1.0:
-                latest_fn = getattr(grid, "latest_exchange_ms", None)
-                latest = latest_fn() if callable(latest_fn) else row["start"] * 1000.0
-                if latest is not None and row["start"] * 1000.0 <= latest <= (now + 1) * 1000.0:
-                    start_twap = twap60(grid, int(row["start"] * 10))
-                    if start_twap is not None:
-                        row["start_twap"] = start_twap
-                        self.save()
+            if row.get("start_twap") is None and now >= row["start"]:
+                start_twap = twap60(grid, int(row["start"] * 10))
+                if start_twap is not None:
+                    row["start_twap"] = start_twap
+                    self.save()
             strike = row.get("strike")
             if strike is None and row["start"] in self.boundaries:
                 row["strike"] = strike = self.boundaries[row["start"]]

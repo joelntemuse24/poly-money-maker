@@ -281,6 +281,42 @@ class BinanceTradesSubSecondTests(unittest.TestCase):
         self.assertFalse(bt.health()["primary"]["connected"])
         self.assertIsNotNone(bt.grid.latest_exchange_ms())
 
+    def test_extra_feed_timeout_sends_heartbeat_and_stays_connected(self):
+        from unittest.mock import patch
+        import websocket
+        from buy.binance_trades import BinanceTrades
+
+        events = []
+        class QuietWS:
+            def __init__(self):
+                self.sent = []
+                self.calls = 0
+            def send(self, message):
+                self.sent.append(message)
+                if message == '{"event":"bts:heartbeat"}':
+                    bt.stop()
+            def recv(self):
+                self.calls += 1
+                if self.calls == 1:
+                    clock[0] = 11.0
+                    raise websocket.WebSocketTimeoutException("Connection timed out")
+                return ""
+            def close(self):
+                pass
+        ws = QuietWS()
+        clock = [0.0]
+        bt = BinanceTrades(connect=lambda _url: ws,
+                           on_event=lambda event, **kw: events.append((event, kw)))
+        with patch("buy.binance_trades.time.monotonic", side_effect=lambda: clock[0]):
+            bt._run("wss://ws.bitstamp.net")
+        self.assertEqual(ws.sent, [
+            '{"event":"bts:subscribe","data":{"channel":"live_trades_btcusd"}}',
+            '{"event":"bts:heartbeat"}',
+        ])
+        disconnects = [fields for event, fields in events if event == "fivemin_binance_disconnect"]
+        self.assertEqual(len(disconnects), 1)
+        self.assertEqual(disconnects[0]["reason"], "closed")
+
     def test_null_primary_url_uses_default_and_health_tracks_connection(self):
         from buy.binance_trades import URL
         grid = PriceGrid()

@@ -405,6 +405,7 @@ class BinanceTrades:
         self._on_event = on_event
         self._feed_state: dict[str, dict[str, Any]] = {}
         self._last_health_log = 0.0
+        self._last_disconnect_log: dict[str, float] = {}
         self._connect = connect
         self._sleep = sleep or time.sleep
         self._on_error = on_error
@@ -486,6 +487,13 @@ class BinanceTrades:
             if message:
                 state["last_message"] = time.monotonic()
 
+    def _disconnect_event(self, feed: str, url: str, reason: str) -> None:
+        now = time.monotonic()
+        previous = self._last_disconnect_log.get(feed)
+        if previous is None or now - previous >= 60.0:
+            self._last_disconnect_log[feed] = now
+            self._event("fivemin_binance_disconnect", feed=feed, url=url, reason=reason)
+
     def _run(self, run_url: Optional[str] = None):
         import websocket
         primary = run_url is None
@@ -520,6 +528,7 @@ class BinanceTrades:
                 received = False
                 last_price = None
                 last_ping = time.monotonic()
+                last_message = last_ping
                 while not self._stop.is_set():
                     if is_bybit and time.monotonic() - last_ping >= 20.0 and hasattr(ws, "send"):
                         try:
@@ -527,9 +536,22 @@ class BinanceTrades:
                         except Exception:
                             pass
                         last_ping = time.monotonic()
-                    raw = ws.recv()
+                    try:
+                        raw = ws.recv()
+                    except websocket.WebSocketTimeoutException:
+                        now_m = time.monotonic()
+                        if primary or now_m - last_message >= 60.0:
+                            raise
+                        if hasattr(ws, "send") and now_m - last_ping >= 10.0:
+                            if "bitstamp.net" in target_url.lower():
+                                ws.send('{"event":"bts:heartbeat"}')
+                            else:
+                                ws.ping()
+                            last_ping = now_m
+                        continue
                     if not raw:
                         break
+                    last_message = time.monotonic()
                     self._feed_update(feed, True, message=True)
                     recv_ms = time.monotonic() * 1000.0
                     parsed = parse_agg_trade(raw)
@@ -554,15 +576,14 @@ class BinanceTrades:
                         received = True
                 ws.close()
                 self._feed_update(feed, False)
-                self._event("fivemin_binance_disconnect", feed=feed, url=target_url, reason="closed")
+                self._disconnect_event(feed, target_url, "closed")
                 attempt = 0 if received else attempt + 1
                 if not self._stop.is_set():
                     self._stop.wait(min(30.0, 0.5 * (2 ** min(attempt, 6))))
             except Exception as exc:
                 attempt += 1
                 self._feed_update(feed, False)
-                self._event("fivemin_binance_disconnect", feed=feed, url=target_url,
-                            reason=str(exc)[:240])
+                self._disconnect_event(feed, target_url, str(exc)[:240])
                 now = time.time()
                 if self._on_error is not None and now - self._last_error_at >= 60:
                     self._last_error_at = now
