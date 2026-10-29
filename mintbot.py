@@ -9345,6 +9345,7 @@ def main() -> int:
             path.parent.mkdir(parents=True, exist_ok=True)
             writer = StateWriter(path, log=log_event)
             runner = None
+            hotpath_gc = None
             try:
                 current_cfg = lambda: cfg_box.get("cfg") or cfg
                 io = FiveMinIO(
@@ -9416,7 +9417,8 @@ def main() -> int:
             finally:
                 if runner is not None:
                     runner.stop()
-                hotpath_gc.disarm()
+                if hotpath_gc is not None:
+                    hotpath_gc.disarm()
                 writer.stop(timeout=10)
 
         threading.Thread(target=run_fivemin, name="mintbot-fivemin", daemon=True).start()
