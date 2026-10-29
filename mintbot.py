@@ -9272,7 +9272,11 @@ def main() -> int:
                 )
                 if not fivemin_dry_run(current_cfg()):
                     io.warmup([])
-                grid = PriceGrid()
+                if settings(current_cfg()).get("gc_freeze_hotpath", False):
+                    import gc as _gc
+                    _gc.collect()
+                    _gc.freeze()  # startup objects leave GC tracking: shorter gen2 pauses on tick threads
+                grid = PriceGrid(use_rust=bool(settings(current_cfg()).get("rust_hotpath", False)) or None)
                 ws_error_at = None
 
                 def fivemin_ws_error(error, delay):

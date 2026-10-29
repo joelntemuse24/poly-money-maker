@@ -48,6 +48,8 @@ DEFAULTS = {
         "wss://ws.bitstamp.net",
     ],
     "sniper_max_book_age_ms": 1500.0,
+    "rust_hotpath": False,
+    "gc_freeze_hotpath": False,
     "fivemin_side98_enabled": False, "fivemin_side98_shares": 20, "fivemin_side98_price": 0.98,
     "fivemin_side98_min_gap_usd": 15.0, "fivemin_side98_max_ttc_s": 60,
     "fivemin_side98_max_adverse_30s_usd": 5.0,

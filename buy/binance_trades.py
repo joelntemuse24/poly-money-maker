@@ -4,6 +4,7 @@ from __future__ import annotations
 import collections
 import json
 import math
+import os
 import socket
 import threading
 import time
@@ -47,9 +48,41 @@ def _fast_loads(raw: Any) -> Any:
     return json.loads(raw)
 
 
+_TICK_RING_CLS: Optional[type] = None
+_TICK_RING_IMPORTED = False
+
+
+def _tick_ring_cls() -> Optional[type]:
+    """Return the ``polyhot.TickRing`` class once, or None if the module is absent."""
+    global _TICK_RING_CLS, _TICK_RING_IMPORTED
+    if not _TICK_RING_IMPORTED:
+        _TICK_RING_IMPORTED = True
+        try:
+            from polyhot import TickRing  # type: ignore
+        except Exception:  # missing wheel, broken build, wrong ABI
+            _TICK_RING_CLS = None
+        else:
+            _TICK_RING_CLS = TickRing
+    return _TICK_RING_CLS
+
+
+def _rust_hotpath_enabled(use_rust: Optional[bool]) -> bool:
+    if use_rust is None:
+        return os.environ.get("POLY_RUST_HOTPATH") == "1"
+    return bool(use_rust)
+
+
 class PriceGrid:
-    def __init__(self, slots: int = 1800):
+    def __init__(self, slots: int = 1800, *, use_rust: Optional[bool] = None):
         self.slots = max(1800, int(slots))
+        ring_cls = _tick_ring_cls() if _rust_hotpath_enabled(use_rust) else None
+        self._ring_cls: Optional[type] = ring_cls
+        self.rust_enabled: bool = ring_cls is not None
+        # Parallel Rust rings mirror the tick deques below; they only serve the
+        # window scans in ``window_extrema`` / ``best_jump_in_window``.
+        self._ring_ms_ticks: Any = ring_cls() if ring_cls is not None else None
+        self._ring_ms_by_source: dict[str, Any] = {}
+        self._ring_recv_by_source: dict[str, Any] = {}
         self._rows: list[Optional[tuple[int, float]]] = [None] * self.slots
         self._latest: Optional[int] = None
         self._twap_cache: dict[int, Optional[float]] = {}
@@ -93,6 +126,18 @@ class PriceGrid:
                 self._recv_ticks_by_source[src_key] = rbuf
             rbuf.append((r_ms, px))
 
+            if self.rust_enabled:
+                ring = self._ring_ms_by_source.get(src_key)
+                if ring is None:
+                    ring = self._ring_cls()
+                    self._ring_ms_by_source[src_key] = ring
+                ring.append(ex_ms, px)
+                rring = self._ring_recv_by_source.get(src_key)
+                if rring is None:
+                    rring = self._ring_cls()
+                    self._ring_recv_by_source[src_key] = rring
+                rring.append(r_ms, px)
+
             self._latest_by_source[src_key] = (r_ms, ex_ms, px)
             if recv_wall_ms is not None:
                 self._latest_recv_wall_ms[src_key] = float(recv_wall_ms)
@@ -113,6 +158,8 @@ class PriceGrid:
             if self._latest is not None and g <= self._latest - self.slots:
                 return None
             self._ms_ticks.append((ex_ms, px))
+            if self.rust_enabled:
+                self._ring_ms_ticks.append(ex_ms, px)
             self._latest = max(g, self._latest if self._latest is not None else g)
             self._rows[g % self.slots] = (g, px)
             self._twap_cache = {cached: value for cached, value in self._twap_cache.items() if cached < g}
@@ -185,6 +232,13 @@ class PriceGrid:
             latest_ms = ticks[-1][0]
             ref_ms = latest_ms if now_ms is None else float(now_ms)
             lower = ref_ms - float(window_ms)
+            if self.rust_enabled:
+                ring = self._ring_ms_ticks if src_key == "primary" else self._ring_ms_by_source.get(src_key)
+                bounds = None if ring is None else ring.window_minmax(lower, ref_ms)
+                if bounds is None:
+                    return None
+                spot_now = ticks[-1][1]
+                return (spot_now, bounds[0], bounds[1], latest_ms)
             prices = [px for ts, px in ticks if lower <= ts <= ref_ms]
             if not prices:
                 return None
@@ -263,11 +317,18 @@ class PriceGrid:
                 if ref_r - latest_r > max(win * 2.0, 1500.0):
                     continue
                 lower = ref_r - win
-                prices = [px for ts, px in rticks if lower <= ts <= ref_r]
-                if not prices:
-                    continue
-                min_px = min(prices)
-                max_px = max(prices)
+                if self.rust_enabled:
+                    rring = self._ring_recv_by_source.get(src_key)
+                    bounds = None if rring is None else rring.window_minmax(lower, ref_r)
+                    if bounds is None:
+                        continue
+                    min_px, max_px = bounds
+                else:
+                    prices = [px for ts, px in rticks if lower <= ts <= ref_r]
+                    if not prices:
+                        continue
+                    min_px = min(prices)
+                    max_px = max(prices)
                 up_j = spot_raw - min_px
                 dn_j = max_px - spot_raw
                 mag = max(up_j, dn_j)

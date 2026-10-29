@@ -1,0 +1,13 @@
+[build-system]
+requires = ["maturin>=1.5,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "polyhot"
+version = "0.1.0"
+description = "Rust hot-path helpers for poly-money-maker (tick ring buffers)"
+requires-python = ">=3.9"
+
+[tool.maturin]
+module-name = "polyhot"
+features = ["pyo3/extension-module"]

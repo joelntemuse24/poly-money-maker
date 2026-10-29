@@ -102,3 +102,6 @@ deploy/tape_remote.path
 # Runtime rotations and operator backups
 *.log.*
 *.bak-*
+
+# Rust build output
+rust/polyhot/target

@@ -182,5 +182,7 @@
   "sniper_use_offset": true,
   "sniper_event_driven": true,
   "sniper_futures_ws_enabled": false,
-  "sniper_futures_ws_url": "wss://fstream.binance.com/stream?streams=btcusdt@aggTrade/btcusdt@bookTicker"
+  "sniper_futures_ws_url": "wss://fstream.binance.com/stream?streams=btcusdt@aggTrade/btcusdt@bookTicker",
+  "rust_hotpath": false,
+  "gc_freeze_hotpath": false
 }
