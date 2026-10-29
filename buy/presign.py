@@ -417,12 +417,34 @@ class PreSignedOrderCache:
 
 _ORDER_HTTP_CLIENT: Any = None
 _LAST_ORDER_ACTIVITY_TS: float = 0.0
+# Number of order POSTs currently on the wire. Plain int assignments only, so
+# neither the POST path nor the warmer ever waits on a lock.
+_ORDER_INFLIGHT: int = 0
+
+_ORDER_CLIENT_FACTORY: Any = None
+_ORDER_WARM_THREAD: Any = None
+_ORDER_WARM_STOP: Optional[threading.Event] = None
+_ORDER_WARM_STATS: dict[str, Any] = {
+    "pings_ok": 0,
+    "pings_fail": 0,
+    "reconnects": 0,
+    "reconnect_fail": 0,
+    "skips_inflight": 0,
+    "skips_recent": 0,
+    "last_rtt_ms": None,
+}
+
+ORDER_WARM_TIMEOUT_S = 1.0
+ORDER_WARM_SUMMARY_S = 60.0
+ORDER_CLIENT_CLOSE_DELAY_S = 10.0
 
 
-def set_order_http_client(http_client: Any) -> None:
+def set_order_http_client(http_client: Any, factory: Any = None) -> None:
     """Register a dedicated warm HTTP/2 client for ``fast_post_order``."""
-    global _ORDER_HTTP_CLIENT
+    global _ORDER_HTTP_CLIENT, _ORDER_CLIENT_FACTORY
     _ORDER_HTTP_CLIENT = http_client
+    if factory is not None:
+        _ORDER_CLIENT_FACTORY = factory
 
 
 def get_order_http_client() -> Any:
@@ -431,6 +453,177 @@ def get_order_http_client() -> Any:
 
 def last_order_activity_ts() -> float:
     return _LAST_ORDER_ACTIVITY_TS
+
+
+def order_inflight() -> int:
+    """Return the number of order POSTs currently in flight."""
+    return _ORDER_INFLIGHT
+
+
+def order_conn_stats() -> dict:
+    """Return a snapshot of the order connection warmer counters."""
+    return dict(_ORDER_WARM_STATS)
+
+
+def default_order_client_factory() -> Any:
+    """Build a fresh HTTP/2 client with the same limits the order path uses."""
+    import httpx
+
+    return httpx.Client(http2=True, limits=httpx.Limits(keepalive_expiry=120))
+
+
+def _close_order_client_later(old_client: Any, delay_s: float) -> None:
+    """Close ``old_client`` in the background so in-flight POSTs on it finish."""
+
+    def _close() -> None:
+        if delay_s > 0:
+            time.sleep(delay_s)
+        try:
+            old_client.close()
+        except Exception:
+            pass
+
+    try:
+        threading.Thread(target=_close, name="order-conn-close", daemon=True).start()
+    except Exception:
+        pass
+
+
+def reconnect_order_http_client(
+    factory: Any = None, close_delay_s: float = ORDER_CLIENT_CLOSE_DELAY_S
+) -> Any:
+    """Swap in a fresh order client and close the old one after a delay."""
+    global _ORDER_HTTP_CLIENT
+    make = factory or _ORDER_CLIENT_FACTORY or default_order_client_factory
+    try:
+        new_client = make()
+    except Exception:
+        _ORDER_WARM_STATS["reconnect_fail"] += 1
+        return None
+    old_client = _ORDER_HTTP_CLIENT
+    _ORDER_HTTP_CLIENT = new_client
+    _ORDER_WARM_STATS["reconnects"] += 1
+    if old_client is not None and old_client is not new_client:
+        _close_order_client_later(old_client, float(close_delay_s))
+    return new_client
+
+
+def _order_ping_ok(resp: Any) -> bool:
+    status = getattr(resp, "status_code", None)
+    if status is None:
+        return True
+    try:
+        return int(status) == 200
+    except (TypeError, ValueError):
+        return False
+
+
+def order_warm_tick(
+    host: str,
+    interval_s: float = 2.0,
+    *,
+    factory: Any = None,
+    timeout: float = ORDER_WARM_TIMEOUT_S,
+    close_delay_s: float = ORDER_CLIENT_CLOSE_DELAY_S,
+) -> str:
+    """Run one warmer pass; return ``ok``, ``fail``, ``inflight``, ``recent`` or ``no_client``."""
+    now = time.time()
+    if _ORDER_INFLIGHT > 0:
+        _ORDER_WARM_STATS["skips_inflight"] += 1
+        return "inflight"
+    if _LAST_ORDER_ACTIVITY_TS and (now - _LAST_ORDER_ACTIVITY_TS) < interval_s:
+        _ORDER_WARM_STATS["skips_recent"] += 1
+        return "recent"
+    hclient = _ORDER_HTTP_CLIENT
+    get = getattr(hclient, "get", None)
+    if not callable(get):
+        return "no_client"
+    start = time.perf_counter()
+    try:
+        resp = get(f"{str(host).rstrip('/')}/time", timeout=timeout)
+        ok = _order_ping_ok(resp)
+    except Exception:
+        ok = False
+    rtt_ms = (time.perf_counter() - start) * 1000.0
+    if ok:
+        _ORDER_WARM_STATS["pings_ok"] += 1
+        _ORDER_WARM_STATS["last_rtt_ms"] = round(rtt_ms, 2)
+        return "ok"
+    _ORDER_WARM_STATS["pings_fail"] += 1
+    reconnect_order_http_client(factory, close_delay_s=close_delay_s)
+    return "fail"
+
+
+def start_order_conn_warmer(
+    host: str,
+    interval_s: float = 2.0,
+    *,
+    factory: Any = None,
+    log: Any = None,
+    timeout: float = ORDER_WARM_TIMEOUT_S,
+    summary_s: float = ORDER_WARM_SUMMARY_S,
+    close_delay_s: float = ORDER_CLIENT_CLOSE_DELAY_S,
+) -> Any:
+    """Keep the dedicated order HTTP/2 connection warm with a ``/time`` GET every ``interval_s``.
+
+    Pings skip while an order is in flight or one was sent within the last
+    interval, so they never contend with a POST. A ping error (or non-200)
+    builds a fresh client through ``factory``, swaps it in, and closes the old
+    one in the background. ``log`` (called as ``log(event, **fields)``) gets a
+    compact ``order_conn_warm`` summary at most every ``summary_s``.
+    """
+    global _ORDER_WARM_THREAD, _ORDER_WARM_STOP, _ORDER_CLIENT_FACTORY
+    thread = _ORDER_WARM_THREAD
+    if thread is not None and thread.is_alive():
+        return thread
+    base = str(host or "").rstrip("/")
+    if not base:
+        return None
+    if callable(factory):
+        _ORDER_CLIENT_FACTORY = factory
+    interval = max(0.01, float(interval_s or 2.0))
+    stop = threading.Event()
+    _ORDER_WARM_STOP = stop
+
+    def _run() -> None:
+        last_log = time.monotonic()
+        while not stop.is_set():
+            try:
+                order_warm_tick(
+                    base,
+                    interval,
+                    factory=factory,
+                    timeout=timeout,
+                    close_delay_s=close_delay_s,
+                )
+            except Exception:
+                pass
+            if callable(log) and (time.monotonic() - last_log) >= summary_s:
+                last_log = time.monotonic()
+                try:
+                    log(
+                        "order_conn_warm",
+                        interval_s=interval,
+                        **order_conn_stats(),
+                    )
+                except Exception:
+                    pass
+            stop.wait(interval)
+
+    thread = threading.Thread(target=_run, name="order-conn-warmer", daemon=True)
+    _ORDER_WARM_THREAD = thread
+    thread.start()
+    return thread
+
+
+def stop_order_conn_warmer() -> None:
+    """Signal the order connection warmer to exit."""
+    global _ORDER_WARM_THREAD, _ORDER_WARM_STOP
+    stop = _ORDER_WARM_STOP
+    if stop is not None:
+        stop.set()
+    _ORDER_WARM_STOP = None
+    _ORDER_WARM_THREAD = None
 
 
 def fast_post_order(
@@ -448,7 +641,7 @@ def fast_post_order(
     ``post_meta`` (optional) is filled in place with send/response epochs and the raw
     response, so the caller can build a latency log after the POST returns.
     """
-    global _LAST_ORDER_ACTIVITY_TS
+    global _LAST_ORDER_ACTIVITY_TS, _ORDER_INFLIGHT
     if (
         entry is not None
         and entry.serialized_body
@@ -463,7 +656,11 @@ def fast_post_order(
             _LAST_ORDER_ACTIVITY_TS = time.time()
             if post_meta is not None:
                 post_meta["send_start_ts"] = time.time()
-            resp = hclient.post(url, headers=headers, content=entry.serialized_bytes)
+            _ORDER_INFLIGHT += 1
+            try:
+                resp = hclient.post(url, headers=headers, content=entry.serialized_bytes)
+            finally:
+                _ORDER_INFLIGHT -= 1
             if post_meta is not None:
                 post_meta["resp_complete_ts"] = time.time()
                 record_response_meta(post_meta, resp)

@@ -2326,12 +2326,26 @@ def _configure_clob_http_client() -> Any:
     )
     helpers._http_client = client
     try:
-        order_client = httpx.Client(
-            http2=True,
-            limits=httpx.Limits(keepalive_expiry=120),
-        )
+        def _make_order_client() -> Any:
+            return httpx.Client(
+                http2=True,
+                limits=httpx.Limits(keepalive_expiry=120),
+            )
+
+        order_client = _make_order_client()
         if callable(set_order_http_client):
-            set_order_http_client(order_client)
+            set_order_http_client(order_client, factory=_make_order_client)
+            try:
+                from buy.presign import start_order_conn_warmer
+
+                start_order_conn_warmer(
+                    str(getattr(client, "host", "https://clob.polymarket.com")),
+                    float(os.getenv("ORDER_WARM_INTERVAL_S", "2.0") or 2.0),
+                    factory=_make_order_client,
+                    log=log_event,
+                )
+            except Exception:
+                pass
     except Exception:
         pass
     return client
@@ -2368,19 +2382,6 @@ def _start_clob_keepalive(state: dict, cfg: Optional[dict] = None) -> None:
                     clob = globals().get("_clob_client")
                     clob_host = str(getattr(clob, "host", host)).rstrip("/")
                     client.get(f"{clob_host}/time", timeout=1.0)
-                    try:
-                        from buy.presign import get_order_http_client, last_order_activity_ts
-
-                        order_hc = get_order_http_client()
-                        if (
-                            order_hc is not None
-                            and order_hc is not client
-                            and callable(getattr(order_hc, "get", None))
-                            and now - float(last_order_activity_ts() or 0.0) >= interval_s
-                        ):
-                            order_hc.get(f"{clob_host}/time", timeout=1.0)
-                    except Exception:
-                        pass
                     last_ping = now
             except Exception:
                 pass
