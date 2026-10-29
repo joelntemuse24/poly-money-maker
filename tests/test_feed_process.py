@@ -13,7 +13,8 @@ from types import SimpleNamespace
 from buy import feed_process as fp
 from buy.binance_trades import PriceGrid
 from buy.feed_process import (
-    H_HEARTBEAT_NS, H_MAGIC, H_STOP, H_TICKS, H_TRIG_W, MAGIC, SOURCE_NAMES,
+    H_HEARTBEAT_NS, H_MAGIC, H_PARENT_NS, H_STOP, H_TICKS, H_TRIG_W, MAGIC,
+    HEADER_SLOTS, PARENT_STALE_S, SOURCE_NAMES,
     FeedProcessClient, FeedWorker, Layout, SharedBlock, SharedPriceGrid, TickRingReader,
     TickRingWriter, detect_trigger, read_trigger, source_slot, trigger_to_jump_info,
     write_trigger,
@@ -588,6 +589,55 @@ class FallbackWiringTest(unittest.TestCase):
         harness.runner.current = row
         harness.runner.tick()
         self.assertEqual(calls, [])
+
+
+class OrphanWatchdogTest(unittest.TestCase):
+    """A child must never outlive its parent."""
+
+    def setUp(self):
+        self.layout = Layout(sources=3, capacity=8, triggers=4)
+        self.block = SharedBlock(self.layout.total_bytes, create=True)
+        self.clock = [1000.0]
+        self.worker = FeedWorker({"sniper_extra_ws_enabled": False}, self.block,
+                                 self.layout, None, now=lambda: self.clock[0])
+
+    def tearDown(self):
+        self.block.close()
+        self.block.unlink()
+
+    def _beat(self, at):
+        self.block.i64[self.layout.header_index(H_PARENT_NS)] = int(at * 1e9)
+
+    def test_parent_slot_does_not_collide_with_tick_counters(self):
+        highest_counter = H_TICKS + 2 * len(SOURCE_NAMES) - 1
+        self.assertGreater(H_PARENT_NS, highest_counter)
+        self.assertLess(H_PARENT_NS, HEADER_SLOTS)
+
+    def test_no_parent_stamp_yet_is_not_treated_as_gone(self):
+        self.assertFalse(self.worker.parent_gone())
+
+    def test_child_survives_while_the_parent_beats(self):
+        for step in range(5):
+            self.clock[0] += 5.0
+            self._beat(self.clock[0])
+            self.assertFalse(self.worker.parent_gone(), f"step {step}")
+
+    def test_child_exits_after_a_silent_parent(self):
+        self._beat(self.clock[0])
+        self.assertFalse(self.worker.parent_gone())
+        # The parent stops bumping.
+        self.clock[0] += PARENT_STALE_S + 1.0
+        self.assertTrue(self.worker.parent_gone())
+
+    def test_a_late_beat_clears_the_stale_timer(self):
+        self._beat(self.clock[0])
+        self.assertFalse(self.worker.parent_gone())
+        self.clock[0] += PARENT_STALE_S * 0.9
+        self.assertFalse(self.worker.parent_gone())
+        self._beat(self.clock[0])          # parent came back
+        self.assertFalse(self.worker.parent_gone())
+        self.clock[0] += PARENT_STALE_S * 0.5
+        self.assertFalse(self.worker.parent_gone())
 
 
 class FlagTest(unittest.TestCase):

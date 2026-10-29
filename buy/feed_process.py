@@ -41,6 +41,8 @@ TRIGGER_SLOTS = 32
 TRIGGER_FIELDS = 16
 HEARTBEAT_S = 1.0
 STALL_FACTOR = 4.0
+# How long the child tolerates a silent parent before it exits on its own.
+PARENT_STALE_S = 30.0
 
 # Header slots (int64).
 H_MAGIC, H_VERSION, H_STOP, H_TICKS, H_TRIG_W, H_TRIG_R, H_HEARTBEAT_NS = range(7)
@@ -56,6 +58,10 @@ SOURCE_NAMES = (
     "primary", "binance_spot", "binance_fut", "bybit", "coinbase",
     "deribit", "kraken", "bitstamp", "other",
 )
+
+# Header slot the parent bumps every tick so the child can tell it is still wanted.
+# Kept clear of the per-source tick counters.
+H_PARENT_NS = HEADER_SLOTS - 1
 
 
 def source_slot(name: str) -> int:
@@ -412,6 +418,8 @@ class FeedWorker:
         self.stop = threading.Event()
         self._last_heartbeat = 0.0
         self._triggers = 0
+        self._parent_beat = 0
+        self._parent_beat_s = 0.0
 
     def _on_event(self, event: str, **fields: Any) -> None:
         # The child has no journal; these are the events an operator needs.
@@ -524,9 +532,7 @@ class FeedWorker:
         )
         self.feeds.start()
         try:
-            while not self.stop.is_set() and not self.block.i64[self.layout.header_index(H_STOP)]:
-                self._heartbeat()
-                self.stop.wait(0.05)
+            self._idle_until_stopped()
         finally:
             self.feeds.stop()
         return 0
@@ -556,10 +562,42 @@ class FeedWorker:
                           recv_wall_ms=self.now() * 1000.0)
             self._on_tick(ms, px)
             self._heartbeat()
+        self._idle_until_stopped()
+        return 0
+
+    def parent_gone(self) -> bool:
+        """True when the parent has stopped bumping its heartbeat.
+
+        A child must never outlive its parent: the parent owns the shared segment
+        and is the only reader of the trigger ring. If it is killed without running
+        ``stop()`` (SIGKILL, a crash) nothing bumps the parent stamp any more, so a
+        stamp that has not moved for ``PARENT_STALE_S`` is the signal to exit.
+        """
+        beat = int(self.block.i64[self.layout.header_index(H_PARENT_NS)])
+        if self._parent_beat <= 0:
+            # First sighting: adopt whatever the parent has published so far.
+            if beat <= 0:
+                return False
+            self._parent_beat = beat
+            self._parent_beat_s = beat / 1e9
+            return False
+        now = self.now()
+        if beat > self._parent_beat:
+            self._parent_beat = beat
+            self._parent_beat_s = beat / 1e9
+            return False
+        # Stamped in the parent's own clock, so compare against ours only as a
+        # duration: how long ago did we last see the stamp move?
+        return bool(now - self._parent_beat_s > PARENT_STALE_S)
+
+    def _idle_until_stopped(self) -> None:
+        """Heartbeat until the parent asks us to stop - or stops existing."""
         while not self.stop.is_set() and not self.block.i64[self.layout.header_index(H_STOP)]:
             self._heartbeat()
-            self.stop.wait(0.02)
-        return 0
+            if self.parent_gone():
+                self._stderr("feed_process_parent_gone: exiting")
+                return
+            self.stop.wait(0.05)
 
 
 def child_main(cfg: dict, shm_name: str, layout: Layout, wake_fd: Any) -> int:
@@ -645,6 +683,7 @@ class FeedProcessClient:
         self._monitor = threading.Thread(target=self._monitor_loop, name="mintbot-feed-health",
                                          daemon=True)
         self._monitor.start()
+        self._beat()
         self.log("feed_process_started", shm=self.block.name, wakeup="eventfd" if self.wake_fd is not None else "poll")
         return True
 
@@ -722,6 +761,15 @@ class FeedProcessClient:
             self.block = None
 
     # -- trigger delivery ------------------------------------------------
+    def _beat(self) -> None:
+        """Tell the child the parent is alive (it exits on its own if we die)."""
+        if self.block is None:
+            return
+        try:
+            self.block.i64[self.layout.header_index(H_PARENT_NS)] = int(self.now() * 1e9)
+        except Exception:
+            pass
+
     def _dispatch(self) -> None:
         if self.block is None:
             return
@@ -757,6 +805,7 @@ class FeedProcessClient:
     def _monitor_loop(self) -> None:
         period = max(0.05, float(self.cfg.get("feed_process_status_s", 5.0) or 5.0))
         while not self._stop.is_set():
+            self._beat()
             self._stop.wait(period)
             if self._stop.is_set():
                 break

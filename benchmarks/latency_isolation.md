@@ -244,6 +244,7 @@ to false, and this is why.
 | reconnect parity | same `BinanceTrades` class and backoff ran in the child |
 | clean shutdown | `H_STOP` flag + `eventfd` poke + `wait`/`terminate`/`kill` escalation; asserted no orphan pid and no leaked segment |
 | fallback to in-process | `Runner._feedproc_fallback` restarts in-process feeds and restores the local grid |
+| the child cannot outlive the parent | the parent bumps `H_PARENT_NS`; a child that sees it frozen for `PARENT_STALE_S` (30 s) exits on its own, so a SIGKILLed bot cannot leave a detector behind |
 
 The child is a **plain subprocess** (`python -m buy.feed_worker`), not
 `multiprocessing`: at start-up the bot has ~20 threads and no `mintbot` module
