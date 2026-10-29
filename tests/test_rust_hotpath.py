@@ -197,3 +197,18 @@ class PriceGridParityTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def test_load_strategy_keeps_rust_hotpath_flag(tmp_path, monkeypatch):
+    """Regression: load_strategy drops keys missing from mintbot.DEFAULTS."""
+    import json
+    import mintbot
+
+    assert mintbot.DEFAULTS["rust_hotpath"] is False
+    assert mintbot.DEFAULTS["gc_freeze_hotpath"] is False
+    example = json.loads((mintbot.REPO / "strategy_mint.example.json").read_text())
+    example["rust_hotpath"] = True
+    path = tmp_path / "strategy_mint.json"
+    path.write_text(json.dumps(example))
+    monkeypatch.setattr(mintbot, "STRATEGY_FILE", path)
+    assert mintbot.load_strategy()["rust_hotpath"] is True

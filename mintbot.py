@@ -328,6 +328,8 @@ DEFAULTS = {
     'sniper_ttm_min_s': 15,
     'sniper_ttm_max_s': 240,
     'sniper_shares': 10,
+    'rust_hotpath': False,
+    'gc_freeze_hotpath': False,
     'sniper_use_offset': True,
     'sniper_event_driven': True,
     'sniper_futures_ws_enabled': False,
