@@ -463,7 +463,11 @@ class WriterTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as tmp:
             log_file = Path(tmp) / "mintbot.log"
+            import os as _os
+            _saved_env = dict(_os.environ)
             import mintbot as _mb
+            _os.environ.clear()
+            _os.environ.update(_saved_env)
 
             ns = functions(
                 "log_setup", LOG_FILE=log_file, sys=SimpleNamespace(stdout=stream),

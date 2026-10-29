@@ -1,7 +1,20 @@
 import json
 import sys
 
-import mintbot
+
+def _import_mintbot_isolated():
+    """Import mintbot without leaking its .env load into later tests."""
+    import os
+    saved = dict(os.environ)
+    try:
+        import mintbot
+    finally:
+        os.environ.clear()
+        os.environ.update(saved)
+    return mintbot
+
+
+mintbot = _import_mintbot_isolated()
 
 
 def _setup(tmp_path, monkeypatch, capsys):
