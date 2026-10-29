@@ -54,7 +54,7 @@ DEFAULTS = {
     "gc_freeze_hotpath": False,
     "gc_hotpath_gen0_threshold": 0, "gc_hotpath_gen2_threshold": 0,
     "gc_hotpath_boundary_collect": False, "gc_hotpath_boundary_offset_s": 2.0,
-    "tick_lock_short": False,
+    "thread_switch_interval_s": 0.0, "tick_lock_short": False,
     "feed_process": False, "feed_process_trigger_ttl_ms": 250,
     "feed_process_status_s": 5.0,
     "fivemin_side98_enabled": False, "fivemin_side98_shares": 20, "fivemin_side98_price": 0.98,

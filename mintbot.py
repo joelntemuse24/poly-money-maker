@@ -353,6 +353,7 @@ DEFAULTS = {
     'gc_hotpath_gen2_threshold': 0,
     'gc_hotpath_boundary_collect': False,
     'gc_hotpath_boundary_offset_s': 2.0,
+    'thread_switch_interval_s': 0.0,
     'tick_lock_short': False,
     'feed_process': False,
     'feed_process_trigger_ttl_ms': 250,
@@ -934,6 +935,7 @@ def validate_strategy(cfg: dict) -> None:
     for key, default, low, high in (("gc_hotpath_gen0_threshold", 0, 0, None),
                                     ("gc_hotpath_gen2_threshold", 0, 0, None),
                                     ("gc_hotpath_boundary_offset_s", 2.0, 0, 300),
+                                    ("thread_switch_interval_s", 0.0, 0, 0.1),
                                     ("feed_process_trigger_ttl_ms", 250, 1, 10_000),
                                     ("feed_process_status_s", 5.0, 0.1, 300)):
         value = float(cfg.get(key, default) or 0)
@@ -9111,6 +9113,10 @@ def main() -> int:
     try:
         cfg = load_strategy()
         _apply_book_timeout(cfg)
+        # thread_switch_interval_s: 0 (the default) leaves the interpreter alone.
+        from buy.hotpath import apply_switch_interval
+
+        apply_switch_interval(cfg, log=log_event)
     except Exception as exc:
         globals().get("_console_print", console.print)(f"[bold red]strategy load failed:[/] {exc}")
         return 1

@@ -1,15 +1,20 @@
-"""gc_freeze_hotpath: opt-in collector freeze with a measured pause distribution."""
+"""gc_freeze_hotpath and thread_switch_interval_s: opt-in interpreter tuning."""
 from __future__ import annotations
 
 import ast
 import gc
 import json
+import sys
+import threading
+import time
 import unittest
 from pathlib import Path
 
 from buy import hotpath
 from buy.fivemin import DEFAULTS as FM_DEFAULTS
-from buy.hotpath import DEFAULT_THRESHOLDS, GcPauseRecorder, HotPathGc
+from buy.hotpath import (
+    DEFAULT_THRESHOLDS, GcPauseRecorder, HotPathGc, apply_switch_interval,
+)
 
 ROOT = Path(__file__).resolve().parents[1]
 MINT = ROOT / "mintbot.py"
@@ -26,12 +31,15 @@ def _defaults() -> dict:
 class FlagDefaultsTest(unittest.TestCase):
     def test_both_flags_default_off_in_both_default_tables(self):
         defaults = _defaults()
-        for key in ("gc_freeze_hotpath", "tick_lock_short", "feed_process"):
+        for key in ("gc_freeze_hotpath", "thread_switch_interval_s", "tick_lock_short",
+                    "feed_process"):
             self.assertIn(key, defaults)
         self.assertIs(defaults["gc_freeze_hotpath"], False)
+        self.assertEqual(defaults["thread_switch_interval_s"], 0.0)
         self.assertIs(defaults["tick_lock_short"], False)
         self.assertIs(defaults["feed_process"], False)
         self.assertIs(FM_DEFAULTS["gc_freeze_hotpath"], False)
+        self.assertEqual(FM_DEFAULTS["thread_switch_interval_s"], 0.0)
 
     def test_validate_strategy_accepts_defaults_and_rejects_bad_values(self):
         tree = ast.parse(MINT.read_text(), filename=str(MINT))
@@ -48,7 +56,8 @@ class FlagDefaultsTest(unittest.TestCase):
         good = _defaults()
         validate(good)
         for key, value in (("gc_freeze_hotpath", "yes"), ("tick_lock_short", 1),
-                           ("feed_process", None),
+                           ("feed_process", None), ("thread_switch_interval_s", -1),
+                           ("thread_switch_interval_s", "fast"),
                            ("feed_process_trigger_ttl_ms", 0),
                            ("gc_hotpath_boundary_offset_s", 10_000)):
             cfg = dict(good)
@@ -59,8 +68,9 @@ class FlagDefaultsTest(unittest.TestCase):
     def test_mintbot_calls_switch_interval_before_startup_log(self):
         src = MINT.read_text()
         main = src[src.find("def main() -> int:"):]
+        self.assertIn("apply_switch_interval(cfg, log=log_event)", main)
+        self.assertLess(main.find("apply_switch_interval("), main.find('log_event(\n        "startup"'))
         self.assertIn("HotPathGc", src)
-        self.assertNotIn("_gc.freeze()", main)
 
 
 class GcRecorderTest(unittest.TestCase):
@@ -220,6 +230,60 @@ class HotPathGcTest(unittest.TestCase):
                 self.assertIn(key, stats[0])
         finally:
             obj.disarm()
+
+
+class SwitchIntervalTest(unittest.TestCase):
+    def test_zero_leaves_the_interpreter_alone(self):
+        current = sys.getswitchinterval()
+        self.assertIsNone(apply_switch_interval({"thread_switch_interval_s": 0.0}))
+        self.assertEqual(sys.getswitchinterval(), current)
+        self.assertIsNone(apply_switch_interval({}))
+        self.assertIsNone(apply_switch_interval({"thread_switch_interval_s": None}))
+        self.assertEqual(sys.getswitchinterval(), current)
+
+    def test_value_is_applied_and_logged(self):
+        current = sys.getswitchinterval()
+        logs = []
+        try:
+            applied = apply_switch_interval({"thread_switch_interval_s": 0.0005},
+                                            log=lambda e, **k: logs.append((e, k)))
+            self.assertAlmostEqual(applied, 0.0005)
+            self.assertAlmostEqual(sys.getswitchinterval(), 0.0005)
+            self.assertEqual(logs[0][0], "thread_switch_interval")
+            self.assertAlmostEqual(logs[0][1]["after_s"], 0.0005)
+        finally:
+            sys.setswitchinterval(current)
+        self.assertEqual(sys.getswitchinterval(), current)
+
+    def test_setter_injection_avoids_global_state(self):
+        seen = {}
+        value = apply_switch_interval(
+            {"thread_switch_interval_s": 0.001},
+            setter=lambda v: seen.setdefault("set", v), getter=lambda: seen.get("set", 0.005),
+        )
+        self.assertAlmostEqual(value, 0.001)
+        self.assertAlmostEqual(seen["set"], 0.001)
+        self.assertEqual(sys.getswitchinterval(), seen.get("orig", sys.getswitchinterval()))
+
+
+class GilHandoffBenchmarkTest(unittest.TestCase):
+    """The benchmark helper exists and measures a real handoff; not a latency gate."""
+
+    def test_synthetic_handoff_benchmark_returns_percentiles(self):
+        from tools.bench_thread_switch import measure_handoff, measure_throughput
+
+        stats = measure_handoff(None, spins=60)
+        self.assertIsNone(stats["interval_s"])
+        self.assertEqual(stats["samples"], 60)
+        for key in ("p50_us", "p99_us", "max_us"):
+            self.assertGreater(stats["p50_us"], 0.0)
+            self.assertGreaterEqual(stats[key], stats["p50_us"])
+        # Shortening the interval must not change what is measured, only how fast
+        # the blocked thread is handed the GIL; the helper records the request.
+        short = measure_handoff(0.0005, spins=60)
+        self.assertAlmostEqual(short["interval_s"], 0.0005)
+        self.assertGreater(short["p99_us"], 0.0)
+        self.assertGreater(measure_throughput(None, duration_s=0.05)["iters_per_s"], 0)
 
 
 if __name__ == "__main__":

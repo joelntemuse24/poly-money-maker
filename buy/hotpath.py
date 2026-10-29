@@ -5,6 +5,10 @@ Every helper here is inert unless its config flag is set:
 * ``HotPathGc``     - ``gc_freeze_hotpath`` (+ optional gen0/gen2 thresholds and
                       safe-point collections). Records every collector pause with
                       ``gc.callbacks`` so the effect is measurable.
+* ``apply_switch_interval`` - ``thread_switch_interval_s``.
+* ``TickEffects``   - ``tick_lock_short``: buffer pure side effects (log, alert)
+                      that a strategy tick emits while ``Runner._tick_lock`` is
+                      held, and replay them right after the lock is released.
 
 Nothing here is read by a trading decision. ``TickEffects`` never buffers
 ``save``: a state snapshot must be taken at call time, or a crash before an
@@ -13,6 +17,7 @@ order could lose the attempt marker.
 from __future__ import annotations
 
 import gc
+import sys
 import threading
 import time
 from typing import Any, Callable, Optional
@@ -226,6 +231,27 @@ class HotPathGc:
             self.log("gc_hotpath_stats", **self.stats())
         except Exception:
             pass
+
+
+def apply_switch_interval(cfg: dict, *, log: Callable[..., None] = lambda *a, **k: None,
+                          setter: Optional[Callable[[float], None]] = None,
+                          getter: Optional[Callable[[], float]] = None) -> Optional[float]:
+    """``thread_switch_interval_s``: set the interpreter switch interval.
+
+    ``0`` (the default) leaves the interpreter alone and returns ``None``.
+    """
+    try:
+        value = float((cfg or {}).get("thread_switch_interval_s") or 0.0)
+    except (TypeError, ValueError):
+        return None
+    if value <= 0:
+        return None
+    get = getter or sys.getswitchinterval
+    set_ = setter or sys.setswitchinterval
+    before = get()
+    set_(value)
+    log("thread_switch_interval", before_s=before, after_s=get())
+    return value
 
 
 class TickEffects:
