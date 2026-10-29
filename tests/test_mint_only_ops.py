@@ -856,6 +856,7 @@ class DeployUnitsTests(unittest.TestCase):
                 "fivemin_tape.py",
                 "binance_trades.py",
                 "presign.py",
+                "hotpath.py",
             },
         )
         market_src = (BUY / "market.py").read_text()

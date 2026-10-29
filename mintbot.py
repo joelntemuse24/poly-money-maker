@@ -347,6 +347,16 @@ DEFAULTS = {
         'wss://ws.bitstamp.net',
     ],
     'sniper_max_book_age_ms': 1500.0,
+    # Hot-path isolation knobs (buy/hotpath.py, buy/feed_process.py). All off:
+    # the defaults change no decision, size, threshold or order.
+    'gc_hotpath_gen0_threshold': 0,
+    'gc_hotpath_gen2_threshold': 0,
+    'gc_hotpath_boundary_collect': False,
+    'gc_hotpath_boundary_offset_s': 2.0,
+    'tick_lock_short': False,
+    'feed_process': False,
+    'feed_process_trigger_ttl_ms': 250,
+    'feed_process_status_s': 5.0,
     'fivemin_min_fill_px': 0.95,
     'fivemin_low_fill_exit': True,
     "entry_enabled": False,
@@ -917,6 +927,20 @@ def validate_strategy(cfg: dict) -> None:
         raise ValueError("fivemin_binance_url must not be empty")
     if not isinstance(cfg.get("fivemin_book_ws", False), bool):
         raise ValueError("fivemin_book_ws must be boolean")
+    for key in ("gc_freeze_hotpath", "gc_hotpath_boundary_collect", "tick_lock_short",
+                "feed_process"):
+        if not isinstance(cfg.get(key, False), bool):
+            raise ValueError(f"{key} must be boolean")
+    for key, default, low, high in (("gc_hotpath_gen0_threshold", 0, 0, None),
+                                    ("gc_hotpath_gen2_threshold", 0, 0, None),
+                                    ("gc_hotpath_boundary_offset_s", 2.0, 0, 300),
+                                    ("feed_process_trigger_ttl_ms", 250, 1, 10_000),
+                                    ("feed_process_status_s", 5.0, 0.1, 300)):
+        value = float(cfg.get(key, default) or 0)
+        if value != value or value in (float("inf"), float("-inf")):
+            raise ValueError(f"invalid {key}")
+        if value < low or (high is not None and value > high):
+            raise ValueError(f"invalid {key}")
     if not isinstance(cfg.get("fivemin_book_record", True), bool):
         raise ValueError("fivemin_book_record must be boolean")
     if not 0 < float(cfg.get("fivemin_book_ws_stale_s", 1.0)) < float("inf"):
@@ -9306,6 +9330,7 @@ def main() -> int:
         from buy.clob_book_ws import ClobBookFeed
         from buy.fivemin_books import RestBookFeed, WsFallbackBookFeed
         from buy.fivemin_tape import BookTape
+        from buy.hotpath import HotPathGc
         from buy.oracle_log import RtdsTwapFeed
         from buy.state_writer import snapshot_state
 
@@ -9328,10 +9353,11 @@ def main() -> int:
                 )
                 if not fivemin_dry_run(current_cfg()):
                     io.warmup([])
+                # gc_freeze_hotpath: collect + freeze once the warmup objects exist,
+                # then record every pause so before/after is measurable.
+                hotpath_gc = HotPathGc(current_cfg, log=log_event)
                 if settings(current_cfg()).get("gc_freeze_hotpath", False):
-                    import gc as _gc
-                    _gc.collect()
-                    _gc.freeze()  # startup objects leave GC tracking: shorter gen2 pauses on tick threads
+                    hotpath_gc.arm()
                 grid = PriceGrid(use_rust=bool(settings(current_cfg()).get("rust_hotpath", False)) or None)
                 log_event("fivemin_price_grid", rust_enabled=bool(getattr(grid, "rust_enabled", False)))
                 ws_error_at = None
@@ -9376,6 +9402,7 @@ def main() -> int:
                     tape=BookTape(REPO / "logs" / "fivemin_books", log=log_event),
                 )
                 runner.gamma_fetch = lambda slug: _fivemin_gamma_winner(current_cfg(), slug)
+                runner.hotpath_gc = hotpath_gc
                 runner.start()
                 run_job_loop(name="fivemin", tick=runner.tick, sleep_s=runner.sleep_s,
                              should_stop=should_stop,
@@ -9383,6 +9410,7 @@ def main() -> int:
             finally:
                 if runner is not None:
                     runner.stop()
+                hotpath_gc.disarm()
                 writer.stop(timeout=10)
 
         threading.Thread(target=run_fivemin, name="mintbot-fivemin", daemon=True).start()

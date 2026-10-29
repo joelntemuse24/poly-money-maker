@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import inspect
 import json
+from contextlib import contextmanager
 from copy import deepcopy
 import math
 import time
@@ -51,6 +52,11 @@ DEFAULTS = {
     "sniper_max_book_age_ms": 1500.0,
     "rust_hotpath": False,
     "gc_freeze_hotpath": False,
+    "gc_hotpath_gen0_threshold": 0, "gc_hotpath_gen2_threshold": 0,
+    "gc_hotpath_boundary_collect": False, "gc_hotpath_boundary_offset_s": 2.0,
+    "tick_lock_short": False,
+    "feed_process": False, "feed_process_trigger_ttl_ms": 250,
+    "feed_process_status_s": 5.0,
     "fivemin_side98_enabled": False, "fivemin_side98_shares": 20, "fivemin_side98_price": 0.98,
     "fivemin_side98_min_gap_usd": 15.0, "fivemin_side98_max_ttc_s": 60,
     "fivemin_side98_max_adverse_30s_usd": 5.0,
@@ -313,11 +319,21 @@ class Strategy:
         self._twap_cache = {}
         self._refetch_threads: list[threading.Thread] = []
         self._buy_post_meta_ok: Optional[tuple[Callable, bool]] = None
+        self._order_in_flight = 0
 
     def _save_time(self):
         if self.io.clock is not None:
             return self.io.clock()
         return self._tick_now if self._tick_now is not None else time.time()
+
+    @contextmanager
+    def _order_scope(self):
+        """Mark an order (buy or sell) in flight for the GC safe point."""
+        self._order_in_flight += 1
+        try:
+            yield
+        finally:
+            self._order_in_flight -= 1
 
     def save(self, force=False):
         self._save_dirty = True
@@ -754,7 +770,8 @@ class Strategy:
         token = row["up_token"] if fav == "up" else row["dn_token"]
         is_dry = dry_run(cfg)
         try:
-            result = self.io.buy(token, shares, limit, is_dry)
+            with self._order_scope():
+                result = self.io.buy(token, shares, limit, is_dry)
         except Exception as exc:
             self.io.log("fivemin_side98_order_error", slug=row["slug"], side=fav,
                         limit=limit, error=str(exc))
@@ -922,9 +939,11 @@ class Strategy:
         post_meta = prepared.setdefault("post_meta", {})
         try:
             if self._buy_takes_post_meta():
-                result = self.io.buy(token, shares, limit, is_dry, post_meta=post_meta)
+                with self._order_scope():
+                    result = self.io.buy(token, shares, limit, is_dry, post_meta=post_meta)
             else:
-                result = self.io.buy(token, shares, limit, is_dry)
+                with self._order_scope():
+                    result = self.io.buy(token, shares, limit, is_dry)
         except Exception as exc:
             if lock is not None:
                 with lock:
@@ -1051,7 +1070,8 @@ class Strategy:
         self.save(force=True)
         shares = p["shares"]
         try:
-            result = self.io.sell(row, p, book, cfg, now)
+            with self._order_scope():
+                result = self.io.sell(row, p, book, cfg, now)
         except Exception as exc:
             p["dumped"] = False
             p["low_fill_exit_failed"] = True
@@ -1153,7 +1173,8 @@ class Strategy:
         is_dry = dry_run(cfg)
         error = None
         try:
-            result = self.io.buy(token, shares, limit, is_dry)
+            with self._order_scope():
+                result = self.io.buy(token, shares, limit, is_dry)
         except Exception as exc:
             error = str(exc)
         response_time = self.io.clock() if self.io.clock is not None else time.perf_counter()
@@ -1251,7 +1272,8 @@ class Strategy:
         self.save(force=True)
         if self.io.clock is not None and self.io.clock() >= row["end"]:
             return
-        result = self.io.sell(row, p, quotes[held], cfg, now)
+        with self._order_scope():
+            result = self.io.sell(row, p, quotes[held], cfg, now)
         sold = min(p["shares"], max(0.0, float(result.get("shares", 0))))
         proceeds = float(result.get("proceeds", sold * float(result.get("price", bid))))
         p["shares"] -= sold
@@ -1323,6 +1345,8 @@ class Runner:
         self._io_thread = None
         self._io_lock = threading.Lock()
         self._tick_lock = threading.RLock()
+        self.hotpath_gc = None
+        self._order_in_flight = 0
         self._markets = []
         self._balance = None
         self._gamma_pending = set()
@@ -1537,6 +1561,13 @@ class Runner:
     def _tick_once(self):
         with self._tick_lock:
             now, cfg = self.clock(), settings(self.cfg())
+            # gc_freeze_hotpath safe point: after a 5m boundary, with no order in
+            # flight. A no-op when the flag is off.
+            if self.hotpath_gc is not None:
+                try:
+                    self.hotpath_gc.maybe_collect(now, self._order_in_flight)
+                except Exception:
+                    pass
             samples = list(self.rtds.drain())
             if samples:
                 self.rtds_last_sample = now
