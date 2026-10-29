@@ -654,15 +654,18 @@ def fast_post_order(
         hclient = http_client if http_client is not None else _ORDER_HTTP_CLIENT
         if hclient is not None and callable(getattr(hclient, "post", None)):
             _LAST_ORDER_ACTIVITY_TS = time.time()
-            if post_meta is not None:
-                post_meta["send_start_ts"] = time.time()
             _ORDER_INFLIGHT += 1
             try:
-                resp = hclient.post(url, headers=headers, content=entry.serialized_bytes)
+                if post_meta is None:
+                    resp = hclient.post(url, headers=headers, content=entry.serialized_bytes)
+                else:
+                    resp = _post_capture_timing(
+                        hclient, url, headers, entry.serialized_bytes, post_meta
+                    )
             finally:
                 _ORDER_INFLIGHT -= 1
             if post_meta is not None:
-                post_meta["resp_complete_ts"] = time.time()
+                post_meta.setdefault("resp_complete_ts", time.time())
                 record_response_meta(post_meta, resp)
             if getattr(resp, "status_code", 200) != 200:
                 try:
@@ -702,18 +705,103 @@ def fast_post_order(
 
 _BODY_TS_KEYS = ("timestamp", "serverTime", "server_time", "transactTime", "matchTime", "ts")
 
+# Response headers that describe server-side time; journaled verbatim when present.
+_TIMING_HEADERS = (("server-timing", "server_timing"), ("x-response-time", "x_response_time"),
+                   ("cf-ray", "cf_ray"), ("x-request-id", "x_request_id"),
+                   ("cf-cache-status", "cf_cache_status"))
+
+# Identity of the connection the previous order POST used (diagnostics only).
+_LAST_CONN: dict[str, Any] = {"ident": None}
+
+
+def _post_capture_timing(hclient: Any, url: str, headers: dict, body: bytes,
+                         post_meta: dict) -> Any:
+    """POST with the response-headers timestamp captured as ``resp_first_byte_ts``.
+
+    An httpx client is driven streamed: ``send(..., stream=True)`` returns as soon
+    as the status line and headers are decoded, so the stamp measures true
+    time-to-first-byte instead of the request's write time. The body is read
+    immediately afterwards. Any other client keeps the plain ``post`` call.
+    """
+    build, send = getattr(hclient, "build_request", None), getattr(hclient, "send", None)
+    if callable(build) and callable(send):
+        request = build("POST", url, headers=headers, content=body)
+        post_meta["send_start_ts"] = time.time()
+        resp = send(request, stream=True)
+        post_meta["resp_first_byte_ts"] = time.time()
+        try:
+            resp.read()
+        finally:
+            post_meta["resp_complete_ts"] = time.time()
+        return resp
+    post_meta["send_start_ts"] = time.time()
+    resp = hclient.post(url, headers=headers, content=body)
+    post_meta["resp_complete_ts"] = time.time()
+    return resp
+
+
+def connection_identity(resp: Any) -> Optional[str]:
+    """Stable per-connection token for ``resp`` (local address, else stream id)."""
+    extensions = getattr(resp, "extensions", None)
+    if not isinstance(extensions, dict):
+        return None
+    stream = extensions.get("network_stream")
+    extra = getattr(stream, "get_extra_info", None)
+    if not callable(extra):
+        return None if stream is None else str(id(stream))
+    for info in ("client_addr", "socket"):
+        try:
+            value = extra(info)
+        except Exception:
+            value = None
+        if value is None:
+            continue
+        if info == "socket":
+            try:
+                value = value.getsockname()
+            except Exception:
+                value = id(value)
+        return f"{value}"
+    return str(id(stream))
+
 
 def record_response_meta(post_meta: dict, resp: Any) -> None:
-    """Record HTTP status, ``date`` header and first response byte time from an httpx response."""
+    """Record HTTP status, timing headers and first response byte time from a response.
+
+    ``resp_first_byte_ts`` is kept when the streaming POST already stamped it;
+    the ``elapsed``-derived fallback only applies to a plain ``post`` client,
+    where it approximates the send time rather than the header arrival.
+    """
     try:
         post_meta["http_status"] = getattr(resp, "status_code", None)
     except Exception:
         post_meta["http_status"] = None
     headers = getattr(resp, "headers", None)
+    get = getattr(headers, "get", None)
     try:
-        post_meta["server_date"] = headers.get("date") if headers is not None else None
+        post_meta["server_date"] = get("date") if callable(get) else None
     except Exception:
         post_meta["server_date"] = None
+    for name, key in _TIMING_HEADERS:
+        try:
+            post_meta[key] = get(name) if callable(get) else None
+        except Exception:
+            post_meta[key] = None
+    version = getattr(resp, "http_version", None)
+    if version is None:
+        extensions = getattr(resp, "extensions", None)
+        if isinstance(extensions, dict):
+            version = extensions.get("http_version")
+    post_meta["http_version"] = (version.decode() if isinstance(version, bytes)
+                                 else None if version is None else str(version))
+    ident = connection_identity(resp)
+    if ident is not None:
+        post_meta["conn_reused"] = _LAST_CONN.get("ident") == ident
+        _LAST_CONN["ident"] = ident
+    else:
+        post_meta["conn_reused"] = None
+    if post_meta.get("resp_first_byte_ts") is not None:
+        return
     first_byte = None
     elapsed = getattr(resp, "elapsed", None)
     complete = post_meta.get("resp_complete_ts")
