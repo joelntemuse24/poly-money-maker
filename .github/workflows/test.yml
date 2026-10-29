@@ -15,6 +15,12 @@ jobs:
           python-version: "3.12"
       - name: Install runtime dependencies
         run: python3 -m pip install -r requirements.txt
+      # tests/test_rust_hotpath.py imports hypothesis at module scope. It was
+      # never installed here, so collection has failed on every run since it
+      # landed. The Rust parity cases themselves still skip cleanly via
+      # requires_rust when the polyhot extension is absent.
+      - name: Install test dependencies
+        run: python3 -m pip install hypothesis
       - name: Compile mint + pathlog
         run: python3 -m py_compile mintbot.py pathlog.py check_path_backtest.py buy/book.py buy/market.py buy/chain.py buy/contracts.py buy/mint_sell.py buy/mint_loops.py
       - name: Run unit tests

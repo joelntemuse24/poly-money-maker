@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import inspect
 import json
+from contextlib import contextmanager
 from copy import deepcopy
 import math
 import time
@@ -14,6 +15,7 @@ from typing import Callable, Optional
 from zoneinfo import ZoneInfo
 
 from buy.fivemin_tape import RECORD_EVENTS
+from buy.hotpath import TickEffects
 from buy.mint_sell import empty_fak_status
 
 DEFAULTS = {
@@ -51,6 +53,11 @@ DEFAULTS = {
     "sniper_max_book_age_ms": 1500.0,
     "rust_hotpath": False,
     "gc_freeze_hotpath": False,
+    "gc_hotpath_gen0_threshold": 0, "gc_hotpath_gen2_threshold": 0,
+    "gc_hotpath_boundary_collect": False, "gc_hotpath_boundary_offset_s": 2.0,
+    "thread_switch_interval_s": 0.0, "tick_lock_short": False,
+    "feed_process": False, "feed_process_trigger_ttl_ms": 250,
+    "feed_process_status_s": 5.0,
     "fivemin_side98_enabled": False, "fivemin_side98_shares": 20, "fivemin_side98_price": 0.98,
     "fivemin_side98_min_gap_usd": 15.0, "fivemin_side98_max_ttc_s": 60,
     "fivemin_side98_max_adverse_30s_usd": 5.0,
@@ -313,11 +320,21 @@ class Strategy:
         self._twap_cache = {}
         self._refetch_threads: list[threading.Thread] = []
         self._buy_post_meta_ok: Optional[tuple[Callable, bool]] = None
+        self._order_in_flight = 0
 
     def _save_time(self):
         if self.io.clock is not None:
             return self.io.clock()
         return self._tick_now if self._tick_now is not None else time.time()
+
+    @contextmanager
+    def _order_scope(self):
+        """Mark an order (buy or sell) in flight for the GC safe point."""
+        self._order_in_flight += 1
+        try:
+            yield
+        finally:
+            self._order_in_flight -= 1
 
     def save(self, force=False):
         self._save_dirty = True
@@ -508,10 +525,14 @@ class Strategy:
                 continue
             if position and not position.get("settled") and now < row["end"]:
                 self._manage(cfg, now, row, books.get(cid, {}))
+            # With feed_process the trigger path is authoritative: the shared grid
+            # only knows the child's last trigger, so a poll here would fire off a
+            # stale verdict instead of a fresh scan.
             if (cfg.get("sniper_5m_enabled", False) and not row.get("sniper_5m")
                     and row["start"] <= now < row["end"]
                     and row.get("strike") is not None
-                    and row.get("skip_reason") != "startup"):
+                    and row.get("skip_reason") != "startup"
+                    and not getattr(grid, "trigger_only", False)):
                 self._sniper_check(cfg, now, row, books.get(cid, {}), grid, row["end"] - now)
             if row["entered"] or not row["start"] <= now < row["end"]:
                 if (row["entered"] and row["start"] <= now < row["end"]
@@ -754,7 +775,8 @@ class Strategy:
         token = row["up_token"] if fav == "up" else row["dn_token"]
         is_dry = dry_run(cfg)
         try:
-            result = self.io.buy(token, shares, limit, is_dry)
+            with self._order_scope():
+                result = self.io.buy(token, shares, limit, is_dry)
         except Exception as exc:
             self.io.log("fivemin_side98_order_error", slug=row["slug"], side=fav,
                         limit=limit, error=str(exc))
@@ -922,9 +944,11 @@ class Strategy:
         post_meta = prepared.setdefault("post_meta", {})
         try:
             if self._buy_takes_post_meta():
-                result = self.io.buy(token, shares, limit, is_dry, post_meta=post_meta)
+                with self._order_scope():
+                    result = self.io.buy(token, shares, limit, is_dry, post_meta=post_meta)
             else:
-                result = self.io.buy(token, shares, limit, is_dry)
+                with self._order_scope():
+                    result = self.io.buy(token, shares, limit, is_dry)
         except Exception as exc:
             if lock is not None:
                 with lock:
@@ -1051,7 +1075,8 @@ class Strategy:
         self.save(force=True)
         shares = p["shares"]
         try:
-            result = self.io.sell(row, p, book, cfg, now)
+            with self._order_scope():
+                result = self.io.sell(row, p, book, cfg, now)
         except Exception as exc:
             p["dumped"] = False
             p["low_fill_exit_failed"] = True
@@ -1119,15 +1144,25 @@ class Strategy:
 
         def record_signal():
             self.save(force=True)
-            log_books = deepcopy({side: quotes.get(side) or {} for side in ("up", "down")})
-            for book in log_books.values():
-                book["bids"] = book.get("bids", [])[:3]
-                book["asks"] = ask_levels(book)[:3]
-            self.io.log("fivemin_signal", ts=now, slug=row["slug"], condition_id=row["condition_id"],
-                        attempt=row["main_attempts"],
-                        ttm=row["end"] - now, gate_ratio=ratio, proxy=proxy, strike=row["strike"],
-                        offset=row.get("offset"), books=log_books, loser=loser,
-                        persisted_s=persisted, **ask_depth(quotes.get(fav, {})))
+
+            def fields():
+                log_books = deepcopy({side: quotes.get(side) or {} for side in ("up", "down")})
+                for book in log_books.values():
+                    book["bids"] = book.get("bids", [])[:3]
+                    book["asks"] = ask_levels(book)[:3]
+                return {"ts": now, "slug": row["slug"], "condition_id": row["condition_id"],
+                        "attempt": row["main_attempts"],
+                        "ttm": row["end"] - now, "gate_ratio": ratio, "proxy": proxy,
+                        "strike": row["strike"], "offset": row.get("offset"),
+                        "books": log_books, "loser": loser, "persisted_s": persisted,
+                        **ask_depth(quotes.get(fav, {}))}
+
+            # ask_depth/deepcopy are pure; with tick_lock_short they run at flush.
+            log_fields = getattr(self.io.log, "log_fields", None)
+            if callable(log_fields):
+                log_fields("fivemin_signal", fields)
+            else:
+                self.io.log("fivemin_signal", **fields())
 
         reason = None
         if sent_now >= row["end"]:
@@ -1153,7 +1188,8 @@ class Strategy:
         is_dry = dry_run(cfg)
         error = None
         try:
-            result = self.io.buy(token, shares, limit, is_dry)
+            with self._order_scope():
+                result = self.io.buy(token, shares, limit, is_dry)
         except Exception as exc:
             error = str(exc)
         response_time = self.io.clock() if self.io.clock is not None else time.perf_counter()
@@ -1251,7 +1287,8 @@ class Strategy:
         self.save(force=True)
         if self.io.clock is not None and self.io.clock() >= row["end"]:
             return
-        result = self.io.sell(row, p, quotes[held], cfg, now)
+        with self._order_scope():
+            result = self.io.sell(row, p, quotes[held], cfg, now)
         sold = min(p["shares"], max(0.0, float(result.get("shares", 0))))
         proceeds = float(result.get("proceeds", sold * float(result.get("price", bid))))
         p["shares"] -= sold
@@ -1323,6 +1360,10 @@ class Runner:
         self._io_thread = None
         self._io_lock = threading.Lock()
         self._tick_lock = threading.RLock()
+        self.hotpath_gc = None
+        self._order_in_flight = 0
+        self.feed_process = None
+        self.local_grid = None
         self._markets = []
         self._balance = None
         self._gamma_pending = set()
@@ -1354,14 +1395,9 @@ class Runner:
             pass
 
     def on_binance_tick(self, exchange_ms: float, price: float):
+        """In-process feed wake-up: run the jump scan on this thread's grid."""
         cfg = settings(self.cfg())
-        if not cfg.get("sniper_5m_enabled", False) or not cfg.get("sniper_event_driven", True):
-            return
-        row = self.current
-        if row is None or row.get("sniper_5m") or row.get("strike") is None:
-            return
-        now = self.clock()
-        if not row["start"] <= now < row["end"] or row.get("skip_reason") == "startup":
+        if not self._sniper_wants_trigger(cfg):
             return
         best_fn = getattr(self.grid, "best_jump_in_window", None) if cfg.get("sniper_extra_ws_enabled", True) else None
         jump_fn = getattr(self.grid, "jump_in_window", None)
@@ -1373,14 +1409,44 @@ class Runner:
                 info = jump_fn(float(cfg["sniper_window_ms"]))
         except Exception:
             return
-        if info is None:
+        self._sniper_on_jump(cfg, info)
+
+    def on_feed_trigger(self, trigger: dict) -> None:
+        """feed_process wake-up: the child already ran the scan, so trust its verdict.
+
+        ``recv_wall_ms`` here is the child's local arrival stamp, i.e. the same
+        per-feed receive time the in-process path records in the tick ring, so
+        ``recv_to_decision_ms`` and ``sniper_order_latency`` keep their meaning.
+        """
+        cfg = settings(self.cfg())
+        if not self._sniper_wants_trigger(cfg):
+            return
+        from buy.feed_process import trigger_to_jump_info
+
+        self._sniper_on_jump(cfg, trigger_to_jump_info(trigger))
+
+    def _sniper_wants_trigger(self, cfg) -> bool:
+        if not cfg.get("sniper_5m_enabled", False) or not cfg.get("sniper_event_driven", True):
+            return False
+        row = self.current
+        if row is None or row.get("sniper_5m") or row.get("strike") is None:
+            return False
+        now = self.clock()
+        return bool(row["start"] <= now < row["end"] and row.get("skip_reason") != "startup")
+
+    def _sniper_on_jump(self, cfg, info) -> None:
+        now = self.clock()
+        row = self.current
+        if info is None or row is None:
             return
         threshold = float(cfg["sniper_jump_usd"]) - EPS
         if float(info["up_jump"]) < threshold and float(info["down_jump"]) < threshold:
             return
         if not self._tick_lock.acquire(timeout=0.05):
+            self._log_sniper_lock_miss(now)
             return
         prepared = None
+        effects = None
         try:
             if row.get("sniper_5m"):
                 return
@@ -1398,18 +1464,30 @@ class Runner:
                     age_ms = round(float(age_val) * 1000.0, 1) if isinstance(age_val, (int, float)) else None
                     sides[side] = {"bid": top.bid, "ask": top.ask, "bids": top.bids, "asks": top.asks,
                                    "src": src, "age_ms": age_ms}
-            prepared = self.strategy._sniper_check(
-                cfg, now, row, sides, self.grid, row["end"] - now, defer_buy=True
-            )
+            with self._defer_effects(cfg) as effects:
+                prepared = self.strategy._sniper_check(
+                    cfg, now, row, sides, self.grid, row["end"] - now, defer_buy=True
+                )
         except Exception as exc:
             self._on_error("fivemin_sniper_tick_error", exc)
         finally:
             self._tick_lock.release()
+            if effects is not None:
+                # A blocked-jump line is journal-only; it must not delay the POST.
+                effects.flush()
         if prepared is not None:
             try:
                 self.strategy._sniper_execute(prepared, lock=self._tick_lock)
             except Exception as exc:
                 self._on_error("fivemin_sniper_tick_error", exc)
+
+    def _log_sniper_lock_miss(self, now: float) -> None:
+        """A trigger arrived while another thread held the lock (throttled)."""
+        last = getattr(self, "_lock_miss_logged_at", None)
+        if last is not None and now - last < 30.0:
+            return
+        self._lock_miss_logged_at = now
+        self._on_error("fivemin_sniper_lock_miss", "tick_lock busy for 50ms")
 
     def _live_book(self, token):
         try:
@@ -1454,16 +1532,77 @@ class Runner:
 
     def start(self):
         self._io_stop.clear()
-        self.binance.start()
+        if not self._start_feed_process():
+            self.binance.start()
         self.rtds.start()
         self.books.start()
         self._io_thread = threading.Thread(target=self._io_run, name="mintbot-fivemin-io", daemon=True)
         self._io_thread.start()
 
+    # -- feed process (``feed_process``) ---------------------------------
+    def _start_feed_process(self) -> bool:
+        """Start the child feed detector; False means "use in-process feeds".
+
+        The flag defaults off, so the default path is exactly the old one: the
+        Binance feed runs here and ``on_binance_tick`` drives the sniper.
+        """
+        cfg = settings(self.cfg())
+        if not cfg.get("feed_process", False):
+            return False
+        from buy.feed_process import FeedProcessClient
+
+        client = FeedProcessClient(cfg, on_trigger=self.on_feed_trigger, log=self._feedproc_log,
+                                   on_fallback=self._feedproc_fallback)
+        if not client.start():
+            self._feedproc_log("feed_process_unavailable", fallback="in_process")
+            return False
+        self.feed_process = client
+        # Reads (twap60 / price_at / latest_exchange_ms / window scans) come from
+        # the child's ring and never touch the wire. ``self.local_grid`` keeps the
+        # in-process grid for the fallback below.
+        self.local_grid = self.grid
+        if client.grid is not None:
+            self.grid = client.grid
+        self._feedproc_log("feed_process_grid", mode="shared_ring")
+        return True
+
+    def _feedproc_log(self, event: str, **fields) -> None:
+        try:
+            self.strategy.io.log(event, **fields)
+        except Exception:
+            pass
+
+    def _feedproc_fallback(self, reason: str) -> None:
+        """The child died or went silent: take the feeds back in this process."""
+        try:
+            self.binance.start()
+        except Exception as exc:
+            self._feedproc_log("feed_process_fallback_start_fail", error=str(exc)[:200],
+                               reason=reason)
+            return
+        if self.feed_process is not None:
+            try:
+                self.feed_process.stop()
+            except Exception:
+                pass
+            self.feed_process = None
+        if self.local_grid is not None:
+            self.grid = self.local_grid
+        self._feedproc_log("feed_process_fallback_ready", reason=reason, mode="in_process")
+
+    def _stop_feed_process(self) -> None:
+        if self.feed_process is not None:
+            try:
+                self.feed_process.stop()
+            except Exception:
+                pass
+            self.feed_process = None
+
     def stop(self):
         self._io_stop.set()
         if self._io_thread is not None:
             self._io_thread.join(timeout=5)
+        self._stop_feed_process()
         self.binance.stop()
         self.rtds.stop()
         self.books.stop()
@@ -1535,80 +1674,137 @@ class Runner:
         self._tick_once()
 
     def _tick_once(self):
+        cfg = settings(self.cfg())
+        now = self.clock()
+        # Lock window 1: read/shared-state prep. Ends before the REST book poll,
+        # which is network I/O.
         with self._tick_lock:
-            now, cfg = self.clock(), settings(self.cfg())
-            samples = list(self.rtds.drain())
-            if samples:
-                self.rtds_last_sample = now
-            self.strategy.boundary_samples(samples)
-            with self._io_lock:
-                markets = self._markets
-                balance = self._balance
-                self._balance = None
-            if markets is not self._last_markets:
-                self._last_markets = markets
-                for market in markets:
-                    if market.active and not market.closed and not market.neg_risk and str(market.condition_id) not in self.strategy.state["markets"]:
-                        self.strategy.add_market(market, now=now)
-            if balance is not None:
-                self.strategy.sample_cash(*balance)
-            self._last_poll = {cid: stamp for cid, stamp in self._last_poll.items()
-                               if cid in self.strategy.state["markets"]}
-            rows = [self.strategy.state["markets"][cid] for cid in self.strategy._active]
-            current = [row for row in rows if row["start"] <= now < row["end"]]
-            upcoming = sorted((row for row in rows if row["start"] > now), key=lambda row: row["start"])
-            self.current = max(current, key=lambda row: row["start"]) if current else (upcoming[0] if upcoming else None)
-            chosen = ([self.current] if self.current else []) + [row for row in upcoming if row is not self.current][:1]
-            # Restored open positions remain managed outside their entry window.
-            for row in rows:
-                if self._has_position(row) and row not in chosen:
-                    chosen.append(row)
-            chosen = [row for row in chosen if self._market_active(row, now, cfg)]
-            tokens = [token for row in chosen for token in (row["up_token"], row["dn_token"])]
-            self.books.set_tokens(tokens)
-            if not dry_run(cfg) and self.strategy.io.warmup is not None:
-                token_set = frozenset(tokens)
-                if token_set != self._warmup_tokens:
-                    self._warmup_tokens = token_set
-                    self.strategy.io.warmup(tokens)
-            self.books.set_stale_s(cfg["fivemin_book_stale_s"])
-            self.books.set_min_size(0.0)
-            to_poll = []
-            poll = getattr(self.books, "poll", None)
-            if callable(poll):
-                for row in chosen:
-                    cid = row["condition_id"]
-                    if now - self._last_poll.get(cid, float("-inf")) + EPS >= float(cfg["fivemin_poll_s"]):
-                        self._last_poll[cid] = now
-                        to_poll.append((row["up_token"], row["dn_token"]))
-        for up_tok, dn_tok in to_poll:
-            poll(now, up_tok, dn_tok)
-        with self._tick_lock:
-            quotes = {}
-            for row in chosen:
-                sides = {}
-                for side, token in (("up", row["up_token"]), ("down", row["dn_token"])):
-                    top = self.books.usable(token)
-                    if top is not None:
-                        source = getattr(self.books, "source", None)
-                        src = source(token) if callable(source) else None
-                        sides[side] = {"bid": top.bid, "ask": top.ask, "bids": top.bids, "asks": top.asks,
-                                       "src": src if isinstance(src, str) else "rest",
-                                       "age_ms": None if getattr(top, "age", None) is None
-                                       else round(top.age * 1000.0, 1)}
-                    else:
-                        bid_status = getattr(self.books, "reason", None) or getattr(self.books, "bid_status", None)
-                        status = bid_status(token) if callable(bid_status) else "missing"
-                        sides[side] = {"bid": None, "miss": status}
-                quotes[row["condition_id"]] = sides
-            self.strategy.io.gamma_winner = self.request_gamma
-            self.strategy.tick(cfg, self.clock(), self.grid, quotes)
+            now, chosen, to_poll = self._tick_prepare(cfg, now)
+        poll = getattr(self.books, "poll", None)
+        if callable(poll):
+            for up_tok, dn_tok in to_poll:
+                poll(now, up_tok, dn_tok)
+        # Lock window 2: books -> quotes -> strategy.tick. The tick mutates the
+        # shared rows the feed thread's sniper path also touches, so it stays
+        # inside the lock. ``tick_lock_short`` moves only the pure parts out:
+        # logging/alerts (json encoding plus the journal write) and, when the
+        # books do not change during the tick, nothing else.
+        effects = None
+        try:
+            with self._tick_lock:
+                with self._defer_effects(cfg) as effects:
+                    quotes = self._tick_decide(cfg, now, chosen)
+        finally:
+            if effects is not None:
+                # Journal write and alert dispatch happen here, with the lock
+                # released. Also runs when the tick raised, so nothing logged
+                # before the failure is lost.
+                effects.flush()
         if self.tape is not None:
             try:
                 self.tape.sample(cfg, now, chosen, quotes, self.grid, self.strategy)
                 self.tape.prune(now)
             except Exception:
                 pass
+
+    @contextmanager
+    def _defer_effects(self, cfg):
+        """Buffer ``io.log``/``io.alert`` for one tick (``tick_lock_short`` only).
+
+        Both return ``None`` and no decision reads them, so a log line written
+        outside the lock is indistinguishable from one written inside it - except
+        that json encoding and the journal write no longer block the feed thread.
+        ``io.save`` is never buffered: a snapshot must capture the state as it was
+        when the mutation happened.
+        """
+        if not cfg.get("tick_lock_short", False):
+            yield None
+            return
+        io = self.strategy.io
+        effects = TickEffects(io)
+        original_log, original_alert = io.log, io.alert
+        try:
+            io.log, io.alert = effects.log, effects.alert
+            yield effects
+        finally:
+            io.log, io.alert = original_log, original_alert
+
+    def _tick_prepare(self, cfg, now):
+        """Everything the tick needs from shared state, plus the mutations it owns."""
+        # gc_freeze_hotpath safe point: after a 5m boundary, with no order in
+        # flight. A no-op when the flag is off.
+        if self.hotpath_gc is not None:
+            try:
+                self.hotpath_gc.maybe_collect(now, self._order_in_flight)
+            except Exception:
+                pass
+        samples = list(self.rtds.drain())
+        if samples:
+            self.rtds_last_sample = now
+        self.strategy.boundary_samples(samples)
+        with self._io_lock:
+            markets = self._markets
+            balance = self._balance
+            self._balance = None
+        if markets is not self._last_markets:
+            self._last_markets = markets
+            for market in markets:
+                if market.active and not market.closed and not market.neg_risk and str(market.condition_id) not in self.strategy.state["markets"]:
+                    self.strategy.add_market(market, now=now)
+        if balance is not None:
+            self.strategy.sample_cash(*balance)
+        self._last_poll = {cid: stamp for cid, stamp in self._last_poll.items()
+                           if cid in self.strategy.state["markets"]}
+        rows = [self.strategy.state["markets"][cid] for cid in self.strategy._active]
+        current = [row for row in rows if row["start"] <= now < row["end"]]
+        upcoming = sorted((row for row in rows if row["start"] > now), key=lambda row: row["start"])
+        self.current = max(current, key=lambda row: row["start"]) if current else (upcoming[0] if upcoming else None)
+        chosen = ([self.current] if self.current else []) + [row for row in upcoming if row is not self.current][:1]
+        # Restored open positions remain managed outside their entry window.
+        for row in rows:
+            if self._has_position(row) and row not in chosen:
+                chosen.append(row)
+        chosen = [row for row in chosen if self._market_active(row, now, cfg)]
+        tokens = [token for row in chosen for token in (row["up_token"], row["dn_token"])]
+        self.books.set_tokens(tokens)
+        if not dry_run(cfg) and self.strategy.io.warmup is not None:
+            token_set = frozenset(tokens)
+            if token_set != self._warmup_tokens:
+                self._warmup_tokens = token_set
+                self.strategy.io.warmup(tokens)
+        self.books.set_stale_s(cfg["fivemin_book_stale_s"])
+        self.books.set_min_size(0.0)
+        to_poll = []
+        if getattr(self.books, "poll", None) is not None:
+            for row in chosen:
+                cid = row["condition_id"]
+                if now - self._last_poll.get(cid, float("-inf")) + EPS >= float(cfg["fivemin_poll_s"]):
+                    self._last_poll[cid] = now
+                    to_poll.append((row["up_token"], row["dn_token"]))
+        return now, chosen, to_poll
+
+    def _tick_decide(self, cfg, now, chosen):
+        """Books -> quotes -> one strategy tick. Caller holds ``_tick_lock``."""
+        quotes = {}
+        for row in chosen:
+            sides = {}
+            for side, token in (("up", row["up_token"]), ("down", row["dn_token"])):
+                top = self.books.usable(token)
+                if top is not None:
+                    source = getattr(self.books, "source", None)
+                    src = source(token) if callable(source) else None
+                    sides[side] = {"bid": top.bid, "ask": top.ask, "bids": top.bids, "asks": top.asks,
+                                   "src": src if isinstance(src, str) else "rest",
+                                   "age_ms": None if getattr(top, "age", None) is None
+                                   else round(top.age * 1000.0, 1)}
+                else:
+                    bid_status = getattr(self.books, "reason", None) or getattr(self.books, "bid_status", None)
+                    status = bid_status(token) if callable(bid_status) else "missing"
+                    sides[side] = {"bid": None, "miss": status}
+            quotes[row["condition_id"]] = sides
+        self.strategy.io.gamma_winner = self.request_gamma
+        self.strategy.tick(cfg, self.clock(), self.grid, quotes)
+        return quotes
 
     @staticmethod
     def _has_position(row):
