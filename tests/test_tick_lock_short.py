@@ -148,7 +148,8 @@ def _normalise(snapshot):
         "resp_complete_ts", "trigger_exchange_ts", "trigger_recv_ts", "server_body_ts",
         "recv_to_decision_ms", "trigger_exchange_to_decision_ms", "decision_to_send_ms",
         "send_to_complete_ms", "trigger_exchange_to_complete_ms", "recv_to_complete_ms",
-        "feed_recv", "transport_ms",
+        "feed_recv", "transport_ms", "fire_event_recv_ts", "first_seen_ts",
+        "first_seen_to_decision_ms", "fire_event_to_decision_ms", "ttfb_ms", "body_ms",
     }
     logs = []
     for event, fields in snapshot["logs"]:

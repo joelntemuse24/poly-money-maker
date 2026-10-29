@@ -75,6 +75,8 @@ DEFAULTS = {
 }
 EPS = 1e-9
 STRIKE_GRACE_S = 5.0
+# (slug, side) diagnostic notes kept in memory by ``Strategy._sniper_note``.
+SNIPER_NOTE_ENTRIES = 64
 # Empty-loser signal valid only if favoured side shows asks at <= cap, where the cap is the
 # configured fivemin_buy_limit; #286 fired 5x live into empty asks, FAK rejected.
 FIVEMIN_LOSER_EMPTY_MIN_ASK_SHARES = 1.0
@@ -193,11 +195,21 @@ def order_latency_fields(prepared: dict, result: Optional[dict] = None, *,
     trigger_recv_ts = _ts(prepared.get("trigger_recv_ts"))
     filled = float(result.get("shares") or 0.0)
     book_fields = decision_book_fields(quotes.get(fav, {}), prepared["limit"])
+    first_seen_ts = _ts(prepared.get("first_seen_ts"))
+    fire_event_recv_ts = _ts(prepared.get("fire_event_recv_ts"))
     return {
         "slug": row.get("slug"), "side": fav,
         "feed": prepared.get("trigger_source"),
         "trigger_exchange_ts": trigger_exchange_ts,
         "trigger_recv_ts": trigger_recv_ts,
+        "fire_path": prepared.get("fire_path"),
+        "fire_event_source": prepared.get("fire_event_source"),
+        "fire_event_recv_ts": fire_event_recv_ts,
+        "first_seen_ts": first_seen_ts,
+        "first_reject_gate": prepared.get("first_reject_gate"),
+        "first_reject_detail": prepared.get("first_reject_detail"),
+        "first_seen_to_decision_ms": _delta(decision_ts, first_seen_ts),
+        "fire_event_to_decision_ms": _delta(decision_ts, fire_event_recv_ts),
         "decision_ts": decision_ts,
         "sign_done_ts": _ts(meta.get("sign_done_ts")),
         "presign_hit": meta.get("presign_hit"),
@@ -223,6 +235,15 @@ def order_latency_fields(prepared: dict, result: Optional[dict] = None, *,
         "dry_run": prepared.get("is_dry"),
         "feed_recv": feed_recv,
         "first_feed": first_feed,
+        "ttfb_ms": _delta(_ts(meta.get("resp_first_byte_ts")), send_ts),
+        "body_ms": _delta(complete_ts, _ts(meta.get("resp_first_byte_ts"))),
+        "conn_reused": meta.get("conn_reused"),
+        "http_version": meta.get("http_version"),
+        "server_timing": meta.get("server_timing"),
+        "x_response_time": meta.get("x_response_time"),
+        "cf_ray": meta.get("cf_ray"),
+        "x_request_id": meta.get("x_request_id"),
+        "cf_cache_status": meta.get("cf_cache_status"),
     }
 
 
@@ -321,6 +342,9 @@ class Strategy:
         self._refetch_threads: list[threading.Thread] = []
         self._buy_post_meta_ok: Optional[tuple[Callable, bool]] = None
         self._order_in_flight = 0
+        # Diagnostics only: per (slug, side) first sighting of a qualifying jump
+        # and the gates already journaled (at most once per gate per slug/side).
+        self._sniper_notes: dict[tuple, dict] = {}
 
     def _save_time(self):
         if self.io.clock is not None:
@@ -415,12 +439,67 @@ class Strategy:
             if not pending_position(row):
                 if not row.get("entered"):
                     self._eval(row, "skip", self.runs.get(cid, {}).get("last_reason", "never_in_window"), now - row.get("end", now), {})
+                slug = row.get("slug")
                 self.state["markets"].pop(cid, None)
                 self._active.discard(cid)
                 self.runs.pop(cid, None)
+                for key in [key for key in self._sniper_notes if key[0] == slug]:
+                    self._sniper_notes.pop(key, None)
                 removed = True
         if removed:
             self.save()
+
+    def _sniper_note(self, row, side=None) -> dict:
+        """Diagnostic note for ``(slug, side)``; bounded to the newest few slugs.
+
+        Holds the first tick that saw a qualifying jump for the slug/side, the
+        first gate that then blocked it, and the gates already journaled. Never
+        read by a trading decision.
+        """
+        slug = row.get("slug")
+        key = (slug, side)
+        notes = self._sniper_notes
+        note = notes.get(key)
+        if note is not None:
+            return note
+        note = notes[key] = {"slug": slug, "side": side, "first_seen_ts": None,
+                             "first_reject_gate": None, "first_reject_detail": None,
+                             "logged_gates": set()}
+        while len(notes) > SNIPER_NOTE_ENTRIES:
+            notes.pop(next(iter(notes)), None)
+        return note
+
+    def _sniper_gate_reject(self, cfg, row, side, gate, *, now, detail=None,
+                            jump_usd=None, gap_usd=None, info=None, pending=None) -> None:
+        """Journal one ``sniper_gate_reject`` per gate per slug/side.
+
+        With ``pending`` the payload is queued for the caller to write after its
+        fire decision, so no journal write can land before an order POST. The
+        rate limit lives in the note and is claimed before either path writes,
+        so a replayed tick cannot log twice.
+        """
+        note = self._sniper_note(row, side)
+        if note["first_reject_gate"] is None:
+            note["first_reject_gate"] = gate
+            note["first_reject_detail"] = detail
+        logged = note["logged_gates"]
+        if gate in logged:
+            return
+        logged.add(gate)
+        fields = {"slug": row.get("slug"), "side": side, "gate": gate,
+                  "detail": detail,
+                  "ttm": None if now is None else round(float(row["end"]) - now, 3),
+                  "jump_usd": None if jump_usd is None else round(float(jump_usd), 2),
+                  "gap_usd": None if gap_usd is None else round(float(gap_usd), 2),
+                  "source": None if info is None else str(info.get("source") or "primary"),
+                  "first_seen_ts": note["first_seen_ts"]}
+        if pending is not None:
+            pending.append(fields)
+            return
+        try:
+            self.io.log("sniper_gate_reject", **fields)
+        except Exception:
+            pass
 
     def _proxy(self, grid, now, row, cfg):
         source = cfg.get("fivemin_gap_source", "twap")
@@ -533,7 +612,8 @@ class Strategy:
                     and row.get("strike") is not None
                     and row.get("skip_reason") != "startup"
                     and not getattr(grid, "trigger_only", False)):
-                self._sniper_check(cfg, now, row, books.get(cid, {}), grid, row["end"] - now)
+                self._sniper_check(cfg, now, row, books.get(cid, {}), grid, row["end"] - now,
+                                   fire_path="poll")
             if row["entered"] or not row["start"] <= now < row["end"]:
                 if (row["entered"] and row["start"] <= now < row["end"]
                         and row.get("strike") is not None
@@ -813,7 +893,34 @@ class Strategy:
         if filled > 0:
             self._low_fill_exit(cfg, now, row, row["side98"]["position"], quotes, "side98")
 
-    def _sniper_check(self, cfg, now, row, quotes, grid, ttm, *, defer_buy: bool = False):
+    def _flush_gate_rejects(self, queue) -> None:
+        """Write queued ``sniper_gate_reject`` payloads; one failure never escapes."""
+        while queue:
+            fields = queue.pop(0)
+            try:
+                self.io.log("sniper_gate_reject", **fields)
+            except Exception:
+                pass
+
+    def _sniper_check(self, cfg, now, row, quotes, grid, ttm, *, defer_buy: bool = False,
+                      fire_path: str = "poll", gate_rejects: Optional[list] = None):
+        """One sniper evaluation.
+
+        ``gate_rejects`` (optional) collects the reject lines for the caller to
+        write after its order POST. Without it the lines are written here, which
+        is still after the POST for the in-tick path because ``_sniper_scan``
+        executes the order before returning.
+        """
+        queue = gate_rejects if gate_rejects is not None else []
+        try:
+            return self._sniper_scan(cfg, now, row, quotes, grid, ttm, defer_buy=defer_buy,
+                                     fire_path=fire_path, queue=queue)
+        finally:
+            if gate_rejects is None:
+                self._flush_gate_rejects(queue)
+
+    def _sniper_scan(self, cfg, now, row, quotes, grid, ttm, *, defer_buy: bool,
+                     fire_path: str, queue: list):
         if not cfg.get("sniper_5m_enabled", False):
             return None if defer_buy else False
         if row.get("sniper_5m"):
@@ -823,6 +930,11 @@ class Strategy:
         if row.get("skip_reason") == "startup":
             return None if defer_buy else False
         if not (float(cfg["sniper_ttm_min_s"]) - EPS <= ttm <= float(cfg["sniper_ttm_max_s"]) + EPS):
+            # Pre-side gate: the note key has no side, so it is one line per slug.
+            self._sniper_gate_reject(cfg, row, None, "ttm", now=now, pending=queue,
+                                     detail={"ttm": round(ttm, 3),
+                                             "min": cfg["sniper_ttm_min_s"],
+                                             "max": cfg["sniper_ttm_max_s"]})
             return None if defer_buy else False
         best_fn = getattr(grid, "best_jump_in_window", None) if cfg.get("sniper_extra_ws_enabled", True) else None
         jump_fn = getattr(grid, "jump_in_window", None)
@@ -839,11 +951,16 @@ class Strategy:
         trigger_source = str(info.get("source") or "primary")
         if cfg.get("sniper_use_offset", True):
             if row.get("offset") is None:
+                self._sniper_gate_reject(cfg, row, None, "offset", now=now, info=info,
+                                         pending=queue, detail={"offset": None})
                 return None if defer_buy else False
             latest_fn = getattr(grid, "latest_exchange_ms", None)
             if callable(latest_fn):
                 latest_ms = latest_fn()
                 if latest_ms is None or not (0 <= now * 1000.0 - latest_ms <= float(cfg["fivemin_btc_max_age_s"]) * 1000.0):
+                    self._sniper_gate_reject(cfg, row, None, "offset", now=now, info=info,
+                                             pending=queue, detail={"stale_ms": None if latest_ms is None
+                                                     else round(now * 1000.0 - latest_ms, 1)})
                     return None if defer_buy else False
             offset = float(row["offset"])
         else:
@@ -853,26 +970,51 @@ class Strategy:
         for side, jump_key, sign in (("up", "up_jump", 1.0), ("down", "down_jump", -1.0)):
             jump_usd = float(info[jump_key])
             gap_usd = sign * (spot_ref - strike)
-            if jump_usd + EPS < float(cfg["sniper_jump_usd"]) or gap_usd + EPS < float(cfg["sniper_min_gap_usd"]):
+            if jump_usd + EPS < float(cfg["sniper_jump_usd"]):
+                continue
+            note = self._sniper_note(row, side)
+            if note["first_seen_ts"] is None:
+                seen = _epoch_s(info.get("recv_wall_ms"))
+                note["first_seen_ts"] = now if seen is None else seen
+                note["first_seen_source"] = trigger_source
+            if gap_usd + EPS < float(cfg["sniper_min_gap_usd"]):
+                self._sniper_gate_reject(cfg, row, side, "min_gap", now=now, info=info, pending=queue,
+                                         jump_usd=jump_usd, gap_usd=gap_usd,
+                                         detail={"gap_usd": round(gap_usd, 2),
+                                                 "min_gap_usd": cfg["sniper_min_gap_usd"]})
                 continue
             side_quote = quotes.get(side, {})
             age_ms = side_quote.get("age_ms")
             max_age_ms = float(cfg.get("sniper_max_book_age_ms", 1500.0))
             if age_ms is not None and max_age_ms > 0 and float(age_ms) > max_age_ms + EPS:
+                self._sniper_gate_reject(cfg, row, side, "book_age", now=now, info=info, pending=queue,
+                                         jump_usd=jump_usd, gap_usd=gap_usd,
+                                         detail={"age_ms": round(float(age_ms), 1), "max_age_ms": max_age_ms})
                 continue
             levels = ask_levels(side_quote)
             best_ask = levels[0][0] if levels else side_quote.get("ask")
             if best_ask is None:
+                self._sniper_gate_reject(cfg, row, side, "ask_range", now=now, info=info, pending=queue,
+                                         jump_usd=jump_usd, gap_usd=gap_usd, detail={"ask": None})
                 continue
             best_ask = float(best_ask)
             if not (float(cfg["sniper_min_ask"]) - EPS <= best_ask <= float(cfg["sniper_max_ask"]) + EPS):
+                self._sniper_gate_reject(cfg, row, side, "ask_range", now=now, info=info, pending=queue,
+                                         jump_usd=jump_usd, gap_usd=gap_usd,
+                                         detail={"ask": best_ask, "min": cfg["sniper_min_ask"],
+                                                 "max": cfg["sniper_max_ask"]})
                 continue
             if self._min_fill_blocked(cfg, row, quotes, side, "sniper_5m"):
+                self._sniper_gate_reject(cfg, row, side, "min_fill", now=now, info=info, pending=queue,
+                                         jump_usd=jump_usd, gap_usd=gap_usd,
+                                         detail={"ask": best_ask, "floor": cfg["sniper_min_ask"]})
                 continue
             prepared = self._sniper_prepare(
                 cfg, now, row, quotes, side, jump_usd, gap_usd, spot_now, trigger_source=trigger_source,
                 trigger_exchange_ts=_epoch_s(info.get("ts_ms")),
                 trigger_recv_ts=_epoch_s(info.get("recv_wall_ms")), grid=grid,
+                fire_path=fire_path, fire_event_source=trigger_source,
+                fire_event_recv_ts=_epoch_s(info.get("recv_wall_ms")),
             )
             if defer_buy:
                 return prepared
@@ -885,7 +1027,10 @@ class Strategy:
                         trigger_source: str = "primary",
                         trigger_exchange_ts: Optional[float] = None,
                         trigger_recv_ts: Optional[float] = None,
-                        grid=None):
+                        grid=None,
+                        fire_path: str = "poll",
+                        fire_event_source: Optional[str] = None,
+                        fire_event_recv_ts: Optional[float] = None):
         decision_time = self.io.clock() if self.io.clock is not None else time.perf_counter()
         decision_ts = time.time()
         sent_now = decision_time if self.io.clock is not None else now
@@ -911,11 +1056,15 @@ class Strategy:
             if free is None or free + EPS < shares * limit:
                 reason = "cash"
         if reason:
+            self._sniper_gate_reject(cfg, row, fav, reason, now=now,
+                                     jump_usd=jump_usd, gap_usd=gap_usd,
+                                     detail={"reason": reason})
             self.save(force=True)
             self.io.log("fivemin_sniper_blocked", slug=row["slug"], reason=reason)
             return None
         token = row["up_token"] if fav == "up" else row["dn_token"]
         is_dry = dry_run(cfg)
+        note = self._sniper_note(row, fav)
         return {
             "cfg": cfg, "now": now, "row": row, "quotes": quotes, "fav": fav,
             "jump_usd": jump_usd, "gap_usd": gap_usd, "spot_now": spot_now,
@@ -924,6 +1073,12 @@ class Strategy:
             "trigger_exchange_ts": trigger_exchange_ts, "trigger_recv_ts": trigger_recv_ts,
             "post_meta": {"decision_ts": decision_ts},
             "grid": grid,
+            "fire_path": fire_path,
+            "fire_event_source": fire_event_source or trigger_source,
+            "fire_event_recv_ts": fire_event_recv_ts,
+            "first_seen_ts": note["first_seen_ts"],
+            "first_reject_gate": note["first_reject_gate"],
+            "first_reject_detail": note["first_reject_detail"],
         }
 
     def _sniper_execute(self, prepared: dict, *, lock: Optional[threading.RLock] = None):
@@ -1447,6 +1602,7 @@ class Runner:
             return
         prepared = None
         effects = None
+        rejects: list[dict] = []
         try:
             if row.get("sniper_5m"):
                 return
@@ -1466,7 +1622,8 @@ class Runner:
                                    "src": src, "age_ms": age_ms}
             with self._defer_effects(cfg) as effects:
                 prepared = self.strategy._sniper_check(
-                    cfg, now, row, sides, self.grid, row["end"] - now, defer_buy=True
+                    cfg, now, row, sides, self.grid, row["end"] - now, defer_buy=True,
+                    fire_path="tick", gate_rejects=rejects,
                 )
         except Exception as exc:
             self._on_error("fivemin_sniper_tick_error", exc)
@@ -1480,6 +1637,8 @@ class Runner:
                 self.strategy._sniper_execute(prepared, lock=self._tick_lock)
             except Exception as exc:
                 self._on_error("fivemin_sniper_tick_error", exc)
+        # Gate-reject journal lines are written only after any order POST.
+        self.strategy._flush_gate_rejects(rejects)
 
     def _log_sniper_lock_miss(self, now: float) -> None:
         """A trigger arrived while another thread held the lock (throttled)."""
