@@ -9277,6 +9277,7 @@ def main() -> int:
                     _gc.collect()
                     _gc.freeze()  # startup objects leave GC tracking: shorter gen2 pauses on tick threads
                 grid = PriceGrid(use_rust=bool(settings(current_cfg()).get("rust_hotpath", False)) or None)
+                log_event("fivemin_price_grid", rust_enabled=bool(getattr(grid, "rust_enabled", False)))
                 ws_error_at = None
 
                 def fivemin_ws_error(error, delay):
