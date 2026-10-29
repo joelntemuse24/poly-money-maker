@@ -117,6 +117,8 @@ from __future__ import annotations
 import atexit
 import fcntl
 import json
+import logging
+import logging.handlers
 import math
 import os
 import signal
@@ -670,17 +672,68 @@ def log_setup() -> None:
     fh.setFormatter(fmt)
     sh = logging.StreamHandler(sys.stdout)
     sh.setFormatter(fmt)
-    records = queue.Queue()
-    logger.addHandler(QueueHandler(records))
+    # Hot threads only enqueue; the listener thread formats/serializes and writes.
+    fh.setFormatter(_DeferredJsonFormatter("%(message)s"))
+    sh.setFormatter(_DeferredJsonFormatter("%(message)s"))
+    records = queue.SimpleQueue()
+    logger.addHandler(_DeferredQueueHandler(records))
     logger.propagate = False
     _LOG_LISTENER = QueueListener(records, fh, sh)
     _LOG_LISTENER.start()
+    atexit.register(_stop_log_listener)
+
+
+def _stop_log_listener() -> None:
+    """Drain and stop the log listener once; safe to call repeatedly."""
+    global _LOG_LISTENER
+    listener, _LOG_LISTENER = _LOG_LISTENER, None
+    if listener is not None:
+        try:
+            listener.stop()
+        except Exception:
+            pass
+
+_LOG_SCALARS = frozenset((str, int, float, bool, type(None)))
+_MINTBOT_LOGGER = logging.getLogger("mintbot")
+
+
+class _DeferredPayload(dict):
+    """Marker: log payload whose JSON encoding is done on the listener thread."""
+    __slots__ = ()
+
+
+class _DeferredQueueHandler(logging.handlers.QueueHandler):
+    """QueueHandler that skips caller-side formatting for deferred payloads."""
+
+    def prepare(self, record):
+        if type(record.msg) is _DeferredPayload:
+            return record
+        return super().prepare(record)
+
+
+class _DeferredJsonFormatter(logging.Formatter):
+    def format(self, record):
+        msg = record.msg
+        if type(msg) is _DeferredPayload:
+            return json.dumps(msg, default=str)
+        return super().format(record)
+
 
 def log_event(event: str, **kwargs: Any) -> None:
-    import logging
-
     payload = {"ts": time.time(), "event": event, **kwargs}
-    logging.getLogger("mintbot").info(json.dumps(payload, default=str))
+    logger = _MINTBOT_LOGGER
+    if not logger.isEnabledFor(logging.INFO):
+        return
+    msg: Any = _DeferredPayload(payload)
+    scalars = _LOG_SCALARS
+    for value in kwargs.values():
+        if type(value) not in scalars:
+            # Mutable/arbitrary values may change after return: encode now
+            # so the line is byte-identical to what it was at call time.
+            msg = json.dumps(payload, default=str)
+            break
+    # Skip Logger.info's findCaller() stack walk; format is "%(message)s".
+    logger.handle(logger.makeRecord(logger.name, logging.INFO, "(unknown file)", 0, msg, None, None))
 
 def notify(title: str, message: str, priority: str = "default") -> None:
     topic = os.getenv("NTFY_TOPIC") or os.getenv("NTFY_TOPIC_BUY") or "polybot-joel-btc"
@@ -9345,8 +9398,7 @@ def main() -> int:
     _HEARTBEAT_WRITER.stop(timeout=10)
     globals().get("_console_print", console.print)("[dim]mintbot stopped[/]")
     _OUTPUT_POOL.shutdown(wait=True)
-    if _LOG_LISTENER is not None:
-        _LOG_LISTENER.stop()
+    _stop_log_listener()
     try:
         lock.close()
     except Exception:

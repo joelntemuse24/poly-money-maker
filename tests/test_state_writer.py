@@ -463,7 +463,15 @@ class WriterTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as tmp:
             log_file = Path(tmp) / "mintbot.log"
-            ns = functions("log_setup", LOG_FILE=log_file, sys=SimpleNamespace(stdout=stream))
+            import mintbot as _mb
+
+            ns = functions(
+                "log_setup", LOG_FILE=log_file, sys=SimpleNamespace(stdout=stream),
+                atexit=SimpleNamespace(register=lambda *a, **k: None),
+                _DeferredJsonFormatter=_mb._DeferredJsonFormatter,
+                _DeferredQueueHandler=_mb._DeferredQueueHandler,
+                _stop_log_listener=lambda: None,
+            )
             try:
                 logger.disabled = False
                 ns["log_setup"]()

@@ -289,7 +289,16 @@ class MintLogArchiveTests(unittest.TestCase):
         self.assertNotIn("backupCount", segment)
         self.assertIn("ArchiveRotatingFileHandler", segment)
 
-        ns: dict = {"LOG_FILE": self.log_path, "sys": __import__("sys")}
+        import mintbot as _mb
+
+        ns: dict = {
+            "LOG_FILE": self.log_path,
+            "sys": __import__("sys"),
+            "atexit": __import__("atexit"),
+            "_DeferredJsonFormatter": _mb._DeferredJsonFormatter,
+            "_DeferredQueueHandler": _mb._DeferredQueueHandler,
+            "_stop_log_listener": lambda: None,
+        }
         exec(compile(ast.Module(body=[fn], type_ignores=[]), str(MINT), "exec"), ns)
         logger = logging.getLogger("mintbot")
         previous = list(logger.handlers)
