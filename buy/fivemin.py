@@ -56,6 +56,8 @@ DEFAULTS = {
     "gc_hotpath_gen0_threshold": 0, "gc_hotpath_gen2_threshold": 0,
     "gc_hotpath_boundary_collect": False, "gc_hotpath_boundary_offset_s": 2.0,
     "thread_switch_interval_s": 0.0, "tick_lock_short": False,
+    "feed_process": False, "feed_process_trigger_ttl_ms": 250,
+    "feed_process_status_s": 5.0,
     "fivemin_side98_enabled": False, "fivemin_side98_shares": 20, "fivemin_side98_price": 0.98,
     "fivemin_side98_min_gap_usd": 15.0, "fivemin_side98_max_ttc_s": 60,
     "fivemin_side98_max_adverse_30s_usd": 5.0,
@@ -523,10 +525,14 @@ class Strategy:
                 continue
             if position and not position.get("settled") and now < row["end"]:
                 self._manage(cfg, now, row, books.get(cid, {}))
+            # With feed_process the trigger path is authoritative: the shared grid
+            # only knows the child's last trigger, so a poll here would fire off a
+            # stale verdict instead of a fresh scan.
             if (cfg.get("sniper_5m_enabled", False) and not row.get("sniper_5m")
                     and row["start"] <= now < row["end"]
                     and row.get("strike") is not None
-                    and row.get("skip_reason") != "startup"):
+                    and row.get("skip_reason") != "startup"
+                    and not getattr(grid, "trigger_only", False)):
                 self._sniper_check(cfg, now, row, books.get(cid, {}), grid, row["end"] - now)
             if row["entered"] or not row["start"] <= now < row["end"]:
                 if (row["entered"] and row["start"] <= now < row["end"]
@@ -1356,6 +1362,8 @@ class Runner:
         self._tick_lock = threading.RLock()
         self.hotpath_gc = None
         self._order_in_flight = 0
+        self.feed_process = None
+        self.local_grid = None
         self._markets = []
         self._balance = None
         self._gamma_pending = set()
@@ -1402,6 +1410,20 @@ class Runner:
         except Exception:
             return
         self._sniper_on_jump(cfg, info)
+
+    def on_feed_trigger(self, trigger: dict) -> None:
+        """feed_process wake-up: the child already ran the scan, so trust its verdict.
+
+        ``recv_wall_ms`` here is the child's local arrival stamp, i.e. the same
+        per-feed receive time the in-process path records in the tick ring, so
+        ``recv_to_decision_ms`` and ``sniper_order_latency`` keep their meaning.
+        """
+        cfg = settings(self.cfg())
+        if not self._sniper_wants_trigger(cfg):
+            return
+        from buy.feed_process import trigger_to_jump_info
+
+        self._sniper_on_jump(cfg, trigger_to_jump_info(trigger))
 
     def _sniper_wants_trigger(self, cfg) -> bool:
         if not cfg.get("sniper_5m_enabled", False) or not cfg.get("sniper_event_driven", True):
@@ -1510,16 +1532,79 @@ class Runner:
 
     def start(self):
         self._io_stop.clear()
-        self.binance.start()
+        if not self._start_feed_process():
+            self.binance.start()
         self.rtds.start()
         self.books.start()
         self._io_thread = threading.Thread(target=self._io_run, name="mintbot-fivemin-io", daemon=True)
         self._io_thread.start()
 
+    # -- feed process (``feed_process``) ---------------------------------
+    def _start_feed_process(self) -> bool:
+        """Start the child feed detector; False means "use in-process feeds".
+
+        The flag defaults off, so the default path is exactly the old one: the
+        Binance feed runs here and ``on_binance_tick`` drives the sniper.
+        """
+        cfg = settings(self.cfg())
+        if not cfg.get("feed_process", False):
+            return False
+        from buy.feed_process import FeedProcessClient
+
+        client = FeedProcessClient(cfg, on_trigger=self.on_feed_trigger, log=self._feedproc_log,
+                                   on_fallback=self._feedproc_fallback)
+        if not client.start():
+            self._feedproc_log("feed_process_unavailable", fallback="in_process")
+            return False
+        self.feed_process = client
+        # Reads (twap60 / price_at / latest_exchange_ms / window scans) come from
+        # the child's ring and never touch the wire. ``self.local_grid`` keeps the
+        # in-process grid for the fallback below.
+        self.local_grid = self.grid
+        if client.grid is not None:
+            self.grid = client.grid
+            self.strategy._grid_source = client.grid
+        self._feedproc_log("feed_process_grid", mode="shared_ring")
+        return True
+
+    def _feedproc_log(self, event: str, **fields) -> None:
+        try:
+            self.strategy.io.log(event, **fields)
+        except Exception:
+            pass
+
+    def _feedproc_fallback(self, reason: str) -> None:
+        """The child died or went silent: take the feeds back in this process."""
+        try:
+            self.binance.start()
+        except Exception as exc:
+            self._feedproc_log("feed_process_fallback_start_fail", error=str(exc)[:200],
+                               reason=reason)
+            return
+        if self.feed_process is not None:
+            try:
+                self.feed_process.stop()
+            except Exception:
+                pass
+            self.feed_process = None
+        if self.local_grid is not None:
+            self.grid = self.local_grid
+            self.strategy._grid_source = self.local_grid
+        self._feedproc_log("feed_process_fallback_ready", reason=reason, mode="in_process")
+
+    def _stop_feed_process(self) -> None:
+        if self.feed_process is not None:
+            try:
+                self.feed_process.stop()
+            except Exception:
+                pass
+            self.feed_process = None
+
     def stop(self):
         self._io_stop.set()
         if self._io_thread is not None:
             self._io_thread.join(timeout=5)
+        self._stop_feed_process()
         self.binance.stop()
         self.rtds.stop()
         self.books.stop()

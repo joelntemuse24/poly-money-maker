@@ -190,5 +190,6 @@
   "gc_hotpath_boundary_collect": false,
   "gc_hotpath_boundary_offset_s": 2.0,
   "thread_switch_interval_s": 0.0,
-  "tick_lock_short": false
+  "tick_lock_short": false,
+  "feed_process": false
 }
