@@ -337,6 +337,7 @@ DEFAULTS = {
     'sniper_extra_ws_enabled': True,
     'sniper_extra_ws_urls': [
         'wss://stream.binance.com:9443/ws/btcusdt@bookTicker',
+        'wss://fstream.binance.com/ws/btcusdt@bookTicker',
         'wss://stream.bybit.com/v5/public/linear',
         'wss://ws-feed.exchange.coinbase.com',
         'wss://www.deribit.com/ws/api/v2',
