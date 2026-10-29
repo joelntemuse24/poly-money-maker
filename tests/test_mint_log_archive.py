@@ -289,7 +289,11 @@ class MintLogArchiveTests(unittest.TestCase):
         self.assertNotIn("backupCount", segment)
         self.assertIn("ArchiveRotatingFileHandler", segment)
 
+        import os as _os
+        _saved_env = dict(_os.environ)
         import mintbot as _mb
+        _os.environ.clear()
+        _os.environ.update(_saved_env)
 
         ns: dict = {
             "LOG_FILE": self.log_path,
