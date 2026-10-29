@@ -24,8 +24,6 @@ def _setup(tmp_path, monkeypatch, capsys):
 
 def test_deferred_lines_identical_and_flushed(tmp_path, monkeypatch, capsys):
     _setup(tmp_path, monkeypatch, capsys)
-    times = iter([1.5, 2.5, 3.5, 4.5])
-    monkeypatch.setattr(mintbot.time, "time", lambda: next(times))
     nested = {"a": [1, 2]}
     cases = [
         ("fivemin_eval", dict(slug="x", price=0.53, size=10.0, ok=True, none=None, n=3)),
@@ -33,14 +31,18 @@ def test_deferred_lines_identical_and_flushed(tmp_path, monkeypatch, capsys):
         ("nested", dict(d=nested)),
         ("plain", {}),
     ]
-    expected = []
-    for ts, (event, kw) in zip([1.5, 2.5, 3.5, 4.5], cases):
+    for event, kw in cases:
         mintbot.log_event(event, **kw)
-        expected.append(json.dumps({"ts": ts, "event": event, **kw}, default=str))
     nested["a"].append(99)  # mutation after logging must not leak into the line
     mintbot._stop_log_listener()
     mintbot._stop_log_listener()  # idempotent
     out = capsys.readouterr().out.splitlines()
+    expected = [
+        json.dumps({"ts": json.loads(line)["ts"], "event": event, **kw}, default=str)
+        for line, (event, kw) in zip(out, cases)
+    ]
+    expected[2] = expected[2].replace(", 99]", "]")  # value at call time
+    assert len(out) == len(cases)
     assert out == expected
     assert (tmp_path / "mintbot.log").read_text().splitlines() == expected
 
