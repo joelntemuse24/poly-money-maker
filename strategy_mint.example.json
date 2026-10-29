@@ -184,5 +184,11 @@
   "sniper_futures_ws_enabled": false,
   "sniper_futures_ws_url": "wss://fstream.binance.com/stream?streams=btcusdt@aggTrade/btcusdt@bookTicker",
   "rust_hotpath": false,
-  "gc_freeze_hotpath": false
+  "gc_freeze_hotpath": false,
+  "gc_hotpath_gen0_threshold": 0,
+  "gc_hotpath_gen2_threshold": 0,
+  "gc_hotpath_boundary_collect": false,
+  "gc_hotpath_boundary_offset_s": 2.0,
+  "thread_switch_interval_s": 0.0,
+  "tick_lock_short": false
 }
