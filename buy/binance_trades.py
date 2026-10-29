@@ -19,6 +19,12 @@ except Exception:  # pragma: no cover - optional dependency
     _HAS_ORJSON = False
 
 URL = "wss://stream.binance.com:9443/ws/btcusdt@aggTrade"
+BINANCE_FALLBACK_URLS = (
+    URL,
+    "wss://stream.binance.com:443/ws/btcusdt@aggTrade",
+    "wss://data-stream.binance.vision:9443/ws/btcusdt@aggTrade",
+    "wss://data-stream.binance.vision:443/ws/btcusdt@aggTrade",
+)
 DEFAULT_EXTRA_WS_URLS = (
     "wss://stream.binance.com:9443/ws/btcusdt@bookTicker",
     "wss://stream.bybit.com/v5/public/linear",
@@ -393,9 +399,12 @@ def subscription_for_url(url: str) -> Optional[str]:
 class BinanceTrades:
     def __init__(self, grid: Optional[PriceGrid] = None, *, url: str = URL,
                  connect=None, sleep=None, on_error=None, on_tick=None,
-                 extra_urls: Optional[list[str]] = None):
+                 extra_urls: Optional[list[str]] = None, on_event=None):
         self.grid = grid or PriceGrid()
-        self.url = url
+        self.url = str(url or URL)
+        self._on_event = on_event
+        self._feed_state: dict[str, dict[str, Any]] = {}
+        self._last_health_log = 0.0
         self._connect = connect
         self._sleep = sleep or time.sleep
         self._on_error = on_error
@@ -449,13 +458,47 @@ class BinanceTrades:
                 if self._ws is ws:
                     self._ws = self._wss[-1] if self._wss else None
 
+    def _event(self, event: str, **fields: Any) -> None:
+        if self._on_event is not None:
+            try:
+                self._on_event(event, **fields)
+            except Exception:
+                pass
+
+    def health(self) -> dict[str, dict[str, Any]]:
+        now = time.monotonic()
+        with self._ws_lock:
+            return {feed: {"connected": state["connected"],
+                           "last_message_age_s": None if state["last_message"] is None else
+                           round(max(0.0, now - state["last_message"]), 2)}
+                    for feed, state in self._feed_state.items()}
+
+    def log_health(self) -> None:
+        now = time.monotonic()
+        if now - self._last_health_log >= 60:
+            self._last_health_log = now
+            self._event("fivemin_binance_health", feeds=self.health())
+
+    def _feed_update(self, feed: str, connected: bool, message: bool = False) -> None:
+        with self._ws_lock:
+            state = self._feed_state.setdefault(feed, {"connected": False, "last_message": None})
+            state["connected"] = connected
+            if message:
+                state["last_message"] = time.monotonic()
+
     def _run(self, run_url: Optional[str] = None):
         import websocket
-        target_url = run_url or self.url
-        sub_msg = subscription_for_url(target_url)
-        is_bybit = "bybit.com" in str(target_url).lower()
+        primary = run_url is None
+        candidates = (
+            (self.url,) + tuple(u for u in BINANCE_FALLBACK_URLS if u != self.url)
+            if primary and self.url.startswith("wss://") else (URL,) if primary else (run_url,)
+        )
+        feed = "primary" if primary else str(run_url)
         attempt = 0
         while not self._stop.is_set():
+            target_url = candidates[attempt % len(candidates)]
+            sub_msg = subscription_for_url(target_url)
+            is_bybit = "bybit.com" in target_url.lower()
             ws = None
             tracked = False
             try:
@@ -470,6 +513,8 @@ class BinanceTrades:
                     )
                 self._track_ws(ws, True)
                 tracked = True
+                self._feed_update(feed, True)
+                self._event("fivemin_binance_connect", feed=feed, url=target_url)
                 if sub_msg and hasattr(ws, "send"):
                     ws.send(sub_msg)
                 received = False
@@ -485,6 +530,7 @@ class BinanceTrades:
                     raw = ws.recv()
                     if not raw:
                         break
+                    self._feed_update(feed, True, message=True)
                     recv_ms = time.monotonic() * 1000.0
                     parsed = parse_agg_trade(raw)
                     if parsed:
@@ -507,18 +553,26 @@ class BinanceTrades:
                                     pass
                         received = True
                 ws.close()
+                self._feed_update(feed, False)
+                self._event("fivemin_binance_disconnect", feed=feed, url=target_url, reason="closed")
                 attempt = 0 if received else attempt + 1
                 if not self._stop.is_set():
                     self._stop.wait(min(30.0, 0.5 * (2 ** min(attempt, 6))))
             except Exception as exc:
                 attempt += 1
+                self._feed_update(feed, False)
+                self._event("fivemin_binance_disconnect", feed=feed, url=target_url,
+                            reason=str(exc)[:240])
                 now = time.time()
                 if self._on_error is not None and now - self._last_error_at >= 60:
                     self._last_error_at = now
                     try:
-                        self._on_error(str(exc))
+                        self._on_error(f"{feed} {target_url}: {exc}")
                     except Exception:
                         pass
+                if primary:
+                    self._stop.wait(min(30.0, 0.5 * (2 ** min(attempt, 6))))
+                    continue
                 if self._sleep is time.sleep:
                     self._stop.wait(min(30.0, 0.5 * (2 ** min(attempt, 6))))
                 else:

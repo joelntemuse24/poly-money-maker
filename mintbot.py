@@ -9289,6 +9289,7 @@ def main() -> int:
                     grid, BinanceTrades(
                         grid, url=str(current_cfg().get("fivemin_binance_url")),
                         on_error=lambda error: log_event("fivemin_binance_error", error=str(error)[:240]),
+                        on_event=lambda event, **fields: log_event(event, **fields),
                         on_tick=lambda ms, px: runner.on_binance_tick(ms, px) if runner is not None else None,
                         extra_urls=extra_urls,
                     ), RtdsTwapFeed(), (

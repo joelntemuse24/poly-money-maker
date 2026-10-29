@@ -262,6 +262,50 @@ class BinanceTradesSubSecondTests(unittest.TestCase):
         self.assertTrue(ticks)
         self.assertIsNotNone(grid.latest_spot())
 
+    def test_primary_endpoint_rotates_after_failed_connect(self):
+        from buy.binance_trades import URL, BINANCE_FALLBACK_URLS
+        urls = []
+        class OneTickWS:
+            def recv(self):
+                return '{"T":1950,"p":"70050"}'
+            def close(self):
+                pass
+        def connect(url):
+            urls.append(url)
+            if len(urls) == 1:
+                raise TimeoutError()
+            return OneTickWS()
+        bt = BinanceTrades(url=URL, connect=connect, on_tick=lambda _ms, _px: bt.stop())
+        bt._run()
+        self.assertEqual(urls, [URL, BINANCE_FALLBACK_URLS[1]])
+        self.assertFalse(bt.health()["primary"]["connected"])
+        self.assertIsNotNone(bt.grid.latest_exchange_ms())
+
+    def test_null_primary_url_uses_default_and_health_tracks_connection(self):
+        from buy.binance_trades import URL
+        grid = PriceGrid()
+        events = []
+        bt = BinanceTrades(grid, url=None, connect=lambda url: None,
+                           on_event=lambda event, **kw: events.append((event, kw)))
+        self.assertEqual(bt.url, URL)
+
+        class FakeWS:
+            def __init__(self):
+                self.done = False
+            def recv(self):
+                if self.done:
+                    return ""
+                self.done = True
+                return '{"T":1950,"p":"70050"}'
+            def close(self):
+                pass
+        bt._connect = lambda _url: FakeWS()
+        bt._on_tick = lambda _ms, _px: bt.stop()
+        bt._run()
+        self.assertIn("fivemin_binance_connect", [e for e, _ in events])
+        self.assertIn("fivemin_binance_disconnect", [e for e, _ in events])
+        self.assertEqual(bt.health()["primary"]["connected"], False)
+
 
 class FiveMinSniperTests(unittest.TestCase):
     def _setup_strategy(self, **cfg_overrides):
@@ -520,6 +564,16 @@ class FiveMinSniperTests(unittest.TestCase):
         row["offset"] = -75.0
         strat.tick(cfg, 1100.0, grid, quotes)
         self.assertEqual(len(buys), 1)
+
+        # A previously established offset cannot authorize a fire with stale BTC data.
+        strat2, row2, cfg2, _events2, buys2 = self._setup_strategy()
+        row2["strike"] = 80400.0
+        row2["offset"] = -75.0
+        stale_grid = PriceGrid()
+        stale_grid.add(1000000.0, 80500.0)
+        stale_grid.add(1000400.0, 80530.0)
+        strat2.tick(cfg2, 1100.0, stale_grid, quotes)
+        self.assertEqual(len(buys2), 0)
 
     def test_buy_matched_shares_and_scale_fill_amount_preserve_cheap_ask_sweep_shares(self):
         from buy.sister_bid import buy_matched_shares

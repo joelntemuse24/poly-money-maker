@@ -238,6 +238,30 @@ class FeedTests(unittest.TestCase):
         self.assertEqual(PING_S, 3.0)
         self.assertGreater(SILENCE_S, PING_S)
 
+    def test_token_renewal_uses_incremental_subscription_messages(self):
+        feed, _clock = self._feed(["old-a", "old-b"])
+        sent = []
+        stop = threading.Event()
+
+        class RenewingWS:
+            def settimeout(self, _timeout): pass
+            def send(self, message):
+                sent.append(json.loads(message))
+                if len(sent) == 1:
+                    feed.set_tokens(["new-a", "old-b"])
+                elif len(sent) == 3:
+                    stop.set()
+            def recv(self):
+                return "PONG"
+            def close(self): pass
+
+        feed._connect = lambda _url: RenewingWS()
+        feed._sleep = lambda _delay: stop.set()
+        feed.run(stop)
+        self.assertEqual(sent[0]["assets_ids"], ["old-a", "old-b"])
+        self.assertEqual(sent[1], {"assets_ids": ["new-a"], "operation": "subscribe"})
+        self.assertEqual(sent[2], {"assets_ids": ["old-a"], "operation": "unsubscribe"})
+
     def test_stop_resets_started_and_closes_off_the_caller(self):
         feed, _clock = self._feed(["tok"])
         ident = {"close": None}

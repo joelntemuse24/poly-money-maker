@@ -378,10 +378,13 @@ class Strategy:
         for cid in list(self._active):
             row = self.state["markets"][cid]
             if row.get("start_twap") is None and now >= row["start"] + 1.0:
-                start_twap = twap60(grid, int(row["start"] * 10))
-                if start_twap is not None:
-                    row["start_twap"] = start_twap
-                    self.save()
+                latest_fn = getattr(grid, "latest_exchange_ms", None)
+                latest = latest_fn() if callable(latest_fn) else row["start"] * 1000.0
+                if latest is not None and row["start"] * 1000.0 <= latest <= (now + 1) * 1000.0:
+                    start_twap = twap60(grid, int(row["start"] * 10))
+                    if start_twap is not None:
+                        row["start_twap"] = start_twap
+                        self.save()
             strike = row.get("strike")
             if strike is None and row["start"] in self.boundaries:
                 row["strike"] = strike = self.boundaries[row["start"]]
@@ -742,6 +745,11 @@ class Strategy:
         if cfg.get("sniper_use_offset", True):
             if row.get("offset") is None:
                 return None if defer_buy else False
+            latest_fn = getattr(grid, "latest_exchange_ms", None)
+            if callable(latest_fn):
+                latest_ms = latest_fn()
+                if latest_ms is None or not (0 <= now * 1000.0 - latest_ms <= float(cfg["fivemin_btc_max_age_s"]) * 1000.0):
+                    return None if defer_buy else False
             offset = float(row["offset"])
         else:
             offset = 0.0
@@ -1348,6 +1356,9 @@ class Runner:
     def _io_once(self, now):
         """One IO-thread pass: discovery, balance, Gamma requests, RTDS watchdog."""
         cfg = settings(self.cfg())
+        log_health = getattr(self.binance, "log_health", None)
+        if callable(log_health):
+            log_health()
         if now >= self.next_discover:
             self.next_discover = now + 20
             try:

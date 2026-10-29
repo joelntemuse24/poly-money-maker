@@ -551,7 +551,7 @@ class ClobBookFeed:
         self.apply_event(payload)
 
     def run(self, stop: Optional[threading.Event] = None) -> None:
-        """Block until ``stop``. One socket, reconnect with backoff."""
+        """Block until ``stop``. One socket, with in-place token renewals."""
         gate = stop or self._stop
         opener = self._connect or _default_connect
         sleeper = self._sleep or (lambda delay: gate.wait(delay))
@@ -578,6 +578,7 @@ class ClobBookFeed:
                 why = self._consume(ws, ids, gate)
                 if why == "silence":
                     self._note_error("silence", backoff_s(1))
+                    attempt += 1
             except Exception as exc:
                 attempt += 1
                 self.reconnects += 1
@@ -603,8 +604,15 @@ class ClobBookFeed:
         last_ping = last_rx
         while not gate.is_set():
             with self._lock:
-                if list(self._wanted) != ids:
-                    return "resubscribe"
+                wanted = list(self._wanted)
+            if wanted != ids:
+                added = [token for token in wanted if token not in ids]
+                removed = [token for token in ids if token not in wanted]
+                if added:
+                    ws.send(json.dumps({"assets_ids": added, "operation": "subscribe"}, separators=(",", ":")))
+                if removed:
+                    ws.send(json.dumps({"assets_ids": removed, "operation": "unsubscribe"}, separators=(",", ":")))
+                ids = wanted
             now_m = self._clock()
             if now_m - last_ping >= PING_S:
                 # A ping proves the socket is up. It does not confirm a
