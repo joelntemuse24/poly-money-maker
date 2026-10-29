@@ -275,7 +275,9 @@ def rtds_compare_fields(prepared: dict) -> dict:
         price = _num(getattr(live, "price", None))
         obs_ts = _num(getattr(live, "obs_ts", None))
         recv_ts = _num(getattr(live, "recv_ts", None))
-        offset = _num(prepared.get("offset"))
+        # row["offset"] is set once per market before any sniper decision, so reading
+        # it after the POST equals the value the decision used.
+        offset = _num(prepared["offset"] if "offset" in prepared else row.get("offset"))
         spot_now = _num(prepared.get("spot_now"))
         strike = _num(row.get("strike"))
         decision_ts = _num(meta.get("decision_ts"))
@@ -1135,8 +1137,8 @@ class Strategy:
             "first_seen_ts": note["first_seen_ts"],
             "first_reject_gate": note["first_reject_gate"],
             "first_reject_detail": note["first_reject_detail"],
+            # Diagnostics: one reference read of the feed's latest live print; formatted after the POST.
             "rtds_live": getattr(self.rtds_feed, "_live", None),
-            "offset": row.get("offset"),
         }
 
     def _sniper_execute(self, prepared: dict, *, lock: Optional[threading.RLock] = None):
