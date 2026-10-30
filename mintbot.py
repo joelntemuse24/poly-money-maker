@@ -9366,7 +9366,8 @@ def main() -> int:
                 if settings(current_cfg()).get("gc_freeze_hotpath", False):
                     hotpath_gc.arm()
                 grid = PriceGrid(use_rust=bool(settings(current_cfg()).get("rust_hotpath", False)) or None)
-                log_event("fivemin_price_grid", rust_enabled=bool(getattr(grid, "rust_enabled", False)))
+                log_event("fivemin_price_grid", rust_enabled=bool(getattr(grid, "rust_enabled", False)),
+                          sniper_trigger_sources=settings(current_cfg()).get("sniper_trigger_sources"))
                 ws_error_at = None
 
                 def fivemin_ws_error(error, delay):

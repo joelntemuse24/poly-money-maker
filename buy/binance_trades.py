@@ -314,6 +314,7 @@ class PriceGrid:
         now_ms: Optional[float] = None,
         *,
         recv_now_ms: Optional[float] = None,
+        sources: Optional[frozenset] = None,
     ) -> Optional[dict]:
         """Return the largest single-source jump across primary and extra feeds.
 
@@ -330,6 +331,8 @@ class PriceGrid:
             best_mag = -1.0
             prim_latest = self._latest_by_source.get("primary")
             for src_key, rticks in self._recv_ticks_by_source.items():
+                if sources is not None and src_key not in sources:
+                    continue
                 if not rticks:
                     continue
                 latest_r, spot_raw = rticks[-1]
