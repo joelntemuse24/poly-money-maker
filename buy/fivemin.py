@@ -50,6 +50,7 @@ DEFAULTS = {
         "wss://ws.kraken.com/v2",
         "wss://ws.bitstamp.net",
     ],
+    "sniper_trigger_sources": None,
     "sniper_max_book_age_ms": 1500.0,
     "rust_hotpath": False,
     "gc_freeze_hotpath": False,
@@ -506,6 +507,33 @@ class Strategy:
                 removed = True
         if removed:
             self.save()
+
+    def _sniper_allowed_sources(self, cfg) -> Optional[frozenset]:
+        """Feed keys the 5m sniper may trigger on; ``None`` means every source.
+
+        Config names are matched against ``feed_name_for_url`` so a raw WS URL
+        entry restricts the same feed as its short name.
+        """
+        raw = cfg.get("sniper_trigger_sources")
+        if not raw:
+            return None
+        if isinstance(raw, str):
+            raw = [raw]
+        key = tuple(raw)
+        if getattr(self, "_sniper_sources_raw", None) == key:
+            return self._sniper_sources_set
+        from buy.binance_trades import feed_name_for_url
+
+        names = {str(n) for n in raw}
+        allowed = {feed_name_for_url(n) for n in names}
+        for url in list(DEFAULTS["sniper_extra_ws_urls"]) + list(cfg.get("sniper_extra_ws_urls") or []):
+            if feed_name_for_url(url) in names:
+                allowed.add(url)
+                allowed.add(feed_name_for_url(url))
+        result = frozenset(allowed)
+        self._sniper_sources_raw = key
+        self._sniper_sources_set = result
+        return result
 
     def _sniper_note(self, row, side=None) -> dict:
         """Diagnostic note for ``(slug, side)``; bounded to the newest few slugs.
@@ -1002,9 +1030,14 @@ class Strategy:
             # on that clock. ``now`` is wall clock and misses the ticks, which made each
             # source anchor on its own newest tick and kept an old jump in window.
             info = best_fn(float(cfg["sniper_window_ms"]), now_ms=now * 1000.0,
-                           recv_now_ms=time.monotonic() * 1000.0)
+                           recv_now_ms=time.monotonic() * 1000.0,
+                           sources=self._sniper_allowed_sources(cfg))
         if info is None and callable(jump_fn):
-            info = jump_fn(float(cfg["sniper_window_ms"]), now_ms=now * 1000.0)
+            # ``jump_in_window`` only reads the primary feed, so a source
+            # allow-list without ``primary`` must not fall back to it.
+            sources = self._sniper_allowed_sources(cfg)
+            if sources is None or "primary" in sources:
+                info = jump_fn(float(cfg["sniper_window_ms"]), now_ms=now * 1000.0)
         if info is None:
             return None if defer_buy else False
         if now * 1000.0 - float(info["ts_ms"]) > float(cfg["fivemin_btc_max_age_s"]) * 1000.0 + EPS:

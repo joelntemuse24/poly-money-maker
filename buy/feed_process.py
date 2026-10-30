@@ -367,8 +367,12 @@ class SharedPriceGrid:
         return (spot_now, bounds[0], bounds[1], latest_ms)
 
     def best_jump_in_window(self, window_ms: float = 500.0, now_ms: Optional[float] = None,
-                            *, recv_now_ms: Optional[float] = None) -> Optional[dict]:
-        return self.latest_trigger()
+                            *, recv_now_ms: Optional[float] = None,
+                            sources: Optional[frozenset] = None) -> Optional[dict]:
+        result = self.latest_trigger()
+        if sources is not None and result is not None and result["source"] not in sources:
+            return None
+        return result
 
     def jump_in_window(self, window_ms: float = 500.0, now_ms: Optional[float] = None,
                        *, source: str = "primary") -> Optional[dict]:
