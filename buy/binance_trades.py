@@ -281,6 +281,40 @@ class PriceGrid:
         with self._lock:
             return self._latest_recv_wall_ms.get(str(source or "primary"))
 
+    def latest_source_tick(self, source: str = "primary"):
+        """``(exchange_ms, recv_wall_ms, price)`` of the newest tick from ``source``.
+
+        ``recv_wall_ms`` is ``None`` for ticks added without a wall stamp (tests,
+        or a caller that only passes a monotonic receive time).
+        """
+        src = str(source or "primary")
+        with self._lock:
+            info = self._latest_by_source.get(src)
+            if info is None:
+                return None
+            return (float(info[1]), self._latest_recv_wall_ms.get(src), float(info[2]))
+
+    def source_price_at(self, source: str, target_ms: float,
+                        *, window_ms: float = 60000.0) -> Optional[float]:
+        """Price of the newest tick from ``source`` at or before epoch-ms ``target_ms``.
+
+        The per-source deques are keyed on exchange time (epoch ms), so no
+        monotonic-to-wall conversion is needed here.
+        """
+        src = str(source or "primary")
+        target = float(target_ms)
+        lower = target - float(window_ms)
+        with self._lock:
+            ticks = self._ms_ticks if src == "primary" else self._ms_ticks_by_source.get(src)
+            if not ticks:
+                return None
+            for ts, px in reversed(ticks):
+                if ts <= target:
+                    return px if ts >= lower else None
+                if ts < lower:
+                    return None
+        return None
+
     def feed_recv_snapshot(self, window_ms: float,
                            ref_ms: Optional[float] = None) -> dict[str, Any]:
         """Cheap snapshot of feeds whose newest tick landed within ``window_ms`` of ``ref_ms``.
