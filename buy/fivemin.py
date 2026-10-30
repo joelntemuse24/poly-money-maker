@@ -60,6 +60,12 @@ DEFAULTS = {
     "sniper_e3_lag_s": 0.5,
     "sniper_e3_max_age_s": 2.0,
     "sniper_e3_offset_max_age_s": 30.0,
+    # Pre-order Chainlink side guard: refuses a side whose live RTDS print is
+    # already on the other side of the strike. Off by default (fully skipped).
+    "sniper_cl_guard": False,
+    "sniper_cl_guard_mode": "raw",
+    "sniper_cl_max_age_s": 5.0,
+    "sniper_cl_min_gap_usd": 0.0,
     "rust_hotpath": False,
     "gc_freeze_hotpath": False,
     "gc_hotpath_gen0_threshold": 0, "gc_hotpath_gen2_threshold": 0,
@@ -464,6 +470,64 @@ def rtds_compare_fields(prepared: dict) -> dict:
     except Exception:
         return {key: None for key in out}
     return out
+
+
+# Shared constant for gate metadata when ``sniper_cl_guard`` is off, so the
+# disabled path only does one dict merge per side.
+CL_GUARD_OFF_META = {"cl_gap_usd": None, "cl_age_s": None,
+                     "cl_guard_mode": None, "cl_guard_decision": "off"}
+
+
+def chainlink_guard_reading(cfg: dict, grid, live, now_wall: float) -> dict:
+    """Pre-order Chainlink reference for the side guard; computed once per scan.
+
+    ``live`` is ``rtds_feed._live`` (``.price``, ``.obs_ts`` in epoch seconds).
+    The helper never raises and only reads cached grid ticks.
+    """
+    reading = {"cl_spot": None, "cl_ref": None, "cl_age_s": None,
+               "cl_guard_mode": None, "cl_guard_decision": "off"}
+    if not cfg.get("sniper_cl_guard", False):
+        return reading
+    try:
+        mode = str(cfg.get("sniper_cl_guard_mode") or "raw").strip().lower()
+        if mode not in ("raw", "projected"):
+            mode = "raw"
+        reading["cl_guard_mode"] = mode
+        price = _finite_float(getattr(live, "price", None))
+        obs_ts = _finite_float(getattr(live, "obs_ts", None))
+        if price is None or obs_ts is None:
+            reading["cl_guard_decision"] = "fail_open_missing"
+            return reading
+        age_s = float(now_wall) - obs_ts
+        reading["cl_spot"] = price
+        reading["cl_age_s"] = age_s
+        max_age_s = cfg.get("sniper_cl_max_age_s")
+        max_age_s = 5.0 if max_age_s is None else float(max_age_s)
+        if age_s > max_age_s:
+            reading["cl_guard_decision"] = "fail_open_stale"
+            return reading
+        ref = price
+        if mode == "projected":
+            tick = lookup = None
+            try:
+                if grid is not None:
+                    tick = grid.latest_source_tick("coinbase")
+                    lookup = grid.source_price_at("coinbase", obs_ts * 1000.0, window_ms=10000.0)
+            except Exception:
+                tick = lookup = None
+            cb_now = _finite_float(tick[2]) if tick else None
+            cb_then = _finite_float(lookup)
+            if cb_now is None or cb_then is None:
+                # No coinbase anchor: keep the raw print but say so in the logs.
+                reading["cl_guard_mode"] = "projected_fallback_raw"
+            else:
+                ref = price + (cb_now - cb_then)
+        reading["cl_ref"] = ref
+        reading["cl_guard_decision"] = "ok"
+    except Exception:
+        reading = {"cl_spot": None, "cl_ref": None, "cl_age_s": None,
+                   "cl_guard_mode": None, "cl_guard_decision": "fail_open_missing"}
+    return reading
 
 
 def decision_book_fields(book: dict, limit: float) -> dict:
@@ -1245,6 +1309,12 @@ class Strategy:
             "e3_feed_count": len(e3_feeds),
         }
         strike = float(row["strike"])
+        cl_guard_on = bool(cfg.get("sniper_cl_guard", False))
+        # One Chainlink read per scan; the side loop only derives the signed gap.
+        cl_reading = None
+        if cl_guard_on:
+            cl_reading = chainlink_guard_reading(
+                cfg, grid, getattr(self.rtds_feed, "_live", None), time.time())
         for side, jump_key, sign in (("up", "up_jump", 1.0), ("down", "down_jump", -1.0)):
             jump_usd = float(info[jump_key])
             gap_legacy = None if offset is None else sign * (spot_now + offset - strike)
@@ -1252,6 +1322,18 @@ class Strategy:
             gap_usd = gap_e3 if use_e3 else gap_legacy
             gap_meta = dict(legacy_gap_meta, gap_legacy_usd=None if gap_legacy is None else round(gap_legacy, 2),
                             gap_e3_usd=None if gap_e3 is None else round(gap_e3, 2))
+            cl_gap = None
+            if not cl_guard_on:
+                gap_meta.update(CL_GUARD_OFF_META)
+            else:
+                cl_ref = cl_reading["cl_ref"]
+                cl_gap = None if cl_ref is None else sign * (cl_ref - strike)
+                gap_meta.update({
+                    "cl_gap_usd": None if cl_gap is None else round(cl_gap, 2),
+                    "cl_age_s": None if cl_reading["cl_age_s"] is None else round(cl_reading["cl_age_s"], 3),
+                    "cl_guard_mode": cl_reading["cl_guard_mode"],
+                    "cl_guard_decision": cl_reading["cl_guard_decision"],
+                })
             if jump_usd + EPS < float(cfg["sniper_jump_usd"]):
                 continue
             note = self._sniper_note(row, side)
@@ -1266,6 +1348,19 @@ class Strategy:
                                                  "min_gap_usd": cfg["sniper_min_gap_usd"],
                                                  **gap_meta})
                 continue
+            if cl_gap is not None:
+                # Pre-order side guard: a live Chainlink print already past the
+                # strike on the other side blocks the order before it is sent.
+                min_cl_gap = cfg.get("sniper_cl_min_gap_usd")
+                min_cl_gap = 0.0 if min_cl_gap is None else float(min_cl_gap)
+                if cl_gap + EPS < min_cl_gap:
+                    gap_meta["cl_guard_decision"] = "reject"
+                    self._sniper_gate_reject(
+                        cfg, row, side, "cl_wrong_side", now=now, info=info, pending=queue,
+                        jump_usd=jump_usd, gap_usd=gap_usd, gap_meta=gap_meta,
+                        detail={"min_gap_usd": min_cl_gap, **gap_meta})
+                    continue
+                gap_meta["cl_guard_decision"] = "pass"
             side_quote = quotes.get(side, {})
             age_ms = side_quote.get("age_ms")
             max_age_ms = float(cfg.get("sniper_max_book_age_ms", 1500.0))
