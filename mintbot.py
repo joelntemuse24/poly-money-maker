@@ -324,6 +324,7 @@ DEFAULTS = {
     'sniper_5m_enabled': False,
     'sniper_jump_usd': 25.0,
     'sniper_window_ms': 500,
+    'sniper_trigger_sources': None,
     'sniper_min_gap_usd': 20.0,
     'sniper_max_ask': 0.97,
     'sniper_min_ask': 0.5,
