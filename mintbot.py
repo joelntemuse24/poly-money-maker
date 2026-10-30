@@ -354,6 +354,12 @@ DEFAULTS = {
     'sniper_e3_lag_s': 0.5,
     'sniper_e3_max_age_s': 2.0,
     'sniper_e3_offset_max_age_s': 30.0,
+    # Pre-order Chainlink side guard (buy/fivemin.py sniper): keys must live
+    # here or load_strategy() drops them.
+    'sniper_cl_guard': False,
+    'sniper_cl_guard_mode': 'raw',
+    'sniper_cl_min_gap_usd': 0.0,
+    'sniper_cl_max_age_s': 5.0,
     # Hot-path isolation knobs (buy/hotpath.py, buy/feed_process.py). All off:
     # the defaults change no decision, size, threshold or order.
     'gc_hotpath_gen0_threshold': 0,
@@ -954,6 +960,21 @@ def validate_strategy(cfg: dict) -> None:
         raise ValueError("fivemin_book_record must be boolean")
     if not 0 < float(cfg.get("fivemin_book_ws_stale_s", 1.0)) < float("inf"):
         raise ValueError("fivemin_book_ws_stale_s must be positive and finite")
+    # Sniper Chainlink side guard (buy/fivemin.py).
+    if not isinstance(cfg.get("sniper_cl_guard", False), bool):
+        raise ValueError("sniper_cl_guard must be boolean")
+    if cfg.get("sniper_cl_guard_mode", "raw") not in ("raw", "projected"):
+        raise ValueError("sniper_cl_guard_mode must be raw or projected")
+    for key, default in (("sniper_cl_min_gap_usd", 0.0),
+                         ("sniper_cl_max_age_s", 5.0)):
+        value = cfg.get(key, default)
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise ValueError(f"{key} must be a number")
+        number = float(value)
+        if number != number or number in (float("inf"), float("-inf")):
+            raise ValueError(f"{key} must be finite")
+        if key == "sniper_cl_max_age_s" and float(value) <= 0:
+            raise ValueError(f"{key} must be > 0")
     for key, default, low, high in (
         ("fivemin_nofill_retry_s", 2.0, 0, None),
         ("fivemin_max_attempts_per_market", 3, 1, 20),
