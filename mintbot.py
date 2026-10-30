@@ -348,6 +348,12 @@ DEFAULTS = {
         'wss://ws.bitstamp.net',
     ],
     'sniper_max_book_age_ms': 1500.0,
+    'sniper_gap_estimator': 'e3',
+    'sniper_e3_feeds': ['binance_spot', 'coinbase', 'bybit'],
+    'sniper_e3_halflife_s': 15.0,
+    'sniper_e3_lag_s': 0.5,
+    'sniper_e3_max_age_s': 2.0,
+    'sniper_e3_offset_max_age_s': 30.0,
     # Hot-path isolation knobs (buy/hotpath.py, buy/feed_process.py). All off:
     # the defaults change no decision, size, threshold or order.
     'gc_hotpath_gen0_threshold': 0,

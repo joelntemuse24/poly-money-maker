@@ -317,6 +317,21 @@ class SharedPriceGrid:
     def latest_recv_wall_ms(self, source: str = "primary") -> Optional[float]:
         return self.latest_recv_ms(source)
 
+    def latest_source_tick(self, source: str = "primary"):
+        """``(exchange_ms, recv_wall_ms, price)`` of the newest tick from ``source``."""
+        latest = self.ring.latest(source)
+        if latest is None:
+            return None
+        recv = self.ring_recv.latest(source)
+        return (float(latest[0]), None if recv is None else float(recv[0]), float(latest[1]))
+
+    def source_price_at(self, source: str, target_ms: float,
+                        *, window_ms: float = 60000.0) -> Optional[float]:
+        """Newest price at or before epoch-ms ``target_ms`` (exchange-time axis)."""
+        target = float(target_ms)
+        rows = self.ring.between(source, target - float(window_ms), target)
+        return None if not rows else float(rows[0][1])
+
     def recv_extrema(self, window_ms: float, *, source: str = "primary",
                      ref_ms: Optional[float] = None):
         """``window_extrema`` on the receive-time axis, as the live grid computes it."""

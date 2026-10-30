@@ -52,6 +52,14 @@ DEFAULTS = {
     ],
     "sniper_trigger_sources": None,
     "sniper_max_book_age_ms": 1500.0,
+    # Gap estimator for the sniper min-gap gate. "e3" anchors each feed's price
+    # to the live Chainlink print; "legacy" keeps spot_now + row offset.
+    "sniper_gap_estimator": "e3",
+    "sniper_e3_feeds": ["binance_spot", "coinbase", "bybit"],
+    "sniper_e3_halflife_s": 15.0,
+    "sniper_e3_lag_s": 0.5,
+    "sniper_e3_max_age_s": 2.0,
+    "sniper_e3_offset_max_age_s": 30.0,
     "rust_hotpath": False,
     "gc_freeze_hotpath": False,
     "gc_hotpath_gen0_threshold": 0, "gc_hotpath_gen2_threshold": 0,
@@ -248,6 +256,160 @@ def order_latency_fields(prepared: dict, result: Optional[dict] = None, *,
     }
 
 
+#: Feeds E3 anchors to the live Chainlink print. All three already have a tick
+#: ring slot (``buy/feed_process.SOURCE_NAMES``); the config list may add more
+#: later without touching the shared-memory layout.
+E3_FEED_NAMES = ("binance_spot", "coinbase", "bybit")
+#: How far back the lag lookup may walk. ``sniper_e3_lag_s`` is under a second,
+#: so a few seconds bounds the shared-ring scan without changing the sample.
+E3_LOOKUP_WINDOW_S = 5.0
+
+
+def _finite_float(value) -> Optional[float]:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if math.isfinite(number) else None
+
+
+class SniperGapEstimator:
+    """E3 gap estimator: per-feed EWMA of ``chainlink - feed(lag)``.
+
+    ``offset_f`` maps each feed onto the Chainlink basis, so the estimate is
+    ``mean(latest_price_f + offset_f)`` over fresh feeds. Updates happen only
+    when a new Chainlink live sample (new ``obs_ts``) arrives; the hot path only
+    reads the cached offsets and the grid's per-source latest tick (O(1)).
+    """
+
+    def __init__(self) -> None:
+        self._obs_ts: Optional[float] = None
+        # feed -> {"offset": float, "obs_ts": float, "wall": float}
+        self._offsets: dict[str, dict] = {}
+        self._lock = threading.Lock()
+
+    def reset(self) -> None:
+        with self._lock:
+            self._obs_ts = None
+            self._offsets.clear()
+
+    def offsets(self) -> dict:
+        """Copy of the per-feed state, for tests and diagnostics."""
+        with self._lock:
+            return {feed: dict(state) for feed, state in self._offsets.items()}
+
+    @staticmethod
+    def aliases(feed: str) -> tuple[str, ...]:
+        """``binance_spot`` falls back to ``primary`` when its extra feed is dark."""
+        return ("binance_spot", "primary") if feed == "binance_spot" else (feed,)
+
+    @staticmethod
+    def feeds(cfg) -> list[str]:
+        raw = cfg.get("sniper_e3_feeds")
+        if not raw:
+            return list(E3_FEED_NAMES)
+        if isinstance(raw, str):
+            raw = [raw]
+        return [str(name) for name in raw if str(name)]
+
+    def update(self, cfg, live, grid, now: float) -> bool:
+        """Fold one new Chainlink live sample into every feed's offset.
+
+        Returns True when a new sample was consumed. A sample whose price is
+        missing at ``obs_ts - lag`` leaves that feed's offset untouched.
+        """
+        if live is None or grid is None:
+            return False
+        obs = _finite_float(getattr(live, "obs_ts", None))
+        price = _finite_float(getattr(live, "price", None))
+        if obs is None or price is None:
+            return False
+        if self._obs_ts is not None and obs <= self._obs_ts:
+            return False
+        lookup = getattr(grid, "source_price_at", None)
+        if not callable(lookup):
+            return False
+        halflife = max(1e-3, float(cfg.get("sniper_e3_halflife_s", 15.0)))
+        lag = max(0.0, float(cfg.get("sniper_e3_lag_s", 0.5)))
+        target_ms = (obs - lag) * 1000.0
+        wall = _finite_float(getattr(live, "recv_ts", None))
+        wall = float(now) if wall is None else wall
+        feeds = self.feeds(cfg)
+        # Look the prices up before taking the state lock: the grid has its own,
+        # and the sniper read must never wait behind a grid scan.
+        samples = {}
+        for feed in feeds:
+            for name in self.aliases(feed):
+                try:
+                    px = _finite_float(lookup(name, target_ms,
+                                              window_ms=E3_LOOKUP_WINDOW_S * 1000.0))
+                except Exception:
+                    px = None
+                if px is not None:
+                    samples[feed] = price - px
+                    break
+        with self._lock:
+            if self._obs_ts is not None and obs <= self._obs_ts:
+                return False
+            for feed, sample in samples.items():
+                state = self._offsets.get(feed)
+                if state is None:
+                    self._offsets[feed] = {"offset": sample, "obs_ts": obs, "wall": wall}
+                    continue
+                dt = obs - float(state["obs_ts"])
+                if dt <= 0:
+                    continue
+                alpha = 1.0 - 0.5 ** (dt / halflife)
+                state["offset"] = float(state["offset"]) + alpha * (sample - float(state["offset"]))
+                state["obs_ts"] = obs
+                state["wall"] = wall
+            self._obs_ts = obs
+        return True
+
+    def estimate(self, cfg, grid, now: float):
+        """``(est_e3, feeds)``; ``est_e3`` is None when no feed qualifies."""
+        if grid is None:
+            return None, ()
+        tick_fn = getattr(grid, "latest_source_tick", None)
+        if not callable(tick_fn):
+            return None, ()
+        max_age = float(cfg.get("sniper_e3_max_age_s", 2.0))
+        offset_age = float(cfg.get("sniper_e3_offset_max_age_s", 30.0))
+        now_ms = float(now) * 1000.0
+        with self._lock:
+            offsets = {feed: float(state["offset"]) for feed, state in self._offsets.items()
+                       if offset_age <= 0 or float(now) - float(state["wall"]) <= offset_age}
+        total = 0.0
+        used: list[str] = []
+        for feed in self.feeds(cfg):
+            offset = offsets.get(feed)
+            if offset is None:
+                continue
+            tick = None
+            for name in self.aliases(feed):
+                try:
+                    tick = tick_fn(name)
+                except Exception:
+                    tick = None
+                if tick is not None:
+                    break
+            if tick is None:
+                continue
+            exchange_ms, recv_wall_ms, px = tick
+            stamp_ms = exchange_ms if recv_wall_ms is None else recv_wall_ms
+            px = _finite_float(px)
+            stamp_ms = _finite_float(stamp_ms)
+            if px is None or stamp_ms is None:
+                continue
+            if max_age > 0 and (now_ms - stamp_ms) / 1000.0 > max_age:
+                continue
+            total += px + offset
+            used.append(feed)
+        if not used:
+            return None, ()
+        return total / len(used), tuple(used)
+
+
 def rtds_compare_fields(prepared: dict) -> dict:
     """Live RTDS/Chainlink print next to the sniper's offset-adjusted estimate.
 
@@ -404,6 +566,8 @@ class Strategy:
         self._sniper_notes: dict[tuple, dict] = {}
         # Diagnostics only: live RTDS/Chainlink feed, wired by ``Runner`` when present.
         self.rtds_feed = None
+        # E3 gap estimator state; offsets update off the hot path (see Runner).
+        self.sniper_e3 = SniperGapEstimator()
 
     def _save_time(self):
         if self.io.clock is not None:
@@ -556,7 +720,8 @@ class Strategy:
         return note
 
     def _sniper_gate_reject(self, cfg, row, side, gate, *, now, detail=None,
-                            jump_usd=None, gap_usd=None, info=None, pending=None) -> None:
+                            jump_usd=None, gap_usd=None, info=None, pending=None,
+                            gap_meta=None) -> None:
         """Journal one ``sniper_gate_reject`` per gate per slug/side.
 
         With ``pending`` the payload is queued for the caller to write after its
@@ -579,6 +744,8 @@ class Strategy:
                   "gap_usd": None if gap_usd is None else round(float(gap_usd), 2),
                   "source": None if info is None else str(info.get("source") or "primary"),
                   "first_seen_ts": note["first_seen_ts"]}
+        if gap_meta:
+            fields.update(gap_meta)
         if pending is not None:
             pending.append(fields)
             return
@@ -1044,27 +1211,47 @@ class Strategy:
             return None if defer_buy else False
         spot_now = float(info["spot"])
         trigger_source = str(info.get("source") or "primary")
-        if cfg.get("sniper_use_offset", True):
-            if row.get("offset") is None:
+        # E3 reads only cached offsets plus each feed's latest tick, so the hot path
+        # stays O(1); the offsets themselves are folded in off-path (Runner tick).
+        estimator = str(cfg.get("sniper_gap_estimator") or "e3").strip().lower()
+        use_offset = bool(cfg.get("sniper_use_offset", True))
+        est_e3, e3_feeds = (None, ())
+        if estimator == "e3" and use_offset:
+            est_e3, e3_feeds = self.sniper_e3.estimate(cfg, grid, now)
+        use_e3 = est_e3 is not None
+        row_offset = row.get("offset")
+        if use_offset:
+            # Legacy drives the gap (and its gates) when E3 has no fresh feed; with
+            # a usable E3 estimate a missing row offset no longer blocks the sniper.
+            if row_offset is None and not use_e3:
                 self._sniper_gate_reject(cfg, row, None, "offset", now=now, info=info,
                                          pending=queue, detail={"offset": None})
                 return None if defer_buy else False
             latest_fn = getattr(grid, "latest_exchange_ms", None)
-            if callable(latest_fn):
+            if callable(latest_fn) and not use_e3:
                 latest_ms = latest_fn()
                 if latest_ms is None or not (0 <= now * 1000.0 - latest_ms <= float(cfg["fivemin_btc_max_age_s"]) * 1000.0):
                     self._sniper_gate_reject(cfg, row, None, "offset", now=now, info=info,
                                              pending=queue, detail={"stale_ms": None if latest_ms is None
                                                      else round(now * 1000.0 - latest_ms, 1)})
                     return None if defer_buy else False
-            offset = float(row["offset"])
+            offset = None if row_offset is None else float(row_offset)
         else:
             offset = 0.0
-        spot_ref = spot_now + offset
+        legacy_gap_meta = {
+            "gap_estimator": "legacy" if estimator != "e3" else ("e3" if use_e3 else "fallback"),
+            "est_e3": None if est_e3 is None else round(est_e3, 2),
+            "e3_feeds": list(e3_feeds),
+            "e3_feed_count": len(e3_feeds),
+        }
         strike = float(row["strike"])
         for side, jump_key, sign in (("up", "up_jump", 1.0), ("down", "down_jump", -1.0)):
             jump_usd = float(info[jump_key])
-            gap_usd = sign * (spot_ref - strike)
+            gap_legacy = None if offset is None else sign * (spot_now + offset - strike)
+            gap_e3 = None if est_e3 is None else sign * (est_e3 - strike)
+            gap_usd = gap_e3 if use_e3 else gap_legacy
+            gap_meta = dict(legacy_gap_meta, gap_legacy_usd=None if gap_legacy is None else round(gap_legacy, 2),
+                            gap_e3_usd=None if gap_e3 is None else round(gap_e3, 2))
             if jump_usd + EPS < float(cfg["sniper_jump_usd"]):
                 continue
             note = self._sniper_note(row, side)
@@ -1074,38 +1261,41 @@ class Strategy:
                 note["first_seen_source"] = trigger_source
             if gap_usd + EPS < float(cfg["sniper_min_gap_usd"]):
                 self._sniper_gate_reject(cfg, row, side, "min_gap", now=now, info=info, pending=queue,
-                                         jump_usd=jump_usd, gap_usd=gap_usd,
+                                         jump_usd=jump_usd, gap_usd=gap_usd, gap_meta=gap_meta,
                                          detail={"gap_usd": round(gap_usd, 2),
-                                                 "min_gap_usd": cfg["sniper_min_gap_usd"]})
+                                                 "min_gap_usd": cfg["sniper_min_gap_usd"],
+                                                 **gap_meta})
                 continue
             side_quote = quotes.get(side, {})
             age_ms = side_quote.get("age_ms")
             max_age_ms = float(cfg.get("sniper_max_book_age_ms", 1500.0))
             if age_ms is not None and max_age_ms > 0 and float(age_ms) > max_age_ms + EPS:
                 self._sniper_gate_reject(cfg, row, side, "book_age", now=now, info=info, pending=queue,
-                                         jump_usd=jump_usd, gap_usd=gap_usd,
+                                         jump_usd=jump_usd, gap_usd=gap_usd, gap_meta=gap_meta,
                                          detail={"age_ms": round(float(age_ms), 1), "max_age_ms": max_age_ms})
                 continue
             levels = ask_levels(side_quote)
             best_ask = levels[0][0] if levels else side_quote.get("ask")
             if best_ask is None:
                 self._sniper_gate_reject(cfg, row, side, "ask_range", now=now, info=info, pending=queue,
-                                         jump_usd=jump_usd, gap_usd=gap_usd, detail={"ask": None})
+                                         jump_usd=jump_usd, gap_usd=gap_usd, gap_meta=gap_meta,
+                                         detail={"ask": None})
                 continue
             best_ask = float(best_ask)
             if not (float(cfg["sniper_min_ask"]) - EPS <= best_ask <= float(cfg["sniper_max_ask"]) + EPS):
                 self._sniper_gate_reject(cfg, row, side, "ask_range", now=now, info=info, pending=queue,
-                                         jump_usd=jump_usd, gap_usd=gap_usd,
+                                         jump_usd=jump_usd, gap_usd=gap_usd, gap_meta=gap_meta,
                                          detail={"ask": best_ask, "min": cfg["sniper_min_ask"],
                                                  "max": cfg["sniper_max_ask"]})
                 continue
             if self._min_fill_blocked(cfg, row, quotes, side, "sniper_5m"):
                 self._sniper_gate_reject(cfg, row, side, "min_fill", now=now, info=info, pending=queue,
-                                         jump_usd=jump_usd, gap_usd=gap_usd,
+                                         jump_usd=jump_usd, gap_usd=gap_usd, gap_meta=gap_meta,
                                          detail={"ask": best_ask, "floor": cfg["sniper_min_ask"]})
                 continue
             prepared = self._sniper_prepare(
                 cfg, now, row, quotes, side, jump_usd, gap_usd, spot_now, trigger_source=trigger_source,
+                gap_meta=gap_meta,
                 trigger_exchange_ts=_epoch_s(info.get("ts_ms")),
                 trigger_recv_ts=_epoch_s(info.get("recv_wall_ms")), grid=grid,
                 fire_path=fire_path, fire_event_source=trigger_source,
@@ -1120,6 +1310,7 @@ class Strategy:
 
     def _sniper_prepare(self, cfg, now, row, quotes, fav, jump_usd, gap_usd, spot_now, *,
                         trigger_source: str = "primary",
+                        gap_meta: Optional[dict] = None,
                         trigger_exchange_ts: Optional[float] = None,
                         trigger_recv_ts: Optional[float] = None,
                         grid=None,
@@ -1129,9 +1320,10 @@ class Strategy:
         decision_time = self.io.clock() if self.io.clock is not None else time.perf_counter()
         decision_ts = time.time()
         sent_now = decision_time if self.io.clock is not None else now
+        gap_meta = {} if gap_meta is None else dict(gap_meta)
         row["sniper_5m"] = {"attempted": True, "side": fav, "attempted_at": now,
                             "jump_usd": jump_usd, "gap_usd": gap_usd, "spot": spot_now,
-                            "trigger_source": trigger_source}
+                            "trigger_source": trigger_source, **gap_meta}
         reason = None
         if sent_now >= row["end"]:
             reason = "expired"
@@ -1152,7 +1344,7 @@ class Strategy:
                 reason = "cash"
         if reason:
             self._sniper_gate_reject(cfg, row, fav, reason, now=now,
-                                     jump_usd=jump_usd, gap_usd=gap_usd,
+                                     jump_usd=jump_usd, gap_usd=gap_usd, gap_meta=gap_meta,
                                      detail={"reason": reason})
             self.save(force=True)
             self.io.log("fivemin_sniper_blocked", slug=row["slug"], reason=reason)
@@ -1163,6 +1355,7 @@ class Strategy:
         return {
             "cfg": cfg, "now": now, "row": row, "quotes": quotes, "fav": fav,
             "jump_usd": jump_usd, "gap_usd": gap_usd, "spot_now": spot_now,
+            "gap_meta": gap_meta,
             "trigger_source": trigger_source, "decision_time": decision_time,
             "shares": shares, "limit": limit, "token": token, "is_dry": is_dry,
             "trigger_exchange_ts": trigger_exchange_ts, "trigger_recv_ts": trigger_recv_ts,
@@ -1251,6 +1444,7 @@ class Strategy:
                     latency_ms=latency_ms, timing=result.get("timing"),
                     jump_usd=jump_usd, gap_usd=gap_usd, spot=spot_now,
                     trigger_source=trigger_source, ttm=row["end"] - now,
+                    **prepared.get("gap_meta", {}),
                     **decision_book_fields(quotes.get(fav, {}), limit),
                     **rtds_compare_fields(prepared))
         if filled > 0:
@@ -1295,6 +1489,8 @@ class Strategy:
         except Exception:
             return
         fields.update(rtds_compare_fields(prepared))
+        # Gap-estimator context rides with the fill/nofill line for the same decision.
+        fields.update(prepared.get("gap_meta") or {})
         self.io.log("sniper_order_latency", **fields)
 
     def _sniper_enter(self, cfg, now, row, quotes, fav, jump_usd, gap_usd, spot_now, *, trigger_source: str = "primary"):
@@ -2004,6 +2200,17 @@ class Runner:
         if samples:
             self.rtds_last_sample = now
         self.strategy.boundary_samples(samples)
+        # E3 offsets fold in one Chainlink live sample per new ``obs_ts``, here on
+        # the main loop. ``_sniper_scan`` (also the feed-thread path) only reads them.
+        latest_live = getattr(self.rtds, "latest_live", None)
+        try:
+            live = latest_live() if callable(latest_live) else getattr(self.rtds, "_live", None)
+        except Exception:
+            live = None
+        try:
+            self.strategy.sniper_e3.update(cfg, live, self.grid, now)
+        except Exception:
+            pass
         with self._io_lock:
             markets = self._markets
             balance = self._balance
