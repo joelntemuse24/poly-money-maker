@@ -66,6 +66,11 @@ DEFAULTS = {
     "sniper_cl_guard_mode": "raw",
     "sniper_cl_max_age_s": 5.0,
     "sniper_cl_min_gap_usd": 0.0,
+    # Judge the side by the projected 60s settlement average (not spot) inside
+    # the last averaging minute. Default on; false restores the spot guard.
+    "sniper_cl_twap_guard": True,
+    # Cap the FAK limit at decision_best_ask + this, still under sniper_max_ask.
+    "sniper_max_slippage": 0.03,
     "rust_hotpath": False,
     "gc_freeze_hotpath": False,
     "gc_hotpath_gen0_threshold": 0, "gc_hotpath_gen2_threshold": 0,
@@ -243,6 +248,7 @@ def order_latency_fields(prepared: dict, result: Optional[dict] = None, *,
         "transport_ms": timing.get("post"),
         "ask_seen": book_fields.get("decision_best_ask"),
         "limit": prepared["limit"],
+        "limit_cap": prepared.get("limit_cap"),
         "fill_price": result.get("price"),
         "filled_shares": filled,
         "user_ws_match_ts": prepared.get("user_ws_match_ts"),
@@ -475,17 +481,64 @@ def rtds_compare_fields(prepared: dict) -> dict:
 # Shared constant for gate metadata when ``sniper_cl_guard`` is off, so the
 # disabled path only does one dict merge per side.
 CL_GUARD_OFF_META = {"cl_gap_usd": None, "cl_age_s": None,
-                     "cl_guard_mode": None, "cl_guard_decision": "off"}
+                     "cl_guard_mode": None, "cl_guard_decision": "off",
+                     "cl_twap_mode": None, "cl_twap_covered_s": None}
+
+# A settlement average needs the whole 60s window; the feed must retain at
+# least that much for a window that opened ~60s ago to still be covered.
+SETTLE_WINDOW_S = 60.0
+# Retention for the RTDS live prints the projection reads. The guard only needs
+# the last averaging window; the spare 30s absorbs a late first print.
+SETTLE_HISTORY_S = 90.0
+# A first tick later than this inside the window means the feed missed part of
+# the elapsed span; the guard then fails open instead of averaging a short slice.
+TWAP_COVER_GRACE_S = 5.0
 
 
-def chainlink_guard_reading(cfg: dict, grid, live, now_wall: float) -> dict:
+def projected_settlement_average(feed, now_wall: float, ttm: float, spot_now: float):
+    """Projected 60s settlement average for a window ending in ``ttm`` seconds.
+
+    Takes the time-weighted mean of the recorded Chainlink prints over the part
+    of the averaging window already elapsed and holds ``spot_now`` for the rest.
+    Returns ``(avg, covered_s)`` or None when the feed has no usable history.
+    """
+    window_start = float(now_wall) + float(ttm) - SETTLE_WINDOW_S
+    history_fn = getattr(feed, "live_average", None)
+    if not callable(history_fn):
+        return None
+    try:
+        result = history_fn(window_start, now_wall)
+    except Exception:
+        return None
+    if not result:
+        return None
+    avg, _ticks, first_obs, _last_obs, covered = result
+    if first_obs > window_start + TWAP_COVER_GRACE_S:
+        return None
+    remaining = max(0.0, float(ttm))
+    total = avg * covered + float(spot_now) * remaining
+    span = covered + remaining
+    if span <= 0:
+        return None
+    return total / span, covered
+
+
+def chainlink_guard_reading(cfg: dict, grid, live, now_wall: float, *,
+                            ttm: Optional[float] = None, feed=None) -> dict:
     """Pre-order Chainlink reference for the side guard; computed once per scan.
 
     ``live`` is ``rtds_feed._live`` (``.price``, ``.obs_ts`` in epoch seconds).
-    The helper never raises and only reads cached grid ticks.
+    The helper never raises and only reads cached grid ticks and feed history.
+
+    Inside the last ``SETTLE_WINDOW_S`` seconds before expiry the reference is
+    the projected 60s settlement average when ``sniper_cl_twap_guard`` is on:
+    markets settle on that average, so a spot print on our side can still lose.
+    Outside that window, and with the flag off, the reference is the spot print
+    (or its projected nowcast in ``projected`` mode) as before.
     """
     reading = {"cl_spot": None, "cl_ref": None, "cl_age_s": None,
-               "cl_guard_mode": None, "cl_guard_decision": "off"}
+               "cl_guard_mode": None, "cl_guard_decision": "off",
+               "cl_twap_mode": None, "cl_twap_covered_s": None}
     if not cfg.get("sniper_cl_guard", False):
         return reading
     try:
@@ -522,12 +575,47 @@ def chainlink_guard_reading(cfg: dict, grid, live, now_wall: float) -> dict:
                 reading["cl_guard_mode"] = "projected_fallback_raw"
             else:
                 ref = price + (cb_now - cb_then)
+        if ttm is not None and 0 <= float(ttm) < SETTLE_WINDOW_S:
+            if not cfg.get("sniper_cl_twap_guard", True):
+                reading["cl_twap_mode"] = "off"
+            else:
+                projected = projected_settlement_average(feed, now_wall, float(ttm), price)
+                if projected is None:
+                    # Never saw the averaging window: keep the old reference and
+                    # say so, like the other fail-open paths.
+                    reading["cl_twap_mode"] = "fallback_spot"
+                else:
+                    ref, covered = projected
+                    reading["cl_twap_mode"] = "settlement"
+                    reading["cl_twap_covered_s"] = round(covered, 3)
         reading["cl_ref"] = ref
         reading["cl_guard_decision"] = "ok"
     except Exception:
         reading = {"cl_spot": None, "cl_ref": None, "cl_age_s": None,
-                   "cl_guard_mode": None, "cl_guard_decision": "fail_open_missing"}
+                   "cl_guard_mode": None, "cl_guard_decision": "fail_open_missing",
+                   "cl_twap_mode": None, "cl_twap_covered_s": None}
     return reading
+
+
+def sniper_limit_price(best_ask, cfg: dict) -> tuple[float, Optional[float]]:
+    """``(limit, cap)`` for one sniper FAK, capped at the decision ask + slippage.
+
+    Fills have printed a median 5c over ``decision_best_ask`` while the order
+    was priced at ``sniper_max_ask``. The posted limit is the best ask seen at
+    decision time plus ``sniper_max_slippage``, floored to the cent (the CLOB
+    tick) and never above ``sniper_max_ask``. ``cap`` echoes the unrounded
+    ask + slippage ceiling for the log. Without an ask the old max stands.
+    """
+    max_ask = float(cfg["sniper_max_ask"])
+    if best_ask is None:
+        return max_ask, None
+    best_ask = float(best_ask)
+    slip = cfg.get("sniper_max_slippage")
+    slip = 0.0 if slip is None else max(0.0, float(slip))
+    cap = min(max_ask, best_ask + slip)
+    # Round down so the limit never exceeds the ceiling; never under the ask.
+    limit = max(best_ask, min(max_ask, math.floor(cap * 100.0 + 1e-9) / 100.0))
+    return limit, round(cap, 4)
 
 
 def decision_book_fields(book: dict, limit: float) -> dict:
@@ -785,7 +873,7 @@ class Strategy:
 
     def _sniper_gate_reject(self, cfg, row, side, gate, *, now, detail=None,
                             jump_usd=None, gap_usd=None, info=None, pending=None,
-                            gap_meta=None) -> None:
+                            gap_meta=None, best_ask=None) -> None:
         """Journal one ``sniper_gate_reject`` per gate per slug/side.
 
         With ``pending`` the payload is queued for the caller to write after its
@@ -808,6 +896,8 @@ class Strategy:
                   "gap_usd": None if gap_usd is None else round(float(gap_usd), 2),
                   "source": None if info is None else str(info.get("source") or "primary"),
                   "first_seen_ts": note["first_seen_ts"]}
+        if best_ask is not None:
+            fields["best_ask"] = best_ask
         if gap_meta:
             fields.update(gap_meta)
         if pending is not None:
@@ -1311,10 +1401,13 @@ class Strategy:
         strike = float(row["strike"])
         cl_guard_on = bool(cfg.get("sniper_cl_guard", False))
         # One Chainlink read per scan; the side loop only derives the signed gap.
+        # Inside the last minute the reference is the projected 60s settlement
+        # average, so the read needs the market end and the recorded ticks.
         cl_reading = None
         if cl_guard_on:
             cl_reading = chainlink_guard_reading(
-                cfg, grid, getattr(self.rtds_feed, "_live", None), time.time())
+                cfg, grid, getattr(self.rtds_feed, "_live", None), time.time(),
+                ttm=float(row["end"]) - now, feed=self.rtds_feed)
         for side, jump_key, sign in (("up", "up_jump", 1.0), ("down", "down_jump", -1.0)):
             jump_usd = float(info[jump_key])
             gap_legacy = None if offset is None else sign * (spot_now + offset - strike)
@@ -1333,6 +1426,11 @@ class Strategy:
                     "cl_age_s": None if cl_reading["cl_age_s"] is None else round(cl_reading["cl_age_s"], 3),
                     "cl_guard_mode": cl_reading["cl_guard_mode"],
                     "cl_guard_decision": cl_reading["cl_guard_decision"],
+                    "cl_twap_mode": cl_reading["cl_twap_mode"],
+                    "cl_twap_covered_s": cl_reading["cl_twap_covered_s"],
+                    # The value the decision used: the projected settlement
+                    # average in the last minute, else the spot / nowcast ref.
+                    "cl_guard_value": None if cl_ref is None else round(cl_ref, 2),
                 })
             if jump_usd + EPS < float(cfg["sniper_jump_usd"]):
                 continue
@@ -1355,10 +1453,19 @@ class Strategy:
                 min_cl_gap = 0.0 if min_cl_gap is None else float(min_cl_gap)
                 if cl_gap + EPS < min_cl_gap:
                     gap_meta["cl_guard_decision"] = "reject"
+                    # The blocked trade's ask, so a guard block can be audited
+                    # against the price that would have been paid.
+                    blocked_levels = ask_levels(quotes.get(side, {}))
+                    blocked_ask = (blocked_levels[0][0] if blocked_levels
+                                   else quotes.get(side, {}).get("ask"))
+                    if blocked_ask is not None:
+                        blocked_ask = float(blocked_ask)
                     self._sniper_gate_reject(
                         cfg, row, side, "cl_wrong_side", now=now, info=info, pending=queue,
                         jump_usd=jump_usd, gap_usd=gap_usd, gap_meta=gap_meta,
-                        detail={"min_gap_usd": min_cl_gap, **gap_meta})
+                        best_ask=blocked_ask,
+                        detail={"min_gap_usd": min_cl_gap, "best_ask": blocked_ask,
+                                **gap_meta})
                     continue
                 gap_meta["cl_guard_decision"] = "pass"
             side_quote = quotes.get(side, {})
@@ -1395,6 +1502,7 @@ class Strategy:
                 trigger_recv_ts=_epoch_s(info.get("recv_wall_ms")), grid=grid,
                 fire_path=fire_path, fire_event_source=trigger_source,
                 fire_event_recv_ts=_epoch_s(info.get("recv_wall_ms")),
+                best_ask=best_ask,
             )
             if defer_buy:
                 return prepared
@@ -1411,7 +1519,8 @@ class Strategy:
                         grid=None,
                         fire_path: str = "poll",
                         fire_event_source: Optional[str] = None,
-                        fire_event_recv_ts: Optional[float] = None):
+                        fire_event_recv_ts: Optional[float] = None,
+                        best_ask: Optional[float] = None):
         decision_time = self.io.clock() if self.io.clock is not None else time.perf_counter()
         decision_ts = time.time()
         sent_now = decision_time if self.io.clock is not None else now
@@ -1426,7 +1535,13 @@ class Strategy:
             reason = "disabled"
         elif self.state.get("paused_until_day") == self.state["day"]:
             reason = "daily_stop"
-        shares, limit = float(cfg["sniper_shares"]), float(cfg["sniper_max_ask"])
+        shares = float(cfg["sniper_shares"])
+        # Cap the FAK limit at the ask seen at decision time plus allowed
+        # slippage, still never above sniper_max_ask.
+        if best_ask is None:
+            fav_levels = ask_levels(quotes.get(fav, {}))
+            best_ask = fav_levels[0][0] if fav_levels else quotes.get(fav, {}).get("ask")
+        limit, limit_cap = sniper_limit_price(best_ask, cfg)
         if reason is None:
             reserves_val = (
                 self._cached_reserves
@@ -1452,7 +1567,7 @@ class Strategy:
             "jump_usd": jump_usd, "gap_usd": gap_usd, "spot_now": spot_now,
             "gap_meta": gap_meta,
             "trigger_source": trigger_source, "decision_time": decision_time,
-            "shares": shares, "limit": limit, "token": token, "is_dry": is_dry,
+            "shares": shares, "limit": limit, "limit_cap": limit_cap, "token": token, "is_dry": is_dry,
             "trigger_exchange_ts": trigger_exchange_ts, "trigger_recv_ts": trigger_recv_ts,
             "post_meta": {"decision_ts": decision_ts},
             "grid": grid,
@@ -1536,6 +1651,7 @@ class Strategy:
         )
         self.io.log(kind, slug=row["slug"], condition_id=row["condition_id"], side=fav,
                     price=avg, size=filled, usdc=cost, status=result.get("status"),
+                    limit=limit, limit_cap=prepared.get("limit_cap"),
                     latency_ms=latency_ms, timing=result.get("timing"),
                     jump_usd=jump_usd, gap_usd=gap_usd, spot=spot_now,
                     trigger_source=trigger_source, ttm=row["end"] - now,

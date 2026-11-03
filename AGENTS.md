@@ -419,3 +419,19 @@ injected callbacks for orders, persistence, logging, alerts, and redeem jobs.
 Keep its sockets and state isolated from the 15-minute sell/mint/oracle paths.
 Do not add network work at module import time. Tests must keep using pure
 helpers or stubs and must not import `mintbot.py`.
+
+Sniper side guard and limit cap (all keys must also exist in `mintbot.DEFAULTS`
+or `load_strategy()` drops them): markets settle on the Chainlink 60s average,
+so inside the last 60s the guard's reference is the projected settlement
+average — the time-weighted mean of the recorded Chainlink live prints over the
+elapsed part of the averaging window, holding the current print for the rest.
+`mintbot` starts that feed with `history_s=SETTLE_HISTORY_S` (90s).
+`sniper_cl_twap_guard` (default true) turns this off and restores the spot
+reference; outside the last 60s, or without enough recorded history, the guard
+keeps the old raw/projected reference and logs `cl_twap_mode` /
+`cl_twap_covered_s`. The decision lines carry `cl_guard_value`, the value the
+guard compared. `sniper_cl_guard` stays off by default, so all of this is inert
+until it is enabled. Blocked trades log `best_ask`. The FAK limit is
+`min(sniper_max_ask, decision_best_ask + sniper_max_slippage)` (default 0.03,
+rounded down to the cent and never under the ask); the order lines carry
+`limit` and `limit_cap`. Fills had printed a median 5c over the decision ask.
