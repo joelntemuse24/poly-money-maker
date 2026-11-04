@@ -1,4 +1,4 @@
-"""Last-minute settlement-average guard and the sniper limit cap."""
+"""Last-minute settlement-average guard for the 5m sniper."""
 from __future__ import annotations
 
 import json
@@ -7,7 +7,7 @@ import unittest
 from types import SimpleNamespace
 
 from buy.fivemin import (DEFAULTS, FiveMinIO, Strategy, chainlink_guard_reading,
-                         projected_settlement_average, sniper_limit_price)
+                         projected_settlement_average)
 from buy.oracle_log import RtdsTwapFeed
 
 import test_fivemin as helpers
@@ -271,63 +271,6 @@ class TwapGuardTests(unittest.TestCase):
 
     def test_defaults_are_on_and_revertible(self):
         self.assertTrue(DEFAULTS["sniper_cl_twap_guard"])
-        self.assertEqual(DEFAULTS["sniper_max_slippage"], 0.03)
-
-
-class LimitCapTests(unittest.TestCase):
-    def test_cap_is_ask_plus_slippage(self):
-        self.assertEqual(sniper_limit_price(.74, cfg()), (.77, .77))
-
-    def test_cap_never_exceeds_the_ask_max(self):
-        self.assertEqual(sniper_limit_price(.96, cfg()), (.97, .97))
-
-    def test_cap_respects_a_custom_slippage(self):
-        self.assertEqual(sniper_limit_price(.74, cfg(sniper_max_slippage=0.10)), (.84, .84))
-        self.assertEqual(sniper_limit_price(.74, cfg(sniper_max_slippage=0.0)), (.74, .74))
-
-    def test_missing_ask_keeps_the_old_max(self):
-        self.assertEqual(sniper_limit_price(None, cfg()), (.97, None))
-
-    def test_order_posts_the_capped_limit_and_logs_it(self):
-        case = Case(ttm=100.0)
-        case.strategy.rtds_feed = None
-        prepared = case.check(cfg(), grid=FakeGrid(up_jump=30.0, spot=90030.0),
-                              quotes=case.quotes(ask=.74))
-        self.assertIsNotNone(prepared)
-        self.assertAlmostEqual(prepared["limit"], .77)
-        case.strategy._sniper_execute(prepared)
-        self.assertAlmostEqual(case.buys[0][2], .77)
-        fill = case.events("fivemin_sniper_fill")[0]
-        self.assertAlmostEqual(fill["limit"], .77)
-        self.assertAlmostEqual(fill["limit_cap"], .77)
-        self.assertAlmostEqual(fill["decision_best_ask"], .74)
-        latency = case.events("sniper_order_latency")[0]
-        self.assertAlmostEqual(latency["limit"], .77)
-        self.assertAlmostEqual(latency["limit_cap"], .77)
-
-    def test_ask_above_the_ask_max_still_blocks(self):
-        case = Case(ttm=100.0)
-        case.strategy.rtds_feed = None
-        # 0.98 is over sniper_max_ask, so the ask_range gate still blocks it.
-        self.assertIsNone(case.check(cfg(), grid=FakeGrid(up_jump=30.0, spot=90030.0),
-                                     quotes=case.quotes(ask=.98)))
-        self.assertEqual(case.rejects()[0]["gate"], "ask_range")
-
-    def test_presign_ladder_covers_the_capped_limits(self):
-        import mintbot
-
-        prices = mintbot.sniper_presign_prices(
-            {"sniper_max_ask": 0.97, "sniper_min_ask": 0.50})
-        self.assertEqual(prices[-1], 0.97)
-        self.assertEqual(prices[0], 0.67)
-        # Every limit the cap can produce for an ask in the band is signed.
-        for ask in (.67, .74, .90, .94, .96, .97):
-            limit, cap = sniper_limit_price(ask, cfg())
-            self.assertIn(limit, prices, f"ask {ask} -> limit {limit}")
-        # A narrower max-ask band still ends at the max.
-        narrow = mintbot.sniper_presign_prices(
-            {"sniper_max_ask": 0.80, "sniper_min_ask": 0.50})
-        self.assertEqual((narrow[0], narrow[-1]), (0.50, 0.80))
 
 
 if __name__ == "__main__":

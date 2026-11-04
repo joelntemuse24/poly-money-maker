@@ -275,11 +275,6 @@ LOCK_FILE = REPO / ".mintbot.lock"
 HEARTBEAT_FILE = REPO / ".heartbeat_mint"
 STOP_FILE = REPO / "STOP_MINT"
 
-# How far under sniper_max_ask the off-path sniper pre-sign ladder starts. The
-# limit is the decision ask + sniper_max_slippage, so a 0.30 band covers asks
-# from 0.67 up at the 0.03 default; lower caps just sign inline.
-SNIPER_PRESIGN_BAND = 0.30
-
 DEFAULTS = {
     'fivemin_book_ws': False,
     'fivemin_book_ws_stale_s': 1.0,
@@ -365,10 +360,11 @@ DEFAULTS = {
     'sniper_cl_guard_mode': 'raw',
     'sniper_cl_min_gap_usd': 0.0,
     'sniper_cl_max_age_s': 5.0,
-    # Last-minute guard uses the projected 60s settlement average, and the FAK
-    # limit is capped at decision_best_ask + sniper_max_slippage.
+    # Last-minute guard uses the projected 60s settlement average.
     'sniper_cl_twap_guard': True,
-    'sniper_max_slippage': 0.03,
+    # Wrong-side trigger guard and the late-trigger cutoff (0 = disabled).
+    'sniper_jump_direction_check': True,
+    'sniper_max_trigger_lag_ms': 0.0,
     # Hot-path isolation knobs (buy/hotpath.py, buy/feed_process.py). All off:
     # the defaults change no decision, size, threshold or order.
     'gc_hotpath_gen0_threshold': 0,
@@ -986,11 +982,14 @@ def validate_strategy(cfg: dict) -> None:
             raise ValueError(f"{key} must be > 0")
     if not isinstance(cfg.get("sniper_cl_twap_guard", True), bool):
         raise ValueError("sniper_cl_twap_guard must be boolean")
-    slippage = cfg.get("sniper_max_slippage", 0.03)
-    if isinstance(slippage, bool) or not isinstance(slippage, (int, float)):
-        raise ValueError("sniper_max_slippage must be a number")
-    if not (0 <= float(slippage) < 1):
-        raise ValueError("sniper_max_slippage must be in [0, 1)")
+    if not isinstance(cfg.get("sniper_jump_direction_check", True), bool):
+        raise ValueError("sniper_jump_direction_check must be boolean")
+    lag_ms = cfg.get("sniper_max_trigger_lag_ms", 0.0)
+    if isinstance(lag_ms, bool) or not isinstance(lag_ms, (int, float)):
+        raise ValueError("sniper_max_trigger_lag_ms must be a number")
+    lag_ms = float(lag_ms)
+    if lag_ms != lag_ms or lag_ms in (float("inf"), float("-inf")) or lag_ms < 0:
+        raise ValueError("sniper_max_trigger_lag_ms must be finite and >= 0")
     for key, default, low, high in (
         ("fivemin_nofill_retry_s", 2.0, 0, None),
         ("fivemin_max_attempts_per_market", 3, 1, 20),
@@ -2945,19 +2944,13 @@ def _fak_warmup_sync(token_ids):
                     if acfg.get("presign_enabled", True) and acfg.get("sniper_5m_enabled", False):
                         from buy.presign import get_presign_cache
                         s_shares = float(acfg.get("sniper_shares", 10))
-                        # The sniper limit is the decision ask + slippage, capped
-                        # at sniper_max_ask, so it moves by the cent. Sign the
-                        # whole range once here instead of ~3ms on the order path.
-                        prices = sniper_presign_prices(acfg)
-                        for s_limit in prices:
-                            s_usdc = reclaim_buy_usdc(s_shares, s_limit)
-                            get_presign_cache().presign_market_order(
-                                client, token, "BUY", s_usdc, s_limit,
-                                tick_size=str(tick_size), neg_risk=bool(neg_risk), version=int(version),
-                            )
-                        log_event("presign_warmed", token_id=str(token)[:18],
-                                  prices=len(prices), price_max=prices[-1],
-                                  usdc=reclaim_buy_usdc(s_shares, prices[0]))
+                        s_limit = float(acfg.get("sniper_max_ask", 0.97))
+                        s_usdc = reclaim_buy_usdc(s_shares, s_limit)
+                        get_presign_cache().presign_market_order(
+                            client, token, "BUY", s_usdc, s_limit,
+                            tick_size=str(tick_size), neg_risk=bool(neg_risk), version=int(version),
+                        )
+                        log_event("presign_warmed", token_id=str(token)[:18], usdc=s_usdc, price=s_limit)
             except Exception as exc:
                 warn(exc)
 
@@ -2966,27 +2959,6 @@ def _fak_warmup_tokens(token_ids):
     """Live-only callers schedule metadata work off the strategy tick."""
     threading.Thread(target=_fak_warmup_sync, args=(tuple(token_ids),),
                      name="mintbot-fivemin-clob-warmup", daemon=True).start()
-
-
-def sniper_presign_prices(cfg: dict) -> list[float]:
-    """The sniper limits worth pre-signing, in cents, low to high.
-
-    The FAK limit is ``min(sniper_max_ask, decision_best_ask +
-    sniper_max_slippage)`` rounded down to the cent, so the ask ladder maps onto
-    a small fixed set of limits. The sniper only fires on a strong jump, so the
-    band is the top ``SNIPER_PRESIGN_BAND`` of the ask range; signing it here
-    keeps the order POST on the pre-sign cache. A cap below the band still
-    works: it just signs inline.
-    """
-    max_ask = round(float(cfg.get("sniper_max_ask", 0.97)), 2)
-    low = max(float(cfg.get("sniper_min_ask", 0.50) or 0.0), max_ask - SNIPER_PRESIGN_BAND)
-    prices = []
-    cent = max(1, int(round(low * 100)))
-    top = max(cent, int(round(max_ask * 100)))
-    while cent <= top:
-        prices.append(round(cent / 100.0, 2))
-        cent += 1
-    return prices
 
 
 def _fak_buy(

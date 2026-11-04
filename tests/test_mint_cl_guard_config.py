@@ -12,7 +12,8 @@ from buy import fivemin
 
 CL_KEYS = ("sniper_cl_guard", "sniper_cl_guard_mode",
            "sniper_cl_min_gap_usd", "sniper_cl_max_age_s",
-           "sniper_cl_twap_guard", "sniper_max_slippage")
+           "sniper_cl_twap_guard", "sniper_jump_direction_check",
+           "sniper_max_trigger_lag_ms")
 
 
 def _strategy(**overrides) -> dict:
@@ -28,6 +29,7 @@ def _write(path, payload: dict) -> None:
 @pytest.mark.parametrize("key", CL_KEYS)
 def test_defaults_define_cl_guard_keys(key):
     assert key in mintbot.DEFAULTS
+    assert key in fivemin.DEFAULTS
 
 
 def test_load_strategy_keeps_cl_guard_keys(tmp_path, monkeypatch):
@@ -37,7 +39,8 @@ def test_load_strategy_keeps_cl_guard_keys(tmp_path, monkeypatch):
                            sniper_cl_min_gap_usd=12.5,
                            sniper_cl_max_age_s=2.0,
                            sniper_cl_twap_guard=False,
-                           sniper_max_slippage=0.05,
+                           sniper_jump_direction_check=False,
+                           sniper_max_trigger_lag_ms=500.0,
                            sniper_gap_estimator="e3",
                            sniper_e3_lag_s=0.75))
     monkeypatch.setattr(mintbot, "STRATEGY_FILE", path)
@@ -48,7 +51,8 @@ def test_load_strategy_keeps_cl_guard_keys(tmp_path, monkeypatch):
     assert cfg["sniper_cl_min_gap_usd"] == 12.5
     assert cfg["sniper_cl_max_age_s"] == 2.0
     assert cfg["sniper_cl_twap_guard"] is False
-    assert cfg["sniper_max_slippage"] == 0.05
+    assert cfg["sniper_jump_direction_check"] is False
+    assert cfg["sniper_max_trigger_lag_ms"] == 500.0
     assert cfg["sniper_gap_estimator"] == "e3"
     assert cfg["sniper_e3_lag_s"] == 0.75
 
@@ -59,7 +63,8 @@ def test_load_strategy_keeps_cl_guard_keys(tmp_path, monkeypatch):
     assert merged["sniper_cl_min_gap_usd"] == 12.5
     assert merged["sniper_cl_max_age_s"] == 2.0
     assert merged["sniper_cl_twap_guard"] is False
-    assert merged["sniper_max_slippage"] == 0.05
+    assert merged["sniper_jump_direction_check"] is False
+    assert merged["sniper_max_trigger_lag_ms"] == 500.0
 
 
 def test_load_strategy_cl_guard_defaults_when_absent(tmp_path, monkeypatch):
@@ -76,7 +81,8 @@ def test_load_strategy_cl_guard_defaults_when_absent(tmp_path, monkeypatch):
     assert cfg["sniper_cl_min_gap_usd"] == 0.0
     assert cfg["sniper_cl_max_age_s"] == 5.0
     assert cfg["sniper_cl_twap_guard"] is True
-    assert cfg["sniper_max_slippage"] == 0.03
+    assert cfg["sniper_jump_direction_check"] is True
+    assert cfg["sniper_max_trigger_lag_ms"] == 0.0
     assert fivemin.settings(cfg)["sniper_cl_guard_mode"] == "raw"
 
 
@@ -95,11 +101,15 @@ def test_load_strategy_cl_guard_defaults_when_absent(tmp_path, monkeypatch):
     {"sniper_cl_max_age_s": -1.0},
     {"sniper_cl_twap_guard": "true"},
     {"sniper_cl_twap_guard": 1},
-    {"sniper_max_slippage": "0.03"},
-    {"sniper_max_slippage": True},
-    {"sniper_max_slippage": -0.01},
-    {"sniper_max_slippage": 1.0},
-    {"sniper_max_slippage": float("nan")},
+    {"sniper_jump_direction_check": "true"},
+    {"sniper_jump_direction_check": 1},
+    {"sniper_jump_direction_check": None},
+    {"sniper_max_trigger_lag_ms": "500"},
+    {"sniper_max_trigger_lag_ms": True},
+    {"sniper_max_trigger_lag_ms": -1},
+    {"sniper_max_trigger_lag_ms": -0.5},
+    {"sniper_max_trigger_lag_ms": float("inf")},
+    {"sniper_max_trigger_lag_ms": float("nan")},
 ])
 def test_load_strategy_rejects_invalid_cl_guard(tmp_path, monkeypatch, overrides):
     path = tmp_path / "strategy_mint.json"
@@ -124,12 +134,14 @@ def test_hot_reload_picks_up_cl_guard(tmp_path, monkeypatch):
                            sniper_cl_guard_mode="projected",
                            sniper_cl_max_age_s=1.5,
                            sniper_cl_twap_guard=False,
-                           sniper_max_slippage=0.02))
+                           sniper_jump_direction_check=False,
+                           sniper_max_trigger_lag_ms=750.0))
     reloaded = mintbot._reload_cfg(cfg_box)
     assert reloaded["sniper_cl_guard"] is True
     assert reloaded["sniper_cl_guard_mode"] == "projected"
     assert reloaded["sniper_cl_max_age_s"] == 1.5
     assert reloaded["sniper_cl_twap_guard"] is False
-    assert reloaded["sniper_max_slippage"] == 0.02
+    assert reloaded["sniper_jump_direction_check"] is False
+    assert reloaded["sniper_max_trigger_lag_ms"] == 750.0
     assert cfg_box["cfg"]["sniper_cl_guard"] is True
     assert fivemin.settings(cfg_box["cfg"])["sniper_cl_guard"] is True

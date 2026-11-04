@@ -69,8 +69,11 @@ DEFAULTS = {
     # Judge the side by the projected 60s settlement average (not spot) inside
     # the last averaging minute. Default on; false restores the spot guard.
     "sniper_cl_twap_guard": True,
-    # Cap the FAK limit at decision_best_ask + this, still under sniper_max_ask.
-    "sniper_max_slippage": 0.03,
+    # Refuse a side whose window move disagrees with it: a spike-and-retrace
+    # inside the 500ms window otherwise fires the opposite side.
+    "sniper_jump_direction_check": True,
+    # Refuse a trigger older than this when it reaches the scan (0 = disabled).
+    "sniper_max_trigger_lag_ms": 0.0,
     "rust_hotpath": False,
     "gc_freeze_hotpath": False,
     "gc_hotpath_gen0_threshold": 0, "gc_hotpath_gen2_threshold": 0,
@@ -97,6 +100,10 @@ EPS = 1e-9
 STRIKE_GRACE_S = 5.0
 # (slug, side) diagnostic notes kept in memory by ``Strategy._sniper_note``.
 SNIPER_NOTE_ENTRIES = 64
+# Marks "caller did not supply an ask" for ``_sniper_gate_reject``. Side gates
+# always pass one (None when the book is missing), so the field is present
+# there; scan-level gates without a side leave it out.
+_BEST_ASK_UNSET = object()
 # Empty-loser signal valid only if favoured side shows asks at <= cap, where the cap is the
 # configured fivemin_buy_limit; #286 fired 5x live into empty asks, FAK rejected.
 FIVEMIN_LOSER_EMPTY_MIN_ASK_SHARES = 1.0
@@ -185,6 +192,22 @@ def _epoch_s(value) -> Optional[float]:
     return out if math.isfinite(out) else None
 
 
+def _trigger_lag_ms(info: dict) -> Optional[float]:
+    """How old the trigger is at the scan: recv wall stamp minus exchange stamp.
+
+    Both stamps are epoch ms. Returns ``None`` when either is missing, which
+    makes the caller skip the cutoff instead of guessing.
+    """
+    try:
+        recv_ms = float(info.get("recv_wall_ms"))
+        exchange_ms = float(info.get("ts_ms"))
+    except (TypeError, ValueError):
+        return None
+    if not (math.isfinite(recv_ms) and math.isfinite(exchange_ms)):
+        return None
+    return recv_ms - exchange_ms
+
+
 def order_latency_fields(prepared: dict, result: Optional[dict] = None, *,
                          error: Optional[str] = None,
                          feed_recv: Optional[dict] = None,
@@ -248,7 +271,6 @@ def order_latency_fields(prepared: dict, result: Optional[dict] = None, *,
         "transport_ms": timing.get("post"),
         "ask_seen": book_fields.get("decision_best_ask"),
         "limit": prepared["limit"],
-        "limit_cap": prepared.get("limit_cap"),
         "fill_price": result.get("price"),
         "filled_shares": filled,
         "user_ws_match_ts": prepared.get("user_ws_match_ts"),
@@ -597,25 +619,21 @@ def chainlink_guard_reading(cfg: dict, grid, live, now_wall: float, *,
     return reading
 
 
-def sniper_limit_price(best_ask, cfg: dict) -> tuple[float, Optional[float]]:
-    """``(limit, cap)`` for one sniper FAK, capped at the decision ask + slippage.
+def side_best_ask(quotes: dict, side: str) -> Optional[float]:
+    """Top ask of one side's book, for the reject log; ``None`` when absent.
 
-    Fills have printed a median 5c over ``decision_best_ask`` while the order
-    was priced at ``sniper_max_ask``. The posted limit is the best ask seen at
-    decision time plus ``sniper_max_slippage``, floored to the cent (the CLOB
-    tick) and never above ``sniper_max_ask``. ``cap`` echoes the unrounded
-    ask + slippage ceiling for the log. Without an ask the old max stands.
+    Only called on a reject path, so the small sort in ``ask_levels`` never
+    runs on a scan that fires.
     """
-    max_ask = float(cfg["sniper_max_ask"])
-    if best_ask is None:
-        return max_ask, None
-    best_ask = float(best_ask)
-    slip = cfg.get("sniper_max_slippage")
-    slip = 0.0 if slip is None else max(0.0, float(slip))
-    cap = min(max_ask, best_ask + slip)
-    # Round down so the limit never exceeds the ceiling; never under the ask.
-    limit = max(best_ask, min(max_ask, math.floor(cap * 100.0 + 1e-9) / 100.0))
-    return limit, round(cap, 4)
+    book = quotes.get(side) or {}
+    levels = ask_levels(book)
+    value = levels[0][0] if levels else book.get("ask")
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
 
 
 def decision_book_fields(book: dict, limit: float) -> dict:
@@ -871,9 +889,64 @@ class Strategy:
             notes.pop(next(iter(notes)), None)
         return note
 
+    def _sniper_direction_decision(self, cfg, grid, info: dict, sign: float,
+                                   cache: dict) -> str:
+        """``pass`` / ``reject_both`` / ``reject_net`` / ``unavailable``.
+
+        A spike-and-retrace inside the jump window makes both ``up_jump`` and
+        ``down_jump`` clear the threshold, so the side loop would trade the
+        retrace against a window that net moved the other way. Reject when both
+        magnitudes qualify, or when the net move from the window's opening tick
+        to the current spot points at the other side.
+
+        Only runs after one side's jump already cleared ``sniper_jump_usd``.
+        The open-price lookup walks the window's ticks once per scan (cached in
+        ``cache``), and every unavailable input fails open as ``unavailable``.
+        """
+        cache.setdefault("net_usd", None)
+        up_j = _finite_float(info.get("up_jump"))
+        down_j = _finite_float(info.get("down_jump"))
+        threshold = float(cfg["sniper_jump_usd"])
+        # ``+ EPS`` matches the side loop's jump gate, so a magnitude that only
+        # clears the threshold within rounding still counts as tripped here.
+        both = (up_j is not None and down_j is not None
+                and up_j + EPS >= threshold and down_j + EPS >= threshold)
+        # Logged with the reject either way: for a spike-and-retrace the net
+        # move is the evidence that the other side's jump is the real story.
+        net = self._sniper_window_net(grid, info, cache)
+        if both:
+            return "reject_both"
+        if net is None:
+            return "unavailable"
+        return "reject_net" if sign * net <= 0 else "pass"
+
+    @staticmethod
+    def _sniper_window_net(grid, info: dict, cache: dict) -> Optional[float]:
+        """``raw_spot - window open price``, or ``None`` when an input is missing."""
+        if "net_px" in cache:
+            return cache["net_px"]
+        cache["net_px"] = None
+        raw_spot = _finite_float(info.get("raw_spot"))
+        lower_ms = _finite_float(info.get("win_lower_ms"))
+        upper_ms = _finite_float(info.get("win_ref_ms"))
+        open_fn = getattr(grid, "window_open_price", None) if grid is not None else None
+        if raw_spot is None or lower_ms is None or upper_ms is None or not callable(open_fn):
+            return None
+        try:
+            open_px = _finite_float(open_fn(str(info.get("source") or "primary"),
+                                            lower_ms, upper_ms))
+        except Exception:
+            open_px = None
+        if open_px is None:
+            return None
+        net = raw_spot - open_px
+        cache["net_px"] = net
+        cache["net_usd"] = round(net, 2)
+        return net
+
     def _sniper_gate_reject(self, cfg, row, side, gate, *, now, detail=None,
                             jump_usd=None, gap_usd=None, info=None, pending=None,
-                            gap_meta=None, best_ask=None) -> None:
+                            gap_meta=None, best_ask=_BEST_ASK_UNSET) -> None:
         """Journal one ``sniper_gate_reject`` per gate per slug/side.
 
         With ``pending`` the payload is queued for the caller to write after its
@@ -896,7 +969,7 @@ class Strategy:
                   "gap_usd": None if gap_usd is None else round(float(gap_usd), 2),
                   "source": None if info is None else str(info.get("source") or "primary"),
                   "first_seen_ts": note["first_seen_ts"]}
-        if best_ask is not None:
+        if best_ask is not _BEST_ASK_UNSET:
             fields["best_ask"] = best_ask
         if gap_meta:
             fields.update(gap_meta)
@@ -1398,6 +1471,22 @@ class Strategy:
             "e3_feeds": list(e3_feeds),
             "e3_feed_count": len(e3_feeds),
         }
+        # Trigger lag and the wrong-side guard context ride with every decision
+        # line for this scan. Both are read once here; only the net move needs
+        # the window open price, which is fetched lazily and at most once.
+        lag_ms = _trigger_lag_ms(info)
+        max_lag_ms = 0.0 if cfg.get("sniper_max_trigger_lag_ms") is None else float(cfg["sniper_max_trigger_lag_ms"])
+        dir_check_on = bool(cfg.get("sniper_jump_direction_check", True))
+        legacy_gap_meta.update({
+            "trigger_lag_ms": None if lag_ms is None else round(lag_ms, 1),
+            "max_trigger_lag_ms": max_lag_ms,
+            "jump_dir_check": dir_check_on,
+            "jump_dir_decision": None if dir_check_on else "off",
+            "jump_net_usd": None,
+            "jump_up_usd": round(float(info["up_jump"]), 2),
+            "jump_down_usd": round(float(info["down_jump"]), 2),
+        })
+        dir_cache: dict = {}
         strike = float(row["strike"])
         cl_guard_on = bool(cfg.get("sniper_cl_guard", False))
         # One Chainlink read per scan; the side loop only derives the signed gap.
@@ -1439,9 +1528,32 @@ class Strategy:
                 seen = _epoch_s(info.get("recv_wall_ms"))
                 note["first_seen_ts"] = now if seen is None else seen
                 note["first_seen_source"] = trigger_source
+            if dir_check_on:
+                decision = self._sniper_direction_decision(
+                    cfg, grid, info, sign, dir_cache)
+                gap_meta.update({"jump_dir_decision": decision,
+                                 "jump_net_usd": dir_cache.get("net_usd")})
+                if decision in ("reject_both", "reject_net"):
+                    self._sniper_gate_reject(
+                        cfg, row, side, "direction", now=now, info=info, pending=queue,
+                        jump_usd=jump_usd, gap_usd=gap_usd, gap_meta=gap_meta,
+                        best_ask=side_best_ask(quotes, side),
+                        detail={"decision": decision,
+                                "net_usd": dir_cache.get("net_usd"),
+                                "up_jump": gap_meta["jump_up_usd"],
+                                "down_jump": gap_meta["jump_down_usd"]})
+                    continue
+            if lag_ms is not None and max_lag_ms > 0 and lag_ms > max_lag_ms + EPS:
+                self._sniper_gate_reject(
+                    cfg, row, side, "trigger_lag", now=now, info=info, pending=queue,
+                    jump_usd=jump_usd, gap_usd=gap_usd, gap_meta=gap_meta,
+                    best_ask=side_best_ask(quotes, side),
+                    detail={"lag_ms": round(lag_ms, 1), "max_lag_ms": max_lag_ms})
+                continue
             if gap_usd + EPS < float(cfg["sniper_min_gap_usd"]):
                 self._sniper_gate_reject(cfg, row, side, "min_gap", now=now, info=info, pending=queue,
                                          jump_usd=jump_usd, gap_usd=gap_usd, gap_meta=gap_meta,
+                                         best_ask=side_best_ask(quotes, side),
                                          detail={"gap_usd": round(gap_usd, 2),
                                                  "min_gap_usd": cfg["sniper_min_gap_usd"],
                                                  **gap_meta})
@@ -1455,11 +1567,7 @@ class Strategy:
                     gap_meta["cl_guard_decision"] = "reject"
                     # The blocked trade's ask, so a guard block can be audited
                     # against the price that would have been paid.
-                    blocked_levels = ask_levels(quotes.get(side, {}))
-                    blocked_ask = (blocked_levels[0][0] if blocked_levels
-                                   else quotes.get(side, {}).get("ask"))
-                    if blocked_ask is not None:
-                        blocked_ask = float(blocked_ask)
+                    blocked_ask = side_best_ask(quotes, side)
                     self._sniper_gate_reject(
                         cfg, row, side, "cl_wrong_side", now=now, info=info, pending=queue,
                         jump_usd=jump_usd, gap_usd=gap_usd, gap_meta=gap_meta,
@@ -1474,6 +1582,7 @@ class Strategy:
             if age_ms is not None and max_age_ms > 0 and float(age_ms) > max_age_ms + EPS:
                 self._sniper_gate_reject(cfg, row, side, "book_age", now=now, info=info, pending=queue,
                                          jump_usd=jump_usd, gap_usd=gap_usd, gap_meta=gap_meta,
+                                         best_ask=side_best_ask(quotes, side),
                                          detail={"age_ms": round(float(age_ms), 1), "max_age_ms": max_age_ms})
                 continue
             levels = ask_levels(side_quote)
@@ -1481,18 +1590,21 @@ class Strategy:
             if best_ask is None:
                 self._sniper_gate_reject(cfg, row, side, "ask_range", now=now, info=info, pending=queue,
                                          jump_usd=jump_usd, gap_usd=gap_usd, gap_meta=gap_meta,
+                                         best_ask=None,
                                          detail={"ask": None})
                 continue
             best_ask = float(best_ask)
             if not (float(cfg["sniper_min_ask"]) - EPS <= best_ask <= float(cfg["sniper_max_ask"]) + EPS):
                 self._sniper_gate_reject(cfg, row, side, "ask_range", now=now, info=info, pending=queue,
                                          jump_usd=jump_usd, gap_usd=gap_usd, gap_meta=gap_meta,
+                                         best_ask=best_ask,
                                          detail={"ask": best_ask, "min": cfg["sniper_min_ask"],
                                                  "max": cfg["sniper_max_ask"]})
                 continue
             if self._min_fill_blocked(cfg, row, quotes, side, "sniper_5m"):
                 self._sniper_gate_reject(cfg, row, side, "min_fill", now=now, info=info, pending=queue,
                                          jump_usd=jump_usd, gap_usd=gap_usd, gap_meta=gap_meta,
+                                         best_ask=best_ask,
                                          detail={"ask": best_ask, "floor": cfg["sniper_min_ask"]})
                 continue
             prepared = self._sniper_prepare(
@@ -1502,7 +1614,6 @@ class Strategy:
                 trigger_recv_ts=_epoch_s(info.get("recv_wall_ms")), grid=grid,
                 fire_path=fire_path, fire_event_source=trigger_source,
                 fire_event_recv_ts=_epoch_s(info.get("recv_wall_ms")),
-                best_ask=best_ask,
             )
             if defer_buy:
                 return prepared
@@ -1519,8 +1630,7 @@ class Strategy:
                         grid=None,
                         fire_path: str = "poll",
                         fire_event_source: Optional[str] = None,
-                        fire_event_recv_ts: Optional[float] = None,
-                        best_ask: Optional[float] = None):
+                        fire_event_recv_ts: Optional[float] = None):
         decision_time = self.io.clock() if self.io.clock is not None else time.perf_counter()
         decision_ts = time.time()
         sent_now = decision_time if self.io.clock is not None else now
@@ -1535,13 +1645,7 @@ class Strategy:
             reason = "disabled"
         elif self.state.get("paused_until_day") == self.state["day"]:
             reason = "daily_stop"
-        shares = float(cfg["sniper_shares"])
-        # Cap the FAK limit at the ask seen at decision time plus allowed
-        # slippage, still never above sniper_max_ask.
-        if best_ask is None:
-            fav_levels = ask_levels(quotes.get(fav, {}))
-            best_ask = fav_levels[0][0] if fav_levels else quotes.get(fav, {}).get("ask")
-        limit, limit_cap = sniper_limit_price(best_ask, cfg)
+        shares, limit = float(cfg["sniper_shares"]), float(cfg["sniper_max_ask"])
         if reason is None:
             reserves_val = (
                 self._cached_reserves
@@ -1555,6 +1659,7 @@ class Strategy:
         if reason:
             self._sniper_gate_reject(cfg, row, fav, reason, now=now,
                                      jump_usd=jump_usd, gap_usd=gap_usd, gap_meta=gap_meta,
+                                     best_ask=side_best_ask(quotes, fav),
                                      detail={"reason": reason})
             self.save(force=True)
             self.io.log("fivemin_sniper_blocked", slug=row["slug"], reason=reason)
@@ -1567,7 +1672,7 @@ class Strategy:
             "jump_usd": jump_usd, "gap_usd": gap_usd, "spot_now": spot_now,
             "gap_meta": gap_meta,
             "trigger_source": trigger_source, "decision_time": decision_time,
-            "shares": shares, "limit": limit, "limit_cap": limit_cap, "token": token, "is_dry": is_dry,
+            "shares": shares, "limit": limit, "token": token, "is_dry": is_dry,
             "trigger_exchange_ts": trigger_exchange_ts, "trigger_recv_ts": trigger_recv_ts,
             "post_meta": {"decision_ts": decision_ts},
             "grid": grid,
@@ -1651,7 +1756,7 @@ class Strategy:
         )
         self.io.log(kind, slug=row["slug"], condition_id=row["condition_id"], side=fav,
                     price=avg, size=filled, usdc=cost, status=result.get("status"),
-                    limit=limit, limit_cap=prepared.get("limit_cap"),
+                    limit=limit,
                     latency_ms=latency_ms, timing=result.get("timing"),
                     jump_usd=jump_usd, gap_usd=gap_usd, spot=spot_now,
                     trigger_source=trigger_source, ttm=row["end"] - now,
