@@ -66,6 +66,14 @@ DEFAULTS = {
     "sniper_cl_guard_mode": "raw",
     "sniper_cl_max_age_s": 5.0,
     "sniper_cl_min_gap_usd": 0.0,
+    # Judge the side by the projected 60s settlement average (not spot) inside
+    # the last averaging minute. Default on; false restores the spot guard.
+    "sniper_cl_twap_guard": True,
+    # Refuse a side whose window move disagrees with it: a spike-and-retrace
+    # inside the 500ms window otherwise fires the opposite side.
+    "sniper_jump_direction_check": True,
+    # Refuse a trigger older than this when it reaches the scan (0 = disabled).
+    "sniper_max_trigger_lag_ms": 0.0,
     "rust_hotpath": False,
     "gc_freeze_hotpath": False,
     "gc_hotpath_gen0_threshold": 0, "gc_hotpath_gen2_threshold": 0,
@@ -92,6 +100,10 @@ EPS = 1e-9
 STRIKE_GRACE_S = 5.0
 # (slug, side) diagnostic notes kept in memory by ``Strategy._sniper_note``.
 SNIPER_NOTE_ENTRIES = 64
+# Marks "caller did not supply an ask" for ``_sniper_gate_reject``. Side gates
+# always pass one (None when the book is missing), so the field is present
+# there; scan-level gates without a side leave it out.
+_BEST_ASK_UNSET = object()
 # Empty-loser signal valid only if favoured side shows asks at <= cap, where the cap is the
 # configured fivemin_buy_limit; #286 fired 5x live into empty asks, FAK rejected.
 FIVEMIN_LOSER_EMPTY_MIN_ASK_SHARES = 1.0
@@ -178,6 +190,22 @@ def _epoch_s(value) -> Optional[float]:
     except (TypeError, ValueError):
         return None
     return out if math.isfinite(out) else None
+
+
+def _trigger_lag_ms(info: dict) -> Optional[float]:
+    """How old the trigger is at the scan: recv wall stamp minus exchange stamp.
+
+    Both stamps are epoch ms. Returns ``None`` when either is missing, which
+    makes the caller skip the cutoff instead of guessing.
+    """
+    try:
+        recv_ms = float(info.get("recv_wall_ms"))
+        exchange_ms = float(info.get("ts_ms"))
+    except (TypeError, ValueError):
+        return None
+    if not (math.isfinite(recv_ms) and math.isfinite(exchange_ms)):
+        return None
+    return recv_ms - exchange_ms
 
 
 def order_latency_fields(prepared: dict, result: Optional[dict] = None, *,
@@ -475,17 +503,64 @@ def rtds_compare_fields(prepared: dict) -> dict:
 # Shared constant for gate metadata when ``sniper_cl_guard`` is off, so the
 # disabled path only does one dict merge per side.
 CL_GUARD_OFF_META = {"cl_gap_usd": None, "cl_age_s": None,
-                     "cl_guard_mode": None, "cl_guard_decision": "off"}
+                     "cl_guard_mode": None, "cl_guard_decision": "off",
+                     "cl_twap_mode": None, "cl_twap_covered_s": None}
+
+# A settlement average needs the whole 60s window; the feed must retain at
+# least that much for a window that opened ~60s ago to still be covered.
+SETTLE_WINDOW_S = 60.0
+# Retention for the RTDS live prints the projection reads. The guard only needs
+# the last averaging window; the spare 30s absorbs a late first print.
+SETTLE_HISTORY_S = 90.0
+# A first tick later than this inside the window means the feed missed part of
+# the elapsed span; the guard then fails open instead of averaging a short slice.
+TWAP_COVER_GRACE_S = 5.0
 
 
-def chainlink_guard_reading(cfg: dict, grid, live, now_wall: float) -> dict:
+def projected_settlement_average(feed, now_wall: float, ttm: float, spot_now: float):
+    """Projected 60s settlement average for a window ending in ``ttm`` seconds.
+
+    Takes the time-weighted mean of the recorded Chainlink prints over the part
+    of the averaging window already elapsed and holds ``spot_now`` for the rest.
+    Returns ``(avg, covered_s)`` or None when the feed has no usable history.
+    """
+    window_start = float(now_wall) + float(ttm) - SETTLE_WINDOW_S
+    history_fn = getattr(feed, "live_average", None)
+    if not callable(history_fn):
+        return None
+    try:
+        result = history_fn(window_start, now_wall)
+    except Exception:
+        return None
+    if not result:
+        return None
+    avg, _ticks, first_obs, _last_obs, covered = result
+    if first_obs > window_start + TWAP_COVER_GRACE_S:
+        return None
+    remaining = max(0.0, float(ttm))
+    total = avg * covered + float(spot_now) * remaining
+    span = covered + remaining
+    if span <= 0:
+        return None
+    return total / span, covered
+
+
+def chainlink_guard_reading(cfg: dict, grid, live, now_wall: float, *,
+                            ttm: Optional[float] = None, feed=None) -> dict:
     """Pre-order Chainlink reference for the side guard; computed once per scan.
 
     ``live`` is ``rtds_feed._live`` (``.price``, ``.obs_ts`` in epoch seconds).
-    The helper never raises and only reads cached grid ticks.
+    The helper never raises and only reads cached grid ticks and feed history.
+
+    Inside the last ``SETTLE_WINDOW_S`` seconds before expiry the reference is
+    the projected 60s settlement average when ``sniper_cl_twap_guard`` is on:
+    markets settle on that average, so a spot print on our side can still lose.
+    Outside that window, and with the flag off, the reference is the spot print
+    (or its projected nowcast in ``projected`` mode) as before.
     """
     reading = {"cl_spot": None, "cl_ref": None, "cl_age_s": None,
-               "cl_guard_mode": None, "cl_guard_decision": "off"}
+               "cl_guard_mode": None, "cl_guard_decision": "off",
+               "cl_twap_mode": None, "cl_twap_covered_s": None}
     if not cfg.get("sniper_cl_guard", False):
         return reading
     try:
@@ -522,12 +597,43 @@ def chainlink_guard_reading(cfg: dict, grid, live, now_wall: float) -> dict:
                 reading["cl_guard_mode"] = "projected_fallback_raw"
             else:
                 ref = price + (cb_now - cb_then)
+        if ttm is not None and 0 <= float(ttm) < SETTLE_WINDOW_S:
+            if not cfg.get("sniper_cl_twap_guard", True):
+                reading["cl_twap_mode"] = "off"
+            else:
+                projected = projected_settlement_average(feed, now_wall, float(ttm), price)
+                if projected is None:
+                    # Never saw the averaging window: keep the old reference and
+                    # say so, like the other fail-open paths.
+                    reading["cl_twap_mode"] = "fallback_spot"
+                else:
+                    ref, covered = projected
+                    reading["cl_twap_mode"] = "settlement"
+                    reading["cl_twap_covered_s"] = round(covered, 3)
         reading["cl_ref"] = ref
         reading["cl_guard_decision"] = "ok"
     except Exception:
         reading = {"cl_spot": None, "cl_ref": None, "cl_age_s": None,
-                   "cl_guard_mode": None, "cl_guard_decision": "fail_open_missing"}
+                   "cl_guard_mode": None, "cl_guard_decision": "fail_open_missing",
+                   "cl_twap_mode": None, "cl_twap_covered_s": None}
     return reading
+
+
+def side_best_ask(quotes: dict, side: str) -> Optional[float]:
+    """Top ask of one side's book, for the reject log; ``None`` when absent.
+
+    Only called on a reject path, so the small sort in ``ask_levels`` never
+    runs on a scan that fires.
+    """
+    book = quotes.get(side) or {}
+    levels = ask_levels(book)
+    value = levels[0][0] if levels else book.get("ask")
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
 
 
 def decision_book_fields(book: dict, limit: float) -> dict:
@@ -783,9 +889,64 @@ class Strategy:
             notes.pop(next(iter(notes)), None)
         return note
 
+    def _sniper_direction_decision(self, cfg, grid, info: dict, sign: float,
+                                   cache: dict) -> str:
+        """``pass`` / ``reject_both`` / ``reject_net`` / ``unavailable``.
+
+        A spike-and-retrace inside the jump window makes both ``up_jump`` and
+        ``down_jump`` clear the threshold, so the side loop would trade the
+        retrace against a window that net moved the other way. Reject when both
+        magnitudes qualify, or when the net move from the window's opening tick
+        to the current spot points at the other side.
+
+        Only runs after one side's jump already cleared ``sniper_jump_usd``.
+        The open-price lookup walks the window's ticks once per scan (cached in
+        ``cache``), and every unavailable input fails open as ``unavailable``.
+        """
+        cache.setdefault("net_usd", None)
+        up_j = _finite_float(info.get("up_jump"))
+        down_j = _finite_float(info.get("down_jump"))
+        threshold = float(cfg["sniper_jump_usd"])
+        # ``+ EPS`` matches the side loop's jump gate, so a magnitude that only
+        # clears the threshold within rounding still counts as tripped here.
+        both = (up_j is not None and down_j is not None
+                and up_j + EPS >= threshold and down_j + EPS >= threshold)
+        # Logged with the reject either way: for a spike-and-retrace the net
+        # move is the evidence that the other side's jump is the real story.
+        net = self._sniper_window_net(grid, info, cache)
+        if both:
+            return "reject_both"
+        if net is None:
+            return "unavailable"
+        return "reject_net" if sign * net <= 0 else "pass"
+
+    @staticmethod
+    def _sniper_window_net(grid, info: dict, cache: dict) -> Optional[float]:
+        """``raw_spot - window open price``, or ``None`` when an input is missing."""
+        if "net_px" in cache:
+            return cache["net_px"]
+        cache["net_px"] = None
+        raw_spot = _finite_float(info.get("raw_spot"))
+        lower_ms = _finite_float(info.get("win_lower_ms"))
+        upper_ms = _finite_float(info.get("win_ref_ms"))
+        open_fn = getattr(grid, "window_open_price", None) if grid is not None else None
+        if raw_spot is None or lower_ms is None or upper_ms is None or not callable(open_fn):
+            return None
+        try:
+            open_px = _finite_float(open_fn(str(info.get("source") or "primary"),
+                                            lower_ms, upper_ms))
+        except Exception:
+            open_px = None
+        if open_px is None:
+            return None
+        net = raw_spot - open_px
+        cache["net_px"] = net
+        cache["net_usd"] = round(net, 2)
+        return net
+
     def _sniper_gate_reject(self, cfg, row, side, gate, *, now, detail=None,
                             jump_usd=None, gap_usd=None, info=None, pending=None,
-                            gap_meta=None) -> None:
+                            gap_meta=None, best_ask=_BEST_ASK_UNSET) -> None:
         """Journal one ``sniper_gate_reject`` per gate per slug/side.
 
         With ``pending`` the payload is queued for the caller to write after its
@@ -808,6 +969,8 @@ class Strategy:
                   "gap_usd": None if gap_usd is None else round(float(gap_usd), 2),
                   "source": None if info is None else str(info.get("source") or "primary"),
                   "first_seen_ts": note["first_seen_ts"]}
+        if best_ask is not _BEST_ASK_UNSET:
+            fields["best_ask"] = best_ask
         if gap_meta:
             fields.update(gap_meta)
         if pending is not None:
@@ -1308,13 +1471,32 @@ class Strategy:
             "e3_feeds": list(e3_feeds),
             "e3_feed_count": len(e3_feeds),
         }
+        # Trigger lag and the wrong-side guard context ride with every decision
+        # line for this scan. Both are read once here; only the net move needs
+        # the window open price, which is fetched lazily and at most once.
+        lag_ms = _trigger_lag_ms(info)
+        max_lag_ms = 0.0 if cfg.get("sniper_max_trigger_lag_ms") is None else float(cfg["sniper_max_trigger_lag_ms"])
+        dir_check_on = bool(cfg.get("sniper_jump_direction_check", True))
+        legacy_gap_meta.update({
+            "trigger_lag_ms": None if lag_ms is None else round(lag_ms, 1),
+            "max_trigger_lag_ms": max_lag_ms,
+            "jump_dir_check": dir_check_on,
+            "jump_dir_decision": None if dir_check_on else "off",
+            "jump_net_usd": None,
+            "jump_up_usd": round(float(info["up_jump"]), 2),
+            "jump_down_usd": round(float(info["down_jump"]), 2),
+        })
+        dir_cache: dict = {}
         strike = float(row["strike"])
         cl_guard_on = bool(cfg.get("sniper_cl_guard", False))
         # One Chainlink read per scan; the side loop only derives the signed gap.
+        # Inside the last minute the reference is the projected 60s settlement
+        # average, so the read needs the market end and the recorded ticks.
         cl_reading = None
         if cl_guard_on:
             cl_reading = chainlink_guard_reading(
-                cfg, grid, getattr(self.rtds_feed, "_live", None), time.time())
+                cfg, grid, getattr(self.rtds_feed, "_live", None), time.time(),
+                ttm=float(row["end"]) - now, feed=self.rtds_feed)
         for side, jump_key, sign in (("up", "up_jump", 1.0), ("down", "down_jump", -1.0)):
             jump_usd = float(info[jump_key])
             gap_legacy = None if offset is None else sign * (spot_now + offset - strike)
@@ -1333,6 +1515,11 @@ class Strategy:
                     "cl_age_s": None if cl_reading["cl_age_s"] is None else round(cl_reading["cl_age_s"], 3),
                     "cl_guard_mode": cl_reading["cl_guard_mode"],
                     "cl_guard_decision": cl_reading["cl_guard_decision"],
+                    "cl_twap_mode": cl_reading["cl_twap_mode"],
+                    "cl_twap_covered_s": cl_reading["cl_twap_covered_s"],
+                    # The value the decision used: the projected settlement
+                    # average in the last minute, else the spot / nowcast ref.
+                    "cl_guard_value": None if cl_ref is None else round(cl_ref, 2),
                 })
             if jump_usd + EPS < float(cfg["sniper_jump_usd"]):
                 continue
@@ -1341,9 +1528,32 @@ class Strategy:
                 seen = _epoch_s(info.get("recv_wall_ms"))
                 note["first_seen_ts"] = now if seen is None else seen
                 note["first_seen_source"] = trigger_source
+            if dir_check_on:
+                decision = self._sniper_direction_decision(
+                    cfg, grid, info, sign, dir_cache)
+                gap_meta.update({"jump_dir_decision": decision,
+                                 "jump_net_usd": dir_cache.get("net_usd")})
+                if decision in ("reject_both", "reject_net"):
+                    self._sniper_gate_reject(
+                        cfg, row, side, "direction", now=now, info=info, pending=queue,
+                        jump_usd=jump_usd, gap_usd=gap_usd, gap_meta=gap_meta,
+                        best_ask=side_best_ask(quotes, side),
+                        detail={"decision": decision,
+                                "net_usd": dir_cache.get("net_usd"),
+                                "up_jump": gap_meta["jump_up_usd"],
+                                "down_jump": gap_meta["jump_down_usd"]})
+                    continue
+            if lag_ms is not None and max_lag_ms > 0 and lag_ms > max_lag_ms + EPS:
+                self._sniper_gate_reject(
+                    cfg, row, side, "trigger_lag", now=now, info=info, pending=queue,
+                    jump_usd=jump_usd, gap_usd=gap_usd, gap_meta=gap_meta,
+                    best_ask=side_best_ask(quotes, side),
+                    detail={"lag_ms": round(lag_ms, 1), "max_lag_ms": max_lag_ms})
+                continue
             if gap_usd + EPS < float(cfg["sniper_min_gap_usd"]):
                 self._sniper_gate_reject(cfg, row, side, "min_gap", now=now, info=info, pending=queue,
                                          jump_usd=jump_usd, gap_usd=gap_usd, gap_meta=gap_meta,
+                                         best_ask=side_best_ask(quotes, side),
                                          detail={"gap_usd": round(gap_usd, 2),
                                                  "min_gap_usd": cfg["sniper_min_gap_usd"],
                                                  **gap_meta})
@@ -1355,10 +1565,15 @@ class Strategy:
                 min_cl_gap = 0.0 if min_cl_gap is None else float(min_cl_gap)
                 if cl_gap + EPS < min_cl_gap:
                     gap_meta["cl_guard_decision"] = "reject"
+                    # The blocked trade's ask, so a guard block can be audited
+                    # against the price that would have been paid.
+                    blocked_ask = side_best_ask(quotes, side)
                     self._sniper_gate_reject(
                         cfg, row, side, "cl_wrong_side", now=now, info=info, pending=queue,
                         jump_usd=jump_usd, gap_usd=gap_usd, gap_meta=gap_meta,
-                        detail={"min_gap_usd": min_cl_gap, **gap_meta})
+                        best_ask=blocked_ask,
+                        detail={"min_gap_usd": min_cl_gap, "best_ask": blocked_ask,
+                                **gap_meta})
                     continue
                 gap_meta["cl_guard_decision"] = "pass"
             side_quote = quotes.get(side, {})
@@ -1367,6 +1582,7 @@ class Strategy:
             if age_ms is not None and max_age_ms > 0 and float(age_ms) > max_age_ms + EPS:
                 self._sniper_gate_reject(cfg, row, side, "book_age", now=now, info=info, pending=queue,
                                          jump_usd=jump_usd, gap_usd=gap_usd, gap_meta=gap_meta,
+                                         best_ask=side_best_ask(quotes, side),
                                          detail={"age_ms": round(float(age_ms), 1), "max_age_ms": max_age_ms})
                 continue
             levels = ask_levels(side_quote)
@@ -1374,18 +1590,21 @@ class Strategy:
             if best_ask is None:
                 self._sniper_gate_reject(cfg, row, side, "ask_range", now=now, info=info, pending=queue,
                                          jump_usd=jump_usd, gap_usd=gap_usd, gap_meta=gap_meta,
+                                         best_ask=None,
                                          detail={"ask": None})
                 continue
             best_ask = float(best_ask)
             if not (float(cfg["sniper_min_ask"]) - EPS <= best_ask <= float(cfg["sniper_max_ask"]) + EPS):
                 self._sniper_gate_reject(cfg, row, side, "ask_range", now=now, info=info, pending=queue,
                                          jump_usd=jump_usd, gap_usd=gap_usd, gap_meta=gap_meta,
+                                         best_ask=best_ask,
                                          detail={"ask": best_ask, "min": cfg["sniper_min_ask"],
                                                  "max": cfg["sniper_max_ask"]})
                 continue
             if self._min_fill_blocked(cfg, row, quotes, side, "sniper_5m"):
                 self._sniper_gate_reject(cfg, row, side, "min_fill", now=now, info=info, pending=queue,
                                          jump_usd=jump_usd, gap_usd=gap_usd, gap_meta=gap_meta,
+                                         best_ask=best_ask,
                                          detail={"ask": best_ask, "floor": cfg["sniper_min_ask"]})
                 continue
             prepared = self._sniper_prepare(
@@ -1440,6 +1659,7 @@ class Strategy:
         if reason:
             self._sniper_gate_reject(cfg, row, fav, reason, now=now,
                                      jump_usd=jump_usd, gap_usd=gap_usd, gap_meta=gap_meta,
+                                     best_ask=side_best_ask(quotes, fav),
                                      detail={"reason": reason})
             self.save(force=True)
             self.io.log("fivemin_sniper_blocked", slug=row["slug"], reason=reason)
@@ -1536,6 +1756,7 @@ class Strategy:
         )
         self.io.log(kind, slug=row["slug"], condition_id=row["condition_id"], side=fav,
                     price=avg, size=filled, usdc=cost, status=result.get("status"),
+                    limit=limit,
                     latency_ms=latency_ms, timing=result.get("timing"),
                     jump_usd=jump_usd, gap_usd=gap_usd, spot=spot_now,
                     trigger_source=trigger_source, ttm=row["end"] - now,

@@ -39,6 +39,22 @@ MAX_BBO_SPREAD_USD = 5.0
 # Deribit closes a session after 10 minutes without a client request, even while
 # subscribed data keeps flowing. ``public/test`` is a cheap no-op request.
 DERIBIT_KEEPALIVE = '{"jsonrpc":"2.0","id":99,"method":"public/test"}'
+# Wait before a reconnect, indexed by consecutive failure count. A feed that had
+# been delivering messages returns to 1s instead of climbing the ladder, so a
+# routine exchange drop costs a second rather than 30.
+RECONNECT_BACKOFF_S = (1.0, 2.0, 5.0, 10.0)
+
+
+def reconnect_backoff_s(attempt: int) -> float:
+    """Sleep before reconnecting: 1s, 2s, 5s, then 10s from the fourth try."""
+    try:
+        step = int(attempt)
+    except (TypeError, ValueError):
+        step = 0
+    if step <= 1:
+        return RECONNECT_BACKOFF_S[0]
+    index = min(step - 1, len(RECONNECT_BACKOFF_S) - 1)
+    return RECONNECT_BACKOFF_S[index]
 
 
 def _fast_loads(raw: Any) -> Any:
@@ -276,6 +292,32 @@ class PriceGrid:
             latest = self._latest_by_source.get(source)
             return None if latest is None else latest[0]
 
+    def window_open_price(self, source: str, lower_ms: float,
+                          upper_ms: float) -> Optional[float]:
+        """Price of the oldest tick from ``source`` inside ``[lower_ms, upper_ms]``.
+
+        The window's own opening print, which the jump maths cannot see: the
+        extrema pair the current spot with the window min/max, so a spike and
+        retrace reads as a jump in both directions. Walks the per-source recv
+        deque from the newest end and stops at the first tick below ``lower_ms``,
+        so the cost is the ticks in the window, not the whole buffer.
+        """
+        src = str(source or "primary")
+        low = float(lower_ms)
+        high = float(upper_ms)
+        with self._lock:
+            ticks = self._recv_ticks_by_source.get(src)
+            if not ticks:
+                return None
+            first = None
+            for ts, px in reversed(ticks):
+                if ts < low:
+                    break
+                if ts <= high:
+                    first = px
+            # Every in-window tick overwrote ``first``, so it holds the oldest.
+            return first
+
     def latest_recv_wall_ms(self, source: str = "primary") -> Optional[float]:
         """Local wall-clock receive time (epoch ms) of the newest tick from ``source``."""
         with self._lock:
@@ -420,6 +462,10 @@ class PriceGrid:
                     "recv_ms": latest_r,
                     "recv_wall_ms": self._latest_recv_wall_ms.get(src_key),
                     "source": src_key,
+                    # The evaluate window itself, so a caller can compare the
+                    # net move with the jump the spot-vs-extrema maths found.
+                    "win_lower_ms": lower,
+                    "win_ref_ms": ref_r,
                 }
                 if mag > best_mag or (mag == best_mag and src_key == "primary"):
                     best_mag = mag
@@ -679,6 +725,7 @@ class BinanceTrades:
             is_deribit = "deribit.com" in target_url.lower()
             ws = None
             tracked = False
+            received = False
             try:
                 if self._connect:
                     ws = self._connect(target_url)
@@ -695,7 +742,6 @@ class BinanceTrades:
                 self._event("fivemin_binance_connect", feed=feed, url=target_url)
                 if sub_msg and hasattr(ws, "send"):
                     ws.send(sub_msg)
-                received = False
                 last_price = None
                 last_ping = time.monotonic()
                 last_message = last_ping
@@ -760,9 +806,12 @@ class BinanceTrades:
                 self._disconnect_event(feed, target_url, "closed")
                 attempt = 0 if received else attempt + 1
                 if not self._stop.is_set():
-                    self._stop.wait(min(30.0, 0.5 * (2 ** min(attempt, 6))))
+                    self._stop.wait(reconnect_backoff_s(attempt))
             except Exception as exc:
-                attempt += 1
+                # A connection that had been delivering messages is a routine
+                # drop (the exchange closing the session), not a failure to
+                # connect: retry in 1s instead of climbing the ladder.
+                attempt = 1 if received else attempt + 1
                 self._feed_update(feed, False)
                 self._disconnect_event(feed, target_url, str(exc)[:240])
                 now = time.time()
@@ -772,13 +821,14 @@ class BinanceTrades:
                         self._on_error(f"{feed} {target_url}: {exc}")
                     except Exception:
                         pass
+                backoff = reconnect_backoff_s(attempt)
                 if primary:
-                    self._stop.wait(min(30.0, 0.5 * (2 ** min(attempt, 6))))
+                    self._stop.wait(backoff)
                     continue
                 if self._sleep is time.sleep:
-                    self._stop.wait(min(30.0, 0.5 * (2 ** min(attempt, 6))))
+                    self._stop.wait(backoff)
                 else:
-                    self._sleep(min(30.0, 0.5 * (2 ** min(attempt, 6))))
+                    self._sleep(backoff)
             finally:
                 if tracked and ws is not None:
                     self._track_ws(ws, False)
