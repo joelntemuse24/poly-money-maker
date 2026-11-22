@@ -1023,6 +1023,56 @@ class RtdsTwapFeed:
         with self._lock:
             return list(self._twap_hist)
 
+    def live_average(self, start_ts: float, end_ts: float):
+        """Time-weighted mean of the retained live prints over ``[start, end]``.
+
+        Returns ``(avg, ticks, first_obs, last_obs, covered_s)`` or None when no
+        print falls inside the window. Walks the deque newest-first and stops at
+        the window start, so a hot-path call only touches the last ~60 prints
+        (the deque holds ``history_s``) and allocates nothing. Each print's
+        price holds until the next print; a print older than the window pins
+        the value at ``start``, and without one the oldest in-window print is
+        extended back across the head. ``first_obs`` lets the caller fail open
+        on a window the feed only partly saw.
+        """
+        end = float(end_ts)
+        start = float(start_ts)
+        if end <= start:
+            return None
+        total = 0.0
+        cursor = end
+        count = 0
+        first_obs = last_obs = None
+        oldest = None
+        pinned = False
+        with self._lock:
+            # Newest first: each print prices the span up to the next newer one.
+            # The last one the walk keeps is the oldest in-window print.
+            for obs, _recv, price in reversed(self._live_hist):
+                if obs >= end:
+                    continue
+                if obs <= start:
+                    total += price * (cursor - start)
+                    cursor = start
+                    pinned = True
+                    if first_obs is None:
+                        first_obs = obs
+                    break
+                total += price * (cursor - obs)
+                cursor = obs
+                oldest = price
+                if last_obs is None:
+                    last_obs = obs
+                first_obs = obs
+                count += 1
+        if not (count or pinned):
+            return None
+        if cursor > start:
+            # The deque ran out before the window start: extend the oldest print.
+            total += oldest * (cursor - start)
+        covered = end - start
+        return total / covered, count, first_obs, last_obs, covered
+
     def _merge_hist(self, bucket: deque, rows: list[tuple[float, float, float]]) -> None:
         if self.history_s <= 0 or not rows:
             return

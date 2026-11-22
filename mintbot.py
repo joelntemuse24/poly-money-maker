@@ -360,6 +360,11 @@ DEFAULTS = {
     'sniper_cl_guard_mode': 'raw',
     'sniper_cl_min_gap_usd': 0.0,
     'sniper_cl_max_age_s': 5.0,
+    # Last-minute guard uses the projected 60s settlement average.
+    'sniper_cl_twap_guard': True,
+    # Wrong-side trigger guard and the late-trigger cutoff (0 = disabled).
+    'sniper_jump_direction_check': True,
+    'sniper_max_trigger_lag_ms': 0.0,
     # Hot-path isolation knobs (buy/hotpath.py, buy/feed_process.py). All off:
     # the defaults change no decision, size, threshold or order.
     'gc_hotpath_gen0_threshold': 0,
@@ -975,6 +980,16 @@ def validate_strategy(cfg: dict) -> None:
             raise ValueError(f"{key} must be finite")
         if key == "sniper_cl_max_age_s" and float(value) <= 0:
             raise ValueError(f"{key} must be > 0")
+    if not isinstance(cfg.get("sniper_cl_twap_guard", True), bool):
+        raise ValueError("sniper_cl_twap_guard must be boolean")
+    if not isinstance(cfg.get("sniper_jump_direction_check", True), bool):
+        raise ValueError("sniper_jump_direction_check must be boolean")
+    lag_ms = cfg.get("sniper_max_trigger_lag_ms", 0.0)
+    if isinstance(lag_ms, bool) or not isinstance(lag_ms, (int, float)):
+        raise ValueError("sniper_max_trigger_lag_ms must be a number")
+    lag_ms = float(lag_ms)
+    if lag_ms != lag_ms or lag_ms in (float("inf"), float("-inf")) or lag_ms < 0:
+        raise ValueError("sniper_max_trigger_lag_ms must be finite and >= 0")
     for key, default, low, high in (
         ("fivemin_nofill_retry_s", 2.0, 0, None),
         ("fivemin_max_attempts_per_market", 3, 1, 20),
@@ -9359,7 +9374,9 @@ def main() -> int:
     )
     redeem_thread.start()
     if cfg.get("fivemin_enabled", False) or cfg.get("sniper_5m_enabled", False):
-        from buy.fivemin import FiveMinIO, Runner, Strategy, dry_run as fivemin_dry_run, load_state as load_fivemin_state, settings
+        from buy.fivemin import (FiveMinIO, Runner, Strategy, SETTLE_HISTORY_S,
+                                 dry_run as fivemin_dry_run,
+                                 load_state as load_fivemin_state, settings)
         from buy.binance_trades import BinanceTrades, PriceGrid
         from buy.clob_book_ws import ClobBookFeed
         from buy.fivemin_books import RestBookFeed, WsFallbackBookFeed
@@ -9425,7 +9442,7 @@ def main() -> int:
                         on_event=lambda event, **fields: log_event(event, **fields),
                         on_tick=lambda ms, px: runner.on_binance_tick(ms, px) if runner is not None else None,
                         extra_urls=extra_urls,
-                    ), RtdsTwapFeed(), (
+                    ), RtdsTwapFeed(history_s=SETTLE_HISTORY_S), (
                         WsFallbackBookFeed(
                             ClobBookFeed(on_error=fivemin_ws_error, custom_features=False,
                                          token_msg_fresh=True),

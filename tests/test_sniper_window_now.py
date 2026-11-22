@@ -54,9 +54,19 @@ class BestJumpRecvNowTests(unittest.TestCase):
         anchored = grid.best_jump_in_window(500.0, recv_now_ms=1_000_510.0)
         self.assertIsNotNone(anchored)
         self.assertAlmostEqual(anchored["up_jump"], 30.0)
+        # The candidate echoes the window it evaluated, anchored here on the
+        # injected recv stamp.
+        self.assertEqual((anchored["win_lower_ms"], anchored["win_ref_ms"]),
+                         (1_000_010.0, 1_000_510.0))
 
         # Tick path: no anchor, ref_r is the newest tick of each source.
         tick_path = grid.best_jump_in_window(500.0)
+        self.assertEqual((tick_path["win_lower_ms"], tick_path["win_ref_ms"]),
+                         (1_000_000.0, 1_000_500.0))
+        # Only the echoed bounds follow the anchor; the jump itself is the same.
+        for info in (anchored, tick_path):
+            info.pop("win_lower_ms")
+            info.pop("win_ref_ms")
         self.assertEqual(tick_path, anchored)
 
 

@@ -419,3 +419,41 @@ injected callbacks for orders, persistence, logging, alerts, and redeem jobs.
 Keep its sockets and state isolated from the 15-minute sell/mint/oracle paths.
 Do not add network work at module import time. Tests must keep using pure
 helpers or stubs and must not import `mintbot.py`.
+
+Sniper side guards, trigger filters and reconnect backoff (all keys must also
+exist in `mintbot.DEFAULTS` or `load_strategy()` drops them): markets settle on
+the Chainlink 60s average, so inside the last 60s the guard's reference is the
+projected settlement average — the time-weighted mean of the recorded Chainlink
+live prints over the elapsed part of the averaging window, holding the current
+print for the rest. `mintbot` starts that feed with `history_s=SETTLE_HISTORY_S`
+(90s). `sniper_cl_twap_guard` (default true) turns this off and restores the
+spot reference; outside the last 60s, or without enough recorded history, the
+guard keeps the old raw/projected reference and logs `cl_twap_mode` /
+`cl_twap_covered_s`. The decision lines carry `cl_guard_value`, the value the
+guard compared. `sniper_cl_guard` stays off by default, so all of this is inert
+until it is enabled. Every `sniper_gate_reject` that has a side carries
+`best_ask`, the top ask of that side's book, so a block can be audited against
+the price that would have been paid.
+
+`sniper_jump_direction_check` (default true) fixes a wrong-side trigger. The
+window maths pairs the current spot with the window min and max, so a spike and
+retrace inside the 500ms window clears `sniper_jump_usd` in both directions and
+the losing side can fire while the net window move points the other way.
+`PriceGrid.best_jump_in_window` now returns the window bounds it evaluated
+(`win_lower_ms`, `win_ref_ms`), and `PriceGrid.window_open_price` returns the
+oldest tick inside them. The scan rejects the side with gate `direction` when
+both jump magnitudes qualify (`reject_both`) or when the net move from the
+window's open print disagrees with the side's sign (`reject_net`); a grid or
+info dict without those inputs fails open as `unavailable`. The check runs only
+after a side's jump already cleared the threshold, and reads the open price at
+most once per scan. Decision lines carry `jump_dir_check`,
+`jump_dir_decision`, `jump_net_usd`, `jump_up_usd` and `jump_down_usd`.
+
+`sniper_max_trigger_lag_ms` (default 0 = disabled) rejects a side with gate
+`trigger_lag` when the trigger's receive-to-exchange lag exceeds the threshold.
+Every decision line carries `trigger_lag_ms` and `max_trigger_lag_ms`.
+
+The sniper FAK limit is `sniper_max_ask` itself; the pre-sign warmup signs that
+single price per token. `BinanceTrades` reconnects on `RECONNECT_BACKOFF_S`
+(1s, 2s, 5s, then 10s) instead of a 30s exponent, and a connection that had been
+receiving messages drops back to the 1s wait rather than climbing the ladder.
